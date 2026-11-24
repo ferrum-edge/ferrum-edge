@@ -6,7 +6,7 @@ the authoritative source for every `FERRUM_*` setting named anywhere else.
 
 Repository-root companions: [README.md](../README.md),
 [FEATURES.md](../FEATURES.md), [ARCHITECTURE.md](../ARCHITECTURE.md),
-[PRODUCTION_READINESS.md](../PRODUCTION_READINESS.md), [SECURITY.md](../SECURITY.md),
+[SECURITY.md](../SECURITY.md),
 [CONTRIBUTING.md](../CONTRIBUTING.md), [CHANGELOG.md](../CHANGELOG.md),
 [CUSTOM_PLUGINS.md](../CUSTOM_PLUGINS.md), [WEBSOCKET.md](../WEBSOCKET.md),
 [CONFORMANCE.md](../CONFORMANCE.md), [openapi.yaml](../openapi.yaml).
@@ -18,6 +18,7 @@ Repository-root companions: [README.md](../README.md),
 | [hardening.md](hardening.md) | **Production hardening checklist** — every surface, the setting that secures it, and the "never in production" list |
 | [threat_model.md](threat_model.md) | **Threat model** — trust boundaries, attacker capabilities, controls, and documented residuals |
 | [support_policy.md](support_policy.md) | **Support, versioning, and deprecation policy** — what a version number promises today and after 1.0 |
+| [deliberate_decisions.md](deliberate_decisions.md) | **Deliberate decisions** — trade-offs made on purpose (bounded UDP amplification, strict admin `aud`, expired-CRL refusal, `panic = "abort"`, ...) and the tests that pin them |
 | [configuration.md](configuration.md) | The complete `FERRUM_*` environment variable reference and file-mode config format |
 
 ## Operator
@@ -50,7 +51,7 @@ Running and securing a gateway.
 | [proxy_alerts.md](proxy_alerts.md) | The `proxy_alerts` plugin |
 | [prometheus_metrics.md](prometheus_metrics.md) | The Prometheus metric contract |
 | [runbooks/gateway.md](runbooks/gateway.md) | First-response procedure for every alert the `ferrum-gateway` chart ships |
-| [admin_metrics.md](admin_metrics.md) | `/metrics/runtime` JSON diagnostics |
+| [admin_metrics.md](admin_metrics.md) | `GET /admin/metrics` JSON runtime-state snapshot and the related `/metrics`, `/live`, `/health` summary |
 | [log_schema.md](log_schema.md) | Customizing transaction log output |
 | [error_classification.md](error_classification.md) | How failures are classified and surfaced |
 | [node_agent.md](node_agent.md) | Node agent capture contract |
@@ -69,18 +70,22 @@ Topology, routing, and the control plane.
 | [retry.md](retry.md) | Retry policy and bounds |
 | [connection_pooling.md](connection_pooling.md) | Backend connection pool sizing and warmup |
 | [connection_saturation_benchmark.md](connection_saturation_benchmark.md) | Connection saturation benchmark results |
+| [request_lifetime_dispatch.md](request_lifetime_dispatch.md) | Authorization lifetime during backend dispatch |
 | [dns_resolver.md](dns_resolver.md) | DNS cache, warmup, TTL overrides, and static entries |
 | [http3.md](http3.md) | HTTP/3 (QUIC) frontend and backend |
 | [tcp_udp_proxy.md](tcp_udp_proxy.md) | TCP/UDP/DTLS stream proxy, encryption matrices, and Gateway API routes |
 | [response_body_streaming.md](response_body_streaming.md) | Streaming response semantics |
+| [stream_authorization_lifetime.md](stream_authorization_lifetime.md) | Authorization lifetime of authenticated streams and uploads |
 | [cp_dp_mode.md](cp_dp_mode.md) | Control plane / data plane distributed mode |
 | [cp_namespace_tenancy.md](cp_namespace_tenancy.md) | Multi-namespace control plane, JWT tenancy, and trust binding |
 | [mesh.md](mesh.md) | Mesh mode: topologies, config sources, data model, and maturity |
 | [mesh_supported_matrix.md](mesh_supported_matrix.md) | Mesh supported-feature product contract |
+| [mesh_udp_capture.md](mesh_udp_capture.md) | Mesh UDP TPROXY capture datapath reference |
 | [mesh_multicluster_federation_runbook.md](mesh_multicluster_federation_runbook.md) | Multicluster federation runbook |
 | [gateway_api_conformance.md](gateway_api_conformance.md) | Kubernetes Gateway API conformance (canonical) |
 | [admin_api.md](admin_api.md) | Admin API reference: auth, health tiers, and every endpoint |
 | [admin_batch_api.md](admin_batch_api.md) | Batch admin operations |
+| [deployment_mutations.md](deployment_mutations.md) | Dependency-fenced `deployment-v1` mutation profile |
 | [admin_backup_restore.md](admin_backup_restore.md) | Backup and restore |
 | [admin_read_only_mode.md](admin_read_only_mode.md) | Read-only admin mode |
 | [api_specs.md](api_specs.md) | OpenAPI/Swagger spec-driven provisioning |
@@ -90,6 +95,18 @@ Topology, routing, and the control plane.
 | [plugin_execution_order.md](plugin_execution_order.md) | Hook phases and ordering |
 | [plugins/ai_tool_governor.md](plugins/ai_tool_governor.md) | `ai_tool_governor` plugin |
 | [plugins/api_chargeback_sink.md](plugins/api_chargeback_sink.md) | `api_chargeback_sink` plugin |
+| [plugins/a2a_gateway.md](plugins/a2a_gateway.md) | `a2a_gateway` plugin |
+| [plugins/ai_federation.md](plugins/ai_federation.md) | `ai_federation` plugin |
+| [plugins/ai_rate_limiter.md](plugins/ai_rate_limiter.md) | `ai_rate_limiter` plugin |
+| [plugins/ai_semantic_cache.md](plugins/ai_semantic_cache.md) | `ai_semantic_cache` plugin |
+| [plugins/ai_semantic_firewall.md](plugins/ai_semantic_firewall.md) | `ai_semantic_firewall` plugin |
+| [plugins/ai_stream_router.md](plugins/ai_stream_router.md) | `ai_stream_router` plugin |
+| [plugins/ai_transcript_audit.md](plugins/ai_transcript_audit.md) | `ai_transcript_audit` plugin |
+| [plugins/mcp_gateway.md](plugins/mcp_gateway.md) | `mcp_gateway` plugin |
+| [plugins/mesh_route_dispatch.md](plugins/mesh_route_dispatch.md) | `mesh_route_dispatch` plugin |
+| [plugins/serverless_function.md](plugins/serverless_function.md) | `serverless_function` plugin |
+| [plugins/rate_limiting_redis.md](plugins/rate_limiting_redis.md) | Centralized rate limiting design notes |
+| [plugins/request_deduplication.md](plugins/request_deduplication.md) | `request_deduplication` design notes |
 | [ai_prompt_compressor.md](ai_prompt_compressor.md) | `ai_prompt_compressor` plugin |
 | [cors_plugin.md](cors_plugin.md) | CORS plugin |
 
@@ -108,25 +125,25 @@ Contributing to Ferrum Edge itself.
 | [functional_testing_database.md](functional_testing_database.md) | Database-mode functional tests |
 | [functional_testing_file_mode.md](functional_testing_file_mode.md) | File-mode functional tests |
 | [functional_testing_load_stress.md](functional_testing_load_stress.md) | Load and stress testing |
-| [functional_testing_port_handoffs.md](functional_testing_port_handoffs.md) | Test port-handoff audit (issue #5579) |
 | [protocol_perf_regression.md](protocol_perf_regression.md) | Protocol performance regression gate |
 | [scaling_reload_diagnostics.md](scaling_reload_diagnostics.md) | 30,000-proxy scale harness publication and slow-query diagnostics |
-| [route_status_profile.md](route_status_profile.md) | Isolated route-status measurements in the Resources Scale Benchmark workflow |
+| [route_status_profile.md](route_status_profile.md) | Isolated route-status measurements (dated study; lane retired) |
 | [h1_internal_profile.md](h1_internal_profile.md) | `bench-h1-profile` hosted HTTP/1 internal profiling feature |
 | [pool_internal_profile.md](pool_internal_profile.md) | `bench-pool-profile` H2/native-gRPC pool acquisition profiling |
 | [udp_internal_profile.md](udp_internal_profile.md) | `bench-udp-profile` UDP internal profiling |
+| [h2_cpu_profile.md](h2_cpu_profile.md) | Manual H2 and gRPC CPU profile workflow |
+| [mesh_runtime_benchmark.md](mesh_runtime_benchmark.md) | Mesh data-plane head-to-head benchmark methodology |
+| [codeql-extraction-diagnostic.md](codeql-extraction-diagnostic.md) | Rust CodeQL extraction diagnostic |
 | [unit_compile_diagnostics.md](unit_compile_diagnostics.md) | Retained CI unit-test compilation diagnostics |
-| [ci_policy_performance.md](ci_policy_performance.md) | Trusted Cross verifier CI performance |
-| [ghcr_cache_migration.md](ghcr_cache_migration.md) | Moving the BuildKit cache to GHCR |
-| [native_cache_envelope.md](native_cache_envelope.md) | Native compiler-cache container-envelope proof |
-| [native_compiler_store_transfer.md](native_compiler_store_transfer.md) | Native compiler-store transfer proof |
-| [release_profile_study.md](release_profile_study.md) | Release build profile (LTO / codegen units) study |
-| [release_platform_build_study.md](release_platform_build_study.md) | Non-publishing macOS/Windows/Linux release-build timing study |
+| [native_cache_envelope.md](native_cache_envelope.md) | Native compiler-cache container-envelope proof (dated study; lane retired) |
+| [native_compiler_store_transfer.md](native_compiler_store_transfer.md) | Native compiler-store transfer proof (dated study; lane retired) |
+| [release_profile_study.md](release_profile_study.md) | Release build profile (LTO / codegen units) study (dated study; lane retired) |
+| [release_platform_build_study.md](release_platform_build_study.md) | Non-publishing macOS/Windows/Linux release-build timing study (dated study; lane retired) |
 | [plans/diagnostic_ref_cross_replica_adr.md](plans/diagnostic_ref_cross_replica_adr.md) | ADR: diagnostic reference lookup across replicas |
 | [plans/mesh_multicluster_lifecycle_adr.md](plans/mesh_multicluster_lifecycle_adr.md) | ADR: mesh multicluster lifecycle |
+| [plans/mesh_virtualservice_servicewaypoint.md](plans/mesh_virtualservice_servicewaypoint.md) | Design spec: ServiceWaypoint VirtualService `http[]` routing, cross-namespace destinations, and live E2E infrastructure (#7423) |
 | [plans/node_waypoint_transport_adr.md](plans/node_waypoint_transport_adr.md) | ADR: NodeWaypoint secured transport |
 | [plans/test_framework_scripted_backends.md](plans/test_framework_scripted_backends.md) | Scripted-backend test framework record |
-| [backlog/issue_2110_register.md](backlog/issue_2110_register.md) | Historical deferral register for issue #2110 |
 
 ## Dated reports
 
@@ -141,8 +158,27 @@ stated date and are not updated as behaviour changes.
 | [benchmark_h3_smoke_2026_09_18.md](benchmark_h3_smoke_2026_09_18.md) | H3 live smoke lifecycle loss ([results](benchmark_h3_smoke_2026_09_18_results.json)) |
 | [benchmark_h2_guard_transitions_2026_09_19.md](benchmark_h2_guard_transitions_2026_09_19.md) | H2 guard campaign findings and transition follow-up |
 | [benchmark_wss_tcp_2026_09_19.md](benchmark_wss_tcp_2026_09_19.md) | WSS and TCP/TLS missing-payload audit ([results](benchmark_wss_tcp_2026_09_19_results.json)) |
+| [benchmark_h2_cpu_profile_envoy_unwind_2026_10_30.md](benchmark_h2_cpu_profile_envoy_unwind_2026_10_30.md) | H2 CPU profile Envoy symbol vs. unwind coverage |
 | [ci_throughput_2026-09-08.md](ci_throughput_2026-09-08.md) | Hosted CI throughput follow-up ([cache inventory](ci_throughput_2026-09-08_cache.json)) |
 | [ci_pr_validation_review_2026_09_24.md](ci_pr_validation_review_2026_09_24.md) | PR validation scope review |
+| [benchmark_mesh_runtime_2026_10_17.md](benchmark_mesh_runtime_2026_10_17.md) | First mesh runtime head-to-head results ([results](benchmark_mesh_runtime_2026_10_17_results.json), [concurrency 1](benchmark_mesh_runtime_2026_10_17_conc1.json)) |
+| [benchmark_mesh_optimization_2026_10_18.md](benchmark_mesh_optimization_2026_10_18.md) | Mesh sidecar optimization findings |
+
+## Release records
+
+Immutable publication and recovery records for individual releases.
+
+| Document | What it covers |
+|---|---|
+| [releases/v0.9.11.md](releases/v0.9.11.md) | v0.9.11 verified release |
+| [releases/v0.9.12.md](releases/v0.9.12.md) | v0.9.12 release |
+| [releases/v0.9.16-candidate.md](releases/v0.9.16-candidate.md) | v0.9.16 candidate provenance |
+| [releases/v0.9.16-arm64-recovery.md](releases/v0.9.16-arm64-recovery.md) | ARM64 recovery after the v0.9.16 production failure |
+| [releases/v0.9.18-candidate.md](releases/v0.9.18-candidate.md) | v0.9.18 candidate provenance |
+| [releases/v0.9.18-arm64-recovery.md](releases/v0.9.18-arm64-recovery.md) | ARM64 OOM recovery after the unpublished v0.9.18 tag |
+| [releases/v0.9.19-publication.md](releases/v0.9.19-publication.md) | v0.9.19 publication record |
+| [releases/v0.9.20-publication.md](releases/v0.9.20-publication.md) | v0.9.20 publication record |
+| [releases/v0.9.21-publication.md](releases/v0.9.21-publication.md) | v0.9.21 publication record |
 
 ## Reference data
 
@@ -196,14 +232,29 @@ text. Governance lives in [dependency-policy.md](dependency-policy.md).
 
 ### hyper
 
+- [Overview](upstream-hyper-patches/README.md)
 - 001 — [reset an upgraded HTTP/2 CONNECT stream with `CONNECT_ERROR`](upstream-hyper-patches/001-upgraded-h2-connect-error-reset/README.md)
   ([issue text](upstream-hyper-patches/001-upgraded-h2-connect-error-reset/issue.md),
   [PR text](upstream-hyper-patches/001-upgraded-h2-connect-error-reset/pr-description.md),
   [patch](upstream-hyper-patches/001-upgraded-h2-connect-error-reset/hyper-upgraded-h2-connect-error-reset.patch))
+- 002 — [preserve HTTP/2 body progress at every positive window](upstream-hyper-patches/002-min-data-frame-capacity/README.md)
+  ([issue text](upstream-hyper-patches/002-min-data-frame-capacity/issue.md),
+  [PR text](upstream-hyper-patches/002-min-data-frame-capacity/pr-description.md),
+  [patch](upstream-hyper-patches/002-min-data-frame-capacity/hyper-min-data-frame-capacity.patch))
+- 003 — [keep reading an HTTP/1 transport past one TLS record](upstream-hyper-patches/003-greedy-h1-read/README.md)
+  ([patch](upstream-hyper-patches/003-greedy-h1-read/hyper-greedy-h1-read.patch))
 - 004 — [bound HTTP/2 request body write stalls](upstream-hyper-patches/004-h2-body-write-timeout/README.md)
   ([patch](upstream-hyper-patches/004-h2-body-write-timeout/hyper-h2-body-write-timeout.patch))
 - 005 — [coalesce DATA frames cut from small HTTP/2 window increments](upstream-hyper-patches/005-h2-small-window-coalescing/README.md)
   ([patch](upstream-hyper-patches/005-h2-small-window-coalescing/hyper-h2-small-window-coalescing.patch))
+- 006 — [report why an HTTP/2 server stream ended before its response](upstream-hyper-patches/006-h2-stream-termination-origin/README.md)
+  ([patch](upstream-hyper-patches/006-h2-stream-termination-origin/hyper-h2-stream-termination-origin.patch))
+- 007 — [absolute HTTP/2 client request-body deadline](upstream-hyper-patches/007-h2-request-body-deadline/README.md)
+  ([patch](upstream-hyper-patches/007-h2-request-body-deadline/hyper-h2-request-body-deadline.patch))
+- 008 — [bound how long an HTTP/2 response body may wait for client window](upstream-hyper-patches/008-h2-response-write-timeout/README.md)
+  ([patch](upstream-hyper-patches/008-h2-response-write-timeout/hyper-h2-response-write-timeout.patch))
+- 009 — [box the HTTP/2 client connection task](upstream-hyper-patches/009-h2-client-conn-task-box/README.md)
+  ([patch](upstream-hyper-patches/009-h2-client-conn-task-box/hyper-h2-client-conn-task-box.patch))
 
 ### h2
 
@@ -213,15 +264,20 @@ text. Governance lives in [dependency-policy.md](dependency-policy.md).
   [patch](upstream-h2-patches/001-coalesce-data-frame-writes/h2-coalesce-data-frame-writes.patch))
 - 003 — [report a stream's assigned send window apart from the send buffer](upstream-h2-patches/003-assigned-send-capacity/README.md)
   ([patch](upstream-h2-patches/003-assigned-send-capacity/h2-assigned-send-capacity.patch))
+- 004 — [report whether a stream's reset was local or the peer's](upstream-h2-patches/004-reset-origin/README.md)
+  ([patch](upstream-h2-patches/004-reset-origin/h2-reset-origin.patch))
 
 ### hyper-util
 
 - 001 — [release an HTTP/1 sender once its dispatcher stops reading](upstream-hyper-util-patches/001-release-h1-sender-on-dispatch-close/README.md)
   ([issue](upstream-hyper-util-patches/001-release-h1-sender-on-dispatch-close/issue.md),
   [patch](upstream-hyper-util-patches/001-release-h1-sender-on-dispatch-close/hyper-util-release-h1-sender-on-dispatch-close.patch))
+- 002 — [forward the HTTP/2 response write-stall bound from the auto builder](upstream-hyper-util-patches/002-forward-h2-response-write-timeout/README.md)
+  ([patch](upstream-hyper-util-patches/002-forward-h2-response-write-timeout/hyper-util-forward-h2-response-write-timeout.patch))
 
 ### reqwest
 
+- [Overview](upstream-reqwest-patches/README.md)
 - 001 — [per-request `connect_timeout`](upstream-reqwest-patches/001-per-request-connect-timeout/README.md)
   ([patch](upstream-reqwest-patches/001-per-request-connect-timeout/reqwest-3017.patch))
 - 002 — [selectable rustls provider fallback](upstream-reqwest-patches/002-selectable-rustls-provider/README.md)
@@ -230,7 +286,8 @@ text. Governance lives in [dependency-policy.md](dependency-policy.md).
 
 ### sqlx
 
-- 001 — [verify-ca hostname-error compatibility](upstream-sqlx-patches/001-verify-ca-name-context/README.md)
+- 001 — [verify-ca exclusive root CA and provider-pinned verifier](upstream-sqlx-patches/001-verify-ca-name-context/README.md)
+- 002 — [`Any` typed floating-point `NULL` bindings](upstream-sqlx-patches/002-typed-float-null-bindings/README.md) (retired: upstream since SQLx 0.9.1)
 
 ### tungstenite
 

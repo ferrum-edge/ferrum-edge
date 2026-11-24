@@ -41,8 +41,9 @@ use rcgen::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
@@ -50,6 +51,9 @@ use tokio_rustls::TlsAcceptor;
 const APP_PORT: u16 = 8080;
 /// Peer path answered with a 1 KiB body instead of the 2-byte `ok`.
 const KIB_PATH: &str = "/kib";
+/// Peer path that never reads its request body and holds its response, so an
+/// upload larger than the stream window stalls on flow control.
+const STALL_PATH: &str = "/stall";
 const PEER_MAX_CONCURRENT_STREAMS: u32 = 1024;
 
 // ===== identity fixtures =====
@@ -165,7 +169,6 @@ fn proxy_for_test(max_connections: Option<u32>) -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
@@ -199,11 +202,15 @@ fn proxy_for_test(max_connections: Option<u32>) -> Proxy {
 /// SPIFFE-mTLS h2 server that answers every request with `200` once `release`
 /// is `true`, and parks the response until then. `connections` counts accepted
 /// TCP connections, i.e. how many physical connections the pool dialed.
+///
+/// While `blackhole` is set, new connections are accepted (and counted) but
+/// never get a TLS handshake, so a dial hangs until its own connect timeout.
 struct HoldingPeer {
     addr: std::net::SocketAddr,
     connections: Arc<AtomicUsize>,
     release: watch::Sender<bool>,
     stop: watch::Sender<bool>,
+    blackhole: Arc<AtomicBool>,
 }
 
 impl HoldingPeer {
@@ -223,6 +230,10 @@ impl HoldingPeer {
     fn accepted(&self) -> usize {
         self.connections.load(Ordering::SeqCst)
     }
+
+    fn blackhole_new_connections(&self, blackhole: bool) {
+        self.blackhole.store(blackhole, Ordering::SeqCst);
+    }
 }
 
 async fn start_holding_peer(server_slot: SharedSvidBundle) -> HoldingPeer {
@@ -234,6 +245,8 @@ async fn start_holding_peer(server_slot: SharedSvidBundle) -> HoldingPeer {
     let (release, release_rx) = watch::channel(true);
     let (stop, mut stop_rx) = watch::channel(false);
     let connections_for_task = connections.clone();
+    let blackhole = Arc::new(AtomicBool::new(false));
+    let blackhole_for_task = blackhole.clone();
 
     tokio::spawn(async move {
         let inbound = build_spiffe_inbound_config(server_slot, true, Arc::new(Vec::new()))
@@ -246,6 +259,19 @@ async fn start_holding_peer(server_slot: SharedSvidBundle) -> HoldingPeer {
             };
             let Ok((tcp, _)) = accepted else { return };
             connections_for_task.fetch_add(1, Ordering::SeqCst);
+            if blackhole_for_task.load(Ordering::SeqCst) {
+                tokio::spawn(async move {
+                    // Swallow the ClientHello and never answer it.
+                    let mut tcp = tcp;
+                    let mut buf = [0u8; 1024];
+                    while let Ok(read) = tcp.read(&mut buf).await {
+                        if read == 0 {
+                            break;
+                        }
+                    }
+                });
+                continue;
+            }
             let acceptor = acceptor.clone();
             let release_rx = release_rx.clone();
             tokio::spawn(async move {
@@ -259,8 +285,16 @@ async fn start_holding_peer(server_slot: SharedSvidBundle) -> HoldingPeer {
                     } else {
                         Bytes::from_static(b"ok")
                     };
+                    let stall = request.uri().path() == STALL_PATH;
                     async move {
-                        let _ = request.into_body().collect().await;
+                        // A stalling peer keeps the body unread (no WINDOW_UPDATE)
+                        // until the response is released.
+                        let _unread_body = if stall {
+                            Some(request.into_body())
+                        } else {
+                            let _ = request.into_body().collect().await;
+                            None
+                        };
                         let _ = release_rx.wait_for(|released| *released).await;
                         Ok::<_, std::convert::Infallible>(Response::new(Full::new(body)))
                     }
@@ -280,6 +314,7 @@ async fn start_holding_peer(server_slot: SharedSvidBundle) -> HoldingPeer {
         connections,
         release,
         stop,
+        blackhole,
     }
 }
 
@@ -292,6 +327,20 @@ struct Fixture {
 }
 
 async fn fixture(width: usize, max_connections: Option<u32>) -> Fixture {
+    fixture_with_pool_config(
+        PoolConfig {
+            http2_connections_per_host: width,
+            ..PoolConfig::default()
+        },
+        max_connections,
+    )
+    .await
+}
+
+async fn fixture_with_pool_config(
+    pool_config: PoolConfig,
+    max_connections: Option<u32>,
+) -> Fixture {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let td = TrustDomain::new("cluster.local").unwrap();
     let (root_der, root_pem, root_key_pem) = synthetic_root(&td);
@@ -308,10 +357,6 @@ async fn fixture(width: usize, max_connections: Option<u32>) -> Fixture {
     let peer_slot = svid_slot(bundle_for(peer_id.clone(), peer_leaf, peer_key, root_der));
     let peer = start_holding_peer(peer_slot).await;
 
-    let pool_config = PoolConfig {
-        http2_connections_per_host: width,
-        ..PoolConfig::default()
-    };
     let pool = MeshMtlsConnectionPool::new(
         pool_config,
         DnsCache::new(DnsConfig::default()),
@@ -417,6 +462,36 @@ async fn sequential_traffic_stays_on_one_connection() {
         1,
         "requests that never overlap must not widen the pool"
     );
+}
+
+/// Issue #7182: an idle connection to a destination that receives no further
+/// lookups is still evicted once `idleTimeout` passes. The cold-create prune
+/// never runs for such a destination, so only the periodic sweep can reach it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_untouched_idle_connection_is_swept_after_the_idle_timeout() {
+    let fixture = fixture_with_pool_config(
+        PoolConfig {
+            idle_timeout_seconds: 1,
+            ..PoolConfig::default()
+        },
+        None,
+    )
+    .await;
+    {
+        let (_sender, future) = dispatch(&fixture).await;
+        expect_ok(future).await;
+    }
+    assert_eq!(fixture.pool.pool_size(), 1);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while fixture.pool.pool_size() != 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the idle connection was never swept"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(fixture.peer.accepted(), 1, "the sweep itself dials nothing");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -623,6 +698,43 @@ async fn failed_growth_dial_keeps_serving_on_the_existing_connection() {
     }
 }
 
+/// A failed growth dial backs the key off for the full 10 s measured from the
+/// FAILURE. The connect timeout here outlasts that window, so a backoff
+/// measured from the dial's start would already have expired when the dial
+/// gave up, and the next pressured checkout would dial again at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_growth_dial_backs_off_from_the_failure_not_the_dial_start() {
+    let mut fixture = fixture(4, None).await;
+    fixture.proxy.backend_connect_timeout_ms = 11_000;
+    let threshold = MESH_MTLS_GROWTH_PENDING_PER_CONNECTION;
+    let parked = park(&fixture, threshold).await;
+
+    // The growth dial hangs until its 11 s connect timeout, then the checkout
+    // falls back to the connection it already has.
+    fixture.peer.blackhole_new_connections(true);
+    let served = fixture.checkout().await;
+    assert_eq!(served.pending_requests(), threshold);
+    assert_eq!(
+        fixture.peer.accepted(),
+        2,
+        "the growth dial reached the peer"
+    );
+    assert_eq!(fixture.pool.pool_size(), 1);
+
+    // With the peer healthy again, a pressured checkout inside the backoff
+    // window dials nothing (growth is inline, so a dial would be counted
+    // before the checkout returns).
+    fixture.peer.blackhole_new_connections(false);
+    let _ = fixture.checkout().await;
+    assert_eq!(fixture.peer.accepted(), 2, "the key is still backed off");
+    assert_eq!(fixture.pool.pool_size(), 1);
+
+    fixture.peer.release_all();
+    for (_, future) in parked {
+        expect_ok(future).await;
+    }
+}
+
 /// Issue #5464: one connection under the shipped `PoolConfig` must carry
 /// hundreds of concurrent small responses without either side closing it.
 ///
@@ -660,4 +772,48 @@ async fn one_connection_carries_hundreds_of_concurrent_small_responses() {
         1,
         "every round rode the single bounded connection; nothing was torn down"
     );
+}
+
+/// The sidecar mesh-mTLS dispatcher bounds an unauthenticated upload with
+/// hyper's HTTP/2 pipe instead of a gateway-owned pump (vendored hyper patch
+/// 004). This proves the transport half of that: on a real mesh-mTLS pool
+/// connection, a request carrying `Http2BodyWriteTimeout` whose peer stops
+/// granting stream window is reset once the bound passes with a ready chunk
+/// unwritten, and the shared flag reports that the bound fired. It sends
+/// through the pool directly, so it does not run the dispatcher; the
+/// dispatcher's install-and-map wiring (pump kept for authorization
+/// lifetimes, `expired()` mapped to the write-watermark terminal) is pinned by
+/// `specialized_streaming_dispatchers_race_the_backend_write_watermark`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_that_stops_reading_trips_the_h2_pipe_write_timeout() {
+    let fixture = fixture(1, None).await;
+    fixture.peer.hold();
+    let mut sender = fixture.checkout().await;
+    let write_timeout = hyper::ext::Http2BodyWriteTimeout::new(Duration::from_millis(200));
+    let mut request = Request::builder()
+        .method("POST")
+        .uri(format!("https://orders.example.com{STALL_PATH}"))
+        .body(MeshMtlsRequestBody::Grpc(GrpcBody::Buffered(Full::new(
+            // Larger than hyper's default 1 MiB stream window, so the pipe
+            // parks on capacity once the peer stops reading.
+            Bytes::from(vec![b'x'; 8 * 1024 * 1024]),
+        ))))
+        .expect("request");
+    request.extensions_mut().insert(write_timeout.clone());
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        sender.send_request(request).expect("send"),
+    )
+    .await
+    .expect("the write bound, not the test timeout, must end the stalled upload");
+    assert!(
+        outcome.is_err(),
+        "an upload the peer stopped reading must not complete"
+    );
+    assert!(
+        write_timeout.expired(),
+        "the reset must be attributed to the HTTP/2 pipe write bound"
+    );
+    fixture.peer.release_all();
 }

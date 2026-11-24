@@ -5,8 +5,8 @@
 //! the SPIFFE peer-cert verifier, and the outbound client config for
 //! `FERRUM_MESH_CA_BACKEND`-issued (and file-gateway) SVIDs. They consume the
 //! `Arc<ArcSwap<Option<SvidBundle>>>` slot produced by
-//! [`crate::identity::workload_api::fetch_loop`] /
-//! [`crate::identity::rotation`] so cert rotation is lock-free and atomic
+//! [`crate::identity::workload_api::fetch_loop`] or the internal mesh CA
+//! rotation loop in [`crate::modes::mesh`], so cert rotation is lock-free and atomic
 //! from the rustls resolver's perspective — no listener restart, no per-
 //! request cloning of the bundle.
 //!
@@ -33,7 +33,6 @@
 //!   any-federated behavior (HBONE operator targets).
 
 use arc_swap::{ArcSwap, ArcSwapOption};
-use rustls::client::WantsClientCert;
 use rustls::pki_types::{
     CertificateDer, CertificateRevocationListDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName,
     UnixTime,
@@ -210,6 +209,11 @@ pub fn build_spiffe_inbound_config(
     // SPIFFE inbound is currently used by HBONE listeners, which require
     // HTTP/2 over mTLS.
     cfg.alpn_protocols = vec![b"h2".to_vec()];
+    // The verifier reads the SVID bundle slot (trust bundles) on every
+    // handshake, and rustls enables a stateful session cache by default. A
+    // resumed peer would skip that live check and the CRL expiry check, so
+    // never resume (issue #6538).
+    crate::tls::disable_server_session_resumption(&mut cfg);
     Ok(Arc::new(cfg))
 }
 
@@ -320,7 +324,7 @@ pub fn build_spiffe_outbound_config(
         bundle_slot.clone(),
         expected_peer,
         expected_trust_domain,
-        crls,
+        Arc::clone(&crls),
     );
     let resolver = SpiffeClientCertResolver::new(bundle_slot);
 
@@ -329,6 +333,9 @@ pub fn build_spiffe_outbound_config(
         .with_custom_certificate_verifier(Arc::new(verifier))
         .with_client_cert_resolver(Arc::new(resolver));
     cfg.alpn_protocols = alpn_protocols;
+    // Pools build one config per dial today; the shared CRL resumption policy
+    // keeps a reused config from skipping the CRL expiration check.
+    crate::tls::apply_crl_enforced_client_resumption(&mut cfg, &crls);
     Ok(Arc::new(cfg))
 }
 
@@ -351,14 +358,6 @@ impl SpiffeServerCertResolver {
     fn build_cert_key(&self) -> Option<Arc<rustls::sign::CertifiedKey>> {
         let snapshot = self.slot.load_full();
         cached_certified_key(&self.certified_key_cache, snapshot, "server")
-    }
-
-    pub fn validate_current(&self) -> Result<(), SpiffeTlsError> {
-        let snapshot = self.slot.load_full();
-        let bundle = snapshot.as_ref().as_ref().ok_or(SpiffeTlsError::NoSvid)?;
-        certified_key_from_bundle(bundle)
-            .map(|_| ())
-            .map_err(SpiffeTlsError::BadKeyMaterial)
     }
 }
 
@@ -427,6 +426,9 @@ struct SpiffeClientCertVerifier {
     /// `peer_verifier_cache` below is only the startup fallback for a listener
     /// whose fence has never published.
     admission: SharedInboundAdmissionArtifact,
+    /// Signature algorithms from the base provider, resolved once at
+    /// construction instead of rebuilding a provider per handshake.
+    algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
     schemes: Vec<rustls::SignatureScheme>,
     /// The verifier's OWN compile of the SVID slot, with last-known-good
     /// retention. Used only while [`Self::admission`] has nothing in force.
@@ -439,13 +441,13 @@ impl SpiffeClientCertVerifier {
         peer_required: bool,
         admission: SharedInboundAdmissionArtifact,
     ) -> Self {
+        let algorithms = crate::fips::base_crypto_provider().signature_verification_algorithms;
         Self {
             slot,
             peer_required,
             admission,
-            schemes: crate::fips::base_crypto_provider()
-                .signature_verification_algorithms
-                .supported_schemes(),
+            algorithms,
+            schemes: algorithms.supported_schemes(),
             peer_verifier_cache: ArcSwap::new(Arc::new(None)),
         }
     }
@@ -515,12 +517,7 @@ impl rustls::server::danger::ClientCertVerifier for SpiffeClientCertVerifier {
         cert: &CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &crate::fips::base_crypto_provider().signature_verification_algorithms,
-        )
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algorithms)
     }
 
     fn verify_tls13_signature(
@@ -529,12 +526,7 @@ impl rustls::server::danger::ClientCertVerifier for SpiffeClientCertVerifier {
         cert: &CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &crate::fips::base_crypto_provider().signature_verification_algorithms,
-        )
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms)
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
@@ -569,6 +561,9 @@ struct SpiffeServerCertVerifier {
     /// inbound session is never re-handshaked. Wrapped in the shared type only
     /// so both sides share one verifier-cache implementation.
     crls: SharedEnforcedCrlSet,
+    /// Signature algorithms from the base provider, resolved once at
+    /// construction instead of rebuilding a provider per handshake.
+    algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
     schemes: Vec<rustls::SignatureScheme>,
     peer_verifier_cache: ArcSwap<Option<SpiffePeerVerifierCache>>,
 }
@@ -580,14 +575,14 @@ impl SpiffeServerCertVerifier {
         expected_trust_domain: Option<TrustDomain>,
         crls: CrlList,
     ) -> Self {
+        let algorithms = crate::fips::base_crypto_provider().signature_verification_algorithms;
         Self {
             slot,
             expected_peer,
             expected_trust_domain,
             crls: enforced_crl_set(crls),
-            schemes: crate::fips::base_crypto_provider()
-                .signature_verification_algorithms
-                .supported_schemes(),
+            algorithms,
+            schemes: algorithms.supported_schemes(),
             peer_verifier_cache: ArcSwap::new(Arc::new(None)),
         }
     }
@@ -631,12 +626,7 @@ impl rustls::client::danger::ServerCertVerifier for SpiffeServerCertVerifier {
         cert: &CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &crate::fips::base_crypto_provider().signature_verification_algorithms,
-        )
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algorithms)
     }
 
     fn verify_tls13_signature(
@@ -645,12 +635,7 @@ impl rustls::client::danger::ServerCertVerifier for SpiffeServerCertVerifier {
         cert: &CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &crate::fips::base_crypto_provider().signature_verification_algorithms,
-        )
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms)
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
@@ -681,7 +666,11 @@ fn certified_key_from_bundle(bundle: &SvidBundle) -> Result<rustls::sign::Certif
 
 struct SpiffeCertifiedKeyCache {
     source: Arc<Option<SvidBundle>>,
-    key: Arc<rustls::sign::CertifiedKey>,
+    /// `None` records that this snapshot's key did not materialise, so a
+    /// broken rotation warns once instead of rebuilding and warning on every
+    /// handshake until the next snapshot (the `SvidServerCertResolver`
+    /// contract in `.claude/rules/tls-security.md`).
+    key: Option<Arc<rustls::sign::CertifiedKey>>,
 }
 
 fn cached_certified_key(
@@ -693,19 +682,12 @@ fn cached_certified_key(
     if let Some(cache) = cached.as_ref()
         && Arc::ptr_eq(&cache.source, &source)
     {
-        return Some(cache.key.clone());
+        return cache.key.clone();
     }
 
     let bundle = source.as_ref().as_ref()?;
-    match certified_key_from_bundle(bundle) {
-        Ok(key) => {
-            let key = Arc::new(key);
-            cache_slot.store(Arc::new(Some(SpiffeCertifiedKeyCache {
-                source,
-                key: key.clone(),
-            })));
-            Some(key)
-        }
+    let key = match certified_key_from_bundle(bundle) {
+        Ok(key) => Some(Arc::new(key)),
         Err(error) => {
             warn!(
                 resolver = resolver_kind,
@@ -714,7 +696,12 @@ fn cached_certified_key(
             );
             None
         }
-    }
+    };
+    cache_slot.store(Arc::new(Some(SpiffeCertifiedKeyCache {
+        source,
+        key: key.clone(),
+    })));
+    key
 }
 
 struct SpiffePeerVerifierCache {
@@ -725,6 +712,14 @@ struct SpiffePeerVerifierCache {
     /// already does through `source`.
     crl_generation: u64,
     verifiers: PeerVerifierMap,
+    /// The latest candidate `(source, CRL generation)` that failed to build
+    /// while these verifiers stayed in force. A handshake that presents the
+    /// same candidate again reuses this set without rebuilding the trust
+    /// stores or re-warning, so a broken rotation warns once per candidate
+    /// (the `SvidServerCertResolver` contract in
+    /// `.claude/rules/tls-security.md`). Any new source snapshot or CRL
+    /// generation misses this memo and is built immediately.
+    rejected_candidate: Option<(Arc<Option<SvidBundle>>, u64)>,
 }
 
 type PeerChainVerifier = Arc<dyn rustls::server::danger::ClientCertVerifier>;
@@ -814,33 +809,53 @@ fn peer_verifier_cache(
         // revocation list the listener started with.
         return Ok(cached);
     }
+    if let Some(cache) = cached.as_ref()
+        && cache.rejected_candidate.as_ref().is_some_and(
+            |(rejected_source, rejected_generation)| {
+                Arc::ptr_eq(rejected_source, &source) && *rejected_generation == crls.generation()
+            },
+        )
+    {
+        // This exact candidate already failed to build and warned; building
+        // is deterministic for one (source, CRL generation) pair.
+        return Ok(cached);
+    }
 
+    let candidate_source = source.clone();
     match SpiffePeerVerifierCache::build(source, crls) {
         Ok(next) => {
             let next = Arc::new(Some(next));
             cache_slot.store(next.clone());
             Ok(next)
         }
-        Err(error) if cached.is_some() => {
+        Err(error) => {
+            let Some(cache) = cached.as_ref() else {
+                return Err(error);
+            };
             warn!(
                 error = %error,
                 "SPIFFE verifier cache: candidate trust update rejected; keeping last-known-good set"
             );
-            // The retained set is returned UNCHANGED, including its
-            // `crl_generation` (issue #5574). Recording the attempted
-            // generation on the last-known-good verifiers would be fail-open:
-            // a build can fail because the candidate SVID SOURCE is unusable
-            // while the enforced CRL generation moved with perfectly good
-            // records, and a cache stamped with that generation would keep
-            // serving handshakes under the OLD revocation list — matching on
-            // both halves — until the source itself changed. Retrying the
-            // build on every handshake while a candidate stays rejected is the
-            // same cost a rejected trust source already carried before CRLs
-            // were live, and it is what makes the next good publication take
-            // effect immediately.
-            Ok(cached)
+            // The retained verifiers keep their source and `crl_generation`
+            // UNCHANGED (issue #5574); only the rejected candidate is
+            // remembered beside them. Stamping the attempted generation on
+            // the last-known-good verifiers would be fail-open: a build can
+            // fail because the candidate SVID SOURCE is unusable while the
+            // enforced CRL generation moved with perfectly good records, and
+            // a cache stamped with that generation would keep serving
+            // handshakes under the OLD revocation list — matching on both
+            // halves — until the source itself changed. The memo matches only
+            // the exact rejected pair, so the next good publication (a new
+            // source or CRL generation) still takes effect immediately.
+            let retained = Arc::new(Some(SpiffePeerVerifierCache {
+                source: cache.source.clone(),
+                crl_generation: cache.crl_generation,
+                verifiers: cache.verifiers.clone(),
+                rejected_candidate: Some((candidate_source, crls.generation())),
+            }));
+            cache_slot.store(retained.clone());
+            Ok(retained)
         }
-        Err(error) => Err(error),
     }
 }
 
@@ -862,6 +877,7 @@ impl SpiffePeerVerifierCache {
             source,
             crl_generation: crls.generation(),
             verifiers,
+            rejected_candidate: None,
         })
     }
 }
@@ -1223,9 +1239,10 @@ fn verify_peer_chain_result(
 /// Validate `end_entity + intermediates` against `bundle.trust_bundles`,
 /// extract the SPIFFE ID, and (optionally) match it against `expected_peer`.
 ///
-/// This uncached helper is retained for direct validation tests. Runtime
-/// verifiers use [`verify_peer_against_cached_snapshot`] so live handshakes
-/// rebuild chain verifiers only when the bundle slot rotates.
+/// Test-only: this uncached helper backs the direct validation tests below.
+/// Runtime verifiers use [`verify_peer_against_cached_snapshot`] so live
+/// handshakes rebuild chain verifiers only when the bundle slot rotates.
+#[cfg(test)]
 fn verify_peer_against_bundle(
     trust_bundles: &TrustBundleSet,
     end_entity: &CertificateDer<'_>,
@@ -1252,11 +1269,6 @@ fn verify_peer_against_bundle(
     );
     Ok(peer_id)
 }
-
-// re-export the ConfigBuilder marker types so the build steps above compile
-// without doc warnings on unused import lints.
-#[allow(dead_code)]
-fn _marker_imports(_x: WantsServerCert, _y: WantsClientCert) {}
 
 #[cfg(test)]
 mod tests {
@@ -1446,6 +1458,53 @@ mod tests {
     }
 
     #[test]
+    fn certified_key_cache_records_a_failed_snapshot_once() {
+        let td = TrustDomain::new("cluster.local").unwrap();
+        let (root_der, root_pem, root_key_pem) = synthetic_root(&td);
+        let id = SpiffeId::from_parts(&td, "ns/default/sa/gateway").unwrap();
+        let trust_bundles = bundle_for(td, root_der);
+        let (leaf, _key) = issue_leaf_with_key(&id, &root_pem, &root_key_pem);
+        // An empty private key cannot materialise a CertifiedKey.
+        let source = Arc::new(Some(svid_bundle_for(id, trust_bundles, leaf)));
+        let cache = ArcSwap::new(Arc::new(None));
+
+        assert!(cached_certified_key(&cache, source.clone(), "test").is_none());
+        let recorded = cache.load_full();
+        let entry = recorded
+            .as_ref()
+            .as_ref()
+            .expect("the failed snapshot is recorded");
+        assert!(Arc::ptr_eq(&entry.source, &source));
+        assert!(entry.key.is_none());
+
+        assert!(cached_certified_key(&cache, source.clone(), "test").is_none());
+        assert!(
+            Arc::ptr_eq(&cache.load_full(), &recorded),
+            "a recorded failure must not rebuild (and re-warn) for the same snapshot"
+        );
+    }
+
+    /// Whether two cache entries serve the same verifier set: same source
+    /// snapshot, CRL generation and per-domain verifiers. A retained
+    /// last-known-good entry may differ only in its rejected-candidate memo.
+    fn same_verifier_set(
+        a: &Arc<Option<SpiffePeerVerifierCache>>,
+        b: &Arc<Option<SpiffePeerVerifierCache>>,
+    ) -> bool {
+        let (Some(a), Some(b)) = (a.as_ref(), b.as_ref()) else {
+            return false;
+        };
+        Arc::ptr_eq(&a.source, &b.source)
+            && a.crl_generation == b.crl_generation
+            && a.verifiers.len() == b.verifiers.len()
+            && a.verifiers.iter().all(|(domain, verifier)| {
+                b.verifiers
+                    .get(domain)
+                    .is_some_and(|other| Arc::ptr_eq(verifier, other))
+            })
+    }
+
+    #[test]
     fn peer_verifier_cache_rejects_partial_trust_update_and_keeps_last_good() {
         let local_td = TrustDomain::new("cache.local").unwrap();
         let federated_td = TrustDomain::new("cache.federated").unwrap();
@@ -1481,15 +1540,33 @@ mod tests {
             .trust_bundles;
         let error = validate_trust_bundle_set(rejected_bundles)
             .expect_err("one unusable federated root must reject the complete update");
-        let retained = peer_verifier_cache(&cache, rejected_source, &no_crls())
+        let retained = peer_verifier_cache(&cache, rejected_source.clone(), &no_crls())
             .expect("a failed reload with an existing cache must retain last-known-good");
 
         assert!(error.contains("certificate record #1"), "got: {error}");
-        assert!(Arc::ptr_eq(&retained, &last_good));
         assert!(
-            Arc::ptr_eq(&cache.load_full(), &last_good),
-            "failed candidate must not replace the last-good verifier cache"
+            same_verifier_set(&retained, &last_good),
+            "failed candidate must not replace the last-good verifier set"
         );
+        assert!(Arc::ptr_eq(&cache.load_full(), &retained));
+
+        // The same rejected candidate is not rebuilt (and not re-warned) on
+        // the next handshake: a rebuild would store a fresh cache entry.
+        let again = peer_verifier_cache(&cache, rejected_source, &no_crls())
+            .expect("a repeated rejected candidate keeps last-known-good");
+        assert!(Arc::ptr_eq(&again, &retained));
+        assert!(
+            Arc::ptr_eq(&cache.load_full(), &retained),
+            "a recorded rejection must not rebuild for the same candidate"
+        );
+
+        // A new good publication is still adopted at once.
+        let adopted = peer_verifier_cache(&cache, valid_source.clone(), &no_crls())
+            .expect("the original good source still builds");
+        assert!(Arc::ptr_eq(
+            &adopted.as_ref().as_ref().expect("cache").source,
+            &valid_source
+        ));
     }
 
     #[test]
@@ -1552,7 +1629,7 @@ mod tests {
         )));
         let retained_after_drop = peer_verifier_cache(&cache, rejected_drop.clone(), &no_crls())
             .expect("rejected candidate must keep last-known-good");
-        assert!(Arc::ptr_eq(&retained_after_drop, &last_good));
+        assert!(same_verifier_set(&retained_after_drop, &last_good));
 
         // Domain present only in LKG (removed by rejected candidate) must still
         // pass membership + chain verification against the retained snapshot.
@@ -1567,7 +1644,7 @@ mod tests {
         )
         .expect("LKG-federated peer must remain trusted after rejected drop");
         assert_eq!(still_trusted.as_str(), federated_peer.as_str());
-        assert!(Arc::ptr_eq(&cache.load_full(), &last_good));
+        assert!(same_verifier_set(&cache.load_full(), &last_good));
 
         // Candidate declares an extra domain that LKG never admitted, but the
         // extra domain's authority is unusable so the whole candidate fails.
@@ -1588,7 +1665,7 @@ mod tests {
         )));
         let retained_after_add = peer_verifier_cache(&cache, rejected_add.clone(), &no_crls())
             .expect("rejected candidate must keep last-known-good");
-        assert!(Arc::ptr_eq(&retained_after_add, &last_good));
+        assert!(same_verifier_set(&retained_after_add, &last_good));
 
         // Membership must deny against the retained snapshot with the unknown-
         // domain diagnostic — not pass candidate membership then fail with
@@ -1614,7 +1691,7 @@ mod tests {
             !err.contains("no usable roots"),
             "candidate-only domain must not surface the unusable-roots path: {err}"
         );
-        assert!(Arc::ptr_eq(&cache.load_full(), &last_good));
+        assert!(same_verifier_set(&cache.load_full(), &last_good));
     }
 
     /// Issue a leaf SVID under `root` with a known serial so a CRL can revoke
@@ -1875,6 +1952,108 @@ mod tests {
         assert!(
             msg.contains("trust domain") || msg.contains("trust bundle"),
             "rejection should cite the missing trust domain, got: {msg}"
+        );
+    }
+
+    fn pump_handshake(
+        client_config: &Arc<ClientConfig>,
+        server_config: &Arc<ServerConfig>,
+    ) -> Result<rustls::ClientConnection, rustls::Error> {
+        let mut client = rustls::ClientConnection::new(
+            Arc::clone(client_config),
+            rustls::pki_types::ServerName::try_from("spiffe-peer.test").expect("server name"),
+        )?;
+        let mut server = rustls::ServerConnection::new(Arc::clone(server_config))?;
+        for _ in 0..HANDSHAKE_ROUNDS {
+            let mut progressed = false;
+            if client.wants_write() {
+                let mut wire = Vec::new();
+                client.write_tls(&mut wire).expect("client write");
+                server
+                    .read_tls(&mut std::io::Cursor::new(wire))
+                    .expect("server read");
+                server.process_new_packets()?;
+                progressed = true;
+            }
+            if server.wants_write() {
+                let mut wire = Vec::new();
+                server.write_tls(&mut wire).expect("server write");
+                client
+                    .read_tls(&mut std::io::Cursor::new(wire))
+                    .expect("client read");
+                client.process_new_packets()?;
+                progressed = true;
+            }
+            if !progressed {
+                return Ok(client);
+            }
+        }
+        panic!("in-memory handshake did not quiesce");
+    }
+
+    const HANDSHAKE_ROUNDS: usize = 32;
+
+    /// Issue #6538: `build_spiffe_inbound_config` reads the SVID bundle slot on
+    /// every handshake, so a trust-domain withdrawal must apply to the peer's
+    /// next connection. A resumed session would skip the verifier, so the
+    /// config never resumes, even without CRLs.
+    #[test]
+    fn inbound_config_never_resumes_so_trust_withdrawal_applies_to_the_next_handshake() {
+        let _ = crate::fips::base_crypto_provider().install_default();
+        let td = TrustDomain::new("td.inbound-resume").unwrap();
+        let server_id = SpiffeId::from_parts(&td, "ns/srv/sa/srv").unwrap();
+        let client_id = SpiffeId::from_parts(&td, "ns/cli/sa/cli").unwrap();
+        let (root_der, root_pem, key_pem) = synthetic_root(&td);
+        let (server_leaf, server_key) = issue_leaf_with_key(&server_id, &root_pem, &key_pem);
+        let (client_leaf, client_key) = issue_leaf_with_key(&client_id, &root_pem, &key_pem);
+        let server_slot = shared_bundle_slot(Some(svid_bundle_with_key(
+            server_id.clone(),
+            bundle_for(td.clone(), root_der.clone()),
+            server_leaf.clone(),
+            server_key.clone(),
+        )));
+        let client_slot = shared_bundle_slot(Some(svid_bundle_with_key(
+            client_id,
+            bundle_for(td, root_der),
+            client_leaf,
+            client_key,
+        )));
+
+        let server = build_spiffe_inbound_config(Arc::clone(&server_slot), true, empty_crls())
+            .expect("inbound config");
+        assert_eq!(server.send_tls13_tickets, 0, "TLS 1.3 tickets");
+        assert!(!server.ticketer.enabled(), "TLS 1.2 tickets");
+        assert!(!server.session_storage.can_cache(), "stateful cache");
+        let client = build_spiffe_outbound_config(
+            client_slot,
+            Some(server_id.clone()),
+            None,
+            vec![b"h2".to_vec()],
+            empty_crls(),
+        )
+        .expect("outbound config");
+
+        pump_handshake(&client, &server).expect("initial handshake");
+        let second = pump_handshake(&client, &server).expect("reconnect");
+        assert_eq!(
+            second.handshake_kind(),
+            Some(rustls::HandshakeKind::Full),
+            "the inbound SPIFFE config must not resume sessions"
+        );
+
+        // Withdraw the client's trust domain: the server now trusts only a
+        // foreign root. The next reconnect must reach the verifier and fail.
+        let foreign_td = TrustDomain::new("td.inbound-resume-foreign").unwrap();
+        let (foreign_root_der, _, _) = synthetic_root(&foreign_td);
+        server_slot.store(Arc::new(Some(svid_bundle_with_key(
+            server_id,
+            bundle_for(foreign_td, foreign_root_der),
+            server_leaf,
+            server_key,
+        ))));
+        assert!(
+            pump_handshake(&client, &server).is_err(),
+            "a peer whose trust domain was withdrawn must not reconnect"
         );
     }
 

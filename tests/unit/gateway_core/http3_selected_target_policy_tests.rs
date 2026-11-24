@@ -599,8 +599,8 @@ fn h3_grpc_web_policy_flavor_is_separate_from_backend_transport() {
         .find("detected_http_flavor == HttpFlavor::WebSocket")
         .expect("H3 WebSocket classification must suppress gRPC-Web promotion");
     let connect_udp_precedence = source
-        .find("|| is_connect_udp_request")
-        .expect("H3 CONNECT-UDP classification must suppress gRPC-Web promotion");
+        .find("|| req.method() == http::Method::CONNECT")
+        .expect("H3 CONNECT (CONNECT-UDP included) must suppress gRPC-Web promotion");
     let effective = source
         .find("let http_flavor = if is_connect_udp_request")
         .expect("H3 CONNECT-UDP must force Plain before gRPC-Web promotion");
@@ -933,7 +933,7 @@ fn h3_grpc_web_accept_rejection_keeps_http_406_contract() {
     );
 
     let committed_start = source
-        .find("async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(")
+        .find("async fn run_h3_deadline_bounded_reject_committed_hooks(")
         .expect("bounded committed-hook helper must remain present");
     let committed = &source[committed_start..];
     let committed_end = committed
@@ -991,7 +991,7 @@ fn h3_plugin_reject_commit_is_not_deferred_to_send_helpers() {
     );
 
     assert!(
-        source.contains("run_h3_deadline_bounded_reject_committed_hooks_with_policy("),
+        source.contains("run_h3_deadline_bounded_reject_committed_hooks("),
         "every public and policy-aware H3 rejection helper must share one bounded contract"
     );
     let committed_boundaries = source
@@ -1072,8 +1072,9 @@ fn h3_plugin_reject_commit_is_not_deferred_to_send_helpers() {
         committed_boundaries - shared_terminal_commit_definitions + shared_terminal_reject_sends;
     assert_eq!(
         effective_plugin_committed_boundaries,
-        plugin_reject_sends + direct_recv_halt_plugin_rejects + 1,
-        "every plugin-aware reject send needs one direct or shared committed boundary; the extra count is the second helper definition"
+        plugin_reject_sends + direct_recv_halt_plugin_rejects + 2,
+        "every plugin-aware reject send needs one direct or shared committed boundary; the two \
+         extra counts are the bounded helper's definition and the public helper's call into it"
     );
 
     for (start_marker, end_marker, phase) in [
@@ -1253,13 +1254,17 @@ fn h3_deferred_hooks_cannot_spoof_backend_gateway_assertions() {
         .find("\npub(crate) fn sanitize_backend_request_trailers")
         .expect("sanitize helper must follow the forbid predicate");
     let forbidden = &forbidden_tail[..forbidden_end];
+    // One folded predicate covers both the `x-consumer-*` namespace and the
+    // private `x-geo-country` assertion, `_`/`-` spellings included, exactly as
+    // the initial header block scrubs them.
     assert!(
-        forbidden.contains("\"x-geo-country\""),
-        "H3 client trailers must not reintroduce a reserved geo assertion"
+        forbidden.contains("|| is_gateway_assertion_header(name)"),
+        "shared request-trailer forbid helper must reject consumer identity and geo \
+         assertions through the folded gateway predicate"
     );
     assert!(
-        forbidden.contains("|| is_consumer_assertion_header(name)"),
-        "shared request-trailer forbid helper must reject consumer identity assertions"
+        !forbidden.contains("\"x-geo-country\""),
+        "a literal geo arm would match only the hyphen spelling; the folded predicate owns it"
     );
 }
 

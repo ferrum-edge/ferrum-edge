@@ -22,5 +22,8 @@ fn registration_is_http_only_and_shared_validation_rejects_unknown_keys() {
     let error = validate_plugin_config("ai_token_metrics", &json!({"cost_per_promt_token": 0.01}))
         .expect_err("unknown cost key must fail shared reload validation");
     assert!(error.contains("cost_per_promt_token"), "got: {error}");
-    assert!(error.contains("allowed keys"), "got: {error}");
+    assert!(
+        error.contains("unknown configuration key(s)"),
+        "got: {error}"
+    );
 }

@@ -245,17 +245,31 @@ fn start_gateway_with_extra_env(
     config_path: &str,
     http_port: u16,
     extra_env: &[(&str, &str)],
-) -> Result<(std::process::Child, u16, String), Box<dyn std::error::Error>> {
+) -> Result<
+    (
+        crate::common::GatewayChildGuard,
+        u16,
+        crate::common::SpawnedGatewayIdentity,
+    ),
+    Box<dyn std::error::Error>,
+> {
     // Fresh admin HTTP port + admin HTTPS disabled so parallel gateways in the
     // same shard never contend on the default admin ports (9000/9443); an admin
-    // bind failure aborts startup. These tests do not use the admin API.
-    let admin_http_port = std::net::TcpListener::bind_test("127.0.0.1:0")?
-        .local_addr()?
-        .port();
-    let observability_token = format!("ferrum-edge-grpc-probe-{}", uuid::Uuid::new_v4().simple());
+    // bind failure aborts startup. The admin API is used only for the
+    // ownership barrier. The port is a registry handoff outside the kernel's
+    // ephemeral source range (issue #7077 D4).
+    let admin_http_port = crate::scaffolding::ports::unbound_tcp_port()?;
+    let identity = crate::common::SpawnedGatewayIdentity::mint("grpc");
     let mut cmd = std::process::Command::new(crate::common::gateway_binary_path());
+    crate::common::configure_coverage_gateway_command(&mut cmd);
     cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
+        // Keep any managed-TLS store out of the checkout (issue #5706): the
+        // config file lives in the test's TempDir, which outlives this child.
+        .env(
+            "FERRUM_TLS_MANAGED_STORE_PATH",
+            std::path::Path::new(config_path).with_file_name("managed-tls"),
+        )
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
         .env("FERRUM_ADMIN_HTTP_PORT", admin_http_port.to_string())
@@ -265,10 +279,6 @@ fn start_gateway_with_extra_env(
         // closed. Pinning one accept task keeps the spawn retry's EADDRINUSE
         // path simple. An explicit test override below remains authoritative.
         .env("FERRUM_ACCEPT_THREADS", "1")
-        // Prove readiness through this exact child instead of accepting any
-        // parallel gateway that happens to answer after bind/drop selection.
-        .env("FERRUM_METRICS_BEARER_TOKEN", &observability_token)
-        .env_remove("FERRUM_METRICS_ALLOWED_CIDRS")
         .env("RUST_LOG", "ferrum_edge=debug")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -277,8 +287,19 @@ fn start_gateway_with_extra_env(
     for (name, value) in extra_env {
         cmd.env(name, value);
     }
+    // Prove ownership through this exact child instead of accepting any
+    // parallel gateway that happens to answer on a released port (issue
+    // #7076): per-attempt admin JWT secret/issuer and metrics bearer token,
+    // applied after `extra_env` so no override can replace them, and no CIDR
+    // allowlist that would grant a foreign gateway `/health` detail.
+    identity.apply_to_command(&mut cmd);
+    cmd.env_remove("FERRUM_METRICS_ALLOWED_CIDRS");
 
-    Ok((cmd.spawn()?, admin_http_port, observability_token))
+    Ok((
+        crate::common::GatewayChildGuard::new(cmd.spawn()?),
+        admin_http_port,
+        identity,
+    ))
 }
 
 /// Write a YAML config file with a gRPC proxy pointing to the given backend port.
@@ -400,7 +421,6 @@ plugin_configs:
     config:
       set:
         X-Synthetic-Policy: "enforced"
-        Content-Type: "text/plain"
         Grpc-Status: "0"
         Grpc-Message: "policy override"
       remove: []
@@ -639,15 +659,28 @@ async fn probe_gateway_h2c(
 }
 
 /// Wait for the gateway to start by proving the selected port speaks h2c.
-/// Returns Ok(()) on success, Err on timeout — does not panic.
+/// Returns Ok(()) on success, Err on timeout or child exit — does not panic.
+///
+/// Bound to `child`: `Child::try_wait` runs before every probe and again after
+/// a successful one, so a child that died after proving ownership fails the
+/// attempt instead of handing the caller whatever claimed its released port.
 async fn wait_for_gateway(
+    child: &mut std::process::Child,
     gateway_port: u16,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    const H2C_TIMEOUT: Duration = Duration::from_secs(15);
+    let deadline = std::time::Instant::now() + H2C_TIMEOUT;
     let addr = format!("127.0.0.1:{}", gateway_port);
     let mut last_err = String::new();
 
     loop {
+        if let Some(status) = child.try_wait()? {
+            return Err(format!(
+                "gateway exited with {status} before its proxy listener spoke h2c \
+                 (last observation: {last_err})"
+            )
+            .into());
+        }
         if std::time::Instant::now() >= deadline {
             return Err(format!(
                 "Gateway did not become h2c-ready within 15 seconds: {}",
@@ -656,7 +689,15 @@ async fn wait_for_gateway(
             .into());
         }
         match probe_gateway_h2c(&addr).await {
-            Ok(_) => return Ok(()),
+            Ok(_) => {
+                if let Some(status) = child.try_wait()? {
+                    return Err(format!(
+                        "gateway exited with {status} right after an h2c probe succeeded"
+                    )
+                    .into());
+                }
+                return Ok(());
+            }
             Err(e) => {
                 last_err = e.to_string();
                 sleep(Duration::from_millis(300)).await;
@@ -667,68 +708,61 @@ async fn wait_for_gateway(
 
 /// Prove both listeners belong to the subprocess selected by this attempt.
 ///
-/// The admin detail-tier probe is keyed by a per-attempt credential, so a
-/// foreign gateway cannot satisfy readiness. The subsequent h2c probe then
-/// establishes that this identified process has also bound its proxy listener.
+/// Stage 1 is the child-bound JWT ownership barrier
+/// (`wait_for_owned_gateway_identity`): authenticated `/health` `ready: true`
+/// for this attempt's metrics token AND HTTP 200 from JWT-only `GET /proxies`
+/// under this attempt's admin JWT, with `Child::try_wait` around both. `/health`
+/// detail alone can be granted to a foreign gateway by
+/// `FERRUM_METRICS_ALLOWED_CIDRS`; the per-attempt JWT cannot (issue #7076).
+/// Stage 2, the child-bound h2c probe, then establishes that this identified
+/// process has also bound its proxy listener and speaks h2c on it.
+///
+/// The two stages keep SEPARATE 15 s budgets on purpose (#7044): the h2c
+/// stage proves protocol readiness of the proxy listener, which is not part of
+/// the ownership proof, and must not be starved by a slow admin start.
 async fn wait_for_owned_gateway(
-    gateway_port: u16,
+    child: &mut std::process::Child,
     admin_port: u16,
-    observability_token: &str,
+    identity: &crate::common::SpawnedGatewayIdentity,
+    gateway_port: u16,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    crate::common::probe_gateway_identity(admin_port, observability_token, Duration::from_secs(15))
+    const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+    crate::common::wait_for_owned_gateway_identity(child, admin_port, identity, STARTUP_TIMEOUT)
         .await?;
-    wait_for_gateway(gateway_port).await
+    wait_for_gateway(child, gateway_port).await
 }
 
-/// Start the gateway with retry logic to handle ephemeral port races.
+/// Start the gateway with retry logic to handle handoff port races.
 ///
 /// Each attempt allocates a fresh gateway port, starts the gateway subprocess,
 /// and waits for it to become healthy. On failure the process is killed and a
 /// new attempt is made with a different port. Panics only after all attempts
 /// are exhausted.
-async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u16) {
+async fn start_gateway_with_retry(config_path: &str) -> (crate::common::GatewayChildGuard, u16) {
     start_gateway_with_retry_extra_env(config_path, &[]).await
 }
 
 async fn start_gateway_with_retry_extra_env(
     config_path: &str,
     extra_env: &[(&str, &str)],
-) -> (std::process::Child, u16) {
+) -> (crate::common::GatewayChildGuard, u16) {
     const MAX_ATTEMPTS: u32 = 3;
     let mut last_err = String::new();
     for attempt in 1..=MAX_ATTEMPTS {
         let gateway_port = free_port().await;
         match start_gateway_with_extra_env(config_path, gateway_port, extra_env) {
-            Ok((mut child, admin_port, observability_token)) => {
-                match wait_for_owned_gateway(gateway_port, admin_port, &observability_token).await {
-                    Ok(()) => match child.try_wait() {
-                        Ok(Some(status)) => {
-                            last_err =
-                                format!("gateway exited during startup with status {status}");
-                            eprintln!(
-                                "Gateway startup attempt {}/{} failed (port {}): {}",
-                                attempt, MAX_ATTEMPTS, gateway_port, last_err
-                            );
-                        }
-                        Ok(None) => return (child, gateway_port),
-                        Err(e) => {
-                            last_err = format!("failed to inspect gateway process status: {e}");
-                            eprintln!(
-                                "Gateway startup attempt {}/{} failed (port {}): {}",
-                                attempt, MAX_ATTEMPTS, gateway_port, last_err
-                            );
-                            let _ = child.kill();
-                            let _ = child.wait();
-                        }
-                    },
+            Ok((mut child, admin_port, identity)) => {
+                match wait_for_owned_gateway(child.child_mut(), admin_port, &identity, gateway_port)
+                    .await
+                {
+                    Ok(()) => return (child, gateway_port),
                     Err(e) => {
                         last_err = e.to_string();
                         eprintln!(
                             "Gateway startup attempt {}/{} failed (port {}): {}",
                             attempt, MAX_ATTEMPTS, gateway_port, last_err
                         );
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        child.shutdown();
                     }
                 }
             }
@@ -817,8 +851,7 @@ async fn test_grpc_unary_echo_through_gateway() {
     assert_eq!(body, grpc_body, "Backend should echo the gRPC message body");
 
     // Cleanup
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     println!("test_grpc_unary_echo_through_gateway PASSED");
 }
@@ -866,8 +899,7 @@ async fn test_grpc_recv_size_limit_returns_resource_exhausted() {
         "gateway-generated gRPC size-limit error should be trailers-only"
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     println!("test_grpc_recv_size_limit_returns_resource_exhausted PASSED");
 }
@@ -916,8 +948,7 @@ async fn test_grpc_recv_size_zero_allows_over_default_request() {
         "echoed gRPC frame prefix should match"
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     println!("test_grpc_recv_size_zero_allows_over_default_request PASSED");
 }
@@ -970,8 +1001,7 @@ async fn test_grpc_error_status_forwarding() {
         "true Trailers-Only metadata must survive hostile initial-header policy"
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     println!("test_grpc_error_status_forwarding PASSED");
 }
@@ -1017,8 +1047,7 @@ async fn test_grpc_trailers_only_terminal_metadata_survives_security_removal() {
         Some("enforced")
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -1064,8 +1093,7 @@ async fn test_grpc_metadata_forwarding() {
         "Authorization metadata should be forwarded to backend"
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     println!("test_grpc_metadata_forwarding PASSED");
 }
@@ -1112,8 +1140,7 @@ async fn test_grpc_backend_unavailable() {
         "post-routing UNAVAILABLE must carry initial-response policy"
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     println!("test_grpc_backend_unavailable PASSED");
 }
@@ -1153,8 +1180,7 @@ async fn test_grpc_no_strip_listen_path() {
         "Full path including listen_path should be forwarded to backend"
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     println!("test_grpc_no_strip_listen_path PASSED");
 }
@@ -1207,8 +1233,7 @@ async fn test_grpc_multiple_sequential_calls() {
         assert_eq!(body, grpc_body, "Call {} should echo the body", i);
     }
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     println!("test_grpc_multiple_sequential_calls PASSED");
 }
@@ -1285,8 +1310,7 @@ async fn test_grpc_key_auth_rejects_missing_key() {
         "Invalid key rejection should preserve the plugin message"
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     println!("test_grpc_key_auth_rejects_missing_key PASSED");
 }
@@ -1341,8 +1365,7 @@ async fn test_grpc_key_auth_accepts_valid_key() {
         "Path should be stripped and forwarded to backend"
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     println!("test_grpc_key_auth_accepts_valid_key PASSED");
 }
@@ -1433,8 +1456,7 @@ async fn test_grpc_early_rejects_use_grpc_error_shape() {
     );
     assert!(!headers2.contains_key("transfer-encoding"));
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     println!("test_grpc_early_rejects_use_grpc_error_shape PASSED");
 }
@@ -1451,10 +1473,10 @@ async fn test_grpc_early_rejects_use_grpc_error_shape() {
 /// long-lived streaming RPCs.
 ///
 /// With the limit at 1 and stream #1 parked mid-response, a SECOND request from
-/// the same IP must be rejected with **HTTP 429**. The per-IP reject fires in
-/// `proxy::handle_request` BEFORE gRPC dispatch and returns a plain
-/// `build_response(StatusCode::TOO_MANY_REQUESTS, ...)` — so the rejection is a
-/// real HTTP 429, NOT a `grpc-status` trailer frame.
+/// the same IP must be rejected. The per-IP reject fires in
+/// `proxy::handle_request` BEFORE gRPC dispatch and, like every pre-routing
+/// refusal (issue #6943), answers native gRPC in its own framing: HTTP 200 with
+/// a Trailers-Only `grpc-status: 8` (`RESOURCE_EXHAUSTED`), as on HTTP/3.
 ///
 /// Structural inverse of the WebSocket case
 /// `test_h3_websocket_releases_per_ip_request_slot_after_200` (WS releases the
@@ -1519,30 +1541,37 @@ async fn test_grpc_streaming_holds_per_ip_request_slot() {
     );
 
     // Request #2 from the SAME IP while stream #1 holds the only slot. The
-    // per-IP limiter must reject it with a plain HTTP 429 BEFORE gRPC dispatch.
+    // per-IP limiter must reject it with Trailers-Only RESOURCE_EXHAUSTED
+    // BEFORE gRPC dispatch.
     //
     // The 5s timeout converts the pre-fix regression into a fast, descriptive
     // failure instead of a hang: pre-fix, the slot was released at stream #1's
     // header flush, so request #2 would be ADMITTED — and `send_grpc_request`
     // would then block in `collect()` on the still-stalled streaming backend
-    // (no EOF until release), hanging the test. Post-fix, the 429 returns
+    // (no EOF until release), hanging the test. Post-fix, the refusal returns
     // immediately, well inside the timeout.
-    let (status2, _headers2, _body2) = tokio::time::timeout(
+    let (status2, headers2, body2) = tokio::time::timeout(
         Duration::from_secs(5),
         send_grpc_request(&gateway_addr, "/grpc/my.EchoService/Echo", b"", &[]),
     )
     .await
     .expect(
-        "request #2 must resolve fast with a 429; a hang here means it was \
+        "request #2 must resolve fast with a per-IP refusal; a hang here means it was \
          wrongly admitted to the stalled streaming backend (F15 regression)",
     )
-    .expect("request #2 should complete (with a 429)");
+    .expect("request #2 should complete (with a per-IP refusal)");
     assert_eq!(
-        status2, 429,
+        (status2, headers2.get("grpc-status").map(String::as_str)),
+        (200, Some("8")),
         "a 2nd same-IP request while a streaming RPC holds the slot must be \
-         rejected with HTTP 429 (per-IP limit), not admitted — this is the F15 \
-         evasion the fix closes"
+         rejected with Trailers-Only RESOURCE_EXHAUSTED (per-IP limit), not \
+         admitted — this is the F15 evasion the fix closes"
     );
+    assert_eq!(
+        headers2.get("grpc-message").map(String::as_str),
+        Some("Too many concurrent requests from this IP")
+    );
+    assert!(body2.is_empty(), "the per-IP refusal carries no gRPC DATA");
 
     // Release the backend (flips the watch to `true`, waking every parked
     // streaming response) and drain stream #1 to completion so the gateway
@@ -1566,8 +1595,7 @@ async fn test_grpc_streaming_holds_per_ip_request_slot() {
     );
     stream3.drain().await;
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     backend_handle.abort();
     println!("test_grpc_streaming_holds_per_ip_request_slot PASSED");
 }
@@ -1651,7 +1679,6 @@ async fn test_grpc_separate_end_stream_frame_keeps_backend_connection_alive() {
     }
 
     conn_task.abort();
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }

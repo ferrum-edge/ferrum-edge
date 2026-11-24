@@ -13,9 +13,11 @@ use ferrum_edge::modes::mesh::config::{
     AppProtocol, MeshConfig, MeshService, MeshSidecar, MeshSidecarIngress, ServicePort, Workload,
     WorkloadPort, WorkloadRef, WorkloadSelector,
 };
-use ferrum_edge::modes::mesh::{MeshRuntimeConfig, MeshTopology, prepare_gateway_config_for_mesh};
+use ferrum_edge::modes::mesh::{
+    MeshRuntimeConfig, MeshTopology, prepare_gateway_config_via_mesh_slice,
+};
 
-use super::mesh_test_support::default_mesh_runtime;
+use super::mesh_test_support::{default_mesh_runtime, service_for, workload_for};
 
 const BIND_ROUTE_PREFIX: &str = "__mesh-ingress-bind:";
 
@@ -163,7 +165,7 @@ fn prepare_sidecar_ingress(
         })),
         ..GatewayConfig::default()
     };
-    prepare_gateway_config_for_mesh(config, &runtime).expect("prepare")
+    prepare_gateway_config_via_mesh_slice(config, &runtime).expect("prepare")
 }
 
 fn sidecar_runtime(namespace: &str, spiffe: &str) -> MeshRuntimeConfig {
@@ -457,7 +459,7 @@ fn dedicated_bind_stream_listener_sharing_an_http_endpoint_is_not_materialized()
         })),
         ..GatewayConfig::default()
     };
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("prepare");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime).expect("prepare");
 
     assert_eq!(
         dedicated_bind_ids(&prepared),
@@ -592,7 +594,7 @@ fn inbound_target_port_on_a_gateway_listener_is_refused() {
             })),
             ..GatewayConfig::default()
         };
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("prepare");
+        let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime).expect("prepare");
         prepared
             .proxies
             .iter()
@@ -606,4 +608,60 @@ fn inbound_target_port_on_a_gateway_listener_is_refused() {
         "an inbound route to the outbound capture listener must be refused"
     );
     assert_eq!(inbound_routes(19011), vec![19011]);
+}
+
+#[test]
+fn stream_dedicated_bind_does_not_suppress_outbound_http_routes() {
+    // Issue #7231: the stream-family dedicated-bind proxy has no hosts and no
+    // listen path. Built with the default (HTTP) dispatch kind, the outbound
+    // materializer's yield scan read it as a host-less HTTP catch-all and
+    // skipped every `__mesh-outbound-*` route, so the workload lost all
+    // HTTP-family mesh egress. Stream proxies route by `listen_port` and must
+    // not shadow host routes.
+    let namespace = "default";
+    let spiffe = "spiffe://cluster.local/ns/default/sa/echo";
+    let (workload, service) = local_echo(namespace, "echo", spiffe, 6379, AppProtocol::Tcp);
+    let reviews = workload_for("reviews", namespace, [("app", "reviews")], ["10.0.0.5"]);
+    let reviews_service = service_for("reviews", namespace, &[&reviews]);
+    let runtime = sidecar_runtime(namespace, spiffe);
+
+    let config = GatewayConfig {
+        mesh: Some(Box::new(MeshConfig {
+            workloads: vec![workload, reviews],
+            services: vec![service, reviews_service],
+            sidecars: vec![MeshSidecar {
+                name: "echo-ingress".to_string(),
+                namespace: namespace.to_string(),
+                workload_selector: None,
+                egress_inherits_defaults: true,
+                egress: Vec::new(),
+                outbound_traffic_policy: None,
+                ingress_declared: true,
+                ingress: vec![ingress_entry(
+                    AppProtocol::Tcp,
+                    Some("127.0.0.1"),
+                    16379,
+                    6379,
+                )],
+            }],
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    };
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime).expect("prepare");
+
+    let bind_ids = dedicated_bind_ids(&prepared);
+    assert_eq!(bind_ids, vec!["__mesh-ingress-bind:default-echo-16379"]);
+    assert!(
+        prepared
+            .proxies
+            .iter()
+            .any(|proxy| proxy.id == "__mesh-outbound-default-reviews-8080"),
+        "the outbound route to an in-mesh HTTP service must survive a stream dedicated bind: {:?}",
+        prepared
+            .proxies
+            .iter()
+            .map(|proxy| proxy.id.as_str())
+            .collect::<Vec<_>>()
+    );
 }

@@ -105,6 +105,25 @@ pub const AUDIT_LOCAL_FALLBACK_CAPACITY: usize = 4_096;
 pub const AUDIT_LOCAL_FALLBACK_MAX_BYTES: usize = AUDIT_LOCAL_FALLBACK_CAPACITY * 4 * 1024;
 const AUDIT_LOCAL_FALLBACK_FILE_NAME: &str = "admin-audit-fallback.json";
 const AUDIT_LOCAL_FALLBACK_LOCK_FILE_NAME: &str = "admin-audit-fallback.lock";
+/// DB-less local audit retention file (issue #7200), kept beside the backup
+/// fallback file under `FERRUM_ADMIN_AUDIT_FALLBACK_PATH` and rotated the same
+/// way (newest kept).
+const AUDIT_LOCAL_RETENTION_FILE_NAME: &str = "admin-audit-retention.json";
+const AUDIT_LOCAL_RETENTION_LOCK_FILE_NAME: &str = "admin-audit-retention.lock";
+/// Default record bound of the DB-less retention file.
+pub const AUDIT_LOCAL_RETENTION_MAX_RECORDS_DEFAULT: u64 = AUDIT_LOCAL_FALLBACK_CAPACITY as u64;
+/// Accepted range for `FERRUM_ADMIN_AUDIT_LOCAL_RETENTION_MAX_RECORDS`.
+pub const AUDIT_LOCAL_RETENTION_MAX_RECORDS_MAX: u64 = 1_000_000;
+/// Default byte bound of the DB-less retention file (16 MiB, as the backup
+/// fallback file).
+pub const AUDIT_LOCAL_RETENTION_MAX_BYTES_DEFAULT: u64 = AUDIT_LOCAL_FALLBACK_MAX_BYTES as u64;
+/// Smallest accepted byte bound: two maximum-size spool records, so a single
+/// bounded record always fits.
+pub const AUDIT_LOCAL_RETENTION_MAX_BYTES_MIN: u64 =
+    2 * crate::admin::audit_spool::AUDIT_SPOOL_MAX_RECORD_BYTES;
+/// Largest accepted byte bound. The file is read and rewritten whole on every
+/// append, so it stays a bounded, rotating file rather than a log store.
+pub const AUDIT_LOCAL_RETENTION_MAX_BYTES_MAX: u64 = 256 * 1024 * 1024;
 /// Default on-disk location when `FERRUM_ADMIN_AUDIT_FALLBACK_PATH` is unset.
 ///
 /// Kept CWD-relative deliberately: an absolute default such as
@@ -336,6 +355,80 @@ pub fn audit_retention_hit_prune_batch_budget(deleted: u64) -> bool {
     deleted
         >= AUDIT_RETENTION_PRUNE_BATCH_SIZE
             .saturating_mul(u64::from(AUDIT_RETENTION_PRUNE_MAX_BATCHES))
+}
+
+/// Mean interval between periodic audit age-retention sweeps. Each wait is
+/// jittered by ±25% ([`crate::util::backoff::jittered_backoff`]) so replicas
+/// started together do not sweep in lockstep.
+pub const AUDIT_RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// Start the periodic age-retention sweep for `FERRUM_AUDIT_RETENTION_DAYS`.
+///
+/// Insert-path pruning reaches a namespace only when that namespace receives
+/// a new audit event, so without this sweep a namespace that goes idle would
+/// keep rows past the configured age forever. Returns `None` (no task) when
+/// age retention is unset. Called by the modes that own the configuration
+/// database (database and CP); the task exits when `shutdown_rx` fires.
+pub fn start_retention_sweep(
+    retention_days: Option<u64>,
+    db: Arc<dyn DatabaseBackend>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Option<JoinHandle<()>> {
+    let retention_days = retention_days?;
+    info!(
+        retention_days,
+        interval_secs = AUDIT_RETENTION_SWEEP_INTERVAL.as_secs(),
+        "Audit retention sweep started"
+    );
+    Some(spawn_retention_sweep(
+        db,
+        AUDIT_RETENTION_SWEEP_INTERVAL,
+        shutdown_rx,
+    ))
+}
+
+/// Run [`DatabaseBackend::prune_expired_audit_events`] after every jittered
+/// `interval` until `shutdown_rx` fires; shutdown also cancels a sweep in
+/// progress. A failed sweep is logged and retried on the next interval.
+pub fn spawn_retention_sweep(
+    db: Arc<dyn DatabaseBackend>,
+    interval: Duration,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            if *shutdown_rx.borrow() {
+                return;
+            }
+            let delay = crate::util::backoff::jittered_backoff(interval.as_secs());
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = shutdown_rx.changed() => {
+                    info!("Audit retention sweep shutting down");
+                    return;
+                }
+            }
+            tokio::select! {
+                result = db.prune_expired_audit_events() => match result {
+                    Ok(deleted) => {
+                        if deleted > 0 {
+                            info!(deleted, "Audit retention sweep pruned expired audit events");
+                        }
+                    }
+                    Err(_error) => {
+                        warn!(
+                            error = "database error (details withheld)",
+                            "Audit retention sweep failed; retrying on the next interval"
+                        );
+                    }
+                },
+                _ = shutdown_rx.changed() => {
+                    info!("Audit retention sweep shutting down");
+                    return;
+                }
+            }
+        }
+    })
 }
 
 /// Per-namespace audit-event retention policy from env/config.
@@ -684,6 +777,28 @@ impl AuditEventDelivery for DatabaseAuditDelivery {
     }
 }
 
+/// Delivery target of modes with no configuration database (mesh, file, DP):
+/// the bounded local retention file (issue #7200). The spool drains into it,
+/// so DB-less durable records are retained and bounded instead of piling up in
+/// `pending/` until the spool ceiling saturates.
+struct LocalRetentionAuditDelivery {
+    dir: PathBuf,
+    bounds: LocalAuditRetentionBounds,
+}
+
+#[async_trait]
+impl AuditEventDelivery for LocalRetentionAuditDelivery {
+    async fn deliver(&self, event: &AuditEvent) -> Result<(), anyhow::Error> {
+        let dir = self.dir.clone();
+        let bounds = self.bounds;
+        let event = event.clone();
+        tokio::task::spawn_blocking(move || append_local_retention_event(&dir, bounds, &event))
+            .await
+            .map_err(|_| anyhow!("local audit retention write task failed"))?
+            .map(|_| ())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -800,6 +915,12 @@ pub struct AuditPipelineConfig {
     pub spool_max_records: u64,
     pub retained_max_records: u64,
     pub max_delivery_attempts: u32,
+    /// Directory of the DB-less local retention file. `None` resolves
+    /// `FERRUM_ADMIN_AUDIT_FALLBACK_PATH` (the backup fallback directory) when
+    /// the file is first written.
+    pub local_retention_dir: Option<PathBuf>,
+    /// Bounds of the DB-less local retention file (issue #7200).
+    pub local_retention: LocalAuditRetentionBounds,
 }
 
 impl Default for AuditPipelineConfig {
@@ -813,6 +934,8 @@ impl Default for AuditPipelineConfig {
             spool_max_records: AUDIT_SPOOL_MAX_RECORDS_DEFAULT,
             retained_max_records: AUDIT_RETAINED_MAX_RECORDS_DEFAULT,
             max_delivery_attempts: AUDIT_MAX_DELIVERY_ATTEMPTS_DEFAULT,
+            local_retention_dir: None,
+            local_retention: LocalAuditRetentionBounds::default(),
         }
     }
 }
@@ -847,6 +970,22 @@ impl AuditPipelineConfig {
             return Err(format!(
                 "FERRUM_ADMIN_AUDIT_MAX_DELIVERY_ATTEMPTS must be between 1 and \
                  {AUDIT_MAX_DELIVERY_ATTEMPTS_MAX}"
+            ));
+        }
+        if self.local_retention.max_records == 0
+            || self.local_retention.max_records > AUDIT_LOCAL_RETENTION_MAX_RECORDS_MAX
+        {
+            return Err(format!(
+                "FERRUM_ADMIN_AUDIT_LOCAL_RETENTION_MAX_RECORDS must be between 1 and \
+                 {AUDIT_LOCAL_RETENTION_MAX_RECORDS_MAX}"
+            ));
+        }
+        if !(AUDIT_LOCAL_RETENTION_MAX_BYTES_MIN..=AUDIT_LOCAL_RETENTION_MAX_BYTES_MAX)
+            .contains(&self.local_retention.max_bytes)
+        {
+            return Err(format!(
+                "FERRUM_ADMIN_AUDIT_LOCAL_RETENTION_MAX_BYTES must be between \
+                 {AUDIT_LOCAL_RETENTION_MAX_BYTES_MIN} and {AUDIT_LOCAL_RETENTION_MAX_BYTES_MAX}"
             ));
         }
         if self.enabled
@@ -1176,19 +1315,16 @@ impl AuditPipeline {
 
     /// Raw counters. Used by external tests; the binary target otherwise flags
     /// it as dead code.
-    #[allow(dead_code)]
     pub fn metrics(&self) -> &Arc<AuditPipelineMetrics> {
         &self.metrics
     }
 
     /// This process generation's spool ownership identity.
-    #[allow(dead_code)]
     pub fn generation(&self) -> &str {
         &self.generation
     }
 
     /// Non-secret audit destination identity bound to every durable record.
-    #[allow(dead_code)]
     pub fn destination(&self) -> &str {
         &self.config.destination
     }
@@ -1198,7 +1334,6 @@ impl AuditPipeline {
     /// Callers must not perform filesystem work through it on an admin request
     /// path: the observability surfaces read [`Self::status`] instead, which is
     /// O(1). Used by the delivery worker and by external tests.
-    #[allow(dead_code)]
     pub fn spool(&self) -> Option<&Arc<AuditSpool>> {
         self.spool.as_ref()
     }
@@ -1567,6 +1702,69 @@ impl AuditPipeline {
             reason = AuditUnavailableReason::NoDurableSpool.as_str(),
             "Admin audit shutdown interrupted delivery of a memory-only event; the event \
              cannot survive process exit"
+        );
+    }
+
+    /// Directory of the DB-less local retention file.
+    pub fn local_retention_dir(&self) -> PathBuf {
+        self.config
+            .local_retention_dir
+            .clone()
+            .unwrap_or_else(audit_local_fallback_dir)
+    }
+
+    /// Bounds of the DB-less local retention file.
+    pub fn local_retention_bounds(&self) -> LocalAuditRetentionBounds {
+        self.config.local_retention
+    }
+
+    /// Write a finalized event straight into the DB-less local retention file.
+    ///
+    /// Used in a mode with no configuration database and no durable spool, so
+    /// there is nothing to replay from: the retention file is the record.
+    /// Blocking filesystem work; callers run it on the blocking pool.
+    /// `evidence_lost` latches only when this write itself fails (issue #7200).
+    fn retain_locally_without_database(
+        &self,
+        record: &SpooledAuditRecord,
+    ) -> Result<(), anyhow::Error> {
+        match append_local_retention_event(
+            &self.local_retention_dir(),
+            self.config.local_retention,
+            &record.event,
+        ) {
+            Ok(_) => {
+                self.metrics.delivered.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(_error) => {
+                self.note_no_database_retention_failure(record);
+                Err(anyhow!(
+                    "admin audit event {} could not be written to the local audit retention file",
+                    record.id()
+                ))
+            }
+        }
+    }
+
+    /// Account for an event recorded in a mode with no configuration database
+    /// (for example a mesh operational action) whose local retention write
+    /// failed. The event has no other representation, so it is lost. Distinct
+    /// from [`Self::note_shutdown_memory_loss`] so operators are not told a
+    /// shutdown interrupted delivery when none happened (issue #7200).
+    fn note_no_database_retention_failure(&self, record: &SpooledAuditRecord) {
+        self.metrics
+            .dropped_no_spool
+            .fetch_add(1, Ordering::Relaxed);
+        self.evidence_lost.store(true, Ordering::Relaxed);
+        self.mark_degraded(AuditUnavailableReason::NoDurableSpool);
+        error!(
+            audit_event_id = %record.id(),
+            surface = "audit_local_retention",
+            reason = AuditUnavailableReason::NoDurableSpool.as_str(),
+            detail_withheld = true,
+            "Admin audit event recorded in a mode with no configuration database could not be \
+             written to the local audit retention file; the event was not retained"
         );
     }
 
@@ -2346,7 +2544,6 @@ impl AuditWorker {
     /// External tests drive queue saturation, backend failure/recovery, replay,
     /// idempotency, and shutdown through this entry point; the binary target
     /// otherwise flags it as dead code.
-    #[allow(dead_code)]
     pub fn spawn_for_delivery(
         pipeline: Arc<AuditPipeline>,
         delivery: Arc<dyn AuditEventDelivery>,
@@ -2872,13 +3069,16 @@ fn enqueue_finalized_without_db(
     pipeline: &Arc<AuditPipeline>,
     record: SpooledAuditRecord,
 ) -> Result<(), anyhow::Error> {
-    let worker = AUDIT_SINKS.iter().find_map(|entry| {
-        entry
-            .backend
-            .upgrade()
-            .is_some()
-            .then(|| Arc::clone(&entry.worker))
-    });
+    let worker = AUDIT_SINKS
+        .iter()
+        .find_map(|entry| {
+            entry
+                .backend
+                .upgrade()
+                .is_some()
+                .then(|| Arc::clone(&entry.worker))
+        })
+        .or_else(local_retention_worker);
     if let Some(worker) = worker {
         return worker.enqueue_finalized(record);
     }
@@ -2944,6 +3144,68 @@ pub fn start_delivery(enabled: bool, db: Arc<dyn DatabaseBackend>) {
     let _ = worker_for_db(db);
 }
 
+/// The DB-less local retention worker (issue #7200), when one was started.
+static LOCAL_RETENTION_WORKER: Mutex<Option<Arc<AuditWorker>>> = Mutex::new(None);
+
+fn local_retention_worker() -> Option<Arc<AuditWorker>> {
+    if pipeline().draining.load(Ordering::Acquire) {
+        return None;
+    }
+    LOCAL_RETENTION_WORKER
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(Arc::clone))
+}
+
+/// Start durable audit delivery in a mode with no configuration database
+/// (mesh, file, DP) during startup (issue #7200).
+///
+/// With a durable spool, a worker claims records abandoned by prior process
+/// generations, replays them, and drains every finalized record into the
+/// bounded local retention file, so `pending/` stays empty instead of growing
+/// until the spool ceiling saturates. Without a spool there is nothing to
+/// replay: [`record_without_database`] writes the retention file directly.
+pub fn start_local_retention_delivery(enabled: bool) {
+    let pipeline = pipeline();
+    if !enabled || !pipeline.config.enabled || pipeline.spool.is_none() {
+        return;
+    }
+    let Ok(mut slot) = LOCAL_RETENTION_WORKER.lock() else {
+        return;
+    };
+    if slot.is_some() {
+        return;
+    }
+    *slot = Some(spawn_local_retention_worker(pipeline));
+}
+
+/// Spawn a delivery worker over the pipeline's local retention file.
+///
+/// Public so external tests can drive drain, rotation, and replay against a
+/// private pipeline; production uses [`start_local_retention_delivery`].
+pub fn spawn_local_retention_worker(pipeline: Arc<AuditPipeline>) -> Arc<AuditWorker> {
+    let delivery: Arc<dyn AuditEventDelivery> = Arc::new(LocalRetentionAuditDelivery {
+        dir: pipeline.local_retention_dir(),
+        bounds: pipeline.local_retention_bounds(),
+    });
+    AuditWorker::spawn(pipeline, delivery, None, None)
+}
+
+/// Drain the DB-less local retention worker within `timeout`.
+///
+/// Called from the shutdown path of every mode without a configuration
+/// database. A no-op when no worker was started. Anything still undelivered
+/// stays in the durable spool for the next process generation.
+pub async fn shutdown_local_retention_delivery(timeout: Duration) {
+    let worker = LOCAL_RETENTION_WORKER
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.take());
+    if let Some(worker) = worker {
+        worker.shutdown(timeout).await;
+    }
+}
+
 /// Durably record an audited admin mutation.
 ///
 /// When the admin write gate prepared an intent for this request, the event
@@ -3007,11 +3269,29 @@ pub async fn record(
 }
 
 /// Record a mutation audit event when no configuration-database backend is
-/// available (for example mesh data-plane operational actions). Finalizes
-/// through the durable spool pipeline — the same path [`record`] uses when no
-/// delivery worker is registered for the backend.
+/// available (mesh, file and DP operational actions such as
+/// `POST /mesh/config-revision/reset` or `POST /admin/tls/rotate`).
+///
+/// The durable record of a DB-less mode is the bounded local retention file
+/// (issue #7200). With a spool, the event is finalized into `pending/` and the
+/// local retention worker drains it into that file; without a spool it is
+/// written to the file directly. `evidence_lost` latches only when that
+/// retention write itself fails.
 pub async fn record_without_database(
     enabled: bool,
+    event: AuditEvent,
+) -> Result<(), anyhow::Error> {
+    record_without_database_with_pipeline(enabled, pipeline(), local_retention_worker(), event)
+        .await
+}
+
+/// [`record_without_database`] against an explicit pipeline and optional
+/// retention worker. Public so external tests can exercise the DB-less path
+/// without installing the process-global pipeline.
+pub async fn record_without_database_with_pipeline(
+    enabled: bool,
+    pipeline: Arc<AuditPipeline>,
+    worker: Option<Arc<AuditWorker>>,
     mut event: AuditEvent,
 ) -> Result<(), anyhow::Error> {
     if !enabled {
@@ -3022,24 +3302,31 @@ pub async fn record_without_database(
         event.outcome = AuditOutcome::Success.as_str().to_string();
     }
 
-    let pipeline = pipeline();
     let event_id = event.id.clone();
-    tokio::task::spawn_blocking(move || {
-        let record = pipeline.finalize_event(event).map_err(|reason| {
-            anyhow!(
-                "admin audit durable handoff failed ({}) for audit event {}",
-                reason.as_str(),
-                event_id
-            )
-        })?;
-        if pipeline.spool.is_some() {
-            Ok(())
-        } else {
-            pipeline.note_shutdown_memory_loss(&record);
-            Err(anyhow!(
-                "admin audit event {} could not be retained after delivery admission closed",
-                event_id
-            ))
+    tokio::task::spawn_blocking(move || match worker {
+        Some(worker) => worker.record(event),
+        None => {
+            let record = pipeline.finalize_event(event).map_err(|reason| {
+                anyhow!(
+                    "admin audit durable handoff failed ({}) for audit event {}",
+                    reason.as_str(),
+                    event_id
+                )
+            })?;
+            if pipeline.spool.is_some() {
+                // Durable in `pending/`; the next local retention worker (this
+                // process's, once started, or the next generation's) drains it.
+                warn!(
+                    audit_event_id = %event_id,
+                    surface = "audit_enqueue",
+                    reason = AuditUnavailableReason::WorkerUnavailable.as_str(),
+                    "Admin audit event deferred to durable spool replay because no local \
+                     retention worker is running"
+                );
+                Ok(())
+            } else {
+                pipeline.retain_locally_without_database(&record)
+            }
         }
     })
     .await
@@ -3110,10 +3397,6 @@ pub fn audit_local_fallback_dir() -> PathBuf {
         .filter(|value| !value.trim().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(AUDIT_LOCAL_FALLBACK_DEFAULT_DIR))
-}
-
-fn audit_local_fallback_file(dir: &Path) -> PathBuf {
-    dir.join(AUDIT_LOCAL_FALLBACK_FILE_NAME)
 }
 
 /// Extract a bounded request/correlation ID from admin headers, or mint one.
@@ -3328,36 +3611,7 @@ struct FallbackFileLock {
 /// [`admit_security_sensitive_event`]'s `spawn_blocking`, so the bounded
 /// sleep stays off the async worker. Never logs event contents.
 pub fn append_local_fallback_event(dir: &Path, event: &AuditEvent) -> Result<(), anyhow::Error> {
-    let deadline = local_fallback_lock_deadline();
-    let _process_guard = acquire_local_fallback_process_lock(deadline)?;
-    prepare_fallback_directory(dir)?;
-    let lock_path = dir.join(AUDIT_LOCAL_FALLBACK_LOCK_FILE_NAME);
-    let _cross_process = acquire_fallback_file_lock(&lock_path, deadline)?;
-    let path = audit_local_fallback_file(dir);
-    reject_symlink_or_non_regular_file(&path, "audit local fallback data file")?;
-    let mut events = read_local_fallback_events_unlocked(&path)?;
-    events.push(event.clone());
-    let evicted = if events.len() > AUDIT_LOCAL_FALLBACK_CAPACITY {
-        let overflow = events.len() - AUDIT_LOCAL_FALLBACK_CAPACITY;
-        events.drain(0..overflow);
-        Some(overflow)
-    } else {
-        None
-    };
-    write_local_fallback_events_unlocked(dir, &path, &events, || {
-        if let Some(overflow) = evicted {
-            // The callback runs immediately after atomic publication, before
-            // fallible post-publication durability and permission steps.
-            // Counts only — never event contents.
-            warn!(
-                surface = "audit_local_fallback_evicted",
-                evicted = overflow,
-                retained = AUDIT_LOCAL_FALLBACK_CAPACITY,
-                "Local audit fallback store is at capacity; oldest security records were dropped"
-            );
-        }
-    })?;
-    Ok(())
+    append_local_audit_event(dir, &LocalAuditStore::BACKUP_FALLBACK, event).map(|_| ())
 }
 
 /// Read all events currently retained in the local fallback store.
@@ -3365,18 +3619,212 @@ pub fn append_local_fallback_event(dir: &Path, event: &AuditEvent) -> Result<(),
 /// Uses the same bounded process and cross-process lock acquisition as
 /// [`append_local_fallback_event`]; contention past the shared deadline fails
 /// closed.
-// This public library surface is exercised by integration tests but is unused
-// when the same module is compiled directly into the `ferrum-edge` binary.
-#[allow(dead_code)]
 pub fn list_local_fallback_events(dir: &Path) -> Result<Vec<AuditEvent>, anyhow::Error> {
+    list_local_audit_events(dir, &LocalAuditStore::BACKUP_FALLBACK)
+}
+
+/// Size and count bounds of the DB-less local audit retention file
+/// (`FERRUM_ADMIN_AUDIT_LOCAL_RETENTION_MAX_RECORDS` /
+/// `FERRUM_ADMIN_AUDIT_LOCAL_RETENTION_MAX_BYTES`, issue #7200).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalAuditRetentionBounds {
+    pub max_records: u64,
+    pub max_bytes: u64,
+}
+
+impl Default for LocalAuditRetentionBounds {
+    fn default() -> Self {
+        Self {
+            max_records: AUDIT_LOCAL_RETENTION_MAX_RECORDS_DEFAULT,
+            max_bytes: AUDIT_LOCAL_RETENTION_MAX_BYTES_DEFAULT,
+        }
+    }
+}
+
+/// What one append to the DB-less retention file did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalRetentionAppend {
+    /// The event is now retained; `rotated` older events were dropped to keep
+    /// the file inside its record and byte bounds.
+    Retained { rotated: usize },
+    /// An event with the same stable id was already retained (a replayed
+    /// delivery). Nothing changed: delivery is idempotent on the id.
+    AlreadyRetained,
+}
+
+/// Append one event to the bounded DB-less local audit retention file
+/// (`admin-audit-retention.json` beside the backup fallback file).
+///
+/// The same hardened, locked, atomically published file as
+/// [`append_local_fallback_event`], rotated the same way (newest kept), but
+/// bounded by both `bounds.max_records` and `bounds.max_bytes`: the events
+/// with the oldest timestamps are dropped until the file fits, whatever order
+/// they were delivered in. A file written under larger bounds is read (up to
+/// [`AUDIT_LOCAL_RETENTION_MAX_BYTES_MAX`]) and rotated down to these. A
+/// replayed event (same id) changes nothing but re-syncs the directory before
+/// it is acknowledged, so spool replay converges to one durable record.
+/// Errors only when the write or sync itself fails (or one event alone
+/// exceeds the byte bound).
+pub fn append_local_retention_event(
+    dir: &Path,
+    bounds: LocalAuditRetentionBounds,
+    event: &AuditEvent,
+) -> Result<LocalRetentionAppend, anyhow::Error> {
+    append_local_audit_event(dir, &LocalAuditStore::retention(bounds), event)
+}
+
+/// Read every event in the DB-less local audit retention file.
+pub fn list_local_retention_events(
+    dir: &Path,
+    bounds: LocalAuditRetentionBounds,
+) -> Result<Vec<AuditEvent>, anyhow::Error> {
+    list_local_audit_events(dir, &LocalAuditStore::retention(bounds))
+}
+
+/// One bounded, newest-kept local audit file: the security-sensitive backup
+/// fallback, or the DB-less retention file (issue #7200).
+struct LocalAuditStore {
+    file_name: &'static str,
+    lock_file_name: &'static str,
+    max_records: usize,
+    /// Bound the published file is rotated to (and the write ceiling).
+    max_bytes: usize,
+    /// Hard ceiling for reading the file already on disk. For the retention
+    /// file it is independent of the operator-configurable `max_bytes`, so a
+    /// file written under a larger bound is still read and rotated down to a
+    /// lowered one instead of blocking every later append (issue #7200
+    /// review).
+    read_max_bytes: usize,
+    /// DB-less retention: also rotate by bytes, dedupe on the event id, keep
+    /// the newest by event timestamp, and write compact JSON so the byte
+    /// accounting is exact.
+    retention: bool,
+}
+
+impl LocalAuditStore {
+    const BACKUP_FALLBACK: Self = Self {
+        file_name: AUDIT_LOCAL_FALLBACK_FILE_NAME,
+        lock_file_name: AUDIT_LOCAL_FALLBACK_LOCK_FILE_NAME,
+        max_records: AUDIT_LOCAL_FALLBACK_CAPACITY,
+        max_bytes: AUDIT_LOCAL_FALLBACK_MAX_BYTES,
+        read_max_bytes: AUDIT_LOCAL_FALLBACK_MAX_BYTES,
+        retention: false,
+    };
+
+    fn retention(bounds: LocalAuditRetentionBounds) -> Self {
+        Self {
+            file_name: AUDIT_LOCAL_RETENTION_FILE_NAME,
+            lock_file_name: AUDIT_LOCAL_RETENTION_LOCK_FILE_NAME,
+            max_records: usize::try_from(bounds.max_records.max(1)).unwrap_or(usize::MAX),
+            max_bytes: usize::try_from(bounds.max_bytes).unwrap_or(usize::MAX),
+            read_max_bytes: usize::try_from(
+                AUDIT_LOCAL_RETENTION_MAX_BYTES_MAX.max(bounds.max_bytes),
+            )
+            .unwrap_or(usize::MAX),
+            retention: true,
+        }
+    }
+}
+
+fn append_local_audit_event(
+    dir: &Path,
+    store: &LocalAuditStore,
+    event: &AuditEvent,
+) -> Result<LocalRetentionAppend, anyhow::Error> {
+    let deadline = local_fallback_lock_deadline();
+    let _process_guard = acquire_local_fallback_process_lock(deadline)?;
+    prepare_fallback_directory(dir)?;
+    let lock_path = dir.join(store.lock_file_name);
+    let _cross_process = acquire_fallback_file_lock(&lock_path, deadline)?;
+    let path = dir.join(store.file_name);
+    reject_symlink_or_non_regular_file(&path, "audit local fallback data file")?;
+    let mut events = read_local_fallback_events_unlocked(&path, store.read_max_bytes)?;
+    if store.retention && events.iter().any(|retained| retained.id == event.id) {
+        // The id can be visible only because an earlier attempt published
+        // the file and then failed (or crashed before) the directory sync.
+        // Re-establish that durability barrier before acknowledging, so a
+        // replayed delivery never settles its spool copy against a rename
+        // that a power loss could still roll back.
+        sync_directory(dir)?;
+        return Ok(LocalRetentionAppend::AlreadyRetained);
+    }
+    events.push(event.clone());
+    if store.retention {
+        // Delivery order is not chronological (spool replay, queue overflow),
+        // so position is not age: keep the newest by event timestamp. The
+        // stable sort keeps file order, then arrival order, for equal
+        // timestamps. A replay older than the whole retained window is the
+        // record rotated out, never a newer one.
+        events.sort_by_key(|retained| retained.ts);
+    }
+    let mut evicted = 0usize;
+    if events.len() > store.max_records {
+        let overflow = events.len() - store.max_records;
+        events.drain(0..overflow);
+        evicted = overflow;
+    }
+    let body = if store.retention {
+        // Compact JSON array: exactly `2 + sum(record bytes) + (n - 1)` bytes,
+        // so the oldest records can be rotated out without re-serializing.
+        let sizes = events
+            .iter()
+            .map(|retained| serde_json::to_vec(retained).map(|bytes| bytes.len()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut total = 2usize
+            .saturating_add(sizes.iter().sum::<usize>())
+            .saturating_add(sizes.len().saturating_sub(1));
+        let mut rotate = 0usize;
+        while total > store.max_bytes && events.len() - rotate > 1 {
+            total = total.saturating_sub(sizes[rotate].saturating_add(1));
+            rotate += 1;
+        }
+        events.drain(0..rotate);
+        evicted = evicted.saturating_add(rotate);
+        serde_json::to_vec(&events)?
+    } else {
+        serde_json::to_vec_pretty(&events)?
+    };
+    let retention = store.retention;
+    let retained = events.len();
+    write_local_fallback_events_unlocked(dir, &path, store, &body, || {
+        if evicted == 0 {
+            return;
+        }
+        // The callback runs immediately after atomic publication, before
+        // fallible post-publication durability and permission steps.
+        // Counts only — never event contents.
+        if retention {
+            warn!(
+                surface = "audit_local_retention_rotated",
+                rotated = evicted,
+                retained,
+                "Local admin audit retention file reached its bound; the oldest records were \
+                 rotated out"
+            );
+        } else {
+            warn!(
+                surface = "audit_local_fallback_evicted",
+                evicted,
+                retained = AUDIT_LOCAL_FALLBACK_CAPACITY,
+                "Local audit fallback store is at capacity; oldest security records were dropped"
+            );
+        }
+    })?;
+    Ok(LocalRetentionAppend::Retained { rotated: evicted })
+}
+
+fn list_local_audit_events(
+    dir: &Path,
+    store: &LocalAuditStore,
+) -> Result<Vec<AuditEvent>, anyhow::Error> {
     let deadline = local_fallback_lock_deadline();
     let _process_guard = acquire_local_fallback_process_lock(deadline)?;
     prepare_existing_fallback_directory(dir)?;
-    let lock_path = dir.join(AUDIT_LOCAL_FALLBACK_LOCK_FILE_NAME);
+    let lock_path = dir.join(store.lock_file_name);
     let _cross_process = acquire_fallback_file_lock(&lock_path, deadline)?;
-    let path = audit_local_fallback_file(dir);
+    let path = dir.join(store.file_name);
     reject_symlink_or_non_regular_file(&path, "audit local fallback data file")?;
-    read_local_fallback_events_unlocked(&path)
+    read_local_fallback_events_unlocked(&path, store.read_max_bytes)
 }
 
 fn local_fallback_lock_deadline() -> std::time::Instant {
@@ -3417,9 +3865,6 @@ fn acquire_local_fallback_process_lock(
 }
 
 /// Test seam: hold the in-process fallback mutex without waiting.
-// The library test harness calls this through `src/lib.rs`; the binary target
-// compiles the shared module without that harness.
-#[allow(dead_code)]
 pub(crate) fn hold_local_fallback_process_lock_for_test()
 -> Result<MutexGuard<'static, ()>, anyhow::Error> {
     match LOCAL_FALLBACK_LOCK.try_lock() {
@@ -3621,7 +4066,10 @@ fn acquire_fallback_file_lock(
     ))
 }
 
-fn read_local_fallback_events_unlocked(path: &Path) -> Result<Vec<AuditEvent>, anyhow::Error> {
+fn read_local_fallback_events_unlocked(
+    path: &Path,
+    max_bytes: usize,
+) -> Result<Vec<AuditEvent>, anyhow::Error> {
     let mut file = match open_fallback_data_file_nofollow(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -3639,7 +4087,7 @@ fn read_local_fallback_events_unlocked(path: &Path) -> Result<Vec<AuditEvent>, a
     confirm_fallback_path_matches_opened(path, &meta, "audit local fallback data file")?;
 
     let len = meta.len();
-    if len > AUDIT_LOCAL_FALLBACK_MAX_BYTES as u64 {
+    if len > max_bytes as u64 {
         return Err(anyhow!(
             "audit local fallback data file exceeds maximum size"
         ));
@@ -3652,11 +4100,11 @@ fn read_local_fallback_events_unlocked(path: &Path) -> Result<Vec<AuditEvent>, a
     let mut raw = Vec::new();
     raw.try_reserve_exact(size)
         .map_err(|_| anyhow!("audit local fallback data file exceeds available memory"))?;
-    let mut limited = (&mut file).take((AUDIT_LOCAL_FALLBACK_MAX_BYTES as u64).saturating_add(1));
+    let mut limited = (&mut file).take((max_bytes as u64).saturating_add(1));
     limited
         .read_to_end(&mut raw)
         .map_err(|error| anyhow!("failed to read audit local fallback data file: {error}"))?;
-    if raw.len() > AUDIT_LOCAL_FALLBACK_MAX_BYTES {
+    if raw.len() > max_bytes {
         return Err(anyhow!(
             "audit local fallback data file exceeds maximum size"
         ));
@@ -3775,16 +4223,16 @@ fn confirm_fallback_path_matches_opened(
 fn write_local_fallback_events_unlocked(
     dir: &Path,
     path: &Path,
-    events: &[AuditEvent],
+    store: &LocalAuditStore,
+    body: &[u8],
     on_published: impl FnOnce(),
 ) -> Result<(), anyhow::Error> {
-    let body = serde_json::to_vec_pretty(events)?;
-    if body.len() > AUDIT_LOCAL_FALLBACK_MAX_BYTES {
+    if body.len() > store.max_bytes {
         return Err(anyhow!("audit local fallback payload exceeds maximum size"));
     }
-    let tmp_name = format!("{}.{}.tmp", AUDIT_LOCAL_FALLBACK_FILE_NAME, Uuid::new_v4());
+    let tmp_name = format!("{}.{}.tmp", store.file_name, Uuid::new_v4());
     let tmp = dir.join(tmp_name);
-    let write_result = write_temp_fallback_file(&tmp, &body);
+    let write_result = write_temp_fallback_file(&tmp, body);
     if let Err(error) = write_result {
         let _ = fs::remove_file(&tmp);
         return Err(error);
@@ -3912,6 +4360,9 @@ fn write_temp_fallback_file(tmp: &Path, body: &[u8]) -> Result<(), anyhow::Error
 }
 
 fn sync_directory(dir: &Path) -> Result<(), anyhow::Error> {
+    if let Some(hook) = snapshot_local_audit_sync_hook_for_tests() {
+        hook(dir)?;
+    }
     #[cfg(unix)]
     {
         let dir_file = OpenOptions::new().read(true).open(dir)?;
@@ -3919,4 +4370,43 @@ fn sync_directory(dir: &Path) -> Result<(), anyhow::Error> {
     }
     let _ = dir;
     Ok(())
+}
+
+/// Test hook run before every local audit store directory sync; an `Err`
+/// fails the sync. The slot is process-global: a hook must pass every
+/// directory other than its own test's.
+type LocalAuditSyncHookForTests = Arc<dyn Fn(&Path) -> std::io::Result<()> + Send + Sync + 'static>;
+
+#[cfg(feature = "test-support")]
+fn local_audit_sync_hook_slot() -> &'static Mutex<Option<LocalAuditSyncHookForTests>> {
+    static HOOK: OnceLock<Mutex<Option<LocalAuditSyncHookForTests>>> = OnceLock::new();
+    HOOK.get_or_init(|| Mutex::new(None))
+}
+
+/// Install or clear the local audit store directory-sync hook.
+///
+/// Tests must clear the hook before finishing (including panic paths) and
+/// return `Ok` for every directory outside their own.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn set_local_audit_sync_hook_for_tests(hook: Option<LocalAuditSyncHookForTests>) {
+    if let Ok(mut slot) = local_audit_sync_hook_slot().lock() {
+        *slot = hook;
+    }
+}
+
+#[cfg(feature = "test-support")]
+fn snapshot_local_audit_sync_hook_for_tests() -> Option<LocalAuditSyncHookForTests> {
+    local_audit_sync_hook_slot()
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+}
+
+/// Without `test-support` no hook can be installed, so the check is a
+/// constant `None` the compiler folds away.
+#[cfg(not(feature = "test-support"))]
+#[inline(always)]
+fn snapshot_local_audit_sync_hook_for_tests() -> Option<LocalAuditSyncHookForTests> {
+    None
 }

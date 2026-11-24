@@ -41,7 +41,7 @@ use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
 use std::convert::Infallible;
 use std::io::Write;
-use std::process::{Child, Command};
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -261,13 +261,12 @@ async fn handle_backend_request(
         .unwrap())
 }
 
-/// Start a high-throughput hyper backend on the given port.
+/// Start a high-throughput hyper backend on an already-bound listener, which
+/// the backend holds for its whole life (no drop-and-rebind window).
 /// Returns a JoinHandle that runs until the tokio runtime shuts down.
 async fn start_hyper_backend(
-    port: u16,
+    listener: tokio::net::TcpListener,
 ) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
-    let listener = tokio::net::TcpListener::bind_test(format!("127.0.0.1:{}", port)).await?;
-
     let handle = tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
@@ -291,7 +290,7 @@ async fn start_hyper_backend(
 #[allow(dead_code)]
 struct LoadTestHarness {
     _temp_dir: TempDir,
-    gateway_process: Option<Child>,
+    gateway_process: Option<crate::common::GatewayChildGuard>,
     proxy_base_url: String,
     admin_base_url: String,
     jwt_secret: String,
@@ -386,20 +385,17 @@ impl LoadTestHarness {
         let observability_token = identity.observability_token.clone();
         let basic_auth_hmac_secret = "load-test-hmac-secret-54321-0123456789".to_string();
 
-        let admin_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0").await?;
-        let admin_port = admin_listener.local_addr()?.port();
-        drop(admin_listener);
+        // Gateway handoff ports come from the registry outside the host's
+        // ephemeral source range; each harness attempt gets fresh ones.
+        let admin_port = crate::scaffolding::ports::unbound_port().await?;
+        let proxy_port = crate::scaffolding::ports::unbound_port().await?;
 
-        let proxy_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0").await?;
-        let proxy_port = proxy_listener.local_addr()?.port();
-        drop(proxy_listener);
-
+        // The backend is in-process, so it keeps its bound fixture socket.
         let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0").await?;
         let backend_port = backend_listener.local_addr()?.port();
-        drop(backend_listener);
 
         // Start high-throughput hyper backend and verify it's listening
-        start_hyper_backend(backend_port).await?;
+        start_hyper_backend(backend_listener).await?;
         let echo_deadline = Instant::now() + Duration::from_secs(5);
         loop {
             match tokio::net::TcpStream::connect(format!("127.0.0.1:{}", backend_port)).await {
@@ -438,8 +434,14 @@ impl LoadTestHarness {
         }
 
         let mut cmd = Command::new(&binary_path);
+        crate::common::configure_coverage_gateway_command(&mut cmd);
         cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
+            // Keep the managed-TLS store out of the checkout (#5706).
+            .env(
+                "FERRUM_TLS_MANAGED_STORE_PATH",
+                temp_dir.path().join("managed-tls"),
+            )
             .env(
                 "FERRUM_ADMIN_JWT_MAX_TTL",
                 scheduled_scaling_admin_jwt_max_ttl_value(),
@@ -490,7 +492,7 @@ impl LoadTestHarness {
             .env("FERRUM_HTTP3_SEND_WINDOW", "8388608")
             .env("FERRUM_LOG_LEVEL", "error");
         identity.apply_to_command(&mut cmd);
-        let child = cmd.spawn()?;
+        let child = crate::common::GatewayChildGuard::new(cmd.spawn()?);
 
         let proxy_base_url = format!("http://127.0.0.1:{}", proxy_port);
         let admin_base_url = format!("http://127.0.0.1:{}", admin_port);
@@ -514,8 +516,7 @@ impl LoadTestHarness {
             Ok(()) => Ok(harness),
             Err(e) => {
                 if let Some(mut child) = harness.gateway_process.take() {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    child.shutdown();
                 }
                 Err(e)
             }
@@ -539,7 +540,7 @@ impl LoadTestHarness {
             .as_mut()
             .ok_or("gateway process missing")?;
         crate::common::wait_for_owned_gateway_identity(
-            child,
+            child.child_mut(),
             admin_port,
             &identity,
             Duration::from_secs(30),
@@ -562,16 +563,17 @@ impl LoadTestHarness {
             "jti": Uuid::new_v4().to_string()
         });
         let header = Header::new(jsonwebtoken::Algorithm::HS256);
-        let key = EncodingKey::from_secret(self.jwt_secret.as_bytes());
+        let key = EncodingKey::from_secret(self.jwt_secret.as_bytes()).unwrap();
         Ok(encode(&header, &claims, &key)?)
     }
 }
 
 impl Drop for LoadTestHarness {
     fn drop(&mut self) {
+        // Reap before `_temp_dir` (the SQLite DB) is removed; SIGTERM + grace
+        // under coverage so the gateway still writes its profile.
         if let Some(mut child) = self.gateway_process.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            child.shutdown();
         }
     }
 }
@@ -628,7 +630,7 @@ fn generate_consumer_jwt(username: &str, secret: &str) -> String {
         "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
     });
     let header = Header::new(jsonwebtoken::Algorithm::HS256);
-    let key = EncodingKey::from_secret(secret.as_bytes());
+    let key = EncodingKey::from_secret(secret.as_bytes()).unwrap();
     encode(&header, &claims, &key).expect("Failed to encode consumer JWT")
 }
 
@@ -682,7 +684,7 @@ async fn provision_resources(
         let listen_path = format!("/svc/{}", i);
 
         let (credentials, entry) = if i < KEY_AUTH_END {
-            let api_key = format!("key-{}-{}", i, &Uuid::new_v4().to_string()[..8]);
+            let api_key = format!("key-{}-{}", i, Uuid::new_v4().as_simple());
             (
                 json!({ "keyauth": [{ "key": api_key.clone() }] }),
                 AuthEntry::KeyAuth {
@@ -1845,8 +1847,8 @@ async fn run_admin_mutation_phase(
                 cycle,
                 client
                     .delete(format!(
-                        "{}/plugins/config/temp-plugin-{}",
-                        admin_url_owned, cycle
+                        "{}/plugins/config/temp-plugin-{}?expected_proxy_ids={}",
+                        admin_url_owned, cycle, temp_id
                     ))
                     .header("Authorization", &admin_auth_owned),
             )

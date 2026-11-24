@@ -4,6 +4,7 @@ use ferrum_edge::plugins::utils::PluginHttpClient;
 use ferrum_edge::plugins::utils::jwks_store::{
     JwksFailureClass, JwksKeyStore, JwksTrustState, redacted_jwks_uri,
 };
+use jsonwebtoken::Algorithm;
 use serde_json::json;
 use std::time::Duration;
 
@@ -603,7 +604,8 @@ async fn an_on_demand_fetch_does_not_shorten_the_periodic_schedule() {
 /// Before this, every unrecognized `alg` fell back to `Algorithm::RS256`, so a
 /// key an issuer published for RSA-OAEP / RSA1_5 encryption — or for RSASSA-PSS
 /// — became a PKCS#1 v1.5 signature-verification key. `use`/`key_ops` did not
-/// catch it: a JWK may omit both.
+/// catch it: a JWK may omit both. RSASSA-PSS keys are now supported, and bound
+/// to exactly their declared PSS algorithm rather than to RS256.
 #[test]
 fn rsa_jwk_alg_must_name_a_supported_signature_algorithm() {
     let jwks = |alg: Option<&str>| {
@@ -619,25 +621,31 @@ fn rsa_jwk_alg_must_name_a_supported_signature_algorithm() {
         json!({"keys": [key]}).to_string()
     };
 
-    for accepted in [
-        jwks(None),
-        jwks(Some("RS256")),
-        jwks(Some("RS384")),
-        jwks(Some("RS512")),
+    for (alg, expected) in [
+        (None, Algorithm::RS256),
+        (Some("RS256"), Algorithm::RS256),
+        (Some("RS384"), Algorithm::RS384),
+        (Some("RS512"), Algorithm::RS512),
+        (Some("PS256"), Algorithm::PS256),
+        (Some("PS384"), Algorithm::PS384),
+        (Some("PS512"), Algorithm::PS512),
     ] {
-        let store = JwksKeyStore::from_inline_jwks(&accepted)
+        let store = JwksKeyStore::from_inline_jwks(&jwks(alg))
             .expect("absent or RSA signature alg should be accepted");
-        assert!(has_trusted_key(&store, "k1"));
+        let keys = store.trusted_keys().expect("inline keys are trusted");
+        assert_eq!(
+            keys.get("k1").map(|key| key.algorithm),
+            Some(expected),
+            "JWK alg {alg:?} must bind verification to exactly {expected:?}"
+        );
     }
 
     for rejected in [
         "RSA-OAEP",
         "RSA-OAEP-256",
         "RSA1_5",
-        "PS256",
-        "PS384",
-        "PS512",
         "ES256",
+        "EdDSA",
         "HS256",
         "none",
         "not-an-algorithm",
@@ -694,4 +702,55 @@ fn ec_jwk_alg_must_agree_with_the_curve_and_name_a_signature_algorithm() {
             "EC JWK alg {alg:?} on {crv} must not become a verification key"
         );
     }
+}
+
+/// RFC 8037 OKP keys: only `Ed25519` (verified as `EdDSA`) is a signature
+/// key. X25519/X448 are key-agreement keys, Ed448 has no verifier in the
+/// selected backend, and a contradicting `alg` or a malformed public key is
+/// skipped rather than admitted.
+#[test]
+fn okp_jwk_admits_only_well_formed_ed25519_eddsa_keys() {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    let jwks = |crv: &str, alg: Option<&str>, x_len: usize| {
+        let mut key = json!({
+            "kty": "OKP",
+            "kid": "k1",
+            "crv": crv,
+            "x": URL_SAFE_NO_PAD.encode(vec![9u8; x_len])
+        });
+        if let Some(alg) = alg {
+            key["alg"] = json!(alg);
+        }
+        json!({"keys": [key]}).to_string()
+    };
+
+    for alg in [None, Some("EdDSA")] {
+        let store = JwksKeyStore::from_inline_jwks(&jwks("Ed25519", alg, 32))
+            .expect("an Ed25519 key should be accepted");
+        let keys = store.trusted_keys().expect("inline keys are trusted");
+        assert_eq!(
+            keys.get("k1").map(|key| key.algorithm),
+            Some(Algorithm::EdDSA)
+        );
+    }
+
+    for (crv, alg, len) in [
+        ("X25519", None, 32),
+        ("Ed448", None, 57),
+        ("X448", None, 56),
+        ("Ed25519", Some("ES256"), 32),
+        ("Ed25519", Some("ECDH-ES"), 32),
+        ("Ed25519", None, 31),
+        ("Ed25519", None, 33),
+    ] {
+        assert!(
+            JwksKeyStore::from_inline_jwks(&jwks(crv, alg, len)).is_err(),
+            "OKP {crv} alg {alg:?} with {len}-byte x must not become a verification key"
+        );
+    }
+
+    let missing_x = json!({"keys": [{"kty": "OKP", "kid": "k1", "crv": "Ed25519"}]}).to_string();
+    assert!(JwksKeyStore::from_inline_jwks(&missing_x).is_err());
 }

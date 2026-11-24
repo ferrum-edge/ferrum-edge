@@ -10,9 +10,8 @@
 //!
 //! This bridge runs inside the **mesh-proxy** (node-waypoint topology). It
 //! opens the pinned maps by path and mirrors their records into the
-//! [`NodeWaypointIdentityResolver`], giving `record_orig_dst4`/
-//! `record_orig_dst6` their first production caller (before this they had no
-//! caller and the resolver's cookie map was always empty).
+//! [`NodeWaypointIdentityResolver`]; it is the production caller of
+//! `record_orig_dst4`/`record_orig_dst6`.
 //!
 //! ## Connect-side vs accept-side cookie (GAP-2M bridge)
 //!
@@ -32,12 +31,12 @@
 //! lookup resolves the source identity without any change to this module.
 //!
 //! **Verification status:** CI compile-checks the kernel program
-//! (`build-ebpf`) and loads + attaches it on a real ≥5.7 kernel (`ebpf-live`).
-//! The full connect→capture→accept datapath (which would confirm the tuple
-//! byte-order and end-to-end resolution) is not exercised by CI and remains a
-//! live multi-pod-node verification step. A tuple/byte-order mismatch fails
-//! closed (no accept-side record written), never misattributes identity, so
-//! the unverified path is safe-by-construction. Pod-identity enrollment into
+//! (`build-ebpf`), loads + attaches it on a real ≥5.7 kernel and asserts a
+//! stamped `FERRUM_ORIG_DST4` record for a captured connection (`ebpf-live`),
+//! and exercises the multi-pod NodeWaypoint datapath in the
+//! `node-waypoint-ebpf-live` gate. A tuple/byte-order mismatch fails closed
+//! (no accept-side record written), never misattributes identity. Pod-identity
+//! enrollment into
 //! `identities_by_pod_uid` is wired: the resolver lazily enrolls
 //! `pod_uid` → identity by hash-joining the eBPF-stamped
 //! `(pod_uid, workload_spiffe_hash)` against the slice's
@@ -83,8 +82,6 @@
 //! no-op stub: it logs once that no orig-dst bridge runs and returns, so the
 //! resolver stays empty and the accept path fails closed — exactly the
 //! documented degraded behavior.
-
-#![allow(dead_code)]
 
 use std::sync::Arc;
 
@@ -192,8 +189,11 @@ mod production {
 
         loop {
             tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
+                // A dropped shutdown sender (`changed()` is `Err`) is a
+                // shutdown too: `changed()` would otherwise complete
+                // immediately on every iteration and spin this loop.
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
                         info!("Node-waypoint orig-dst bridge shutting down");
                         // Drop the fallback so the resolver no longer references
                         // these maps once this task (and the maps) go away.
@@ -352,8 +352,9 @@ mod production {
                 _ = tokio::time::sleep(backoff) => {
                     backoff = (backoff * 2).min(BACKOFF_MAX);
                 }
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
+                // A dropped shutdown sender ends the wait instead of spinning.
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
                         return WaitOutcome::Shutdown;
                     }
                 }

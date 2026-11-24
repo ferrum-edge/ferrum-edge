@@ -30,7 +30,7 @@ fn sql_migration_pool_options(db_type: &str) -> sqlx::any::AnyPoolOptions {
 
 pub async fn run(
     env_config: EnvConfig,
-    _shutdown_tx: tokio::sync::watch::Sender<bool>,
+    _shutdown_tx: crate::overload::ShutdownSender,
 ) -> Result<(), anyhow::Error> {
     let action = &env_config.migrate_action;
     let dry_run = env_config.migrate_dry_run;

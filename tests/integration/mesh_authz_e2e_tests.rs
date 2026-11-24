@@ -51,7 +51,7 @@ use ferrum_edge::modes::mesh::config::MeshConfig;
 use ferrum_edge::modes::mesh::policy::{
     BareServiceFqdnSniCondition, find_bare_service_fqdn_sni_conditions,
 };
-use ferrum_edge::modes::mesh::{MESH_AUTHZ_PLUGIN_ID, prepare_gateway_config_for_mesh};
+use ferrum_edge::modes::mesh::{MESH_AUTHZ_PLUGIN_ID, prepare_gateway_config_via_mesh_slice};
 
 const CLIENT_SPIFFE: &str = "spiffe://cluster.local/ns/default/sa/client";
 const ROGUE_SPIFFE: &str = "spiffe://cluster.local/ns/default/sa/rogue";
@@ -75,7 +75,7 @@ fn ctx_with_principal(method: &str, path: &str, principal: Option<&str>) -> Requ
 
 /// Build a `MeshAuthz` plugin from the prepared mesh config for the given
 /// workload identity. Mirrors what production does: build a
-/// `GatewayConfig`, run `prepare_gateway_config_for_mesh`, then construct
+/// `GatewayConfig`, run `prepare_gateway_config_via_mesh_slice`, then construct
 /// the plugin from the injected `mesh_authz` plugin config. This is the
 /// realistic path — tests that build `MeshAuthz` directly from
 /// `{"mesh_policies": [...]}` bypass the scope-filter context the plugin
@@ -107,6 +107,7 @@ fn prepared_mesh_plugin_configs(
 ) -> Vec<ferrum_edge::config::types::PluginConfig> {
     let config = ferrum_edge::config::types::GatewayConfig {
         quarantined_plugin_configs: Vec::new(),
+        quarantined_jwt_shared_secrets: Default::default(),
         version: "test".to_string(),
         proxies: Vec::new(),
         upstreams: Vec::new(),
@@ -127,7 +128,7 @@ fn prepared_mesh_plugin_configs(
         k8s_mesh_overlay: Default::default(),
         gateway_trust_bundles: Vec::new(),
     };
-    prepare_gateway_config_for_mesh(config, runtime)
+    prepare_gateway_config_via_mesh_slice(config, runtime)
         .expect("mesh-prepared")
         .plugin_configs
 }
@@ -1904,6 +1905,7 @@ async fn trust_domain_alias_accepts_baggage_principal_from_aliased_domain() {
     let mesh = mesh_config_with(Vec::new(), Vec::new(), vec![allow]);
     let config = ferrum_edge::config::types::GatewayConfig {
         quarantined_plugin_configs: Vec::new(),
+        quarantined_jwt_shared_secrets: Default::default(),
         version: "test".to_string(),
         proxies: Vec::new(),
         upstreams: Vec::new(),
@@ -1924,7 +1926,7 @@ async fn trust_domain_alias_accepts_baggage_principal_from_aliased_domain() {
         k8s_mesh_overlay: Default::default(),
         gateway_trust_bundles: Vec::new(),
     };
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh-prepared");
+    let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh-prepared");
     let authz_cfg = prepared
         .plugin_configs
         .iter()

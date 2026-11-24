@@ -175,12 +175,55 @@ python3 .github/scripts/h1_tls_post_comparison.py self-test
 bash -n .github/scripts/run_h1_tls_post_comparison.sh
 ```
 
+## Daily full-matrix gateways benchmark
+
+`.github/workflows/gateways-protocol-benchmark-daily.yml` dispatches
+`gateways-protocol-benchmark.yml` on `main` once a day (08:29 UTC) with the
+inputs earlier full `main` runs used: every protocol and gateway, 30 s per
+payload size, 100 connections, 3 iterations, and no `ferrum-baseline` arm. A
+baseline arm at three iterations would push the six-arm `http1-tls` job past
+its step timeout. The dispatcher skips a day while an earlier bot-dispatched
+run is still queued or running. It exists because the benchmark's `benchmark`
+job is frozen by the trusted Cross policy and reads its workload from
+`inputs.*`, which a `schedule` trigger would leave empty.
+
+Reading the series:
+
+- Find the daily runs with
+  `gh run list --workflow gateways-protocol-benchmark.yml --user github-actions[bot]`.
+- Do not compare absolute RPS across days. Each protocol job gets its own
+  hosted runner, and the CPU class varies (Intel Xeon 8370C/8573C, AMD EPYC
+  7763/9V74/9V45 were all seen in October and November 2026). Between
+  classes Ferrum ÷ Envoy moved by 10–25% with no code change. Compare
+  within-run ratios (Ferrum ÷ direct, Ferrum ÷ competitor), and only between
+  runs whose job logs show the same `Model name` in the runner health check.
+- A ratio step that persists across several days on the same CPU class is the
+  signal to confirm with a same-runner A/B: dispatch the workflow with
+  `baseline_image=ferrumedge/ferrum-edge:main-<sha>` for a revision before the
+  step and skip the unaffected protocols.
+
+Artifacts request `retention-days: 90`. The repository's Actions artifact and
+log retention setting (Settings → Actions → General) caps artifacts, logs and
+job summaries. It was raised from 30 to 90 days, the public-repository
+maximum, on 2026-11-07, so a run keeps 90 days of history. Runs uploaded
+before that keep their 30-day expiry.
+
+## gRPC RPC-deadline A/B (#6904)
+
+The paired same-runner lane that measured the gRPC RPC-deadline response pump
+added by [#6870](https://github.com/ferrum-edge/ferrum-edge/pull/6870)
+(`grpc-deadline-ab-benchmark.yml`, its pinned reference revisions and its
+`grpc_deadline_*` route configs) was retired with the closed #6904 study
+(#7279). `proto_bench`'s `grpc-deadline-probe` subcommand and
+`proto_backend`'s `grpc_deadline_requests` / `grpc_stalled_started` /
+`grpc_stalled_released` counters remain in the harness for a manual rerun.
+
 ## Request-upload hand-off on the H1 TLS POST path
 
 Issue [#5537](https://github.com/ferrum-edge/ferrum-edge/issues/5537) item 4
 asks what the gateway-owned request-upload relay costs on this workload, and
 whether a fully buffered upload can be handed to the backend transport without
-it. This section records the answer, derived by static inspection of
+it. This section records the answer as of 2026-09-16, derived by static inspection of
 `src/proxy/mod.rs`, `src/proxy/body.rs`, `src/proxy/upload_pump.rs` and the
 harness, so a later attribution round does not have to re-derive it.
 
@@ -192,8 +235,17 @@ The workload's POST body is **streamed**, not buffered. Four facts decide it:
   `requires_request_body_buffering` and `has_effective_http_retries` are both
   false and `stream_request_body` is true.
 - `proto_backend`'s HTTPS listener on port 3447 advertises only `http/1.1` in
-  ALPN, so the backend capability registry can never mark it direct-H2 or H3;
-  the dispatch runs through the reqwest pool.
+  ALPN, so the backend capability registry can never mark it direct-H2 or H3.
+  When this analysis was written (2026-09-16) the dispatch therefore ran
+  through the reqwest pool. Since the direct HTTP/1.1 pool landed
+  ([#5961](https://github.com/ferrum-edge/ferrum-edge/pull/5961), on by
+  default via `FERRUM_POOL_HTTP1_DIRECT=true`, which the harness does not
+  override), a streamed request to this backend is dispatched on the direct
+  HTTP/1.1 pool once the capability registry records that the backend lacks
+  TLS HTTP/2; only requests sent before that record exists still use the
+  reqwest pool. The direct pool wraps the upload in the same `CountingIncoming`
+  and `install_counting_upload_authorization` relay, so the conclusions below
+  about the bridged relay hold for both.
 - `.github/scripts/h1_tls_post_comparison.py` sets
   `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0`, so that dispatch takes the
   `CountingIncoming` arm rather than `SizeLimitedIncoming`.
@@ -258,8 +310,8 @@ request:
   `Incoming`, both optional `Sleep`s and the `select!` state.
 - **Per DATA frame: one task hand-off the direct body does not have.** The
   relay is polled by the frontend connection task (inline, through the
-  dispatcher's header race) while the body is polled by reqwest's connection
-  task, so every frame crosses a semaphore acquire/release pair, an
+  dispatcher's header race) while the body is polled by the backend
+  connection task (reqwest's, or the direct HTTP/1.1 pool's hyper connection), so every frame crosses a semaphore acquire/release pair, an
   intrusive-list push and pop, and both wakers.
 - **Per relay-loop iteration while the watermark is armed:** one clock read and
   one `Sleep::reset()` — a timer-wheel deregistration and reinsertion — plus one
@@ -389,9 +441,7 @@ executable/configuration prose, including Markdown. Its historical
 "Benches deferred (not yet implemented)" section is **not** the current
 backlog source of truth and must remain unchanged. Live suite status and the
 published `mesh-hbone-e2e` / `mesh-dns-e2e` baseline pointers are documented
-here (and in
-[`docs/backlog/issue_2110_register.md`](backlog/issue_2110_register.md))
-instead of rewriting that protected README.
+here instead of rewriting that protected README.
 
 ## Related surfaces
 

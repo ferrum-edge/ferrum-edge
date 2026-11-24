@@ -1460,3 +1460,328 @@ async fn a_frame_queued_before_the_bound_is_never_delivered_after_it() {
     );
     assert!(body.frame().await.is_none(), "no second completion");
 }
+
+/// Ready-frame body that advertises an exact `size_hint()` (just like a
+/// Content-Length HTTP/1.1 `hyper::body::Incoming`).
+struct ReadyExactBody {
+    frames: VecDeque<Frame<Bytes>>,
+    remaining: u64,
+}
+
+impl ReadyExactBody {
+    fn new(chunks: &[&'static [u8]]) -> Self {
+        let mut remaining = 0u64;
+        let mut frames = VecDeque::with_capacity(chunks.len());
+        for chunk in chunks {
+            remaining += chunk.len() as u64;
+            frames.push_back(Frame::data(Bytes::from_static(chunk)));
+        }
+        Self { frames, remaining }
+    }
+}
+
+impl Body for ReadyExactBody {
+    type Data = Bytes;
+    type Error = ProxyBodyError;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match self.frames.pop_front() {
+            Some(frame) => {
+                if let Some(data) = frame.data_ref() {
+                    self.remaining = self.remaining.saturating_sub(data.len() as u64);
+                }
+                std::task::Poll::Ready(Some(Ok(frame)))
+            }
+            None => std::task::Poll::Ready(None),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::SizeHint::with_exact(self.remaining)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn settled_http_body_preserves_exact_size_hint_and_decrements_on_poll() {
+    let latch = StreamAuthTerminationLatch::default();
+    let closer = AuthorizationConnectionCloser::new();
+    let mut body = wrapped_body(
+        proxy_body_streaming_for_test(Box::pin(ReadyExactBody::new(&[b"hello ", b"world!"]))),
+        future_deadline(
+            Duration::from_secs(30),
+            StreamAuthTermination::CredentialExpired,
+        ),
+        &latch,
+        &closer,
+    );
+
+    assert_eq!(
+        body.size_hint().exact(),
+        Some(12),
+        "settled authenticated HTTP body must preserve exact Content-Length size_hint"
+    );
+
+    let first = body
+        .frame()
+        .await
+        .expect("first frame")
+        .expect("ok")
+        .into_data()
+        .expect("data");
+    assert_eq!(first.as_ref(), b"hello ");
+    assert_eq!(body.size_hint().exact(), Some(6));
+
+    let second = body
+        .frame()
+        .await
+        .expect("second frame")
+        .expect("ok")
+        .into_data()
+        .expect("data");
+    assert_eq!(second.as_ref(), b"world!");
+    assert_eq!(body.size_hint().exact(), Some(0));
+    assert!(body.frame().await.is_none());
+    assert_eq!(latch.observed(), None);
+    assert!(!closer.close_requested());
+}
+
+#[tokio::test(start_paused = true)]
+async fn settled_watchdog_hub_enforces_expiry_rearms_earlier_deadline_and_deregisters_on_drop() {
+    let closer = AuthorizationConnectionCloser::new();
+    let grace = ferrum_edge::_test_support::authorization_transport_close_grace();
+
+    // 1. Register a far-future settled body first (spawns the hub worker sleeping on its deadline).
+    let latch_late = StreamAuthTerminationLatch::default();
+    let _body_late = wrapped_body(
+        proxy_body_streaming_for_test(Box::pin(ReadyExactBody::new(&[b"late-payload"]))),
+        future_deadline(
+            Duration::from_secs(60) + grace * 4,
+            StreamAuthTermination::CredentialExpired,
+        ),
+        &latch_late,
+        &closer,
+    );
+    tokio::task::yield_now().await;
+
+    // 2. Register a 2s settled body that is dropped before its deadline; it must
+    //    deregister cleanly without latching or closing the shared connection.
+    let latch_dropped = StreamAuthTerminationLatch::default();
+    let body_dropped = wrapped_body(
+        proxy_body_streaming_for_test(Box::pin(ReadyExactBody::new(&[b"drop-me"]))),
+        future_deadline(
+            Duration::from_secs(2),
+            StreamAuthTermination::CredentialExpired,
+        ),
+        &latch_dropped,
+        &closer,
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    drop(body_dropped);
+    tokio::time::sleep(Duration::from_secs(2) + grace).await;
+    assert_eq!(latch_dropped.observed(), None);
+    assert!(
+        !closer.close_requested(),
+        "dropping a settled body before expiry must deregister it from the hub"
+    );
+
+    // 3. Register a 5s settled body while the hub still holds the 30s entry;
+    //    the hub must re-arm its sleep to the earlier 5s deadline, latch once,
+    //    and close the shared connection after TRANSPORT_CLOSE_GRACE.
+    let latch_early = StreamAuthTerminationLatch::default();
+    let mut body_early = wrapped_body(
+        proxy_body_streaming_for_test(Box::pin(ReadyExactBody::new(&[b"early-payload"]))),
+        future_deadline(
+            Duration::from_secs(5),
+            StreamAuthTermination::CredentialExpired,
+        ),
+        &latch_early,
+        &closer,
+    );
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        latch_early.observed(),
+        Some(StreamAuthTermination::CredentialExpired),
+        "earlier deadline registered on an active hub must re-arm the sleep and fire on time"
+    );
+    assert_eq!(
+        latch_late.observed(),
+        None,
+        "later 30s entry on the same hub must remain unaffected at t+5s"
+    );
+    assert!(
+        !closer.close_requested(),
+        "connection must stay open during TRANSPORT_CLOSE_GRACE"
+    );
+
+    tokio::time::sleep(grace).await;
+    tokio::task::yield_now().await;
+    assert!(
+        closer.close_requested(),
+        "connection must close once TRANSPORT_CLOSE_GRACE elapses"
+    );
+
+    let err = body_early
+        .frame()
+        .await
+        .expect("expired settled body yields terminal")
+        .expect_err("expired settled body must not deliver buffered payload");
+    assert!(
+        err.to_string().contains("credential expired"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn inner_route_deadline_is_not_erased_by_outer_authorization_read_ahead() {
+    let latch = StreamAuthTerminationLatch::default();
+    let closer = AuthorizationConnectionCloser::new();
+
+    // Two ready frames wrapped in a 5s route request deadline, then wrapped in
+    // a 60s authorization deadline with a connection closer.
+    let inner =
+        proxy_body_streaming_for_test(Box::pin(ReadyExactBody::new(&[b"chunk-1", b"chunk-2"])));
+    let route_timed = ferrum_edge::_test_support::proxy_body_with_route_request_deadline_for_test(
+        inner,
+        tokio::time::Instant::now() + Duration::from_secs(5),
+    );
+    let mut body = wrapped_body(
+        route_timed,
+        future_deadline(
+            Duration::from_secs(60),
+            StreamAuthTermination::CredentialExpired,
+        ),
+        &latch,
+        &closer,
+    );
+
+    // Advance past the 5s route deadline (still well before the 60s auth deadline).
+    tokio::time::sleep(Duration::from_secs(6)).await;
+
+    // The VERY FIRST poll after the 5s route deadline expires must return the
+    // route request timeout — never delivering a frame queued by the outer
+    // authorization pump ahead of the deadline.
+    let err = body
+        .frame()
+        .await
+        .expect("expired route-timed body must yield a terminal")
+        .expect_err("first poll after route deadline expiry must fail with route request timeout");
+    assert!(
+        err.to_string().contains("route request timeout"),
+        "expected route request timeout on first poll, got: {err}"
+    );
+    assert_eq!(latch.observed(), None);
+}
+
+#[test]
+fn cloned_request_context_shares_lazy_authorization_latch() {
+    assert!(
+        ferrum_edge::_test_support::cloned_request_context_shares_lazy_auth_latch_for_test(),
+        "cloning RequestContext before latch init must still share the authorization latch"
+    );
+}
+
+struct ChannelBody(tokio::sync::mpsc::Receiver<Result<Frame<Bytes>, ProxyBodyError>>);
+
+impl http_body::Body for ChannelBody {
+    type Data = Bytes;
+    type Error = ProxyBodyError;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        self.0.poll_recv(cx)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn pump_claimed_terminal_before_route_deadline_is_not_overwritten_by_route_timeout() {
+    // 1. Clean EOF claimed by the authorization pump before the route deadline.
+    {
+        let latch = StreamAuthTerminationLatch::default();
+        let closer = AuthorizationConnectionCloser::new();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let inner = proxy_body_streaming_for_test(Box::pin(ChannelBody(rx)));
+        let route_timed =
+            ferrum_edge::_test_support::proxy_body_with_route_request_deadline_for_test(
+                inner,
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            );
+        let mut body = wrapped_body(
+            route_timed,
+            future_deadline(
+                Duration::from_secs(60),
+                StreamAuthTermination::CredentialExpired,
+            ),
+            &latch,
+            &closer,
+        );
+
+        // Close upstream cleanly before the 5s route deadline and let the pump
+        // claim InnerCompletion and queue PumpItem::End.
+        drop(tx);
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+
+        // Downstream polls only AFTER the 5s route deadline has elapsed.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(
+            body.frame().await.is_none(),
+            "clean EOF already claimed before the route deadline must not be overwritten by route timeout"
+        );
+        assert_eq!(latch.observed(), None);
+    }
+
+    // 2. Upstream error claimed by the authorization pump before the route deadline.
+    {
+        let latch = StreamAuthTerminationLatch::default();
+        let closer = AuthorizationConnectionCloser::new();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let inner = proxy_body_streaming_for_test(Box::pin(ChannelBody(rx)));
+        let route_timed =
+            ferrum_edge::_test_support::proxy_body_with_route_request_deadline_for_test(
+                inner,
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            );
+        let mut body = wrapped_body(
+            route_timed,
+            future_deadline(
+                Duration::from_secs(60),
+                StreamAuthTermination::CredentialExpired,
+            ),
+            &latch,
+            &closer,
+        );
+
+        tx.send(Err(
+            Box::new(std::io::Error::other("upstream reset")) as ProxyBodyError
+        ))
+        .await
+        .expect("channel open");
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        let err = body
+            .frame()
+            .await
+            .expect("upstream error must still be delivered")
+            .expect_err("expected upstream error, not clean EOF");
+        assert!(
+            err.to_string().contains("upstream reset"),
+            "expected queued upstream error, got: {err}"
+        );
+        assert_eq!(latch.observed(), None);
+    }
+}

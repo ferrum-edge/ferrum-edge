@@ -272,7 +272,6 @@ deploy_control_plane() {
     --set image.tag=gateway-api-conformance \
     --set image.pullPolicy=IfNotPresent \
     --set injector.enabled=false \
-    --set ca.enabled=false \
     --set gatewayClass.create=false \
     --set controlPlane.enabled=true \
     --set controlPlane.rbac.create=true \

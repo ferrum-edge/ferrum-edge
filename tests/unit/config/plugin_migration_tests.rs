@@ -1725,6 +1725,18 @@ fn mysql_missing_index_error_is_benign_only_for_drop_index() {
 }
 
 #[test]
+fn mysql_existing_index_error_is_benign_only_for_structured_1061() {
+    use ferrum_edge::config::migrations::mysql_create_index_exists_is_benign;
+
+    assert!(mysql_create_index_exists_is_benign(Some(1061)));
+    // Missing-index, duplicate-entry and non-MySQL errors stay fatal even when
+    // their rendered text could contain "1061" (an index name, a byte count).
+    assert!(!mysql_create_index_exists_is_benign(Some(1091)));
+    assert!(!mysql_create_index_exists_is_benign(Some(1062)));
+    assert!(!mysql_create_index_exists_is_benign(None));
+}
+
+#[test]
 fn example_audit_plugin_mysql_overrides_rebuild_exact_indexes() {
     let migrations = ferrum_edge::custom_plugins::collect_all_custom_plugin_migrations();
     let Some((_, example)) = migrations

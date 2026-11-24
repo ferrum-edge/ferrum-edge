@@ -27,7 +27,7 @@ use std::collections::HashSet;
 use std::convert::Infallible;
 use std::io::Write;
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -36,6 +36,10 @@ use ferrum_edge::_test_support::{
 };
 use ferrum_edge::capture::{CaptureConfig, CaptureMode};
 use ferrum_edge::cni::client::send_rpc;
+use ferrum_edge::cni::ownership::{
+    configure_cni_ownership_store, load_configured_cni_ownership,
+    reset_cni_ownership_store_for_tests, store_durable_cni_ownership,
+};
 use ferrum_edge::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
 use ferrum_edge::ebpf::{
     CaptureContract, FallbackMode, MockEbpfBackend, NodeAgentMetrics, PodAttachmentState,
@@ -62,8 +66,8 @@ fn build_request(verb: RpcVerb) -> CniRpcRequest {
         container_id: "ctr-1".to_string(),
         ifname: Some("eth0".to_string()),
         netns_path: Some("/var/run/netns/cni-1".to_string()),
-        args: std::collections::HashMap::new(),
         valid_attachments: Vec::new(),
+        pod_ips: Vec::new(),
     }
 }
 
@@ -382,6 +386,52 @@ async fn cni_round_trip_surfaces_main_loop_error() {
     let _ = tokio::time::timeout(Duration::from_secs(2), listener).await;
 }
 
+/// The lifecycle verbs share `cni::install` with the node-agent, which logs
+/// through `tracing`. The CLI must route those diagnostics to stderr, or an
+/// operator never learns why the installer ignored a file on the node.
+#[cfg(unix)]
+#[test]
+fn ferrum_cni_uninstall_reports_install_module_diagnostics_on_stderr() {
+    let dir = tempdir().expect("tempdir");
+    let bin_dir = dir.path().join("opt-cni-bin");
+    let conf_dir = dir.path().join("etc-cni-net-d");
+    std::fs::create_dir_all(&bin_dir).expect("bin dir");
+    std::fs::create_dir_all(&conf_dir).expect("conf dir");
+    std::fs::write(
+        conf_dir.join(ferrum_edge::cni::install::OWNERSHIP_MANIFEST_FILE_NAME),
+        b"not json",
+    )
+    .expect("write corrupt ownership manifest");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ferrum-cni"))
+        .arg("uninstall")
+        .env_remove("RUST_LOG")
+        .env_remove("READY_MARKER_PATH")
+        .env_remove("EXPECTED_OWNER")
+        .env_remove("EXPECTED_GENERATION")
+        .env("HOST_BIN_DIR", &bin_dir)
+        .env("HOST_CONF_DIR", &conf_dir)
+        .env("CONF_FILE_NAME", "00-ferrum.conflist")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run ferrum-cni uninstall");
+
+    assert!(
+        output.status.success(),
+        "nothing was installed, so uninstall succeeds: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "lifecycle diagnostics must not reach stdout"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Ignoring unparseable CNI ownership manifest"),
+        "install-module warning must reach stderr, got: {stderr}"
+    );
+}
+
 /// Binary-level behavior: a rejected CHECK must fail the CNI invocation
 /// so kubelet can detect that the pod is not currently enrolled.
 #[tokio::test]
@@ -459,7 +509,10 @@ async fn ferrum_cni_binary_check_rejection_exits_nonzero() {
     );
     let payload: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("CNI error JSON should parse");
-    assert_eq!(payload["code"], 12);
+    assert_eq!(
+        payload["code"],
+        ferrum_edge::cni::spec::CNI_ERROR_CODE_REJECTED
+    );
     assert!(
         payload["msg"]
             .as_str()
@@ -511,11 +564,11 @@ async fn cni_gc_round_trip_forwards_valid_attachments() {
             container_id: String::new(),
             ifname: None,
             netns_path: None,
-            args: std::collections::HashMap::new(),
             valid_attachments: vec![CniValidAttachment {
                 container_id: "ctr-live".to_string(),
                 ifname: "eth0".to_string(),
             }],
+            pod_ips: Vec::new(),
         };
         let mut last_err = None;
         for _ in 0..50 {
@@ -685,11 +738,11 @@ fn cni_rpc_boundary_rejects_cross_verb_paths_and_identifiers() {
         container_id: String::new(),
         ifname: None,
         netns_path: None,
-        args: std::collections::HashMap::new(),
         valid_attachments: vec![CniValidAttachment {
             container_id: "ctr-live".to_string(),
             ifname: "eth0".to_string(),
         }],
+        pod_ips: Vec::new(),
     };
     assert!(valid_gc.validate().is_ok());
 
@@ -709,11 +762,10 @@ fn cni_rpc_boundary_rejects_cross_verb_paths_and_identifiers() {
     unsafe_path.netns_path = Some("/var/run/netns/../host".to_string());
     assert!(unsafe_path.validate().is_err());
 
-    let mut oversized_args = build_request(RpcVerb::Add);
-    oversized_args.args = (0..65)
-        .map(|index| (format!("ARG_{index}"), "value".to_string()))
-        .collect();
-    assert!(oversized_args.validate().is_err());
+    // The request carries no free-form CNI argument map: an unknown wire
+    // field (an `args` object from any peer) is refused at decode.
+    let with_args = r#"{"verb":"add","network_name":"ferrum-mesh","pod_namespace":"demo","pod_name":"alpha","container_id":"ctr-1","ifname":"eth0","netns_path":"/var/run/netns/cni-1","args":{"K8S_POD_NAME":"alpha"},"valid_attachments":[]}"#;
+    assert!(serde_json::from_str::<CniRpcRequest>(with_args).is_err());
 }
 
 #[test]
@@ -847,7 +899,6 @@ async fn cni_status_round_trip_forwards_without_attachment_fields() {
         assert!(work.request.container_id.is_empty());
         assert!(work.request.ifname.is_none());
         assert!(work.request.netns_path.is_none());
-        assert!(work.request.args.is_empty());
         assert!(work.request.valid_attachments.is_empty());
         let _ = work.respond.send(CniRpcResponse::Ok);
     });
@@ -869,8 +920,8 @@ async fn cni_status_round_trip_forwards_without_attachment_fields() {
             container_id: String::new(),
             ifname: None,
             netns_path: None,
-            args: std::collections::HashMap::new(),
             valid_attachments: Vec::new(),
+            pod_ips: Vec::new(),
         };
         let mut last_err = None;
         for _ in 0..50 {
@@ -1259,8 +1310,8 @@ fn cni_rpc_status_boundary_rejects_attachment_specific_fields() {
         container_id: String::new(),
         ifname: None,
         netns_path: None,
-        args: std::collections::HashMap::new(),
         valid_attachments: Vec::new(),
+        pod_ips: Vec::new(),
     };
     assert!(valid_status.validate().is_ok());
 
@@ -1310,8 +1361,8 @@ fn status_rpc_request() -> CniRpcRequest {
         container_id: String::new(),
         ifname: None,
         netns_path: None,
-        args: std::collections::HashMap::new(),
         valid_attachments: Vec::new(),
+        pod_ips: Vec::new(),
     }
 }
 
@@ -1445,7 +1496,20 @@ fn assert_sanitized_status_error(response: &CniRpcResponse) {
     );
 }
 
+/// STATUS consults the process-global durable CNI ownership store. Tests that
+/// expect STATUS success, or that drive that store, serialize on this lock so a
+/// parallel test cannot leave it refusing (or admitting) mid-assertion.
+static CNI_OWNERSHIP_STORE_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 async fn run_status_with_client(
+    kube_client: &Client,
+) -> (CniRpcResponse, DashMap<String, PodAttachmentState>) {
+    let _ownership_store = CNI_OWNERSHIP_STORE_LOCK.lock().await;
+    run_status_with_client_holding_store_lock(kube_client).await
+}
+
+async fn run_status_with_client_holding_store_lock(
     kube_client: &Client,
 ) -> (CniRpcResponse, DashMap<String, PodAttachmentState>) {
     let mut backend = MockEbpfBackend::default();
@@ -1579,6 +1643,71 @@ async fn cni_status_kube_dependency_recovers_after_outage() {
     let (second, _) = run_status_with_client(&client).await;
     assert_eq!(second, CniRpcResponse::Ok);
     assert_eq!(state.lock().expect("lock").hits, 2);
+}
+
+fn assert_status_ownership_refusal(response: &CniRpcResponse, refusal: &str) {
+    let CniRpcResponse::Error { reason } = response else {
+        panic!("expected STATUS Error while durable ownership is {refusal}, got {response:?}");
+    };
+    assert!(
+        reason.contains(&format!("durable Ferrum CNI ownership state is {refusal}")),
+        "unexpected STATUS reason: {reason}"
+    );
+    assert!(
+        !reason.contains("cni-owned-attachments") && !reason.contains('/'),
+        "STATUS must not echo the durable store path: {reason}"
+    );
+}
+
+/// Regression (explicit-state audit C3). Any durable ownership load error used
+/// to latch `rejected`, after which every CNI ADD for an enrolled pod failed
+/// its ownership claim while STATUS still answered Ok, so the install
+/// rollback-watch accepted the node as Ready. STATUS now fails closed while the
+/// store refuses claims; a transient I/O failure is retried on the CNI request
+/// path, while rejected content stays terminal until the store is reconfigured.
+#[cfg(unix)]
+#[tokio::test]
+async fn cni_status_fails_closed_while_durable_ownership_refuses_claims() {
+    /// Restores the default (disabled) store even when an assertion fails, so
+    /// later STATUS tests in this binary are not left refused.
+    struct ResetOwnershipStore;
+    impl Drop for ResetOwnershipStore {
+        fn drop(&mut self) {
+            reset_cni_ownership_store_for_tests();
+        }
+    }
+
+    let _ownership_store = CNI_OWNERSHIP_STORE_LOCK.lock().await;
+    let _reset = ResetOwnershipStore;
+    let client = mock_status_probe_client(Arc::new(Mutex::new(MockStatusProbeState::default())));
+    let dir = tempdir().expect("tempdir");
+
+    // Transient: a regular file where the store's parent directory belongs
+    // makes the load fail with ENOTDIR.
+    let blocker = dir.path().join("not-a-directory");
+    std::fs::write(&blocker, b"").expect("seed blocker file");
+    configure_cni_ownership_store(Some(blocker.join("cni-owned-attachments.test.v2")));
+    load_configured_cni_ownership().expect_err("startup load fails on a filesystem error");
+    let (response, _) = run_status_with_client_holding_store_lock(&client).await;
+    assert_status_ownership_refusal(&response, "unavailable");
+
+    // Repairing the filesystem lets the next CNI request reload the store
+    // without a node-agent restart.
+    std::fs::remove_file(&blocker).expect("remove blocker");
+    std::fs::create_dir(&blocker).expect("restore parent directory");
+    let (response, _) = run_status_with_client_holding_store_lock(&client).await;
+    assert_eq!(response, CniRpcResponse::Ok);
+
+    // Terminal: invalid content is never re-read for this configuration.
+    let corrupt = dir.path().join("cni-owned-attachments.corrupt.v2");
+    std::fs::write(&corrupt, b"{not json").expect("seed corrupt store");
+    configure_cni_ownership_store(Some(corrupt.clone()));
+    load_configured_cni_ownership().expect_err("startup load rejects corrupt content");
+    let (response, _) = run_status_with_client_holding_store_lock(&client).await;
+    assert_status_ownership_refusal(&response, "rejected");
+    store_durable_cni_ownership(&corrupt, &[]).expect("operator repair");
+    let (response, _) = run_status_with_client_holding_store_lock(&client).await;
+    assert_status_ownership_refusal(&response, "rejected");
 }
 
 /// Install / uninstall / rollback lifecycle for the chained CNI artifacts
@@ -3078,4 +3207,314 @@ mod install_lifecycle {
             "an attested previous digest still authorizes removal: {report:?}"
         );
     }
+}
+
+// ── ADD fails closed without pod metadata (GHSA-7x6j-vmqm-xx2v) ────────────
+
+fn add_metadata_pod_response(opted_in: bool) -> Response<Body> {
+    let mut metadata = json!({
+        "name": "alpha",
+        "namespace": "demo",
+        "uid": "uid-1",
+        "resourceVersion": "1"
+    });
+    if opted_in {
+        metadata["labels"] = json!({ "ferrum.io/mesh": "enabled" });
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": metadata,
+                "spec": { "containers": [] },
+                "status": {}
+            }))
+            .expect("serialize Pod"),
+        ))
+        .expect("build Pod response")
+}
+
+/// Serves the ADD metadata GET for `demo/alpha`: each hit takes the next
+/// outcome (`Ready` answers with a pod that is not opted in to the mesh).
+fn mock_add_metadata_client(state: Arc<Mutex<MockStatusProbeState>>) -> Client {
+    let service = service_fn(move |request: Request<Body>| {
+        let state = state.clone();
+        async move {
+            assert_eq!(request.method(), Method::GET);
+            assert_eq!(
+                request.uri().path(),
+                "/api/v1/namespaces/demo/pods/alpha",
+                "ADD must read exactly the pod named by CNI_ARGS"
+            );
+            let mut guard = state.lock().expect("lock mock ADD metadata state");
+            let idx = guard.hits;
+            guard.hits += 1;
+            let outcome = guard
+                .outcomes
+                .get(idx)
+                .copied()
+                .unwrap_or(MockProbeOutcome::Ready);
+            let response = match outcome {
+                MockProbeOutcome::Ready => add_metadata_pod_response(false),
+                MockProbeOutcome::Unavailable => kube_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "injected https://kube.example/token=secret namespace=hostile failure",
+                ),
+            };
+            Ok::<_, Infallible>(response)
+        }
+    });
+    Client::new(service, "default")
+}
+
+async fn run_add_with_metadata_client(
+    kube_client: &Client,
+) -> (
+    CniRpcResponse,
+    Option<String>,
+    DashMap<String, PodAttachmentState>,
+    MockEbpfBackend,
+) {
+    let _ownership_store = CNI_OWNERSHIP_STORE_LOCK.lock().await;
+    let mut backend = MockEbpfBackend::default();
+    let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+    let metrics = NodeAgentMetrics::default();
+    let config = status_probe_config();
+    let (response, enrolled) = apply_cni_request_with_kube_metadata_for_test(
+        &mut backend,
+        &pod_states,
+        &config,
+        &metrics,
+        kube_client,
+        &build_request(RpcVerb::Add),
+    )
+    .await;
+    (response, enrolled, pod_states, backend)
+}
+
+/// The node-agent cannot tell whether a pod must be captured without its
+/// labels and annotations, so a metadata outage refuses ADD (kubelet retries
+/// the sandbox) instead of acknowledging it and letting an opted-in pod start
+/// outside the mesh. The lookup is retried once within the RPC budget, and the
+/// refusal never echoes the Kubernetes error.
+#[tokio::test]
+async fn cni_add_fails_closed_when_pod_metadata_is_unavailable() {
+    let state = Arc::new(Mutex::new(MockStatusProbeState {
+        outcomes: vec![MockProbeOutcome::Unavailable, MockProbeOutcome::Unavailable],
+        hits: 0,
+    }));
+    let client = mock_add_metadata_client(state.clone());
+    let (response, enrolled, pod_states, backend) = run_add_with_metadata_client(&client).await;
+    let CniRpcResponse::Error { reason } = &response else {
+        panic!("ADD without pod metadata must fail closed, got {response:?}");
+    };
+    assert!(
+        reason.contains("pod metadata is unavailable") && reason.contains("fails closed"),
+        "unexpected ADD refusal: {reason}"
+    );
+    assert!(
+        !reason.contains("https://") && !reason.contains("token=") && !reason.contains("hostile"),
+        "ADD refusal must not echo the Kubernetes error: {reason}"
+    );
+    assert_eq!(state.lock().expect("lock").hits, 2, "one bounded retry");
+    assert!(enrolled.is_none());
+    assert!(pod_states.is_empty());
+    assert!(
+        backend.cgroup_attachments.is_empty() && backend.tc_attachments.is_empty(),
+        "a refused ADD must not attach anything"
+    );
+}
+
+/// One transient metadata failure is absorbed by the bounded retry: the
+/// second read decides the ADD (here a pod that is not opted in, so ADD
+/// succeeds without enrollment).
+#[tokio::test]
+async fn cni_add_retries_one_transient_metadata_failure() {
+    let state = Arc::new(Mutex::new(MockStatusProbeState {
+        outcomes: vec![MockProbeOutcome::Unavailable, MockProbeOutcome::Ready],
+        hits: 0,
+    }));
+    let client = mock_add_metadata_client(state.clone());
+    let (response, enrolled, pod_states, _backend) = run_add_with_metadata_client(&client).await;
+    assert_eq!(response, CniRpcResponse::Ok);
+    assert_eq!(state.lock().expect("lock").hits, 2);
+    assert!(enrolled.is_none());
+    assert!(pod_states.is_empty());
+}
+
+/// `ferrum-cni` forwards the primary CNI's pod addresses from `prevResult` on
+/// ADD so the node-agent can enroll before `status.podIP` exists.
+#[test]
+fn prev_result_pod_ips_reads_sandbox_addresses_only() {
+    use ferrum_edge::cni::rpc::MAX_CNI_POD_IPS;
+    use ferrum_edge::cni::spec::prev_result_pod_ips;
+    use std::net::IpAddr;
+
+    let prev = json!({
+        "cniVersion": "1.0.0",
+        "interfaces": [
+            { "name": "cali1234", "mac": "aa:bb:cc:dd:ee:ff" },
+            { "name": "eth0", "sandbox": "/var/run/netns/cni-1" }
+        ],
+        "ips": [
+            { "address": "10.0.0.9/32", "interface": 1 },
+            { "address": "fd00::9/128", "interface": 1 },
+            { "address": "10.0.0.1/24", "interface": 0 },
+            { "address": "10.0.0.10/32" },
+            { "address": "10.0.0.9/32", "interface": 1 },
+            { "address": "not-an-ip/32", "interface": 1 },
+            { "address": "127.0.0.1/8", "interface": 1 },
+            { "address": "10.0.0.11/32", "interface": 7 }
+        ]
+    });
+    let expected: Vec<IpAddr> = vec![
+        "10.0.0.9".parse().unwrap(),
+        "fd00::9".parse().unwrap(),
+        "10.0.0.10".parse().unwrap(),
+    ];
+    assert_eq!(prev_result_pod_ips(Some(&prev)), expected);
+    assert!(prev_result_pod_ips(None).is_empty());
+    assert!(prev_result_pod_ips(Some(&json!({ "ip4": { "ip": "10.0.0.9/32" } }))).is_empty());
+
+    let many: Vec<serde_json::Value> = (0..20)
+        .map(|i| json!({ "address": format!("10.1.0.{i}/32") }))
+        .collect();
+    assert_eq!(
+        prev_result_pod_ips(Some(&json!({ "ips": many }))).len(),
+        MAX_CNI_POD_IPS
+    );
+}
+
+/// The node-agent revalidates the forwarded addresses: ADD only, bounded,
+/// assignable unicast.
+#[test]
+fn rpc_pod_ips_are_validated_at_the_node_agent_boundary() {
+    use std::net::IpAddr;
+
+    let mut add = build_request(RpcVerb::Add);
+    add.pod_ips = vec!["10.0.0.9".parse::<IpAddr>().unwrap()];
+    assert!(add.validate().is_ok());
+
+    let mut del = build_request(RpcVerb::Del);
+    del.pod_ips = vec!["10.0.0.9".parse::<IpAddr>().unwrap()];
+    assert!(del.validate().is_err(), "only ADD carries pod addresses");
+
+    for bad in ["0.0.0.0", "127.0.0.1", "224.0.0.1", "255.255.255.255", "::"] {
+        let mut add = build_request(RpcVerb::Add);
+        add.pod_ips = vec![bad.parse::<IpAddr>().unwrap()];
+        assert!(add.validate().is_err(), "{bad} is not a pod address");
+    }
+
+    let mut too_many = build_request(RpcVerb::Add);
+    too_many.pod_ips = (0..=ferrum_edge::cni::rpc::MAX_CNI_POD_IPS)
+        .map(|i| IpAddr::from([10, 2, 0, i as u8]))
+        .collect();
+    assert!(too_many.validate().is_err());
+
+    let wire = serde_json::to_string(&add).expect("serialize");
+    let back: CniRpcRequest = serde_json::from_str(&wire).expect("deserialize");
+    assert_eq!(back.pod_ips, add.pod_ips);
+    let without = serde_json::to_string(&build_request(RpcVerb::Add)).expect("serialize");
+    assert!(
+        !without.contains("pod_ips"),
+        "an empty address list stays off the wire"
+    );
+}
+
+/// The `ferrum-cni` binary forwards the `prevResult` container-side addresses
+/// on ADD, end to end over the UDS (GHSA-7x6j-vmqm-xx2v).
+#[tokio::test]
+async fn ferrum_cni_add_forwards_prev_result_pod_addresses() {
+    let dir = tempdir().expect("tempdir");
+    let socket_path = dir.path().join("agent.sock");
+    let socket_path_str = socket_path.to_string_lossy().to_string();
+    let metrics = Arc::new(NodeAgentMetrics::default());
+    let (work_tx, mut work_rx) = cni_work_channel();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let drained = tokio::spawn(async move {
+        let work = work_rx.recv().await.expect("work item arrives");
+        assert_eq!(work.request.verb, RpcVerb::Add);
+        assert_eq!(
+            work.request.pod_ips,
+            vec![
+                "10.0.0.9"
+                    .parse::<std::net::IpAddr>()
+                    .expect("literal address"),
+            ],
+            "only the sandbox-side address is forwarded"
+        );
+        let _ = work.respond.send(CniRpcResponse::Ok);
+    });
+
+    let listener = spawn_cni_listener(
+        socket_path_str.clone(),
+        work_tx,
+        metrics.clone(),
+        shutdown_rx,
+    );
+
+    wait_for_cni_listener_ready(&socket_path).await;
+
+    let output = tokio::task::spawn_blocking(move || {
+        let stdin_config = serde_json::json!({
+            "cniVersion": "1.0.0",
+            "name": "ferrum-mesh-chain",
+            "type": "ferrum-cni",
+            "ferrum": {
+                "socketPath": socket_path_str
+            },
+            "prevResult": {
+                "cniVersion": "1.0.0",
+                "interfaces": [
+                    { "name": "veth1234" },
+                    { "name": "eth0", "sandbox": "/var/run/netns/cni-1" }
+                ],
+                "ips": [
+                    { "address": "10.0.0.9/32", "interface": 1 },
+                    { "address": "169.254.1.1/32", "interface": 0 }
+                ]
+            }
+        })
+        .to_string();
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_ferrum-cni"))
+            .env("CNI_COMMAND", "ADD")
+            .env("CNI_CONTAINERID", "ctr-1")
+            .env("CNI_NETNS", "/var/run/netns/cni-1")
+            .env("CNI_IFNAME", "eth0")
+            .env(
+                "CNI_ARGS",
+                "K8S_POD_NAMESPACE=demo;K8S_POD_NAME=alpha;K8S_POD_UID=uid-1",
+            )
+            .env("CNI_PATH", "/opt/cni/bin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn ferrum-cni");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin pipe")
+            .write_all(stdin_config.as_bytes())
+            .expect("write stdin");
+        child.wait_with_output().expect("wait ferrum-cni")
+    })
+    .await
+    .expect("blocking task joined");
+
+    assert!(
+        output.status.success(),
+        "ADD must succeed when the node-agent answers Ok, stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    drained.await.expect("drainer joined");
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(2), listener).await;
 }

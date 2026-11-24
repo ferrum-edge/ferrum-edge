@@ -468,6 +468,81 @@ async fn a_hidden_query_credential_undecides_query_rules() {
     );
 }
 
+/// `jwks_auth` / `oauth2_introspection` providers with `forward_original_token:
+/// false` strip their query token locations: the accepted token, and a `;`
+/// alias marked by the pre-authentication discovery hook even when another
+/// mechanism authenticates (GHSA-c259-vchc-3vgr). A query rule is therefore
+/// undecided before authentication, including when the request carries an
+/// alias the preview would otherwise read as a fixed ambiguous query.
+#[tokio::test]
+async fn a_hidden_provider_query_token_undecides_query_rules() {
+    let rules = json!([
+        rule(
+            json!({"query_params": {"access_token": "batch"}}),
+            Some(9000)
+        ),
+        path_rule("/", Some(1000)),
+    ]);
+    let mut alias = request("/soap", &[]);
+    alias.set_raw_query_string("carrier=;access_token=aliased&keep=1".to_string());
+    alias.materialize_query_params();
+    for name in ["jwks_auth", "oauth2_introspection"] {
+        for (forward_original_token, expected) in [(false, Some(9000)), (true, Some(1000))] {
+            let mut config = minimal_plugin_config(name);
+            config["providers"][0]["from_params"] = json!(["access_token"]);
+            config["providers"][0]["forward_original_token"] = json!(forward_original_token);
+            let auth = built_in(name, config);
+            assert_eq!(
+                auth.modifies_request_query(),
+                !forward_original_token,
+                "{name} forward_original_token={forward_original_token}"
+            );
+            let plugins = [auth, dispatch(rules.clone())];
+            assert_eq!(
+                preview(&plugins, &request("/soap", &[])),
+                expected,
+                "{name} forward_original_token={forward_original_token}"
+            );
+            if !forward_original_token {
+                assert_eq!(
+                    preview(&plugins, &alias),
+                    Some(9000),
+                    "{name}: discovery may strip the alias before dispatch reads the query"
+                );
+            }
+        }
+        // A provider without a query location never strips the query.
+        let auth = built_in(name, minimal_plugin_config(name));
+        assert!(!auth.modifies_request_query(), "{name}");
+    }
+
+    // `oauth2_introspection` strips an accepted token from EVERY provider's
+    // configured locations, so a hiding header provider beside a forwarding
+    // query provider still rewrites the query.
+    let mut config = minimal_plugin_config("oauth2_introspection");
+    let header_provider = json!({
+        "introspection_endpoint": "http://127.0.0.1:9/introspect",
+        "client_auth": {"method": "none"},
+        "from_headers": [{"name": "x-opaque-token"}],
+        "forward_original_token": false
+    });
+    let query_provider = json!({
+        "introspection_endpoint": "http://127.0.0.1:9/introspect",
+        "client_auth": {"method": "none"},
+        "from_params": ["access_token"],
+        "forward_original_token": true
+    });
+    config["providers"] = json!([header_provider, query_provider]);
+    let auth = built_in("oauth2_introspection", config);
+    assert!(auth.modifies_request_query());
+    let plugins = [auth, dispatch(rules)];
+    assert_eq!(
+        preview(&plugins, &request("/soap", &[])),
+        Some(9000),
+        "the hiding header provider may strip the query provider's token copy"
+    );
+}
+
 #[tokio::test]
 async fn compression_declares_its_no_transform_merge() {
     let compression = built_in("compression", json!({"decompress_request": true}));

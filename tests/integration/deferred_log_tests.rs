@@ -34,11 +34,12 @@ use ferrum_edge::_test_support::{
     proxy_body_into_grpc_web_passthrough_streaming_with_headers_for_test,
     proxy_body_streaming_for_test, proxy_body_with_grpc_admission_outcome_for_test,
 };
+use ferrum_edge::plugins::mesh::prometheus_helpers::MeshRequestKey;
 use ferrum_edge::plugins::prometheus_metrics::{ClientDisconnectKey, MetricsRegistry};
 use ferrum_edge::plugins::{
-    Plugin, RequestContext, ResponseStreamAction, ResponseStreamInspector, TransactionSummary,
-    create_plugin, create_response_stream_inspector, log_with_mirror_before_buffered_response,
-    spawn_bounded_terminal_summary_log,
+    MirrorResponseMeta, Plugin, RequestContext, ResponseDelivery, ResponseStreamAction,
+    ResponseStreamInspector, TransactionSummary, create_plugin, create_response_stream_inspector,
+    log_with_mirror, log_with_mirror_before_buffered_response, spawn_bounded_terminal_summary_log,
 };
 use ferrum_edge::proxy::ProxyBody;
 use ferrum_edge::proxy::body::ProxyBodyError;
@@ -102,8 +103,8 @@ struct OrderedLogPlugin {
 
 #[async_trait]
 impl ResponseStreamInspector for PassthroughInspector {
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
-        ResponseStreamAction::Forward(Bytes::copy_from_slice(chunk))
+    async fn on_chunk(&mut self, chunk: &Bytes) -> ResponseStreamAction {
+        ResponseStreamAction::Forward(chunk.clone())
     }
 }
 
@@ -178,6 +179,7 @@ fn make_summary_with_status(status: u16) -> TransactionSummary {
         timestamp_received: "2026-04-16T00:00:00Z".to_string(),
         client_ip: "10.0.0.1".to_string(),
         consumer_username: None,
+        principal_origin: None,
         auth_method: None,
         http_method: "GET".to_string(),
         request_path: "/things/42".to_string(),
@@ -199,12 +201,13 @@ fn make_summary_with_status(status: u16) -> TransactionSummary {
         error_class: None,
         body_error_class: None,
         body_completed: false,
+        response_delivery: Default::default(),
         bytes_sent: 0,
         bytes_received: 0,
         grpc_request_messages: 0,
         grpc_response_messages: 0,
         mirror: false,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
         ai_usage_export: None,
         proxy_lifecycle_generation: None,
     }
@@ -305,6 +308,381 @@ async fn direct_terminal_dispatch_reaches_log_sinks() {
         "detached terminal delivery must be admitted for a fixture that opened it"
     );
     assert_eq!(delivered[0].response_status_code, 200);
+}
+
+/// Records the mesh key terminal delivery precomputes. It declares
+/// `uses_mesh_request_key` like the built-in consumers, so `log_with_mirror`
+/// computes the key for it.
+struct MeshKeyCapture {
+    keys: Arc<Mutex<Vec<Option<MeshRequestKey>>>>,
+}
+
+#[async_trait]
+impl Plugin for MeshKeyCapture {
+    fn name(&self) -> &str {
+        "workload_metrics"
+    }
+
+    fn uses_mesh_request_key(&self) -> bool {
+        true
+    }
+
+    async fn log_with_mesh_key(
+        &self,
+        _summary: &TransactionSummary,
+        mesh_key: Option<&MeshRequestKey>,
+    ) {
+        self.keys.lock().unwrap().push(mesh_key.cloned());
+    }
+}
+
+/// Detached terminal delivery hands its task a slim copy of the request
+/// context instead of a deep clone (issue #6793). The sinks must still receive
+/// exactly what an inline delivery of the same summary gives them, with every
+/// context field that delivery reads set to a non-default value: the `HEAD`
+/// delivered-byte rule, the WebSocket flavor, a trigger decision, a response
+/// size refusal, the deferred typed mesh labels behind the metric key, and the
+/// mirror summary.
+#[tokio::test(flavor = "multi_thread")]
+async fn detached_terminal_delivery_matches_inline_delivery() {
+    async fn deliver(detached: bool) -> (Vec<TransactionSummary>, Vec<Option<MeshRequestKey>>) {
+        let (capturing, captured) = CapturingPlugin::new();
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        // Key capture runs first: each summary's plugins run in order, so a
+        // captured summary implies its key was already recorded.
+        let plugins: Vec<Arc<dyn Plugin>> = vec![
+            Arc::new(MeshKeyCapture {
+                keys: Arc::clone(&keys),
+            }),
+            Arc::new(capturing),
+        ];
+        let mut ctx = make_ctx();
+        ctx.method = "HEAD".to_string();
+        ferrum_edge::_test_support::populate_terminal_delivery_state_for_test(&mut ctx);
+        ferrum_edge::_test_support::defer_mesh_label_projection_for_test(&mut ctx);
+        ferrum_edge::_test_support::annotate_gateway_mesh_dispatch_for_test(
+            &mut ctx,
+            HashMap::from([
+                (
+                    "mesh.spiffe_id".to_string(),
+                    "spiffe://cluster.local/ns/shop/sa/orders".to_string(),
+                ),
+                ("mesh.namespace".to_string(), "shop".to_string()),
+            ]),
+        );
+        let (mirror_tx, mirror_rx) = tokio::sync::watch::channel(None);
+        ctx.mirror_result_rxs.push(mirror_rx);
+        let mut summary = make_summary_with_status(200);
+        summary.http_method = "HEAD".to_string();
+        summary.bytes_received = 512;
+        summary
+            .metadata
+            .insert("mesh.request_protocol".to_string(), "http".to_string());
+        if detached {
+            spawn_bounded_terminal_summary_log(&plugins, summary, &ctx);
+        } else {
+            log_with_mirror(&plugins, &summary, &ctx).await;
+        }
+        drop(ctx);
+        mirror_tx.send_replace(Some(MirrorResponseMeta {
+            mirror_plugin_id: Some("mirror-1".to_string()),
+            mirror_target_url: "http://shadow:8080/things/42".to_string(),
+            mirror_response_status_code: Some(204),
+            mirror_response_size_bytes: Some(0),
+            mirror_response_advertised_size_bytes: None,
+            mirror_latency_ms: 1.5,
+            mirror_error: None,
+        }));
+        let mut delivered = wait_for_captures(&captured, 2).await;
+        delivered.sort_by_key(|summary| summary.mirror);
+        let keys = keys.lock().unwrap().clone();
+        (delivered, keys)
+    }
+
+    let (inline, inline_keys) = deliver(false).await;
+    let (detached, detached_keys) = deliver(true).await;
+    assert_eq!(inline.len(), 2, "inline: primary and mirror summaries");
+    assert_eq!(detached.len(), 2, "detached: primary and mirror summaries");
+    assert_eq!(inline_keys.len(), 2, "inline: primary and mirror keys");
+    assert_eq!(detached_keys.len(), 2, "detached: primary and mirror keys");
+    // The fixture really exercises each context-derived stamp.
+    let primary = &inline[0];
+    assert_eq!(
+        primary.bytes_received, 0,
+        "a HEAD response delivers no body"
+    );
+    assert_eq!(
+        primary.metadata.get("request_protocol").map(String::as_str),
+        Some("ws")
+    );
+    assert_eq!(
+        primary.error_class,
+        Some(ErrorClass::DispatchPolicyRejected)
+    );
+    assert_ne!(
+        format!("{:?}", primary.plugin_trigger_decisions),
+        format!(
+            "{:?}",
+            TransactionSummary::default().plugin_trigger_decisions
+        )
+    );
+    let primary_key = inline_keys
+        .first()
+        .and_then(Option::as_ref)
+        .expect("a mesh key from the typed labels");
+    assert_eq!(
+        &*primary_key.destination_principal,
+        "spiffe://cluster.local/ns/shop/sa/orders"
+    );
+    for (inline, detached) in inline.iter().zip(&detached) {
+        assert_eq!(inline.mirror, detached.mirror);
+        assert_eq!(inline.response_status_code, detached.response_status_code);
+        assert_eq!(inline.bytes_received, detached.bytes_received);
+        assert_eq!(inline.backend_target, detached.backend_target);
+        assert_eq!(inline.error_class, detached.error_class);
+        assert_eq!(inline.metadata, detached.metadata);
+        assert_eq!(
+            format!("{:?}", inline.plugin_trigger_decisions),
+            format!("{:?}", detached.plugin_trigger_decisions)
+        );
+    }
+    assert_eq!(
+        inline_keys, detached_keys,
+        "the same mesh keys, primary and mirror"
+    );
+}
+
+/// Every context read on the detached terminal-delivery path is one the slim
+/// detached context carries (issue #6793). A new `ctx.` read there must be
+/// added to `RequestContext::clone_for_detached_terminal_log` and this list.
+#[test]
+fn detached_terminal_delivery_reads_only_what_its_slim_context_carries() {
+    fn item<'a>(source: &'a str, start: &str) -> &'a str {
+        let begin = source
+            .find(start)
+            .unwrap_or_else(|| panic!("missing {start}"));
+        let rest = &source[begin..];
+        &rest[..rest.find("\n}\n").unwrap_or(rest.len())]
+    }
+    fn context_reads(body: &str, reads: &mut std::collections::BTreeSet<String>) {
+        for (index, _) in body.match_indices("ctx.") {
+            if index > 0
+                && body[..index]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_')
+            {
+                continue;
+            }
+            let name: String = body[index + 4..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            reads.insert(name);
+        }
+    }
+    let plugins = include_str!("../../src/plugins/mod.rs");
+    let mut reads = std::collections::BTreeSet::new();
+    for start in [
+        "async fn log_with_mirror_inner(",
+        "fn finish_terminal_delivery(",
+        "impl Drop for TerminalDeliveryGuard",
+    ] {
+        context_reads(item(plugins, start), &mut reads);
+    }
+    context_reads(
+        item(
+            include_str!("../../src/diagnostic_ref.rs"),
+            "pub(crate) fn record_request_detail(",
+        ),
+        &mut reads,
+    );
+    context_reads(
+        item(
+            include_str!("../../src/plugins/mesh/prometheus_helpers.rs"),
+            "pub fn mesh_request_key_for_request(",
+        ),
+        &mut reads,
+    );
+    let carried: std::collections::BTreeSet<String> = [
+        "backend_dispatch_state",
+        "clone",
+        "diagnostic_slot",
+        "grpc_deadline_at",
+        "has_plugin_trigger_decisions",
+        "mark_terminal_record_finished",
+        "mark_terminal_record_started",
+        "mesh_label_projection_deferred",
+        "mesh_label_shadow",
+        "method",
+        "mirror_result_rxs",
+        "plugin_trigger_decisions",
+        "request_http_flavor",
+        "response_policy_error_class",
+        "route_request_timeout_phase",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    let uncarried: Vec<_> = reads.difference(&carried).collect();
+    assert!(
+        uncarried.is_empty(),
+        "detached terminal delivery reads context state its slim copy does not carry: {uncarried:?}"
+    );
+    let slim = {
+        let start = "pub(crate) fn clone_for_detached_terminal_log(";
+        let rest = &plugins[plugins.find(start).expect("slim detached context")..];
+        &rest[..rest.find("\n    }\n").expect("end of the method")]
+    };
+    assert!(slim.contains("Self::new(String::new(), self.method.clone(), String::new())"));
+    for field in [
+        "plugin_trigger_decisions",
+        "request_http_flavor",
+        "response_transform_size_refusal_selected",
+        "route_request_timeout_phase",
+        "backend_dispatch_state",
+        "diagnostic_slot",
+        "grpc_deadline_at",
+        "mesh_labels",
+        "mesh_label_projection_deferred",
+        "mirror_result_rxs",
+    ] {
+        assert!(
+            slim.contains(&format!("ctx.{field} =")) && slim.contains(&format!("self.{field}")),
+            "the slim detached context must carry `{field}`"
+        );
+    }
+}
+
+/// The streaming terminal logger moves the context's metadata into the summary
+/// instead of cloning it (issue #6793): the projected map must be exactly the
+/// one `clone_log_metadata` produces, redaction and stripping included.
+#[tokio::test]
+async fn taking_log_metadata_projects_exactly_what_cloning_it_does() {
+    let (mut ctx, request_id) = seeded_log_metadata_ctx().await;
+    let cloned = ferrum_edge::_test_support::clone_log_metadata(&ctx);
+    let taken = ferrum_edge::_test_support::take_log_metadata(&mut ctx);
+
+    assert_eq!(taken, cloned);
+    assert!(ctx.metadata.is_empty(), "the map is moved, not copied");
+    assert_seeded_projection(&taken, &request_id);
+}
+
+/// End to end: a streamed terminal delivers exactly the projection
+/// `clone_log_metadata` gives for the same context, whatever reads the
+/// projection or the rest of the delivery task performs.
+#[tokio::test(flavor = "multi_thread")]
+async fn streamed_terminal_delivers_the_cloned_projection_after_moving_it() {
+    let (ctx, request_id) = seeded_log_metadata_ctx().await;
+    let expected = ferrum_edge::_test_support::clone_log_metadata(&ctx);
+    let (plugin, captured) = CapturingPlugin::new();
+    let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![Arc::new(plugin)]);
+    let logger = DeferredTransactionLogger::new(make_summary_with_status(200), plugins, ctx);
+
+    logger.fire(BodyOutcome::success(64));
+
+    let captures = wait_for_captures(&captured, 1).await;
+    assert_eq!(captures.len(), 1);
+    let delivered: HashMap<String, String> = captures[0]
+        .metadata
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    assert_eq!(delivered, expected);
+    assert_seeded_projection(&delivered, &request_id);
+}
+
+/// A context whose log projection exercises every step: retention, stripping
+/// and redaction of the map, plus re-application of each typed source (the
+/// authorization-termination latch, the canonical correlation id, and
+/// WAF-owned fields). The public copies of the typed values are overwritten,
+/// so only the typed sources can produce the projected values. Returns the
+/// canonical request id.
+async fn seeded_log_metadata_ctx() -> (RequestContext, String) {
+    let mut ctx = make_ctx();
+    let correlation =
+        ferrum_edge::plugins::correlation_id::CorrelationId::new(&serde_json::json!({}))
+            .expect("valid correlation config");
+    let _ = correlation.on_request_received(&mut ctx).await;
+    let request_id = ctx
+        .metadata
+        .get(ferrum_edge::plugins::REQUEST_ID_METADATA_KEY)
+        .expect("canonical request id published")
+        .clone();
+    ferrum_edge::_test_support::latch_credential_expired_termination_for_test(&ctx);
+    ferrum_edge::_test_support::set_waf_metadata_for_test(&mut ctx, "waf.action", "block");
+    for (key, value) in [
+        (ferrum_edge::plugins::REQUEST_ID_METADATA_KEY, "forged"),
+        ("authorization.termination_reason", "forged"),
+        ("trace_id", "trace-visible"),
+        ("mesh.source.workload", "client"),
+        ("mesh.metrics.request_count.tag_overrides", "plan"),
+        ("request_body", "raw-body-sentinel"),
+        ("_dedup_key", "dedup-sentinel"),
+        ("waf.score", "plugin-written"),
+    ] {
+        ctx.metadata.insert(key.to_string(), value.to_string());
+    }
+    (ctx, request_id)
+}
+
+fn assert_seeded_projection(projected: &HashMap<String, String>, request_id: &str) {
+    for (key, value) in [
+        ("trace_id", "trace-visible"),
+        (ferrum_edge::plugins::REQUEST_ID_METADATA_KEY, request_id),
+        ("authorization.termination_reason", "credential_expired"),
+        ("waf.action", "block"),
+    ] {
+        assert_eq!(
+            projected.get(key).map(String::as_str),
+            Some(value),
+            "{key} must come from its authoritative source"
+        );
+    }
+    for stripped in ["request_body", "_dedup_key", "waf.score"] {
+        assert!(
+            !projected.contains_key(stripped),
+            "{stripped} must be projected out"
+        );
+    }
+}
+
+/// Moving the map is sound only while nothing after the move reads
+/// `ctx.metadata`: the projection itself and the rest of the deferred delivery
+/// task. Terminal delivery is pinned separately by
+/// `detached_terminal_delivery_reads_only_what_its_slim_context_carries`.
+#[test]
+fn nothing_reads_context_metadata_after_the_streaming_terminal_takes_it() {
+    let proxy = include_str!("../../src/proxy/mod.rs");
+    let start = "fn project_log_metadata(";
+    let projection = &proxy[proxy.find(start).expect("log metadata projection")..];
+    let projection = &projection[..projection.find("\n}\n").expect("end of projection")];
+    assert!(
+        !projection.contains("ctx.metadata"),
+        "the log metadata projection must not read the map it may have been handed"
+    );
+
+    let deferred = include_str!("../../src/proxy/deferred_log.rs");
+    let take = "summary.metadata = crate::proxy::take_log_metadata(&mut ctx);";
+    let after = &deferred[deferred
+        .find(take)
+        .expect("streaming terminal takes the metadata")
+        + take.len()..];
+    let funnel = "log_with_mirror(plugins.as_slice(), &summary, &ctx).await;";
+    assert!(after.contains(funnel), "deferred delivery funnel");
+    // The whole remainder of the delivery task, not just up to the funnel.
+    let task_end = after
+        .find("\n        };\n")
+        .expect("end of the delivery task");
+    assert!(after[..task_end].contains(funnel));
+    assert!(
+        !after[..task_end].contains("ctx.metadata"),
+        "the deferred task must not read ctx.metadata after taking it"
+    );
+    assert!(
+        !deferred.contains("clone_log_metadata("),
+        "the streaming terminal must move, not clone, its log metadata"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -491,6 +869,33 @@ async fn success_outcome_populates_body_fields() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn fire_with_response_status_logs_the_status_actually_sent() {
+    // #6775: when the H1/H2 response builder rejects a prepared response, the
+    // client receives the gateway's 500 fallback instead, so the single
+    // terminal record must carry 500 rather than the status captured at
+    // header commit — and still fire exactly once.
+    let (plugin, captured) = CapturingPlugin::new();
+    let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![Arc::new(plugin)]);
+    let summary = make_summary_with_status(200);
+    let logger = DeferredTransactionLogger::new(summary, plugins, make_ctx());
+
+    logger.fire_with_response_status(BodyOutcome::error(ErrorClass::RequestError, 0, false), 500);
+    logger.fire(BodyOutcome::success(10));
+    drop(logger);
+
+    let captures = wait_for_captures(&captured, 1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let captures_after = captured.lock().unwrap().len();
+    assert_eq!(captures.len(), 1);
+    assert_eq!(captures_after, 1, "later fire/Drop must not log again");
+    let got = &captures[0];
+    assert_eq!(got.response_status_code, 500);
+    assert_eq!(got.body_error_class, Some(ErrorClass::RequestError));
+    assert!(!got.body_completed);
+    assert!(!got.client_disconnected);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn fire_invokes_response_stream_termination_before_log() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let status = Arc::new(Mutex::new(None));
@@ -644,6 +1049,11 @@ async fn client_disconnect_outcome_sets_flag() {
     assert_eq!(got.bytes_received, 512);
     assert!(!got.body_completed);
     assert_eq!(got.body_error_class, Some(ErrorClass::ClientDisconnect));
+    // Issue #6768 / #6769: the head was committed, so a later disconnect keeps
+    // the status the client saw (never a `499`, RFC 9112 §8) and the record
+    // says it observed the body's transport terminal.
+    assert_eq!(got.response_status_code, 200);
+    assert_eq!(got.response_delivery, ResponseDelivery::Observed);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -766,6 +1176,11 @@ async fn drop_without_fire_is_safety_net() {
     assert_eq!(got.body_error_class, Some(ErrorClass::ClientDisconnect));
     assert!(!got.body_completed);
     assert_eq!(got.bytes_received, 0);
+    assert_eq!(
+        got.response_status_code, 200,
+        "a committed status is never rewritten to 499"
+    );
+    assert_eq!(got.response_delivery, ResponseDelivery::Observed);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -893,7 +1308,7 @@ async fn body_dropped_before_polling_fires_client_disconnect() {
 /// ever polling it — hyper sees from the response metadata that there's
 /// nothing to stream. Before the fix, the `Drop` safety net checked
 /// `is_end_stream()` on the inner body, which for streaming wrappers
-/// (`DirectH3Body`, partially-polled `CoalescingH3Body`) returns `false`
+/// (`DirectH3Body`, partially-polled H3 `Coalescing<S>`) returns `false`
 /// even for successful zero-length streams. That misclassified every
 /// HEAD / 204 streaming response as `client_disconnected=true`.
 ///
@@ -915,7 +1330,7 @@ async fn unpolled_empty_streaming_body_is_not_client_disconnect() {
     // exercises is the STRUCTURAL path — when `kind` is `Stream` and the
     // body is dropped unpolled, the Drop impl MUST treat it as success
     // regardless of `is_end_stream()`, because streaming wrappers like
-    // `DirectH3Body` and partially-polled `CoalescingH3Body` return
+    // `DirectH3Body` and partially-polled H3 `Coalescing<S>` return
     // `false` from `is_end_stream()` even for successful zero-length
     // streams. The pre-fix Drop consulted `is_end_stream()` on the inner
     // body and flipped H3 wrappers into `client_disconnect`. The post-fix
@@ -1066,7 +1481,7 @@ struct HoldingResponseInspector {
 
 #[async_trait]
 impl ResponseStreamInspector for HoldingResponseInspector {
-    async fn on_chunk(&mut self, _chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, _chunk: &Bytes) -> ResponseStreamAction {
         self.saw_backend_chunk.notify_one();
         std::future::pending::<ResponseStreamAction>().await
     }
@@ -1644,7 +2059,7 @@ async fn deferred_terminal_projects_context_metadata_without_a_header_commit_cop
 
     // Exactly what the streaming arm now hands in: no header-commit projection.
     let mut summary = make_summary_with_status(200);
-    summary.metadata = HashMap::new();
+    summary.metadata = ferrum_edge::plugins::MetadataMap::default();
 
     let logger = DeferredTransactionLogger::new_with_start_time(
         summary,
@@ -1682,7 +2097,7 @@ async fn deferred_grpc_terminal_without_trailer_status_is_unknown_with_empty_sum
         .insert("request_protocol".to_string(), "grpc".to_string());
 
     let mut summary = make_summary_with_status(200);
-    summary.metadata = HashMap::new();
+    summary.metadata = ferrum_edge::plugins::MetadataMap::default();
 
     let logger = DeferredTransactionLogger::new_with_start_time(
         summary,
@@ -1717,7 +2132,7 @@ async fn deferred_terminal_without_grpc_classification_leaves_status_unstamped()
         .insert("request_protocol".to_string(), "grpc-web".to_string());
 
     let mut summary = make_summary_with_status(200);
-    summary.metadata = HashMap::new();
+    summary.metadata = ferrum_edge::plugins::MetadataMap::default();
 
     let logger = DeferredTransactionLogger::new_with_start_time(
         summary,
@@ -1880,7 +2295,7 @@ fn grpc_terminal_logger(plugins: Arc<Vec<Arc<dyn Plugin>>>) -> Arc<DeferredTrans
     ctx.metadata
         .insert("request_protocol".to_string(), "grpc".to_string());
     let mut summary = make_summary_with_status(200);
-    summary.metadata = HashMap::new();
+    summary.metadata = ferrum_edge::plugins::MetadataMap::default();
     DeferredTransactionLogger::new_with_start_time(
         summary,
         plugins,
@@ -2211,4 +2626,59 @@ async fn grpc_web_passthrough_drop_without_a_logger_classifies_the_backend_statu
     let body = proxy_body_into_grpc_web_passthrough_streaming_for_test(inner, false, 200);
     assert_eq!(drain_passthrough(body).await, wire);
     assert_eq!(recorded.statuses(), vec![503]);
+}
+
+/// A stream observer publishes typed AI usage from its terminal hook, after the
+/// header-commit summary skeleton was captured. The fired summary must carry
+/// that usage, or `prometheus_metrics` never counts streamed tokens or cost
+/// (ai_token_metrics-SOL-2).
+#[tokio::test(flavor = "multi_thread")]
+async fn terminal_hook_ai_usage_export_reaches_the_logged_summary() {
+    let token_metrics: Arc<dyn Plugin> = Arc::new(
+        ferrum_edge::plugins::ai_token_metrics::AiTokenMetrics::new(&serde_json::json!({
+            "cost_per_prompt_token": 0.000001,
+            "cost_per_completion_token": 0.000002
+        }))
+        .expect("valid ai_token_metrics config"),
+    );
+    let (capturing, captured) = CapturingPlugin::new();
+    let plugins: Vec<Arc<dyn Plugin>> = vec![token_metrics, Arc::new(capturing)];
+    let mut ctx = make_ctx();
+    let body: &[u8] = b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7,\"total_tokens\":18}}\n\ndata: [DONE]\n\n";
+    let mut inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+            .expect("ai_token_metrics observes a 2xx SSE stream");
+    match inspector.on_chunk(&Bytes::copy_from_slice(body)).await {
+        ResponseStreamAction::Forward(bytes) => assert_eq!(&bytes[..], body),
+        ResponseStreamAction::Terminate(_) => panic!("observer must not truncate"),
+    }
+    let _ = inspector.on_end().await;
+    drop(inspector);
+    assert!(
+        ctx.authoritative_ai_usage_export().is_none(),
+        "usage is published by the terminal hook, not at header commit"
+    );
+
+    let logger =
+        DeferredTransactionLogger::new(make_summary_with_status(200), Arc::new(plugins), ctx);
+    logger.fire(BodyOutcome::success(body.len() as u64));
+
+    let captures = wait_for_captures(&captured, 1).await;
+    assert_eq!(captures.len(), 1, "log should fire exactly once");
+    let export = captures[0]
+        .ai_usage_export
+        .as_ref()
+        .expect("terminal-hook usage must reach the logged summary");
+    assert_eq!(export.provider, "openai");
+    assert_eq!(export.prompt_tokens, Some(11));
+    assert_eq!(export.completion_tokens, Some(7));
+    assert_eq!(export.total_tokens, Some(18));
+    assert!(export.cost.is_some());
+    assert_eq!(
+        captures[0]
+            .metadata
+            .get("ai_total_tokens")
+            .map(String::as_str),
+        Some("18")
+    );
 }

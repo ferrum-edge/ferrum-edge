@@ -520,7 +520,7 @@ fn mesh_observed_stream_ctx() -> StreamConnectionContext {
         "1".to_string(),
     );
     metadata.insert("mesh.request_protocol".to_string(), "tcp".to_string());
-    ctx.metadata = Some(metadata);
+    ctx.metadata = Some(metadata.into_iter().collect());
     ctx
 }
 

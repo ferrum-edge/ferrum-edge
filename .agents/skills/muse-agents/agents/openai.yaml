@@ -1,0 +1,4 @@
+interface:
+  display_name: "Muse Wonder Full Agents"
+  short_description: "Orchestrate local Muse Code Wonder Full coding agents"
+  default_prompt: "Use $muse-agents to dispatch Muse Wonder Full agents for this Ferrum Edge task."

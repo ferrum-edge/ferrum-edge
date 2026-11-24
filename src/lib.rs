@@ -32,10 +32,10 @@ pub mod consumer_index;
 #[path = "../custom_plugins/mod.rs"]
 pub mod custom_plugins;
 pub mod data_path_metrics;
-pub mod date_cache;
 pub mod diagnostic_ref;
 #[cfg(test)]
-use diagnostic_test_logs::interest as diagnostic_test_interest;
+#[path = "../tests/support/diagnostic_interest.rs"]
+mod diagnostic_test_interest;
 #[cfg(test)]
 #[path = "../tests/common/diagnostic_logs.rs"]
 mod diagnostic_test_logs;
@@ -79,6 +79,7 @@ pub mod service_discovery;
 pub mod socket_opts;
 pub mod startup;
 pub mod system_metrics;
+pub mod time_compat;
 pub mod tls;
 pub mod tls_offload;
 pub mod udp_amplification;
@@ -86,16 +87,11 @@ pub mod util;
 pub mod xds;
 
 pub use admin::api_specs::ExtractedBundle;
-pub use admin::spec_codec::{compress_gzip, decompress_gzip_capped, sha256_hex};
-pub use config::types::{
-    ApiSpec, AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig, HttpFlavor,
-    Proxy, SpecFormat,
-};
+pub use config::types::{BackendScheme, GatewayConfig, HttpFlavor, Proxy};
 pub use consumer_index::ConsumerIndex;
 pub use load_balancer::LoadBalancerCache;
 pub use plugin_cache::{PluginCache, PluginCapabilities};
-pub use proxy::{build_backend_url, build_backend_url_with_target};
-pub use router_cache::{RouteMatch, RouterCache};
+pub use router_cache::RouterCache;
 
 /// Test-only re-exports of crate-private items.
 ///
@@ -104,6 +100,388 @@ pub use router_cache::{RouteMatch, RouterCache};
 /// The leading underscore signals that this module is not part of the public API.
 #[doc(hidden)]
 pub mod _test_support {
+    /// Signature schemes the mesh app-probe loopback HTTPS verifier
+    /// advertises when its client is built from `provider` (issue #7075).
+    pub fn mesh_app_probe_loopback_verifier_schemes_for_test(
+        provider: &rustls::crypto::CryptoProvider,
+    ) -> Vec<rustls::SignatureScheme> {
+        use rustls::client::danger::ServerCertVerifier;
+        crate::modes::mesh::app_probe::LoopbackNoVerifier::for_provider(provider)
+            .supported_verify_schemes()
+    }
+
+    /// Attach a connection's authorization closer to a request context, as the
+    /// H1/H2 accept loop does (issue #6768 client-abort scope tests).
+    pub fn attach_authorization_connection_closer_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        closer: crate::proxy::auth_lifetime::AuthorizationConnectionCloser,
+    ) {
+        ctx.authorization_connection_closer = Some(closer);
+    }
+
+    /// Install a route's credential-header redaction set on a request
+    /// context, as the H1/H2/H3 handlers do from the plugin cache view
+    /// (`opa` obligation-destination conflict tests).
+    pub fn set_request_headers_to_redact_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        headers: Vec<String>,
+    ) {
+        ctx.set_request_headers_to_redact(std::sync::Arc::new(headers));
+    }
+
+    /// Install a route's request-trailer strip list (credential locations plus
+    /// owned claim destinations) on a request context, as the H1/H2/H3
+    /// handlers do from `PluginCacheRequestView::request_trailer_strip_headers`.
+    pub fn set_request_trailer_strip_headers_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        headers: Vec<String>,
+    ) {
+        let owned = std::sync::Arc::new(headers.clone());
+        ctx.set_request_trailer_strip_headers(std::sync::Arc::new(headers), owned);
+    }
+
+    /// Install the request-trailer policy a plugin cache view carries, exactly
+    /// as the H1/H2 and H3 handlers do at request setup.
+    pub fn apply_request_view_trailer_policy_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        view: &crate::plugin_cache::PluginCacheRequestView,
+    ) {
+        ctx.set_request_headers_to_redact(view.request_headers_to_redact());
+        ctx.set_request_trailer_strip_headers(
+            view.request_trailer_strip_headers(),
+            view.owned_request_assertion_headers(),
+        );
+    }
+
+    /// Drop the pristine client field lines for the route's owned
+    /// gateway-assertion headers, exactly as the H1/H2 ladder does after the
+    /// final assertion pass and before any raw-line reconstruction boundary.
+    pub fn strip_route_owned_assertion_field_lines_for_test(
+        ctx: &crate::plugins::RequestContext,
+        headers: &mut hyper::HeaderMap,
+    ) {
+        crate::proxy::strip_route_owned_assertion_field_lines(ctx, headers);
+    }
+
+    /// Drop the retained wire view's client lines for the route's owned
+    /// assertion headers, as both ladders do after the final assertion pass.
+    pub fn strip_route_owned_assertion_raw_lines_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+    ) {
+        ctx.strip_route_owned_assertion_raw_lines();
+    }
+
+    /// The retained wire view the secured-mesh retry replay and request
+    /// mirroring rebuild from (`RequestContext::raw_headers_snapshot`).
+    pub fn raw_headers_snapshot_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> Option<hyper::HeaderMap> {
+        ctx.raw_headers_snapshot().map(|raw| raw.as_ref().clone())
+    }
+
+    /// The gateway's `499` client-closed-request logging status (issue #6768
+    /// client-abort scope tests).
+    pub const CLIENT_CLOSED_REQUEST_STATUS: u16 =
+        crate::proxy::client_abort::CLIENT_CLOSED_REQUEST_STATUS;
+
+    /// Mark a request context as already counted by its handler, as every
+    /// H1/H2 handler counting site does (issue #6768 client-abort scope tests).
+    pub fn mark_terminal_status_counted_for_test(ctx: &crate::plugins::RequestContext) {
+        ctx.terminal_record.mark_counted();
+    }
+
+    /// Bind a caller-owned shutdown broadcaster exactly as the serving modes do.
+    pub fn shutdown_overload_for_test(
+        shutdown: &crate::overload::ShutdownSender,
+    ) -> std::sync::Arc<crate::overload::OverloadState> {
+        let state = std::sync::Arc::new(crate::overload::OverloadState::new());
+        state.attach_shutdown(shutdown);
+        state
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum H3DrainOutcomeForTest {
+        Drained,
+        TimedOut,
+        Escalated,
+    }
+
+    impl From<crate::http3::server::H3DrainOutcome> for H3DrainOutcomeForTest {
+        fn from(outcome: crate::http3::server::H3DrainOutcome) -> Self {
+            match outcome {
+                crate::http3::server::H3DrainOutcome::Drained => Self::Drained,
+                crate::http3::server::H3DrainOutcome::TimedOut => Self::TimedOut,
+                crate::http3::server::H3DrainOutcome::Escalated => Self::Escalated,
+            }
+        }
+    }
+
+    pub async fn wait_for_h3_drain_for_test(
+        state: &crate::overload::OverloadState,
+        open_connections: impl Fn() -> usize,
+        local_deadline: tokio::time::Instant,
+        escalation: &tokio_util::sync::CancellationToken,
+    ) -> H3DrainOutcomeForTest {
+        crate::http3::server::wait_for_h3_drain(
+            open_connections,
+            &state.drain_complete,
+            state,
+            local_deadline,
+            escalation,
+        )
+        .await
+        .into()
+    }
+
+    pub async fn wait_for_h3_close_for_test(
+        state: &crate::overload::OverloadState,
+        local_deadline: tokio::time::Instant,
+        escalation: &tokio_util::sync::CancellationToken,
+        wait_idle: impl std::future::Future<Output = ()>,
+    ) -> H3DrainOutcomeForTest {
+        crate::http3::server::wait_for_h3_close(state, local_deadline, escalation, wait_idle)
+            .await
+            .into()
+    }
+
+    /// Run the real file/database listener supervisor with an isolated sender.
+    pub async fn supervise_shutdown_listeners_for_test(
+        handles: Vec<(String, tokio::task::JoinHandle<Result<(), anyhow::Error>>)>,
+        shutdown: crate::overload::ShutdownSender,
+    ) -> Result<(), anyhow::Error> {
+        crate::modes::file::await_fallible_listener_handles(handles, move || shutdown.shutdown())
+            .await
+    }
+
+    /// Bytes of backend-provided semantic text (task id, context id, task
+    /// state) an `a2a_gateway` SSE inspector retains after ingesting `chunks`,
+    /// before the stream ends.
+    pub fn a2a_sse_retained_semantic_bytes_for_test(
+        binding: &'static str,
+        metadata_limit: usize,
+        chunks: &[&[u8]],
+    ) -> usize {
+        crate::plugins::a2a_gateway::sse_inspector_retained_semantic_bytes(
+            binding,
+            metadata_limit,
+            chunks,
+        )
+    }
+
+    /// `body_validator`'s omitted-field gRPC decompression default resolved
+    /// from a raw `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` value (clamped to the
+    /// hard ceiling).
+    pub fn inherited_grpc_max_decompressed_size_bytes_for_test(raw: Option<&str>) -> usize {
+        crate::plugins::body_validator::inherited_grpc_max_decompressed_size_bytes(raw)
+    }
+
+    /// `body_validator`'s request-side gRPC protobuf validation of `body` for
+    /// `grpc_path`, in the framing `content_type` names (native gRPC or
+    /// gRPC-Web binary/text), with the aggregate decode budget bound to an
+    /// ISOLATED semaphore so a test can observe admission, refusal, and
+    /// release deterministically. Answers `"pass"`, `"invalid"`,
+    /// `"capacity"`, or `"unconfigured"` (no descriptor for the method, or not
+    /// a gRPC media type).
+    pub fn body_validator_protobuf_request_outcome_in_budget_for_test(
+        plugin: &crate::plugins::body_validator::BodyValidator,
+        probe: &ResponseBufferBudgetProbe,
+        grpc_path: &str,
+        content_type: &str,
+        body: &[u8],
+    ) -> &'static str {
+        plugin.protobuf_request_outcome_in(grpc_path, content_type, body, probe.0.handle())
+    }
+
+    /// Record the genuine origin/backend HTTP status exactly as
+    /// `run_after_proxy_hooks` does before any response hook runs.
+    pub fn record_origin_http_response_status_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        status: u16,
+    ) {
+        ctx.record_origin_http_response_status(status);
+    }
+
+    /// How many `body_validator` instances recorded an early `before_proxy`
+    /// pass on this request (the typed digest the final hook compares against
+    /// to skip re-validating byte-identical bytes).
+    pub fn body_validator_early_pass_count_for_test(ctx: &crate::plugins::RequestContext) -> usize {
+        ctx.plugin_state()
+            .map_or(0, |state| state.body_validator_early_request_digests.len())
+    }
+
+    /// The plugin material registry as `(plugin, field path, class)`, where
+    /// class is `tls`, `gateway_only` or `open_map`.
+    pub fn scoped_plugin_registry_for_test() -> Vec<(&'static str, &'static str, &'static str)> {
+        use crate::admin::crud::scoped_references::{PLUGIN_SCOPED_FIELDS, ScopedReferenceClass};
+        let mut rows = Vec::new();
+        for entry in PLUGIN_SCOPED_FIELDS {
+            for field in entry.fields {
+                let class = match field.class {
+                    ScopedReferenceClass::TlsMaterial(_) => "tls",
+                    ScopedReferenceClass::GatewayOnly => "gateway_only",
+                };
+                rows.push((entry.plugin, field.path, class));
+            }
+            for map in entry.open_maps {
+                rows.push((entry.plugin, map.path, "open_map"));
+            }
+        }
+        rows
+    }
+
+    /// The native-key refusals the shared publication validator applies to a
+    /// snapshot's plugin configs, disabled rows included (issue #6539).
+    pub fn kafka_snapshot_native_key_refusals_for_test(
+        plugin_configs: &[crate::config::types::PluginConfig],
+    ) -> Vec<String> {
+        crate::plugins::kafka_logging::snapshot_native_key_refusals(plugin_configs)
+    }
+
+    /// `kafka_logging` `producer_config` keys refused without
+    /// `FERRUM_KAFKA_ALLOW_NATIVE_CONFIG`, as `(key, effect)` (issue #6539).
+    pub fn kafka_native_producer_keys_for_test() -> &'static [(&'static str, &'static str)] {
+        crate::admin::crud::scoped_references::KAFKA_NATIVE_PRODUCER_KEYS
+    }
+
+    /// Reviewed path-shaped plugin fields that name no gateway material.
+    pub fn reviewed_non_material_plugin_fields_for_test() -> &'static [(&'static str, &'static str)]
+    {
+        crate::admin::crud::scoped_references::REVIEWED_NON_MATERIAL_FIELDS
+    }
+
+    /// Concrete references the admission gate classifies in a plugin config,
+    /// as `(field path, value, class)`.
+    pub fn plugin_scoped_references_for_test(
+        plugin: &str,
+        config: &serde_json::Value,
+    ) -> Vec<(String, String, &'static str)> {
+        use crate::admin::crud::scoped_references::{
+            ScopedReferenceClass, plugin_scoped_references,
+        };
+        plugin_scoped_references(plugin, config)
+            .into_iter()
+            .map(|(path, value, class)| {
+                let class = match class {
+                    ScopedReferenceClass::TlsMaterial(_) => "tls",
+                    ScopedReferenceClass::GatewayOnly => "gateway_only",
+                };
+                (path, value.to_string(), class)
+            })
+            .collect()
+    }
+
+    pub fn spawn_backend_material_reload_for_test(
+        config: crate::tls::source::subscription::DynamicMaterialSetReloadConfig,
+        shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> tokio::task::JoinHandle<()> {
+        crate::tls::source::subscription::spawn_backend_material_set_reload_task(config, shutdown)
+    }
+
+    pub fn validate_tls_material_source_for_test(
+        value: &str,
+        kind: crate::tls::source::MaterialKind,
+    ) -> Result<(), String> {
+        crate::config::types::validate_tls_material_source_field("test-source", value, kind)
+    }
+
+    pub fn bind_tenant_tls_file_for_test(
+        value: &str,
+        kind: crate::tls::source::MaterialKind,
+    ) -> Result<Option<String>, crate::tls::source::MaterialError> {
+        crate::tls::source::bind_tenant_file_reference(value, kind)
+    }
+
+    pub fn load_tenant_tls_file_for_test(
+        value: &str,
+        kind: crate::tls::source::MaterialKind,
+        roots: &[std::path::PathBuf],
+        max_bytes: usize,
+    ) -> Result<crate::tls::source::MaterializedMaterial, crate::tls::source::MaterialError> {
+        crate::tls::source::load_material_blocking_with_tenant_roots(
+            &crate::tls::source::CertSource::parse(value, kind),
+            kind,
+            max_bytes,
+            Some(roots),
+        )
+    }
+
+    pub fn open_resolved_tenant_tls_file_for_test(
+        root: &std::path::Path,
+        resolved: &std::path::Path,
+    ) -> std::io::Result<std::fs::File> {
+        crate::tls::source::open_resolved_tenant_file(root, resolved)
+    }
+
+    pub fn apply_destination_rules_with_tenant_roots_for_test(
+        config: &mut crate::config::types::GatewayConfig,
+        runtime: &crate::modes::mesh::MeshRuntimeConfig,
+        slice: &crate::modes::mesh::slice::MeshSlice,
+        roots: &[std::path::PathBuf],
+    ) -> Result<(), anyhow::Error> {
+        crate::modes::mesh::apply_destination_rules_with_tenant_file_roots(
+            config, runtime, slice, roots,
+        )
+    }
+
+    /// The cached rustls config a CRL-enforcing plugin/notification client
+    /// builds from the gateway TLS inputs (`tcp_logging`, `ws_logging`,
+    /// `ldap_auth`, and SMTP `email`, which always verifies).
+    pub fn crl_enforcing_outbound_client_config_for_test(
+        surface: &str,
+        no_verify: bool,
+        ca: Option<&str>,
+        crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
+    ) -> Result<rustls::ClientConfig, String> {
+        use crate::notifications::channels::email;
+        use crate::plugins::{ldap_auth, tcp_logging, ws_logging};
+
+        let config = match surface {
+            "tcp_logging" => {
+                let connector = tcp_logging::build_tls_connector(no_verify, ca, crls, None)?;
+                Arc::clone(connector.config())
+            }
+            "ws_logging" => Arc::new(ws_logging::build_tls_client_config(
+                no_verify, ca, crls, None,
+            )?),
+            "ldap_auth" => ldap_auth::build_ldap_tls_config(no_verify, ca, crls, None)?,
+            "email" if !no_verify => {
+                let config =
+                    email::build_client_config(ca.map(str::to_string), crls.to_vec(), None);
+                config.map_err(|error| format!("{error:?}"))?
+            }
+            other => return Err(format!("unsupported CRL-enforcing surface {other:?}")),
+        };
+        Ok((*config).clone())
+    }
+
+    /// How specifically DestinationRule `rule_host` (declared in `namespace`)
+    /// names `candidate`: `None` for no match, `Some(None)` for an exact host
+    /// or Service alias, `Some(Some(n))` for a wildcard with an `n`-byte suffix.
+    pub fn destination_rule_host_specificity_for_test(
+        rule_host: &str,
+        namespace: &str,
+        candidate: &str,
+    ) -> Option<Option<usize>> {
+        crate::modes::mesh::destination_rule_host_specificity(rule_host, namespace, candidate).map(
+            |specificity| match specificity {
+                crate::modes::mesh::DestinationRuleHostSpecificity::Exact => None,
+                crate::modes::mesh::DestinationRuleHostSpecificity::Wildcard(suffix) => {
+                    Some(suffix)
+                }
+            },
+        )
+    }
+
+    /// The effective proxy dispatch builds for the LB-selected `target`
+    /// (per-port TLS, timeouts and HTTP overlays projected onto the route),
+    /// as an owned value.
+    pub fn resolve_effective_proxy_for_target_for_test(
+        proxy: &crate::config::types::Proxy,
+        target: Option<&crate::config::types::UpstreamTarget>,
+    ) -> crate::config::types::Proxy {
+        crate::proxy::resolve_effective_proxy_for_target(proxy, target).into_owned()
+    }
+
     /// The origin-form request target the direct HTTP/1.1 pool sends for an
     /// absolute backend URL (issue #5588), for parity checks against the `url`
     /// serialization reqwest used.
@@ -135,6 +513,22 @@ pub mod _test_support {
     /// from a later required-field or value-shape rejection.
     pub fn restore_envelope_admission_for_test(body: &[u8]) -> Result<(), serde_json::Error> {
         crate::admin::restore_envelope_admission_for_test(body)
+    }
+
+    /// Database-independent `POST /restore` admission errors for `candidate`,
+    /// in the order the restore response reports them. Runs on the calling
+    /// thread (production runs it on the blocking pool) so a test can capture
+    /// the logs validation emits.
+    pub fn restore_candidate_validation_errors_for_test(
+        candidate: &mut crate::config::types::GatewayConfig,
+        cert_expiry_days: u64,
+        backend_allow_ips: &crate::config::BackendEgressPolicy,
+    ) -> Vec<String> {
+        crate::admin::restore_candidate_validation_errors_for_test(
+            candidate,
+            cert_expiry_days,
+            backend_allow_ips,
+        )
     }
 
     /// Serde-accepted member names of the `POST /restore` envelope
@@ -187,6 +581,35 @@ pub mod _test_support {
         ctx: &mut crate::plugins::RequestContext,
     ) {
         crate::proxy::publish_websocket_handshake_body_digests(plugins, ctx);
+    }
+
+    /// Record the frontend request line exactly as the H1/H2 handler does at
+    /// context creation (RFC 9421 `@method` / `@request-target` provenance).
+    pub fn record_wire_request_line_for_hmac_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        wire_method: &str,
+        version: http::Version,
+        uri: &http::Uri,
+    ) {
+        ctx.record_wire_request_line_for_hmac(wire_method, version, uri);
+    }
+
+    /// Record buffered-body metadata exactly as the H1/H2/H3 body ladders do,
+    /// so tests can pin which body digest snapshots are computed.
+    pub fn store_request_body_metadata_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        body: &[u8],
+        needs_body_text: bool,
+        needs_body_bytes: bool,
+        needs_body_digests: bool,
+    ) {
+        crate::proxy::store_request_body_metadata(
+            ctx,
+            body,
+            needs_body_text,
+            needs_body_bytes,
+            needs_body_digests,
+        );
     }
 
     /// Answer an inbound CONNECT relay-synthesis refusal exactly as the
@@ -399,6 +822,44 @@ pub mod _test_support {
         Some((host, uri_authority))
     }
 
+    /// The `:authority` Sidecar mesh-mTLS dispatch presents to the peer for
+    /// `target` (`mesh_mtls_dispatch_authority`), so tests can prove the
+    /// destination Sidecar can route what a selected target sends.
+    pub fn mesh_mtls_dispatch_authority_for_test(
+        target: &crate::config::types::UpstreamTarget,
+        preserve_host_header: bool,
+        client_host: Option<&str>,
+    ) -> String {
+        crate::proxy::mesh_mtls_dispatch_authority(target, preserve_host_header, client_host)
+            .into_owned()
+    }
+
+    /// Acquire one destination-wide active-request permit
+    /// (`connectionPool.http.http2MaxRequests`) for `proxy` exactly as backend
+    /// admission does: the same cap resolution and the same destination scope.
+    pub fn try_acquire_destination_active_request_for_test(
+        limiter: &crate::backend_active_request_limit::BackendActiveRequestLimiter,
+        proxy: &crate::config::types::Proxy,
+        policy_port: u16,
+    ) -> Result<
+        Option<crate::backend_active_request_limit::BackendActiveRequestGuard>,
+        crate::backend_active_request_limit::BackendActiveRequestLimitExceeded,
+    > {
+        let cap = crate::proxy::resolve_backend_http2_max_requests(proxy, policy_port);
+        limiter.try_acquire(
+            crate::proxy::destination_active_request_scope(proxy, policy_port),
+            cap,
+        )
+    }
+
+    /// The production `mesh_route_dispatch` upstream-reference check the
+    /// validation pipeline runs on every candidate config.
+    pub fn validate_mesh_route_dispatch_upstream_references_for_test(
+        config: &crate::config::types::GatewayConfig,
+    ) -> Result<(), Vec<String>> {
+        crate::proxy::validate_mesh_route_dispatch_upstream_references(config)
+    }
+
     /// Release an xDS node permit through the production last-stream cleanup
     /// fence. The closure runs while same-key registration is excluded, which
     /// lets external tests prove a departing generation cannot delete its
@@ -517,7 +978,7 @@ pub mod _test_support {
     /// expanding the production API solely for external regression tests.
     pub async fn await_dp_listener_handles(
         listener_handles: Vec<tokio::task::JoinHandle<()>>,
-        shutdown_tx: tokio::sync::watch::Sender<bool>,
+        shutdown_tx: crate::overload::ShutdownSender,
     ) -> Result<(), tokio::task::JoinError> {
         crate::modes::data_plane::await_dp_listener_handles(listener_handles, shutdown_tx).await
     }
@@ -973,9 +1434,37 @@ pub mod _test_support {
             failed_websocket_handshake: false,
             body_disposition: disposition,
             grpc_trailers: HashMap::new(),
-            aggregate_sse: Some(listener),
+            aggregate_sse: Some(crate::proxy::AdoptedAggregateSse {
+                listener,
+                response_byte_ceiling: 0,
+            }),
         };
         crate::proxy::build_response_from_normalized_reject(reject).into_parts()
+    }
+
+    /// Run a plugin rejection through the production H1/H2 reject lifecycle
+    /// (`finalize_reject_response_with_after_proxy_hooks`: the shared synthetic
+    /// finalizer, the reject-path hooks, and the aggregate SSE adoption gate)
+    /// and build the client response exactly as the H1/H2 writer does.
+    pub async fn finalize_and_build_plugin_reject_response_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        rejection: crate::plugins::PluginResult,
+    ) -> (http::response::Parts, crate::proxy::body::ProxyBody) {
+        let Some(parts) = crate::proxy::plugin_result_into_reject_parts(rejection) else {
+            panic!("finalize_and_build_plugin_reject_response_for_test needs a rejection");
+        };
+        let status = StatusCode::from_u16(parts.status_code).unwrap_or(StatusCode::BAD_GATEWAY);
+        let normalized = crate::proxy::finalize_reject_response_with_after_proxy_hooks(
+            plugins,
+            ctx,
+            status,
+            parts.body,
+            parts.headers,
+            false,
+        )
+        .await;
+        crate::proxy::build_response_from_normalized_reject(normalized).into_parts()
     }
 
     /// Whether a finalized reject header map still selects the gateway-authored
@@ -1044,13 +1533,16 @@ pub mod _test_support {
         ctx.clone_for_final_request_body_hooks()
     }
 
-    /// Install the route's precomputed credential-header registry so external
-    /// replay-partition tests can exercise stripped custom auth locations.
-    pub fn set_replay_credential_headers_for_test(
+    /// Run the initial dispatch-boundary gateway-assertion refresh the H1/H2
+    /// ladder and the native HTTP/3 frontend share
+    /// (`crate::proxy::refresh_initial_backend_gateway_assertion_headers`),
+    /// so ownership tests can observe whether it materialized an owned copy
+    /// of the request header map.
+    pub fn refresh_initial_backend_gateway_assertion_headers_for_test(
         ctx: &mut crate::plugins::RequestContext,
-        headers: Vec<String>,
+        owned_proxy_headers: &mut Option<std::collections::HashMap<String, String>>,
     ) {
-        ctx.set_request_headers_to_redact(Arc::new(headers));
+        crate::proxy::refresh_initial_backend_gateway_assertion_headers(ctx, owned_proxy_headers);
     }
 
     /// Model proxy core's typed backend-dispatch provenance for direct plugin
@@ -1064,6 +1556,15 @@ pub mod _test_support {
         request_on_wire: bool,
     ) {
         ctx.record_backend_dispatch_outcome(error_class, request_on_wire);
+    }
+
+    /// Model proxy core's typed marker for a route-rule total deadline that
+    /// expired while a backend held the request (the gateway-authored route
+    /// `504`), for direct plugin lifecycle tests.
+    pub fn mark_route_request_timeout_in_dispatch_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+    ) {
+        ctx.mark_route_request_timeout_exceeded(crate::proxy::ROUTE_REQUEST_TIMEOUT_PHASE_DISPATCH);
     }
 
     /// Attach a gateway diagnostic-reference slot to a request context, as
@@ -1167,7 +1668,7 @@ pub mod _test_support {
     /// Record a bridge attempt that ended as `end` at the bridge's one record
     /// point (issue #5875).
     pub fn record_plain_bridge_attempt_for_test(
-        ctx: &crate::plugins::RequestContext,
+        ctx: &mut crate::plugins::RequestContext,
         end: PlainBridgeAttemptEndForTest,
     ) {
         use crate::http3::cross_protocol::PlainAttemptEnd;
@@ -1338,7 +1839,7 @@ pub mod _test_support {
 
     pub fn udp_dtls_disconnect_metadata_after_datagram_metadata_for_test(
         ctx: &mut crate::plugins::StreamConnectionContext,
-        datagram_metadata: HashMap<String, String>,
+        datagram_metadata: crate::plugins::MetadataMap,
     ) -> (HashMap<String, String>, HashMap<String, String>) {
         let (connect_metadata, correlation_ids) = ctx.take_metadata_with_correlation_ids();
 
@@ -1361,7 +1862,10 @@ pub mod _test_support {
             &correlation_ids,
         );
 
-        (udp_metadata, dtls_metadata)
+        (
+            udp_metadata.into_iter().collect(),
+            dtls_metadata.into_iter().collect(),
+        )
     }
 
     /// Signal a UDP reply task to stop using the production flag+`notify_one`
@@ -1447,6 +1951,52 @@ pub mod _test_support {
         destination: std::net::IpAddr,
     ) -> bool {
         crate::proxy::udp_proxy::udp_backend_host_matches_destination_family(host, destination)
+    }
+
+    /// The per-port LB lane admission policy every stream path shares
+    /// (`backend_dispatch::stream_port_lane`). A refusal renders as its variant
+    /// name (`LeastLatency` / `NonIpHashKey`).
+    pub fn stream_port_lane_for_test(
+        proxy: &crate::config::types::Proxy,
+        snapshot: &crate::load_balancer::LoadBalancerCacheInner,
+        upstream_id: &str,
+        health_port_scope: Option<u16>,
+        selection_subset: Option<&str>,
+    ) -> Result<Option<u16>, String> {
+        crate::proxy::backend_dispatch::stream_port_lane(
+            proxy,
+            snapshot,
+            upstream_id,
+            health_port_scope,
+            selection_subset,
+        )
+        .map_err(|refusal| format!("{refusal:?}"))
+    }
+
+    /// `backend_dispatch::stream_health_port_scope`: the per-port scope a stream
+    /// path hands to [`stream_port_lane_for_test`].
+    pub fn stream_health_port_scope_for_test(
+        proxy: &crate::config::types::Proxy,
+        snapshot: &crate::load_balancer::LoadBalancerCacheInner,
+        upstream_id: &str,
+        dispatch_port: u16,
+    ) -> Option<u16> {
+        crate::proxy::backend_dispatch::stream_health_port_scope(
+            proxy,
+            snapshot,
+            upstream_id,
+            dispatch_port,
+        )
+    }
+
+    /// The shared hyper HTTP/2 client builder every `PoolConfig`-driven pool
+    /// family uses (`pool::hyper_h2_client_builder`). hyper's builder has no
+    /// getters, but its `Debug` rendering covers the full HTTP/2 config, and it
+    /// can drive a real handshake over an in-memory transport.
+    pub fn hyper_h2_client_builder_for_test(
+        pool_config: &crate::config::PoolConfig,
+    ) -> hyper::client::conn::http2::Builder<hyper_util::rt::TokioExecutor> {
+        crate::pool::hyper_h2_client_builder(pool_config)
     }
 
     /// UDP backend selection with an optional session destination, so tests can
@@ -1609,21 +2159,6 @@ pub mod _test_support {
     }
 
     /// Whether an incremental rebuild would reconstruct an active
-    /// `ai_transcript_audit` with a node-local descriptor.
-    pub fn ai_transcript_audit_descriptor_preload_required_for_test(
-        cache: &crate::PluginCache,
-        config: &crate::config::types::GatewayConfig,
-        proxy_ids_to_rebuild: &HashSet<crate::config::db_backend::NamespacedResourceId>,
-        rebuild_globals: bool,
-    ) -> bool {
-        cache.ai_transcript_audit_descriptor_preload_required(
-            config,
-            proxy_ids_to_rebuild,
-            rebuild_globals,
-        )
-    }
-
-    /// Whether an incremental rebuild would reconstruct an active
     /// `body_validator` with a node-local descriptor (parity helper for tests).
     pub fn body_validator_descriptor_preload_required_for_test(
         cache: &crate::PluginCache,
@@ -1643,6 +2178,54 @@ pub mod _test_support {
     /// The global gRPC-Web view is built from the global chain this way.
     pub fn grpc_web_view_omits_admission_policy_for_test(plugins: &[Arc<dyn Plugin>]) -> bool {
         crate::plugin_cache::grpc_web_view_omits_admission_policy_for_test(plugins)
+    }
+
+    /// The capability bits of the request view a dispatcher resolves for
+    /// `(namespace, proxy_id, protocol)` — the same view the H1/H2 and H3
+    /// entry paths read before any plugin runs (issue #6793).
+    pub fn request_view_capabilities_for_test(
+        cache: &crate::plugin_cache::PluginCache,
+        namespace: &str,
+        proxy_id: &str,
+        protocol: crate::plugins::ProxyProtocol,
+    ) -> crate::plugin_cache::PluginCapabilities {
+        cache
+            .request_view(namespace, proxy_id, protocol)
+            .capabilities()
+    }
+
+    /// Give `ctx` non-default values for the request state detached terminal
+    /// delivery stamps onto the summary (issue #6793): the WebSocket flavor,
+    /// one plugin trigger decision and a selected response-transform size
+    /// refusal.
+    pub fn populate_terminal_delivery_state_for_test(ctx: &mut crate::plugins::RequestContext) {
+        ctx.set_request_http_flavor(crate::config::types::HttpFlavor::WebSocket);
+        ctx.record_plugin_trigger_decision(7, true);
+        ctx.mark_response_transform_size_refusal_selected();
+    }
+
+    /// Mark `ctx` as the dispatcher marks a request whose plugin view defers
+    /// the mesh label projection (issue #6793).
+    pub fn defer_mesh_label_projection_for_test(ctx: &mut crate::plugins::RequestContext) {
+        ctx.set_mesh_label_projection_deferred(true);
+    }
+
+    /// Run the gateway's real outbound mesh-dispatch overlay for a Sidecar
+    /// mesh-mTLS target carrying `tags` (issue #6793).
+    pub fn annotate_gateway_mesh_dispatch_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        tags: std::collections::HashMap<String, String>,
+    ) {
+        let target = crate::config::types::UpstreamTarget {
+            host: "10.0.0.8".to_string(),
+            port: 8443,
+            service_port_policy_key: None,
+            weight: 1,
+            tags,
+            locality: None,
+            path: None,
+        };
+        crate::proxy::annotate_gateway_mesh_metadata(ctx, Some(&target), Some("mtls"), None);
     }
 
     /// Prepend a plugin onto one proxy's resolved list for external tests.
@@ -2178,11 +2761,38 @@ pub mod _test_support {
         crate::plugins::grpc_deadline::duration_millis_ceil_saturating(duration)
     }
 
+    pub fn grpc_deadline_parse_grpc_timeout_for_test(value: &str) -> Option<std::time::Duration> {
+        crate::plugins::grpc_deadline::parse_grpc_timeout(value)
+    }
+
+    pub fn grpc_proxy_parse_grpc_timeout_value_for_test(value: &str) -> Option<u64> {
+        crate::proxy::grpc_proxy::parse_grpc_timeout_value(value)
+    }
+
     pub fn apply_remaining_grpc_timeout_header_for_test(
         headers: &mut hyper::HeaderMap,
         deadline: tokio::time::Instant,
     ) {
         crate::proxy::grpc_proxy::apply_remaining_grpc_timeout_header(headers, deadline);
+    }
+
+    /// The shared owner rule for two racing bounds (issue #6976): `Some(true)`
+    /// for the dispatch bound, `Some(false)` for the response-header bound,
+    /// `None` while neither has elapsed.
+    pub fn elapsed_owning_bound_for_test(
+        dispatch_at: Option<tokio::time::Instant>,
+        header_at: Option<tokio::time::Instant>,
+        now: tokio::time::Instant,
+    ) -> Option<bool> {
+        crate::proxy::elapsed_owning_bound(dispatch_at, header_at, now)
+            .map(|bound| bound == crate::proxy::OwningBound::Dispatch)
+    }
+
+    pub fn client_deadline_owns_failure_for_test(
+        deadline: Option<tokio::time::Instant>,
+        now: tokio::time::Instant,
+    ) -> bool {
+        crate::proxy::grpc_proxy::client_deadline_owns_failure(deadline, now)
     }
 
     pub fn direct_h2_send_request_error_response_for_class_for_test(
@@ -2215,6 +2825,115 @@ pub mod _test_support {
         class: crate::retry::ErrorClass,
     ) -> (u16, &'static str) {
         crate::proxy::http_backend_failure_status_and_body(class)
+    }
+
+    pub fn internal_error_fallback_response_for_test(
+        body: &'static str,
+    ) -> hyper::Response<crate::proxy::ProxyBody> {
+        crate::proxy::internal_error_fallback_response(body)
+    }
+
+    pub fn h3_pool_failure_backend_response_for_test(
+        error_class: crate::retry::ErrorClass,
+        connection_error: bool,
+        request_on_wire: bool,
+    ) -> crate::retry::BackendResponse {
+        crate::proxy::h3_pool_failure_backend_response(
+            error_class,
+            connection_error,
+            request_on_wire,
+            None,
+        )
+    }
+
+    pub fn websocket_backend_failure_status_and_body_for_test(
+        class: crate::retry::ErrorClass,
+    ) -> (hyper::StatusCode, &'static str) {
+        crate::proxy::websocket_backend_failure_status_and_body(class)
+    }
+
+    /// The backend refusal (status, collected headers, relayed body) the H1/H2
+    /// and H3 WebSocket bridges relay for a failed upgrade dial, or `None` when
+    /// the failure is a gateway-side `502`/`504` (GHSA-7x2j-3389-2h35).
+    pub fn websocket_backend_refusal_for_test(
+        error: &(dyn std::error::Error + 'static),
+    ) -> Option<(u16, HashMap<String, String>, bytes::Bytes)> {
+        crate::proxy::websocket_backend_refusal(error)
+            .map(|refusal| (refusal.status.as_u16(), refusal.headers, refusal.body))
+    }
+
+    /// The H1/H2 client response for a relayed WebSocket backend refusal, after
+    /// the given initial response header policy plugins.
+    pub fn websocket_backend_refusal_response_for_test(
+        error: &(dyn std::error::Error + 'static),
+        initial_response_header_policy_plugins: &[Arc<dyn crate::plugins::Plugin>],
+    ) -> Option<hyper::Response<crate::proxy::ProxyBody>> {
+        crate::proxy::websocket_backend_refusal(error).map(|refusal| {
+            crate::proxy::build_websocket_backend_refusal_response(
+                refusal,
+                initial_response_header_policy_plugins,
+            )
+        })
+    }
+
+    /// The validated client Host a direct WebSocket dial sends under
+    /// `preserve_host_header` (issue #7392), or `None` for the backend authority.
+    pub fn websocket_preserved_backend_host_for_test(
+        preserve_host_header: bool,
+        client_host: Option<&str>,
+    ) -> Option<String> {
+        crate::proxy::websocket_preserved_backend_host(preserve_host_header, client_host)
+            .map(str::to_owned)
+    }
+
+    /// Backend response trailers as the buffered native gRPC path collects them.
+    pub fn collect_buffered_grpc_trailers_for_test(
+        source: &http::HeaderMap,
+    ) -> HashMap<String, String> {
+        let mut collected = HashMap::new();
+        crate::proxy::grpc_proxy::collect_buffered_grpc_trailers(source, &mut collected);
+        collected
+    }
+
+    pub fn grpc_bridge_failure_health_for_test(
+        err: &crate::proxy::grpc_proxy::GrpcProxyError,
+        error_class: crate::retry::ErrorClass,
+    ) -> (u16, crate::retry::ErrorClass) {
+        crate::http3::cross_protocol::grpc_bridge_failure_health(err, error_class)
+    }
+
+    pub fn admin_builder_failure_response_for_test()
+    -> hyper::Response<http_body_util::Full<bytes::Bytes>> {
+        crate::admin::admin_builder_failure_response()
+    }
+
+    /// Collect an admin response through the connection body wrapper exactly
+    /// as the admin listener does (`/charges` delivery acknowledgement tests).
+    pub async fn collect_guarded_admin_response_for_test(
+        response: hyper::Response<http_body_util::Full<bytes::Bytes>>,
+    ) -> bytes::Bytes {
+        crate::admin::collect_guarded_admin_response_for_test(response).await
+    }
+
+    /// `GET /charges` exactly as the admin dispatcher answers it for
+    /// `authorization` (collector-scope decision included), rendered from
+    /// `registry` instead of the process-global one. `None` when the token
+    /// does not verify.
+    pub async fn charges_response_for_test(
+        jwt_manager: &crate::admin::jwt_auth::JwtManager,
+        authorization: &str,
+        registry: std::sync::Arc<crate::plugins::api_chargeback::ChargebackRegistry>,
+        query: Option<&str>,
+    ) -> Option<hyper::Response<http_body_util::Full<bytes::Bytes>>> {
+        crate::admin::charges_response_for_test(jwt_manager, authorization, registry, query).await
+    }
+
+    /// Wrap an admin response as the admin listener does, then drop it
+    /// without writing its body (`/charges` delivery acknowledgement tests).
+    pub fn drop_guarded_admin_response_unpolled_for_test(
+        response: hyper::Response<http_body_util::Full<bytes::Bytes>>,
+    ) {
+        crate::admin::drop_guarded_admin_response_unpolled_for_test(response)
     }
 
     pub fn x_gateway_error_for_backend_failure_for_test(
@@ -2426,7 +3145,7 @@ pub mod _test_support {
             proxy,
             backend_url,
             "GET",
-            &HashMap::new(),
+            crate::proxy::request_headers::RequestHeaders::Materialized(&HashMap::new()),
             None,
             None,
             true,
@@ -2438,6 +3157,48 @@ pub mod _test_support {
             hyper::Version::HTTP_11,
         )
         .await
+    }
+
+    /// One native-H3 retry attempt (`proxy_to_backend_http3_retry`) for a
+    /// plain `GET` with no body, upstream target, or plugins.
+    pub async fn proxy_to_backend_http3_retry_for_test(
+        state: &crate::proxy::ProxyState,
+        proxy: &crate::config::types::Proxy,
+        backend_url: &str,
+    ) -> crate::retry::BackendResponse {
+        let ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/".to_string(),
+        );
+        crate::proxy::proxy_to_backend_http3_retry(
+            state,
+            proxy,
+            backend_url,
+            "GET",
+            &HashMap::new(),
+            None,
+            None,
+            false,
+            &[],
+            &ctx,
+            "127.0.0.1",
+            "127.0.0.1",
+            true,
+            hyper::Version::HTTP_3,
+        )
+        .await
+    }
+
+    /// The `backend_resolved_ip` a transaction summary logs for the target
+    /// that served the request (`boxed_resolve_summary_backend_ip`, issue
+    /// #7159), with no RPC deadline.
+    pub async fn resolve_summary_backend_ip_for_test(
+        state: &crate::proxy::ProxyState,
+        proxy: &crate::config::types::Proxy,
+        target: Option<&crate::config::types::UpstreamTarget>,
+    ) -> Option<String> {
+        crate::proxy::boxed_resolve_summary_backend_ip(state, proxy, target, None).await
     }
 
     pub fn request_method_is_allowed_for_test(allowed: &[String], method: &str) -> bool {
@@ -2565,8 +3326,10 @@ pub mod _test_support {
             deadline,
             headers,
             body.to_vec(),
+            None,
         )
         .await;
+        let transformed = uncharged_request_body_transform(transformed);
         let result = crate::proxy::run_final_request_body_hooks_with_provenance(
             plugins,
             Some(&mut *ctx),
@@ -2601,8 +3364,10 @@ pub mod _test_support {
             deadline,
             headers,
             body.to_vec(),
+            None,
         )
         .await;
+        let transformed = uncharged_request_body_transform(transformed);
         let result = crate::proxy::run_final_request_body_hooks_with_provenance_in(
             plugins,
             Some(&mut *ctx),
@@ -2661,8 +3426,10 @@ pub mod _test_support {
             deadline,
             headers,
             body.to_vec(),
+            None,
         )
         .await;
+        let transformed = uncharged_request_body_transform(transformed);
         crate::proxy::run_final_request_body_hooks_with_provenance(
             plugins,
             None,
@@ -2713,6 +3480,38 @@ pub mod _test_support {
     }
 
     // ── adaptive_concurrency lifecycle ──────────────────────────────────────
+
+    /// The timing correction shared by intermediate retry settlement and the
+    /// final response/stream settlement. Explicit durations keep tests independent
+    /// of wall-clock delays and scheduler timing.
+    pub fn backend_admission_attempt_elapsed_for_test(
+        attempt_started_at: std::time::Instant,
+        elapsed: Duration,
+        client_upload_gate: (std::time::Instant, Duration),
+    ) -> Duration {
+        crate::proxy::backend_admission_attempt_elapsed(
+            attempt_started_at,
+            elapsed,
+            client_upload_gate,
+        )
+    }
+
+    /// Settle a replaced retry attempt through the production timing/ownership
+    /// funnel, with explicit elapsed time for deterministic external tests.
+    pub fn record_backend_admission_retry_outcome_for_test(
+        permits: &mut Option<crate::plugins::BackendAdmissionPermitSet>,
+        outcome: crate::plugins::BackendAdmissionOutcome,
+        attempt_started_at: std::time::Instant,
+        client_upload_gate: (std::time::Instant, Duration),
+    ) {
+        crate::proxy::record_backend_admission_retry_outcome(
+            permits,
+            outcome,
+            attempt_started_at,
+            client_upload_gate,
+        );
+    }
+
     pub struct AdaptiveConcurrencyDecreaseHarness {
         limit: AtomicU64,
         config: crate::adaptive_concurrency::AdaptiveConcurrencyConfig,
@@ -2892,6 +3691,13 @@ pub mod _test_support {
         crate::plugin_cache::request_reject_after_jwks_startup_for_test();
     }
 
+    /// `ai_federation` streaming route plans resolved on the calling thread so
+    /// far; a cache build resolves each attached config's plan once
+    /// (issue #7018).
+    pub fn ai_federation_route_plan_resolutions_for_test() -> u64 {
+        crate::plugin_cache::ai_federation_route_plan_resolutions_for_test()
+    }
+
     pub fn clear_jwks_cache_for_test() {
         crate::plugins::utils::jwks_cache::clear_jwks_cache();
     }
@@ -2969,21 +3775,33 @@ pub mod _test_support {
 
     /// Resolve a live discovery document with optional operator-supplied
     /// `userinfo_endpoint` / `end_session_endpoint` overrides, returning the
-    /// effective optional endpoints as `(userinfo, end_session)`.
+    /// effective optional endpoints as `(userinfo, end_session)`. The
+    /// document's `issuer` must equal `expected_issuer`.
     pub async fn oidc_resolve_discovery_for_test(
         http_client: &crate::plugins::PluginHttpClient,
         discovery_url: &str,
+        expected_issuer: &str,
         explicit_userinfo_endpoint: Option<String>,
         explicit_end_session_endpoint: Option<String>,
     ) -> Result<(Option<String>, Option<String>), String> {
         let resolved = oidc_discovery_seams::resolve_discovery_for_test(
             http_client,
             discovery_url,
+            expected_issuer,
             explicit_userinfo_endpoint,
             explicit_end_session_endpoint,
         )
         .await?;
         Ok((resolved.userinfo_endpoint, resolved.end_session_endpoint))
+    }
+
+    /// Whether an `oidc_relying_party` instance's discovery task published a
+    /// document within `wait` (a refused document is retried, never published).
+    pub async fn oidc_discovery_published_within_for_test(
+        plugin: &crate::plugins::oidc_relying_party::OidcRelyingParty,
+        wait: std::time::Duration,
+    ) -> bool {
+        plugin.discovery_published_within_for_tests(wait).await
     }
 
     /// Await a plugin's background discovery task and return the resolved
@@ -3216,6 +4034,17 @@ pub mod _test_support {
             .map_err(|error| error.to_string())
     }
 
+    /// Whether the audit spool claimer may take the owner lock of `instance`
+    /// on a host that creates instance trees in place (`creates_in_place`,
+    /// the non-Unix startup path) or by a locked rename (Unix). Exposes the
+    /// non-Unix startup claim-race rule (issue #7200) to Linux CI.
+    pub fn audit_spool_instance_lock_is_claimable_for_test(
+        instance: &std::path::Path,
+        creates_in_place: bool,
+    ) -> bool {
+        crate::admin::audit_spool::instance_lock_is_claimable(instance, creates_in_place)
+    }
+
     /// Drive the cancellation-safe pre-mutation audit prepare with two blocking
     /// barriers around the durable write. External tests abort the enclosing
     /// request scope between them, then prove the detached prepare finalizes the
@@ -3279,7 +4108,6 @@ pub mod _test_support {
         pub outcome: TestLeaseRenewalOutcome,
         pub renewals: u32,
         pub retries: u32,
-        pub reclaims: u32,
         pub still_held: bool,
     }
 
@@ -3316,7 +4144,6 @@ pub mod _test_support {
             outcome,
             renewals: report.counters.renewals,
             retries: report.counters.retries,
-            reclaims: report.counters.reclaims,
             still_held,
         }
     }
@@ -3478,6 +4305,14 @@ pub mod _test_support {
         )
     }
 
+    /// Providers `jwks_auth` would verify `token` against, in order.
+    pub fn jwks_auth_candidate_providers_for_test(
+        plugin: &crate::plugins::jwks_auth::JwksAuth,
+        token: &str,
+    ) -> Vec<usize> {
+        plugin.candidate_provider_indices_for_test(token)
+    }
+
     pub fn request_mirror_retained_request_body_bytes_for_test(
         plugin: &crate::plugins::request_mirror::RequestMirror,
     ) -> u64 {
@@ -3494,12 +4329,6 @@ pub mod _test_support {
         plugin: &crate::plugins::request_mirror::RequestMirror,
     ) -> u64 {
         plugin.max_mirrored_request_body_bytes_for_test()
-    }
-
-    pub fn request_mirror_mirror_timeout_ms_for_test(
-        plugin: &crate::plugins::request_mirror::RequestMirror,
-    ) -> Option<u64> {
-        plugin.mirror_timeout_ms_for_test()
     }
 
     pub fn request_mirror_metrics_snapshot_for_test(
@@ -3744,6 +4573,20 @@ pub mod _test_support {
         crate::plugins::request_deduplication::redis_record_payload_is_valid_for_test(data)
     }
 
+    pub fn request_deduplication_completed_redis_record_for_test(
+        fingerprint: &str,
+        payload: Option<Vec<u8>>,
+    ) -> Option<Vec<u8>> {
+        crate::plugins::request_deduplication::completed_redis_record_for_test(fingerprint, payload)
+    }
+
+    pub async fn request_deduplication_redis_record_state_for_test(
+        plugin: &crate::plugins::request_deduplication::RequestDeduplication,
+        key: &str,
+    ) -> &'static str {
+        plugin.redis_record_state_for_test(key).await
+    }
+
     pub fn request_deduplication_completed_size_snapshot_for_test(
         plugin: &crate::plugins::request_deduplication::RequestDeduplication,
     ) -> (usize, usize) {
@@ -3754,6 +4597,22 @@ pub mod _test_support {
         plugin: &crate::plugins::request_deduplication::RequestDeduplication,
     ) -> usize {
         plugin.inflight_count_snapshot_for_tests()
+    }
+
+    /// Record a present credential query parameter exactly as an
+    /// authentication plugin's `mark_query_credentials_for_redaction` hook does
+    /// (`jwt_auth` `token_lookup: query:<name>`, `key_auth` query keys). The
+    /// value is read from `ctx.query_params`.
+    pub fn mark_query_credential_for_test(ctx: &mut crate::plugins::RequestContext, name: &str) {
+        crate::plugins::utils::token_extract::mark_query_credential_metadata(ctx, name);
+    }
+
+    /// Exact live in-flight marker count (execution barriers excluded): the
+    /// `max_inflight_entries` admission counter.
+    pub fn request_deduplication_live_inflight_count_snapshot_for_test(
+        plugin: &crate::plugins::request_deduplication::RequestDeduplication,
+    ) -> usize {
+        plugin.live_inflight_count_snapshot_for_tests()
     }
 
     /// Whether a constructed `request_deduplication` instance's Redis client
@@ -3919,6 +4778,54 @@ pub mod _test_support {
             ceiling,
             record_count,
         )
+    }
+
+    // ── plugins/ws_logging ──────────────────────────────────────────────────
+    /// Construct WebSocket logging against a test-owned retained-byte ceiling,
+    /// covering both record admission and the persistent connection's codec
+    /// output charge.
+    pub fn ws_logging_with_ceiling_for_test(
+        config: &serde_json::Value,
+        http_client: crate::plugins::PluginHttpClient,
+        ceiling: &'static crate::plugins::utils::byte_budget::RetainedByteCeiling,
+    ) -> Result<crate::plugins::ws_logging::WsLogging, String> {
+        crate::plugins::ws_logging::WsLogging::new_with_ceiling(config, http_client, ceiling)
+    }
+
+    /// Deterministic probe: an immediate librdkafka `QueueFull` waits for
+    /// queue space within `budget` instead of dropping the record at once, and
+    /// a saturated producer stops waiting until an enqueue succeeds.
+    pub async fn kafka_logging_probe_queue_full_backoff_for_test(
+        free_queue_after: Option<std::time::Duration>,
+        budget: std::time::Duration,
+    ) -> Result<crate::plugins::kafka_logging::KafkaQueueFullProbeOutcome, String> {
+        crate::plugins::kafka_logging::probe_queue_full_backoff_for_test(free_queue_after, budget)
+            .await
+    }
+
+    /// Deterministic probe: the production flush-worker configuration hands
+    /// librdkafka many records per worker turn. Returns
+    /// `(flushes, records_flushed)`.
+    pub async fn kafka_logging_probe_worker_batching_for_test(
+        records: usize,
+    ) -> Result<(usize, usize), String> {
+        crate::plugins::kafka_logging::probe_worker_batching_for_test(records).await
+    }
+
+    /// The partition key `kafka_logging` derives for an HTTP summary.
+    pub fn kafka_logging_http_record_key_for_test(
+        config: &serde_json::Value,
+        summary: &crate::plugins::TransactionSummary,
+    ) -> Result<Option<String>, String> {
+        crate::plugins::kafka_logging::http_record_key_for_test(config, summary)
+    }
+
+    /// The partition key `kafka_logging` derives for a stream summary.
+    pub fn kafka_logging_stream_record_key_for_test(
+        config: &serde_json::Value,
+        summary: &crate::plugins::StreamTransactionSummary,
+    ) -> Result<Option<String>, String> {
+        crate::plugins::kafka_logging::stream_record_key_for_test(config, summary)
     }
 
     // ── plugins/loki_logging ────────────────────────────────────────────────
@@ -4276,6 +5183,29 @@ pub mod _test_support {
             .shared_claim_retention_seconds_for_tests()
     }
 
+    /// Whether a constructed `soap_ws_security` instance's shared replay client
+    /// demands the no-eviction retention screen (`None` in process scope).
+    pub fn soap_shared_replay_requires_no_eviction_for_test(
+        config: &serde_json::Value,
+    ) -> Result<Option<bool>, String> {
+        Ok(
+            crate::plugins::soap_ws_security::SoapWsSecurity::new(config)?
+                .shared_replay_requires_no_eviction_for_tests(),
+        )
+    }
+
+    /// One SAML assertion single-use claim against `plugin`'s configured replay
+    /// backend (process or shared), without minting a signed assertion.
+    pub async fn soap_claim_saml_assertion_for_test(
+        plugin: &crate::plugins::soap_ws_security::SoapWsSecurity,
+        issuer: &str,
+        assertion_id: &str,
+    ) -> Result<(), String> {
+        plugin
+            .claim_saml_assertion_for_tests(issuer, assertion_id)
+            .await
+    }
+
     /// One-shot proof that map/index drift cannot be recovered as a fresh
     /// admission. The inconsistent plugin never escapes this helper.
     pub fn soap_nonce_inconsistent_state_outcome_for_test(
@@ -4294,10 +5224,6 @@ pub mod _test_support {
         crate::plugins::soap_ws_security::MAX_NONCE_REPLAY_SCOPES_FOR_TESTS;
     pub const NONCE_CLAIM_RETENTION_SECONDS_FOR_TESTS: u64 =
         crate::plugins::soap_ws_security::NONCE_CLAIM_RETENTION_SECONDS_FOR_TESTS;
-
-    pub fn soap_nonce_replay_registry_len_for_test() -> Result<usize, String> {
-        crate::plugins::soap_ws_security::nonce_replay_registry_len_for_tests()
-    }
 
     pub fn soap_nonce_replay_registry_contains_for_test(scope_key: &str) -> Result<bool, String> {
         crate::plugins::soap_ws_security::nonce_replay_registry_contains_for_tests(scope_key)
@@ -4497,6 +5423,24 @@ pub mod _test_support {
         crate::proxy::tcp_proxy::no_matching_sni_route_error(port)
     }
 
+    /// Production typed emits for the two L4 `stream_match` refusals and the
+    /// failed inspected-prefix forward (issue #7185).
+    pub fn no_matching_l4_route_error_for_test(port: u16) -> anyhow::Error {
+        crate::proxy::tcp_proxy::no_matching_l4_route_error(port)
+    }
+
+    pub fn l4_stream_match_denied_error_for_test(
+        proxy_namespace: &str,
+        proxy_id: &str,
+        port: u16,
+    ) -> anyhow::Error {
+        crate::proxy::tcp_proxy::l4_stream_match_denied_error(proxy_namespace, proxy_id, port)
+    }
+
+    pub fn backend_first_bytes_forward_error_for_test(error: std::io::Error) -> anyhow::Error {
+        crate::proxy::tcp_proxy::backend_first_bytes_forward_error(error)
+    }
+
     pub fn pre_copy_disconnect_cause_for_test(
         error: &anyhow::Error,
         class: &crate::retry::ErrorClass,
@@ -4516,15 +5460,90 @@ pub mod _test_support {
         response_status: u16,
         connection_error: bool,
         error_class: Option<crate::retry::ErrorClass>,
-        is_half_open_probe: bool,
+        ticket: crate::circuit_breaker::ProbeTicket,
     ) {
         crate::proxy::backend_dispatch::apply_circuit_breaker_outcome(
             cb,
             response_status,
             connection_error,
             error_class,
-            is_half_open_probe,
+            ticket,
         )
+    }
+
+    /// Drive the shared ordinary-completion recorder
+    /// (`record_backend_outcome_no_conn_end`) for an attempt admitted under
+    /// `proxy` — the request's captured snapshot, whose breaker config may be
+    /// older than the live one — and owned by `cb_probe` (issue #6799). No
+    /// balancer or upstream target is attributed, so only the circuit-breaker
+    /// arm runs.
+    pub fn record_backend_completion_for_test(
+        state: &crate::proxy::ProxyState,
+        proxy: &crate::config::types::Proxy,
+        final_cb_target_key: Option<&str>,
+        response_status: u16,
+        connection_error: bool,
+        error_class: Option<crate::retry::ErrorClass>,
+        cb_probe: &crate::proxy::HalfOpenProbeGuard,
+    ) {
+        let epoch = state.request_epoch.load();
+        crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
+            state,
+            proxy,
+            &epoch.load_balancer,
+            None,
+            None,
+            final_cb_target_key,
+            response_status,
+            connection_error,
+            error_class,
+            cb_probe.settle(),
+            false,
+            std::time::Duration::ZERO,
+        );
+    }
+
+    /// Drive the production synchronous record for a deferred streaming
+    /// outcome whose body an `after_proxy` reject replaced (H1/H2
+    /// `StreamingH2`/`StreamingH3` and buffered-request native gRPC), for an
+    /// attempt owned by `cb_probe` and admitted at `admission_open_epoch`.
+    pub fn record_replaced_streaming_outcome_for_test(
+        state: &crate::proxy::ProxyState,
+        proxy: &crate::config::types::Proxy,
+        final_cb_target_key: Option<&str>,
+        response_status: u16,
+        cb_probe: &crate::proxy::HalfOpenProbeGuard,
+        skip_circuit_breaker_record: bool,
+        admission_open_epoch: u64,
+    ) {
+        let epoch = state.request_epoch.load();
+        crate::proxy::backend_dispatch::record_replaced_streaming_outcome(
+            state,
+            proxy,
+            &epoch.load_balancer,
+            None,
+            None,
+            final_cb_target_key,
+            response_status,
+            false,
+            None,
+            cb_probe,
+            skip_circuit_breaker_record,
+            admission_open_epoch,
+            std::time::Duration::ZERO,
+        );
+    }
+
+    /// Drive the production retry-attempt circuit-breaker admission every
+    /// HTTP/3 native and cross-protocol retry loop runs before dialing the next
+    /// (possibly rotated, possibly not yet cached) target (issue #6799).
+    pub fn admit_retry_attempt_for_test(
+        state: &crate::proxy::ProxyState,
+        proxy: &crate::config::types::Proxy,
+        target_key: Option<&str>,
+        cb_probe: &crate::proxy::HalfOpenProbeGuard,
+    ) -> bool {
+        crate::proxy::admit_retry_attempt(state, proxy, target_key, cb_probe)
     }
 
     /// Drive the production UDP setup-failure ownership + emit path.
@@ -4608,6 +5627,38 @@ pub mod _test_support {
         }
     }
 
+    /// Drive the production frontend-DTLS plugin-rejection summary path: the
+    /// same attribution snapshot and emission the DTLS accept handler runs
+    /// when its `on_stream_connect` chain rejects. Returns whether a summary
+    /// was emitted.
+    pub async fn emit_dtls_plugin_rejection_summary_for_test(
+        plugins: Vec<Arc<dyn Plugin>>,
+        proxy: &crate::config::types::Proxy,
+        ctx: &crate::plugins::StreamConnectionContext,
+        client_ip: &str,
+        listen_port: u16,
+    ) -> bool {
+        let progress = crate::proxy::udp_proxy::dtls_plugin_rejection_progress(
+            Arc::new(plugins),
+            proxy.name.as_deref(),
+            proxy.effective_scheme(),
+            format!("{}:{}", proxy.backend_host, proxy.backend_port),
+            ctx,
+        );
+        crate::proxy::udp_proxy::emit_dtls_plugin_rejection_summary(
+            progress,
+            crate::proxy::udp_proxy::DtlsPluginRejection {
+                namespace: &proxy.namespace,
+                proxy_id: &proxy.id,
+                client_ip,
+                listen_port,
+                connected_wall_at: chrono::Utc::now(),
+                duration_ms: 0.0,
+            },
+        )
+        .await
+    }
+
     /// The production wrapper that decides whether a stream-setup DNS resolve
     /// failure becomes a typed `StreamSetupKind::DnsLookup` or stays an
     /// untyped gateway-side egress-policy denial.
@@ -4623,41 +5674,25 @@ pub mod _test_support {
         crate::proxy::tcp_proxy::find_listener_proxy(config, proxy_namespace, proxy_id).cloned()
     }
 
-    /// Mirror the TCP accept-loop disconnect summary contract: `duration_ms`
-    /// from process-monotonic `Instant`, RFC3339 connect/disconnect stamps
-    /// from civil/UTC wall clocks only. Used by parity regression tests for
-    /// issue #2624 (WebSocket/UDP/DTLS must match this split).
-    pub fn tcp_stream_summary_from_clocks_for_test(
+    /// The TCP accept loop's disconnect-summary clock fields
+    /// (`tcp_proxy::stream_disconnect_clocks`) as `(duration_ms,
+    /// timestamp_connected, timestamp_disconnected)`. Used by the issue #2624
+    /// parity regression tests (WebSocket/UDP/DTLS must match this split).
+    pub fn tcp_stream_disconnect_clocks_for_test(
         connected_mono: std::time::Instant,
         connected_wall_at: chrono::DateTime<chrono::Utc>,
         disconnected_wall_at: chrono::DateTime<chrono::Utc>,
-    ) -> crate::plugins::StreamTransactionSummary {
-        crate::plugins::StreamTransactionSummary {
-            plugin_trigger_decisions: Default::default(),
-            namespace: "ferrum".to_string(),
-            proxy_id: "tcp-proxy".to_string(),
-            proxy_lifecycle_generation: None,
-            proxy_name: Some("TCP Proxy".to_string()),
-            client_ip: "10.0.0.1".to_string(),
-            consumer_username: None,
-            auth_method: None,
-            backend_target: "10.0.0.2:9000".to_string(),
-            backend_resolved_ip: Some("10.0.0.2".to_string()),
-            protocol: "tcp".to_string(),
-            listen_port: 9000,
-            // Production: `connected_at.elapsed().as_millis() as f64`
-            duration_ms: connected_mono.elapsed().as_millis() as f64,
-            bytes_sent: 0,
-            bytes_received: 0,
-            connection_error: None,
-            error_class: None,
-            disconnect_direction: None,
-            disconnect_cause: Some(crate::plugins::DisconnectCause::GracefulShutdown),
-            timestamp_connected: connected_wall_at.to_rfc3339(),
-            timestamp_disconnected: disconnected_wall_at.to_rfc3339(),
-            sni_hostname: None,
-            metadata: Default::default(),
-        }
+    ) -> (f64, String, String) {
+        let clocks = crate::proxy::tcp_proxy::stream_disconnect_clocks(
+            connected_mono,
+            connected_wall_at,
+            disconnected_wall_at,
+        );
+        (
+            clocks.duration_ms,
+            clocks.timestamp_connected,
+            clocks.timestamp_disconnected,
+        )
     }
 
     /// Resolve the DestinationRule `connectionPool.tcp.maxConnections` cap a
@@ -4761,6 +5796,30 @@ pub mod _test_support {
             publish_seams,
         )
         .await
+    }
+
+    /// Drive the production direct HTTP/1.1 checkout with a hook run AFTER it
+    /// has sampled the lane map's drain epoch and read the SVID generation its
+    /// lane key carries, and BEFORE it looks its lane up.
+    ///
+    /// That is the one interleaving the lane map's drain fence exists for: a
+    /// checkout that read a generation, or found no lane, just before a drain
+    /// and would open a lane just after it. The stretch is synchronous, so
+    /// only this hook can place a drain there. Production `checkout_h1` is
+    /// this same function with a hook that does nothing.
+    pub async fn checkout_direct_h1_with_lane_lookup_seam<F>(
+        pool: &crate::proxy::http2_pool::Http2ConnectionPool,
+        proxy: &crate::config::types::Proxy,
+        tls: bool,
+        connect_timeout: std::time::Duration,
+        fresh: bool,
+        before_lane_lookup: F,
+    ) -> Result<crate::proxy::http2_pool::Http1Checkout, crate::proxy::http2_pool::Http2PoolError>
+    where
+        F: FnOnce(),
+    {
+        pool.checkout_h1_seamed(proxy, tls, connect_timeout, fresh, before_lane_lookup)
+            .await
     }
 
     /// Drive the production HTTP/1.1 checkout with a hook awaited AFTER the
@@ -4900,8 +5959,10 @@ pub mod _test_support {
     }
 
     pub use crate::proxy::tcp_proxy::{
+        RelayEndReason, STREAM_RELAY_AUTHORIZATION_EXPIRED_MESSAGE,
         STREAM_RELAY_HALF_CLOSE_CAP_MESSAGE, STREAM_RELAY_IDLE_TIMEOUT_MESSAGE, StreamCopyResult,
-        StreamIoSide, relay_failure_is_client_facing, relay_failure_is_idle_expiry,
+        StreamIoSide, relay_failure_is_client_facing, relay_failure_is_half_close_cap,
+        relay_failure_is_idle_expiry,
     };
 
     /// Reach into `tcp_proxy` to exercise the `Direction` + IO-side →
@@ -5058,9 +6119,40 @@ pub mod _test_support {
             4_096,
             None,
             None,
+            None,
         )
         .await?;
         Ok(handshake.stream)
+    }
+
+    /// Dial a direct WebSocket backend through the production
+    /// `connect_websocket_backend`, sending `preserved_host` as `Host` exactly
+    /// as the bridges do under `preserve_host_header` (issue #7392). Returns
+    /// the backend's collected handshake response headers (issue #7391), or
+    /// the dial error unchanged so a test can classify a backend refusal.
+    pub async fn connect_websocket_backend_headers_for_test(
+        backend_url: &str,
+        proxy: &crate::config::types::Proxy,
+        preserved_host: Option<&str>,
+    ) -> Result<HashMap<String, String>, Box<dyn std::error::Error + Send + Sync>> {
+        let env_config = crate::config::EnvConfig::default();
+        let tls_configs = websocket_backend_tls_configs_for_test(&env_config);
+        let handshake = crate::proxy::connect_websocket_backend(
+            backend_url,
+            proxy,
+            &env_config,
+            &[],
+            &tls_configs,
+            65_536,
+            262_144,
+            4_096,
+            None,
+            None,
+            preserved_host,
+        )
+        .await?;
+        let mut handshake = crate::proxy::WsBackendHandshake::Direct(Box::new(handshake));
+        Ok(handshake.take_backend_response_headers())
     }
 
     /// Exercise the production bounded WebSocket close/queued-echo path.
@@ -5107,24 +6199,51 @@ pub mod _test_support {
         crate::proxy::ws_capacity_error_class(size, client_to_backend)
     }
 
+    /// Effective parser ceilings `(max_frame_bytes, max_message_bytes)` the
+    /// relay installs in the framer reading frames that travel in `direction`.
+    pub fn effective_ws_size_limits_for_test(
+        global_frame_bytes: usize,
+        plugins: &[Arc<dyn Plugin>],
+        direction: crate::plugins::WebSocketFrameDirection,
+    ) -> (usize, usize) {
+        let limits = crate::proxy::EffectiveWsSizeLimits::from_plugins(
+            global_frame_bytes,
+            plugins,
+            direction,
+        );
+        (limits.max_frame_bytes, limits.max_message_bytes)
+    }
+
+    /// Plugin-attributed 1009 Close the relay publishes for a parser capacity
+    /// error read in `direction`; `None` when no plugin rule binds.
+    pub fn ws_plugin_capacity_close_for_test(
+        global_frame_bytes: usize,
+        plugins: &[Arc<dyn Plugin>],
+        direction: crate::plugins::WebSocketFrameDirection,
+        error: &WsError,
+    ) -> Option<CloseFrame> {
+        crate::proxy::EffectiveWsSizeLimits::from_plugins(global_frame_bytes, plugins, direction)
+            .plugin_close_for_error(error)
+            .map(|(close, _, _, _)| close)
+    }
+
+    /// Close the relay publishes for a terminated `permessage-deflate` read
+    /// fault in `direction`, and whether a size-policy plugin rule bound it.
+    pub fn ws_permessage_deflate_fault_close_for_test(
+        global_frame_bytes: usize,
+        plugins: &[Arc<dyn Plugin>],
+        direction: crate::plugins::WebSocketFrameDirection,
+        fault: crate::proxy::ws_permessage_deflate::PermessageDeflateFault,
+    ) -> (CloseFrame, bool) {
+        crate::proxy::EffectiveWsSizeLimits::from_plugins(global_frame_bytes, plugins, direction)
+            .permessage_deflate_fault_close(fault)
+    }
+
     /// Global capacity-overflow Close selection used when no plugin rule binds.
     pub fn global_ws_capacity_close_for_error_for_test(
         error: &WsError,
     ) -> Option<(CloseFrame, &'static str, usize, usize)> {
         crate::proxy::EffectiveWsSizeLimits::global_capacity_close_for_error(error)
-    }
-
-    /// Resolve the parser incomplete-message bounds from env config.
-    /// Returns `(max_frames, max_duration)`; `None` means that bound is off.
-    pub fn ws_fragment_policy_from_env_for_test(
-        env_config: &crate::config::EnvConfig,
-    ) -> (Option<usize>, Option<std::time::Duration>) {
-        crate::proxy::WsFragmentPolicy::from_env(env_config).bounds()
-    }
-
-    /// Bounded incomplete-message policy Close (RFC 6455 1008).
-    pub fn ws_fragment_policy_close_frame_for_test() -> CloseFrame {
-        crate::proxy::ws_fragment_policy_close_frame()
     }
 
     /// Policy-Close selection for the parser's incomplete-message bounds.
@@ -5166,9 +6285,12 @@ pub mod _test_support {
     /// Prepare deferred delivery observations for the final post-plugin message.
     pub fn prepare_ws_frame_deliveries_for_test(
         plugins: &[Arc<dyn crate::plugins::Plugin>],
+        connection_id: u64,
+        direction: crate::plugins::WebSocketFrameDirection,
         message: &Message,
     ) -> Vec<(usize, crate::plugins::WsFrameDeliveryObservation)> {
-        match crate::proxy::prepare_ws_frame_deliveries(plugins, message) {
+        match crate::proxy::prepare_ws_frame_deliveries(plugins, connection_id, direction, message)
+        {
             crate::proxy::WsFrameDeliveryBatch::None => Vec::new(),
             crate::proxy::WsFrameDeliveryBatch::One(index, observation) => {
                 vec![(index, observation)]
@@ -5206,15 +6328,6 @@ pub mod _test_support {
         )
     }
 
-    /// Apply the shared Ping/Pong control-frame guard used after frame plugins.
-    pub fn guard_ws_control_transform_for_test(
-        original: &Message,
-        transformed: Message,
-        direction: crate::plugins::WebSocketFrameDirection,
-    ) -> Message {
-        crate::proxy::guard_ws_control_transform(original, transformed, direction)
-    }
-
     /// Simulate the shared relay's post-plugin success boundary: run plugins,
     /// apply the control guard, prepare delivery observations from the final
     /// message, then emit them (as if the destination sink accepted the write).
@@ -5229,12 +6342,14 @@ pub mod _test_support {
             crate::proxy::apply_ws_frame_plugins(plugins, proxy_id, connection_id, direction, raw)
                 .await;
         if matches!(&outgoing, Message::Close(_)) {
-            // Policy Close is already recorded by observational `on_ws_frame`
-            // hooks inside the applicator; the production relay does not also
-            // emit a delivered observation for that rejection path.
+            // Policy Close is already reported to decision observers
+            // (`on_ws_policy_close`) by the applicator after the full pass; the
+            // production relay does not also emit a delivered observation for
+            // that rejection path.
             return outgoing;
         }
-        let prepared = crate::proxy::prepare_ws_frame_deliveries(plugins, &outgoing);
+        let prepared =
+            crate::proxy::prepare_ws_frame_deliveries(plugins, connection_id, direction, &outgoing);
         crate::proxy::emit_ws_frame_deliveries(
             plugins,
             proxy_id,
@@ -5243,6 +6358,96 @@ pub mod _test_support {
             prepared,
         );
         outgoing
+    }
+
+    /// Open the production H2 byte transport over an in-memory test connection.
+    pub async fn open_h2_byte_tunnel_for_test(
+        sender: h2::client::SendRequest<bytes::Bytes>,
+    ) -> Result<crate::proxy::hbone_pool::H2ConnectTunnel, crate::proxy::hbone_pool::HbonePoolError>
+    {
+        crate::proxy::hbone_pool::open_h2_connect_stream(
+            crate::proxy::hbone_pool::MeshH2Transport {
+                sender,
+                gate: crate::proxy::mesh_trust_registry::MeshTransportGate::new(),
+                load: crate::proxy::hbone_pool::HboneConnectionLoad::default(),
+            },
+            "backend.test",
+            80,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Drive the production framed WebSocket relay (`run_websocket_session`,
+    /// shared by H1 Upgrade and H2/H3 Extended CONNECT) end to end over
+    /// caller-owned transports.
+    ///
+    /// `client_io` is the gateway's client-side byte transport (the relay runs
+    /// a server-role framer over it, so client frames must be masked);
+    /// `backend_ws_stream` is the gateway's client-role framer toward the
+    /// backend. `plugins` goes through the production per-session collection
+    /// (execution-trigger admission and `bind_ws_session` substitution) to
+    /// build the parser-policy, frame-hook, and disconnect lists. Tunnel mode,
+    /// the idle timeout, the session deadline, drain, client trust, and
+    /// `permessage-deflate` are all off, so the session ends only through peer
+    /// Close, transport EOF/error, or a policy Close. `client_transport_settle`
+    /// is the H3 bridge verdict seam ([`crate::proxy::WsClientTransportSettle`]).
+    pub async fn run_framed_websocket_relay_for_test<C, B>(
+        client_io: C,
+        backend_ws_stream: tokio_tungstenite::WebSocketStream<B>,
+        proxy_id: &str,
+        connection_id: u64,
+        plugins: &[Arc<dyn crate::plugins::Plugin>],
+        session_meta: crate::proxy::WsSessionMeta,
+        client_transport_settle: Option<crate::proxy::WsClientTransportSettle<'_>>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+        B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let env_config = crate::config::EnvConfig::default();
+        let mut upgrade_ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/ws".to_string(),
+        );
+        let (ws_framing_plugins, ws_frame_plugins) =
+            crate::proxy::collect_websocket_relay_plugins(plugins, true, &mut upgrade_ctx);
+        let ws_disconnect_plugins =
+            crate::proxy::collect_websocket_disconnect_plugins(plugins, &mut upgrade_ctx);
+        let adaptive_buffer = crate::adaptive_buffer::AdaptiveBufferTracker::new(
+            false, false, 300, 8_192, 65_536, 65_536, 64,
+        );
+        let session_deadline = crate::proxy::WsSessionDeadline {
+            at: tokio::time::Instant::now() + Duration::from_secs(3_600),
+            reason: crate::proxy::WsTerminationReason::MaxLifetime,
+        };
+        crate::proxy::run_websocket_session(
+            client_io,
+            backend_ws_stream,
+            proxy_id,
+            connection_id,
+            ws_framing_plugins,
+            ws_frame_plugins,
+            ws_disconnect_plugins,
+            session_meta,
+            None,
+            env_config.max_websocket_frame_size_bytes,
+            env_config.websocket_write_buffer_size,
+            false,
+            Duration::from_secs(30),
+            None,
+            session_deadline,
+            None,
+            Arc::new(crate::overload::OverloadState::new()),
+            crate::proxy::WsFragmentPolicy::from_env(&env_config),
+            &adaptive_buffer,
+            None,
+            None,
+            client_transport_settle,
+        )
+        .await
     }
 
     /// Run the production per-session plugin-collection step, including
@@ -5364,6 +6569,7 @@ pub mod _test_support {
             65_536,
             262_144,
             4_096,
+            None,
             None,
             None,
         )
@@ -5533,12 +6739,6 @@ pub mod _test_support {
         plugin.notify_cleanup_for_tests();
     }
 
-    pub fn ai_semantic_cache_notify_rebuild_for_test(
-        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
-    ) {
-        plugin.notify_rebuild_for_tests();
-    }
-
     pub fn ai_semantic_cache_set_singleflight_wait_override_for_test(
         plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
         wait: Option<std::time::Duration>,
@@ -5561,6 +6761,20 @@ pub mod _test_support {
         body: &[u8],
     ) -> Option<(u16, HashMap<String, String>)> {
         plugin.admit_sealed_redis_hit_for_tests(redis_key, status_code, headers, body)
+    }
+
+    /// Seal an authenticated envelope as a writer whose wall clock is
+    /// `seal_offset_seconds` ahead of (positive) or behind (negative) this
+    /// replica and classify it as a Redis lookup would: `"admit"`, `"miss"`
+    /// (authentic but not fresh, never quarantined), or `"quarantine"`.
+    pub fn ai_semantic_cache_redis_hit_verdict_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+        redis_key: &str,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+        seal_offset_seconds: i64,
+    ) -> &'static str {
+        plugin.redis_hit_verdict_for_tests(redis_key, headers, body, seal_offset_seconds)
     }
 
     pub fn ai_semantic_cache_instance_id_for_test(
@@ -5796,18 +7010,16 @@ pub mod _test_support {
         plugin.cache_keys_for_tests()
     }
 
-    /// Apply `response_caching`'s underflow-safe cache-size subtraction to a
-    /// standalone counter so tests can prove a drift larger than the current
-    /// total saturates at `0` instead of wrapping to `usize::MAX`.
-    pub fn response_caching_sub_total_size(total: &std::sync::atomic::AtomicUsize, n: usize) {
-        use std::sync::atomic::Ordering;
-
-        if n == 0 {
-            return;
-        }
-        let _ = total.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-            Some(v.saturating_sub(n))
-        });
+    /// Add `add` to, then subtract `sub` from, `response_caching`'s running
+    /// cache-size accountant through its production helpers, so tests can prove
+    /// a drift larger than the current total saturates at `0` instead of
+    /// wrapping to `usize::MAX`.
+    pub fn response_caching_adjust_total_size_for_test(
+        plugin: &crate::plugins::response_caching::ResponseCaching,
+        add: usize,
+        sub: usize,
+    ) {
+        plugin.adjust_total_size_for_tests(add, sub);
     }
 
     // ── plugins/rate-limit cleanup wrappers (#2316) ──────────────────────────
@@ -5884,8 +7096,7 @@ pub mod _test_support {
         }
 
         pub fn seed_udp(&self, ip: &str, now: std::time::Instant) {
-            self.udp
-                .seed_client_at_for_test(std::sync::Arc::<str>::from(ip), 1, now);
+            self.udp.seed_client_at_for_test(ip, 1, now);
         }
 
         pub fn seed_udp_with_cap(
@@ -5894,12 +7105,8 @@ pub mod _test_support {
             now: std::time::Instant,
             max_entries: usize,
         ) -> bool {
-            self.udp.seed_client_at_with_cap_for_test(
-                std::sync::Arc::<str>::from(ip),
-                1,
-                now,
-                max_entries,
-            )
+            self.udp
+                .seed_client_at_with_cap_for_test(ip, 1, now, max_entries)
         }
 
         pub fn arm_udp_periodic(&self) {
@@ -5915,8 +7122,7 @@ pub mod _test_support {
         }
 
         pub fn udp_contains(&self, ip: &str) -> bool {
-            self.udp
-                .contains_client_for_test(&std::sync::Arc::<str>::from(ip))
+            self.udp.contains_client_for_test(ip)
         }
 
         pub fn udp_tracked(&self) -> Option<usize> {
@@ -5977,14 +7183,8 @@ pub mod _test_support {
             self.rate_limiting.tracked_keys_count()
         }
 
-        pub fn rate_limiting_apply_branch(
-            &self,
-            now: std::time::Instant,
-            over_capacity: bool,
-            max_entries: usize,
-        ) {
-            self.rate_limiting
-                .apply_cleanup_branch_for_test(now, over_capacity, max_entries);
+        pub fn rate_limiting_prune_stale(&self, now: std::time::Instant) {
+            self.rate_limiting.prune_stale_for_test(now);
         }
 
         pub fn seed_ai(&self, key: &str, now: std::time::Instant) {
@@ -6018,14 +7218,8 @@ pub mod _test_support {
             self.ai.tracked_keys_count()
         }
 
-        pub fn ai_apply_branch(
-            &self,
-            now: std::time::Instant,
-            over_capacity: bool,
-            max_entries: usize,
-        ) {
-            self.ai
-                .apply_cleanup_branch_for_test(now, over_capacity, max_entries);
+        pub fn ai_prune_stale(&self, now: std::time::Instant) {
+            self.ai.prune_stale_for_test(now);
         }
 
         pub fn seed_graphql(&self, key: &str, now: std::time::Instant) {
@@ -6059,14 +7253,8 @@ pub mod _test_support {
             self.graphql.tracked_keys_count()
         }
 
-        pub fn graphql_apply_branch(
-            &self,
-            now: std::time::Instant,
-            over_capacity: bool,
-            max_entries: usize,
-        ) {
-            self.graphql
-                .apply_cleanup_branch_for_test(now, over_capacity, max_entries);
+        pub fn graphql_prune_stale(&self, now: std::time::Instant) {
+            self.graphql.prune_stale_for_test(now);
         }
 
         pub fn seed_grpc(&self, key: &str, now: std::time::Instant) {
@@ -6100,14 +7288,8 @@ pub mod _test_support {
             self.grpc.tracked_keys_count()
         }
 
-        pub fn grpc_apply_branch(
-            &self,
-            now: std::time::Instant,
-            over_capacity: bool,
-            max_entries: usize,
-        ) {
-            self.grpc
-                .apply_cleanup_branch_for_test(now, over_capacity, max_entries);
+        pub fn grpc_prune_stale(&self, now: std::time::Instant) {
+            self.grpc.prune_stale_for_test(now);
         }
 
         pub fn seed_ws(&self, connection_id: u64, now: std::time::Instant) {
@@ -6145,14 +7327,8 @@ pub mod _test_support {
             self.ws.tracked_keys_count()
         }
 
-        pub fn ws_apply_branch(
-            &self,
-            now: std::time::Instant,
-            over_capacity: bool,
-            max_entries: usize,
-        ) {
-            self.ws
-                .apply_cleanup_branch_for_test(now, over_capacity, max_entries);
+        pub fn ws_prune_stale(&self, now: std::time::Instant) {
+            self.ws.prune_stale_for_test(now);
         }
     }
 
@@ -6202,7 +7378,78 @@ pub mod _test_support {
         datagram_size: u64,
         now: std::time::Instant,
     ) {
-        plugin.seed_client_at_for_test(std::sync::Arc::<str>::from(client_ip), datagram_size, now);
+        plugin.seed_client_at_for_test(client_ip, datagram_size, now);
+    }
+
+    /// Seed one client through the production atomic capacity gate with an
+    /// explicit cap. False for a previously unseen client at that cap.
+    pub fn udp_rate_limiting_seed_client_at_with_cap_for_test(
+        plugin: &crate::plugins::udp_rate_limiting::UdpRateLimiting,
+        client_ip: &str,
+        now: std::time::Instant,
+        max_entries: usize,
+    ) -> bool {
+        plugin.seed_client_at_with_cap_for_test(client_ip, 1, now, max_entries)
+    }
+
+    /// Run the production sampled/cooldown/at-cap cleanup path with an
+    /// explicit cap, WITHOUT arming the periodic sample.
+    pub fn udp_rate_limiting_maybe_evict_at_with_cap_for_test(
+        plugin: &crate::plugins::udp_rate_limiting::UdpRateLimiting,
+        now: std::time::Instant,
+        max_entries: usize,
+    ) -> bool {
+        plugin.maybe_evict_at_with_cap_for_test(now, max_entries)
+    }
+
+    pub fn udp_rate_limiting_contains_client_for_test(
+        plugin: &crate::plugins::udp_rate_limiting::UdpRateLimiting,
+        client_ip: &str,
+    ) -> bool {
+        plugin.contains_client_for_test(client_ip)
+    }
+
+    /// Exclusive `DashMap::entry` acquisitions on the local/fallback map
+    /// (always 0 without `debug_assertions`).
+    pub fn udp_rate_limiting_exclusive_entry_calls_for_test(
+        plugin: &crate::plugins::udp_rate_limiting::UdpRateLimiting,
+    ) -> usize {
+        plugin.exclusive_entry_calls_for_test()
+    }
+
+    /// Opaque handle over the datagram-hook policy fence an established
+    /// UDP/DTLS session carries.
+    pub struct UdpDatagramPolicyFenceForTest(crate::proxy::udp_proxy::UdpDatagramPolicyFence);
+
+    impl UdpDatagramPolicyFenceForTest {
+        /// Whether a session admitted when this fence was built may keep
+        /// running its admitted datagram hooks.
+        pub fn is_current(&self) -> bool {
+            self.0.is_current()
+        }
+    }
+
+    /// Build the fence a UDP/DTLS session admitted NOW on
+    /// `(namespace, proxy_id)` would carry: the store's current epoch and that
+    /// proxy's current UDP plugin list.
+    pub fn udp_datagram_policy_fence_for_test(
+        store: &std::sync::Arc<crate::request_epoch::RequestEpochStore>,
+        namespace: &str,
+        proxy_id: &str,
+    ) -> UdpDatagramPolicyFenceForTest {
+        let epoch = store.load();
+        let plugins = epoch.plugin_cache.plugins_for_protocol(
+            namespace,
+            proxy_id,
+            crate::plugins::ProxyProtocol::Udp,
+        );
+        UdpDatagramPolicyFenceForTest(crate::proxy::udp_proxy::UdpDatagramPolicyFence::new(
+            std::sync::Arc::clone(store),
+            &epoch,
+            namespace,
+            proxy_id,
+            plugins,
+        ))
     }
 
     pub fn udp_rate_limiting_maybe_evict_at_for_test(
@@ -6252,6 +7499,39 @@ pub mod _test_support {
         plugin: &crate::plugins::udp_rate_limiting::UdpRateLimiting,
     ) {
         plugin.reset_rate_limit_rejection_warn_for_test();
+    }
+
+    // ── plugins/mesh/outbound_registry ───────────────────────────────────────
+    /// Reset the process-wide HTTP REGISTRY_ONLY denial-log limiter so a
+    /// capture test can observe the next denial line.
+    pub fn mesh_outbound_registry_reset_http_deny_warn_for_test() {
+        crate::plugins::mesh::outbound_registry::reset_http_deny_warn_for_test();
+    }
+
+    /// Emit the HTTP REGISTRY_ONLY denial warning against a caller-owned
+    /// limiter and clock (deterministic log-capture coverage).
+    pub fn mesh_outbound_registry_warn_http_deny_with_for_test(
+        limiter: &crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter,
+        now_ms: u64,
+        host: Option<&str>,
+        port: Option<u16>,
+        listen_port: Option<u16>,
+        client_ip: &str,
+    ) {
+        crate::plugins::mesh::outbound_registry::warn_http_registry_deny_with(
+            limiter,
+            now_ms,
+            host,
+            port,
+            listen_port,
+            client_ip,
+            crate::plugins::mesh::outbound_registry::DENY_SOURCE_PLUGIN,
+        );
+    }
+
+    /// Request-authority split used by `mesh_outbound_registry`.
+    pub fn mesh_outbound_registry_split_host_header_for_test(value: &str) -> (&str, Option<u16>) {
+        crate::plugins::mesh::outbound_registry::split_host_header(value)
     }
 
     // ── util/atomic_log_rate_limiter ─────────────────────────────────────────
@@ -6318,6 +7598,18 @@ pub mod _test_support {
     }
 
     // ── rate-limit policy isolation (GHSA-gr3x-g777-hm78) ────────────────────
+    /// Construct a gRPC method router with an isolated metrics registry.
+    pub fn grpc_method_router_with_metrics_registry_for_test(
+        config: &serde_json::Value,
+        registry: std::sync::Arc<crate::plugins::prometheus_metrics::MetricsRegistry>,
+    ) -> Result<crate::plugins::grpc_method_router::GrpcMethodRouter, String> {
+        crate::plugins::grpc_method_router::GrpcMethodRouter::new(
+            config,
+            crate::plugins::PluginHttpClient::default(),
+        )
+        .map(|plugin| plugin.with_metrics_registry_for_test(registry))
+    }
+
     /// Effective default Redis key prefix for one rate-limit plugin config.
     ///
     /// Returns `None` for local-only configs. Used to prove that two
@@ -6491,7 +7783,7 @@ pub mod _test_support {
     pub use crate::plugins::utils::redis_rate_limiter::{
         MemoryPolicyScreen, ReplaySetNxReplyError, classify_memory_info,
         classify_replay_set_nx_reply, is_cluster_topology_code, is_cluster_topology_error,
-        parse_cluster_enabled, parse_memory_policy_fields,
+        parse_cluster_enabled,
     };
 
     // ── plugins/utils/rate_limit (stable local-state lifecycle, issue #4268) ──
@@ -6743,6 +8035,43 @@ pub mod _test_support {
         plugin.contains_connection_for_test(connection_id)
     }
 
+    /// `ws_rate_limiting`'s production hard cap on resident local/fallback keys.
+    pub fn ws_rate_limiting_max_state_entries_for_test() -> usize {
+        crate::plugins::ws_rate_limiting::WsRateLimiting::max_state_entries_for_test()
+    }
+
+    /// Seed one connection's local frame state at `now`, bypassing the cap.
+    pub fn ws_rate_limiting_seed_connection_for_test(
+        plugin: &crate::plugins::ws_rate_limiting::WsRateLimiting,
+        connection_id: u64,
+        now: std::time::Instant,
+    ) {
+        plugin.seed_connection_at_for_test(connection_id, now);
+    }
+
+    /// Whether the production capacity gate admits `connection_id` at `now`.
+    /// Returns false only for a previously unseen key while the map is full.
+    pub fn ws_rate_limiting_admits_at_production_cap_for_test(
+        plugin: &crate::plugins::ws_rate_limiting::WsRateLimiting,
+        connection_id: u64,
+        now: std::time::Instant,
+    ) -> bool {
+        plugin.seed_connection_at_with_cap_for_test(
+            connection_id,
+            now,
+            crate::plugins::ws_rate_limiting::WsRateLimiting::max_state_entries_for_test(),
+        )
+    }
+
+    /// Run the production capacity/periodic eviction gate at `now`, as every
+    /// frame does before admission.
+    pub fn ws_rate_limiting_maybe_evict_at_for_test(
+        plugin: &crate::plugins::ws_rate_limiting::WsRateLimiting,
+        now: std::time::Instant,
+    ) -> bool {
+        plugin.maybe_evict_at_for_test(now)
+    }
+
     /// Whether two `ws_rate_limiting` instances enforce on the same live state.
     pub fn ws_rate_limiting_shares_local_state_for_test(
         left: &crate::plugins::ws_rate_limiting::WsRateLimiting,
@@ -6764,11 +8093,7 @@ pub mod _test_support {
     }
 
     // ── plugins/utils/rate_limit (Redis failure policy) ──────────────────────
-    pub use crate::plugins::utils::rate_limit::{
-        ENFORCEMENT_UNAVAILABLE_BODY, ENFORCEMENT_UNAVAILABLE_MESSAGE,
-        ENFORCEMENT_UNAVAILABLE_STATUS, RATE_LIMIT_REDIS_CONFIG_KEYS, RedisFailurePolicy,
-        parse_redis_failure_policy,
-    };
+    pub use crate::plugins::utils::rate_limit::{RedisFailurePolicy, parse_redis_failure_policy};
 
     /// Redis key a rate-limit window bucket would use, for hash-tag coverage.
     pub fn redis_slot_key(config: RedisConfig, rate_key: &str, suffix: &[&str]) -> String {
@@ -6863,15 +8188,9 @@ pub mod _test_support {
         RedisRateLimitClient::sub_bucket_at(now, window_seconds)
     }
 
-    /// Live-clock Redis request-quota sub-bucket (single timestamp sample).
-    pub fn redis_sub_bucket(window_seconds: u64) -> RedisSubBucket {
-        RedisRateLimitClient::sub_bucket(window_seconds)
-    }
-
     // ── config/db_loader ─────────────────────────────────────────────────────
     pub use crate::config::db_loader::{
-        DbPoolConfig, SqlReconnectTopology, SqlReconnectTransitionHook,
-        SqlReconnectTransitionTestHooks,
+        DbPoolConfig, SqlReconnectTopology, SqlReconnectTransitionTestHooks,
     };
     pub use crate::config::db_tls_snapshot::SqlTlsSnapshot;
 
@@ -6890,6 +8209,16 @@ pub mod _test_support {
         db_url: &str,
     ) -> Result<(), anyhow::Error> {
         store.reconnect_as_failover(db_url).await
+    }
+
+    /// Re-arm `DatabaseStore`'s offline-bootstrap deferred-migration flag so
+    /// reconnect tests can make a failback's deferred migrations run (and
+    /// fail) against the staged primary pool (issue #7033).
+    pub fn database_store_set_migrations_pending_for_test(
+        store: &crate::config::db_loader::DatabaseStore,
+        pending: bool,
+    ) {
+        store.set_migrations_pending_for_test(pending);
     }
 
     /// Fail `DatabaseStore::latest_change_sequence` so live-apply tests can
@@ -6916,7 +8245,9 @@ pub mod _test_support {
 
     // ── config/mongo_store: Admin write-topology / publication test seams ────
     pub use crate::config::mongo_store::{
-        MongoReconnectTopology, MongoReconnectTransitionHook, MongoReconnectTransitionTestHooks,
+        AdmissionFence as MongoAdmissionFence, AdmissionFenceProbe as MongoAdmissionFenceProbe,
+        AdmissionFenceReason as MongoAdmissionFenceReason, MongoReconnectTopology,
+        MongoReconnectTransitionTestHooks,
     };
 
     // External test crates only: mirror production `config_changes` shapes without
@@ -7023,6 +8354,58 @@ pub mod _test_support {
         store.acquire_connection_generation_pin_for_test().await
     }
 
+    /// Retain an mTLS DNS admission fence exactly as an uncertain single-call
+    /// guard's Drop does, handing over a real generation read pin (#7031).
+    pub async fn mongo_store_retain_mtls_dns_admission_fence_for_test(
+        store: &crate::config::mongo_store::MongoStore,
+        namespace: &str,
+        owner: &str,
+    ) {
+        store
+            .retain_mtls_dns_admission_fence_for_test(namespace, owner)
+            .await;
+    }
+
+    /// Register a live multi-step persistent admission pin (holding the
+    /// generation read pin); `uncertain` marks an unknown borrowed outcome
+    /// (#7031).
+    pub async fn mongo_store_insert_persistent_admission_pin_for_test(
+        store: &crate::config::mongo_store::MongoStore,
+        namespace: &str,
+        guard_owner: &str,
+        uncertain: bool,
+    ) {
+        store
+            .insert_persistent_admission_pin_for_test(namespace, guard_owner, uncertain)
+            .await;
+    }
+
+    /// Explicit per-namespace mTLS DNS admission fence state (no I/O).
+    pub fn mongo_store_mtls_dns_admission_fence(
+        store: &crate::config::mongo_store::MongoStore,
+        namespace: &str,
+    ) -> crate::config::mongo_store::AdmissionFence {
+        store.mtls_dns_admission_fence(namespace)
+    }
+
+    /// The fail-closed fence gate admission runs under its generation pin.
+    pub fn mongo_store_ensure_mtls_dns_admission_unfenced_for_test(
+        store: &crate::config::mongo_store::MongoStore,
+        namespace: &str,
+    ) -> Result<(), anyhow::Error> {
+        store.ensure_mtls_dns_admission_unfenced_for_test(namespace)
+    }
+
+    /// Apply one exit-probe outcome to every retained fence on `namespace`
+    /// through the production decision; returns how many were cleared.
+    pub fn mongo_store_apply_mtls_dns_admission_fence_probe_for_test(
+        store: &crate::config::mongo_store::MongoStore,
+        namespace: &str,
+        probe: crate::config::mongo_store::AdmissionFenceProbe,
+    ) -> usize {
+        store.apply_mtls_dns_admission_fence_probe_for_test(namespace, probe)
+    }
+
     /// Active published Mongo database name (white-box accessor).
     pub fn mongo_store_published_database_name_for_test(
         store: &crate::config::mongo_store::MongoStore,
@@ -7096,10 +8479,6 @@ pub mod _test_support {
         )
     }
 
-    pub fn db_diff_removed(known: &HashSet<String>, current: &HashSet<String>) -> Vec<String> {
-        known.difference(current).cloned().collect()
-    }
-
     pub fn db_code_is_transient(code: &str, is_sqlite: bool) -> bool {
         crate::config::db_loader::is_transient_database_code(code, is_sqlite)
     }
@@ -7128,8 +8507,12 @@ pub mod _test_support {
         crate::config::db_loader::parse_scheme(s)
     }
 
-    pub fn parse_auth_mode(s: &str) -> AuthMode {
+    pub fn parse_auth_mode(s: &str) -> Result<AuthMode, String> {
         crate::config::db_loader::parse_auth_mode(s)
+    }
+
+    pub fn parse_plugin_scope(s: &str) -> Result<crate::config::types::PluginScope, String> {
+        crate::config::db_loader::parse_plugin_scope(s)
     }
 
     pub fn lock_wait_timeout_sql(timeout_seconds: u64, is_mysql: bool) -> Option<String> {
@@ -7258,6 +8641,91 @@ pub mod _test_support {
             mutation_started,
             outcome_settled,
         )
+    }
+
+    /// Drives the shared admin mTLS DNS admission hold state (single-mutation
+    /// state plus the multi-phase restore phase) the way the restore flow
+    /// does, so external tests can assert when guard Drop releases the
+    /// durable fence (issue #7032).
+    pub struct AdminMtlsDnsAdmissionHoldProbe(
+        std::sync::Arc<crate::admin::MtlsDnsAdmissionHoldState>,
+    );
+
+    impl Default for AdminMtlsDnsAdmissionHoldProbe {
+        fn default() -> Self {
+            Self(std::sync::Arc::new(
+                crate::admin::MtlsDnsAdmissionHoldState::new(),
+            ))
+        }
+    }
+
+    impl AdminMtlsDnsAdmissionHoldProbe {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        pub async fn run_mutation<T, F>(&self, mutation: F) -> T
+        where
+            F: std::future::Future<Output = T>,
+        {
+            self.0.run_mutation(mutation).await
+        }
+
+        pub async fn run_restore_clear<T, E, F>(&self, clear: F) -> Result<T, E>
+        where
+            F: std::future::Future<Output = Result<T, E>>,
+        {
+            self.0.run_restore_clear(clear).await
+        }
+
+        pub async fn run_restore_import<T, F>(
+            &self,
+            import: F,
+            succeeded: impl FnOnce(&T) -> bool,
+        ) -> T
+        where
+            F: std::future::Future<Output = T>,
+        {
+            self.0.run_restore_import(import, succeeded).await
+        }
+
+        pub async fn run_restore_rollback<T, E, F>(&self, rollback: F) -> Result<T, E>
+        where
+            F: std::future::Future<Output = Result<T, E>>,
+        {
+            self.0.run_restore_rollback(rollback).await
+        }
+
+        /// Mirror the restore flow's explicit `Cleared` transitions (ambiguous
+        /// atomic clear, or a lost lease during a clear that may have removed
+        /// rows).
+        pub fn mark_restore_cleared(&self) {
+            self.0.mark_restore_cleared_for_test();
+        }
+
+        /// Mirror the restore flow's explicit failed-import transition (lease
+        /// lost during import; the same guard carries the rollback).
+        pub fn mark_restore_import_failed(&self) {
+            self.0.mark_restore_import_failed_for_test();
+        }
+
+        /// Whether `MtlsDnsAdmissionGuardLifecycle::drop` would release the
+        /// durable fence in the current state.
+        pub fn drop_releases(&self) -> bool {
+            self.0.release_on_drop()
+        }
+    }
+
+    /// Abandon a restore's lost-lease recovery while its namespace lease
+    /// reacquisition is pending (issue #7062). Returns the abandoned restore
+    /// guard owner. See `admin::abandon_restore_lost_lease_recovery_for_test`.
+    pub async fn admin_abandon_restore_lost_lease_recovery_for_test(
+        db: std::sync::Arc<dyn crate::config::db_backend::DatabaseBackend>,
+        namespace: &str,
+        after_import: bool,
+    ) -> Result<String, anyhow::Error> {
+        crate::admin::abandon_restore_lost_lease_recovery_for_test(db, namespace, after_import)
+            .await
     }
 
     pub fn admin_mtls_dns_admission_contention_response(
@@ -8056,27 +9524,29 @@ pub mod _test_support {
             .map(|split| split.map(|frame| (frame.data_end, frame.trailers)))
     }
 
-    /// The request trailers a gRPC dispatch would send, read back from
-    /// owner-scoped request staging exactly as the dispatch paths read them.
+    /// The request trailers a gRPC dispatch would send, read back from the
+    /// owner's typed request staging exactly as the dispatch paths read them.
     ///
     /// Sorted by name so assertions do not depend on `HeaderMap`'s hash order;
     /// the sort is stable, so repeated values of one name keep wire order.
     pub fn staged_grpc_web_request_trailers(
-        metadata: &HashMap<String, String>,
+        ctx: &crate::plugins::RequestContext,
     ) -> Option<Vec<(String, String)>> {
-        crate::plugins::grpc_web::staged_request_trailers(metadata).map(|map| {
-            let mut entries: Vec<(String, String)> = map
-                .iter()
-                .map(|(name, value)| {
-                    (
-                        name.as_str().to_string(),
-                        String::from_utf8_lossy(value.as_bytes()).into_owned(),
-                    )
-                })
-                .collect();
-            entries.sort_by(|a, b| a.0.cmp(&b.0));
-            entries
-        })
+        crate::plugins::grpc_web::staged_request_trailers(&ctx.grpc_web_request_trailers).map(
+            |map| {
+                let mut entries: Vec<(String, String)> = map
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            name.as_str().to_string(),
+                            String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                        )
+                    })
+                    .collect();
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                entries
+            },
+        )
     }
 
     pub fn response_content_type(original_ct: &str) -> String {
@@ -8184,6 +9654,15 @@ pub mod _test_support {
         crate::proxy::collect_forwardable_websocket_headers(raw_headers, proxy_headers)
     }
 
+    /// The H3 frontend's backend WebSocket handshake header collector
+    /// (`http3::websocket::collect_forwardable_h3_headers`).
+    pub fn collect_forwardable_h3_websocket_headers_for_test(
+        headers: &HashMap<String, String>,
+        is_early_data: bool,
+    ) -> Vec<(String, String)> {
+        crate::http3::websocket::collect_forwardable_h3_headers(headers, is_early_data)
+    }
+
     /// Forward a `permessage-deflate` offer the way a passthrough proxy does;
     /// returns whether an offer was forwarded (issue #5769).
     pub fn push_permessage_deflate_offer_for_test(
@@ -8213,7 +9692,9 @@ pub mod _test_support {
     pub fn permessage_deflate_answer_for_test(
         headers: &hyper::HeaderMap,
     ) -> Option<hyper::header::HeaderValue> {
-        crate::proxy::permessage_deflate_answer(headers)
+        crate::proxy::backend_extensions_answer(headers)
+            .as_ref()
+            .and_then(crate::proxy::permessage_deflate_answer_from)
     }
 
     /// Finish a `websocket_permessage_deflate: terminate` negotiation against
@@ -8552,19 +10033,6 @@ pub mod _test_support {
         .await
     }
 
-    /// Build the log metadata a transaction summary is rendered from, exactly as
-    /// every logger sink does.
-    ///
-    /// This is the production projection (`clone_log_metadata`), not a
-    /// re-implementation, so a test asserting that an internal lifecycle marker
-    /// is absent is asserting on the same redaction pass the operator's
-    /// transaction logs go through.
-    pub fn clone_log_metadata_for_test(
-        ctx: &crate::plugins::RequestContext,
-    ) -> HashMap<String, String> {
-        crate::proxy::clone_log_metadata(ctx)
-    }
-
     /// The stamped `Content-Length` a LATER buffered body transform will read
     /// for this response.
     ///
@@ -8572,7 +10040,7 @@ pub mod _test_support {
     /// (`get(ORIGINAL_RESPONSE_CONTENT_LENGTH_METADATA_KEY).and_then(parse)`), so
     /// a test asserting on it is asserting on what the MCP reverse-mapping
     /// transform actually sees. The key is deliberately stripped from transaction
-    /// metadata, so `clone_log_metadata_for_test` cannot answer this.
+    /// metadata, so `clone_log_metadata` cannot answer this.
     pub fn stamped_response_content_length_for_test(
         ctx: &crate::plugins::RequestContext,
     ) -> Option<usize> {
@@ -8637,8 +10105,8 @@ pub mod _test_support {
     /// Drive the transaction-metadata status refresh the buffered gRPC paths run
     /// after trailer reconciliation, including the body-framed gRPC-Web case
     /// where the terminal status is deliberately absent from both maps.
-    pub fn refresh_grpc_status_metadata_for_test(
-        metadata: &mut HashMap<String, String>,
+    pub fn refresh_grpc_status_metadata_for_test<MS: std::hash::BuildHasher>(
+        metadata: &mut std::collections::HashMap<String, String, MS>,
         trailers: &HashMap<String, String>,
         headers: &HashMap<String, String>,
         terminal_metadata_is_body_framed: bool,
@@ -8823,6 +10291,12 @@ pub mod _test_support {
         .await;
     }
 
+    pub fn plugin_capabilities_for_plugins_for_test(
+        plugins: &[Arc<dyn Plugin>],
+    ) -> crate::PluginCapabilities {
+        crate::plugin_cache::plugin_capabilities_for_plugins_for_test(plugins)
+    }
+
     pub async fn run_after_proxy_hooks_for_test(
         plugins: &[Arc<dyn Plugin>],
         ctx: &mut crate::plugins::RequestContext,
@@ -8849,6 +10323,22 @@ pub mod _test_support {
             crate::proxy::BackendPathBeforeProxyPass::Initial,
         )
         .await
+    }
+
+    /// The production successful-WebSocket-handshake response header pass,
+    /// including the matched route response-header list.
+    pub fn finalize_successful_websocket_response_headers_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &crate::plugins::RequestContext,
+        response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        crate::proxy::finalize_successful_websocket_response_headers(
+            plugins,
+            ctx,
+            response_status,
+            response_headers,
+        );
     }
 
     /// Like [`run_after_proxy_hooks_for_test`] but surfaces the terminal
@@ -8939,6 +10429,23 @@ pub mod _test_support {
         .0
     }
 
+    /// The final per-frontend repair point for a gateway-replaced `401`
+    /// (issue #6774), run where every frontend runs it: after the buffered
+    /// transform and policy stages, before committed observers and the wire.
+    pub fn ensure_replaced_response_challenge_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &crate::plugins::RequestContext,
+        response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        crate::proxy::ensure_replaced_response_challenge(
+            plugins,
+            ctx,
+            response_status,
+            response_headers,
+        );
+    }
+
     pub fn strip_content_length_for_streaming_grpc_deadline_for_test(
         response_headers: &mut HashMap<String, String>,
         deadline_enabled: bool,
@@ -8955,6 +10462,8 @@ pub mod _test_support {
     pub enum H3GrpcUploadFaultKind {
         ClientAbort,
         MalformedTrailers,
+        MalformedBody,
+        GatewayTerminated,
         Oversize,
         BackendUploadHalted,
         AuthorizationExpired,
@@ -8969,6 +10478,12 @@ pub mod _test_support {
             }
             H3GrpcUploadFaultKind::MalformedTrailers => {
                 crate::http3::server::H3GrpcUploadFault::MalformedTrailers
+            }
+            H3GrpcUploadFaultKind::MalformedBody => {
+                crate::http3::server::H3GrpcUploadFault::MalformedBody
+            }
+            H3GrpcUploadFaultKind::GatewayTerminated => {
+                crate::http3::server::H3GrpcUploadFault::GatewayTerminated
             }
             H3GrpcUploadFaultKind::Oversize => crate::http3::server::H3GrpcUploadFault::Oversize,
             H3GrpcUploadFaultKind::BackendUploadHalted => {
@@ -9042,6 +10557,12 @@ pub mod _test_support {
             Some(crate::http3::server::H3GrpcUploadFault::MalformedTrailers) => {
                 H3GrpcUploadFaultKind::MalformedTrailers
             }
+            Some(crate::http3::server::H3GrpcUploadFault::MalformedBody) => {
+                H3GrpcUploadFaultKind::MalformedBody
+            }
+            Some(crate::http3::server::H3GrpcUploadFault::GatewayTerminated) => {
+                H3GrpcUploadFaultKind::GatewayTerminated
+            }
             Some(crate::http3::server::H3GrpcUploadFault::Oversize) => {
                 H3GrpcUploadFaultKind::Oversize
             }
@@ -9052,6 +10573,92 @@ pub mod _test_support {
                 H3GrpcUploadFaultKind::AuthorizationExpired
             }
             None => unreachable!("a published fault must latch"),
+        }
+    }
+
+    /// The fault a native-H3 gRPC upload state latches when `kind` is published
+    /// while the client's connection is `peer` (issue #6772): a
+    /// gateway-terminated read on a connection the client closed latches as
+    /// the client's abort.
+    pub fn h3_grpc_upload_fault_latched_with_peer_for_test(
+        kind: H3GrpcUploadFaultKind,
+        peer: Option<crate::plugins::PeerConnectionSignal>,
+    ) -> H3GrpcUploadFaultKind {
+        let state = crate::http3::server::H3GrpcUploadState::new().with_peer_connection(peer);
+        state.publish_fault(h3_grpc_upload_fault_for_test(kind));
+        match state.fault() {
+            Some(crate::http3::server::H3GrpcUploadFault::ClientAbort) => {
+                H3GrpcUploadFaultKind::ClientAbort
+            }
+            Some(crate::http3::server::H3GrpcUploadFault::MalformedTrailers) => {
+                H3GrpcUploadFaultKind::MalformedTrailers
+            }
+            Some(crate::http3::server::H3GrpcUploadFault::MalformedBody) => {
+                H3GrpcUploadFaultKind::MalformedBody
+            }
+            Some(crate::http3::server::H3GrpcUploadFault::GatewayTerminated) => {
+                H3GrpcUploadFaultKind::GatewayTerminated
+            }
+            Some(crate::http3::server::H3GrpcUploadFault::Oversize) => {
+                H3GrpcUploadFaultKind::Oversize
+            }
+            Some(crate::http3::server::H3GrpcUploadFault::BackendUploadHalted) => {
+                H3GrpcUploadFaultKind::BackendUploadHalted
+            }
+            Some(crate::http3::server::H3GrpcUploadFault::AuthorizationExpired(_)) => {
+                H3GrpcUploadFaultKind::AuthorizationExpired
+            }
+            None => unreachable!("a published fault must latch"),
+        }
+    }
+
+    /// Replay a sequence of QUIC close reasons through the HTTP/3 peer watch's
+    /// write-once close latch, classifying each with the watch's own
+    /// predicate, and return the latched verdict: `None` while every
+    /// observation saw an open connection, `Some(true)` when the first
+    /// observed close was the client's (issue #6772). Models a request task
+    /// settling its terminal after the h3 teardown's `LocallyClosed`
+    /// overwrote a client's close.
+    pub fn quic_close_latch_verdict_for_test(
+        observed: Vec<Option<quinn::ConnectionError>>,
+    ) -> Option<bool> {
+        let latch = crate::proxy::client_abort::ConnectionCloseLatch::new();
+        let mut verdict = None;
+        for reason in observed {
+            verdict = latch.observe(
+                reason
+                    .as_ref()
+                    .map(crate::http3::server::quinn_close_reason_is_peer),
+            );
+        }
+        verdict
+    }
+
+    /// The positive classification of a failed HTTP/3 request-stream read
+    /// (issue #6772).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum H3RequestReadFailureKind {
+        ClientAbort,
+        Malformed,
+        GatewayTerminated,
+    }
+
+    /// Classify the QUIC connection error h3 surfaced for a request-stream
+    /// read, exactly as `classify_h3_request_read_error` does for a remote
+    /// connection error.
+    pub fn h3_connection_error_incoming_failure_for_test(
+        incoming: &h3::quic::ConnectionErrorIncoming,
+    ) -> H3RequestReadFailureKind {
+        match crate::http3::stream_util::classify_connection_error_incoming(incoming) {
+            crate::http3::stream_util::H3RequestReadFailure::ClientAbort => {
+                H3RequestReadFailureKind::ClientAbort
+            }
+            crate::http3::stream_util::H3RequestReadFailure::Malformed => {
+                H3RequestReadFailureKind::Malformed
+            }
+            crate::http3::stream_util::H3RequestReadFailure::GatewayTerminated => {
+                H3RequestReadFailureKind::GatewayTerminated
+            }
         }
     }
 
@@ -9321,22 +10928,6 @@ pub mod _test_support {
         )
     }
 
-    pub fn can_dispatch_direct_http2_pool(
-        enable_http2: bool,
-        retain_request_body: bool,
-        requires_request_body_buffering: bool,
-        max_request_body_size_bytes: usize,
-        max_response_body_size_bytes: usize,
-    ) -> bool {
-        crate::proxy::can_dispatch_direct_http2_pool(
-            enable_http2,
-            retain_request_body,
-            requires_request_body_buffering,
-            max_request_body_size_bytes,
-            max_response_body_size_bytes,
-        )
-    }
-
     /// Issue #3942: ordinary unlimited direct-H2 must not wrap
     /// `SizeLimitedIncoming` (the adapter treats `max_bytes = 0` as deny-all
     /// and a `usize::MAX` wrap still costs a per-frame atomic + limit compare).
@@ -9371,15 +10962,163 @@ pub mod _test_support {
         crate::proxy::request_may_have_body(method, headers)
     }
 
+    /// Whether the HTTP/1.1 dispatchers add explicit `Transfer-Encoding:
+    /// chunked` for this method and outbound body.
+    pub fn h1_request_requires_explicit_chunked_framing<B>(method: &str, body: &B) -> bool
+    where
+        B: http_body::Body + ?Sized,
+    {
+        crate::proxy::h1_request_requires_explicit_chunked_framing(method, body)
+    }
+
+    /// Proxy core's pre-body final-header boundary: provisional media-type
+    /// skip recording and clone-on-write stale request-digest retirement.
+    pub fn finalize_request_transformer_headers(
+        ctx: &mut crate::plugins::RequestContext,
+        owned_proxy_headers: &mut Option<HashMap<String, String>>,
+    ) {
+        crate::proxy::finalize_request_transformer_headers(ctx, owned_proxy_headers)
+    }
+
+    /// Native HTTP/3 deferred-pass variant of the final-header boundary.
+    pub fn finalize_request_transformer_headers_in_map(
+        ctx: &mut crate::plugins::RequestContext,
+        headers: &mut HashMap<String, String>,
+    ) {
+        crate::proxy::finalize_request_transformer_headers_in_map(ctx, headers)
+    }
+
+    pub fn apply_finalized_request_egress_header_overlay(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        owned_proxy_headers: &mut Option<HashMap<String, String>>,
+        overlay: HashMap<String, String>,
+        strip_baggage_keys: &[String],
+    ) {
+        crate::proxy::apply_finalized_request_egress_header_overlay(
+            plugins,
+            ctx,
+            owned_proxy_headers,
+            overlay,
+            strip_baggage_keys,
+        );
+    }
+
+    pub fn apply_finalized_request_egress_header_overlay_in_map(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &crate::plugins::RequestContext,
+        headers: &mut HashMap<String, String>,
+        overlay: HashMap<String, String>,
+        strip_baggage_keys: &[String],
+    ) {
+        crate::proxy::apply_finalized_request_egress_header_overlay_in_map(
+            plugins,
+            ctx,
+            headers,
+            overlay,
+            strip_baggage_keys,
+        );
+    }
+
     pub async fn apply_request_body_plugins(
         plugins: &[Arc<dyn Plugin>],
         headers: &HashMap<String, String>,
         body_bytes: Vec<u8>,
     ) -> Vec<u8> {
+        let transformed = crate::proxy::apply_request_body_plugins_with_context(
+            plugins, None, None, headers, body_bytes, None,
+        )
+        .await;
+        uncharged_request_body_transform(transformed)
+    }
+
+    /// The transform chain with no request-buffer charge has nothing to
+    /// refuse, so its capacity error is unreachable.
+    fn uncharged_request_body_transform(
+        transformed: Result<Vec<u8>, crate::proxy::RequestBodyCapacityExceeded>,
+    ) -> Vec<u8> {
+        match transformed {
+            Ok(body) => body,
+            Err(crate::proxy::RequestBodyCapacityExceeded) => {
+                unreachable!("an uncharged body is never refused for capacity")
+            }
+        }
+    }
+
+    /// Run the PRODUCTION request-body transform chain with a request-buffer
+    /// charge, so a test can observe that every replacement is charged before
+    /// the next transform runs. `None` is the capacity refusal: the uncovered
+    /// replacement and the body were dropped and the charge released.
+    pub async fn apply_request_body_plugins_with_charge_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        headers: &HashMap<String, String>,
+        body: Vec<u8>,
+        charge: &mut RequestBufferPermitProbe,
+    ) -> Option<Vec<u8>> {
         crate::proxy::apply_request_body_plugins_with_context(
-            plugins, None, None, headers, body_bytes,
+            plugins,
+            None,
+            None,
+            headers,
+            body,
+            Some(&mut charge.0),
         )
         .await
+        .ok()
+    }
+
+    /// Model the H1/H2 buffered request-body hook round trip: clone the live
+    /// context into the compatibility hook context, run the transform chain and
+    /// the final request-body chain on that clone, then hand state back to the
+    /// live context exactly as the dispatcher does (typed terminals and staged
+    /// state first, then the metadata swap). Returns the backend-bound body and
+    /// the final chain's verdict.
+    pub async fn run_buffered_request_body_hook_round_trip_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        headers: &HashMap<String, String>,
+        body: Vec<u8>,
+    ) -> (Vec<u8>, crate::plugins::PluginResult) {
+        let mut hook_ctx = ctx.clone_for_final_request_body_hooks();
+        let transformed = crate::proxy::apply_request_body_plugins_with_context(
+            plugins,
+            Some(&mut hook_ctx),
+            None,
+            headers,
+            body,
+            None,
+        )
+        .await;
+        let transformed = uncharged_request_body_transform(transformed);
+        let result = crate::proxy::run_final_request_body_hooks(
+            plugins,
+            Some(&mut hook_ctx),
+            None,
+            headers,
+            &transformed,
+        )
+        .await;
+        ctx.adopt_final_request_body_hook_context(hook_ctx);
+        (transformed, result)
+    }
+
+    /// The listen port a WebSocket session's disconnect metadata reports
+    /// (issue #7164).
+    pub fn websocket_session_listen_port_for_test(
+        ctx: &crate::plugins::RequestContext,
+        is_tls: bool,
+        env_config: &crate::config::EnvConfig,
+    ) -> u16 {
+        crate::proxy::websocket_session_listen_port(ctx, is_tls, env_config)
+    }
+
+    /// Stage a typed AI usage snapshot on `ctx`, as a built-in AI plugin
+    /// does, so hook hand-back tests can observe which context's value wins.
+    pub fn stage_ai_usage_export_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        export: crate::plugins::AiUsageExport,
+    ) {
+        ctx.stage_ai_usage_export(export);
     }
 
     pub async fn apply_buffered_request_body_normalization_before_before_proxy_for_test(
@@ -9388,7 +11127,7 @@ pub mod _test_support {
         headers: &mut HashMap<String, String>,
         body: &mut Vec<u8>,
     ) -> crate::plugins::PluginResult {
-        crate::proxy::apply_buffered_request_body_normalization_before_before_proxy(
+        apply_buffered_request_body_normalization_with_requirements_for_test(
             plugins, ctx, headers, body, true, true,
         )
         .await
@@ -9402,15 +11141,65 @@ pub mod _test_support {
         needs_body_text: bool,
         needs_body_bytes: bool,
     ) -> crate::plugins::PluginResult {
-        crate::proxy::apply_buffered_request_body_normalization_before_before_proxy(
+        // With no request-buffer charge there is nothing for the budget to
+        // refuse, so the phase always yields a plugin result.
+        match crate::proxy::apply_buffered_request_body_normalization_before_before_proxy(
             plugins,
             ctx,
             headers,
             body,
+            None,
             needs_body_text,
             needs_body_bytes,
         )
         .await
+        {
+            Ok(result) => result,
+            Err(crate::proxy::RequestBodyCapacityExceeded) => {
+                unreachable!("an uncharged body is never refused for capacity")
+            }
+        }
+    }
+
+    /// Outcome of the PRODUCTION pre-`before_proxy` normalization phase run
+    /// with a request-buffer charge.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ChargedNormalizationOutcomeForTest {
+        Continue,
+        Rejected,
+        BufferCapacityExceeded,
+    }
+
+    /// Run the PRODUCTION pre-`before_proxy` normalization phase with the
+    /// collected body's request-buffer charge, exactly as both protocol
+    /// handlers do, so a test can observe that a normalized (for example
+    /// decompressed) body is charged before any later phase keeps it.
+    pub async fn apply_buffered_request_body_normalization_with_charge_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        headers: &mut HashMap<String, String>,
+        body: &mut Vec<u8>,
+        charge: &mut RequestBufferPermitProbe,
+    ) -> ChargedNormalizationOutcomeForTest {
+        match crate::proxy::apply_buffered_request_body_normalization_before_before_proxy(
+            plugins,
+            ctx,
+            headers,
+            body,
+            Some(&mut charge.0),
+            true,
+            true,
+        )
+        .await
+        {
+            Ok(crate::plugins::PluginResult::Continue) => {
+                ChargedNormalizationOutcomeForTest::Continue
+            }
+            Ok(_) => ChargedNormalizationOutcomeForTest::Rejected,
+            Err(crate::proxy::RequestBodyCapacityExceeded) => {
+                ChargedNormalizationOutcomeForTest::BufferCapacityExceeded
+            }
+        }
     }
 
     /// Drive the client-request-contract phase exactly as both protocol
@@ -9615,6 +11404,15 @@ pub mod _test_support {
         ctx.serverless_terminate_response = value;
     }
 
+    /// Note `plugin` as the plugin whose hook rejected the request, exactly as
+    /// the rejection funnel does (origin provenance included, issue #6774).
+    pub fn note_rejecting_plugin_for_test(
+        ctx: &crate::plugins::RequestContext,
+        plugin: &dyn crate::plugins::Plugin,
+    ) {
+        crate::diagnostic_ref::note_rejecting_plugin(ctx, plugin);
+    }
+
     /// The production gate that decides whether a plugin short-circuit runs the
     /// shared response-body policy lifecycle (`on_response_body`,
     /// representation admission, transforms, `on_final_response_body`).
@@ -9791,6 +11589,17 @@ pub mod _test_support {
         ctx.set_request_http_flavor(flavor);
     }
 
+    /// Record the transport's request end-of-stream evidence exactly as the
+    /// H1/H2 (`!Incoming::is_end_stream()`) and H3 (always `Some(true)`)
+    /// frontends do, so body-governance decisions can be exercised for a head
+    /// that omits `Content-Length` / `Content-Type`.
+    pub fn set_inbound_request_body_may_follow_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        may_follow: Option<bool>,
+    ) {
+        ctx.inbound_request_body_may_follow = may_follow;
+    }
+
     /// Stamp the authoritative client-visible wire transport a frontend would
     /// record, so trigger `protocol:` predicates can be exercised without
     /// standing up an H1/H2/H3 listener.
@@ -9818,8 +11627,8 @@ pub mod _test_support {
         crate::proxy::tcp_proxy::tcp_fault_admission_should_cancel(&readiness, &socket_error)
     }
 
-    pub fn insert_grpc_error_metadata(
-        metadata: &mut HashMap<String, String>,
+    pub fn insert_grpc_error_metadata<MS: std::hash::BuildHasher>(
+        metadata: &mut std::collections::HashMap<String, String, MS>,
         grpc_status: u32,
         grpc_message: &str,
     ) {
@@ -9827,7 +11636,22 @@ pub mod _test_support {
     }
 
     pub fn clone_log_metadata(ctx: &crate::plugins::RequestContext) -> HashMap<String, String> {
-        crate::proxy::clone_log_metadata(ctx)
+        crate::proxy::clone_log_metadata(ctx).into_iter().collect()
+    }
+
+    /// The streaming terminal logger's projection: moves `ctx.metadata` out
+    /// instead of cloning it (issue #6793).
+    pub fn take_log_metadata(ctx: &mut crate::plugins::RequestContext) -> HashMap<String, String> {
+        crate::proxy::take_log_metadata(ctx).into_iter().collect()
+    }
+
+    /// Latch a credential-expiry termination on the request's shared
+    /// authorization latch, as a body adapter does when the lifetime elapses.
+    pub fn latch_credential_expired_termination_for_test(ctx: &crate::plugins::RequestContext) {
+        ctx.authorization_termination_latch().record_once(
+            crate::proxy::auth_lifetime::StreamAuthTermination::CredentialExpired,
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
+        );
     }
 
     /// Whether this request has materialized the boxed per-plugin working state
@@ -9942,7 +11766,7 @@ pub mod _test_support {
         backend_target: String,
         listen_port: u16,
         consumer_username: Option<String>,
-        metadata: HashMap<String, String>,
+        metadata: crate::plugins::MetadataMap,
         session_start: chrono::DateTime<chrono::Utc>,
     ) -> crate::proxy::WsSessionMeta {
         crate::proxy::WsSessionMeta {
@@ -9955,6 +11779,10 @@ pub mod _test_support {
             handshake_status_code: 101,
             listen_port,
             connection_id: 0,
+            // Test sessions model a mapped Consumer.
+            principal_origin: consumer_username
+                .as_ref()
+                .map(|_| crate::plugins::utils::principal::PrincipalOrigin::Consumer),
             consumer_username,
             auth_method: None,
             metadata,
@@ -9974,7 +11802,7 @@ pub mod _test_support {
         backend_target: String,
         listen_port: u16,
         consumer_username: Option<String>,
-        metadata: HashMap<String, String>,
+        metadata: crate::plugins::MetadataMap,
         session_start: chrono::DateTime<chrono::Utc>,
         session_start_mono: std::time::Instant,
     ) -> crate::proxy::WsSessionMeta {
@@ -9988,6 +11816,10 @@ pub mod _test_support {
             handshake_status_code: 101,
             listen_port,
             connection_id: 0,
+            // Test sessions model a mapped Consumer.
+            principal_origin: consumer_username
+                .as_ref()
+                .map(|_| crate::plugins::utils::principal::PrincipalOrigin::Consumer),
             consumer_username,
             auth_method: None,
             metadata,
@@ -10111,7 +11943,8 @@ pub mod _test_support {
         deadline_after: std::time::Duration,
         overload: std::sync::Arc<crate::overload::OverloadState>,
     ) -> &'static str {
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let deadline = crate::proxy::WsSessionDeadline {
             at: tokio::time::Instant::now()
                 .checked_add(deadline_after)
@@ -10134,6 +11967,16 @@ pub mod _test_support {
     ) -> Option<std::time::Duration> {
         ctx.credential_deadline_at
             .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
+    }
+
+    /// Whether `ctx` carries, or would admit, a verified peer SPIFFE identity
+    /// — the HBONE refusal paths' peerless classifier. Exposed so external
+    /// tests can pin its agreement with `spiffe_identity` admission after a
+    /// captured deadline elapses.
+    pub fn has_verified_peer_spiffe_identity_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        crate::plugins::mesh::spiffe_identity::has_verified_peer_spiffe_identity(ctx)
     }
 
     /// The accepted request credential's monotonic deadline Instant, if any.
@@ -10336,6 +12179,36 @@ pub mod _test_support {
         )
     }
 
+    /// The client RPC deadline's pump guard, held by the client-facing body
+    /// in production. Opaque: a test only keeps it alive or drops it.
+    pub struct RpcDeadlinePumpGuardForTest(
+        #[allow(dead_code)] crate::proxy::response_watchdog::ResponsePumpGuard,
+    );
+
+    /// Move one body into the client RPC deadline's response pump, as
+    /// `ProxyBody::with_client_grpc_deadline` does on an H1/H2 frontend, and
+    /// return the pump's intermediate reader separately from its guard, so a
+    /// test can drive that reader's own expiry acknowledgement while the
+    /// client-facing guard stays alive.
+    pub fn rpc_deadline_cancellable_body_for_test(
+        inner: crate::proxy::ProxyBody,
+        deadline_at: tokio::time::Instant,
+        fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        closer: crate::proxy::auth_lifetime::AuthorizationConnectionCloser,
+    ) -> (
+        crate::proxy::response_watchdog::AuthorizationCancellableBody,
+        RpcDeadlinePumpGuardForTest,
+    ) {
+        let (body, guard) =
+            crate::proxy::response_watchdog::AuthorizationCancellableBody::for_client_rpc_deadline(
+                inner,
+                deadline_at,
+                fired,
+                Some(closer),
+            );
+        (body, RpcDeadlinePumpGuardForTest(guard))
+    }
+
     /// Which owner settled one authenticated streaming response (issue #3815).
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum AuthorizationTerminalOwnershipForTest {
@@ -10510,9 +12383,38 @@ pub mod _test_support {
     where
         F: std::future::Future,
     {
-        match crate::proxy::collect_response_under_authorization(grpc_deadline_at, auth, collect)
-            .await
-        {
+        // An infallible collect: only the bound itself can end it.
+        let collect = async move { Ok::<_, std::convert::Infallible>(collect.await) };
+        response_collect_bound_for_test(
+            crate::proxy::collect_response_under_authorization(grpc_deadline_at, auth, collect)
+                .await,
+        )
+    }
+
+    /// [`collect_response_under_authorization_for_test`] for a collect that can
+    /// FAIL, so a test can drive the late-failure cutoff (issue #6022).
+    pub async fn fallible_collect_response_under_authorization_for_test<F>(
+        collect: F,
+        grpc_deadline_at: Option<tokio::time::Instant>,
+        auth: Option<&(
+            crate::proxy::auth_lifetime::StreamAuthDeadline,
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+            crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        )>,
+    ) -> ResponseCollectBoundForTest
+    where
+        F: std::future::Future<Output = Result<(), ()>>,
+    {
+        response_collect_bound_for_test(
+            crate::proxy::collect_response_under_authorization(grpc_deadline_at, auth, collect)
+                .await,
+        )
+    }
+
+    fn response_collect_bound_for_test<T>(
+        outcome: Result<T, crate::proxy::ResponseCollectBound>,
+    ) -> ResponseCollectBoundForTest {
+        match outcome {
             Ok(_) => ResponseCollectBoundForTest::Completed,
             Err(crate::proxy::ResponseCollectBound::RpcDeadline) => {
                 ResponseCollectBoundForTest::RpcDeadline
@@ -10875,7 +12777,7 @@ pub mod _test_support {
         /// The session metadata map `handle_dtls_client` drains into
         /// `DtlsHandlerResult::metadata`, which the accept loop merges into the
         /// `StreamTransactionSummary` and delivers to `on_stream_disconnect`.
-        pub metadata: HashMap<String, String>,
+        pub metadata: crate::plugins::MetadataMap,
         /// `Display` of the returned typed error.
         pub error: String,
         /// The typed setup kind, when the error carries one.
@@ -10889,7 +12791,7 @@ pub mod _test_support {
     fn classify_dtls_session_failure_for_test(
         error: &anyhow::Error,
         probe_releases: usize,
-        metadata: HashMap<String, String>,
+        metadata: crate::plugins::MetadataMap,
     ) -> DtlsAuthorizationExpiryForTest {
         let error_class = crate::proxy::udp_proxy::dtls_error_class(error);
         DtlsAuthorizationExpiryForTest {
@@ -10924,7 +12826,7 @@ pub mod _test_support {
         F: std::future::Future,
     {
         let latch = crate::proxy::auth_lifetime::StreamAuthTerminationLatch::default();
-        let metadata = std::sync::Mutex::new(HashMap::new());
+        let metadata = std::sync::Mutex::new(crate::plugins::MetadataMap::default());
         let releases = std::sync::atomic::AtomicUsize::new(0);
         let unarmed = crate::proxy::udp_proxy::DtlsClientTrustFence::unarmed();
         let outcome = crate::proxy::udp_proxy::dtls_setup_stage_under_bounds(
@@ -10997,7 +12899,11 @@ pub mod _test_support {
         #[must_use]
         pub fn settle_withdrawal(&self) -> DtlsAuthorizationExpiryForTest {
             let error = self.0.settle_withdrawal();
-            classify_dtls_session_failure_for_test(&error, 0, HashMap::new())
+            classify_dtls_session_failure_for_test(
+                &error,
+                0,
+                crate::plugins::MetadataMap::default(),
+            )
         }
     }
 
@@ -11056,7 +12962,7 @@ pub mod _test_support {
         F: std::future::Future,
     {
         let latch = crate::proxy::auth_lifetime::StreamAuthTerminationLatch::default();
-        let metadata = std::sync::Mutex::new(HashMap::new());
+        let metadata = std::sync::Mutex::new(crate::plugins::MetadataMap::default());
         let releases = std::sync::atomic::AtomicUsize::new(0);
         let outcome = crate::proxy::udp_proxy::dtls_setup_stage_under_bounds(
             plan,
@@ -11101,7 +13007,7 @@ pub mod _test_support {
     where
         F: std::future::Future,
     {
-        let metadata = std::sync::Mutex::new(HashMap::new());
+        let metadata = std::sync::Mutex::new(crate::plugins::MetadataMap::default());
         crate::proxy::udp_proxy::dtls_c2b_under_bounds(plan, latch, &metadata, &trust.0, stage)
             .await
             .map_err(|interrupt| match interrupt {
@@ -11135,6 +13041,7 @@ pub mod _test_support {
     ) -> DtlsReplyDatagramCommitForTest {
         let ctx = crate::plugins::UdpDatagramContext {
             client_ip: Arc::from("127.0.0.1"),
+            client_ip_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             proxy_id: Arc::from("dtls-proxy"),
             proxy_name: None,
             listen_port: 5301,
@@ -11143,6 +13050,7 @@ pub mod _test_support {
             payload,
             payload_kind: crate::plugins::StreamBytesKind::DecryptedApp,
             metadata_sink: None,
+            admission_datagram: false,
         };
         match crate::proxy::udp_proxy::dtls_reply_commit_after_backend_hooks(
             plugins, &ctx, plan, &trust.0,
@@ -11164,6 +13072,16 @@ pub mod _test_support {
         }
     }
 
+    /// Classify a DTLS-frontend session that ended because its backend leg
+    /// failed, exactly as the reply task wraps the backend receive error and
+    /// the accept loop derives the disconnect summary (issue #7186).
+    pub fn dtls_backend_relay_failure_for_test(
+        cause: anyhow::Error,
+    ) -> DtlsAuthorizationExpiryForTest {
+        let error: anyhow::Error = crate::proxy::udp_proxy::DtlsBackendRelayFailure(cause).into();
+        classify_dtls_session_failure_for_test(&error, 0, crate::plugins::MetadataMap::default())
+    }
+
     /// Settle a RELAY-phase DTLS authorization expiry exactly as the session
     /// relay's deadline arm does: record the bounded class once through the
     /// session's shared latch, stamp it into the session metadata that reaches
@@ -11172,7 +13090,7 @@ pub mod _test_support {
     pub fn settle_dtls_relay_authorization_expiry_for_test(
         termination: crate::proxy::auth_lifetime::StreamAuthTermination,
         latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
-        session_metadata: &std::sync::Mutex<HashMap<String, String>>,
+        session_metadata: &std::sync::Mutex<crate::plugins::MetadataMap>,
     ) -> DtlsAuthorizationExpiryForTest {
         crate::proxy::udp_proxy::settle_dtls_auth_expiry(termination, latch, session_metadata);
         let error: anyhow::Error = crate::proxy::udp_proxy::DtlsAuthorizationExpired.into();
@@ -11222,7 +13140,7 @@ pub mod _test_support {
         F: std::future::Future,
     {
         let latch = crate::proxy::auth_lifetime::StreamAuthTerminationLatch::default();
-        let metadata = std::sync::Mutex::new(HashMap::new());
+        let metadata = std::sync::Mutex::new(crate::plugins::MetadataMap::default());
         let releases = std::sync::atomic::AtomicUsize::new(0);
         let outcome = crate::proxy::udp_proxy::stream_udp_setup_stage_under_authorization(
             plan,
@@ -11368,7 +13286,7 @@ pub mod _test_support {
     where
         F: std::future::Future,
     {
-        let metadata = std::sync::Mutex::new(std::collections::HashMap::new());
+        let metadata = std::sync::Mutex::new(crate::plugins::MetadataMap::default());
         crate::proxy::udp_proxy::dtls_c2b_until_expiry(plan, latch, &metadata, stage).await
     }
 
@@ -11405,6 +13323,7 @@ pub mod _test_support {
     ) -> UdpReplyDatagramCommitForTest {
         let ctx = crate::plugins::UdpDatagramContext {
             client_ip: Arc::from("127.0.0.1"),
+            client_ip_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             proxy_id: Arc::from("udp-proxy"),
             proxy_name: None,
             listen_port: 5300,
@@ -11413,6 +13332,7 @@ pub mod _test_support {
             payload,
             payload_kind: crate::plugins::StreamBytesKind::PlaintextWire,
             metadata_sink: None,
+            admission_datagram: false,
         };
         match crate::proxy::udp_proxy::udp_reply_commit_after_backend_hooks(plugins, &ctx, plan)
             .await
@@ -11475,7 +13395,7 @@ pub mod _test_support {
         pub body: Vec<u8>,
         /// Exactly what `TransactionSummary::metadata` receives, including the
         /// bounded `authorization.termination_reason` the gate latched.
-        pub log_metadata: HashMap<String, String>,
+        pub log_metadata: crate::plugins::MetadataMap,
     }
 
     /// Apply the AUTHORITATIVE pre-commitment authorization gate the buffered
@@ -11494,8 +13414,31 @@ pub mod _test_support {
         protected_status: u16,
         protected_body: &[u8],
     ) -> PrecommitAuthorizationGateForTest {
+        precommit_authorization_gate_with_policy_for_test(
+            ctx,
+            max_lifetime_seconds,
+            request_uses_grpc_content_type,
+            protected_status,
+            HashMap::new(),
+            protected_body,
+            &[],
+        )
+    }
+
+    /// The same production gate, starting from an already-decorated protected
+    /// response and given the route's precomputed initial-response header
+    /// policy slice, as the H1/H2 funnel passes it.
+    pub fn precommit_authorization_gate_with_policy_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        max_lifetime_seconds: u64,
+        request_uses_grpc_content_type: bool,
+        protected_status: u16,
+        protected_headers: HashMap<String, String>,
+        protected_body: &[u8],
+        initial_response_header_policy_plugins: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+    ) -> PrecommitAuthorizationGateForTest {
         let mut status = protected_status;
-        let mut headers = HashMap::new();
+        let mut headers = protected_headers;
         let mut body = crate::retry::ResponseBody::buffered(protected_body.to_vec());
         let termination = crate::proxy::apply_precommit_authorization_terminal(
             ctx,
@@ -11504,6 +13447,7 @@ pub mod _test_support {
             &mut status,
             &mut headers,
             &mut body,
+            initial_response_header_policy_plugins,
         );
         let body = match body {
             crate::retry::ResponseBody::Buffered(bytes) => bytes.to_vec(),
@@ -11516,6 +13460,29 @@ pub mod _test_support {
             body,
             log_metadata: crate::proxy::clone_log_metadata(ctx),
         }
+    }
+
+    /// The buffered-response authorization terminal builder on a plain HTTP
+    /// request (no gRPC-Web content type), given an already-decorated
+    /// protected header map and the route's initial-response header policy.
+    /// Returns `(status, headers, body_bytes)`.
+    pub fn buffered_authorization_terminal_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+        protected_headers: HashMap<String, String>,
+        initial_response_header_policy_plugins: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+    ) -> (u16, HashMap<String, String>, Vec<u8>) {
+        let mut headers = protected_headers;
+        let mut body = bytes::Bytes::from_static(b"protected");
+        let status = crate::proxy::replace_buffered_response_with_authorization_terminal(
+            ctx,
+            termination,
+            None,
+            &mut headers,
+            &mut body,
+            initial_response_header_policy_plugins,
+        );
+        (status, headers, body.to_vec())
     }
 
     /// The authorization-lifetime plan and bounded protocol family every H1/H2
@@ -12159,6 +14126,36 @@ pub mod _test_support {
         .await
     }
 
+    /// Open the production native-H3 backend's independently driven halves.
+    /// The fixture owns protocol/authorization bounds for this unbounded call.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn h3_pool_open_bidi_with_target_for_test<F>(
+        pool: &crate::http3::client::Http3ConnectionPool,
+        proxy: &crate::config::types::Proxy,
+        (host, port, policy_port): (&str, u16, u16),
+        method: &str,
+        url: &str,
+        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
+        tls_config: F,
+    ) -> crate::http3::client::H3PoolResult<crate::http3::client::H3BidiBackendStream>
+    where
+        F: std::future::Future<Output = Result<Arc<rustls::ClientConfig>, anyhow::Error>>,
+    {
+        pool.open_bidi_backend_stream_with_target(
+            proxy,
+            host,
+            port,
+            policy_port,
+            method,
+            url,
+            headers,
+            None,
+            crate::http3::client::H3Authorization::new(None, None),
+            || tls_config,
+        )
+        .await
+    }
+
     /// The sidecar readiness terminal chosen from the captured connect winner.
     pub fn sidecar_readiness_connect_terminal_for_test() -> (u16, Option<String>, bool) {
         let response = crate::proxy::sidecar_readiness_connect_timeout_response(true, None);
@@ -12641,16 +14638,6 @@ pub mod _test_support {
         // `Ready` means the watermark fired; the join point remembers that
         // and reports it on the next real poll, so the result is not needed.
         let _ = std::future::Future::poll(race.as_mut(), &mut cx);
-    }
-
-    /// Whether any upload pump has been handed to a task of its own since
-    /// the process started, and how each was settled (issue #5505). Debug
-    /// builds only; empty in release builds.
-    pub fn upload_pump_driver_diagnostics() -> Vec<(&'static str, u64)> {
-        crate::proxy::backend_send_queue::diagnostics::snapshot()
-            .into_iter()
-            .filter(|(name, _)| name.starts_with("PUMP_"))
-            .collect()
     }
 
     /// One gateway-owned BUFFERED upload pump under test (issue #4055).
@@ -13537,7 +15524,69 @@ pub mod _test_support {
         deadline: tokio::time::Instant,
         grpc_web_response_content_type: Option<&str>,
     ) -> crate::proxy::ProxyBody {
-        body.with_client_grpc_deadline(deadline, grpc_web_response_content_type)
+        body.with_client_grpc_deadline(deadline, grpc_web_response_content_type, None)
+    }
+
+    /// [`proxy_body_with_client_grpc_deadline_for_test`] on a hyper-driven
+    /// HTTP/1.1 / HTTP/2 frontend connection: the upstream moves into the
+    /// gateway-owned response pump, so the client RPC deadline releases the
+    /// backend and, after the bounded grace, requests `closer` even while
+    /// nothing polls the client-visible body.
+    pub fn proxy_body_with_client_grpc_deadline_and_closer_for_test(
+        body: crate::proxy::ProxyBody,
+        deadline: tokio::time::Instant,
+        grpc_web_response_content_type: Option<&str>,
+        closer: crate::proxy::auth_lifetime::AuthorizationConnectionCloser,
+    ) -> crate::proxy::ProxyBody {
+        body.with_client_grpc_deadline(deadline, grpc_web_response_content_type, Some(closer))
+    }
+
+    /// Whether `body` holds a frame-relaying client RPC deadline response pump
+    /// (issue #6904): a response whose terminal was read ahead at construction
+    /// holds none.
+    pub fn proxy_body_holds_client_grpc_deadline_pump_for_test(
+        body: &crate::proxy::ProxyBody,
+    ) -> bool {
+        body.holds_client_grpc_deadline_pump()
+    }
+
+    /// Whether `body` holds any client RPC deadline guard: a pump, or the
+    /// close-only watchdog of a response settled from memory.
+    pub fn proxy_body_holds_client_grpc_deadline_guard_for_test(
+        body: &crate::proxy::ProxyBody,
+    ) -> bool {
+        body.holds_client_grpc_deadline_guard()
+    }
+
+    /// Poll a native-gRPC streaming upload (`GrpcBody::Streaming`, the body
+    /// hyper's HTTP/2 request pipe reads) whose client never ends the upload,
+    /// under an optional client RPC deadline, and report its first item.
+    /// `Some(Err(message))` means the deadline ended the upload in an error,
+    /// which hyper turns into RST_STREAM on the backend stream.
+    pub async fn grpc_streaming_upload_first_item_under_rpc_deadline_for_test(
+        deadline: Option<tokio::time::Instant>,
+    ) -> Option<Result<(), String>> {
+        let client = http_body_util::StreamBody::new(futures_util::stream::pending::<
+            Result<http_body::Frame<bytes::Bytes>, std::io::Error>,
+        >());
+        let (source, join) = crate::proxy::upload_pump::spawn_upload_pump(client, None, 0, false);
+        let mut body = Box::pin(crate::proxy::grpc_proxy::GrpcBody::Streaming {
+            require_end_stream: false,
+            incoming: crate::proxy::body::UploadSource::Pumped(source),
+            auth_deadline: None,
+            rpc_deadline: crate::proxy::grpc_proxy::streaming_upload_rpc_deadline(deadline),
+            bytes_seen: 0,
+            max_bytes: 0,
+            exceeded: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            request_bytes: None,
+            upload_observer: None,
+            grpc_messages: None,
+            grpc_scanner: None,
+            trailer_credential_header_names: None,
+        });
+        let first = std::future::poll_fn(|cx| http_body::Body::poll_frame(body.as_mut(), cx)).await;
+        drop(join);
+        first.map(|item| item.map(|_| ()).map_err(|error| error.to_string()))
     }
 
     /// Parse a Gateway API Duration (GEP-2257) exactly as the HTTPRoute
@@ -13563,7 +15612,7 @@ pub mod _test_support {
         deadline: Option<tokio::time::Instant>,
         attempt: F,
     ) -> Result<F::Output, &'static str> {
-        crate::proxy::await_route_request_deadline(deadline, None, attempt)
+        crate::proxy::await_backend_attempt_route_deadline(deadline, None, None, attempt)
             .await
             .map_err(route_deadline_expiry_label)
     }
@@ -13596,9 +15645,10 @@ pub mod _test_support {
                 &mut armed_deadline,
             ),
         };
-        let outcome = crate::proxy::await_route_request_deadline(deadline, budget, attempt)
-            .await
-            .map_err(route_deadline_expiry_label);
+        let outcome =
+            crate::proxy::await_backend_attempt_route_deadline(deadline, budget, None, attempt)
+                .await
+                .map_err(route_deadline_expiry_label);
         (outcome, armed_deadline)
     }
 
@@ -13651,9 +15701,10 @@ pub mod _test_support {
 
     /// The native HTTP/3 terminal for an attempt a matched route rule's
     /// deadline ended before the response head (#5646): `(status, body, error
-    /// class, logged phase, reads as a post-wire read timeout)`. Every native
-    /// HTTP/3 attempt is handed to the backend from its first poll. `expiry` is
-    /// one of `"not_started"`, `"in_flight"`, or `"attempt_budget"`.
+    /// class, logged phase, carries the typed read-timeout signal)`. Every
+    /// native HTTP/3 attempt is handed to the backend from its first poll.
+    /// `expiry` is one of `"not_started"`, `"in_flight"`, or `"attempt_budget"`.
+    /// [`h3_route_deadline_wire_bits_for_test`] reports the wire state.
     pub fn h3_route_deadline_terminal_for_test(
         expiry: &str,
     ) -> (
@@ -13683,16 +15734,43 @@ pub mod _test_support {
             body,
             crate::http3::route_deadline::expiry_error_class(expiry),
             phase,
-            error.request_on_wire() && error.is_read_timeout(),
+            error.is_read_timeout(),
         )
+    }
+
+    /// `(request_on_wire, connection_error)` that each native HTTP/3 surface
+    /// reports for an attempt a matched route rule's deadline ended (#5646), in
+    /// order: the pool error the native relays raise, the buffered result the
+    /// native retry loop records (built by its production constructor), and the
+    /// `BackendResponse` the cross-protocol mesh bridge records. `expiry` is one of `"not_started"`, `"in_flight"`,
+    /// or `"attempt_budget"`.
+    pub fn h3_route_deadline_wire_bits_for_test(expiry: &str) -> [(bool, bool); 3] {
+        let expiry = match expiry {
+            "not_started" => crate::proxy::RouteDeadlineExpiry::BeforeDispatch,
+            "in_flight" => crate::proxy::RouteDeadlineExpiry::InFlight,
+            _ => crate::proxy::RouteDeadlineExpiry::AttemptBudget,
+        };
+        let mut ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/".to_string(),
+        );
+        let error = crate::http3::route_deadline::expiry_pool_error(&mut ctx, expiry);
+        let buffered =
+            crate::http3::server::h3_route_deadline_buffered_wire_bits_for_test(&mut ctx, expiry);
+        let response = crate::http3::route_deadline::expiry_backend_response(&mut ctx, expiry);
+        [
+            (error.request_on_wire(), error.connection_error()),
+            buffered,
+            (response.request_on_wire, response.connection_error),
+        ]
     }
 
     /// How the native HTTP/3 relays bound one attempt under a matched route
     /// rule's deadlines (#5646), for a total deadline `total`, an attempt
     /// budget `attempt_timeout`, and the committed attempt's budget instant
     /// `attempt_deadline`: `(a fresh attempt's budget instant, the committed
-    /// body's deadline, whether the attempt budget alone has expired, how the
-    /// body deadline ended the attempt)`.
+    /// body's deadline, how the body deadline ended the attempt)`.
     pub fn h3_route_attempt_bounds_for_test(
         total: Option<tokio::time::Instant>,
         attempt_timeout: Option<std::time::Duration>,
@@ -13700,14 +15778,12 @@ pub mod _test_support {
     ) -> (
         Option<tokio::time::Instant>,
         Option<tokio::time::Instant>,
-        bool,
         &'static str,
     ) {
         let route = crate::http3::route_deadline::H3RouteDeadlines::new(total, attempt_timeout);
         (
             route.start_attempt(),
             route.body_deadline(attempt_deadline),
-            route.attempt_budget_expired(attempt_deadline),
             route_deadline_expiry_label(route.body_expiry()),
         )
     }
@@ -13825,7 +15901,33 @@ pub mod _test_support {
         http_status: u16,
         initial_terminal_metadata: Option<HashMap<String, String>>,
     ) -> crate::proxy::ProxyBody {
-        body.into_grpc_web_streaming(content_type, http_status, initial_terminal_metadata, false)
+        body.into_grpc_web_streaming(
+            content_type,
+            http_status,
+            initial_terminal_metadata,
+            false,
+            0,
+        )
+    }
+
+    /// Same as [`proxy_body_into_grpc_web_streaming_for_test`], with the
+    /// request's effective response ceiling (`0` = unlimited) charged against
+    /// the translated bytes the client receives, exactly as the H1/H2 response
+    /// funnels install it.
+    pub fn proxy_body_into_grpc_web_streaming_with_response_limit_for_test(
+        body: crate::proxy::ProxyBody,
+        content_type: &str,
+        http_status: u16,
+        initial_terminal_metadata: Option<HashMap<String, String>>,
+        max_response_body_size_bytes: usize,
+    ) -> crate::proxy::ProxyBody {
+        body.into_grpc_web_streaming(
+            content_type,
+            http_status,
+            initial_terminal_metadata,
+            false,
+            max_response_body_size_bytes,
+        )
     }
 
     /// Same as [`proxy_body_into_grpc_web_streaming_for_test`], with the
@@ -13837,7 +15939,13 @@ pub mod _test_support {
         http_status: u16,
         initial_terminal_metadata: Option<HashMap<String, String>>,
     ) -> crate::proxy::ProxyBody {
-        body.into_grpc_web_streaming(content_type, http_status, initial_terminal_metadata, true)
+        body.into_grpc_web_streaming(
+            content_type,
+            http_status,
+            initial_terminal_metadata,
+            true,
+            0,
+        )
     }
 
     /// Wrap a body in the pass-through gRPC-Web relay, exactly as the H1/H2
@@ -14048,11 +16156,11 @@ pub mod _test_support {
 
     /// Record a pass-through body's terminal status into `metadata` exactly as
     /// the buffered response paths do.
-    pub fn record_grpc_web_passthrough_status_for_test(
+    pub fn record_grpc_web_passthrough_status_for_test<MS: std::hash::BuildHasher>(
         ctx: &crate::plugins::RequestContext,
         response_headers: &HashMap<String, String>,
         body: &[u8],
-        metadata: &mut HashMap<String, String>,
+        metadata: &mut std::collections::HashMap<String, String, MS>,
     ) {
         if let Some(passthrough) =
             crate::plugins::grpc_web::passthrough_body_trailer_status(ctx, response_headers, body)
@@ -14102,68 +16210,28 @@ pub mod _test_support {
         crate::proxy::body::inspected_streaming_body(rx)
     }
 
-    /// H1/reqwest-style inspection seam: feed decoded body byte chunks through
-    /// a [`ResponseStreamInspector`] into the shared [`inspected_streaming_body`]
-    /// channel that production `run_response_inspection` uses.
-    ///
-    /// Pair with [`inspected_proxy_body_for_test`] (direct-H2 / native-H3
-    /// `run_proxy_body_response_inspection`) so external tests can prove an
-    /// attached inspector is driven on every HTTP body variant without standing
-    /// up a separate server framework.
-    pub fn inspected_byte_chunks_body_for_test(
-        chunks: Vec<bytes::Bytes>,
-        mut inspector: Box<dyn crate::plugins::ResponseStreamInspector>,
+    /// Drive the PRODUCTION reqwest response-inspection task
+    /// (`run_response_inspection`, the H1/H2 inspect path) over a scripted
+    /// backend body of `chunks`, with the request's effective response ceiling
+    /// `max_response_body_size_bytes` (`0` = unlimited), and return the
+    /// client-visible inspected body.
+    pub fn reqwest_inspected_response_body_for_test(
+        chunks: &[&'static [u8]],
+        inspector: Box<dyn crate::plugins::ResponseStreamInspector>,
+        max_response_body_size_bytes: usize,
     ) -> crate::proxy::ProxyBody {
-        use crate::plugins::ResponseStreamAction;
-        use http_body::Frame;
-
+        let response = reqwest_response_with_trailers_for_test(chunks, &[]);
         let (tx, rx) = tokio::sync::mpsc::channel(16);
-        tokio::spawn(async move {
-            for chunk in chunks {
-                if tx.is_closed() {
-                    return;
-                }
-                let action = tokio::select! {
-                    biased;
-                    _ = tx.closed() => return,
-                    action = inspector.on_chunk(&chunk) => action,
-                };
-                match action {
-                    ResponseStreamAction::Forward(out) => {
-                        if !out.is_empty() && tx.send(Ok(Frame::data(out))).await.is_err() {
-                            return;
-                        }
-                    }
-                    ResponseStreamAction::Terminate(final_bytes) => {
-                        if let Some(fb) = final_bytes
-                            && !fb.is_empty()
-                        {
-                            let _ = tx.send(Ok(Frame::data(fb))).await;
-                        }
-                        return;
-                    }
-                }
-            }
-            let action = tokio::select! {
-                biased;
-                _ = tx.closed() => return,
-                action = inspector.on_end() => action,
-            };
-            match action {
-                ResponseStreamAction::Forward(out) => {
-                    if !out.is_empty() {
-                        let _ = tx.send(Ok(Frame::data(out))).await;
-                    }
-                }
-                ResponseStreamAction::Terminate(final_bytes) => {
-                    if let Some(fb) = final_bytes
-                        && !fb.is_empty()
-                    {
-                        let _ = tx.send(Ok(Frame::data(fb))).await;
-                    }
-                }
-            }
-        });
+        tokio::spawn(crate::proxy::body::run_response_inspection(
+            response,
+            inspector,
+            tx,
+            max_response_body_size_bytes,
+            0,
+            None,
+            crate::proxy::LoadBalancerConnectionGuard::new(None, None),
+            crate::proxy::body::ReqwestResponseTrailers::drop_all(),
+        ));
         crate::proxy::body::inspected_streaming_body(rx)
     }
 
@@ -14228,9 +16296,8 @@ pub mod _test_support {
 
     pub fn h3_plugin_protocol_for_request_for_test(
         flavor: crate::config::types::HttpFlavor,
-        grpc_web_request: bool,
     ) -> crate::plugins::ProxyProtocol {
-        crate::http3::server::h3_plugin_protocol_for_request(flavor, grpc_web_request)
+        crate::http3::server::h3_plugin_protocol_for_request(flavor)
     }
 
     pub fn udp_logging_should_replace_sender_on_resolve_for_test(
@@ -14380,6 +16447,10 @@ pub mod _test_support {
         crate::dtls::dtls_datagram_opens_session_for_test(data)
     }
 
+    pub fn dtls_packet_error_is_droppable_for_test(error: &dimpl::Error) -> bool {
+        crate::dtls::dtls_packet_error_is_droppable_for_test(error)
+    }
+
     /// External regression coverage for issue #2959 (DTLS demux identity-aware
     /// session removal). See
     /// [`crate::dtls::dtls_stale_session_removal_preserves_newer_generation_for_test`].
@@ -14487,6 +16558,24 @@ pub mod _test_support {
         crate::dtls::frontend_app_ciphertext_send_until_expiry_for_test(deadline, cancel, send)
             .await
             .map_err(map_frontend_app_send_reject_for_test)
+    }
+
+    /// Race one application-ciphertext send (or a test double) against the
+    /// admitted deadline and the production single-`oneshot` completion sender
+    /// cancellation (`completion.is_closed()` / `closed()`).
+    pub async fn frontend_app_ciphertext_send_with_completion_cancel_for_test<F>(
+        deadline: Option<tokio::time::Instant>,
+        completion: Option<&mut tokio::sync::oneshot::Sender<Result<(), String>>>,
+        send: F,
+    ) -> Result<F::Output, FrontendAppSendRejectForTest>
+    where
+        F: std::future::Future,
+    {
+        crate::dtls::frontend_app_ciphertext_send_with_completion_cancel_for_test(
+            deadline, completion, send,
+        )
+        .await
+        .map_err(map_frontend_app_send_reject_for_test)
     }
 
     /// Race one post-registration DTLS delivery (plaintext, accept handoff, or
@@ -14751,6 +16840,146 @@ pub mod _test_support {
         )
     }
 
+    /// Public mirror of the crate-private attribution of a pre-response-head
+    /// `send_request` failure on the sidecar mesh-mTLS, HBONE, and Unix-socket
+    /// dispatchers (issue #6776).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum PreHeaderSendTerminationForTest {
+        Transport,
+        ClientAbort,
+        MalformedUpload,
+        BackendWriteTimeout,
+        AuthorizationExpired,
+    }
+
+    /// Public mirror of the crate-private typed client upload fault (issue
+    /// #6776).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ClientUploadFaultForTest {
+        Disconnected,
+        Malformed,
+    }
+
+    fn client_upload_fault_from_test(
+        fault: ClientUploadFaultForTest,
+    ) -> crate::proxy::upload_pump::ClientUploadFault {
+        use crate::proxy::upload_pump::ClientUploadFault;
+        match fault {
+            ClientUploadFaultForTest::Disconnected => ClientUploadFault::Disconnected,
+            ClientUploadFaultForTest::Malformed => ClientUploadFault::Malformed,
+        }
+    }
+
+    /// The typed fault the upload pump and the unpumped size-limit adapter
+    /// record for a failed read of the client's upload.
+    pub fn client_upload_error_fault_for_test(
+        error: &(dyn std::error::Error + 'static),
+    ) -> ClientUploadFaultForTest {
+        match crate::proxy::upload_pump::client_upload_error_fault(error) {
+            crate::proxy::upload_pump::ClientUploadFault::Disconnected => {
+                ClientUploadFaultForTest::Disconnected
+            }
+            crate::proxy::upload_pump::ClientUploadFault::Malformed => {
+                ClientUploadFaultForTest::Malformed
+            }
+        }
+    }
+
+    /// Record a buffered native-gRPC terminal's header status into transaction
+    /// metadata, exactly as the generic dispatch handler does before it builds
+    /// the terminal summary (issue #6776).
+    pub fn record_buffered_native_grpc_header_status_for_test<MS: std::hash::BuildHasher>(
+        metadata: &mut std::collections::HashMap<String, String, MS>,
+        native_grpc_request: bool,
+        response_is_buffered: bool,
+        response_headers: &std::collections::HashMap<String, String>,
+    ) {
+        crate::proxy::record_buffered_native_grpc_header_status(
+            metadata,
+            native_grpc_request,
+            response_is_buffered,
+            response_headers,
+        )
+    }
+
+    fn pre_header_send_termination_from_test(
+        termination: PreHeaderSendTerminationForTest,
+    ) -> crate::proxy::upload_pump::PreHeaderSendTermination {
+        use crate::proxy::upload_pump::PreHeaderSendTermination;
+        match termination {
+            PreHeaderSendTerminationForTest::Transport => PreHeaderSendTermination::Transport,
+            PreHeaderSendTerminationForTest::ClientAbort => PreHeaderSendTermination::ClientAbort,
+            PreHeaderSendTerminationForTest::MalformedUpload => {
+                PreHeaderSendTermination::MalformedUpload
+            }
+            PreHeaderSendTerminationForTest::BackendWriteTimeout => {
+                PreHeaderSendTermination::BackendWriteTimeout
+            }
+            PreHeaderSendTerminationForTest::AuthorizationExpired => {
+                PreHeaderSendTermination::AuthorizationExpired
+            }
+        }
+    }
+
+    /// How the sidecar mesh-mTLS, HBONE, and Unix-socket dispatchers attribute
+    /// a `send_request` failure before the backend response head: whether the
+    /// transport error proves the gateway's body ended the exchange, whether
+    /// the authorization lifetime ended it, whether the transport read a
+    /// streaming client body, whether a gateway-owned pump fed it, and the
+    /// joined pump terminal, and the recorded typed client upload fault.
+    pub fn pre_header_send_termination_for_test(
+        gateway_ended_upload: bool,
+        authorization_ended: bool,
+        client_body_streamed: bool,
+        upload_pumped: bool,
+        pump_outcome: Option<UploadPumpOutcomeForTest>,
+        client_fault: Option<ClientUploadFaultForTest>,
+    ) -> PreHeaderSendTerminationForTest {
+        use crate::proxy::upload_pump::PreHeaderSendTermination;
+        match crate::proxy::upload_pump::pre_header_send_termination(
+            gateway_ended_upload,
+            authorization_ended,
+            client_body_streamed,
+            upload_pumped,
+            pump_outcome.map(upload_pump_outcome_from_test),
+            client_fault.map(client_upload_fault_from_test),
+        ) {
+            PreHeaderSendTermination::Transport => PreHeaderSendTerminationForTest::Transport,
+            PreHeaderSendTermination::ClientAbort => PreHeaderSendTerminationForTest::ClientAbort,
+            PreHeaderSendTermination::MalformedUpload => {
+                PreHeaderSendTerminationForTest::MalformedUpload
+            }
+            PreHeaderSendTermination::BackendWriteTimeout => {
+                PreHeaderSendTerminationForTest::BackendWriteTimeout
+            }
+            PreHeaderSendTermination::AuthorizationExpired => {
+                PreHeaderSendTerminationForTest::AuthorizationExpired
+            }
+        }
+    }
+
+    /// Whether a hyper `send_request` failure is typed proof that the
+    /// gateway's own request body ended the exchange (issue #6776).
+    pub fn hyper_send_error_ended_by_gateway_upload_for_test(err: &hyper::Error) -> bool {
+        crate::proxy::upload_pump::hyper_send_error_ended_by_gateway_upload(err)
+    }
+
+    /// The dispatch response the sidecar mesh-mTLS, HBONE, and Unix-socket
+    /// dispatchers return for an attributed pre-response-head send failure.
+    pub fn pre_header_upload_termination_response_for_test(
+        termination: PreHeaderSendTerminationForTest,
+        is_grpc_flavored: bool,
+        resolved_ip: Option<String>,
+    ) -> crate::retry::BackendResponse {
+        crate::proxy::pre_header_upload_termination_response(
+            "issue-6776-test",
+            "test",
+            pre_header_send_termination_from_test(termination),
+            is_grpc_flavored,
+            resolved_ip,
+        )
+    }
+
     /// Public mirror of the direct-H2 upload cancellation signal.
     #[derive(Debug, PartialEq, Eq)]
     pub enum UploadCancelSignalForTest {
@@ -14841,6 +17070,29 @@ pub mod _test_support {
         }
     }
 
+    /// The trailer block the backend would observe after the native HTTP/3
+    /// relays' late boundary: the static filter
+    /// (`sanitize_backend_request_trailers`) followed by the route's configured
+    /// credential header locations
+    /// (`strip_configured_credential_request_trailers`), exactly the two calls
+    /// the H3 client relay, the H3 gRPC upload pump, and the H3-to-H2 bridge
+    /// make.
+    ///
+    /// Sorted by `(name, value)`.
+    pub fn sanitized_backend_request_trailers_for_route(
+        trailers: &[(&str, &str)],
+        credential_header_names: &[&str],
+    ) -> Vec<(String, String)> {
+        let names: Vec<String> = credential_header_names
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        let mut map = request_trailer_probe_map(trailers);
+        crate::proxy::headers::sanitize_backend_request_trailers(&mut map);
+        crate::proxy::headers::strip_configured_credential_request_trailers(&mut map, &names);
+        sorted_trailer_entries(&map)
+    }
+
     /// A DATA frame must cross the late request-trailer boundary byte-for-byte:
     /// the sanitizer is a trailer-only filter, never a body rewriter.
     pub fn sanitize_backend_request_trailer_frame_preserves_data(payload: &'static [u8]) -> bool {
@@ -14891,6 +17143,50 @@ pub mod _test_support {
         }
         // Dropping the join disarms cancellation (a dropped sender is not a
         // cancellation), so the pump is never torn down mid-relay.
+        drop(join);
+        forwarded_trailers.sort();
+        (forwarded_data, forwarded_trailers)
+    }
+
+    /// [`h1_h2_upload_source_forwarded_frames`] with a route's configured
+    /// credential header locations, driven through
+    /// `UploadSource::poll_frame_with_trailer_credentials` — the seam
+    /// `SizeLimitedIncoming`, `CountingIncoming`, and `GrpcBody::Streaming`
+    /// poll with the list `RequestContext::request_trailer_credential_header_names`
+    /// hands them.
+    pub async fn h1_h2_upload_source_forwarded_frames_for_route(
+        payload: &'static [u8],
+        trailers: &[(&str, &str)],
+        credential_header_names: &[&str],
+    ) -> (Vec<u8>, Vec<(String, String)>) {
+        let names: Vec<String> = credential_header_names
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        let body = RequestTrailerProbeBody {
+            data: Some(bytes::Bytes::from_static(payload)),
+            trailers: Some(request_trailer_probe_map(trailers)),
+        };
+        let (source, join) = crate::proxy::upload_pump::spawn_upload_pump(body, None, 0, false);
+        let mut source = crate::proxy::body::UploadSource::Pumped(source);
+        let mut forwarded_data = Vec::new();
+        let mut forwarded_trailers = Vec::new();
+        loop {
+            let next =
+                std::future::poll_fn(|cx| source.poll_frame_with_trailer_credentials(cx, &names))
+                    .await;
+            match next {
+                Some(Ok(frame)) => match frame.into_data() {
+                    Ok(data) => forwarded_data.extend_from_slice(data.as_ref()),
+                    Err(frame) => match frame.into_trailers() {
+                        Ok(map) => forwarded_trailers.extend(sorted_trailer_entries(&map)),
+                        Err(_) => panic!("unexpected non-data non-trailer frame"),
+                    },
+                },
+                Some(Err(e)) => panic!("probe upload failed: {e}"),
+                None => break,
+            }
+        }
         drop(join);
         forwarded_trailers.sort();
         (forwarded_data, forwarded_trailers)
@@ -14956,6 +17252,15 @@ pub mod _test_support {
     /// decode pass before it constructs the decoder.
     pub const RESPONSE_DECODE_BROTLI_SCRATCH_BYTES: usize =
         crate::plugins::charged_decode::BROTLI_DECODER_SCRATCH_BYTES;
+
+    /// Conservative heap ceiling the charged content-coding chain reserves for
+    /// one `zstd` decode pass before it constructs the decoder.
+    pub const CHARGED_DECODE_ZSTD_SCRATCH_BYTES: usize =
+        crate::plugins::charged_decode::ZSTD_DECODER_SCRATCH_BYTES;
+
+    /// The `zstd` window cap (as a base-2 log) the charged chain enforces.
+    pub const CHARGED_DECODE_ZSTD_WINDOW_LOG_MAX: u32 =
+        crate::plugins::charged_decode::ZSTD_WINDOW_LOG_MAX;
 
     /// The output-buffer capacity the production decode ends up holding for a
     /// decoded body of `decoded_len` bytes under `limit`, computed with the
@@ -15064,18 +17369,22 @@ pub mod _test_support {
         /// Move this claim onto a cheaply cloneable [`bytes::Bytes`] view of
         /// `data`, exactly as dispatch does after a governed collect (in-dispatch
         /// or pre-auth). The charge is released when the last clone drops
-        /// (issue #4231).
-        pub fn into_charged_bytes(self, data: Vec<u8>) -> bytes::Bytes {
+        /// (issue #4231). `None` is the fail-closed capacity refusal: the
+        /// budget could not grow the charge to cover `data`, and both were
+        /// dropped.
+        pub fn into_charged_bytes(self, data: Vec<u8>) -> Option<bytes::Bytes> {
             self.0.into_charged_bytes(data)
         }
     }
 
     impl RequestBufferBudgetProbe {
         pub fn new(fallback_per_request_bytes: usize, total_bytes: usize) -> Self {
-            Self(crate::proxy::response_buffer_budget::IsolatedBudget::new(
-                fallback_per_request_bytes,
-                total_bytes,
-            ))
+            Self(
+                crate::proxy::response_buffer_budget::IsolatedBudget::new_request(
+                    fallback_per_request_bytes,
+                    total_bytes,
+                ),
+            )
         }
 
         /// Currently unreserved capacity, in bytes.
@@ -15089,13 +17398,158 @@ pub mod _test_support {
             self.0.buffered_request_body_ceiling(effective_limit)
         }
 
-        /// The PRODUCTION admission a buffered request path takes before it
-        /// allocates. `None` when the aggregate budget refuses, which is what
-        /// makes the refusal happen BEFORE the collect rather than after it.
+        /// A buffered-request charge of `bytes`, taken up front: the same
+        /// permit type the production collectors grow and publish. `None` when
+        /// the aggregate budget refuses.
         pub fn try_reserve(&self, bytes: usize) -> Option<RequestBufferPermitProbe> {
             self.0
                 .try_reserve_request_permit(bytes)
                 .map(RequestBufferPermitProbe)
+        }
+
+        /// The PRODUCTION buffered-request collector every H1/H2 collect and
+        /// native-H3 drain uses, bound to this budget. Charges nothing until
+        /// bytes are appended.
+        pub fn collector(&self, effective_limit: usize) -> RequestBufferCollectorProbe {
+            RequestBufferCollectorProbe(self.0.request_collector(effective_limit))
+        }
+    }
+
+    /// Hold every block currently free in the PROCESS-GLOBAL buffered-request
+    /// budget until the returned claim drops, so an in-process gateway's next
+    /// buffered collect is refused on its first growth. The budget charges
+    /// retained bytes, so this is how a functional test reaches the capacity
+    /// refusal without uploading the whole budget. Process-global: only for a
+    /// test that owns its process (nextest runs each test in its own).
+    pub fn exhaust_process_request_buffer_budget_for_test() -> Option<RequestBufferPermitProbe> {
+        use crate::proxy::response_buffer_budget::{
+            BudgetRef, RequestBufferPermit, request_buffer_snapshot,
+        };
+        let available = request_buffer_snapshot().available_bytes;
+        RequestBufferPermit::reserve_in(BudgetRef::request_buffer(), available)
+            .map(RequestBufferPermitProbe)
+    }
+
+    /// The PRODUCTION buffered-request collector (`ChargedRequestCollector`),
+    /// bound to a [`RequestBufferBudgetProbe`].
+    pub struct RequestBufferCollectorProbe(
+        crate::proxy::response_buffer_budget::ChargedRequestCollector,
+    );
+
+    impl RequestBufferCollectorProbe {
+        /// Append one body chunk under the per-request ceiling and the
+        /// aggregate budget, exactly as every buffered collect does per frame.
+        pub fn append(&mut self, chunk: &[u8]) -> Result<(), ResponseBufferRetainRejection> {
+            self.0
+                .append(chunk)
+                .map_err(ResponseBufferRetainRejection::from_internal)
+        }
+
+        /// Bytes collected so far.
+        pub fn len(&self) -> usize {
+            self.0.len()
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.0.len() == 0
+        }
+
+        /// Capacity the charge currently covers, in bytes.
+        pub fn reserved_bytes(&self) -> usize {
+            self.0.reserved_bytes()
+        }
+
+        /// The collected body and its narrowed charge.
+        pub fn finish(self) -> (Vec<u8>, RequestBufferPermitProbe) {
+            let (body, permit) = self.0.finish();
+            (body, RequestBufferPermitProbe(permit))
+        }
+    }
+
+    /// Terminal outcome of the PRODUCTION buffered native-gRPC charged collect
+    /// (`collect_grpc_upload`), projected from the crate-private error.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum GrpcChargedCollectOutcomeForTest {
+        Collected(usize),
+        ResourceExhausted(String),
+        BufferCapacityExceeded,
+        ClientDisconnected,
+        Other,
+    }
+
+    /// Run the PRODUCTION buffered native-gRPC collect over `body` against an
+    /// isolated buffered-request budget, with `max_grpc_recv_size_bytes` as the
+    /// gRPC ceiling exactly as the proxy folds it.
+    pub async fn collect_grpc_upload_for_test<B>(
+        body: B,
+        budget: &RequestBufferBudgetProbe,
+        max_grpc_recv_size_bytes: usize,
+    ) -> GrpcChargedCollectOutcomeForTest
+    where
+        B: http_body::Body<Data = bytes::Bytes, Error = crate::proxy::body::ProxyBodyError>,
+    {
+        use crate::proxy::grpc_proxy::{GrpcRequestBodyCollectError, collect_grpc_upload};
+        let ceiling = budget
+            .0
+            .buffered_request_body_ceiling(max_grpc_recv_size_bytes);
+        let collector = budget.0.request_collector(max_grpc_recv_size_bytes);
+        match collect_grpc_upload(body, collector, ceiling, 0, None, None).await {
+            Ok(collected) => GrpcChargedCollectOutcomeForTest::Collected(collected.body.len()),
+            Err(GrpcRequestBodyCollectError::ResourceExhausted(message)) => {
+                GrpcChargedCollectOutcomeForTest::ResourceExhausted(message)
+            }
+            Err(GrpcRequestBodyCollectError::BufferCapacityExceeded) => {
+                GrpcChargedCollectOutcomeForTest::BufferCapacityExceeded
+            }
+            Err(GrpcRequestBodyCollectError::ClientDisconnected) => {
+                GrpcChargedCollectOutcomeForTest::ClientDisconnected
+            }
+            Err(_) => GrpcChargedCollectOutcomeForTest::Other,
+        }
+    }
+
+    /// Terminal outcome of the PRODUCTION H1/H2 charged request-body collect
+    /// (`collect_charged_request_body`), projected from the crate-private
+    /// types.
+    pub enum ChargedRequestCollectOutcomeForTest {
+        Collected {
+            body: Vec<u8>,
+            trailers: Option<hyper::HeaderMap>,
+            permit: RequestBufferPermitProbe,
+        },
+        TooLarge,
+        BufferCapacityExceeded,
+        ClientDisconnected,
+    }
+
+    /// Run the PRODUCTION H1/H2 charged request-body collect over `body`
+    /// against an isolated budget, so a test can hold collects open and
+    /// observe what they charge.
+    pub async fn collect_charged_request_body_for_test<B>(
+        body: B,
+        budget: &RequestBufferBudgetProbe,
+        effective_limit: usize,
+    ) -> ChargedRequestCollectOutcomeForTest
+    where
+        B: http_body::Body<Data = bytes::Bytes, Error = crate::proxy::body::ProxyBodyError>,
+    {
+        use crate::proxy::ChargedRequestCollectError;
+        let collector = budget.0.request_collector(effective_limit);
+        match crate::proxy::collect_charged_request_body(body, collector).await {
+            Ok(collected) => ChargedRequestCollectOutcomeForTest::Collected {
+                body: collected.body,
+                trailers: collected.trailers,
+                permit: RequestBufferPermitProbe(collected.permit),
+            },
+            Err(ChargedRequestCollectError::TooLarge) => {
+                ChargedRequestCollectOutcomeForTest::TooLarge
+            }
+            Err(ChargedRequestCollectError::BufferCapacityExceeded) => {
+                ChargedRequestCollectOutcomeForTest::BufferCapacityExceeded
+            }
+            Err(ChargedRequestCollectError::Body(_)) => {
+                ChargedRequestCollectOutcomeForTest::ClientDisconnected
+            }
         }
     }
 
@@ -15209,6 +17663,7 @@ pub mod _test_support {
     pub enum GrpcBufferedCollectOutcomeForTest {
         Collected(usize),
         ResourceExhausted,
+        BufferCapacityExceeded,
         ClientDisconnected,
         TimedOut,
         DeadlineExceeded,
@@ -15223,7 +17678,7 @@ pub mod _test_support {
         request_body_read_timeout_ms: u64,
     ) -> GrpcBufferedCollectOutcomeForTest {
         use crate::proxy::grpc_proxy::GrpcRequestBodyCollectError;
-        let collected = crate::proxy::grpc_proxy::collect_grpc_request_body(
+        let collected = crate::proxy::grpc_proxy::collect_grpc_request_body_published(
             request,
             max_grpc_recv_size_bytes,
             request_body_read_timeout_ms,
@@ -15235,6 +17690,9 @@ pub mod _test_support {
             Ok((_, _, body)) => GrpcBufferedCollectOutcomeForTest::Collected(body.len()),
             Err(GrpcRequestBodyCollectError::ResourceExhausted(_)) => {
                 GrpcBufferedCollectOutcomeForTest::ResourceExhausted
+            }
+            Err(GrpcRequestBodyCollectError::BufferCapacityExceeded) => {
+                GrpcBufferedCollectOutcomeForTest::BufferCapacityExceeded
             }
             Err(GrpcRequestBodyCollectError::TimedOut) => {
                 GrpcBufferedCollectOutcomeForTest::TimedOut
@@ -15267,17 +17725,22 @@ pub mod _test_support {
     pub struct H3RetainedUploadProbe(crate::http3::server::H3RetainedUpload);
 
     impl H3RetainedUploadProbe {
-        /// Admit one upload exactly as every native-H3 drain site does: fold
-        /// the effective limit to the retained ceiling, then charge that
-        /// ceiling before a byte is allocated. `None` is the `503` refusal.
-        pub fn admit(budget: &RequestBufferBudgetProbe, effective_limit: usize) -> Option<Self> {
+        /// Open one upload exactly as every native-H3 drain site does: fold
+        /// the effective limit to the retained ceiling. Nothing is charged
+        /// until a DATA chunk is retained.
+        pub fn admit(budget: &RequestBufferBudgetProbe, effective_limit: usize) -> Self {
             let ceiling = budget.0.buffered_request_body_ceiling(effective_limit);
-            crate::http3::server::H3RetainedUpload::admit_in(budget.0.handle(), ceiling).map(Self)
+            let upload =
+                crate::http3::server::H3RetainedUpload::admit_in(budget.0.handle(), ceiling);
+            Self(upload)
         }
 
-        /// Append one DATA chunk; `false` is the `413` (drop the probe).
-        pub fn push(&mut self, chunk: &[u8]) -> bool {
-            self.0.push(chunk)
+        /// Append one DATA chunk. `TooLarge` is the `413` and
+        /// `BudgetExhausted` the `503` (drop the probe either way).
+        pub fn push(&mut self, chunk: &[u8]) -> Result<(), ResponseBufferRetainRejection> {
+            self.0
+                .push(chunk)
+                .map_err(ResponseBufferRetainRejection::from_internal)
         }
 
         pub fn collected_len(&self) -> usize {
@@ -15298,7 +17761,7 @@ pub mod _test_support {
         /// Finish and publish the body for dispatch through the PRODUCTION
         /// native-H3 publication (`publish_h3_retained_body`): the charge
         /// moves onto the shared `Bytes` every attempt and retry replays.
-        pub fn finish_and_publish(self) -> bytes::Bytes {
+        pub fn finish_and_publish(self) -> Option<bytes::Bytes> {
             let (body, permit) = self.0.finish();
             crate::http3::server::publish_h3_retained_body(body, Some(permit))
         }
@@ -15356,6 +17819,145 @@ pub mod _test_support {
             Err(ChargedDecodeError::TooLarge) => ChargedCodingChainOutcome::TooLarge,
             Err(ChargedDecodeError::CapacityRefused) => ChargedCodingChainOutcome::CapacityRefused,
         }
+    }
+
+    /// Budget readings across one decoded request-body replacement.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct DecodeChargeHandoffForTest {
+        pub plaintext_capacity: usize,
+        /// Available bytes once the decode returned its plaintext.
+        pub available_after_decode: usize,
+        /// Available bytes after the replacement scope handed the charge
+        /// back, with the worker output still unconsumed.
+        pub available_after_handoff: usize,
+        /// Available bytes once the handed-off charge is released.
+        pub available_after_release: usize,
+    }
+
+    /// Decode through the PRODUCTION charge-retaining decoder against an
+    /// ISOLATED budget, then pass the decode charge through the PRODUCTION
+    /// replacement scope exactly as a decoding normalizer does, holding the
+    /// completed output across yields before it is consumed. `None` when the
+    /// decode is refused.
+    pub async fn decode_and_hand_off_charge_for_test(
+        probe: &ResponseBufferBudgetProbe,
+        codings: &[String],
+        body: &[u8],
+        max_decoded_bytes: usize,
+    ) -> Option<DecodeChargeHandoffForTest> {
+        use crate::plugins::charged_decode::decode_charged_content_coding_chain_with_charge;
+        use crate::proxy::response_buffer_budget::{
+            DecodeChargeHold, hand_off_replacement_decode_charge, with_replacement_decode_charge,
+        };
+        let limits = crate::plugins::utils::content_encoding::DecodeLimits {
+            max_decoded_bytes,
+            max_cumulative_bytes: max_decoded_bytes,
+            max_codings: codings.len().max(1),
+            max_amplification_ratio: 1024,
+        };
+        let (plaintext, charge) = decode_charged_content_coding_chain_with_charge(
+            codings,
+            body,
+            limits,
+            probe.0.handle(),
+        )
+        .ok()?;
+        let available_after_decode = probe.available_bytes();
+        let ((), handed_off) = with_replacement_decode_charge(async {
+            tokio::task::yield_now().await;
+            hand_off_replacement_decode_charge(DecodeChargeHold::new(charge));
+            tokio::task::yield_now().await;
+        })
+        .await;
+        let available_after_handoff = probe.available_bytes();
+        drop(handed_off);
+        let available_after_release = probe.available_bytes();
+        Some(DecodeChargeHandoffForTest {
+            plaintext_capacity: plaintext.capacity(),
+            available_after_decode,
+            available_after_handoff,
+            available_after_release,
+        })
+    }
+
+    /// Budget readings across the `compression` staged-plaintext handoff.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct StagedDecodeChargeForTest {
+        /// Available bytes while the plaintext is staged on the context.
+        pub available_while_staged: usize,
+        /// Available bytes after a context clone carrying it was dropped.
+        pub available_after_clone_dropped: usize,
+        /// Available bytes after the owning transform emitted the plaintext,
+        /// with the handed-off charge still held by the replacement scope.
+        pub available_after_emit: usize,
+        /// Available bytes once that charge is released.
+        pub available_after_release: usize,
+    }
+
+    /// Stage `staged_bytes` of plaintext on a request context with a decode
+    /// charge taken from an ISOLATED budget, exactly as the `compression`
+    /// fallback decode does, then emit it through the PRODUCTION replacement
+    /// scope as its transform does.
+    pub async fn staged_decode_charge_for_test(
+        probe: &ResponseBufferBudgetProbe,
+        staged_bytes: usize,
+    ) -> Option<StagedDecodeChargeForTest> {
+        use crate::proxy::response_buffer_budget::{
+            DecodeChargeHold, hand_off_replacement_decode_charge, with_replacement_decode_charge,
+        };
+        let charge = probe.0.try_reserve(staged_bytes)?;
+        let mut ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/upload".to_string(),
+        );
+        ctx.set_compression_staged_request_plaintext(
+            vec![0u8; staged_bytes],
+            DecodeChargeHold::new(charge),
+        );
+        let available_while_staged = probe.available_bytes();
+        drop(ctx.clone());
+        let available_after_clone_dropped = probe.available_bytes();
+        let (plaintext, handed_off) = with_replacement_decode_charge(async {
+            let (plaintext, decode_charge) = ctx.take_compression_staged_request_plaintext()?;
+            hand_off_replacement_decode_charge(decode_charge);
+            tokio::task::yield_now().await;
+            Some(plaintext)
+        })
+        .await;
+        let plaintext = plaintext?;
+        let available_after_emit = probe.available_bytes();
+        drop(handed_off);
+        drop(plaintext);
+        let available_after_release = probe.available_bytes();
+        Some(StagedDecodeChargeForTest {
+            available_while_staged,
+            available_after_clone_dropped,
+            available_after_emit,
+            available_after_release,
+        })
+    }
+
+    /// Undo a body's `Content-Encoding` exactly as `openapi_validator` does
+    /// before schema validation, charged against an ISOLATED budget.
+    ///
+    /// On success returns the plaintext and the budget's available bytes
+    /// measured WHILE the decoded body is still held (as during inspection).
+    /// `Err(None)` is the decode-capacity refusal (the plugin's `503` capacity
+    /// terminal); `Err(Some(detail))` is the fixed violation detail.
+    pub fn openapi_validator_decode_body_in(
+        probe: &ResponseBufferBudgetProbe,
+        content_encoding: Option<&str>,
+        body: &[u8],
+        max_body_bytes: usize,
+    ) -> Result<(Vec<u8>, usize), Option<String>> {
+        crate::plugins::openapi_validator::decode_body_for_test(
+            content_encoding,
+            body,
+            max_body_bytes,
+            probe.0.handle(),
+            |plaintext| (plaintext.to_vec(), probe.available_bytes()),
+        )
     }
 
     /// The exact backend-request header filter the H3 cross-protocol bridge
@@ -15431,7 +18033,7 @@ pub mod _test_support {
         crate::proxy::inbound_request_declares_body(ctx)
     }
 
-    /// The exact replay-safety gate `proxy_to_backend_inner` applies at the top
+    /// The exact replay-safety gate `handle_proxy_request_inner` applies at the top
     /// of its retry loop, covering the mesh, native-H3, and reqwest replay
     /// transports. `false` means the loop refuses to replay and surfaces the
     /// original backend failure instead.
@@ -16128,6 +18730,338 @@ pub mod _test_support {
         crate::proxy::canonical_header_content_length(headers)
     }
 
+    /// One wire request-header block observed through both request-header
+    /// representations (issue #6671).
+    pub struct RequestHeaderPassthroughProbe {
+        /// The map the eager routed path builds: materialization, the `Host`
+        /// backfill from the request authority, then the hop re-assertion.
+        pub eager: std::collections::HashMap<String, String>,
+        /// The passthrough view rebuilt as a map.
+        pub view_map: std::collections::HashMap<String, String>,
+        /// The map a passthrough request holds after leaving the lane.
+        pub rematerialized: std::collections::HashMap<String, String>,
+        /// Every eager key and probe name reads the same through the view, the
+        /// lookup trait, and the context accessor as through the eager map.
+        pub lookups_match: bool,
+        /// The view's length and entry count both equal the eager map's length.
+        pub len_matches: bool,
+        /// The view's `Connection`-listed names equal the eager map parse.
+        pub connection_listed_matches: bool,
+        /// Outbound headers built from the eager map, as sorted name/bytes pairs.
+        pub eager_outbound: Vec<(String, Vec<u8>)>,
+        /// Outbound headers built from the passthrough view.
+        pub view_outbound: Vec<(String, Vec<u8>)>,
+    }
+
+    /// Drive `raw` through the eager routed materialization and through the
+    /// passthrough lane, with `authority` as the request URI authority and
+    /// `proxy_hops` as the re-asserted `X-Ferrum-Hops` count. `None` when the
+    /// block is not passthrough-eligible.
+    pub fn request_header_passthrough_probe_for_test(
+        raw: http::HeaderMap,
+        authority: Option<&str>,
+        proxy_hops: Option<u8>,
+        probe_names: &[&str],
+    ) -> Option<RequestHeaderPassthroughProbe> {
+        use crate::proxy::request_headers::{RequestHeaderLookup, RequestHeaders};
+
+        fn new_ctx() -> crate::plugins::RequestContext {
+            crate::plugins::RequestContext::new(
+                "127.0.0.1".to_string(),
+                "GET".to_string(),
+                "/".to_string(),
+            )
+        }
+        fn sorted(map: &http::HeaderMap) -> Vec<(String, Vec<u8>)> {
+            let mut out: Vec<(String, Vec<u8>)> = map
+                .iter()
+                .map(|(name, value)| (name.as_str().to_owned(), value.as_bytes().to_vec()))
+                .collect();
+            out.sort();
+            out
+        }
+
+        let mut eager_ctx = new_ctx();
+        eager_ctx.set_raw_headers(raw.clone());
+        eager_ctx.materialize_headers();
+        let mut eager = std::mem::take(&mut eager_ctx.headers);
+        if !eager.contains_key("host")
+            && let Some(authority) = authority
+        {
+            eager.insert("host".to_string(), authority.to_string());
+        }
+        crate::proxy::hop_limit::reassert_outbound_proxy_hops_in_map(proxy_hops, &mut eager);
+
+        let mut ctx = new_ctx();
+        ctx.set_raw_headers(raw);
+        if !ctx.try_begin_request_header_passthrough(authority) {
+            return None;
+        }
+        ctx.set_request_header_passthrough_proxy_hops(proxy_hops);
+        let view = ctx.request_headers_view(None);
+        let view_map = view.to_map().into_owned();
+        let lookups_match = eager
+            .keys()
+            .map(String::as_str)
+            .chain(probe_names.iter().copied())
+            .all(|name| {
+                let expected = eager.get(name).map(String::as_str);
+                view.get(name) == expected
+                    && view.request_header(name) == expected
+                    && ctx.effective_request_header(name) == expected
+            });
+        let len_matches = view.len() == eager.len() && view.entries().count() == eager.len();
+        let connection_listed_matches = view.connection_listed()
+            == crate::proxy::headers::parse_connection_listed_from_str_map(&eager);
+        let eager_outbound = sorted(&crate::proxy::outbound_request_headers_for_test(
+            RequestHeaders::Materialized(&eager),
+        ));
+        let view_outbound = sorted(&crate::proxy::outbound_request_headers_for_test(view));
+        ctx.end_request_header_passthrough();
+        Some(RequestHeaderPassthroughProbe {
+            eager,
+            view_map,
+            rematerialized: ctx.headers.clone(),
+            lookups_match,
+            len_matches,
+            connection_listed_matches,
+            eager_outbound,
+            view_outbound,
+        })
+    }
+
+    /// Attach `raw` and enter the request-header passthrough lane on `ctx`,
+    /// leaving `ctx.headers` empty and unmaterialized just as `handle_proxy_request_inner`
+    /// does for passthrough-eligible plugin chains.
+    pub fn begin_request_header_passthrough_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        raw: http::HeaderMap,
+        authority: Option<&str>,
+    ) -> bool {
+        ctx.set_raw_headers(raw);
+        ctx.try_begin_request_header_passthrough(authority)
+    }
+
+    /// End the request-header passthrough lane on `ctx` and materialize the
+    /// effective request header map (including strips and gateway assertions).
+    pub fn end_request_header_passthrough_for_test(ctx: &mut crate::plugins::RequestContext) {
+        ctx.end_request_header_passthrough();
+    }
+
+    /// Drive `raw` through both the eager path and the passthrough lane WITH
+    /// stripped credential headers and gateway-asserted headers (`key_auth`
+    /// passthrough overlay). Returns `None` if either the block is ineligible
+    /// or any gateway-assertion value cannot forward unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn request_header_passthrough_overlay_probe_for_test(
+        raw: http::HeaderMap,
+        authority: Option<&str>,
+        proxy_hops: Option<u8>,
+        stripped_headers: &[&str],
+        username: Option<&str>,
+        custom_id: Option<&str>,
+        identity: Option<&str>,
+        geo_country: Option<&str>,
+        probe_names: &[&str],
+    ) -> Option<RequestHeaderPassthroughProbe> {
+        use crate::proxy::request_headers::{RequestHeaderLookup, RequestHeaders};
+
+        fn new_ctx() -> crate::plugins::RequestContext {
+            crate::plugins::RequestContext::new(
+                "127.0.0.1".to_string(),
+                "GET".to_string(),
+                "/".to_string(),
+            )
+        }
+        fn sorted(map: &http::HeaderMap) -> Vec<(String, Vec<u8>)> {
+            let mut out: Vec<(String, Vec<u8>)> = map
+                .iter()
+                .map(|(name, value)| (name.as_str().to_owned(), value.as_bytes().to_vec()))
+                .collect();
+            out.sort();
+            out
+        }
+
+        let mut eager_ctx = new_ctx();
+        eager_ctx.set_raw_headers(raw.clone());
+        eager_ctx.materialize_headers();
+        let mut eager = std::mem::take(&mut eager_ctx.headers);
+        if !eager.contains_key("host")
+            && let Some(authority) = authority
+        {
+            eager.insert("host".to_string(), authority.to_string());
+        }
+        for name in stripped_headers {
+            eager.remove(*name);
+        }
+        if let Some(u) = username {
+            eager.insert("x-consumer-username".to_string(), u.to_string());
+            if let Some(c) = custom_id {
+                eager.insert("x-consumer-custom-id".to_string(), c.to_string());
+            }
+        }
+        if let Some(id) = identity {
+            eager.insert("x-authenticated-identity".to_string(), id.to_string());
+        }
+        if let Some(geo) = geo_country {
+            eager.insert("x-geo-country".to_string(), geo.to_string());
+        }
+        crate::proxy::hop_limit::reassert_outbound_proxy_hops_in_map(proxy_hops, &mut eager);
+
+        let mut ctx = new_ctx();
+        ctx.set_raw_headers(raw);
+        if !ctx.try_begin_request_header_passthrough(authority) {
+            return None;
+        }
+        ctx.set_request_header_passthrough_proxy_hops(proxy_hops);
+        if !stripped_headers.is_empty() {
+            ctx.set_request_header_passthrough_stripped_headers(std::sync::Arc::new(
+                stripped_headers.iter().map(|s| (*s).to_string()).collect(),
+            ));
+        }
+        if !ctx.try_set_request_header_passthrough_gateway_assertions(
+            username,
+            custom_id,
+            identity,
+            geo_country,
+        ) {
+            return None;
+        }
+        let view = ctx.request_headers_view(None);
+        let view_map = view.to_map().into_owned();
+        let lookups_match = eager
+            .keys()
+            .map(String::as_str)
+            .chain(stripped_headers.iter().copied())
+            .chain(probe_names.iter().copied())
+            .all(|name| {
+                let expected = eager.get(name).map(String::as_str);
+                view.get(name) == expected
+                    && view.request_header(name) == expected
+                    && ctx.effective_request_header(name) == expected
+            });
+        let len_matches = view.len() == eager.len() && view.entries().count() == eager.len();
+        let connection_listed_matches = view.connection_listed()
+            == crate::proxy::headers::parse_connection_listed_from_str_map(&eager);
+        let eager_outbound = sorted(&crate::proxy::outbound_request_headers_for_test(
+            RequestHeaders::Materialized(&eager),
+        ));
+        let view_outbound = sorted(&crate::proxy::outbound_request_headers_for_test(view));
+        ctx.end_request_header_passthrough();
+        Some(RequestHeaderPassthroughProbe {
+            eager,
+            view_map,
+            rematerialized: ctx.headers.clone(),
+            lookups_match,
+            len_matches,
+            connection_listed_matches,
+            eager_outbound,
+            view_outbound,
+        })
+    }
+
+    /// Sorted wire `(lowercase-name, raw-bytes)` pairs used by header-parity tests.
+    pub type WireHeaderList = Vec<(String, Vec<u8>)>;
+
+    /// Compare the deferred `HeaderMap` streaming response-header lane against
+    /// the materialized `HashMap` round-trip. Returns `None` when
+    /// `response_headers_passthrough_eligible` rejects `raw`.
+    pub fn response_header_passthrough_parity_for_test(
+        raw: http::HeaderMap,
+        status: u16,
+        via: Option<&str>,
+        alt_svc: Option<&str>,
+    ) -> Option<(WireHeaderList, WireHeaderList)> {
+        use crate::proxy::headers::{
+            ClientResponseFraming, apply_sanitized_response_headers,
+            response_headers_passthrough_eligible, sanitize_client_response_header_map_for_wire,
+            strip_gateway_owned_diagnostic_response_headers,
+        };
+
+        if !response_headers_passthrough_eligible(&raw) {
+            return None;
+        }
+
+        fn sorted(map: &http::HeaderMap) -> Vec<(String, Vec<u8>)> {
+            let mut out: Vec<(String, Vec<u8>)> = map
+                .iter()
+                .map(|(name, value)| (name.as_str().to_owned(), value.as_bytes().to_vec()))
+                .collect();
+            out.sort();
+            out
+        }
+
+        let framing = ClientResponseFraming::Streaming;
+
+        let mut map = std::collections::HashMap::new();
+        crate::proxy::collect_hyper_response_headers(&raw, &mut map);
+        strip_gateway_owned_diagnostic_response_headers(&mut map);
+        let mut builder = http::Response::builder().status(status);
+        builder = apply_sanitized_response_headers(builder, &mut map, framing);
+        if let Some(alt_svc) = alt_svc
+            && let Ok(value) = http::HeaderValue::from_str(alt_svc)
+        {
+            builder = builder.header(http::header::ALT_SVC, value);
+        }
+        if let Some(via) = via
+            && let Ok(value) = http::HeaderValue::from_str(via)
+        {
+            builder = builder.header(http::header::VIA, value);
+        }
+        let materialized_resp = builder
+            .body(())
+            .expect("materialized response builder must succeed");
+
+        let mut deferred = raw;
+        sanitize_client_response_header_map_for_wire(&mut deferred, framing);
+        if let Some(alt_svc) = alt_svc
+            && let Ok(value) = http::HeaderValue::from_str(alt_svc)
+        {
+            deferred.append(http::header::ALT_SVC, value);
+        }
+        if let Some(via) = via
+            && let Ok(value) = http::HeaderValue::from_str(via)
+        {
+            deferred.append(http::header::VIA, value);
+        }
+
+        Some((sorted(materialized_resp.headers()), sorted(&deferred)))
+    }
+
+    /// Compare `preserved_response_content_length` (materialized map) against
+    /// `preserved_response_content_length_from_header_map` (deferred lane) for
+    /// the same backend header block and status.
+    pub fn preserved_response_content_length_parity_for_test(
+        raw: http::HeaderMap,
+        status: u16,
+    ) -> (Option<u64>, Option<u64>) {
+        let mut map = std::collections::HashMap::new();
+        crate::proxy::collect_hyper_response_headers(&raw, &mut map);
+        let materialized = crate::proxy::headers::preserved_response_content_length(&map, status);
+        let deferred =
+            crate::proxy::headers::preserved_response_content_length_from_header_map(&raw, status);
+        (materialized, deferred)
+    }
+
+    /// Prove that cloning a `RequestContext` before its lazy
+    /// `StreamAuthTerminationLatch` is initialized still shares the exact same
+    /// underlying `Arc`-backed handle.
+    pub fn cloned_request_context_shares_lazy_auth_latch_for_test() -> bool {
+        use crate::proxy::auth_lifetime::{StreamAuthProtocolFamily, StreamAuthTermination};
+
+        let ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/".to_string(),
+        );
+        let cloned = ctx.clone();
+        let _ = cloned.authorization_termination_latch().record_once(
+            StreamAuthTermination::CredentialExpired,
+            StreamAuthProtocolFamily::Http,
+        );
+        ctx.observed_authorization_termination() == Some(StreamAuthTermination::CredentialExpired)
+    }
+
     /// Canonical declared `Content-Length` from a comma-folded header map.
     pub fn canonical_header_content_length_from_map_for_test(
         headers: &std::collections::HashMap<String, String>,
@@ -16406,8 +19340,8 @@ pub mod _test_support {
     // ── CP overlay / poll isolation (#2982–#2984) ───────────────────────────
 
     pub use crate::k8s_controller::reconciler::{
-        AcceptedK8sOverlay, merge_k8s_translation, publish_k8s_reconcile,
-        store_accepted_k8s_overlay, swap_merged_k8s_translation,
+        merge_k8s_translation, publish_k8s_reconcile, store_accepted_k8s_overlay,
+        swap_merged_k8s_translation,
     };
     pub use crate::k8s_controller::{
         CpPublicationGate, K8sOverlaySlot, compose_db_with_k8s_overlay, empty_k8s_overlay_slot,
@@ -16428,6 +19362,26 @@ pub mod _test_support {
         )
     }
 
+    /// Test-only view of the crate-private reconcile status dispatch: plans
+    /// and patches both writers' batches exactly as a reconcile does (no route
+    /// conflicts, no translation reuse, default Gateway API status context).
+    pub async fn run_status_patchers_for_test(
+        gateway_writer: Option<crate::k8s_controller::status::GatewayApiStatusWriter>,
+        istio_writer: Option<crate::k8s_controller::istio_status::IstioStatusWriter>,
+        objects: Vec<crate::config_sources::k8s::K8sObject>,
+        options: crate::config_sources::k8s::K8sTranslationOptions,
+        metrics: &crate::k8s_controller::metrics::ControllerMetrics,
+    ) {
+        crate::k8s_controller::reconciler::run_status_patchers_for_test(
+            gateway_writer,
+            istio_writer,
+            objects,
+            options,
+            metrics,
+        )
+        .await
+    }
+
     /// One-shot GET/PATCH intercept for the live Istio status competing-writer
     /// lane. After the first identity-matching GET, Ferrum waits until `resume`
     /// is completed before PATCHing.
@@ -16446,9 +19400,7 @@ pub mod _test_support {
 
     // ── K8s controller shutdown supervision (#3220) ─────────────────────────
 
-    pub use crate::k8s_controller::{
-        K8sControllerHandle, K8sControllerShutdownOutcome, K8sControllerTaskFailure,
-    };
+    pub use crate::k8s_controller::K8sControllerHandle;
 
     /// Test-only view of the crate-private controller task registry.
     ///
@@ -16561,6 +19513,17 @@ pub mod _test_support {
         /// increment this long-standing metric.
         pub fn watch_idle_relists(&self) -> u64 {
             self.metrics.snapshot().watch_idle_relists
+        }
+
+        /// Reflector rebuilds a demand-driven revision-evidence refresh started
+        /// (issue #7399), counted apart from idle relists.
+        pub fn watch_evidence_refresh_relists(&self) -> u64 {
+            self.metrics.snapshot().watch_evidence_refresh_relists
+        }
+
+        /// Watch `Delete` events the production watcher observed (issue #4491).
+        pub fn watch_deletes(&self) -> u64 {
+            self.metrics.snapshot().watch_deletes
         }
 
         /// Watch stream errors the production watcher counted (issue #4491),
@@ -17031,7 +19994,7 @@ pub mod _test_support {
         backend: &mut crate::ebpf::MockEbpfBackend,
         config: &crate::modes::node_agent::NodeAgentConfig,
         metrics: Arc<crate::ebpf::NodeAgentMetrics>,
-        shutdown_tx: &tokio::sync::watch::Sender<bool>,
+        shutdown_tx: &crate::overload::ShutdownSender,
         pod_stream: S,
         seed_pods: I,
     ) -> Result<(), anyhow::Error>
@@ -17054,8 +20017,6 @@ pub mod _test_support {
         backend: &mut crate::ebpf::MockEbpfBackend,
         config: &crate::modes::node_agent::NodeAgentConfig,
         metrics: &crate::ebpf::NodeAgentMetrics,
-        topology_ready: bool,
-        startup_ready: bool,
         initial_sync_complete: bool,
         outcome: &crate::ebpf::ingress_topology::IngressTopologyOutcome,
     ) -> (bool, bool) {
@@ -17063,8 +20024,6 @@ pub mod _test_support {
             backend,
             config,
             metrics,
-            topology_ready,
-            startup_ready,
             initial_sync_complete,
             outcome,
         )
@@ -17113,11 +20072,16 @@ pub mod _test_support {
         .await
     }
 
+    /// `startup_ready` is the loop's published `/health` bit; a
+    /// `udp_migration_generation` requires `config.node_waypoint_pod_registry_dir`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_with_node_agent_topology_outcome_stream_for_test<S, T>(
         backend: &mut crate::ebpf::MockEbpfBackend,
         config: &crate::modes::node_agent::NodeAgentConfig,
         metrics: Arc<crate::ebpf::NodeAgentMetrics>,
-        shutdown_tx: &tokio::sync::watch::Sender<bool>,
+        shutdown_tx: &crate::overload::ShutdownSender,
+        startup_ready: Arc<std::sync::atomic::AtomicBool>,
+        udp_migration_generation: Option<String>,
         pod_stream: S,
         initial_topology: NodeAgentIngressTopologyOutcomeForTest,
         topology_stream: T,
@@ -17134,23 +20098,13 @@ pub mod _test_support {
             config,
             metrics,
             shutdown_tx,
+            startup_ready,
+            udp_migration_generation,
             pod_stream,
             initial_topology,
             topology_stream,
         )
         .await
-    }
-
-    pub fn node_agent_cni_topology_readiness_rejection_for_test(
-        verb: crate::cni::rpc::RpcVerb,
-        initial_sync_complete: bool,
-        startup_ready: bool,
-    ) -> Option<&'static str> {
-        crate::modes::node_agent::cni_topology_readiness_rejection_for_test(
-            verb,
-            initial_sync_complete,
-            startup_ready,
-        )
     }
 
     pub fn node_agent_cni_capture_readiness_rejection_for_test(
@@ -17174,7 +20128,7 @@ pub mod _test_support {
     /// (issue #3704) from external unit/integration tests.
     pub async fn start_node_agent_admin_listeners_for_test(
         env_config: &crate::config::EnvConfig,
-        shutdown_tx: &tokio::sync::watch::Sender<bool>,
+        shutdown_tx: &crate::overload::ShutdownSender,
         startup_ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Vec<tokio::task::JoinHandle<()>>, anyhow::Error> {
         crate::modes::node_agent::start_node_agent_admin_listeners_for_test(
@@ -17305,7 +20259,7 @@ pub mod _test_support {
     /// so external tests can assert Ok/Err without constructing a full CP.
     pub async fn wait_for_cp_listeners_until_shutdown_or_exit_for_test(
         listener_handles: Vec<(String, tokio::task::JoinHandle<Result<(), anyhow::Error>>)>,
-        shutdown_tx: tokio::sync::watch::Sender<bool>,
+        shutdown_tx: crate::overload::ShutdownSender,
         drain_timeout: std::time::Duration,
     ) -> Result<(), anyhow::Error> {
         crate::modes::control_plane::wait_for_cp_listeners_until_shutdown_or_exit(
@@ -17375,13 +20329,13 @@ pub mod _test_support {
         cb: &crate::circuit_breaker::CircuitBreaker,
         status: hyper::StatusCode,
         policy_refusal: bool,
-        is_half_open_probe: bool,
+        ticket: crate::circuit_breaker::ProbeTicket,
     ) {
         crate::proxy::settle_hbone_backend_connect_circuit_breaker_outcome(
             cb,
             status,
             policy_refusal,
-            is_half_open_probe,
+            ticket,
         )
     }
 
@@ -17536,7 +20490,10 @@ pub mod _test_support {
                 http_body_util::StreamBody::new(backend),
                 None,
                 0,
-                Some(deadline()),
+                Some(crate::proxy::body::ClientGrpcResponseDeadline::new(
+                    deadline(),
+                    None,
+                )),
                 None,
             ),
             "h2_coalescing" => coalescing_h2_body_strip_hop_by_hop_trailers(
@@ -17552,7 +20509,10 @@ pub mod _test_support {
                 None,
                 default_coalesce_target_bytes(),
                 0,
-                Some(deadline()),
+                Some(crate::proxy::body::ClientGrpcResponseDeadline::new(
+                    deadline(),
+                    None,
+                )),
                 None,
             ),
             "h3_direct" => direct_streaming_h3_body(

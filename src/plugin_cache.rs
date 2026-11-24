@@ -31,7 +31,7 @@ use tracing::{error, info, warn};
 
 use crate::adaptive_concurrency::{
     AdaptiveConcurrencyConfig, AdaptiveConcurrencyKeyBy, AdaptiveConcurrencyLimiter,
-    AdaptiveConcurrencySnapshot, adaptive_concurrency_scope,
+    AdaptiveConcurrencySnapshot, AdaptiveConcurrencyTotals, adaptive_concurrency_scope,
 };
 use crate::config::types::PluginConfig;
 use crate::plugins::early_route_total::{
@@ -85,6 +85,12 @@ use async_trait::async_trait;
 /// no-contribution answer in the proxy's `all(...)` fold: a skipped instance may
 /// neither need the body retained nor pin the response to the buffered path.
 ///
+/// Fail-safe work is NOT suppressed: credential-redaction discovery, and the
+/// removal of client copies of request headers the instance owns as gateway
+/// assertions (`sanitize_owned_request_headers`, run where `before_proxy` would
+/// have been). A trigger may only remove work, never add disclosure or let a
+/// client forge a gateway assertion.
+///
 /// Static chain-shape declarations (`supported_protocols`,
 /// `requires_*_body_buffering`, `modifies_request_*`) are deliberately NOT
 /// gated: they describe the published generation, not one request, and gating
@@ -98,7 +104,8 @@ use async_trait::async_trait;
 /// wrapped instance — a capability regression that appears only when an operator
 /// sets `priority_override` or a trigger. Adding a `Plugin` hook means adding it
 /// here; `tests/unit/plugins/plugin_trigger_gate_tests.rs` pins the ones whose
-/// default is a silent no-op.
+/// default is a silent no-op, and `tests/unit/plugins/plugin_cache_tests.rs`
+/// fails when any `Plugin` trait method lacks a forward here.
 ///
 /// `is_deferred_cors_wrapper` is the one deliberate exception: this wrapper is
 /// not that marker, and claiming it would stop `install_cors_finalizer` from
@@ -217,6 +224,7 @@ struct FinalizedRequestPolicyCompositionPlugin {
     name: &'static str,
     priority: u16,
     protocols: &'static [ProxyProtocol],
+    request_headers_to_redact: Vec<String>,
 }
 
 #[async_trait]
@@ -235,6 +243,10 @@ impl Plugin for FinalizedRequestPolicyCompositionPlugin {
 
     fn enforces_finalized_request_policy(&self) -> bool {
         true
+    }
+
+    fn request_headers_to_redact(&self) -> &[String] {
+        &self.request_headers_to_redact
     }
 }
 
@@ -266,6 +278,13 @@ const FINALIZED_REQUEST_POLICY_COMPOSITION_SPECS: &[FinalizedRequestPolicyCompos
         name: "body_validator",
         default_priority: crate::plugins::priority::BODY_VALIDATOR,
         protocols: crate::plugins::HTTP_GRPC_PROTOCOLS,
+    },
+    // Every `graphql` instance has a protection rule (the constructor refuses
+    // one without), so it always enforces finalized request policy.
+    FinalizedRequestPolicyCompositionSpec {
+        name: "graphql",
+        default_priority: crate::plugins::priority::GRAPHQL,
+        protocols: crate::plugins::graphql::GRAPHQL_PROTOCOLS,
     },
     FinalizedRequestPolicyCompositionSpec {
         name: "openapi_validator",
@@ -325,6 +344,10 @@ impl Plugin for DeferredCorsPlugin {
         self.inner.on_request_received(ctx).await
     }
 
+    fn execution_trigger_reads_query(&self) -> bool {
+        self.inner.execution_trigger_reads_query()
+    }
+
     fn is_deferred_cors_wrapper(&self) -> bool {
         true
     }
@@ -377,6 +400,7 @@ pub(crate) fn cache_owned_plugin(plugin: &dyn std::any::Any) -> Option<CacheOwne
         return Some(CacheOwnedPlugin::Wraps(wrapper.inner.as_ref()));
     }
     let builtin = plugin.is::<MeshRouteDispatchFinalizer>()
+        || plugin.is::<RouteHeaderConsumerStandIn>()
         || plugin.is::<CompositionShapePlugin>()
         || plugin.is::<ServerlessSecurityCompositionPlugin>()
         || plugin.is::<FinalizedRequestPolicyCompositionPlugin>();
@@ -384,7 +408,10 @@ pub(crate) fn cache_owned_plugin(plugin: &dyn std::any::Any) -> Option<CacheOwne
 }
 
 const MESH_ROUTE_DISPATCH_NAME: &str = "mesh_route_dispatch";
+const REQUEST_TRANSFORMER_NAME: &str = "request_transformer";
+const RESPONSE_TRANSFORMER_NAME: &str = "response_transformer";
 const MESH_ROUTE_DISPATCH_FINALIZER_NAME: &str = "__mesh_route_dispatch_finalizer";
+const ROUTE_HEADER_CONSUMER_STAND_IN_NAME: &str = "__route_header_transform_consumer";
 const CORS_NAME: &str = "cors";
 
 /// Warn when a proxy expresses a strict HTTP/gRPC CORS origin policy but leaves
@@ -415,6 +442,10 @@ fn warn_if_cors_ws_origin_policy_gap(proxy: &Proxy, merged: &[Arc<dyn Plugin>]) 
 /// match nor an override from an earlier routing plugin.
 struct MeshRouteDispatchFinalizer {
     priority: u16,
+    /// The chain's dispatch instances that carry weighted-split tables (issue
+    /// #7387), collected once when the chain is assembled. Each is asked per
+    /// request, so an instance its trigger skipped selects nothing.
+    weighted_split_instances: Vec<Arc<dyn Plugin>>,
 }
 
 #[async_trait]
@@ -440,23 +471,54 @@ impl Plugin for MeshRouteDispatchFinalizer {
         crate::plugins::ResponseBodyProduction::Never
     }
 
-    /// Cache-internal sentinel: rewrites no request input (issue #6008).
+    /// Cache-internal sentinel: rewrites no request input of its own (issue
+    /// #6008). On a NodeWaypoint route with per-destination verdicts it
+    /// installs the selected destination's CUSTOM provider result (issue
+    /// #7383), whose header names the owning `mesh_authz` instance declares;
+    /// it runs after every dispatch instance and before request transformers,
+    /// deduplication and caching.
     fn declares_request_input_mutations(&self) -> bool {
         true
+    }
+
+    /// A chain whose dispatch instances carry weighted splits (issue #7387)
+    /// has its split resolved to a leg here, which moves the destination.
+    fn modifies_request_destination(&self) -> bool {
+        !self.weighted_split_instances.is_empty()
     }
 
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
-        _headers: &mut std::collections::HashMap<String, String>,
+        headers: &mut std::collections::HashMap<String, String>,
     ) -> PluginResult {
-        if !std::mem::take(&mut ctx.mesh_route_dispatch_reject_unmatched)
-            || ctx.mesh_route_dispatch_matched
-            || ctx.has_route_overrides()
+        if std::mem::take(&mut ctx.mesh_route_dispatch_reject_unmatched)
+            && !ctx.mesh_route_dispatch_matched
+            && !ctx.has_route_overrides()
         {
-            return PluginResult::Continue;
+            return crate::plugins::mesh_route_dispatch::reject_unmatched_result();
         }
-        crate::plugins::mesh_route_dispatch::reject_unmatched_result()
+        // Weighted split dispatched leg by leg (issue #7387): every instance
+        // has run, so the destination is final. When it is a weighted split,
+        // pick its leg now and route the request through the leg's own
+        // upstream, before the leg is judged below.
+        if let Some(refusal) = crate::plugins::mesh_route_dispatch::select_weighted_split_leg(
+            ctx,
+            &self.weighted_split_instances,
+        ) {
+            return refusal;
+        }
+        // NodeWaypoint per-destination authorization (issue #7383): every
+        // instance has run, so the effective destination is final. Admit it
+        // on its own verdict and run its own CUSTOM check here, before any
+        // request transformer.
+        if let Some(refusal) =
+            crate::plugins::mesh_route_dispatch::finalize_node_waypoint_route_branch(ctx, headers)
+                .await
+        {
+            return refusal;
+        }
+        PluginResult::Continue
     }
 }
 
@@ -492,17 +554,200 @@ pub(crate) fn install_mesh_route_dispatch_finalizer(
         );
     }
 
+    let mut weighted_split_instances = Vec::new();
     for plugin in plugins
         .iter()
         .filter(|plugin| is_builtin_named(plugin, MESH_ROUTE_DISPATCH_NAME))
     {
         plugin.enable_deferred_unmatched_rejection();
+        if plugin.mesh_route_weighted_splits().is_some() {
+            weighted_split_instances.push(Arc::clone(plugin));
+        }
     }
     let priority = plugins[last_index].priority();
     plugins.insert(
         last_index + 1,
-        Arc::new(MeshRouteDispatchFinalizer { priority }),
+        Arc::new(MeshRouteDispatchFinalizer {
+            priority,
+            weighted_split_instances,
+        }),
     );
+    Ok(())
+}
+
+/// Cache-internal stand-in for an eligible route-header consumer in a protocol
+/// view that consumer does not run on.
+///
+/// `response_transformer` runs on HTTP and gRPC only, while
+/// `mesh_route_dispatch` also routes WebSocket handshakes. Without a stand-in
+/// the WebSocket view has no eligible response consumer, so proxy core would
+/// leave a matched rule's route response list unused. `request_transformer`
+/// runs on WebSocket handshakes itself, so it stays the request list's sole
+/// consumer there and no request stand-in is synthesized (the slot logic only
+/// fills a direction the view has no eligible participant for, which keeps the
+/// request list applied exactly once). The stand-in carries only the
+/// route-header finalization participation of the consumer it replaces —
+/// never that transformer's static header, query, or body rules — and sits at
+/// that consumer's chain position.
+struct RouteHeaderConsumerStandIn {
+    priority: u16,
+    request: bool,
+    response: bool,
+}
+
+#[async_trait]
+impl Plugin for RouteHeaderConsumerStandIn {
+    fn name(&self) -> &str {
+        ROUTE_HEADER_CONSUMER_STAND_IN_NAME
+    }
+
+    fn priority(&self) -> u16 {
+        self.priority
+    }
+
+    fn supported_protocols(&self) -> &'static [crate::plugins::ProxyProtocol] {
+        crate::plugins::HTTP_FAMILY_PROTOCOLS
+    }
+
+    /// Cache-internal sentinel: never replaces a response body. Declared
+    /// explicitly for the same reason as the dispatch finalizer sentinel.
+    fn response_body_production(&self) -> crate::plugins::ResponseBodyProduction {
+        crate::plugins::ResponseBodyProduction::Never
+    }
+
+    /// Cache-internal sentinel: its only request-input effect is the declared
+    /// header map the route finalization phase writes.
+    fn declares_request_input_mutations(&self) -> bool {
+        true
+    }
+
+    /// Route request writes must reach the backend request, so the dispatcher
+    /// takes the cloned-header path exactly as for the replaced transformer.
+    fn modifies_request_headers(&self) -> bool {
+        self.request
+    }
+
+    fn participates_in_route_request_header_finalization(&self) -> bool {
+        self.request
+    }
+
+    fn participates_in_route_response_header_finalization(&self) -> bool {
+        self.response
+    }
+
+    /// The replaced `response_transformer` opts into reject hooks, so the
+    /// stand-in must too: the rejection loop finalizes the route response
+    /// list at this chain position, before later decorators such as
+    /// `security_headers`, instead of in the end-of-chain fallback after
+    /// them (which would let an earlier route write override a later scrub).
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        self.response
+    }
+}
+
+/// Where `filter_for_protocol` inserts route-header consumer stand-ins: the
+/// full-chain index of the last eligible consumer for each direction that the
+/// protocol view would otherwise lose, when a dispatcher in that view publishes
+/// route lists for the direction.
+#[derive(Default)]
+struct RouteHeaderConsumerStandInSlots {
+    request: Option<usize>,
+    response: Option<usize>,
+}
+
+impl RouteHeaderConsumerStandInSlots {
+    fn for_view(plugins: &[Arc<dyn Plugin>], protocol: ProxyProtocol) -> Self {
+        Self {
+            request: route_header_consumer_stand_in_slot(
+                plugins,
+                protocol,
+                |plugin| plugin.publishes_route_request_header_transforms(),
+                |plugin| plugin.participates_in_route_request_header_finalization(),
+            ),
+            response: route_header_consumer_stand_in_slot(
+                plugins,
+                protocol,
+                |plugin| plugin.publishes_route_response_header_transforms(),
+                |plugin| plugin.participates_in_route_response_header_finalization(),
+            ),
+        }
+    }
+}
+
+/// The full-chain index of the last eligible consumer (`participates`) when a
+/// dispatcher in `protocol`'s view publishes route lists (`publishes`) but the
+/// view keeps no eligible consumer for them. `None` otherwise: an RTDS-disabled
+/// consumer stays ineligible and its stand-in is never synthesized.
+fn route_header_consumer_stand_in_slot(
+    plugins: &[Arc<dyn Plugin>],
+    protocol: ProxyProtocol,
+    publishes: impl Fn(&Arc<dyn Plugin>) -> bool,
+    participates: impl Fn(&Arc<dyn Plugin>) -> bool,
+) -> Option<usize> {
+    let in_view = |plugin: &Arc<dyn Plugin>| plugin.supported_protocols().contains(&protocol);
+    let view_publishes = plugins.iter().any(|plugin| {
+        in_view(plugin) && is_builtin_named(plugin, MESH_ROUTE_DISPATCH_NAME) && publishes(plugin)
+    });
+    if !view_publishes
+        || plugins
+            .iter()
+            .any(|plugin| in_view(plugin) && participates(plugin))
+    {
+        return None;
+    }
+    plugins.iter().rposition(participates)
+}
+
+/// Refuse an effective chain whose `mesh_route_dispatch` rules publish
+/// route-level header transforms that no configured transformer on the same
+/// chain can apply.
+///
+/// Proxy core applies a matched rule's `request_transform` /
+/// `response_transform` only when the chain carries an eligible
+/// `request_transformer` / `response_transformer`; without one the published
+/// list is silently dropped, so a rule that strips a sensitive request header
+/// would forward it untouched. The translators auto-emit an empty
+/// `apply_route_overrides: true` consumer; a hand-authored chain must attach
+/// one too. Presence is judged by the configured built-in instance, not by its
+/// RTDS gate: a transformer an RTDS overlay disables is still the operator's
+/// configured consumer (its kill switch must not wedge every reload), and it
+/// keeps the documented "not eligible, route list unused" behavior at runtime.
+/// `request_transformer` runs in every view the dispatcher runs in; the
+/// WebSocket view, which drops the HTTP/gRPC-only `response_transformer`, keeps
+/// an eligible response consumer through [`RouteHeaderConsumerStandIn`], so
+/// presence on the effective chain is sufficient for every view.
+pub(crate) fn validate_mesh_route_transform_consumers(
+    plugins: &[Arc<dyn Plugin>],
+) -> Result<(), String> {
+    let dispatchers = || {
+        plugins
+            .iter()
+            .filter(|plugin| is_builtin_named(plugin, MESH_ROUTE_DISPATCH_NAME))
+    };
+    let publishes_request =
+        dispatchers().any(|plugin| plugin.publishes_route_request_header_transforms());
+    let publishes_response =
+        dispatchers().any(|plugin| plugin.publishes_route_response_header_transforms());
+    if publishes_request
+        && !plugins
+            .iter()
+            .any(|plugin| is_builtin_named(plugin, REQUEST_TRANSFORMER_NAME))
+    {
+        return Err(
+            "mesh_route_dispatch rules carry request_transform, but the effective plugin chain has no request_transformer to apply them, so the route-level request header policy would be silently dropped; attach a request_transformer to this proxy (`{\"rules\": [], \"apply_route_overrides\": true}` is enough) or remove the rules' request_transform"
+                .to_string(),
+        );
+    }
+    if publishes_response
+        && !plugins
+            .iter()
+            .any(|plugin| is_builtin_named(plugin, RESPONSE_TRANSFORMER_NAME))
+    {
+        return Err(
+            "mesh_route_dispatch rules carry response_transform, but the effective plugin chain has no response_transformer to apply them, so the route-level response header policy would be silently dropped; attach a response_transformer to this proxy (`{\"rules\": [], \"apply_route_overrides\": true}` is enough) or remove the rules' response_transform"
+                .to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -561,6 +806,133 @@ fn is_builtin_named(plugin: &Arc<dyn Plugin>, name: &str) -> bool {
     plugin.name() == name && crate::plugins::is_builtin_plugin(plugin.as_ref())
 }
 
+/// The built-in `opa` instance behind `plugin`, looking through cache wrappers.
+/// Keyed on the concrete type, never the reported name.
+fn builtin_opa<'a>(plugin: &'a (dyn Plugin + 'static)) -> Option<&'a crate::plugins::opa::Opa> {
+    let any: &dyn std::any::Any = plugin;
+    if let Some(opa) = any.downcast_ref::<crate::plugins::opa::Opa>() {
+        return Some(opa);
+    }
+    match cache_owned_plugin(any) {
+        Some(CacheOwnedPlugin::Wraps(inner)) => builtin_opa(inner),
+        _ => None,
+    }
+}
+
+/// An `opa` allow obligation (`decision_request_headers`) must never author a
+/// header any plugin on the same effective chain publishes as a
+/// credential location: the policy would replace the client's credential on
+/// the upstream request, or the owner's `hide_credentials` strip would silently
+/// drop the obligation after OPA recorded an allow. Names are compared as
+/// backends read them (ASCII case, `_` and `-` equivalent). OPA repeats this
+/// refusal per request as a fail-closed backstop.
+fn validate_opa_obligations_against_credential_owners(
+    plugins: &[Arc<dyn Plugin>],
+) -> Result<(), String> {
+    for plugin in plugins {
+        let Some(opa) = builtin_opa(plugin.as_ref()) else {
+            continue;
+        };
+        let destinations = opa.decision_request_header_destinations();
+        if destinations.is_empty() {
+            continue;
+        }
+        for owner in plugins.iter().filter(|owner| {
+            owner
+                .supported_protocols()
+                .iter()
+                .any(|protocol| plugin.supported_protocols().contains(protocol))
+        }) {
+            if let Some(credential) = owner.request_headers_to_redact().iter().find(|credential| {
+                destinations.iter().any(|destination| {
+                    crate::proxy::headers::field_names_equivalent_for_backends(
+                        destination,
+                        credential,
+                    )
+                })
+            }) {
+                return Err(format!(
+                    "opa `decision_request_headers` cannot name {credential:?}, which \
+                     plugin {:?} on the same effective plugin chain publishes as a \
+                     credential location; a policy decision must never author or replace a \
+                     credential",
+                    owner.name()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a configured request-header write (a `request_transformer` header
+/// rule, a `mesh_route_dispatch` `request_transform`) that could re-author a
+/// header another plugin on the same chain owns as a gateway assertion
+/// (`Plugin::owned_request_assertion_header_names`): a `claim_headers`
+/// destination, an OPA decision header, `x-ferrum-peer-spiffe-id`.
+///
+/// Those writes run in `before_proxy`, after the owner's sanitization, so a
+/// template such as `$(header.x-user-email)` would copy the client's value
+/// straight back into the destination the owner just stripped, and a literal
+/// would assert a fixed identity no principal earned. On a chain that owns such
+/// a header but carries no `grpc_web` translator, a write that could label the
+/// request gRPC-Web (`content-type` with a request-derived value or a gRPC-Web
+/// literal) is refused too: it would run after the untranslated gRPC-Web
+/// refusal and send the client's body-embedded trailer frame to a gRPC-Web
+/// backend. Removing an owned header stays legal.
+fn validate_request_header_writes_against_owned_assertions(
+    plugins: &[Arc<dyn Plugin>],
+) -> Result<(), String> {
+    use crate::proxy::headers::field_names_equivalent_for_backends;
+
+    let owners: Vec<(&Arc<dyn Plugin>, Vec<String>)> = plugins
+        .iter()
+        .map(|plugin| (plugin, plugin.owned_request_assertion_header_names()))
+        .filter(|(_, owned)| !owned.is_empty())
+        .collect();
+    if owners.is_empty() {
+        return Ok(());
+    }
+    let translator_present = plugins
+        .iter()
+        .any(|plugin| is_builtin_named(plugin, "grpc_web"));
+    for writer in plugins {
+        for (name, literal) in writer.configured_request_header_writes() {
+            for (owner, owned) in &owners {
+                if Arc::ptr_eq(owner, writer) {
+                    continue;
+                }
+                if owned
+                    .iter()
+                    .any(|owned| field_names_equivalent_for_backends(owned, &name))
+                {
+                    return Err(format!(
+                        "plugin {:?} writes request header {name:?}, which plugin {:?} on the \
+                         same effective plugin chain owns as a gateway assertion; a configured \
+                         rule must never re-author a gateway-asserted header",
+                        writer.name(),
+                        owner.name()
+                    ));
+                }
+            }
+            if !translator_present
+                && field_names_equivalent_for_backends(&name, "content-type")
+                && literal
+                    .as_deref()
+                    .is_none_or(crate::plugins::grpc_web::is_grpc_web_content_type)
+            {
+                return Err(format!(
+                    "plugin {:?} may set `content-type` to a gRPC-Web media type on a plugin \
+                     chain that owns gateway-asserted request headers but has no `grpc_web` \
+                     translator; untranslated gRPC-Web is refused there, and relabelling a \
+                     request after that refusal would forward its body-embedded trailers",
+                    writer.name()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Reject security-sensitive plugin compositions whose ordering or body view
 /// cannot preserve the configured enforcement contract.
 pub(crate) fn validate_plugin_security_composition(
@@ -585,6 +957,9 @@ pub(crate) fn validate_plugin_security_composition(
             plugin.name()
         ));
     }
+
+    validate_opa_obligations_against_credential_owners(plugins)?;
+    validate_request_header_writes_against_owned_assertions(plugins)?;
 
     for protocol in ALL_PROXY_PROTOCOLS {
         let identity_soap_count = plugins
@@ -814,6 +1189,42 @@ pub(crate) fn validate_plugin_security_composition(
             // capability.
         }
 
+        // `ai_semantic_cache` answers a HIT from its final-request-body hook,
+        // and the final-body chain stops at the first `RejectBinary`, so every
+        // fail-closed final-request-body policy on the route must run BEFORE
+        // the cache — otherwise a `priority_override` on either side lets a
+        // hit answer a request that policy would refuse. Equal priority is
+        // refused too: the name tie-break would put `ai_semantic_cache` ahead
+        // of e.g. `waf`. `ai_federation` is the documented downstream
+        // dispatcher: its final-body checks govern only the provider request
+        // it would send, which a hit never sends. Candidate admission needs no
+        // full construction here: the cache's `CompositionShapePlugin`
+        // stand-in carries its name and effective priority, and the cheap
+        // finalized-policy views carry the enforcers'.
+        for semantic_cache in plugins.iter().filter(|plugin| {
+            plugin.supported_protocols().contains(&protocol)
+                && is_builtin_named(plugin, "ai_semantic_cache")
+        }) {
+            if let Some(enforcer) = plugins.iter().find(|plugin| {
+                plugin.supported_protocols().contains(&protocol)
+                    && !Arc::ptr_eq(plugin, semantic_cache)
+                    && !is_builtin_named(plugin, "ai_federation")
+                    && plugin.enforces_finalized_request_policy()
+                    && plugin.priority() >= semantic_cache.priority()
+            }) {
+                return Err(format!(
+                    "final request-body policy plugin {:?} at effective priority \"{}\" must \
+                     run before every ai_semantic_cache instance for protocol {:?}; \
+                     ai_semantic_cache priority \"{}\" would answer a cache hit before that \
+                     policy decides the finalized request",
+                    enforcer.name(),
+                    enforcer.priority(),
+                    protocol,
+                    semantic_cache.priority()
+                ));
+            }
+        }
+
         for side_effecting_plugin in plugins.iter().filter(|plugin| {
             plugin.supported_protocols().contains(&protocol)
                 && plugin.requires_prior_request_deduplication()
@@ -901,7 +1312,7 @@ pub(crate) fn validate_plugin_security_composition(
 ///   the override applied while its request-conditional trailer policy
 ///   answered "not governed", forwarding a trailer a route `remove` targets.
 /// * **An identity-reading trigger on an authentication plugin.** `authenticate`
-///   is the phase that establishes `consumer` / `auth_method` / `spiffe_id`, so
+///   is the phase that establishes `consumer` / `external_identity` / `external_identity_authority` / `auth_method` / `spiffe_id`, so
 ///   such a trigger could only ever read another mechanism's committed identity,
 ///   which makes the effective auth chain order-dependent.
 /// * **An identity-reading trigger on a STREAM-ONLY plugin.** The stream
@@ -960,12 +1371,12 @@ fn trigger_composition_error(
     }
     if gate.reads_authenticated_identity() && plugin.is_auth_plugin() {
         return Some(
-            "an authentication plugin cannot be gated on `consumer` / `auth_method` / `spiffe_id`, which its own phase establishes",
+            "an authentication plugin cannot be gated on `consumer` / `external_identity` / `external_identity_authority` / `auth_method` / `spiffe_id`, which its own phase establishes",
         );
     }
     if gate.reads_authenticated_identity() && is_stream_only_plugin(plugin) {
         return Some(
-            "a stream-only plugin cannot be gated on `consumer` / `auth_method` / `spiffe_id`: the only gated phase of a stream connection is `on_stream_connect`, which is also where stream authentication runs, so an identity predicate never gates one — and a stream connection carries no authoritative peer SPIFFE fact at all",
+            "a stream-only plugin cannot be gated on `consumer` / `external_identity` / `external_identity_authority` / `auth_method` / `spiffe_id`: the only gated phase of a stream connection is `on_stream_connect`, which is also where stream authentication runs, so an identity predicate never gates one — and a stream connection carries no authoritative peer SPIFFE fact at all",
         );
     }
     None
@@ -1126,8 +1537,26 @@ impl Plugin for PluginInstanceWrapper {
     fn may_inject_route_fault(&self) -> bool {
         self.inner.may_inject_route_fault()
     }
+    fn execution_trigger_reads_query(&self) -> bool {
+        self.trigger
+            .as_ref()
+            .is_some_and(PluginTriggerGate::reads_query)
+            || self.inner.execution_trigger_reads_query()
+    }
     fn answers_cors_preflights(&self) -> bool {
         self.inner.answers_cors_preflights()
+    }
+    fn cors_uses_strict_origin_policy(&self) -> bool {
+        self.inner.cors_uses_strict_origin_policy()
+    }
+    fn rejects_with_origin_response(&self) -> bool {
+        self.inner.rejects_with_origin_response()
+    }
+    /// Forwarded regardless of the trigger: the kTLS handoff is decided before
+    /// the handshake, when a gated instance may still admit a principal on
+    /// this connection, so the listener must stay on the buffered path.
+    fn admits_authenticated_stream_principal(&self) -> bool {
+        self.inner.admits_authenticated_stream_principal()
     }
     fn country_mmdb_snapshot(&self) -> Option<&crate::config::types::CountryMmdbSnapshot> {
         self.inner.country_mmdb_snapshot()
@@ -1182,6 +1611,9 @@ impl Plugin for PluginInstanceWrapper {
     fn metric_tag_override_plans_are_conditional(&self) -> bool {
         self.trigger.is_some() || self.inner.metric_tag_override_plans_are_conditional()
     }
+    fn uses_mesh_request_key(&self) -> bool {
+        self.inner.uses_mesh_request_key()
+    }
     fn records_mesh_service_graph(&self, summary: &TransactionSummary) -> bool {
         self.inner.records_mesh_service_graph(summary)
             && self
@@ -1194,6 +1626,18 @@ impl Plugin for PluginInstanceWrapper {
     }
     fn priority(&self) -> u16 {
         self.priority
+    }
+    /// A priority-only wrapper forwards every one of these hooks unchanged,
+    /// so it implements exactly what the wrapped plugin does. A trigger gate
+    /// takes and memoizes its decision from inside these hooks (normally
+    /// `on_request_received`, which the inner plugin need not implement), so a
+    /// triggered instance keeps every hook dispatched (issue #6615).
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        if self.trigger.is_some() {
+            crate::plugins::PluginHooks::ALL
+        } else {
+            self.inner.lifecycle_hooks()
+        }
     }
     fn prepare_grpc_deadline(&self, ctx: &mut RequestContext) -> PluginResult {
         if !self.runs(ctx, TriggerPhase::PreAuth) {
@@ -1265,8 +1709,20 @@ impl Plugin for PluginInstanceWrapper {
     fn allows_hbone_inner_reuse_for(&self, admission: &HboneReuseContext) -> bool {
         self.inner.allows_hbone_inner_reuse_for(admission)
     }
+    /// A trigger only skips hooks and records its own skip key; it never reads
+    /// the mesh label projection, so the wrapped plugin's answer stands.
+    fn observes_mesh_label_metadata(&self) -> bool {
+        self.inner.observes_mesh_label_metadata()
+    }
     fn modifies_request_headers(&self) -> bool {
         self.inner.modifies_request_headers()
+    }
+    fn supports_request_header_passthrough(&self) -> bool {
+        if self.trigger.is_some() {
+            false
+        } else {
+            self.inner.supports_request_header_passthrough()
+        }
     }
     fn participates_in_route_request_header_finalization(&self) -> bool {
         self.inner
@@ -1275,6 +1731,15 @@ impl Plugin for PluginInstanceWrapper {
     fn participates_in_route_response_header_finalization(&self) -> bool {
         self.inner
             .participates_in_route_response_header_finalization()
+    }
+    fn publishes_route_request_header_transforms(&self) -> bool {
+        self.inner.publishes_route_request_header_transforms()
+    }
+    fn replaces_route_request_header_transforms(&self) -> bool {
+        self.inner.replaces_route_request_header_transforms()
+    }
+    fn publishes_route_response_header_transforms(&self) -> bool {
+        self.inner.publishes_route_response_header_transforms()
     }
     fn modifies_request_query(&self) -> bool {
         self.inner.modifies_request_query()
@@ -1411,15 +1876,46 @@ impl Plugin for PluginInstanceWrapper {
     fn enforced_response_body_limit(&self) -> Option<u64> {
         self.inner.enforced_response_body_limit()
     }
+    fn refuses_unprovable_response_stream(&self, ctx: &RequestContext) -> Option<u64> {
+        // A skipped instance enforces nothing.
+        if !self.runs_cached(ctx) {
+            return None;
+        }
+        self.inner.refuses_unprovable_response_stream(ctx)
+    }
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
         headers: &mut std::collections::HashMap<String, String>,
     ) -> PluginResult {
         if !self.runs(ctx, TriggerPhase::PostAuth) {
+            // A skipped instance installs nothing, but it still owns the
+            // headers it documents as always sanitized (`claim_headers`
+            // destinations, `x-ferrum-peer-spiffe-id`, OPA decision headers).
+            // Leaving their client
+            // copies would let a trigger forward a client-chosen value the
+            // backend reads as a gateway assertion; like credential-redaction
+            // discovery, this fail-safe work is never gated.
+            self.inner.sanitize_owned_request_headers(ctx, headers);
             return PluginResult::Continue;
         }
         self.inner.before_proxy(ctx, headers).await
+    }
+    /// Deliberately UNGATED: see `before_proxy` above, its only caller.
+    fn sanitize_owned_request_headers(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut std::collections::HashMap<String, String>,
+    ) {
+        self.inner.sanitize_owned_request_headers(ctx, headers);
+    }
+    /// Static chain shape, never gated: the trailer strip list is per route.
+    fn owned_request_assertion_header_names(&self) -> Vec<String> {
+        self.inner.owned_request_assertion_header_names()
+    }
+    /// Static chain shape, never gated: refused at publication.
+    fn configured_request_header_writes(&self) -> Vec<(String, Option<String>)> {
+        self.inner.configured_request_header_writes()
     }
     fn defer_before_proxy_until_backend_path_resolved(&self) -> bool {
         self.inner.defer_before_proxy_until_backend_path_resolved()
@@ -1458,6 +1954,21 @@ impl Plugin for PluginInstanceWrapper {
     }
     fn enable_deferred_unmatched_rejection(&self) {
         self.inner.enable_deferred_unmatched_rejection();
+    }
+    fn mesh_route_weighted_splits(
+        &self,
+    ) -> Option<Arc<crate::plugins::mesh_route_dispatch::MeshRouteWeightedSplits>> {
+        self.inner.mesh_route_weighted_splits()
+    }
+    /// Gated: a trigger-skipped instance resolves no weighted split.
+    fn mesh_route_weighted_splits_for_request(
+        &self,
+        ctx: &RequestContext,
+    ) -> Option<&crate::plugins::mesh_route_dispatch::MeshRouteWeightedSplits> {
+        if !self.runs_cached(ctx) {
+            return None;
+        }
+        self.inner.mesh_route_weighted_splits_for_request(ctx)
     }
     fn is_backend_admission_plugin(&self) -> bool {
         self.inner.is_backend_admission_plugin()
@@ -1956,6 +2467,13 @@ impl Plugin for PluginInstanceWrapper {
         }
         self.inner.enforces_final_client_visible_response_body(ctx)
     }
+    fn has_staged_response_body_transform_refusal(&self, ctx: &RequestContext) -> bool {
+        // A skipped instance ran no transform and staged nothing.
+        if !self.runs_cached(ctx) {
+            return false;
+        }
+        self.inner.has_staged_response_body_transform_refusal(ctx)
+    }
     async fn finalize_client_visible_response_body(
         &self,
         ctx: &mut RequestContext,
@@ -2105,6 +2623,9 @@ impl Plugin for PluginInstanceWrapper {
     fn has_execution_trigger(&self) -> bool {
         self.trigger.is_some() || self.inner.has_execution_trigger()
     }
+    fn admits_missing_credential(&self) -> bool {
+        self.inner.admits_missing_credential()
+    }
     fn authentication_applies(&self, ctx: &RequestContext) -> bool {
         self.runs_cached(ctx) && self.inner.authentication_applies(ctx)
     }
@@ -2209,11 +2730,24 @@ impl Plugin for PluginInstanceWrapper {
             .on_ws_reassembly_frames(proxy_id, connection_id, direction, fragment_frames)
             .await
     }
+    fn on_ws_policy_close(
+        &self,
+        proxy_id: &str,
+        connection_id: u64,
+        direction: WebSocketFrameDirection,
+        close: Option<&tokio_tungstenite::tungstenite::protocol::CloseFrame>,
+    ) {
+        self.inner
+            .on_ws_policy_close(proxy_id, connection_id, direction, close);
+    }
     fn prepare_ws_frame_delivery(
         &self,
+        connection_id: u64,
+        direction: WebSocketFrameDirection,
         message: &tokio_tungstenite::tungstenite::Message,
     ) -> Option<crate::plugins::WsFrameDeliveryObservation> {
-        self.inner.prepare_ws_frame_delivery(message)
+        self.inner
+            .prepare_ws_frame_delivery(connection_id, direction, message)
     }
     fn emit_ws_frame_delivery(
         &self,
@@ -2305,6 +2839,10 @@ impl Plugin for PluginInstanceWrapper {
 ///   could start overlapping high-cost cohorts against one gateway without any
 ///   reload at all (GHSA-wmqm-6mxj-gm9p). Rejecting the composition at cache
 ///   construction is what makes the shared per-identity guard authoritative.
+/// * `otel_tracing` owns one gateway SERVER span per request: its trace
+///   identity, sampling decision, and per-attempt CLIENT span recorder are
+///   single request slots, so a second instance would overwrite the first's
+///   trust/sampling decision and attempt recorder and orphan its spans.
 const EXCLUSIVE_EFFECTIVE_INSTANCE_PLUGINS: &[(&str, &str)] = &[
     ("api_chargeback", "shared /charges registry is exactly-once"),
     (
@@ -2314,6 +2852,10 @@ const EXCLUSIVE_EFFECTIVE_INSTANCE_PLUGINS: &[(&str, &str)] = &[
     (
         "load_testing",
         "one detached run cohort is admitted per policy",
+    ),
+    (
+        "otel_tracing",
+        "one gateway SERVER span and attempt recorder per request",
     ),
 ];
 
@@ -2344,9 +2886,10 @@ fn validate_tcp_connection_throttle_attachment(
     pc: &PluginConfig,
     gateway_config: &GatewayConfig,
 ) -> Result<(), String> {
-    let attached = gateway_config.proxies.iter().filter(|proxy| {
-        tcp_connection_throttle_effectively_applies_to_proxy(pc, proxy, gateway_config)
-    });
+    let attached = gateway_config
+        .proxies
+        .iter()
+        .filter(|proxy| plugin_config_effectively_applies_to_proxy(pc, proxy, gateway_config));
     let mut attached_count = 0usize;
     let mut unsupported = Vec::new();
     for proxy in attached {
@@ -2375,18 +2918,86 @@ fn validate_tcp_connection_throttle_attachment(
     }
 }
 
-/// Validate protocol attachment semantics for every enabled TCP throttle in a
+/// `udp_rate_limiting` runs only as a UDP/DTLS datagram hook. A proxy or
+/// proxy-group attachment that reaches a TCP or HTTP-family proxy would be
+/// filtered out of every protocol view that proxy runs — protection that
+/// looks configured but never enforces — so it fails visibly, the mirror of
+/// [`validate_tcp_connection_throttle_attachment`]. A global policy keeps the
+/// ordinary per-protocol filtering, so a mixed deployment applies it to its
+/// UDP/DTLS listeners only.
+fn validate_udp_rate_limiting_attachment(
+    pc: &PluginConfig,
+    gateway_config: &GatewayConfig,
+) -> Result<(), String> {
+    if !pc.enabled {
+        return Ok(());
+    }
+    if pc.scope == PluginScope::Global {
+        // Filter-only by design (a mixed deployment applies it to its UDP/DTLS
+        // listeners), but a global policy with no UDP/DTLS proxy at all
+        // enforces nothing; say so instead of loading silently.
+        let mut attached = gateway_config
+            .proxies
+            .iter()
+            .filter(|proxy| plugin_config_effectively_applies_to_proxy(pc, proxy, gateway_config));
+        let mut any_attached = false;
+        let covers_udp = attached.any(|proxy| {
+            any_attached = true;
+            matches!(
+                proxy.effective_scheme(),
+                BackendScheme::Udp | BackendScheme::Dtls
+            )
+        });
+        if any_attached && !covers_udp {
+            warn!(
+                plugin = "udp_rate_limiting",
+                plugin_config_id = ?pc.id,
+                "Global udp_rate_limiting has no UDP/DTLS proxy to protect; it is inert until one is configured"
+            );
+        }
+        return Ok(());
+    }
+    let unsupported: Vec<String> = gateway_config
+        .proxies
+        .iter()
+        .filter(|proxy| scoped_plugin_config_applies_to_proxy(pc, proxy))
+        .filter(|proxy| {
+            !matches!(
+                proxy.effective_scheme(),
+                BackendScheme::Udp | BackendScheme::Dtls
+            )
+        })
+        .map(|proxy| format!("{:?} ({})", proxy.id, proxy.effective_scheme()))
+        .collect();
+    if unsupported.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "udp_rate_limiting: plugin config {:?} is attached to unsupported TCP or HTTP-family proxy/proxies {}; only UDP/DTLS is supported (use tcp_connection_throttle for TCP connection admission or rate_limiting for HTTP-family requests)",
+        pc.id,
+        unsupported.join(", ")
+    ))
+}
+
+/// Validate protocol attachment semantics for every enabled stream-only
+/// protection — `tcp_connection_throttle` and `udp_rate_limiting` — in a
 /// complete candidate graph. Admin admission and config-source validation use
 /// this before persistence/publication so unsupported protection is never
-/// accepted only to be silently filtered from a UDP/DTLS or HTTP plugin list.
+/// accepted only to be silently filtered from another protocol's plugin list.
 pub(crate) fn validate_tcp_connection_throttle_attachments(
     gateway_config: &GatewayConfig,
 ) -> Result<(), Vec<String>> {
     let errors: Vec<String> = gateway_config
         .plugin_configs
         .iter()
-        .filter(|pc| pc.enabled && pc.plugin_name == "tcp_connection_throttle")
-        .filter_map(|pc| validate_tcp_connection_throttle_attachment(pc, gateway_config).err())
+        .filter(|pc| pc.enabled)
+        .filter_map(|pc| match pc.plugin_name.as_str() {
+            "tcp_connection_throttle" => {
+                validate_tcp_connection_throttle_attachment(pc, gateway_config).err()
+            }
+            "udp_rate_limiting" => validate_udp_rate_limiting_attachment(pc, gateway_config).err(),
+            _ => None,
+        })
         .collect();
     if errors.is_empty() {
         Ok(())
@@ -2398,7 +3009,9 @@ pub(crate) fn validate_tcp_connection_throttle_attachments(
 /// Whether an effective plugin config can require the parsed WebSocket relay.
 ///
 /// Built-ins answer from the config-independent
-/// [`crate::plugins::BUILTIN_WEBSOCKET_FRAMING_PLUGINS`] declaration. An
+/// [`crate::plugins::BUILTIN_WEBSOCKET_FRAMING_PLUGINS`] declaration, except
+/// `api_chargeback`, which needs the parsed relay only when it prices
+/// bandwidth and answers from its parsed pricing without being constructed. An
 /// out-of-tree plugin is constructed and asked through
 /// [`Plugin::requires_websocket_framing`]; a plugin that cannot be constructed
 /// is reported as an error so the caller fails closed.
@@ -2409,6 +3022,13 @@ fn plugin_config_may_require_websocket_framing(
     let name = pc.plugin_name.as_str();
     if crate::plugins::BUILTIN_WEBSOCKET_FRAMING_PLUGINS.contains(&name) {
         return Ok(true);
+    }
+    // The one built-in whose framing need depends on its config: a
+    // bandwidth-priced `api_chargeback` bills WebSocket sessions from the
+    // parsed relay's payload counters, which a compressed passthrough session
+    // relayed as raw bytes would not provide.
+    if name == "api_chargeback" {
+        return crate::plugins::api_chargeback::config_requires_websocket_framing(&pc.config);
     }
     if crate::plugins::builtin_plugin_parity_meta(name).is_some() {
         return Ok(false);
@@ -2490,7 +3110,6 @@ fn create_tcp_connection_throttle_plugin(
         identity,
         TcpConnectionThrottleInstance {
             state: plugin.shared_state(),
-            cleanup_interval_seconds: plugin.cleanup_interval_seconds(),
         },
     );
     Ok(Some(Arc::new(plugin)))
@@ -2577,16 +3196,21 @@ fn try_create_plugin(
     country_mmdb_load_session: &CountryMmdbLoadSession,
     current_adaptive_states: &AdaptiveConcurrencyInstanceMap,
     staged_adaptive_states: &mut AdaptiveConcurrencyInstanceMap,
+    route_override_memo: &mut RouteOverrideFactsMemo<'_>,
     current_tcp_throttle_states: &TcpConnectionThrottleInstanceMap,
     staged_tcp_throttle_states: &mut TcpConnectionThrottleInstanceMap,
 ) -> Result<Option<Arc<dyn Plugin>>, String> {
+    debug_assert!(
+        std::ptr::eq(route_override_memo.config(), gateway_config),
+        "a route-override memo must belong to the generation being built"
+    );
     let created = if pc.plugin_name == "adaptive_concurrency" {
         create_adaptive_concurrency_plugin(
             pc,
-            gateway_config,
             http_client,
             current_adaptive_states,
             staged_adaptive_states,
+            route_override_memo,
         )
     } else if pc.plugin_name == "geo_restriction" {
         crate::plugins::geo_restriction::GeoRestriction::new_with_load_session(
@@ -2626,38 +3250,6 @@ fn try_create_plugin(
         // mode, Redis key prefix, or failure posture) isolates onto fresh
         // state instead of inheriting.
         create_local_rate_limit_plugin(pc, http_client)
-    } else if matches!(
-        pc.plugin_name.as_str(),
-        "request_mirror"
-            | "api_chargeback_sink"
-            | "soap_ws_security"
-            | "jwks_auth"
-            | "hmac_auth"
-            | "waf"
-    ) {
-        // Pass the stable plugin-config resource id through the production
-        // factory so identity-aware plugins partition or attribute sibling
-        // instances. Do not use the process-local runtime instance id here. It
-        // must be the configured resource id, not a process-local id: replicas
-        // of the same policy on separate data planes must keep sharing one
-        // distributed keyspace.
-        //
-        // `soap_ws_security` uses the same stable identity for its process
-        // replay registry and shared Redis keyspace. Passing `None` here would
-        // leave every production reload generation with private replay state.
-        //
-        // `waf` uses it as the operator-facing anomaly-score identity
-        // (`waf.instances.<id>.score`, `waf.instance_scores`,
-        // `waf.scoring_instance`). Passing `None` here would mint a
-        // process-local `standalone-N` surrogate that is unstable across
-        // reload/rebuild and across replicas consuming the same file, database,
-        // CP, or DP config (issue #3940).
-        create_plugin_with_http_client_and_config_id(
-            &pc.plugin_name,
-            &pc.config,
-            http_client.clone(),
-            Some(&pc.id),
-        )
     } else if pc.plugin_name == "request_deduplication" {
         // Share local idempotency state (active leases, retained completions,
         // execution barriers, and their accounting) across compatible reload
@@ -2698,7 +3290,13 @@ fn try_create_plugin(
         // Configured runtime construction always has a plugin-config resource
         // id. Pass it through so identity-aware plugins (and any future ones
         // that opt into the factory argument) cannot fall back to a
-        // process-local standalone identity on this path.
+        // process-local standalone identity on this path. It must be the
+        // configured resource id, not a process-local runtime instance id:
+        // replicas of the same policy on separate data planes must keep
+        // sharing one distributed keyspace (`request_mirror`,
+        // `api_chargeback_sink`, `jwks_auth`, `hmac_auth`), `soap_ws_security`
+        // keys its replay registry and Redis keyspace on it, and `waf` uses it
+        // as the operator-facing anomaly-score identity (issue #3940).
         create_plugin_with_http_client_and_config_id(
             &pc.plugin_name,
             &pc.config,
@@ -2708,6 +3306,126 @@ fn try_create_plugin(
     };
 
     finalize_created_plugin(pc, created)
+}
+
+/// SHA-256 policy digest of a UDP datagram-hook plugin set.
+pub(crate) type UdpDatagramPolicyDigest = [u8; 32];
+
+/// Live datagram-hook plugin instance (keyed by its `Arc` data pointer) →
+/// digest of the plugin config it was built from.
+type UdpDatagramPolicyRegistry =
+    std::sync::RwLock<HashMap<usize, (std::sync::Weak<dyn Plugin>, UdpDatagramPolicyDigest)>>;
+
+/// Process registry of datagram-hook instance policy digests, filled once per
+/// constructed instance at the cache-construction funnel and read only while
+/// a protocol entry is built. Entries are `Weak`, pruned on every insert, so
+/// retention is bounded by the live plugin generations. Never touched on a
+/// datagram path.
+static UDP_DATAGRAM_POLICY_DIGESTS: std::sync::OnceLock<UdpDatagramPolicyRegistry> =
+    std::sync::OnceLock::new();
+
+fn plugin_instance_key(plugin: &Arc<dyn Plugin>) -> usize {
+    Arc::as_ptr(plugin) as *const () as usize
+}
+
+/// Digest of everything in one plugin config that decides how its instance
+/// treats datagrams: identity (namespace, id, kind), scope and target,
+/// priority override, execution trigger, and the full config document.
+/// Timestamps and labels are excluded, so a full reload that reconstructs an
+/// unchanged config yields the same digest. `None` (fall back to instance
+/// identity) only if a component cannot be serialized.
+fn udp_datagram_plugin_config_digest(pc: &PluginConfig) -> Option<UdpDatagramPolicyDigest> {
+    use crate::fips::approved::Sha256;
+
+    let scope = serde_json::to_vec(&pc.scope).ok()?;
+    let trigger = serde_json::to_vec(&pc.trigger).ok()?;
+    let config = serde_json::to_vec(&pc.config).ok()?;
+    let priority_override = pc.priority_override.map(u16::to_le_bytes);
+    let mut hasher = Sha256::new();
+    // Length-prefixed framing: no component can be re-read as part of another.
+    let mut absorb = |label: &str, value: &[u8]| {
+        hasher.update((label.len() as u64).to_le_bytes());
+        hasher.update(label.as_bytes());
+        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(value);
+    };
+    absorb("v", b"ferrum-edge/udp-datagram-plugin-policy/v1");
+    absorb("namespace", pc.namespace.as_bytes());
+    absorb("id", pc.id.as_bytes());
+    absorb("plugin_name", pc.plugin_name.as_bytes());
+    absorb("scope", &scope);
+    absorb("proxy_id", pc.proxy_id.as_deref().unwrap_or("").as_bytes());
+    absorb(
+        "priority_override",
+        priority_override
+            .as_ref()
+            .map_or(&[][..], |bytes| &bytes[..]),
+    );
+    absorb("trigger", &trigger);
+    absorb("config", &config);
+    Some(hasher.finalize())
+}
+
+fn register_udp_datagram_policy_digest(pc: &PluginConfig, plugin: &Arc<dyn Plugin>) {
+    let Some(digest) = udp_datagram_plugin_config_digest(pc) else {
+        return;
+    };
+    let registry = UDP_DATAGRAM_POLICY_DIGESTS.get_or_init(Default::default);
+    let mut guard = registry
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.retain(|_, (weak, _)| weak.strong_count() > 0);
+    guard.insert(
+        plugin_instance_key(plugin),
+        (Arc::downgrade(plugin), digest),
+    );
+}
+
+fn registered_udp_datagram_policy_digest(
+    plugin: &Arc<dyn Plugin>,
+) -> Option<UdpDatagramPolicyDigest> {
+    let registry = UDP_DATAGRAM_POLICY_DIGESTS.get()?;
+    let guard = registry
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (weak, digest) = guard.get(&plugin_instance_key(plugin))?;
+    let live = weak.upgrade()?;
+    Arc::ptr_eq(&live, plugin).then_some(*digest)
+}
+
+/// Stable policy digest of the datagram-hook plugins in `plugins`, in chain
+/// order (`udp_rate_limiting` and every other `requires_udp_datagram_hooks`
+/// plugin; the rest are ignored because an established session never re-runs
+/// them).
+///
+/// Each instance contributes the digest of the plugin config it was built
+/// from, so a full rebuild that reconstructs semantically identical instances
+/// (file-mode `SIGHUP`, a DP full snapshot, a DB-mode full reload) yields the
+/// SAME digest and established UDP/DTLS sessions continue, while any change to
+/// a datagram plugin's config, trigger, priority, presence, or order changes
+/// it. An instance that was not built through the cache funnel contributes its
+/// `Arc` identity instead, which is the conservative (session-ending) answer.
+pub(crate) fn udp_datagram_policy_digest(plugins: &[Arc<dyn Plugin>]) -> UdpDatagramPolicyDigest {
+    use crate::fips::approved::Sha256;
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"ferrum-edge/udp-datagram-policy/v1");
+    for plugin in plugins
+        .iter()
+        .filter(|plugin| plugin.requires_udp_datagram_hooks())
+    {
+        match registered_udp_datagram_policy_digest(plugin) {
+            Some(digest) => {
+                hasher.update(b"cfg");
+                hasher.update(digest);
+            }
+            None => {
+                hasher.update(b"ptr");
+                hasher.update((plugin_instance_key(plugin) as u64).to_le_bytes());
+            }
+        }
+    }
+    hasher.finalize()
 }
 
 /// Apply the shared post-construction contract to a plugin instance built for
@@ -2773,6 +3491,9 @@ fn finalize_created_plugin(
             } else {
                 plugin
             };
+            if plugin.requires_udp_datagram_hooks() {
+                register_udp_datagram_policy_digest(pc, &plugin);
+            }
             Ok(Some(plugin))
         }
         Ok(None) => {
@@ -3183,6 +3904,7 @@ fn try_create_plugin_for_cache(
     country_mmdb_instances: &mut CountryMmdbPluginInstanceMap,
     current_adaptive_states: &AdaptiveConcurrencyInstanceMap,
     staged_adaptive_states: &mut AdaptiveConcurrencyInstanceMap,
+    route_override_memo: &mut RouteOverrideFactsMemo<'_>,
     current_tcp_throttle_states: &TcpConnectionThrottleInstanceMap,
     staged_tcp_throttle_states: &mut TcpConnectionThrottleInstanceMap,
 ) -> Result<Option<Arc<dyn Plugin>>, String> {
@@ -3201,6 +3923,7 @@ fn try_create_plugin_for_cache(
             country_mmdb_load_session,
             current_adaptive_states,
             staged_adaptive_states,
+            route_override_memo,
             current_tcp_throttle_states,
             staged_tcp_throttle_states,
         )?
@@ -3280,7 +4003,13 @@ struct AdaptiveConcurrencyRouteOverride {
     proxy_key: String,
     plugin_name: String,
     effective_priority: u16,
-    destination_fingerprint: serde_json::Value,
+    /// The execution trigger decides which requests the route plugin rewrites
+    /// at all, so editing it can move traffic between destinations that are
+    /// all already route keys.
+    trigger: Option<crate::config::plugin_trigger::PluginTrigger>,
+    /// Shared across every protected proxy the config attaches to: it is
+    /// resolved once per pass by [`RouteOverrideFactsMemo`].
+    destination_fingerprint: Arc<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -3327,7 +4056,6 @@ struct TcpConnectionThrottlePolicyId {
 #[derive(Clone)]
 struct TcpConnectionThrottleInstance {
     state: Arc<TcpConnectionThrottleState>,
-    cleanup_interval_seconds: u64,
 }
 
 type TcpConnectionThrottleInstanceMap =
@@ -3386,27 +4114,7 @@ fn scoped_plugin_config_applies_to_proxy(
     }
 }
 
-fn plugin_config_effectively_applies_to_proxy(
-    pc: &PluginConfig,
-    proxy: &crate::config::types::Proxy,
-    config: &GatewayConfig,
-) -> bool {
-    if !pc.enabled {
-        return false;
-    }
-    match &pc.scope {
-        PluginScope::Global => !config.plugin_configs.iter().any(|candidate| {
-            candidate.enabled
-                && candidate.plugin_name == pc.plugin_name
-                && scoped_plugin_config_applies_to_proxy(candidate, proxy)
-        }),
-        PluginScope::Proxy | PluginScope::ProxyGroup => {
-            scoped_plugin_config_applies_to_proxy(pc, proxy)
-        }
-    }
-}
-
-fn tcp_connection_throttle_effectively_applies_to_proxy(
+pub(crate) fn plugin_config_effectively_applies_to_proxy(
     pc: &PluginConfig,
     proxy: &crate::config::types::Proxy,
     config: &GatewayConfig,
@@ -3617,6 +4325,7 @@ fn normalize_adaptive_concurrency_direct_host(host: &str) -> String {
 fn route_override_priority(pc: &PluginConfig) -> u16 {
     pc.priority_override
         .unwrap_or(match pc.plugin_name.as_str() {
+            "ai_federation" => crate::plugins::priority::AI_FEDERATION,
             "ai_stream_router" => crate::plugins::priority::AI_STREAM_ROUTER,
             "mcp_gateway" => crate::plugins::priority::MCP_GATEWAY,
             "mesh_route_dispatch" => crate::plugins::priority::MESH_ROUTE_DISPATCH,
@@ -3624,39 +4333,181 @@ fn route_override_priority(pc: &PluginConfig) -> u16 {
         })
 }
 
+/// Whether this plugin config can rewrite proxy dispatch through
+/// `route_override_*`.
+///
+/// `ai_federation` does so only on its streaming path (issue #3298); with
+/// `streaming` disabled it makes its own plugin-client call outside proxy
+/// dispatch, so it contributes no route destination. This is a scan predicate
+/// evaluated for every config against every protected proxy, so it checks
+/// `streaming.enabled` alone and never resolves the provider plan: the plan
+/// is built once per pass, only for configs that also attach to a protected
+/// proxy (issue #7018).
+fn plugin_config_writes_route_overrides(pc: &PluginConfig) -> bool {
+    match pc.plugin_name.as_str() {
+        "ai_stream_router" | "mcp_gateway" | "mesh_route_dispatch" => true,
+        "ai_federation" => crate::plugins::ai_federation::streaming_enabled(&pc.config),
+        _ => false,
+    }
+}
+
+/// The proxy-independent part of one route-override config's contribution to
+/// an `adaptive_concurrency` route definition.
+struct RouteOverrideFacts {
+    destination_fingerprint: Arc<serde_json::Value>,
+    /// `ai_federation` streaming destinations `(dial host, port)` in dispatch
+    /// order. Empty for every other route-override plugin, whose destinations
+    /// depend on the proxy (upstream subsets, backend ports) and are collected
+    /// per proxy.
+    federation_destinations: Vec<(String, u16)>,
+}
+
+/// Memoizes [`RouteOverrideFacts`] for one candidate generation, keyed by the
+/// config's index in `GatewayConfig::plugin_configs`.
+///
+/// A config attached to many protected proxies, or shared by many adaptive
+/// policies, is otherwise resolved once per proxy and per policy, and for
+/// `ai_federation` that means a provider loop, a sort, and one URL parse per
+/// provider for the fingerprint and again for the destinations (issue #7018).
+/// One memo is owned by each cache build (full, incremental, or composition
+/// candidate) and threaded through the retain, rebuild-scope, and plugin
+/// creation passes, so every adaptive policy in that build shares it. Facts
+/// are resolved lazily, only when an adaptive policy's route definition asks
+/// for them.
+///
+/// The memo borrows the one `GatewayConfig` whose indexes it is keyed by, and
+/// route definitions read that config from the memo, so it can never serve
+/// facts for a different generation.
+struct RouteOverrideFactsMemo<'cfg> {
+    config: &'cfg GatewayConfig,
+    by_config_index: HashMap<usize, RouteOverrideFacts>,
+}
+
+impl<'cfg> RouteOverrideFactsMemo<'cfg> {
+    fn new(config: &'cfg GatewayConfig) -> Self {
+        Self {
+            config,
+            by_config_index: HashMap::new(),
+        }
+    }
+
+    fn config(&self) -> &'cfg GatewayConfig {
+        self.config
+    }
+
+    /// Facts for `pc`, which must be `self.config().plugin_configs[config_index]`.
+    fn facts(&mut self, config_index: usize, pc: &PluginConfig) -> &RouteOverrideFacts {
+        debug_assert!(
+            self.config
+                .plugin_configs
+                .get(config_index)
+                .is_some_and(|indexed| std::ptr::eq(indexed, pc)),
+            "route-override facts must be keyed by the memo's own config"
+        );
+        self.by_config_index
+            .entry(config_index)
+            .or_insert_with(|| route_override_facts(pc))
+    }
+}
+
+thread_local! {
+    /// `ai_federation` route plans resolved on this thread, so a test can prove
+    /// a build resolves each config's plan once (issue #7018). Thread-local so
+    /// a parallel cache build on another test thread cannot perturb the count.
+    static AI_FEDERATION_ROUTE_PLAN_RESOLUTIONS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Number of `ai_federation` streaming route plans resolved on the calling
+/// thread since it started.
+#[doc(hidden)]
+pub fn ai_federation_route_plan_resolutions_for_test() -> u64 {
+    AI_FEDERATION_ROUTE_PLAN_RESOLUTIONS.with(Cell::get)
+}
+
+fn route_override_facts(pc: &PluginConfig) -> RouteOverrideFacts {
+    if pc.plugin_name != "ai_federation" {
+        return RouteOverrideFacts {
+            destination_fingerprint: Arc::new(route_override_destination_fingerprint(pc)),
+            federation_destinations: Vec::new(),
+        };
+    }
+    AI_FEDERATION_ROUTE_PLAN_RESOLUTIONS.with(|count| count.set(count.get().saturating_add(1)));
+    // One plan serves both the fingerprint and the destinations.
+    let plan = crate::plugins::ai_federation::stream_route_plan(&pc.config);
+    let federation_destinations: Vec<(String, u16)> = plan
+        .iter()
+        .flat_map(|plan| plan.providers.iter())
+        .filter_map(|provider| provider.destination.as_ref())
+        .map(|destination| (destination.host.clone(), destination.port))
+        .collect();
+    let destination_fingerprint = plan
+        .and_then(|plan| serde_json::to_value(plan).ok())
+        .unwrap_or_else(|| serde_json::json!({"streaming": false}));
+    RouteOverrideFacts {
+        destination_fingerprint: Arc::new(destination_fingerprint),
+        federation_destinations,
+    }
+}
+
+/// The route-override configs effective on `proxy`, in execution order, each
+/// paired with its index in `config.plugin_configs` (the
+/// [`RouteOverrideFactsMemo`] key).
 fn effective_route_override_configs_for_proxy<'a>(
     proxy: &crate::config::types::Proxy,
     config: &'a GatewayConfig,
-) -> Vec<&'a PluginConfig> {
-    const ROUTE_OVERRIDE_PLUGINS: &[&str] =
-        &["ai_stream_router", "mcp_gateway", "mesh_route_dispatch"];
+) -> Vec<(usize, &'a PluginConfig)> {
     let mut route_configs = Vec::new();
 
-    // Match PluginCache construction order before its stable priority sort:
-    // globals, proxy-scoped configs in config order, then proxy-group configs
-    // in association order.
-    route_configs.extend(config.plugin_configs.iter().filter(|pc| {
-        pc.scope == PluginScope::Global
-            && ROUTE_OVERRIDE_PLUGINS.contains(&pc.plugin_name.as_str())
-            && plugin_config_effectively_applies_to_proxy(pc, proxy, config)
-    }));
-    route_configs.extend(config.plugin_configs.iter().filter(|pc| {
-        pc.scope == PluginScope::Proxy
-            && ROUTE_OVERRIDE_PLUGINS.contains(&pc.plugin_name.as_str())
-            && plugin_config_effectively_applies_to_proxy(pc, proxy, config)
-    }));
-    for association in &proxy.plugins {
-        if let Some(pc) = config.plugin_configs.iter().find(|pc| {
+    // Match PluginCache construction order before its stable
+    // `(priority, name)` sort: globals, then proxy-scoped configs, then
+    // proxy-group configs, each class in ascending plugin-config id. Only the
+    // few matching route-override configs are ordered, never the whole set.
+    let by_canonical_id = |(_, left): &(usize, &PluginConfig),
+                           (_, right): &(usize, &PluginConfig)| {
+        left.id
+            .cmp(&right.id)
+            .then_with(|| left.namespace.cmp(&right.namespace))
+    };
+    let mut globals: Vec<(usize, &PluginConfig)> = config
+        .plugin_configs
+        .iter()
+        .enumerate()
+        .filter(|(_, pc)| {
+            pc.scope == PluginScope::Global
+                && plugin_config_writes_route_overrides(pc)
+                && plugin_config_effectively_applies_to_proxy(pc, proxy, config)
+        })
+        .collect();
+    globals.sort_by(by_canonical_id);
+    route_configs.extend(globals);
+    let mut scoped: Vec<(usize, &PluginConfig)> = config
+        .plugin_configs
+        .iter()
+        .enumerate()
+        .filter(|(_, pc)| {
+            pc.scope == PluginScope::Proxy
+                && plugin_config_writes_route_overrides(pc)
+                && plugin_config_effectively_applies_to_proxy(pc, proxy, config)
+        })
+        .collect();
+    scoped.sort_by(by_canonical_id);
+    route_configs.extend(scoped);
+    for association in proxy_plugin_associations_in_canonical_order(proxy) {
+        if let Some(entry) = config.plugin_configs.iter().enumerate().find(|(_, pc)| {
             pc.id == association.plugin_config_id
                 && pc.namespace == proxy.namespace
                 && pc.scope == PluginScope::ProxyGroup
-                && ROUTE_OVERRIDE_PLUGINS.contains(&pc.plugin_name.as_str())
+                && plugin_config_writes_route_overrides(pc)
                 && plugin_config_effectively_applies_to_proxy(pc, proxy, config)
         }) {
-            route_configs.push(pc);
+            route_configs.push(entry);
         }
     }
-    route_configs.sort_by_key(|pc| route_override_priority(pc));
+    route_configs.sort_by(|(_, left), (_, right)| {
+        route_override_priority(left)
+            .cmp(&route_override_priority(right))
+            .then_with(|| left.plugin_name.cmp(&right.plugin_name))
+    });
     route_configs
 }
 
@@ -3676,6 +4527,9 @@ fn url_destination_fingerprint(url: &str) -> serde_json::Value {
     serde_json::Value::String(url.to_string())
 }
 
+/// Fingerprint of a non-`ai_federation` route-override config. `ai_federation`
+/// is fingerprinted by [`route_override_facts`], which builds its plan once
+/// for both the fingerprint and the destinations.
 fn route_override_destination_fingerprint(pc: &PluginConfig) -> serde_json::Value {
     match pc.plugin_name.as_str() {
         "mesh_route_dispatch" => {
@@ -3747,13 +4601,19 @@ fn route_override_destination_fingerprint(pc: &PluginConfig) -> serde_json::Valu
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            serde_json::json!({
+            let mut fingerprint = serde_json::json!({
                 "reject_unmatched": fingerprint_config
                     .get("reject_unmatched")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false),
                 "rules": rules
-            })
+            });
+            // Weighted-split legs (issue #7387) are route-override
+            // destinations too.
+            if let Some(splits) = fingerprint_config.get("weighted_splits") {
+                fingerprint["weighted_splits"] = splits.clone();
+            }
+            fingerprint
         }
         "ai_stream_router" => {
             let enabled = pc
@@ -3901,6 +4761,7 @@ fn route_override_destination_fingerprint(pc: &PluginConfig) -> serde_json::Valu
 
 fn collect_route_override_destinations(
     route_pc: &PluginConfig,
+    facts: &RouteOverrideFacts,
     proxy: &crate::config::types::Proxy,
     key_by: AdaptiveConcurrencyKeyBy,
     config: &GatewayConfig,
@@ -3908,16 +4769,20 @@ fn collect_route_override_destinations(
     upstream_routes: &mut Vec<AdaptiveConcurrencyUpstreamRoute>,
 ) {
     match route_pc.plugin_name.as_str() {
+        "ai_federation" => {
+            for (host, port) in &facts.federation_destinations {
+                push_direct_route_key(keys, key_by, proxy, host, *port);
+            }
+        }
         "mesh_route_dispatch" => {
-            let Some(rules) = route_pc
+            // `rules` is optional when `weighted_splits` is set (issue
+            // #7387): never return before the legs below are walked.
+            for destination in route_pc
                 .config
                 .get("rules")
                 .and_then(serde_json::Value::as_array)
-            else {
-                return;
-            };
-            for destination in rules
-                .iter()
+                .into_iter()
+                .flatten()
                 .filter(|rule| rule.get("redirect").is_none_or(serde_json::Value::is_null))
                 .filter_map(|rule| {
                     rule.get("destination")
@@ -3957,6 +4822,32 @@ fn collect_route_override_destinations(
                 ) {
                     push_direct_route_key(keys, key_by, proxy, host, port);
                 }
+            }
+            // Weighted-split legs (issue #7387) are dispatched through their
+            // own upstreams exactly like a rule's `upstream_id`.
+            for leg_id in route_pc
+                .config
+                .get("weighted_splits")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|split| split.get("legs").and_then(serde_json::Value::as_array))
+                .flatten()
+                .filter_map(|leg| leg.get("upstream_id").and_then(serde_json::Value::as_str))
+            {
+                let upstream = config.upstreams.iter().find(|upstream| {
+                    upstream.id == leg_id && upstream.namespace == proxy.namespace
+                });
+                push_upstream_route(
+                    keys,
+                    upstream_routes,
+                    adaptive_concurrency_scope(key_by, proxy, Some(leg_id)),
+                    &proxy.namespace,
+                    leg_id,
+                    None,
+                    proxy.backend_port,
+                    upstream,
+                );
             }
         }
         "ai_stream_router" => {
@@ -4027,11 +4918,14 @@ fn collect_route_override_destinations(
     }
 }
 
+/// The route definition of adaptive policy `pc` in the generation the memo
+/// was created for; the config is read from the memo so the two cannot drift.
 fn adaptive_concurrency_route_definition(
     pc: &PluginConfig,
     key_by: AdaptiveConcurrencyKeyBy,
-    config: &GatewayConfig,
+    route_override_memo: &mut RouteOverrideFactsMemo<'_>,
 ) -> AdaptiveConcurrencyRouteDefinition {
+    let config = route_override_memo.config();
     let mut protected_proxy_keys = Vec::new();
     let mut keys = Vec::new();
     let mut overrides = Vec::new();
@@ -4042,9 +4936,11 @@ fn adaptive_concurrency_route_definition(
         }
         protected_proxy_keys.push(proxy_runtime_key(proxy));
 
-        for route_pc in effective_route_override_configs_for_proxy(proxy, config) {
+        for (config_index, route_pc) in effective_route_override_configs_for_proxy(proxy, config) {
+            let facts = route_override_memo.facts(config_index, route_pc);
             collect_route_override_destinations(
                 route_pc,
+                facts,
                 proxy,
                 key_by,
                 config,
@@ -4055,7 +4951,8 @@ fn adaptive_concurrency_route_definition(
                 proxy_key: proxy_runtime_key(proxy),
                 plugin_name: route_pc.plugin_name.clone(),
                 effective_priority: route_override_priority(route_pc),
-                destination_fingerprint: route_override_destination_fingerprint(route_pc),
+                trigger: route_pc.trigger.clone(),
+                destination_fingerprint: Arc::clone(&facts.destination_fingerprint),
             });
         }
 
@@ -4226,8 +5123,9 @@ fn adaptive_concurrency_lb_key_space_changed(
 
 fn retained_adaptive_concurrency_states(
     current: &AdaptiveConcurrencyInstanceMap,
-    config: &GatewayConfig,
+    route_override_memo: &mut RouteOverrideFactsMemo<'_>,
 ) -> AdaptiveConcurrencyInstanceMap {
+    let config = route_override_memo.config();
     let mut retained = HashMap::new();
     for pc in &config.plugin_configs {
         if !pc.enabled
@@ -4238,8 +5136,11 @@ fn retained_adaptive_concurrency_states(
         }
         let identity = adaptive_concurrency_policy_id(pc);
         if let Some(existing) = current.get(&identity) {
-            let route_definition =
-                adaptive_concurrency_route_definition(pc, existing.config.key_by, config);
+            let route_definition = adaptive_concurrency_route_definition(
+                pc,
+                existing.config.key_by,
+                route_override_memo,
+            );
             if adaptive_definition_matches(existing, pc, &route_definition) {
                 retained.insert(identity, existing.clone());
             }
@@ -4275,10 +5176,11 @@ fn adaptive_concurrency_policy_is_active(pc: &PluginConfig, config: &GatewayConf
 
 fn include_adaptive_concurrency_route_rebuilds(
     current: &AdaptiveConcurrencyInstanceMap,
-    config: &GatewayConfig,
+    route_override_memo: &mut RouteOverrideFactsMemo<'_>,
     proxy_ids_to_rebuild: &mut HashSet<NamespacedResourceId>,
     rebuild_adaptive_globals: &mut bool,
 ) {
+    let config = route_override_memo.config();
     for (identity, existing) in current {
         let Some(pc) = config.plugin_configs.iter().find(|pc| {
             pc.enabled
@@ -4289,7 +5191,7 @@ fn include_adaptive_concurrency_route_rebuilds(
             continue;
         };
         let route_definition =
-            adaptive_concurrency_route_definition(pc, existing.config.key_by, config);
+            adaptive_concurrency_route_definition(pc, existing.config.key_by, route_override_memo);
         if route_definition == existing.route_definition {
             continue;
         }
@@ -4328,16 +5230,17 @@ fn include_adaptive_concurrency_route_rebuilds(
 
 fn create_adaptive_concurrency_plugin(
     pc: &PluginConfig,
-    gateway_config: &GatewayConfig,
     http_client: &PluginHttpClient,
     current: &AdaptiveConcurrencyInstanceMap,
     staged: &mut AdaptiveConcurrencyInstanceMap,
+    route_override_memo: &mut RouteOverrideFactsMemo<'_>,
 ) -> Result<Option<Arc<dyn Plugin>>, String> {
     let identity = adaptive_concurrency_policy_id(pc);
     let parsed = Arc::new(crate::plugins::adaptive_concurrency::parse_config_value(
         &pc.config,
     )?);
-    let route_definition = adaptive_concurrency_route_definition(pc, parsed.key_by, gateway_config);
+    let route_definition =
+        adaptive_concurrency_route_definition(pc, parsed.key_by, route_override_memo);
     if let Some(existing) = staged.get(&identity) {
         if !adaptive_definition_matches(existing, pc, &route_definition) {
             return Err(format!(
@@ -4410,6 +5313,38 @@ fn create_adaptive_concurrency_plugin(
 struct ProxyGroupPluginInstance {
     plugin: Arc<dyn Plugin>,
     config: PluginConfig,
+    /// Raw named-schema definition the instance's `schema_ref` resolved to
+    /// when it was constructed (`None` when the config carries no
+    /// `schema_ref`, or the name was unresolved). Loggers compile `schema_ref`
+    /// once at construction, so the referenced definition is part of what the
+    /// shared instance IS: an incremental rebuild must not retain a group
+    /// instance whose own row is unchanged when the definition it resolved has
+    /// since changed.
+    schema_ref_definition: Option<Arc<serde_json::Value>>,
+}
+
+impl ProxyGroupPluginInstance {
+    /// Record a freshly constructed group instance together with the
+    /// named-schema definition its `schema_ref` resolves to right now. Called
+    /// on the same thread, inside the same reload bracket, as the
+    /// construction itself, so the captured definition is the one the
+    /// constructor compiled.
+    fn new(plugin: Arc<dyn Plugin>, config: PluginConfig) -> Self {
+        let schema_ref_definition = proxy_group_schema_ref_definition(&config);
+        Self {
+            plugin,
+            config,
+            schema_ref_definition,
+        }
+    }
+}
+
+/// The raw named-schema definition a plugin config's `schema_ref` resolves to
+/// in the registry view of the calling thread (the open reload staging map on
+/// the reload thread, the live map elsewhere).
+fn proxy_group_schema_ref_definition(config: &PluginConfig) -> Option<Arc<serde_json::Value>> {
+    let name = config.config.get("schema_ref")?.as_str()?;
+    crate::plugins::utils::log_schema::registry::lookup_named_raw(name)
 }
 
 /// Built-in plugin types whose constructed instance can participate in a
@@ -4451,12 +5386,22 @@ const SECURITY_COMPOSITION_PLUGIN_NAMES: &[&str] = &[
     "grpc_web",
     "hmac_auth",
     "jwks_auth",
+    // `jwt_auth` publishes its configured token header as a credential
+    // location, which the `opa` obligation-destination refusal reads; the
+    // candidate view must see it exactly as runtime construction does.
+    // Construction is pure config parsing.
+    "jwt_auth",
     "key_auth",
     "load_testing",
     "mcp_gateway",
     "mesh_route_dispatch",
     "oauth2_introspection",
     "oidc_relying_party",
+    // `opa` with `decision_request_headers` reports request-header mutation
+    // from `authorize`, so the `response_caching` / `request_deduplication`
+    // ordering gates must see the constructed instance in candidate admission
+    // too, not a capability-less shape. Construction is pure config parsing.
+    "opa",
     "otel_tracing",
     "rate_limiting",
     "request_deduplication",
@@ -4464,6 +5409,10 @@ const SECURITY_COMPOSITION_PLUGIN_NAMES: &[&str] = &[
     "request_transformer",
     "serverless_function",
     "soap_ws_security",
+    // `spiffe_identity` with `forward_identity` owns `x-ferrum-peer-spiffe-id`
+    // as a gateway assertion, which the request-header-write refusal reads.
+    // Construction is pure config parsing.
+    "spiffe_identity",
     "sse",
     "workload_metrics",
 ];
@@ -4516,6 +5465,47 @@ pub(crate) fn composition_shape_plugin(config: &PluginConfig) -> Option<Arc<dyn 
     }))
 }
 
+/// Total order of one effective chain: effective priority, then plugin name.
+///
+/// The sort that uses it is stable, so instances that tie on both keep their
+/// assembly order. Every assembly site builds that order canonically (globals,
+/// then proxy-scoped instances, then proxy-group instances, each class in
+/// ascending plugin-config id; see [`plugin_configs_in_canonical_order`] and
+/// [`proxy_plugin_associations_in_canonical_order`]), so the complete tie order
+/// is `(priority, name, scope class, id)`. That makes the chain independent of
+/// database row order, file entry order, and which incremental rebuild path
+/// produced it (issue #6614).
+fn plugin_chain_order(left: &Arc<dyn Plugin>, right: &Arc<dyn Plugin>) -> std::cmp::Ordering {
+    left.priority()
+        .cmp(&right.priority())
+        .then_with(|| left.name().cmp(right.name()))
+}
+
+/// Plugin configs in the canonical assembly order chain construction iterates:
+/// ascending plugin-config id, then namespace (global fallback chains span
+/// namespaces, where bare ids may repeat).
+///
+/// Built once per cache generation; the request path never sees it.
+fn plugin_configs_in_canonical_order(configs: &[PluginConfig]) -> Vec<&PluginConfig> {
+    let mut ordered: Vec<&PluginConfig> = configs.iter().collect();
+    ordered.sort_by(|left, right| {
+        left.id
+            .cmp(&right.id)
+            .then_with(|| left.namespace.cmp(&right.namespace))
+    });
+    ordered
+}
+
+/// A proxy's plugin associations in ascending plugin-config id, so proxy-group
+/// instances join the chain independently of association row order.
+fn proxy_plugin_associations_in_canonical_order(
+    proxy: &Proxy,
+) -> Vec<&crate::config::types::PluginAssociation> {
+    let mut ordered: Vec<&crate::config::types::PluginAssociation> = proxy.plugins.iter().collect();
+    ordered.sort_by(|left, right| left.plugin_config_id.cmp(&right.plugin_config_id));
+    ordered
+}
+
 /// One assembly gate for admission, full construction and incremental rebuilds.
 /// Call only with the complete effective chain, including topology-only entries
 /// during admission, so an omitted plugin cannot conceal an interleaving.
@@ -4529,10 +5519,11 @@ fn prepare_plugin_chain(
         |proxy| format!("proxy_id={:?}", proxy.id),
     );
     let mut errors = Vec::new();
-    plugins.sort_by_key(|plugin| plugin.priority());
+    plugins.sort_by(plugin_chain_order);
     for result in [
         install_cors_finalizer(plugins),
         install_mesh_route_dispatch_finalizer(plugins),
+        validate_mesh_route_transform_consumers(plugins),
         validate_plugin_security_composition(plugins),
         validate_correlation_id_composition(plugins, real_ip_header),
     ] {
@@ -4570,11 +5561,12 @@ pub(crate) fn validate_plugin_security_composition_candidate(
     let custom_plugin_names = crate::custom_plugins::custom_plugin_names();
     let current_adaptive_states = AdaptiveConcurrencyInstanceMap::new();
     let mut staged_adaptive_states = AdaptiveConcurrencyInstanceMap::new();
+    let mut route_override_memo = RouteOverrideFactsMemo::new(config);
     let country_mmdb_load_session = CountryMmdbLoadSession::default();
     let current_tcp_throttle_states = TcpConnectionThrottleInstanceMap::new();
     let mut staged_tcp_throttle_states = TcpConnectionThrottleInstanceMap::new();
 
-    for plugin_config in &config.plugin_configs {
+    for plugin_config in plugin_configs_in_canonical_order(&config.plugin_configs) {
         let has_trigger = plugin_config.trigger.is_some();
         if !plugin_config.enabled {
             continue;
@@ -4632,6 +5624,7 @@ pub(crate) fn validate_plugin_security_composition_candidate(
                 &country_mmdb_load_session,
                 &current_adaptive_states,
                 &mut staged_adaptive_states,
+                &mut route_override_memo,
                 &current_tcp_throttle_states,
                 &mut staged_tcp_throttle_states,
             )
@@ -4650,13 +5643,31 @@ pub(crate) fn validate_plugin_security_composition_candidate(
         } else if let Some(spec) =
             finalized_request_policy_composition_spec(plugin_config.plugin_name.as_str())
         {
-            Ok(Some(Arc::new(FinalizedRequestPolicyCompositionPlugin {
-                name: spec.name,
-                priority: plugin_config
-                    .priority_override
-                    .unwrap_or(spec.default_priority),
-                protocols: spec.protocols,
-            }) as Arc<dyn Plugin>))
+            // Preserve credential publishers in the cheap view too: WAF and
+            // OpenAPI bypass headers contain reusable secrets even though
+            // neither plugin participates in authentication. Reuse their
+            // parsers without compiling rule packs or operation schemas.
+            let credential_headers = match spec.name {
+                "waf" => crate::plugins::waf::Waf::credential_headers_for_composition(
+                    &plugin_config.config,
+                ),
+                "openapi_validator" => {
+                    crate::plugins::openapi_validator::OpenapiValidator::credential_headers_for_composition(
+                        &plugin_config.config,
+                    )
+                }
+                _ => Ok(Vec::new()),
+            };
+            credential_headers.map(|request_headers_to_redact| {
+                Some(Arc::new(FinalizedRequestPolicyCompositionPlugin {
+                    name: spec.name,
+                    priority: plugin_config
+                        .priority_override
+                        .unwrap_or(spec.default_priority),
+                    protocols: spec.protocols,
+                    request_headers_to_redact,
+                }) as Arc<dyn Plugin>)
+            })
         } else {
             try_create_plugin(
                 plugin_config,
@@ -4665,6 +5676,7 @@ pub(crate) fn validate_plugin_security_composition_candidate(
                 &country_mmdb_load_session,
                 &current_adaptive_states,
                 &mut staged_adaptive_states,
+                &mut route_override_memo,
                 &current_tcp_throttle_states,
                 &mut staged_tcp_throttle_states,
             )
@@ -4698,8 +5710,8 @@ pub(crate) fn validate_plugin_security_composition_candidate(
             .iter()
             .map(|plugin| Arc::as_ptr(plugin) as *const () as usize)
             .collect();
-        // Match runtime's stable tie ordering: config-order proxy instances,
-        // then association-order proxy-group instances, after all globals.
+        // Match runtime's canonical tie ordering: id-ordered proxy instances,
+        // then id-ordered proxy-group instances, after all globals.
         let attached_ids: HashSet<&str> = proxy
             .plugins
             .iter()
@@ -4711,13 +5723,15 @@ pub(crate) fn validate_plugin_security_composition_candidate(
             .flatten()
             .copied()
             .filter(|pc| attached_ids.contains(pc.id.as_str()));
-        let group_configs = proxy.plugins.iter().filter_map(|association| {
-            let (pc, _) = scoped_plugins.get(&(
-                proxy.namespace.as_str(),
-                association.plugin_config_id.as_str(),
-            ))?;
-            (pc.scope == PluginScope::ProxyGroup && pc.proxy_id.is_none()).then_some(*pc)
-        });
+        let group_configs = proxy_plugin_associations_in_canonical_order(proxy)
+            .into_iter()
+            .filter_map(|association| {
+                let (pc, _) = scoped_plugins.get(&(
+                    proxy.namespace.as_str(),
+                    association.plugin_config_id.as_str(),
+                ))?;
+                (pc.scope == PluginScope::ProxyGroup && pc.proxy_id.is_none()).then_some(*pc)
+            });
         for plugin_config in local_configs.chain(group_configs) {
             let Some((_, plugin)) =
                 scoped_plugins.get(&(plugin_config.namespace.as_str(), plugin_config.id.as_str()))
@@ -4906,13 +5920,15 @@ fn same_proxy_group_plugin_config(left: &PluginConfig, right: &PluginConfig) -> 
 pub struct PluginCapabilities(u32);
 
 impl PluginCapabilities {
-    pub const HAS_AUTH_PLUGINS: u32 = 1 << 0;
+    // `1 << 0` was `HAS_AUTH_PLUGINS`; no frontend read it (they check
+    // `auth_plugins()` directly).
     pub const MODIFIES_REQUEST_HEADERS: u32 = 1 << 1;
     pub const MODIFIES_REQUEST_BODY: u32 = 1 << 2;
     pub const HAS_BODY_BEFORE_BEFORE_PROXY: u32 = 1 << 3;
-    pub const NEEDS_REQUEST_BODY_BYTES: u32 = 1 << 4;
+    // `1 << 4` was `NEEDS_REQUEST_BODY_BYTES`; no frontend read it.
     pub const HAS_BODY_BEFORE_AUTHENTICATE: u32 = 1 << 5;
-    pub const NEEDS_DECODED_QUERY_PARAMS: u32 = 1 << 6;
+    // `1 << 6` was `NEEDS_DECODED_QUERY_PARAMS`; HTTP/3 now always decodes
+    // query params (#6580), so no frontend reads that bit.
     pub const NEEDS_FINAL_REQUEST_BODY_CONTEXT: u32 = 1 << 7;
     pub const HAS_RESPONSE_COMMITTED_HOOK: u32 = 1 << 8;
     pub const HAS_RESPONSE_STREAM_HOOKS: u32 = 1 << 9;
@@ -4940,11 +5956,12 @@ impl PluginCapabilities {
     /// entirely — no extra scan, clone, or hook pass on the ordinary hot path.
     pub const DISPATCHES_FINALIZED_REQUEST_EGRESS: u32 = 1 << 16;
     /// At least one plugin declared `enforces_final_backend_header_policy()`,
-    /// so the dispatch ladders must re-assert that plugin's backend-boundary
-    /// header policy over the finalized outbound header map after every generic
-    /// `before_proxy` header transform (`GHSA-xhp5-hqj8-3mwg`). Chains without
-    /// such a plugin skip the pass entirely — no extra scan or hook call on the
-    /// ordinary hot path.
+    /// or the chain owns gateway-asserted request headers, so the dispatch
+    /// ladders must re-assert the backend-boundary header policy (and the
+    /// gateway-assertion boundary) over the finalized outbound header map after
+    /// every generic `before_proxy` header transform (`GHSA-xhp5-hqj8-3mwg`).
+    /// Chains without either skip the pass entirely — no extra scan or hook
+    /// call on the ordinary hot path.
     pub const ENFORCES_FINAL_BACKEND_HEADER_POLICY: u32 = 1 << 17;
     /// This client-selected flavor view omits a request-admission instance
     /// (`Plugin::gates_request_admission`) that another view of the same
@@ -4972,6 +5989,47 @@ impl PluginCapabilities {
     /// response as gRPC-Web for that translator's body transform only when
     /// this is set, so a custom plugin reporting `grpc_web` cannot select it.
     pub const RUNS_BUILTIN_GRPC_WEB: u32 = 1 << 20;
+    /// At least one instance carries an execution trigger that reads a
+    /// `query` field (`Plugin::execution_trigger_reads_query`). Trigger query
+    /// predicates split pairs only on `&`, while some backends also split on
+    /// `;`, so the request dispatchers refuse a query containing an unencoded
+    /// `;` with `400` (`semicolon_separator`) before any plugin phase runs
+    /// (issue #6655). `%3B` is an unambiguous literal and is unaffected, and a
+    /// view without such a trigger never inspects the query on this path.
+    pub const HAS_QUERY_READING_TRIGGER: u32 = 1 << 21;
+    /// No plugin in the view can observe the `mesh.source.*` /
+    /// `mesh.destination.*` label projection
+    /// (`Plugin::observes_mesh_label_metadata` is `false` for every instance),
+    /// so `workload_metrics` may keep those labels only in typed request state
+    /// (issue #6793). Set only when proven, so a view built without consulting
+    /// its plugins, or from an empty plugin list, keeps the eager projection.
+    pub const MESH_LABEL_PROJECTION_DEFERRABLE: u32 = 1 << 22;
+    /// At least one plugin in the view declares `PluginHooks::ON_REQUEST_RECEIVED`.
+    pub const HAS_ON_REQUEST_RECEIVED_HOOK: u32 = 1 << 23;
+    /// At least one plugin in the view declares `PluginHooks::BEFORE_PROXY`.
+    pub const HAS_BEFORE_PROXY_HOOK: u32 = 1 << 24;
+    /// At least one plugin in the view may participate in `run_after_proxy_hooks`
+    /// (`PluginHooks::AFTER_PROXY`, route response-header finalization, or any
+    /// non-built-in/custom plugin, which may override auxiliary response-header
+    /// trait hooks such as `enforces_final_client_visible_response_headers` or
+    /// `on_final_response_headers` without declaring `PluginHooks::AFTER_PROXY`).
+    pub const HAS_AFTER_PROXY_HOOK: u32 = 1 << 25;
+    /// At least one plugin in the view consumes a terminal `TransactionSummary`
+    /// or response-stream completion (`PluginHooks::LOG`,
+    /// `PluginHooks::ON_RESPONSE_STREAM_TERMINATED`,
+    /// `requires_response_stream_hooks()`, `uses_mesh_request_key()`, or any
+    /// non-built-in/custom plugin, which may override
+    /// `on_response_stream_terminated` without declaring the new hook bit).
+    /// When unset (e.g. a built-in `key_auth`-only chain), the request path
+    /// uses the compact runtime-metrics terminal instead of building a full
+    /// `TransactionSummary` and spawning a deferred logging task.
+    pub const HAS_TERMINAL_SUMMARY_CONSUMER: u32 = 1 << 26;
+    /// Every plugin in a non-empty view supports `RequestHeaderPassthrough`
+    /// (reads `ctx.raw_headers`, performs no query/body/response/logging hooks,
+    /// and its only `before_proxy` mutation is stripping declared credential
+    /// header names), allowing authenticated chains like header-only `key_auth`
+    /// to avoid materializing and cloning `HashMap<String, String>`.
+    pub const SUPPORTS_REQUEST_HEADER_PASSTHROUGH: u32 = 1 << 27;
 
     // Bit 31 is the LAST bit of the `u32` backing store. A thirty-third flag
     // must widen `PluginCapabilities` (to `u64`) rather than shift further;
@@ -5016,6 +6074,22 @@ pub struct PluginPhaseData {
     pub backend_path_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Credential-bearing request header names used by safe downstream views.
     pub request_headers_to_redact: Arc<Vec<String>>,
+    /// Lowercase wire header names stripped by passthrough-safe auth plugins
+    /// (`hide_credentials`) when `SUPPORTS_REQUEST_HEADER_PASSTHROUGH` is set.
+    pub passthrough_strip_request_headers: Arc<Vec<String>>,
+    /// Route-configured names every late request-trailer boundary strips:
+    /// the credential locations above plus every request header a plugin on
+    /// the route owns as a gateway assertion
+    /// (`Plugin::owned_request_assertion_header_names`), whatever any trigger
+    /// decides.
+    pub request_trailer_strip_headers: Arc<Vec<String>>,
+    /// Every gateway-assertion request header a plugin on the route owns
+    /// (`Plugin::owned_request_assertion_header_names`), whatever any trigger
+    /// decides. Non-empty sets `ENFORCES_FINAL_BACKEND_HEADER_POLICY`, so the
+    /// final assertion pass (`proxy::enforce_route_owned_request_assertions`)
+    /// runs on every dispatch ladder, and gates the untranslated gRPC-Web
+    /// refusal.
+    pub owned_request_assertion_headers: Arc<Vec<String>>,
     /// Deterministic initial-response header policy plugins, already filtered
     /// and kept in configured priority order for protocol boundary paths.
     pub initial_response_header_policy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
@@ -5088,6 +6162,14 @@ pub struct PluginPhaseData {
     pub response_presentation_policy_digest: Option<[u8; 32]>,
 }
 
+/// Test-only helper exposing the precomputed `PluginCapabilities` for an
+/// arbitrary plugin slice (including custom test plugins).
+pub(crate) fn plugin_capabilities_for_plugins_for_test(
+    plugins: &[Arc<dyn Plugin>],
+) -> PluginCapabilities {
+    build_phase_data(plugins).capabilities
+}
+
 /// Build `PluginPhaseData` from a protocol-filtered plugin list.
 fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
     let mut caps = 0u32;
@@ -5097,6 +6179,9 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
     let mut backend_admission = Vec::new();
     let mut backend_path = Vec::new();
     let mut request_headers_to_redact = Vec::new();
+    let mut passthrough_strip_request_headers: Vec<String> = Vec::new();
+    let mut supports_request_header_passthrough = !plugins.is_empty();
+    let mut owned_request_assertion_headers: Vec<String> = Vec::new();
     let mut initial_response_header_policy_plugins = Vec::new();
     let mut initial_response_header_policy_names = Vec::new();
     let mut response_trailer_policy_names: Vec<String> = Vec::new();
@@ -5114,7 +6199,12 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
     let mut presentation_policy_unprovable = false;
     let mut enforced_request_body_limit: Option<u64> = None;
     let mut enforced_response_body_limit: Option<u64> = None;
+    // An empty list proves nothing, so it keeps the eager projection.
+    let mut mesh_label_projection_deferrable = !plugins.is_empty();
     for p in plugins {
+        if p.observes_mesh_label_metadata() {
+            mesh_label_projection_deferrable = false;
+        }
         match p.response_presentation_policy() {
             Some(ResponsePresentationPolicy::Static(digest)) => {
                 presentation_policy_contributions.push((p.name(), digest));
@@ -5126,7 +6216,6 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
             grpc_deadline.push(Arc::clone(p));
         }
         if p.is_auth_plugin() {
-            caps |= PluginCapabilities::HAS_AUTH_PLUGINS;
             auth.push(Arc::clone(p));
         }
         if p.is_authorize_plugin() {
@@ -5141,6 +6230,9 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         }
         if p.deferred_before_proxy_may_change_routing_headers() {
             caps |= PluginCapabilities::HAS_DEFERRED_ROUTING_HEADER_HOOKS;
+        }
+        if p.execution_trigger_reads_query() {
+            caps |= PluginCapabilities::HAS_QUERY_READING_TRIGGER;
         }
         if p.is_initial_response_header_policy() {
             initial_response_header_policy_plugins.push(Arc::clone(p));
@@ -5200,6 +6292,14 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
                 request_headers_to_redact.push(header.clone());
             }
         }
+        for header in p.owned_request_assertion_header_names() {
+            if !owned_request_assertion_headers
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(&header))
+            {
+                owned_request_assertion_headers.push(header);
+            }
+        }
         if p.modifies_request_headers() {
             caps |= PluginCapabilities::MODIFIES_REQUEST_HEADERS;
         }
@@ -5217,12 +6317,6 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         }
         if p.requires_request_body_before_authorize() {
             caps |= PluginCapabilities::HAS_BODY_BEFORE_AUTHORIZE;
-        }
-        if p.needs_request_body_bytes() {
-            caps |= PluginCapabilities::NEEDS_REQUEST_BODY_BYTES;
-        }
-        if p.requires_decoded_query_params() {
-            caps |= PluginCapabilities::NEEDS_DECODED_QUERY_PARAMS;
         }
         if p.needs_final_request_body_context() {
             caps |= PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT;
@@ -5242,6 +6336,27 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         }
         if p.requires_response_stream_hooks() {
             caps |= PluginCapabilities::HAS_RESPONSE_STREAM_HOOKS;
+            caps |= PluginCapabilities::HAS_TERMINAL_SUMMARY_CONSUMER;
+        }
+        let hooks = p.lifecycle_hooks();
+        if hooks.contains(crate::plugins::PluginHooks::ON_REQUEST_RECEIVED) {
+            caps |= PluginCapabilities::HAS_ON_REQUEST_RECEIVED_HOOK;
+        }
+        if hooks.contains(crate::plugins::PluginHooks::BEFORE_PROXY) {
+            caps |= PluginCapabilities::HAS_BEFORE_PROXY_HOOK;
+        }
+        if hooks.contains(crate::plugins::PluginHooks::AFTER_PROXY)
+            || p.participates_in_route_response_header_finalization()
+            || !crate::plugins::is_builtin_plugin(p.as_ref())
+        {
+            caps |= PluginCapabilities::HAS_AFTER_PROXY_HOOK;
+        }
+        if hooks.contains(crate::plugins::PluginHooks::LOG)
+            || hooks.contains(crate::plugins::PluginHooks::ON_RESPONSE_STREAM_TERMINATED)
+            || p.uses_mesh_request_key()
+            || !crate::plugins::is_builtin_plugin(p.as_ref())
+        {
+            caps |= PluginCapabilities::HAS_TERMINAL_SUMMARY_CONSUMER;
         }
         if p.answers_cors_preflights() {
             caps |= PluginCapabilities::ANSWERS_CORS_PREFLIGHTS;
@@ -5253,6 +6368,28 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         // Multiple instances (and a global plus a proxy-scoped instance) compose
         // to their minimum; a zero/disabled instance contributes nothing rather
         // than relaxing a sibling's active bound (`GHSA-xrfj-852f-645j`).
+        // Only registered built-in plugins whose request-header reads and
+        // assertions are audited for the wire passthrough lane may keep
+        // `SUPPORTS_REQUEST_HEADER_PASSTHROUGH` active; custom plugins (including
+        // an impostor reporting a built-in name) always stay on the materialized
+        // path so their hooks can never be skipped. Built-ins with a
+        // `BEFORE_PROXY` hook are excluded unless `key_auth` (whose `before_proxy`
+        // only strips `request_headers_to_redact()`, elided into the passthrough
+        // strip overlay).
+        let passthrough_builtin_eligible = crate::plugins::is_builtin_plugin(p.as_ref())
+            && p.supports_request_header_passthrough()
+            && (!hooks.contains(crate::plugins::PluginHooks::BEFORE_PROXY)
+                || is_builtin_named(p, "key_auth"));
+        if !passthrough_builtin_eligible {
+            supports_request_header_passthrough = false;
+        } else if p.modifies_request_headers() {
+            for name in p.request_headers_to_redact() {
+                let lower = name.to_ascii_lowercase();
+                if !passthrough_strip_request_headers.contains(&lower) {
+                    passthrough_strip_request_headers.push(lower);
+                }
+            }
+        }
         if let Some(limit) = p.enforced_request_body_limit().filter(|limit| *limit > 0) {
             enforced_request_body_limit =
                 Some(enforced_request_body_limit.map_or(limit, |current: u64| current.min(limit)));
@@ -5260,6 +6397,50 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         if let Some(limit) = p.enforced_response_body_limit().filter(|limit| *limit > 0) {
             enforced_response_body_limit =
                 Some(enforced_response_body_limit.map_or(limit, |current: u64| current.min(limit)));
+        }
+    }
+    if mesh_label_projection_deferrable {
+        caps |= PluginCapabilities::MESH_LABEL_PROJECTION_DEFERRABLE;
+    }
+    if !owned_request_assertion_headers.is_empty() {
+        // The final gateway-assertion pass rides the backend-boundary header
+        // policy pass, which every H1/H2 and H3 ladder runs at each point the
+        // outbound map is complete.
+        caps |= PluginCapabilities::ENFORCES_FINAL_BACKEND_HEADER_POLICY;
+    }
+    let passthrough_blocked_caps = PluginCapabilities::MODIFIES_REQUEST_BODY
+        | PluginCapabilities::HAS_BODY_BEFORE_BEFORE_PROXY
+        | PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE
+        | PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT
+        | PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK
+        | PluginCapabilities::HAS_RESPONSE_STREAM_HOOKS
+        | PluginCapabilities::HAS_BODY_BEFORE_AUTHORIZE
+        | PluginCapabilities::HAS_BACKEND_PATH_PLUGINS
+        | PluginCapabilities::HAS_DEFERRED_ROUTING_HEADER_HOOKS
+        | PluginCapabilities::FINAL_BODY_BEFORE_BACKEND_DISPATCH
+        | PluginCapabilities::NORMALIZES_BUFFERED_REQUEST_BODY_BEFORE_BEFORE_PROXY
+        | PluginCapabilities::DISPATCHES_FINALIZED_REQUEST_EGRESS
+        | PluginCapabilities::ENFORCES_FINAL_BACKEND_HEADER_POLICY
+        | PluginCapabilities::HAS_QUERY_READING_TRIGGER
+        | PluginCapabilities::HAS_AFTER_PROXY_HOOK
+        | PluginCapabilities::HAS_TERMINAL_SUMMARY_CONSUMER;
+    if supports_request_header_passthrough
+        && (caps & passthrough_blocked_caps) == 0
+        && backend_path.is_empty()
+        && grpc_deadline.is_empty()
+        && initial_response_header_policy_plugins.is_empty()
+    {
+        caps |= PluginCapabilities::SUPPORTS_REQUEST_HEADER_PASSTHROUGH;
+    } else {
+        passthrough_strip_request_headers.clear();
+    }
+    let mut request_trailer_strip_headers = request_headers_to_redact.clone();
+    for header in &owned_request_assertion_headers {
+        if !request_trailer_strip_headers
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(header))
+        {
+            request_trailer_strip_headers.push(header.clone());
         }
     }
     PluginPhaseData {
@@ -5271,6 +6452,9 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         backend_admission_plugins: Arc::new(backend_admission),
         backend_path_plugins: Arc::new(backend_path),
         request_headers_to_redact: Arc::new(request_headers_to_redact),
+        passthrough_strip_request_headers: Arc::new(passthrough_strip_request_headers),
+        request_trailer_strip_headers: Arc::new(request_trailer_strip_headers),
+        owned_request_assertion_headers: Arc::new(owned_request_assertion_headers),
         initial_response_header_policy_plugins: Arc::new(initial_response_header_policy_plugins),
         initial_response_header_policy_names: Arc::new(initial_response_header_policy_names),
         response_trailer_policy_names: Arc::new(response_trailer_policy_names),
@@ -5291,13 +6475,29 @@ fn filter_for_protocol(
     plugins: &[Arc<dyn Plugin>],
     protocol: ProxyProtocol,
 ) -> Arc<Vec<Arc<dyn Plugin>>> {
-    Arc::new(
-        plugins
-            .iter()
-            .filter(|p| p.supported_protocols().contains(&protocol))
-            .cloned()
-            .collect(),
-    )
+    // A WebSocket view drops the HTTP/gRPC-only `response_transformer` but
+    // keeps `mesh_route_dispatch`; stand in for a route-header consumer the
+    // view lost so the matched rule's route lists still apply to the
+    // handshake. A direction the view already has an eligible consumer for
+    // (the request side, via `request_transformer`) gets no stand-in, so each
+    // list is still applied exactly once.
+    let slots = RouteHeaderConsumerStandInSlots::for_view(plugins, protocol);
+    let mut filtered = Vec::with_capacity(plugins.len());
+    for (index, plugin) in plugins.iter().enumerate() {
+        if plugin.supported_protocols().contains(&protocol) {
+            filtered.push(Arc::clone(plugin));
+        }
+        let request = slots.request == Some(index);
+        let response = slots.response == Some(index);
+        if request || response {
+            filtered.push(Arc::new(RouteHeaderConsumerStandIn {
+                priority: plugin.priority(),
+                request,
+                response,
+            }) as Arc<dyn Plugin>);
+        }
+    }
+    Arc::new(filtered)
 }
 
 /// Config-side state of global `mesh_authz` rows for one generation.
@@ -5339,8 +6539,7 @@ fn mesh_authz_global_config_state(config: &GatewayConfig) -> (bool, usize) {
 ///
 /// `pub(crate)` so `_test_support` can pin the "managed row configured but its
 /// runtime policy never reached the prebuilt TCP chain" arm directly, without
-/// forging a plugin construction failure. A dedicated `_for_test` wrapper would
-/// be dead code in the binary target, which does not compile `lib.rs`.
+/// forging a plugin construction failure.
 pub(crate) fn node_waypoint_destination_authz_ready_from_counts(
     managed_config_present: bool,
     enabled_global_mesh_authz_configs: usize,
@@ -5361,7 +6560,7 @@ pub(crate) fn node_waypoint_destination_authz_ready_from_counts(
 /// connection path only ever reads a `bool`.
 fn compute_node_waypoint_destination_authz_ready(
     config: &GatewayConfig,
-    global: &HashMap<ProxyProtocol, ProtocolEntry>,
+    global: &HashMap<ProxyProtocol, SharedProtocolEntry>,
 ) -> bool {
     let (managed, enabled_global) = mesh_authz_global_config_state(config);
     let built = match global.get(&ProxyProtocol::Tcp) {
@@ -5393,24 +6592,84 @@ pub(crate) fn node_waypoint_destination_authz_ready_over_globals_for_test(
 // ---------------------------------------------------------------------------
 
 /// Per-proxy, per-protocol entry: the filtered plugin list and its derived phase data.
-#[derive(Clone)]
+///
+/// Built once per cache generation and only ever shared behind an `Arc`
+/// ([`SharedProtocolEntry`]): a [`PluginCacheRequestView`] holds that one
+/// `Arc`, so building a view costs one reference-count increment however many
+/// phase lists the entry carries (issue #7207). Deliberately not `Clone`, so
+/// nothing deep-copies an entry by accident.
 struct ProtocolEntry {
     plugins: PluginList,
     phase: PluginPhaseData,
+    /// [`udp_datagram_policy_digest`] of `plugins`, computed once when the
+    /// entry is built. `Some` only for the UDP view.
+    udp_datagram_policy_digest: Option<UdpDatagramPolicyDigest>,
+    /// Proxy-wide flags precomputed from the full merged proxy (or global)
+    /// chain so `request_view()` resolves everything in a single map lookup.
+    requires_response_body_buffering: bool,
+    requires_request_body_buffering: bool,
+    requires_ws_frame_hooks: bool,
+    uses_openai_auth_error_envelope: bool,
+}
+
+/// The shared handle every protocol map stores and every request view holds.
+type SharedProtocolEntry = Arc<ProtocolEntry>;
+
+impl ProtocolEntry {
+    /// The entry a request view reads when no protocol entry resolves: every
+    /// list empty, no capability bit, no body ceiling, and no provable
+    /// response-presentation digest (`None`, never the digest of an empty
+    /// chain, so replay consumers fail closed). Built once per process and
+    /// shared, so even this fallback allocates nothing per request.
+    fn empty_shared() -> SharedProtocolEntry {
+        static EMPTY: std::sync::LazyLock<SharedProtocolEntry> = std::sync::LazyLock::new(|| {
+            Arc::new(ProtocolEntry {
+                plugins: Arc::new(Vec::new()),
+                phase: PluginPhaseData {
+                    enforced_request_body_limit: None,
+                    enforced_response_body_limit: None,
+                    grpc_deadline_plugins: Arc::new(Vec::new()),
+                    auth_plugins: Arc::new(Vec::new()),
+                    authorize_plugins: Arc::new(Vec::new()),
+                    backend_admission_plugins: Arc::new(Vec::new()),
+                    backend_path_plugins: Arc::new(Vec::new()),
+                    request_headers_to_redact: Arc::new(Vec::new()),
+                    passthrough_strip_request_headers: Arc::new(Vec::new()),
+                    request_trailer_strip_headers: Arc::new(Vec::new()),
+                    owned_request_assertion_headers: Arc::new(Vec::new()),
+                    initial_response_header_policy_plugins: Arc::new(Vec::new()),
+                    initial_response_header_policy_names: Arc::new(Vec::new()),
+                    response_trailer_policy_names: Arc::new(Vec::new()),
+                    response_trailer_policy_prefixes: Arc::new(Vec::new()),
+                    conditional_unbounded_trailer_policy_plugins: Arc::new(Vec::new()),
+                    response_committed_plugins: Arc::new(Vec::new()),
+                    early_route_total_plan: Arc::default(),
+                    capabilities: PluginCapabilities::default(),
+                    response_presentation_policy_digest: None,
+                },
+                udp_datagram_policy_digest: None,
+                requires_response_body_buffering: false,
+                requires_request_body_buffering: false,
+                requires_ws_frame_hooks: false,
+                uses_openai_auth_error_envelope: false,
+            })
+        });
+        Arc::clone(&EMPTY)
+    }
 }
 
 /// All per-proxy protocol data, swapped atomically as one unit.
 #[derive(Clone)]
 struct ProtocolSnapshot {
     /// proxy_id → (protocol → ProtocolEntry)
-    proxy: HashMap<String, HashMap<ProxyProtocol, ProtocolEntry>>,
+    proxy: HashMap<String, HashMap<ProxyProtocol, SharedProtocolEntry>>,
     /// Global fallback: protocol → ProtocolEntry
-    global: HashMap<ProxyProtocol, ProtocolEntry>,
+    global: HashMap<ProxyProtocol, SharedProtocolEntry>,
     /// HTTP plugin view plus the two native-gRPC policies that are compatible
     /// with recognized H3 gRPC-Web requests.
-    grpc_web_proxy: HashMap<String, ProtocolEntry>,
+    grpc_web_proxy: HashMap<String, SharedProtocolEntry>,
     /// Global fallback for the composed H3 gRPC-Web view.
-    grpc_web_global: ProtocolEntry,
+    grpc_web_global: SharedProtocolEntry,
     /// Generation-level readiness bit for NodeWaypoint transparent-capture
     /// destination authorization: the mesh-managed `__mesh_authz` reserved
     /// global row is enabled AND its runtime policy is provably present in
@@ -5518,20 +6777,61 @@ fn is_global_plugin_instance(plugin: &Arc<dyn Plugin>, globals: &[Arc<dyn Plugin
         .any(|global| std::ptr::eq(Arc::as_ptr(global) as *const (), instance))
 }
 
+/// Global `stdout_logging` instances a route-miss summary is delivered to.
+///
+/// Keyed on the registered built-in type, never the reported name, so a custom
+/// plugin reporting `stdout_logging` is not handed proxy-less summaries. An
+/// instance with an execution trigger is skipped: nothing evaluated its
+/// trigger for a request that never reached a plugin phase.
+fn collect_unrouted_transaction_log_plugins(globals: &[Arc<dyn Plugin>]) -> Option<PluginList> {
+    let sinks: Vec<Arc<dyn Plugin>> = globals
+        .iter()
+        .filter(|plugin| {
+            is_builtin_named(plugin, "stdout_logging")
+                && !plugin.has_execution_trigger()
+                && plugin.supported_protocols().contains(&ProxyProtocol::Http)
+        })
+        .cloned()
+        .collect();
+    (!sinks.is_empty()).then(|| Arc::new(sinks))
+}
+
+/// Only registered global correlation policies may run without a matched
+/// proxy. Keep their lifecycle order and priority wrappers.
+fn collect_unrouted_correlation_plugins(globals: &[Arc<dyn Plugin>]) -> Option<PluginList> {
+    let policies: Vec<Arc<dyn Plugin>> = globals
+        .iter()
+        .filter(|plugin| is_builtin_named(plugin, "correlation_id"))
+        .cloned()
+        .collect();
+    (!policies.is_empty()).then(|| Arc::new(policies))
+}
+
 fn build_protocol_entry(
     plugins: &[Arc<dyn Plugin>],
     globals: &[Arc<dyn Plugin>],
     proto: ProxyProtocol,
-) -> ProtocolEntry {
+) -> SharedProtocolEntry {
     let filtered = filter_for_protocol(plugins, proto);
     let mut phase = build_phase_data(&filtered);
     if view_omits_route_admission_policy(plugins, globals, proto) {
         phase.capabilities.0 |= PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY;
     }
-    ProtocolEntry {
+    let udp_datagram_policy_digest =
+        (proto == ProxyProtocol::Udp).then(|| udp_datagram_policy_digest(&filtered));
+    Arc::new(ProtocolEntry {
         plugins: filtered,
         phase,
-    }
+        udp_datagram_policy_digest,
+        requires_response_body_buffering: plugins
+            .iter()
+            .any(|p| p.requires_response_body_buffering()),
+        requires_request_body_buffering: plugins
+            .iter()
+            .any(|p| p.requires_request_body_buffering()),
+        requires_ws_frame_hooks: plugins.iter().any(|p| p.requires_websocket_framing()),
+        uses_openai_auth_error_envelope: proxy_has_openai_auth_error_envelope_plugin(plugins),
+    })
 }
 
 const H3_GRPC_WEB_NATIVE_POLICY_PLUGINS: [&str; 2] = ["grpc_method_router", "grpc_deadline"];
@@ -5546,7 +6846,7 @@ fn is_grpc_web_native_policy(plugin: &Arc<dyn Plugin>) -> bool {
         .any(|name| is_builtin_named(plugin, name))
 }
 
-fn build_grpc_web_protocol_entry(plugins: &[Arc<dyn Plugin>]) -> ProtocolEntry {
+fn build_grpc_web_protocol_entry(plugins: &[Arc<dyn Plugin>]) -> SharedProtocolEntry {
     // The merged proxy list is already in configured priority/config order.
     // Filtering it once preserves that order, retains every ordinary HTTP
     // guardrail, and includes each compatible native-gRPC policy instance at
@@ -5566,10 +6866,19 @@ fn build_grpc_web_protocol_entry(plugins: &[Arc<dyn Plugin>]) -> ProtocolEntry {
     if grpc_web_view_omits_grpc_admission_policy(plugins) {
         phase.capabilities.0 |= PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY;
     }
-    ProtocolEntry {
+    Arc::new(ProtocolEntry {
         plugins: composed,
         phase,
-    }
+        udp_datagram_policy_digest: None,
+        requires_response_body_buffering: plugins
+            .iter()
+            .any(|p| p.requires_response_body_buffering()),
+        requires_request_body_buffering: plugins
+            .iter()
+            .any(|p| p.requires_request_body_buffering()),
+        requires_ws_frame_hooks: plugins.iter().any(|p| p.requires_websocket_framing()),
+        uses_openai_auth_error_envelope: proxy_has_openai_auth_error_envelope_plugin(plugins),
+    })
 }
 
 /// Whether the composed gRPC-Web view of `plugins` drops an admission-gating
@@ -5649,6 +6958,11 @@ fn build_protocol_snapshot(
                     .auth_plugins
                     .iter()
                     .all(|plugin| plugin.has_execution_trigger())
+                && !entry
+                    .phase
+                    .auth_plugins
+                    .iter()
+                    .all(|plugin| plugin.admits_missing_credential())
             {
                 warn!(
                     proxy_id = %crate::startup::sanitize_startup_scalar(proxy_id),
@@ -5719,7 +7033,6 @@ thread_local! {
 /// Arm a single post-JWKS-startup rejection for the next staged PluginCache
 /// build. Consumed once by [`reject_after_jwks_startup_if_requested_for_test`].
 #[doc(hidden)]
-#[allow(dead_code)] // Bin target omits lib::_test_support; external tests call through its wrapper.
 pub fn request_reject_after_jwks_startup_for_test() {
     REJECT_AFTER_JWKS_STARTUP_FOR_TEST.with(|requested| requested.set(true));
 }
@@ -5869,6 +7182,15 @@ pub(crate) struct PluginCacheInner {
     pub(crate) proxy_plugins: ProxyPluginMap,
     /// Fallback: global plugins only (for proxies with no scoped overrides).
     global_plugins: PluginList,
+    /// Global `stdout_logging` instances without an execution trigger, in
+    /// configured order: the access logs a request that matched no proxy
+    /// (route-miss `404`) is delivered to. `None` when there are none, so the
+    /// route-miss arm pays one pointer check and nothing else. Trigger-gated
+    /// instances are excluded because no request hook evaluated their trigger.
+    unrouted_transaction_log_plugins: Option<PluginList>,
+    /// Global correlation policies in lifecycle order. `None` keeps a route
+    /// miss to one pointer check without header materialization or allocation.
+    unrouted_correlation_plugins: Option<PluginList>,
     /// Pre-computed: does any plugin for this proxy require response body buffering?
     requires_buffering: BufferingMap,
     /// Whether global-only plugins require response body buffering (fallback).
@@ -5924,6 +7246,9 @@ pub(crate) struct PluginCacheInner {
     /// single `ArcSwap` load — never by scanning plugins and never by
     /// retaining a stale removed/replaced instance across reloads.
     mesh_bpf_metrics_exporter: Option<crate::plugins::mesh::bpf_metrics::MeshBpfMetricsExporter>,
+    /// Precreated aggregate rows are pinned before this generation is visible.
+    /// Dropping a rejected stage releases unused rows and their byte budget.
+    chargeback_overflow: Option<Arc<crate::plugins::api_chargeback::OverflowReservation>>,
 }
 
 /// Advance or assign per-proxy lifecycle ownership generations for `config`.
@@ -6070,10 +7395,17 @@ impl PluginCacheInner {
         mesh_bpf_metrics_exporter: Option<
             crate::plugins::mesh::bpf_metrics::MeshBpfMetricsExporter,
         >,
+        chargeback_overflow: Option<Arc<crate::plugins::api_chargeback::OverflowReservation>>,
     ) -> Self {
+        let unrouted_transaction_log_plugins =
+            collect_unrouted_transaction_log_plugins(global_plugins.as_slice());
+        let unrouted_correlation_plugins =
+            collect_unrouted_correlation_plugins(global_plugins.as_slice());
         Self {
             proxy_plugins,
             global_plugins,
+            unrouted_transaction_log_plugins,
+            unrouted_correlation_plugins,
             requires_buffering,
             global_requires_buffering,
             requires_request_buffering,
@@ -6091,14 +7423,7 @@ impl PluginCacheInner {
             proxy_lifecycle_generations,
             proxy_lifecycle_generation_high_water,
             mesh_bpf_metrics_exporter,
-        }
-    }
-
-    fn apply_tcp_connection_throttle_cleanup_intervals(&self) {
-        for instance in self.tcp_connection_throttle_instances.values() {
-            instance
-                .state
-                .set_cleanup_interval(instance.cleanup_interval_seconds);
+            chargeback_overflow,
         }
     }
 
@@ -6163,6 +7488,30 @@ impl PluginCacheInner {
         }
     }
 
+    /// Whether this generation can enforce NodeWaypoint transparent-capture
+    /// destination authorization.
+    ///
+    /// O(1) read of a bit precomputed at cache construction/reload — the
+    /// captured-connection path must never re-derive this by scanning
+    /// `config.plugin_configs` or the built plugin chain.
+    #[inline]
+    pub(crate) fn node_waypoint_destination_authz_ready(&self) -> bool {
+        self.protocol_snapshot.node_waypoint_destination_authz_ready
+    }
+
+    /// Global access logs for a request that matched no proxy, or `None` when
+    /// this generation has none. Precomputed at cache construction; an
+    /// `Arc` clone on a route miss, nothing when no global logger exists.
+    #[inline]
+    pub(crate) fn unrouted_transaction_log_plugins(&self) -> Option<Arc<Vec<Arc<dyn Plugin>>>> {
+        self.unrouted_transaction_log_plugins.clone()
+    }
+
+    #[inline]
+    pub(crate) fn unrouted_correlation_plugins(&self) -> Option<PluginList> {
+        self.unrouted_correlation_plugins.clone()
+    }
+
     /// Per-protocol entry for one proxy, falling back to the global entry when
     /// the proxy has no protocol-scoped override.
     ///
@@ -6175,18 +7524,11 @@ impl PluginCacheInner {
     /// [`Self::grpc_web_request_view`], or a namespace-taking accessor such as
     /// [`Self::initial_response_header_policy_plugins`] instead of passing
     /// `proxy.id` here.
-    /// Whether this generation can enforce NodeWaypoint transparent-capture
-    /// destination authorization.
-    ///
-    /// O(1) read of a bit precomputed at cache construction/reload — the
-    /// captured-connection path must never re-derive this by scanning
-    /// `config.plugin_configs` or the built plugin chain.
-    #[inline]
-    pub(crate) fn node_waypoint_destination_authz_ready(&self) -> bool {
-        self.protocol_snapshot.node_waypoint_destination_authz_ready
-    }
-
-    fn protocol_entry(&self, proxy_key: &str, protocol: ProxyProtocol) -> Option<&ProtocolEntry> {
+    fn protocol_entry(
+        &self,
+        proxy_key: &str,
+        protocol: ProxyProtocol,
+    ) -> Option<&SharedProtocolEntry> {
         self.protocol_snapshot
             .proxy
             .get(proxy_key)
@@ -6223,6 +7565,24 @@ impl PluginCacheInner {
             write_namespaced_runtime_key(&mut key, namespace, proxy_id);
             self.get_plugins_for_protocol(key.as_str(), protocol)
         })
+    }
+
+    /// Precomputed [`udp_datagram_policy_digest`] of the UDP plugin list
+    /// [`Self::plugins_for_protocol`] returns for `(namespace, proxy_id)`.
+    /// Lock-free and allocation-free when the entry exists (the digest was
+    /// computed when the entry was built); a missing entry is the empty set.
+    pub(crate) fn udp_datagram_policy_digest(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+    ) -> UdpDatagramPolicyDigest {
+        let precomputed = PROXY_KEY_BUF.with(|buf| {
+            let mut key = buf.borrow_mut();
+            write_namespaced_runtime_key(&mut key, namespace, proxy_id);
+            self.protocol_entry(key.as_str(), ProxyProtocol::Udp)
+                .and_then(|entry| entry.udp_datagram_policy_digest)
+        });
+        precomputed.unwrap_or_else(|| udp_datagram_policy_digest(&[]))
     }
 
     /// Authenticate-phase plugins for a composed `proxy_key` + protocol.
@@ -6344,86 +7704,12 @@ impl PluginCacheInner {
             write_namespaced_runtime_key(&mut key, namespace, proxy_id);
             let proxy_key = key.as_str();
             // One protocol lookup per request instead of one per field: every
-            // per-field getter resolves this same entry (issue #5588).
-            match self.protocol_entry(proxy_key, protocol) {
-                Some(entry) => self.request_view_from_entry(proxy_key, entry),
-                None => self.empty_request_view(proxy_key),
-            }
+            // accessor reads this same entry (issue #5588).
+            let entry = self
+                .protocol_entry(proxy_key, protocol)
+                .map_or_else(ProtocolEntry::empty_shared, Arc::clone);
+            PluginCacheRequestView { entry }
         })
-    }
-
-    /// The request view for a resolved [`ProtocolEntry`], shared by
-    /// [`Self::request_view`] and [`Self::grpc_web_request_view`].
-    fn request_view_from_entry(
-        &self,
-        proxy_key: &str,
-        entry: &ProtocolEntry,
-    ) -> PluginCacheRequestView {
-        let capabilities = entry.phase.capabilities;
-        let backend_path_plugins = capabilities
-            .has(PluginCapabilities::HAS_BACKEND_PATH_PLUGINS)
-            .then(|| Arc::clone(&entry.phase.backend_path_plugins));
-        PluginCacheRequestView {
-            plugins: Arc::clone(&entry.plugins),
-            grpc_deadline_plugins: Arc::clone(&entry.phase.grpc_deadline_plugins),
-            auth_plugins: Arc::clone(&entry.phase.auth_plugins),
-            authorize_plugins: Arc::clone(&entry.phase.authorize_plugins),
-            backend_admission_plugins: Arc::clone(&entry.phase.backend_admission_plugins),
-            backend_path_plugins,
-            request_headers_to_redact: Arc::clone(&entry.phase.request_headers_to_redact),
-            initial_response_header_policy_plugins: Arc::clone(
-                &entry.phase.initial_response_header_policy_plugins,
-            ),
-            initial_response_header_policy_names: Arc::clone(
-                &entry.phase.initial_response_header_policy_names,
-            ),
-            response_trailer_policy_names: Arc::clone(&entry.phase.response_trailer_policy_names),
-            response_trailer_policy_prefixes: Arc::clone(
-                &entry.phase.response_trailer_policy_prefixes,
-            ),
-            conditional_unbounded_trailer_policy_plugins: Arc::clone(
-                &entry.phase.conditional_unbounded_trailer_policy_plugins,
-            ),
-            response_committed_plugins: Arc::clone(&entry.phase.response_committed_plugins),
-            response_presentation_policy_digest: entry.phase.response_presentation_policy_digest,
-            early_route_total_plan: Arc::clone(&entry.phase.early_route_total_plan),
-            capabilities,
-            requires_response_body_buffering: self.requires_response_body_buffering(proxy_key),
-            requires_request_body_buffering: self.requires_request_body_buffering(proxy_key),
-            requires_ws_frame_hooks: self.requires_ws_frame_hooks(proxy_key),
-            uses_openai_auth_error_envelope: self.uses_openai_auth_error_envelope(proxy_key),
-            enforced_request_body_limit: entry.phase.enforced_request_body_limit,
-            enforced_response_body_limit: entry.phase.enforced_response_body_limit,
-        }
-    }
-
-    /// The request view when no protocol entry resolves: every per-field
-    /// getter's `None` default.
-    fn empty_request_view(&self, proxy_key: &str) -> PluginCacheRequestView {
-        PluginCacheRequestView {
-            plugins: Arc::new(Vec::new()),
-            grpc_deadline_plugins: Arc::new(Vec::new()),
-            auth_plugins: Arc::new(Vec::new()),
-            authorize_plugins: Arc::new(Vec::new()),
-            backend_admission_plugins: Arc::new(Vec::new()),
-            backend_path_plugins: None,
-            request_headers_to_redact: Arc::new(Vec::new()),
-            initial_response_header_policy_plugins: Arc::new(Vec::new()),
-            initial_response_header_policy_names: Arc::new(Vec::new()),
-            response_trailer_policy_names: Arc::new(Vec::new()),
-            response_trailer_policy_prefixes: Arc::new(Vec::new()),
-            conditional_unbounded_trailer_policy_plugins: Arc::new(Vec::new()),
-            response_committed_plugins: Arc::new(Vec::new()),
-            response_presentation_policy_digest: None,
-            early_route_total_plan: Arc::default(),
-            capabilities: PluginCapabilities::default(),
-            requires_response_body_buffering: self.requires_response_body_buffering(proxy_key),
-            requires_request_body_buffering: self.requires_request_body_buffering(proxy_key),
-            requires_ws_frame_hooks: self.requires_ws_frame_hooks(proxy_key),
-            uses_openai_auth_error_envelope: self.uses_openai_auth_error_envelope(proxy_key),
-            enforced_request_body_limit: None,
-            enforced_response_body_limit: None,
-        }
     }
 
     pub(crate) fn grpc_web_request_view(
@@ -6440,7 +7726,9 @@ impl PluginCacheInner {
                 .grpc_web_proxy
                 .get(proxy_key)
                 .unwrap_or(&self.protocol_snapshot.grpc_web_global);
-            self.request_view_from_entry(proxy_key, entry)
+            PluginCacheRequestView {
+                entry: Arc::clone(entry),
+            }
         })
     }
 }
@@ -6448,32 +7736,16 @@ impl PluginCacheInner {
 /// Request-scoped plugin cache values for one proxy/protocol pair.
 ///
 /// Built from one cache generation near the start of request handling. It
-/// stores only the values that request paths need, so the full plugin-cache
-/// snapshot does not stay pinned across plugin/backend awaits.
+/// holds that generation's resolved [`ProtocolEntry`] for the pair — one
+/// shared, immutable snapshot of the filtered plugin list, its phase data,
+/// and the four proxy-wide flags. Building or cloning a view is therefore a
+/// single HashMap lookup and one `Arc` increment, never a per-phase-list
+/// fan-out of reference-count writes on shared cache lines (issue #7207).
+/// Only that one entry stays pinned across plugin/backend awaits, not the
+/// full plugin-cache snapshot.
 #[derive(Clone)]
 pub struct PluginCacheRequestView {
-    plugins: Arc<Vec<Arc<dyn Plugin>>>,
-    grpc_deadline_plugins: Arc<Vec<Arc<dyn Plugin>>>,
-    auth_plugins: Arc<Vec<Arc<dyn Plugin>>>,
-    authorize_plugins: Arc<Vec<Arc<dyn Plugin>>>,
-    backend_admission_plugins: Arc<Vec<Arc<dyn Plugin>>>,
-    backend_path_plugins: Option<Arc<Vec<Arc<dyn Plugin>>>>,
-    request_headers_to_redact: Arc<Vec<String>>,
-    initial_response_header_policy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
-    initial_response_header_policy_names: Arc<Vec<String>>,
-    response_trailer_policy_names: Arc<Vec<String>>,
-    response_trailer_policy_prefixes: Arc<Vec<String>>,
-    conditional_unbounded_trailer_policy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
-    response_committed_plugins: Arc<Vec<Arc<dyn Plugin>>>,
-    response_presentation_policy_digest: Option<[u8; 32]>,
-    early_route_total_plan: Arc<EarlyRouteTotalPlan>,
-    capabilities: PluginCapabilities,
-    requires_response_body_buffering: bool,
-    requires_request_body_buffering: bool,
-    requires_ws_frame_hooks: bool,
-    uses_openai_auth_error_envelope: bool,
-    enforced_request_body_limit: Option<u64>,
-    enforced_response_body_limit: Option<u64>,
+    entry: SharedProtocolEntry,
 }
 
 impl PluginCacheRequestView {
@@ -6488,7 +7760,11 @@ impl PluginCacheRequestView {
         ctx: &RequestContext,
         identity_ready: bool,
     ) -> Option<tokio::time::Instant> {
-        let timeout_ms = self.early_route_total_plan.select_ms(ctx, identity_ready)?;
+        let timeout_ms = self
+            .entry
+            .phase
+            .early_route_total_plan
+            .select_ms(ctx, identity_ready)?;
         ctx.grpc_deadline_received_at
             .checked_add(std::time::Duration::from_millis(timeout_ms))
     }
@@ -6500,88 +7776,185 @@ impl PluginCacheRequestView {
     /// `crate::proxy::effective_request_body_limit` before forwarding or
     /// retaining any bytes (`GHSA-xrfj-852f-645j`).
     pub fn enforced_request_body_limit(&self) -> Option<u64> {
-        self.enforced_request_body_limit
+        self.entry.phase.enforced_request_body_limit
     }
 
     /// Strictest active client-facing response-body ceiling for this
     /// proxy/protocol pair, or `None` when no matched plugin enforces one.
     pub fn enforced_response_body_limit(&self) -> Option<u64> {
-        self.enforced_response_body_limit
+        self.entry.phase.enforced_response_body_limit
+    }
+
+    /// Publish this view's precomputed route body policy on the request
+    /// context, before any body is forwarded, retained, or collected: the
+    /// route request/response ceilings (`GHSA-xrfj-852f-645j`) and whether a
+    /// streaming response inspector may rewrite the client-visible bytes.
+    /// Every handler (H1/H2 and native H3) stamps through this one call, so
+    /// the fields cannot drift apart. Three copies, no lookup, no allocation.
+    pub fn stamp_route_body_policy(&self, ctx: &mut RequestContext) {
+        ctx.route_request_body_limit_bytes = self.entry.phase.enforced_request_body_limit;
+        ctx.route_response_body_limit_bytes = self.entry.phase.enforced_response_body_limit;
+        ctx.route_may_rewrite_response_stream = Some(self.requires_response_stream_hooks());
+    }
+
+    /// Whether any protocol-compatible plugin is configured on this route.
+    #[inline]
+    pub fn has_plugins(&self) -> bool {
+        !self.entry.plugins.is_empty()
+    }
+
+    /// Borrow pre-resolved protocol-filtered plugins without bumping an `Arc`.
+    #[inline]
+    pub fn plugins_slice(&self) -> &[Arc<dyn Plugin>] {
+        self.entry.plugins.as_slice()
     }
 
     /// Get pre-resolved protocol-filtered plugins from this request view.
     pub fn plugins(&self) -> Arc<Vec<Arc<dyn Plugin>>> {
-        Arc::clone(&self.plugins)
+        Arc::clone(&self.entry.plugins)
     }
 
     /// Get the pre-filtered synchronous gRPC deadline-policy chain.
     pub fn grpc_deadline_plugins(&self) -> &[Arc<dyn Plugin>] {
-        self.grpc_deadline_plugins.as_slice()
+        self.entry.phase.grpc_deadline_plugins.as_slice()
+    }
+
+    /// Borrow pre-computed auth plugins without bumping an `Arc`.
+    #[inline]
+    pub fn auth_plugins_slice(&self) -> &[Arc<dyn Plugin>] {
+        self.entry.phase.auth_plugins.as_slice()
     }
 
     /// Get pre-computed auth plugins from this request view.
     pub fn auth_plugins(&self) -> Arc<Vec<Arc<dyn Plugin>>> {
-        Arc::clone(&self.auth_plugins)
+        Arc::clone(&self.entry.phase.auth_plugins)
+    }
+
+    /// Borrow pre-computed authorization plugins without bumping an `Arc`.
+    #[inline]
+    pub fn authorize_plugins_slice(&self) -> &[Arc<dyn Plugin>] {
+        self.entry.phase.authorize_plugins.as_slice()
     }
 
     /// Get pre-computed authorization plugins from this request view.
     pub fn authorize_plugins(&self) -> Arc<Vec<Arc<dyn Plugin>>> {
-        Arc::clone(&self.authorize_plugins)
+        Arc::clone(&self.entry.phase.authorize_plugins)
+    }
+
+    /// Borrow pre-computed backend admission plugins without bumping an `Arc`.
+    #[inline]
+    pub fn backend_admission_plugins_slice(&self) -> &[Arc<dyn Plugin>] {
+        self.entry.phase.backend_admission_plugins.as_slice()
     }
 
     /// Get pre-computed backend admission plugins from this request view.
     pub fn backend_admission_plugins(&self) -> Arc<Vec<Arc<dyn Plugin>>> {
-        Arc::clone(&self.backend_admission_plugins)
+        Arc::clone(&self.entry.phase.backend_admission_plugins)
     }
 
-    /// Get plugins that inspect the finalized backend path.
+    /// Get plugins that inspect the finalized backend path. Empty unless the
+    /// entry's [`PluginCapabilities::HAS_BACKEND_PATH_PLUGINS`] bit is set.
     pub fn backend_path_plugins(&self) -> &[Arc<dyn Plugin>] {
-        self.backend_path_plugins
-            .as_deref()
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+        let phase = &self.entry.phase;
+        if phase
+            .capabilities
+            .has(PluginCapabilities::HAS_BACKEND_PATH_PLUGINS)
+        {
+            phase.backend_path_plugins.as_slice()
+        } else {
+            &[]
+        }
+    }
+
+    /// Borrow credential-bearing request headers without bumping an `Arc`.
+    #[inline]
+    pub fn request_headers_to_redact_slice(&self) -> &[String] {
+        self.entry.phase.request_headers_to_redact.as_slice()
     }
 
     /// Get credential-bearing request headers precomputed for safe downstream views.
     pub fn request_headers_to_redact(&self) -> Arc<Vec<String>> {
-        Arc::clone(&self.request_headers_to_redact)
+        Arc::clone(&self.entry.phase.request_headers_to_redact)
+    }
+
+    /// Borrow late request-trailer strip headers without bumping an `Arc`.
+    #[inline]
+    pub fn request_trailer_strip_headers_slice(&self) -> &[String] {
+        self.entry.phase.request_trailer_strip_headers.as_slice()
+    }
+
+    /// Get the names every late request-trailer boundary strips on this route:
+    /// the credential locations plus every owned gateway-assertion header.
+    pub fn request_trailer_strip_headers(&self) -> Arc<Vec<String>> {
+        Arc::clone(&self.entry.phase.request_trailer_strip_headers)
+    }
+
+    /// Whether a plugin on this route owns any gateway-assertion request header
+    /// (`claim_headers` destinations, OPA decision headers,
+    /// `x-ferrum-peer-spiffe-id`).
+    pub fn owns_request_assertion_headers(&self) -> bool {
+        !self.entry.phase.owned_request_assertion_headers.is_empty()
+    }
+
+    /// Borrow gateway-assertion request headers without bumping an `Arc`.
+    #[inline]
+    pub fn owned_request_assertion_headers_slice(&self) -> &[String] {
+        self.entry.phase.owned_request_assertion_headers.as_slice()
+    }
+
+    /// Every gateway-assertion request header a plugin on this route owns.
+    pub fn owned_request_assertion_headers(&self) -> Arc<Vec<String>> {
+        Arc::clone(&self.entry.phase.owned_request_assertion_headers)
+    }
+
+    /// Borrow the pre-filtered deterministic initial-response header policy chain.
+    #[inline]
+    pub fn initial_response_header_policy_plugins_slice(&self) -> &[Arc<dyn Plugin>] {
+        self.entry
+            .phase
+            .initial_response_header_policy_plugins
+            .as_slice()
     }
 
     /// Get the pre-filtered deterministic initial-response header policy chain.
     pub fn initial_response_header_policy_plugins(&self) -> Arc<Vec<Arc<dyn Plugin>>> {
-        Arc::clone(&self.initial_response_header_policy_plugins)
+        Arc::clone(&self.entry.phase.initial_response_header_policy_plugins)
     }
 
     /// Get canonical field names touched by initial-response policy.
     pub fn initial_response_header_policy_names(&self) -> Arc<Vec<String>> {
-        Arc::clone(&self.initial_response_header_policy_names)
+        Arc::clone(&self.entry.phase.initial_response_header_policy_names)
     }
 
     /// Canonical field names whose response-header policy also binds the
     /// trailer section. Empty for chains that only observe, authenticate, or
     /// authorize, so those chains forward backend trailers untouched.
     pub fn response_trailer_policy_names(&self) -> &[String] {
-        self.response_trailer_policy_names.as_slice()
+        self.entry.phase.response_trailer_policy_names.as_slice()
     }
 
     /// Shared handle to the same list, for relays whose trailer boundary is
     /// enforced by a response BODY that outlives the request handler (the
     /// streaming HTTP/2 arm). One `Arc` bump, no per-request allocation.
     pub fn response_trailer_policy_names_shared(&self) -> Arc<Vec<String>> {
-        Arc::clone(&self.response_trailer_policy_names)
+        Arc::clone(&self.entry.phase.response_trailer_policy_names)
+    }
+
+    pub fn passthrough_strip_request_headers_shared(&self) -> Arc<Vec<String>> {
+        Arc::clone(&self.entry.phase.passthrough_strip_request_headers)
     }
 
     /// Case-insensitive ASCII prefixes whose response-header policy also binds
     /// the trailer section. Empty unless a plugin declared
     /// `ResponseTrailerPolicy::NamesAndPrefixes`.
     pub fn response_trailer_policy_prefixes(&self) -> &[String] {
-        self.response_trailer_policy_prefixes.as_slice()
+        self.entry.phase.response_trailer_policy_prefixes.as_slice()
     }
 
     /// Shared handle to the same prefix list, for the streaming HTTP/2 body
     /// governor. One `Arc` bump, no per-request allocation.
     pub fn response_trailer_policy_prefixes_shared(&self) -> Arc<Vec<String>> {
-        Arc::clone(&self.response_trailer_policy_prefixes)
+        Arc::clone(&self.entry.phase.response_trailer_policy_prefixes)
     }
 
     /// Whether the fail-closed "drop the whole backend trailer section" arm is
@@ -6602,20 +7975,22 @@ impl PluginCacheRequestView {
     /// exemptions may key on the authenticated consumer, which only exists after
     /// the authentication phase.
     pub fn unbounded_response_trailer_policy_applies(&self, ctx: &RequestContext) -> bool {
-        if self
+        let phase = &self.entry.phase;
+        if phase
             .capabilities
             .has(PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY)
         {
             return true;
         }
-        self.conditional_unbounded_trailer_policy_plugins
+        phase
+            .conditional_unbounded_trailer_policy_plugins
             .iter()
             .any(|plugin| plugin.request_applies_unbounded_response_trailer_policy(ctx))
     }
 
     /// Get the pre-filtered committed-response observer chain.
     pub fn response_committed_plugins(&self) -> &[Arc<dyn Plugin>] {
-        self.response_committed_plugins.as_slice()
+        self.entry.phase.response_committed_plugins.as_slice()
     }
 
     /// Effective static response-presentation policy digest for this request,
@@ -6624,40 +7999,46 @@ impl PluginCacheRequestView {
     /// is driven by live runtime state. Either way the policy is unknown, not
     /// empty, and replay consumers must fail closed.
     pub fn response_presentation_policy_digest(&self) -> Option<[u8; 32]> {
-        self.response_presentation_policy_digest
+        self.entry.phase.response_presentation_policy_digest
     }
 
     /// Get pre-computed capability bitset from this request view.
     pub fn capabilities(&self) -> PluginCapabilities {
-        self.capabilities
+        self.entry.phase.capabilities
     }
 
     /// Check response-body buffering requirement from this request view.
+    #[inline]
     pub fn requires_response_body_buffering(&self) -> bool {
-        self.requires_response_body_buffering
+        self.entry.requires_response_body_buffering
     }
 
     /// Check request-body buffering requirement from this request view.
+    #[inline]
     pub fn requires_request_body_buffering(&self) -> bool {
-        self.requires_request_body_buffering
+        self.entry.requires_request_body_buffering
     }
 
     /// Check parsed WebSocket relay requirement from this request view.
+    #[inline]
     pub fn requires_ws_frame_hooks(&self) -> bool {
-        self.requires_ws_frame_hooks
+        self.entry.requires_ws_frame_hooks
     }
 
     /// Whether authentication rejects on this proxy should use the OpenAI
     /// nested error envelope.
+    #[inline]
     pub fn uses_openai_auth_error_envelope(&self) -> bool {
-        self.uses_openai_auth_error_envelope
+        self.entry.uses_openai_auth_error_envelope
     }
 
     /// Check whether any protocol-compatible plugin opted into response-stream
     /// inspection or terminal hooks. Precomputed at cache-build time so the
     /// common response path does not scan plugins per request.
     pub fn requires_response_stream_hooks(&self) -> bool {
-        self.capabilities
+        self.entry
+            .phase
+            .capabilities
             .has(PluginCapabilities::HAS_RESPONSE_STREAM_HOOKS)
     }
 }
@@ -6772,7 +8153,6 @@ fn validate_mesh_bpf_metrics_ownership(config: &GatewayConfig) -> Result<(), Str
 
 impl PluginCache {
     /// Build a new plugin cache from the given config with a default HTTP client.
-    #[allow(dead_code)]
     pub fn new(config: &GatewayConfig) -> Result<Self, String> {
         let http_client = PluginHttpClient::default();
         Self::with_http_client(config, http_client)
@@ -6852,6 +8232,7 @@ impl PluginCache {
             country_mmdb_instances,
             country_mmdb_snapshot_bytes,
             tcp_connection_throttle_instances,
+            schema_reload_guard,
         ) = Self::build_cache(
             config,
             http_client,
@@ -6859,13 +8240,45 @@ impl PluginCache {
             current_tcp_throttle_states,
         )?;
         let snapshot = build_protocol_snapshot(config, &proxy_map, &globals);
-        let (proxy_lifecycle_generations, proxy_lifecycle_generation_high_water) =
-            build_proxy_lifecycle_generations(
-                previous_lifecycle_generations,
-                previous_lifecycle_generation_high_water,
-                config,
-            )?;
-        let mesh_bpf_metrics_exporter = extract_mesh_bpf_metrics_exporter(&globals)?;
+        // `build_cache` returns with the named-schema reload bracket still
+        // open. Run every remaining fallible step before promoting it, so a
+        // refused build (duplicate mesh exporter, lifecycle generation
+        // overflow, api_chargeback overflow budget) cannot leave the registry
+        // on the rejected generation while the published cache stays on the
+        // old one (issue #7198).
+        let prepared = build_proxy_lifecycle_generations(
+            previous_lifecycle_generations,
+            previous_lifecycle_generation_high_water,
+            config,
+        )
+        .and_then(|lifecycle| {
+            extract_mesh_bpf_metrics_exporter(&globals).map(|exporter| (lifecycle, exporter))
+        })
+        .and_then(|(lifecycle, exporter)| {
+            crate::plugins::api_chargeback::prepare_global_overflow_reservations(config)
+                .map(|overflow| (lifecycle, exporter, overflow))
+        });
+        let (
+            (proxy_lifecycle_generations, proxy_lifecycle_generation_high_water),
+            mesh_bpf_metrics_exporter,
+            overflow_reservations,
+        ) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                crate::plugins::utils::log_schema::registry::abort_reload().map_err(
+                    |registry_error| {
+                        format!("{error}; registry abort also failed: {registry_error}")
+                    },
+                )?;
+                return Err(error);
+            }
+        };
+        // All plugins validated and every fallible step succeeded — promote
+        // the staged named schemas to live. Pairs with the `begin_reload` in
+        // `build_cache`.
+        crate::plugins::utils::log_schema::registry::commit_reload()
+            .map_err(|error| format!("Gateway startup aborted: {error}"))?;
+        drop(schema_reload_guard);
 
         Ok(Arc::new(PluginCacheInner::new(
             proxy_map,
@@ -6887,6 +8300,7 @@ impl PluginCache {
             proxy_lifecycle_generations,
             proxy_lifecycle_generation_high_water,
             mesh_bpf_metrics_exporter,
+            overflow_reservations,
         )))
     }
 
@@ -6912,20 +8326,10 @@ impl PluginCache {
     }
 
     pub(crate) fn store_inner(&self, inner: Arc<PluginCacheInner>) {
-        let previous = self.inner.load_full();
         inner.prepare_adaptive_concurrency_generations();
         self.inner.store(Arc::clone(&inner));
         commit_background_tasks(&inner.proxy_plugins, &inner.global_plugins);
         inner.commit_adaptive_concurrency_generations();
-        for (identity, instance) in &previous.tcp_connection_throttle_instances {
-            if !inner
-                .tcp_connection_throttle_instances
-                .contains_key(identity)
-            {
-                instance.state.set_cleanup_interval(0);
-            }
-        }
-        inner.apply_tcp_connection_throttle_cleanup_intervals();
     }
 
     pub(crate) fn load_inner(&self) -> Arc<PluginCacheInner> {
@@ -6934,7 +8338,6 @@ impl PluginCache {
 
     /// Every target tracked by the live adaptive-concurrency policies.
     /// Inspection only, for in-process fixtures that settle real requests.
-    #[allow(dead_code)] // Bin target omits lib::_test_support; integration tests call via that seam.
     pub(crate) fn adaptive_concurrency_snapshots(&self) -> Vec<AdaptiveConcurrencySnapshot> {
         self.inner
             .load()
@@ -6956,7 +8359,6 @@ impl PluginCache {
     /// so the injected plugin is actually visible to
     /// [`Self::get_plugins_for_protocol`] and friends. A bare-id key would land
     /// in the map unreachable and the seam would silently no-op.
-    #[allow(dead_code)] // Bin target omits lib::_test_support; integration tests call via that seam.
     pub(crate) fn prepend_proxy_plugin_for_test(
         &self,
         namespace: &str,
@@ -7018,6 +8420,7 @@ impl PluginCache {
             current.proxy_lifecycle_generations.clone(),
             current.proxy_lifecycle_generation_high_water,
             current.mesh_bpf_metrics_exporter.clone(),
+            current.chargeback_overflow.clone(),
         ));
         self.store_inner(next);
         Ok(())
@@ -7059,6 +8462,9 @@ impl PluginCache {
         // order, so a late retired-generation request cannot restore an old
         // proxy name (issue #2572).
         crate::plugins::api_chargeback::publish_active_proxy_names(config);
+        if let Some(reservation) = &inner.chargeback_overflow {
+            reservation.activate();
+        }
 
         // Ownership generations are keyed by the namespace-qualified runtime key
         // (`namespace|id`), the same identity the request/frame samples resolve,
@@ -7150,6 +8556,27 @@ impl PluginCache {
         inner.grpc_web_request_view(namespace, proxy_id)
     }
 
+    /// Global access logs a request that matched no proxy is delivered to
+    /// (route-miss `404`), in configured order; empty when the published
+    /// generation has none.
+    pub fn unrouted_transaction_log_plugins(&self) -> Vec<Arc<dyn Plugin>> {
+        self.inner
+            .load()
+            .unrouted_transaction_log_plugins()
+            .map(|plugins| plugins.to_vec())
+            .unwrap_or_default()
+    }
+
+    /// Global correlation policies applied to route-miss responses, in
+    /// lifecycle order; empty when this generation has none.
+    pub fn unrouted_correlation_plugins(&self) -> Vec<Arc<dyn Plugin>> {
+        self.inner
+            .load()
+            .unrouted_correlation_plugins()
+            .map(|plugins| plugins.to_vec())
+            .unwrap_or_default()
+    }
+
     /// Atomically rebuild the cache when config changes. Most old plugin
     /// instances are dropped only after in-flight requests release them;
     /// adaptive-concurrency and TCP-throttle policies additionally carry
@@ -7183,9 +8610,10 @@ impl PluginCache {
         let current = self.inner.load();
         let mut expanded_proxy_ids = proxy_ids_to_rebuild.clone();
         let mut rebuild_adaptive_globals = false;
+        // A preload-scope query, not a build: it owns its own memo.
         include_adaptive_concurrency_route_rebuilds(
             &current.adaptive_concurrency_instances,
-            config,
+            &mut RouteOverrideFactsMemo::new(config),
             &mut expanded_proxy_ids,
             &mut rebuild_adaptive_globals,
         );
@@ -7369,15 +8797,21 @@ impl PluginCache {
         let mut plugin_errors: Vec<String> = Vec::new();
         let mut proxy_ids_to_rebuild = proxy_ids_to_rebuild.clone();
         let mut rebuild_adaptive_globals = false;
+        // One route-override memo for this candidate generation, shared by the
+        // rebuild-scope expansion, the retain pass, and every adaptive policy
+        // created below (issue #7018).
+        let mut route_override_memo = RouteOverrideFactsMemo::new(config);
         include_adaptive_concurrency_route_rebuilds(
             &current.adaptive_concurrency_instances,
-            config,
+            &mut route_override_memo,
             &mut proxy_ids_to_rebuild,
             &mut rebuild_adaptive_globals,
         );
         let mut global_plugins_changed = rebuild_globals || rebuild_adaptive_globals;
-        let mut adaptive_concurrency_instances =
-            retained_adaptive_concurrency_states(&current.adaptive_concurrency_instances, config);
+        let mut adaptive_concurrency_instances = retained_adaptive_concurrency_states(
+            &current.adaptive_concurrency_instances,
+            &mut route_override_memo,
+        );
         let mut tcp_connection_throttle_instances = retained_tcp_connection_throttle_states(
             &current.tcp_connection_throttle_instances,
             config,
@@ -7411,6 +8845,7 @@ impl PluginCache {
                     country_mmdb_load_session,
                     &current.adaptive_concurrency_instances,
                     &mut adaptive_concurrency_instances,
+                    &mut route_override_memo,
                     &current.tcp_connection_throttle_instances,
                     &mut tcp_connection_throttle_instances,
                 ) {
@@ -7464,6 +8899,19 @@ impl PluginCache {
                 HashMap::new()
             };
 
+        // Unwind-safety net for the named-schema reload bracket opened below:
+        // the explicit commit/abort calls on every normal path disarm it, and
+        // its `Drop` discards the staging map if construction panics before
+        // either runs (see `registry::begin_reload_guarded`).
+        let _schema_reload_guard = if rebuild_globals {
+            Some(
+                crate::plugins::utils::log_schema::registry::begin_reload_guarded()
+                    .map_err(|error| format!("Config reload rejected: {error}"))?,
+            )
+        } else {
+            None
+        };
+
         // Rebuild globals if any global plugin config changed
         let mut new_globals = if rebuild_globals {
             let mut global_plugins: Vec<Arc<dyn Plugin>> = Vec::new();
@@ -7480,9 +8928,8 @@ impl PluginCache {
             // `transaction_log_schema` itself changed — the bracket is
             // cheap (one Mutex acquire + empty HashMap) and guarantees
             // the registry stays in sync even if a sibling global plugin
-            // was the trigger for the rebuild.
-            crate::plugins::utils::log_schema::registry::begin_reload()
-                .map_err(|error| format!("Config reload rejected: {error}"))?;
+            // was the trigger for the rebuild. The bracket itself was opened
+            // just above, guarded against unwinding.
             for pc in &config.plugin_configs {
                 if !pc.enabled || pc.scope != PluginScope::Global {
                     continue;
@@ -7499,6 +8946,7 @@ impl PluginCache {
                     &mut country_mmdb_instances,
                     &current.adaptive_concurrency_instances,
                     &mut adaptive_concurrency_instances,
+                    &mut route_override_memo,
                     &current.tcp_connection_throttle_instances,
                     &mut tcp_connection_throttle_instances,
                 ) {
@@ -7516,7 +8964,7 @@ impl PluginCache {
                 }
             }
 
-            for pc in &config.plugin_configs {
+            for pc in plugin_configs_in_canonical_order(&config.plugin_configs) {
                 if !pc.enabled {
                     continue;
                 }
@@ -7533,6 +8981,7 @@ impl PluginCache {
                         &mut country_mmdb_instances,
                         &current.adaptive_concurrency_instances,
                         &mut adaptive_concurrency_instances,
+                        &mut route_override_memo,
                         &current.tcp_connection_throttle_instances,
                         &mut tcp_connection_throttle_instances,
                     ) {
@@ -7559,7 +9008,7 @@ impl PluginCache {
             // without any global PluginConfig changing. Replace only those
             // wrappers so unrelated stateful globals retain their Arc/state.
             let mut global_plugins = globals_without_adaptive_concurrency(&current.global_plugins);
-            for pc in &config.plugin_configs {
+            for pc in plugin_configs_in_canonical_order(&config.plugin_configs) {
                 if !pc.enabled
                     || pc.scope != PluginScope::Global
                     || pc.plugin_name != "adaptive_concurrency"
@@ -7575,6 +9024,7 @@ impl PluginCache {
                     &mut country_mmdb_instances,
                     &current.adaptive_concurrency_instances,
                     &mut adaptive_concurrency_instances,
+                    &mut route_override_memo,
                     &current.tcp_connection_throttle_instances,
                     &mut tcp_connection_throttle_instances,
                 ) {
@@ -7610,7 +9060,7 @@ impl PluginCache {
         // resolves plugin configs from its own tenant.
         let mut proxy_scoped_configs: ProxyScopedConfigIndex = HashMap::new();
         let mut proxy_group_configs: ProxyGroupConfigIndex = HashMap::new();
-        for pc in &config.plugin_configs {
+        for pc in plugin_configs_in_canonical_order(&config.plugin_configs) {
             if !pc.enabled {
                 continue;
             }
@@ -7646,6 +9096,16 @@ impl PluginCache {
         // instances that are still referenced in the post-delta config. This
         // keeps state shared with unchanged proxies but drops cascade-deleted
         // group state once the last proxy association is removed.
+        //
+        // A retained instance must also still resolve the same named-schema
+        // definition: loggers compile `schema_ref` at construction, so when a
+        // global `transaction_log_schema` change re-staged the registry
+        // (`rebuild_globals`) and the definition a group instance resolved has
+        // changed, retaining it would keep emitting the old output contract
+        // (for example a newly added privacy `omit`) indefinitely. Such groups
+        // are reconstructed against the staged registry below, and every proxy
+        // associated with them is rebuilt so they keep sharing one instance.
+        let mut schema_invalidated_groups: Vec<NamespacedResourceId> = Vec::new();
         let mut group_plugin_instances: ProxyGroupInstanceMap = current
             .proxy_group_plugins
             .iter()
@@ -7654,6 +9114,12 @@ impl PluginCache {
                     return None;
                 }
                 let pc = proxy_group_configs.get(identity)?;
+                if rebuild_globals
+                    && proxy_group_schema_ref_definition(pc) != existing.schema_ref_definition
+                {
+                    schema_invalidated_groups.push(identity.clone());
+                    return None;
+                }
                 if pc.plugin_name == "adaptive_concurrency"
                     && !adaptive_concurrency_instances
                         .contains_key(&adaptive_concurrency_policy_id(pc))
@@ -7673,6 +9139,22 @@ impl PluginCache {
                 }
             })
             .collect();
+        if !schema_invalidated_groups.is_empty() {
+            for proxy in &config.proxies {
+                let references_invalidated_group = proxy.plugins.iter().any(|assoc| {
+                    schema_invalidated_groups.iter().any(|identity| {
+                        *identity
+                            == NamespacedResourceId::new(
+                                proxy.namespace.as_str(),
+                                assoc.plugin_config_id.as_str(),
+                            )
+                    })
+                });
+                if references_invalidated_group {
+                    proxy_ids_to_rebuild.insert(proxy_namespaced_id(proxy));
+                }
+            }
+        }
         if let Some(forced) = forced_country_mmdb_instances {
             for (id, plugin_config) in &active_country_mmdb_configs {
                 if plugin_config.scope != PluginScope::ProxyGroup {
@@ -7684,10 +9166,7 @@ impl PluginCache {
                             plugin_config.namespace.as_str(),
                             plugin_config.id.as_str(),
                         ),
-                        ProxyGroupPluginInstance {
-                            plugin: Arc::clone(plugin),
-                            config: (*plugin_config).clone(),
-                        },
+                        ProxyGroupPluginInstance::new(Arc::clone(plugin), (*plugin_config).clone()),
                     );
                 }
             }
@@ -7733,6 +9212,7 @@ impl PluginCache {
                             &mut country_mmdb_instances,
                             &current.adaptive_concurrency_instances,
                             &mut adaptive_concurrency_instances,
+                            &mut route_override_memo,
                             &current.tcp_connection_throttle_instances,
                             &mut tcp_connection_throttle_instances,
                         ) {
@@ -7776,7 +9256,7 @@ impl PluginCache {
 
             // Resolve proxy_group-scoped plugins via the proxy's association
             // list, resolved within the proxy's own namespace.
-            for assoc in &proxy.plugins {
+            for assoc in proxy_plugin_associations_in_canonical_order(proxy) {
                 let group_identity = NamespacedResourceId::new(
                     proxy.namespace.as_str(),
                     assoc.plugin_config_id.as_str(),
@@ -7796,16 +9276,17 @@ impl PluginCache {
                             &mut country_mmdb_instances,
                             &current.adaptive_concurrency_instances,
                             &mut adaptive_concurrency_instances,
+                            &mut route_override_memo,
                             &current.tcp_connection_throttle_instances,
                             &mut tcp_connection_throttle_instances,
                         ) {
                             Ok(Some(plugin)) => {
                                 group_plugin_instances.insert(
                                     group_identity.clone(),
-                                    ProxyGroupPluginInstance {
-                                        plugin: Arc::clone(&plugin),
-                                        config: (*pc).clone(),
-                                    },
+                                    ProxyGroupPluginInstance::new(
+                                        Arc::clone(&plugin),
+                                        (*pc).clone(),
+                                    ),
                                 );
                                 remove_shadowed_global_plugin(&mut merged, &global_ptrs, &plugin);
                                 merged.push(plugin);
@@ -8039,14 +9520,6 @@ impl PluginCache {
             }
         };
 
-        // Delta build succeeded. If a registry reload bracket was opened
-        // above (rebuild_globals == true), promote the staged named
-        // schemas now — pairs with the `begin_reload` at the top.
-        if rebuild_globals {
-            crate::plugins::utils::log_schema::registry::commit_reload()
-                .map_err(|error| format!("Config reload rejected: {error}"))?;
-        }
-
         let lifecycle_advances: HashSet<String> = config
             .proxies
             .iter()
@@ -8064,13 +9537,45 @@ impl PluginCache {
                 proxy_alerts_instances_changed(previous, next).then_some(key)
             })
             .collect();
-        let (proxy_lifecycle_generations, proxy_lifecycle_generation_high_water) =
-            build_proxy_lifecycle_generations_with_advances(
-                &current.proxy_lifecycle_generations,
-                current.proxy_lifecycle_generation_high_water,
-                config,
-                &lifecycle_advances,
-            )?;
+        // The lifecycle generations and the api_chargeback overflow
+        // reservations are the last fallible steps; both run before
+        // `commit_reload` so a refusal (for example an overflow budget that
+        // cannot reserve the new rows) cannot leave the named-schema registry
+        // promoted against a rejected cache (issue #7198).
+        let prepared = build_proxy_lifecycle_generations_with_advances(
+            &current.proxy_lifecycle_generations,
+            current.proxy_lifecycle_generation_high_water,
+            config,
+            &lifecycle_advances,
+        )
+        .and_then(|lifecycle| {
+            crate::plugins::api_chargeback::prepare_global_overflow_reservations(config)
+                .map(|overflow| (lifecycle, overflow))
+        });
+        let (
+            (proxy_lifecycle_generations, proxy_lifecycle_generation_high_water),
+            overflow_reservations,
+        ) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if rebuild_globals {
+                    crate::plugins::utils::log_schema::registry::abort_reload().map_err(
+                        |registry_error| {
+                            format!("{error}; registry abort also failed: {registry_error}")
+                        },
+                    )?;
+                }
+                return Err(error);
+            }
+        };
+
+        // Delta build succeeded. If a registry reload bracket was opened
+        // above (rebuild_globals == true), promote the staged named
+        // schemas now — pairs with the `begin_reload` at the top.
+        if rebuild_globals {
+            crate::plugins::utils::log_schema::registry::commit_reload()
+                .map_err(|error| format!("Config reload rejected: {error}"))?;
+        }
 
         // Recomputed against the incoming config and the NEW global TCP entry
         // on every delta, including the `global_plugins_changed == false` reuse
@@ -8105,6 +9610,7 @@ impl PluginCache {
             proxy_lifecycle_generations,
             proxy_lifecycle_generation_high_water,
             mesh_bpf_metrics_exporter,
+            overflow_reservations,
         ));
         jwks_rollback.disarm();
         Ok(inner)
@@ -8146,7 +9652,6 @@ impl PluginCache {
     ///
     /// Returns an Arc to the cached plugin Vec — zero allocation per request.
     /// Callers iterate by reference; no Vec clone needed.
-    #[allow(dead_code)] // Used by tests for protocol-agnostic plugin inspection
     pub fn get_plugins(&self, namespace: &str, proxy_id: &str) -> Arc<Vec<Arc<dyn Plugin>>> {
         PROXY_KEY_BUF.with(|buf| {
             let mut key = buf.borrow_mut();
@@ -8181,7 +9686,6 @@ impl PluginCache {
     /// Standalone accessor: each call loads the cache independently. Request
     /// paths that need multiple plugin-cache values should use
     /// `request_view()` for cross-accessor generation consistency.
-    #[allow(dead_code)] // Retained standalone API; hot request paths use request_view().
     pub fn get_auth_plugins(
         &self,
         namespace: &str,
@@ -8201,7 +9705,6 @@ impl PluginCache {
     /// Standalone accessor: each call loads the cache independently. Request
     /// paths that need multiple plugin-cache values should use
     /// `request_view()` for cross-accessor generation consistency.
-    #[allow(dead_code)] // Retained standalone API; hot request paths use request_view().
     pub fn get_capabilities(
         &self,
         namespace: &str,
@@ -8221,7 +9724,6 @@ impl PluginCache {
     /// Standalone accessor: each call loads the cache independently. Request
     /// paths that need multiple plugin-cache values should use
     /// `request_view()` for cross-accessor generation consistency.
-    #[allow(dead_code)] // Retained standalone API; hot request paths use request_view().
     pub fn requires_response_body_buffering(&self, namespace: &str, proxy_id: &str) -> bool {
         PROXY_KEY_BUF.with(|buf| {
             let mut key = buf.borrow_mut();
@@ -8253,7 +9755,6 @@ impl PluginCache {
     /// Standalone accessor: each call loads the cache independently. Request
     /// paths that need multiple plugin-cache values should use
     /// `request_view()` for cross-accessor generation consistency.
-    #[allow(dead_code)] // Retained standalone API; hot request paths use request_view().
     pub fn requires_ws_frame_hooks(&self, namespace: &str, proxy_id: &str) -> bool {
         PROXY_KEY_BUF.with(|buf| {
             let mut key = buf.borrow_mut();
@@ -8307,6 +9808,24 @@ impl PluginCache {
         result
     }
 
+    /// Live `adaptive_concurrency` policy count and their tracked targets'
+    /// summed limits and in-flight admissions, for `GET /admin/metrics`.
+    /// Summed at read time from each policy's active tracking space; never
+    /// called on the request path.
+    pub fn adaptive_concurrency_totals(&self) -> (usize, AdaptiveConcurrencyTotals) {
+        let inner = self.inner.load();
+        let mut totals = AdaptiveConcurrencyTotals::default();
+        for instance in inner.adaptive_concurrency_instances.values() {
+            let policy = instance.limiter.totals();
+            totals.tracked_targets = totals
+                .tracked_targets
+                .saturating_add(policy.tracked_targets);
+            totals.limit = totals.limit.saturating_add(policy.limit);
+            totals.in_flight = totals.in_flight.saturating_add(policy.in_flight);
+        }
+        (inner.adaptive_concurrency_instances.len(), totals)
+    }
+
     /// Total number of tracked rate-limiter keys across all plugin instances.
     pub fn total_rate_limiter_keys(&self) -> usize {
         let mut total = 0usize;
@@ -8338,6 +9857,23 @@ impl PluginCache {
         total
     }
 
+    /// Live TCP connections currently admitted by every `tcp_connection_throttle`
+    /// policy in the published generation, summed across keys.
+    ///
+    /// Read on demand for authenticated `/admin/metrics`: it walks each
+    /// policy's counter map and adds nothing to the stream admission path.
+    /// Connections still held by a policy that was since removed finish against
+    /// their detached state and are not counted here.
+    pub fn tcp_connection_throttle_active_connections(&self) -> u64 {
+        self.inner
+            .load()
+            .tcp_connection_throttle_instances
+            .values()
+            .fold(0u64, |total, instance| {
+                total.saturating_add(instance.state.active_connections())
+            })
+    }
+
     /// Deduplicated immutable country-MMDB bytes retained by the live cache
     /// generation. Exposed for diagnostics and admission regression tests.
     pub fn country_mmdb_snapshot_bytes(&self) -> u64 {
@@ -8345,7 +9881,6 @@ impl PluginCache {
     }
 
     /// Number of proxy entries in the cache (for testing).
-    #[allow(dead_code)]
     pub fn proxy_count(&self) -> usize {
         self.inner.load().proxy_plugins.len()
     }
@@ -8373,6 +9908,7 @@ impl PluginCache {
             CountryMmdbPluginInstanceMap,
             u64,
             TcpConnectionThrottleInstanceMap,
+            crate::plugins::utils::log_schema::registry::ReloadBracketGuard,
         ),
         String,
     > {
@@ -8380,8 +9916,11 @@ impl PluginCache {
             CountryMmdbLoadSession::claim(&config.country_mmdb_file_dependency_paths())?;
         // Step 1: Create all enabled global plugins (shared across proxies)
         let mut global_plugins: Vec<Arc<dyn Plugin>> = Vec::new();
+        // One route-override memo for this candidate generation, shared by the
+        // retain pass and every adaptive policy created below (issue #7018).
+        let mut route_override_memo = RouteOverrideFactsMemo::new(config);
         let mut adaptive_concurrency_instances =
-            retained_adaptive_concurrency_states(current_adaptive_states, config);
+            retained_adaptive_concurrency_states(current_adaptive_states, &mut route_override_memo);
         let mut country_mmdb_instances = CountryMmdbPluginInstanceMap::new();
         let mut tcp_connection_throttle_instances =
             retained_tcp_connection_throttle_states(current_tcp_throttle_states, config);
@@ -8410,8 +9949,11 @@ impl PluginCache {
         // the rest of the plugin-cache build succeeds; `abort_reload`
         // runs if any plugin fails validation, so the process-global
         // registry stays atomically tied to the cache.
-        crate::plugins::utils::log_schema::registry::begin_reload()
-            .map_err(|error| format!("Gateway startup aborted: {error}"))?;
+        // The guard is an unwind-safety net only: the explicit commit/abort
+        // calls below close the bracket on every normal path.
+        let schema_reload_guard =
+            crate::plugins::utils::log_schema::registry::begin_reload_guarded()
+                .map_err(|error| format!("Gateway startup aborted: {error}"))?;
         for pc in &config.plugin_configs {
             if !pc.enabled || pc.scope != PluginScope::Global {
                 continue;
@@ -8428,6 +9970,7 @@ impl PluginCache {
                 &mut country_mmdb_instances,
                 current_adaptive_states,
                 &mut adaptive_concurrency_instances,
+                &mut route_override_memo,
                 current_tcp_throttle_states,
                 &mut tcp_connection_throttle_instances,
             ) {
@@ -8441,7 +9984,7 @@ impl PluginCache {
 
         // Second pass: everything else, including other globals,
         // proxy-scoped, and proxy_group-scoped configs.
-        for pc in &config.plugin_configs {
+        for pc in plugin_configs_in_canonical_order(&config.plugin_configs) {
             if !pc.enabled {
                 continue;
             }
@@ -8458,6 +10001,7 @@ impl PluginCache {
                     &mut country_mmdb_instances,
                     current_adaptive_states,
                     &mut adaptive_concurrency_instances,
+                    &mut route_override_memo,
                     current_tcp_throttle_states,
                     &mut tcp_connection_throttle_instances,
                 ) {
@@ -8529,6 +10073,7 @@ impl PluginCache {
                             &mut country_mmdb_instances,
                             current_adaptive_states,
                             &mut adaptive_concurrency_instances,
+                            &mut route_override_memo,
                             current_tcp_throttle_states,
                             &mut tcp_connection_throttle_instances,
                         ) {
@@ -8563,7 +10108,7 @@ impl PluginCache {
             // Resolve proxy_group-scoped plugins via the proxy's association
             // list, resolved within the proxy's own namespace. Shared Arc
             // instances are reused across all proxies in the group.
-            for assoc in &proxy.plugins {
+            for assoc in proxy_plugin_associations_in_canonical_order(proxy) {
                 let group_identity = NamespacedResourceId::new(
                     proxy.namespace.as_str(),
                     assoc.plugin_config_id.as_str(),
@@ -8585,16 +10130,17 @@ impl PluginCache {
                             &mut country_mmdb_instances,
                             current_adaptive_states,
                             &mut adaptive_concurrency_instances,
+                            &mut route_override_memo,
                             current_tcp_throttle_states,
                             &mut tcp_connection_throttle_instances,
                         ) {
                             Ok(Some(plugin)) => {
                                 group_plugin_instances.insert(
                                     group_identity.clone(),
-                                    ProxyGroupPluginInstance {
-                                        plugin: Arc::clone(&plugin),
-                                        config: (*pc).clone(),
-                                    },
+                                    ProxyGroupPluginInstance::new(
+                                        Arc::clone(&plugin),
+                                        (*pc).clone(),
+                                    ),
                                 );
                                 remove_shadowed_global_plugin(&mut merged, &global_ptrs, &plugin);
                                 merged.push(plugin);
@@ -8705,10 +10251,9 @@ impl PluginCache {
             return Err(format!("Gateway startup aborted: {error}"));
         }
 
-        // All plugins validated — promote the staged named schemas to live.
-        // Pairs with the `begin_reload` at the start of this function.
-        crate::plugins::utils::log_schema::registry::commit_reload()
-            .map_err(|error| format!("Gateway startup aborted: {error}"))?;
+        // All plugins validated. The bracket stays open and is returned to
+        // the caller, which commits it only after its own remaining fallible
+        // steps succeed (issue #7198).
 
         let global_needs_buffering = global_plugins
             .iter()
@@ -8738,6 +10283,7 @@ impl PluginCache {
             country_mmdb_instances,
             country_mmdb_snapshot_bytes,
             tcp_connection_throttle_instances,
+            schema_reload_guard,
         ))
     }
 }

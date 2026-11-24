@@ -48,6 +48,9 @@ on:
         default: ""
         type: string
 
+permissions:
+  contents: read
+
 jobs:
   comparison:
     name: Gateway Comparison
@@ -61,7 +64,9 @@ jobs:
       INPUT_SKIP_GATEWAYS: ${{ inputs.skip_gateways }}
 
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -73,13 +78,15 @@ jobs:
       - uses: ./.github/actions/setup-fast-linker
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: "ci-comparison-bench"
           # Host builds use a nested workspace; root target/ has no reuse here.
           cache-targets: "false"
           cache-directories: ${{ github.workspace }}/.cache/sccache
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          # Dispatch-only lane: it never runs on a push to main, so it never
+          # saves (see docs/ci_cd.md, 10 GB quota policy).
+          save-if: "false"
 
       - name: Install system dependencies
         run: |
@@ -547,7 +554,6 @@ jobs:
               # Compute win counts: for each (proto, ep), which gateway had highest RPS?
               wins = {}  # gw -> win count
               total_scenarios = 0
-              scenario_winners = []  # [(proto, ep, winner_gw, rps)]
 
               for proto in PROTOCOLS:
                   for ep in ENDPOINTS:
@@ -563,7 +569,6 @@ jobs:
                       if best_gw:
                           wins[best_gw] = wins.get(best_gw, 0) + 1
                           total_scenarios += 1
-                          scenario_winners.append((proto, ep, best_gw, best_rps))
 
               # Key-auth scenario
               if key_auth:
@@ -579,7 +584,6 @@ jobs:
                   if best_ka_gw:
                       wins[best_ka_gw] = wins.get(best_ka_gw, 0) + 1
                       total_scenarios += 1
-                      scenario_winners.append(("key_auth", "users-auth", best_ka_gw, best_ka_rps))
 
               lines.append(f"**Scenario Wins** (out of {total_scenarios} test scenarios):\n")
               lines.append("| Gateway | Wins | Win Rate |")
@@ -691,7 +695,7 @@ jobs:
 
       - name: Upload comparison results
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: comparison-results-${{ github.sha }}
           path: comparison-results/
@@ -699,7 +703,7 @@ jobs:
 
       - name: Upload HTML reports
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: comparison-html-reports-${{ github.sha }}
           path: comparison-results/*/comparison_report.html

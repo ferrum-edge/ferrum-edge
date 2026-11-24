@@ -38,9 +38,7 @@ tests/
 │
 ├── common/                       # Shared helpers (gateway harness, echo servers, ...)
 ├── scaffolding/                  # Protocol backends/clients, port registry, harness
-├── scenarios/                    # Catalog of scripted failure modes
 ├── support/                      # Tracing/diagnostic capture helpers
-├── helpers/bin/                  # Standalone test server binaries
 ├── scripts/                      # Setup scripts (e.g. setup_db_tls.sh)
 │
 ├── k8s/                          # Kubernetes live suites (kind), shared lib/
@@ -77,13 +75,14 @@ cargo test --test functional_tests -- --ignored --nocapture
 ### Mesh Conformance and Live Evidence
 
 `tests/conformance/ga_contract.yaml` is the machine-readable GA product
-contract for mesh semantic coverage. `cargo test --test conformance_tests`
-validates the manifest and emits `target/conformance/coverage.json` plus
-`target/conformance/coverage.md`.
+contract for mesh semantic coverage. `cargo test --test conformance_tests --
+--test-threads=1` validates the manifest and emits
+`target/conformance/coverage.json` plus `target/conformance/coverage.md` (a
+multi-threaded run can emit an incomplete matrix).
 
-Kubernetes live suites should source helpers from `tests/k8s/lib/`:
+Kubernetes live suites create and load their kind clusters in their own
+`run.sh`, and source shared helpers from `tests/k8s/lib/`:
 
-- `kind.sh` for disposable kind clusters and shared diagnostics.
 - `spire.sh` for the common SPIRE install/readiness/diagnostics flow.
 - `live_assertions.sh` for `live-assertions.json` files keyed by stable
   assertion IDs from the GA contract.
@@ -150,13 +149,10 @@ cargo test --test service_integration db_tls
 ```
 
 ### Performance Tests
-```bash
-cd tests/performance
-./run_perf_test.sh          # Local HTTP/1.1 wrk smoke test
-```
 
-See [`performance/README.md`](performance/README.md) for the full suite index
-(multi-protocol, payload-size, mesh Criterion, mesh DNS/HBONE E2E).
+See [`performance/README.md`](performance/README.md) for the suite index
+(CI overhead gate, multi-protocol, payload-size, mesh Criterion, mesh DNS/HBONE
+E2E, mesh runtime).
 
 ## Test Categories Explained
 

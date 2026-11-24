@@ -231,6 +231,23 @@ fn http_only_graphs_skip_post_write_policy_admission() {
         admission_lease: None,
     };
     assert!(associated_graph.requires_post_write_policy_admission());
+
+    // A `spiffe_identity` row can attach to a persisted non-terminating stream
+    // proxy, so its stream TLS-termination compatibility must be re-read after
+    // the write (spiffe_identity-MUSE-2).
+    let mut spiffe = plugin_config("ferrum", "pc-spiffe");
+    spiffe.plugin_name = "spiffe_identity".to_string();
+    spiffe.config = json!({});
+    let spiffe_plugins = vec![spiffe];
+    let spiffe_graph = AtomicBatchGraph {
+        namespace: "ferrum",
+        consumers: &[],
+        upstreams: &[],
+        proxies: &[],
+        plugin_configs: &spiffe_plugins,
+        admission_lease: None,
+    };
+    assert!(spiffe_graph.requires_post_write_policy_admission());
 }
 
 #[test]
@@ -407,7 +424,16 @@ fn sql_atomic_batch_uses_a_single_transaction_for_every_phase() {
 
     // Proxies are inserted without associations so a plugin config submitted in
     // the same graph is present before anything references it.
-    assert!(body.contains("self.insert_proxies_in_tx(&mut tx, chunk, false,"));
+    assert!(body.contains("self.insert_proxies_in_tx(&mut tx, chunk, &mut touched_namespaces)"));
+    let insert_proxies = SQL_STORE_SOURCE
+        .split("    async fn insert_proxies_in_tx(")
+        .nth(1)
+        .and_then(|tail| tail.split("\n    pub async fn ").next())
+        .expect("proxy insert helper remains inspectable");
+    assert!(
+        !insert_proxies.contains("INSERT INTO proxy_plugins"),
+        "the shared proxy insert helper must never write plugin associations"
+    );
     // Every chunked phase is chunk-aware inside the one transaction, so a fault
     // after a chunk boundary is reachable and still rolls everything back.
     assert_eq!(
@@ -430,8 +456,8 @@ fn mongo_atomic_batch_refuses_standalone_and_uses_one_session_transaction() {
         .find("        async fn batch_create_config_graph_atomically(")
         .expect("Mongo atomic batch writer must exist");
     let end = MONGO_STORE_SOURCE[start..]
-        .find("\n        async fn batch_create_proxies(")
-        .expect("batch_create_proxies must follow the atomic writer")
+        .find("\n        async fn batch_create_proxies_without_plugins(")
+        .expect("batch_create_proxies_without_plugins must follow the atomic writer")
         + start;
     let body = &MONGO_STORE_SOURCE[start..end];
 
@@ -542,8 +568,8 @@ fn atomic_batch_lease_gate_compares_expiry_against_current_database_time() {
         .find("        async fn batch_create_config_graph_atomically(")
         .expect("Mongo atomic batch writer must exist");
     let outer_end = MONGO_STORE_SOURCE[outer_start..]
-        .find("\n        async fn batch_create_proxies(")
-        .expect("batch_create_proxies must follow the atomic writer")
+        .find("\n        async fn batch_create_proxies_without_plugins(")
+        .expect("batch_create_proxies_without_plugins must follow the atomic writer")
         + outer_start;
     let outer = &MONGO_STORE_SOURCE[outer_start..outer_end];
     assert!(
@@ -714,8 +740,8 @@ fn atomic_batch_persist_skips_namespace_policy_reload_when_unneeded() {
         .find("        async fn batch_create_config_graph_atomically(")
         .expect("Mongo atomic batch writer");
     let mongo_end = MONGO_STORE_SOURCE[mongo_start..]
-        .find("\n        async fn batch_create_proxies(")
-        .expect("batch_create_proxies follows Mongo atomic writer")
+        .find("\n        async fn batch_create_proxies_without_plugins(")
+        .expect("batch_create_proxies_without_plugins follows Mongo atomic writer")
         + mongo_start;
     let mongo = &MONGO_STORE_SOURCE[mongo_start..mongo_end];
     assert!(

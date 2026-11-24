@@ -39,7 +39,13 @@ use crate::grpc::proto::ConfigUpdate;
 use crate::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 use crate::xds::carrier::XdsNodeScoping;
 
+/// Defence-in-depth cap on distinct subscribed type URLs per stream.
+///
+/// Unreachable today: `ensure_supported_type_url` runs first and admits only
+/// the fixed `XDS_TYPE_URLS` set, which the assert below keeps under this cap.
+/// It bounds per-stream state if that admission is ever widened.
 const MAX_SUBSCRIPTIONS_PER_STREAM: usize = 32;
+const _: () = assert!(super::translator::XDS_TYPE_URLS.len() <= MAX_SUBSCRIPTIONS_PER_STREAM);
 const MAX_RESOURCE_NAMES_PER_REQUEST: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,8 +126,9 @@ pub struct XdsAdsServer {
     sidecar_enforced: bool,
     /// Mirror of `EnvConfig.mesh_sidecar_enforced_dry_run`.
     sidecar_enforced_dry_run: bool,
-    /// Mirror of `EnvConfig.mesh_sidecar_identity_narrowing`. Only takes
-    /// effect when `sidecar_enforced` is also true.
+    /// Mirror of `EnvConfig.mesh_sidecar_identity_narrowing` (default `true`,
+    /// like the env var). Only takes effect when `sidecar_enforced` is also
+    /// true.
     sidecar_identity_narrowing: bool,
     /// Cluster DNS suffix used when synthesizing MeshService FQDN aliases for
     /// Sidecar egress matching.
@@ -260,7 +267,7 @@ impl XdsAdsServer {
             ambient_udp_source_bearer_namespaces: None,
             sidecar_enforced,
             sidecar_enforced_dry_run: false,
-            sidecar_identity_narrowing: false,
+            sidecar_identity_narrowing: true,
             cluster_domain: crate::modes::mesh::dns_proxy::DEFAULT_CLUSTER_DOMAIN.to_string(),
         }
     }
@@ -341,6 +348,7 @@ impl XdsAdsServer {
     /// Reserve an aggregate permit for the existing inline guard tests, which
     /// exercise node-scoped cleanup rather than the aggregate budget.
     #[cfg(test)]
+    #[cfg(test)]
     fn test_permit(&self) -> XdsStreamPermit {
         self.admission
             .reserve_stream(&self.namespace, "test-principal")
@@ -351,22 +359,13 @@ impl XdsAdsServer {
         AggregatedDiscoveryServiceServer::new(self)
     }
 
-    pub fn snapshot_cache(&self) -> Arc<XdsSnapshotCache> {
-        self.snapshot_cache.clone()
-    }
-
-    pub fn nonce_tracker(&self) -> Arc<XdsNonceTracker> {
-        self.nonce_tracker.clone()
-    }
-
     /// Verify the stream's bearer and return BOTH the tenant ceiling and the
     /// authenticated principal (JWT `sub`).
     ///
-    /// The audience posture is unchanged from the previous
-    /// `verify_grpc_jwt_metadata_with_claims` call
-    /// ([`GrpcAudiencePolicy::ReservedForbidden`]); the only difference is that
-    /// the subject is no longer discarded — ADS needs it to keep unrelated
-    /// principals off one mutable state key and one quota (issue #3741).
+    /// The audience posture is [`GrpcAudiencePolicy::ReservedForbidden`], as on
+    /// the other non-remote-discovery surfaces. The subject is kept because ADS
+    /// needs it to keep unrelated principals off one mutable state key and one
+    /// quota (issue #3741).
     #[allow(clippy::result_large_err)]
     fn verify_jwt_metadata(
         &self,
@@ -431,7 +430,8 @@ impl XdsAdsServer {
         .with_sidecar_egress_dry_run(self.sidecar_enforced_dry_run)
         .with_enforce_sidecar_identity_narrowing(self.sidecar_identity_narrowing)
         .with_ambient_udp_source_scoping(scoping.ambient_udp_source_scoping)
-        .with_node_waypoint_capture_scoping(scoping.node_waypoint_capture_scoping);
+        .with_node_waypoint_capture_scoping(scoping.node_waypoint_capture_scoping)
+        .with_sidecar_http_routes(scoping.sidecar_http_routes);
         CpGrpcServer::filter_config_to_mesh_request_for_scope_and_bearer(
             config,
             &request,
@@ -531,11 +531,13 @@ impl XdsAdsServer {
         self.namespace.clone()
     }
 
+    #[cfg(test)]
     fn rebuild_snapshot(&self, node_id: &str) -> XdsSnapshot {
         let config = self.config.load_full();
         self.rebuild_snapshot_from_config(node_id, config.as_ref())
     }
 
+    #[cfg(test)]
     fn rebuild_snapshot_from_config(&self, node_id: &str, config: &GatewayConfig) -> XdsSnapshot {
         self.rebuild_snapshot_from_config_for_node(node_id, node_id, config)
     }
@@ -567,7 +569,8 @@ impl XdsAdsServer {
             .with_sidecar_egress_dry_run(self.sidecar_enforced_dry_run)
             .with_enforce_sidecar_identity_narrowing(self.sidecar_identity_narrowing)
             .with_ambient_udp_source_scoping(scoping.ambient_udp_source_scoping)
-            .with_node_waypoint_capture_scoping(scoping.node_waypoint_capture_scoping);
+            .with_node_waypoint_capture_scoping(scoping.node_waypoint_capture_scoping)
+            .with_sidecar_http_routes(scoping.sidecar_http_routes);
         let mut config = config.clone();
         config.normalize_fields();
         config.normalize_mesh_fields();
@@ -575,6 +578,7 @@ impl XdsAdsServer {
         translate_mesh_slice_to_snapshot(&slice)
     }
 
+    #[cfg(test)]
     fn snapshot_for_config(&self, node_id: &str, config: &GatewayConfig) -> Arc<XdsSnapshot> {
         // Non-stream helper for tests and one-off callers. ADS streams carry
         // XdsStreamConfig so request/ACK cache hits do not rehash config.
@@ -582,6 +586,7 @@ impl XdsAdsServer {
         self.snapshot_for_config_with_fingerprint(node_id, node_id, config, &fingerprint)
     }
 
+    #[cfg(test)]
     fn snapshot_for_stream_config(
         &self,
         node_id: &str,
@@ -665,6 +670,43 @@ impl XdsAdsServer {
         identity_changed || waypoint_changed || scoping_changed
     }
 
+    /// Reconcile a request's `Node.metadata` and, when it changed OR this is
+    /// the stream's first node-identified request, rebuild the stream config
+    /// from the authoritative shared config under the node's scoping.
+    ///
+    /// Every stream starts from a placeholder filtered with default scoping
+    /// (the node is unknown before its first request). That placeholder is
+    /// narrowed without a NodeWaypoint capture inventory, and a narrowed config
+    /// can never yield one later. Another stream for the same node (a reconnect
+    /// racing the predecessor's teardown, or SotW beside Delta) finds the
+    /// node's metadata already recorded, so "metadata changed" alone would
+    /// leave this stream on the placeholder and serve an empty inventory until
+    /// the next full config update. Binding on the first identified request
+    /// closes that.
+    fn bind_stream_config_to_node(
+        &self,
+        stream_config: &mut XdsStreamConfig,
+        namespace: &str,
+        state_key: &str,
+        node: Option<&super::proto::Node>,
+        first_identified_request: bool,
+    ) {
+        let metadata_changed = node.is_some_and(|node| {
+            self.reconcile_node_metadata(
+                state_key,
+                crate::xds::carrier::decode_node_metadata(&node.metadata),
+            )
+        });
+        if metadata_changed || first_identified_request {
+            self.refresh_stream_config_from_current(
+                stream_config,
+                namespace,
+                self.waypoint_name_for_state_key(state_key),
+                self.node_scoping_for_state_key(state_key),
+            );
+        }
+    }
+
     fn reconcile_optional_string_state(
         values: &DashMap<String, String>,
         key: &str,
@@ -702,14 +744,6 @@ impl XdsAdsServer {
         )
     }
 
-    fn sotw_response(
-        &self,
-        snapshot: &XdsSnapshot,
-        subscription: &XdsSubscription,
-    ) -> DiscoveryResponse {
-        self.sotw_response_with_nonce_key(snapshot, subscription, &snapshot.node_id)
-    }
-
     fn sotw_response_with_nonce_key(
         &self,
         snapshot: &XdsSnapshot,
@@ -741,6 +775,7 @@ impl XdsAdsServer {
         }
     }
 
+    #[cfg(test)]
     fn delta_response(
         &self,
         snapshot: &XdsSnapshot,
@@ -894,6 +929,7 @@ impl XdsAdsServer {
         }
     }
 
+    #[cfg(test)]
     fn sotw_responses_for_subscriptions(
         &self,
         node_id: &str,
@@ -903,6 +939,7 @@ impl XdsAdsServer {
         self.sotw_responses_for_subscriptions_from_config(node_id, subscriptions, config.as_ref())
     }
 
+    #[cfg(test)]
     fn sotw_responses_for_subscriptions_from_config(
         &self,
         node_id: &str,
@@ -919,6 +956,7 @@ impl XdsAdsServer {
         .1
     }
 
+    #[cfg(test)]
     fn sotw_responses_for_subscriptions_from_config_with_previous(
         &self,
         node_id: &str,
@@ -933,22 +971,6 @@ impl XdsAdsServer {
             subscriptions,
             config,
             &fingerprint,
-            previous,
-        )
-    }
-
-    fn sotw_responses_for_stream_config_with_previous(
-        &self,
-        node_id: &str,
-        subscriptions: &HashMap<String, XdsSubscription>,
-        stream_config: &XdsStreamConfig,
-        previous: Option<&XdsSnapshot>,
-    ) -> (Arc<XdsSnapshot>, Vec<DiscoveryResponse>) {
-        self.sotw_responses_for_stream_config_with_previous_key(
-            node_id,
-            node_id,
-            subscriptions,
-            stream_config,
             previous,
         )
     }
@@ -997,6 +1019,7 @@ impl XdsAdsServer {
         (snapshot, responses)
     }
 
+    #[cfg(test)]
     fn sotw_response_for_request(
         &self,
         node_id: &str,
@@ -1015,6 +1038,7 @@ impl XdsAdsServer {
         )
     }
 
+    #[cfg(test)]
     fn sotw_response_for_stream_request(
         &self,
         node_id: &str,
@@ -1114,6 +1138,7 @@ impl XdsAdsServer {
         }
     }
 
+    #[cfg(test)]
     fn delta_response_for_stream_request(
         &self,
         node_id: &str,
@@ -1132,6 +1157,7 @@ impl XdsAdsServer {
         )
     }
 
+    #[cfg(test)]
     fn delta_response_for_stream_request_without_ack(
         &self,
         node_id: &str,
@@ -1164,27 +1190,6 @@ impl XdsAdsServer {
             node_id,
             &stream_config.config,
             &stream_config.fingerprint,
-            subscriptions,
-            request,
-            previous,
-        )
-    }
-
-    fn delta_response_for_request_with_fingerprint(
-        &self,
-        node_id: &str,
-        config: &GatewayConfig,
-        fingerprint: &XdsConfigFingerprint,
-        subscriptions: &mut HashMap<String, XdsSubscription>,
-        request: &DeltaDiscoveryRequest,
-        previous: Option<&XdsSnapshot>,
-    ) -> Option<(Arc<XdsSnapshot>, DeltaDiscoveryResponse)> {
-        let _ = self.record_and_log_delta_ack(node_id, request);
-        self.delta_response_for_request_with_fingerprint_without_ack(
-            node_id,
-            node_id,
-            config,
-            fingerprint,
             subscriptions,
             request,
             previous,
@@ -1269,99 +1274,6 @@ impl XdsAdsServer {
         Some(outcome)
     }
 
-    fn delta_responses_for_subscriptions(
-        &self,
-        node_id: &str,
-        subscriptions: &HashMap<String, XdsSubscription>,
-    ) -> Vec<DeltaDiscoveryResponse> {
-        let config = self.config.load_full();
-        self.delta_responses_for_subscriptions_from_config(node_id, subscriptions, config.as_ref())
-    }
-
-    fn delta_responses_for_subscriptions_from_config(
-        &self,
-        node_id: &str,
-        subscriptions: &HashMap<String, XdsSubscription>,
-        config: &GatewayConfig,
-    ) -> Vec<DeltaDiscoveryResponse> {
-        let previous = self.snapshot_cache.get(node_id);
-        self.delta_responses_for_subscriptions_from_config_with_previous(
-            node_id,
-            subscriptions,
-            config,
-            previous.as_deref(),
-        )
-        .1
-    }
-
-    fn delta_responses_for_subscriptions_from_config_with_previous(
-        &self,
-        node_id: &str,
-        subscriptions: &HashMap<String, XdsSubscription>,
-        config: &GatewayConfig,
-        previous: Option<&XdsSnapshot>,
-    ) -> (Arc<XdsSnapshot>, Vec<DeltaDiscoveryResponse>) {
-        let fingerprint = config_fingerprint(config);
-        self.delta_responses_for_subscriptions_from_config_with_fingerprint(
-            node_id,
-            node_id,
-            subscriptions,
-            config,
-            &fingerprint,
-            previous,
-        )
-    }
-
-    fn delta_responses_for_stream_config_with_previous(
-        &self,
-        node_id: &str,
-        subscriptions: &HashMap<String, XdsSubscription>,
-        stream_config: &XdsStreamConfig,
-        previous: Option<&XdsSnapshot>,
-    ) -> (Arc<XdsSnapshot>, Vec<DeltaDiscoveryResponse>) {
-        self.delta_responses_for_stream_config_with_previous_key(
-            node_id,
-            node_id,
-            subscriptions,
-            stream_config,
-            previous,
-        )
-    }
-
-    fn delta_responses_for_stream_config_with_previous_key(
-        &self,
-        cache_key: &str,
-        node_id: &str,
-        subscriptions: &HashMap<String, XdsSubscription>,
-        stream_config: &XdsStreamConfig,
-        previous: Option<&XdsSnapshot>,
-    ) -> (Arc<XdsSnapshot>, Vec<DeltaDiscoveryResponse>) {
-        self.delta_responses_for_subscriptions_from_config_with_fingerprint(
-            cache_key,
-            node_id,
-            subscriptions,
-            &stream_config.config,
-            &stream_config.fingerprint,
-            previous,
-        )
-    }
-
-    fn delta_responses_for_stream_config_with_previous_by_type(
-        &self,
-        node_id: &str,
-        subscriptions: &HashMap<String, XdsSubscription>,
-        stream_config: &XdsStreamConfig,
-        previous_by_type: &HashMap<String, Arc<XdsSnapshot>>,
-    ) -> (Arc<XdsSnapshot>, Vec<DeltaDiscoveryResponse>) {
-        self.delta_responses_for_stream_config_with_previous_by_type_key(
-            node_id,
-            node_id,
-            subscriptions,
-            stream_config,
-            previous_by_type,
-        )
-    }
-
     fn delta_responses_for_stream_config_with_previous_by_type_key(
         &self,
         cache_key: &str,
@@ -1389,37 +1301,6 @@ impl XdsAdsServer {
                         cache_key,
                     )
                 })
-            })
-            .collect();
-        (snapshot, responses)
-    }
-
-    fn delta_responses_for_subscriptions_from_config_with_fingerprint(
-        &self,
-        cache_key: &str,
-        node_id: &str,
-        subscriptions: &HashMap<String, XdsSubscription>,
-        config: &GatewayConfig,
-        fingerprint: &XdsConfigFingerprint,
-        previous: Option<&XdsSnapshot>,
-    ) -> (Arc<XdsSnapshot>, Vec<DeltaDiscoveryResponse>) {
-        let snapshot =
-            self.snapshot_for_config_with_fingerprint(cache_key, node_id, config, fingerprint);
-        let responses = subscriptions
-            .values()
-            .filter(|subscription| {
-                subscription_resources_changed(previous, &snapshot, subscription)
-            })
-            .map(|subscription| {
-                self.delta_response_with_nonce_key(
-                    &snapshot,
-                    previous,
-                    subscription,
-                    &HashMap::new(),
-                    &[],
-                    &[],
-                    cache_key,
-                )
             })
             .collect();
         (snapshot, responses)
@@ -1610,11 +1491,26 @@ fn config_fingerprint(config: &GatewayConfig) -> XdsConfigFingerprint {
     // never rides raw ConfigSync `GatewayConfig` JSON, but xDS CP filtering
     // stores it in the in-process filtered config before snapshot translation.
     // Include it here so off-visible source-waypoint inventory changes still
-    // invalidate the stream/snapshot cache.
+    // invalidate the stream/snapshot cache. The NodeWaypoint capture
+    // inventory (destinations, their PeerAuthentication, and their
+    // AuthorizationPolicy) is the same kind of runtime-only, cross-namespace
+    // field: a DENY added in a captured pod's namespace changes nothing else in
+    // the filtered config, so it must be fingerprinted too or the stream would
+    // keep serving the snapshot without it.
     let assertor_bytes = match config
         .mesh
         .as_ref()
-        .map(|mesh| serde_json::to_vec(&mesh.node_waypoint_assertors))
+        .map(|mesh| {
+            serde_json::to_vec(&(
+                &mesh.node_waypoint_assertors,
+                &mesh.node_waypoint_capture_destinations,
+                &mesh.node_waypoint_capture_peer_authentications,
+                &mesh.node_waypoint_capture_mesh_policies,
+                // Provenance too: a narrowed placeholder and a resolved-empty
+                // inventory have identical vectors but build different slices.
+                mesh.node_waypoint_capture_inventory_state.as_str(),
+            ))
+        })
         .transpose()
     {
         Ok(Some(bytes)) => bytes,
@@ -1667,7 +1563,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                     "",
                     "",
                     "failure",
-                    status.message(),
+                    crate::grpc::cp_server::tenant_authentication_rejection_reason(&status),
                 );
                 return Err(status);
             }
@@ -1686,7 +1582,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                     "",
                     "",
                     "failure",
-                    status.message(),
+                    crate::grpc::cp_server::tenant_rejection_reason::NAMESPACE_NOT_AUTHORIZED,
                 );
                 return Err(status);
             }
@@ -1840,6 +1736,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                 &current_node_id,
                             )
                         });
+                        let first_identified_request = node_id.is_none();
                         if node_id.is_none() {
                             if let Err(rejection) =
                                 stream_guard.set_node_state_key(&current_state_key)
@@ -1864,19 +1761,13 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                         // fingerprint) only, so any identity CHANGE must drop the
                         // cached slice. ACKs carry `node: None` and don't reach
                         // here, preserving the identity mid-stream.
-                        if let Some(node) = request.node.as_ref()
-                            && server.reconcile_node_metadata(
-                                &current_state_key,
-                                crate::xds::carrier::decode_node_metadata(&node.metadata),
-                            )
-                        {
-                            server.refresh_stream_config_from_current(
-                                &mut stream_config,
-                                &stream_namespace,
-                                server.waypoint_name_for_state_key(&current_state_key),
-                                server.node_scoping_for_state_key(&current_state_key),
-                            );
-                        }
+                        server.bind_stream_config_to_node(
+                            &mut stream_config,
+                            &stream_namespace,
+                            &current_state_key,
+                            request.node.as_ref(),
+                            first_identified_request,
+                        );
 
                         if let Err(status) = ensure_supported_type_url(&request.type_url) {
                             warn_xds_request_rejected(
@@ -2058,7 +1949,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                     "",
                     "",
                     "failure",
-                    status.message(),
+                    crate::grpc::cp_server::tenant_authentication_rejection_reason(&status),
                 );
                 return Err(status);
             }
@@ -2077,7 +1968,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                     "",
                     "",
                     "failure",
-                    status.message(),
+                    crate::grpc::cp_server::tenant_rejection_reason::NAMESPACE_NOT_AUTHORIZED,
                 );
                 return Err(status);
             }
@@ -2226,6 +2117,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                 &current_node_id,
                             )
                         });
+                        let first_identified_request = node_id.is_none();
                         if node_id.is_none() {
                             if let Err(rejection) =
                                 stream_guard.set_node_state_key(&current_state_key)
@@ -2250,19 +2142,13 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                         // fingerprint) only, so any identity CHANGE must drop the
                         // cached slice. ACKs carry `node: None` and don't reach
                         // here, preserving the identity mid-stream.
-                        if let Some(node) = request.node.as_ref()
-                            && server.reconcile_node_metadata(
-                                &current_state_key,
-                                crate::xds::carrier::decode_node_metadata(&node.metadata),
-                            )
-                        {
-                            server.refresh_stream_config_from_current(
-                                &mut stream_config,
-                                &stream_namespace,
-                                server.waypoint_name_for_state_key(&current_state_key),
-                                server.node_scoping_for_state_key(&current_state_key),
-                            );
-                        }
+                        server.bind_stream_config_to_node(
+                            &mut stream_config,
+                            &stream_namespace,
+                            &current_state_key,
+                            request.node.as_ref(),
+                            first_identified_request,
+                        );
 
                         if let Err(status) = ensure_supported_type_url(&request.type_url) {
                             warn_xds_request_rejected(
@@ -2778,8 +2664,9 @@ mod tests {
                 peer_authentications: vec![PeerAuthentication {
                     name: "strict".to_string(),
                     namespace: "default".to_string(),
-                    scope: None,
-                    selector: None,
+                    scope: PolicyScope::Namespace {
+                        namespace: "default".to_string(),
+                    },
                     mtls_mode: MtlsMode::Strict,
                     port_overrides: HashMap::new(),
                 }],
@@ -3210,6 +3097,312 @@ mod tests {
         );
     }
 
+    /// The real ADS path for a NodeWaypoint: the prefilter runs without the
+    /// node's workload identity, then the snapshot builder applies it. The
+    /// capture inventory must come from the CP's pre-narrowing resolution: a
+    /// destination outside the bearer bound is never rebuilt from a
+    /// Sidecar-widened routing view, and an authorized destination keeps its
+    /// own DENY on the AuthorizationPolicy carrier.
+    #[test]
+    fn xds_prefilter_to_snapshot_keeps_the_capture_inventory_authoritative() {
+        use crate::modes::mesh::config::{MeshRule, NodeWaypointEndpoint, PolicyAction};
+        use crate::xds::carrier::MeshSliceCarrier;
+
+        let this_waypoint = "spiffe://cluster.local/ns/ferrum/sa/node-waypoint-a";
+        let ledger = Workload {
+            spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/payments/sa/ledger")
+                .expect("spiffe"),
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "ledger".to_string())]),
+                namespace: Some("payments".to_string()),
+            },
+            service_name: "ledger".to_string(),
+            service_namespace: None,
+            addresses: vec!["10.244.1.7".to_string()],
+            ports: Vec::new(),
+            trust_domain: TrustDomain::new("cluster.local").expect("trust domain"),
+            namespace: "payments".to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: Some("ledger".to_string()),
+            pod_uid: None,
+            node_waypoint: Some(NodeWaypointEndpoint {
+                address: "10.0.0.1".to_string(),
+                hbone_port: 15008,
+                spiffe_id: SpiffeId::new(this_waypoint).expect("spiffe"),
+                node_name: None,
+                node_uid: None,
+                network: None,
+                cluster: None,
+            }),
+            remote_provenance: false,
+        };
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                workloads: vec![ledger],
+                mesh_policies: vec![MeshPolicy {
+                    name: "payments-deny".to_string(),
+                    namespace: "payments".to_string(),
+                    scope: PolicyScope::Namespace {
+                        namespace: "payments".to_string(),
+                    },
+                    rules: vec![MeshRule {
+                        action: PolicyAction::Deny,
+                        ..MeshRule::default()
+                    }],
+                }],
+                sidecars: vec![MeshSidecar {
+                    name: "default".to_string(),
+                    namespace: "ferrum".to_string(),
+                    workload_selector: None,
+                    egress_inherits_defaults: false,
+                    egress: vec![MeshSidecarEgress {
+                        hosts: vec!["payments/*".to_string()],
+                        port: None,
+                    }],
+                    ingress_declared: false,
+                    ingress: Vec::new(),
+                    outbound_traffic_policy: None,
+                }],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let scoping = XdsNodeScoping {
+            ambient_udp_source_scoping: false,
+            node_waypoint_capture_scoping: true,
+            sidecar_http_routes: false,
+        };
+        let capture_carriers = |server: &XdsAdsServer| {
+            server
+                .workload_identities
+                .insert("node-a".to_string(), this_waypoint.to_string());
+            server.node_scoping.insert("node-a".to_string(), scoping);
+            let filtered = server.filter_config_for_xds_request(&config, "ferrum", None, scoping);
+            let snapshot =
+                server.rebuild_snapshot_from_config_for_node("node-a", "node-a", &filtered);
+            let mut destinations = Vec::new();
+            let mut policies = None;
+            for resource in snapshot.resources(super::super::translator::ECDS_TYPE_URL) {
+                let typed_extension =
+                    crate::xds::proto::TypedExtensionConfig::decode(resource.value.as_slice())
+                        .expect("ECDS resource decodes");
+                let Some(inner) = typed_extension.typed_config.as_ref() else {
+                    continue;
+                };
+                match MeshSliceCarrier::decode(&inner.type_url, &inner.value)
+                    .expect("carrier decodes")
+                {
+                    Some(MeshSliceCarrier::NodeWaypointCaptureDestinations(value)) => {
+                        destinations = value;
+                    }
+                    Some(MeshSliceCarrier::NodeWaypointCaptureMeshPolicies(value)) => {
+                        policies = Some(value);
+                    }
+                    _ => {}
+                }
+            }
+            (destinations, policies)
+        };
+
+        let mut withheld =
+            test_server_with_sidecar_enforcement(config.clone(), true).with_scope(CpScope::All);
+        withheld.ambient_udp_source_bearer_namespaces = Some(HashSet::from(["ferrum".to_string()]));
+        let (destinations, policies) = capture_carriers(&withheld);
+        assert!(
+            destinations.is_empty(),
+            "a capture destination outside the bearer bound must not be rebuilt"
+        );
+        assert_eq!(
+            policies,
+            Some(Vec::new()),
+            "the resolved (empty) inventory still carries its completeness evidence"
+        );
+
+        let mut authorized =
+            test_server_with_sidecar_enforcement(config.clone(), true).with_scope(CpScope::All);
+        authorized.ambient_udp_source_bearer_namespaces = Some(HashSet::from([
+            "ferrum".to_string(),
+            "payments".to_string(),
+        ]));
+        let (destinations, policies) = capture_carriers(&authorized);
+        assert_eq!(
+            destinations
+                .iter()
+                .map(|workload| workload.service_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ledger"]
+        );
+        assert!(
+            policies
+                .expect("completeness evidence")
+                .iter()
+                .any(|policy| policy.name == "payments-deny"),
+            "the authorized destination keeps its own DENY through the ADS prefilter"
+        );
+    }
+
+    /// A second stream for a node whose metadata is already recorded (a
+    /// reconnect racing the predecessor's teardown, or SotW beside Delta) must
+    /// still leave the default-scoping placeholder: its first identified
+    /// request rebuilds the stream config from the authoritative config under
+    /// the node's capture scoping, so the inventory is `Resolved`.
+    #[test]
+    fn a_stream_for_an_already_known_node_resolves_its_capture_inventory() {
+        use crate::modes::mesh::config::{NodeWaypointCaptureInventoryState, NodeWaypointEndpoint};
+
+        let this_waypoint = "spiffe://cluster.local/ns/ferrum/sa/node-waypoint-a";
+        let ledger = Workload {
+            spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/payments/sa/ledger")
+                .expect("spiffe"),
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "ledger".to_string())]),
+                namespace: Some("payments".to_string()),
+            },
+            service_name: "ledger".to_string(),
+            service_namespace: None,
+            addresses: vec!["10.244.1.7".to_string()],
+            ports: Vec::new(),
+            trust_domain: TrustDomain::new("cluster.local").expect("trust domain"),
+            namespace: "payments".to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: Some("ledger".to_string()),
+            pod_uid: None,
+            node_waypoint: Some(NodeWaypointEndpoint {
+                address: "10.0.0.1".to_string(),
+                hbone_port: 15008,
+                spiffe_id: SpiffeId::new(this_waypoint).expect("spiffe"),
+                node_name: None,
+                node_uid: None,
+                network: None,
+                cluster: None,
+            }),
+            remote_provenance: false,
+        };
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                workloads: vec![ledger],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let server = test_server(config.clone()).with_scope(CpScope::All);
+        let node = super::super::proto::Node {
+            id: "node-a".to_string(),
+            cluster: "ferrum".to_string(),
+            metadata: crate::xds::carrier::encode_node_metadata_with_scoping(
+                Some(this_waypoint),
+                None,
+                XdsNodeScoping {
+                    ambient_udp_source_scoping: false,
+                    node_waypoint_capture_scoping: true,
+                    sidecar_http_routes: false,
+                },
+            ),
+        };
+        let placeholder = || {
+            XdsStreamConfig::new(server.filter_config_for_xds_request(
+                &config,
+                "ferrum",
+                None,
+                XdsNodeScoping::default(),
+            ))
+        };
+        let state = |stream: &XdsStreamConfig| {
+            let mesh = stream.config.mesh.as_deref().expect("mesh");
+            (
+                mesh.node_waypoint_capture_inventory_state,
+                mesh.node_waypoint_capture_destinations.len(),
+            )
+        };
+
+        // First stream: metadata is new.
+        let mut first = placeholder();
+        assert_eq!(
+            state(&first).0,
+            NodeWaypointCaptureInventoryState::NotResolved,
+            "precondition: the placeholder is narrowed without an inventory"
+        );
+        server.bind_stream_config_to_node(&mut first, "ferrum", "node-a", Some(&node), true);
+        assert_eq!(
+            state(&first),
+            (NodeWaypointCaptureInventoryState::Resolved, 1)
+        );
+
+        // Second stream: identical metadata is already recorded, so nothing
+        // "changed" — the first identified request must still bind.
+        let mut second = placeholder();
+        server.bind_stream_config_to_node(&mut second, "ferrum", "node-a", Some(&node), true);
+        assert_eq!(
+            state(&second),
+            (NodeWaypointCaptureInventoryState::Resolved, 1)
+        );
+
+        // A later request with unchanged metadata does not refilter.
+        let fingerprint = second.fingerprint.clone();
+        server.bind_stream_config_to_node(&mut second, "ferrum", "node-a", Some(&node), false);
+        assert_eq!(second.fingerprint, fingerprint);
+    }
+
+    #[test]
+    fn xds_config_fingerprint_distinguishes_capture_inventory_provenance() {
+        use crate::modes::mesh::config::NodeWaypointCaptureInventoryState;
+
+        let mut placeholder = gateway_config_with_service(true, 0);
+        placeholder
+            .mesh
+            .as_mut()
+            .expect("mesh should exist")
+            .node_waypoint_capture_inventory_state = NodeWaypointCaptureInventoryState::NotResolved;
+        let mut resolved = placeholder.clone();
+        resolved
+            .mesh
+            .as_mut()
+            .expect("mesh should exist")
+            .node_waypoint_capture_inventory_state = NodeWaypointCaptureInventoryState::Resolved;
+        assert_ne!(
+            config_fingerprint(&placeholder),
+            config_fingerprint(&resolved)
+        );
+    }
+
+    #[test]
+    fn xds_config_fingerprint_includes_runtime_capture_authorization_inventory() {
+        let left = gateway_config_with_service(true, 0);
+        let mut right = left.clone();
+        right
+            .mesh
+            .as_mut()
+            .expect("mesh should exist")
+            .node_waypoint_capture_mesh_policies = vec![crate::modes::mesh::config::MeshPolicy {
+            name: "payments-deny".to_string(),
+            namespace: "payments".to_string(),
+            scope: crate::modes::mesh::config::PolicyScope::Namespace {
+                namespace: "payments".to_string(),
+            },
+            rules: vec![crate::modes::mesh::config::MeshRule {
+                action: crate::modes::mesh::config::PolicyAction::Deny,
+                ..crate::modes::mesh::config::MeshRule::default()
+            }],
+        }];
+
+        assert_eq!(
+            serde_json::to_vec(&left).expect("serialized config"),
+            serde_json::to_vec(&right).expect("serialized config"),
+            "the runtime-only capture inventory is skipped from raw GatewayConfig JSON"
+        );
+        assert_ne!(
+            config_fingerprint(&left),
+            config_fingerprint(&right),
+            "a capture-only AuthorizationPolicy change must invalidate the xDS stream config"
+        );
+    }
+
     #[test]
     fn xds_config_fingerprint_includes_runtime_node_waypoint_assertors() {
         let mut left = gateway_config_with_service(true, 0);
@@ -3313,6 +3506,7 @@ mod tests {
                 waypoint_name: Some("waypoint".to_string()),
                 ambient_udp_source_scoping: false,
                 node_waypoint_capture_scoping: false,
+                sidecar_http_routes: false,
             },
         ));
         assert!(server.waypoint_names.get(&tenant_key).is_some());
@@ -3396,6 +3590,7 @@ mod tests {
             XdsNodeScoping {
                 ambient_udp_source_scoping: true,
                 node_waypoint_capture_scoping: false,
+                sidecar_http_routes: false,
             },
         );
         let bearer_restricted = bearer_restricted_server.filter_config_for_xds_request(
@@ -3405,6 +3600,7 @@ mod tests {
             XdsNodeScoping {
                 ambient_udp_source_scoping: true,
                 node_waypoint_capture_scoping: false,
+                sidecar_http_routes: false,
             },
         );
         let bearer_multi_namespace = bearer_multi_namespace_server.filter_config_for_xds_request(
@@ -3414,6 +3610,7 @@ mod tests {
             XdsNodeScoping {
                 ambient_udp_source_scoping: true,
                 node_waypoint_capture_scoping: false,
+                sidecar_http_routes: false,
             },
         );
 
@@ -3471,6 +3668,7 @@ mod tests {
                 waypoint_name: Some("waypoint".to_string()),
                 ambient_udp_source_scoping: false,
                 node_waypoint_capture_scoping: false,
+                sidecar_http_routes: false,
             },
         );
         let snapshot =
@@ -4063,20 +4261,58 @@ mod tests {
         assert_ne!(old_snapshot.version, new_snapshot.version);
     }
 
+    /// Resend a Delta generation exactly as the live stream does after a config
+    /// update or broadcast lag: each subscribed type is diffed against the
+    /// snapshot that type last had ACKed (`last_accepted_snapshot_by_type`).
+    fn delta_resend(
+        server: &XdsAdsServer,
+        subscriptions: &HashMap<String, XdsSubscription>,
+        config: GatewayConfig,
+        accepted_by_type: &HashMap<String, Arc<XdsSnapshot>>,
+    ) -> (Arc<XdsSnapshot>, Vec<DeltaDiscoveryResponse>) {
+        let stream_config = XdsStreamConfig::new(config);
+        server.invalidate_snapshot_for_config_update("node-a");
+        server.delta_responses_for_stream_config_with_previous_by_type_key(
+            "node-a",
+            "node-a",
+            subscriptions,
+            &stream_config,
+            accepted_by_type,
+        )
+    }
+
+    /// Record `snapshot` as ACKed for every subscribed type.
+    fn accepted_for_all(
+        subscriptions: &HashMap<String, XdsSubscription>,
+        snapshot: &Arc<XdsSnapshot>,
+    ) -> HashMap<String, Arc<XdsSnapshot>> {
+        subscriptions
+            .keys()
+            .map(|type_url| (type_url.clone(), Arc::clone(snapshot)))
+            .collect()
+    }
+
     #[test]
     fn delta_lag_recovery_reports_removed_resources() {
         let server = test_server(gateway_config_with_service(true, 0));
         let subscriptions = cds_subscription();
 
-        let initial = server.delta_responses_for_subscriptions("node-a", &subscriptions);
+        let (initial_snapshot, initial) = delta_resend(
+            &server,
+            &subscriptions,
+            gateway_config_with_service(true, 0),
+            &HashMap::new(),
+        );
         assert_eq!(initial.len(), 1);
         assert_eq!(initial[0].resources.len(), 1);
         assert!(initial[0].removed_resources.is_empty());
 
-        server
-            .config
-            .store(Arc::new(gateway_config_with_service(false, 1)));
-        let recovered = server.delta_responses_for_subscriptions("node-a", &subscriptions);
+        let (_, recovered) = delta_resend(
+            &server,
+            &subscriptions,
+            gateway_config_with_service(false, 1),
+            &accepted_for_all(&subscriptions, &initial_snapshot),
+        );
 
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].resources.len(), 0);
@@ -4091,15 +4327,62 @@ mod tests {
         let server = test_server(gateway_config_with_service(true, 0));
         let subscriptions = cds_subscription();
 
-        let initial = server.delta_responses_for_subscriptions("node-a", &subscriptions);
+        let (initial_snapshot, initial) = delta_resend(
+            &server,
+            &subscriptions,
+            gateway_config_with_service(true, 0),
+            &HashMap::new(),
+        );
         assert_eq!(initial.len(), 1);
 
-        server
-            .config
-            .store(Arc::new(gateway_config_with_service(true, 1)));
-        let unchanged = server.delta_responses_for_subscriptions("node-a", &subscriptions);
+        let (_, unchanged) = delta_resend(
+            &server,
+            &subscriptions,
+            gateway_config_with_service(true, 1),
+            &accepted_for_all(&subscriptions, &initial_snapshot),
+        );
 
         assert!(unchanged.is_empty());
+    }
+
+    /// The resend diffs each type against ITS OWN last-accepted snapshot, not
+    /// one shared previous: a type whose earlier response was never ACKed is
+    /// re-sent in full even though a sibling type is already current.
+    #[test]
+    fn delta_resend_diffs_each_type_against_its_own_accepted_snapshot() {
+        let server = test_server(gateway_config_with_service(true, 0));
+        let cds = super::super::translator::CDS_TYPE_URL;
+        let eds = super::super::translator::EDS_TYPE_URL;
+        let mut subscriptions = wildcard_subscription(cds);
+        subscriptions.extend(wildcard_subscription(eds));
+
+        let (current, _) = delta_resend(
+            &server,
+            &subscriptions,
+            gateway_config_with_service(true, 0),
+            &HashMap::new(),
+        );
+        // CDS ACKed the current generation; EDS has nothing accepted yet.
+        let accepted = HashMap::from([(cds.to_string(), Arc::clone(&current))]);
+
+        let (_, responses) = delta_resend(
+            &server,
+            &subscriptions,
+            gateway_config_with_service(true, 1),
+            &accepted,
+        );
+
+        let resent: Vec<&str> = responses
+            .iter()
+            .map(|response| response.type_url.as_str())
+            .collect();
+        assert_eq!(
+            resent,
+            vec![eds],
+            "only the type without an accepted snapshot is re-sent"
+        );
+        assert!(!responses[0].resources.is_empty());
+        assert!(responses[0].removed_resources.is_empty());
     }
 
     #[test]
@@ -4107,24 +4390,21 @@ mod tests {
         let server = test_server(gateway_config_with_service(true, 0));
         let subscriptions = cds_subscription();
         let previous = server.snapshot_for_config("node-a", &gateway_config_with_service(true, 0));
-        let first_previous = Some(previous.clone());
-        let second_previous = Some(previous);
-        let next_config = gateway_config_with_service(false, 1);
+        let first_accepted = accepted_for_all(&subscriptions, &previous);
+        let second_accepted = accepted_for_all(&subscriptions, &previous);
 
-        let (_, first_responses) = server
-            .delta_responses_for_subscriptions_from_config_with_previous(
-                "node-a",
-                &subscriptions,
-                &next_config,
-                first_previous.as_deref(),
-            );
-        let (_, second_responses) = server
-            .delta_responses_for_subscriptions_from_config_with_previous(
-                "node-a",
-                &subscriptions,
-                &next_config,
-                second_previous.as_deref(),
-            );
+        let (_, first_responses) = delta_resend(
+            &server,
+            &subscriptions,
+            gateway_config_with_service(false, 1),
+            &first_accepted,
+        );
+        let (_, second_responses) = delta_resend(
+            &server,
+            &subscriptions,
+            gateway_config_with_service(false, 1),
+            &second_accepted,
+        );
 
         assert_eq!(first_responses.len(), 1);
         assert_eq!(second_responses.len(), 1);

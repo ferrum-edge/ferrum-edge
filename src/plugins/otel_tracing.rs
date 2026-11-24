@@ -36,7 +36,6 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::Duration;
 use tracing::{debug, warn};
 use url::{Host, Url};
-use uuid::Uuid;
 
 use crate::modes::mesh::config::TracingProvider;
 use crate::observability_delivery::DeliveryWorkerControl;
@@ -49,9 +48,11 @@ use super::utils::PluginHttpClient;
 use super::utils::byte_budget::{
     JSON_STRING_WORST_CASE_EXPANSION, PayloadMaterializationError, ProcessByteReservation,
     ReservedPayload, RetainedByteCeiling, materialize_reserved_payload, process_ceiling,
-    record_batch_materialization_loss,
+    record_batch_materialization_fallback, record_batch_materialization_loss,
 };
 use super::utils::plugin_secret_env::{resolve_plugin_secret_env, validate_plugin_secret_env_name};
+use super::utils::sink_loss::{SinkLossReason, SinkLossSlot};
+use super::utils::socket_host::is_loopback_ip_literal_endpoint;
 use super::{
     Direction, DisconnectCause, Plugin, PluginResult, RequestContext, StreamTransactionSummary,
     TransactionSummary, WsDisconnectContext,
@@ -94,6 +95,8 @@ const ALLOWED_CONFIG_KEYS: &[&str] = &[
     "root_sampling",
     "root_sampling_ratio",
     "include_url_path",
+    "allow_plaintext",
+    "compression",
 ];
 
 const MIN_BATCH_SIZE: u64 = 1;
@@ -124,6 +127,46 @@ const INVALID_AUTHORIZATION_ERROR: &str =
 const MAX_PARTIAL_SUCCESS_MESSAGE_BYTES: usize = 512;
 const MAX_OTLP_SUCCESS_BODY_BYTES: usize = 64 * 1024;
 const MAX_URL_PATH_BYTES: usize = 512;
+/// W3C Trace Context caps `tracestate` at 32 list members.
+const MAX_TRACESTATE_MEMBERS: usize = 32;
+/// Hard byte cap on a forwarded `tracestate`. 32 maximal members fit the W3C
+/// grammar in about 16 KiB; vendors are only required to propagate 512 bytes,
+/// so a larger header is dropped rather than carried to every backend attempt.
+const MAX_TRACESTATE_BYTES: usize = 8 * 1024;
+/// Closed `sink_loss` label for this plugin's span export accounting.
+const OTEL_TRACING_SINK_PLUGIN: &str = "otel_tracing";
+/// [`OTEL_TRACING_SINK_PLUGIN`] resolved once, so a span admission is one
+/// relaxed counter increment rather than a label lookup.
+static OTEL_TRACING_LOSS_SLOT: std::sync::LazyLock<SinkLossSlot> =
+    std::sync::LazyLock::new(|| SinkLossSlot::for_plugin(OTEL_TRACING_SINK_PLUGIN));
+/// Export request headers the exporter sets itself. A custom `headers` entry
+/// naming one would be appended beside the exporter's own value (or describe
+/// a body framing the exporter did not produce), so it is refused at
+/// construction rather than sent as a conflicting duplicate.
+const RESERVED_EXPORT_HEADER_NAMES: &[&str] = &[
+    "content-type",
+    "content-length",
+    "content-encoding",
+    "transfer-encoding",
+    "host",
+];
+
+/// Which tracing plugin established a request's gateway `SERVER` span: its
+/// `trace_id` / `span_id` / `traceparent` in request metadata.
+///
+/// The first plugin to establish the span owns it for the rest of the request.
+/// A sibling tracing plugin then reuses that identity instead of re-deriving
+/// it, so the exported `SERVER` span, the per-attempt `CLIENT` spans parented
+/// under it, the backend's `traceparent`, and the client echo all name the
+/// same span. Recorded on [`RequestContext`] as typed state, never metadata, so
+/// another plugin cannot claim or release it by writing a string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewayTraceOwner {
+    /// The standalone `otel_tracing` plugin.
+    OtelTracing,
+    /// A trace-enabled `workload_metrics` instance (mesh tracing).
+    WorkloadMetrics,
+}
 
 /// Whether inbound W3C parents are trusted as span parents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -650,11 +693,18 @@ impl OtelTracing {
         // admission now, not silently lose every export once an endpoint is
         // added later.
         let authorization = parse_authorization(config)?;
-        let custom_headers = parse_custom_headers(config.get("headers"))?;
+        let custom_headers = parse_custom_headers(config.get("headers"), authorization.is_some())?;
+        let gzip = parse_compression(config)?;
         // Validate exporter controls even in propagation-only mode. A stored
         // typo or invalid queue setting must not become latent until an
         // endpoint is added later.
-        let options = TraceExporterOptions::from_config(config, service_name.clone(), http_client)?;
+        let mut options =
+            TraceExporterOptions::from_config(config, service_name.clone(), http_client)?;
+        // Only this plugin's own exporter compresses and publishes per-plugin
+        // span accounting; mesh Telemetry provider exporters keep the shared
+        // defaults.
+        options.gzip = gzip;
+        options.loss_slot = Some(*OTEL_TRACING_LOSS_SLOT);
 
         let exporter = if let Some(endpoint) = endpoint {
             Some(Arc::new(OtlpTraceExporter::new(
@@ -747,11 +797,11 @@ impl OtelTracing {
     }
 
     pub(crate) fn generate_trace_id() -> String {
-        hex_encode(Uuid::new_v4().as_bytes())
+        super::utils::fast_id::fast_trace_id_hex()
     }
 
     pub(crate) fn generate_span_id() -> String {
-        hex_encode(&Uuid::new_v4().as_bytes()[..8])
+        super::utils::fast_id::fast_span_id_hex()
     }
 
     fn decide_root_sampled(&self) -> bool {
@@ -762,14 +812,20 @@ impl OtelTracing {
         }
     }
 
-    fn store_sampling(metadata: &mut HashMap<String, String>, sampled: bool) {
+    fn store_sampling<MS: std::hash::BuildHasher>(
+        metadata: &mut HashMap<String, String, MS>,
+        sampled: bool,
+    ) {
         metadata.insert(
             "trace_sampled".to_string(),
             if sampled { "true" } else { "false" }.to_string(),
         );
     }
 
-    fn apply_generated_root(&self, ctx_metadata: &mut HashMap<String, String>) -> String {
+    fn apply_generated_root<MS: std::hash::BuildHasher>(
+        &self,
+        ctx_metadata: &mut HashMap<String, String, MS>,
+    ) -> String {
         let sampled = self.decide_root_sampled();
         let generated = Self::generate_trace_context(sampled);
         ctx_metadata.insert("trace_id".to_string(), generated.trace_id);
@@ -779,9 +835,16 @@ impl OtelTracing {
         generated.traceparent
     }
 
+    /// Whether a finished span can reach an exporter. The terminal hooks check
+    /// this BEFORE building a [`SpanData`], so propagation-only mode never
+    /// materializes a span just to discard it.
+    fn span_export_active(&self) -> bool {
+        self.exporter.is_some()
+    }
+
     fn maybe_export(&self, span: SpanData) {
         if let Some(exporter) = &self.exporter
-            && let Err(error) = exporter.try_export(span)
+            && let Err(error) = record_span_admission(exporter.try_export(span))
         {
             let now_ms = crate::socket_opts::monotonic_now_ms();
             let suppressed = match self.export_drop_log_limiter.lock() {
@@ -800,14 +863,64 @@ impl OtelTracing {
     }
 }
 
+/// Publish one span admission of the standalone plugin's exporter on the
+/// per-plugin sink accounting (`plugin="otel_tracing"`), then hand the result
+/// back. Only `otel_tracing`'s own SERVER and attempt spans come through here;
+/// mesh Telemetry provider exporters are not counted under this label.
+fn record_span_admission(result: Result<(), String>) -> Result<(), String> {
+    let slot = *OTEL_TRACING_LOSS_SLOT;
+    match &result {
+        Ok(()) => slot.record_accepted(1),
+        Err(error) => slot.record_dropped(trace_admission_loss_reason(error), 1),
+    }
+    result
+}
+
+/// Fixed loss reason for a [`TraceExporter::try_export`] refusal, folded from
+/// the closed refusal classification [`trace_export_drop_reason`] shares with
+/// the mesh span-drop counter onto the per-plugin sink-loss reasons.
+fn trace_admission_loss_reason(error: &str) -> SinkLossReason {
+    use crate::plugins::mesh::prometheus_helpers::MeshTracingSpanDropReason;
+    match trace_export_drop_reason(error) {
+        MeshTracingSpanDropReason::QueueFull => SinkLossReason::QueueFull,
+        MeshTracingSpanDropReason::ByteBudget | MeshTracingSpanDropReason::ProcessCeiling => {
+            SinkLossReason::ByteBudget
+        }
+        // Closing for reload/shutdown, or no flush worker yet. `ExportFailed`
+        // is a post-enqueue delivery loss and never a `try_export` refusal.
+        MeshTracingSpanDropReason::ShuttingDown
+        | MeshTracingSpanDropReason::Unavailable
+        | MeshTracingSpanDropReason::ExportFailed => SinkLossReason::Shutdown,
+    }
+}
+
+/// Count `spans` an exporter accepted and then lost at delivery, when the
+/// exporter belongs to the standalone plugin.
+fn record_delivered_span_loss(cfg: &TraceHttpExporterConfig, reason: SinkLossReason, spans: u64) {
+    if let Some(slot) = cfg.loss_slot {
+        slot.record_dropped(reason, spans);
+    }
+}
+
 #[async_trait]
 impl Plugin for OtelTracing {
     fn name(&self) -> &str {
         "otel_tracing"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::OTEL_TRACING
+    }
+
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::ON_REQUEST_RECEIVED
+            | crate::plugins::PluginHooks::BEFORE_PROXY
+            | crate::plugins::PluginHooks::AFTER_PROXY
+            | crate::plugins::PluginHooks::LOG
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
@@ -859,7 +972,9 @@ impl Plugin for OtelTracing {
             .map(|s| s.as_str())
             .unwrap_or("");
 
-        tracing::info!(
+        // Per-transaction diagnostic, emitted before the sampling and export
+        // decision (and carrying the client address), so DEBUG, not INFO.
+        tracing::debug!(
             target: "otel",
             service_name = %self.service_name,
             trace_id = %trace_id,
@@ -874,7 +989,7 @@ impl Plugin for OtelTracing {
             "stream trace"
         );
 
-        if !trace_is_sampled(&summary.metadata) {
+        if !self.span_export_active() || !trace_is_sampled(&summary.metadata) {
             return;
         }
         if let Some(span_data) =
@@ -888,7 +1003,9 @@ impl Plugin for OtelTracing {
         let Some(trace_id) = ctx.metadata.get("trace_id") else {
             return;
         };
-        tracing::info!(
+        // Per-transaction diagnostic, emitted before the sampling and export
+        // decision (and carrying the client address), so DEBUG, not INFO.
+        tracing::debug!(
             target: "otel",
             service_name = %self.service_name,
             trace_id = %trace_id,
@@ -897,7 +1014,7 @@ impl Plugin for OtelTracing {
             duration_ms = %ctx.duration_ms,
             "websocket session trace"
         );
-        if !trace_is_sampled(&ctx.metadata) {
+        if !self.span_export_active() || !trace_is_sampled(&ctx.metadata) {
             return;
         }
         if let Some(span_data) =
@@ -950,14 +1067,38 @@ impl Plugin for OtelTracing {
             }
         }
 
+        // A sibling tracing plugin ordered ahead of this one (a trace-enabled
+        // `workload_metrics` with a priority override) already established the
+        // gateway SERVER span. Re-deriving it here would leave that plugin's
+        // stamped identity, and anything it already handed out, pointing at a
+        // span this plugin never exports. Reuse it instead.
+        if ctx
+            .gateway_trace_owner()
+            .is_some_and(|owner| owner != GatewayTraceOwner::OtelTracing)
+        {
+            // The identity is reused, but companion state is still held to
+            // the W3C list grammar before this plugin forwards it.
+            if ctx
+                .metadata
+                .get(TRACESTATE_HEADER)
+                .is_some_and(|tracestate| !is_valid_tracestate(tracestate))
+            {
+                ctx.metadata.remove(TRACESTATE_HEADER);
+            }
+            return PluginResult::Continue;
+        }
+
         let incoming = unique_header_value_case_insensitive(&ctx.headers, TRACEPARENT_HEADER)
             .ok()
             .flatten()
             .map(str::to_owned);
+        // W3C Trace Context: a `tracestate` that is not a valid list is
+        // dropped, never forwarded, while its `traceparent` is still honored.
         let incoming_tracestate =
             unique_header_value_case_insensitive(&ctx.headers, TRACESTATE_HEADER)
                 .ok()
                 .flatten()
+                .filter(|value| is_valid_tracestate(value))
                 .map(str::to_owned);
         // A companion state is valid only when this hook accepts the parent.
         // Clear any pre-existing metadata value before adjudicating the wire
@@ -1010,8 +1151,12 @@ impl Plugin for OtelTracing {
             }
         };
 
+        // Both arms above built this value with a fresh gateway span id, so
+        // it is gateway-minted per-request state (issue #7130).
+        ctx.stage_gateway_minted_traceparent(traceparent.clone());
         ctx.metadata
             .insert(TRACEPARENT_HEADER.to_string(), traceparent);
+        ctx.claim_gateway_trace_owner(GatewayTraceOwner::OtelTracing);
 
         PluginResult::Continue
     }
@@ -1031,8 +1176,16 @@ impl Plugin for OtelTracing {
         });
         if let Some(traceparent) = ctx.metadata.get(TRACEPARENT_HEADER) {
             headers.insert(TRACEPARENT_HEADER.to_string(), traceparent.clone());
+            // Forwarding the SERVER span (and below, freezing it into the
+            // attempt recorder) adopts it: from here on no sibling may
+            // re-derive it, even one that created it (`workload_metrics`
+            // after a later final-header transform), or the attempt spans
+            // and the exported SERVER span would name different spans.
+            ctx.adopt_gateway_trace_owner(GatewayTraceOwner::OtelTracing);
         }
-        if let Some(tracestate) = ctx.metadata.get(TRACESTATE_HEADER) {
+        if let Some(tracestate) = ctx.metadata.get(TRACESTATE_HEADER)
+            && is_valid_tracestate(tracestate)
+        {
             headers.insert(TRACESTATE_HEADER.to_string(), tracestate.clone());
         }
         // Per-attempt CLIENT spans (issue #5864): only an exporting instance
@@ -1056,6 +1209,23 @@ impl Plugin for OtelTracing {
             response_headers.insert(TRACEPARENT_HEADER.to_string(), traceparent.clone());
         }
         PluginResult::Continue
+    }
+
+    /// Successful H1 Upgrade and H2/H3 extended CONNECT handshakes bypass
+    /// `after_proxy`, so echo the gateway SERVER span's `traceparent` here as
+    /// well. Every casing the backend supplied is replaced, so a backend that
+    /// echoed its own (attempt) context cannot hand the client a span the
+    /// gateway did not author.
+    fn apply_websocket_handshake_response_headers(
+        &self,
+        ctx: &RequestContext,
+        _response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        if let Some(traceparent) = ctx.metadata.get(TRACEPARENT_HEADER) {
+            response_headers.retain(|name, _| !name.eq_ignore_ascii_case(TRACEPARENT_HEADER));
+            response_headers.insert(TRACEPARENT_HEADER.to_string(), traceparent.clone());
+        }
     }
 
     fn applies_after_proxy_on_reject(&self) -> bool {
@@ -1092,7 +1262,9 @@ impl Plugin for OtelTracing {
             .map(|s| s.as_str())
             .unwrap_or("");
 
-        tracing::info!(
+        // Per-transaction diagnostic, emitted before the sampling and export
+        // decision (and carrying the client address), so DEBUG, not INFO.
+        tracing::debug!(
             target: "otel",
             service_name = %self.service_name,
             trace_id = %trace_id,
@@ -1107,7 +1279,10 @@ impl Plugin for OtelTracing {
             "request trace"
         );
 
-        if !trace_is_sampled(&summary.metadata) {
+        // Propagation-only mode has no exporter: return before materializing
+        // an owned span (IDs, attributes, backend target parse) only for
+        // `maybe_export` to drop it.
+        if !self.span_export_active() || !trace_is_sampled(&summary.metadata) {
             return;
         }
 
@@ -1143,20 +1318,25 @@ pub(crate) struct TraceExporterOptions {
     retry_delay: Duration,
     service_name: String,
     deployment_environment: Option<String>,
+    /// `allow_plaintext`: admit an `http://` exporter endpoint whose host is
+    /// not a loopback IP literal.
+    allow_plaintext: bool,
     /// Retained-byte ceiling every exporter built from these options charges.
     ceiling: &'static RetainedByteCeiling,
+    /// `compression: gzip`: send each OTLP batch gzip-compressed. Set only by
+    /// the standalone plugin; mesh provider exporters send uncompressed.
+    gzip: bool,
+    /// Per-plugin span accounting (`ferrum_plugin_log_sink_records_*`). Set
+    /// only by the standalone plugin, whose exporter is not shared.
+    loss_slot: Option<SinkLossSlot>,
+    /// Count spans this exporter discards after enqueue (terminal collector
+    /// failure, exhausted retries, no HTTP client) on the mesh span-drop
+    /// counter. Set only for `workload_metrics` mesh exporters, so
+    /// standalone `otel_tracing` losses never reach a mesh-named series.
+    mesh_span_drop_accounting: bool,
 }
 
 impl TraceExporterOptions {
-    /// Rebind these options to an explicit ceiling. External tests use this so
-    /// batch-materialization assertions run against their own leaked ceiling.
-    // The binary target always keeps the process ceiling from `from_config`.
-    #[allow(dead_code)]
-    pub(crate) fn with_ceiling(mut self, ceiling: &'static RetainedByteCeiling) -> Self {
-        self.ceiling = ceiling;
-        self
-    }
-
     pub(crate) fn from_config(
         config: &Value,
         service_name: String,
@@ -1208,7 +1388,11 @@ impl TraceExporterOptions {
             )?),
             service_name,
             deployment_environment: optional_string_config(config, "deployment_environment")?,
+            allow_plaintext: bool_config(config, "allow_plaintext", false)?,
             ceiling: process_ceiling(),
+            gzip: false,
+            loss_slot: None,
+            mesh_span_drop_accounting: false,
         })
     }
 }
@@ -1234,9 +1418,18 @@ struct TraceHttpExporterConfig {
     service_name: String,
     deployment_environment: Option<String>,
     payload_kind: TracePayloadKind,
+    /// Admit a cleartext endpoint whose host is not a loopback IP literal.
+    allow_plaintext: bool,
     /// Ceiling the queued spans *and* every batch representation built from them
     /// are charged to. Always the process ceiling in production.
     ceiling: &'static RetainedByteCeiling,
+    /// Compress each delivered body with gzip (`Content-Encoding: gzip`).
+    gzip: bool,
+    /// Where delivered-batch losses are published, when this exporter belongs
+    /// to the standalone plugin.
+    loss_slot: Option<SinkLossSlot>,
+    /// See [`TraceExporterOptions::mesh_span_drop_accounting`].
+    mesh_span_drop_accounting: bool,
 }
 
 struct QueuedSpan {
@@ -1268,7 +1461,8 @@ impl BufferedTraceExporter {
         buffer_capacity: usize,
         buffer_max_bytes: usize,
     ) -> Result<Self, String> {
-        let hostname = validate_endpoint_for_provider(cfg.provider_name, &cfg.endpoint)?;
+        let hostname =
+            validate_endpoint_for_provider(cfg.provider_name, &cfg.endpoint, cfg.allow_plaintext)?;
         // `buffer_capacity` bounds this channel only. The flush worker moves
         // spans out of it into its own batch, so total pending spans can reach
         // `buffer_capacity + batch_size` before a flush completes. Aggregate
@@ -1358,7 +1552,7 @@ impl BufferedTraceExporter {
     fn try_reserve_queued_bytes(&self, bytes: usize) -> Result<ProcessByteReservation, String> {
         let process = self.ceiling.try_acquire(bytes).ok_or_else(|| {
             format!(
-                "process-wide observability retained-byte ceiling exceeded (+{bytes} > {})",
+                "{TRACE_EXPORT_PROCESS_CEILING_PREFIX} (+{bytes} > {})",
                 self.ceiling.max()
             )
         })?;
@@ -1371,7 +1565,7 @@ impl BufferedTraceExporter {
             .map(|_| process)
             .map_err(|current| {
                 format!(
-                    "queued byte budget exceeded ({current}+{bytes} > {})",
+                    "{TRACE_EXPORT_BYTE_BUDGET_PREFIX} ({current}+{bytes} > {})",
                     self.buffer_max_bytes
                 )
             })
@@ -1404,7 +1598,7 @@ impl TraceExporter for BufferedTraceExporter {
             .get()
             .ok_or_else(|| "trace exporter worker is unavailable".to_string())?;
         let Some(_admission) = worker.try_admit() else {
-            return Err("trace exporter is shutting down".to_string());
+            return Err(TRACE_EXPORT_SHUTTING_DOWN.to_string());
         };
         self.queued_spans.fetch_add(1, Ordering::Relaxed);
         let bytes = span.approx_queued_bytes();
@@ -1426,9 +1620,46 @@ impl TraceExporter for BufferedTraceExporter {
                 // releases it on drop; only the per-instance charge is manual.
                 self.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
                 decrement_queued_spans(&self.queued_spans, 1);
-                Err(error.to_string())
+                Err(match error {
+                    mpsc::error::TrySendError::Full(_) => TRACE_EXPORT_QUEUE_FULL,
+                    mpsc::error::TrySendError::Closed(_) => TRACE_EXPORT_QUEUE_CLOSED,
+                }
+                .to_string())
             }
         }
+    }
+}
+
+/// `try_export` refusal when the bounded span queue (`buffer_capacity`) is full.
+const TRACE_EXPORT_QUEUE_FULL: &str = "trace exporter queue is full";
+/// `try_export` refusal when the flush worker's receiver is gone.
+const TRACE_EXPORT_QUEUE_CLOSED: &str = "trace exporter queue is closed";
+/// `try_export` refusal once admission is closed for reload or shutdown.
+const TRACE_EXPORT_SHUTTING_DOWN: &str = "trace exporter is shutting down";
+/// Prefix of the `try_export` refusal for an exhausted process-wide ceiling.
+const TRACE_EXPORT_PROCESS_CEILING_PREFIX: &str =
+    "process-wide observability retained-byte ceiling exceeded";
+/// Prefix of the `try_export` refusal for an exhausted per-exporter byte budget.
+const TRACE_EXPORT_BYTE_BUDGET_PREFIX: &str = "queued byte budget exceeded";
+
+/// Classify a [`TraceExporter::try_export`] refusal into the closed drop-reason
+/// set the mesh span-drop counter reports. The messages are produced only by
+/// [`BufferedTraceExporter::try_export`] from the constants above; anything
+/// else (no flush worker, a poisoned startup lock) is `Unavailable`.
+pub(crate) fn trace_export_drop_reason(
+    error: &str,
+) -> crate::plugins::mesh::prometheus_helpers::MeshTracingSpanDropReason {
+    use crate::plugins::mesh::prometheus_helpers::MeshTracingSpanDropReason;
+    if error == TRACE_EXPORT_QUEUE_FULL {
+        MeshTracingSpanDropReason::QueueFull
+    } else if error.starts_with(TRACE_EXPORT_BYTE_BUDGET_PREFIX) {
+        MeshTracingSpanDropReason::ByteBudget
+    } else if error.starts_with(TRACE_EXPORT_PROCESS_CEILING_PREFIX) {
+        MeshTracingSpanDropReason::ProcessCeiling
+    } else if error == TRACE_EXPORT_SHUTTING_DOWN || error == TRACE_EXPORT_QUEUE_CLOSED {
+        MeshTracingSpanDropReason::ShuttingDown
+    } else {
+        MeshTracingSpanDropReason::Unavailable
     }
 }
 
@@ -1518,6 +1749,9 @@ impl DatadogTraceExporter {
         mut options: TraceExporterOptions,
     ) -> Result<Self, String> {
         options.service_name = service_name;
+        // Screen the configured spelling: the derived traces URL is normalized
+        // (`127.1` becomes `127.0.0.1`) and must not widen the exemption.
+        screen_cleartext_endpoint("Datadog", &agent_url, options.allow_plaintext)?;
         let cfg = TraceHttpExporterConfig::from_options(
             "Datadog",
             datadog_traces_endpoint(&agent_url)?,
@@ -1596,7 +1830,11 @@ impl TraceHttpExporterConfig {
             service_name: options.service_name.clone(),
             deployment_environment: options.deployment_environment.clone(),
             payload_kind,
+            allow_plaintext: options.allow_plaintext,
             ceiling: options.ceiling,
+            gzip: options.gzip,
+            loss_slot: options.loss_slot,
+            mesh_span_drop_accounting: options.mesh_span_drop_accounting,
         })
     }
 }
@@ -1614,7 +1852,10 @@ pub(crate) fn trace_exporters_from_providers(
         return Ok(Vec::new());
     }
     let service_name = string_config(config, "service_name", default_service_name)?;
-    let options = TraceExporterOptions::from_config(config, service_name.clone(), http_client)?;
+    let mut options = TraceExporterOptions::from_config(config, service_name.clone(), http_client)?;
+    // Only `workload_metrics` builds exporters here: their post-enqueue
+    // losses belong on the mesh span-drop counter.
+    options.mesh_span_drop_accounting = true;
     providers
         .iter()
         .enumerate()
@@ -1696,7 +1937,6 @@ pub(crate) struct TraceMaterializationProbe {
 /// queue does, then materializes one export body while those reservations are
 /// still held, so an external test can pin that the body is charged, released on
 /// drop, and refused rather than materialized when the ceiling is exhausted.
-#[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub(crate) fn probe_trace_batch_materialization_for_test(
     ceiling: &'static RetainedByteCeiling,
     span_count: usize,
@@ -1716,7 +1956,11 @@ pub(crate) fn probe_trace_batch_materialization_for_test(
         service_name: "ferrum-edge".to_string(),
         deployment_environment: None,
         payload_kind: TracePayloadKind::Otlp,
+        allow_plaintext: false,
         ceiling,
+        gzip: false,
+        loss_slot: None,
+        mesh_span_drop_accounting: false,
     };
 
     let mut spans = Vec::with_capacity(span_count);
@@ -1758,7 +2002,6 @@ pub(crate) fn probe_trace_batch_materialization_for_test(
     }
 }
 
-#[allow(dead_code)] // reached only from the probe above
 fn probe_span_for_test(index: usize, attribute_bytes: usize) -> SpanData {
     SpanData {
         trace_id: format!("{index:032x}"),
@@ -1831,42 +2074,73 @@ pub(crate) fn validate_trace_provider_secret_refs(
     Ok(())
 }
 
+/// `true` when any provider exports over cleartext `http://`. Mesh injection
+/// uses it to write the explicit `allow_plaintext` opt-in beside providers it
+/// translated from Istio Telemetry / MeshConfig.
+pub(crate) fn trace_providers_use_plaintext(providers: &[TracingProvider]) -> bool {
+    providers.iter().any(|provider| {
+        let url = match provider {
+            TracingProvider::Zipkin { url } => url.as_str(),
+            TracingProvider::Datadog { agent_url, .. } => agent_url.as_str(),
+            TracingProvider::Lightstep { collector_url, .. } => collector_url.as_str(),
+            TracingProvider::OpenTelemetry { endpoint } => endpoint.as_str(),
+        };
+        Url::parse(url.trim()).is_ok_and(|parsed| parsed.scheme() == "http")
+    })
+}
+
 pub(crate) fn validate_trace_provider_endpoints(
     providers: &[TracingProvider],
+    allow_plaintext: bool,
 ) -> Result<(), String> {
     for (index, provider) in providers.iter().enumerate() {
-        validate_trace_provider_endpoint(provider)
+        validate_trace_provider_endpoint(provider, allow_plaintext)
             .map_err(|error| format!("`providers[{index}].config`: {error}"))?;
     }
     Ok(())
 }
 
-fn validate_trace_provider_endpoint(provider: &TracingProvider) -> Result<(), String> {
+fn validate_trace_provider_endpoint(
+    provider: &TracingProvider,
+    allow_plaintext: bool,
+) -> Result<(), String> {
     match provider {
         TracingProvider::Zipkin { url } => {
-            validate_endpoint_for_provider("Zipkin", url)
+            validate_endpoint_for_provider("Zipkin", url, allow_plaintext)
                 .map_err(|error| format!("`url`: {error}"))?;
         }
         TracingProvider::Datadog { agent_url, .. } => {
+            screen_cleartext_endpoint("Datadog", agent_url, allow_plaintext)?;
             let endpoint = datadog_traces_endpoint(agent_url)?;
-            validate_endpoint_for_provider("Datadog", &endpoint)?;
+            validate_endpoint_for_provider("Datadog", &endpoint, allow_plaintext)?;
         }
         TracingProvider::Lightstep {
             collector_url,
             access_token_env,
         } => {
-            validate_endpoint_for_provider("Lightstep", collector_url)
+            validate_endpoint_for_provider("Lightstep", collector_url, allow_plaintext)
                 .map_err(|error| format!("`collector_url`: {error}"))?;
             validate_plugin_secret_env_name(LIGHTSTEP_ACCESS_TOKEN_ENV_FIELD, access_token_env)?;
         }
         TracingProvider::OpenTelemetry { endpoint } => {
-            validate_endpoint_for_provider("OTLP", endpoint)?;
+            validate_endpoint_for_provider("OTLP", endpoint, allow_plaintext)?;
         }
     }
     Ok(())
 }
 
-fn parse_custom_headers(value: Option<&Value>) -> Result<Vec<(String, String)>, String> {
+/// Parse the exporter's custom `headers`.
+///
+/// HTTP field names are case-insensitive and delivery appends each entry, so
+/// two keys that differ only in case would send the collector two values for
+/// one field. Those are refused, as is a name the exporter already sets
+/// itself ([`RESERVED_EXPORT_HEADER_NAMES`]) and `Authorization` when the
+/// `authorization` field supplies it. Diagnostics for these refusals name no
+/// configured key, because header names can themselves carry tenant hints.
+fn parse_custom_headers(
+    value: Option<&Value>,
+    has_authorization: bool,
+) -> Result<Vec<(String, String)>, String> {
     let Some(value) = value else {
         return Ok(Vec::new());
     };
@@ -1878,12 +2152,32 @@ fn parse_custom_headers(value: Option<&Value>) -> Result<Vec<(String, String)>, 
     };
 
     let mut headers = Vec::with_capacity(map.len());
+    let mut seen: Vec<HeaderName> = Vec::with_capacity(map.len());
     for (key, value) in map {
-        if HeaderName::from_bytes(key.as_bytes()).is_err() {
+        let Ok(name) = HeaderName::from_bytes(key.as_bytes()) else {
             return Err(format!(
                 "otel_tracing: `headers` contains an invalid HTTP header name: {key:?}"
             ));
+        };
+        if RESERVED_EXPORT_HEADER_NAMES.contains(&name.as_str()) {
+            return Err(format!(
+                "otel_tracing: `headers` must not set an exporter-managed header ({})",
+                RESERVED_EXPORT_HEADER_NAMES.join(", ")
+            ));
         }
+        if has_authorization && name == http::header::AUTHORIZATION {
+            return Err(
+                "otel_tracing: `headers` must not set Authorization when `authorization` is configured"
+                    .to_string(),
+            );
+        }
+        if seen.contains(&name) {
+            return Err(
+                "otel_tracing: `headers` names the same HTTP header more than once (header names are case-insensitive)"
+                    .to_string(),
+            );
+        }
+        seen.push(name);
         let Some(value) = value.as_str() else {
             return Err(format!(
                 "otel_tracing: `headers` key {key:?} must be a string value"
@@ -2080,7 +2374,8 @@ async fn send_trace_batch(cfg: &TraceHttpExporterConfig, batch: &[SpanData]) {
             match materialize_trace_body(cfg, slice) {
                 Ok(body) => {
                     window = end - start;
-                    deliver_trace_payload(cfg, body, slice.len()).await;
+                    let (body, gzipped) = encode_trace_body(cfg, body);
+                    deliver_trace_payload(cfg, body, gzipped, slice.len()).await;
                     start = end;
                     break;
                 }
@@ -2101,6 +2396,56 @@ async fn send_trace_batch(cfg: &TraceHttpExporterConfig, batch: &[SpanData]) {
     }
     if let Some(reason) = loss_reason {
         record_batch_materialization_loss(cfg.provider_name, lost_spans as u64, reason);
+    }
+}
+
+/// Worst-case gzip output for `input_len` bytes: DEFLATE stored blocks cost
+/// five header bytes per 65535 input bytes, plus the gzip header and trailer.
+fn trace_gzip_byte_bound(input_len: usize) -> Option<usize> {
+    input_len
+        .checked_add((input_len / 65_535).checked_mul(5)?)?
+        .checked_add(64)
+}
+
+/// Apply `compression: gzip` to a materialized batch body. The compressed copy
+/// coexists with the JSON body until this returns, so it is reserved under the
+/// same ceiling first. A refused or failed compression delivers the JSON body
+/// uncompressed (a degraded representation, not a loss). Returns the body to
+/// send and whether it is gzip-encoded.
+fn encode_trace_body(
+    cfg: &TraceHttpExporterConfig,
+    body: ReservedPayload,
+) -> (ReservedPayload, bool) {
+    if !cfg.gzip {
+        return (body, false);
+    }
+    let Some(bound) = trace_gzip_byte_bound(body.len()) else {
+        record_batch_materialization_fallback(
+            cfg.provider_name,
+            PayloadMaterializationError::BoundOverflowed.reason(),
+        );
+        return (body, false);
+    };
+    let compressed = materialize_reserved_payload(cfg.ceiling, bound, |writer| {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write as _;
+
+        let mut encoder = GzEncoder::new(writer, Compression::fast());
+        encoder
+            .write_all(body.as_slice())
+            .map_err(|error| format!("gzip write failed: {error}"))?;
+        encoder
+            .finish()
+            .map_err(|error| format!("gzip finish failed: {error}"))?;
+        Ok(())
+    });
+    match compressed {
+        Ok(compressed) => (compressed, true),
+        Err(error) => {
+            record_batch_materialization_fallback(cfg.provider_name, error.reason());
+            (body, false)
+        }
     }
 }
 
@@ -2220,6 +2565,7 @@ pub(crate) fn trace_retry_delay_ms_for_test(
 async fn deliver_trace_payload(
     cfg: &TraceHttpExporterConfig,
     body: ReservedPayload,
+    gzipped: bool,
     entry_count: usize,
 ) {
     let total_attempts = cfg.max_retries + 1;
@@ -2233,6 +2579,8 @@ async fn deliver_trace_payload(
                 cfg.provider_name,
                 entry_count,
             );
+            record_delivered_span_loss(cfg, SinkLossReason::BatchDiscard, entry_count as u64);
+            record_mesh_trace_batch_discard(cfg, entry_count);
             return;
         };
         let request = match cfg.payload_kind {
@@ -2244,6 +2592,9 @@ async fn deliver_trace_payload(
         let mut req = request
             .header("Content-Type", "application/json")
             .body(body.bytes());
+        if gzipped {
+            req = req.header("Content-Encoding", "gzip");
+        }
 
         if let Some(auth) = &cfg.authorization {
             req = req.header("Authorization", auth);
@@ -2281,6 +2632,12 @@ async fn deliver_trace_payload(
                         status,
                         entry_count,
                     );
+                    record_delivered_span_loss(
+                        cfg,
+                        SinkLossReason::BatchDiscard,
+                        entry_count as u64,
+                    );
+                    record_mesh_trace_batch_discard(cfg, entry_count);
                     return;
                 }
                 throttle = retry_after_from_headers(response.headers());
@@ -2307,6 +2664,26 @@ async fn deliver_trace_payload(
         cfg.provider_name,
         total_attempts,
         entry_count,
+    );
+    record_delivered_span_loss(cfg, SinkLossReason::BatchDiscard, entry_count as u64);
+    record_mesh_trace_batch_discard(cfg, entry_count);
+}
+
+/// Count spans [`deliver_trace_payload`] permanently lost on the mesh
+/// span-drop counter (`reason="export_failed"`), once per lost span, for
+/// `workload_metrics` exporters only: a discarded batch, or the spans an OTLP
+/// HTTP-200 partial-success response reports as rejected.
+fn record_mesh_trace_batch_discard(cfg: &TraceHttpExporterConfig, entry_count: usize) {
+    if !cfg.mesh_span_drop_accounting || entry_count == 0 {
+        return;
+    }
+    use crate::plugins::mesh::prometheus_helpers::{
+        MeshTracingProvider, MeshTracingSpanDropReason, add_mesh_tracing_spans_dropped,
+    };
+    add_mesh_tracing_spans_dropped(
+        MeshTracingProvider::from_exporter_name(cfg.provider_name),
+        MeshTracingSpanDropReason::ExportFailed,
+        u64::try_from(entry_count).unwrap_or(u64::MAX),
     );
 }
 
@@ -2411,6 +2788,18 @@ async fn handle_otlp_partial_success(
             }
         },
     };
+    // Bounded by the batch: a collector cannot claim more lost spans than sent.
+    record_mesh_trace_batch_discard(
+        cfg,
+        usize::try_from(rejected).map_or(entry_count, |n| n.min(entry_count)),
+    );
+    // The same refused spans on the standalone plugin's sink-loss series
+    // (no-op for mesh exporters): retrying the batch cannot fix them.
+    record_delivered_span_loss(
+        cfg,
+        SinkLossReason::SinkError,
+        rejected.min(entry_count as u64),
+    );
     let message_value = partial
         .get("errorMessage")
         .or_else(|| partial.get("error_message"));
@@ -3055,6 +3444,100 @@ fn parse_authorization(config: &Value) -> Result<Option<String>, String> {
     Ok(Some(value))
 }
 
+/// `compression`: `none` (default) or `gzip`, trimmed and case-insensitive.
+/// Returns whether export bodies are gzip-compressed.
+fn parse_compression(config: &Value) -> Result<bool, String> {
+    match config.get("compression") {
+        None => Ok(false),
+        Some(Value::Null) => {
+            Err("otel_tracing: `compression` must be a non-null string".to_string())
+        }
+        Some(Value::String(value)) => match value.trim().to_ascii_lowercase().as_str() {
+            "none" => Ok(false),
+            "gzip" => Ok(true),
+            _ => Err("otel_tracing: `compression` must be `none` or `gzip`".to_string()),
+        },
+        Some(other) => Err(format!(
+            "otel_tracing: `compression` must be a string, got: {}",
+            json_type_name(other)
+        )),
+    }
+}
+
+/// Whether `value` is a well-formed W3C Trace Context `tracestate` list:
+/// at most 32 members, each `key=value` under the W3C key and value grammar,
+/// no duplicate keys, at least one member, and at most
+/// [`MAX_TRACESTATE_BYTES`] overall. Empty list members (`a=1,,b=2`) and
+/// optional whitespace around members are allowed by the specification.
+pub(crate) fn is_valid_tracestate(value: &str) -> bool {
+    if value.len() > MAX_TRACESTATE_BYTES {
+        return false;
+    }
+    let mut keys: Vec<&str> = Vec::new();
+    for member in value.split(',') {
+        let member = member.trim_matches(|c: char| c == ' ' || c == '\t');
+        if member.is_empty() {
+            continue;
+        }
+        let Some((key, member_value)) = member.split_once('=') else {
+            return false;
+        };
+        if !is_valid_tracestate_key(key)
+            || !is_valid_tracestate_value(member_value)
+            || keys.contains(&key)
+            || keys.len() == MAX_TRACESTATE_MEMBERS
+        {
+            return false;
+        }
+        keys.push(key);
+    }
+    !keys.is_empty()
+}
+
+/// W3C `tracestate` key: `simple-key` or `tenant-id@system-id`.
+fn is_valid_tracestate_key(key: &str) -> bool {
+    fn key_char(byte: u8) -> bool {
+        byte.is_ascii_lowercase()
+            || byte.is_ascii_digit()
+            || matches!(byte, b'_' | b'-' | b'*' | b'/')
+    }
+    fn bounded(part: &str, max_len: usize, first: fn(u8) -> bool) -> bool {
+        let bytes = part.as_bytes();
+        match bytes.split_first() {
+            Some((head, rest)) => {
+                bytes.len() <= max_len && first(*head) && rest.iter().all(|byte| key_char(*byte))
+            }
+            None => false,
+        }
+    }
+    match key.split_once('@') {
+        // tenant-id = (lcalpha / DIGIT) 0*240(key-char)
+        // system-id = lcalpha 0*13(key-char)
+        Some((tenant, system)) => {
+            bounded(tenant, 241, |byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit()
+            }) && bounded(system, 14, |byte| byte.is_ascii_lowercase())
+        }
+        // simple-key = lcalpha 0*255(key-char)
+        None => bounded(key, 256, |byte| byte.is_ascii_lowercase()),
+    }
+}
+
+/// W3C `tracestate` value: 1 to 256 printable ASCII characters other than
+/// `,` and `=`, not ending in a space.
+fn is_valid_tracestate_value(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let non_blank = |byte: u8| (0x21..=0x7e).contains(&byte) && byte != b',' && byte != b'=';
+    match bytes.last() {
+        Some(last) => {
+            bytes.len() <= 256
+                && non_blank(*last)
+                && bytes.iter().all(|byte| *byte == b' ' || non_blank(*byte))
+        }
+        None => false,
+    }
+}
+
 fn optional_string_config(config: &Value, key: &str) -> Result<Option<String>, String> {
     match config.get(key) {
         None => Ok(None),
@@ -3224,7 +3707,11 @@ fn parse_root_sampling(config: &Value) -> Result<RootSampling, String> {
     }
 }
 
-fn validate_endpoint_for_provider(provider_name: &str, endpoint: &str) -> Result<String, String> {
+fn validate_endpoint_for_provider(
+    provider_name: &str,
+    endpoint: &str,
+    allow_plaintext: bool,
+) -> Result<String, String> {
     let url = Url::parse(endpoint)
         .map_err(|_| format!("{provider_name}: `endpoint` must be a valid URL"))?;
     match url.scheme() {
@@ -3245,8 +3732,33 @@ fn validate_endpoint_for_provider(provider_name: &str, endpoint: &str) -> Result
             "{provider_name}: `endpoint` must include a hostname"
         ));
     }
-    normalized_url_hostname(&url)
-        .ok_or_else(|| format!("{provider_name}: `endpoint` must include a hostname"))
+    let hostname = normalized_url_hostname(&url)
+        .ok_or_else(|| format!("{provider_name}: `endpoint` must include a hostname"))?;
+    screen_cleartext_endpoint(provider_name, endpoint, allow_plaintext)?;
+    Ok(hostname)
+}
+
+/// Spans (request metadata) and any `authorization`/`headers` credential or
+/// provider token travel on an export. Cleartext is admitted without an opt-in
+/// only to a loopback IP literal (a node-local collector or agent), judged on
+/// the configured spelling.
+fn screen_cleartext_endpoint(
+    provider_name: &str,
+    endpoint: &str,
+    allow_plaintext: bool,
+) -> Result<(), String> {
+    let Ok(url) = Url::parse(endpoint) else {
+        return Ok(());
+    };
+    if url.scheme() == "http"
+        && !allow_plaintext
+        && !is_loopback_ip_literal_endpoint(endpoint, url.host())
+    {
+        return Err(format!(
+            "{provider_name}: `endpoint` uses `http://` to a host that is not a loopback IP literal, which is rejected by default; use `https://` or set `allow_plaintext: true`"
+        ));
+    }
+    Ok(())
 }
 
 fn datadog_traces_endpoint(agent_url: &str) -> Result<String, String> {
@@ -3321,10 +3833,13 @@ pub(crate) fn build_traceparent(
     traceparent
 }
 
-pub(crate) fn ensure_trace_metadata(
-    metadata: &mut HashMap<String, String>,
+/// Returns whether this call minted the `traceparent` it left in `metadata`
+/// (a fresh root, or the header's trace id under a fresh span id); false when
+/// existing trace metadata was kept as is.
+pub(crate) fn ensure_trace_metadata<MS: std::hash::BuildHasher>(
+    metadata: &mut HashMap<String, String, MS>,
     headers: &HashMap<String, String>,
-) {
+) -> bool {
     if metadata.contains_key("trace_id") && metadata.contains_key("span_id") {
         if !metadata.contains_key("trace_sampled") {
             let sampled = metadata
@@ -3337,7 +3852,7 @@ pub(crate) fn ensure_trace_metadata(
                 if sampled { "true" } else { "false" }.to_string(),
             );
         }
-        return;
+        return false;
     }
 
     if let Some(existing) = header_value_case_insensitive(headers, TRACEPARENT_HEADER)
@@ -3364,7 +3879,7 @@ pub(crate) fn ensure_trace_metadata(
                 if sampled { "01" } else { "00" },
             ),
         );
-        return;
+        return true;
     }
 
     let generated = OtelTracing::generate_trace_context(true);
@@ -3372,13 +3887,16 @@ pub(crate) fn ensure_trace_metadata(
     metadata.insert("span_id".to_string(), generated.span_id);
     metadata.insert("trace_sampled".to_string(), "true".to_string());
     metadata.insert(TRACEPARENT_HEADER.to_string(), generated.traceparent);
+    true
 }
 
 /// Return true only when metadata carries an affirmative sampling decision.
 ///
 /// Missing `trace_sampled` and traceparent flags are treated as not sampled;
 /// callers that want fallback local sampling should apply it explicitly.
-pub(crate) fn trace_is_sampled(metadata: &HashMap<String, String>) -> bool {
+pub(crate) fn trace_is_sampled<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
+) -> bool {
     if let Some(value) = metadata.get("trace_sampled") {
         return value.eq_ignore_ascii_case("true");
     }
@@ -3415,16 +3933,6 @@ fn unique_header_value_case_insensitive<'a>(
         }
     }
     Ok(value)
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(HEX[(byte >> 4) as usize] as char);
-        output.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    output
 }
 
 fn otlp_attribute(key: &str, value: &str) -> Value {
@@ -3513,8 +4021,7 @@ fn sample_ratio(ratio: f64) -> bool {
     if ratio >= 1.0 {
         return true;
     }
-    let random = Uuid::new_v4().as_u128() as f64 / (u128::MAX as f64);
-    random < ratio
+    super::utils::fast_id::fast_unit_f64() < ratio
 }
 
 /// Mesh trace attributes with every value bounded by `max_attribute_bytes`.
@@ -3524,8 +4031,8 @@ fn sample_ratio(ratio: f64) -> bool {
 /// request metadata and can be attacker-shaped, so they get the same
 /// per-attribute ceiling and `...` truncation marker as every other span
 /// string field.
-fn bounded_mesh_attributes(
-    metadata: &HashMap<String, String>,
+fn bounded_mesh_attributes<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
     max_attribute_bytes: usize,
 ) -> Vec<(String, String)> {
     mesh_trace_attributes(metadata)
@@ -3624,8 +4131,8 @@ fn http_span_is_error(summary: &TransactionSummary) -> bool {
     status >= 500 || summary.is_terminal_failure()
 }
 
-fn server_authority_from_metadata(
-    metadata: &HashMap<String, String>,
+fn server_authority_from_metadata<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
 ) -> (Option<String>, Option<u16>) {
     let address = metadata.get("server_address").cloned();
     let port = metadata
@@ -3858,7 +4365,11 @@ mod tests {
             service_name: "ferrum-edge".to_string(),
             deployment_environment: None,
             payload_kind: TracePayloadKind::Otlp,
+            allow_plaintext: true,
             ceiling: process_ceiling(),
+            gzip: false,
+            loss_slot: None,
+            mesh_span_drop_accounting: false,
         }
     }
 

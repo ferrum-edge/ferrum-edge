@@ -171,6 +171,13 @@ fn gateway_api_status_plan_cursor_retries_same_window_after_patch_failure() {
     // invariant (#2397, #6370): every cursor write goes through the one
     // bounded-retry helper; empty plans and successful patches advance, patch
     // errors and batch timeouts record a failed batch.
+    // Planning (with the empty-plan cursor record) runs synchronously before
+    // the patch phase so concurrent writers' clocks never include it.
+    let planner = RECONCILER_SRC
+        .split("fn plan_gateway_api_status_batch(")
+        .nth(1)
+        .and_then(|rest| rest.split("async fn patch_gateway_api_statuses(").next())
+        .expect("plan_gateway_api_status_batch body");
     let body = RECONCILER_SRC
         .split("async fn patch_gateway_api_statuses(")
         .nth(1)
@@ -199,8 +206,8 @@ fn gateway_api_status_plan_cursor_retries_same_window_after_patch_failure() {
         "record_gateway_api_status_batch must be the only status-plan cursor writer"
     );
 
-    let empty_return = body
-        .split("if updates.is_empty()")
+    let empty_return = planner
+        .split("if outcome.updates.is_empty()")
         .nth(1)
         .and_then(|rest| rest.split("if outcome.eligible_candidates").next())
         .expect("empty-updates branch");
@@ -259,9 +266,10 @@ fn gateway_api_status_plan_cursor_retries_same_window_after_patch_failure() {
         .next()
         .expect("pre-patch region");
     assert_eq!(
-        before_patch
-            .matches("record_gateway_api_status_batch(")
-            .count(),
+        planner.matches("record_gateway_api_status_batch(").count()
+            + before_patch
+                .matches("record_gateway_api_status_batch(")
+                .count(),
         1,
         "only the empty-plan branch may record the cursor before patch_updates"
     );
@@ -465,6 +473,7 @@ fn large_route_snapshots_scale_indexing_while_budget_bounds_planning() {
         .with_ansi(false)
         .without_time()
         .finish();
+    crate::diagnostic_test_interest::ensure_interest_floor();
     let dispatch = tracing::Dispatch::new(subscriber);
     tracing::dispatcher::with_default(&dispatch, || {
         // Table-driven scale regression (#2397): snapshot size grows with route
@@ -2734,4 +2743,59 @@ fn reference_grant_translation_and_status_share_fail_closed_semantics() {
         Some("RefNotPermitted"),
         "malformed present from + missing to must grant nothing in status"
     );
+}
+
+#[test]
+fn rejected_gateway_listeners_report_translation_failed_not_unsupported_protocol() {
+    // A plain HTTP listener on a Gateway that failed translation must name
+    // that cause on every listener condition (as the listener's `Accepted`
+    // already does), not `UnsupportedProtocol` (issue #7261).
+    let objects = base_objects_with_routes(0);
+    let gateway = objects
+        .iter()
+        .find(|object| object.kind == "Gateway")
+        .expect("fixture gateway");
+    let conflicts = gateway_api_route_conflicts(&objects, &options());
+    let (translation, mut errors) =
+        ferrum_edge::config_sources::k8s::translate_k8s_objects_collecting_skips(
+            &objects,
+            options(),
+        )
+        .expect("primary translation");
+    errors.insert(
+        ferrum_edge::config_sources::k8s::K8sResourceKey::from_object(gateway),
+        ferrum_edge::config_sources::k8s::K8sTranslateError::InvalidResource {
+            kind: "Gateway".to_string(),
+            namespace: gateway.metadata.namespace.clone(),
+            name: gateway.metadata.name.clone(),
+            message: "synthetic gateway rejection".to_string(),
+        },
+    );
+    let reuse = StatusTranslationReuse::from_owned(translation, errors);
+    let planned = plan_gateway_api_status_updates_budgeted(
+        &objects,
+        options(),
+        &conflicts,
+        Default::default(),
+        Some(&reuse),
+        StatusPlanBudget::unlimited(0),
+    );
+    let gateway_status = &planned
+        .updates
+        .iter()
+        .find(|update| update.kind == "Gateway")
+        .expect("gateway status planned")
+        .status;
+    for condition_type in ["Accepted", "ResolvedRefs", "Programmed"] {
+        assert_eq!(
+            condition_status(gateway_status, condition_type),
+            Some("False"),
+            "{condition_type}: {gateway_status}"
+        );
+        assert_eq!(
+            condition_reason(gateway_status, condition_type),
+            Some("TranslationFailed"),
+            "{condition_type}: {gateway_status}"
+        );
+    }
 }

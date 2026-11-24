@@ -30,11 +30,6 @@
 //! cardinality, and rejection-accounting behaviour. These names are the
 //! admin-facing spelling of that primitive.
 
-// `#[allow(unused_imports)]` for the same reason `ConnLimiter::unlimited`
-// carries `#[allow(dead_code)]`: the binary target compiles this module tree
-// separately from the library, where the snapshot/permit spellings are only
-// named by the external test crates.
-#[allow(unused_imports)]
 pub use crate::util::conn_limit::{
     ConnLimiter as AdminConnLimiter, ConnLimiterSnapshot as AdminConnLimiterSnapshot,
     ConnPermit as AdminConnPermit, ConnRejectReason as AdminConnRejectReason,

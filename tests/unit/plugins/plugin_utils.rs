@@ -103,7 +103,7 @@ pub fn create_test_consumer() -> Consumer {
     let mut jwt_creds = Map::new();
     jwt_creds.insert(
         "secret".to_string(),
-        Value::String("test-jwt-secret".to_string()),
+        Value::String("test-jwt-secret-0123456789abcdefghij".to_string()),
     );
     credentials.insert(
         "jwt".to_string(),
@@ -139,6 +139,62 @@ pub fn create_test_context() -> RequestContext {
 
     // Set a test consumer so access control plugin doesn't reject
     ctx.identified_consumer = Some(std::sync::Arc::new(create_test_consumer()));
+    ctx
+}
+
+/// Replace `ctx`'s principal with an unmapped external identity committed
+/// through the shared authentication boundary by `mechanism`, so it carries
+/// that verified realm — what `jwks_auth`, `ldap_auth`, and the other external
+/// mechanisms leave behind (GHSA-rxwj-x6c6-f4j5).
+pub fn commit_external_identity(ctx: &mut RequestContext, identity: &str, mechanism: &'static str) {
+    commit_external_identity_with_authority(ctx, identity, mechanism, None);
+}
+
+/// [`commit_external_identity`] with a staged verifying-authority digest, the
+/// way a multi-provider `jwks_auth` / `oauth2_introspection` commits one per
+/// accepted issuer.
+pub fn commit_external_identity_with_authority(
+    ctx: &mut RequestContext,
+    identity: &str,
+    mechanism: &'static str,
+    authority: Option<[u8; 32]>,
+) {
+    use ferrum_edge::plugins::utils::auth_attempt::AuthenticationAttempt;
+    use ferrum_edge::plugins::utils::auth_flow::{VerifyOutcome, commit_authentication_attempt};
+
+    ctx.identified_consumer = None;
+    let mut attempt = AuthenticationAttempt::new();
+    if let Some(authority) = authority {
+        attempt.stage_identity_realm_authority(authority);
+    }
+    let committed = commit_authentication_attempt(
+        ctx,
+        attempt,
+        VerifyOutcome::success(None, Some(identity.to_string()), None),
+        mechanism,
+        true,
+    )
+    .expect("external identity commits");
+    assert!(committed, "the external identity must be committed");
+}
+
+/// [`create_test_context`] with its Consumer replaced by a committed external
+/// identity (see [`commit_external_identity`]).
+pub fn committed_external_identity_context(
+    identity: &str,
+    mechanism: &'static str,
+) -> RequestContext {
+    let mut ctx = create_test_context();
+    commit_external_identity(&mut ctx, identity, mechanism);
+    ctx
+}
+
+/// A request whose mapped gateway Consumer has `username`.
+pub fn consumer_context(username: &str) -> RequestContext {
+    let mut consumer = create_test_consumer();
+    consumer.username = username.to_string();
+    let mut ctx = create_test_context();
+    ctx.identified_consumer = Some(Arc::new(consumer));
     ctx
 }
 
@@ -275,7 +331,6 @@ pub fn create_test_proxy() -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
@@ -315,6 +370,7 @@ pub fn create_test_transaction_summary() -> ferrum_edge::plugins::TransactionSum
         timestamp_received: Utc::now().to_rfc3339(),
         client_ip: "127.0.0.1".to_string(),
         consumer_username: Some("testuser".to_string()),
+        principal_origin: Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer),
         auth_method: None,
         http_method: "GET".to_string(),
         request_path: "/test".to_string(),
@@ -336,15 +392,81 @@ pub fn create_test_transaction_summary() -> ferrum_edge::plugins::TransactionSum
         error_class: None,
         body_error_class: None,
         body_completed: false,
+        response_delivery: Default::default(),
         bytes_sent: 0,
         bytes_received: 0,
         grpc_request_messages: 0,
         grpc_response_messages: 0,
         mirror: false,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
         ai_usage_export: None,
         proxy_lifecycle_generation: None,
     }
+}
+
+/// A WebSocket session end with an in-session fault, for the shared log-sink
+/// session-end contract (issue #7144).
+#[allow(dead_code)]
+pub fn create_test_ws_disconnect_context() -> ferrum_edge::plugins::WsDisconnectContext {
+    ferrum_edge::plugins::WsDisconnectContext {
+        namespace: "ferrum".to_string(),
+        proxy_id: "test-ws-proxy".to_string(),
+        proxy_name: Some("Test WS Proxy".to_string()),
+        client_ip: "127.0.0.1".to_string(),
+        backend_target: "ws://127.0.0.1:9000/chat".to_string(),
+        http_method: "GET".to_string(),
+        request_path: "/chat".to_string(),
+        handshake_status_code: 101,
+        listen_port: 8080,
+        connection_id: 7,
+        duration_ms: 1500.0,
+        frames_client_to_backend: 3,
+        frames_backend_to_client: 4,
+        bytes_client_to_backend: 16,
+        bytes_backend_to_client: 32,
+        timestamp_connected: "2026-11-14T10:00:00+00:00".to_string(),
+        timestamp_disconnected: "2026-11-14T10:00:01.500+00:00".to_string(),
+        direction: Some(ferrum_edge::plugins::Direction::BackendToClient),
+        io_side: Some(ferrum_edge::proxy::tcp_proxy::StreamIoSide::Read),
+        error_class: Some(ferrum_edge::retry::ErrorClass::ConnectionReset),
+        consumer_username: Some("testuser".to_string()),
+        principal_origin: Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer),
+        auth_method: None,
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
+        proxy_lifecycle_generation: None,
+    }
+}
+
+/// Assert `record` is the shared WebSocket session-end record
+/// (`WsDisconnectContext::session_end_summary`) for
+/// [`create_test_ws_disconnect_context`], as every `TransactionSummary` log
+/// sink must emit it (issue #7144).
+#[allow(dead_code)]
+pub fn assert_ws_session_end_record(record: &Value, sink: &str) {
+    assert_eq!(record["http_method"], "GET", "{sink}: {record}");
+    assert_eq!(record["request_path"], "/chat", "{sink}: {record}");
+    assert_eq!(record["response_status_code"], 101, "{sink}: {record}");
+    assert_eq!(record["proxy_id"], "test-ws-proxy", "{sink}: {record}");
+    assert_eq!(
+        record["backend_target"], "ws://127.0.0.1:9000/chat",
+        "{sink}: {record}"
+    );
+    assert_eq!(
+        record["error_class"], "connection_reset",
+        "{sink}: {record}"
+    );
+    assert_eq!(record["latency_total_ms"], 1500.0, "{sink}: {record}");
+    assert_eq!(record["latency_backend_ttfb_ms"], -1.0, "{sink}: {record}");
+    assert_eq!(record["bytes_sent"], 16, "{sink}: {record}");
+    assert_eq!(record["bytes_received"], 32, "{sink}: {record}");
+    assert_eq!(
+        record["timestamp_received"], "2026-11-14T10:00:00+00:00",
+        "{sink}: {record}"
+    );
+    assert_eq!(
+        record["metadata"]["websocket.timestamp_disconnected"], "2026-11-14T10:00:01.500+00:00",
+        "{sink}: {record}"
+    );
 }
 
 /// Create a test stream transaction summary for stream-aware logging plugins
@@ -358,6 +480,7 @@ pub fn create_test_stream_transaction_summary() -> ferrum_edge::plugins::StreamT
         proxy_name: Some("Test Stream Proxy".to_string()),
         client_ip: "127.0.0.1".to_string(),
         consumer_username: Some("testuser".to_string()),
+        principal_origin: Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer),
         auth_method: None,
         backend_target: "127.0.0.1:9000".to_string(),
         backend_resolved_ip: Some("127.0.0.1".to_string()),
@@ -373,7 +496,7 @@ pub fn create_test_stream_transaction_summary() -> ferrum_edge::plugins::StreamT
         timestamp_connected: Utc::now().to_rfc3339(),
         timestamp_disconnected: Utc::now().to_rfc3339(),
         sni_hostname: None,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
     }
 }
 
@@ -501,6 +624,60 @@ pub fn assert_reject(result: PluginResult, expected_status: Option<u16>) {
         }
         _ => panic!("Expected Reject, got {:?}", result),
     }
+}
+
+/// The `WWW-Authenticate` field of a response header map, matched
+/// case-insensitively (issue #6774).
+#[allow(dead_code)]
+pub fn challenge_header(headers: &HashMap<String, String>) -> Option<&str> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("www-authenticate"))
+        .map(|(_, value)| value.as_str())
+}
+
+/// Assert a `401` plugin rejection whose `WWW-Authenticate` field is exactly
+/// `expected_challenge` (RFC 9110 §15.5.2, issue #6774).
+#[allow(dead_code)]
+pub fn assert_unauthorized_with_challenge(result: PluginResult, expected_challenge: &str) {
+    match result {
+        PluginResult::Reject {
+            status_code,
+            headers,
+            body,
+        } => {
+            assert_eq!(status_code, 401, "expected a 401 rejection, body={body}");
+            assert_eq!(
+                challenge_header(&headers),
+                Some(expected_challenge),
+                "a 401 must carry the applicable challenge, body={body}"
+            );
+        }
+        other => panic!("Expected a 401 Reject, got {other:?}"),
+    }
+}
+
+/// Assert an authentication-phase rejection is a `401` whose
+/// `WWW-Authenticate` field is exactly `expected_challenge` (issue #6774).
+#[allow(dead_code)]
+pub fn assert_phase_unauthorized_with_challenge(
+    rejection: Option<(u16, bytes::Bytes, HashMap<String, String>)>,
+    expected_challenge: &str,
+) {
+    let (status_code, body, headers) =
+        rejection.expect("the authentication phase must reject the request");
+    assert_eq!(
+        status_code,
+        401,
+        "expected a 401 rejection, body={}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        challenge_header(&headers),
+        Some(expected_challenge),
+        "a 401 must carry every applicable challenge, body={}",
+        String::from_utf8_lossy(&body)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -775,7 +952,7 @@ pub(crate) fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
         "http_logging" => json!({"endpoint_url": "http://localhost:9200/logs"}),
         "tcp_logging" => json!({"host": "localhost", "port": 5140}),
         "ws_logging" => json!({"endpoint_url": "ws://localhost:9300/logs"}),
-        "otel_tracing" => json!({"endpoint": "http://localhost:4318/v1/traces"}),
+        "otel_tracing" => json!({"endpoint": "http://127.0.0.1:4318/v1/traces"}),
         // `hmac_auth` defaults to the single-use `ferrum-hmac-v2` profile, which
         // requires an explicit replay-scope declaration.
         "hmac_auth" => json!({"replay_scope": "process"}),
@@ -811,7 +988,7 @@ pub(crate) fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
         "serverless_function" => {
             json!({"provider": "azure_functions", "function_url": "https://example.com/func"})
         }
-        "request_mirror" => json!({"mirror_host": "mirror.local"}),
+        "request_mirror" => json!({"allow_plaintext": true, "mirror_host": "mirror.local"}),
         "load_testing" => json!({
             "key": "test-load-key-0123456789abcdef!!",
             "concurrent_clients": 1,
@@ -987,7 +1164,6 @@ pub(crate) fn make_proxy(id: &str, listen_path: &str, plugin_ids: Vec<&str>) -> 
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,

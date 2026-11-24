@@ -130,6 +130,44 @@ async fn assert_clean(plugin: &Waf, rule_id: &str, surface: Surface<'_>) {
     );
 }
 
+#[tokio::test]
+async fn xpath_injection_needs_xpath_syntax_and_leaves_sql_tautologies_to_sqli() {
+    let plugin = monitor_waf(1);
+    for query in [
+        // `'] | //user/*`: close the predicate and union a new path.
+        "user=%27%5D%20%7C%20%2F%2Fuser%2F*",
+        // `' or name()='admin`
+        "user=x%27%20or%20name()%3D%27admin",
+        // `' and string-length(name(/*[1]))=4`
+        "user=x%27%20and%20string-length(name(%2F*%5B1%5D))%3D4",
+        // An explicit axis.
+        "path=%2Fdescendant%3A%3Anode()",
+    ] {
+        assert_detected(&plugin, "FE-XPATH-001", Surface::Query(query)).await;
+    }
+
+    // A bare quoted tautology carries no XPath syntax. The SQLi rule owns it,
+    // so it is scored once instead of as two independent signals.
+    let tautology = Surface::Query("user=x%27%20or%20%271%27%3D%271");
+    assert_detected(
+        &plugin,
+        "FE-SQLI-002",
+        Surface::Query("user=x%27%20or%20%271%27%3D%271"),
+    )
+    .await;
+    assert_clean(&plugin, "FE-XPATH-001", tautology).await;
+
+    // Code that shares XPath's `::` or a SQL function name stays clean.
+    for query in [
+        "code=parent%3A%3A__construct()",
+        "code=Self%3A%3Anew()",
+        "code=std%3A%3Avector",
+        "user=x%27%20or%20count(*)%3E0",
+    ] {
+        assert_clean(&plugin, "FE-XPATH-001", Surface::Query(query)).await;
+    }
+}
+
 const JSON: &str = "application/json";
 const TEXT: &str = "text/plain";
 const FORM: &str = "application/x-www-form-urlencoded";

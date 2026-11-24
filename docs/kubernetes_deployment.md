@@ -300,13 +300,13 @@ UID/GID and `fsGroup`; an `emptyDir` loses the database when its Pod is deleted.
 
 ## Ferrum Mesh Helm Chart Contract
 
-The `charts/ferrum-mesh` chart defaults to scaffolding only. It creates the
-shared ServiceAccount, but runtime components that need external material are
+The `charts/ferrum-mesh` chart defaults to scaffolding only. It renders only the
+Ferrum-owned CRD (each component's ServiceAccount is created with that
+component), and runtime components that need external material are
 disabled by default:
 
 - `controlPlane.enabled=false`
 - `injector.enabled=false`
-- `ca.enabled=false`
 
 This is intentional. In `cp` mode the runtime refuses to start without all of:
 
@@ -326,7 +326,7 @@ The Helm chart separately requires its two credential sources —
 `controlPlane.credentials.adminJwtSecret` and
 `controlPlane.credentials.cpDpGrpcJwtSecret` (each exactly one of `value`,
 `existingSecret.name`, or `valueFrom`, minimum 32 characters) — whenever
-`controlPlane.enabled=true` or `ca.enabled=true`. A runtime trust-bundle
+`controlPlane.enabled=true`. A runtime trust-bundle
 alternative to the legacy secret does not let the chart omit those credential
 fields. The chart validates these requirements during `helm template` and `helm
 install`. When
@@ -339,6 +339,18 @@ independent `ferrum-mesh` release in the same cluster must set a unique
 `gatewayClass.name`; Helm ownership of the cluster-scoped object is
 intentional, and a later release must not force-import or skip-create to share
 another release's class.
+
+The control plane is held to the CP gRPC transport check at render time: a
+non-loopback, non-zero `FERRUM_CP_GRPC_LISTEN_ADDR` (default
+`0.0.0.0:<controlPlane.grpcPort>`) fails `helm template` unless
+`controlPlane.env` sets both `FERRUM_CP_GRPC_TLS_CERT_PATH` and
+`FERRUM_CP_GRPC_TLS_KEY_PATH` or `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT: "true"`
+(the development example sets the opt-in). The binary refuses the same
+configuration at startup.
+
+The chart ships no certificate authority (the standalone `ca` component was
+removed): mesh workload identity comes from SPIRE (`FERRUM_MESH_CA_BACKEND=spire`),
+file SVIDs, or the dev-only in-process `internal` CA.
 
 ### Gateway API CRDs (required)
 
@@ -362,18 +374,27 @@ kubectl get crd udpresponseamplificationpolicies.gateway.ferrum.io \
   -o jsonpath='{.metadata.annotations.gateway\.ferrum\.io/crd-schema-version}'
 ```
 
-A mismatch is an operator failure. Leave `crds.install=true`, or apply the
-template YAML with `kubectl apply --server-side` and set
-`crds.skipInstallAcknowledged=true`. `crds.install=false` without that
-acknowledgement fails `helm template` / `helm upgrade`.
+A mismatch is an operator failure. Leave `crds.install=true`, or set
+`crds.skipInstallAcknowledged=true` and apply the rendered CRD yourself (the
+template file is a Helm template, not plain YAML):
+
+```bash
+helm template <release> ./charts/ferrum-mesh -n <namespace> \
+  --show-only templates/crds-udpresponseamplificationpolicy.yaml \
+  --set crds.install=true | kubectl apply --server-side -f -
+```
+
+`crds.install=false` without that acknowledgement fails `helm template` /
+`helm upgrade`.
 
 Existing clusters that installed this CRD from the former
-`charts/ferrum-mesh/crds/` directory must adopt it once so Helm can update it.
-**Operator action:**
+`charts/ferrum-mesh/crds/` directory must let Helm take ownership of it once so
+Helm can update it; a plain `helm upgrade` fails on Helm's own ownership check.
+**Operator action** (`--take-ownership` needs a Helm 3.17+ client):
 
 ```bash
 helm upgrade <release> ./charts/ferrum-mesh -n <namespace> \
-  --take-ownership --set crds.adoptExisting=true
+  --take-ownership
 ```
 
 Independent `ferrum-mesh` releases in one cluster share this cluster-scoped CRD.
@@ -575,8 +596,9 @@ dependency-aware readiness.
 
 | Workload | Liveness / startup default | Readiness default |
 | --- | --- | --- |
-| `controlPlane`, `ca` | `ferrum-edge health --live` against the admin listener | `ferrum-edge health` (503 while starting/unavailable; ready-but-degraded stays HTTP 200 with JSON `status: "degraded"`) |
-| `ambient`, `nodeAgent` | same admin `--live` exec when admin is enabled and port ≠ `0` | same admin `/health` exec; omitted when admin is disabled or port is `0` (NodeWaypoint still requires a non-zero ambient admin port) |
+| `controlPlane` | `ferrum-edge health --live` against the admin listener | `ferrum-edge health` (503 while starting/unavailable; ready-but-degraded stays HTTP 200 with JSON `status: "degraded"`) |
+| `ambient` | same admin `--live` exec against the ambient admin port | same admin `/health` exec. With the ambient admin HTTP port set to `0` there is no computed handler, so every **enabled** ambient probe fails render: supply `ambient.probes.<probe>.override` or set `ambient.probes.<probe>.enabled=false`. NodeWaypoint additionally refuses a `0` ambient admin port outright |
+| `nodeAgent` | same admin `--live` exec when `nodeAgent.admin.enabled` and an admin port is available (the plaintext port, or the HTTPS port with `--tls` when plaintext is `0`) | same admin `/health` exec. The computed probe is omitted (not refused) when node-agent admin is disabled or has no usable port, unless an `override` handler is set. An HTTPS-only admin that requires client certificates (`tls.clientCaKey`) fails render while any enabled probe still uses the computed handler |
 | `injector` | `tcpSocket` on the `webhook` port | `tcpSocket` on the `webhook` port |
 | `eastWest` | `ferrum-edge health --live` against the east-west admin listener | `ferrum-edge health` (drain-aware `/health`; `tcpSocket` on `tls-passthru` is not used because it stays ready after SIGTERM) |
 
@@ -588,11 +610,11 @@ built-in `ferrum-edge health` command evaluates HTTP status). Per-probe
 `override` maps replace only that probe's handler; a shared `probes.override`
 is rejected by `values.schema.json`.
 
-Serving mesh workloads (`controlPlane`, `ca`, `eastWest`, `ambient`) also render
+Serving mesh workloads (`controlPlane`, `eastWest`, `ambient`) also render
 the gateway chart's graceful-shutdown contract: `FERRUM_SHUTDOWN_DRAIN_SECONDS`,
 optional `FERRUM_SHUTDOWN_PREDRAIN_SECONDS`, native `preStop.sleep`, and
 `terminationGracePeriodSeconds` sized for the full additive budget in
-[graceful_shutdown.md](graceful_shutdown.md). `controlPlane` and `ca` run `cp`
+[graceful_shutdown.md](graceful_shutdown.md). `controlPlane` runs `cp`
 mode, which honors the pre-drain window on its admin and CP-gRPC accept loops,
 so the `<1.29` remediation (`shutdownPreStopSeconds: 0` plus a raised
 `shutdownPreDrainSeconds`) is a real contract there and not just a rendered env.
@@ -609,7 +631,7 @@ connection-refused and fails pod CREATE cluster-wide. The **node-agent** renders
 preStop sleep would only delay node drains.
 
 Restricted-compatible `securityContext` and non-empty `resources` defaults
-apply to control plane, CA, and east-west. Ambient keeps its host-network
+apply to control plane and east-west. Ambient keeps its host-network
 datapath capabilities after dropping ALL; its `securityContext` accepts only
 `allowPrivilegeEscalation`, `readOnlyRootFilesystem`, `capabilities.drop`, and
 `capabilities.add`, so an unsupported key is rejected rather than ignored.
@@ -618,8 +640,8 @@ container, not only on the UDP preflight.
 
 Each workload's `admin.bindAddress` must be an IP literal and its
 `admin.allowedCidrs` (and `observability.metrics.allowedCidrs`) is validated
-entry-for-entry against the runtime's strict CIDR parser. For `controlPlane` and
-`ca` a full-family allowlist (`0.0.0.0/0`, `::/0`, an IPv4-mapped `/96`, or a
+entry-for-entry against the runtime's strict CIDR parser. For `controlPlane` a
+full-family allowlist (`0.0.0.0/0`, `::/0`, an IPv4-mapped `/96`, or a
 covering union) is not accepted as plaintext-admin protection. While the
 computed exec probes are enabled, the chart predicts the probe's source address
 from the bind: wildcard and loopback IPv4 binds (`""`, `*`, `0.0.0.0`, and any
@@ -659,7 +681,7 @@ scrape carries no credential and may stay on plaintext `admin-http`.
 Admin HTTPS uses one shape on every mesh workload —
 `<component>.admin.httpsPort` (default `0`) plus `<component>.admin.tls`
 (`enabled`, `secretName`, `mountPath`, `certKey`, `keyKey`, optional
-`clientCaKey` / `crlKey`) for `controlPlane`, `ca`, `eastWest`, and `ambient`,
+`clientCaKey` / `crlKey`) for `controlPlane`, `eastWest`, and `ambient`,
 and the pre-existing `nodeAgent.admin.httpsPort` / `nodeAgent.admin.tls`. The
 chart mounts the Secret read-only and renders `FERRUM_ADMIN_HTTPS_PORT` with the
 matching `FERRUM_ADMIN_TLS_*` paths; setting `admin.httpPort: 0` alongside it
@@ -852,7 +874,7 @@ spec:
       terminationGracePeriodSeconds: 110
       containers:
         - name: ferrum-edge
-          image: docker.io/ferrumedge/ferrum-edge:0.9.17
+          image: docker.io/ferrumedge/ferrum-edge:0.9.21
           imagePullPolicy: IfNotPresent
           args: ["run"]
           env:
@@ -1031,6 +1053,11 @@ env:
 ## Control Plane / Data Plane Layout
 
 For CP/DP mode, keep the Control Plane private and expose only the Data Plane proxy service.
+
+The Control Plane and Data Plane manifests below read `cp-dp-grpc-jwt-secret` from
+the `ferrum-edge-secrets` Secret. Add that key (at least 32 characters, distinct
+from `admin-jwt-secret`) to the Secret shown in the single-node example before
+applying them.
 
 > **Admin bind for CP/DP admin Services.** The admin Services below publish ports
 > `9000`/`9443`, but admin binds to loopback by default (see "Admin bind address"

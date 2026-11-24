@@ -13,7 +13,7 @@ For the full Prometheus family reference (exact names, types, HELP text, label k
 | `/metrics` | GET | JWT / metrics token / allowed CIDR | 5-second TTL (configurable via `render_cache_ttl_seconds`); process-static families are exempt — see below | Prometheus exposition format, including request, AI token/cost, and TLS certificate metrics |
 | `/health` | GET | None (tiered) | None | `status`+`ready` unauthenticated; full diagnostics require auth |
 
-`/metrics` "Auth" means a valid admin JWT, a matching `FERRUM_METRICS_BEARER_TOKEN`, or a source IP within `FERRUM_METRICS_ALLOWED_CIDRS`; otherwise it returns `401`. An admin JWT carrying an `ns` claim (or a viewer-key JWT under a namespace ceiling) is namespace-bounded: it receives `403` from `/metrics`, `/admin/metrics`, and `/metrics/runtime`, even from a `FERRUM_METRICS_ALLOWED_CIDRS` source IP (the CIDR allowance covers only scrapes that present no such token). The same credential set unlocks the detailed `/health` and `/overload` views; a namespace-bounded JWT gets the bounded tenant tier of `/health` and `/status` instead (see [admin_api.md](admin_api.md#tenant-tier-for-namespace-bounded-tokens)).
+`/metrics` "Auth" means a valid admin JWT, a matching `FERRUM_METRICS_BEARER_TOKEN`, or a source IP within `FERRUM_METRICS_ALLOWED_CIDRS`; otherwise it returns `401`. A namespace-bounded JWT receives `403` from `/metrics`, `/admin/metrics`, and `/metrics/runtime`, even from an allowlisted source IP; the detailed `/health` / `/overload` views and the tenant tier follow [admin_api.md](admin_api.md#authentication).
 
 #### What `render_cache_ttl_seconds` does and does not cover
 
@@ -31,6 +31,16 @@ every scrape and are unaffected by the TTL:
   (`ferrum_mesh_remote_discovery_*`), and xDS intake (`ferrum_xds_*`)
 - the NodeWaypoint ADR series (`ferrum_mesh_node_waypoint_*`)
 - the shared JWKS trust/failure families (`ferrum_jwks_*`)
+- service-discovery task health (`ferrum_service_discovery_tasks*` gauges and
+  the wall-clock `ferrum_service_discovery_last_success_age_seconds_max`),
+  compression codec admission (`ferrum_compression_codec_*`,
+  `ferrum_compression_response_buffer_*`), the admin audit pipeline
+  (`ferrum_admin_audit_*`, including `ferrum_admin_audit_available` and
+  `ferrum_admin_audit_degraded`), UDP response amplification
+  (`ferrum_udp_amplification_*`), gateway trust bundles
+  (`ferrum_gateway_trust_bundle_*`), the admin and CP gRPC connection limiters
+  (`ferrum_admin_*_connections*`, `ferrum_cp_grpc_*_connections*`), and the node
+  agent (`ferrum_node_agent_*`, `ferrum_mesh_node_topology_degraded`)
 
 Keeping these off the cache is load-bearing rather than incidental. Their
 counters would otherwise appear frozen to any scrape landing inside the TTL of a
@@ -47,8 +57,9 @@ transition.
 ### Metrics vs Prometheus vs Health
 
 - **`/admin/metrics`** — JSON with connection pools, circuit breakers, health checks, cache stats, load-balancer state, consumer index breakdown, rate-limiter counters, and (in `database` and `cp` modes) database polling state. Use it for custom dashboards.
-- **`/metrics`** — Prometheus text format. Requires one globally scoped `prometheus_metrics` plugin and is **gated by default** (see the auth note above); configure a metrics bearer token or an allowed scrape CIDR for Prometheus/Grafana. Families include:
-  - Per-proxy request counters (bounded standard-method/`OTHER` method labels; terminal `grpc_status` for gRPC), latency histograms, and WebSocket session/duration/traffic families.
+- **`/metrics`** — Prometheus text format, built into the admin API and **gated by default** (see the auth note above); configure a metrics bearer token or an allowed scrape CIDR for Prometheus/Grafana. The endpoint always renders the process registry: process-wide families below are recorded by their own subsystems whether or not a `prometheus_metrics` plugin is configured. The per-proxy request/stream/WebSocket RED families are recorded only while one globally scoped `prometheus_metrics` plugin is enabled, and that plugin owns the render-cache, retention, mesh-budget, and duration-bucket tunables (removing it leaves the last committed values in place). Families include:
+  - Per-proxy request counters (bounded standard-method/`OTHER` method labels; terminal `grpc_status` for gRPC), latency histograms (request- and session-scoped bucket layouts, configurable via `request_duration_buckets_ms` / `session_duration_buckets_ms`), HTTP body-byte counters (`ferrum_request_body_bytes_total`, `ferrum_response_body_bytes_total`), and WebSocket session/duration/traffic families (plugin-recorded).
+  - Pre-routing rejections: `ferrum_unmatched_requests_total{reason,status_code}` counts unmatched-route `404`s and mesh `REGISTRY_ONLY` refusals, which never reach a plugin (always recorded).
   - AI usage: `ferrum_ai_prompt_tokens_total`, `ferrum_ai_completion_tokens_total`, `ferrum_ai_tokens_total`, `ferrum_ai_estimated_cost_currency_units_total`. Labels are limited to `proxy_id`, a bounded provider family, and the configured namespace. Cost keeps sub-micro precision while accumulating and is published rounded to six decimal places.
   - JWKS trust: `ferrum_jwks_trust_stores`, `ferrum_jwks_trust_age_seconds`, `ferrum_jwks_refresh_failures_total`, `ferrum_jwks_consecutive_failures`, labeled only by closed trust state or failure class (never URL, `kid`, token, claim, or key data).
   - The aggregate built-in rate-limit rejection counter.
@@ -166,12 +177,10 @@ curl -s -H "Authorization: Bearer $TOKEN" \
       "max_idle_per_host": 32,
       "idle_timeout_seconds": 90,
       "entries_per_host": {
-        "api-users.internal:8080:false": 1,
-        "api-users.internal:8080:true": 1,
-        "api-orders.internal:8080:true": 1,
-        "api-payments.internal:443:true": 1,
-        "auth-service.internal:443:true": 1,
-        "search-cluster.internal:9200:true": 1
+        "d=api-users.internal:8080|0||||…|rcfg=…": 1,
+        "d=api-users.internal:8443|1||||…|rcfg=…": 1,
+        "u=orders-upstream|1||||…|rcfg=…": 1,
+        "u=payments-upstream|1|h1|||…|rcfg=…": 1
       }
     },
     "grpc": {
@@ -280,9 +289,16 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   "rate_limiting": {
     "tracked_key_count": 4217
   },
+  "adaptive_concurrency": {
+    "policy_count": 2,
+    "tracked_target_count": 3,
+    "limit_total": 96,
+    "in_flight_total": 7
+  },
   "tcp_connection_throttle": {
     "enforcement_scope": "process_local",
-    "replica_limit_behavior": "configured_limit_per_replica"
+    "replica_limit_behavior": "configured_limit_per_replica",
+    "active_connections": 37
   }
 }
 ```
@@ -312,11 +328,11 @@ Top-level gateway info and throughput counters.
 
 ### `connection_pools`
 
-Connection pool sizes for all four protocol pools. Each pool reuses connections to avoid TCP/TLS handshake overhead per request.
+Sizes of the backend client and connection pools. Each pool reuses clients or connections to avoid TCP/TLS handshake overhead per request. The four entries are not one complete count of backend connections: `http` counts cached client entries rather than sockets, and some transports (the direct HTTP/1.1 pool, HBONE inner pools, Unix-socket backends) are not reported here at all.
 
 | Pool | Description |
 |------|-------------|
-| `http` | HTTP/1.1 connection pool (reqwest-based). Handles both plaintext HTTP and HTTPS backends. The `entries_per_host` map shows pool keys in `host:port:tls` format |
+| `http` | The shared reqwest **client cache** used for HTTP-family backends that are not dispatched on a dedicated pool. Each entry is one cached `reqwest::Client`, which owns its own internal socket pool; the live socket count inside each client is not exposed. With `FERRUM_POOL_HTTP1_DIRECT=true` (the default), eligible HTTP/1.1 requests go to the separate direct HTTP/1.1 pool instead, so this map does not describe all HTTP/1.1 connections |
 | `grpc` | gRPC HTTP/2 connection pool with trailer support. Uses sharded connections per backend for concurrency |
 | `http2` | HTTP/2 connection pool for HTTPS backends with proper stream multiplexing |
 | `http3` | HTTP/3 (QUIC) connection pool. Distributes across multiple QUIC connections per backend |
@@ -325,10 +341,10 @@ The `http` pool has additional detail fields:
 
 | Field | Description |
 |-------|-------------|
-| `total_pools` | Distinct backend pool entries |
-| `max_idle_per_host` | Max idle connections kept per host (`FERRUM_POOL_MAX_IDLE_PER_HOST`) |
+| `total_pools` | Number of resident cached client entries (one per distinct pool key) |
+| `max_idle_per_host` | Max idle connections each cached client keeps per host (`FERRUM_POOL_MAX_IDLE_PER_HOST`) |
 | `idle_timeout_seconds` | Seconds before idle connections are evicted (`FERRUM_POOL_IDLE_TIMEOUT_SECONDS`) |
-| `entries_per_host` | Map of pool key to connection count |
+| `entries_per_host` | Map of pool key to `1` for every resident client entry. The value is always `1`: it marks that the entry exists and is **not** a connection count. Keys are pipe-separated and start with `d=<host>:<port>` (direct backend) or `u=<upstream_id>` (upstream); the remaining fields carry the backend scheme, a forced-HTTP/1.1 marker, DNS override, upstream subset, backend TLS identity and an `rcfg=` client-behavior suffix. Several keys can share one destination when those settings differ. The key layout is internal and can change between releases, so do not parse it in dashboards |
 
 ### `circuit_breakers`
 
@@ -394,7 +410,7 @@ The router cache stores `(host, path) → proxy` lookups in bounded DashMaps for
 | `regex_cache_entries` | integer | Current entries in the regex route cache |
 | `prefix_eviction_count` | integer | Total eviction sweeps for the prefix cache since startup |
 | `regex_eviction_count` | integer | Total eviction sweeps for the regex cache since startup |
-| `max_cache_entries` | integer | Maximum entries per partition before random-sample eviction triggers (default 10,000) |
+| `max_cache_entries` | integer | Maximum entries per partition before random-sample eviction triggers (`FERRUM_ROUTER_CACHE_MAX_ENTRIES`; default auto-sizes to proxies × 3, clamped to 10,000–1,000,000) |
 
 **What to look for:**
 
@@ -425,21 +441,40 @@ Pre-built hash map indexes for O(1) credential lookup during authentication. The
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `tracked_key_count` | integer | Total rate-limit keys currently tracked across all `rate_limiting` plugin instances. Each key represents a unique client (by IP, consumer identity, or SPIFFE identity) with an active rate-limit window. Bounded to 100K entries per plugin instance with automatic stale entry eviction |
+| `tracked_key_count` | integer | Total keys currently tracked across deduplicated plugin instances that report a tracked-key count: rate limiters (`rate_limiting` and the other rate-limiting plugins) plus other state/cache plugins such as `request_deduplication`, `ai_semantic_cache`, and `adaptive_concurrency`. For `rate_limiting`, each key represents a unique client (by IP, consumer identity, or SPIFFE identity) with an active rate-limit window. Capacity depends on each contributing plugin; `rate_limiting` instances are bounded by `max_state_entries` (default 100,000) with automatic stale entry eviction |
 
 **What to look for:**
 
-- A `tracked_key_count` approaching 100K may indicate a DDoS or scanner generating many unique source IPs
+- Interpret `tracked_key_count` growth against the configured capacity of the contributing plugins and the observed client cardinality; unexpected growth well beyond the normal client count may indicate a DDoS or scanner generating many unique source IPs
 - Under normal traffic, this count should correlate with the number of unique clients in your active window duration
+
+### `adaptive_concurrency`
+
+Live state of every `adaptive_concurrency` policy, summed when the snapshot is built. Per-target values are not listed, so the response size does not grow with `max_tracked_keys`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `policy_count` | integer | Live `adaptive_concurrency` policies (one per namespace + plugin-config id) |
+| `tracked_target_count` | integer | Backend target keys tracked across those policies |
+| `limit_total` | integer | Sum of the tracked targets' current adaptive limits |
+| `in_flight_total` | integer | Sum of the tracked targets' current in-flight admissions |
+
+Untracked admissions beyond `max_tracked_keys` and permits still finishing against a structurally retired tracking space are not included. Shed, shadow-mode would-reject, and key-cap bypass decisions are counted per proxy by the `ferrum_adaptive_concurrency_decisions_total` Prometheus counter (see [`prometheus_metrics.md`](prometheus_metrics.md)).
+
+**What to look for:**
+
+- `in_flight_total` close to `limit_total` means the tracked targets are running at their learned limits and new requests are likely being shed
+- A falling `limit_total` with a steady `tracked_target_count` means backends are reporting higher latency or failures
 
 ### `tcp_connection_throttle`
 
-Static description of how the `tcp_connection_throttle` plugin enforces limits.
+How the `tcp_connection_throttle` plugin enforces limits, plus its live occupancy.
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `enforcement_scope` | string | Always `process_local`: connection counters live only in this process |
 | `replica_limit_behavior` | string | Always `configured_limit_per_replica`: each replica enforces the configured limit independently, so the deployment-wide allowance can reach the limit multiplied by the number of replicas receiving that client's connections |
+| `active_connections` | integer | Live TCP connections this process currently holds under every configured `tcp_connection_throttle` policy, summed across all Consumer/IP keys (`0` when none is configured). Computed when the endpoint is read; connections still held by a policy that was since removed are not counted. Per-proxy refusals are the Prometheus counter `ferrum_tcp_connection_throttle_rejections_total` |
 
 ### `database_polling`
 
@@ -473,7 +508,7 @@ Present only in `database` and `cp` modes, once the database poll loop has regis
 
 4. **`health_check.unhealthy_target_count`** — Alert when this rises above zero. Cross-reference with `unhealthy_targets` to identify which backends are down.
 
-5. **`connection_pools.http.total_pools`** — Should be stable. Rapid growth may indicate pool key fragmentation or misconfigured backends.
+5. **`connection_pools.http.total_pools`** — Should be stable. Rapid growth may indicate pool key fragmentation or misconfigured backends. It counts cached clients, not open connections.
 
 6. **`caches.router.prefix_eviction_count`** — Should stay low. Rapid increase indicates cache thrashing from high-cardinality traffic.
 

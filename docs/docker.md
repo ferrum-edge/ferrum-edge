@@ -73,7 +73,7 @@ docker build -t myregistry.azurecr.io/ferrum-edge:latest .
 
 ### Base Image Pinning
 
-Every image reference in `Dockerfile`, `Dockerfile.release`, `Dockerfile.test`,
+Every image reference in `Dockerfile`, `Dockerfile.release`,
 `Dockerfile.ebpf-tools-layer`, and `Dockerfile.iproute2-layer` — `FROM` lines and
 the `ARG <NAME>=<image>` defaults their `FROM ${VAR}` stages expand — is pinned
 by `@sha256:` digest, fixing the base image bytes independently of the tag.
@@ -205,7 +205,9 @@ mode, probes `/live` and readiness, restarts the gateway, and checks that the
 original migration records persist in a valid SQLite database. It removes its
 containers, volume, and temporary snapshots on exit.
 
-This script is not yet wired into CI as an automated gate.
+The release workflow runs it against every published `docker.io` image tag
+(`release.yml`, job `anonymous-pull-smoke`), so a release whose image cannot
+use a fresh `/data` volume turns the release run red.
 
 ### Health Check
 
@@ -216,7 +218,8 @@ The container includes a built-in `HEALTHCHECK` that runs the `ferrum-edge healt
 docker ps
 # Shows health status (healthy/starting/unhealthy)
 
-# Test from the host
+# Test from the host (only when admin is bound non-loopback and its port is
+# published, as in Basic Usage above; admin binds loopback by default)
 curl -f http://localhost:9000/health
 ```
 
@@ -227,7 +230,7 @@ When the plaintext admin listener is disabled (`FERRUM_ADMIN_HTTP_PORT=0`), the 
 HEALTHCHECK CMD ["/app/ferrum-edge", "health", "--tls", "--tls-no-verify"]
 ```
 
-> **Note**: The distroless images have no shell or curl. Use `curl` from the host or configure orchestrator-level health checks (for example, Kubernetes `httpGet` probes).
+> **Note**: The distroless images have no shell or curl. Use the built-in `ferrum-edge health` exec check. Kubernetes `httpGet` probes work only when admin is bound to a reachable non-loopback address; see [Kubernetes probe guidance](kubernetes_deployment.md#default-probe-strategy).
 
 ## Running with Docker Compose
 
@@ -290,6 +293,10 @@ docker compose --profile mongodb up -d mongodb ferrum-mongodb
 # loopback inside the pod; the admin port is not published to the host by default)
 docker compose ps   # STATUS column shows healthy/unhealthy
 ```
+
+**Environment**:
+- HTTP: http://localhost:8004 (HTTPS 8447, admin 9446 when served; these do not collide with the CP/DP profile, so both profiles can run together)
+- Admin API: bound to loopback inside the container and **not published** by default (see the admin-exposure note at the top of `docker-compose.yml` to enable host access)
 
 Uses the `mongodb` and `ferrum-mongodb` services defined in `docker-compose.yml`. The Mongo container refuses to start with a missing, short, or non-URL-safe `MONGO_PASSWORD`, and port `27017` is not published to the host. `MONGO_PASSWORD` only seeds a new volume; to change the password of an existing volume (including one created with the old `dev-password-change-in-production` default), follow [the upgrade guide](upgrade_guide.md#development-compose-fixtures). See [docs/mongodb.md](mongodb.md) for the full MongoDB deployment guide including replica sets, primary-consistent reads, and managed service configuration.
 
@@ -531,7 +538,9 @@ docker run \
 
 **Prometheus Metrics**:
 ```bash
-# Metrics available at Admin API (requires observability auth)
+# Metrics available at Admin API (requires observability auth; from the host only
+# when admin is bound non-loopback and its port is published — admin binds
+# loopback by default, see the admin-exposure note in docker-compose.yml)
 curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/metrics
 ```
 
@@ -587,21 +596,31 @@ services:
 docker run -d \
   --network <project>_ferrum-network \
   -p 80:80 \
-  -v /path/to/nginx.conf:/etc/nginx/nginx.conf \
+  -v /path/to/nginx.conf:/etc/nginx/nginx.conf:ro \
   nginx:latest
 ```
 
-**nginx.conf Example**:
-```nginx
-upstream ferrum {
-    server ferrum-dp-1:8000;
-    server ferrum-dp-2:8000;
-}
+**nginx.conf Example**: this is a complete file, not a fragment, because the
+command above mounts it over the image's main `/etc/nginx/nginx.conf`, where
+`upstream` and `server` must sit inside an `http` block. Check it with
+`nginx -t` before starting the load balancer. The check resolves the upstream
+names, so run it on the Compose network while the DP containers are up:
+`docker run --rm --network <project>_ferrum-network -v /path/to/nginx.conf:/etc/nginx/nginx.conf:ro nginx:latest nginx -t`.
 
-server {
-    listen 80;
-    location / {
-        proxy_pass http://ferrum;
+```nginx
+events {}
+
+http {
+    upstream ferrum {
+        server ferrum-dp-1:8000;
+        server ferrum-dp-2:8000;
+    }
+
+    server {
+        listen 80;
+        location / {
+            proxy_pass http://ferrum;
+        }
     }
 }
 ```

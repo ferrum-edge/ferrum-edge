@@ -19,15 +19,21 @@ kubectl get crd udpresponseamplificationpolicies.gateway.ferrum.io \
 
 The chart ships `v1alpha1-1` (`crds.udpResponseAmplificationPolicy.schemaVersion`).
 A mismatch is a loud operator failure: either upgrade with `crds.install=true`,
-or apply the template YAML with `kubectl apply --server-side` and set
-`crds.skipInstallAcknowledged=true`.
+or set `crds.skipInstallAcknowledged=true` and apply the rendered CRD yourself
+(the template file is a Helm template, not plain YAML):
 
-Existing clusters that still have the CRD from this directory must adopt it
-once. **Operator action:**
+```bash
+helm template <release> ./charts/ferrum-mesh -n <namespace> \
+  --show-only templates/crds-udpresponseamplificationpolicy.yaml \
+  --set crds.install=true | kubectl apply --server-side -f -
+```
+
+Existing clusters that still have the CRD from this directory must let Helm
+take ownership of it once. **Operator action:**
 
 ```bash
 helm upgrade <release> ./charts/ferrum-mesh -n <namespace> \
-  --take-ownership --set crds.adoptExisting=true
+  --take-ownership
 ```
 
 See [`docs/upgrade_guide.md`](../../../docs/upgrade_guide.md).

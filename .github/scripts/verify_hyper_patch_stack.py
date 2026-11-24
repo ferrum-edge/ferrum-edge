@@ -29,8 +29,14 @@ SERIES = (
     "003-greedy-h1-read/hyper-greedy-h1-read.patch",
     "004-h2-body-write-timeout/hyper-h2-body-write-timeout.patch",
     "005-h2-small-window-coalescing/hyper-h2-small-window-coalescing.patch",
+    "006-h2-stream-termination-origin/hyper-h2-stream-termination-origin.patch",
+    "007-h2-request-body-deadline/hyper-h2-request-body-deadline.patch",
+    "008-h2-response-write-timeout/hyper-h2-response-write-timeout.patch",
+    "009-h2-client-conn-task-box/hyper-h2-client-conn-task-box.patch",
 )
 ROOT_FILES = {"Cargo.toml", "LICENSE", "README.md"}
+
+_SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
 
 
 def sha256(data: bytes) -> str:
@@ -44,7 +50,7 @@ def source_hash(path: Path) -> str:
 
 def validate_series(lines: list[str], available: set[str]) -> None:
     if tuple(lines) != SERIES or available != set(SERIES):
-        raise ValueError("Hyper patches must be exactly the complete ordered 001-005 series")
+        raise ValueError("Hyper patches must be exactly the complete ordered 001-009 series")
 
 
 def validate_member(member: tarfile.TarInfo) -> None:
@@ -71,7 +77,7 @@ def manifest_hashes(manifest: Path) -> dict[str, str]:
         relative = name.removeprefix(prefix)
         path = PurePosixPath(relative)
         if (
-            not re.fullmatch(r"[0-9a-f]{64}", digest)
+            not _SHA256_HEX_RE.fullmatch(digest)
             or path.is_absolute()
             or ".." in path.parts
             or relative in hashes

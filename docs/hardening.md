@@ -15,9 +15,8 @@ Companion documents:
 > **Build-out status.** Ferrum Edge is pre-1.0 and publishes semver releases on
 > the `v0.9.x` channel (see the [Releases
 > page](https://github.com/ferrum-edge/ferrum-edge/releases) for the current
-> tag). The latest published release is **v0.9.17**, which replaces the
-> v0.9.16 tag that was never published (see the
-> [changelog](../CHANGELOG.md#0917---2026-10-10)). Read
+> tag). The latest published release is **v0.9.21** (see the
+> [changelog](../CHANGELOG.md#0921---2026-11-21)). Read
 > [support_policy.md](support_policy.md) before treating any item here as a
 > stability commitment.
 >
@@ -104,7 +103,7 @@ See [admin_metrics.md](admin_metrics.md) and
 | Do this | Setting | Secure value | Reference |
 |---|---|---|---|
 | Terminate TLS at the gateway | `FERRUM_FRONTEND_TLS_CERT_PATH`, `FERRUM_FRONTEND_TLS_KEY_PATH` | file or provider-backed material | [Frontend TLS](frontend_tls.md) |
-| Disable the plaintext proxy listener when clients are TLS-only | `FERRUM_PROXY_HTTP_PORT` | `0` | [Deployment Flexibility](frontend_tls.md#deployment-flexibility) |
+| Disable the plaintext proxy listener when clients are TLS-only | `FERRUM_PROXY_HTTP_PORT` | `0` | [TLS Only](frontend_tls.md#4-tls-only-no-plaintext) |
 | Raise the protocol floor where clients allow it | `FERRUM_TLS_MIN_VERSION` | `1.3` (default `1.2`) | [TLS / mTLS](configuration.md#tls--mtls) |
 | Require client certificates for zero-trust frontends | `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` | your client CA bundle | [Client Certificate Verification (mTLS)](frontend_tls.md#client-certificate-verification-mtls) |
 | Keep a handshake deadline | `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` | leave at `10`; `0` only behind a load balancer with an equivalent deadline | [Handshake Timeout](frontend_tls.md#handshake-timeout) |
@@ -144,10 +143,12 @@ link-local, multicast and unspecified addresses. Precedence is first match wins:
 `FERRUM_BACKEND_ALLOW_CIDRS`, then `FERRUM_BACKEND_DENY_CIDRS`, then the
 dangerous-range baseline, then `FERRUM_BACKEND_ALLOW_IPS`.
 
-`kafka_logging` is admitted **only** under a fully open egress policy, because
-librdkafka dials cluster-advertised brokers Ferrum never screens. If you enable
-it you have given up backend egress enforcement process-wide — see
-[`kafka_logging` requires a fully-open egress policy](configuration.md#kafka_logging-requires-a-fully-open-egress-policy).
+`kafka_logging` is refused under any egress policy that can deny addresses,
+because librdkafka resolves broker hostnames and dials cluster-advertised
+brokers Ferrum never screens. Keep the policy on and attest a trusted cluster
+with `FERRUM_KAFKA_ALLOWED_BROKERS` (list every broker the cluster advertises,
+or its subnet) rather than disarming backend egress enforcement process-wide —
+see [`kafka_logging` and restrictive egress policies](configuration.md#kafka_logging-and-restrictive-egress-policies).
 
 Database connections have their own TLS surface: see
 [database_tls.md](database_tls.md) and, for MongoDB, [mongodb.md](mongodb.md).
@@ -160,7 +161,7 @@ Database connections have their own TLS surface: see
 | Serve CP gRPC over TLS | `FERRUM_CP_GRPC_TLS_CERT_PATH`, `FERRUM_CP_GRPC_TLS_KEY_PATH` | file or provider-backed material | [Transport security](cp_dp_mode.md#transport-security-tlsmtls) |
 | Pin the CP's CA on every data plane | `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` | the CP issuing CA | [Transport security](cp_dp_mode.md#transport-security-tlsmtls) |
 | Use a distinct plane secret | `FERRUM_CP_DP_GRPC_JWT_SECRET` | >= 32 chars, distinct from `FERRUM_ADMIN_JWT_SECRET` | [Control Plane / Data Plane](configuration.md#control-plane--data-plane) |
-| Prefer an externally issued token so no signing key sits on the node | `FERRUM_DP_CP_GRPC_TOKEN_FILE` | a short-lived issued token file | [Control Plane / Data Plane](configuration.md#control-plane--data-plane) |
+| Prefer an externally issued token so no signing key sits on the node (mesh/xDS clients only; `dp` mode refuses it at startup, so stock DPs need a per-tenant secret plus `FERRUM_CP_DP_GRPC_JWT_KEY_ID`, see [Data-plane side](cp_namespace_tenancy.md#data-plane-side)) | `FERRUM_DP_CP_GRPC_TOKEN_FILE` | a short-lived issued token file | [Control Plane / Data Plane](configuration.md#control-plane--data-plane) |
 | Bind namespace authority to the credential in multi-tenant CPs | `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM` | `true` | [JWT tenancy claim](cp_namespace_tenancy.md#jwt-tenancy-claim) |
 | Use per-namespace verification credentials rather than one shared secret | `FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH` | a trust-bundle document | [Trust binding](cp_namespace_tenancy.md#trust-binding-ghsa-3f2j-wwqw-grmg) |
 | Bound how long an unrevalidatable verifier keeps authorizing | `FERRUM_CP_DP_TRUST_MAX_STALE_SECONDS` | leave at `900` or lower | [Retention of an unrevalidatable verifier is bounded (issue #3813)](cp_namespace_tenancy.md#retention-of-an-unrevalidatable-verifier-is-bounded-issue-3813) |
@@ -219,6 +220,7 @@ transform sees different input. See
 | Keep TLS private keys non-extractable where an HSM exists | `pkcs11://` key sources | frontend/admin server keys, backend client keys | [PKCS#11 TLS keys](pkcs11_tls.md) |
 | Source Kubernetes TLS material from Secrets, not files baked into images | `k8s://` sources | cert-manager-managed Secrets | [Kubernetes Secret TLS sources](k8s_cert_manager.md) |
 | Redact anything sensitive your backends echo into logs | `FERRUM_LOG_REDACT_METADATA_KEYS` | your sensitive metadata keys | [Core Settings](configuration.md#core-settings) |
+| Keep metadata values redacted unless you have reviewed the name | `FERRUM_LOG_SAFE_METADATA_KEYS` | only the custom metadata names you have reviewed as non-secret | [Core Settings](configuration.md#core-settings) |
 | Bound the size of any material accepted from a source | `FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES` | leave at the default 4 MiB | [Core Settings](configuration.md#core-settings) |
 
 A provider conflict for one base key (two suffixes on the same variable) is a
@@ -243,9 +245,9 @@ posture see [fips.md](fips.md).
 
 ## Never in production
 
-Each of these is verified against the shipped configuration reference. The first
-two are refused or refused-in-context rather than merely discouraged; the rest
-are accepted and silently weaken the deployment.
+These settings weaken production security or availability. Some are rejected or
+disabled in the contexts described below; accepted development opt-ins may emit
+warnings.
 
 | Setting | Why not |
 |---|---|
@@ -260,7 +262,7 @@ are accepted and silently weaken the deployment.
 | `FERRUM_MESH_ALLOW_NO_CA=true` | Runs mesh mode with no workload identity at all. Refused under `FERRUM_MESH_PRODUCTION_MODE`. |
 | `FERRUM_MESH_ALLOW_EPHEMERAL_JWT_KEY=true` | Mints a process-local JWT signing key, so tokens stop verifying across replicas and restarts. Refused under `FERRUM_MESH_PRODUCTION_MODE`. |
 | `FERRUM_MESH_CA_BOOTSTRAP_DEV=true` | Mints a self-signed root for the internal CA backend. Refused under `FERRUM_MESH_PRODUCTION_MODE`. |
-| `FERRUM_MESH_STOCK_XDS_ALLOW_PLAINTEXT=true` | Admits plaintext (h2c) stock ADS endpoints. Development only. |
+| `FERRUM_MESH_STOCK_XDS_ALLOW_PLAINTEXT=true` | Admits plaintext (h2c) stock ADS endpoints. Development only: loopback hosts only, incompatible with a bearer credential (`FERRUM_MESH_STOCK_XDS_TOKEN_FILE`), and refused under `FERRUM_MESH_PRODUCTION_MODE`. |
 | `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true` on a networked address | Sends the entire configuration stream, including the plane bearer token, in cleartext. |
 | `udp_max_response_amplification_factor: 0` on a `udp`/`dtls` proxy | Removes the reply budget (unset defaults to `8.0`), so any small-request/large-response backend becomes a spoofed-source reflector. The listener logs a startup warning. |
 

@@ -145,6 +145,9 @@ pub fn retain_namespace(
         // rather than tenant-owned resources. Filtering happens before any
         // quarantine runs, so it is empty here and passed through unchanged.
         quarantined_plugin_configs,
+        // Same per-load bookkeeping for stripped shared JWT secrets: filled
+        // only by the full loaders after filtering, so empty here.
+        quarantined_jwt_shared_secrets,
         mesh,
         http_tls_listen_ports,
         // Monotonic revision of the source snapshot; a property of the
@@ -229,6 +232,7 @@ pub fn retain_namespace(
         trust_bundles,
         gateway_trust_bundles,
         quarantined_plugin_configs,
+        quarantined_jwt_shared_secrets,
         mesh,
         http_tls_listen_ports,
         mesh_revision,

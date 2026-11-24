@@ -34,19 +34,19 @@ pub const PROCESS_MAX_RETAINED_BYTES_MAX: usize = 2_147_483_648;
 /// the same binary depend on.
 #[derive(Debug)]
 pub struct RetainedByteCeiling {
-    used: AtomicUsize,
+    used: crossbeam_utils::CachePadded<AtomicUsize>,
     max: AtomicUsize,
     rejections: AtomicU64,
-    high_water: AtomicUsize,
+    high_water: crossbeam_utils::CachePadded<AtomicUsize>,
 }
 
 impl RetainedByteCeiling {
     pub const fn new(max_bytes: usize) -> Self {
         Self {
-            used: AtomicUsize::new(0),
+            used: crossbeam_utils::CachePadded::new(AtomicUsize::new(0)),
             max: AtomicUsize::new(max_bytes),
             rejections: AtomicU64::new(0),
-            high_water: AtomicUsize::new(0),
+            high_water: crossbeam_utils::CachePadded::new(AtomicUsize::new(0)),
         }
     }
 
@@ -64,8 +64,6 @@ impl RetainedByteCeiling {
 
     /// Install an exact ceiling with no clamping. Test-only: saturation
     /// coverage needs ceilings far below the production minimum.
-    // The binary target never calls this; external unit tests do.
-    #[allow(dead_code)]
     pub fn set_max_unclamped_for_test(&self, max_bytes: usize) {
         self.max.store(max_bytes, Ordering::Release);
     }
@@ -102,8 +100,10 @@ impl RetainedByteCeiling {
                 used.checked_add(bytes).filter(|next| *next <= max)
             }) {
             Ok(previous) => {
-                self.high_water
-                    .fetch_max(previous.saturating_add(bytes), Ordering::AcqRel);
+                let next = previous.saturating_add(bytes);
+                if next > self.high_water.load(Ordering::Relaxed) {
+                    self.high_water.fetch_max(next, Ordering::AcqRel);
+                }
                 Some(ProcessByteReservation {
                     ceiling: self,
                     bytes: AtomicUsize::new(bytes),
@@ -122,9 +122,6 @@ static PROCESS_CEILING: RetainedByteCeiling =
     RetainedByteCeiling::new(PROCESS_MAX_RETAINED_BYTES_DEFAULT);
 
 /// Handle on the process-wide ceiling.
-// The binary target reaches the ceiling through the wrappers below; external
-// tests use this handle directly.
-#[allow(dead_code)]
 pub fn process_ceiling() -> &'static RetainedByteCeiling {
     &PROCESS_CEILING
 }
@@ -289,7 +286,6 @@ impl ProcessByteReservation {
 
     /// Bytes still held by this reservation.
     // Read by external unit tests only.
-    #[allow(dead_code)]
     pub fn reserved(&self) -> usize {
         self.bytes.load(Ordering::Acquire)
     }
@@ -370,8 +366,6 @@ impl GrowableProcessReservation {
     }
 
     /// Bytes currently charged by this reservation.
-    // Read by external unit tests only; the binary target cannot observe them.
-    #[allow(dead_code)]
     pub fn held(&self) -> usize {
         self.held.load(Ordering::Acquire)
     }
@@ -468,8 +462,6 @@ impl ByteBudget {
     /// External tests pass their own leaked ceiling so saturation and
     /// byte-accounting assertions stay exact while other tests in the same
     /// binary run concurrently.
-    // The binary target uses the named constructors; external unit tests use this.
-    #[allow(dead_code)]
     pub fn with_ceiling(
         plugin_name: &'static str,
         max_bytes: usize,
@@ -493,9 +485,6 @@ impl ByteBudget {
         self.used_bytes.load(Ordering::Acquire)
     }
 
-    // Read by external unit tests; the binary target compiles this shared
-    // module separately and cannot observe those callers.
-    #[allow(dead_code)]
     pub fn drops_total(&self) -> u64 {
         self.drops.load(Ordering::Relaxed)
     }
@@ -625,6 +614,13 @@ impl Drop for ByteLease {
 }
 
 /// JSON writer that fails closed once `max_bytes` would be exceeded.
+///
+/// The one bounded serialization sink for retained observability entries
+/// (summary/stream loggers, `loki_logging`, `ws_logging`, `kafka_logging`) and
+/// `ai_federation`'s translated provider bodies. A write that would cross the
+/// limit appends nothing, sets `limit_exceeded`, and fails the serializer;
+/// callers branch on `limit_exceeded` (too large) versus any other serializer
+/// error, never on the `io::Error` text.
 #[derive(Debug)]
 pub struct BoundedJsonWriter {
     pub bytes: Vec<u8>,
@@ -647,7 +643,7 @@ impl Write for BoundedJsonWriter {
         if buf.len() > self.max_bytes.saturating_sub(self.bytes.len()) {
             self.limit_exceeded = true;
             return Err(std::io::Error::other(
-                "serialized observability entry exceeded its byte limit",
+                "serialized JSON exceeded its byte limit",
             ));
         }
         self.bytes.extend_from_slice(buf);
@@ -823,9 +819,7 @@ impl ReservedPayload {
 
     /// Companion to [`ReservedPayload::len`], required by
     /// `clippy::len_without_is_empty`. No sink needs it — every caller either
-    /// measures the payload or hands it to delivery — so it is dead in the
-    /// binary target, which does not compile the `_test_support` wrappers.
-    #[allow(dead_code)]
+    /// measures the payload or hands it to delivery.
     pub fn is_empty(&self) -> bool {
         self.bytes.is_empty()
     }
@@ -838,7 +832,6 @@ impl ReservedPayload {
 /// reservation; this probe exists so the undersized-charge refusal stays
 /// covered without opening a runtime-visible API.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn probe_preallocated_payload_capacity_guard_for_tests(
     ceiling: &'static RetainedByteCeiling,
 ) -> Result<(), String> {

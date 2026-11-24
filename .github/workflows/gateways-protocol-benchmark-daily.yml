@@ -1,0 +1,74 @@
+# Daily full-matrix run of gateways-protocol-benchmark.yml on the `main` tip.
+#
+# Why a separate dispatcher: the `benchmark` job of
+# gateways-protocol-benchmark.yml is frozen by the trusted Cross build policy,
+# and it reads its workload straight from `inputs.*`. A `schedule` trigger on
+# that workflow would run it with empty inputs (an empty `iterations` and
+# `duration`), and its steps cannot be edited to add defaults. This workflow
+# dispatches it instead, with the same inputs the earlier full `main` runs used
+# (30 s per payload size, 100 connections, 3 iterations, every protocol and
+# gateway, no baseline arm), so day-over-day runs stay comparable with them.
+#
+# A run started with GITHUB_TOKEN does not start other workflows, except
+# `workflow_dispatch` and `repository_dispatch`, so `actions: write` on this
+# job is enough. Everything runs on standard GitHub-hosted runners, which are
+# free for this public repository.
+#
+# The benchmark matrix takes about two hours on nine runners. A dispatch is
+# skipped while an earlier bot-dispatched benchmark run is still queued or in
+# progress, so a slow day never stacks a second matrix behind it.
+
+name: Gateways Protocol Benchmark (Daily)
+
+on:
+  schedule:
+    # Once a day, off the hour and clear of the other scheduled lanes.
+    - cron: "29 8 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gateways-protocol-benchmark-daily
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    name: Dispatch full benchmark on main
+    # Forks have no use for a daily benchmark and would only burn their quota.
+    if: github.repository == 'ferrum-edge/ferrum-edge'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      BENCH_WORKFLOW: gateways-protocol-benchmark.yml
+    steps:
+      - name: Skip while an earlier daily run is unfinished
+        id: guard
+        run: |
+          set -euo pipefail
+          busy=$(gh api "repos/${GH_REPO}/actions/workflows/${BENCH_WORKFLOW}/runs?event=workflow_dispatch&per_page=20" \
+            --jq '[.workflow_runs[]
+                   | select(.triggering_actor.login == "github-actions[bot]")
+                   | select(.status != "completed")] | length')
+          if [ "$busy" -gt 0 ]; then
+            echo "::notice::An earlier daily benchmark run is still unfinished; skipping today's dispatch."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Dispatch the full protocol matrix
+        if: steps.guard.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          gh workflow run "$BENCH_WORKFLOW" --ref main \
+            -f duration=30 \
+            -f concurrency=100 \
+            -f iterations=3
+          echo "Dispatched ${BENCH_WORKFLOW} on main (duration=30, concurrency=100, iterations=3, all protocols)." >> "$GITHUB_STEP_SUMMARY"

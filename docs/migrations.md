@@ -109,11 +109,6 @@ When Ferrum Edge starts in `database`, `cp`, or `migrate` mode, it runs the **Mi
 4. Checks which migrations have been applied
 5. Runs any pending migrations in order
 6. Records each applied migration with its version, name, timestamp, checksum, and execution time
-7. On MySQL only, probes identity-bearing column collations against
-   `utf8mb4_0900_bin` and emits a structured startup warning with exact
-   `ALTER TABLE ... CONVERT TO` remediation when a database
-   carries a stale collation (warn-and-continue; never refuses startup — see
-   [configuration.md → MySQL minimum version](configuration.md#mysql-minimum-version))
 
 The applied-version read happens after the lock is acquired. When two replicas
 start together, the waiter therefore observes the winner's committed tracking
@@ -574,22 +569,6 @@ manually inserting/deleting tracking rows, overwriting a stored checksum, or
 changing and re-running an already-applied migration. Ferrum intentionally
 provides no emergency bypass for this integrity check.
 
-### MySQL stale identity collation warning
-
-On MySQL, after migrations, Ferrum inspects Ferrum identity-bearing columns
-for `utf8mb4_0900_bin`. A structured `warn!` listing
-affected `table.column` pairs and the exact
-`ALTER TABLE <name> CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin`
-statements means an upgraded database still uses an older collation (for
-example `utf8mb4_general_ci` or `utf8mb4_0900_as_cs`). Until those ALTERs run,
-DB uniqueness can silently diverge from the runtime's byte-keyed indexes.
-Startup is not blocked. See
-[configuration.md → MySQL minimum version](configuration.md#mysql-minimum-version).
-
-### "Database has duplicate listen_path values"
-
-This is a data integrity error, not a migration error. It means two proxies in the database have the same `listen_path`. Fix this by removing or updating one of the conflicting proxies via the Admin API.
-
 ### Recovering from a failed migration
 
 If a migration fails partway through:
@@ -675,7 +654,7 @@ FERRUM_MODE=migrate \
 - **No junction tables**: SQL uses `proxy_plugins` — keyed `(namespace, proxy_id, plugin_config_id)` — to associate proxies with plugins. MongoDB embeds plugin associations directly in proxy documents.
 - **Composite document keys**: the `proxies`, `upstreams`, `plugin_configs`, `api_specs`, and `consumers` collections use `_id = "{namespace}:{id}"`, matching the SQL `PRIMARY KEY (namespace, id)`. Hand-written queries must build that key, not the bare resource id.
 - **No migration tracking table**: SQL tracks applied migrations in `_ferrum_migrations`. MongoDB indexes are idempotent and don't need tracking.
-- **Automatic field propagation**: New fields added to domain types (`Proxy`, `Consumer`, etc.) are automatically persisted to MongoDB via serde BSON serialization — no ALTER TABLE equivalent needed.
+- **Automatic field propagation**: New fields added to domain types (`Proxy`, `Consumer`, etc.) are automatically persisted to MongoDB via serde BSON serialization — no ALTER TABLE equivalent needed. See [mongodb.md](mongodb.md#adding-new-fields).
 
 ### MongoDB Custom Plugin Storage
 

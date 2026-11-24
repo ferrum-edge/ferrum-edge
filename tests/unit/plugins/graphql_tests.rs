@@ -2739,3 +2739,56 @@ async fn repeated_graphql_envelope_members_are_rejected() {
     let mut headers = make_graphql_headers();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
 }
+
+/// Issue #7152: `before_proxy` inspects the buffered body in place instead of
+/// copying it, and leaves `request_body` exactly as it found it for later
+/// plugins on every outcome.
+#[tokio::test]
+async fn before_proxy_leaves_the_request_body_metadata_in_place() {
+    let plugin = create_plugin(
+        "graphql",
+        &json!({ "max_depth": 3, "introspection_allowed": false }),
+    )
+    .unwrap()
+    .unwrap();
+    for (body, admitted) in [
+        (r#"{"query":"{ user { id } }"}"#, true),
+        (r#"{"query":"{ a { b { c { d } } } }"}"#, false),
+        (r#"{"query":"{ __schema { types { name } } }"}"#, false),
+        (r#"{"query":"{ ok }","query":"{ ok }"}"#, false),
+        (r#"[{"query":"{ ok }"}]"#, false),
+        ("not-valid-json{{{", false),
+    ] {
+        let mut ctx = create_raw_graphql_context(body);
+        let mut headers = make_graphql_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_eq!(matches!(result, PluginResult::Continue), admitted, "{body}");
+        assert_eq!(
+            ctx.metadata.get("request_body").map(String::as_str),
+            Some(body),
+            "request_body must be restored after the check: {body}"
+        );
+    }
+}
+
+/// Issue #7152: the single envelope parse refuses every non-object JSON
+/// document as uninspectable, as the separate `Value` parse did.
+#[tokio::test]
+async fn non_object_json_envelopes_are_uninspectable() {
+    let plugin = create_plugin("graphql", &json!({ "max_depth": 10 }))
+        .unwrap()
+        .unwrap();
+    for body in [
+        "null",
+        "true",
+        "42",
+        "-1.5e3",
+        r#""{ ok }""#,
+        "[]",
+        r#"[1,{"query":"{ ok }"}]"#,
+    ] {
+        let mut ctx = create_raw_graphql_context(body);
+        let mut headers = make_graphql_headers();
+        assert_uninspectable_reject(plugin.before_proxy(&mut ctx, &mut headers).await);
+    }
+}

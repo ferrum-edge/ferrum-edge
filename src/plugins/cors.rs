@@ -110,6 +110,17 @@ pub(crate) const MAX_ALLOWED_ORIGIN_ENTRIES: usize = 64;
 /// into every proxy's plugin cache.
 pub(crate) const MAX_ORIGIN_MATCHER_BYTES: usize = 512;
 
+/// Maximum number of entries in ONE `allowed_methods`, `allowed_headers`, or
+/// `exposed_headers` list. Like the origin list, these are scanned per
+/// cross-origin request, intersected pairwise when policies compose, and
+/// serialized into every allowed response, so they carry an explicit budget
+/// instead of inheriting only the gateway-wide plugin-config size cap. Shared
+/// with the Istio translator and the mesh validator.
+pub(crate) const MAX_CORS_TOKEN_LIST_ENTRIES: usize = 128;
+
+/// Maximum byte length of one method or header-name token in those lists.
+pub(crate) const MAX_CORS_TOKEN_BYTES: usize = 256;
+
 /// Compiled-program byte ceiling for one origin regex. The regex crate is
 /// finite-automaton based (no catastrophic backtracking), but an adversarial
 /// pattern can still compile to a very large program; bound it explicitly
@@ -170,7 +181,8 @@ const ORIGIN_REGEX_MOZ_EXTENSION_UNIVERSALITY_PROBES: &[&str] = &[
 pub(crate) enum OriginPolicyBreadth {
     /// Explicit allow-all: native `"*"` or Istio `{exact: "*"}`.
     Wildcard,
-    /// An opaque exact `null`, or a prefix/regex that admits every origin (or
+    /// An opaque exact `null`, a `*.suffix` wildcard whose suffix is a single
+    /// label or a public suffix, or a prefix/regex that admits every origin (or
     /// every origin of a scheme). Not the `AllowedOrigins::Wildcard` variant,
     /// but equivalent for credentialed reflection.
     EffectivelyUniversal,
@@ -189,6 +201,10 @@ pub(crate) enum OriginMatcherSpec<'a> {
     /// `null` is non-strict because unrelated sandboxed/file origins collapse
     /// to that same value.
     Exact(&'a str),
+    /// Native `*.suffix` wildcard-subdomain string, as configured (`*.` form).
+    /// An entry the wildcard validator refuses is not classified universal —
+    /// the caller already refused it at admission.
+    WildcardSubdomain(&'a str),
     Prefix(&'a str),
     /// Already-compiled regex (plugin construction).
     CompiledRegex(&'a Regex),
@@ -211,6 +227,12 @@ pub(crate) fn origin_matcher_breadth(spec: OriginMatcherSpec<'_>) -> OriginPolic
                 OriginPolicyBreadth::Strict
             }
         }
+        OriginMatcherSpec::WildcardSubdomain(pattern) => match validate_wildcard_origin(pattern) {
+            Ok(suffix) if wildcard_suffix_is_effectively_universal(&suffix) => {
+                OriginPolicyBreadth::EffectivelyUniversal
+            }
+            _ => OriginPolicyBreadth::Strict,
+        },
         OriginMatcherSpec::Prefix(prefix) => {
             if origin_prefix_is_effectively_universal(prefix) {
                 OriginPolicyBreadth::EffectivelyUniversal
@@ -238,6 +260,11 @@ pub(crate) fn origin_matcher_breadth(spec: OriginMatcherSpec<'_>) -> OriginPolic
 pub(crate) fn origin_matcher_spec_from_entry(origin: &Value) -> Option<OriginMatcherSpec<'_>> {
     match origin {
         Value::String(value) if value == "*" => Some(OriginMatcherSpec::AllowAll),
+        // Native plain strings starting with `*` are wildcard-subdomain
+        // patterns at plugin construction; classify them the same way here.
+        Value::String(value) if value.starts_with('*') => {
+            Some(OriginMatcherSpec::WildcardSubdomain(value))
+        }
         Value::String(value) => Some(OriginMatcherSpec::Exact(value)),
         Value::Object(map) => {
             if let Some(exact) = map.get("exact").and_then(Value::as_str) {
@@ -261,9 +288,284 @@ pub(crate) fn origin_matcher_spec_from_entry(origin: &Value) -> Option<OriginMat
 
 /// Whether one projected `allowed_origins` entry is wildcard or effectively
 /// universal. Shared Istio/mesh admission screen (issue #4269).
+///
+/// Istio translation deliberately screens with the reserved-name probe set
+/// only, not the host-pinning proof. A credentialed policy that is only
+/// unprovable (for example `^https://[a-z]{2,}\.com$`) is therefore still
+/// projected, and `cors` construction then refuses it. `cors` is registered
+/// fail-closed, so the reload is rejected and the last published policy keeps
+/// serving. Deferring it instead would publish the route with no CORS
+/// ownership, letting a backend's own permissive CORS headers through.
 pub(crate) fn allowed_origin_entry_is_non_strict(origin: &Value) -> bool {
-    origin_matcher_spec_from_entry(origin)
-        .is_some_and(|spec| origin_matcher_breadth(spec) != OriginPolicyBreadth::Strict)
+    // Projected entries never carry a compiled regex; `RegexPattern` is the
+    // only regex form `origin_matcher_spec_from_entry` returns.
+    origin_matcher_spec_from_entry(origin).is_some_and(|spec| match spec {
+        OriginMatcherSpec::RegexPattern(pattern) => compile_origin_regex(pattern)
+            .is_ok_and(|re| origin_regex_matches_universality_probes(&re)),
+        OriginMatcherSpec::WildcardSubdomain(_) => false,
+        other => origin_matcher_breadth(other) != OriginPolicyBreadth::Strict,
+    })
+}
+
+/// Whether a validated wildcard-subdomain suffix (`.example.com`, as stored
+/// by [`validate_wildcard_origin`]) admits hosts that anyone can register.
+///
+/// `*.com` or `*.co.uk` matches every site under a TLD or public registry
+/// suffix, and `*.github.io` every tenant of a shared hosting suffix, so for
+/// credentialed reflection they are as broad as `*`. A suffix is therefore
+/// strict only when it has at least two labels, is not itself a public suffix
+/// (ICANN or private section of the Public Suffix List), and is not the parent
+/// of a wildcard rule (`*.run.app` makes every `<x>.run.app` a public suffix,
+/// so `*.run.app` as an origin wildcard covers independent tenants). A suffix
+/// the list does not resolve is treated as universal (fail closed).
+///
+/// A domain with any PSL rule strictly beneath it (`amazonaws.com`, above
+/// `s3.amazonaws.com`) is universal too, because the wildcard covers that
+/// subtree's independent tenants. The `psl` crate exposes lookups only, so
+/// those ancestors come from a generated index of the same list
+/// (`cors_psl_ancestors.rs`).
+pub(crate) fn wildcard_suffix_is_effectively_universal(suffix: &str) -> bool {
+    let domain = suffix.strip_prefix('.').unwrap_or(suffix);
+    let domain = domain
+        .strip_suffix('.')
+        .unwrap_or(domain)
+        .to_ascii_lowercase();
+    if domain.is_empty() || !domain.contains('.') {
+        return true;
+    }
+    // A numeric final label is an IP-literal fragment (`1.1` in `*.1.1`), not
+    // a DNS suffix with a registrable owner.
+    if domain
+        .rsplit('.')
+        .next()
+        .is_none_or(|tld| tld.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return true;
+    }
+    if psl::suffix_str(&domain).is_none_or(|public_suffix| public_suffix == domain) {
+        return true;
+    }
+    if psl_ancestors::PSL_SUFFIX_ANCESTORS
+        .binary_search(&domain.as_str())
+        .is_ok()
+    {
+        return true;
+    }
+    let child = format!("{WILDCARD_RULE_PROBE_LABEL}.{domain}");
+    psl::suffix_str(&child).is_none_or(|public_suffix| public_suffix == child)
+}
+
+#[path = "cors_psl_ancestors.rs"]
+mod psl_ancestors;
+
+/// Label placed under a wildcard suffix to detect a PSL wildcard rule
+/// (`*.<domain>`) directly beneath it. Chosen so no exception rule names it.
+const WILDCARD_RULE_PROBE_LABEL: &str = "ferrum-psl-probe";
+
+/// Positive proof that every origin a regex admits has a host pinned to a
+/// registrable domain (or below one).
+///
+/// The pattern is parsed with `regex-syntax` and its literal **suffixes** are
+/// extracted: every match must end with one of them. Each must either be
+/// exact (the whole match, so the origin is fully literal), contain the scheme
+/// separator (`://host[:port]`, so the whole authority is literal), or carry,
+/// after its first `.`, a domain that [`wildcard_suffix_is_effectively_universal`]
+/// accepts as strict, optionally followed by a literal `:port`. The text
+/// before that first `.` may be extended to the left by the match, so it never
+/// counts: `[a-z]+example\.com` leaves only `com` and is refused, while
+/// `pr-[0-9]+\.preview\.example\.com` keeps `preview.example.com`. Anything
+/// else — an unbounded suffix set, a variable port, or a public suffix
+/// (`[a-z]{2,}\.com`) — is not provable and is classified non-strict. Finite host alternations
+/// such as `^https://(?:a|b)\.github\.io$` extract as exact literals and
+/// stay strict.
+fn origin_regex_host_is_provably_constrained(re: &Regex) -> bool {
+    use regex_syntax::hir::literal::{ExtractKind, Extractor};
+
+    let Ok(hir) = regex_syntax::ParserBuilder::new()
+        .nest_limit(ORIGIN_REGEX_NEST_LIMIT)
+        .build()
+        .parse(re.as_str())
+    else {
+        return false;
+    };
+    let suffix_proof = |hir: &regex_syntax::hir::Hir| {
+        let suffixes = Extractor::new().kind(ExtractKind::Suffix).extract(hir);
+        suffixes.literals().is_some_and(|literals| {
+            !literals.is_empty()
+                && literals.iter().all(|literal| {
+                    origin_suffix_literal_pins_host(literal.as_bytes(), literal.is_exact())
+                })
+        })
+    };
+    if suffix_proof(&hir) {
+        return true;
+    }
+    // A fixed DNS suffix followed by a variable numeric port
+    // (`[a-z]+\.example\.com:[0-9]+`): prove the host without the port.
+    if origin_regex_without_trailing_port(&hir).is_some_and(|stripped| suffix_proof(&stripped)) {
+        return true;
+    }
+    // A pattern whose every match STARTS with `scheme://host:` (or is a
+    // complete literal origin) also pins the host, whatever follows the port
+    // separator, e.g. `^https://app\.example\.com:[0-9]+$`.
+    let prefixes = Extractor::new().kind(ExtractKind::Prefix).extract(&hir);
+    prefixes.literals().is_some_and(|literals| {
+        !literals.is_empty()
+            && literals.iter().all(|literal| {
+                origin_prefix_literal_pins_host(literal.as_bytes(), literal.is_exact())
+            })
+    })
+}
+
+fn origin_prefix_literal_pins_host(bytes: &[u8], exact: bool) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    let Some((_, authority)) = text.split_once("://") else {
+        return false;
+    };
+    if exact {
+        return !authority.is_empty();
+    }
+    // Inexact: the complete host must be terminated by the port separator
+    // inside the literal, so nothing after it can extend the host. A
+    // bracketed IPv6 host ends at `]`; its inner colons are not separators.
+    let host_end = if authority.starts_with('[') {
+        match authority.find(']') {
+            Some(close) => close + 1,
+            None => return false,
+        }
+    } else {
+        match authority.find(':') {
+            Some(colon) => colon,
+            None => return false,
+        }
+    };
+    let (host, rest) = authority.split_at(host_end);
+    let host_ok = if let Some(inner) = host.strip_prefix('[') {
+        inner
+            .strip_suffix(']')
+            .is_some_and(|ip| ip.parse::<std::net::Ipv6Addr>().is_ok())
+    } else {
+        !host.is_empty()
+            && host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+    };
+    host_ok && rest.starts_with(':')
+}
+
+/// `hir` with a trailing variable port removed: `...:[0-9]+` or an optional
+/// `(?::[0-9]+)?` group at the end of the top-level concatenation (end
+/// anchors kept). Lets the suffix proof see the fixed host before the port.
+fn origin_regex_without_trailing_port(
+    hir: &regex_syntax::hir::Hir,
+) -> Option<regex_syntax::hir::Hir> {
+    use regex_syntax::hir::{Hir, HirKind, Literal};
+
+    fn unwrap_capture(hir: &Hir) -> &Hir {
+        match hir.kind() {
+            HirKind::Capture(capture) => unwrap_capture(&capture.sub),
+            _ => hir,
+        }
+    }
+    fn is_ascii_digit_class(hir: &Hir) -> bool {
+        match hir.kind() {
+            HirKind::Class(regex_syntax::hir::Class::Unicode(class)) => class
+                .ranges()
+                .iter()
+                .all(|range| range.start() >= '0' && range.end() <= '9'),
+            HirKind::Class(regex_syntax::hir::Class::Bytes(class)) => class
+                .ranges()
+                .iter()
+                .all(|range| range.start() >= b'0' && range.end() <= b'9'),
+            _ => false,
+        }
+    }
+    fn is_digit_run(hir: &Hir) -> bool {
+        match unwrap_capture(hir).kind() {
+            HirKind::Repetition(rep) => rep.min >= 1 && is_ascii_digit_class(&rep.sub),
+            _ => false,
+        }
+    }
+    fn is_optional_port(hir: &Hir) -> bool {
+        let HirKind::Repetition(rep) = unwrap_capture(hir).kind() else {
+            return false;
+        };
+        if rep.min != 0 || rep.max != Some(1) {
+            return false;
+        }
+        match unwrap_capture(&rep.sub).kind() {
+            HirKind::Concat(parts) => {
+                parts.len() == 2
+                    && matches!(parts[0].kind(), HirKind::Literal(Literal(bytes)) if &**bytes == b":")
+                    && is_digit_run(&parts[1])
+            }
+            _ => false,
+        }
+    }
+
+    let HirKind::Concat(items) = hir.kind() else {
+        return None;
+    };
+    let mut items: Vec<Hir> = items.to_vec();
+    let mut trailing_looks = Vec::new();
+    while items
+        .last()
+        .is_some_and(|last| matches!(last.kind(), HirKind::Look(_)))
+    {
+        trailing_looks.push(items.pop()?);
+    }
+    let last = items.last()?;
+    if is_optional_port(last) {
+        items.pop();
+    } else if is_digit_run(last) {
+        items.pop();
+        let previous = items.pop()?;
+        let HirKind::Literal(Literal(bytes)) = previous.kind() else {
+            return None;
+        };
+        let host_part = bytes.strip_suffix(b":")?;
+        if !host_part.is_empty() {
+            items.push(Hir::literal(host_part.to_vec()));
+        }
+    } else {
+        return None;
+    }
+    items.extend(trailing_looks.into_iter().rev());
+    Some(Hir::concat(items))
+}
+
+fn origin_suffix_literal_pins_host(bytes: &[u8], exact: bool) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    if let Some((_, authority)) = text.split_once("://") {
+        // The whole authority is literal: one host (and at most one port).
+        return !authority.is_empty();
+    }
+    if exact {
+        // A complete match with no scheme separator is not a host-bearing
+        // origin (for example the opaque `null`).
+        return false;
+    }
+    // The match may extend this literal to the left, so its first label is
+    // open-ended; everything after the first `.` is fixed and must be a domain
+    // that pins a registrable owner.
+    let Some((_, rest)) = text.split_once('.') else {
+        return false;
+    };
+    let host = match rest.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
+        Some(_) => return false,
+        None => rest,
+    };
+    !host.is_empty()
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+        && matches!(Host::parse(host), Ok(Host::Domain(_)))
+        && !wildcard_suffix_is_effectively_universal(host)
 }
 
 /// A prefix is strict only when it terminates at an origin boundary, i.e. it
@@ -307,6 +609,12 @@ pub(crate) fn origin_prefix_is_effectively_universal(prefix: &str) -> bool {
 /// probe in at least one scheme group. Bounded: the probe sets are fixed, the
 /// engine is finite-automaton based, and this runs once at config construction.
 pub(crate) fn origin_regex_is_effectively_universal(re: &Regex) -> bool {
+    origin_regex_matches_universality_probes(re) || !origin_regex_host_is_provably_constrained(re)
+}
+
+/// The reserved-name probe screen alone: matches `null` or every probe origin
+/// of one scheme.
+fn origin_regex_matches_universality_probes(re: &Regex) -> bool {
     // `null` represents every opaque origin (for example sandboxed documents
     // and local files), so admitting it with credentials is itself non-strict.
     let matches_all = |probes: &[&str]| probes.iter().all(|origin| re.is_match(origin));
@@ -323,6 +631,7 @@ const CORS_CONFIG_KEYS: &[&str] = &[
     "allowed_headers",
     "exposed_headers",
     "allow_credentials",
+    "allow_private_network",
     "max_age",
     "preflight_continue",
     "unmatched_preflights",
@@ -363,7 +672,13 @@ pub(crate) struct CorsRequestState {
     allowed_method_union: Option<CorsTokenSet>,
     allowed_headers: Option<CorsTokenSet>,
     allowed_header_union: Option<CorsTokenSet>,
-    exposed_headers: Option<Arc<Vec<String>>>,
+    exposed_headers: Option<CorsTokenSet>,
+    /// Every matching policy opted into Private Network Access (AND).
+    allow_private_network: bool,
+    /// The preflight carried `Access-Control-Request-Private-Network: true`.
+    /// Captured when the CORS chain runs so a later request mutation cannot
+    /// change the answer on a forwarded (`preflight_continue`) preflight.
+    private_network_requested: bool,
     max_age: Option<Option<u64>>,
     forward_preflight: bool,
     ignore_preflight: bool,
@@ -380,6 +695,7 @@ impl CorsRequestState {
             self.response_allowed = true;
             self.all_wildcard = true;
             self.allow_credentials = true;
+            self.allow_private_network = true;
         }
         self.policy_count += 1;
     }
@@ -388,6 +704,7 @@ impl CorsRequestState {
         self.sanitize_response = true;
         self.all_wildcard &= matches!(&plugin.allowed_origins, AllowedOrigins::Wildcard);
         self.allow_credentials &= plugin.allow_credentials;
+        self.allow_private_network &= plugin.allow_private_network;
         intersect_only(&mut self.exposed_headers, &plugin.exposed_headers);
         if is_preflight {
             intersect_values(
@@ -411,15 +728,15 @@ impl CorsRequestState {
     }
 }
 
-fn intersect_only(intersection: &mut Option<Arc<Vec<String>>>, values: &Arc<Vec<String>>) {
-    match intersection.take() {
-        None => *intersection = Some(Arc::clone(values)),
-        Some(existing) => {
-            let mut narrowed = existing.as_ref().clone();
-            narrowed.retain(|value| contains_ascii_case(values, value));
-            *intersection = Some(Arc::new(narrowed));
-        }
-    }
+/// Intersect without tracking a union (actual-request exposure policy). Uses
+/// the wildcard-aware [`CorsTokenSet::combine`], so an uncredentialed
+/// `exposed_headers: ["*"]` intersected with an explicit list keeps that list
+/// instead of collapsing to nothing.
+fn intersect_only(intersection: &mut Option<CorsTokenSet>, values: &CorsTokenSet) {
+    *intersection = Some(match intersection.take() {
+        None => values.clone(),
+        Some(existing) => existing.combine(values, true),
+    });
 }
 
 fn contains_ascii_case(values: &[String], candidate: &str) -> bool {
@@ -431,20 +748,26 @@ fn contains_ascii_case(values: &[String], candidate: &str) -> bool {
 #[derive(Debug, Clone, Copy)]
 enum CorsTokenKind {
     Method,
+    /// Preflight request header (`Access-Control-Allow-Headers`). The Fetch
+    /// wildcard never covers `Authorization`.
     Header,
+    /// Exposed response header (`Access-Control-Expose-Headers`). The Fetch
+    /// wildcard covers every name; there is no `Authorization` carve-out on
+    /// the response side.
+    ResponseHeader,
 }
 
 impl CorsTokenKind {
     fn contains(self, values: &[String], candidate: &str) -> bool {
         match self {
             Self::Method => values.iter().any(|value| value == candidate),
-            Self::Header => contains_ascii_case(values, candidate),
+            Self::Header | Self::ResponseHeader => contains_ascii_case(values, candidate),
         }
     }
 
     fn wildcard_covers(self, candidate: &str) -> bool {
         match self {
-            Self::Method => true,
+            Self::Method | Self::ResponseHeader => true,
             Self::Header => !candidate.eq_ignore_ascii_case("authorization"),
         }
     }
@@ -456,6 +779,10 @@ impl CorsTokenKind {
 #[derive(Debug, Clone)]
 struct CorsTokenSet {
     values: Arc<Vec<String>>,
+    /// Pre-joined header value (`", "`) when `*` is kept (or absent).
+    joined: Option<Arc<str>>,
+    /// Pre-joined header value (`", "`) with literal `"*"` filtered out.
+    joined_without_star: Option<Arc<str>>,
     kind: CorsTokenKind,
     wildcard: bool,
 }
@@ -463,8 +790,30 @@ struct CorsTokenSet {
 impl CorsTokenSet {
     fn new(values: Vec<String>, kind: CorsTokenKind, allow_credentials: bool) -> Self {
         let wildcard = !allow_credentials && values.iter().any(|value| value == "*");
+        let joined = if values.is_empty() {
+            None
+        } else {
+            Some(Arc::<str>::from(values.join(", ")))
+        };
+        let has_star = values.iter().any(|value| value == "*");
+        let joined_without_star = if !has_star {
+            joined.clone()
+        } else {
+            let filtered: Vec<&str> = values
+                .iter()
+                .map(String::as_str)
+                .filter(|value| *value != "*")
+                .collect();
+            if filtered.is_empty() {
+                None
+            } else {
+                Some(Arc::<str>::from(filtered.join(", ")))
+            }
+        };
         Self {
             values: Arc::new(values),
+            joined,
+            joined_without_star,
             kind,
             wildcard,
         }
@@ -484,34 +833,46 @@ impl CorsTokenSet {
                 values.push(value.clone());
             }
         }
+        let wildcard = if intersection {
+            self.wildcard && other.wildcard
+        } else {
+            self.wildcard || other.wildcard
+        };
+        // Defer serialization for request-time composed sets: the union is used
+        // only for membership checks and rejected preflights emit neither list.
         Self {
             values: Arc::new(values),
+            joined: None,
+            joined_without_star: None,
             kind: self.kind,
-            wildcard: if intersection {
-                self.wildcard && other.wildcard
-            } else {
-                self.wildcard || other.wildcard
-            },
+            wildcard,
         }
     }
 
-    fn response_value(&self, allow_credentials: bool) -> Option<String> {
+    fn response_value(&self, allow_credentials: bool) -> Option<std::borrow::Cow<'_, str>> {
         if self.values.is_empty() {
             return None;
         }
-        if self.wildcard || allow_credentials || !self.values.iter().any(|value| value == "*") {
-            return Some(self.values.join(", "));
+        if self.wildcard || allow_credentials {
+            if let Some(joined) = self.joined.as_deref() {
+                return Some(std::borrow::Cow::Borrowed(joined));
+            }
+            return Some(std::borrow::Cow::Owned(self.values.join(", ")));
         }
-        let values: Vec<&str> = self
-            .values
-            .iter()
-            .map(String::as_str)
-            .filter(|value| *value != "*")
-            .collect();
-        if values.is_empty() {
+        if let Some(joined) = self.joined_without_star.as_deref() {
+            return Some(std::borrow::Cow::Borrowed(joined));
+        }
+        let mut out = String::new();
+        for value in self.values.iter().filter(|value| *value != "*") {
+            if !out.is_empty() {
+                out.push_str(", ");
+            }
+            out.push_str(value);
+        }
+        if out.is_empty() {
             None
         } else {
-            Some(values.join(", "))
+            Some(std::borrow::Cow::Owned(out))
         }
     }
 }
@@ -611,7 +972,13 @@ fn origin_pattern_breadth(pattern: &OriginPattern) -> OriginPolicyBreadth {
         OriginPattern::Exact(value) | OriginPattern::LiteralExact(value) => {
             OriginMatcherSpec::Exact(value)
         }
-        OriginPattern::WildcardSubdomain(_) => return OriginPolicyBreadth::Strict,
+        OriginPattern::WildcardSubdomain(suffix) => {
+            return if wildcard_suffix_is_effectively_universal(suffix) {
+                OriginPolicyBreadth::EffectivelyUniversal
+            } else {
+                OriginPolicyBreadth::Strict
+            };
+        }
         OriginPattern::Prefix(prefix) => OriginMatcherSpec::Prefix(prefix),
         OriginPattern::Regex(re) => OriginMatcherSpec::CompiledRegex(re),
     };
@@ -627,8 +994,9 @@ pub struct CorsPlugin {
     allowed_origins: AllowedOrigins,
     allowed_methods: CorsTokenSet,
     allowed_headers: CorsTokenSet,
-    exposed_headers: Arc<Vec<String>>,
+    exposed_headers: CorsTokenSet,
     allow_credentials: bool,
+    allow_private_network: bool,
     max_age: Option<u64>,
     preflight_continue: bool,
     unmatched_preflights: UnmatchedPreflights,
@@ -695,8 +1063,9 @@ impl CorsPlugin {
             Self::parse_string_array(config, "exposed_headers", &[], true, validate_header_name)?;
 
         let mut allow_credentials = bool_config(config, "allow_credentials", false)?;
+        let allow_private_network = bool_config(config, "allow_private_network", false)?;
         let max_age = match object.get("max_age") {
-            Some(_) => Some(u64_config(config, "max_age", 86400)?),
+            Some(value) => Some(u64_value(value, "max_age")?),
             None if istio_semantics => None,
             None => Some(86400),
         };
@@ -727,11 +1096,13 @@ impl CorsPlugin {
                 OriginPolicyBreadth::EffectivelyUniversal => {
                     return Err(
                         "cors: allow_credentials=true is incompatible with an effectively \
-                         universal origin matcher (the opaque exact `null` origin, a prefix \
+                         universal origin matcher (the opaque exact `null` origin, a `*.suffix` \
+                         wildcard whose suffix is a single label or a public suffix such as \
+                         `*.com` or `*.co.uk`, a prefix \
                          that does not terminate at an origin boundary — only a \
                          `scheme://host:` prefix pins the host, because prefix matching is an \
                          unbounded starts_with — or a regex that admits every origin of a \
-                         scheme); specify a host-constraining origin policy to use credentials"
+                         scheme or every host under a public suffix); specify a host-constraining origin policy to use credentials"
                             .to_string(),
                     );
                 }
@@ -751,8 +1122,13 @@ impl CorsPlugin {
                 CorsTokenKind::Header,
                 allow_credentials,
             ),
-            exposed_headers: Arc::new(exposed_headers),
+            exposed_headers: CorsTokenSet::new(
+                exposed_headers,
+                CorsTokenKind::ResponseHeader,
+                allow_credentials,
+            ),
             allow_credentials,
+            allow_private_network,
             max_age,
             preflight_continue,
             unmatched_preflights,
@@ -970,6 +1346,7 @@ impl CorsPlugin {
                 if arr.is_empty() && !allow_empty {
                     return Err(format!("cors: `{key}` must contain at least one value"));
                 }
+                validate_token_list_count(key, arr.len())?;
                 let mut values = Vec::with_capacity(arr.len());
                 for value in arr {
                     let value = value.as_str().ok_or_else(|| {
@@ -1052,8 +1429,16 @@ impl Plugin for CorsPlugin {
         "cors"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::CORS
+    }
+
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::ON_REQUEST_RECEIVED | crate::plugins::PluginHooks::AFTER_PROXY
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
@@ -1094,6 +1479,12 @@ impl Plugin for CorsPlugin {
             ctx.method == "OPTIONS" && ctx.headers.contains_key("access-control-request-method");
 
         ctx.cors_state.begin_policy(is_preflight);
+        if is_preflight {
+            ctx.cors_state.private_network_requested = ctx
+                .headers
+                .get("access-control-request-private-network")
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"));
+        }
         let origin_allowed = self.is_origin_allowed(origin);
         if !is_preflight {
             if !origin_allowed {
@@ -1233,8 +1624,16 @@ impl Plugin for CorsFinalizer {
         CORS_FINALIZER_NAME
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         self.priority
+    }
+
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::ON_REQUEST_RECEIVED | crate::plugins::PluginHooks::AFTER_PROXY
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
@@ -1400,12 +1799,9 @@ fn finalize_cors_response(
         return PluginResult::Continue;
     }
 
-    let cors_headers = cors_headers(ctx, ctx.cors_state.is_preflight);
-    for (name, value) in cors_headers {
-        if name != "vary" {
-            response_headers.insert(name, value);
-        }
-    }
+    // Write CORS headers directly into `response_headers` without allocating a
+    // throwaway HashMap or a duplicate `Vary` header (already merged above).
+    write_cors_headers_into(ctx, ctx.cors_state.is_preflight, false, response_headers);
     PluginResult::Continue
 }
 
@@ -1416,10 +1812,20 @@ fn record_matched_origin(ctx: &mut RequestContext, origin: String) {
 }
 
 fn cors_headers(ctx: &RequestContext, preflight: bool) -> HashMap<String, String> {
+    let mut headers = HashMap::with_capacity(if preflight { 8 } else { 4 });
+    write_cors_headers_into(ctx, preflight, true, &mut headers);
+    headers
+}
+
+fn write_cors_headers_into(
+    ctx: &RequestContext,
+    preflight: bool,
+    include_vary: bool,
+    headers: &mut HashMap<String, String>,
+) {
     let state = &ctx.cors_state;
-    let mut headers = HashMap::new();
     let Some(origin) = state.matched_origin.as_ref() else {
-        return headers;
+        return;
     };
 
     headers.insert(
@@ -1439,11 +1845,11 @@ fn cors_headers(ctx: &RequestContext, preflight: bool) -> HashMap<String, String
     if let Some(exposed) = state
         .exposed_headers
         .as_ref()
-        .filter(|values| !values.is_empty())
+        .and_then(|values| values.response_value(state.allow_credentials))
     {
         headers.insert(
             "access-control-expose-headers".to_string(),
-            exposed.join(", "),
+            exposed.into_owned(),
         );
     }
     if preflight {
@@ -1452,25 +1858,42 @@ fn cors_headers(ctx: &RequestContext, preflight: bool) -> HashMap<String, String
             .as_ref()
             .and_then(|values| values.response_value(state.allow_credentials))
         {
-            headers.insert("access-control-allow-methods".to_string(), methods);
+            headers.insert(
+                "access-control-allow-methods".to_string(),
+                methods.into_owned(),
+            );
         }
         if let Some(allowed) = state
             .allowed_headers
             .as_ref()
             .and_then(|values| values.response_value(state.allow_credentials))
         {
-            headers.insert("access-control-allow-headers".to_string(), allowed);
+            headers.insert(
+                "access-control-allow-headers".to_string(),
+                allowed.into_owned(),
+            );
         }
         if let Some(Some(max_age)) = state.max_age {
             headers.insert("access-control-max-age".to_string(), max_age.to_string());
         }
+        // Private Network Access opt-in: only on a preflight that asked for it,
+        // and only when every matching policy enabled `allow_private_network`.
+        // The backend's own field is always stripped first, so this is the
+        // only way the response can carry it.
+        if state.allow_private_network && state.private_network_requested {
+            headers.insert(
+                "access-control-allow-private-network".to_string(),
+                "true".to_string(),
+            );
+        }
     }
 
-    headers.insert(
-        "vary".to_string(),
-        merge_vary_tokens(None, cors_vary_tokens(preflight)),
-    );
-    headers
+    if include_vary {
+        headers.insert(
+            "vary".to_string(),
+            merge_vary_tokens(None, cors_vary_tokens(preflight)),
+        );
+    }
 }
 
 fn cors_vary_tokens(preflight: bool) -> &'static [&'static str] {
@@ -1511,9 +1934,38 @@ fn merge_vary_tokens(existing: Option<&str>, required: &[&str]) -> String {
 /// admission the plugin applies at construction, so a policy that passes those
 /// boundaries can never fail `CorsPlugin` construction later. Do not fork.
 pub(crate) fn validate_method(key: &str, value: &str) -> Result<(), String> {
+    validate_token_len(key, value)?;
     Method::from_bytes(value.as_bytes())
         .map(|_| ())
         .map_err(|_| format!("cors: `{key}` contains an invalid HTTP method: {value:?}"))
+}
+
+/// Shared bound on how many entries one `allowed_methods` / `allowed_headers` /
+/// `exposed_headers` list may carry ([`MAX_CORS_TOKEN_LIST_ENTRIES`]).
+/// `pub(crate)` for the same reason as [`validate_method`]: the Istio
+/// translator and the native/file mesh validator admit against this exact
+/// predicate. Do not fork.
+pub(crate) fn validate_token_list_count(key: &str, count: usize) -> Result<(), String> {
+    if count > MAX_CORS_TOKEN_LIST_ENTRIES {
+        return Err(format!(
+            "cors: `{key}` must contain at most {MAX_CORS_TOKEN_LIST_ENTRIES} entries, got: {count}"
+        ));
+    }
+    Ok(())
+}
+
+/// Byte bound for one method/header token ([`MAX_CORS_TOKEN_BYTES`]). Applied
+/// inside [`validate_method`] and [`validate_header_name`] so every boundary
+/// that shares those predicates enforces it. The diagnostic reports only the
+/// length, never the supplied value.
+fn validate_token_len(key: &str, value: &str) -> Result<(), String> {
+    if value.len() > MAX_CORS_TOKEN_BYTES {
+        return Err(format!(
+            "cors: `{key}` entries must be at most {MAX_CORS_TOKEN_BYTES} bytes (got {} bytes)",
+            value.len()
+        ));
+    }
+    Ok(())
 }
 
 /// Shared bound on how many `allowed_origins` entries one policy may carry.
@@ -1626,6 +2078,7 @@ pub(crate) fn compile_origin_regex(pattern: &str) -> Result<Regex, String> {
 
 /// Shared admission gate — see [`validate_method`].
 pub(crate) fn validate_header_name(key: &str, value: &str) -> Result<(), String> {
+    validate_token_len(key, value)?;
     HeaderName::from_bytes(value.as_bytes())
         .map(|_| ())
         .map_err(|_| format!("cors: `{key}` contains an invalid HTTP header name: {value:?}"))
@@ -1747,9 +2200,11 @@ fn split_raw_authority(origin: &str) -> Option<(&str, &str)> {
     Some(authority_and_path.split_at(authority_end))
 }
 
+/// `null` values are refused up front in [`CorsPlugin::new`], so an absent key
+/// is the only way to select `default`.
 fn bool_config(config: &Value, key: &str, default: bool) -> Result<bool, String> {
     match config.get(key) {
-        None | Some(Value::Null) => Ok(default),
+        None => Ok(default),
         Some(Value::Bool(value)) => Ok(*value),
         Some(other) => Err(format!(
             "cors: `{key}` must be a boolean, got: {other:?}",
@@ -1758,13 +2213,12 @@ fn bool_config(config: &Value, key: &str, default: bool) -> Result<bool, String>
     }
 }
 
-fn u64_config(config: &Value, key: &str, default: u64) -> Result<u64, String> {
-    match config.get(key) {
-        None | Some(Value::Null) => Ok(default),
-        Some(Value::Number(value)) => value
+fn u64_value(value: &Value, key: &str) -> Result<u64, String> {
+    match value {
+        Value::Number(value) => value
             .as_u64()
             .ok_or_else(|| format!("cors: `{key}` must be a non-negative integer")),
-        Some(other) => Err(format!(
+        other => Err(format!(
             "cors: `{key}` must be a non-negative integer, got: {other:?}",
             other = other.to_string()
         )),
@@ -1816,4 +2270,33 @@ fn ascii_ends_with_ignore_case(value: &str, suffix: &str) -> bool {
         .iter()
         .zip(suffix.iter())
         .all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+#[cfg(test)]
+mod psl_ancestor_index_tests {
+    use super::psl_ancestors::PSL_SUFFIX_ANCESTORS;
+
+    #[test]
+    fn ancestor_index_is_sorted_lowercase_ascii_and_not_itself_a_suffix() {
+        assert!(
+            PSL_SUFFIX_ANCESTORS
+                .windows(2)
+                .all(|pair| pair[0] < pair[1]),
+            "index must be strictly sorted for binary search"
+        );
+        for domain in PSL_SUFFIX_ANCESTORS {
+            assert!(
+                domain.bytes().all(|b| b.is_ascii_lowercase()
+                    || b.is_ascii_digit()
+                    || b == b'-'
+                    || b == b'.'),
+                "{domain}"
+            );
+            assert_ne!(
+                psl::suffix_str(domain),
+                Some(*domain),
+                "{domain} is itself a public suffix; regenerate the index"
+            );
+        }
+    }
 }

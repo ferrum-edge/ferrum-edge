@@ -20,12 +20,12 @@
 //! the request/response wide-charset decoding parity table, which needs the WAF
 //! plugin surface.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, LazyLock};
 
-use ferrum_edge::circuit_breaker::CircuitBreaker;
+use ferrum_edge::circuit_breaker::{BreakerOutcome, CircuitBreaker, ProbeTicket};
 use ferrum_edge::config::types::{CircuitBreakerConfig, Proxy, UpstreamTarget};
 use ferrum_edge::config::{BackendEgressPolicy, EnvConfig, PoolConfig};
 use ferrum_edge::connection_pool::ConnectionPool;
@@ -37,6 +37,123 @@ use ferrum_edge::service_discovery::filter_discovered_targets;
 use ferrum_edge::tls::backend::SvidGenerationMatcher;
 use ferrum_edge::util::sharding::pool_shard_amount;
 use serde_json::json;
+
+/// Issue #6902: history reads and accepted recording must share the epoch's
+/// publication boundary on every sibling config path. Pin the private cold
+/// path without timer races or production-visible pause hooks.
+#[test]
+fn every_config_publication_commits_jwt_history_under_the_same_lock() {
+    let proxy = source("src/proxy/mod.rs");
+    let function_body = |signature: &str| {
+        proxy
+            .split(signature)
+            .nth(1)
+            .and_then(|rest| rest.split("\n    }\n").next())
+            .unwrap_or_else(|| panic!("missing function {signature}"))
+    };
+    for (signature, publications) in [
+        ("fn update_config_with_mesh_ids(", 3),
+        ("async fn apply_incremental_inner(", 1),
+    ] {
+        let body = function_body(signature);
+        let sites: Vec<_> = body
+            .split("self.publish_request_epoch_with_gateway_trust(")
+            .skip(1)
+            .collect();
+        assert_eq!(sites.len(), publications, "{signature}");
+        for site in sites {
+            let (arguments, _) = site
+                .split_once("&jwt_shared,")
+                .expect("publication receives JWT records");
+            assert!(
+                !arguments.contains('|'),
+                "{signature}: pass the records before the staging/mirror closures"
+            );
+        }
+    }
+    let full = function_body("fn update_config_with_mesh_ids(");
+    assert!(full.contains("Configuration changed during empty snapshot staging"));
+
+    let mut publication = function_body("fn publish_request_epoch_with_gateway_trust(");
+    for step in [
+        ".gateway_trust_publication_lock",
+        ".jwt_shared_secret_history",
+        "history.contains(&consumer.namespace, secret)",
+        ".update_config_with_trust(staging, build, mirror)?",
+        "history.merge(jwt_shared)",
+        "drop(history)",
+    ] {
+        publication = publication
+            .split_once(step)
+            .unwrap_or_else(|| panic!("publication must perform {step} in order"))
+            .1;
+    }
+}
+
+#[test]
+fn request_transformer_header_outcomes_share_every_dispatch_boundary() {
+    // Behavioral tests cover both helper shapes; this inventory pins their
+    // placement after initial/deferred header hooks on H1/H2 and H3. Post-body
+    // finalized-egress overlays retire digests without relabeling body outcomes.
+    let proxy = source("src/proxy/mod.rs");
+    let h3 = source("src/http3/server.rs");
+    for (text, signature) in [
+        (proxy.as_str(), "async fn handle_proxy_request_inner("),
+        (h3.as_str(), "async fn handle_h3_request("),
+    ] {
+        let dispatcher = item_body(text, signature, "\n}");
+        let wire = dispatcher.find("ctx.set_raw_headers(").unwrap();
+        let hooks = dispatcher
+            .find("BackendPathBeforeProxyPass::Initial")
+            .unwrap();
+        let boundary = dispatcher
+            .find("finalize_request_transformer_headers(&mut ctx, &mut owned_proxy_headers)")
+            .unwrap();
+        assert!(wire < hooks && hooks < boundary, "{signature}");
+    }
+    let h1_dispatcher = item_body(&proxy, "async fn handle_proxy_request_inner(", "\n}");
+    assert_eq!(
+        h1_dispatcher
+            .matches("finalize_request_transformer_headers(&mut ctx,")
+            .count(),
+        3
+    );
+    let h3_dispatcher = item_body(&h3, "async fn handle_h3_request(", "\n}");
+    assert_eq!(
+        h3_dispatcher
+            .matches("finalize_request_transformer_headers_in_map(")
+            .count(),
+        2
+    );
+    for (signature, required) in [
+        (
+            "pub(crate) fn apply_finalized_request_egress_header_overlay(",
+            "retire_stale_request_integrity_headers(ctx, owned_proxy_headers)",
+        ),
+        (
+            "pub(crate) fn apply_finalized_request_egress_header_overlay_in_map(",
+            "retire_stale_request_integrity_headers_in_map(ctx, headers)",
+        ),
+    ] {
+        let overlay = item_body(&proxy, signature, "\n}");
+        assert!(overlay.contains(required), "{signature}");
+        assert!(
+            !overlay.contains("finalize_request_transformer_headers"),
+            "{signature}"
+        );
+    }
+    for signature in [
+        "pub(crate) fn retire_stale_request_integrity_headers(",
+        "pub(crate) fn retire_stale_request_integrity_headers_in_map(",
+    ] {
+        let retirement = item_body(&proxy, signature, "\n}");
+        assert!(
+            !retirement.contains("record_body_rule_header_skip"),
+            "{signature}"
+        );
+        assert!(!retirement.contains("&mut RequestContext"), "{signature}");
+    }
+}
 
 #[test]
 fn every_startup_failure_site_renders_the_sanitized_cause_chain() {
@@ -312,11 +429,11 @@ const DIRECT_PROBE_ADMISSION_SITES: &[(&str, &str, usize)] = &[
 ];
 
 /// What each direct-cache admission arm must contain, whitespace-stripped: the
-/// guard is bound to the generation that SAME admission returned (#6177).
-const DIRECT_ADMISSION_ARM: &str = "Ok((cb,is_half_open_probe,admission_generation))";
-const DIRECT_ADMISSION_GUARD: &str =
-    "HalfOpenProbeGuard::for_admitted_probe(&cb,is_half_open_probe,admission_generation";
-const DIRECT_ADMISSION_REARM: &str = "cb_probe.rearm(&cb,is_half_open_probe,admission_generation";
+/// guard owns the `ProbeTicket` that SAME admission returned, so the slot and
+/// its open generation travel as one value (#6177, CB-1).
+const DIRECT_ADMISSION_ARM: &str = "Ok((cb,probe_ticket,_admission_generation))";
+const DIRECT_ADMISSION_GUARD: &str = "HalfOpenProbeGuard::for_admitted_probe(&cb,probe_ticket";
+const DIRECT_ADMISSION_REARM: &str = "cb_probe.rearm(&cb,probe_ticket";
 
 /// Files that must own a guard rather than re-deriving the release: the
 /// admission sites plus every module they hand the guard to.
@@ -332,27 +449,28 @@ const PROBE_GUARD_HOLDERS: &[&str] = &[
 ];
 
 /// Every settle path on the shared guard:
-/// `(label, signature, terminator, neutral release it must reach)`. The guard's
-/// own releases are bound to the slot's admission generation (#6177), so a guard
-/// that outlives a reopen cannot free a later cycle's slot.
+/// `(label, signature, terminator, neutral release it must reach)`. Each release
+/// settles the admission's `ProbeTicket`, whose generation the breaker checks
+/// in the releasing CAS (#6177, CB-1), so a guard or recorder that outlives a
+/// reopen cannot free a later cycle's slot.
 const PROBE_GUARD_SETTLE_PATHS: &[(&str, &str, &str, &str)] = &[
     (
         "explicit gateway-side refusal",
         "    pub fn release_neutral(&self) {",
         "\n    }\n",
-        "record_neutral_for_admission(true, self.admission_generation)",
+        "cb.settle(ticket, BreakerOutcome::Neutral)",
     ),
     (
         "dropped future (client disconnect)",
         "impl Drop for HalfOpenProbeGuard {",
         "\n}\n",
-        "record_neutral_for_admission(true, self.admission_generation)",
+        "cb.settle(ticket, BreakerOutcome::Neutral)",
     ),
     (
         "gRPC streaming recorder handoff",
         "impl Drop for GrpcStreamingProbeRecorder {",
         "\n}\n",
-        "record_neutral(",
+        "self.cb.settle(self.ticket, BreakerOutcome::Neutral)",
     ),
 ];
 
@@ -471,21 +589,220 @@ fn every_probe_guard_settle_path_releases_neutrally() {
 #[test]
 fn taking_the_probe_slot_is_what_disarms_the_guard() {
     // The exactly-once property the whole design rests on: every explicit
-    // `record_*` argument comes from `take_slot`, which atomically clears the
-    // armed flag, so no path can release the same slot twice (a double release
+    // `settle` ticket comes from `take_slot`, which atomically clears the held
+    // ticket, so no path can release the same slot twice (a double release
     // decrements a DIFFERENT probe's slot and over-admits).
     let text = source("src/proxy/mod.rs");
-    let take = item_body(&text, "    pub fn take_slot(&self) -> bool {", "\n    }\n");
+    let take = item_body(
+        &text,
+        "    pub fn take_slot(&self) -> ProbeTicket {",
+        "\n    }\n",
+    );
     assert!(
-        take.contains("self.armed.swap(false"),
-        "`take_slot` must atomically clear the armed flag as it hands the slot over"
+        take.contains("self.slot.swap(0"),
+        "`take_slot` must atomically clear the held ticket as it hands the slot over"
     );
     let drop_body = item_body(&text, "impl Drop for HalfOpenProbeGuard {", "\n}\n");
     assert!(
-        drop_body.contains("self.armed.swap(false"),
+        drop_body.contains("self.slot.swap(0"),
         "the guard's `Drop` must claim the slot with the same atomic swap so it \
          cannot race an explicit release"
     );
+}
+
+/// Issue #6799: only admission (`CircuitBreakerCache::can_execute`, inside
+/// `src/circuit_breaker.rs`) may resolve — and, on a config change, replace — a
+/// cached breaker. Every completion settles on the breaker instance its
+/// admission returned (`HalfOpenProbeGuard`), checked for identity with
+/// `CircuitBreakerCache::is_current`, so a request's captured config can never
+/// replace live state or settle on an instance it never ran against.
+///
+/// Receiver-agnostic: ANY `.get_or_create(` / `::get_or_create(` call outside
+/// `src/circuit_breaker.rs` fails, whatever the receiver is called and however
+/// rustfmt breaks the line. Identifiers that merely start with the name
+/// (`get_or_create_sender(`) do not match.
+#[test]
+fn no_breaker_completion_path_uses_the_replacing_lookup() {
+    for (path, text) in production_sources() {
+        if path == "src/circuit_breaker.rs" {
+            continue;
+        }
+        let production: String = without_inline_test_module(&text)
+            .split_whitespace()
+            .collect();
+        for replacing in [".get_or_create(", "::get_or_create("] {
+            assert!(
+                !production.contains(replacing),
+                "{path} calls `{replacing}`; completions must settle on the breaker their \
+                 admission returned (`HalfOpenProbeGuard::current_breaker` / `settle`), and \
+                 only admissions (`can_execute`) may resolve a breaker"
+            );
+        }
+    }
+    let shared_recorder = source("src/proxy/backend_dispatch.rs");
+    let recorder: String = item_body(
+        &shared_recorder,
+        "fn record_backend_outcome_inner(",
+        "\n}\n",
+    )
+    .split_whitespace()
+    .collect();
+    assert!(
+        recorder.contains("cb_settlement.breaker")
+            && recorder.contains("circuit_breaker_cache.is_current("),
+        "the shared ordinary-completion recorder must settle on the admitting breaker, \
+         checked for identity with `is_current`"
+    );
+}
+
+/// Issue #6799 (sibling): every HTTP/3 native and cross-protocol retry loop
+/// admits each retry attempt through the breaker of the target it will dial,
+/// in the H1/H2 retry loops' order: AFTER the backoff sleep (so no probe slot is
+/// held across it and a cooldown that ends during it admits the retry as a
+/// recovery probe) and after the rotated target's policy/transport screens,
+/// immediately before the attempt is handed on. Without it a rotated target that
+/// was never admitted has no cached breaker, so its failures never open it.
+///
+/// `(file, function, admissions, screens that must precede each admission
+/// since its backoff, what must follow it before the next backoff)`.
+type RetryAdmissionSite = (
+    &'static str,
+    &'static str,
+    usize,
+    &'static [&'static str],
+    &'static str,
+);
+const RETRY_ADMISSION_SITES: &[RetryAdmissionSite] = &[
+    // Native H3 buffered retry loop.
+    (
+        "src/http3/server.rs",
+        "async fn handle_h3_request(",
+        1,
+        &[
+            "denied_literal_backend_or_dns_override(",
+            "h3_bridge_transport_refusal(",
+        ],
+        "run_h3_backend_admission_or_send_reject(",
+    ),
+    // H3 -> HTTP plain bridge: mesh arm plus the reqwest success / error arms.
+    // Each arm keeps the attempt it is about to replace until the admission,
+    // so a refusal can serve it; the next attempt starts at `continue`.
+    (
+        "src/http3/cross_protocol.rs",
+        "async fn dispatch_plain<S>(",
+        3,
+        &[],
+        "continue;",
+    ),
+    // H3 -> gRPC bridge buffered retry loop.
+    (
+        "src/http3/cross_protocol.rs",
+        "async fn dispatch_grpc<S>(",
+        1,
+        &["resolve_h3_grpc_transport("],
+        "run_cross_protocol_backend_admission_or_reject(",
+    ),
+];
+
+#[test]
+fn every_http3_retry_loop_admits_each_attempt_through_the_circuit_breaker() {
+    let call = "crate::proxy::admit_retry_attempt(";
+    let backoff = "tokio::time::sleep(delay)";
+    for &(file, signature, expected, screens, handoff) in RETRY_ADMISSION_SITES {
+        let text = source(file);
+        let body: String = item_body(&text, signature, "\n}\n")
+            .split_whitespace()
+            .collect();
+        let admissions: Vec<usize> = body.match_indices(call).map(|(at, _)| at).collect();
+        assert_eq!(
+            admissions.len(),
+            expected,
+            "{file} `{signature}` must admit every retry attempt through the breaker"
+        );
+        for at in admissions {
+            let args = body[at + call.len()..]
+                .split_once("cb_probe")
+                .map(|(args, _)| args);
+            assert!(
+                args.is_some_and(|args| args.len() < 80),
+                "{file} `{signature}`: each retry admission must re-point the request's \
+                 probe guard (`cb_probe`)"
+            );
+            let slept = body[..at]
+                .rfind(backoff)
+                .unwrap_or_else(|| panic!("{file} `{signature}`: admission precedes any backoff"));
+            let since_backoff = &body[slept..at];
+            assert!(
+                !since_backoff.contains("continue;") && !since_backoff.contains("retry_delay("),
+                "{file} `{signature}`: the admission must follow THIS attempt's backoff"
+            );
+            for screen in screens {
+                assert!(
+                    since_backoff.contains(screen),
+                    "{file} `{signature}`: `{screen}` must screen the rotated target \
+                     before the breaker admits it"
+                );
+            }
+            let after = &body[at..];
+            let next_backoff = after.find(backoff).unwrap_or(after.len());
+            assert!(
+                after[..next_backoff].contains(handoff),
+                "{file} `{signature}`: `{handoff}` must follow the admission before the \
+                 next backoff"
+            );
+        }
+    }
+    let admission = source("src/proxy/mod.rs");
+    let helper = item_body(&admission, "pub(crate) fn admit_retry_attempt(", "\n}\n");
+    assert!(helper.contains("circuit_breaker_cache.can_execute("));
+    assert!(helper.contains("cb_probe.rearm(&cb, probe_ticket)"));
+    assert!(helper.contains("cb_probe.retire()"));
+}
+
+/// Issue #6799 (sibling): the synchronous fallbacks that record a deferred
+/// streaming outcome whose body an `after_proxy` reject replaced must record it
+/// on the admitting breaker, through the one shared helper. An empty
+/// `BreakerSettlement` there silently drops the only breaker record the
+/// attempt gets. Every production recorder call that passes an empty
+/// settlement must also skip the breaker outright.
+#[test]
+fn replaced_streaming_outcomes_record_on_the_admitting_breaker() {
+    let proxy = source("src/proxy/mod.rs");
+    let production = without_inline_test_module(&proxy);
+    assert_eq!(
+        production
+            .matches("backend_dispatch::record_replaced_streaming_outcome(")
+            .count(),
+        2,
+        "the H1/H2 streaming and the buffered-request gRPC after_proxy fallbacks"
+    );
+    let helper_source = source("src/proxy/backend_dispatch.rs");
+    let helper = item_body(
+        &helper_source,
+        "pub(crate) fn record_replaced_streaming_outcome(",
+        "\n}\n",
+    );
+    assert!(helper.contains("cb_probe.settlement_without_slot()"));
+
+    for (path, text) in production_sources() {
+        let production: String = without_inline_test_module(&text)
+            .split_whitespace()
+            .collect();
+        for call in production
+            .split("record_backend_outcome_no_conn_end(")
+            .skip(1)
+        {
+            // The call's own arguments end at its closing `);`.
+            let args = call.split(");").next().unwrap_or_default();
+            if let Some((_, after_empty)) = args.split_once("BreakerSettlement::none(),") {
+                assert!(
+                    after_empty.starts_with("true,"),
+                    "{path}: a recorder call with an empty settlement must skip the breaker \
+                     (`true`); pass the attempt guard's settlement instead"
+                );
+            }
+        }
+    }
 }
 
 fn probe_breaker_config() -> CircuitBreakerConfig {
@@ -532,10 +849,30 @@ fn record_probe_neutral(cb: &CircuitBreaker) {
     cb.record_neutral(true);
 }
 
-fn record_probe_neutral_for_admission(cb: &CircuitBreaker) {
-    // `breaker_holding_one_probe` admits with no concurrent transition, so the
-    // current generation is the probe's admission generation.
-    cb.record_neutral_for_admission(true, cb.open_epoch());
+/// The probe's own ticket. `breaker_holding_one_probe` admits with no
+/// concurrent transition, so the current generation is the admission's.
+fn admitted_probe_ticket(cb: &CircuitBreaker) -> ProbeTicket {
+    ProbeTicket::Probe {
+        generation: u32::try_from(cb.open_epoch()).expect("generation is a u32 field"),
+    }
+}
+
+fn settle_probe_success(cb: &CircuitBreaker) {
+    cb.settle(admitted_probe_ticket(cb), BreakerOutcome::Success);
+}
+
+fn settle_probe_tripping_failure(cb: &CircuitBreaker) {
+    cb.settle(
+        admitted_probe_ticket(cb),
+        BreakerOutcome::Failure {
+            status_code: 500,
+            connection_error: false,
+        },
+    );
+}
+
+fn settle_probe_neutral(cb: &CircuitBreaker) {
+    cb.settle(admitted_probe_ticket(cb), BreakerOutcome::Neutral);
 }
 
 /// One probe outcome: its label and the breaker call that reports it.
@@ -557,10 +894,9 @@ const PROBE_OUTCOMES: &[ProbeOutcome] = &[
         record_probe_connection_failure,
     ),
     ("record_neutral", record_probe_neutral),
-    (
-        "record_neutral_for_admission",
-        record_probe_neutral_for_admission,
-    ),
+    ("settle(Success)", settle_probe_success),
+    ("settle(Failure)", settle_probe_tripping_failure),
+    ("settle(Neutral)", settle_probe_neutral),
 ];
 
 #[test]
@@ -576,6 +912,710 @@ fn every_probe_outcome_kind_releases_the_half_open_slot() {
             "{label} must release the HALF_OPEN probe slot"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// (a2) HALF_OPEN is decided only by its own cycle's probes (#7030)
+//
+// A `ProbeTicket::NonProbe` outcome reaching a HALF_OPEN breaker belongs to a
+// request admitted in an earlier CLOSED cycle and is dropped. Every protocol
+// path — H1/H2, WebSocket, gRPC, HTTP/3, the HBONE relay, raw TCP and UDP/DTLS
+// — settles through `CircuitBreaker::settle`, so the rule lives in the breaker
+// once; the runtime table pins it for every outcome kind. A probe whose slot
+// is released separately from its outcome (the deferred streaming records, the
+// gRPC streaming recorder, the eager gRPC header-time record) must therefore
+// carry its cycle as `ProbeTicket::SlotlessProbe`; the structural check below
+// fails if one of those sites goes back to a bare `NonProbe`, which would stop
+// every streaming probe from closing or reopening the cycle it probed.
+// ---------------------------------------------------------------------------
+
+/// Every outcome a CLOSED-cycle straggler can carry into a HALF_OPEN breaker.
+const STRAGGLER_OUTCOMES: &[(&str, BreakerOutcome)] = &[
+    ("success", BreakerOutcome::Success),
+    (
+        "tripping status failure",
+        BreakerOutcome::Failure {
+            status_code: 500,
+            connection_error: false,
+        },
+    ),
+    (
+        "connection failure",
+        BreakerOutcome::Failure {
+            status_code: 502,
+            connection_error: true,
+        },
+    ),
+    ("neutral", BreakerOutcome::Neutral),
+];
+
+#[test]
+fn a_closed_cycle_straggler_never_decides_a_half_open_cycle() {
+    for &(label, outcome) in STRAGGLER_OUTCOMES {
+        let cb = breaker_holding_one_probe();
+        let generation = cb.open_epoch();
+        cb.settle(ProbeTicket::NonProbe, outcome);
+        assert_eq!(
+            cb.state_name(),
+            "half_open",
+            "a straggler {label} must not move the HALF_OPEN cycle"
+        );
+        assert_eq!(cb.open_epoch(), generation, "a straggler {label} reopened");
+        assert_eq!(
+            cb.half_open_in_flight(),
+            1,
+            "a straggler {label} must not touch the probe's slot"
+        );
+        assert_eq!(cb.success_count(), 0, "a straggler {label} earned credit");
+    }
+}
+
+/// `src/proxy/mod.rs` calls that record a probe's outcome while its slot is
+/// released elsewhere. None may name a bare `ProbeTicket::NonProbe`.
+const SLOTLESS_OUTCOME_CALLS: &[&str] = &[
+    "backend_dispatch::apply_deferred_circuit_breaker_outcome(",
+    "record_grpc_backend_status_outcome(",
+];
+
+#[test]
+fn probe_outcomes_recorded_apart_from_their_slot_keep_their_cycle() {
+    let text = source("src/proxy/mod.rs");
+    for call in SLOTLESS_OUTCOME_CALLS {
+        let mut calls = 0;
+        for after in text.split(call).skip(1) {
+            let args = &after[..after.find(");").unwrap_or(after.len())];
+            calls += 1;
+            assert!(
+                !args.contains("ProbeTicket::NonProbe"),
+                "`{call}` must settle the admission's own ticket (`.without_slot()`), \
+                 not a bare `NonProbe` the HALF_OPEN breaker drops"
+            );
+        }
+        assert!(calls > 0, "`{call}` must still exist in src/proxy/mod.rs");
+    }
+    let without_slot = item_body(
+        &text,
+        "    pub fn settlement_without_slot(&self) -> BreakerSettlement {",
+        "\n    }\n",
+    );
+    assert!(
+        without_slot.contains("self.held_ticket().without_slot()"),
+        "`settlement_without_slot` must keep a probe's cycle"
+    );
+    assert!(
+        text.contains("cb_probe.release_slot_deferring_outcome();"),
+        "the H1/H2 deferred streaming release must keep the probe's cycle for the \
+         body-completion record"
+    );
+}
+
+/// Whether `byte` can continue an identifier (non-ASCII bytes count, so a
+/// multibyte identifier never looks like a literal prefix).
+fn is_ident_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte >= 0x80
+}
+
+/// Length of the comment, string, raw string, byte string or char literal
+/// starting at `at` — the tokens that can hide brackets or `#[` — or `None`
+/// when `at` starts ordinary code (a lifetime's quote included).
+fn opaque_token_len(bytes: &[u8], at: usize) -> Option<usize> {
+    let rest = &bytes[at..];
+    let after_ident = at > 0 && is_ident_byte(bytes[at - 1]);
+    if rest.starts_with(b"//") {
+        return Some(rest.iter().position(|&b| b == b'\n').unwrap_or(rest.len()));
+    }
+    if rest.starts_with(b"/*") {
+        let mut depth = 0usize;
+        let mut i = 0;
+        while i < rest.len() {
+            if rest[i..].starts_with(b"/*") {
+                depth += 1;
+                i += 2;
+            } else if rest[i..].starts_with(b"*/") {
+                depth -= 1;
+                i += 2;
+                if depth == 0 {
+                    return Some(i);
+                }
+            } else {
+                i += 1;
+            }
+        }
+        return Some(rest.len());
+    }
+    if !after_ident {
+        let raw_prefix = if rest.starts_with(b"br") {
+            Some(2)
+        } else if rest.starts_with(b"r") {
+            Some(1)
+        } else {
+            None
+        };
+        if let Some(prefix) = raw_prefix {
+            let hashes = rest[prefix..].iter().take_while(|&&b| b == b'#').count();
+            if rest.get(prefix + hashes) == Some(&b'"') {
+                let mut closing = vec![b'"'];
+                closing.resize(1 + hashes, b'#');
+                let body = prefix + hashes + 1;
+                return Some(
+                    rest[body..]
+                        .windows(closing.len())
+                        .position(|window| window == closing.as_slice())
+                        .map_or(rest.len(), |p| body + p + closing.len()),
+                );
+            }
+        }
+    }
+    let string_prefix = if rest.starts_with(b"\"") {
+        Some(0)
+    } else if !after_ident && rest.starts_with(b"b\"") {
+        Some(1)
+    } else {
+        None
+    };
+    if let Some(prefix) = string_prefix {
+        let mut i = prefix + 1;
+        while i < rest.len() {
+            match rest[i] {
+                b'\\' => i += 2,
+                b'"' => return Some(i + 1),
+                _ => i += 1,
+            }
+        }
+        return Some(rest.len());
+    }
+    let quote = if rest.starts_with(b"'") {
+        Some(0)
+    } else if !after_ident && rest.starts_with(b"b'") {
+        Some(1)
+    } else {
+        None
+    };
+    if let Some(q) = quote {
+        if rest.get(q + 1) == Some(&b'\\') {
+            // '\n', '\'', '\u{..}': the escaped byte sits at q + 2.
+            return Some(
+                rest.get(q + 3..)
+                    .and_then(|tail| tail.iter().position(|&b| b == b'\''))
+                    .map_or(rest.len(), |p| q + 3 + p + 1),
+            );
+        }
+        let width = match rest.get(q + 1) {
+            Some(&b) if b < 0x80 => 1,
+            Some(&b) if b >= 0xF0 => 4,
+            Some(&b) if b >= 0xE0 => 3,
+            Some(_) => 2,
+            None => return None,
+        };
+        if rest.get(q + 1 + width) == Some(&b'\'') {
+            return Some(q + 2 + width);
+        }
+        // A lifetime or label: ordinary code.
+    }
+    None
+}
+
+/// Index just past the bracket matching the one at `open_at`.
+fn after_matching_close(bytes: &[u8], open_at: usize) -> usize {
+    let mut depth = 0usize;
+    let mut at = open_at;
+    while at < bytes.len() {
+        if let Some(len) = opaque_token_len(bytes, at) {
+            at += len;
+            continue;
+        }
+        match bytes[at] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return at + 1;
+                }
+            }
+            _ => {}
+        }
+        at += 1;
+    }
+    bytes.len()
+}
+
+/// Index just past what an attribute ending at `from` annotates, or a point
+/// inside it — not past it. After its further attributes and any `( .. )` /
+/// `[ .. ]` groups, the annotated text ends at the FIRST of:
+///
+/// - a `;` or `,` at its own depth, consumed: an out-of-line `mod name;`, a
+///   `use`, a statement, or a comma-terminated field, struct-literal field,
+///   tuple field, enum variant or match arm;
+/// - the close of its first `{ .. }` group: an item or block body;
+/// - a closing bracket it did not open, not consumed: the end of the field,
+///   variant, argument or arm list holding a last element with no trailing
+///   comma.
+///
+/// The first of these is never beyond the annotated item's real end, so the
+/// stripper can keep test-only text (an `else` after a gated `if`, or a gated
+/// item whose header has a `,` in its generics), which the parity scan then
+/// sees as production — a loud false positive — but it never erases the
+/// production code that follows. The one shape it does not bound is an
+/// attribute on a generic parameter (`fn f<#[cfg(test)] T>`), which the
+/// scanned sources do not use.
+fn end_of_annotated_item(bytes: &[u8], from: usize) -> usize {
+    let mut at = from;
+    while at < bytes.len() {
+        if let Some(len) = opaque_token_len(bytes, at) {
+            at += len;
+            continue;
+        }
+        match bytes[at] {
+            b';' | b',' => return at + 1,
+            b'{' => return after_matching_close(bytes, at),
+            b'(' | b'[' => at = after_matching_close(bytes, at),
+            b')' | b']' | b'}' => return at,
+            _ => at += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// Whether an attribute body (between `#[` and `]`) compiles its item only
+/// under test: `cfg(test)` or `cfg(all(.., test, ..))`. `cfg(not(test))`,
+/// `cfg(any(..))` and `cfg_attr` gate nothing out of production.
+fn cfg_is_test_only(attribute: &str) -> bool {
+    let compact: String = attribute.split_whitespace().collect();
+    let Some(predicate) = compact
+        .strip_prefix("cfg(")
+        .and_then(|p| p.strip_suffix(')'))
+    else {
+        return false;
+    };
+    if predicate == "test" {
+        return true;
+    }
+    let Some(args) = predicate
+        .strip_prefix("all(")
+        .and_then(|p| p.strip_suffix(')'))
+    else {
+        return false;
+    };
+    let mut depth = 0i32;
+    let mut start = 0;
+    let mut top_level = Vec::new();
+    for (i, c) in args.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                top_level.push(&args[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    top_level.push(&args[start..]);
+    top_level.contains(&"test")
+}
+
+/// `text` with everything gated by a test-only `cfg` removed — inline and
+/// out-of-line modules, helper fns, impls, fields, struct-literal fields,
+/// variants, match arms and statements — at any indentation, including one at
+/// byte zero. Comments, strings and char literals are lexed, so a brace or
+/// `#[cfg(test)]` inside one changes nothing. Everything else is kept: see
+/// `end_of_annotated_item` for why a removal never reaches past the gated
+/// text, and `production_items_missing_after_strip` for the independent check
+/// that holds it to that over every scanned file.
+fn without_cfg_test_items(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut production = String::with_capacity(text.len());
+    let mut copied_to = 0;
+    let mut at = 0;
+    while at < bytes.len() {
+        if let Some(len) = opaque_token_len(bytes, at) {
+            at += len;
+            continue;
+        }
+        if bytes[at..].starts_with(b"#[") {
+            let attribute_end = after_matching_close(bytes, at + 1);
+            let body = text
+                .get(at + 2..attribute_end.saturating_sub(1))
+                .unwrap_or("");
+            if cfg_is_test_only(body) {
+                let item_end = end_of_annotated_item(bytes, attribute_end);
+                production.push_str(&text[copied_to..at]);
+                copied_to = item_end;
+                at = item_end;
+            } else {
+                at = attribute_end;
+            }
+            continue;
+        }
+        at += 1;
+    }
+    production.push_str(&text[copied_to..]);
+    production
+}
+
+/// Per byte of `bytes`, whether it lies inside a comment, string or char
+/// literal past that token's first byte: a line starting there is literal
+/// text, not code.
+fn opaque_token_interior(bytes: &[u8]) -> Vec<bool> {
+    let mut interior = vec![false; bytes.len() + 1];
+    let mut at = 0;
+    while at < bytes.len() {
+        match opaque_token_len(bytes, at) {
+            Some(len) => {
+                if len > 1 {
+                    interior[at + 1..at + len].fill(true);
+                }
+                at += len.max(1);
+            }
+            None => at += 1,
+        }
+    }
+    interior
+}
+
+/// Whether a trimmed rustfmt line opens an item: optional visibility, then an
+/// item keyword or qualifier.
+fn is_item_header(trimmed: &str) -> bool {
+    let mut rest = trimmed;
+    if let Some(after) = rest.strip_prefix("pub(") {
+        rest = after
+            .split_once(')')
+            .map_or(after, |(_, tail)| tail)
+            .trim_start();
+    } else if let Some(after) = rest.strip_prefix("pub ") {
+        rest = after;
+    }
+    let word_len = rest
+        .bytes()
+        .take_while(|&b| b.is_ascii_alphanumeric() || b == b'_')
+        .count();
+    matches!(
+        &rest[..word_len],
+        "fn" | "async"
+            | "const"
+            | "static"
+            | "struct"
+            | "enum"
+            | "union"
+            | "impl"
+            | "trait"
+            | "mod"
+            | "use"
+            | "type"
+            | "unsafe"
+            | "extern"
+            | "macro_rules"
+    )
+}
+
+/// Whether the attribute lines directly above `lines[header]` (at `indent`,
+/// with doc comments and the continuation lines of a multi-line attribute)
+/// carry a test-only `cfg`.
+fn header_attributes_are_test_only(
+    lines: &[(usize, &str)],
+    interior: &[bool],
+    header: usize,
+    indent: usize,
+) -> bool {
+    // Walking up: deeper lines and a `)` / `]` closer are a multi-line
+    // attribute's body only once the `#[` line that opens it is reached, so a
+    // previous item's tail (`struct Pair(\n    #[cfg(test)] T,\n);`) never
+    // gates the header below it.
+    let mut run = Vec::new();
+    let mut continuation = Vec::new();
+    for &(start, line) in lines[..header].iter().rev() {
+        let trimmed = line.trim_start();
+        if interior[start] || trimmed.is_empty() {
+            break;
+        }
+        let line_indent = line.len() - trimmed.len();
+        if line_indent > indent || (line_indent == indent && trimmed.starts_with([')', ']'])) {
+            if !trimmed.starts_with("//") {
+                continuation.push(line);
+            }
+        } else if line_indent == indent && trimmed.starts_with("#[") {
+            run.append(&mut continuation);
+            run.push(line);
+        } else if !(line_indent == indent && trimmed.starts_with("//") && continuation.is_empty()) {
+            break;
+        }
+    }
+    run.reverse();
+    let attributes = run.join("\n");
+    let bytes = attributes.as_bytes();
+    let mut from = 0;
+    while let Some(offset) = attributes[from..].find("#[") {
+        let at = from + offset;
+        let end = after_matching_close(bytes, at + 1);
+        if cfg_is_test_only(attributes.get(at + 2..end.saturating_sub(1)).unwrap_or("")) {
+            return true;
+        }
+        from = at + 2;
+    }
+    false
+}
+
+/// The item header lines of rustfmt-formatted `text` that are production
+/// code, found line by line, independently of the stripper's lexing: every
+/// header at column 0, and every header at four spaces inside an ungated
+/// column-0 item (an `impl`'s methods, an inline module's items), whose own
+/// attribute lines carry no test-only `cfg`. Lines inside comments and string
+/// literals are skipped.
+fn production_item_headers(text: &str) -> Vec<&str> {
+    let interior = opaque_token_interior(text.as_bytes());
+    let mut lines = Vec::new();
+    let mut start = 0;
+    for line in text.split('\n') {
+        lines.push((start, line));
+        start += line.len() + 1;
+    }
+    let mut headers = Vec::new();
+    let mut enclosing_is_test_only = false;
+    for (index, &(start, line)) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if interior[start] || trimmed.is_empty() {
+            continue;
+        }
+        let indent = line.len() - trimmed.len();
+        if indent == 0 {
+            if trimmed.starts_with(['}', ')', ']', '#', '/', '*']) {
+                continue;
+            }
+            enclosing_is_test_only = header_attributes_are_test_only(&lines, &interior, index, 0);
+            if !enclosing_is_test_only && is_item_header(trimmed) {
+                headers.push(line);
+            }
+        } else if indent == 4
+            && !enclosing_is_test_only
+            && is_item_header(trimmed)
+            && !header_attributes_are_test_only(&lines, &interior, index, 4)
+        {
+            headers.push(line);
+        }
+    }
+    headers
+}
+
+/// The production item headers of `text` (see `production_item_headers`) that
+/// `production` — `text` after `without_cfg_test_items` — no longer has as a
+/// whole line, counted with multiplicity so a surviving duplicate cannot hide
+/// a lost one.
+fn production_items_missing_after_strip<'a>(text: &'a str, production: &str) -> Vec<&'a str> {
+    let mut kept: BTreeMap<&str, usize> = BTreeMap::new();
+    for line in production.split('\n') {
+        *kept.entry(line).or_default() += 1;
+    }
+    let mut missing = Vec::new();
+    for header in production_item_headers(text) {
+        match kept.get_mut(header) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => missing.push(header),
+        }
+    }
+    missing
+}
+
+#[test]
+fn cfg_test_item_stripper_keeps_every_production_item() {
+    // Every `PROD_n` item must survive and every `TEST_ONLY_n` item must go.
+    // The former column-0 `"\n#[cfg(test)]\nmod "` splitter lost PROD_1 and
+    // PROD_2 (an out-of-line `mod name;` swallowed the production code after
+    // it: a false negative for the parity scan) and kept TEST_ONLY_1
+    // (attribute at byte zero), TEST_ONLY_3 (`cfg(all(test, ..))`),
+    // TEST_ONLY_4 (indented) and TEST_ONLY_5 (a test-only fn). The string,
+    // raw-string, char and comment braces inside `linux_only` pin the lexing.
+    // Issue #7026: an item-only stripper read past a gated field, struct-literal
+    // field, tuple field or match arm to the next `;` or `{ .. }`, so it erased
+    // PROD_7 through PROD_13 — the shape that hid production items of
+    // `src/proxy/deferred_log.rs` and `src/grpc/dp_client.rs` from the scan.
+    let fixture = r##"#[cfg(test)]
+mod at_byte_zero { fn t() { TEST_ONLY_1(); } }
+#[cfg(test)]
+mod out_of_line;
+fn production_after_out_of_line() { PROD_1(); }
+#[cfg(test)]
+#[path = "pump_tests.rs"]
+mod pathed;
+fn production_after_path() { PROD_2(); }
+#[cfg(all(test, target_os = "linux"))]
+mod linux_only {
+    const TRICKY: &str = "
+}
+{";
+    const ESCAPED: &str = "\"}";
+    const RAW: &str = r#"}"#;
+    const BRACE: char = '}';
+    fn t<'a>(x: &'a str) { /* } */ TEST_ONLY_3(); }
+}
+fn production_after_tricky_module() { PROD_3(); }
+#[cfg(not(test))]
+fn production_not_test() { PROD_4(); }
+impl Production {
+    #[cfg(test)]
+    fn indented_helper(&self) { TEST_ONLY_4(); }
+    fn production_method(&self) { PROD_5(); }
+}
+#[cfg(test)]
+fn test_helper(a: [u8; 3]) -> u8 { TEST_ONLY_5(); a[0] }
+// #[cfg(test)] in a comment gates nothing
+fn production_tail() { PROD_6(); }
+struct Logger {
+    state: u8,
+    #[cfg(test)]
+    delivery: Option<Delivery>,
+}
+impl Drop for Logger {
+    fn drop(&mut self) { PROD_7(); }
+}
+struct TrailingField {
+    #[cfg(test)]
+    last: u8
+}
+fn production_after_trailing_field() { PROD_8(); }
+fn build() -> Logger {
+    Logger {
+        state: 0,
+        #[cfg(test)]
+        delivery: TEST_ONLY_6(),
+    }
+}
+fn production_after_struct_literal() { PROD_9(); }
+fn dispatch(kind: u8) -> u8 {
+    match kind {
+        #[cfg(test)]
+        0 => TEST_ONLY_7(),
+        _ => PROD_10(),
+    }
+}
+fn statement() {
+    #[cfg(test)]
+    if let Some(delivery) = DELIVERY { TEST_ONLY_8(); return; }
+    PROD_11();
+}
+enum Kind {
+    #[cfg(test)]
+    TestOnly(TEST_ONLY_9),
+    Production(PROD_12),
+}
+struct Pair(
+    #[cfg(test)] TEST_ONLY_10,
+    PROD_13,
+);
+fn production_after_pair() { PROD_14(); }
+"##;
+    let production = without_cfg_test_items(fixture);
+    // A whole marker, so `PROD_1` is not satisfied by `PROD_13`.
+    let has_marker = |marker: &str| {
+        production.match_indices(marker).any(|(at, _)| {
+            !production
+                .as_bytes()
+                .get(at + marker.len())
+                .is_some_and(u8::is_ascii_digit)
+        })
+    };
+    for kept in [
+        "PROD_1", "PROD_2", "PROD_3", "PROD_4", "PROD_5", "PROD_6", "PROD_7", "PROD_8", "PROD_9",
+        "PROD_10", "PROD_11", "PROD_12", "PROD_13", "PROD_14",
+    ] {
+        assert!(
+            has_marker(kept),
+            "{kept} is production code and must survive the stripper:\n{production}"
+        );
+    }
+    for dropped in [
+        "TEST_ONLY_1",
+        "TEST_ONLY_3",
+        "TEST_ONLY_4",
+        "TEST_ONLY_5",
+        "TEST_ONLY_6",
+        "TEST_ONLY_7",
+        "TEST_ONLY_8",
+        "TEST_ONLY_9",
+        "TEST_ONLY_10",
+        "mod out_of_line",
+        "mod pathed",
+        "delivery: Option",
+        "last: u8",
+    ] {
+        assert!(
+            !has_marker(dropped),
+            "{dropped} is test-only and must be stripped:\n{production}"
+        );
+    }
+    // The independent line-based check agrees, and it notices a lost item.
+    let missing = production_items_missing_after_strip(fixture, &production);
+    assert!(
+        missing.is_empty(),
+        "the stripper erased production items {missing:?}:\n{production}"
+    );
+    assert!(production_item_headers(fixture).contains(&"impl Drop for Logger {"));
+    assert!(production_item_headers(fixture).contains(&"    fn drop(&mut self) { PROD_7(); }"));
+    assert!(!production_item_headers(fixture).contains(&"mod pathed;"));
+    let lost_impl = production.replacen("impl Drop for Logger {\n", "", 1);
+    assert_eq!(
+        production_items_missing_after_strip(fixture, &lost_impl),
+        ["impl Drop for Logger {"],
+        "a production item the stripper lost must be reported"
+    );
+}
+
+/// CB-1: every production settlement of a circuit-breaker admission goes
+/// through `CircuitBreaker::settle` with the admission's own `ProbeTicket`.
+/// The `bool` conveniences (`record_success` / `record_failure` /
+/// `record_neutral`) settle against whatever cycle is current at the call, so a
+/// probe that outlived a reopen would free a LATER cycle's slot (over-admitting
+/// past `half_open_max_requests`) or close/reopen a cycle it never probed —
+/// exactly what the TCP relay end and the gRPC streaming recorder used to do.
+/// They exist for unit tests only.
+#[test]
+fn no_production_path_settles_a_breaker_without_its_probe_ticket() {
+    let mut scanned = 0usize;
+    for (path, text) in production_sources() {
+        if !(path.starts_with("src/proxy/")
+            || path.starts_with("src/http3/")
+            || path.starts_with("src/grpc/"))
+        {
+            continue;
+        }
+        scanned += 1;
+        let stripped = without_cfg_test_items(&text);
+        // The scan is only as good as the stripper: a removal that ran past
+        // its gated text would hide production calls from it (issue #7026).
+        assert!(
+            !production_item_headers(&text).is_empty(),
+            "{path}: the line-based production-item check found nothing to check"
+        );
+        let missing = production_items_missing_after_strip(&text, &stripped);
+        assert!(
+            missing.is_empty(),
+            "{path}: stripping `cfg(test)` items erased production items {missing:?}"
+        );
+        let production: String = stripped.split_whitespace().collect();
+        for blind in [
+            ".record_success(",
+            ".record_failure(",
+            ".record_neutral(",
+            ".record_neutral_for_admission(",
+        ] {
+            assert!(
+                !production.contains(blind),
+                "{path} settles a circuit breaker through the generation-blind `{blind}`; \
+                 settle the admission's `ProbeTicket` with `CircuitBreaker::settle` instead"
+            );
+        }
+    }
+    assert!(scanned > 0, "the proxy/http3/grpc sources must be scanned");
+    // The one production entry point checks the ticket's cycle in the CAS.
+    let breaker = source("src/circuit_breaker.rs");
+    let release = item_body(
+        &breaker,
+        "    fn release_slot(&self, ticket: ProbeTicket) {",
+        "\n    }\n",
+    );
+    assert!(
+        release.contains("packed_generation(packed) != generation"),
+        "the slot release must compare the ticket's generation inside its CAS"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -978,6 +2018,55 @@ fn no_caller_carries_a_local_shard_count_workaround() {
     }
 }
 
+/// Issue #7207: the per-proxy passive-health maps are the one recorded
+/// exception to the `pool_shard_amount` rule. Each proxy with a passive policy
+/// owns a pair, so they take a small fixed shard count rather than the
+/// gateway-wide hot-map sizing (or DashMap's `4 × cores` default).
+#[test]
+fn per_proxy_passive_health_maps_use_the_fixed_small_shard_count() {
+    assert_eq!(
+        ferrum_edge::health_check::PER_PROXY_PASSIVE_HEALTH_SHARD_AMOUNT,
+        8,
+        "the per-proxy passive-health shard count is the CLAUDE.md exception's value"
+    );
+    let health = source("src/health_check.rs");
+    let fixed = "DashMap::with_shard_amount(PER_PROXY_PASSIVE_HEALTH_SHARD_AMOUNT)";
+    for (owner, constructor_head, field) in [
+        (
+            "PassiveUnhealthyTargets",
+            "impl PassiveUnhealthyTargets {\n    pub fn new() -> Self {",
+            "map: ",
+        ),
+        (
+            "ProxyHealthState",
+            "impl ProxyHealthState {\n    fn new() -> Self {",
+            "states: ",
+        ),
+    ] {
+        let start = health
+            .find(constructor_head)
+            .unwrap_or_else(|| panic!("{owner}::new must exist in src/health_check.rs"));
+        let body = &health[start..];
+        let body = &body[..body.find("\n    }\n").unwrap_or(body.len())];
+        assert!(
+            body.contains(&format!("{field}{fixed}")),
+            "{owner}::new must build its per-proxy map with {fixed} (#7207), got:\n{body}"
+        );
+        assert!(
+            !body.contains("DashMap::new()"),
+            "{owner}::new must not fall back to DashMap's per-core default shard count"
+        );
+    }
+    let passive_default = health
+        .find("impl Default for PassiveUnhealthyTargets")
+        .map(|start| &health[start..])
+        .and_then(|rest| rest.find("Self::new()").map(|end| &rest[..end]));
+    assert!(
+        passive_default.is_some_and(|text| !text.contains("DashMap")),
+        "PassiveUnhealthyTargets::default must delegate to new() so it keeps the fixed shard count"
+    );
+}
+
 #[test]
 fn the_stream_throttle_shard_count_comes_from_the_shared_helper() {
     let throttle = source("src/plugins/tcp_connection_throttle.rs");
@@ -1100,6 +2189,300 @@ async fn every_pool_family_key_is_drained_by_the_svid_generation_matcher() {
                 );
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The drain-epoch sample precedes the SVID generation read
+//
+// A pool key embeds `|svidg=<n>`. A generation drain (a withdrawn trust
+// bundle, or an SVID rotation's forced drain after its configured window)
+// runs after the generation has advanced, and bumps the pool's drain epoch.
+// An acquisition that read the generation BEFORE sampling the epoch could
+// straddle that drain, sample the new epoch, and publish a connection under
+// the drained generation's key: no later request looks it up there, and it
+// can hold a `maxConnections` slot the current generation needs.
+//
+// Siblings: the direct HTTP/2 and gRPC request paths, both pools' detached
+// shard fills, `GenericPool::get_with` (the reqwest pool), every HTTP/3
+// checkout (which also reads its TLS configuration before it enters the
+// pool, so the sample precedes that read too) with the capability probe that
+// warms the HTTP/3 pool, and the direct HTTP/1.1 checkout, whose lanes have
+// an epoch of their own. The HBONE inner pool and the Unix-socket pool bind
+// each lease to their own drain generation and are pinned by their own tests.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_generation_keyed_acquisition_samples_the_drain_epoch_first() {
+    // (file, item signature, epoch sample, generation read)
+    let sites: &[(&str, &str, &str, &str)] = &[
+        (
+            "src/proxy/http2_pool.rs",
+            "    async fn get_sender_unprofiled(",
+            "self.pool.drain_epoch()",
+            "svid_generation_for_proxy(proxy)",
+        ),
+        (
+            "src/proxy/grpc_proxy.rs",
+            "    async fn get_sender_with_purpose_unprofiled(",
+            "self.pool.drain_epoch()",
+            "svid_generation_for_proxy(proxy)",
+        ),
+        (
+            "src/proxy/http2_pool.rs",
+            "    fn spawn_shard_fill(",
+            "self.pool.drain_epoch()",
+            "svid_generation_for_proxy(proxy) != svid_generation",
+        ),
+        (
+            "src/proxy/grpc_proxy.rs",
+            "    fn spawn_shard_fill(",
+            "self.pool.drain_epoch()",
+            "svid_generation_for_proxy(proxy) != svid_generation",
+        ),
+        (
+            "src/pool/mod.rs",
+            "    pub async fn get_with<",
+            "self.drain_epoch()",
+            "self.lookup_or_build_key(build_key)",
+        ),
+        (
+            "src/proxy/http2_pool.rs",
+            "    pub(crate) async fn checkout_h1_seamed<",
+            "self.h1.drain_epoch()",
+            "svid_generation_for_proxy(proxy)",
+        ),
+        // The capability probe reads the TLS configuration it hands to
+        // `Http3ConnectionPool::warmup_connection`, so it takes the sample.
+        (
+            "src/proxy/mod.rs",
+            "    async fn probe_backend_capabilities(",
+            "self.h3_pool.drain_epoch()",
+            ".get_tls_config_for_backend(&probe_proxy)",
+        ),
+    ];
+    for (file, signature, sample, read) in sites {
+        let text = source(file);
+        let body = item_body(&text, signature, "\n    }\n");
+        let sampled_at = body
+            .find(sample)
+            .unwrap_or_else(|| panic!("{file}: `{signature}` must sample the drain epoch"));
+        let read_at = body
+            .find(read)
+            .unwrap_or_else(|| panic!("{file}: `{signature}` must read the SVID generation"));
+        assert!(
+            sampled_at < read_at,
+            "{file}: `{signature}` must sample the drain epoch before it reads the SVID \
+             generation, or a rotation between the two publishes under the retired key"
+        );
+    }
+}
+
+/// The method of `text` that contains byte offset `at`, from the end of the
+/// method before it through its own closing brace. Methods sit at one level of
+/// indentation, so each ends at the first `\n    }\n`.
+fn enclosing_method(text: &str, at: usize) -> &str {
+    const END: &str = "\n    }\n";
+    let start = text[..at].rfind(END).map_or(0, |end| end + END.len());
+    let end = text[at..]
+        .find(END)
+        .unwrap_or_else(|| panic!("the method at byte {at} must close at one level of indent"));
+    &text[start..at + end + END.len()]
+}
+
+fn without_whitespace(text: &str) -> String {
+    text.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// The earliest of `needles` in `body`.
+fn first_of(body: &str, needles: &[&str]) -> Option<usize> {
+    needles.iter().filter_map(|needle| body.find(needle)).min()
+}
+
+/// Every HTTP/3 checkout reads the SVID generation its pool key carries AND
+/// the backend TLS configuration before it reaches the pool's create path, so
+/// it samples the drain epoch before both and hands the sample to the create.
+///
+/// The checkouts are discovered rather than listed: every pool method that
+/// takes the caller's TLS configuration closure is one, so an entry point
+/// added later is held to the same order without being added to a table.
+#[test]
+fn every_http3_checkout_samples_the_drain_epoch_before_its_generation_and_tls_reads() {
+    const SAMPLE: &str = "let drain_epoch = self.drain_epoch();";
+    const TLS_READ: &str = "tls_config_fn()";
+    const TLS_PARAMETER: &str = "tls_config_fn: impl FnOnce() -> TlsFut,";
+    const GENERATION_READS: [&str; 3] = [
+        "self.svid_generation_for_proxy(proxy)",
+        "self.pool_key_with_current_generation(",
+        "self.pool_key_for_target_with_current_generation(",
+    ];
+    const CREATES: [&str; 4] = [
+        ".create_or_get_proxy_sender(",
+        ".create_or_get_target_sender(",
+        ".create_or_get_proxy_sender_with_connect_deadline(",
+        ".create_or_get_target_sender_with_connect_deadline(",
+    ];
+
+    let client = source("src/http3/client.rs");
+    let checkouts: Vec<&str> = client
+        .match_indices(TLS_PARAMETER)
+        .map(|(at, _)| enclosing_method(&client, at))
+        .collect();
+    assert!(
+        checkouts.len() >= 10,
+        "expected the ten HTTP/3 pool checkouts, found {}",
+        checkouts.len()
+    );
+    for body in checkouts {
+        let name = body
+            .split("async fn ")
+            .nth(1)
+            .and_then(|rest| rest.split(['<', '(']).next())
+            .unwrap_or("an HTTP/3 checkout");
+        let sampled_at = body
+            .find(SAMPLE)
+            .unwrap_or_else(|| panic!("`{name}` must sample the pool's drain epoch"));
+        let generation_at = first_of(body, &GENERATION_READS)
+            .unwrap_or_else(|| panic!("`{name}` must read the SVID generation for its pool key"));
+        let tls_at = body
+            .find(TLS_READ)
+            .unwrap_or_else(|| panic!("`{name}` must read its TLS configuration"));
+        assert!(
+            sampled_at < generation_at,
+            "`{name}` must sample the drain epoch before it reads the SVID generation"
+        );
+        assert!(
+            sampled_at < tls_at,
+            "`{name}` must sample the drain epoch before it reads its TLS configuration"
+        );
+        let compact = without_whitespace(body);
+        let creates: usize = CREATES
+            .iter()
+            .map(|create| compact.matches(create).count())
+            .sum();
+        let sampled_creates: usize = CREATES
+            .iter()
+            .map(|create| {
+                compact
+                    .matches(&format!("{create}key,drain_epoch,"))
+                    .count()
+            })
+            .sum();
+        assert!(creates > 0, "`{name}` must reach the pool's create path");
+        assert_eq!(
+            creates, sampled_creates,
+            "`{name}` must hand its drain-epoch sample to every create"
+        );
+    }
+
+    // The probe's sample comes from its caller, which read the TLS
+    // configuration (pinned in the table above); the generation is read here.
+    let warmup = item_body(&client, "    pub async fn warmup_connection(", "\n    }\n");
+    assert!(warmup.contains("drain_epoch: u64,"));
+    let warmup = without_whitespace(warmup);
+    let probe_creates = warmup.matches(".create_or_get_probe_sender(").count();
+    assert!(
+        probe_creates > 0,
+        "`warmup_connection` must reach the pool through the probe create"
+    );
+    assert_eq!(
+        probe_creates,
+        warmup
+            .matches(".create_or_get_probe_sender(primary_key,drain_epoch,")
+            .count()
+            + warmup
+                .matches(".create_or_get_probe_sender(key,drain_epoch,")
+                .count(),
+        "every probe create must carry the caller's drain-epoch sample"
+    );
+
+    // One way into the shared pool: the create that takes a sample. A create
+    // that sampled inside the pool would be late for every caller above.
+    let production = without_cfg_test_items(&client);
+    let pool_creates = production.matches(".create_or_get_existing_owned").count();
+    assert!(
+        pool_creates > 0,
+        "the HTTP/3 pool must create through the shared pool's sampled entry point"
+    );
+    assert_eq!(
+        pool_creates,
+        production
+            .matches(".create_or_get_existing_owned_sampled_as(key, drain_epoch, caller,")
+            .count(),
+        "the HTTP/3 pool must create only through the sampled entry point"
+    );
+}
+
+/// The direct HTTP/1.1 lane map carries the same fence in its own terms: a
+/// drain bumps the lane epoch before it retires a lane, and a checkout whose
+/// sample predates a drain is not given a lane in the map.
+#[test]
+fn the_direct_http1_lane_map_fences_a_checkout_that_straddles_a_drain() {
+    let pool = source("src/proxy/http2_pool.rs");
+
+    // The checkout: sample, then the generation, then the seam the
+    // integration tests drain through, then the lane lookup with the sample.
+    let checkout = item_body(
+        &pool,
+        "    pub(crate) async fn checkout_h1_seamed<",
+        "\n    }\n",
+    );
+    let order = [
+        "self.h1.drain_epoch()",
+        "svid_generation_for_proxy(proxy)",
+        "before_lane_lookup();",
+        "self.h1.lane_for_key(&buf, drain_epoch)",
+    ];
+    let mut previous = 0;
+    for step in order {
+        let at = checkout
+            .find(step)
+            .unwrap_or_else(|| panic!("`checkout_h1_seamed` must contain `{step}`"));
+        assert!(
+            previous <= at,
+            "`checkout_h1_seamed` must run `{step}` in order: sample, generation, seam, lookup"
+        );
+        previous = at;
+    }
+    let entry = item_body(&pool, "    pub fn checkout_h1(", "\n    }\n");
+    assert!(
+        entry.contains("self.checkout_h1_seamed(proxy, tls, connect_timeout, fresh, || {})"),
+        "production checkout must be the seamed body with a hook that does nothing"
+    );
+
+    let lanes = pool
+        .split("\nimpl Http1Lanes {")
+        .nth(1)
+        .expect("Http1Lanes impl");
+    let lookup = item_body(lanes, "    fn lane_for_key(", "\n    }\n");
+    let checked_at = lookup
+        .find("self.drain_epoch.load(Ordering::Acquire) != drain_epoch")
+        .expect("a lane insert must compare the epoch with the checkout's sample");
+    let inserted_at = lookup
+        .find("vacant.insert(")
+        .expect("lane_for_key must insert a missing lane");
+    assert!(
+        checked_at < inserted_at,
+        "the epoch must be compared, under the shard lock, before a lane is inserted"
+    );
+    let lookup = without_whitespace(lookup);
+    assert!(
+        lookup.contains("retired:AtomicBool::new(fenced)")
+            && lookup.contains("if!fenced{vacant.insert(Arc::clone(&lane));}"),
+        "a fenced checkout's lane must be retired from birth and must not enter the map"
+    );
+    for drain in ["    fn clear(&self) {", "    fn retain_keys("] {
+        let body = item_body(lanes, drain, "\n    }\n");
+        let bumped_at = body
+            .find("self.drain_epoch.fetch_add(1, Ordering::AcqRel)")
+            .unwrap_or_else(|| panic!("`{drain}` must bump the lane map's drain epoch"));
+        let retired_at = body
+            .find("self.lanes.retain(")
+            .unwrap_or_else(|| panic!("`{drain}` must retire lanes"));
+        assert!(
+            bumped_at < retired_at,
+            "`{drain}` must bump the epoch before its removal pass"
+        );
     }
 }
 
@@ -1745,6 +3128,7 @@ const EXPECTED_OBJECT_ADMISSION_FIELDS: &[&str] = &[
     "src/modes/mesh/slice.rs:MeshSlice.mesh_policies",
     "src/modes/mesh/slice.rs:MeshSlice.node_waypoint_assertors",
     "src/modes/mesh/slice.rs:MeshSlice.node_waypoint_capture_destinations",
+    "src/modes/mesh/slice.rs:MeshSlice.node_waypoint_capture_mesh_policies",
     "src/modes/mesh/slice.rs:MeshSlice.node_waypoint_capture_peer_authentications",
     "src/modes/mesh/slice.rs:MeshSlice.peer_authentications",
     "src/modes/mesh/slice.rs:MeshSlice.proxy_configs",
@@ -1767,6 +3151,7 @@ const EXPECTED_OBJECT_ADMISSION_FIELDS: &[&str] = &[
     "src/config/plugin_trigger.rs:PluginTriggerIdentityMatch.value",
     "src/config/plugin_trigger.rs:PluginTriggerMatch.consumer",
     "src/config/plugin_trigger.rs:PluginTriggerMatch.cookie",
+    "src/config/plugin_trigger.rs:PluginTriggerMatch.external_identity",
     "src/config/plugin_trigger.rs:PluginTriggerMatch.header",
     "src/config/plugin_trigger.rs:PluginTriggerMatch.host",
     "src/config/plugin_trigger.rs:PluginTriggerMatch.path",
@@ -1816,7 +3201,6 @@ const EXPECTED_OBJECT_ADMISSION_FIELDS: &[&str] = &[
     "src/modes/mesh/config.rs:MeshTrafficPolicy.tcp_keepalive",
     "src/modes/mesh/config.rs:MeshTrafficPolicy.tls",
     "src/modes/mesh/config.rs:MeshVirtualServiceCorsPolicy.cors",
-    "src/modes/mesh/config.rs:PeerAuthentication.selector",
     "src/modes/mesh/config.rs:PolicyScope.selector",
     "src/modes/mesh/config.rs:ServiceEntry.workload_selector",
     "src/modes/mesh/config.rs:TrustBundleSet.local",
@@ -1854,36 +3238,52 @@ fn admission_source_without_line_comments(text: &str) -> String {
         .join("\n")
 }
 
+/// A named `struct` declaration; captures the struct name.
+static STRUCT_DECLARATION: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?struct\s+(\w+)[^{;\n]*\{").unwrap()
+});
+/// A `#[derive(..)]` struct/enum item; captures indent, derives, kind, and name.
+static DERIVED_ITEM: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(concat!(
+        r"(?m)^([ \t]*)#\[derive\(([^)]*)\)\]\s*",
+        r"(?:#\[[^\]]*\]\s*)*",
+        r"(?:pub(?:\([^)]*\))?\s+)?(struct|enum)\s+(\w+)[^{;]*\{",
+    ))
+    .unwrap()
+});
+/// A named struct field; captures the field name and type text.
+static STRUCT_FIELD: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(concat!(
+        r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?",
+        r"([a-z_]\w*)\s*:\s*([^,]+),",
+    ))
+    .unwrap()
+});
+/// A serde `skip` / `skip_deserializing` option.
+static SERDE_SKIP: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"\bskip(?:_deserializing)?\b").unwrap());
+/// The attribute group immediately preceding a field.
+static FIELD_ATTRIBUTES: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?:#\[[^\]]*\]\s*)+$").unwrap());
+/// A tuple-newtype enum variant; captures name, attributes, and inner type.
+static NEWTYPE_VARIANT: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(concat!(
+        r"(?m)^[ \t]*([A-Z]\w*)\(\s*",
+        r"((?:#\[[^\]]*\]\s*)*)([\w:]+)\s*,?\s*\)",
+    ))
+    .unwrap()
+});
+
 #[test]
 fn every_nested_admin_struct_field_has_an_object_admission_decision() {
     // Named structs are the serde shape that accepts positional sequences.
     // Include definitions across src/, so an imported or fully qualified
     // struct cannot evade the inventory.
-    let declaration =
-        regex::Regex::new(r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?struct\s+(\w+)[^{;\n]*\{").unwrap();
-    let items = regex::Regex::new(concat!(
-        r"(?m)^([ \t]*)#\[derive\(([^)]*)\)\]\s*",
-        r"(?:#\[[^\]]*\]\s*)*",
-        r"(?:pub(?:\([^)]*\))?\s+)?(struct|enum)\s+(\w+)[^{;]*\{",
-    ))
-    .unwrap();
-    let fields = regex::Regex::new(concat!(
-        r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?",
-        r"([a-z_]\w*)\s*:\s*([^,]+),",
-    ))
-    .unwrap();
-    let skip = regex::Regex::new(r"\bskip(?:_deserializing)?\b").unwrap();
-    let field_attributes = regex::Regex::new(r"(?:#\[[^\]]*\]\s*)+$").unwrap();
-    let newtype_variants = regex::Regex::new(concat!(
-        r"(?m)^[ \t]*([A-Z]\w*)\(\s*",
-        r"((?:#\[[^\]]*\]\s*)*)([\w:]+)\s*,?\s*\)",
-    ))
-    .unwrap();
     let sources = production_sources();
     let struct_names: BTreeSet<String> = sources
         .iter()
         .flat_map(|(_, text)| {
-            declaration
+            STRUCT_DECLARATION
                 .captures_iter(text)
                 .map(|item| item[1].to_string())
         })
@@ -1893,7 +3293,7 @@ fn every_nested_admin_struct_field_has_an_object_admission_decision() {
 
     for (path, text) in &sources {
         let text = admission_source_without_line_comments(text);
-        for item in items.captures_iter(&text) {
+        for item in DERIVED_ITEM.captures_iter(&text) {
             if !item[2]
                 .split(',')
                 .any(|derive| derive.trim().rsplit("::").next() == Some("Deserialize"))
@@ -1907,9 +3307,9 @@ fn every_nested_admin_struct_field_has_an_object_admission_decision() {
                 panic!("{path}: {resource} must have a terminated declaration")
             })];
             let mut previous_field_end = 0;
-            for field in fields.captures_iter(body) {
+            for field in STRUCT_FIELD.captures_iter(body) {
                 let span = field.get(0).unwrap();
-                let attributes = field_attributes
+                let attributes = FIELD_ATTRIBUTES
                     .find(&body[previous_field_end..span.start()])
                     .map_or("", |attributes| attributes.as_str());
                 previous_field_end = span.end();
@@ -1932,7 +3332,7 @@ fn every_nested_admin_struct_field_has_an_object_admission_decision() {
                 let name = inner.rsplit("::").next().unwrap_or(inner);
                 if inner.contains(['<', '>', '&'])
                     || !struct_names.contains(name)
-                    || skip.is_match(attributes)
+                    || SERDE_SKIP.is_match(attributes)
                 {
                     continue;
                 }
@@ -2007,7 +3407,7 @@ fn every_nested_admin_struct_field_has_an_object_admission_decision() {
                 checked.insert(key);
             }
             if &item[3] == "enum" {
-                for variant in newtype_variants.captures_iter(body) {
+                for variant in NEWTYPE_VARIANT.captures_iter(body) {
                     let name = variant[3].rsplit("::").next().unwrap();
                     if struct_names.contains(name) {
                         let key = format!("{path}:{resource}.{}", &variant[1]);
@@ -2246,7 +3646,7 @@ fn api_spec_restore_section_requires_an_object_and_preserves_absence() {
     for accepted in [
         json!({}),
         json!({"api_specs": null}),
-        json!({"api_specs": {"section_version": "1", "items": []}}),
+        json!({"api_specs": {"section_version": "2", "items": []}}),
     ] {
         restore_envelope_admission_for_test(&serde_json::to_vec(&accepted).unwrap()).unwrap();
     }
@@ -2316,6 +3716,7 @@ fn mesh_config_updates_reject_positional_slice_roots() {
         false,
         [],
         [],
+        {},
         "v1",
     ]);
     let slice: MeshSlice = serde_json::from_value(positional.clone())
@@ -2438,6 +3839,12 @@ fn plugin_struct_lists_behind_raw_json_values_retain_element_admission() {
         ),
         (
             "src/plugins/mesh/authz.rs",
+            "fn parse_node_waypoint_route_branches(",
+            "\n}",
+            "json_object::from_json_object_vec_value",
+        ),
+        (
+            "src/plugins/mesh/authz.rs",
             "pub fn new_with_http_client(",
             "\n    }",
             "Vec<crate::util::json_object::JsonObject<MeshPolicy>>",
@@ -2457,7 +3864,6 @@ fn plugin_struct_lists_behind_raw_json_values_retain_element_admission() {
     }
     let text = admission_source_without_line_comments(&source("src/modes/mesh/slice.rs"));
     let body = item_body(&text, "pub struct MeshSlice {", "\n}");
-    let field_attributes = regex::Regex::new(r"(?:#\[[^\]]*\]\s*)+$").unwrap();
     for field in ["virtual_service_l4_proxies", "virtual_service_l4_upstreams"] {
         let declaration = format!("pub {field}:");
         let start = body
@@ -2465,7 +3871,7 @@ fn plugin_struct_lists_behind_raw_json_values_retain_element_admission() {
             .expect("MeshSlice L4 field must exist");
         // Inspect this field's full attribute group independently of ordering
         // or whether serde options share one attribute or use separate ones.
-        let attributes = field_attributes
+        let attributes = FIELD_ATTRIBUTES
             .find(&body[..start])
             .expect("MeshSlice L4 field must carry attributes");
         assert!(
@@ -2854,9 +4260,11 @@ const CONSUMER_ASSERTION_NAMESPACE_SITES: &[(&str, &str, &str)] = &[
         ".filter(|name| is_consumer_assertion_header(name.as_str()))",
     ),
     (
+        // The folded gateway predicate, so underscore spellings of
+        // `x-geo-country` / `x-consumer-*` cannot ride a trailer block either.
         "H1/H2/H3 request trailers",
         "src/proxy/headers.rs",
-        "|| is_consumer_assertion_header(name)\n",
+        "|| is_gateway_assertion_header(name)\n",
     ),
     (
         "post-plugin refresh (H1/H2, H3, egress overlay, deferred passes)",
@@ -2869,19 +4277,26 @@ const CONSUMER_ASSERTION_NAMESPACE_SITES: &[(&str, &str, &str)] = &[
         ".any(|name| headers_mod::is_gateway_assertion_header(name));",
     ),
     (
-        "H1/H2 WebSocket handshake",
-        "src/proxy/mod.rs",
-        "    headers_mod::is_consumer_assertion_header(name)\n        || matches!(",
+        "WebSocket backend handshake strip predicate",
+        "src/proxy/headers.rs",
+        "        || is_websocket_handshake_strip_header(name)\n        || is_consumer_assertion_header(name)\n}",
     ),
     (
+        "H1/H2 WebSocket handshake",
+        "src/proxy/mod.rs",
+        "headers_mod::is_websocket_backend_request_strip_header(lower_name.as_str())",
+    ),
+    (
+        // Delegates to the same initial-boundary helper whose gate is the
+        // "H1/H2 dispatch refresh gate" above.
         "native H3 dispatch refresh gate",
         "src/http3/server.rs",
-        ".any(|k| crate::proxy::headers::is_gateway_assertion_header(k));",
+        "crate::proxy::refresh_initial_backend_gateway_assertion_headers(",
     ),
     (
         "H3 WebSocket handshake",
         "src/http3/websocket.rs",
-        "crate::proxy::headers::is_consumer_assertion_header(&lower)",
+        "crate::proxy::headers::is_websocket_backend_request_strip_header(&lower)",
     ),
     (
         "H3-to-gRPC bridge trusted overlay",
@@ -2941,6 +4356,81 @@ fn without_inline_test_module(text: &str) -> &str {
     text.split("\n#[cfg(test)]\nmod tests {")
         .next()
         .unwrap_or(text)
+}
+
+#[test]
+fn request_header_case_variants_are_folded_at_shared_authz_and_egress_boundaries() {
+    for (path, signature, delegation) in [
+        (
+            "src/plugins/mod.rs",
+            "pub fn materialize_headers(&mut self)",
+            "crate::proxy::headers::canonicalize_request_header_map(&mut self.headers)",
+        ),
+        (
+            "src/plugins/mesh/authz.rs",
+            "async fn authorize(&self, ctx: &mut RequestContext)",
+            "crate::proxy::headers::canonicalize_request_header_map(&mut ctx.headers)",
+        ),
+        (
+            "src/proxy/headers.rs",
+            "pub fn merge_proxy_headers_preserving_repeated(",
+            "canonical_request_header_map(proxy_headers)",
+        ),
+        (
+            "src/proxy/headers.rs",
+            "pub fn filter_secondary_request_headers(",
+            "canonical_request_header_map(headers)",
+        ),
+        (
+            "src/proxy/mod.rs",
+            "pub(crate) fn refresh_initial_backend_gateway_assertion_headers(",
+            "headers_mod::canonicalize_request_header_map(",
+        ),
+        (
+            "src/proxy/mod.rs",
+            "pub fn refresh_backend_gateway_assertion_headers(",
+            "headers_mod::canonicalize_request_header_map(headers)",
+        ),
+        (
+            "src/proxy/mod.rs",
+            "pub(crate) fn run_final_backend_header_policy_hooks(",
+            "headers_mod::canonicalize_request_header_map(headers)",
+        ),
+    ] {
+        let text = source(path);
+        let terminator = if path.starts_with("src/plugins/") {
+            "\n    }"
+        } else {
+            "\n}"
+        };
+        let body = item_body(&text, signature, terminator);
+        assert!(
+            body.contains(delegation),
+            "{path}: {signature} must fold through the shared request-map rule"
+        );
+    }
+    // Both frontends share the initial map boundary for HTTP, gRPC, and
+    // WebSocket dispatch; deferred passes and egress overlays use its refresh.
+    for path in ["src/proxy/mod.rs", "src/http3/server.rs"] {
+        let text = source(path);
+        let minimum = if path == "src/proxy/mod.rs" { 2 } else { 1 };
+        assert!(
+            text.matches("refresh_initial_backend_gateway_assertion_headers(")
+                .count()
+                >= minimum
+        );
+    }
+    let text = source("src/proxy/mod.rs");
+    let initial = item_body(
+        &text,
+        "pub(crate) fn refresh_initial_backend_gateway_assertion_headers(",
+        "\n}",
+    );
+    assert!(
+        initial.find("canonicalize_request_header_map(").unwrap()
+            < initial.find("return;").unwrap(),
+        "anonymous requests must fold before the no-assertion early return"
+    );
 }
 
 #[test]
@@ -3362,4 +4852,917 @@ fn every_functional_gateway_spawner_launches_the_harness_selected_binary() {
     );
     let path = item_body(&harness, "pub fn gateway_binary_path()", "\n}\n");
     assert!(path.contains("locate_binary(false)"));
+}
+
+// The feature-gated suites (`secrets_functional`, `service_integration`) are
+// outside that harness rule on purpose: they spawn the gateway Cargo built
+// with THEIR features, through the compile-time `CARGO_BIN_EXE_ferrum-edge`.
+// The secrets startup smoke used a third spelling, walking up from its own
+// executable to a sibling `ferrum-edge`. That depends on Cargo's target
+// directory layout: Cargo 1.100 moved test executables out of
+// `target/<profile>/deps/`, the walk found nothing, and all four smokes failed
+// on `main` as "binary not found".
+//
+// The scan covers the files inside the two suite directories only. Both suites
+// also compile the shared `tests/scaffolding` helpers through `#[path]`, and
+// those legitimately re-execute the test executable for their child fixtures;
+// they stay out of the scan. No file inside either suite directory has that
+// reason, so one that reads the test executable's path is that spelling again.
+// The match is textual and deliberately broad (a comment trips it too): if a
+// suite-local test ever needs to re-execute itself, exempt that file here by
+// name rather than loosening the rule for the gateway locator.
+
+const FEATURE_SUITE_SOURCES: [&str; 2] = ["tests/secrets_functional", "tests/service_integration"];
+const SECRETS_STARTUP_SMOKE: &str = "tests/secrets_functional/startup_smoke.rs";
+
+#[test]
+fn feature_suite_gateway_spawners_use_the_binary_cargo_built_for_them() {
+    let offenders: Vec<String> = rust_sources_under(&FEATURE_SUITE_SOURCES)
+        .into_iter()
+        .filter(|(_, text)| text.contains("current_exe("))
+        .map(|(path, _)| path)
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "resolve the gateway with env!(\"CARGO_BIN_EXE_ferrum-edge\"), not from the test \
+         executable's own location, which follows Cargo's target layout (a suite-local \
+         self re-exec needs a named exemption in this test): {offenders:#?}"
+    );
+
+    let smoke = source(SECRETS_STARTUP_SMOKE);
+    let locate = item_body(&smoke, "fn locate_binary()", "\n}\n");
+    assert!(
+        locate.contains("env!(\"CARGO_BIN_EXE_ferrum-edge\")"),
+        "the secrets startup smoke must spawn the binary Cargo built with its features"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Thread-local tracing captures register the process-wide interest floor
+// ---------------------------------------------------------------------------
+//
+// tracing-core caches each callsite's interest the first time it is hit. While
+// at most one dispatcher is registered it computes that interest from the
+// HITTING thread's default dispatcher alone, so a sibling test with no
+// subscriber that reaches a callsite first caches `never` for it, and the
+// capturing test's own event at that callsite is then skipped before its
+// thread-local subscriber is consulted. That emptied two captures in CI
+// (`test_proxy_allowed_ws_origins_load_warns_once_per_proxy` got zero warnings
+// because the sibling star-proxy load test hits the same `warn!`, and
+// `ceiling_refusal_warning_is_rate_limited_but_metric_is_exact` saw no
+// refusal warning). The remedy is the shared floor
+// (`tests/support/diagnostic_interest.rs` via `ensure_interest_floor()`, or
+// `plugin_utils::install_interest_floor()` in the plugin targets) registered
+// before the capture dispatch is built. Every capture install in the unit and
+// integration suites must be preceded by one inside the same function.
+
+const TRACING_CAPTURE_INSTALL_TOKENS: [&str; 5] = [
+    "subscriber::set_default(",
+    "subscriber::with_default(",
+    "dispatcher::with_default(",
+    // Registering the dispatch is what rebuilds the interest cache, so the
+    // floor must come before it, in any spelling (`tracing::Dispatch::new(`
+    // or a bare `Dispatch::new(` after `use tracing::Dispatch`).
+    "Dispatch::new(",
+    // `WithSubscriber::with_subscriber` sets the dispatch as the polling
+    // thread's default on every poll of the wrapped future.
+    ".with_subscriber(",
+];
+
+/// The suites' sources, including the shared capture helpers they compile in.
+const TRACING_CAPTURE_SCAN_DIRS: [&str; 4] = [
+    "tests/unit",
+    "tests/integration",
+    "tests/common",
+    "tests/support",
+];
+
+/// Files exempt from the scan: this guard, and the floor itself (its own
+/// `Dispatch::new(InterestFloorSubscriber)`, its silent-sibling canary, and
+/// the regression macro that runs a caller's capture helper).
+const TRACING_CAPTURE_SCAN_EXEMPT_FILES: [&str; 2] = [
+    "tests/unit/gateway_core/shared_invariant_parity_tests.rs",
+    "tests/support/diagnostic_interest.rs",
+];
+
+/// Installs that are not captures: a `NoSubscriber` silences a callsite and
+/// never reads output back, and a capture-local floor dispatch (bound as
+/// `_interest_floor`, as `plugin_cache_tests` does) IS the floor.
+const TRACING_NON_CAPTURE_INSTALLS: [&str; 2] =
+    ["tracing::subscriber::NoSubscriber", "let _interest_floor ="];
+
+/// Evidence, on a non-comment line inside the installing function, that a
+/// floor is registered: a call statement or a bound floor dispatch.
+const TRACING_INTEREST_FLOOR_MARKERS: [&str; 2] = ["interest_floor();", "let _interest_floor ="];
+
+/// Whether a source line declares a function item (`fn`, optionally after
+/// visibility and `async`/`const`/`unsafe`), as opposed to mentioning `fn `.
+fn declares_fn(line: &str) -> bool {
+    let mut rest = line.trim_start();
+    loop {
+        let before = rest;
+        for prefix in [
+            "pub(crate) ",
+            "pub(super) ",
+            "pub ",
+            "async ",
+            "const ",
+            "unsafe ",
+        ] {
+            if let Some(stripped) = rest.strip_prefix(prefix) {
+                rest = stripped;
+            }
+        }
+        if rest == before {
+            return rest.starts_with("fn ");
+        }
+    }
+}
+
+#[test]
+fn every_tracing_capture_registers_the_interest_floor_first() {
+    let mut offenders = Vec::new();
+    let mut installs = 0usize;
+    for (path, text) in rust_sources_under(&TRACING_CAPTURE_SCAN_DIRS) {
+        if TRACING_CAPTURE_SCAN_EXEMPT_FILES.contains(&path.as_str()) {
+            continue;
+        }
+        let lines: Vec<&str> = text.lines().collect();
+        for token in TRACING_CAPTURE_INSTALL_TOKENS {
+            for (at, _) in text.match_indices(token) {
+                // `MeshRouteDispatch::new(` and the like are not tracing.
+                if text[..at]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                {
+                    continue;
+                }
+                let line_idx = text[..at].matches('\n').count();
+                let line = lines[line_idx];
+                if line.trim_start().starts_with("//")
+                    || TRACING_NON_CAPTURE_INSTALLS
+                        .iter()
+                        .any(|exempt| line.contains(exempt))
+                {
+                    continue;
+                }
+                installs += 1;
+                let fn_line = (0..=line_idx)
+                    .rev()
+                    .find(|&i| declares_fn(lines[i]))
+                    .unwrap_or(0);
+                let floored = lines[fn_line..=line_idx]
+                    .iter()
+                    .filter(|l| !l.trim_start().starts_with("//"))
+                    .any(|l| {
+                        TRACING_INTEREST_FLOOR_MARKERS
+                            .iter()
+                            .any(|marker| l.contains(marker))
+                    });
+                if !floored {
+                    offenders.push(format!("{path}:{}: {}", line_idx + 1, line.trim()));
+                }
+            }
+        }
+    }
+    assert!(
+        installs > 0,
+        "the scan must find the suites' tracing capture installs"
+    );
+    assert!(
+        offenders.is_empty(),
+        "call crate::diagnostic_test_interest::ensure_interest_floor(); (or \
+         plugin_utils::install_interest_floor();) as a statement in the \
+         installing function, before installing a thread-local tracing \
+         capture: {offenders:#?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Stream per-port LB lane admission: TCP, UDP/DTLS, mesh raw-TCP egress, mesh
+// UDP egress. The four paths once carried their own copies of this decision
+// and drifted (per-port `LEAST_CONN`, the subset refinement). The behaviour of
+// the shared `backend_dispatch::stream_port_lane` is pinned in
+// `stream_port_lane_tests.rs`; this table pins that every stream path calls
+// it, with the selection subset it actually selects from, and keeps no copy.
+// ---------------------------------------------------------------------------
+
+/// `(path, selection_subset argument)` for every stream path that selects a
+/// load-balanced target. Only TCP selects inside a route subset:
+/// `upstream_subset` is a validation error on udp/dtls, and mesh relay proxies
+/// select from the entry upstream.
+const STREAM_PORT_LANE_SITES: &[(&str, &str)] = &[
+    ("src/proxy/tcp_proxy.rs", "proxy.upstream_subset.as_deref()"),
+    ("src/proxy/udp_proxy.rs", "None"),
+    ("src/proxy/mesh_tcp_egress.rs", "None"),
+    ("src/proxy/mesh_udp_capture.rs", "None"),
+];
+
+/// The top-level arguments of every `stream_port_lane(` call in `text`.
+fn stream_port_lane_call_args(text: &str) -> Vec<Vec<String>> {
+    const CALL: &str = "backend_dispatch::stream_port_lane(";
+    let mut calls = Vec::new();
+    for (at, _) in text.match_indices(CALL) {
+        let bytes = text.as_bytes();
+        let open = at + CALL.len() - 1;
+        let close = after_matching_close(bytes, open) - 1;
+        let compact: String = text[open + 1..close].split_whitespace().collect();
+        let mut depth = 0i32;
+        let mut start = 0;
+        let mut args = Vec::new();
+        for (i, c) in compact.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                ',' if depth == 0 => {
+                    args.push(compact[start..i].to_string());
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        if start < compact.len() {
+            args.push(compact[start..].to_string());
+        }
+        calls.push(args);
+    }
+    calls
+}
+
+#[test]
+fn every_stream_path_admits_its_port_lane_through_the_shared_policy() {
+    for &(path, subset) in STREAM_PORT_LANE_SITES {
+        let production = without_cfg_test_items(&source(path));
+        let calls = stream_port_lane_call_args(&production);
+        assert_eq!(
+            calls.len(),
+            1,
+            "{path} must make exactly one production per-port lane decision \
+             through backend_dispatch::stream_port_lane"
+        );
+        assert_eq!(
+            calls[0].last().map(String::as_str),
+            Some(subset),
+            "{path} must pass its own selection subset explicitly"
+        );
+        for copy in [
+            "override_config.locality_lb_setting.is_some()",
+            "HashOnStrategy::Ip",
+            "LoadBalancerAlgorithm::LeastLatency",
+        ] {
+            assert!(
+                !production.contains(copy),
+                "{path} re-implements part of the stream lane policy (`{copy}`); \
+                 call backend_dispatch::stream_port_lane instead"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// hyper HTTP/2 client builders configured from `PoolConfig`
+// ---------------------------------------------------------------------------
+//
+// Issue #5464: every hyper-based backend H2 client must pass
+// `pool_config.http2_adaptive_window`. The direct-H2, gRPC, mesh-mTLS and
+// nested-HBONE gRPC builders used to be four hand-written copies; they now
+// call `pool::hyper_h2_client_builder`, whose behaviour is pinned in
+// `h2_client_builder_tests.rs`. Issue #7071 removed the per-site keepalive and
+// initial-send-stream options, so every site gets identical wire settings and a
+// pool key built from the same `PoolConfig` describes what was dialed. This
+// table pins that each site calls the shared builder with the `PoolConfig`
+// alone and that no site builds its own `PoolConfig`-driven hyper H2 client.
+
+/// `(path, number of shared-builder calls)`.
+const H2_CLIENT_BUILDER_SITES: &[(&str, usize)] = &[
+    ("src/proxy/http2_pool.rs", 1),
+    ("src/proxy/mesh_mtls_pool.rs", 1),
+    ("src/proxy/grpc_proxy.rs", 2),
+];
+
+#[test]
+fn every_pool_config_h2_client_uses_the_shared_builder_with_no_site_options() {
+    const CALL: &str = "crate::pool::hyper_h2_client_builder(";
+    let args_at = |text: &str, at: usize| -> String {
+        let open = at + CALL.len() - 1;
+        let close = after_matching_close(text.as_bytes(), open);
+        text[open..close].split_whitespace().collect()
+    };
+
+    for &(path, calls) in H2_CLIENT_BUILDER_SITES {
+        let production = without_cfg_test_items(&source(path));
+        let found: Vec<_> = production.match_indices(CALL).collect();
+        assert_eq!(found.len(), calls, "{path}: shared H2 builder calls");
+        for (at, _) in found {
+            let args = args_at(&production, at);
+            assert!(
+                !args.contains(','),
+                "{path}: the shared H2 builder takes the `PoolConfig` alone, got \
+                 {args}; a per-site wire difference would let a pool key and the \
+                 connection it names disagree (issue #7071)"
+            );
+        }
+    }
+
+    // gRPC: both the pooled direct dial (`build_h2_builder`) and the
+    // nested-HBONE dial build through the shared helper.
+    let grpc = without_cfg_test_items(&source("src/proxy/grpc_proxy.rs"));
+    for (site, body) in [
+        (
+            "gRPC pool",
+            item_body(&grpc, "fn build_h2_builder(", "\n    }\n"),
+        ),
+        (
+            "nested-HBONE gRPC dial",
+            item_body(&grpc, "async fn open_hbone_grpc_sender(", "\n}\n"),
+        ),
+    ] {
+        assert!(body.contains(CALL), "{site} must use the shared H2 builder");
+    }
+
+    // No PoolConfig-driven hyper H2 client is hand-built anywhere else. The
+    // Unix-socket h2c client uses fixed constants, not `PoolConfig`, and the
+    // frontend H2 *server* builders in `proxy/mod.rs` use their own env
+    // settings; neither reads `pool_config.http2_adaptive_window`.
+    for (path, text) in production_sources() {
+        if path == "src/pool/mod.rs" {
+            continue;
+        }
+        let production = without_cfg_test_items(&text);
+        assert!(
+            !production.contains(".adaptive_window(pool_config.http2_adaptive_window)"),
+            "{path} hand-builds a PoolConfig-driven hyper H2 client; call \
+             crate::pool::hyper_h2_client_builder instead"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #7075: control-plane and platform copies of one rule
+// ---------------------------------------------------------------------------
+
+/// `FERRUM_MESH_CA_BOOTSTRAP_DEV` is read in exactly one place,
+/// `identity::ca::bootstrap::dev_bootstrap_opted_in`, which `bootstrap_allowed`,
+/// `bootstrap_dev_root`, and the `EnvConfig` validation gate all call. A second
+/// inline read could drift to a different spelling.
+#[test]
+fn mesh_ca_bootstrap_dev_opt_in_has_one_reader() {
+    let mut readers = Vec::new();
+    for (path, text) in production_sources() {
+        let production = without_cfg_test_items(&text);
+        let reads = production
+            .matches("var(\"FERRUM_MESH_CA_BOOTSTRAP_DEV\")")
+            .count();
+        if reads > 0 {
+            readers.push((path, reads));
+        }
+    }
+    assert_eq!(
+        readers,
+        vec![("src/identity/ca/bootstrap.rs".to_string(), 1)],
+        "read FERRUM_MESH_CA_BOOTSTRAP_DEV only through \
+         identity::ca::bootstrap::dev_bootstrap_opted_in"
+    );
+    let bootstrap = source("src/identity/ca/bootstrap.rs");
+    let helper = item_body(&bootstrap, "pub fn dev_bootstrap_opted_in(", "\n}");
+    assert!(helper.contains("var(\"FERRUM_MESH_CA_BOOTSTRAP_DEV\")"));
+    for caller in ["pub fn bootstrap_allowed(", "pub fn bootstrap_dev_root("] {
+        let body = item_body(&bootstrap, caller, "\n}");
+        assert!(body.contains("dev_bootstrap_opted_in()"), "{caller}");
+    }
+    assert!(
+        source("src/config/env_config.rs")
+            .contains("crate::identity::ca::bootstrap::dev_bootstrap_opted_in()"),
+        "EnvConfig validation must share the bootstrap opt-in read"
+    );
+}
+
+/// `SpireAgentCa` consumes the shared Workload API fetch loop rather than a
+/// private copy, so it inherits the loop's telemetry fixes (`0afac83f7`): the
+/// `spire_agent` CA-health series exists before the first connect, and a clean
+/// stream end counts as a rotation failure.
+#[test]
+fn spire_agent_ca_x509_stream_is_the_shared_workload_api_fetch_loop() {
+    let spire = without_cfg_test_items(&source("src/identity/ca/spire.rs"));
+    assert!(spire.contains("spawn_fetch_loop_with_handle("));
+    assert!(spire.contains("metrics_source: FetchLoopMetricsSource::SpireAgent"));
+    assert!(
+        !spire.contains("fetch_x509_svid_stream("),
+        "SpireAgentCa must not open its own FetchX509SVID stream"
+    );
+    let fetch_loop = source("src/identity/workload_api/fetch_loop.rs");
+    let main = item_body(&fetch_loop, "async fn fetch_loop_main(", "\n}");
+    assert!(main.contains("config.metrics_source.set_ca_health(false);"));
+    assert!(main.contains("if !failure_recorded {"));
+}
+
+/// Remote control-plane URLs are logged in the same structural
+/// `scheme://host[:port]/redacted` form as notification and observability
+/// endpoints: no userinfo, path, query, or fragment survives.
+#[test]
+fn remote_control_plane_url_logs_use_structural_endpoint_redaction() {
+    use ferrum_edge::plugins::utils::redacted_endpoint_url_str;
+
+    for (url, expected) in [
+        (
+            "https://user:pw@cp.example:8443/tenant-secret?token=x#frag",
+            "https://cp.example:8443/redacted",
+        ),
+        (
+            "http://user@cp.example/tenant-secret?token=x",
+            "http://cp.example/redacted",
+        ),
+        ("https://cp.example", "https://cp.example/redacted"),
+        ("not a url", "redacted-host/redacted"),
+    ] {
+        let rendered = redacted_endpoint_url_str(url);
+        assert_eq!(rendered, expected, "{url}");
+        for leaked in ["user", "pw", "tenant-secret", "token", "frag"] {
+            assert!(!rendered.contains(leaked), "{url} leaked {leaked}");
+        }
+    }
+    let multicluster = without_cfg_test_items(&source("src/modes/mesh/multicluster.rs"));
+    let sanitizer = item_body(&multicluster, "fn sanitize_url_for_logging(", "\n}");
+    assert!(
+        sanitizer.contains("log_helpers::redacted_endpoint_url_str(url)"),
+        "remote CP URL logging must delegate to the shared structural redaction"
+    );
+}
+
+/// Accept-any verifiers live in `crate::tls::NoVerifier` (base provider) or
+/// derive their schemes from the provider their client is built from. No
+/// production `ServerCertVerifier` hard-codes a scheme list, and the CLI keeps
+/// no private copy of `NoVerifier`.
+#[test]
+fn no_production_certificate_verifier_hard_codes_its_signature_schemes() {
+    const SIGNATURE: &str = "fn supported_verify_schemes(";
+    let mut checked = 0;
+    for (path, text) in production_sources() {
+        let production = without_cfg_test_items(&text);
+        for (at, _) in production.match_indices(SIGNATURE) {
+            let rest = &production[at + SIGNATURE.len()..];
+            let body = rest.split("fn ").next().unwrap_or(rest);
+            assert!(
+                !body.contains("SignatureScheme::"),
+                "{path}: supported_verify_schemes must come from a crypto provider or \
+                 an inner verifier, not a fixed list"
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        checked >= 5,
+        "expected the production verifiers, found {checked}"
+    );
+    let cli = without_cfg_test_items(&source("src/cli.rs"));
+    assert!(
+        !cli.contains("ServerCertVerifier for"),
+        "src/cli.rs must use crate::tls::NoVerifier instead of a private verifier"
+    );
+    assert!(cli.contains("crate::tls::NoVerifier"));
+}
+
+/// The final-request-body hook-context hand-back lives in one
+/// `RequestContext` method (issue #7223). No production path or test seam
+/// re-implements the swap field by field, so a field added to the hand-back
+/// cannot be forgotten on one dispatch path.
+#[test]
+fn final_request_body_hook_context_hand_back_has_one_implementation() {
+    let mut adopters = 0;
+    for (path, text) in production_sources() {
+        if path == "src/plugins/mod.rs" {
+            continue;
+        }
+        let production = without_cfg_test_items(&text);
+        for piecemeal in [
+            "adopt_final_request_body_hook_terminals(",
+            "adopt_final_request_body_hook_plugin_state(",
+            ".waf_metadata_initialized = ",
+        ] {
+            assert!(
+                !production.contains(piecemeal),
+                "{path}: hand a final-request-body hook context back through \
+                 `RequestContext::adopt_final_request_body_hook_context`, not `{piecemeal}`"
+            );
+        }
+        adopters += production
+            .matches("adopt_final_request_body_hook_context(")
+            .count();
+    }
+    assert!(
+        adopters >= 6,
+        "expected the five proxy dispatch sites and the `_test_support` seam, found {adopters}"
+    );
+}
+
+/// NodeWaypoint per-destination authorization (issue #7383): every place that
+/// decides which destination a carried VirtualService route reaches must
+/// consult the request's per-destination verdicts before the blanket
+/// single-destination guard. The siblings are route dispatch's matched-rule
+/// admission, its early route-total preview, the dispatch finalizer's
+/// weighted-split leg selection (issue #7387), and proxy core's final check in
+/// the one `before_proxy` runner every transport (H1/H2, native gRPC,
+/// WebSocket, H3, deferred passes) converges on. A new call site of the
+/// blanket guard, or a runner without the final check, fails here.
+/// Issue #7387: a `mesh_route_dispatch` instance can reach destinations
+/// through `weighted_splits` legs as well as through rule destinations. Every
+/// place that enumerates the destinations an instance names must read both,
+/// or a leg is left unauthorized (candidate threading), un-probed (HBONE
+/// capability enrollment), pruned (route upstream references), deletable
+/// while referenced (store references, API-spec replacement), dangling
+/// (runtime and admin-write reference validation), untracked (adaptive
+/// concurrency route-override destinations), or uncounted against the
+/// per-route candidate bound (slice binding), or missing from the route's
+/// RequestAuthentication set (destination scoping). The split upstream itself
+/// keeps only its Service legs' workloads, so no enumerator may stand it in
+/// for an external leg.
+#[test]
+fn mesh_route_dispatch_destination_enumerators_cover_weighted_split_legs() {
+    let mesh = source("src/modes/mesh/mod.rs");
+    let slice = source("src/modes/mesh/slice.rs");
+    let proxy = source("src/proxy/mod.rs");
+    let dispatch = source("src/plugins/mesh_route_dispatch.rs");
+    let store_policy = source("src/config/store_policy.rs");
+    let crud = source("src/admin/crud.rs");
+    let cache = source("src/plugin_cache.rs");
+    for (file, text, signature, needle) in [
+        (
+            "src/proxy/mod.rs",
+            &proxy,
+            "pub(crate) fn validate_mesh_route_dispatch_upstream_references(",
+            ".weighted_splits",
+        ),
+        (
+            "src/admin/crud.rs",
+            &crud,
+            "pub(crate) async fn validate_mesh_route_dispatch_plugin_upstream_references(",
+            ".weighted_splits",
+        ),
+        (
+            "src/config/store_policy.rs",
+            &store_policy,
+            "pub fn mesh_route_dispatch_referenced_upstream(",
+            ".referenced_upstream_ids()",
+        ),
+        (
+            "src/plugin_cache.rs",
+            &cache,
+            "fn collect_route_override_destinations(",
+            "\"weighted_splits\"",
+        ),
+        (
+            "src/plugin_cache.rs",
+            &cache,
+            "fn route_override_destination_fingerprint(",
+            "\"weighted_splits\"",
+        ),
+        (
+            "src/modes/mesh/mod.rs",
+            &mesh,
+            "fn thread_node_waypoint_route_branches_to_authz(",
+            "\"weighted_splits\"",
+        ),
+        (
+            "src/modes/mesh/mod.rs",
+            &mesh,
+            "fn bind_carried_http_routes_to_node_waypoint_transport(",
+            "leg_dispatched",
+        ),
+        (
+            "src/modes/mesh/slice.rs",
+            &slice,
+            "pub(crate) fn mesh_route_dispatch_rule_upstream_ids(",
+            "\"weighted_splits\"",
+        ),
+        (
+            "src/proxy/mod.rs",
+            &proxy,
+            "fn collect_mesh_route_dispatch_capability_targets(",
+            ".weighted_splits",
+        ),
+        (
+            "src/plugins/mesh_route_dispatch.rs",
+            &dispatch,
+            "pub fn references_upstream_id(",
+            "self.referenced_upstream_ids()",
+        ),
+        (
+            "src/plugins/mesh_route_dispatch.rs",
+            &dispatch,
+            "pub fn referenced_upstream_ids(",
+            "self.weighted_splits",
+        ),
+    ] {
+        assert!(
+            item_body(text, signature, "\n    }\n").contains(needle)
+                || item_body(text, signature, "\n}\n").contains(needle),
+            "{file}: `{signature}` must enumerate weighted-split legs too"
+        );
+    }
+    assert!(
+        item_body(
+            &mesh,
+            "fn scope_request_auth_to_node_waypoint_destinations(",
+            "\n}\n",
+        )
+        .contains("\"weighted_splits\""),
+        "RequestAuthentication scoping must expand a weighted split into its legs"
+    );
+}
+
+#[test]
+fn node_waypoint_route_branch_verdicts_gate_every_destination_decision() {
+    let proxy = admission_source_without_line_comments(&source("src/proxy/mod.rs"));
+    let runner = item_body(
+        &proxy,
+        "pub(crate) async fn run_before_proxy_hooks_for_backend_path_policy(",
+        "\n}",
+    );
+    assert!(
+        runner.contains("enforce_node_waypoint_route_branch_for_effective_destination("),
+        "the shared before_proxy runner must admit the reached destination on its own verdict"
+    );
+
+    let dispatch = source("src/plugins/mesh_route_dispatch.rs");
+    let production = dispatch
+        .split("\n#[cfg(test)]\nmod tests {")
+        .next()
+        .expect("dispatch source");
+    let production = admission_source_without_line_comments(production);
+    let guard_calls = production
+        .matches("reject_node_waypoint_authz_destination_override(")
+        .count();
+    assert_eq!(
+        guard_calls, 2,
+        "the blanket guard is defined once and reached only through the verdict-aware wrapper"
+    );
+    let finalize = item_body(
+        &production,
+        "pub(crate) async fn finalize_node_waypoint_route_branch(",
+        "\n}",
+    );
+    assert!(
+        finalize.contains("admit_node_waypoint_route_branch_for_effective_destination(ctx"),
+        "the group-level admission must judge the destination every instance selected"
+    );
+    let cache = admission_source_without_line_comments(&source("src/plugin_cache.rs"));
+    let finalizer = item_body(
+        &cache,
+        "impl Plugin for MeshRouteDispatchFinalizer {",
+        "\n}",
+    );
+    assert!(
+        finalizer.contains("finalize_node_waypoint_route_branch(ctx, headers)"),
+        "the dispatch finalizer must admit the selected destination after the last instance"
+    );
+    // Issue #7387: a weighted split dispatched leg by leg resolves to its leg
+    // in the finalizer, once routing is final and BEFORE the destination is
+    // admitted, so the leg (never the split, never an unselected leg) is what
+    // the finalizer and proxy core judge.
+    let leg_selection = finalizer
+        .find("select_weighted_split_leg(")
+        .expect("the dispatch finalizer must resolve weighted splits to a leg");
+    let admission = finalizer
+        .find("finalize_node_waypoint_route_branch(ctx, headers)")
+        .expect("admission call");
+    assert!(
+        leg_selection < admission,
+        "the leg is selected before the group's destination is admitted"
+    );
+    assert_eq!(
+        production.matches("fn select_weighted_split_leg(").count(),
+        1,
+        "weighted-split legs are selected in one place"
+    );
+    assert!(
+        item_body(
+            &production,
+            "pub(crate) fn select_weighted_split_leg(",
+            "\n}"
+        )
+        .contains("reject_unauthorized_node_waypoint_rule_destination(ctx, &leg.destination)"),
+        "a selected leg passes the same verdict-aware guard as a matched rule"
+    );
+    let preview = item_body(
+        &production,
+        "fn node_waypoint_rule_destination_vetoed(",
+        "\n}",
+    );
+    assert!(
+        preview.contains("reject_unauthorized_node_waypoint_rule_destination(ctx, destination)"),
+        "the preview must follow the same per-rule decision as execution"
+    );
+    assert!(
+        item_body(&production, "fn rule_answers_before_dispatch(", "\n}")
+            .contains("node_waypoint_rule_destination_vetoed(ctx, &rule.destination)"),
+        "early route-total planning must use the verdict-aware preview"
+    );
+    assert_eq!(
+        production
+            .matches("reject_unauthorized_node_waypoint_rule_destination(")
+            .count(),
+        4,
+        "matched-rule admission, the preview and weighted-split leg selection share the \
+         verdict-aware check (definition + three calls)"
+    );
+    assert_eq!(
+        production
+            .matches("admit_node_waypoint_route_branch_for_effective_destination(")
+            .count(),
+        1,
+        "no single dispatch instance may admit an intermediate destination"
+    );
+}
+
+// ---- `allowed_ws_origins` grandfathering warning vs admission refusal ----
+
+/// Every production caller of whole-config field validation, split by whether
+/// it may emit the #5454 `allowed_ws_origins` grandfathering warning
+/// ("stored database/control-plane config is still loaded").
+///
+/// Load paths (database, CP, DP, the pre-swap guard) keep the warning. A path
+/// that refuses `*` / non-origin entries must not emit it: file mode refuses
+/// before its pipeline runs (issue #7218), and Admin API restore validates
+/// through the admission variant. A new caller fails here until it is placed
+/// in one column, so a refusing path cannot silently pick up a false warning.
+#[test]
+fn allowed_ws_origins_grandfathering_warning_never_precedes_an_admission_refusal() {
+    const WARNING_CALL: &str = ".validate_all_fields_with_ip_policy(";
+    const ADMISSION_CALL: &str = ".validate_all_fields_for_admission_with_ip_policy(";
+    // (file, warning-variant call sites, admission-variant call sites)
+    let expected: BTreeMap<&str, (usize, usize)> = BTreeMap::from([
+        // Restore: refuses through `allowed_ws_origins_admission_errors`.
+        ("src/admin/mod.rs", (0, 1)),
+        // `validate_all_fields` delegating to the warning variant.
+        ("src/config/types.rs", (1, 0)),
+        // The pipeline step dispatching to either variant.
+        ("src/config/validation_pipeline.rs", (1, 1)),
+        // File mode: reached only after the admission refusal (pinned below).
+        ("src/config/file_loader.rs", (1, 0)),
+        // Database, CP and DP loads and the pre-swap guard keep #5454.
+        ("src/config/db_loader.rs", (1, 0)),
+        ("src/config/mongo_store.rs", (1, 0)),
+        ("src/modes/control_plane.rs", (1, 0)),
+        ("src/grpc/dp_client.rs", (1, 0)),
+        ("src/proxy/mod.rs", (1, 0)),
+    ]);
+    // `validate_all_fields` delegates to the warning variant. No production
+    // caller may use it, so every caller names a variant and lands in the
+    // table below.
+    const PLAIN_CALL: &str = ".validate_all_fields(";
+    let sources = production_sources();
+    let plain_callers: Vec<&str> = sources
+        .iter()
+        .filter(|(_, text)| text.contains(PLAIN_CALL))
+        .map(|(path, _)| path.as_str())
+        .collect();
+    assert!(
+        plain_callers.is_empty(),
+        "production code must call a named field-validation variant, not \
+         `validate_all_fields`: {plain_callers:?}"
+    );
+    let actual: BTreeMap<String, (usize, usize)> = sources
+        .into_iter()
+        .filter_map(|(path, text)| {
+            let counts = (
+                text.matches(WARNING_CALL).count(),
+                text.matches(ADMISSION_CALL).count(),
+            );
+            (counts != (0, 0)).then_some((path, counts))
+        })
+        .collect();
+    let expected: BTreeMap<String, (usize, usize)> = expected
+        .into_iter()
+        .map(|(path, counts)| (path.to_string(), counts))
+        .collect();
+    assert_eq!(
+        actual, expected,
+        "classify every whole-config field-validation caller: a path that refuses \
+         `allowed_ws_origins` `*` must use the admission variant or refuse first"
+    );
+
+    let restore = source("src/admin/mod.rs");
+    let restore = item_body(&restore, "fn restore_candidate_validation_errors(", "\n}");
+    let admission = restore
+        .find(ADMISSION_CALL)
+        .expect("restore validates through the admission variant");
+    let refusal = restore
+        .find("candidate.allowed_ws_origins_admission_errors()")
+        .expect("restore refuses `*` / non-origin entries");
+    assert!(
+        admission < refusal,
+        "restore keeps its error order: pipeline first, admission refusal last"
+    );
+
+    let file_loader = source("src/config/file_loader.rs");
+    let core = item_body(&file_loader, "fn decode_and_validate_document(", "\n}");
+    let refusal = core
+        .find("config.allowed_ws_origins_admission_errors()")
+        .expect("file mode refuses `*` / non-origin entries");
+    let pipeline = core
+        .find(WARNING_CALL)
+        .expect("file mode runs the field validators");
+    assert!(
+        refusal < pipeline,
+        "file mode must refuse before the warning-emitting field validators run"
+    );
+}
+
+/// Issue #7395 (from the #7387 round-four design): DestinationRule host
+/// matching has ONE implementation, with Istio wildcard semantics.
+/// DestinationRule application (`apply_destination_rules`, through its
+/// `(tier, specificity)` winner), the NodeWaypoint carried-route binding
+/// (which decides that an external host's rule needs its own residual leg)
+/// and the ServiceWaypoint slice narrowing all select rules through
+/// `destination_rule_host_specificity`; a second, exact-only matcher dropped
+/// every wildcard rule (ServiceWaypoint) or isolated a wildcard-governed leg
+/// that never received its rule. No hand-rolled wildcard test and no
+/// wildcard refusal may reappear beside them.
+#[test]
+fn destination_rule_host_matching_has_one_implementation() {
+    let mesh = source("src/modes/mesh/mod.rs");
+    let slice = source("src/modes/mesh/slice.rs");
+    for (text, signature, needle) in [
+        (
+            &mesh,
+            "fn destination_rules_naming_host<'a>(",
+            "destination_rule_host_specificity(",
+        ),
+        (
+            &mesh,
+            "fn destination_rule_winner_candidate(",
+            "host.specificity(dr)",
+        ),
+        (
+            &mesh,
+            "pub(crate) fn apply_destination_rules_with_tenant_file_roots(",
+            "destination_rule_winner_candidate(",
+        ),
+        (
+            &mesh,
+            "pub(crate) fn apply_destination_rules_with_tenant_file_roots(",
+            "host.specificity(dr)",
+        ),
+        (
+            &mesh,
+            "impl DestinationRuleMatchHost<'_> {",
+            "destination_rule_host_specificity(",
+        ),
+        (
+            &slice,
+            "fn destination_rule_matches_admitted_service(",
+            "super::destination_rule_host_specificity(",
+        ),
+        (
+            &slice,
+            "fn wildcard_destination_rule_admitted_destination<F>(",
+            "super::destination_rule_host_specificity(",
+        ),
+    ] {
+        let body = item_body(text, signature, "\n}\n");
+        assert!(
+            body.contains(needle),
+            "`{signature}` must select DestinationRules through `{needle}`"
+        );
+        assert!(
+            !body.contains("strip_prefix('*')")
+                && !body.contains("destination_rule_host_matches(")
+                && !body.contains("host_matches_admitted_service("),
+            "`{signature}` must not carry its own DestinationRule host matcher"
+        );
+    }
+    assert!(
+        !mesh.contains("fn destination_rule_host_matches("),
+        "the exact-only matcher is gone; every caller uses the specificity matcher"
+    );
+    assert_eq!(
+        mesh.matches("rule_host.strip_prefix('*')").count(),
+        1,
+        "the one wildcard rule lives in `destination_rule_host_specificity`"
+    );
+    // An upstream id is never a wildcard candidate (review F4): a catch-all
+    // must not latch onto a synthetic dotted identifier.
+    let match_hosts = item_body(&mesh, "fn upstream_destination_rule_match_hosts(", "\n}\n");
+    assert!(
+        match_hosts.contains("host: upstream.id.as_str(),\n        wildcard_eligible: false,"),
+        "the upstream id must stay an exact-only DestinationRule candidate"
+    );
+    let bind = item_body(
+        &mesh,
+        "fn bind_carried_http_routes_to_node_waypoint_transport(",
+        "\n}\n",
+    );
+    assert!(
+        !bind.contains("wildcard_covered") && !bind.contains("wildcard_destination_rule_refused"),
+        "a wildcard rule is applied to a split leg like an exact one, so the binding \
+         no longer refuses the splits it covers"
+    );
+    assert_eq!(
+        bind.matches("wildcard_destination_rule_names_direct_backend(")
+            .count(),
+        2,
+        "a wildcard naming a direct external backend (own or rule) refuses the route: no \
+         rule can apply to a direct backend (review round 2, sol F3)"
+    );
 }

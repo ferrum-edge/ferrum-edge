@@ -1,0 +1,1 @@
+{"service": {"name": "svc", "id": "svc-1", "port": 18080, "connect": {"sidecar_service": {"port": 21000}}}}

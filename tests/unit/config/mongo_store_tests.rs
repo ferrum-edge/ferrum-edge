@@ -9,17 +9,22 @@
 //! detection without requiring a live DocumentDB backend.
 
 use ferrum_edge::_test_support::{
-    MongoConfigChangeOp, MongoReconnectTopology, MongoReconnectTransitionTestHooks,
-    decode_mongo_config_change_record, mongo_migration_lease_acquire_filter_classic,
-    mongo_migration_lease_acquire_update_classic, mongo_migration_lease_duration_millis,
-    mongo_migration_lease_renew_update_classic, mongo_mtls_dns_admission_drop_must_retain,
-    mongo_mtls_dns_admission_lock_filter, mongo_mtls_dns_admission_lock_update,
-    mongo_pipeline_update_unsupported, mongo_store_acquire_connection_generation_pin_for_test,
+    MongoAdmissionFence, MongoAdmissionFenceProbe, MongoAdmissionFenceReason, MongoConfigChangeOp,
+    MongoReconnectTopology, MongoReconnectTransitionTestHooks, decode_mongo_config_change_record,
+    mongo_migration_lease_acquire_filter_classic, mongo_migration_lease_acquire_update_classic,
+    mongo_migration_lease_duration_millis, mongo_migration_lease_renew_update_classic,
+    mongo_mtls_dns_admission_drop_must_retain, mongo_mtls_dns_admission_lock_filter,
+    mongo_mtls_dns_admission_lock_update, mongo_pipeline_update_unsupported,
+    mongo_store_acquire_connection_generation_pin_for_test,
+    mongo_store_apply_mtls_dns_admission_fence_probe_for_test,
+    mongo_store_ensure_mtls_dns_admission_unfenced_for_test,
+    mongo_store_insert_persistent_admission_pin_for_test, mongo_store_mtls_dns_admission_fence,
     mongo_store_new_unconnected_for_test, mongo_store_published_database_name_for_test,
+    mongo_store_retain_mtls_dns_admission_fence_for_test,
     mongo_store_set_reconnect_transition_hooks_for_test,
     mongo_store_try_publish_reconnected_bundle_for_test, mtls_dns_policy_requires_consumer_load,
 };
-use ferrum_edge::config::db_backend::DatabaseBackend;
+use ferrum_edge::config::db_backend::{DatabaseBackend, MtlsDnsAdmissionUnavailable};
 use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope};
 use mongodb::bson::{Bson, Document, doc};
 use serde_json::json;
@@ -178,6 +183,56 @@ fn mongo_backup_restore_api_specs_methods_exist() {
     );
 }
 
+/// Issue #7211: the MongoDB full load must run the same warn-level validation
+/// passes as the SQL full load, so `FERRUM_TLS_CERT_EXPIRY_WARNING_DAYS` and the
+/// backend egress policy take effect on MongoDB too. Both loaders are scanned
+/// for the same pass list, and the Mongo passes must read the store's
+/// configured values rather than defaults.
+#[test]
+fn mongo_full_load_runs_sql_warn_validation_passes() {
+    fn load_body(source: &'static str, start: &str, end: &str) -> &'static str {
+        let start = source.find(start).expect("full-load function");
+        let body = &source[start..];
+        let end = body.find(end).expect("function following the full load");
+        &body[..end]
+    }
+    let mongo = load_body(
+        MONGO_STORE_SOURCE,
+        "async fn load_full_config_for_purpose(",
+        "async fn load_deployment_snapshot(",
+    );
+    let sql = load_body(
+        include_str!("../../../src/config/db_loader.rs"),
+        "pub async fn load_full_config_for_purpose(",
+        "pub async fn load_namespace_snapshot(",
+    );
+    for pass in [
+        ".validate_all_fields_with_ip_policy(",
+        "self.cert_expiry_warning_days,",
+        ".validate_hosts(ValidationAction::Warn)",
+        ".validate_unique_consumer_identities(ValidationAction::Warn)",
+        ".validate_unique_consumer_credentials(ValidationAction::Warn)",
+        ".validate_plugin_configs(&self.backend_allow_ips, ValidationAction::Warn)",
+    ] {
+        assert!(sql.contains(pass), "SQL full load lost {pass}");
+        assert!(mongo.contains(pass), "MongoDB full load is missing {pass}");
+    }
+    let rejecting = mongo
+        .find("collect_rejecting_runtime_config_errors(&config)")
+        .expect("rejecting validation");
+    let field_pass = mongo
+        .find(".validate_all_fields_with_ip_policy(")
+        .expect("field pass");
+    let plugin_pass = mongo
+        .find(".validate_plugin_configs(&self.backend_allow_ips")
+        .expect("plugin pass");
+    assert!(
+        field_pass < rejecting && rejecting < plugin_pass,
+        "SQL order: field/host warnings before the rejecting contract, plugin-config \
+         warnings after it"
+    );
+}
+
 /// Namespace enumeration must scan gateway_trust_bundles so a trust-only
 /// namespace is still discovered by CP/admin listing (issue #3727 / PR #3782).
 /// Paginated listing reuses `list_namespaces()`, so covering the merge is enough.
@@ -312,9 +367,9 @@ fn mongo_plugin_graph_validation_runs_under_the_durable_namespace_fence() {
         "update_proxy(&self, proxy: &Proxy)",
         "delete_proxy_with_orphan_cleanup(",
         "create_plugin_config(&self, pc: &PluginConfig)",
-        "update_plugin_config(&self, pc: &PluginConfig)",
-        "delete_plugin_config(",
-        "batch_create_proxies(",
+        "update_plugin_config_inner(",
+        "delete_plugin_config_inner(",
+        "batch_create_proxies_without_plugins(",
         "batch_create_plugin_configs(",
         "submit_api_spec_bundle(",
         "delete_api_spec(&self, namespace: &str, id: &str)",
@@ -965,7 +1020,7 @@ fn mongo_batch_create_serializers_do_not_repeat_domain_normalization() {
     }
 
     for method_name in [
-        "batch_create_proxies(",
+        "batch_create_proxies_without_plugins(",
         "batch_create_upstreams(",
         "batch_create_consumers(",
         "batch_create_plugin_configs(",
@@ -978,14 +1033,18 @@ fn mongo_batch_create_serializers_do_not_repeat_domain_normalization() {
     }
 }
 
-/// Issue #3001: Mongo failover must flip the write gate before publishing the
-/// connection (SQL `reconnect_for_topology` parity). Default-disabled admin
-/// writes must never observe a failover connection while `primary_active`
-/// still reads true. Primary `mark_primary` must finalize under the same
-/// publication guards after ArcSwap. Deferred reconnects must not change
-/// topology.
+/// Issue #3001: default-disabled admin writes must never observe a failover
+/// connection while `primary_active` still reads true, and a primary
+/// connection must never go live while topology still reports failover.
+/// Since issue #7061 that is a type-level guarantee: the connection (Mongo
+/// bundle, SQL pool) lives inside `DbFailoverTopologyState` and the only way
+/// to replace it is `publish_failover` / `publish_primary`, which store the
+/// handle and its topology together (behaviour pinned in
+/// `db_backend_tests::failover_topology_publication_*`). What remains
+/// structural here is lock order, fail-fast publication, and staged
+/// migrations. Deferred reconnects must not change topology.
 #[test]
-fn reconnect_failover_marks_topology_before_publishing_connection() {
+fn reconnect_publishes_connection_and_topology_together_under_guards() {
     let reconnect_failover = mongo_fn_body("        async fn reconnect_failover(");
     assert!(
         reconnect_failover.contains("build_connection_bundle("),
@@ -993,22 +1052,13 @@ fn reconnect_failover_marks_topology_before_publishing_connection() {
     );
     assert!(
         reconnect_failover.contains("publish_reconnected_bundle("),
-        "reconnect_failover must publish through the ordered helper"
+        "reconnect_failover must publish through the guarded helper"
     );
     assert!(
         reconnect_failover.contains("MongoReconnectTopology::Failover")
             && (reconnect_failover.contains("redact_url(db_url)")
                 || reconnect_failover.contains("crate::config::db_backend::redact_url(db_url)")),
         "reconnect_failover must publish as Failover with a redacted URL:\n{reconnect_failover}"
-    );
-    // Must not reintroduce the old post-publish mark_failover call site.
-    let after_publish = reconnect_failover
-        .split("publish_reconnected_bundle(")
-        .nth(1)
-        .expect("publish call");
-    assert!(
-        !after_publish.contains("mark_failover("),
-        "mark_failover must not run after publication in reconnect_failover:\n{reconnect_failover}"
     );
 
     let publish = mongo_fn_body("        async fn publish_reconnected_bundle(");
@@ -1024,42 +1074,28 @@ fn reconnect_failover_marks_topology_before_publishing_connection() {
     let generation_try_write_at = publish_body
         .find("connection_generation.try_write()")
         .expect("publish_reconnected_bundle must fail-fast on the generation guard second");
-    let mark_failover_at = publish_body
-        .find("mark_failover(")
-        .expect("publish_reconnected_bundle must mark failover under the guards");
-    let swap_at = publish_body
-        .find("connection.swap(")
-        .expect("publish_reconnected_bundle must ArcSwap the connection");
-    let mark_primary_at = publish_body
-        .find("mark_primary(")
-        .expect("publish_reconnected_bundle must mark primary under the guards");
+    let failback_check_at = publish_body
+        .find("ensure_primary_failback_allowed()")
+        .expect("publish_reconnected_bundle must check the failback fence under the guards");
+    let publish_at = publish_body
+        .find(".publish_primary(")
+        .into_iter()
+        .chain(publish_body.find(".publish_failover("))
+        .min()
+        .expect("publish_reconnected_bundle must publish through the topology state");
     assert!(
         admin_try_write_at < generation_try_write_at
-            && generation_try_write_at < mark_failover_at
-            && mark_failover_at < swap_at
-            && swap_at < mark_primary_at,
-        "admin try_write -> generation try_write -> mark_failover -> swap -> mark_primary is the serialized order:\n{publish_body}"
+            && generation_try_write_at < failback_check_at
+            && failback_check_at < publish_at,
+        "admin try_write -> generation try_write -> failback fence -> publish is the serialized order:\n{publish_body}"
     );
     assert!(
         !publish_body.contains(".write().await"),
         "Mongo publication must stay fail-fast (try_write), never unbounded write().await:\n{publish_body}"
     );
 
-    // Primary reconnect must not finalize topology outside the publication
-    // critical section (the pre-fix fail-open race).
-    let reconnect = mongo_fn_body("        async fn reconnect(");
-    assert!(
-        reconnect.contains("install_reconnected_bundle("),
-        "reconnect must publish via install_reconnected_bundle:\n{reconnect}"
-    );
-    assert!(
-        !reconnect.contains("mark_primary("),
-        "reconnect must not call mark_primary after releasing publication guards:\n{reconnect}"
-    );
-
-    // SQL parity: failover topology flips before pool publication, and the
-    // reconnect transition *write* lock serializes publication through deferred
-    // migrations / primary mark_primary. Admin mutations take a shared *read*
+    // SQL parity: the reconnect transition *write* lock serializes publication
+    // through staged deferred migrations. Admin mutations take a shared *read*
     // pin via acquire_write_topology_permit so reconnect cannot redirect an
     // in-flight write (issue #3001 check-to-use race).
     let sql_source = include_str!("../../../src/config/db_loader.rs");
@@ -1068,32 +1104,28 @@ fn reconnect_failover_marks_topology_before_publishing_connection() {
         .nth(1)
         .and_then(|rest| rest.split("\n    /// Extract the hostname").next())
         .expect("DatabaseStore::reconnect_for_topology body");
-    assert!(
-        sql_reconnect.contains("self.reconnect_transition.write().await"),
-        "SQL reconnect_for_topology must serialize publication under reconnect_transition write lock:\n{sql_reconnect}"
-    );
     let sql_lock = sql_reconnect
         .find("self.reconnect_transition.write().await")
-        .expect("reconnect_transition write lock");
-    let sql_mark = sql_reconnect
-        .find("mark_failover(")
-        .expect("SQL failover path must call mark_failover");
-    let sql_swap = sql_reconnect
-        .find("self.pool.swap(")
-        .expect("SQL failover path must swap the pool");
+        .expect("SQL reconnect must serialize publication under reconnect_transition write lock");
+    let sql_failback_check = sql_reconnect
+        .find("ensure_primary_failback_allowed()")
+        .expect("SQL primary path must check the failback fence under the transition lock");
     let sql_migrations = sql_reconnect
-        .find("maybe_apply_deferred_migrations()")
-        .expect("SQL reconnect must await deferred migrations under the transition lock");
-    let sql_mark_primary = sql_reconnect
-        .find("mark_primary(")
-        .expect("SQL primary path must call mark_primary after migrations");
+        .find("maybe_apply_deferred_migrations_on_pool(new_pool.clone())")
+        .expect("SQL reconnect must migrate the staged pool under the transition lock");
+    let sql_publish = sql_reconnect
+        .find(".publish_primary(")
+        .into_iter()
+        .chain(sql_reconnect.find(".publish_failover("))
+        .min()
+        .expect("SQL reconnect must publish through the topology state");
+    // Issue #7033: deferred migrations run on the staged pool *before* any
+    // publication, so a migration failure can never leave the new pool live.
     assert!(
-        sql_lock < sql_mark && sql_mark < sql_swap,
-        "write lock -> mark_failover -> pool.swap is the fail-closed failover order:\n{sql_reconnect}"
-    );
-    assert!(
-        sql_swap < sql_migrations && sql_migrations < sql_mark_primary,
-        "pool.swap -> deferred migrations -> mark_primary must stay under the same write lock:\n{sql_reconnect}"
+        sql_lock < sql_failback_check
+            && sql_failback_check < sql_migrations
+            && sql_migrations < sql_publish,
+        "write lock -> failback fence -> staged-pool migrations -> publish must stay under the same write lock:\n{sql_reconnect}"
     );
     let connect_at = sql_reconnect
         .find("connect_any_pool_with_timeout(")
@@ -1284,6 +1316,428 @@ async fn admission_pin_defers_publish_without_topology_change() {
     );
 }
 
+/// Serializes every test that creates or clears an mTLS DNS admission fence.
+/// The `ferrum_database_mtls_dns_admission_fences_retained` gauge is process
+/// global, and only these tests in this binary move it, so ordering them
+/// against each other makes before/after deltas exact. Bind the guard as the
+/// FIRST local so it drops last, after the store (whose fence registry
+/// decrements the gauge on drop).
+static FENCE_GAUGE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn fence_gauge() -> u64 {
+    ferrum_edge::plugins::prometheus_metrics::global_registry().mtls_dns_admission_fences_retained()
+}
+
+fn assert_namespace_fenced(store: &ferrum_edge::config::mongo_store::MongoStore, namespace: &str) {
+    let refused = mongo_store_ensure_mtls_dns_admission_unfenced_for_test(store, namespace)
+        .expect_err("a fenced namespace must refuse mTLS DNS admission");
+    assert!(
+        refused
+            .downcast_ref::<MtlsDnsAdmissionUnavailable>()
+            .is_some(),
+        "fence refusal must be the typed fail-closed admission error, got: {refused:#}"
+    );
+}
+
+/// Issue #7031: an uncertain mTLS DNS admission mutation used to keep a
+/// `connection_generation` read pin forever, so every later reconnect and
+/// failover failed fast until restart. The explicit namespace fence must
+/// release that pin (reconnect/failover proceed) while admissions for the
+/// fenced namespace keep failing closed across every published topology.
+#[tokio::test(flavor = "current_thread")]
+async fn retained_admission_fence_does_not_block_reconnect_or_failover() {
+    let _gauge_lock = FENCE_GAUGE_LOCK.lock().await;
+    let store = mongo_store_new_unconnected_for_test(vec![]).expect("lazy mongo store");
+    let gauge_before = fence_gauge();
+    mongo_store_retain_mtls_dns_admission_fence_for_test(&store, "ferrum", "uncertain-owner").await;
+    // Retaining the same owner again is idempotent for state and gauge.
+    mongo_store_retain_mtls_dns_admission_fence_for_test(&store, "ferrum", "uncertain-owner").await;
+
+    match mongo_store_mtls_dns_admission_fence(&store, "ferrum") {
+        MongoAdmissionFence::Retained {
+            reason, retained, ..
+        } => {
+            assert_eq!(reason, MongoAdmissionFenceReason::UncertainMutation);
+            assert_eq!(retained, 1);
+        }
+        MongoAdmissionFence::Clear => panic!("uncertain mutation must retain a namespace fence"),
+    }
+    assert_namespace_fenced(&store, "ferrum");
+    mongo_store_ensure_mtls_dns_admission_unfenced_for_test(&store, "other")
+        .expect("other namespaces are not fenced");
+
+    // Failover is no longer wedged by the retained fence.
+    mongo_store_try_publish_reconnected_bundle_for_test(
+        &store,
+        "failover_db",
+        MongoReconnectTopology::Failover,
+        "mongodb://failover.example/test",
+    )
+    .await
+    .expect("a retained admission fence must not block failover publication");
+    assert!(!store.failover_topology_status().primary_active);
+    assert_eq!(
+        mongo_store_published_database_name_for_test(&store),
+        "failover_db"
+    );
+    assert_namespace_fenced(&store, "ferrum");
+
+    // Nor is a later primary reconnect.
+    mongo_store_try_publish_reconnected_bundle_for_test(
+        &store,
+        "primary_db",
+        MongoReconnectTopology::Primary,
+        "mongodb://primary.example/test",
+    )
+    .await
+    .expect("a retained admission fence must not block primary reconnect");
+    assert!(store.failover_topology_status().primary_active);
+    assert_namespace_fenced(&store, "ferrum");
+
+    // The fence is surfaced for authenticated /health and /metrics.
+    let status = store.mtls_dns_admission_fence_status();
+    assert!(status.fenced());
+    assert_eq!(status.retained_fences, 1);
+    assert_eq!(status.namespaces, vec!["ferrum".to_string()]);
+    assert!(status.oldest_retained_since_unix_ms.is_some());
+    assert_eq!(
+        fence_gauge(),
+        gauge_before + 1,
+        "the retained-fence gauge must count this fence exactly once"
+    );
+}
+
+/// Issue #7031 exit: only a probe of the ORIGINAL connection proving the
+/// owner-qualified durable lock absent clears the fence; a present lock or an
+/// unverifiable probe keeps admissions failing closed.
+#[tokio::test(flavor = "current_thread")]
+async fn admission_fence_exit_requires_proven_absence_of_durable_lock() {
+    let _gauge_lock = FENCE_GAUGE_LOCK.lock().await;
+    let store = mongo_store_new_unconnected_for_test(vec![]).expect("lazy mongo store");
+    let gauge_before = fence_gauge();
+    mongo_store_retain_mtls_dns_admission_fence_for_test(&store, "ferrum", "uncertain-owner").await;
+    assert_eq!(fence_gauge(), gauge_before + 1);
+
+    for probe in [
+        MongoAdmissionFenceProbe::DurableFencePresent,
+        MongoAdmissionFenceProbe::Unverifiable,
+    ] {
+        assert_eq!(
+            mongo_store_apply_mtls_dns_admission_fence_probe_for_test(&store, "ferrum", probe),
+            0,
+            "{probe:?} must keep the fence"
+        );
+        assert_namespace_fenced(&store, "ferrum");
+    }
+
+    assert_eq!(
+        mongo_store_apply_mtls_dns_admission_fence_probe_for_test(
+            &store,
+            "ferrum",
+            MongoAdmissionFenceProbe::DurableFenceAbsent,
+        ),
+        1,
+        "proven absence of the owner-qualified lock must clear the fence"
+    );
+    assert_eq!(
+        mongo_store_mtls_dns_admission_fence(&store, "ferrum"),
+        MongoAdmissionFence::Clear
+    );
+    mongo_store_ensure_mtls_dns_admission_unfenced_for_test(&store, "ferrum")
+        .expect("a cleared fence admits again");
+    assert!(!store.mtls_dns_admission_fence_status().fenced());
+    assert_eq!(
+        fence_gauge(),
+        gauge_before,
+        "clearing the fence must return the gauge to its baseline"
+    );
+    assert_eq!(
+        mongo_store_apply_mtls_dns_admission_fence_probe_for_test(
+            &store,
+            "ferrum",
+            MongoAdmissionFenceProbe::DurableFenceAbsent,
+        ),
+        0,
+        "a second clear is a no-op"
+    );
+    assert_eq!(fence_gauge(), gauge_before);
+}
+
+/// A multi-step (restore) guard legitimately pins the generation while it is
+/// active. Once a borrowed mutation is uncertain, release (which refuses) and
+/// the abandon hook must hand the pin to a namespace fence instead of holding
+/// it for the life of the process.
+#[tokio::test(flavor = "current_thread")]
+async fn uncertain_multi_step_guard_converts_generation_pin_into_namespace_fence() {
+    let _gauge_lock = FENCE_GAUGE_LOCK.lock().await;
+    let store = mongo_store_new_unconnected_for_test(vec![]).expect("lazy mongo store");
+
+    // Release path.
+    mongo_store_insert_persistent_admission_pin_for_test(&store, "tenant-a", "restore-owner", true)
+        .await;
+    let blocked = mongo_store_try_publish_reconnected_bundle_for_test(
+        &store,
+        "blocked",
+        MongoReconnectTopology::Failover,
+        "mongodb://failover.example/test",
+    )
+    .await
+    .expect_err("an active multi-step guard still pins the generation");
+    assert!(blocked.to_string().contains("admission operation pins"));
+
+    let refused = store
+        .release_mtls_dns_admission_guard("tenant-a", "restore-owner")
+        .await
+        .expect_err("release must refuse an uncertain multi-step guard");
+    assert!(refused.to_string().contains("uncertain"), "got: {refused}");
+    match mongo_store_mtls_dns_admission_fence(&store, "tenant-a") {
+        MongoAdmissionFence::Retained { reason, .. } => {
+            assert_eq!(reason, MongoAdmissionFenceReason::UncertainGuardedOperation);
+        }
+        MongoAdmissionFence::Clear => panic!("refused release must retain a namespace fence"),
+    }
+    assert_namespace_fenced(&store, "tenant-a");
+    mongo_store_try_publish_reconnected_bundle_for_test(
+        &store,
+        "after_release_refusal",
+        MongoReconnectTopology::Failover,
+        "mongodb://failover.example/test",
+    )
+    .await
+    .expect("the converted fence must not keep the generation pinned");
+    store
+        .release_mtls_dns_admission_guard("tenant-a", "restore-owner")
+        .await
+        .expect_err("the converted owner stays unusable (fail closed)");
+    assert_namespace_fenced(&store, "tenant-a");
+
+    // Abandon path (Admin lifecycle Drop with an uncertain outcome).
+    mongo_store_insert_persistent_admission_pin_for_test(
+        &store,
+        "tenant-b",
+        "abandoned-owner",
+        true,
+    )
+    .await;
+    mongo_store_try_publish_reconnected_bundle_for_test(
+        &store,
+        "blocked_again",
+        MongoReconnectTopology::Primary,
+        "mongodb://primary.example/test",
+    )
+    .await
+    .expect_err("an active multi-step guard still pins the generation");
+    store.retain_uncertain_mtls_dns_admission_guard("tenant-b", "abandoned-owner");
+    assert_namespace_fenced(&store, "tenant-b");
+    mongo_store_try_publish_reconnected_bundle_for_test(
+        &store,
+        "after_abandon",
+        MongoReconnectTopology::Primary,
+        "mongodb://primary.example/test",
+    )
+    .await
+    .expect("an abandoned uncertain guard must not keep the generation pinned");
+    assert_eq!(
+        mongo_store_published_database_name_for_test(&store),
+        "after_abandon"
+    );
+
+    let status = store.mtls_dns_admission_fence_status();
+    assert_eq!(status.retained_fences, 2);
+    assert_eq!(
+        status.namespaces,
+        vec!["tenant-a".to_string(), "tenant-b".to_string()]
+    );
+}
+
+/// Fix round for #7031: a SETTLED multi-step guard's release awaits a
+/// majority delete of its durable lock. The Admin lifecycle wraps that in a
+/// 5 s timeout, shorter than default driver server selection, so the release
+/// future can be dropped mid-delete. The persistent pin must already be out of
+/// the map and owned by a cancellation-safe cleanup state: dropping the future
+/// releases the generation pin (reconnect succeeds) and, because the delete
+/// outcome is unknown, leaves an explicit namespace fence the exit probe can
+/// clear, never an ownerless pin.
+#[tokio::test(flavor = "current_thread")]
+async fn cancelled_settled_guard_release_cannot_pin_reconnect() {
+    let _gauge_lock = FENCE_GAUGE_LOCK.lock().await;
+    let store = mongo_store_new_unconnected_for_test(vec![]).expect("lazy mongo store");
+    let gauge_before = fence_gauge();
+    mongo_store_insert_persistent_admission_pin_for_test(
+        &store,
+        "tenant-c",
+        "settled-owner",
+        false,
+    )
+    .await;
+    mongo_store_try_publish_reconnected_bundle_for_test(
+        &store,
+        "blocked",
+        MongoReconnectTopology::Failover,
+        "mongodb://failover.example/test",
+    )
+    .await
+    .expect_err("an active multi-step guard still pins the generation");
+
+    // The lazy store has no reachable server, so the delete cannot complete
+    // inside this bound: the release future is dropped mid-await exactly as
+    // the Admin cleanup timeout drops it. (Should the driver instead fail
+    // fast, the cleanup-error path must reach the same end state.)
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        store.release_mtls_dns_admission_guard("tenant-c", "settled-owner"),
+    )
+    .await;
+
+    mongo_store_try_publish_reconnected_bundle_for_test(
+        &store,
+        "after_cancelled_release",
+        MongoReconnectTopology::Failover,
+        "mongodb://failover.example/test",
+    )
+    .await
+    .expect("a dropped settled release must not leave the generation pinned");
+    assert_eq!(
+        mongo_store_published_database_name_for_test(&store),
+        "after_cancelled_release"
+    );
+    match mongo_store_mtls_dns_admission_fence(&store, "tenant-c") {
+        MongoAdmissionFence::Retained { reason, .. } => {
+            assert_eq!(reason, MongoAdmissionFenceReason::UncertainCleanup);
+        }
+        MongoAdmissionFence::Clear => {
+            panic!("an unknown lock-delete outcome must leave the namespace fenced")
+        }
+    }
+    assert_namespace_fenced(&store, "tenant-c");
+    assert_eq!(fence_gauge(), gauge_before + 1);
+    store
+        .release_mtls_dns_admission_guard("tenant-c", "settled-owner")
+        .await
+        .expect_err("the released owner is gone; a second release fails closed");
+
+    assert_eq!(
+        mongo_store_apply_mtls_dns_admission_fence_probe_for_test(
+            &store,
+            "tenant-c",
+            MongoAdmissionFenceProbe::DurableFenceAbsent,
+        ),
+        1,
+        "the exit probe clears the cleanup fence once the lock is proven absent"
+    );
+    mongo_store_ensure_mtls_dns_admission_unfenced_for_test(&store, "tenant-c")
+        .expect("a cleared cleanup fence admits again");
+    assert_eq!(fence_gauge(), gauge_before);
+}
+
+/// The fence snapshot walks the store's whole fence registry under shard read
+/// locks, so `/health` / `/status` must build it only in the authenticated
+/// detail tier: unauthenticated (minimal) and namespace-bounded (tenant)
+/// probes return before any detail field is read and must never pay for it.
+#[test]
+fn health_builds_admission_fence_snapshot_only_in_the_detailed_tier() {
+    let call = "db.mtls_dns_admission_fence_status()";
+    assert_eq!(
+        ADMIN_SOURCE.matches(call).count(),
+        1,
+        "exactly one admin call site may snapshot mTLS DNS admission fences"
+    );
+    let at = ADMIN_SOURCE.find(call).expect("fence snapshot call site");
+    // Issue #7216 moved the gate up to the whole failover/fence block.
+    let gate = "if detailed && let Some(db) = &state.db {";
+    let gate_at = ADMIN_SOURCE[..at]
+        .rfind(gate)
+        .expect("the fence snapshot must follow the `detailed` database-detail gate");
+    let gated = &ADMIN_SOURCE[gate_at + gate.len()..at];
+    assert!(
+        gated.matches('{').count() >= gated.matches('}').count(),
+        "the fence snapshot must stay inside the `if detailed` block"
+    );
+    let health = ADMIN_SOURCE
+        .find("if path == \"/health\" || path == \"/status\" {")
+        .expect("/health handler");
+    let minimal = health
+        + ADMIN_SOURCE[health..]
+            .find("let minimal = json!({")
+            .expect("minimal /health body");
+    assert!(
+        health < at && at < minimal,
+        "the fence snapshot must live in the /health handler, before the tiered returns"
+    );
+}
+
+/// Ordering seams that cannot be exercised without a live MongoDB: the exit
+/// probe runs before the generation pin is taken (never defers reconnect),
+/// the authoritative fence check runs under the pin, the probe reads only the
+/// original bundle with majority read concern, and an uncertain guard Drop
+/// hands its generation pin to the fence rather than retaining it.
+#[test]
+fn admission_fence_is_checked_under_the_generation_pin_and_probes_the_original_bundle() {
+    let acquire = mongo_fn_body("        async fn acquire_durable_admission_lock(");
+    let reverify = acquire
+        .find("self.reverify_admission_fences(&lock_id).await")
+        .expect("admission must attempt the fence exit probe");
+    let pin = acquire
+        .find("self.connection_generation.clone().read_owned().await")
+        .expect("admission takes the generation read pin");
+    let checks: Vec<usize> = acquire
+        .match_indices("self.admission_fences.ensure_unfenced(&lock_id)?")
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(
+        checks.len(),
+        2,
+        "both admission branches must check the fence"
+    );
+    assert!(
+        reverify < pin,
+        "the exit probe must run before the generation pin"
+    );
+    assert!(
+        checks.iter().any(|check| *check > pin),
+        "the owned-guard fence check must run while the generation pin is held"
+    );
+
+    let probe = mongo_fn_body("        async fn probe_retained_admission_fence(")
+        .split_once("\n        }\n")
+        .map(|(body, _)| body)
+        .expect("probe body ends at its closing brace");
+    assert!(probe.contains("read_concern(ReadConcern::majority())"));
+    assert!(probe.contains("ReadPreference::Primary"));
+    assert!(
+        !probe.contains("self."),
+        "the exit probe must only use the retained original bundle"
+    );
+
+    let drop_start = MONGO_STORE_SOURCE
+        .find("impl Drop for MongoLockGuard {")
+        .expect("MongoLockGuard Drop");
+    let drop_body = &MONGO_STORE_SOURCE[drop_start..];
+    let drop_body = &drop_body[..drop_body
+        .find("impl MongoConnectionBundle {")
+        .expect("Drop ends before MongoConnectionBundle impl")];
+    let retain = drop_body
+        .find("AdmissionFenceReason::UncertainMutation,")
+        .expect("an uncertain guard Drop must retain a namespace fence");
+    assert!(
+        drop_body[retain..]
+            .split_once(");")
+            .is_some_and(|(call, _)| call.contains("self.connection_generation_guard.take()")),
+        "an uncertain guard Drop must hand its generation pin to the fence"
+    );
+    assert!(
+        !drop_body.contains("retained_admission_pins"),
+        "the never-removed retained generation pins must not return"
+    );
+
+    assert!(
+        ADMIN_SOURCE.contains(
+            ".retain_uncertain_mtls_dns_admission_guard(&self.namespace, &self.guard_owner);"
+        ),
+        "an abandoned uncertain Admin guard must hand off its generation pin"
+    );
+}
+
 /// Concurrent reconnect attempt that races between outer Admin permit acquire
 /// and nested admission must observe fail-fast deferral (never hang), then
 /// succeed once both pins drop. Uses oneshot barriers — no timing sleeps.
@@ -1345,11 +1799,13 @@ async fn reconnect_between_admin_permit_and_admission_is_fail_fast() {
     );
 }
 
-/// Issue #3001: a primary publication that pauses after ArcSwap (before
-/// `mark_primary`) must not let a concurrent failover publish and then be
-/// overwritten only in metadata by a delayed `mark_primary` — that left the
-/// live bundle on failover while `primary_active=true` and made write gating
-/// fail open. Rendezvous via test seams; no sleeps.
+/// Issue #3001: a primary publication that pauses while holding the
+/// publication guards must not let a concurrent failover publish and then be
+/// overwritten only in metadata by a delayed primary finalization — that left
+/// the live bundle on failover while `primary_active=true` and made write
+/// gating fail open. Since issue #7061 the bundle and topology are published
+/// in one store, so the paused primary is already consistent. Rendezvous via
+/// test seams; no sleeps.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delayed_primary_publish_cannot_overwrite_later_failover_topology() {
     use std::sync::Mutex as StdMutex;
@@ -1436,13 +1892,13 @@ async fn delayed_primary_publish_cannot_overwrite_later_failover_topology() {
         .await
         .expect("primary publish must enter while_holding under the publication guards");
     assert!(
-        !store.failover_topology_status().primary_active,
-        "primary must stay fail-closed until mark_primary after the deferred window"
+        store.failover_topology_status().primary_active,
+        "the primary bundle and its topology are published together (issue #7061)"
     );
     assert_eq!(
         mongo_store_published_database_name_for_test(&store),
         "primary_bundle",
-        "bundle must already be primary while mark_primary is still pending under the guards"
+        "the published bundle must match the published primary topology"
     );
 
     let failover_store = store.clone();
@@ -2513,7 +2969,7 @@ fn mongo_query_index_and_transaction_correctness_invariants() {
         );
     }
     for method in [
-        "batch_create_proxies(",
+        "batch_create_proxies_without_plugins(",
         "write_atomic_batch_graph_in_session(",
     ] {
         let body = mongo_method(method);
@@ -2613,4 +3069,37 @@ fn mongo_compaction_gate_throttles_by_namespace_local_writes_and_batches() {
     assert!(ns_quiet.should_check(1_024));
     ns_quiet.mark_checked();
     assert!(!ns_quiet.should_check(1_024));
+}
+
+#[test]
+fn documented_kubernetes_deployment_has_selector_matching_pod_labels() {
+    // apps/v1 Deployments require spec.selector, and the API server rejects a
+    // selector that does not match spec.template.metadata.labels.
+    let section = MONGODB_DOC
+        .split("### MongoDB with Ferrum Edge on Kubernetes")
+        .nth(1)
+        .expect("Kubernetes deployment section exists");
+    let yaml = section
+        .split("```yaml")
+        .nth(1)
+        .and_then(|tail| tail.split("```").next())
+        .expect("section contains a YAML manifest");
+    let manifest: serde_yaml::Value =
+        serde_yaml::from_str(yaml).expect("documented Deployment parses as YAML");
+    assert_eq!(manifest["apiVersion"].as_str(), Some("apps/v1"));
+    assert_eq!(manifest["kind"].as_str(), Some("Deployment"));
+    let match_labels = manifest["spec"]["selector"]["matchLabels"]
+        .as_mapping()
+        .expect("Deployment declares spec.selector.matchLabels");
+    assert!(!match_labels.is_empty(), "selector must not be empty");
+    let pod_labels = manifest["spec"]["template"]["metadata"]["labels"]
+        .as_mapping()
+        .expect("Deployment declares spec.template.metadata.labels");
+    for (key, value) in match_labels {
+        assert_eq!(
+            pod_labels.get(key),
+            Some(value),
+            "selector label {key:?} must match the Pod template labels"
+        );
+    }
 }

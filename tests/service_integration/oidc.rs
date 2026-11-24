@@ -740,6 +740,11 @@ async fn oidc_live_session_expiry_refresh_and_logout() {
         .and_then(Value::as_str)
         .expect("Hydra discovery must advertise end_session_endpoint");
     let mut logout_ctx = session_ctx(&renewed, LOGOUT_PATH);
+    // Logout is refused without browser proof of a same-origin navigation
+    // (issue #6660).
+    logout_ctx
+        .headers
+        .insert("sec-fetch-site".to_string(), "same-origin".to_string());
     match plugin.on_request_received(&mut logout_ctx).await {
         PluginResult::Reject {
             status_code: 302,

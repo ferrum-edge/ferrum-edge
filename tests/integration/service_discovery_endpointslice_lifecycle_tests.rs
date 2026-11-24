@@ -62,6 +62,7 @@ fn make_upstream(id: &str) -> Upstream {
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         k8s_service_uid: None,
+        admission_upstream_id: None,
         pending_limit_scope: None,
     }
 }
@@ -172,8 +173,8 @@ async fn kubernetes_endpointslice_active_to_terminating_removes_endpoint_from_lb
     assert_eq!(live.targets.len(), 1);
     assert_eq!(live.targets[0].host, "10.244.0.11");
 
-    let selected = cache
-        .select_target("ferrum", "users", "sticky", None)
-        .expect("healthy peer must remain selectable");
+    let selected =
+        LoadBalancerCache::select_target_from(&cache.load(), "ferrum", "users", "sticky", None)
+            .expect("healthy peer must remain selectable");
     assert_eq!(selected.target.host, "10.244.0.11");
 }

@@ -417,15 +417,14 @@ fn build_gateway() -> Result<(), Box<dyn std::error::Error>> {
     crate::common::ensure_gateway_built().map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 
-/// Mint a per-spawn-attempt observability credential.
+/// Mint per-spawn-attempt admin credentials (issue #3428 / #7076).
 ///
 /// Nothing here is a real secret — it exists only so two gateways started by two
 /// parallel tests can never be mistaken for each other — but it is still handled
 /// like one: it is never printed, and identity failures report why the probe
-/// failed, never the credential. Mirrors `InstanceIdentity` in
-/// `tests/common/gateway_harness.rs` (issue #3428).
-fn mint_observability_token() -> String {
-    format!("ferrum-edge-ws-probe-{}", uuid::Uuid::new_v4().simple())
+/// failed, never the credential.
+fn mint_gateway_identity() -> crate::common::SpawnedGatewayIdentity {
+    crate::common::SpawnedGatewayIdentity::mint("ws")
 }
 
 /// Spawn the gateway subprocess. Returns the child plus the admin HTTP port
@@ -437,8 +436,9 @@ fn start_gateway_with_extra_env(
     tls_cert_path: Option<&str>,
     tls_key_path: Option<&str>,
     extra_env: &[(&str, &str)],
-    observability_token: &str,
-) -> Result<(std::process::Child, u16, std::path::PathBuf), Box<dyn std::error::Error>> {
+    identity: &crate::common::SpawnedGatewayIdentity,
+) -> Result<(crate::common::GatewayChildGuard, u16, std::path::PathBuf), Box<dyn std::error::Error>>
+{
     // Use a fresh admin HTTP port and disable admin HTTPS so parallel gateways
     // in the same functional shard never contend on the default admin ports
     // (9000/9443). Admin-listener bind failure aborts startup (fatal), which
@@ -447,14 +447,14 @@ fn start_gateway_with_extra_env(
     //
     // The admin HTTP port must be a real port, never the `0` sentinel: `0`
     // disables the plaintext admin listener, and this file's readiness barrier
-    // proves child identity through that listener.
-    let admin_http_port = std::net::TcpListener::bind_test("127.0.0.1:0")
-        .and_then(|l| l.local_addr())
-        .map(|a| a.port())?;
+    // proves child identity through that listener. It is a registry handoff
+    // outside the kernel's ephemeral source range (issue #7077 D4).
+    let admin_http_port = crate::scaffolding::ports::unbound_tcp_port()?;
     let stderr_path =
         std::path::Path::new(config_path).with_extension(format!("gateway-{http_port}.stderr.log"));
     let stderr_file = std::fs::File::create(&stderr_path)?;
     let mut cmd = std::process::Command::new(crate::common::gateway_binary_path());
+    crate::common::configure_coverage_gateway_command(&mut cmd);
     cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
@@ -462,13 +462,12 @@ fn start_gateway_with_extra_env(
         .env("FERRUM_ADMIN_HTTP_PORT", admin_http_port.to_string())
         .env("FERRUM_ADMIN_HTTPS_PORT", "0")
         .env("FERRUM_POOL_WARMUP_ENABLED", "false")
-        // Ownership proof for this exact child (issue #3428 pattern). Presenting
-        // this token unlocks the authenticated detail tier of `/health`, which
-        // no other gateway on the box can answer with. A leaked parent-shell
-        // CIDR allowlist would let a foreign gateway answer the detail tier
-        // without the token, so it is scrubbed from the child's environment.
-        .env("FERRUM_METRICS_BEARER_TOKEN", observability_token)
-        .env_remove("FERRUM_METRICS_ALLOWED_CIDRS")
+        // Keep any managed-TLS store out of the checkout (issue #5706): the
+        // config file lives in the test's TempDir, which outlives this child.
+        .env(
+            "FERRUM_TLS_MANAGED_STORE_PATH",
+            std::path::Path::new(config_path).with_file_name("managed-tls"),
+        )
         .env("RUST_LOG", "ferrum_edge=debug")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -487,8 +486,18 @@ fn start_gateway_with_extra_env(
     for (name, value) in extra_env {
         cmd.env(name, value);
     }
+    // Ownership proof for this exact child (issue #3428 / #7076), applied last
+    // so `extra_env` cannot replace it: a per-attempt admin JWT secret/issuer
+    // and metrics bearer token no other gateway on the box can answer for. A
+    // leaked parent-shell CIDR allowlist is scrubbed as well.
+    identity.apply_to_command(&mut cmd);
+    cmd.env_remove("FERRUM_METRICS_ALLOWED_CIDRS");
 
-    Ok((cmd.spawn()?, admin_http_port, stderr_path))
+    Ok((
+        crate::common::GatewayChildGuard::new(cmd.spawn()?),
+        admin_http_port,
+        stderr_path,
+    ))
 }
 
 /// Include the bounded tail of the child log in startup failures. The previous
@@ -497,13 +506,15 @@ fn start_gateway_with_extra_env(
 fn gateway_startup_error(
     error: &str,
     stderr_path: &std::path::Path,
-    observability_token: &str,
+    identity: &crate::common::SpawnedGatewayIdentity,
 ) -> String {
     const MAX_LOG_CHARS: usize = 4_000;
     let Ok(stderr) = std::fs::read_to_string(stderr_path) else {
         return error.to_string();
     };
-    let stderr = stderr.replace(observability_token, "[REDACTED]");
+    let stderr = stderr
+        .replace(&identity.observability_token, "[REDACTED]")
+        .replace(&identity.jwt_secret, "[REDACTED]");
     let stderr = stderr.trim();
     if stderr.is_empty() {
         return error.to_string();
@@ -666,6 +677,9 @@ plugin_configs:
             content-type: "application/json"
             x-mock: "ws"
           body: '{{"mock":"ws-handshake"}}'
+        - path: "/success"
+          status_code: 200
+          body: "would-claim-an-open-tunnel"
     scope: global
     enabled: true
 "#,
@@ -710,7 +724,7 @@ plugin_configs:
         X-WS-Reject-Order: "security-policy"
         Sec-WebSocket-Accept: "policy-must-not-escape"
         Sec-WebSocket-Protocol: "policy-must-not-escape"
-      remove: ["server", "x-powered-by", "content-type"]
+      remove: ["server", "x-powered-by"]
     scope: global
     enabled: true
   - id: "plugin-correlation-id-ws-admission"
@@ -1084,16 +1098,19 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 /// an h2 server without RFC 8441 `SETTINGS_ENABLE_CONNECT_PROTOCOL`, so it reset
 /// the Extended CONNECT that a real Ferrum listener accepts.
 ///
-/// The barrier is the same one `TestGateway` uses (issue #3428), applied to this
-/// file's bespoke spawner:
+/// The barrier is `TestGateway`'s JWT ownership path (issues #3428 / #7076), via
+/// the shared `wait_for_owned_gateway_identity` + `wait_for_child_tcp_accept`
+/// helpers:
 ///
-/// 1. `Child::try_wait` is polled around every probe, so a child that died after
-///    a partial bind consumes its retry attempt immediately instead of polling
-///    whatever claimed the released port.
+/// 1. `Child::try_wait` is polled before every probe and after a successful
+///    one, in both stages, so a child that died after a partial bind consumes
+///    its retry attempt immediately instead of polling whatever claimed the
+///    released port.
 /// 2. The admin port must answer `/health` in the authenticated detail tier for
-///    this attempt's `FERRUM_METRICS_BEARER_TOKEN` *and* report `ready: true`.
-///    A foreign listener has a different token (or is not a gateway at all) and
-///    is rejected.
+///    this attempt's `FERRUM_METRICS_BEARER_TOKEN` *and* report `ready: true`,
+///    and then answer JWT-only `GET /proxies` with HTTP 200 under this
+///    attempt's admin JWT. `/health` detail alone can be granted to a foreign
+///    gateway by `FERRUM_METRICS_ALLOWED_CIDRS`; the per-attempt JWT cannot.
 /// 3. `ready` flips only after `wait_for_start_signals` observed every listener
 ///    bind — HTTP, HTTPS, and HTTP/3 proxy listeners included — so an identified,
 ///    ready child is proof that the child owns the port being probed. It holds
@@ -1109,72 +1126,20 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 async fn wait_for_owned_gateway(
     child: &mut std::process::Child,
     admin_port: u16,
-    observability_token: &str,
+    identity: &crate::common::SpawnedGatewayIdentity,
     gateway_port: u16,
-) -> Result<(), Box<dyn std::error::Error>> {
-    const STARTUP_TIMEOUT_SECS: u64 = 60;
-    // Slice the ownership probe so `try_wait` is re-polled while it retries.
-    const PROBE_SLICE: Duration = Duration::from_secs(1);
-    let deadline = std::time::Instant::now() + Duration::from_secs(STARTUP_TIMEOUT_SECS);
-    let addr = format!("127.0.0.1:{}", gateway_port);
-
-    let mut last_observation = String::from("no response yet");
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Err(format!(
-                "Gateway exited during startup with {status} \
-                 (last observation: {last_observation})"
-            )
-            .into());
-        }
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(format!(
-                "Gateway did not prove ownership of admin port {admin_port} within \
-                 {STARTUP_TIMEOUT_SECS} seconds (last observation: {last_observation})"
-            )
-            .into());
-        }
-        match crate::common::probe_gateway_identity(
-            admin_port,
-            observability_token,
-            remaining.min(PROBE_SLICE),
-        )
-        .await
-        {
-            Ok(()) => break,
-            Err(err) => last_observation = err.to_string(),
-        }
-    }
-
-    // Identity is proven, so this child bound every listener. The proxy socket
-    // can still need a moment to surface in the kernel's accept queue on a
-    // loaded runner, and a connect that fails now means the child died between
-    // the two stages — which `try_wait` reports distinctly.
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Err(format!("Gateway exited after reporting ready with {status}").into());
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err(format!(
-                "Gateway port {gateway_port} did not accept TCP connections within \
-                 {STARTUP_TIMEOUT_SECS} seconds"
-            )
-            .into());
-        }
-        match tokio::net::TcpStream::connect(&addr).await {
-            Ok(stream) => {
-                drop(stream);
-                return Ok(());
-            }
-            Err(_) => sleep(Duration::from_millis(25)).await,
-        }
-    }
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // 60s, not 30s: the TLS/HTTP3 cold start documented above.
+    const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + STARTUP_TIMEOUT;
+    crate::common::wait_for_owned_gateway_identity(child, admin_port, identity, STARTUP_TIMEOUT)
+        .await?;
+    crate::common::wait_for_child_tcp_accept(child, gateway_port, deadline).await
 }
 
-/// Start the gateway with retry logic to handle ephemeral port races.
+/// Start the gateway with retry logic to handle handoff port races.
 ///
-/// Each attempt allocates a fresh gateway port and a fresh instance credential,
+/// Each attempt allocates a fresh gateway port and a fresh admin identity,
 /// starts the gateway subprocess, and waits for that child to prove it owns its
 /// ports ([`wait_for_owned_gateway`]). An attempt whose child lost the port race
 /// is void: the process is killed and a new attempt is made with a different
@@ -1184,7 +1149,7 @@ async fn start_gateway_with_retry(
     https_port: Option<u16>,
     tls_cert_path: Option<&str>,
     tls_key_path: Option<&str>,
-) -> (std::process::Child, u16) {
+) -> (crate::common::GatewayChildGuard, u16) {
     start_gateway_with_retry_extra_env(config_path, https_port, tls_cert_path, tls_key_path, &[])
         .await
 }
@@ -1195,12 +1160,12 @@ async fn start_gateway_with_retry_extra_env(
     tls_cert_path: Option<&str>,
     tls_key_path: Option<&str>,
     extra_env: &[(&str, &str)],
-) -> (std::process::Child, u16) {
+) -> (crate::common::GatewayChildGuard, u16) {
     const MAX_ATTEMPTS: u32 = 3;
     let mut last_err = String::new();
     for attempt in 1..=MAX_ATTEMPTS {
         let gateway_port = free_port().await;
-        let observability_token = mint_observability_token();
+        let identity = mint_gateway_identity();
         match start_gateway_with_extra_env(
             config_path,
             gateway_port,
@@ -1208,26 +1173,17 @@ async fn start_gateway_with_retry_extra_env(
             tls_cert_path,
             tls_key_path,
             extra_env,
-            &observability_token,
+            &identity,
         ) {
             Ok((mut child, admin_port, stderr_path)) => {
-                let owned = wait_for_owned_gateway(
-                    &mut child,
-                    admin_port,
-                    &observability_token,
-                    gateway_port,
-                )
-                .await;
+                let owned =
+                    wait_for_owned_gateway(child.child_mut(), admin_port, &identity, gateway_port)
+                        .await;
                 match owned {
                     Ok(()) => return (child, gateway_port),
                     Err(e) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        last_err = gateway_startup_error(
-                            &e.to_string(),
-                            &stderr_path,
-                            &observability_token,
-                        );
+                        child.shutdown();
+                        last_err = gateway_startup_error(&e.to_string(), &stderr_path, &identity);
                         eprintln!(
                             "Gateway startup attempt {}/{} failed (port {}): {}",
                             attempt, MAX_ATTEMPTS, gateway_port, last_err
@@ -1256,12 +1212,12 @@ async fn start_gateway_with_retry_extra_env(
 async fn start_gateway_plain_with_retry_extra_env(
     config_path: &str,
     extra_env: &[(&str, &str)],
-) -> (std::process::Child, u16) {
+) -> (crate::common::GatewayChildGuard, u16) {
     const MAX_ATTEMPTS: u32 = 3;
     let mut last_err = String::new();
     for attempt in 1..=MAX_ATTEMPTS {
         let gateway_port = free_port().await;
-        let observability_token = mint_observability_token();
+        let identity = mint_gateway_identity();
         match start_gateway_with_extra_env(
             config_path,
             gateway_port,
@@ -1269,26 +1225,17 @@ async fn start_gateway_plain_with_retry_extra_env(
             None,
             None,
             extra_env,
-            &observability_token,
+            &identity,
         ) {
             Ok((mut child, admin_port, stderr_path)) => {
-                let owned = wait_for_owned_gateway(
-                    &mut child,
-                    admin_port,
-                    &observability_token,
-                    gateway_port,
-                )
-                .await;
+                let owned =
+                    wait_for_owned_gateway(child.child_mut(), admin_port, &identity, gateway_port)
+                        .await;
                 match owned {
                     Ok(()) => return (child, gateway_port),
                     Err(e) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        last_err = gateway_startup_error(
-                            &e.to_string(),
-                            &stderr_path,
-                            &observability_token,
-                        );
+                        child.shutdown();
+                        last_err = gateway_startup_error(&e.to_string(), &stderr_path, &identity);
                         eprintln!(
                             "Gateway startup attempt {}/{} failed (port {}): {}",
                             attempt, MAX_ATTEMPTS, gateway_port, last_err
@@ -1321,7 +1268,7 @@ async fn start_gateway_tls_with_retry(
     config_path: &str,
     tls_cert_path: &str,
     tls_key_path: &str,
-) -> (std::process::Child, u16, u16) {
+) -> (crate::common::GatewayChildGuard, u16, u16) {
     start_gateway_tls_with_retry_extra_env(config_path, tls_cert_path, tls_key_path, &[]).await
 }
 
@@ -1330,13 +1277,13 @@ async fn start_gateway_tls_with_retry_extra_env(
     tls_cert_path: &str,
     tls_key_path: &str,
     extra_env: &[(&str, &str)],
-) -> (std::process::Child, u16, u16) {
+) -> (crate::common::GatewayChildGuard, u16, u16) {
     const MAX_ATTEMPTS: u32 = 3;
     let mut last_err = String::new();
     for attempt in 1..=MAX_ATTEMPTS {
         let gateway_http_port = free_port().await;
         let gateway_https_port = free_port().await;
-        let observability_token = mint_observability_token();
+        let identity = mint_gateway_identity();
         match start_gateway_with_extra_env(
             config_path,
             gateway_http_port,
@@ -1344,26 +1291,21 @@ async fn start_gateway_tls_with_retry_extra_env(
             Some(tls_cert_path),
             Some(tls_key_path),
             extra_env,
-            &observability_token,
+            &identity,
         ) {
             Ok((mut child, admin_port, stderr_path)) => {
                 let owned = wait_for_owned_gateway(
-                    &mut child,
+                    child.child_mut(),
                     admin_port,
-                    &observability_token,
+                    &identity,
                     gateway_https_port,
                 )
                 .await;
                 match owned {
                     Ok(()) => return (child, gateway_http_port, gateway_https_port),
                     Err(e) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        last_err = gateway_startup_error(
-                            &e.to_string(),
-                            &stderr_path,
-                            &observability_token,
-                        );
+                        child.shutdown();
+                        last_err = gateway_startup_error(&e.to_string(), &stderr_path, &identity);
                         eprintln!(
                             "Gateway TLS startup attempt {}/{} failed (ports {}/{}): {}",
                             attempt, MAX_ATTEMPTS, gateway_http_port, gateway_https_port, last_err
@@ -1570,12 +1512,16 @@ async fn test_file_mode_rejects_non_object_correlation_id_config() {
         None,
         None,
         &[],
-        &mint_observability_token(),
+        &mint_gateway_identity(),
     )
     .expect("spawn gateway with invalid file config");
     let exit_status = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            if let Some(status) = gateway.try_wait().expect("poll invalid gateway") {
+            if let Some(status) = gateway
+                .child_mut()
+                .try_wait()
+                .expect("poll invalid gateway")
+            {
                 break status;
             }
             sleep(Duration::from_millis(50)).await;
@@ -1589,8 +1535,7 @@ async fn test_file_mode_rejects_non_object_correlation_id_config() {
             "file mode must fail startup for non-object correlation_id config"
         ),
         Err(_) => {
-            let _ = gateway.kill();
-            let _ = gateway.wait();
+            gateway.shutdown();
             panic!("gateway stayed running with non-object correlation_id config");
         }
     }
@@ -1688,8 +1633,7 @@ async fn test_websocket_plaintext_echo() {
         .expect("close preserved-ID H1 WebSocket");
 
     // Cleanup
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     println!("test_websocket_plaintext_echo PASSED");
 }
@@ -1778,8 +1722,7 @@ async fn test_websocket_origin_allowlist_rejects_missing_and_disallowed_h1() {
         .await
         .expect("Failed to send close");
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     println!("test_websocket_origin_allowlist_rejects_missing_and_disallowed_h1 PASSED");
 }
@@ -1829,8 +1772,7 @@ async fn test_websocket_upgrade_ignores_cors_without_allowed_ws_origins() {
         .await
         .expect("Failed to send close");
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -1910,8 +1852,7 @@ async fn test_websocket_global_frame_limit_enforced_both_directions() {
         "probe backend should have attempted exactly one oversized response"
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     probe_handle.abort();
     println!("test_websocket_global_frame_limit_enforced_both_directions PASSED");
 }
@@ -1951,14 +1892,13 @@ async fn test_websocket_key_auth_rejects_missing_key() {
                     .headers()
                     .get("www-authenticate")
                     .and_then(|v| v.to_str().ok()),
-                Some("ferrum-edge")
+                Some(r#"ApiKey realm="ferrum-edge""#)
             );
         }
         other => panic!("expected HTTP 401 handshake rejection, got {other:?}"),
     }
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     println!("test_websocket_key_auth_rejects_missing_key PASSED");
 }
@@ -1998,11 +1938,10 @@ async fn test_h3_websocket_key_auth_reject_strips_transport_policy_fields() {
             .headers
             .get("www-authenticate")
             .and_then(|value| value.to_str().ok()),
-        Some("ferrum-edge")
+        Some(r#"ApiKey realm="ferrum-edge""#)
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -2051,8 +1990,7 @@ async fn test_websocket_key_auth_accepts_valid_key() {
         .await
         .expect("Failed to send close");
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     println!("test_websocket_key_auth_accepts_valid_key PASSED");
 }
@@ -2107,8 +2045,7 @@ async fn test_websocket_tls_echo() {
         .expect("Failed to send close");
 
     // Cleanup
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     println!("test_websocket_tls_echo PASSED");
 }
@@ -2168,8 +2105,7 @@ async fn test_websocket_multiple_messages() {
         .expect("Failed to send close");
 
     // Cleanup
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     println!("test_websocket_multiple_messages PASSED");
 }
@@ -2298,8 +2234,7 @@ async fn test_h2_websocket_extended_connect_echo() {
     drop(preserved_ws);
     let _ = tokio::time::timeout(Duration::from_secs(2), conn_task).await;
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     println!("test_h2_websocket_extended_connect_echo PASSED");
 }
@@ -2340,7 +2275,7 @@ async fn test_foreign_listener_on_proxy_port_is_not_gateway_readiness() {
         .expect("bind foreign listener");
     let contested_port = squatter.local_addr().unwrap().port();
 
-    let observability_token = mint_observability_token();
+    let identity = mint_gateway_identity();
     let (mut child, admin_port, _stderr_path) = start_gateway_with_extra_env(
         config_path.to_str().unwrap(),
         contested_port,
@@ -2348,14 +2283,13 @@ async fn test_foreign_listener_on_proxy_port_is_not_gateway_readiness() {
         None,
         None,
         &[],
-        &observability_token,
+        &identity,
     )
     .expect("spawn gateway onto the contested port");
 
     let outcome =
-        wait_for_owned_gateway(&mut child, admin_port, &observability_token, contested_port).await;
-    let _ = child.kill();
-    let _ = child.wait();
+        wait_for_owned_gateway(child.child_mut(), admin_port, &identity, contested_port).await;
+    child.shutdown();
 
     assert!(
         tokio::net::TcpStream::connect(("127.0.0.1", contested_port))
@@ -2370,8 +2304,8 @@ async fn test_foreign_listener_on_proxy_port_is_not_gateway_readiness() {
         .expect_err("readiness must not accept a foreign listener as the spawned gateway")
         .to_string();
     assert!(
-        err.contains("exited during startup") || err.contains("did not prove ownership"),
-        "readiness must fail on child death or on the unproven ownership probe, got: {err}"
+        err.contains("before proving ownership") || err.contains("did not prove readiness"),
+        "readiness must fail on child death or on the unproven identity probe, got: {err}"
     );
     println!("test_foreign_listener_on_proxy_port_is_not_gateway_readiness PASSED");
 }
@@ -2454,8 +2388,7 @@ async fn test_websocket_global_connection_limit_rejects_second_upgrade() {
         .send(Message::Close(None))
         .await
         .expect("close first");
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -2520,8 +2453,7 @@ async fn test_websocket_backend_admission_reject_strips_transport_policy_fields(
         .send(Message::Close(None))
         .await
         .expect("close first WebSocket");
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -2574,10 +2506,6 @@ async fn test_h3_websocket_backend_admission_preserves_later_reject_hook_order()
     assert_no_ws_transport_policy_values(&rejected.headers);
     assert_no_h1_only_websocket_headers(&rejected.headers);
     assert_no_failed_websocket_negotiation_headers(&rejected.headers);
-    assert!(
-        !rejected.headers.contains_key(http::header::CONTENT_TYPE),
-        "the final H3 reject writer must preserve policy removal of content-type"
-    );
     assert_failed_websocket_handshake_framing(&rejected.headers);
     let rejected_headers = rejected.headers.clone();
     let rejected_body = rejected
@@ -2593,12 +2521,11 @@ async fn test_h3_websocket_backend_admission_preserves_later_reject_hook_order()
         .send_close()
         .await
         .expect("close first H3 WebSocket");
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
-/// A failed backend dial opens the breaker, then the next Extended CONNECT is
+/// A timed-out backend dial opens the breaker, then the next Extended CONNECT is
 /// rejected in `handle_h3_request` before the dedicated WebSocket handler. The
 /// final flavor-aware writer must still remove every transport-owned header
 /// injected by response policy after the circuit-breaker reject hooks run.
@@ -2625,7 +2552,17 @@ async fn test_h3_websocket_open_circuit_reject_strips_transport_policy_fields() 
         .websocket(&url, WebSocketOptions::default())
         .await
         .expect("initial failed backend handshake response");
-    assert_eq!(first_rejected.status, StatusCode::BAD_GATEWAY);
+    // The listener never accepts, so the dial outlives
+    // `backend_connect_timeout_ms`: a connect timeout is 504 (#6770), still a
+    // pre-wire connection failure that trips the breaker below.
+    assert_eq!(first_rejected.status, StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(
+        first_rejected
+            .headers
+            .get("x-gateway-error")
+            .and_then(|value| value.to_str().ok()),
+        Some("connection_failure")
+    );
 
     let second_client = Http3Client::insecure().expect("second H3 client");
     let mut circuit_rejected = second_client
@@ -2646,8 +2583,7 @@ async fn test_h3_websocket_open_circuit_reject_strips_transport_policy_fields() 
     assert!(circuit_body.contains("circuit breaker open"));
     assert_authoritative_content_length(&circuit_headers, circuit_body.len());
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
 }
 
 /// Route method filtering runs before ordinary plugins, but the failed
@@ -2756,8 +2692,7 @@ async fn test_websocket_method_filter_reject_applies_security_policy_h1_h2_and_h
     assert!(h3_reject_body.contains("Method Not Allowed"));
     assert_authoritative_content_length(&h3_reject_headers, h3_reject_body.len());
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
 }
 
 /// Extended CONNECT (H2 and H3) is forwarded as a WebSocket GET, so route
@@ -2862,14 +2797,82 @@ async fn test_websocket_method_policy_uses_forwarded_get_method() {
     h3_ws.send_text("h3 get").await.expect("send text");
     assert_eq!(h3_ws.recv_text().await.expect("echo"), "Echo: h3 get");
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
+    echo_handle.abort();
+}
+
+/// Issue #7188: a clean end of an H3 WebSocket session halts the client's
+/// still-open request direction with `STOP_SENDING(H3_NO_ERROR)`, never the
+/// `STOP_SENDING(0)` a dropped receive half produces (`0x0` is not an HTTP/3
+/// code, so clients log a reset on a successful session).
+#[ignore]
+#[tokio::test]
+async fn test_h3_websocket_clean_close_stops_the_request_direction_with_h3_no_error() {
+    let backend_port = free_port().await;
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_config(&config_path, backend_port);
+    let cert_path = "tests/certs/server.crt";
+    let key_path = "tests/certs/server.key";
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, _gateway_http_port, gateway_https_port) =
+        start_gateway_tls_with_retry(config_path.to_str().unwrap(), cert_path, key_path).await;
+
+    let h3_url = format!("https://localhost:{gateway_https_port}/ws-echo");
+    let h3_client = Http3Client::insecure().expect("H3 client");
+    let mut h3_ws = h3_client
+        .websocket(&h3_url, WebSocketOptions::default())
+        .await
+        .expect("send H3 Extended CONNECT");
+    assert_eq!(h3_ws.status, StatusCode::OK);
+    h3_ws.send_text("before close").await.expect("send text");
+    assert_eq!(h3_ws.recv_text().await.expect("echo"), "Echo: before close");
+
+    // A WebSocket Close WITHOUT a QUIC FIN: the client's request direction
+    // stays open while the gateway ends the session cleanly.
+    h3_ws
+        .send_fragment(0x8, &[], true)
+        .await
+        .expect("send Close frame");
+    loop {
+        match h3_ws.recv_frame().await {
+            Ok(H3WebSocketFrame::Close(_)) | Err(_) => break,
+            Ok(_) => continue,
+        }
+    }
+
+    // The client sees the gateway's STOP_SENDING code on its next write.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let stopped = loop {
+        match h3_ws.send_binary(b"after close").await {
+            Err(error) => break error.to_string(),
+            Ok(()) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the gateway never halted the client's request direction"
+                );
+                sleep(Duration::from_millis(50)).await;
+            }
+        }
+    };
+    assert!(
+        stopped.contains("H3_NO_ERROR"),
+        "a clean H3 WebSocket end must halt the request direction with H3_NO_ERROR: {stopped}"
+    );
+
+    gateway.shutdown();
     echo_handle.abort();
 }
 
 /// Issue #2467: response_mock intentionally participates in every WebSocket
 /// handshake frontend. Matching and default-unmatched responses must terminate
 /// H1 Upgrade and H2/H3 Extended CONNECT before any backend dial or frame relay.
+/// A success-shaped (2xx) rule must surface as a final 500 on every frontend,
+/// never as an H2 stream reset or an Extended CONNECT "tunnel established"
+/// (response_mock-SOL-1).
 #[ignore]
 #[tokio::test]
 async fn test_response_mock_short_circuits_websocket_handshakes_h1_h2_and_h3() {
@@ -2936,6 +2939,26 @@ async fn test_response_mock_short_circuits_websocket_handshakes_h1_h2_and_h3() {
             .contains("no mock rule matched")
     );
 
+    let h1_success = h1_client
+        .get(format!(
+            "http://127.0.0.1:{gateway_http_port}/ws-mock/success"
+        ))
+        .header("connection", "Upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-version", "13")
+        .send()
+        .await
+        .expect("success-shaped H1 response-mock handshake");
+    assert_eq!(h1_success.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        h1_success
+            .text()
+            .await
+            .expect("success-shaped H1 mock body")
+            .contains("cannot mock a successful WebSocket handshake")
+    );
+
     let h2_stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{gateway_http_port}"))
         .await
         .expect("connect to gateway H2 port");
@@ -2997,6 +3020,32 @@ async fn test_response_mock_short_circuits_websocket_handshakes_h1_h2_and_h3() {
         .expect("unmatched H2 mock body")
         .to_bytes();
     assert!(String::from_utf8_lossy(&h2_miss_body).contains("no mock rule matched"));
+
+    let h2_success_request = http::Request::builder()
+        .method(Method::CONNECT)
+        .uri(format!(
+            "http://127.0.0.1:{gateway_http_port}/ws-mock/success"
+        ))
+        .version(Version::HTTP_2)
+        .header(http::header::SEC_WEBSOCKET_VERSION, "13")
+        .extension(hyper::ext::Protocol::from_static("websocket"))
+        .body(Empty::<Bytes>::new())
+        .expect("build success-shaped H2 WebSocket request");
+    let h2_success = h2_sender
+        .send_request(h2_success_request)
+        .await
+        .expect("success-shaped H2 mock must be a final response, not a stream reset");
+    let (h2_success_parts, h2_success_body) = h2_success.into_parts();
+    assert_eq!(h2_success_parts.status, StatusCode::INTERNAL_SERVER_ERROR);
+    let h2_success_body = h2_success_body
+        .collect()
+        .await
+        .expect("success-shaped H2 mock body")
+        .to_bytes();
+    assert!(
+        String::from_utf8_lossy(&h2_success_body)
+            .contains("cannot mock a successful WebSocket handshake")
+    );
     h2_connection_task.abort();
 
     let h3_match_url = format!("https://localhost:{gateway_https_port}/ws-mock/match");
@@ -3036,8 +3085,22 @@ async fn test_response_mock_short_circuits_websocket_handshakes_h1_h2_and_h3() {
             .contains("no mock rule matched")
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    let h3_success_url = format!("https://localhost:{gateway_https_port}/ws-mock/success");
+    let h3_success_client = Http3Client::insecure().expect("success-shaped H3 client");
+    let mut h3_success = h3_success_client
+        .websocket(&h3_success_url, WebSocketOptions::default())
+        .await
+        .expect("success-shaped H3 response-mock handshake");
+    assert_eq!(h3_success.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        h3_success
+            .recv_body_text()
+            .await
+            .expect("success-shaped H3 mock body")
+            .contains("cannot mock a successful WebSocket handshake")
+    );
+
+    gateway.shutdown();
 }
 
 /// Test HTTP/3 WebSocket (RFC 9220 Extended CONNECT) proxying through the
@@ -3150,8 +3213,7 @@ async fn test_h3_websocket_rfc6455_masked_frames_and_unmasked_refusal() {
         .await
         .expect("close preserved-ID H3 WebSocket");
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -3203,8 +3265,7 @@ async fn test_h3_websocket_disabled_env_rejects_extended_connect_only() {
         "disabled response should explain H3 WebSocket is disabled"
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     http_handle.abort();
 }
 
@@ -3288,8 +3349,7 @@ async fn test_h3_websocket_global_frame_limit_rejects_oversized_client_frame() {
         "oversized H3 WebSocket frame reached backend despite FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES"
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     probe_handle.abort();
 }
 
@@ -3372,8 +3432,7 @@ async fn test_h3_websocket_subprotocol_forwarding_and_none() {
     );
     without_subprotocol.send_close().await.expect("close");
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -3462,8 +3521,7 @@ async fn test_h3_websocket_origin_allowlist_enforced_before_backend_connect() {
     );
     allowed_origin.send_close().await.expect("close");
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -3502,8 +3560,7 @@ async fn test_h3_websocket_retry_rotates_to_next_upstream_target() {
     assert_eq!(ws.recv_text().await.expect("echo"), "Echo: retry rotation");
     ws.send_close().await.expect("close");
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     let _keep_dead_port = dead_port_reservation;
 }
@@ -3544,8 +3601,91 @@ async fn test_h3_websocket_failed_backend_upgrade_returns_502() {
             .contains("Backend WebSocket connection failed")
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
+    let _keep_dead_port = dead_port_reservation;
+}
+
+/// A failed WebSocket backend dial is logged at ERROR with the backend URL,
+/// but never with the client's query string: browsers cannot set headers on a
+/// WebSocket handshake, so the query routinely carries `?access_token=`
+/// credentials (GHSA-pwwg-8543-q37r). Covers the H1 and H3 failure records.
+#[ignore]
+#[tokio::test]
+async fn test_websocket_backend_failure_log_omits_query_credentials() {
+    const SECRET: &str = "ws-query-secret-7c1f0e";
+    let dead_port_reservation = reserve_refused_tcp_port().expect("reserve refused dead port");
+    let dead_port = dead_port_reservation.port;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_config(&config_path, dead_port);
+
+    let cert_path = "tests/certs/server.crt";
+    let key_path = "tests/certs/server.key";
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, gateway_http_port, gateway_https_port) =
+        start_gateway_tls_with_retry(config_path.to_str().unwrap(), cert_path, key_path).await;
+    // ERROR/WARN records land in this file (see `start_gateway_with_extra_env`).
+    let stderr_path = config_path.with_extension(format!("gateway-{gateway_http_port}.stderr.log"));
+
+    let h1_url = format!(
+        "ws://127.0.0.1:{}/ws-echo?access_token={}",
+        gateway_http_port, SECRET
+    );
+    assert!(
+        tokio_tungstenite::connect_async(&h1_url).await.is_err(),
+        "H1 upgrade to a refused backend must fail"
+    );
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let h3_url = format!(
+        "https://localhost:{}/ws-echo?access_token={}",
+        gateway_https_port, SECRET
+    );
+    let ws = client
+        .websocket(&h3_url, WebSocketOptions::default())
+        .await
+        .expect("H3 WebSocket failed-upgrade response");
+    assert_eq!(ws.status, StatusCode::BAD_GATEWAY);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let (h1_lines, h3_lines) = loop {
+        let log = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        let h1_lines: Vec<String> = log
+            .lines()
+            .filter(|line| {
+                line.contains("WebSocket backend connection failed") && !line.contains("H3 ")
+            })
+            .map(str::to_owned)
+            .collect();
+        let h3_lines: Vec<String> = log
+            .lines()
+            .filter(|line| line.contains("H3 WebSocket backend connection failed"))
+            .map(str::to_owned)
+            .collect();
+        if (!h1_lines.is_empty() && !h3_lines.is_empty()) || tokio::time::Instant::now() >= deadline
+        {
+            break (h1_lines, h3_lines);
+        }
+        sleep(Duration::from_millis(50)).await;
+    };
+    assert!(
+        !h1_lines.is_empty(),
+        "expected the H1 WebSocket backend failure record"
+    );
+    assert!(
+        !h3_lines.is_empty(),
+        "expected the H3 WebSocket backend failure record"
+    );
+    for line in h1_lines.iter().chain(h3_lines.iter()) {
+        assert!(
+            !line.contains(SECRET),
+            "WebSocket backend failure log leaked the query credential: {line}"
+        );
+    }
+
+    gateway.shutdown();
     let _keep_dead_port = dead_port_reservation;
 }
 
@@ -3600,8 +3740,7 @@ async fn test_h3_websocket_releases_per_ip_request_slot_after_200() {
     assert_eq!(ws.recv_text().await.expect("echo"), "Echo: still open");
     ws.send_close().await.expect("close");
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     http_handle.abort();
 }
@@ -3659,8 +3798,7 @@ async fn test_h3_websocket_env_disabled_rejects_connect_but_plain_h3_works() {
         "disabled H3 WebSocket response should explain the env gate"
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     http_handle.abort();
 }
@@ -3760,8 +3898,7 @@ async fn test_websocket_idle_timeout_closes_idle_session() {
         "idle WebSocket session should be closed by the gateway within the idle window"
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -3803,8 +3940,7 @@ async fn test_websocket_idle_timeout_disabled_keeps_session_open() {
     let reply = ws.next().await.expect("No reply").expect("Error reading");
     assert_eq!(reply, Message::Text("Echo: still-here".into()));
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -3856,8 +3992,7 @@ async fn test_websocket_idle_timeout_activity_refreshes_then_closes() {
         "session should close once activity stops and the idle window elapses"
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -3971,8 +4106,7 @@ async fn test_websocket_max_lifetime_active_traffic_h1_h2_h3_parity() {
         "active H3 traffic must not extend the maximum lifetime"
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -4017,7 +4151,7 @@ async fn test_websocket_active_jwt_session_closes_at_credential_expiry() {
             "exp": expires_at,
             "nbf": 0,
         }),
-        &jsonwebtoken::EncodingKey::from_secret(WS_JWT_SECRET.as_bytes()),
+        &jsonwebtoken::EncodingKey::from_secret(WS_JWT_SECRET.as_bytes()).unwrap(),
     )
     .unwrap_or_else(|_| panic!("failed to sign short-lived functional-test JWT"));
 
@@ -4081,8 +4215,7 @@ async fn test_websocket_active_jwt_session_closes_at_credential_expiry() {
         "credential expiry must close the active session well before the 30-second maximum"
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -4126,8 +4259,7 @@ async fn test_websocket_idle_timeout_tunnel_mode_closes_idle_session() {
         "tunnel-mode idle WebSocket session should be closed within the idle window"
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -4227,8 +4359,7 @@ async fn test_websocket_idle_timeout_sends_symmetric_1001_close() {
     assert_eq!(backend_code, CloseCode::Away);
     assert_eq!(backend_reason, "idle timeout");
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -4335,8 +4466,7 @@ async fn test_websocket_client_protocol_violation_closes_with_1002() {
     assert_eq!(close.code, CloseCode::Protocol);
     assert_eq!(close.reason.as_str(), "protocol error");
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -4387,8 +4517,7 @@ async fn test_websocket_backend_reset_closes_client_with_1011() {
     assert_eq!(close.code, CloseCode::Error);
     assert_eq!(close.reason.as_str(), "relay error");
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     reset_handle.abort();
 }
 
@@ -4436,8 +4565,7 @@ async fn test_websocket_ping_unresponsive_backend_yields_no_local_pong() {
         Some(other) => panic!("unexpected frame while waiting for silence: {other:?}"),
     }
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     backend_handle.abort();
 }
 
@@ -4481,8 +4609,7 @@ async fn test_websocket_ping_responsive_backend_yields_exactly_one_pong() {
         Some(other) => panic!("unexpected trailing frame: {other:?}"),
     }
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -4534,8 +4661,7 @@ async fn test_websocket_backend_ping_unresponsive_client_yields_no_local_pong() 
     );
 
     let _ = ws.send(Message::Close(None)).await;
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     backend_handle.abort();
 }
 
@@ -4598,8 +4724,7 @@ async fn test_websocket_backend_ping_responsive_client_yields_exactly_one_pong()
     );
 
     let _ = ws.send(Message::Close(None)).await;
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     backend_handle.abort();
 }
 
@@ -4664,8 +4789,7 @@ async fn test_h2_websocket_ping_unresponsive_backend_yields_no_local_pong() {
 
     drop(ws);
     conn_task.abort();
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     backend_handle.abort();
 }
 
@@ -4734,8 +4858,7 @@ async fn test_h2_websocket_ping_responsive_backend_yields_exactly_one_pong() {
 
     drop(ws);
     conn_task.abort();
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -4776,8 +4899,7 @@ async fn test_h3_websocket_ping_unresponsive_backend_yields_no_local_pong() {
         Ok(Err(err)) => panic!("H3 recv error while expecting silence: {err}"),
     }
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     backend_handle.abort();
 }
 
@@ -4825,7 +4947,361 @@ async fn test_h3_websocket_ping_responsive_backend_yields_exactly_one_pong() {
         Ok(Err(err)) => panic!("H3 recv error after first Pong: {err}"),
     }
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
+}
+
+// ============================================================================
+// Backend handshake responses: forwarded 101 headers (issue #7391), preserved
+// Host on direct dials (issue #7392) and relayed backend refusals
+// (GHSA-7x2j-3389-2h35) on H1, H2 Extended CONNECT and H3 Extended CONNECT.
+// ============================================================================
+
+/// Raw backend for the handshake-response tests. Every request head is read and
+/// its `(path, Host)` recorded. A path containing `deny` answers `401` with a
+/// challenge and a JSON body; any other WebSocket upgrade answers a valid `101`
+/// carrying two `Set-Cookie` lines, an end-to-end header, a header the route's
+/// policy removes and a forged gateway diagnostic header, then holds the socket;
+/// everything else (plain HTTP, the capability probe) answers `200 plain-ok`.
+async fn start_handshake_response_backend(
+    listener: TcpListener,
+    seen: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+) {
+    loop {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            continue;
+        };
+        let seen = seen.clone();
+        tokio::spawn(async move {
+            let mut head = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(read) => head.extend_from_slice(&buf[..read]),
+                }
+            }
+            let head = String::from_utf8_lossy(&head).into_owned();
+            let path = head
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or("")
+                .to_string();
+            let header = |name: &str| {
+                head.lines().find_map(|line| {
+                    let (field, value) = line.split_once(':')?;
+                    field
+                        .trim()
+                        .eq_ignore_ascii_case(name)
+                        .then(|| value.trim().to_string())
+                })
+            };
+            let is_upgrade =
+                header("upgrade").is_some_and(|value| value.eq_ignore_ascii_case("websocket"));
+            if is_upgrade {
+                seen.lock()
+                    .expect("seen lock")
+                    .push((path.clone(), header("host").unwrap_or_default()));
+            }
+            let response = if path.contains("deny") {
+                let body = r#"{"error":"backend-auth"}"#;
+                format!(
+                    "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"ws\"\r\n\
+                     Content-Type: application/json\r\nContent-Length: {}\r\n\
+                     X-Gateway-Error: forged\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+            } else if is_upgrade {
+                let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(
+                    header("sec-websocket-key").unwrap_or_default().as_bytes(),
+                );
+                format!(
+                    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+                     Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\
+                     Set-Cookie: sid=abc; Path=/\r\nSet-Cookie: theme=dark\r\n\
+                     X-Backend-Upgrade: yes\r\nX-Backend-Remove: secret\r\n\
+                     X-Gateway-Error: forged\r\n\r\n"
+                )
+            } else {
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 8\r\n\
+                 Connection: close\r\n\r\nplain-ok"
+                    .to_string()
+            };
+            if stream.write_all(response.as_bytes()).await.is_err() {
+                return;
+            }
+            // Hold an upgraded session open until the gateway closes it.
+            while let Ok(read) = stream.read(&mut buf).await {
+                if read == 0 {
+                    break;
+                }
+            }
+        });
+    }
+}
+
+fn write_ws_handshake_response_config(config_path: &std::path::Path, backend_port: u16) {
+    let config = format!(
+        r#"
+version: "1"
+proxies:
+  - id: "ws-handshake-response-proxy"
+    listen_path: "/ws-hdr"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    strip_listen_path: true
+    preserve_host_header: true
+    circuit_breaker:
+      failure_threshold: 1
+      success_threshold: 1
+      timeout_seconds: 60
+      failure_status_codes: [500, 502, 503, 504]
+      trip_on_connection_errors: true
+
+consumers: []
+plugin_configs:
+  - id: "plugin-security-headers-ws-handshake-response"
+    plugin_name: "security_headers"
+    config:
+      hsts: true
+      set:
+        X-WS-Security: "gateway-enforced"
+      remove: ["x-backend-remove"]
+    scope: global
+    enabled: true
+"#
+    );
+    let mut file = std::fs::File::create(config_path).expect("Failed to create config file");
+    file.write_all(config.as_bytes())
+        .expect("Failed to write config");
+}
+
+/// The forwarded backend `101` headers on a successful client handshake.
+fn assert_forwarded_backend_handshake_headers(headers: &http::HeaderMap, frontend: &str) {
+    let cookies: Vec<&str> = headers
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect();
+    assert_eq!(
+        cookies,
+        ["sid=abc; Path=/", "theme=dark"],
+        "{frontend}: every backend Set-Cookie on the 101 must reach the client"
+    );
+    assert_eq!(
+        headers
+            .get("x-backend-upgrade")
+            .and_then(|value| value.to_str().ok()),
+        Some("yes"),
+        "{frontend}: end-to-end backend handshake headers must be forwarded"
+    );
+    assert!(
+        headers.get("x-backend-remove").is_none(),
+        "{frontend}: response policy must still govern forwarded backend headers"
+    );
+    assert!(
+        headers.get("x-gateway-error").is_none(),
+        "{frontend}: a backend copy of a gateway-owned header must not be forwarded"
+    );
+    assert_eq!(
+        headers
+            .get("x-ws-security")
+            .and_then(|value| value.to_str().ok()),
+        Some("gateway-enforced")
+    );
+}
+
+/// The relayed backend `401` refusal on a failed client handshake.
+fn assert_relayed_backend_refusal(status: StatusCode, headers: &http::HeaderMap, frontend: &str) {
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "{frontend}: the backend's refusal must be relayed, not turned into a 502"
+    );
+    assert_eq!(
+        headers
+            .get("www-authenticate")
+            .and_then(|value| value.to_str().ok()),
+        Some("Bearer realm=\"ws\""),
+        "{frontend}: the backend challenge must reach the client"
+    );
+    assert!(
+        headers.get("x-gateway-error").is_none(),
+        "{frontend}: a relayed backend answer carries no gateway error token"
+    );
+}
+
+#[ignore]
+#[tokio::test]
+async fn test_websocket_backend_handshake_response_headers_host_and_refusal_h1_h2_h3() {
+    use bytes::Bytes;
+    use http::{Method, Version};
+    use http_body_util::{BodyExt, Empty};
+    use hyper::client::conn::http2;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+
+    let listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind handshake-response backend");
+    let backend_port = listener.local_addr().expect("backend addr").port();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let backend = tokio::spawn(start_handshake_response_backend(listener, seen.clone()));
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_handshake_response_config(&config_path, backend_port);
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, gateway_http_port, gateway_https_port) = start_gateway_tls_with_retry(
+        config_path.to_str().unwrap(),
+        "tests/certs/server.crt",
+        "tests/certs/server.key",
+    )
+    .await;
+
+    let backend_host_for = |path: &str| {
+        seen.lock()
+            .expect("seen lock")
+            .iter()
+            .find(|(seen_path, _)| seen_path == path)
+            .map(|(_, host)| host.clone())
+    };
+
+    // ── HTTP/1.1 Upgrade ────────────────────────────────────────────────
+    let mut h1_request = format!("ws://127.0.0.1:{gateway_http_port}/ws-hdr/up-h1")
+        .into_client_request()
+        .expect("H1 WebSocket request");
+    h1_request.headers_mut().insert(
+        http::header::HOST,
+        http::HeaderValue::from_static("tenant-h1.example.test"),
+    );
+    let (mut h1_ws, h1_response) = tokio_tungstenite::connect_async(h1_request)
+        .await
+        .expect("H1 WebSocket upgrade through the gateway");
+    assert_forwarded_backend_handshake_headers(h1_response.headers(), "H1");
+    assert_eq!(
+        backend_host_for("/up-h1").as_deref(),
+        Some("tenant-h1.example.test"),
+        "H1: preserve_host_header must reach the direct WebSocket backend"
+    );
+    let _ = h1_ws.close(None).await;
+
+    let h1_deny = reqwest::Client::builder()
+        .http1_only()
+        .build()
+        .expect("H1 client")
+        .get(format!(
+            "http://127.0.0.1:{gateway_http_port}/ws-hdr/deny-h1"
+        ))
+        .header("connection", "Upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-version", "13")
+        .send()
+        .await
+        .expect("H1 refused upgrade");
+    assert_relayed_backend_refusal(h1_deny.status(), h1_deny.headers(), "H1");
+    assert_eq!(
+        h1_deny.text().await.expect("H1 refusal body"),
+        r#"{"error":"backend-auth"}"#
+    );
+
+    // ── HTTP/2 Extended CONNECT (RFC 8441) ──────────────────────────────
+    let h2_stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{gateway_http_port}"))
+        .await
+        .expect("connect to gateway H2 port");
+    let (mut h2_sender, h2_connection) =
+        http2::handshake(TokioExecutor::new(), TokioIo::new(h2_stream))
+            .await
+            .expect("H2 handshake");
+    let h2_connection_task = tokio::spawn(async move {
+        let _ = h2_connection.await;
+    });
+    let h2_request = |path: &str| {
+        http::Request::builder()
+            .method(Method::CONNECT)
+            .uri(format!("http://tenant-h2.example.test/ws-hdr/{path}"))
+            .version(Version::HTTP_2)
+            .header(http::header::SEC_WEBSOCKET_VERSION, "13")
+            .extension(hyper::ext::Protocol::from_static("websocket"))
+            .body(Empty::<Bytes>::new())
+            .expect("build H2 WebSocket request")
+    };
+    let h2_up = h2_sender
+        .send_request(h2_request("up-h2"))
+        .await
+        .expect("H2 Extended CONNECT through the gateway");
+    assert_eq!(h2_up.status(), StatusCode::OK);
+    assert_forwarded_backend_handshake_headers(h2_up.headers(), "H2");
+    assert_eq!(
+        backend_host_for("/up-h2").as_deref(),
+        Some("tenant-h2.example.test"),
+        "H2: preserve_host_header must reach the direct WebSocket backend"
+    );
+    drop(h2_up);
+
+    let h2_deny = h2_sender
+        .send_request(h2_request("deny-h2"))
+        .await
+        .expect("H2 refused Extended CONNECT");
+    let (h2_deny_parts, h2_deny_body) = h2_deny.into_parts();
+    assert_relayed_backend_refusal(h2_deny_parts.status, &h2_deny_parts.headers, "H2");
+    let h2_deny_body = h2_deny_body
+        .collect()
+        .await
+        .expect("H2 refusal body")
+        .to_bytes();
+    assert_eq!(h2_deny_body.as_ref(), br#"{"error":"backend-auth"}"#);
+    h2_connection_task.abort();
+
+    // ── HTTP/3 Extended CONNECT (RFC 9220) ──────────────────────────────
+    let h3_client = Http3Client::insecure().expect("H3 client");
+    let h3_up = h3_client
+        .websocket(
+            &format!("https://localhost:{gateway_https_port}/ws-hdr/up-h3"),
+            WebSocketOptions::default(),
+        )
+        .await
+        .expect("H3 Extended CONNECT through the gateway");
+    assert_eq!(h3_up.status, StatusCode::OK);
+    assert_forwarded_backend_handshake_headers(&h3_up.headers, "H3");
+    assert_eq!(
+        backend_host_for("/up-h3"),
+        Some(format!("localhost:{gateway_https_port}")),
+        "H3: preserve_host_header must reach the direct WebSocket backend"
+    );
+    drop(h3_up);
+
+    let h3_deny_client = Http3Client::insecure().expect("H3 refusal client");
+    let mut h3_deny = h3_deny_client
+        .websocket(
+            &format!("https://localhost:{gateway_https_port}/ws-hdr/deny-h3"),
+            WebSocketOptions::default(),
+        )
+        .await
+        .expect("H3 refused Extended CONNECT");
+    assert_relayed_backend_refusal(h3_deny.status, &h3_deny.headers, "H3");
+    assert_eq!(
+        h3_deny.recv_body_text().await.expect("H3 refusal body"),
+        r#"{"error":"backend-auth"}"#
+    );
+
+    // Three backend 401 refusals against a `failure_threshold: 1` breaker:
+    // none may count as a backend failure, so plain HTTP on the same proxy and
+    // target still reaches the backend instead of the open breaker's 503.
+    let plain = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{gateway_http_port}/ws-hdr/plain"))
+        .send()
+        .await
+        .expect("plain HTTP after refused upgrades");
+    assert_eq!(
+        plain.status(),
+        StatusCode::OK,
+        "a backend 4xx upgrade refusal must not open the route's circuit breaker"
+    );
+    assert_eq!(plain.text().await.expect("plain body"), "plain-ok");
+
+    gateway.shutdown();
+    backend.abort();
 }

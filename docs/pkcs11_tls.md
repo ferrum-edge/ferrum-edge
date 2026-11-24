@@ -27,12 +27,14 @@ Supported options:
 | Option | Description |
 |---|---|
 | `module` / `module_path` | PKCS#11 shared library path for this source |
-| `module_env` | Name of a `FERRUM_*` variable containing the module path |
-| `pin_env` | Name of a `FERRUM_*` variable containing the token user PIN |
+| `module_env` | Name of an environment variable (or recognized `ferrum.conf` key) containing the module path, e.g. `FERRUM_PKCS11_MODULE_PATH` |
+| `pin_env` | Name of an environment variable (or recognized `ferrum.conf` key) containing the token user PIN, e.g. `FERRUM_PKCS11_PIN` |
 | `slot` / `slot_id` | Numeric slot id; if omitted, Ferrum uses the first slot with a token |
 | `label` | Key label selector; overrides the URI path |
 | `id_hex` / `id` | Hex key id selector, with optional `:` separators |
 | `key_type` | Currently only `rsa` is supported |
+
+`module_env` and `pin_env` names must match `[A-Za-z_][A-Za-z0-9_]*`. A recognized `ferrum.conf` key supplies a fallback value; the process environment takes precedence.
 
 If `module`, `module_path`, and `module_env` are omitted, Ferrum reads `FERRUM_PKCS11_MODULE_PATH`. PIN values are optional for tokens that expose the key without login, but production HSMs normally require `pin_env`.
 

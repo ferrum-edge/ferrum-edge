@@ -1,6 +1,6 @@
 [package]
 name = "ferrum-edge"
-version = "0.9.17"
+version = "0.9.21"
 edition = "2024"
 description = "A high-performance edge proxy built in Rust"
 license = "PolyForm-Noncommercial-1.0.0"
@@ -97,7 +97,11 @@ tokio-stream = { version = "0.1", features = ["full"] }
 
 # HTTP
 hyper = { version = "=1.10.0", features = ["full"] }
-hyper-util = { version = "0.1", features = ["full"] }
+# `ferrum-h2-response-write-timeout` exists only in the vendored hyper-util
+# (patch 002): it forwards hyper patch 008's HTTP/2 response write-stall bound
+# from the frontends' auto builder. Dropping the vendored copy fails the build
+# here instead of silently losing the bound.
+hyper-util = { version = "0.1", features = ["full", "ferrum-h2-response-write-timeout"] }
 # ACME wraps hyper-rustls around Ferrum's policy-aware connector so the
 # original hostname remains the SNI/certificate identity while only screened
 # resolved addresses are dialed.
@@ -119,6 +123,13 @@ http = "1"
 # aws-lc while a ring feature is still compiled leaves the non-validated
 # implementation in charge while looking switched. Moving every provider
 # selection onto the feature pair is what makes the switch real.
+#
+# The one additive edge is deliberate and runs the safe way round: the ordinary
+# `crypto-ring` profile also links rustls's own AWS-LC arm (`rustls/aws_lc_rs`)
+# so `crate::fips::aead_backend` can pick the faster TLS record-layer cipher
+# suites for the CPU at startup. That profile claims no validated module, every
+# dependency in it still selects its ring arm, and the `fips` profile is
+# untouched. See the `[features]` comments below.
 #
 # `ring` and `aws-lc-rs` are the ring-API-compatible backends behind
 # `crate::fips::backend` (randomness, HMAC, digests, signature verification).
@@ -149,19 +160,23 @@ serde_yaml = "0.9"
 # them under explicit budgets without relying on serde_yaml's unbounded alias
 # materialization (issue #3307 and PR #3843).
 unsafe-libyaml = "0.2.11"
-jsonschema = { version = "0.46.5", default-features = false }
-roxmltree = "0.20"
+jsonschema = { version = "0.49.9", default-features = false }
+roxmltree = "0.21.2"
 memchr = "2"
 
 # Database
 # `runtime-tokio-rustls` is deliberately NOT used: it hard-wires
 # `tls-rustls-ring`. The TLS arm comes from `crypto-ring` / `fips` instead.
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "mysql", "sqlite", "chrono", "json"] }
+# `mysql-rsa` keeps MySQL `caching_sha2_password` / `sha256_password` working
+# over a non-TLS link: SQLx 0.9 makes the RSA password exchange optional and
+# fails that login at runtime without it. `sqlite-bundled` +
+# `sqlite-unlock-notify` replace the `sqlite` umbrella, which would also enable
+# `sqlite-load-extension` and `sqlite-deserialize`; Ferrum uses neither.
+sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "mysql", "mysql-rsa", "sqlite-bundled", "sqlite-unlock-notify", "chrono", "time", "json"] }
 
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-tracing-appender = "0.2"
 
 # gRPC
 # TLS arm (`tls-ring` / `tls-aws-lc`) comes from `crypto-ring` / `fips`.
@@ -175,12 +190,20 @@ tower = { version = "0.5", features = ["util"] }
 
 # JWT and auth
 #
-# The signing/verification backend (`rust_crypto` vs `aws_lc_rs`) comes from
-# `crypto-ring` / `fips`. jsonwebtoken 10 prefers `aws_lc_rs` when both are
-# compiled, but leaving `rust_crypto` on in a FIPS build would still link a
-# second, non-validated implementation of the same primitives, so the arms are
-# exclusive here too.
-jsonwebtoken = { version = "10", default-features = false, features = ["use_pem"] }
+# jsonwebtoken's signing/verification backend is `aws_lc_rs` on BOTH profiles,
+# selected inline here rather than through the `crypto-ring` / `fips` pair.
+# jsonwebtoken 12 picks its provider automatically only when exactly one of
+# `rust_crypto` / `aws_lc_rs` is compiled (both, or neither, panics at first
+# use), so a single inline selection keeps that true for every feature
+# combination. On a `fips` build, `aws-lc-rs/fips` unifies onto this same
+# `aws-lc-rs`, so JWT signing and verification run in the validated module; on
+# the ordinary profile they run on AWS-LC, which dimpl, rcgen and x509-parser
+# already compile in. `rust_crypto` is never enabled: it pulls in the
+# RustCrypto `rsa` (RUSTSEC-2023-0071) and `p256`/`p384` 0.13 on
+# `crypto-bigint` 0.5 (RUSTSEC-2026-0387), and would sign ES256/ES384/RS*
+# outbound assertions and JWT-SVIDs on those implementations.
+# `.github/scripts/check_fips_feature_policy.py` enforces both.
+jsonwebtoken = { version = "12", default-features = false, features = ["use_pem", "aws_lc_rs"] }
 # NOTE: `argon2` was declared here and referenced by nothing in `src/` or
 # `custom_plugins/`. Argon2 is not an SP 800-132 approved KDF, so an unused
 # declaration was a non-approved primitive sitting in the dependency graph for
@@ -222,6 +245,7 @@ httpdate = "1"
 
 # Other utilities
 regex = "1"
+regex-syntax = "0.8"
 semver = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 dashmap = "6"
@@ -253,20 +277,26 @@ pin-project-lite = "0.2"
 # load-bearing: `crypto-ring` / `fips`, not reqwest, selects the provider.
 reqwest = { version = "=0.13.4", default-features = false, features = ["json", "form", "rustls-no-provider", "stream", "http2", "charset"] }
 hickory-resolver = { version = "0.26.2", features = ["tokio", "system-config"] }
-base64 = "0.22"
+base64 = "0.23"
 # AWS event-stream prelude/message CRC32 (ITU-T V.42). Already transitive via
 # flate2; the explicit dependency makes the Bedrock integrity check intentional.
 crc32fast = "1"
 url = "2"
-# Mozilla Public Suffix List for browser-equivalent Set-Cookie Domain handling.
+# Mozilla Public Suffix List for browser-equivalent Set-Cookie Domain handling
+# and CORS credentialed-wildcard classification. A version bump must regenerate
+# `src/plugins/cors_psl_ancestors.rs` from the new bundled list with
+# `python3 scripts/generate_cors_psl_ancestors.py`; the
+# `psl_ancestor_index_is_generated_from_the_locked_psl_version` unit test fails
+# until the index header names the locked version, and the Dependency Audit CI
+# job fails until every entry matches.
 psl = "2"
 percent-encoding = "2"
 socket2 = { version = "0.6.3", features = ["all"] }
 tokio-util = { version = "0.7.18", default-features = false }
 prost-reflect = "0.16"
-brotli = "8"
+brotli = "9"
 flate2 = "1"
-zstd = "0.13"
+zstd = "0.14"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
@@ -300,8 +330,8 @@ glob = "0.3"
 # kube's default feature set hard-selects `ring` for its hyper-rustls client.
 # Keep the transport/provider-neutral surface here; the mutually exclusive
 # backend features below choose kube-client's provider together with Ferrum's.
-kube = { version = "3.1", default-features = false, features = ["runtime", "client", "derive", "ws", "rustls-tls"] }
-k8s-openapi = { version = "0.27", features = ["latest"] }
+kube = { version = "5.0", default-features = false, features = ["runtime", "client", "derive", "ws", "rustls-tls"] }
+k8s-openapi = { version = "0.29", features = ["latest"] }
 # Used by `rcgen::CertificateParams::not_before` / `not_after` (rcgen's
 # choice — it needs `time::OffsetDateTime`). Already in `[dev-dependencies]`
 # for testing; promoting to a regular dep so the mesh CA can reference it.
@@ -312,35 +342,47 @@ time = "0.3"
 instant-acme = { version = "0.8.5", default-features = false, features = ["hyper-rustls", "rcgen", "time", "x509-parser"], optional = true }
 cryptoki = { version = "0.12", optional = true }
 vaultrs = { version = "0.8", optional = true }
-aws-config = { version = "1.8", features = ["behavior-version-latest"], optional = true }
+# aws-config >= 1.12 and aws-sdk-secretsmanager >= 1.120 are the first lines whose
+# whole SDK graph (sts/sso/ssooidc included) requires aws-smithy-json ^0.63, so
+# the direct `aws-smithy-json` floor below unifies with the SDK (issue #6755).
+aws-config = { version = "1.12", features = ["behavior-version-latest"], optional = true }
 # `default-features = false` drops the SDK's legacy `rustls` feature, which pulls
 # the hyper 0.14 / rustls 0.21 / h2 0.3 connector stack (RUSTSEC-2026-0098,
 # -0099, -0104, -0258). The client is built from `aws_config::load_defaults`,
 # whose `default-https-client` (hyper 1.x + rustls 0.23) is what it uses.
-aws-sdk-secretsmanager = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
-google-cloud-secretmanager-v1 = { version = "=1.10.0", optional = true }
+aws-sdk-secretsmanager = { version = "1.120", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
+google-cloud-secretmanager-v1 = { version = "=1.14.0", optional = true }
 # Provides anonymous credentials so the GCP Secret Manager client can target a
 # local fake/emulator endpoint (`FERRUM_GCP_SECRET_MANAGER_ENDPOINT`) without
 # attempting Application Default Credentials discovery. Already in the tree
 # transitively via google-cloud-secretmanager-v1 → gaxi; pinned here so the
 # direct `with_credentials(..)` call site has a declared dependency.
-google-cloud-auth = { version = "=1.11.0", optional = true }
-# Security-only constraints for #5912. GAX 0.7.13 requires the vulnerable
-# OpenTelemetry 0.31 line; newer GAX generations require a different reqwest
-# line. Keep this published, compatible chain on the audited vendor pair.
+# 1.16.0+ replaced chrono with jiff (issue #7419); 1.17.0 pairs with gaxi 0.7.19
+# on the vendored reqwest 0.13.4 and opentelemetry_sdk 0.32.x lines.
+google-cloud-auth = { version = "=1.17.0", optional = true }
+# Security and dependency-chain constraints (#5912, #7419). GAX 0.7.19 stays on
+# the vendored reqwest 0.13.4 and OpenTelemetry 0.32.x lines (0.7.20+ moves to
+# opentelemetry_sdk 0.33) while pairing with google-cloud-auth 1.17.0 (chrono-free).
 # These pins add no provider features beyond the existing GCP client graph.
-google-cloud-gax-internal = { version = "=0.7.14", default-features = false, optional = true }
-google-cloud-gax = { version = "=1.11.0", default-features = false, optional = true }
-google-cloud-wkt = { version = "=1.5.0", default-features = false, optional = true }
+google-cloud-gax-internal = { version = "=0.7.19", default-features = false, optional = true }
+google-cloud-gax = { version = "=1.15.0", default-features = false, optional = true }
+google-cloud-wkt = { version = "=1.11.0", default-features = false, optional = true }
 opentelemetry_sdk = { version = "0.32.1", default-features = false, optional = true }
-# GHSA-8ffr-xgwf-xj56: constrain the AWS runtime to the fixed JSON parser.
-aws-smithy-json = { version = "=0.62.7", optional = true }
-azure_security_keyvault_secrets = { version = "0.14", optional = true }
-azure_identity = { version = "0.35", optional = true }
-azure_core = { version = "0.35", optional = true }
+# GHSA-8ffr-xgwf-xj56: constrain the AWS runtime to the fixed JSON parser. Keep
+# this direct pin aligned with the resolved SDK graph: another 0.x minor can
+# resolve a second copy and constrain nothing (issue #6755). Move it together
+# with the SDK crates; the dependency-chain check requires one copy.
+aws-smithy-json = { version = "0.65.0", optional = true }
+# Azure SDK 1.x trio: upgrade all three together (`azure_identity` and the
+# Key Vault client implement/consume `azure_core`'s `TokenCredential`, so a
+# mixed major line does not compile). 1.x refuses bearer auth over non-TLS
+# URLs, so Key Vault references must be `https://` (see src/secrets/azure.rs).
+azure_security_keyvault_secrets = { version = "1.0.1", optional = true }
+azure_identity = { version = "1.0", optional = true }
+azure_core = { version = "1.1", optional = true }
 
 # GeoIP (geo_restriction plugin)
-maxminddb = "0.28"
+maxminddb = "0.33"
 
 # Redis (centralized rate limiting across multiple gateway instances)
 redis = { version = "1", features = ["tokio-rustls-comp", "tls-rustls-insecure", "connection-manager"] }
@@ -353,11 +395,11 @@ rdkafka = { version = "0.39", features = ["cmake-build", "zstd", "ssl-vendored"]
 # MongoDB (NoSQL database backend). Its default `rustls-tls` feature selects
 # ring, so retain the non-crypto defaults explicitly and select the TLS provider
 # through `crypto-ring` / `fips` below.
-# 3.7 is the first release on hickory 0.26; older 3.x pin hickory-proto 0.25
-# (RUSTSEC-2026-0118 / RUSTSEC-2026-0119). Capped below 3.9, which raised the
-# driver's minimum wire version to 9 (MongoDB 4.4) and would drop MongoDB 4.2 /
-# Cosmos DB server-version-4.2 support; 3.7 and 3.8 still accept wire version 8.
-mongodb = { version = ">=3.7, <3.9", default-features = false, features = ["compat-3-0-0", "dns-resolver"] }
+# 3.9.1 is the floor: it fixes CVE-2026-88024 (GridFS file-ID matching; Ferrum
+# does not use GridFS), and 3.7+ is on hickory 0.26 (RUSTSEC-2026-0118 /
+# RUSTSEC-2026-0119 hit the hickory-proto 0.25 line). 3.9 raised the driver's
+# minimum wire version to 9, so MongoDB 4.4 is the oldest supported server.
+mongodb = { version = "3.9.1", default-features = false, features = ["compat-3-0-0", "dns-resolver"] }
 
 # DTLS 1.2/1.3 (secure UDP) — Sans-IO state machine
 # SYNC: version must match tests/performance/multi_protocol/Cargo.toml (cross-version DTLS handshakes hang)
@@ -379,8 +421,8 @@ libc = "0.2"
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
 # eBPF program loader (optional, behind `ebpf` feature)
-aya = { version = "0.13", optional = true }
-aya-log = { version = "0.2", optional = true }
+aya = { version = "0.16", optional = true }
+aya-log = { version = "0.4", optional = true }
 
 # ── Feature flags ──────────────────────────────────────────────────────────
 # Cloud secret backends are optional.  Disabling them saves ~1,900 transitive
@@ -403,12 +445,33 @@ bench-udp-profile = []
 # feature graph so a transitive edge cannot quietly put ring back in control of
 # a nominal FIPS build.
 #
-# `crypto-ring` (default) reproduces the historical, non-FIPS build exactly.
-# Ordinary deployments are behaviourally unchanged by the existence of the
-# FIPS profile.
+# `crypto-ring` (default) reproduces the historical, non-FIPS build, with two
+# deliberate exceptions:
+#
+# 1. jsonwebtoken signs and verifies on AWS-LC on both profiles (its backend is
+#    selected inline above, not by this pair).
+# 2. `rustls/aws_lc_rs` links rustls's AWS-LC cipher suites BESIDE ring's. They
+#    are used only for the TLS record layer, and only where
+#    `crate::fips::aead_backend` selects them: by default on the x86-64 CPUs
+#    where AWS-LC's AVX-512 AES-GCM measurably beats ring's AVX2 one, or when
+#    `FERRUM_TLS_AEAD_BACKEND=aws-lc` asks for them. Key exchange, signature
+#    verification and every dependency's own provider arm stay on ring. No new
+#    library is linked: `aws-lc-sys` is already in this profile through
+#    jsonwebtoken and dimpl.
+#
+# `rustls/aws_lc_rs` is the ONLY AWS-LC edge this list may carry.
+# `.github/scripts/check_fips_feature_policy.py` allows exactly that entry
+# (`RING_PROFILE_ALLOWED_AWS_LC_EDGES`), refuses any other spelling or any
+# other dependency's aws-lc arm here, and audits the resolved graph so no
+# dependency in this profile moves off its ring arm. It is not mirrored in
+# `fips`, whose `rustls/fips` already implies it.
+#
+# Ordinary deployments are otherwise behaviourally unchanged by the existence
+# of the FIPS profile.
 crypto-ring = [
     "dep:ring",
     "rustls/ring",
+    "rustls/aws_lc_rs",
     "tokio-rustls/ring",
     "tonic/tls-ring",
     "quinn/rustls-ring",
@@ -416,7 +479,6 @@ crypto-ring = [
     "ldap3/tls-rustls-ring",
     "rcgen/ring",
     "x509-parser/verify",
-    "jsonwebtoken/rust_crypto",
     "reqwest/__rustls-ring",
     "hyper-rustls?/ring",
     "instant-acme?/ring",
@@ -426,9 +488,9 @@ crypto-ring = [
 
 # `fips` builds against the FIPS build of AWS-LC (`aws-lc-fips-sys`) through
 # `aws-lc-rs` and rustls. Every arm below is the aws-lc counterpart of the
-# `crypto-ring` line directly above it, so the two lists must stay
-# position-for-position comparable — that correspondence is what the CI policy
-# check reads.
+# `crypto-ring` line in the same position once that list's one unpaired entry
+# (`rustls/aws_lc_rs`, see above) is set aside, so the two lists must stay
+# comparable in order — that correspondence is what the CI policy check reads.
 #
 # Building this profile requires a C toolchain, CMake, Go, and Perl for
 # `aws-lc-fips-sys`. The committed lockfile pins both profiles; feature
@@ -456,7 +518,6 @@ fips = [
     "ldap3/tls-rustls-aws-lc-rs",
     "rcgen/fips",
     "x509-parser/verify-aws",
-    "jsonwebtoken/aws_lc_rs",
     "reqwest/__rustls-aws-lc-rs",
     "hyper-rustls?/fips",
     "instant-acme?/fips",
@@ -465,6 +526,14 @@ fips = [
 ]
 
 fuzzing = []
+# Test-only fault injection and per-operation test hooks that must never ship
+# (issue #7122): the `api_chargeback_sink` billing-spool fsync/rename/directory
+# fault dispatch and its process-global spool write/walk/replay hook slots.
+# Never enable it on a shipped build. Test targets enable it through the
+# self dev-dependency below, so `cargo test` / nextest / clippy `--all-targets`
+# get it on both crypto profiles while `cargo build --release` (release,
+# Docker and FIPS artifacts) never resolves dev-dependencies and leaves it off.
+test-support = []
 acme = ["dep:instant-acme", "dep:hyper-rustls"]
 pkcs11 = ["dep:cryptoki"]
 cloud-secrets = ["secrets-vault", "secrets-aws", "secrets-gcp", "secrets-azure"]
@@ -497,7 +566,7 @@ split-debuginfo = "unpacked"
 # including a background poller or accept loop — terminates the process.
 # Background-task supervisors still handle non-panic unexpected exits.
 # Operators must run a process supervisor (systemd, Kubernetes). See
-# PRODUCTION_READINESS.md ("Deliberate decisions") and docs/ci_cd.md.
+# docs/deliberate_decisions.md and docs/ci_cd.md.
 [profile.release]
 opt-level = 3
 lto = "fat"             # fat LTO: full cross-crate inlining for maximum hot-path perf
@@ -528,8 +597,9 @@ codegen-units = 256
 
 # Maximum-performance: for production shipping builds and benchmarks.
 # Fat LTO + single codegen unit enables whole-program optimisation across
-# all crates. Compile time is 3-5× slower than `release` but yields 5-10%
-# better runtime throughput.
+# all crates. Since `release` adopted the same settings (#362), this profile
+# builds the same configuration as `release`; it is kept as a named benchmark
+# build input.
 [profile.max-perf]
 inherits = "release"
 lto = "fat"             # full inter-module LTO (cross-crate inlining, DCE)
@@ -545,20 +615,20 @@ tonic-prost-build = "0.14.6"
 # `crate::fips::approved` and must not depend on these RustCrypto crates.
 sha2 = "0.11.0"
 hmac = "0.13.0"
-# `tempfile` is intentionally also declared in `[dependencies]` for
-# `src/config/mongo_store.rs`. Keeping it dev-only would re-introduce the
-# `cargo check --lib` break (see the dependency-section comment).
+# `tempfile` is declared in `[dependencies]` (used by
+# `src/config/mongo_store.rs`), not here: keeping it dev-only would break
+# `cargo check --lib`.
 wiremock = "0.6"
 # Functional secret-backend tests: Vault dev server + LocalStack run in Docker
 # via testcontainers; env-mutating tests serialize via serial_test. Only the
 # `secrets_functional` test target uses testcontainers.
 # See tests/secrets_functional/.
-testcontainers = "0.27"
+testcontainers = "0.28"
 # `serial_test` is also the reader/writer gate in
 # `tests/unit/plugins/serverless_function_tests.rs`: a test that publishes a
 # provider credential fixture is `#[serial(serverless_env)]` and every test that
 # constructs the plugin — an environment READ — is `#[parallel(serverless_env)]`.
-serial_test = "3"
+serial_test = "4"
 # Functional testing dependencies
 rand = "0.10"
 futures = "0.3"
@@ -568,6 +638,13 @@ futures = "0.3"
 # Required for `tests/unit/plugins/soap_ws_security_tests.rs` end-to-end
 # sign-then-verify roundtrip coverage of the X.509 signature path.
 rcgen = { version = "0.14", features = ["aws_lc_rs"] }
+# Independent strict DTLS 1.3 peer for `tests/integration/dtls_integration_tests.rs`.
+# Registry dimpl 0.8.0 rejects an empty `certificate_authorities` list in a
+# CertificateRequest (RFC 8446 §4.2.4), which the vendored 0.6.1 copy tolerates,
+# so a gateway built on the vendored server alone cannot catch that regression
+# (issue #7000). The exact `=0.8.0` requirement is outside the vendored patch's
+# 0.6 range, so `[patch.crates-io]` leaves it on the registry release.
+strict_dimpl = { package = "dimpl", version = "=0.8.0" }
 # Test fixtures construct rustls providers and raw digests directly. Pinning
 # `ring` here — a DEV dependency, never linked into the shipped binary — keeps
 # the whole suite compiling under both `--features crypto-ring` and
@@ -577,7 +654,6 @@ rcgen = { version = "0.14", features = ["aws_lc_rs"] }
 # with dev-dependency edges excluded for exactly this reason.
 ring = "0.17"
 rustls = { version = "0.23", features = ["ring"] }
-rstest = "0.26"
 time = "0.3"
 # Phase 6 cross-protocol matrix macro: concatenates idents at macro
 # expansion to generate one #[tokio::test] per (frontend, backend)
@@ -585,6 +661,12 @@ time = "0.3"
 paste = "1"
 # Simple HTTP server dependencies
 tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"] }
+# Self dev-dependency (issue #7122): every test, bench and example build gets
+# the `test-support` feature. `default-features = false` so the crypto
+# backend still comes from the command line: `--no-default-features
+# --features fips` must not pull `crypto-ring` back in, which `src/fips/mod.rs`
+# refuses at compile time.
+ferrum-edge = { path = ".", default-features = false, features = ["test-support"] }
 
 # ── Vendored upstream patches ──────────────────────────────────────────────
 # We carry a vendored copy of reqwest 0.13.4 with PR seanmonstar/reqwest#3017
@@ -594,9 +676,12 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 # fields like `backend_connect_timeout_ms`) would also share whichever
 # connect timeout the underlying `reqwest::Client` was first built with.
 #
-# Retirement plan: when reqwest#3017 merges and ships in a release we use,
-# remove this `[patch.crates-io]` entry, drop `vendor/reqwest-0.13.4-ferrum-patched/`,
-# and unpin the dependency. The call-site change in `src/connection_pool.rs`
+# Retirement plan: when reqwest#3017 merges and ships in a release we use, and
+# reqwest patches 002-004 in the same vendor copy are retired too, remove the
+# `reqwest` entry from every `[patch.crates-io]` table (here, in
+# `fuzz/Cargo.toml` and in `tests/performance/mesh/Cargo.toml`), update the
+# three lockfiles, then drop `vendor/reqwest-0.13.4-ferrum-patched/` and unpin
+# the dependency (docs/dependency-policy.md, "Retiring a vendored patch"). The call-site change in `src/connection_pool.rs`
 # uses the upstream API as proposed in the PR, so it stays intact.
 # See `docs/upstream-reqwest-patches/001-per-request-connect-timeout/README.md`.
 #
@@ -612,9 +697,12 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 # errors; a stream reset or any other stream-level error (including a rejected
 # 0-RTT read) surfaces ahead of buffered bytes, as in stock h3.
 #
-# Retirement plan: when h3 ships a release with the fix, remove the
-# corresponding `[patch.crates-io]` line, drop `vendor/h3-0.0.8-ferrum-patched/`,
-# and bump the `h3` floor in `Cargo.toml` to that version. The gateway-side
+# Retirement plan: when h3 ships a release with the fix, bump the `h3` floor.
+# The vendor copy also carries h3 patches 002-005 (co-retirement group
+# `h3-all`; production uses patch 005's `max_buffered_frame_len`), so only once
+# all of them are upstream remove the `h3` entry from every `[patch.crates-io]`
+# table (here, in `fuzz/Cargo.toml` and in `tests/performance/mesh/Cargo.toml`),
+# update the three lockfiles, then drop `vendor/h3-0.0.8-ferrum-patched/`. The gateway-side
 # suppression in PR #506 stays — it is correct independently of whether the
 # underlying h3 library can recover the response.
 # See `docs/upstream-h3-patches/001-recv-frame-drain-on-quic-close/README.md`.
@@ -628,15 +716,19 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 #
 # Retirement plan: when both upstream changes and equivalent frame/message
 # capacity attribution ship in compatible published releases consumed by
-# ferrum-edge, remove both `[patch.crates-io]` lines, drop the two vendor
-# directories, bump dependency versions/lockfile normally, and keep the gateway
+# ferrum-edge, bump the dependency versions, remove both lines from every
+# `[patch.crates-io]` table (here, in `fuzz/Cargo.toml` and in
+# `tests/performance/mesh/Cargo.toml`), update the three lockfiles, then drop
+# the two vendor directories, and keep the gateway
 # call site using the same upstream API. See
 # `docs/upstream-tungstenite-patches/README.md`.
 #
 # We also carry a narrowly scoped copy of dimpl 0.6.1 that transmits complete
 # leaf-first certificate chains and owns every retained private-key byte copy
 # in zeroizing storage. No compatible upstream release currently provides
-# either security property. See
+# either security property. The copy also backports upstream algesten/dimpl#153
+# (released in 0.7.0) so a DTLS 1.3 CertificateRequest omits, rather than sends
+# empty, the `certificate_authorities` extension. See
 # `docs/upstream-dimpl-patches/001-certificate-chain-and-key-zeroization/README.md`.
 #
 # We also carry a vendored copy of h3-quinn 0.0.10 whose `RecvStream` owns its
@@ -654,33 +746,29 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 #
 # Retirement plan: when h3-quinn ships a release whose `stop_sending` is
 # correct while a read is in flight *and* whose `SendStream`/`BidiStream`
-# expose an equivalent `&self` + `'static` `stopped` watch, remove the
-# `[patch.crates-io]` line, drop `vendor/h3-quinn-0.0.10-ferrum-patched/`,
-# and bump the `h3-quinn` floor. See `docs/upstream-h3-quinn-patches/`.
+# expose an equivalent `&self` + `'static` `stopped` watch, bump the `h3-quinn`
+# floor, remove the `h3-quinn` entry from every `[patch.crates-io]` table (here,
+# in `fuzz/Cargo.toml` and in `tests/performance/mesh/Cargo.toml`), update the
+# three lockfiles, then drop `vendor/h3-quinn-0.0.10-ferrum-patched/`. See `docs/upstream-h3-quinn-patches/`.
 #
-# We also carry a vendored copy of sqlx-core 0.8.6 whose rustls handshake
-# treats a configured root CA as EXCLUSIVE and accepts rustls 0.23's
-# context-bearing hostname error under `verify-ca`. Upstream unions the
-# configured CA with the ~150 bundled WebPKI roots, so a `verify-ca`
-# connection — which deliberately waives the hostname check — would accept any
-# publicly-trusted certificate for any name; and upstream waives only
-# `CertificateError::NotValidForName`, so `verify-ca` rejects every trusted
-# chain whose SAN does not match once rustls reports
-# `NotValidForNameContext`. The verify-ca WebPKI verifier is also pinned to
-# the provider the handshake already selected, because the provider-less
-# builder panics when both `ring` and `aws-lc-rs` are compiled in and no
-# process default was installed. A gateway-side TLS option cannot reach SQLx
-# Any's internal verifier, and a SQLx 0.9 migration would change the whole
-# database dependency graph for a compatibility fix.
-# The same vendor also corrects Any typed-NULL conversion: REAL binds through
-# Option<f32>, and DOUBLE through Option<f64> (patch 002).
+# We also carry a vendored copy of sqlx-core 0.9.1 whose rustls connector
+# treats a configured root CA as EXCLUSIVE and builds the verify-ca verifier
+# with the provider it already selected. Upstream unions the configured CA with
+# the ~150 bundled WebPKI roots, so a `verify-ca` connection — which
+# deliberately waives the hostname check — would accept any publicly-trusted
+# certificate for any name. The provider-less verifier builder upstream uses
+# panics when both `ring` and `aws-lc-rs` are compiled in and no process
+# default was installed. A gateway-side TLS option cannot reach SQLx Any's
+# internal verifier. (The rustls context-bearing hostname-error waiver and the
+# Any typed-NULL float fix this vendor carried on 0.8.6 are upstream in 0.9.1.)
 #
 # Retirement plan: when a compatible SQLx release treats a configured root CA
-# as exclusive and handles both rustls hostname-error variants while keeping
-# chain, validity, and signature verification, and preserves native REAL/DOUBLE
-# typed-NULL parameter types, remove the `[patch.crates-io]` line, drop
-# `vendor/sqlx-core-0.8.6-ferrum-patched/`, and update both lockfiles and the drift
-# manifest. See `docs/upstream-sqlx-patches/` for both retirement plans.
+# as exclusive and builds the verify-ca verifier with the selected provider
+# while keeping chain, validity, and signature verification, remove the
+# `[patch.crates-io]` line (here, in `fuzz/Cargo.toml` and in
+# `tests/performance/mesh/Cargo.toml`), update the three lockfiles, then drop
+# `vendor/sqlx-core-0.9.1-ferrum-patched/` and update the drift manifest. See
+# `docs/upstream-sqlx-patches/001-verify-ca-name-context/README.md`.
 #
 # We also carry a vendored copy of hyper-util 0.1.21 whose legacy client stops
 # holding an HTTP/1 connection's only request sender once that connection's
@@ -695,9 +783,9 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 #
 # Retirement plan: when a hyper-util release no longer holds the only HTTP/1
 # sender while waiting (or hyper's dispatcher no longer strands a racing send),
-# remove the `[patch.crates-io]` line, drop
-# `vendor/hyper-util-0.1.21-ferrum-patched/`, and update both lockfiles and the
-# drift manifest. See
+# remove the `[patch.crates-io]` line (here, in `fuzz/Cargo.toml` and in
+# `tests/performance/mesh/Cargo.toml`), update the three lockfiles, then drop
+# `vendor/hyper-util-0.1.21-ferrum-patched/` and update the drift manifest. See
 # `docs/upstream-hyper-util-patches/001-release-h1-sender-on-dispatch-close/README.md`.
 #
 # We also carry a vendored copy of hyper 1.10.0 that adds
@@ -709,9 +797,12 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 # `CONNECT_ERROR` as the signal for a tunnel whose connection failed.
 #
 # Retirement plan: when a hyper release can reset an upgraded HTTP/2 stream
-# with a chosen error code, remove the `hyper` line below, drop
-# `vendor/hyper-1.10.0-ferrum-patched/`, move the HBONE relays to the upstream
-# API, and update the three lockfiles and the drift manifest. See
+# with a chosen error code, move the HBONE relays to the upstream API and drop
+# only patch 001's hunks. The vendored copy also carries hyper patches 002-009
+# (`docs/upstream-hyper-patches/series`), so remove the `hyper` line below (and
+# its fuzz and mesh mirrors), update the three lockfiles, and drop
+# `vendor/hyper-1.10.0-ferrum-patched/` only once every one of them has an
+# adopted upstream replacement. See
 # `docs/upstream-hyper-patches/001-upgraded-h2-connect-error-reset/README.md`.
 #
 # We also carry a vendored copy of h2 0.4.20 whose frame writer copies DATA
@@ -724,10 +815,11 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 # tracks the problem as hyperium/h2#902, with a frame-queue fix in PR
 # hyperium/h2#903.
 #
-# Retirement plan: retire both h2 patches before dropping the vendored crate.
-# An adopted h2 release must batch DATA frames into one write
-# (hyperium/h2#903 or an equivalent) AND expose a stream's assigned send window
-# (h2 patch 003, or retire it with Hyper patch 005). Alternatively, Ferrum must
+# Retirement plan: retire all three h2 patches before dropping the vendored
+# crate. An adopted h2 release must batch DATA frames into one write
+# (hyperium/h2#903 or an equivalent), expose a stream's assigned send window
+# (h2 patch 003, or retire it with Hyper patch 005) AND report whether a reset
+# was local or the peer's (h2 patch 004). Alternatively, Ferrum must
 # stop using h2. (h2 0.4.20 retired the runtime-budget and client close-wakeup
 # patches: hyperium/h2#965 and #956.)
 # Then remove the `h2` line below (here, in `tests/performance/mesh/Cargo.toml`
@@ -735,7 +827,7 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 # the three lockfiles and the drift manifest. See
 # `docs/upstream-h2-patches/001-coalesce-data-frame-writes/README.md`.
 [patch.crates-io]
-sqlx-core = { path = "vendor/sqlx-core-0.8.6-ferrum-patched" }
+sqlx-core = { path = "vendor/sqlx-core-0.9.1-ferrum-patched" }
 reqwest = { path = "vendor/reqwest-0.13.4-ferrum-patched" }
 h3 = { path = "vendor/h3-0.0.8-ferrum-patched" }
 h3-quinn = { path = "vendor/h3-quinn-0.0.10-ferrum-patched" }

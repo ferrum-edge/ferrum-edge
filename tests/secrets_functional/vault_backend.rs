@@ -7,7 +7,9 @@
 
 use crate::common::containers::{VaultContainer, fail_in_ci_else_skip, start_vault_dev_container};
 use crate::common::env::{EnvGuard, assert_resolved_var};
-use ferrum_edge::secrets::{resolve_all_env_secrets, resolve_external_reference, resolve_secret};
+#[cfg(feature = "secrets-azure")]
+use crate::common::fakes::AzureKeyVaultFake;
+use ferrum_edge::secrets::{resolve_all_env_secrets, resolve_external_reference};
 use serial_test::serial;
 use std::time::Duration;
 use wiremock::matchers::{header, method, path};
@@ -56,16 +58,17 @@ async fn vault_address_validation_precedes_reference_parsing_without_panicking()
 
 #[tokio::test]
 #[serial]
-async fn vault_invalid_address_fails_single_and_batch_resolution() {
+async fn vault_invalid_address_fails_direct_reference_and_batch_resolution() {
     let guard = EnvGuard::new();
     guard.set("VAULT_TOKEN", "address-token-sentinel");
     guard.set("FERRUM_ADMIN_JWT_SECRET_VAULT", "secret/data/app#field");
     for &(address, reason) in INVALID_ADDRESSES {
         guard.set("VAULT_ADDR", address);
-        let single = resolve_secret("FERRUM_ADMIN_JWT_SECRET")
-            .await
-            .err()
-            .expect("single-key resolution must reject the address");
+        let single =
+            resolve_external_reference("vault", "secret/data/app#field", "FERRUM_ADMIN_JWT_SECRET")
+                .await
+                .err()
+                .expect("direct-reference resolution must reject the address");
         let batch = resolve_all_env_secrets()
             .await
             .err()
@@ -521,4 +524,765 @@ async fn vault_database_tls_snapshots_follow_pool_lifetime() {
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
         assert_eq!(std::fs::read_to_string(&foreign).unwrap(), "foreign owner");
     }
+}
+
+// --- Plaintext transport policy (issue #6582) -------------------------------
+//
+// `VAULT_ADDR` must use https unless the host is loopback or
+// `FERRUM_VAULT_ALLOW_PLAINTEXT=true`, and the same rule follows redirects and
+// keeps loopback traffic off any configured proxy.
+
+/// Stop resolution right after client construction: "Invalid Vault KV v2
+/// reference" proves `VAULT_ADDR` was admitted, any other error is the
+/// construction refusal itself.
+async fn vault_construction_outcome(guard: &EnvGuard, address: &str, allow: &str) -> String {
+    guard.set("VAULT_ADDR", address);
+    guard.set("VAULT_TOKEN", "plaintext-token-sentinel");
+    guard.set("FERRUM_VAULT_ALLOW_PLAINTEXT", allow);
+    resolve_external_reference("vault", "invalid-reference", "FERRUM_TEST")
+        .await
+        .err()
+        .expect("a malformed reference never resolves")
+}
+
+fn kv2_body(field: &str) -> serde_json::Value {
+    serde_json::json!({
+        "request_id": "plaintext-policy",
+        "lease_id": "",
+        "lease_duration": 0,
+        "renewable": false,
+        "data": {
+            "data": { "field": field },
+            "metadata": {
+                "created_time": "2026-01-01T00:00:00Z",
+                "deletion_time": "",
+                "destroyed": false,
+                "version": 1
+            }
+        }
+    })
+}
+
+/// A non-loopback address of this host, or `None` when it has no route. A
+/// server bound on `0.0.0.0` is reachable there, which lets a test stand up a
+/// "remote" plaintext destination and observe whether it was contacted.
+fn non_loopback_local_ip() -> Option<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("192.0.2.1:9").ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    (!ip.is_loopback() && !ip.is_unspecified()).then_some(ip)
+}
+
+async fn mock_server_on_all_interfaces() -> MockServer {
+    let listener = std::net::TcpListener::bind("0.0.0.0:0").expect("bind 0.0.0.0");
+    MockServer::builder().listener(listener).start().await
+}
+
+#[tokio::test]
+#[serial]
+async fn vault_plaintext_http_to_remote_host_is_refused() {
+    let guard = EnvGuard::new();
+    for address in [
+        "http://vault.example.com:8200",
+        "http://10.0.0.5:8200",
+        "http://[2001:db8::1]:8200",
+        "http://localhost.example.com:8200",
+    ] {
+        let error = vault_construction_outcome(&guard, address, "").await;
+        assert!(
+            error.contains("VAULT_ADDR must use https")
+                && error.contains("FERRUM_VAULT_ALLOW_PLAINTEXT"),
+            "{address}: {error}"
+        );
+        assert!(!error.contains("example.com") && !error.contains("10.0.0.5"));
+        assert!(!error.contains("plaintext-token-sentinel"));
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn vault_loopback_http_and_remote_https_are_admitted() {
+    let guard = EnvGuard::new();
+    for address in [
+        "http://127.0.0.1:8200",
+        "http://127.8.9.10:8200",
+        "http://localhost:8200",
+        "http://LOCALHOST:8200",
+        "http://[::1]:8200",
+        "http://[::ffff:127.0.0.1]:8200",
+        "https://vault.example.com:8200",
+    ] {
+        let error = vault_construction_outcome(&guard, address, "").await;
+        assert!(
+            error.contains("Invalid Vault KV v2 reference"),
+            "{address} must construct a client: {error}"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn vault_plaintext_opt_in_is_explicit_and_strict() {
+    let guard = EnvGuard::new();
+    let remote = "http://vault.example.com:8200";
+    for allow in ["true", "TRUE", "1", "yes"] {
+        let error = vault_construction_outcome(&guard, remote, allow).await;
+        assert!(
+            error.contains("Invalid Vault KV v2 reference"),
+            "FERRUM_VAULT_ALLOW_PLAINTEXT={allow} must admit remote http: {error}"
+        );
+    }
+    for deny in ["false", "0", "no"] {
+        let error = vault_construction_outcome(&guard, remote, deny).await;
+        assert!(
+            error.contains("VAULT_ADDR must use https"),
+            "{deny}: {error}"
+        );
+    }
+    // A typo must not read as either answer, even for an https address.
+    for address in [remote, "https://vault.example.com:8200"] {
+        let error = vault_construction_outcome(&guard, address, "maybe").await;
+        assert!(
+            error.contains("FERRUM_VAULT_ALLOW_PLAINTEXT must be true or false"),
+            "{address}: {error}"
+        );
+    }
+}
+
+/// reqwest strips `Authorization` on a cross-origin redirect but not
+/// `X-Vault-Token`, so an admitted loopback address must not be able to bounce
+/// the token to a plaintext remote host.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn vault_redirect_to_remote_plaintext_is_refused_before_any_request() {
+    let guard = EnvGuard::new();
+    let Some(lan_ip) = non_loopback_local_ip() else {
+        eprintln!("skipping: this host has no non-loopback address to stand in for a remote host");
+        return;
+    };
+    let remote = mock_server_on_all_interfaces().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(kv2_body("leaked")))
+        .mount(&remote)
+        .await;
+    let remote_port = remote.address().port();
+
+    let local = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/app"))
+        .respond_with(ResponseTemplate::new(307).insert_header(
+            "Location",
+            format!("http://{lan_ip}:{remote_port}/v1/secret/data/app").as_str(),
+        ))
+        .mount(&local)
+        .await;
+
+    guard.set("VAULT_ADDR", local.uri());
+    guard.set("VAULT_TOKEN", "redirect-token-sentinel");
+    let outcome = resolve_external_reference("vault", "secret/data/app#field", "FERRUM_TEST").await;
+    assert!(
+        outcome.is_err(),
+        "a redirect to remote plaintext must not resolve the secret"
+    );
+    assert!(
+        remote
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "the plaintext redirect target must never receive the token"
+    );
+
+    // The explicit opt-in follows the same redirect.
+    guard.set("FERRUM_VAULT_ALLOW_PLAINTEXT", "true");
+    let resolved = resolve_external_reference("vault", "secret/data/app#field", "FERRUM_TEST")
+        .await
+        .expect("the opt-in admits plaintext redirects");
+    assert_eq!(resolved.value, "leaked");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn vault_loopback_redirect_is_followed() {
+    let guard = EnvGuard::new();
+    let target = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/app"))
+        .and(header("X-Vault-Token", "loopback-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(kv2_body("followed")))
+        .expect(1)
+        .mount(&target)
+        .await;
+    let origin = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/app"))
+        .respond_with(ResponseTemplate::new(307).insert_header(
+            "Location",
+            format!("{}/v1/secret/data/app", target.uri()).as_str(),
+        ))
+        .mount(&origin)
+        .await;
+
+    guard.set("VAULT_ADDR", origin.uri());
+    guard.set("VAULT_TOKEN", "loopback-token");
+    let resolved = resolve_external_reference("vault", "secret/data/app#field", "FERRUM_TEST")
+        .await
+        .expect("a loopback-to-loopback redirect is followed");
+    assert_eq!(resolved.value, "followed");
+    target.verify().await;
+}
+
+/// A loopback `http` Vault never goes through `HTTP_PROXY`: the proxy may be
+/// remote, and the request would carry the token to it in plaintext.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn vault_loopback_http_bypasses_http_proxy() {
+    let guard = EnvGuard::new();
+    let proxy = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(502))
+        .mount(&proxy)
+        .await;
+    let vault = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/app"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(kv2_body("direct")))
+        .expect(1)
+        .mount(&vault)
+        .await;
+
+    for key in ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
+        guard.set_other(key, proxy.uri());
+    }
+    for key in ["NO_PROXY", "no_proxy"] {
+        guard.set_other(key, "");
+    }
+    guard.set("VAULT_ADDR", vault.uri());
+    guard.set("VAULT_TOKEN", "proxy-token-sentinel");
+    let resolved = resolve_external_reference("vault", "secret/data/app#field", "FERRUM_TEST")
+        .await
+        .expect("loopback Vault resolves directly");
+    assert_eq!(resolved.value, "direct");
+    assert!(
+        proxy
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "the proxy must never see the loopback Vault request"
+    );
+    vault.verify().await;
+}
+
+/// Startup resolution runs before logging exists, so the opt-in warning is
+/// deferred and must still appear exactly once.
+#[tokio::test]
+#[serial]
+async fn vault_plaintext_opt_in_warning_survives_startup_resolution() {
+    let Some(lan_ip) = non_loopback_local_ip() else {
+        eprintln!("skipping: this host has no non-loopback address to stand in for a remote host");
+        return;
+    };
+    let temp = tempfile::TempDir::new().unwrap();
+    let vault = mock_server_on_all_interfaces().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/app"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(kv2_body("valid-vault-admin-secret-0123456789abcdef")),
+        )
+        .mount(&vault)
+        .await;
+    let address = format!("http://{lan_ip}:{}", vault.address().port());
+    let output = tokio::time::timeout(
+        Duration::from_secs(15),
+        vault_cli_command(&temp, "validate")
+            .env("VAULT_ADDR", &address)
+            .env("FERRUM_VAULT_ALLOW_PLAINTEXT", "true")
+            .output(),
+    )
+    .await
+    .expect("validate must exit promptly")
+    .expect("spawn the feature-enabled Ferrum binary");
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{diagnostic}");
+    assert_eq!(
+        diagnostic
+            .matches("Vault traffic uses plaintext http to a non-loopback host")
+            .count(),
+        1,
+        "{diagnostic}"
+    );
+}
+
+/// `localhost` is admitted as loopback by name, and the transport pins it to
+/// the loopback addresses rather than the system resolver.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn vault_localhost_http_resolves_to_loopback() {
+    let guard = EnvGuard::new();
+    let vault = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/app"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(kv2_body("pinned")))
+        .expect(1)
+        .mount(&vault)
+        .await;
+    guard.set(
+        "VAULT_ADDR",
+        format!("http://localhost:{}", vault.address().port()),
+    );
+    guard.set("VAULT_TOKEN", "localhost-token-sentinel");
+    let resolved = resolve_external_reference("vault", "secret/data/app#field", "FERRUM_TEST")
+        .await
+        .expect("localhost Vault resolves over loopback");
+    assert_eq!(resolved.value, "pinned");
+    vault.verify().await;
+}
+
+/// A redirect that only the opt-in admits carries the token off the host in
+/// plaintext, so it warns exactly like a plaintext `VAULT_ADDR` does.
+#[tokio::test]
+#[serial]
+async fn vault_opted_in_plaintext_redirect_warns_once() {
+    let Some(lan_ip) = non_loopback_local_ip() else {
+        eprintln!("skipping: this host has no non-loopback address to stand in for a remote host");
+        return;
+    };
+    let temp = tempfile::TempDir::new().unwrap();
+    let remote = mock_server_on_all_interfaces().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/app"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(kv2_body("valid-vault-admin-secret-0123456789abcdef")),
+        )
+        .mount(&remote)
+        .await;
+    let origin = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/app"))
+        .respond_with(
+            ResponseTemplate::new(307).insert_header(
+                "Location",
+                format!(
+                    "http://{lan_ip}:{}/v1/secret/data/app",
+                    remote.address().port()
+                )
+                .as_str(),
+            ),
+        )
+        .mount(&origin)
+        .await;
+    let output = tokio::time::timeout(
+        Duration::from_secs(15),
+        vault_cli_command(&temp, "validate")
+            .env("VAULT_ADDR", origin.uri())
+            .env("FERRUM_VAULT_ALLOW_PLAINTEXT", "true")
+            .output(),
+    )
+    .await
+    .expect("validate must exit promptly")
+    .expect("spawn the feature-enabled Ferrum binary");
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{diagnostic}");
+    assert_eq!(
+        diagnostic
+            .matches("Vault traffic uses plaintext http to a non-loopback host")
+            .count(),
+        1,
+        "{diagnostic}"
+    );
+}
+
+/// The redirect policy keeps reqwest's own ten-hop limit: ten loopback hops
+/// resolve, an eleventh fails.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn vault_redirect_limit_matches_reqwest_default() {
+    let guard = EnvGuard::new();
+    let vault = MockServer::start().await;
+    for hop in 0..11 {
+        Mock::given(method("GET"))
+            .and(path(format!("/hop/{hop}")))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("Location", format!("/hop/{}", hop + 1).as_str()),
+            )
+            .mount(&vault)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/ten"))
+        .respond_with(ResponseTemplate::new(307).insert_header("Location", "/hop/2"))
+        .mount(&vault)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/eleven"))
+        .respond_with(ResponseTemplate::new(307).insert_header("Location", "/hop/1"))
+        .mount(&vault)
+        .await;
+    // `/hop/10` redirects to `/hop/11`, which serves the secret.
+    Mock::given(method("GET"))
+        .and(path("/hop/11"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(kv2_body("ten-hops")))
+        .mount(&vault)
+        .await;
+
+    guard.set("VAULT_ADDR", vault.uri());
+    guard.set("VAULT_TOKEN", "redirect-limit-token");
+    // `ten` -> /hop/2 -> ... -> /hop/11: ten redirects in all.
+    let resolved = resolve_external_reference("vault", "secret/data/ten#field", "FERRUM_TEST")
+        .await
+        .expect("ten redirects are within the limit");
+    assert_eq!(resolved.value, "ten-hops");
+    // `eleven` -> /hop/1 -> ... -> /hop/11: eleven redirects.
+    assert!(
+        resolve_external_reference("vault", "secret/data/eleven#field", "FERRUM_TEST")
+            .await
+            .is_err(),
+        "an eleventh redirect must be refused"
+    );
+}
+
+#[cfg(unix)]
+/// Run one Vault construction-and-reference check on its own thread and
+/// runtime, so a construction that blocks the calling thread (a plain
+/// `std::fs::read` of a FIFO) fails the test instead of hanging it.
+fn vault_reference_outcome_off_thread(timeout: Duration) -> Option<Result<(), String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        // Only the outcome class matters here; never carry a resolved value.
+        let outcome = runtime
+            .block_on(resolve_external_reference(
+                "vault",
+                "invalid-reference",
+                "FERRUM_TEST",
+            ))
+            .map(|_| ());
+        let _ = tx.send(outcome);
+    });
+    rx.recv_timeout(timeout).ok()
+}
+
+/// `FERRUM_TLS_CA_BUNDLE_PATH` goes through the same hardened reader Azure
+/// uses (#6603): a FIFO without a writer must be refused at once rather than
+/// block the startup secret-resolution runtime on `open(2)`/`read(2)`, where
+/// no fetch timeout can fire.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn vault_fifo_ca_bundle_is_refused_without_blocking() {
+    let guard = EnvGuard::new();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let fifo = dir.path().join("vault-ca-fifo-sentinel");
+    let c_path = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).expect("fifo path");
+    // SAFETY: `c_path` is a valid NUL-terminated path for the call's duration.
+    let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+    assert_eq!(rc, 0, "mkfifo failed");
+    guard.set("VAULT_ADDR", "https://127.0.0.1:8200");
+    guard.set("VAULT_TOKEN", "fifo-token-sentinel");
+    guard.set("FERRUM_TLS_CA_BUNDLE_PATH", fifo.to_string_lossy());
+
+    let outcome = vault_reference_outcome_off_thread(Duration::from_secs(5));
+    if outcome.is_none() {
+        // Release a reader blocked in `open(2)` before failing.
+        let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+    }
+    let err = outcome
+        .expect("a FIFO CA bundle must not block Vault client construction")
+        .err()
+        .expect("a FIFO CA bundle must fail");
+    assert!(
+        err.contains("FERRUM_TLS_CA_BUNDLE_PATH")
+            && err.contains("regular file")
+            && !err.contains("vault-ca-fifo-sentinel")
+            && !err.contains("fifo-token-sentinel"),
+        "expected a reference-free regular-file error, got: {err}"
+    );
+}
+
+/// The Vault CA bundle is capped and type-checked like Azure's, and its
+/// diagnostics name the variable and failure class, never the path.
+#[tokio::test]
+#[serial]
+async fn vault_invalid_ca_bundle_is_refused_with_a_reference_free_error() {
+    let guard = EnvGuard::new();
+    guard.set("VAULT_ADDR", "https://127.0.0.1:8200");
+    guard.set("VAULT_TOKEN", "root");
+    let dir = tempfile::tempdir().expect("temp dir");
+
+    let not_pem = dir.path().join("vault-not-pem-sentinel.pem");
+    std::fs::write(&not_pem, "this is not a certificate").expect("write bundle");
+    let oversized = dir.path().join("vault-oversized-ca-sentinel.pem");
+    std::fs::File::create(&oversized)
+        .expect("create oversized bundle")
+        .set_len(5 * 1024 * 1024)
+        .expect("size oversized bundle");
+    let directory = dir.path().join("vault-ca-directory-sentinel");
+    std::fs::create_dir(&directory).expect("create directory");
+
+    for (source, expected, sentinel) in [
+        (&not_pem, "no certificates", "vault-not-pem-sentinel"),
+        (&oversized, "limit", "vault-oversized-ca-sentinel"),
+        (&directory, "regular file", "vault-ca-directory-sentinel"),
+    ] {
+        guard.set("FERRUM_TLS_CA_BUNDLE_PATH", source.to_string_lossy());
+        let err = resolve_external_reference("vault", "invalid-reference", "FERRUM_TEST")
+            .await
+            .err()
+            .expect("an invalid CA bundle must fail");
+        assert!(
+            err.contains("FERRUM_TLS_CA_BUNDLE_PATH")
+                && err.contains(expected)
+                && !err.contains(sentinel),
+            "expected a reference-free `{expected}` error, got: {err}"
+        );
+    }
+}
+
+/// vaultrs falls back to `VAULT_CACERT` / `VAULT_CAPATH` (read with a blocking
+/// `std::fs::read`) when it is handed no CA list. Ferrum's trust input is
+/// `FERRUM_TLS_CA_BUNDLE_PATH` alone, so the ambient fallbacks are never read.
+#[tokio::test]
+#[serial]
+async fn vault_ignores_ambient_vaultrs_ca_fallbacks() {
+    let guard = EnvGuard::new();
+    guard.set("VAULT_ADDR", "https://127.0.0.1:8200");
+    guard.set("VAULT_TOKEN", "root");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let missing = dir.path().join("missing-vault-cacert.pem");
+    guard.set("VAULT_CACERT", missing.to_string_lossy());
+    // A directory whose entry is not a certificate: vaultrs would read and
+    // fail to parse it.
+    let capath = dir.path().join("vault-capath");
+    std::fs::create_dir(&capath).expect("create VAULT_CAPATH");
+    std::fs::write(capath.join("not-a-cert.pem"), "not a certificate").expect("write entry");
+    guard.set("VAULT_CAPATH", capath.to_string_lossy());
+
+    let err = resolve_external_reference("vault", "invalid-reference", "FERRUM_TEST")
+        .await
+        .err()
+        .expect("the reference is invalid");
+    assert!(
+        err.contains("Invalid Vault KV v2 reference"),
+        "construction must succeed without reading VAULT_CACERT, got: {err}"
+    );
+}
+
+/// A plaintext `http` Vault address uses no TLS, so the bundle is never read:
+/// even a FIFO there cannot block or fail construction.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn vault_plaintext_http_never_reads_the_ca_bundle() {
+    let guard = EnvGuard::new();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let fifo = dir.path().join("vault-http-ca-fifo");
+    let c_path = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).expect("fifo path");
+    // SAFETY: `c_path` is a valid NUL-terminated path for the call's duration.
+    let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+    assert_eq!(rc, 0, "mkfifo failed");
+    guard.set("VAULT_ADDR", "http://127.0.0.1:8200");
+    guard.set("VAULT_TOKEN", "root");
+    guard.set("FERRUM_TLS_CA_BUNDLE_PATH", fifo.to_string_lossy());
+
+    let outcome = vault_reference_outcome_off_thread(Duration::from_secs(5));
+    if outcome.is_none() {
+        let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+    }
+    let err = outcome
+        .expect("plaintext Vault construction must not touch the CA bundle")
+        .err()
+        .expect("the reference is invalid");
+    assert!(
+        err.contains("Invalid Vault KV v2 reference"),
+        "construction must succeed without reading the bundle, got: {err}"
+    );
+}
+
+/// The bundle read through the shared reader actually reaches the Vault
+/// transport: an https Vault whose certificate chains only to the bundle CA is
+/// refused without the bundle and fetched with it. The TLS fake (a terminator
+/// with a per-fake CA in front of a wiremock server) is the Azure one; only its
+/// transport is reused.
+#[cfg(feature = "secrets-azure")]
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn vault_https_trusts_the_configured_ca_bundle() {
+    let guard = EnvGuard::new();
+    let fake = AzureKeyVaultFake::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/app"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(kv2_body("vault-tls-value")))
+        .mount(&fake.server)
+        .await;
+    guard.set("VAULT_ADDR", fake.uri());
+    guard.set("VAULT_TOKEN", "root");
+    // The ambient vaultrs `VAULT_SKIP_VERIFY` default is not honoured:
+    // verification stays on.
+    guard.set("VAULT_SKIP_VERIFY", "1");
+
+    let untrusted = resolve_external_reference("vault", "secret/data/app#field", "FERRUM_TEST")
+        .await
+        .err()
+        .expect("a certificate outside the platform roots must be refused");
+    assert!(!untrusted.contains("vault-tls-value"), "{untrusted}");
+
+    fake.trust_ca(&guard);
+    let resolved = resolve_external_reference("vault", "secret/data/app#field", "FERRUM_TEST")
+        .await
+        .expect("the bundle CA must be trusted by the Vault transport");
+    assert!(
+        resolved.value == "vault-tls-value",
+        "unexpected resolved value"
+    );
+}
+
+/// Batch client construction is bounded by the fetch timeout: with the shared
+/// CA reader admission held (as a stalled reader thread would hold it),
+/// startup resolution reports a bounded initialization timeout instead of
+/// hanging.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn vault_batch_client_construction_is_bounded_by_the_fetch_timeout() {
+    let guard = EnvGuard::new();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let bundle = dir.path().join("vault-ca.pem");
+    std::fs::write(&bundle, "not read while admission is held").expect("write bundle");
+    guard.set("VAULT_ADDR", "https://127.0.0.1:8200");
+    guard.set("VAULT_TOKEN", "root");
+    guard.set("FERRUM_TLS_CA_BUNDLE_PATH", bundle.to_string_lossy());
+    guard.set("FERRUM_SECRET_FETCH_TIMEOUT_SECONDS", "1");
+    guard.set("FERRUM_ADMIN_JWT_SECRET_VAULT", "secret/data/app#field");
+
+    let held = ferrum_edge::secrets::hold_ca_bundle_reader_permit_for_test().await;
+    let started = std::time::Instant::now();
+    let err = resolve_all_env_secrets()
+        .await
+        .err()
+        .expect("held CA reader admission must time out");
+    drop(held);
+    assert!(err.contains("Timeout initializing"), "got: {err}");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "construction should give up at ~1s, not hang"
+    );
+}
+
+/// With no system CA certificates at all, the configured bundle is still the
+/// whole trust story: client construction must not initialize a platform
+/// verifier that needs system roots, and the https fetch must succeed through
+/// the bundle CA alone. `rustls-native-certs` reads `SSL_CERT_FILE` /
+/// `SSL_CERT_DIR` on Linux, so pointing both at empty locations removes the
+/// system roots for this (nextest-isolated) process.
+#[cfg(all(feature = "secrets-azure", target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn vault_https_works_with_only_the_configured_bundle_and_no_system_roots() {
+    let guard = EnvGuard::new();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let empty_file = dir.path().join("empty-ca-file.pem");
+    std::fs::write(&empty_file, "").expect("write empty CA file");
+    let empty_dir = dir.path().join("empty-ca-dir");
+    std::fs::create_dir(&empty_dir).expect("create empty CA dir");
+    guard.set_other("SSL_CERT_FILE", empty_file.to_string_lossy());
+    guard.set_other("SSL_CERT_DIR", empty_dir.to_string_lossy());
+
+    let fake = AzureKeyVaultFake::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/app"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(kv2_body("bundle-only-value")))
+        .mount(&fake.server)
+        .await;
+    guard.set("VAULT_ADDR", fake.uri());
+    guard.set("VAULT_TOKEN", "root");
+    fake.trust_ca(&guard);
+
+    let resolved = resolve_external_reference("vault", "secret/data/app#field", "FERRUM_TEST")
+        .await
+        .expect("the bundle alone must be enough trust for the Vault transport");
+    assert!(
+        resolved.value == "bundle-only-value",
+        "unexpected resolved value"
+    );
+}
+
+/// Direct provider lookup reads `FERRUM_TLS_CA_BUNDLE_PATH` as an `OsString`,
+/// like Azure, so a non-UTF-8 path is read (here: refused as a directory)
+/// rather than silently skipped. Startup resolution still rejects a non-UTF-8
+/// `FERRUM_*` value before any provider runs; that policy is unchanged.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn vault_direct_lookup_reads_a_non_utf8_ca_bundle_path() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let guard = EnvGuard::new();
+    guard.set("VAULT_ADDR", "https://127.0.0.1:8200");
+    guard.set("VAULT_TOKEN", "root");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let raw_name = std::ffi::OsStr::from_bytes(b"vault-ca-\xff-dir");
+    let raw_dir = dir.path().join(raw_name);
+    std::fs::create_dir(&raw_dir).expect("create non-UTF-8 directory");
+    // SAFETY: serialized by `#[serial]`.
+    unsafe { std::env::set_var("FERRUM_TLS_CA_BUNDLE_PATH", raw_dir.as_os_str()) };
+
+    let outcome = resolve_external_reference("vault", "invalid-reference", "FERRUM_TEST").await;
+    // Remove the non-Unicode value before the guard's `std::env::vars()`
+    // snapshot on drop, which would panic on it.
+    // SAFETY: serialized by `#[serial]`.
+    unsafe { std::env::remove_var("FERRUM_TLS_CA_BUNDLE_PATH") };
+    drop(guard);
+    let err = outcome.err().expect("a directory CA bundle must fail");
+    assert!(
+        err.contains("FERRUM_TLS_CA_BUNDLE_PATH") && err.contains("regular file"),
+        "the non-UTF-8 path must be read, got: {err}"
+    );
+}
+
+/// The ambient vaultrs `VAULT_CLIENT_CERT` / `VAULT_CLIENT_KEY` defaults are
+/// never read: vaultrs read them with a blocking `std::fs::read` inside its
+/// settings `build()`, so a FIFO there hung construction before any timeout
+/// could fire.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn vault_ignores_ambient_vaultrs_client_identity() {
+    let guard = EnvGuard::new();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let fifo = dir.path().join("vault-client-cert-fifo");
+    let c_path = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).expect("fifo path");
+    // SAFETY: `c_path` is a valid NUL-terminated path for the call's duration.
+    let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+    assert_eq!(rc, 0, "mkfifo failed");
+    guard.set("VAULT_ADDR", "https://127.0.0.1:8200");
+    guard.set("VAULT_TOKEN", "root");
+    guard.set("VAULT_CLIENT_CERT", fifo.to_string_lossy());
+    guard.set("VAULT_CLIENT_KEY", fifo.to_string_lossy());
+
+    let outcome = vault_reference_outcome_off_thread(Duration::from_secs(5));
+    if outcome.is_none() {
+        let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+    }
+    let err = outcome
+        .expect("an ambient client identity must not block Vault construction")
+        .err()
+        .expect("the reference is invalid");
+    assert!(
+        err.contains("Invalid Vault KV v2 reference"),
+        "construction must succeed without reading VAULT_CLIENT_CERT, got: {err}"
+    );
 }

@@ -13,7 +13,8 @@
 //!   compiles to a synthetic never-match rule (Istio allow-nothing
 //!   semantics), or that the policy was rejected with a translator error.
 //! - `PeerAuthentication` — status confirms the resolved mTLS mode
-//!   (UNSET → PERMISSIVE in Istio) and surfaces port-level overrides.
+//!   (UNSET inherits the next-higher tier, PERMISSIVE when none applies)
+//!   and surfaces port-level overrides.
 //! - `DestinationRule` — status reports whether the rule's host could be
 //!   matched and which `connectionPool` knobs landed vs. were deferred.
 //! - `VirtualService` — status reports host/HTTP-route counts. `tcp`/`tls` L4
@@ -56,9 +57,14 @@
 //! Istio CRDs, so `patch_status` works against any standard Istio install.
 //! If a cluster has stripped the subresource (rare; usually an intentional
 //! admission-policy decision), `patch_status` returns
-//! `kube::Error::Api(_)` with `code: 404` — the writer logs a single warn
-//! and otherwise no-ops, never panics, never aborts reconcile. The
-//! Gateway API path uses the same defensive pattern; see [`status.rs`].
+//! `kube::Error::Api(_)` with `code: 404` — the writer skips that object's
+//! write with a warn and an `istio_status_unsupported` count, never panics,
+//! never aborts reconcile. Nothing remembers the outcome: the planner keeps
+//! emitting an update for every such object whose live status differs (always,
+//! when no write can land), so each reconcile costs one `get_status` and one
+//! warn per affected object until the subresource is restored or
+//! `watch_istio` is turned off. The Gateway API path uses the same defensive
+//! pattern; see [`status.rs`].
 //!
 //! ## Concurrency
 //!
@@ -95,10 +101,11 @@ use tracing::warn;
 
 use crate::config_sources::k8s::{
     K8sObject, K8sTranslateError, K8sTranslation, K8sTranslationOptions, SidecarOutboundPolicy,
-    classify_sidecar_outbound_traffic_policy, route_local_fault_delay_for_rule,
-    service_entry_port_protocol_is_udp, service_entry_spec_has_unresolvable_stream_wildcard_host,
-    sidecar_selector_from_istio, translate_k8s_objects_collecting_skips,
-    workload_entry_service_key_from_host, workload_selector_from_istio,
+    classify_sidecar_outbound_traffic_policy, refused_sidecar, route_local_fault_delay_for_rule,
+    service_entry_endpoint_is_network_gateway_only, service_entry_port_protocol_is_udp,
+    service_entry_spec_has_unresolvable_stream_wildcard_host, sidecar_selector_from_istio,
+    translate_k8s_objects_collecting_skips, workload_entry_service_key_from_host,
+    workload_selector_from_istio,
 };
 use crate::k8s_controller::metrics::ControllerMetrics;
 use crate::k8s_controller::status::StatusTranslationReuse;
@@ -642,6 +649,32 @@ fn ferrum_detail_matches(status: &Value, desired: &Option<Value>) -> bool {
         .is_none_or(|detail| status.get("ferrum") == Some(detail))
 }
 
+/// JSON Merge Patch (RFC 7396) that turns `live` into exactly `desired`.
+///
+/// For objects on both sides this recurses key by key and adds an explicit
+/// `null` for every live key `desired` lacks; anything else (scalars, arrays,
+/// or a type change) replaces the live value wholesale, as merge patch does.
+/// Recursion follows `desired`, which Ferrum builds, so its depth is bounded
+/// by Ferrum's own detail shape rather than by the live object.
+fn merge_patch_replacing(live: Option<&Value>, desired: &Value) -> Value {
+    let (Some(Value::Object(live)), Value::Object(desired)) = (live, desired) else {
+        return desired.clone();
+    };
+    let mut patch = serde_json::Map::with_capacity(desired.len());
+    for (key, desired_value) in desired {
+        patch.insert(
+            key.clone(),
+            merge_patch_replacing(live.get(key), desired_value),
+        );
+    }
+    for key in live.keys() {
+        if !desired.contains_key(key) {
+            patch.insert(key.clone(), Value::Null);
+        }
+    }
+    Value::Object(patch)
+}
+
 fn is_supported_istio_kind(kind: &str) -> bool {
     matches!(
         kind,
@@ -708,8 +741,18 @@ fn istio_status_patch(
         // Pin the Ferrum-specific block under `status.ferrum` so the
         // existing `status` fields Istio writes stay untouched. This is
         // a JSON Merge Patch so `null` would delete; only insert when
-        // Some.
-        status_patch.insert("ferrum".to_string(), detail.clone());
+        // Some. The detail's key set differs per outcome (a rejection
+        // carries `translation.error`, an acceptance does not), and RFC 7396
+        // leaves keys absent from the patch untouched, so every key the live
+        // block has but the desired one lacks is deleted explicitly. Without
+        // that a fixed resource would keep its stale `error` beside
+        // `FerrumAccepted=True`, and `ferrum_detail_matches` would never
+        // match again, re-patching the object on every reconcile.
+        let live_detail = live_status.and_then(|status| status.get("ferrum"));
+        status_patch.insert(
+            "ferrum".to_string(),
+            merge_patch_replacing(live_detail, detail),
+        );
     }
 
     let mut patch = serde_json::Map::new();
@@ -912,10 +955,28 @@ fn authorization_policy_status(
             }
         }
         Err(error) => {
-            let message = format!("Ferrum rejected this AuthorizationPolicy: {error}");
+            // GHSA-2r85-85hh-23mw: the rejected policy is published as a
+            // fail-closed marker (`refused_authorization_policy`), so state its
+            // effect on the workloads it selects.
+            let action_value = object.spec.get("action");
+            let (enforcement, consequence) = match action_value.map(Value::as_str) {
+                None | Some(Some("ALLOW")) => (
+                    "allow_nothing",
+                    "; it is enforced as allow-nothing until it is fixed (fail closed): the \
+                     workloads it selects accept only what their other ALLOW policies grant",
+                ),
+                Some(Some("AUDIT")) => ("none", ""),
+                Some(_) => (
+                    "deny_all",
+                    "; every request and connection to the workloads it selects is denied \
+                     until it is fixed (fail closed)",
+                ),
+            };
+            let message = format!("Ferrum rejected this AuthorizationPolicy: {error}{consequence}");
             let detail = json!({
                 "translation": {
                     "action": action,
+                    "enforcement": enforcement,
                     "error": format!("{error}"),
                 }
             });
@@ -968,7 +1029,7 @@ fn peer_authentication_status(
             // resolved mode so operators can confirm without grepping
             // Ferrum-side state.
             let effective_mode = if resolved_mode == "UNSET" {
-                "PERMISSIVE (Istio default for UNSET)"
+                "UNSET (inherits the next-higher tier's mode; PERMISSIVE when none applies)"
             } else {
                 resolved_mode.as_str()
             };
@@ -991,11 +1052,18 @@ fn peer_authentication_status(
             (true, "Accepted", message, Some(detail))
         }
         Err(error) => {
-            let message = format!("Ferrum rejected this PeerAuthentication: {error}");
+            // GHSA-2r85-85hh-23mw: the rejected resource is published as a
+            // STRICT marker (`refused_peer_authentication`) instead of being
+            // dropped, which would let its workloads fall back to a laxer tier.
+            let message = format!(
+                "Ferrum rejected this PeerAuthentication: {error}; the workloads it selects are \
+                 held at STRICT mTLS until it is fixed (fail closed)"
+            );
             let detail = json!({
                 "translation": {
                     "scope": scope,
                     "configured_mtls_mode": resolved_mode,
+                    "enforcement": "strict",
                     "error": format!("{error}"),
                 }
             });
@@ -1323,6 +1391,17 @@ fn accepted_status(
     (status, detail)
 }
 
+/// `status.ferrum.translation.mesh_http_routes` for a mesh-bound
+/// VirtualService with `http[]` routes (issues #7390, #7423): mesh data planes
+/// apply those routes on the Sidecar and NodeWaypoint topologies only.
+pub const VIRTUAL_SERVICE_MESH_HTTP_ROUTES_SCOPE: &str = "sidecar_and_node_waypoint";
+
+/// The `FerrumAccepted` message note naming the topologies that do NOT apply a
+/// mesh-bound VirtualService's `http[]` routes (issues #7390, #7423).
+pub const VIRTUAL_SERVICE_MESH_HTTP_ROUTES_NOTE: &str = "mesh http[] routes are applied only by \
+     Sidecar and NodeWaypoint data planes; Ambient and ServiceWaypoint data planes ignore them \
+     and route to the destination Service";
+
 /// Status for `VirtualService`. The translator consumes `spec.http` routes
 /// (incl. `mirror` / `rewrite` / `redirect` / `corsPolicy`) and `spec.tcp` /
 /// `spec.tls` L4 route blocks (translated to stream proxies: port / SNI
@@ -1358,24 +1437,35 @@ fn virtual_service_status(
         Ok(_translation) => {
             let deferred = virtual_service_deferred_fields(&object.spec);
             let clamped = virtual_service_clamped_fields(&object.spec);
-            let message = if deferred.is_empty() && clamped.is_empty() {
+            // Issues #7390, #7423: a mesh-bound VirtualService's `http[]`
+            // routes reach only Sidecar and NodeWaypoint data planes
+            // (`MeshSlice.http_routes`); Ambient and ServiceWaypoint data planes
+            // keep routing to the plain Service. Say so instead of reporting
+            // the route count alone.
+            let mesh_http_routes = (http_route_count > 0
+                && crate::config_sources::k8s::virtual_service_binds_mesh(object))
+            .then_some(VIRTUAL_SERVICE_MESH_HTTP_ROUTES_SCOPE);
+            let mut notes = Vec::new();
+            if !deferred.is_empty() {
+                notes.push(format!("deferred fields: {}", deferred.join(", ")));
+            }
+            if !clamped.is_empty() {
+                notes.push(format!("clamped fields: {}", clamped.join(", ")));
+            }
+            if mesh_http_routes.is_some() {
+                notes.push(VIRTUAL_SERVICE_MESH_HTTP_ROUTES_NOTE.to_string());
+            }
+            let message = if notes.is_empty() {
                 format!(
                     "Ferrum accepted this VirtualService ({host_count} host(s), {http_route_count} HTTP route(s))"
                 )
             } else {
-                let mut notes = Vec::new();
-                if !deferred.is_empty() {
-                    notes.push(format!("deferred fields: {}", deferred.join(", ")));
-                }
-                if !clamped.is_empty() {
-                    notes.push(format!("clamped fields: {}", clamped.join(", ")));
-                }
                 format!(
                     "Ferrum accepted this VirtualService ({host_count} host(s), {http_route_count} HTTP route(s)); {}",
                     notes.join("; ")
                 )
             };
-            let detail = json!({
+            let mut detail = json!({
                 "translation": {
                     "hosts": host_count,
                     "http_routes_translated": http_route_count,
@@ -1383,6 +1473,9 @@ fn virtual_service_status(
                     "clamped_fields": clamped,
                 }
             });
+            if let Some(scope) = mesh_http_routes {
+                detail["translation"]["mesh_http_routes"] = json!(scope);
+            }
             accepted_status(object, true, "Accepted", &message, Some(detail))
         }
         Err(error) => {
@@ -1415,7 +1508,9 @@ fn virtual_service_deferred_fields(spec: &Value) -> Vec<&'static str> {
     // upstream-backed stream proxy). Malformed predicates, `destination.subset`,
     // and invalid weights surface via the `Invalid` arm of
     // `virtual_service_status`. `mirror` /
-    // `mirrorPercentage` / `redirect` / `rewrite` are translated, and
+    // `mirrorPercentage` / `redirect` / `rewrite` are translated (a non-zero
+    // mirror to anything but a loopback IP literal is omitted and reported
+    // below, GHSA-gcwp-xp94-4pcv), and
     // `corsPolicy` is translated to a proxy-scoped `cors` plugin when its
     // origins are representable — `allowOrigins[]` `exact`/`prefix`/`regex`
     // `StringMatch` (exact projected LITERALLY, so a wildcard-shaped or
@@ -1443,6 +1538,31 @@ fn virtual_service_deferred_fields(spec: &Value) -> Vec<&'static str> {
              (not projected; use the cors plugin)",
         );
     }
+    // A valid `http[].mirror` the translator omits instead of opting in to
+    // cleartext, and the never-projected `http[].mirrors` list. The shared
+    // predicates are the translator's own decision (GHSA-gcwp-xp94-4pcv).
+    if http_routes.is_some_and(|routes| {
+        routes
+            .iter()
+            .any(crate::config_sources::k8s::virtual_service_route_mirror_is_deferred)
+    }) {
+        deferred.push(
+            "http[].mirror to a destination other than a loopback IP literal (not projected; \
+             Ferrum would send the mirror traffic in cleartext outside the mesh's mTLS, and a \
+             VirtualService cannot express the request_mirror allow_plaintext opt-in — use a \
+             request_mirror plugin with mirror_protocol https)",
+        );
+    }
+    if http_routes.is_some_and(|routes| {
+        routes
+            .iter()
+            .any(crate::config_sources::k8s::virtual_service_route_mirrors_are_deferred)
+    }) {
+        deferred.push(
+            "http[].mirrors (not projected; only a single http[].mirror to a loopback IP literal \
+             is translated)",
+        );
+    }
     // `http[].headers.{request,response}.{set,add,remove}` IS translated onto
     // the emitted `mesh_route_dispatch` rules and consumed by the auto-attached
     // request/response transformer instances (issue #4304), so it is not
@@ -1468,6 +1588,21 @@ fn virtual_service_deferred_fields(spec: &Value) -> Vec<&'static str> {
              (not projected; per-destination transforms cannot be bound to one \
              share of a weighted split — move them to http[].headers)",
         );
+    }
+    // Istio-valid `retries` settings the translator accepts but does not
+    // enforce (`perTryTimeout`, `retryRemoteLocalities`, and `retryOn`
+    // policies outside Ferrum's retry model). Invalid `retryOn` tokens refuse
+    // the resource instead and surface through the `Invalid` arm.
+    for retries in http_routes
+        .into_iter()
+        .flatten()
+        .filter_map(|route| route.get("retries"))
+    {
+        for field in crate::config_sources::k8s::virtual_service_retry_deferred_fields(retries) {
+            if !deferred.contains(&field) {
+                deferred.push(field);
+            }
+        }
     }
     deferred
 }
@@ -1498,16 +1633,14 @@ fn virtual_service_clamped_fields(spec: &Value) -> Vec<&'static str> {
 /// counts so operators can confirm Ferrum's view of an external service.
 ///
 /// A `protocol: UDP` port is ACCEPTED (it translates to `AppProtocol::Udp`) but
-/// its EgressGateway egress lane is INERT: the EgressGateway materializer skips
-/// UDP ports because ServiceEntry/egress-external UDP is out of scope (east-west
-/// UDP capture/egress shipped in F3 §3.3, but external-UDP egress did not), so
-/// the resource would
-/// otherwise show as fully accepted in `kubectl describe` while no
-/// proxy/listener/upstream is produced. Surface that gap as a `deferred_fields`
-/// entry (keeping `FerrumAccepted=True` — it IS accepted/translated, just
-/// inert), detected via the SHARED `service_entry_port_protocol_is_udp` predicate
-/// so the status report can never diverge from the translator's classification or
-/// the materializer's skip.
+/// its external egress is CONDITIONAL (issue #3263): the EgressGateway admits
+/// it into a datagram allowlist only with `FERRUM_MESH_EGRESS_STREAM_ENABLED`,
+/// and Sidecar/Ambient sources capture it only for a `MESH_EXTERNAL`,
+/// `resolution: STATIC` entry with IP-literal endpoints. No listener is ever
+/// bound for it. Surface those conditions as a `deferred_fields` entry
+/// (keeping `FerrumAccepted=True`), detected via the SHARED
+/// `service_entry_port_protocol_is_udp` predicate so the status report can never
+/// diverge from the translator's classification.
 ///
 /// A wildcard `spec.hosts[]` element on a stream-family port is reported the
 /// same way (issue #4535): the stream materialization branch refuses a wildcard
@@ -1554,15 +1687,10 @@ fn service_entry_status(
         .unwrap_or(0);
 
     // A `protocol: UDP` ServiceEntry is accepted (it translates to
-    // `AppProtocol::Udp`) but the EgressGateway materializer skips UDP ports as
-    // inert (ServiceEntry/egress-external UDP is out of scope; east-west UDP
-    // capture/egress shipped in F3 §3.3 — see `build_egress_proxies_and_upstreams`
-    // in `src/modes/mesh/mod.rs`, which keys its one-time deferral warning off
-    // `AppProtocol::Udp`). Surface that gap as a deferred field so the resource
-    // does not appear fully accepted while no proxy/listener/upstream is produced.
-    // Detect UDP ports on the raw spec via the SHARED predicate the translator's
-    // classifier feeds, so this report stays in lock-step with the materializer's
-    // skip.
+    // `AppProtocol::Udp`), but external UDP egress needs conditions the
+    // resource alone does not establish (see the doc comment above). Detect UDP
+    // ports on the raw spec via the SHARED predicate the translator's
+    // classifier feeds, so this report stays in lock-step with it.
     let has_udp_port = object
         .spec
         .get("ports")
@@ -1575,9 +1703,11 @@ fn service_entry_status(
     let mut deferred: Vec<&'static str> = Vec::new();
     if has_udp_port {
         deferred.push(
-            "spec.ports[].protocol: UDP — egress materialization deferred \
-             (ServiceEntry/egress-external UDP is out of scope; east-west UDP \
-             capture/egress shipped in F3 §3.3)",
+            "spec.ports[].protocol: UDP — external UDP egress is conditional (the \
+             EgressGateway admits it only with FERRUM_MESH_EGRESS_STREAM_ENABLED; \
+             Sidecar/Ambient sources capture it only for a MESH_EXTERNAL, \
+             resolution: STATIC entry with IP-literal endpoints; no UDP listener is \
+             bound)",
         );
     }
 
@@ -1596,6 +1726,34 @@ fn service_entry_status(
              deferred (a stream-family wildcard host is only materializable with \
              resolution: STATIC and a non-empty endpoints[]; a raw stream has no request \
              authority from which to concretize the dial target)",
+        );
+    }
+
+    // An address-less endpoint that names a `network` is valid Istio (reached
+    // through that network's gateway) but is skipped by the translator through
+    // the SAME shared predicate; report it rather than counting it served.
+    if object
+        .spec
+        .get("endpoints")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(service_entry_endpoint_is_network_gateway_only)
+    {
+        deferred.push(
+            "spec.endpoints[] without address (network-gateway endpoints are not \
+             materialized)",
+        );
+    }
+
+    // `spec.workloadSelector` is translated onto `ServiceEntry.workload_selector`
+    // but nothing consumes it: Ferrum does not select the entry's endpoints from
+    // the matching Pods/WorkloadEntries (Istio's meaning), so the entry serves
+    // only its declared `endpoints[]` (issue #7243).
+    if object.spec.get("workloadSelector").is_some() {
+        deferred.push(
+            "spec.workloadSelector — endpoint selection from the selected workloads is \
+             not implemented; only the declared endpoints[] are used",
         );
     }
 
@@ -1689,12 +1847,19 @@ fn request_authentication_status(
             accepted_status(object, true, "Accepted", &message, Some(detail))
         }
         Err(error) => {
-            let message = format!("Ferrum rejected this RequestAuthentication: {error}");
+            // Issue #6656: the rejected resource is published as a fail-closed
+            // marker, so the workloads it selects refuse every HTTP request
+            // rather than running without JWT validation.
+            let message = format!(
+                "Ferrum rejected this RequestAuthentication: {error}; HTTP requests to the \
+                 workloads it selects are refused until it is fixed (fail closed)"
+            );
             let detail = json!({
                 "translation": {
                     "scope": scope,
                     "jwt_rules": jwt_rule_count,
                     "target_refs_declared": declared_target_refs,
+                    "enforcement": "refuse_all",
                     "error": format!("{error}"),
                 }
             });
@@ -1868,7 +2033,7 @@ fn workload_entry_status(
 /// `ingress[]` custom inbound listeners. Egress narrowing is gated by
 /// `FERRUM_MESH_SIDECAR_ENFORCED` (Sidecars are always parsed/persisted).
 /// Ingress entries that Ferrum cannot represent (an inadmissible Unix-socket
-/// path, non-loopback `defaultEndpoint`, or non-HTTP-family protocol) stay in
+/// path, non-loopback `defaultEndpoint`, or unrecognized/UDP protocol) stay in
 /// `deferred_fields`; resolvable listeners are materialized and reported via
 /// `ingress_modeled`.
 ///
@@ -1896,9 +2061,11 @@ fn workload_entry_status(
 /// present-but-unrepresentable block is reported in `deferred_fields` with the
 /// enforced fail-closed outcome (`REGISTRY_ONLY`) named explicitly; the
 /// classification comes from the same shared predicate the translator applies.
-/// A REJECTED Sidecar reports the classified mode with an explicit
-/// `outbound_traffic_policy_enforced: false` — a dropped resource enforces
-/// nothing, and an absent qualifier could read as "enforced".
+/// A REJECTED Sidecar is published as a fail-closed marker
+/// ([`refused_sidecar`], GHSA-2r85-85hh-23mw), so its detail reports what that
+/// marker enforces: its `outbound_traffic_policy` (REGISTRY_ONLY when `egress`
+/// did not translate), `outbound_traffic_policy_enforced` under the same gate as
+/// an accepted Sidecar, and `egress_blocked` / `ingress_blocked`.
 fn sidecar_status(
     object: &K8sObject,
     result: Result<&K8sTranslation, &K8sTranslateError>,
@@ -2011,18 +2178,35 @@ fn sidecar_status(
             accepted_status(object, true, "Accepted", &message, Some(detail))
         }
         Err(error) => {
-            let message = format!("Ferrum rejected this Sidecar: {error}");
-            // A rejected Sidecar is dropped from the translation entirely, so it
-            // enforces nothing regardless of the rollout gate. State that
-            // explicitly: an `outbound_traffic_policy` with no
-            // `outbound_traffic_policy_enforced` sibling reads as enforced to
-            // anyone (or anything) diffing the two Sidecar detail shapes.
+            // GHSA-2r85-85hh-23mw: a rejected Sidecar is not dropped (that would
+            // widen the egress scope, REGISTRY_ONLY registry, and inbound
+            // listeners of the workloads it selects). Translation publishes the
+            // fail-closed marker built here, under the same rollout gate as an
+            // accepted Sidecar, so report what that marker enforces.
+            let marker = refused_sidecar(object);
+            // Whether the published marker blocks all egress / all inbound
+            // listeners (an untranslatable block, or an explicit empty one).
+            let egress_blocked = !marker.egress_inherits_defaults && marker.egress.is_empty();
+            let ingress_blocked = marker.ingress_declared && marker.ingress.is_empty();
+            let marker_outbound = SidecarOutboundPolicy {
+                policy: marker.outbound_traffic_policy,
+                deferred: None,
+            };
+            let message = format!(
+                "Ferrum rejected this Sidecar: {error}; it is enforced fail closed until it is \
+                 fixed: a block that does not translate takes its most restrictive form \
+                 (egress: [] with REGISTRY_ONLY, ingress: []) for the workloads it selects"
+            );
             let detail = json!({
                 "translation": {
                     "scope": scope,
                     "egress_entries": egress_entry_count,
-                    "outbound_traffic_policy": outbound_mode,
-                    "outbound_traffic_policy_enforced": false,
+                    "outbound_traffic_policy": sidecar_outbound_policy_label(&marker_outbound),
+                    "outbound_traffic_policy_enforced":
+                        marker.outbound_traffic_policy.is_some() && ingress_enforced,
+                    "enforcement": "fail_closed",
+                    "egress_blocked": egress_blocked,
+                    "ingress_blocked": ingress_blocked,
                     "error": format!("{error}"),
                 }
             });
@@ -2249,7 +2433,8 @@ fn telemetry_status(
 
     match result {
         Ok(_translation) => {
-            let message = if sections.is_empty() {
+            let deferred = crate::config_sources::k8s::telemetry_deferred_fields(&object.spec);
+            let mut message = if sections.is_empty() {
                 "Ferrum accepted this Telemetry (no tracing/metrics/accessLogging sections)"
                     .to_string()
             } else {
@@ -2258,10 +2443,14 @@ fn telemetry_status(
                     sections.join(", ")
                 )
             };
+            if !deferred.is_empty() {
+                message.push_str(&format!("; deferred fields: {}", deferred.join(", ")));
+            }
             let detail = json!({
                 "translation": {
                     "sections": sections,
                     "target_refs_declared": declared_target_refs,
+                    "deferred_fields": deferred,
                 }
             });
             accepted_status(object, true, "Accepted", &message, Some(detail))
@@ -2689,8 +2878,8 @@ mod tests {
 
     #[test]
     fn peer_auth_unset_mode_reports_permissive() {
-        // Istio: UNSET mode resolves to PERMISSIVE — operators often
-        // miss this and end up with surprise non-mTLS traffic.
+        // Istio: UNSET inherits from the next-higher tier and falls back to
+        // PERMISSIVE only when no tier sets a mode — surface both.
         let obj = object(
             "security.istio.io/v1",
             "PeerAuthentication",
@@ -2707,6 +2896,11 @@ mod tests {
         assert!(
             c["message"].as_str().unwrap().contains("PERMISSIVE"),
             "message should surface PERMISSIVE default: {}",
+            c["message"]
+        );
+        assert!(
+            c["message"].as_str().unwrap().contains("inherits"),
+            "message should surface UNSET inheritance: {}",
             c["message"]
         );
         let detail = update.ferrum_detail.as_ref().unwrap();
@@ -3287,6 +3481,64 @@ mod tests {
         );
     }
 
+    /// RFC 7396 `MergePatch(target, patch)`.
+    fn apply_merge_patch(target: &mut Value, patch: &Value) {
+        let Value::Object(patch) = patch else {
+            *target = patch.clone();
+            return;
+        };
+        if !target.is_object() {
+            *target = json!({});
+        }
+        let target = target.as_object_mut().unwrap();
+        for (key, value) in patch {
+            if value.is_null() {
+                target.remove(key);
+            } else {
+                apply_merge_patch(target.entry(key.clone()).or_insert(Value::Null), value);
+            }
+        }
+    }
+
+    #[test]
+    fn patch_status_removes_stale_ferrum_detail_keys_after_a_fix() {
+        // The object was rejected last reconcile; it is accepted now. The
+        // stale `translation.error` (and any other key the new detail lacks)
+        // must be deleted, or the live block never matches the desired one
+        // and the object is re-patched forever (issue #7261).
+        let live_status = json!({
+            "conditions": [],
+            "validationMessages": [{"type": "istio"}],
+            "ferrum": {
+                "translation": {"action": "rejected", "error": "spec.foo is invalid"},
+                "legacy": {"note": "old"}
+            }
+        });
+        let desired_detail = json!({
+            "translation": {"action": "accepted", "rules_translated": 2, "target_refs": []}
+        });
+        let update = IstioStatusUpdate {
+            api_version: "security.istio.io/v1".to_string(),
+            kind: "AuthorizationPolicy".to_string(),
+            namespace: "default".to_string(),
+            name: "test".to_string(),
+            uid: String::new(),
+            status: json!({ "conditions": [] }),
+            ferrum_detail: Some(desired_detail.clone()),
+        };
+        let patch = istio_status_patch(&update, Some(&live_status), "42", "uid-test");
+
+        let mut patched = live_status.clone();
+        apply_merge_patch(&mut patched, &patch["status"]);
+        assert_eq!(patched["ferrum"], desired_detail);
+        assert!(ferrum_detail_matches(&patched, &Some(desired_detail)));
+        // Istio's own fields are untouched.
+        assert_eq!(
+            patched["validationMessages"],
+            live_status["validationMessages"]
+        );
+    }
+
     #[test]
     fn supported_kind_filter_accepts_proxy_config() {
         // ProxyConfig is watched (`ISTIO_CRDS`) and the status writer surfaces
@@ -3685,7 +3937,7 @@ mod tests {
                 "http": [
                     {
                         "route": [ { "destination": { "host": "reviews.default.svc.cluster.local" } } ],
-                        "mirror": { "host": "reviews-canary.default.svc.cluster.local" },
+                        "mirror": { "host": "127.0.0.1" },
                         "corsPolicy": { "allowOrigins": [ { "exact": "https://example.com" } ] }
                     }
                 ]
@@ -3711,6 +3963,55 @@ mod tests {
         assert!(
             !deferred.iter().any(|f| f.contains("mirror")),
             "http[].mirror is translated and must not be deferred, got {deferred:?}"
+        );
+    }
+
+    /// GHSA-gcwp-xp94-4pcv: a mirror to a Service host is omitted, not
+    /// refused. The VirtualService stays accepted and the omission is reported
+    /// in `deferred_fields`, as is the never-projected `mirrors` list.
+    #[test]
+    fn virtual_service_cleartext_mirror_is_deferred_not_refused() {
+        let obj = object(
+            "networking.istio.io/v1",
+            "VirtualService",
+            "mirror-vs",
+            json!({
+                "hosts": ["reviews.default.svc.cluster.local"],
+                "http": [
+                    {
+                        "route": [ { "destination": { "host": "reviews.default.svc.cluster.local" } } ],
+                        "mirror": { "host": "reviews-canary.default.svc.cluster.local" },
+                        "mirrors": [ { "destination": { "host": "reviews-shadow.default.svc.cluster.local" } } ]
+                    }
+                ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(
+            c["status"].as_str(),
+            Some("True"),
+            "the VirtualService must stay accepted"
+        );
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            deferred
+                .iter()
+                .any(|f| f.starts_with("http[].mirror to a destination") && f.contains("mTLS")),
+            "the omitted mirror must be reported with its reason, got {deferred:?}"
+        );
+        assert!(
+            deferred.iter().any(|f| f.starts_with("http[].mirrors ")),
+            "the unprojected mirrors list must be reported, got {deferred:?}"
         );
     }
 
@@ -4026,8 +4327,8 @@ mod tests {
         assert!(
             deferred
                 .iter()
-                .any(|f| f.contains("UDP") && f.contains("egress materialization deferred")),
-            "deferred_fields should mention the deferred UDP egress lane, got {deferred:?}"
+                .any(|f| f.contains("UDP") && f.contains("external UDP egress is conditional")),
+            "deferred_fields should state the UDP egress conditions, got {deferred:?}"
         );
     }
 
@@ -4097,7 +4398,10 @@ mod tests {
             "jwt-req",
             json!({
                 "selector": { "matchLabels": { "app": "api" } },
-                "jwtRules": [ { "issuer": "https://issuer.example.com" } ]
+                "jwtRules": [ {
+                    "issuer": "https://issuer.example.com",
+                    "jwksUri": "https://issuer.example.com/jwks"
+                } ]
             }),
         );
         let updates = plan_istio_status_updates(&[obj], options());
@@ -4120,6 +4424,31 @@ mod tests {
     }
 
     #[test]
+    fn request_authentication_without_jwks_source_is_refused() {
+        // Ferrum has no OIDC discovery: an issuer-only rule cannot be enforced,
+        // so it is refused (fail closed) rather than reported Accepted and then
+        // rejected by mesh admission, which would veto the whole reload.
+        let obj = object(
+            "security.istio.io/v1",
+            "RequestAuthentication",
+            "issuer-only",
+            json!({ "jwtRules": [ { "issuer": "https://issuer.example.com" } ] }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("False"));
+        assert_eq!(c["reason"].as_str(), Some("Invalid"));
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        assert_eq!(
+            detail["translation"]["enforcement"].as_str(),
+            Some("refuse_all")
+        );
+    }
+
+    #[test]
     fn request_authentication_missing_issuer_is_rejected() {
         // jwtRules[].issuer is required; an entry without it fails translation.
         let obj = object(
@@ -4135,6 +4464,13 @@ mod tests {
         );
         assert_eq!(c["status"].as_str(), Some("False"));
         assert_eq!(c["reason"].as_str(), Some("Invalid"));
+        // Issue #6656: the status states the fail-closed consequence.
+        assert!(c["message"].as_str().unwrap().contains("fail closed"));
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        assert_eq!(
+            detail["translation"]["enforcement"].as_str(),
+            Some("refuse_all")
+        );
     }
 
     // ── WorkloadEntry ─────────────────────────────────────────────────────────
@@ -4816,6 +5152,91 @@ mod tests {
             .collect();
         assert!(sections.contains(&"metrics"));
         assert!(sections.contains(&"accessLogging"));
+    }
+
+    #[test]
+    fn telemetry_reports_entries_past_the_first_as_deferred() {
+        let obj = object(
+            "telemetry.istio.io/v1",
+            "Telemetry",
+            "multi-provider",
+            json!({
+                "metrics": [
+                    { "providers": [ { "name": "prometheus" } ] },
+                    { "providers": [ { "name": "stackdriver" } ], "overrides": [ { "disabled": true } ] }
+                ],
+                "accessLogging": [ { "disabled": false } ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("True"));
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(deferred.len(), 1, "{deferred:?}");
+        assert!(deferred[0].starts_with("metrics[1..]"));
+        assert!(
+            c["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("deferred fields: metrics[1..]"))
+        );
+    }
+
+    #[test]
+    fn virtual_service_reports_unenforced_retry_settings_as_deferred() {
+        let obj = object(
+            "networking.istio.io/v1",
+            "VirtualService",
+            "retry-vs",
+            json!({
+                "hosts": ["reviews.default.svc.cluster.local"],
+                "http": [
+                    {
+                        "route": [ { "destination": { "host": "reviews.default.svc.cluster.local" } } ],
+                        "retries": { "attempts": 2, "retryOn": "5xx,retriable-4xx", "perTryTimeout": "1s" }
+                    },
+                    {
+                        "route": [ { "destination": { "host": "reviews.default.svc.cluster.local" } } ],
+                        "retries": { "attempts": 2, "perTryTimeout": "1s" }
+                    }
+                ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("True"));
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(
+            deferred
+                .iter()
+                .filter(|field| field.starts_with("http[].retries.perTryTimeout"))
+                .count(),
+            1,
+            "{deferred:?}"
+        );
+        assert!(
+            deferred
+                .iter()
+                .any(|field| field.starts_with("http[].retries.retryOn")),
+            "{deferred:?}"
+        );
     }
 
     #[test]

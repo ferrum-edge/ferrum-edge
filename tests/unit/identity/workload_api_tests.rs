@@ -27,17 +27,6 @@ fn workload_request<T>(payload: T) -> Request<T> {
     req
 }
 
-fn workload_request_with_bearer<T>(payload: T, bearer: &str) -> Request<T> {
-    let mut req = workload_request(payload);
-    let value = format!("Bearer {bearer}");
-    req.metadata_mut().insert(
-        "authorization",
-        tonic::metadata::AsciiMetadataValue::try_from(value.as_str())
-            .expect("bearer authorization metadata must be ASCII"),
-    );
-    req
-}
-
 // ── CA stub ──────────────────────────────────────────────────────────────
 
 struct StubCa {
@@ -246,12 +235,13 @@ impl Attestor for ScriptedAttestor {
     }
 }
 
-/// Attestor that records the peer identity presented on every call and only
-/// succeeds when the bearer matches the expected retained transport identity.
+/// The transport identity an attestor sees: the `SO_PEERCRED` pid/uid/gid.
+type SeenPeer = (Option<i32>, Option<u32>, Option<u32>);
+
+/// Attestor that records the peer identity presented on every call.
 struct PeerRecordingAttestor {
     id: SpiffeId,
-    expected_bearer: String,
-    seen_bearers: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    seen_peers: Arc<std::sync::Mutex<Vec<SeenPeer>>>,
     calls: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -266,20 +256,15 @@ impl Attestor for PeerRecordingAttestor {
         peer: &PeerInfo,
     ) -> Result<WorkloadIdentity, ferrum_edge::identity::attestation::AttestError> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.seen_bearers
+        self.seen_peers
             .lock()
             .expect("peer recording mutex poisoned")
-            .push(peer.bearer_token.clone());
-        match peer.bearer_token.as_deref() {
-            Some(token) if token == self.expected_bearer => Ok(WorkloadIdentity {
-                spiffe_id: self.id.clone(),
-                selectors: HashMap::new(),
-                attestor_kind: "peer_recording".to_string(),
-            }),
-            _ => Err(ferrum_edge::identity::attestation::AttestError::Failed(
-                "peer identity mismatch".to_string(),
-            )),
-        }
+            .push((peer.pid, peer.uid, peer.gid));
+        Ok(WorkloadIdentity {
+            spiffe_id: self.id.clone(),
+            selectors: HashMap::new(),
+            attestor_kind: "peer_recording".to_string(),
+        })
     }
 }
 
@@ -747,14 +732,12 @@ async fn fetch_x509svid_rotation_reattests_retained_peer_identity() {
         counter: std::sync::atomic::AtomicU64::new(0),
     });
     let id = SpiffeId::from_parts(&trust_domain, "ns/peer/sa/check").unwrap();
-    let expected_bearer = "retained-peer-psat".to_string();
-    let seen_bearers = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_peers = Arc::new(std::sync::Mutex::new(Vec::new()));
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let attestor: Arc<dyn ferrum_edge::identity::attestation::Attestor> =
         Arc::new(PeerRecordingAttestor {
             id,
-            expected_bearer: expected_bearer.clone(),
-            seen_bearers: Arc::clone(&seen_bearers),
+            seen_peers: Arc::clone(&seen_peers),
             calls: Arc::clone(&calls),
         });
 
@@ -769,10 +752,7 @@ async fn fetch_x509svid_rotation_reattests_retained_peer_identity() {
     );
 
     let resp = svc
-        .fetch_x509svid(workload_request_with_bearer(
-            X509svidRequest {},
-            &expected_bearer,
-        ))
+        .fetch_x509svid(workload_request(X509svidRequest {}))
         .await
         .unwrap();
     let mut stream = resp.into_inner();
@@ -795,14 +775,14 @@ async fn fetch_x509svid_rotation_reattests_retained_peer_identity() {
     assert_eq!(second.svids.len(), 1);
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
 
-    let seen = seen_bearers
+    let seen = seen_peers
         .lock()
         .expect("peer recording mutex poisoned")
         .clone();
+    assert_eq!(seen.len(), 2, "stream open and the rotation each attest");
     assert_eq!(
-        seen,
-        vec![Some(expected_bearer.clone()), Some(expected_bearer.clone())],
-        "each rotation epoch must re-attest the retained peer bearer identity"
+        seen[0], seen[1],
+        "each rotation epoch must re-attest the peer identity retained at stream open"
     );
 }
 

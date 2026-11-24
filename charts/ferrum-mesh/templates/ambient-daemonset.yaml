@@ -318,10 +318,7 @@
 {{- if or $ambientUdpLifecycle $nodeWaypointUdpListeners -}}
 {{- $ambientImageTag = include "ferrum-mesh.toolsImageTag" $ambientImageTag -}}
 {{- else if or (eq (lower (toString .Values.ambient.captureMode)) "ebpf") (eq $ambientTopology "node_waypoint") -}}
-{{- /* "-ebpf-tools" already satisfies this tier, so never suffix it again. */ -}}
-{{- if not (or (hasSuffix "-ebpf" $ambientImageTag) (hasSuffix "-ebpf-tools" $ambientImageTag)) -}}
-{{- $ambientImageTag = printf "%s-ebpf" $ambientImageTag -}}
-{{- end -}}
+{{- $ambientImageTag = include "ferrum-mesh.ebpfImageTag" $ambientImageTag -}}
 {{- end -}}
 {{- $ambientImage := printf "%s:%s" $ambientImageRepository $ambientImageTag -}}
 apiVersion: apps/v1
@@ -558,12 +555,12 @@ spec:
                 - {{ $cap }}
                 {{- end }}
           ports:
-            - name: outbound
-              containerPort: {{ .Values.ambient.outboundPort }}
-            - name: inbound
-              containerPort: {{ .Values.ambient.inboundPort }}
-            - name: hbone
-              containerPort: {{ .Values.ambient.hbonePort }}
+            {{- range $listener := list (list "outbound" "FERRUM_MESH_OUTBOUND_LISTEN_ADDR" "127.0.0.1:15001") (list "inbound" "FERRUM_MESH_INBOUND_LISTEN_ADDR" "0.0.0.0:15006") (list "hbone" "FERRUM_MESH_HBONE_LISTEN_ADDR" "0.0.0.0:15008") }}
+            {{- with (include "ferrum-mesh.ambientListenPort" (dict "env" $ambientEnv "name" (index $listener 1) "default" (index $listener 2))) }}
+            - name: {{ index $listener 0 }}
+              containerPort: {{ . }}
+            {{- end }}
+            {{- end }}
             {{- if ne $ambientAdminPort "0" }}
             - name: admin-http
               containerPort: {{ $ambientAdminPort }}
@@ -675,8 +672,11 @@ spec:
             {{- . | nindent 12 }}
             {{- end }}
             {{- if $nodeWaypointRegistryEnabled }}
+            {{- /* Fixed in-container mount: the orig-dst bridge opens the
+                   node-agent's pins at constant /sys/fs/bpf/ferrum paths.
+                   nodeAgent.bpfFsPath only selects the host bpffs. */}}
             - name: bpf-fs
-              mountPath: {{ .Values.nodeAgent.bpfFsPath }}
+              mountPath: /sys/fs/bpf
               readOnly: true
             {{- end }}
             {{- if $ambientInNetnsCapture }}

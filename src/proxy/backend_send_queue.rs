@@ -123,7 +123,6 @@ impl BackendSocketHandle {
     // publishing it: the direct HTTP/1.1 pool wraps its stream in
     // `ObservedTcpStream`, and the reqwest path reports a raw fd. Kept as the
     // owned-stream counterpart of `duplicate_from_raw_fd` for the tests.
-    #[allow(dead_code)]
     #[cfg(unix)]
     pub fn duplicate_from(stream: &tokio::net::TcpStream) -> Option<Arc<Self>> {
         if !crate::socket_opts::send_queue_probe_supported() {
@@ -136,7 +135,6 @@ impl BackendSocketHandle {
         }))
     }
 
-    #[allow(dead_code)]
     #[cfg(not(unix))]
     pub fn duplicate_from(_stream: &tokio::net::TcpStream) -> Option<Arc<Self>> {
         None
@@ -521,8 +519,7 @@ pub(crate) fn publish_reqwest_backend_socket(fd: std::os::fd::RawFd) {
 /// reached its terminal under the race bumps nothing.
 ///
 /// `#[allow(dead_code)]`: the snapshot side is reached only through
-/// `_test_support`, and the binary target recompiles this module without the
-/// test crates that call it.
+/// `_test_support`.
 #[allow(dead_code)]
 pub(crate) mod diagnostics {
     #[cfg(debug_assertions)]

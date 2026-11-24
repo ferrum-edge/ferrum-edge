@@ -120,7 +120,6 @@ impl Default for TlsInventoryCache {
 impl TlsInventoryCache {
     /// Create an independent cache with an owner-supplied collector. Listener
     /// startup cannot replace it. This never pins or mutates the process cache.
-    #[allow(dead_code)] // External in-process fixtures supply their own collector.
     pub fn with_collector(collector: Arc<dyn TlsInventoryCollector>) -> Self {
         let cache = Self {
             collector_pinned: true,

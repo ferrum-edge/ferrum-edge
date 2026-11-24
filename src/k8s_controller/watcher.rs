@@ -936,6 +936,61 @@ const BOUNDARY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// and only while mesh content is actually being withheld.
 const REVISION_EVIDENCE_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Ceiling for one scope's backed-off evidence-refresh spacing (issue #7259):
+/// the default `FERRUM_K8S_WATCH_IDLE_RELIST_SECS` window, which every scope
+/// relists on anyway.
+const REVISION_EVIDENCE_REFRESH_MAX_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Spacing of ONE scope's demand-driven evidence refreshes (issue #7259).
+///
+/// A refresh only helps while relisting can produce the missing proof. When a
+/// scope can never gain evidence (an authorization refusal, a list that keeps
+/// failing), the watermark stays unavailable, every reconcile retains and asks
+/// again, and a fixed floor would relist every scope every
+/// [`REVISION_EVIDENCE_REFRESH_MIN_INTERVAL`] for as long as the fault lasts.
+/// So the spacing doubles each time a refresh fires without the published
+/// sequence having advanced since the previous one, up to
+/// [`REVISION_EVIDENCE_REFRESH_MAX_INTERVAL`], and drops back to the floor as
+/// soon as the sequence advances. Retention and the request itself are
+/// unchanged: this bounds the relist rate, it never relaxes the proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EvidenceRefreshBackoff {
+    interval: Duration,
+    published_floor_at_last_refresh: Option<u64>,
+}
+
+impl Default for EvidenceRefreshBackoff {
+    fn default() -> Self {
+        Self {
+            interval: REVISION_EVIDENCE_REFRESH_MIN_INTERVAL,
+            published_floor_at_last_refresh: None,
+        }
+    }
+}
+
+impl EvidenceRefreshBackoff {
+    /// Spacing to apply before the next demand-driven refresh, measured from
+    /// the start of the current generation.
+    fn interval(&self) -> Duration {
+        self.interval
+    }
+
+    /// Record that a demand-driven refresh fired while the tracker's published
+    /// sequence floor was `published_floor`.
+    fn record_refresh(&mut self, published_floor: u64) {
+        match self.published_floor_at_last_refresh {
+            Some(previous) if published_floor <= previous => {
+                self.interval = self
+                    .interval
+                    .saturating_mul(2)
+                    .min(REVISION_EVIDENCE_REFRESH_MAX_INTERVAL);
+            }
+            _ => self.interval = REVISION_EVIDENCE_REFRESH_MIN_INTERVAL,
+        }
+        self.published_floor_at_last_refresh = Some(published_floor);
+    }
+}
+
 /// Reads the authoritative `resourceVersion` boundary for one watch scope.
 ///
 /// Invoked once per watcher generation, immediately BEFORE the generation's own
@@ -1118,52 +1173,82 @@ pub(crate) async fn run_watcher_generations<S, F>(
     // initial list. A relist diff against a store that never listed would
     // report every object as "appeared without an event".
     let mut live_store_listed = false;
+    // Issue #7259: outlives a generation so a scope that keeps being asked
+    // for evidence it cannot produce backs off instead of relisting on the
+    // floor forever.
+    let mut refresh_backoff = EvidenceRefreshBackoff::default();
+    // Issue #7399: the live stream of a generation a demand-driven evidence
+    // refresh retired. A refresh is not a symptom of a stalled watch (that is
+    // the idle relist's job), so the live watch keeps feeding the registered
+    // store while the replacement lists. Dropping it left the scope blind for
+    // as long as the replacement took to list — bounded only by
+    // `readiness_timeout`, two idle windows — so a `Delete` arriving in that
+    // window was not observed until the replacement finished, and nothing
+    // above debug said so. `Some` only while a replacement is pending.
+    let mut retiring_live: Option<Pin<Box<S>>> = None;
+    // Set when the retiring live stream delivered before the replacement
+    // finished listing: the next generation resumes it instead of listing.
+    let mut resume_live: Option<Pin<Box<S>>> = None;
 
     loop {
         // `pending` is `Some` only for a replacement generation, i.e. exactly
         // while an older store is still the one registered for this scope.
-        let (writer, mut pending) = match initial_writer.take() {
-            Some(writer) => (writer, None),
-            None => {
-                let writer = reflector::store::Writer::new(target.resource.clone());
-                let store = Arc::new(CrdResourceStore::new_scoped(
-                    target.api_version.clone(),
-                    target.kind.clone(),
-                    target.scope.clone(),
-                    writer.as_reader(),
-                ));
-                (writer, Some(store))
-            }
-        };
+        let (mut stream, mut pending): (Pin<Box<S>>, Option<Arc<CrdResourceStore>>) =
+            if let Some(live) = resume_live.take() {
+                // The registered store's own watch, proven alive. Its writer
+                // is the registered store's, so there is nothing to swap and
+                // no boundary to read: its evidence keeps advancing from the
+                // events it applies.
+                (live, None)
+            } else {
+                let (writer, pending) = match initial_writer.take() {
+                    Some(writer) => (writer, None),
+                    None => {
+                        let writer = reflector::store::Writer::new(target.resource.clone());
+                        let store = Arc::new(CrdResourceStore::new_scoped(
+                            target.api_version.clone(),
+                            target.kind.clone(),
+                            target.scope.clone(),
+                            writer.as_reader(),
+                        ));
+                        (writer, Some(store))
+                    }
+                };
 
-        // Capture the authoritative boundary BEFORE the generation's own list
-        // is issued (issue #3611). kube-rs surfaces neither the list revision
-        // nor watch bookmarks, and its list defaults to `MostRecent` (a quorum
-        // read at the current cluster revision), so a revision read here is
-        // necessarily at or below the revision this generation's store will be
-        // coherent as of. The boundary is only adopted at `InitDone`, when that
-        // store actually holds the listed content.
-        let boundary = tokio::select! {
-            biased;
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() {
-                    debug!(
-                        kind = %target.kind,
-                        scope = %target.scope,
-                        "Watcher shutting down"
-                    );
-                    return;
-                }
-                // Not a shutdown: skip this generation's boundary rather than
-                // re-racing it. No boundary only understates convergence.
-                None
-            }
-            boundary = read_boundary() => boundary,
-        };
-        revision.begin_generation(&scope_key, boundary);
+                // Capture the authoritative boundary BEFORE the generation's
+                // own list is issued (issue #3611). kube-rs surfaces neither
+                // the list revision nor watch bookmarks, and its list defaults
+                // to `MostRecent` (a quorum read at the current cluster
+                // revision), so a revision read here is necessarily at or below
+                // the revision this generation's store will be coherent as of.
+                // The boundary is only adopted at `InitDone`, when that store
+                // actually holds the listed content.
+                let boundary = tokio::select! {
+                    biased;
+                    _ = shutdown.changed() => {
+                        if *shutdown.borrow() {
+                            debug!(
+                                kind = %target.kind,
+                                scope = %target.scope,
+                                "Watcher shutting down"
+                            );
+                            return;
+                        }
+                        // Not a shutdown: skip this generation's boundary
+                        // rather than re-racing it. No boundary only
+                        // understates convergence.
+                        None
+                    }
+                    boundary = read_boundary() => boundary,
+                };
+                revision.begin_generation(&scope_key, boundary);
 
-        let stream = make_stream(writer);
-        tokio::pin!(stream);
+                (Box::pin(make_stream(writer)), pending)
+            };
+        // Set when this (live) generation ends for a demand-driven evidence
+        // refresh: its stream then becomes `retiring_live` instead of being
+        // dropped.
+        let mut keep_live_for_refresh = false;
 
         let generation_start = tokio::time::Instant::now();
         // When the current attempt began: the generation start, or the end of
@@ -1195,7 +1280,7 @@ pub(crate) async fn run_watcher_generations<S, F>(
             // replacement already listing needs no second trigger — it will
             // adopt a boundary read taken after the request was raised.
             let refresh_deadline = (refresh_requested && pending.is_none())
-                .then(|| generation_start + REVISION_EVIDENCE_REFRESH_MIN_INTERVAL);
+                .then(|| generation_start + refresh_backoff.interval());
             // Preserve the reason as well as the earliest deadline. An armed
             // refresh can coexist with an earlier idle deadline; classifying
             // that wake-up from `refresh_requested` alone would both mislabel
@@ -1237,13 +1322,22 @@ pub(crate) async fn run_watcher_generations<S, F>(
                             target.watcher_label
                         );
                     } else if relist_for_evidence_refresh {
+                        refresh_backoff.record_refresh(revision.published_floor());
+                        metrics
+                            .watch_evidence_refresh_relists
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // Issue #7399: keep the live watch delivering while
+                        // the replacement lists (see `retiring_live`).
+                        keep_live_for_refresh = true;
                         debug!(
                             kind = %target.kind,
                             api_version = %target.api_version,
                             scope = %target.scope,
+                            next_refresh_spacing_secs = refresh_backoff.interval().as_secs(),
                             "{} rebuilding its reflector from an authoritative list because \
                              mesh config publication is withholding content under a revision \
-                             this scope cannot advance",
+                             this scope cannot advance; its live watch keeps delivering until \
+                             the replacement is listed",
                             target.watcher_label
                         );
                     } else {
@@ -1273,6 +1367,94 @@ pub(crate) async fn run_watcher_generations<S, F>(
                 _ = sleep_until_or_pending(stream_hold), if stream_hold.is_some() => {
                     stream_hold = None;
                     attempt_start = tokio::time::Instant::now();
+                }
+                // Issue #7399: the registered store's own watch, still running
+                // while a refresh replacement lists. Its writer is the
+                // registered store's, so whatever it delivers is already
+                // visible to the reconciler.
+                item = async {
+                    match retiring_live.as_mut() {
+                        Some(live) => live.try_next().await,
+                        None => std::future::pending().await,
+                    }
+                }, if pending.is_some() && retiring_live.is_some() => {
+                    match item {
+                        // Proves nothing, exactly as on the generation stream.
+                        Ok(Some(watcher::Event::Init)) => {}
+                        Ok(Some(event)) => {
+                            // A delivered item ends a failure streak whichever
+                            // stream polled it (issue #4491), so a later fault
+                            // is announced as a new streak, not a repeat.
+                            if let Some(failed_attempts) = failure_streak.record_success() {
+                                info!(
+                                    kind = %target.kind,
+                                    api_version = %target.api_version,
+                                    scope = %target.scope,
+                                    failed_attempts,
+                                    "{} recovered; the watch is delivering again",
+                                    target.watcher_label
+                                );
+                            }
+                            if matches!(event, watcher::Event::Delete(_)) {
+                                metrics
+                                    .watch_deletes
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            // The live watch is delivering, so it is not the
+                            // stall a relist repairs. Abandon the replacement
+                            // and resume the live watch. Forget the evidence
+                            // the replacement buffered (its pre-list boundary
+                            // and listed revisions describe a store that will
+                            // never be registered) BEFORE recording this event,
+                            // so a live `InitDone` cannot adopt them. Dropping
+                            // buffered evidence only understates convergence.
+                            revision.begin_generation(&scope_key, None);
+                            record_watch_evidence(&revision, &scope_key, &event, false);
+                            if matches!(event, watcher::Event::InitDone) {
+                                revision.commit_list(&scope_key);
+                                live_store_listed = true;
+                            }
+                            change_notifier.notify_change();
+                            info!(
+                                kind = %target.kind,
+                                api_version = %target.api_version,
+                                scope = %target.scope,
+                                "{} kept delivering while a revision-evidence refresh relisted \
+                                 it; abandoning the replacement and keeping the live watch",
+                                target.watcher_label
+                            );
+                            resume_live = retiring_live.take();
+                            break;
+                        }
+                        // The live watch ended or failed: from here on the
+                        // replacement alone repairs the scope, exactly as it
+                        // did before #7399.
+                        Ok(None) => {
+                            debug!(
+                                kind = %target.kind,
+                                api_version = %target.api_version,
+                                scope = %target.scope,
+                                "{} live watch ended while a refresh replacement was listing",
+                                target.watcher_label
+                            );
+                            retiring_live = None;
+                        }
+                        Err(e) => {
+                            metrics
+                                .watch_errors
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            debug!(
+                                kind = %target.kind,
+                                api_version = %target.api_version,
+                                scope = %target.scope,
+                                error = %e,
+                                "{} live watch failed while a refresh replacement was listing; \
+                                 the replacement alone repairs the scope",
+                                target.watcher_label
+                            );
+                            retiring_live = None;
+                        }
+                    }
                 }
                 item = stream.try_next(), if stream_hold.is_none() => {
                     match item {
@@ -1378,6 +1560,9 @@ pub(crate) async fn run_watcher_generations<S, F>(
                                 (replaced, divergence)
                             };
                             live_store_listed = true;
+                            // The replacement is registered: the watch that fed
+                            // the store it retired is retired with it.
+                            retiring_live = None;
                             match divergence {
                                 Some(divergence) if !divergence.is_empty() => {
                                     metrics
@@ -1504,6 +1689,9 @@ pub(crate) async fn run_watcher_generations<S, F>(
                 }
             }
         }
+        if keep_live_for_refresh {
+            retiring_live = Some(stream);
+        }
     }
 }
 
@@ -1579,6 +1767,12 @@ pub(crate) async fn start_crd_watchers(
     // serving every optional CRD version Ferrum knows about.
     let mut checked_groups = HashSet::new();
     let mut installed_groups: HashMap<&'static str, discovery::ApiGroup> = HashMap::new();
+    // Group discovery runs at startup and again on every reprobe pass. Only the
+    // startup pass reports group presence at info/warn: repeating it on each
+    // reprobe would warn forever about every optional group a cluster does not
+    // install. A group that appears later is reported by the reprobe loop's
+    // "started additional watchers" event.
+    let reprobe = task_label == REPROBE_WATCHER_LABEL;
 
     for crd in &crd_specs {
         if !checked_groups.insert(crd.group) {
@@ -1587,14 +1781,26 @@ pub(crate) async fn start_crd_watchers(
         match discovery::oneshot::group(&client, crd.group).await {
             Ok(api_group) => {
                 installed_groups.insert(crd.group, api_group);
-                info!(group = crd.group, "CRD group detected");
+                if reprobe {
+                    debug!(group = crd.group, "CRD group detected");
+                } else {
+                    info!(group = crd.group, "CRD group detected");
+                }
+            }
+            Err(e) if reprobe => {
+                debug!(
+                    group = crd.group,
+                    error = %e,
+                    "CRD group still not installed; it will be re-probed"
+                );
             }
             Err(e) => {
                 warn!(
                     group = crd.group,
                     error = %e,
-                    "CRD group not installed, its resources will not be watched. \
-                     Install the CRDs and restart the controller to enable."
+                    "CRD group not installed, its resources will not be watched until it is. \
+                     The controller re-probes CRD groups periodically and starts the watchers \
+                     once the CRDs are installed; no restart is needed."
                 );
             }
         }
@@ -1971,6 +2177,35 @@ pub(crate) fn spawn_crd_reprobe_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evidence_refresh_backoff_doubles_while_the_sequence_cannot_advance() {
+        // Issue #7259: a scope that can never gain evidence keeps the
+        // watermark unavailable, so every reconcile asks again. Unproductive
+        // refreshes must space out instead of relisting on the floor forever.
+        let mut backoff = EvidenceRefreshBackoff::default();
+        assert_eq!(backoff.interval(), REVISION_EVIDENCE_REFRESH_MIN_INTERVAL);
+
+        backoff.record_refresh(100);
+        assert_eq!(
+            backoff.interval(),
+            REVISION_EVIDENCE_REFRESH_MIN_INTERVAL,
+            "the first refresh has nothing to compare against"
+        );
+        let mut seen = Vec::new();
+        for _ in 0..10 {
+            backoff.record_refresh(100);
+            seen.push(backoff.interval().as_secs());
+        }
+        assert_eq!(seen, vec![10, 20, 40, 80, 160, 300, 300, 300, 300, 300]);
+
+        // The sequence advanced: refreshes are productive again, back to the
+        // floor so the quiet-scope case stays prompt.
+        backoff.record_refresh(101);
+        assert_eq!(backoff.interval(), REVISION_EVIDENCE_REFRESH_MIN_INTERVAL);
+        backoff.record_refresh(101);
+        assert_eq!(backoff.interval(), Duration::from_secs(10));
+    }
 
     #[test]
     fn watch_scopes_uses_all_namespaces_when_unset() {

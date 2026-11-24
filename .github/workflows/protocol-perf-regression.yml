@@ -7,8 +7,7 @@
 # versioned budgets (alert/non-block until absolute floors are measured) and a
 # rolling median±MAD baseline when prior trends are available.
 #
-# This workflow is intentionally NOT a required PR check. The lightweight
-# HTTP/1 overhead gate in ci.yml remains the PR path.
+# This workflow is intentionally NOT a required PR check.
 
 name: Protocol Performance Regression
 
@@ -79,7 +78,9 @@ jobs:
     timeout-minutes: 120
 
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Verify workflow contract (static)
         run: |
@@ -368,7 +369,7 @@ jobs:
 
       - name: Upload protocol performance artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: protocol-perf-regression-${{ github.sha }}
           path: protocol-perf-results/
@@ -376,7 +377,7 @@ jobs:
 
       - name: Upload trends alias artifact
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: protocol-perf-trends-latest
           path: protocol-perf-results/protocol_perf_trends.json

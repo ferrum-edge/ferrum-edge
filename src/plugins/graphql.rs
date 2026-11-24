@@ -32,7 +32,6 @@ use crate::plugins::utils::log_sampling::warn_sampled;
 
 use async_trait::async_trait;
 use serde_json::Value;
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -40,12 +39,12 @@ use std::time::{Duration, Instant};
 use tracing::debug;
 
 use super::utils::body_transform::is_json_content_type;
+use super::utils::principal::Principal;
 use super::utils::rate_limit::{
     DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, ENFORCEMENT_UNAVAILABLE_BODY,
     ENFORCEMENT_UNAVAILABLE_STATUS, LocalStateSemantics, RATE_LIMIT_REDIS_CONFIG_KEYS,
     RateLimitBackend, RateLimitOutcome, RateLimitWindowSpec, STANDALONE_RATE_LIMIT_CONFIG_ID,
-    apply_rate_limit_cleanup, debug_assert_rate_limit_redis_keys, validate_max_requests,
-    validate_window_seconds,
+    debug_assert_rate_limit_redis_keys, validate_max_requests, validate_window_seconds,
 };
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 use crate::util::unknown_keys::reject_unknown_keys;
@@ -60,7 +59,7 @@ const EVICTION_CHECK_INTERVAL_REQUESTS: u64 = 1024;
 const EVICTION_COOLDOWN_SECS: u64 = 1;
 const CAPACITY_REJECT_BODY: &str =
     r#"{"errors":[{"message":"Rate limit state capacity exceeded"}]}"#;
-const GRAPHQL_PROTOCOLS: &[super::ProxyProtocol] =
+pub(crate) const GRAPHQL_PROTOCOLS: &[super::ProxyProtocol] =
     &[super::ProxyProtocol::Http, super::ProxyProtocol::WebSocket];
 
 /// GraphQL-specific top-level config keys (excludes shared Redis sync fields).
@@ -140,7 +139,6 @@ pub struct GraphqlPlugin {
     request_counter: AtomicU64,
     epoch_base: Instant,
     last_periodic_sweep_secs: AtomicU64,
-    has_any_config: bool,
     /// Process-unique identity for this constructed instance, used to scope the
     /// per-request "already evaluated this envelope" marker so multiple
     /// configured `graphql` instances cannot consume each other's decision.
@@ -152,7 +150,6 @@ pub struct GraphqlPlugin {
 static NEXT_GRAPHQL_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 impl GraphqlPlugin {
-    #[allow(dead_code)] // direct/test construction; production factory supplies the config id
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
         Self::new_with_config_id(config, http_client, STANDALONE_RATE_LIMIT_CONFIG_ID)
     }
@@ -302,7 +299,6 @@ impl GraphqlPlugin {
             request_counter: AtomicU64::new(0),
             epoch_base: Instant::now(),
             last_periodic_sweep_secs: AtomicU64::new(0),
-            has_any_config,
             instance_id: NEXT_GRAPHQL_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
         })
     }
@@ -395,15 +391,10 @@ impl GraphqlPlugin {
         self.evict_stale_entries_at(now);
     }
 
-    /// Exercise the shared prune/enforce branch with a testable cap. Test-only.
+    /// Run the shared idle-state prune at `now`. Test-only.
     #[allow(dead_code)] // used only by external tests; dead in binary test target
-    pub(crate) fn apply_cleanup_branch_for_test(
-        &self,
-        now: Instant,
-        over_capacity: bool,
-        max_entries: usize,
-    ) {
-        apply_rate_limit_cleanup(&self.limiter, max_entries, now, over_capacity);
+    pub(crate) fn prune_stale_for_test(&self, now: Instant) {
+        self.limiter.prune_stale_at(now);
     }
 
     #[allow(dead_code)] // used only by external tests; dead in binary test target
@@ -436,7 +427,7 @@ impl GraphqlPlugin {
         // atomic admission reservation. The below-cap cooldown must not
         // suppress this branch once pressure is seen on a sampled pass.
         if len > MAX_STATE_ENTRIES {
-            apply_rate_limit_cleanup(&self.limiter, MAX_STATE_ENTRIES, now, true);
+            self.limiter.prune_stale_at(now);
             self.last_periodic_sweep_secs
                 .store(now_secs, Ordering::Release);
             return;
@@ -456,19 +447,23 @@ impl GraphqlPlugin {
             return;
         }
 
-        apply_rate_limit_cleanup(&self.limiter, MAX_STATE_ENTRIES, now, false);
+        self.limiter.prune_stale_at(now);
     }
 
     /// Check a rate limit by key, creating a bucket if needed.
     ///
     /// Returns `None` when a previously unseen local/fallback key is denied at
     /// the hard cardinality cap (Redis-healthy admission is unaffected).
-    async fn check_rate(&self, key: &str, spec: &RateSpec) -> Option<RateLimitOutcome> {
+    ///
+    /// Takes the key by value: the local limiter keeps it, and only a
+    /// Redis-backed limiter needs (and gets) a second copy for the shared key.
+    async fn check_rate(&self, key: String, spec: &RateSpec) -> Option<RateLimitOutcome> {
         self.evict_stale_entries();
+        let redis_key = matches!(self.limiter, RateLimitBackend::Failover(_)).then(|| key.clone());
         self.limiter
             .check_with_redis_key_and_local_capacity(
-                key.to_string(),
-                || key.to_string(),
+                key,
+                move || redis_key.unwrap_or_default(),
                 &spec.op,
                 MAX_STATE_ENTRIES,
             )
@@ -495,29 +490,27 @@ impl GraphqlPlugin {
 
     /// Build the rate limit key based on `limit_by` config.
     ///
-    /// The identity is tagged `consumer:` or `ip:` (as in `rate_limiting`) so an
-    /// identity string that equals an IP never shares a budget with the
-    /// unauthenticated caller at that IP.
+    /// The caller is keyed as in `rate_limiting`: `consumer:<username>` for a
+    /// mapped Consumer, `external:<realm>:<identity>` for an unmapped external
+    /// principal (so neither namespace nor two realms share a budget,
+    /// GHSA-rxwj-x6c6-f4j5), else `ip:`, so an identity string that equals an
+    /// IP never shares a budget with the unauthenticated caller at that IP.
     fn rate_key(&self, ctx: &RequestContext, kind: &str, value: &str) -> String {
-        let (identity_kind, identity) = match (self.limit_by == "consumer")
-            .then(|| ctx.effective_identity())
-            .flatten()
-        {
-            Some(identity) => ("consumer:", Cow::Borrowed(identity)),
-            None => (
-                "ip:",
-                Cow::Owned(
-                    crate::util::client_identity::rate_limit_client_ip_string(&ctx.client_ip, 64)
-                        .unwrap_or_else(|| ctx.client_ip.clone()),
-                ),
-            ),
-        };
-        let mut key = String::with_capacity(
-            4 + identity_kind.len() + identity.len() + kind.len() + value.len() + 2,
-        );
+        let principal = (self.limit_by == "consumer")
+            .then(|| Principal::of_request(ctx))
+            .flatten();
+        let mut key = String::with_capacity(4 + kind.len() + value.len() + 2 + 64);
         key.push_str("gql:");
-        key.push_str(identity_kind);
-        key.push_str(&identity);
+        match principal {
+            Some(principal) => principal.push_key(&mut key),
+            None => {
+                key.push_str("ip:");
+                key.push_str(
+                    &crate::util::client_identity::rate_limit_client_ip_string(&ctx.client_ip, 64)
+                        .unwrap_or_else(|| ctx.client_ip.clone()),
+                );
+            }
+        }
         key.push(':');
         key.push_str(kind);
         key.push(':');
@@ -1559,12 +1552,27 @@ fn ascii_contains_ignore_case(haystack: &str, needle: &str) -> bool {
 
 #[async_trait]
 impl Plugin for GraphqlPlugin {
+    /// Starts the Redis failover health observer only once this generation is
+    /// installed, so validation that builds and drops the plugin spawns
+    /// nothing (issue #6616).
+    fn commit_background_tasks(&self) {
+        self.limiter.commit_background_tasks();
+    }
+
     fn name(&self) -> &str {
         "graphql"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::GRAPHQL
+    }
+
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::BEFORE_PROXY
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
@@ -1576,7 +1584,8 @@ impl Plugin for GraphqlPlugin {
     /// pair it with a plugin that egresses the request before finalization, the
     /// same rule `waf` and `body_validator` carry (GHSA-4vr5-4wm3-x5xv).
     fn enforces_finalized_request_policy(&self) -> bool {
-        self.has_any_config
+        // The constructor refuses an instance without a protection rule.
+        true
     }
 
     /// Depth, complexity, alias, introspection, and rate-limit rules refuse
@@ -1584,7 +1593,7 @@ impl Plugin for GraphqlPlugin {
     /// `Grpc` view, which this plugin does not run on, so the route must refuse
     /// it instead of forwarding the body unchecked.
     fn gates_request_admission(&self) -> bool {
-        self.has_any_config
+        true
     }
 
     fn tracked_keys_count(&self) -> Option<usize> {
@@ -1596,12 +1605,11 @@ impl Plugin for GraphqlPlugin {
     }
 
     fn requires_request_body_before_before_proxy(&self) -> bool {
-        self.has_any_config
+        true
     }
 
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
-        self.has_any_config
-            && ctx.method == "POST"
+        ctx.method == "POST"
             && ctx
                 .headers
                 .get("content-type")
@@ -1632,22 +1640,35 @@ impl Plugin for GraphqlPlugin {
             );
         }
 
-        let body = match ctx.metadata.get("request_body") {
-            Some(b) if !b.is_empty() => b.as_str(),
-            _ => {
-                debug!("graphql: no request body available");
-                return reject_uninspectable_transport(
-                    "GraphQL request body is missing or empty \
-                     and cannot be inspected",
-                );
-            }
+        // Lift the body out of `metadata` for the duration of the check, rather
+        // than copying it, so `enforce_graphql_envelope` can borrow `ctx`
+        // mutably; it is put back under the same key on every outcome. Nothing
+        // the check runs reads `request_body`.
+        if ctx
+            .metadata
+            .get("request_body")
+            .is_none_or(|body| body.is_empty())
+        {
+            debug!("graphql: no request body available");
+            return reject_uninspectable_transport(
+                "GraphQL request body is missing or empty \
+                 and cannot be inspected",
+            );
+        }
+        let Some((body_key, body)) = ctx.metadata.remove_entry("request_body") else {
+            // Unreachable: presence was checked just above.
+            return reject_uninspectable_transport(
+                "GraphQL request body is missing or empty \
+                 and cannot be inspected",
+            );
         };
 
-        let body = body.as_bytes().to_vec();
         ctx.plugin_state_mut()
             .graphql_request_envelope_hashes
-            .insert(self.instance_id, graphql_envelope_digest(&body));
-        self.enforce_graphql_envelope(ctx, &body).await
+            .insert(self.instance_id, graphql_envelope_digest(body.as_bytes()));
+        let result = self.enforce_graphql_envelope(ctx, body.as_bytes()).await;
+        ctx.metadata.insert(body_key, body);
+        result
     }
 
     /// Re-evaluate the envelope the backend will actually receive.
@@ -1676,9 +1697,6 @@ impl Plugin for GraphqlPlugin {
         headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        if !self.has_any_config {
-            return PluginResult::Continue;
-        }
         // Only a request this instance already admitted has a recorded digest.
         // Its absence means `before_proxy` never ran or already rejected, so
         // there is nothing to re-decide here.
@@ -1703,7 +1721,8 @@ impl Plugin for GraphqlPlugin {
         // here.
         let decoded_view = ctx.inspectable_final_request_body_owned();
         let envelope: &[u8] = decoded_view.as_deref().unwrap_or(body);
-        if graphql_envelope_digest(envelope) == previous {
+        let digest = graphql_envelope_digest(envelope);
+        if digest == previous {
             return PluginResult::Continue;
         }
 
@@ -1728,12 +1747,12 @@ impl Plugin for GraphqlPlugin {
         }
         ctx.plugin_state_mut()
             .graphql_request_envelope_hashes
-            .insert(self.instance_id, graphql_envelope_digest(envelope));
+            .insert(self.instance_id, digest);
         self.enforce_graphql_envelope(ctx, envelope).await
     }
 
     fn needs_final_request_body_context(&self) -> bool {
-        self.has_any_config
+        true
     }
 
     /// Claim the finalized envelope so the shared request representation gate
@@ -1745,15 +1764,13 @@ impl Plugin for GraphqlPlugin {
         headers: &HashMap<String, String>,
         _body: &[u8],
     ) -> bool {
-        self.has_any_config
-            && ctx.plugin_state().is_some_and(|state| {
-                state
-                    .graphql_request_envelope_hashes
-                    .contains_key(&self.instance_id)
-            })
-            && headers
-                .get("content-type")
-                .is_some_and(|ct| is_graphql_json_content_type(ct))
+        ctx.plugin_state().is_some_and(|state| {
+            state
+                .graphql_request_envelope_hashes
+                .contains_key(&self.instance_id)
+        }) && headers
+            .get("content-type")
+            .is_some_and(|ct| is_graphql_json_content_type(ct))
     }
 }
 
@@ -1771,40 +1788,39 @@ fn graphql_envelope_digest(envelope: &[u8]) -> [u8; 32] {
 /// Top-level envelope members whose value decides what the backend executes.
 const GRAPHQL_ENVELOPE_MEMBERS: [&str; 4] = ["query", "operationName", "variables", "extensions"];
 
-/// Whether the envelope's top-level JSON object names one of
-/// [`GRAPHQL_ENVELOPE_MEMBERS`] more than once, compared after JSON unescaping
-/// (`"qu\u0065ry"` is `query`) and ignoring ASCII case (`Query` is `query`,
-/// for backends whose JSON binding ignores case). Only called on a body that
-/// already parsed as a JSON object; a body the audit cannot read is treated as
-/// repeating one.
-fn envelope_repeats_a_graphql_member(body: &[u8]) -> bool {
-    match serde_json::from_slice::<EnvelopeMemberAudit>(body) {
-        Ok(audit) => audit.repeated,
-        Err(_) => true,
-    }
+/// One parse of a GraphQL request envelope (issue #7152).
+///
+/// A top-level object yields its members exactly as `serde_json::Value` would
+/// collect them (a repeated name keeps its last value), together with whether
+/// one of [`GRAPHQL_ENVELOPE_MEMBERS`] is named more than once, compared after
+/// JSON unescaping (`"qu\u0065ry"` is `query`) and ignoring ASCII case (`Query`
+/// is `query`, for backends whose JSON binding ignores case). Any other JSON
+/// document is only validated. This replaces a `Value` parse followed by a
+/// second pass over the same bytes for the member audit.
+enum GraphqlEnvelope {
+    Object {
+        members: serde_json::Map<String, Value>,
+        repeats_a_member: bool,
+    },
+    NotAnObject,
 }
 
-/// Result of one pass over an envelope's top-level member names.
-struct EnvelopeMemberAudit {
-    repeated: bool,
-}
-
-impl<'de> serde::Deserialize<'de> for EnvelopeMemberAudit {
+impl<'de> serde::Deserialize<'de> for GraphqlEnvelope {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        deserializer.deserialize_map(EnvelopeMemberAuditVisitor)
+        deserializer.deserialize_any(GraphqlEnvelopeVisitor)
     }
 }
 
-struct EnvelopeMemberAuditVisitor;
+struct GraphqlEnvelopeVisitor;
 
-impl<'de> serde::de::Visitor<'de> for EnvelopeMemberAuditVisitor {
-    type Value = EnvelopeMemberAudit;
+impl<'de> serde::de::Visitor<'de> for GraphqlEnvelopeVisitor {
+    type Value = GraphqlEnvelope;
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("a GraphQL request envelope object")
+        formatter.write_str("a JSON document")
     }
 
     fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
@@ -1812,17 +1828,79 @@ impl<'de> serde::de::Visitor<'de> for EnvelopeMemberAuditVisitor {
         A: serde::de::MapAccess<'de>,
     {
         let mut seen = [false; GRAPHQL_ENVELOPE_MEMBERS.len()];
-        let mut repeated = false;
+        let mut repeats_a_member = false;
+        let mut members = serde_json::Map::new();
         while let Some(key) = map.next_key::<String>()? {
-            map.next_value::<serde::de::IgnoredAny>()?;
-            let member = GRAPHQL_ENVELOPE_MEMBERS
+            let value = map.next_value::<Value>()?;
+            if let Some(index) = GRAPHQL_ENVELOPE_MEMBERS
                 .iter()
-                .position(|m| m.eq_ignore_ascii_case(&key));
-            if let Some(index) = member {
-                repeated |= std::mem::replace(&mut seen[index], true);
+                .position(|member| member.eq_ignore_ascii_case(&key))
+            {
+                repeats_a_member |= std::mem::replace(&mut seen[index], true);
             }
+            members.insert(key, value);
         }
-        Ok(EnvelopeMemberAudit { repeated })
+        Ok(GraphqlEnvelope::Object {
+            members,
+            repeats_a_member,
+        })
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+        Ok(GraphqlEnvelope::NotAnObject)
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(GraphqlEnvelope::NotAnObject)
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(GraphqlEnvelope::NotAnObject)
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(GraphqlEnvelope::NotAnObject)
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(GraphqlEnvelope::NotAnObject)
+    }
+
+    fn visit_str<E>(self, _: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(GraphqlEnvelope::NotAnObject)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(GraphqlEnvelope::NotAnObject)
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(GraphqlEnvelope::NotAnObject)
     }
 }
 
@@ -1839,8 +1917,12 @@ impl GraphqlPlugin {
         ctx: &mut RequestContext,
         body: &[u8],
     ) -> PluginResult {
-        let parsed: Value = match serde_json::from_slice(body) {
-            Ok(v) => v,
+        let (members, repeats_a_member) = match serde_json::from_slice(body) {
+            Ok(GraphqlEnvelope::Object {
+                members,
+                repeats_a_member,
+            }) => (Some(members), repeats_a_member),
+            Ok(GraphqlEnvelope::NotAnObject) => (None, false),
             Err(_) => {
                 debug!("graphql: request body is not valid JSON");
                 return reject_uninspectable_transport(
@@ -1850,7 +1932,11 @@ impl GraphqlPlugin {
             }
         };
 
-        let query = match parsed.get("query").and_then(|q| q.as_str()) {
+        let query = match members
+            .as_ref()
+            .and_then(|members| members.get("query"))
+            .and_then(|q| q.as_str())
+        {
             Some(q) if !q.is_empty() => q,
             _ => {
                 // Batch arrays, APQ hash-only envelopes, empty/missing query.
@@ -1866,14 +1952,17 @@ impl GraphqlPlugin {
         // readers keep the first or refuse the body. A repeated member that
         // decides what the backend executes is therefore refused outright
         // rather than enforced over a copy the backend may not read.
-        if envelope_repeats_a_graphql_member(body) {
+        if repeats_a_member {
             return reject_uninspectable_transport(
                 "GraphQL request body repeats a top-level query, operationName, \
                  variables, or extensions member",
             );
         }
 
-        let operation_name = parsed.get("operationName").and_then(|n| n.as_str());
+        let operation_name = members
+            .as_ref()
+            .and_then(|members| members.get("operationName"))
+            .and_then(|n| n.as_str());
 
         // Parse the GraphQL query and select the operation to analyze. The
         // parser rejects spec-invalid documents (e.g. multiple operations
@@ -1970,7 +2059,7 @@ impl GraphqlPlugin {
         if let Some((key, spec)) = type_bucket
             && self.charge_bucket_once(ctx, &key)
         {
-            match self.check_rate(&key, spec).await {
+            match self.check_rate(key, spec).await {
                 None => {
                     super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
                     return PluginResult::Reject {
@@ -2026,7 +2115,7 @@ impl GraphqlPlugin {
         if let Some((op_name, key, spec)) = operation_bucket
             && self.charge_bucket_once(ctx, &key)
         {
-            match self.check_rate(&key, spec).await {
+            match self.check_rate(key, spec).await {
                 None => {
                     super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
                     return PluginResult::Reject {

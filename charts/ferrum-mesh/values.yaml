@@ -9,8 +9,6 @@ image:
   # Names of imagePullSecrets to attach to the pod.
   pullSecrets: []
 
-namespace: ferrum
-
 # Optional PodDisruptionBudget for mesh Deployments with replicas >= 2. Skipped
 # when a workload runs fewer than two replicas so minAvailable: 1 cannot block
 # node drains. Set minAvailable: null and maxUnavailable: 1 to allow full
@@ -26,14 +24,9 @@ podDisruptionBudget:
 # (`helm.sh/resource-policy: keep`) so UDPResponseAmplificationPolicy objects
 # are not cascade-deleted. Compare the live annotation
 # gateway.ferrum.io/crd-schema-version to schemaVersion below.
-#
-# Existing clusters that installed the CRD from the former crds/ directory
-# must adopt it once: `helm upgrade --take-ownership --set crds.adoptExisting=true`.
-# See docs/upgrade_guide.md.
 crds:
   install: true
   skipInstallAcknowledged: false
-  adoptExisting: false
   udpResponseAmplificationPolicy:
     schemaVersion: v1alpha1-1
 
@@ -47,6 +40,9 @@ controlPlane:
   # to >= 2 for HA before enabling production control planes; the PDB renders
   # only when replicas >= 2.
   replicas: 1
+  # CP/DP gRPC port: the chart renders FERRUM_CP_GRPC_LISTEN_ADDR=0.0.0.0:<grpcPort>
+  # (unless controlPlane.env sets FERRUM_CP_GRPC_LISTEN_ADDR) and uses the same
+  # port for the container port and the control-plane Service.
   grpcPort: 50051
   rbac:
     create: true
@@ -89,7 +85,7 @@ controlPlane:
     # not affect trusted NodeWaypoint discovery.
   database:
     # One of: sqlite, postgres, mysql, mongodb. Required when controlPlane.enabled
-    # or ca.enabled is true.
+    # is true.
     type: ""
     # Direct URL value. Suitable for local/dev only; prefer urlFrom or
     # existingSecret for shared environments.
@@ -368,9 +364,12 @@ ambient:
   # joined node adopt the already-established placement instead of refusing it
   # forever. It is never rendered by the release that changes the placement.
   enabled: false
-  inboundPort: 15006
-  outboundPort: 15001
-  hbonePort: 15008
+  # The outbound/inbound/HBONE listen addresses are set only through
+  # ambient.env (FERRUM_MESH_OUTBOUND_LISTEN_ADDR, default 127.0.0.1:15001;
+  # FERRUM_MESH_INBOUND_LISTEN_ADDR, default 0.0.0.0:15006;
+  # FERRUM_MESH_HBONE_LISTEN_ADDR, default 0.0.0.0:15008). The container ports
+  # `outbound`, `inbound` and `hbone` are derived from those addresses (a port
+  # of 0 disables the listener and omits its container port).
   captureMode: iptables
   # Privileged one-shot preflight for the SETTLED host-netns UDP placement
   # (issue #3809). The installed placement ConfigMap is release desired state
@@ -633,83 +632,6 @@ eastWest:
       memory: 256Mi
   priorityClassName: ""
 
-ca:
-  # Disabled by default. This Deployment runs the Ferrum binary in CP mode, so
-  # it shares the controlPlane database/JWT contract when enabled. Replicas are
-  # fixed at 1 in the template — an explicit non-HA choice; scale via separate
-  # releases or out-of-band if you need CA redundancy.
-  enabled: false
-  env:
-    FERRUM_MESH_PRODUCTION_MODE: "true"
-  # Same admin health semantics as controlPlane (CP mode).
-  probes:
-    startup:
-      enabled: true
-      failureThreshold: 36
-      periodSeconds: 5
-      override: {}
-    liveness:
-      enabled: true
-      initialDelaySeconds: 10
-      periodSeconds: 15
-      override: {}
-    readiness:
-      enabled: true
-      initialDelaySeconds: 5
-      periodSeconds: 10
-      failureThreshold: 3
-      override: {}
-  admin:
-    bindAddress: "127.0.0.1"
-    httpPort: 9000
-    allowInsecureHttp: false
-    allowedCidrs: ""
-    # Admin HTTPS port. Default 0 keeps existing HTTP-only installs unchanged
-    # (the binary default is 9443, so the chart must pin 0 until TLS is opted
-    # in). Set a nonzero port together with admin.tls below for HTTPS-only
-    # (httpPort=0) or dual-listener operation. A metrics bearer scrape is only
-    # ever attached to this HTTPS listener, never to httpPort.
-    httpsPort: 0
-    # Optional admin TLS Secret mount. Uses the shared FERRUM_ADMIN_TLS_*
-    # contract, the same shape nodeAgent.admin.tls uses. When enabled with a
-    # secretName the chart mounts cert/key (and optional client CA / CRL)
-    # read-only and sets the matching PATH env vars. Incomplete or invalid
-    # combinations fail at helm render; do not store PEM material in values.
-    tls:
-      enabled: false
-      secretName: ""
-      mountPath: /etc/ferrum/tls/admin
-      certKey: tls.crt
-      keyKey: tls.key
-      clientCaKey: ""
-      crlKey: ""
-  shutdownDrainSeconds: 30
-  shutdownPreStopSeconds: 30
-  shutdownPreDrainSeconds: 0
-  terminationGracePeriodSeconds: 110
-  podSecurityContext:
-    runAsNonRoot: true
-    runAsUser: 65532
-    runAsGroup: 65532
-    fsGroup: 65532
-    fsGroupChangePolicy: OnRootMismatch
-    seccompProfile:
-      type: RuntimeDefault
-  securityContext:
-    allowPrivilegeEscalation: false
-    readOnlyRootFilesystem: true
-    capabilities:
-      drop:
-        - ALL
-  resources:
-    requests:
-      cpu: 100m
-      memory: 64Mi
-    limits:
-      cpu: "1"
-      memory: 256Mi
-  priorityClassName: ""
-
 observability:
   # Master switch for the observability subtree. Default `false` so a fresh
   # install does not assume the cluster runs Prometheus / a Grafana sidecar.
@@ -875,6 +797,12 @@ nodeAgent:
   # it when UDP capture is enabled.
   podRegistryDir: /run/ferrum/node-waypoint-pods
   cgroupRoot: /sys/fs/cgroup
+  # Host bpffs mount (hostPath) shared by the node-agent and the ambient
+  # NodeWaypoint proxy. Inside both containers it is always mounted at
+  # /sys/fs/bpf, because Ferrum's pinned maps live at fixed
+  # /sys/fs/bpf/ferrum/* paths that the node-agent writes and the proxy reads.
+  # Override this only when the node mounts bpffs somewhere other than
+  # /sys/fs/bpf.
   bpfFsPath: /sys/fs/bpf
   admin:
     # Enables the read-only node-agent admin listener for /health and /metrics.

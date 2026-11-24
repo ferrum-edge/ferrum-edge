@@ -72,7 +72,6 @@ fn minimal_proxy() -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
@@ -1604,6 +1603,74 @@ fn backend_capability_key_uses_target_host_and_port() {
     );
 }
 
+/// Issue #7166: the HBONE peer segment of a capability key is the raw
+/// `mesh.hbone_peer_spiffe_id` (else `mesh.spiffe_id`) tag, borrowed rather
+/// than parsed and re-rendered. A valid and an invalid tag are both keyed by
+/// their exact value, and distinct peers never share a key.
+#[test]
+fn backend_capability_key_uses_the_raw_hbone_peer_spiffe_tag() {
+    let proxy = minimal_proxy();
+    let hbone_target = |tags: &[(&str, &str)]| UpstreamTarget {
+        host: "10.0.0.7".to_string(),
+        port: 9080,
+        service_port_policy_key: None,
+        weight: 1,
+        tags: std::iter::once(("mesh.hbone".to_string(), "true".to_string()))
+            .chain(tags.iter().map(|(k, v)| (k.to_string(), v.to_string())))
+            .collect(),
+        locality: None,
+        path: None,
+    };
+
+    let valid = "spiffe://cluster.local/ns/default/sa/reviews";
+    let peer_key = capability_key_for_proxy_target(
+        &proxy,
+        Some(&hbone_target(&[
+            ("mesh.hbone_peer_spiffe_id", valid),
+            (
+                "mesh.spiffe_id",
+                "spiffe://cluster.local/ns/default/sa/ignored",
+            ),
+        ])),
+    );
+    assert!(
+        peer_key.ends_with(&format!("|15008|10.0.0.7|{valid}")),
+        "the peer tag wins over the workload tag and is keyed verbatim: {peer_key}"
+    );
+
+    let workload_key =
+        capability_key_for_proxy_target(&proxy, Some(&hbone_target(&[("mesh.spiffe_id", valid)])));
+    assert_eq!(
+        workload_key, peer_key,
+        "the same identity from the workload tag yields the same key"
+    );
+
+    let other_key = capability_key_for_proxy_target(
+        &proxy,
+        Some(&hbone_target(&[(
+            "mesh.hbone_peer_spiffe_id",
+            "spiffe://cluster.local/ns/default/sa/ratings",
+        )])),
+    );
+    assert_ne!(other_key, peer_key, "distinct peers must not share probes");
+
+    let invalid = "spiffe://Not A Trust Domain/x";
+    let invalid_key = capability_key_for_proxy_target(
+        &proxy,
+        Some(&hbone_target(&[("mesh.hbone_peer_spiffe_id", invalid)])),
+    );
+    assert!(
+        invalid_key.ends_with(&format!("|{invalid}")),
+        "malformed metadata is keyed by its raw value: {invalid_key}"
+    );
+
+    let no_peer_key = capability_key_for_proxy_target(&proxy, Some(&hbone_target(&[])));
+    assert!(
+        no_peer_key.ends_with("|15008|10.0.0.7|"),
+        "an HBONE target without a peer tag has an empty peer segment: {no_peer_key}"
+    );
+}
+
 #[test]
 fn backend_capability_key_includes_tls_identity_fields() {
     let mut p1 = minimal_proxy();
@@ -2347,6 +2414,7 @@ fn make_upstream(id: &str, targets: Vec<UpstreamTarget>) -> Upstream {
         created_at: now,
         updated_at: now,
         k8s_service_uid: None,
+        admission_upstream_id: None,
         pending_limit_scope: None,
     }
 }
@@ -2447,6 +2515,20 @@ async fn h3_backend_tls_cold_miss_with_missing_ca_fails_closed() {
             .to_string()
             .starts_with("Failed to build HTTP/3 backend TLS config"),
         "{error}"
+    );
+    // #6773: the failure is typed as a gateway-internal fault, so the native-H3
+    // gRPC dispatch answers INTERNAL instead of UNAVAILABLE and keeps backend
+    // health neutral.
+    assert!(
+        error
+            .chain()
+            .any(|cause| cause.is::<ferrum_edge::connection_pool::BackendTlsConfigUnavailable>()),
+        "the TLS build failure must carry the typed marker: {error}"
+    );
+    assert!(ferrum_edge::http3::client::H3PoolError::pre_wire(error).is_gateway_internal());
+    assert!(
+        !ferrum_edge::http3::client::H3PoolError::pre_wire(anyhow::anyhow!("connection refused"))
+            .is_gateway_internal()
     );
     let cache = pool.backend_tls_config_cache();
     assert!(cache.is_empty());

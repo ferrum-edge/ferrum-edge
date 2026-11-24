@@ -14,7 +14,8 @@ Ferrum Edge is in active build-out with no deployed-user compatibility obligatio
 
 - Mesh behavior: `docs/mesh.md`, `src/modes/mesh/`, `.claude/rules/mesh.md` (plus `mesh-hbone-waypoint.md`,
   `mesh-capture-cni.md`, `mesh-k8s-controller.md`)
-- HTTP/3, WebSocket, QUIC, TCP/UDP: `docs/http3.md`, `docs/tcp_udp_proxy.md`, `src/proxy/`, `src/http3/`, `.claude/rules/proxy-protocols.md`
+- HTTP/3, WebSocket, QUIC, TCP/UDP: `docs/http3.md`, `docs/tcp_udp_proxy.md`, `src/proxy/`, `src/http3/`, `.claude/rules/proxy-protocols.md` (plus `connect-udp.md`,
+  `ktls.md`, `datagram-proxy-protocol.md`)
 - Plugin ordering/hooks: `docs/plugin_execution_order.md`, `src/plugins/mod.rs`, `.claude/rules/plugins.md`
 - Config/env/database: `docs/configuration.md`, `ferrum.conf`, `src/config/env_config.rs`, `.claude/rules/config-database.md`
 - Admin API/spec extraction: `docs/admin_api.md`, `docs/api_specs.md`, `openapi.yaml`, `.claude/rules/admin-api-specs.md`
@@ -92,13 +93,13 @@ Run the full local suite only for shared infrastructure, cross-module refactors,
 - Avoid per-request allocations and `format!()` in hot loops. Use thread-local buffers and precomputed indexes.
 - Rebuild `RouterCache`, `PluginCache`, `ConsumerIndex`, and `LoadBalancerCache` on reload, not per request.
 - Atomic config reload uses `ArcSwap`: in-flight requests see old or new config, never partial state.
-- Hot-path `DashMap` construction must use `crate::util::sharding::pool_shard_amount(env_config.pool_shard_amount)`.
+- Hot-path `DashMap` construction must use `crate::util::sharding::pool_shard_amount(env_config.pool_shard_amount)`. Exception: per-proxy passive-health maps (`ProxyHealthState.states`, `PassiveUnhealthyTargets`) use the fixed `health_check::PER_PROXY_PASSIVE_HEALTH_SHARD_AMOUNT` (8), since one pair exists per proxy (#7207).
 - Pool keys use `|` as delimiter. Include every field that affects constructed shared-client / connection behavior; exclude request-only policy and the deliberate `max_idle_per_host` tradeoff. Reqwest keys carry an inspectable `rcfg=…` client-behavior suffix.
 - Keep protocol correctness over shortcuts, especially HTTP/2/gRPC trailers, stream accounting, flow control, and WebSocket CONNECT behavior.
 
 ## Startup And Shutdown
 
-Startup order: jemalloc on non-Windows, CLI parse/env overrides, rustls crypto provider (ring, or AWS-LC FIPS on a `--features fips` build), external secret resolution on a single-threaded runtime, non-blocking tracing stdout, `validate` exit point, `overload::raise_fd_limit()`, `EnvConfig` parse, multi-threaded tokio, mode dispatch, SIGINT/SIGTERM via `watch::channel`.
+Startup order: jemalloc on non-Windows, CLI parse/env overrides, rustls crypto provider (ring, with the record-layer cipher suites chosen by CPU per `FERRUM_TLS_AEAD_BACKEND`; AWS-LC FIPS on a `--features fips` build), external secret resolution on a single-threaded runtime, non-blocking stdout/stderr tracing, `validate` exit point, `overload::raise_fd_limit()`, `EnvConfig` parse, multi-threaded tokio, mode dispatch, SIGINT/SIGTERM via `overload::ShutdownSender` (a second signal escalates).
 
 Serving modes initialize TLS policy, frontend/admin TLS, DTLS, backend TLS validation, CP/DP gRPC TLS, stream port validation, stream listener binds, DNS warmup, optional pool warmup, and overload monitoring. Stream listener bind is fatal in database/file mode and non-fatal in DP.
 

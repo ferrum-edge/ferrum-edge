@@ -22,6 +22,20 @@ pub const MIN_IDLE_PER_HOST: usize = 4;
 /// 1024 rarely help because the backend itself becomes the bottleneck.
 pub const MAX_IDLE_PER_HOST: usize = 1024;
 
+/// Default `max_idle_per_host` (issue #6793).
+///
+/// A ceiling reserves nothing: a pool keeps only the connections its own
+/// concurrency opened, and each expires after the idle timeout. It costs only
+/// when a backend's sustained concurrency exceeds it, and then every check-in
+/// beyond it drops a connection that is redialed. On the mesh runtime
+/// benchmark that cost about 2.5% of throughput and server CPU (64 at 100
+/// concurrent requests, 256 at 500), while 128 and 256 were indistinguishable
+/// from 1024 at 100, as was 256 at 250. 256 is the smallest ceiling that matched
+/// 1024 through 250 concurrent requests per backend; set
+/// `FERRUM_POOL_MAX_IDLE_PER_HOST` up to 1024 for higher sustained
+/// concurrency.
+pub const DEFAULT_IDLE_PER_HOST: usize = 256;
+
 /// Global connection pool configuration from environment variables or ferrum.conf.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolConfig {
@@ -82,11 +96,13 @@ pub struct PoolConfig {
     /// links. Measured on loopback the two are within noise for small
     /// responses.
     ///
-    /// Precedence is resolved at configuration load time: an explicit stream or
-    /// connection window override from env/`ferrum.conf` or a per-proxy field
-    /// auto-disables adaptive windowing when adaptive was not also set
-    /// explicitly, so operator-tuned fixed windows take effect. An explicit
-    /// adaptive choice remains authoritative.
+    /// The env/`ferrum.conf` layer needs no precedence pass: adaptive is off
+    /// unless `FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW` sets it, and that explicit
+    /// choice is authoritative. Per-proxy resolution does apply one: a
+    /// per-proxy stream or connection window override disables a globally
+    /// enabled adaptive window unless the proxy also sets
+    /// `pool_http2_adaptive_window`, so operator-tuned fixed windows take
+    /// effect.
     pub http2_adaptive_window: bool,
 
     /// Maximum HTTP/2 frame payload size in bytes.
@@ -105,7 +121,7 @@ pub struct PoolConfig {
 impl Default for PoolConfig {
     fn default() -> Self {
         Self {
-            max_idle_per_host: 64,
+            max_idle_per_host: DEFAULT_IDLE_PER_HOST,
             idle_timeout_seconds: 90,
             enable_http_keep_alive: true,
             enable_http2: true,
@@ -206,10 +222,6 @@ impl PoolConfig {
     /// ranged settings, fall inside the documented bounds.
     pub fn from_env_with_conf(conf: &ConfFile) -> Result<Self, String> {
         let mut config = Self::default();
-        // Track explicit operator intent separately from the shipped default so
-        // we never treat "value happens to equal the default" as an override.
-        let mut window_explicit = false;
-        let mut adaptive_explicit = false;
 
         if let Some(parsed) = optional_int::<usize>(
             conf,
@@ -296,7 +308,6 @@ impl PoolConfig {
                 ));
             }
             config.http2_initial_stream_window_size = parsed;
-            window_explicit = true;
         }
 
         if let Some(parsed) = optional_int::<u32>(
@@ -313,12 +324,10 @@ impl PoolConfig {
                 ));
             }
             config.http2_initial_connection_window_size = parsed;
-            window_explicit = true;
         }
 
         if let Some(parsed) = optional_bool(conf, "FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW")? {
             config.http2_adaptive_window = parsed;
-            adaptive_explicit = true;
         }
 
         if let Some(parsed) = optional_int::<u32>(
@@ -351,13 +360,6 @@ impl PoolConfig {
             }
             config.http2_max_concurrent_streams = Some(parsed);
         }
-
-        config.apply_adaptive_window_precedence(
-            window_explicit,
-            adaptive_explicit,
-            "global env/ferrum.conf",
-            true,
-        );
 
         // Advisory only: any valid u64 is accepted. Sub-10s is unusually low
         // next to the HTTP read timeout, but it is a deliberate operator value.
@@ -432,50 +434,28 @@ impl PoolConfig {
             config.http2_max_concurrent_streams = Some(val.max(1));
         }
 
-        // Resolve without an info log: `for_proxy` runs whenever a pool client /
-        // H2 builder is constructed, so logging here would spam under connection
-        // churn. Global env resolution logs once at startup; docs cover per-proxy.
-        config.apply_adaptive_window_precedence(
-            window_explicit,
-            adaptive_explicit,
-            proxy.id.as_str(),
-            false,
-        );
+        // Resolved without logging: `for_proxy` runs whenever a pool client /
+        // H2 builder is constructed, so logging here would spam under
+        // connection churn.
+        config.apply_adaptive_window_precedence(window_explicit, adaptive_explicit);
 
         config
     }
 
-    /// Resolve adaptive-vs-fixed H2 window precedence for one configuration layer.
+    /// Resolve adaptive-vs-fixed H2 window precedence for the per-proxy layer.
     ///
     /// Hyper/reqwest adaptive windowing overrides fixed initial window sizes.
-    /// When an operator sets an explicit stream/connection window at this layer
-    /// without also setting adaptive windowing explicitly, disable adaptive so
-    /// the fixed windows are not silently inert. An explicit adaptive choice at
-    /// the same layer remains authoritative.
+    /// When a proxy sets an explicit stream/connection window without also
+    /// setting adaptive windowing explicitly, disable an inherited adaptive
+    /// window so the fixed windows are not silently inert. An explicit
+    /// per-proxy adaptive choice remains authoritative.
     ///
-    /// Explicitness is represented by the caller (env/`Option` presence), never
-    /// inferred by comparing numeric values to shipped defaults. Resolution runs
-    /// at config load and when resolving proxy overrides for client construction
-    /// or pool-key generation. Per-proxy resolution performs no I/O or logging.
-    fn apply_adaptive_window_precedence(
-        &mut self,
-        window_explicit: bool,
-        adaptive_explicit: bool,
-        source: &str,
-        emit_info_log: bool,
-    ) {
+    /// Explicitness is `Option` presence on the proxy, never inferred by
+    /// comparing numeric values to shipped defaults. Resolution runs when
+    /// resolving proxy overrides for client construction or pool-key
+    /// generation and performs no I/O or logging.
+    fn apply_adaptive_window_precedence(&mut self, window_explicit: bool, adaptive_explicit: bool) {
         if window_explicit && !adaptive_explicit && self.http2_adaptive_window {
-            if emit_info_log {
-                tracing::info!(
-                    source = %source,
-                    stream_window = self.http2_initial_stream_window_size,
-                    connection_window = self.http2_initial_connection_window_size,
-                    "Explicit HTTP/2 window size override present without an explicit \
-                     adaptive_window setting; disabling http2_adaptive_window so fixed \
-                     windows take effect (set FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW / \
-                     pool_http2_adaptive_window to keep adaptive flow control)"
-                );
-            }
             self.http2_adaptive_window = false;
         }
     }
@@ -574,44 +554,5 @@ impl PoolConfig {
             let _ = write!(buf, ";sw{stream_window};cw{conn_window}");
         }
         let _ = write!(buf, ";mf{max_frame}");
-    }
-
-    /// Validate and clamp `max_idle_per_host` to the allowed range, logging
-    /// a warning when the value is adjusted.
-    ///
-    /// Global env/`ferrum.conf` parsing ([`Self::from_env_with_conf`]) rejects
-    /// out-of-range values instead of clamping. This helper remains for
-    /// non-env call sites that still want a defensive clamp.
-    pub fn validate_max_idle_per_host(value: usize, source: &str) -> usize {
-        if value < MIN_IDLE_PER_HOST {
-            tracing::warn!(
-                "{}",
-                crate::startup::sanitize_startup_cause(
-                    format!(
-                        "pool_max_idle_per_host=\"{value}\" for {source:?} is below the minimum \
-                         ({MIN_IDLE_PER_HOST}). Values this low cause excessive connection churn \
-                         under load, leading to high latency and errors. Clamping to \
-                         {MIN_IDLE_PER_HOST}."
-                    ),
-                    &[]
-                )
-            );
-            MIN_IDLE_PER_HOST
-        } else if value > MAX_IDLE_PER_HOST {
-            tracing::warn!(
-                "{}",
-                crate::startup::sanitize_startup_cause(
-                    format!(
-                        "pool_max_idle_per_host=\"{value}\" for {source:?} exceeds the maximum \
-                         ({MAX_IDLE_PER_HOST}). Very high values waste file descriptors and \
-                         memory without improving performance. Clamping to {MAX_IDLE_PER_HOST}."
-                    ),
-                    &[]
-                )
-            );
-            MAX_IDLE_PER_HOST
-        } else {
-            value
-        }
     }
 }

@@ -3,16 +3,24 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
+import shlex
 import sys
 import textwrap
-from pathlib import Path
-from verify_cross_build_policy import cargo_cache_branch_projection
+import tomllib
+from pathlib import Path, PurePosixPath
 
 from test_ci_policy_parallel import run_self_test as ci_policy_parallel_self_test
 from test_release_dispatch import run_self_test as release_dispatch_self_test
+from test_latest_trusted_scheduled_runs import (
+    run_self_test as latest_trusted_scheduled_runs_self_test,
+)
+from test_smoke_sqlite_volume import (
+    run_self_test as smoke_sqlite_volume_self_test,
+)
 from test_unit_ci import (
     check_repository as unit_ci_contract_errors,
     self_test as unit_ci_self_test,
@@ -37,6 +45,7 @@ from pr_ci_plan import (
     JOB_GATE_NAMES,
     UNCLASSIFIABLE_REASON,
     self_test as planner_self_test,
+    validate_doc_parity_inputs,
 )
 from validate_live_assertions import (
     run_self_test as live_assertion_validator_self_test,
@@ -49,6 +58,10 @@ from verify_coverage_workflow import (
 )
 from verify_mesh_performance_baselines_workflow import (
     main as mesh_baselines_workflow_main,
+)
+from verify_protocol_perf_regression_workflow import (
+    self_test as protocol_perf_workflow_self_test,
+    validate_repository_contract as protocol_perf_repository_contract,
 )
 from verify_main_latest_image_workflow import (
     main as main_latest_image_workflow_main,
@@ -77,6 +90,10 @@ from verify_release_image_attestations import (
 )
 from verify_release_image_attestations import (
     validate_release_workflow,
+)
+from verify_workflow_permissions import (
+    check_repository as workflow_permission_errors,
+    run_self_test as workflow_permissions_self_test,
 )
 from verify_ci_runtime_cache import (
     CANONICAL_MERGE_GROUP_BODY,
@@ -119,11 +136,10 @@ REQUIRED_JOBS = {
     "standalone-cargo",
 }
 
-# Every compile-based job is now path-gated by the PR planner: a job runs on
-# a pull request only when the planner proves a path it owns changed, and on
-# every push to `main` (the planner force-schedules every gate there). No job
-# remains that requires full mode without also naming its gate.
-DIRECT_FULL_CI_JOBS: set[str] = set()
+# Every compile-based job is path-gated by the PR planner (PATH_GATED_JOBS): a
+# job runs on a pull request only when the planner proves a path it owns
+# changed, and on every push to `main` (the planner force-schedules every gate
+# there).
 
 # Job -> planner output that schedules it. Several jobs share the broad
 # `run_rust` compile-and-test gate; the rest carry a narrow owner-path gate.
@@ -288,7 +304,10 @@ DEDICATED_REQUIRED_CHECKS = {
         # fail-closed step so a later change cannot keep the check name while
         # dropping a producer, and pin the planner-verdict guards so an
         # unusable relevance output cannot be reported as success.
+        # GHSA-cgg3-3m23-23gx: `FIPS Feature Policy` is not itself required,
+        # so the aggregate must need it and fail unless it succeeded.
         "needs": {
+            "feature-policy",
             "fips-plan",
             "fips-compile",
             "fips-claimed-checks",
@@ -297,6 +316,7 @@ DEDICATED_REQUIRED_CHECKS = {
             "fips-test",
         },
         "contract": {
+            "if: needs.feature-policy.result != 'success'",
             "if: needs.fips-plan.result != 'success'",
             "needs.fips-plan.result == 'success' && "
             "needs.fips-plan.outputs.relevant != 'true' && "
@@ -319,8 +339,11 @@ DEDICATED_REQUIRED_CHECKS = {
 # download and no toolchain step. Pin those properties structurally rather than
 # by substring alone.
 ARTIFACT_GATE_WORKFLOW = ".github/workflows/multicluster-federation-live.yml"
-ARTIFACT_GATE_DOWNLOAD_ACTION = (
-    "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
+# Any full-commit pin: the trusted action pin rotation check governs which
+# upstream release it is (docs/dependency-policy.md → "Automated action pin
+# rotation").
+ARTIFACT_GATE_DOWNLOAD_ACTION = re.compile(
+    r"(?m)^\s*(?:-\s+)?uses:\s+actions/download-artifact@[0-9a-f]{40}(?:\s+#.*)?$"
 )
 # The release-blocking `multicluster.*` ids, mirrored from the enforced,
 # non-deferred `multicluster-federation` rows of tests/conformance/ga_contract.yaml.
@@ -341,6 +364,48 @@ ARTIFACT_GATE_REQUIRED_IDS = {
     "multicluster.federation.trust_restored_recovers",
     "multicluster.eastwest.endpoint_blackhole_when_dest_down",
     "multicluster.eastwest.endpoint_recovers_when_dest_returns",
+}
+
+# Issue #7282: `Multicluster Poller Partition Live` publishes the same kind of
+# emitted-artifact gate, so it gets the same wiring proof. Its ids mirror the
+# `--require` list of its gate (and the DEDICATED_REQUIRED_CHECKS contract).
+POLLER_ARTIFACT_GATE_WORKFLOW = (
+    ".github/workflows/multicluster-poller-partition-live.yml"
+)
+POLLER_ARTIFACT_GATE_REQUIRED_IDS = {
+    "multicluster_poller.initial.polled_trust_endpoints_installed",
+    "multicluster_poller.transient.last_good_retained",
+    "multicluster_poller.transient.cache_age_increased",
+    "multicluster_poller.endpoint.expired_fail_closed",
+    "multicluster_poller.endpoint.remote_target_removed",
+    "multicluster_poller.endpoint.recovered_same_generation",
+    "multicluster_poller.trust.expired_fail_closed",
+    "multicluster_poller.trust.inbound_outbound_recomputed",
+    "multicluster_poller.trust.recovered_same_generation",
+    "multicluster_poller.metrics.failure_backoff_recovery_bounded",
+    "multicluster_poller.metrics.admin_status_parity",
+    "multicluster_poller.withdrawal.inflight_generation_retired",
+    "multicluster_poller.withdrawal.retired_state_not_reinstalled",
+}
+# workflow -> (release-contract ids, artifact steps that must be gated on the
+# summarize step's positive `validate` output).
+ARTIFACT_GATE_CONTRACTS = {
+    ARTIFACT_GATE_WORKFLOW: (
+        ARTIFACT_GATE_REQUIRED_IDS,
+        (
+            "name: Checkout Ferrum Edge",
+            "name: Download live assertion artifact",
+            "name: Validate emitted live assertion artifact",
+        ),
+    ),
+    POLLER_ARTIFACT_GATE_WORKFLOW: (
+        POLLER_ARTIFACT_GATE_REQUIRED_IDS,
+        (
+            "name: Checkout validator",
+            "name: Download emitted evidence",
+            "name: Validate exact poller boundary contract",
+        ),
+    ),
 }
 
 DEDICATED_WORKFLOW_NAMES = {
@@ -434,13 +499,47 @@ MERGE_GROUP_CONCURRENCY_MARKERS = (
     "merge_group.head_sha",
 )
 
+_TEST_JOB_RE = re.compile(r"(?ms)^  test:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)")
+_JOB_NEEDS_LIST_RE = re.compile(r"(?m)^    needs:\n(?P<needs>(?:^      - [^\n]+\n)+)")
+_JOB_NEEDS_FLOW_RE = re.compile(
+    r"(?m)^    needs: \["
+    r"(?P<needs>[A-Za-z0-9_-]+(?:, [A-Za-z0-9_-]+)*)"
+    r"\]$"
+)
+_JOB_NEEDS_SCALAR_RE = re.compile(r"(?m)^    needs: ([A-Za-z0-9_-]+)$")
+_TOP_LEVEL_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+:")
+_EVENT_KEY_RE = re.compile(r"^  [A-Za-z0-9_-]+:")
+_PATHS_FILTER_RE = re.compile(r"(?m)^    paths(?:-ignore)?:")
+_JOB_IF_ALWAYS_RE = re.compile(r"(?m)^    if: always\(\)$")
+_MERGE_GROUP_FILTER_RE = re.compile(r"(?m)^    (?:branches(?:-ignore)?|paths(?:-ignore)?):")
+_BINARY_MATRIX_SCRIPT_RE = re.compile(
+    r"python3 - <<'PY' >> \"\$GITHUB_OUTPUT\"\n(?P<script>.*?)^          PY\n",
+    re.M | re.S,
+)
+_PUSH_FILTER_RE = re.compile(r"(?m)^    (?:branches-ignore|paths|paths-ignore):")
+_PUSH_BRANCHES_RE = re.compile(r"(?m)^    branches:\n(?P<branches>(?:^      - [^\n]+\n?)+)")
+_WORKFLOW_NAME_RE = re.compile(r"(?m)^name: ([^\n]+)$")
+_REQUIRE_ASSERTION_RE = re.compile(r"--require\s+(\S+)")
+_RUNS_ON_UBUNTU_RE = re.compile(r"(?m)^    runs-on: ubuntu-26.04$")
+_CONTENTS_WRITE_RE = re.compile(r"(?m)^\s+contents:\s+write\s*$")
+_TRUSTED_ACTION_ARCHIVE_RE = re.compile(
+    r'(?m)^\s*git archive --format=tar --output="\$archive" '
+    r'"\$trusted_ref" -- "\$action_dir"\s*$'
+)
+_TRUSTED_ACTION_VERIFIER_RE = re.compile(
+    r'(?m)^\s*python3 -I "\$verifier" --action-path "\$action_dir" '
+    r'--trusted-archive "\$archive"\s*$'
+)
+_PROPOSED_CHART_CHECKER_RUN_RE = re.compile(r'(?m)^\s*python3 -I "\$proposed"\s*$')
+_CHART_CHECKER_RUN_RE = re.compile(r'(?m)^\s*python3 -I "\$checker"\s*$')
+
 def extract_test_needs(ci_yml: str) -> set[str]:
-    match = re.search(r"(?ms)^  test:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)", ci_yml)
+    match = _TEST_JOB_RE.search(ci_yml)
     if not match:
         raise RuntimeError("could not find jobs.test in ci.yml")
 
     body = match.group("body")
-    needs_match = re.search(r"(?m)^    needs:\n(?P<needs>(?:^      - [^\n]+\n)+)", body)
+    needs_match = _JOB_NEEDS_LIST_RE.search(body)
     if not needs_match:
         raise RuntimeError("could not find jobs.test.needs in ci.yml")
 
@@ -462,9 +561,7 @@ def extract_job_body(ci_yml: str, job: str) -> str:
 
 
 def extract_job_needs(job_body: str) -> set[str]:
-    list_match = re.search(
-        r"(?m)^    needs:\n(?P<needs>(?:^      - [^\n]+\n)+)", job_body
-    )
+    list_match = _JOB_NEEDS_LIST_RE.search(job_body)
     if list_match:
         return {
             line.strip().removeprefix("- ").strip()
@@ -472,16 +569,11 @@ def extract_job_needs(job_body: str) -> set[str]:
             if line.strip().startswith("- ")
         }
 
-    inline_match = re.search(
-        r"(?m)^    needs: \["
-        r"(?P<needs>[A-Za-z0-9_-]+(?:, [A-Za-z0-9_-]+)*)"
-        r"\]$",
-        job_body,
-    )
+    inline_match = _JOB_NEEDS_FLOW_RE.search(job_body)
     if inline_match:
         return set(inline_match.group("needs").split(", "))
 
-    scalar_match = re.search(r"(?m)^    needs: ([A-Za-z0-9_-]+)$", job_body)
+    scalar_match = _JOB_NEEDS_SCALAR_RE.search(job_body)
     if scalar_match:
         return {scalar_match.group(1)}
     return set()
@@ -506,7 +598,7 @@ def workflow_event_body(workflow_yml: str, event: str) -> str | None:
         (
             index
             for index in range(on_start + 1, len(lines))
-            if re.match(r"^[A-Za-z0-9_-]+:", lines[index])
+            if _TOP_LEVEL_KEY_RE.match(lines[index])
         ),
         len(lines),
     )
@@ -524,7 +616,7 @@ def workflow_event_body(workflow_yml: str, event: str) -> str | None:
         (
             index
             for index in range(event_start + 1, on_end)
-            if re.match(r"^  [A-Za-z0-9_-]+:", lines[index])
+            if _EVENT_KEY_RE.match(lines[index])
         ),
         on_end,
     )
@@ -538,7 +630,7 @@ def pull_request_trigger_is_unconditional(workflow_yml: str) -> bool:
         body = workflow_event_body(workflow_yml, "pull_request_target")
         if body is None:
             return False
-    return not re.search(r"(?m)^    paths(?:-ignore)?:", body)
+    return not _PATHS_FILTER_RE.search(body)
 
 
 def optional_live_suite_trigger_errors(
@@ -621,7 +713,7 @@ def check_optional_live_suite_aggregate(
             f"{workflow_path} jobs.{job} must keep the always-reporting "
             f"aggregate `{expected_name}`"
         )
-    if not re.search(r"(?m)^    if: always\(\)$", body):
+    if not _JOB_IF_ALWAYS_RE.search(body):
         errors.append(
             f"{workflow_path} jobs.{job} aggregate must run with if: always()"
         )
@@ -692,7 +784,7 @@ def merge_group_trigger_is_present(workflow_yml: str) -> bool:
     body = workflow_event_body(workflow_yml, "merge_group")
     if body is None:
         return False
-    if re.search(r"(?m)^    (?:branches(?:-ignore)?|paths(?:-ignore)?):", body):
+    if _MERGE_GROUP_FILTER_RE.search(body):
         return False
     return True
 
@@ -709,11 +801,7 @@ def extract_binary_matrix_script(ci_yml: str) -> str:
     """Return the ci-plan Python that selects the native binary matrix."""
 
     body = extract_job_body(ci_yml, "ci-plan")
-    match = re.search(
-        r"python3 - <<'PY' >> \"\$GITHUB_OUTPUT\"\n(?P<script>.*?)^          PY\n",
-        body,
-        flags=re.M | re.S,
-    )
+    match = _BINARY_MATRIX_SCRIPT_RE.search(body)
     if not match:
         raise RuntimeError("could not find jobs.ci-plan binary-matrix script")
     return textwrap.dedent(match.group("script"))
@@ -778,9 +866,6 @@ def native_binary_compile_gate_self_test() -> list[str]:
         failures.append("push-to-main verification must build Linux x86_64 only")
 
     build_body = extract_job_body(ci_yml, "build-binaries")
-    build_body = cargo_cache_branch_projection(build_body)
-    build_body = re.sub(r'(?m)^(        )run: \|\n          (cargo [^\n]+)\n',
-                        r'\1run: \2\n', build_body)
     macos_check_gate = (
         "- name: Check merge-group macOS target\n"
         "        if: github.event_name == 'merge_group' && runner.os == 'macOS'\n"
@@ -803,31 +888,6 @@ def native_binary_compile_gate_self_test() -> list[str]:
         failures.append("CI must not compile production release binaries")
     if 'shared-key: "build-${{ matrix.target }}-prbuild"' not in build_body:
         failures.append("CI verification must use the prbuild cache namespace")
-    if "./.github/actions/setup-sccache" not in build_body:
-        failures.append(
-            "jobs.build-binaries must install sccache via the pinned repository action"
-        )
-    if '"${FERRUM_SCCACHE_BIN}" --show-stats' not in build_body:
-        failures.append(
-            "jobs.build-binaries must report pinned sccache --show-stats telemetry"
-        )
-    # Issue #6282: an installer failure leaves FERRUM_SCCACHE_BIN empty while
-    # Cargo builds uncached, so the statistics step must be guarded and best
-    # effort rather than failing an otherwise successful build.
-    stats_guard = (
-        '          if [ -n "${FERRUM_SCCACHE_BIN:-}" ]; then\n'
-        '            "${FERRUM_SCCACHE_BIN}" --show-stats || echo '
-        '"::warning::sccache statistics were unavailable"\n'
-    )
-    if stats_guard not in build_body:
-        failures.append(
-            "jobs.build-binaries sccache statistics must be guarded on a non-empty "
-            "FERRUM_SCCACHE_BIN and be best effort (#6282)"
-        )
-    if "run: '\"${FERRUM_SCCACHE_BIN}\" --show-stats'" in build_body:
-        failures.append(
-            "jobs.build-binaries must not run unguarded sccache --show-stats (#6282)"
-        )
     return failures
 
 
@@ -1505,12 +1565,9 @@ def main_push_trigger_is_unconditional(workflow_yml: str) -> bool:
     body = workflow_event_body(workflow_yml, "push")
     if body is None:
         return False
-    if re.search(r"(?m)^    (?:branches-ignore|paths|paths-ignore):", body):
+    if _PUSH_FILTER_RE.search(body):
         return False
-    branches = re.search(
-        r"(?m)^    branches:\n(?P<branches>(?:^      - [^\n]+\n?)+)",
-        body,
-    )
+    branches = _PUSH_BRANCHES_RE.search(body)
     if not branches:
         return False
     configured = {
@@ -1522,7 +1579,7 @@ def main_push_trigger_is_unconditional(workflow_yml: str) -> bool:
 
 
 def workflow_has_exact_name(workflow_yml: str, expected: str) -> bool:
-    names = re.findall(r"(?m)^name: ([^\n]+)$", workflow_yml)
+    names = _WORKFLOW_NAME_RE.findall(workflow_yml)
     if len(names) != 1:
         return False
     actual = names[0].strip()
@@ -1534,7 +1591,7 @@ def workflow_has_exact_name(workflow_yml: str, expected: str) -> bool:
 def extract_required_assertion_ids(gate_body: str) -> set[str]:
     """Return the `--require <id>` arguments the artifact gate passes."""
 
-    return set(re.findall(r"--require\s+(\S+)", gate_body))
+    return set(_REQUIRE_ASSERTION_RE.findall(gate_body))
 
 
 def validate_artifact_gate_wiring() -> list[str]:
@@ -1548,13 +1605,68 @@ def validate_artifact_gate_wiring() -> list[str]:
     """
 
     errors: list[str] = []
-    workflow_yml = Path(ARTIFACT_GATE_WORKFLOW).read_text(encoding="utf-8")
-    gate_body = extract_job_body(workflow_yml, "gate")
+    for workflow_path, (required, step_markers) in sorted(
+        ARTIFACT_GATE_CONTRACTS.items()
+    ):
+        workflow_yml = Path(workflow_path).read_text(encoding="utf-8")
+        errors.extend(
+            artifact_gate_wiring_errors(
+                workflow_path,
+                extract_job_body(workflow_yml, "gate"),
+                required,
+                step_markers,
+            )
+        )
+    return errors
 
-    if ARTIFACT_GATE_DOWNLOAD_ACTION not in gate_body:
+
+def artifact_gate_wiring_self_test() -> list[str]:
+    """Each emitted-artifact gate rejects a dropped id and a dropped download."""
+
+    failures: list[str] = []
+    for workflow_path, (required, step_markers) in sorted(
+        ARTIFACT_GATE_CONTRACTS.items()
+    ):
+        gate_body = extract_job_body(
+            Path(workflow_path).read_text(encoding="utf-8"), "gate"
+        )
+        dropped_id = sorted(required)[0]
+        for label, mutated in (
+            ("a dropped release-contract id", gate_body.replace(
+                f"--require {dropped_id}", "", 1
+            )),
+            ("a dropped artifact download", gate_body.replace(
+                "actions/download-artifact@", "actions/download-artifacts@", 1
+            )),
+        ):
+            if mutated == gate_body:
+                failures.append(
+                    f"artifact gate self-test fixture for {workflow_path} "
+                    f"({label}) did not alter the gate"
+                )
+            elif not artifact_gate_wiring_errors(
+                workflow_path, mutated, required, step_markers
+            ):
+                failures.append(
+                    f"{workflow_path} artifact gate accepted {label}"
+                )
+    return failures
+
+
+def artifact_gate_wiring_errors(
+    workflow_path: str,
+    gate_body: str,
+    required_contract_ids: set[str],
+    step_markers: tuple[str, ...],
+) -> list[str]:
+    """Wiring errors for one workflow's emitted-artifact `gate` job."""
+
+    errors: list[str] = []
+
+    if ARTIFACT_GATE_DOWNLOAD_ACTION.search(gate_body) is None:
         errors.append(
-            f"{ARTIFACT_GATE_WORKFLOW} jobs.gate must download the published live "
-            f"artifact with the pinned `{ARTIFACT_GATE_DOWNLOAD_ACTION}`"
+            f"{workflow_path} jobs.gate must download the published live "
+            "artifact with a full-commit-pinned `actions/download-artifact`"
         )
 
     # The gate must stay free of any build/toolchain step so the trusted build
@@ -1562,7 +1674,7 @@ def validate_artifact_gate_wiring() -> list[str]:
     for forbidden in ("cargo ", "setup-rust", "rustup", "docker build", "kind "):
         if forbidden in gate_body:
             errors.append(
-                f"{ARTIFACT_GATE_WORKFLOW} jobs.gate must not run `{forbidden.strip()}`; "
+                f"{workflow_path} jobs.gate must not run `{forbidden.strip()}`; "
                 "the aggregate gate carries no build or toolchain surface"
             )
 
@@ -1571,11 +1683,11 @@ def validate_artifact_gate_wiring() -> list[str]:
         errors.append(f"{validator} must exist; it is the emitted-artifact gate")
 
     required_ids = extract_required_assertion_ids(gate_body)
-    if required_ids != ARTIFACT_GATE_REQUIRED_IDS:
-        missing = sorted(ARTIFACT_GATE_REQUIRED_IDS - required_ids)
-        unexpected = sorted(required_ids - ARTIFACT_GATE_REQUIRED_IDS)
+    if required_ids != required_contract_ids:
+        missing = sorted(required_contract_ids - required_ids)
+        unexpected = sorted(required_ids - required_contract_ids)
         errors.append(
-            f"{ARTIFACT_GATE_WORKFLOW} jobs.gate must require exactly the "
+            f"{workflow_path} jobs.gate must require exactly the "
             f"release-contract assertion ids (missing: {missing}, "
             f"unexpected: {unexpected})"
         )
@@ -1583,25 +1695,444 @@ def validate_artifact_gate_wiring() -> list[str]:
     # Every artifact step must be reached only through the positively
     # established relevant-and-successful path, so an irrelevant pull request
     # never tries to download an artifact that was never produced.
-    for step_marker in (
-        "name: Checkout Ferrum Edge",
-        "name: Download live assertion artifact",
-        "name: Validate emitted live assertion artifact",
-    ):
+    for step_marker in step_markers:
         index = gate_body.find(step_marker)
         if index < 0:
             errors.append(
-                f"{ARTIFACT_GATE_WORKFLOW} jobs.gate is missing step `{step_marker}`"
+                f"{workflow_path} jobs.gate is missing step `{step_marker}`"
             )
             continue
         following = gate_body[index : index + 400]
         if "if: steps.summarize.outputs.validate == 'true'" not in following:
             errors.append(
-                f"{ARTIFACT_GATE_WORKFLOW} jobs.gate step `{step_marker}` must be "
+                f"{workflow_path} jobs.gate step `{step_marker}` must be "
                 "gated on the summarize step's `validate` output"
             )
 
     return errors
+
+
+# Checked-in files a job reads from the checkout: scripts, configs, manifests,
+# lockfiles and sources under `.github/scripts/` and `tests/`. Paths under
+# `target/` (build outputs) and `ci_results/` (files the job writes) are
+# produced by the run itself and are not inputs.
+_WORKFLOW_INPUT_PATH_RE = re.compile(
+    r"(?:\.github/scripts|tests)/[A-Za-z0-9._/-]+"
+    r"\.(?:ya?ml|json|py|sh|toml|lock|rs)\b"
+)
+_WORKFLOW_GENERATED_PATH_PARTS = ("/target/", "/ci_results/")
+# `[cd <dir> &&] cargo <build|bench|run|test> <args>` on one shell line.
+_CARGO_INVOCATION_RE = re.compile(
+    r"(?:\bcd\s+(?P<dir>[A-Za-z0-9._/-]+)\s*&&\s*)?"
+    r"\bcargo\s+(?:build|bench|run|test)\b(?P<args>[^\n;&|]*)"
+)
+_CARGO_TARGET_FLAGS = {"--bin": "bin", "--bench": "bench"}
+PERFORMANCE_GATEWAY_FIXTURE_TEST = (
+    "tests/unit/config/performance_regression_gateway_config_tests.rs"
+)
+_FILE_CONFIG_PATH_RE = re.compile(r'FERRUM_FILE_CONFIG_PATH="\$\(pwd\)/([^"]+)"')
+
+
+def _is_workflow_input(relative: str) -> bool:
+    return not any(part in relative for part in _WORKFLOW_GENERATED_PATH_PARTS)
+
+
+def _named_inputs(text: str) -> set[str]:
+    return {
+        relative
+        for relative in _WORKFLOW_INPUT_PATH_RE.findall(text)
+        if _is_workflow_input(relative)
+    }
+
+
+def _cargo_target_inputs(text: str, root: Path) -> set[str]:
+    """Manifests, lockfiles and target sources the cargo calls in `text` need.
+
+    A cargo call reads its manifest, the committed `Cargo.lock` beside it and
+    the source file of every `--bin` / `--bench` target it names, and the
+    command line never has to spell any of them out:
+    `cd tests/performance && cargo build --release --bin backend_server`.
+    The target source comes from the manifest's `[[bin]]` / `[[bench]]` table
+    or from Cargo's default layout. A manifest path built from a shell
+    variable names a copy the script makes at run time, not a checkout file,
+    so it is skipped.
+    """
+
+    inputs: set[str] = set()
+    for match in _CARGO_INVOCATION_RE.finditer(text):
+        raw_args = match.group("args")
+        try:
+            args = shlex.split(raw_args)
+        except ValueError:
+            args = raw_args.split()
+        manifest: str | None = None
+        targets: list[tuple[str, str]] = []
+        index = 0
+        while index < len(args):
+            arg = args[index]
+            value = args[index + 1] if index + 1 < len(args) else None
+            if arg == "--manifest-path" and value is not None:
+                manifest = value
+                index += 2
+                continue
+            if arg.startswith("--manifest-path="):
+                manifest = arg.split("=", 1)[1]
+            elif (
+                arg in _CARGO_TARGET_FLAGS
+                and value is not None
+                and not value.startswith("-")
+            ):
+                targets.append((_CARGO_TARGET_FLAGS[arg], value))
+                index += 2
+                continue
+            index += 1
+        if manifest is None:
+            directory = match.group("dir")
+            manifest = f"{directory}/Cargo.toml" if directory else "Cargo.toml"
+        if "$" in manifest:
+            continue
+        manifest = manifest.removeprefix("./")
+        base = PurePosixPath(manifest).parent
+        inputs.add(manifest)
+        inputs.add((base / "Cargo.lock").as_posix())
+        try:
+            data = tomllib.loads((root / manifest).read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+            # A missing manifest is already reported; cargo itself rejects a
+            # malformed one.
+            continue
+        package = data.get("package", {}).get("name")
+        for kind, name in targets:
+            declared = next(
+                (
+                    entry.get("path")
+                    for entry in data.get(kind, [])
+                    if isinstance(entry, dict) and entry.get("name") == name
+                ),
+                None,
+            )
+            if declared is None:
+                if kind == "bin":
+                    declared = "src/main.rs" if name == package else f"src/bin/{name}.rs"
+                else:
+                    declared = f"benches/{name}.rs"
+            inputs.add((base / declared).as_posix())
+    return inputs
+
+
+def _python_import_inputs(script: str, root: Path) -> set[str]:
+    """Sibling modules a checked-in Python script imports.
+
+    The scripts the performance job runs import only the standard library and
+    modules from their own directory. Any other top-level import must resolve
+    to a sibling `<name>.py` or `<name>/__init__.py`, so deleting one fails
+    here instead of as an `ImportError` in the scheduled run.
+    """
+
+    try:
+        tree = ast.parse((root / script).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, SyntaxError):
+        return set()
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            names.add(node.module.split(".")[0])
+    base = PurePosixPath(script).parent
+    inputs: set[str] = set()
+    for name in names:
+        if name in sys.stdlib_module_names:
+            continue
+        package_init = base / name / "__init__.py"
+        if (root / package_init).is_file():
+            inputs.add(package_init.as_posix())
+        else:
+            inputs.add((base / f"{name}.py").as_posix())
+    return inputs
+
+
+def workflow_inputs(job_body: str, root: Path) -> set[str]:
+    """Every checked-in file a job reads, directly or one step removed.
+
+    - Paths the job body names.
+    - Paths named by the shell scripts the job runs (one hop).
+    - Each cargo call's manifest, lockfile and `--bin` / `--bench` source,
+      both in the job body and in those shell scripts.
+    - The sibling modules every collected Python script imports.
+
+    Files the Python verifiers locate from their own repository-root
+    constants are not listed here. `main()` runs those verifiers' contract
+    checks against the checkout instead.
+    """
+
+    inputs = _named_inputs(job_body)
+    texts = [job_body]
+    for script in sorted(relative for relative in inputs if relative.endswith(".sh")):
+        try:
+            text = (root / script).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        texts.append(text)
+        inputs.update(_named_inputs(text))
+    for text in texts:
+        inputs.update(_cargo_target_inputs(text, root))
+    for script in sorted(relative for relative in inputs if relative.endswith(".py")):
+        inputs.update(_python_import_inputs(script, root))
+    return inputs
+
+
+def missing_workflow_inputs(job_body: str, root: Path) -> list[str]:
+    """Return the checked-in files a job reads that do not exist.
+
+    `performance-regression.yml` runs only on its daily schedule and on manual
+    dispatch, never on a pull request. A pull request that deletes a file the
+    job reads therefore goes green, and the next scheduled run fails instead.
+    #7300 deleted `tests/performance/perf_config.yaml` as dead while the job's
+    "Start gateway" step still loaded it. Every scheduled run from 2026-11-12
+    then failed with `Configuration file not found`. Checking here moves that
+    failure onto the pull request that removes the file, including inputs the
+    job reaches only through a manifest, a script or an import
+    (`workflow_inputs`).
+
+    This checks existence only. Whether the gateway config still loads is
+    covered by `PERFORMANCE_GATEWAY_FIXTURE_TEST`.
+    """
+
+    return sorted(
+        relative
+        for relative in workflow_inputs(job_body, root)
+        if not (root / relative).is_file()
+    )
+
+
+def performance_gateway_fixture_errors(job_body: str, test_source: str) -> list[str]:
+    """The gateway config the job starts from is the one the Rust test loads."""
+
+    paths = _FILE_CONFIG_PATH_RE.findall(job_body)
+    if len(paths) != 1:
+        return [
+            "jobs.performance-regression must start its gateway from exactly one "
+            'FERRUM_FILE_CONFIG_PATH="$(pwd)/<checked-in file>"'
+        ]
+    if f'"/{paths[0]}"' not in test_source:
+        return [
+            f"jobs.performance-regression starts its gateway from {paths[0]}, but "
+            f"{PERFORMANCE_GATEWAY_FIXTURE_TEST} does not load that file through "
+            "the file loader; point the test at the file the workflow uses"
+        ]
+    return []
+
+
+def missing_workflow_inputs_self_test() -> list[str]:
+    """Each input class is required, and generated paths are ignored."""
+
+    import tempfile
+
+    failures: list[str] = []
+    job_body = textwrap.dedent(
+        """\
+        steps:
+          - run: python3 .github/scripts/verify_contract.py --self-test
+          - run: cargo bench --manifest-path tests/performance/mesh/Cargo.toml --bench rr_selection
+          - run: bash .github/scripts/run_compare.sh
+          - run: |
+              cargo build --profile ci-release --bin ferrum-edge
+              cd tests/performance && cargo build --release --bin backend_server
+          - run: |
+              FERRUM_FILE_CONFIG_PATH="$(pwd)/tests/fixtures/gateway.yaml" \\
+              ./target/ci-release/ferrum-edge run
+          - run: |
+              python3 tests/performance/ci_overhead_bench.py \\
+                --output tests/performance/ci_results/overhead_results.json
+              ls tests/performance/mesh/target/criterion/fixture.json
+        """
+    )
+    tree = {
+        "Cargo.toml": (
+            '[package]\nname = "ferrum-edge"\n\n'
+            '[[bin]]\nname = "ferrum-edge"\npath = "src/main.rs"\n'
+        ),
+        "Cargo.lock": "",
+        "src/main.rs": "",
+        "tests/performance/Cargo.toml": (
+            '[package]\nname = "backend_server"\n\n'
+            '[[bin]]\nname = "backend_server"\npath = "backend_server.rs"\n'
+        ),
+        "tests/performance/Cargo.lock": "",
+        "tests/performance/backend_server.rs": "",
+        "tests/performance/ci_overhead_bench.py": "import json\n",
+        "tests/performance/mesh/Cargo.toml": (
+            '[package]\nname = "mesh"\n\n'
+            '[[bench]]\nname = "rr_selection"\nharness = false\n'
+        ),
+        "tests/performance/mesh/Cargo.lock": "",
+        "tests/performance/mesh/benches/rr_selection.rs": "",
+        "tests/fixtures/gateway.yaml": "",
+        ".github/scripts/verify_contract.py": "import sys\nfrom pathlib import Path\n",
+        ".github/scripts/run_compare.sh": (
+            "python3 .github/scripts/compare_helper.py\n"
+            'cargo bench --manifest-path "$SRC/tests/performance/mesh/Cargo.toml" '
+            "--bench rr_selection --no-run\n"
+        ),
+        ".github/scripts/compare_helper.py": "import json\nfrom compare_lib import load\n",
+        ".github/scripts/compare_lib.py": "",
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        for relative, content in tree.items():
+            (root / relative).parent.mkdir(parents=True, exist_ok=True)
+            (root / relative).write_text(content, encoding="utf-8")
+        missing = missing_workflow_inputs(job_body, root)
+        if missing:
+            failures.append(
+                "workflow input self-test reported inputs that exist or are "
+                f"generated by the job: {missing}"
+            )
+        expected_inputs = set(tree)
+        found = workflow_inputs(job_body, root)
+        if found != expected_inputs:
+            failures.append(
+                "workflow input self-test collected the wrong input set "
+                f"(missing: {sorted(expected_inputs - found)}, "
+                f"unexpected: {sorted(found - expected_inputs)})"
+            )
+        # Deleting any one input, whether named or reached through a
+        # manifest, a script or an import, is reported, and nothing else is.
+        for relative in sorted(tree):
+            path = root / relative
+            content = path.read_text(encoding="utf-8")
+            path.unlink()
+            missing = missing_workflow_inputs(job_body, root)
+            path.write_text(content, encoding="utf-8")
+            if missing != [relative]:
+                failures.append(
+                    f"workflow input self-test expected exactly {relative} to be "
+                    f"reported once deleted, got {missing}"
+                )
+
+    test_source = (
+        'const CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), '
+        '"/tests/fixtures/gateway.yaml");\n'
+    )
+    if performance_gateway_fixture_errors(job_body, test_source):
+        failures.append(
+            "gateway fixture parity self-test rejected a test that loads the "
+            "workflow's config"
+        )
+    if not performance_gateway_fixture_errors(
+        job_body, test_source.replace("gateway.yaml", "other.yaml")
+    ):
+        failures.append(
+            "gateway fixture parity self-test accepted a test that loads a "
+            "different file than the workflow"
+        )
+    return failures
+
+
+PKCS11_JOB = "test-pkcs11-softhsm"
+PKCS11_PRECOMPILE_STEP = "Precompile PKCS#11 signer and pairing test binaries"
+PKCS11_SIGNER_STEP = "Run PKCS#11 signer smoke test"
+PKCS11_PAIRING_STEP = "Run PKCS#11 certificate-pairing tests"
+# Both PKCS#11 libtest binaries are built before either filter runs, one Cargo
+# invocation each. In a single invocation the library test harness and the
+# plain library that unit_tests links compile side by side, and that pair of
+# whole-crate rustc runs has exhausted the hosted runner. The step's executable
+# lines (comments and blank lines aside) are pinned exactly, so an appended
+# target, a commented or echoed build, or a suppressed failure is rejected.
+PKCS11_PRECOMPILE_LINES = (
+    f"- name: {PKCS11_PRECOMPILE_STEP}",
+    "run: |",
+    "set -euo pipefail",
+    "cargo test --features pkcs11 --lib --no-run",
+    "cargo test --features pkcs11 --test unit_tests --no-run",
+    "env:",
+    "RUST_BACKTRACE: 1",
+)
+_WORKFLOW_STEP_BOUNDARY_RE = re.compile(r"(?m)^(?=      - )")
+
+
+def _executable_step_lines(step: str) -> list[str]:
+    return [
+        line.strip()
+        for line in step.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+
+def pkcs11_precompile_errors(ci_yml: str) -> list[str]:
+    """Require the PKCS#11 binaries to be built, separately, before any filter."""
+
+    try:
+        steps = _WORKFLOW_STEP_BOUNDARY_RE.split(extract_job_body(ci_yml, PKCS11_JOB))
+    except RuntimeError as error:
+        return [str(error)]
+    positions: dict[str, list[int]] = {}
+    for index, step in enumerate(steps):
+        for name in (PKCS11_PRECOMPILE_STEP, PKCS11_SIGNER_STEP, PKCS11_PAIRING_STEP):
+            if step.startswith(f"      - name: {name}\n"):
+                positions.setdefault(name, []).append(index)
+    precompile = positions.get(PKCS11_PRECOMPILE_STEP, [])
+    signer = positions.get(PKCS11_SIGNER_STEP, [])
+    pairing = positions.get(PKCS11_PAIRING_STEP, [])
+    if not (
+        len(precompile) == len(signer) == len(pairing) == 1
+        and precompile[0] < signer[0] < pairing[0]
+        and _executable_step_lines(steps[precompile[0]]) == list(PKCS11_PRECOMPILE_LINES)
+    ):
+        return [
+            f"jobs.{PKCS11_JOB} must precompile the pkcs11 lib harness and the "
+            "unit_tests binary, one Cargo invocation each under "
+            "`set -euo pipefail`, before running either filter"
+        ]
+    return []
+
+
+def pkcs11_precompile_self_test(ci_yml: str) -> list[str]:
+    """Mutations of the real workflow that must fail the PKCS#11 contract."""
+
+    failures: list[str] = []
+    if pkcs11_precompile_errors(ci_yml):
+        return failures  # The repository check itself reports the failure.
+    lib_build = "          cargo test --features pkcs11 --lib --no-run\n"
+    unit_build = "          cargo test --features pkcs11 --test unit_tests --no-run\n"
+    body = extract_job_body(ci_yml, PKCS11_JOB)
+    steps = _WORKFLOW_STEP_BOUNDARY_RE.split(body)
+    precompile = next(
+        step for step in steps
+        if step.startswith(f"      - name: {PKCS11_PRECOMPILE_STEP}\n")
+    )
+    signer = next(
+        step for step in steps
+        if step.startswith(f"      - name: {PKCS11_SIGNER_STEP}\n")
+    )
+    reordered_body = body.replace(precompile, "", 1).replace(signer, signer + precompile, 1)
+    mutations = {
+        "combined invocation": (
+            lib_build + unit_build,
+            "          cargo test --features pkcs11 --lib --test unit_tests --no-run\n",
+        ),
+        "appended unit_tests target": (
+            lib_build,
+            "          cargo test --features pkcs11 --lib --no-run --test unit_tests\n",
+        ),
+        "commented lib build": (lib_build, "          # cargo test --features pkcs11 --lib --no-run\n"),
+        "echoed unit build": (unit_build, "          echo cargo test --features pkcs11 --test unit_tests --no-run\n"),
+        "suppressed failure": (unit_build, unit_build.rstrip("\n") + " || true\n"),
+        "missing pipefail": ("          set -euo pipefail\n          cargo test --features pkcs11 --lib", "          cargo test --features pkcs11 --lib"),
+        "disabled step": (
+            f"      - name: {PKCS11_PRECOMPILE_STEP}\n",
+            f"      - name: {PKCS11_PRECOMPILE_STEP}\n        if: false\n",
+        ),
+        "precompile after signer": (body, reordered_body),
+    }
+    for label, (before, after) in mutations.items():
+        if before not in ci_yml:
+            failures.append(f"PKCS#11 precompile self-test fixture is stale: {label}")
+            continue
+        if not pkcs11_precompile_errors(ci_yml.replace(before, after, 1)):
+            failures.append(f"PKCS#11 precompile contract accepted mutation: {label}")
+    return failures
 
 
 def main() -> int:
@@ -1637,23 +2168,9 @@ def main() -> int:
     planner_errors.extend(unit_ci_contract_errors())
     planner_errors.extend(unit_ci_self_test())
 
-    pkcs11_body = extract_job_body(ci_yml, "test-pkcs11-softhsm")
-    pkcs11_precompile = "Precompile PKCS#11 signer and pairing test binaries"
-    pkcs11_signer = "Run PKCS#11 signer smoke test"
-    pkcs11_pairing = "Run PKCS#11 certificate-pairing tests"
-    if not (
-        pkcs11_body.count(
-            "cargo test --features pkcs11 --lib --test unit_tests --no-run"
-        )
-        == 1
-        and 0 <= pkcs11_body.find(pkcs11_precompile)
-        < pkcs11_body.find(pkcs11_signer)
-        < pkcs11_body.find(pkcs11_pairing)
-    ):
-        planner_errors.append(
-            "jobs.test-pkcs11-softhsm must precompile the pkcs11 lib and "
-            "unit_tests binaries together before running either filter"
-        )
+    planner_errors.extend(pkcs11_precompile_errors(ci_yml))
+    planner_errors.extend(pkcs11_precompile_self_test(ci_yml))
+
     for job in sorted(REQUIRED_JOBS):
         if f"needs.{job}.result" not in aggregate_body:
             planner_errors.append(
@@ -1665,13 +2182,6 @@ def main() -> int:
             planner_errors.append(f"jobs.{job} must remain removed from ci.yml")
     if "(CI mirror)" in ci_yml:
         planner_errors.append("ci.yml must not contain runner-holding CI mirror jobs")
-
-    for job in sorted(DIRECT_FULL_CI_JOBS):
-        body = extract_job_body(ci_yml, job)
-        if not job_needs(body, "ci-plan"):
-            planner_errors.append(f"jobs.{job} must directly need ci-plan")
-        if "needs.ci-plan.outputs.mode == 'full'" not in body:
-            planner_errors.append(f"jobs.{job} must require full CI mode")
 
     for job, output in sorted(PATH_GATED_JOBS.items()):
         body = extract_job_body(ci_yml, job)
@@ -1704,12 +2214,12 @@ def main() -> int:
             if not workflow_has_exact_name(workflow_yml, expected_workflow_name):
                 planner_errors.append(
                     f"{workflow_path} must keep workflow name "
-                    f"`{expected_workflow_name}` for the main publish gate"
+                    f"`{expected_workflow_name}` for the publication inventory"
                 )
             if not main_push_trigger_is_unconditional(workflow_yml):
                 planner_errors.append(
-                    f"{workflow_path} must run on every push to main for the "
-                    "main publish gate"
+                    f"{workflow_path} must run on every push to main so each "
+                    "main commit carries the release evidence"
                 )
         if not pull_request_trigger_is_unconditional(workflow_yml):
             planner_errors.append(
@@ -1723,9 +2233,9 @@ def main() -> int:
             planner_errors.append(
                 f"{workflow_path} jobs.{job} must keep required check name `{expected_name}`"
             )
-        if not re.search(r"(?m)^    if: always\(\)$", body):
+        if not _JOB_IF_ALWAYS_RE.search(body):
             planner_errors.append(f"{workflow_path} jobs.{job} must run with if: always()")
-        if not re.search(r"(?m)^    runs-on: ubuntu-26.04$", body):
+        if not _RUNS_ON_UBUNTU_RE.search(body):
             planner_errors.append(
                 f"{workflow_path} jobs.{job} must use the dedicated required-check runner"
             )
@@ -1794,7 +2304,7 @@ def main() -> int:
                 planner_errors.append(
                     f"{workflow_path} must keep persist-credentials disabled"
                 )
-            if re.search(r"(?m)^\s+contents:\s+write\s*$", workflow_yml):
+            if _CONTENTS_WRITE_RE.search(workflow_yml):
                 planner_errors.append(
                     f"{workflow_path} must not grant contents: write"
                 )
@@ -1803,8 +2313,7 @@ def main() -> int:
                 planner_errors.append(
                     "ci.yml job gates must include merge_group alongside pull_request"
                 )
-            if 'EVENT_NAME" = "merge_group"' not in workflow_yml and \
-               '"$EVENT_NAME" = "merge_group"' not in workflow_yml:
+            if '"$EVENT_NAME" = "merge_group"' not in workflow_yml:
                 planner_errors.append(
                     "ci.yml planner must handle merge_group base/head selection"
                 )
@@ -1838,6 +2347,8 @@ def main() -> int:
 
     planner_errors.extend(ci_policy_parallel_self_test())
     planner_errors.extend(release_dispatch_self_test())
+    planner_errors.extend(latest_trusted_scheduled_runs_self_test())
+    planner_errors.extend(smoke_sqlite_volume_self_test())
     planner_errors.extend(merge_group_self_test())
     planner_errors.extend(optional_live_suite_self_test())
 
@@ -1998,20 +2509,27 @@ def main() -> int:
         "changes",
     )
     if (
-        'git diff --name-only --no-renames "${base_ref}...HEAD" | sort > "$changed_files"'
+        'git diff --name-only --no-renames "${trusted_sha}...HEAD" \\\n'
+        '              | sort > "$changed_files"'
         not in gateway_changes_body
     ):
         planner_errors.append(
-            "jobs.changes in gateway-api-conformance.yml must disable rename "
-            "detection when collecting pull_request changed files"
+            "jobs.changes in gateway-api-conformance.yml must diff against the "
+            "pinned trusted base with rename detection disabled"
         )
+    # GHSA-c57q-j5hg-w4vc: relevance for this required gate comes from the
+    # trusted-base filter blob (verify_cross_build_policy.py freezes the job
+    # as LIVE_SUITE_RELEVANCE_JOB_TEMPLATE); the checkout's copy never runs.
     if (
-        'git diff --name-only --no-renames "${MERGE_BASE_SHA}...HEAD" | sort > "$changed_files"'
+        'git cat-file blob "$entry_object" > "$trusted_filter"'
         not in gateway_changes_body
+        or "filter_args=(--suite gateway-api " not in gateway_changes_body
+        or "python3 .github/scripts/live_suite_path_filter.py" in gateway_changes_body
     ):
         planner_errors.append(
-            "jobs.changes in gateway-api-conformance.yml must diff merge_group "
-            "commits with rename detection disabled"
+            "jobs.changes in gateway-api-conformance.yml must run the trusted-base "
+            "live_suite_path_filter.py for --suite gateway-api, never the "
+            "pull request's own copy"
         )
 
     # The performance regression check runs out of band (daily schedule and
@@ -2022,14 +2540,6 @@ def main() -> int:
     performance_regression_body = extract_job_body(
         performance_regression_yml, "performance-regression"
     )
-    if (
-        'git diff --name-only --no-renames "${perf_base}...HEAD"'
-        not in performance_regression_body
-    ):
-        planner_errors.append(
-            "jobs.performance-regression must disable rename detection when "
-            "collecting changed files for pull_request and merge_group diffs"
-        )
     if "verify_mesh_performance_baselines_workflow.py" not in performance_regression_body:
         planner_errors.append(
             "jobs.performance-regression must invoke "
@@ -2043,9 +2553,10 @@ def main() -> int:
             "jobs.performance-regression must self-test the mesh baselines "
             "workflow verifier"
         )
-    if (
-        "python3 .github/scripts/verify_mesh_performance_baselines_workflow.py"
-        not in performance_regression_body
+    if not re.search(
+        r"(?m)^\s*python3 \.github/scripts/"
+        r"verify_mesh_performance_baselines_workflow\.py\s*$",
+        performance_regression_body,
     ):
         planner_errors.append(
             "jobs.performance-regression must run the mesh baselines workflow verifier"
@@ -2053,12 +2564,43 @@ def main() -> int:
     static_idx = performance_regression_body.find(
         "Verify mesh performance baselines workflow contract"
     )
-    detect_idx = performance_regression_body.find("Detect performance-sensitive changes")
-    if static_idx == -1 or detect_idx == -1 or static_idx > detect_idx:
+    benchmark_setup_idx = performance_regression_body.find(
+        "uses: ./.github/actions/setup-rust-ci"
+    )
+    if static_idx == -1 or benchmark_setup_idx == -1 or static_idx > benchmark_setup_idx:
         planner_errors.append(
             "jobs.performance-regression must run mesh baseline workflow "
-            "contracts after checkout and before optional benchmark path gating"
+            "contracts after checkout and before the benchmark toolchain setup"
         )
+    # The job never runs on a pull request, so a deleted input would otherwise
+    # surface only as a red scheduled run on `main`.
+    planner_errors.extend(missing_workflow_inputs_self_test())
+    for relative in missing_workflow_inputs(performance_regression_body, Path(".")):
+        planner_errors.append(
+            "jobs.performance-regression reads "
+            f"{relative}, which does not exist in the checkout; restore it or "
+            "change the workflow in the same pull request"
+        )
+    fixture_test = Path(PERFORMANCE_GATEWAY_FIXTURE_TEST)
+    planner_errors.extend(
+        performance_gateway_fixture_errors(
+            performance_regression_body,
+            fixture_test.read_text(encoding="utf-8") if fixture_test.is_file() else "",
+        )
+    )
+    # The job's static protocol-perf step runs this verifier, which reads its
+    # inputs (budgets, runbook, harness, configs) from repository-root
+    # constants that `workflow_inputs` cannot see. Run the same contract here
+    # so a pull request that breaks it fails before the scheduled run does.
+    # The mesh baselines verifier, the other such step, is run further down.
+    if protocol_perf_workflow_self_test() != 0:
+        planner_errors.append("protocol-perf-regression workflow verifier self-test failed")
+    protocol_perf_errors: list[str] = []
+    protocol_perf_repository_contract(protocol_perf_errors)
+    planner_errors.extend(
+        f"protocol-perf-regression workflow contract: {error}"
+        for error in protocol_perf_errors
+    )
 
     for output in sorted(set(PATH_GATED_JOBS.values())):
         if not re.search(rf"(?m)^      {re.escape(output)}:", ci_plan_body):
@@ -2138,20 +2680,12 @@ def main() -> int:
         planner_errors.append(
             "jobs.helm-chart must self-test the trusted local action verifier"
         )
-    if not re.search(
-        r'(?m)^\s*git archive --format=tar --output="\$archive" '
-        r'"\$trusted_ref" -- "\$action_dir"\s*$',
-        chart_runtime_lint_body,
-    ):
+    if not _TRUSTED_ACTION_ARCHIVE_RE.search(chart_runtime_lint_body):
         planner_errors.append(
             "jobs.helm-chart must materialize the trusted setup-kubernetes-tools "
             "tree with git archive rather than trusting the checkout"
         )
-    if not re.search(
-        r'(?m)^\s*python3 -I "\$verifier" --action-path "\$action_dir" '
-        r'--trusted-archive "\$archive"\s*$',
-        chart_runtime_lint_body,
-    ):
+    if not _TRUSTED_ACTION_VERIFIER_RE.search(chart_runtime_lint_body):
         planner_errors.append(
             "jobs.helm-chart must compare the local setup-kubernetes-tools tree "
             "against the trusted archive before the action executes"
@@ -2203,7 +2737,7 @@ def main() -> int:
         planner_errors.append(
             "jobs.helm-chart must self-test the proposed chart runtime checker"
         )
-    if not re.search(r'(?m)^\s*python3 -I "\$proposed"\s*$', chart_runtime_lint_body):
+    if not _PROPOSED_CHART_CHECKER_RUN_RE.search(chart_runtime_lint_body):
         planner_errors.append(
             "jobs.helm-chart must execute the proposed chart runtime checker "
             "against the checkout during non-authoritative validation"
@@ -2213,7 +2747,7 @@ def main() -> int:
             "jobs.helm-chart must run the chart runtime lint self-test "
             "via isolated python3 -I"
         )
-    if not re.search(r'(?m)^\s*python3 -I "\$checker"\s*$', chart_runtime_lint_body):
+    if not _CHART_CHECKER_RUN_RE.search(chart_runtime_lint_body):
         planner_errors.append(
             "jobs.helm-chart must run the chart runtime lint against the "
             "checkout"
@@ -2263,6 +2797,11 @@ def main() -> int:
     # influence which jobs the trusted scheduler selected.
     if planner_self_test() != 0:
         planner_errors.append("proposed PR CI planner self-test failed")
+    # The doc-parity drift check reads the checkout's parity test, so it runs
+    # here with the proposed planner (same revision as the test), never from
+    # the trusted-base self-test, which would compare the base input set with
+    # a candidate test and refuse every change to the test's inputs.
+    planner_errors.extend(validate_doc_parity_inputs(Path.cwd()))
     if ci_gate_replay_self_test() != 0:
         planner_errors.append("CI gate replay self-test failed")
     try:
@@ -2288,6 +2827,7 @@ def main() -> int:
     else:
         planner_errors.extend(chart_runtime_findings)
     planner_errors.extend(validate_artifact_gate_wiring())
+    planner_errors.extend(artifact_gate_wiring_self_test())
     planner_errors.extend(error.format() for error in check_repository())
     planner_errors.extend(install_docs_contract_self_test())
     planner_errors.extend(check_install_docs_contract())
@@ -2296,6 +2836,10 @@ def main() -> int:
     release_yml = Path(".github/workflows/release.yml").read_text(encoding="utf-8")
     planner_errors.extend(validate_release_workflow(release_yml))
     planner_errors.extend(release_attestation_self_test(release_yml))
+    # Every workflow states its own GITHUB_TOKEN default instead of inheriting
+    # the repository setting, and code-triggered workflows keep it read-only.
+    planner_errors.extend(workflow_permissions_self_test())
+    planner_errors.extend(workflow_permission_errors())
 
     # None of the governed live workflows carries a top-level `paths:` block any
     # more: `ambient-host-udp-live.yml` never did, and issue #3908 retired the
@@ -2337,7 +2881,7 @@ def main() -> int:
     if not missing and not extra and not planner_errors:
         print(
             f"Required CI aggregate covers {len(REQUIRED_JOBS)} jobs; "
-            f"{len(DIRECT_FULL_CI_JOBS)} roots and "
+            f"{len(PATH_GATED_JOBS)} path-gated jobs and "
             f"{len(required_full_ci_docs)} live-suite docs enforce the CI plan."
         )
         return 0

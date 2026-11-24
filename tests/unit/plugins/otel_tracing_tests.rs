@@ -15,7 +15,7 @@ fn new_otel(config: &serde_json::Value) -> OtelTracing {
     let mut merged = config.clone();
     if merged.get("endpoint").is_none() {
         merged["endpoint"] =
-            serde_json::Value::String("http://localhost:4318/v1/traces".to_string());
+            serde_json::Value::String("http://127.0.0.1:4318/v1/traces".to_string());
     }
     OtelTracing::new_with_http_client(&merged, PluginHttpClient::default()).unwrap()
 }
@@ -43,6 +43,7 @@ fn make_summary(metadata: HashMap<String, String>) -> TransactionSummary {
         timestamp_received: "2026-03-23T12:00:00Z".to_string(),
         client_ip: "10.0.0.1".to_string(),
         consumer_username: None,
+        principal_origin: None,
         auth_method: None,
         http_method: "GET".to_string(),
         request_path: "/api/test".to_string(),
@@ -64,12 +65,13 @@ fn make_summary(metadata: HashMap<String, String>) -> TransactionSummary {
         error_class: None,
         body_error_class: None,
         body_completed: false,
+        response_delivery: Default::default(),
         bytes_sent: 0,
         bytes_received: 0,
         grpc_request_messages: 0,
         grpc_response_messages: 0,
         mirror: false,
-        metadata,
+        metadata: metadata.into_iter().collect(),
         ai_usage_export: None,
         proxy_lifecycle_generation: None,
     }
@@ -105,6 +107,7 @@ fn make_stream_summary(metadata: HashMap<String, String>) -> StreamTransactionSu
         proxy_name: Some("postgres".to_string()),
         client_ip: "10.0.0.1".to_string(),
         consumer_username: Some("alice".to_string()),
+        principal_origin: Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer),
         auth_method: None,
         backend_target: "10.0.0.20:5432".to_string(),
         backend_resolved_ip: Some("10.0.0.20".to_string()),
@@ -120,7 +123,7 @@ fn make_stream_summary(metadata: HashMap<String, String>) -> StreamTransactionSu
         timestamp_connected: "2026-03-23T12:00:00Z".to_string(),
         timestamp_disconnected: "2026-03-23T12:00:00.042Z".to_string(),
         sni_hostname: None,
-        metadata,
+        metadata: metadata.into_iter().collect(),
     }
 }
 
@@ -183,6 +186,7 @@ fn make_rich_summary(metadata: HashMap<String, String>) -> TransactionSummary {
         timestamp_received: "2026-03-23T12:00:00Z".to_string(),
         client_ip: "10.0.0.1".to_string(),
         consumer_username: Some("alice".to_string()),
+        principal_origin: Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer),
         auth_method: None,
         http_method: "POST".to_string(),
         request_path: "/api/llm/chat".to_string(),
@@ -204,12 +208,13 @@ fn make_rich_summary(metadata: HashMap<String, String>) -> TransactionSummary {
         error_class: None,
         body_error_class: None,
         body_completed: true,
+        response_delivery: Default::default(),
         bytes_sent: 0,
         bytes_received: 0,
         grpc_request_messages: 0,
         grpc_response_messages: 0,
         mirror: false,
-        metadata,
+        metadata: metadata.into_iter().collect(),
         ai_usage_export: None,
         proxy_lifecycle_generation: None,
     }
@@ -289,7 +294,7 @@ async fn test_otel_tracing_rejects_non_bool_generate_trace_id() {
 async fn test_otel_tracing_rejects_invalid_custom_header_name() {
     let err = OtelTracing::new_with_http_client(
         &json!({
-            "endpoint": "http://localhost:4318/v1/traces",
+            "endpoint": "http://127.0.0.1:4318/v1/traces",
             "headers": {
                 "bad header": "value"
             }
@@ -306,7 +311,7 @@ async fn test_otel_tracing_rejects_invalid_custom_header_name() {
 async fn test_otel_tracing_rejects_non_string_custom_header_value() {
     let err = OtelTracing::new_with_http_client(
         &json!({
-            "endpoint": "http://localhost:4318/v1/traces",
+            "endpoint": "http://127.0.0.1:4318/v1/traces",
             "headers": {
                 "x-tenant-id": 42
             }
@@ -598,6 +603,43 @@ async fn test_otel_tracing_log_emits_without_otlp() {
 }
 
 #[tokio::test]
+async fn per_transaction_trace_records_are_not_info_logs() {
+    // Issue #7140: the per-request / per-stream / per-WebSocket "trace" record
+    // is emitted before the sampling and export decision and carries the
+    // client address, so it must not appear at FERRUM_LOG_LEVEL=info.
+    super::plugin_utils::install_interest_floor();
+    let logs = super::plugin_utils::CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(logs.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    tracing::callsite::rebuild_interest_cache();
+
+    let plugin =
+        OtelTracing::new_with_http_client(&json!({}), PluginHttpClient::default()).unwrap();
+    plugin.log(&make_summary(make_trace_metadata())).await;
+    plugin
+        .on_stream_disconnect(&make_stream_summary(make_trace_metadata()))
+        .await;
+    // Positive control: the capture does record INFO events on this target.
+    tracing::info!(target: "otel", "otel capture control 7140");
+
+    let contents = logs.contents();
+    assert!(
+        contents.contains("otel capture control 7140"),
+        "capture must observe INFO events: {contents}"
+    );
+    for record in ["request trace", "stream trace"] {
+        assert!(
+            !contents.contains(record),
+            "`{record}` must not be an INFO record: {contents}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_otel_tracing_with_otlp_endpoint() {
     // Start a wiremock server to receive OTLP spans
     let mock_server = wiremock::MockServer::start().await;
@@ -697,7 +739,7 @@ async fn test_workload_metrics_exporters_preserve_composed_custom_tags() {
     for plugin in &plugins {
         plugin.before_proxy(&mut ctx, &mut headers).await;
     }
-    let summary = make_summary(ctx.metadata);
+    let summary = make_summary(ctx.metadata.into_iter().collect());
     for plugin in &plugins {
         plugin.log(&summary).await;
     }
@@ -1308,7 +1350,7 @@ async fn test_otel_tracing_deployment_environment() {
 async fn test_otel_tracing_rejects_unknown_config_keys() {
     let err = OtelTracing::new_with_http_client(
         &json!({
-            "endpoint": "http://localhost:4318/v1/traces",
+            "endpoint": "http://127.0.0.1:4318/v1/traces",
             "buffer_capcity": 1
         }),
         PluginHttpClient::default(),
@@ -1338,7 +1380,7 @@ async fn test_otel_tracing_rejects_explicit_null_properties() {
         "root_sampling",
         "include_url_path",
     ] {
-        let mut config = json!({"endpoint": "http://localhost:4318/v1/traces"});
+        let mut config = json!({"endpoint": "http://127.0.0.1:4318/v1/traces"});
         config
             .as_object_mut()
             .expect("config object")
@@ -1383,7 +1425,7 @@ async fn test_otel_tracing_validates_exporter_controls_without_an_endpoint() {
 async fn test_otel_tracing_rejects_out_of_range_batch_size() {
     let err = OtelTracing::new_with_http_client(
         &json!({
-            "endpoint": "http://localhost:4318/v1/traces",
+            "endpoint": "http://127.0.0.1:4318/v1/traces",
             "batch_size": 0
         }),
         PluginHttpClient::default(),
@@ -1546,7 +1588,7 @@ async fn test_otel_tracing_parent_not_sampled_skips_export() {
         Some("false")
     );
 
-    let mut summary = make_summary(ctx.metadata.clone());
+    let mut summary = make_summary(ctx.metadata.clone().into_iter().collect());
     summary.proxy_name = Some("api".to_string());
     plugin.log(&summary).await;
     assert_no_requests(&mock_server).await;
@@ -1731,9 +1773,10 @@ async fn test_otel_tracing_ws_disconnect_uses_new_span_id() {
         io_side: None,
         error_class: None,
         consumer_username: None,
+        principal_origin: None,
         auth_method: None,
         connection_id: 0,
-        metadata,
+        metadata: metadata.into_iter().collect(),
     };
     plugin.on_ws_disconnect(&ctx).await;
 
@@ -1822,9 +1865,10 @@ async fn test_otel_tracing_ws_disconnect_distinguishes_client_and_backend_failur
             io_side: Some(io_side),
             error_class: Some(ferrum_edge::retry::ErrorClass::ConnectionReset),
             consumer_username: None,
+            principal_origin: None,
             auth_method: None,
             connection_id: 0,
-            metadata: make_trace_metadata(),
+            metadata: make_trace_metadata().into_iter().collect(),
         };
         plugin.on_ws_disconnect(&ctx).await;
 
@@ -2230,7 +2274,7 @@ async fn test_workload_metrics_zipkin_sets_error_tag_on_failure() {
 async fn test_otel_tracing_rejects_inert_root_sampling_ratio() {
     let err = OtelTracing::new_with_http_client(
         &json!({
-            "endpoint": "http://localhost:4318/v1/traces",
+            "endpoint": "http://127.0.0.1:4318/v1/traces",
             "root_sampling_ratio": 0.01
         }),
         PluginHttpClient::default(),
@@ -2244,7 +2288,7 @@ async fn test_otel_tracing_rejects_inert_root_sampling_ratio() {
 
     let err = OtelTracing::new_with_http_client(
         &json!({
-            "endpoint": "http://localhost:4318/v1/traces",
+            "endpoint": "http://127.0.0.1:4318/v1/traces",
             "root_sampling": "always_off",
             "root_sampling_ratio": 0.5
         }),
@@ -2259,7 +2303,7 @@ async fn test_otel_tracing_rejects_inert_root_sampling_ratio() {
 
     OtelTracing::new_with_http_client(
         &json!({
-            "endpoint": "http://localhost:4318/v1/traces",
+            "endpoint": "http://127.0.0.1:4318/v1/traces",
             "root_sampling": "ratio",
             "root_sampling_ratio": 0.01
         }),
@@ -2269,7 +2313,7 @@ async fn test_otel_tracing_rejects_inert_root_sampling_ratio() {
 
     OtelTracing::new_with_http_client(
         &json!({
-            "endpoint": "http://localhost:4318/v1/traces",
+            "endpoint": "http://127.0.0.1:4318/v1/traces",
             "root_sampling": "always_on"
         }),
         PluginHttpClient::default(),
@@ -2505,7 +2549,7 @@ async fn test_otel_tracing_rejects_unusable_authorization_header_values() {
         "Bearer bad\u{0}value",
     ] {
         let error = OtelTracing::new_with_http_client(
-            &json!({"endpoint": "http://localhost:4318/v1/traces", "authorization": value}),
+            &json!({"endpoint": "http://127.0.0.1:4318/v1/traces", "authorization": value}),
             PluginHttpClient::default(),
         )
         .err()
@@ -2529,7 +2573,7 @@ async fn test_otel_tracing_rejects_unusable_authorization_header_values() {
 
     // Ordinary bearer values stay admitted.
     OtelTracing::new_with_http_client(
-        &json!({"endpoint": "http://localhost:4318/v1/traces", "authorization": "Bearer abc.def"}),
+        &json!({"endpoint": "http://127.0.0.1:4318/v1/traces", "authorization": "Bearer abc.def"}),
         PluginHttpClient::default(),
     )
     .expect("a valid bearer value stays admitted");
@@ -2797,7 +2841,7 @@ fn startup_diagnostics_withhold_sampling_values_and_header_keys() {
             "diagnostic-secret-5594",
         ),
     ] {
-        let mut config = json!({"endpoint": "http://localhost:4318/v1/traces"});
+        let mut config = json!({"endpoint": "http://127.0.0.1:4318/v1/traces"});
         config
             .as_object_mut()
             .unwrap()
@@ -2811,4 +2855,192 @@ fn startup_diagnostics_withhold_sampling_values_and_header_keys() {
         assert!(!rendered.contains(hidden), "{rendered}");
         assert!(!rendered.contains("987654321"), "{rendered}");
     }
+}
+
+#[tokio::test]
+async fn test_otel_tracing_cleartext_endpoint_needs_opt_in_off_loopback() {
+    let build =
+        |config: Value| OtelTracing::new_with_http_client(&config, PluginHttpClient::default());
+
+    let err = build(json!({"endpoint": "http://collector.internal:4318/v1/traces"}))
+        .err()
+        .expect("non-loopback http:// must be refused without the opt-in");
+    assert!(err.contains("allow_plaintext"), "got: {err}");
+    let err = build(json!({"endpoint": "http://localhost:4318/v1/traces"}))
+        .err()
+        .expect("a hostname is never a loopback literal");
+    assert!(err.contains("allow_plaintext"), "got: {err}");
+
+    for config in [
+        json!({"endpoint": "http://collector.internal:4318/v1/traces", "allow_plaintext": true}),
+        json!({"endpoint": "http://127.0.0.1:4318/v1/traces"}),
+        json!({"endpoint": "http://[::1]:4318/v1/traces"}),
+        json!({"endpoint": "https://collector.internal/v1/traces"}),
+    ] {
+        assert!(build(config.clone()).is_ok(), "{config} must be admitted");
+    }
+}
+
+/// workload_metrics-MUSE-5: a span a workload_metrics exporter refuses is
+/// counted on `ferrum_mesh_tracing_spans_dropped_total{provider,reason}` with
+/// fixed labels only, never the endpoint or the exporter error text.
+#[tokio::test]
+async fn workload_metrics_counts_refused_spans_by_provider_and_reason() {
+    use ferrum_edge::plugins::mesh::prometheus_helpers::{
+        self, MeshTracingProvider, MeshTracingSpanDropReason,
+    };
+
+    // One-slot queue and a flush interval far beyond the test: on this
+    // current-thread runtime the flush worker never runs between the two
+    // `log` calls, so the second span finds the queue full.
+    let plugin = WorkloadMetrics::new(&json!({
+        "service_name": "reviews",
+        "batch_size": 10_000,
+        "flush_interval_ms": 600_000,
+        "buffer_capacity": 1,
+        "tracing_providers": [{
+            "kind": "zipkin",
+            "config": {"url": "http://127.0.0.1:9/api/v2/spans"}
+        }]
+    }))
+    .expect("workload metrics with zipkin provider");
+    let before = prometheus_helpers::mesh_tracing_spans_dropped_count(
+        MeshTracingProvider::Zipkin,
+        MeshTracingSpanDropReason::QueueFull,
+    );
+
+    plugin.log(&make_summary(make_trace_metadata())).await;
+    plugin.log(&make_summary(make_trace_metadata())).await;
+
+    let after = prometheus_helpers::mesh_tracing_spans_dropped_count(
+        MeshTracingProvider::Zipkin,
+        MeshTracingSpanDropReason::QueueFull,
+    );
+    assert!(
+        after > before,
+        "queue-full drop must be counted ({before} -> {after})"
+    );
+
+    let mut output = String::new();
+    prometheus_helpers::render_mesh_observability_metrics(&mut output);
+    assert!(
+        output.contains("# TYPE ferrum_mesh_tracing_spans_dropped_total counter"),
+        "{output}"
+    );
+    let series = output
+        .lines()
+        .find(|line| {
+            line.starts_with(
+                "ferrum_mesh_tracing_spans_dropped_total{provider=\"zipkin\",reason=\"queue_full\"}",
+            )
+        })
+        .expect("zipkin queue_full series");
+    assert!(!series.contains("127.0.0.1"), "{series}");
+}
+
+/// PR6817-SOL-2: an enqueued span the exporter discards at delivery (here a
+/// non-retryable collector `400` with no retries) is counted once per lost
+/// span as `reason="export_failed"`, though no queue refusal ever happened.
+#[tokio::test]
+async fn workload_metrics_counts_spans_discarded_after_collector_failure() {
+    use ferrum_edge::plugins::mesh::prometheus_helpers::{
+        self, MeshTracingProvider, MeshTracingSpanDropReason,
+    };
+
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/api/v2/spans"))
+        .respond_with(wiremock::ResponseTemplate::new(400))
+        .mount(&mock_server)
+        .await;
+    let plugin = WorkloadMetrics::new(&json!({
+        "service_name": "reviews",
+        "batch_size": 1,
+        "flush_interval_ms": 100,
+        "max_retries": 0,
+        "tracing_providers": [{
+            "kind": "zipkin",
+            "config": {"url": format!("{}/api/v2/spans", mock_server.uri())}
+        }]
+    }))
+    .expect("workload metrics with zipkin provider");
+    let count = || {
+        prometheus_helpers::mesh_tracing_spans_dropped_count(
+            MeshTracingProvider::Zipkin,
+            MeshTracingSpanDropReason::ExportFailed,
+        )
+    };
+    let before = count();
+
+    plugin.log(&make_summary(make_trace_metadata())).await;
+
+    // Completion barrier: the collector saw the batch, then the counter moves.
+    let _ = received_json(&mock_server).await;
+    let mut after = count();
+    for _ in 0..100 {
+        if after > before {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        after = count();
+    }
+    assert!(
+        after > before,
+        "a span discarded on a terminal collector failure must be counted ({before} -> {after})"
+    );
+}
+
+/// PR6817-SOL-3: an OTLP collector that answers HTTP 200 with a partial
+/// success rejecting spans lost them as surely as a 400; the rejected count is
+/// recorded as `reason="export_failed"` for workload_metrics exporters.
+#[tokio::test]
+async fn workload_metrics_counts_otlp_partial_success_rejected_spans() {
+    use ferrum_edge::plugins::mesh::prometheus_helpers::{
+        self, MeshTracingProvider, MeshTracingSpanDropReason,
+    };
+
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/traces"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(json!({"partialSuccess": {"rejectedSpans": 1}})),
+        )
+        .mount(&mock_server)
+        .await;
+    let plugin = WorkloadMetrics::new(&json!({
+        "service_name": "reviews",
+        "batch_size": 1,
+        "flush_interval_ms": 100,
+        "max_retries": 0,
+        "tracing_providers": [{
+            "kind": "opentelemetry",
+            "config": {"endpoint": format!("{}/v1/traces", mock_server.uri())}
+        }]
+    }))
+    .expect("workload metrics with otlp provider");
+    let count = || {
+        prometheus_helpers::mesh_tracing_spans_dropped_count(
+            MeshTracingProvider::OpenTelemetry,
+            MeshTracingSpanDropReason::ExportFailed,
+        )
+    };
+    let before = count();
+
+    plugin.log(&make_summary(make_trace_metadata())).await;
+
+    // Completion barrier: the collector saw the batch, then the counter moves.
+    let _ = received_json(&mock_server).await;
+    let mut after = count();
+    for _ in 0..100 {
+        if after > before {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        after = count();
+    }
+    assert!(
+        after > before,
+        "spans an OTLP partial success rejected must be counted ({before} -> {after})"
+    );
 }

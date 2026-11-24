@@ -417,6 +417,131 @@ async fn test_ws_message_size_limiting_backend_direction_and_instances_e2e() {
     echo_handle.abort();
 }
 
+/// Read one direction's `ferrum_ws_message_size_limit_rejected_total` sample.
+fn ws_size_limit_rejections(metrics: &str, direction: &str) -> Option<u64> {
+    let label = format!("direction=\"{direction}\"");
+    metrics
+        .lines()
+        .filter(|line| line.starts_with("ferrum_ws_message_size_limit_rejected_total{"))
+        .find(|line| line.contains(&label))
+        .and_then(|line| line.rsplit(' ').next())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
+/// Directional overrides: a backend frame larger than the client ceiling is
+/// admitted under the larger `backend_to_client` override, while a client frame
+/// one byte over the tight top-level ceiling is refused with the client reason.
+/// The refusal is counted once, under the client direction.
+#[ignore]
+#[tokio::test]
+async fn test_ws_message_size_limiting_directional_limits_and_metric_e2e() {
+    let (backend_port, backend_listener) = bind_ws_backend_listener().await;
+    let (backend_close_tx, mut backend_close_rx) = mpsc::unbounded_channel();
+    let echo_handle = tokio::spawn(start_ws_echo_server_recording_close(
+        backend_listener,
+        backend_close_tx,
+    ));
+
+    let gateway = spawn_ws_plugins_gateway(
+        backend_port,
+        r#"  - id: "ws-size-directional"
+    plugin_name: "ws_message_size_limiting"
+    scope: "proxy"
+    proxy_id: "ws-echo-proxy"
+    enabled: true
+    config:
+      max_frame_bytes: 50
+      max_message_bytes: 200
+      close_reason: "client payload limit"
+      backend_to_client:
+        max_frame_bytes: 100
+        close_reason: "backend payload limit""#,
+        r#"      - plugin_config_id: "ws-size-directional""#,
+    )
+    .await;
+    let url = format!("ws://127.0.0.1:{}/ws-echo", gateway.proxy_port);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("connect WebSocket");
+
+    // The backend answers with a 10-byte frame plus a 60-byte continuation:
+    // over the 50-byte client ceiling, within the 100-byte backend override.
+    ws.send(Message::Text("__backend_oversized_frame__".into()))
+        .await
+        .expect("request backend frame larger than the client ceiling");
+    let backend_reply = tokio::time::timeout(Duration::from_secs(2), ws.next())
+        .await
+        .expect("backend reply timed out")
+        .expect("client stream ended before backend reply")
+        .expect("backend reply read failed");
+    let payload = match backend_reply {
+        Message::Binary(payload) => payload,
+        other => panic!("backend frame under its override must be relayed, got {other:?}"),
+    };
+    assert_eq!(payload.len(), 70);
+
+    // One byte over the client ceiling is refused from the client direction.
+    ws.send(Message::Binary(vec![5u8; 51].into()))
+        .await
+        .expect("send oversized client frame");
+    let client_close = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(close @ Message::Close(_))) => break close,
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+                other => panic!("unexpected reply before policy close: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("client close timed out");
+    let Message::Close(Some(client_close)) = client_close else {
+        panic!("offending client did not receive detailed close");
+    };
+    assert_eq!(client_close.code, CloseCode::Size);
+    assert_eq!(client_close.reason.as_str(), "client payload limit");
+
+    let (backend_code, backend_reason) =
+        tokio::time::timeout(Duration::from_secs(2), backend_close_rx.recv())
+            .await
+            .expect("backend close timed out")
+            .expect("backend close channel ended");
+    assert_eq!(backend_code, CloseCode::Size);
+    assert_eq!(backend_reason, "client payload limit");
+
+    let client = reqwest::Client::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let body = loop {
+        let body = client
+            .get(gateway.admin_url("/metrics"))
+            .header("Authorization", gateway.auth_header())
+            .send()
+            .await
+            .expect("scrape /metrics")
+            .text()
+            .await
+            .expect("read /metrics body");
+        if ws_size_limit_rejections(&body, "client_to_backend") == Some(1)
+            || tokio::time::Instant::now() >= deadline
+        {
+            break body;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(
+        ws_size_limit_rejections(&body, "client_to_backend"),
+        Some(1),
+        "client-direction rejection must be counted once:\n{body}"
+    );
+    assert_eq!(
+        ws_size_limit_rejections(&body, "backend_to_client"),
+        Some(0),
+        "the admitted backend frame must not be counted:\n{body}"
+    );
+
+    echo_handle.abort();
+}
+
 /// Continuation accumulation is bounded independently from the per-frame cap.
 #[ignore]
 #[tokio::test]

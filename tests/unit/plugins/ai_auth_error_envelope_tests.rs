@@ -123,7 +123,7 @@ async fn ai_route_missing_credential_uses_openai_auth_envelope() {
     assert_openai_auth_body(&body, "Authentication required", "missing_api_key");
     assert_eq!(
         headers.get("WWW-Authenticate").map(String::as_str),
-        Some("ferrum-edge")
+        Some(r#"ApiKey realm="ferrum-edge""#)
     );
 }
 

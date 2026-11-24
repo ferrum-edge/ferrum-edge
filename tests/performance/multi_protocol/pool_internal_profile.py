@@ -20,12 +20,16 @@ PREFIX = "ferrum_pool_profile_"
 FIELDS = set(SCHEMA["counters"] + SCHEMA["metadata"])
 
 
+_PROFILE_METRIC_RE = re.compile(r"ferrum_pool_profile_([a-z0-9_]+) ([0-9]+)")
+_GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
+
+
 def parse_metrics(text):
     counters = {}
     for line in text.splitlines():
         if not line.startswith(PREFIX):
             continue
-        match = re.fullmatch(r"ferrum_pool_profile_([a-z0-9_]+) ([0-9]+)", line)
+        match = _PROFILE_METRIC_RE.fullmatch(line)
         if not match or match[1] not in FIELDS or match[1] in counters:
             raise ValueError("unknown, duplicate or malformed pool profile metric")
         value = int(match[2])
@@ -235,7 +239,7 @@ def retain_runtime(destination, container, config_path):
     if environment.get("RUST_LOG") or environment.get("FERRUM_TLS_NO_VERIFY", "false") != "false":
         issues.append("unexpected logging/verification override")
     revision = container["Config"].get("Labels", {}).get("org.opencontainers.image.revision")
-    if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
+    if not isinstance(revision, str) or not _GIT_SHA_RE.fullmatch(revision):
         issues.append("missing immutable revision")
     observer = container["Config"].get("Labels", {}).get("ferrum.pool-profile")
     if observer not in ("on", "off"):

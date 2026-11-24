@@ -16,7 +16,7 @@ use super::utils::PluginHttpClient;
 use super::utils::auth_attempt::AuthenticationAttempt;
 use super::utils::auth_flow::constant_time_eq;
 use super::utils::auth_flow::{
-    AuthMechanism, ExtractedCredential, VerifyOutcome, commit_authentication_attempt,
+    self, CredentialRejection, ExtractedCredential, VerifyOutcome, commit_authentication_attempt,
     credential_deadline_from_claims, external_identity_realm_authority, nonblank_identity,
     refine_external_identity_realm_authority,
 };
@@ -24,7 +24,7 @@ use super::utils::cert_hash::sha256_base64url_no_pad;
 use super::utils::claim_header_fanout::{
     ClaimHeaderDestinations, ClaimHeaderMapping, apply_claim_headers_from_context,
     emit_claim_headers_to_attempt, emit_output_claim_headers_to_attempt, parse_claim_header_list,
-    parse_claim_headers, parse_separator,
+    parse_claim_headers, parse_separator, sanitize_claim_header_destinations,
 };
 use super::utils::claim_resolver::{
     extract_claim_string, extract_claim_string_exact, parse_claim_path_value,
@@ -44,8 +44,13 @@ pub use super::utils::jwks_store::{
     DEFAULT_JWKS_MAX_STALE_SECONDS, DEFAULT_KID_MISS_REFRESH_COOLDOWN_SECONDS,
     MAX_JWKS_MAX_STALE_SECONDS, MAX_KID_MISS_REFRESH_COOLDOWN_SECONDS,
 };
-use super::utils::jwks_store::{JwksKeyStore, redacted_jwks_uri};
-use super::utils::jwt_verifier::{JwtVerifyParams, peek_unverified_issuer, verify_jwt_with_jwks};
+use super::utils::jwks_store::{
+    JwksKeyStore, canonical_managed_jwks_source, check_managed_jwks_source, redacted_jwks_uri,
+};
+use super::utils::jwt_verifier::{
+    CompiledJwtValidation, JwtVerifyParams, peek_unverified_issuer,
+    verify_jwt_with_compiled_validation,
+};
 use super::utils::redis_rate_limiter::{
     REDIS_PLUGIN_CONFIG_KEYS, RedisConfig, RedisRateLimitClient,
 };
@@ -57,10 +62,11 @@ use super::utils::replay_partition::PartitionHasher;
 use super::utils::response_body::read_response_body_bounded;
 use super::utils::scope_role_check::{self, ScopeRoleRequirements};
 use super::utils::token_extract::{
-    STRIP_QUERY_PARAM_METADATA_PREFIX, TokenHeaderLocation, TokenLocation, TokenLocationExtract,
-    extract_authorization_bearer, extract_authorization_dpop, extract_from_location,
-    mark_present_query_credential_locations, provider_locations_extract_token,
-    push_stripped_credential_header_names, stage_original_token_stripping as stage_token_stripping,
+    AMBIGUOUS_QUERY_TOKEN_BODY, STRIP_QUERY_PARAM_METADATA_PREFIX, TokenHeaderLocation,
+    TokenLocation, TokenLocationExtract, extract_authorization_bearer, extract_authorization_dpop,
+    extract_from_location, mark_provider_query_credential_locations,
+    provider_locations_extract_token, push_stripped_credential_header_names,
+    query_locations_have_semicolon_alias, stage_original_token_stripping as stage_token_stripping,
 };
 use super::{JwtAuthAttributeValue, PluginResult, RequestContext};
 
@@ -80,12 +86,23 @@ const MAX_DISCOVERED_JWKS_URI_BYTES: usize = 8 * 1024;
 const STRIP_AUTHORIZATION_METADATA_KEY: &str = "jwks_auth.strip_authorization";
 const STRIP_HEADER_METADATA_PREFIX: &str = "jwks_auth.strip_header.";
 const CLAIM_HEADER_METADATA_PREFIX: &str = "jwks_auth.claim_header.";
+/// Maximum `providers` entries in one `jwks_auth` instance.
+pub const MAX_JWKS_PROVIDERS: usize = 64;
+/// Widest admissible JWT `exp`/`nbf` clock leeway (`clock_skew_seconds`).
+/// Matches the `jwt_auth` `leeway_secs` ceiling.
+pub const MAX_JWT_CLOCK_SKEW_SECONDS: u64 = 300;
+/// Maximum providers a single token can be verified against: the providers
+/// pinning its exact `iss` plus every provider pinning no issuer. Enforced at
+/// admission so an unauthenticated token costs a bounded number of signature
+/// verifications.
+pub const MAX_JWKS_CANDIDATE_PROVIDERS: usize = 8;
 
 /// JWKS authentication plugin.
 ///
 /// Validates Bearer tokens using public keys fetched from one or more
-/// Identity Provider JWKS endpoints. Supports RSA (RS256/384/512) and
-/// EC (ES256/384) algorithms.
+/// Identity Provider JWKS endpoints. Supports RSA (RS256/384/512 and
+/// RSASSA-PSS PS256/384/512), EC (ES256/384), and Ed25519 (EdDSA, refused
+/// while FIPS mode is enforced) algorithms.
 ///
 /// ## Key features
 ///
@@ -94,9 +111,14 @@ const CLAIM_HEADER_METADATA_PREFIX: &str = "jwks_auth.claim_header.";
 ///   authorization rules.
 /// - **Claim-based authorization**: Per-provider `required_scopes` and
 ///   `required_roles` filter requests without needing a separate ACL plugin.
-/// - **Consumer-optional flow**: When no matching `Consumer` exists in the
-///   gateway, the plugin still sets `authenticated_identity` on the request
-///   context for downstream use (logging, rate limiting, consumer header).
+/// - **External identity, never a Consumer**: The verified identity claim
+///   (`consumer_identity_claim`) becomes `authenticated_identity` on the
+///   request context for downstream use (logging, rate limiting, identity
+///   header). It is never resolved to a gateway `Consumer` — not by username,
+///   id, or `custom_id` — because an external subject is scoped to the
+///   provider that verified it. Consumer-scoped policy (Consumer ACL groups,
+///   per-Consumer credentials) therefore does not apply to `jwks_auth`
+///   principals.
 /// - **Shared JWKS cache**: Stores keyed by resolved `jwks_uri` are shared
 ///   across plugin instances — no duplicate fetches or refresh tasks.
 /// - **Header `kid` is binding**: A missing, empty, or unknown JWT `kid` is
@@ -149,6 +171,11 @@ pub struct JwksAuth {
     claim_header_destinations: ClaimHeaderDestinations,
     strip_authorization_on_success: bool,
     has_custom_query_token_locations: bool,
+    /// Some provider has a query token location and does not forward the
+    /// original token, so this instance may strip a query parameter (an
+    /// accepted token, or a `;` alias marked during discovery) before the
+    /// backend request (GHSA-c259-vchc-3vgr).
+    strips_query_tokens: bool,
     /// Providers that may accept an access token presented under the RFC 9449
     /// `DPoP` authorization scheme (§7.1).
     ///
@@ -159,8 +186,32 @@ pub struct JwksAuth {
     /// bearer — and requires the `Authorization` header to be one of the
     /// provider's token locations (explicitly, with no prefix, or by default).
     dpop_authorization_scheme_providers: Vec<usize>,
+    /// Exact issuers pinned by a provider that requires a sender constraint
+    /// (`require_dpop` or `require_mtls_binding`).
+    ///
+    /// A provider that pins no issuer may share key material with such a
+    /// provider (one multi-tenant IdP JWKS). A token from a sender-constrained
+    /// realm that fails that realm's own provider on an `aud`/`exp` difference
+    /// would otherwise fall through to the issuer-less sibling and
+    /// authenticate as a plain bearer token, skipping the proof or
+    /// certificate binding. Same-issuer siblings are already refused at
+    /// admission; this closes the issuer-less sibling at verification time.
+    sender_constrained_issuers: Vec<String>,
+    /// `WWW-Authenticate` challenge advertised for an absent credential
+    /// (issue #6774), precomputed at construction. `DPoP` only when every
+    /// provider demands a proof; otherwise `Bearer`, which every provider
+    /// accepts (the RFC 9449 §7.1 migration shape).
+    advertised_challenge: &'static str,
     request_headers_to_redact: Vec<String>,
     emit_mesh_request_principal_metadata: bool,
+    /// Istio `RequestAuthentication` semantics: a request carrying no token
+    /// (no configured token location present) is passed through
+    /// unauthenticated when this plugin is the sole applicable auth plugin.
+    ///
+    /// Deliberately independent of `emit_mesh_request_principal_metadata`:
+    /// that flag only emits metadata, and enabling it must never relax
+    /// authentication. Defaults to `false` (fail closed).
+    allow_missing_token: bool,
     http_client: PluginHttpClient,
     refresh_interval: Duration,
     /// Minimum spacing between on-demand JWKS refetches triggered by a token
@@ -172,16 +223,38 @@ pub struct JwksAuth {
     /// Only a committed generation may contribute to readiness and metrics.
     discovery_owner_committed: Arc<AtomicBool>,
     discovery_publication_gate: Arc<Mutex<()>>,
+    /// Unit-test record of provider verifications; compiled out of builds.
+    #[cfg(test)]
+    verification_attempts: Mutex<Vec<usize>>,
+}
+
+/// Fixed-capacity, ordered list of providers one token is verified against.
+#[derive(Default)]
+struct CandidateProviders {
+    indices: [usize; MAX_JWKS_CANDIDATE_PROVIDERS],
+    len: usize,
+}
+
+impl CandidateProviders {
+    /// Append `idx`; returns `false` once the list is full.
+    fn push(&mut self, idx: usize) -> bool {
+        if self.len == self.indices.len() {
+            return false;
+        }
+        self.indices[self.len] = idx;
+        self.len += 1;
+        true
+    }
+
+    fn as_slice(&self) -> &[usize] {
+        &self.indices[..self.len]
+    }
 }
 
 /// A single identity provider configuration.
 struct JwksProvider {
     /// Expected `iss` claim value. Used to match incoming tokens to this provider.
     issuer: Option<String>,
-    /// Accepted `aud` claim values. jsonwebtoken treats this as OR matching.
-    /// When non-empty, `aud` must be present; `set_audience` alone does not
-    /// require presence.
-    audiences: Vec<String>,
     /// Configured token extraction locations.
     token_locations: Vec<TokenLocation>,
     /// Scopes that must be present in the token (all required).
@@ -198,8 +271,14 @@ struct JwksProvider {
     consumer_header_claim: Option<String>,
     /// Whether to forward the original token-bearing header or query param upstream.
     forward_original_token: bool,
-    /// Whether this provider requires tokens to include an `exp` claim.
-    require_exp: bool,
+    /// JWT `exp`/`nbf` clock leeway in seconds (`clock_skew_seconds`). Also
+    /// extends the authenticated-stream credential deadline by the same
+    /// amount so the stream lifetime agrees with verification.
+    clock_skew_seconds: u64,
+    /// Verification policy (issuer, audiences, required claims, leeway)
+    /// compiled once at construction so the request path never rebuilds the
+    /// audience/issuer sets per verification.
+    validation: CompiledJwtValidation,
     /// Claim values to forward as backend request headers for this provider.
     claim_headers: Vec<ClaimHeaderMapping>,
     /// Per-provider array separator for claim header fan-out.
@@ -276,6 +355,9 @@ enum JwksSource {
     Inline,
     Direct(String),
     Discovery(String),
+    /// Canonical `managed://jwks/<id>#jwks` source: an admin-managed record
+    /// read from the managed TLS store (issue #7277).
+    Managed(String),
 }
 
 const CONFIG_FIELDS: &[&str] = &[
@@ -287,10 +369,12 @@ const CONFIG_FIELDS: &[&str] = &[
     "claim_headers",
     "claim_headers_separator",
     "emit_mesh_request_principal_metadata",
+    "allow_missing_token",
     "require_exp",
     "jwks_refresh_interval_secs",
     "jwks_max_stale_seconds",
     "kid_miss_refresh_cooldown_seconds",
+    "clock_skew_seconds",
 ];
 
 /// Complete root allowlist: the plugin's own fields plus the shared Redis
@@ -308,8 +392,8 @@ const PROVIDER_FIELDS: &[&str] = &[
     "jwks_uri",
     "discovery_url",
     "jwks",
+    "jwks_source",
     "issuer",
-    "audience",
     "audiences",
     "from_headers",
     "from_params",
@@ -330,25 +414,7 @@ const PROVIDER_FIELDS: &[&str] = &[
     "dpop_replay_scope",
     "dpop_replay_max_entries",
     "jwks_max_stale_seconds",
-];
-
-/// Provider fields removed by the shared replay-authority migration, with the
-/// replacement named explicitly. Rejected rather than ignored: a config that
-/// still carries `dpop_jti_ttl_secs` was written believing it controls how long
-/// a proof stays single-use, and silently dropping it would leave that operator
-/// with an unexamined retention contract.
-const REMOVED_PROVIDER_FIELDS: &[(&str, &str)] = &[
-    (
-        "dpop_jti_ttl_secs",
-        "replay retention is no longer configurable — every marker is retained for a fixed \
-         horizon that dominates the widest admissible clock skew, so no reload can shorten the \
-         protection of an already-admitted proof",
-    ),
-    (
-        "dpop_jti_cache_max_entries",
-        "renamed to `dpop_replay_max_entries`; it now bounds a process replay lane that never \
-         evicts an unexpired marker (at capacity the request is refused instead)",
-    ),
+    "clock_skew_seconds",
 ];
 
 impl Drop for JwksAuth {
@@ -408,7 +474,6 @@ impl JwksAuth {
     /// a process readiness dependency or arms a Redis recovery task. Live
     /// readiness is published from
     /// [`crate::plugins::Plugin::commit_background_tasks`].
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
         Self::new_with_config_id(config, http_client, None)
     }
@@ -431,7 +496,12 @@ impl JwksAuth {
                 config = config.to_string()
             )
         })?;
-        reject_unknown_fields(config_obj, &root_config_fields(), "config")?;
+        crate::util::unknown_keys::reject_unknown_keys(
+            config_obj,
+            "config",
+            &root_config_fields(),
+            "jwks_auth: `config`: ",
+        )?;
 
         // A blank id would collapse every jwks_auth config in a namespace onto
         // one replay domain; fail closed rather than merge them.
@@ -446,6 +516,20 @@ impl JwksAuth {
         // activates them, matching every other Redis-backed plugin: toggling a
         // provider to `shared` later cannot suddenly activate a malformed URL,
         // a wrong scalar type, or a zero connection bound.
+        // The shared Redis helper ASCII-lowercases `sync_mode` before matching,
+        // which would admit spellings the published enum does not list. Screen
+        // the exact wire form here first (same pattern as `hmac_auth` and
+        // `graphql`) so the schema and the constructor accept the same set.
+        match config_obj.get("sync_mode") {
+            None => {}
+            Some(Value::String(mode)) if matches!(mode.as_str(), "local" | "redis") => {}
+            Some(Value::String(mode)) => {
+                return Err(format!(
+                    "jwks_auth: `sync_mode` must be exactly `local` or `redis`, got: {mode:?}"
+                ));
+            }
+            Some(_) => return Err("jwks_auth: `sync_mode` must be a string".to_string()),
+        }
         let default_redis_prefix = default_dpop_redis_key_prefix(&namespace, &policy_config_id);
         let redis_config = RedisConfig::from_plugin_config(config, &default_redis_prefix)?;
         let redis_configured = redis_config.is_some();
@@ -508,6 +592,8 @@ impl JwksAuth {
         let consumer_identity_claim =
             optional_claim_path(config_obj, "consumer_identity_claim", "sub")?;
         let global_require_exp = optional_bool(config_obj, "require_exp")?.unwrap_or(true);
+        let global_clock_skew_seconds = optional_u64(config_obj, "clock_skew_seconds", 0)?;
+        validate_clock_skew_seconds("clock_skew_seconds", global_clock_skew_seconds)?;
         let consumer_header_claim = match config_obj.get("consumer_header_claim") {
             Some(value) => {
                 let claim = parse_claim_path_value("consumer_header_claim", value, "jwks_auth")?;
@@ -525,6 +611,22 @@ impl JwksAuth {
             parse_separator(config_obj, "claim_headers_separator", "jwks_auth", ",")?;
         let emit_mesh_request_principal_metadata =
             optional_bool(config_obj, "emit_mesh_request_principal_metadata")?.unwrap_or(false);
+        let allow_missing_token =
+            optional_bool(config_obj, "allow_missing_token")?.unwrap_or(false);
+        // Only the mesh-managed RequestAuthentication instance (a reserved
+        // plugin-config id operators cannot create) is expected to carry this.
+        // Validation construction passes no id and stays quiet; a runtime
+        // instance under any other id is an operator opt-in to optional auth.
+        if allow_missing_token
+            && let Some(config_id) = plugin_config_id
+            && !crate::modes::mesh::is_mesh_request_auth_plugin_id(config_id)
+        {
+            warn!(
+                plugin_config_id = %config_id,
+                "jwks_auth: `allow_missing_token` is enabled; requests without a token are \
+                 forwarded unauthenticated when this is the only applicable auth plugin"
+            );
+        }
         let shard_amount = http_client.pool_shard_amount();
 
         let providers_val = config_obj.get("providers").unwrap_or(&Value::Null);
@@ -533,6 +635,11 @@ impl JwksAuth {
         };
         if providers_arr.is_empty() {
             return Err("jwks_auth: `providers` array must not be empty".to_string());
+        }
+        if providers_arr.len() > MAX_JWKS_PROVIDERS {
+            return Err(format!(
+                "jwks_auth: `providers` supports at most {MAX_JWKS_PROVIDERS} entries"
+            ));
         }
 
         let mut providers = Vec::with_capacity(providers_arr.len());
@@ -558,12 +665,17 @@ impl JwksAuth {
                     prov_cfg = prov_cfg.to_string()
                 )
             })?;
-            reject_removed_provider_fields(prov_obj, idx)?;
-            reject_unknown_fields(prov_obj, PROVIDER_FIELDS, &format!("provider[{idx}]"))?;
+            crate::util::unknown_keys::reject_unknown_keys(
+                prov_obj,
+                &format!("provider[{idx}]"),
+                PROVIDER_FIELDS,
+                &format!("jwks_auth: `provider[{idx}]`: "),
+            )?;
 
             let jwks_endpoint = parse_url_field(prov_obj, "jwks_uri", idx)?;
             let discovery_endpoint = parse_url_field(prov_obj, "discovery_url", idx)?;
             let inline_jwks = parse_inline_jwks(prov_obj, idx)?;
+            let managed_jwks_source = parse_managed_jwks_source(prov_obj, idx)?;
             let provider_max_stale_seconds =
                 optional_provider_u64(prov_obj, "jwks_max_stale_seconds", idx)?
                     .unwrap_or(default_max_stale_seconds);
@@ -578,22 +690,23 @@ impl JwksAuth {
 
             let configured_jwks_sources = usize::from(jwks_uri.is_some())
                 + usize::from(discovery_url.is_some())
-                + usize::from(inline_jwks.is_some());
+                + usize::from(inline_jwks.is_some())
+                + usize::from(managed_jwks_source.is_some());
             if configured_jwks_sources == 0 {
                 return Err(format!(
-                    "jwks_auth: `provider[{}]` requires one of `jwks_uri`, `discovery_url`, or `jwks`",
+                    "jwks_auth: `provider[{}]` requires one of `jwks_uri`, `discovery_url`, `jwks`, or `jwks_source`",
                     idx
                 ));
             }
             if configured_jwks_sources > 1 {
                 return Err(format!(
-                    "jwks_auth: `provider[{}]` must configure exactly one of `jwks_uri`, `discovery_url`, or `jwks`",
+                    "jwks_auth: `provider[{}]` must configure exactly one of `jwks_uri`, `discovery_url`, `jwks`, or `jwks_source`",
                     idx
                 ));
             }
             if inline_jwks.is_some() && prov_obj.contains_key("jwks_max_stale_seconds") {
                 return Err(format!(
-                    "jwks_auth: `provider[{idx}].jwks_max_stale_seconds` applies only to remote JWKS sources"
+                    "jwks_auth: `provider[{idx}].jwks_max_stale_seconds` applies only to remote and managed JWKS sources"
                 ));
             }
             if inline_jwks.is_none() && refresh_interval_secs > provider_max_stale_seconds {
@@ -620,6 +733,13 @@ impl JwksAuth {
                 optional_provider_bool(prov_obj, "forward_original_token", idx)?.unwrap_or(true);
             let provider_require_exp =
                 optional_bool(prov_obj, "require_exp")?.unwrap_or(global_require_exp);
+            let provider_clock_skew_seconds =
+                optional_provider_u64(prov_obj, "clock_skew_seconds", idx)?
+                    .unwrap_or(global_clock_skew_seconds);
+            validate_clock_skew_seconds(
+                &format!("provider[{idx}].clock_skew_seconds"),
+                provider_clock_skew_seconds,
+            )?;
             let provider_claim_headers = parse_claim_headers(
                 prov_obj,
                 "claim_headers",
@@ -640,9 +760,12 @@ impl JwksAuth {
                 provider_claim_headers.as_slice()
             };
             if let Some(duplicate) = provider_output_claim_headers.iter().find(|output| {
-                effective_claim_headers
-                    .iter()
-                    .any(|mapping| mapping.destination_header == output.destination_header)
+                effective_claim_headers.iter().any(|mapping| {
+                    crate::proxy::headers::field_names_equivalent_for_backends(
+                        &mapping.destination_header,
+                        &output.destination_header,
+                    )
+                })
             }) {
                 return Err(format!(
                     "jwks_auth: `provider[{idx}]` maps header {:?} through both \
@@ -686,6 +809,19 @@ impl JwksAuth {
             // deployment that simply set `require_dpop: true`.
             let declared_scope = match optional_provider_string(prov_obj, "dpop_replay_scope", idx)?
             {
+                // `ReplayScope::parse` trims and ASCII-lowercases, which would
+                // admit spellings the published enum does not list. Screen the
+                // exact wire form first (as `hmac_auth` does for
+                // `replay_scope`); the shared parser still owns the mapping.
+                Some(value) if !matches!(value.as_str(), "process" | "shared") => {
+                    return Err(format!(
+                        "jwks_auth: `provider[{idx}].dpop_replay_scope` must be exactly \
+                         `process` or `shared` — use `shared` together with sync_mode: `redis` \
+                         for any deployment running more than one gateway replica, or `process` \
+                         to declare a single-process deployment whose replay protection is not \
+                         cross-replica"
+                    ));
+                }
                 Some(value) => Some(ReplayScope::parse(
                     "jwks_auth",
                     &format!("provider[{idx}].dpop_replay_scope"),
@@ -810,6 +946,14 @@ impl JwksAuth {
                 JwksSource::Direct(uri.clone())
             } else if let Some(ref disc_url) = discovery_url {
                 JwksSource::Discovery(disc_url.clone())
+            } else if let Some(ref source) = managed_jwks_source {
+                // Same pure-construction contract as a direct URI: a local,
+                // not-yet-read store; runtime startup swaps in the shared one.
+                let store = JwksKeyStore::new_managed(source.clone(), http_client.clone());
+                store.configure_trust_policy(refresh_interval, provider_max_stale);
+                store.configure_kid_miss_cooldown(kid_miss_cooldown);
+                jwks_store_slot.store(Arc::new(Some(Arc::new(store))));
+                JwksSource::Managed(source.clone())
             } else {
                 return Err(format!(
                     "jwks_auth: provider[{idx}] has no usable JWKS source"
@@ -819,20 +963,35 @@ impl JwksAuth {
             let identity_claim = prov_consumer_identity_claim
                 .as_deref()
                 .unwrap_or(consumer_identity_claim.as_str());
-            let identity_realm_authority = external_identity_realm_authority(
-                "jwks_auth",
-                &[
-                    ("provider.issuer", issuer.as_deref()),
-                    ("provider.jwks_uri", jwks_uri.as_deref()),
-                    ("provider.discovery_url", discovery_url.as_deref()),
-                    ("provider.jwks", inline_jwks.as_deref()),
-                    ("provider.identity_claim", Some(identity_claim)),
-                ],
-            );
+            // A managed source joins the realm only when configured, so the
+            // realm of every remote/inline provider is unchanged by the field's
+            // existence (live sessions bound to a realm survive the upgrade).
+            let mut realm_fields: Vec<(&str, Option<&str>)> = vec![
+                ("provider.issuer", issuer.as_deref()),
+                ("provider.jwks_uri", jwks_uri.as_deref()),
+                ("provider.discovery_url", discovery_url.as_deref()),
+                ("provider.jwks", inline_jwks.as_deref()),
+            ];
+            if let Some(source) = managed_jwks_source.as_deref() {
+                realm_fields.push(("provider.jwks_source", Some(source)));
+            }
+            realm_fields.push(("provider.identity_claim", Some(identity_claim)));
+            let identity_realm_authority =
+                external_identity_realm_authority("jwks_auth", &realm_fields);
+
+            let validation = CompiledJwtValidation::new(&JwtVerifyParams {
+                issuer: issuer.as_deref(),
+                audiences: &audiences,
+                require_exp: provider_require_exp,
+                leeway_secs: provider_clock_skew_seconds,
+                // `nbf` stays optional (not a required claim). When present it
+                // must be enforced so a pre-minted credential cannot
+                // authenticate before its not-before instant.
+                validate_nbf: true,
+            });
 
             providers.push(JwksProvider {
                 issuer,
-                audiences,
                 token_locations,
                 required_scopes,
                 required_roles,
@@ -841,7 +1000,8 @@ impl JwksAuth {
                 consumer_identity_claim: prov_consumer_identity_claim,
                 consumer_header_claim: prov_consumer_header_claim,
                 forward_original_token,
-                require_exp: provider_require_exp,
+                clock_skew_seconds: provider_clock_skew_seconds,
+                validation,
                 claim_headers: provider_claim_headers,
                 claim_headers_separator: provider_claim_headers_separator,
                 output_claim_headers: provider_output_claim_headers,
@@ -857,6 +1017,36 @@ impl JwksAuth {
                 warmup_hostnames,
                 identity_realm_authority,
             });
+        }
+
+        if let Some(reason) =
+            jwks_provider_bound_error(providers.iter().map(|p| p.issuer.as_deref()))
+        {
+            return Err(format!("jwks_auth: {reason}"));
+        }
+
+        // An mTLS-bound provider that pins no issuer has no realm the
+        // verification-time sender-constraint guard can key on. Any sibling
+        // that does not also require the binding, and whose key set can verify
+        // the same token, would authenticate a certificate-bound token without
+        // its certificate whenever the bound provider rejects it on an
+        // `aud`/`exp` difference — including through an explicit/default
+        // `Authorization` location overlap. Key overlap is not knowable at
+        // admission (remote JWKS), so the mix is refused outright.
+        if let Some(open_mtls_idx) = providers
+            .iter()
+            .position(|provider| provider.issuer.is_none() && provider.require_mtls_binding)
+            && let Some(unbound_idx) = providers
+                .iter()
+                .position(|provider| !provider.require_mtls_binding)
+        {
+            return Err(format!(
+                "jwks_auth: `provider[{open_mtls_idx}]` sets `require_mtls_binding` without an \
+                 `issuer`, so its tokens cannot be told apart from those `provider[{unbound_idx}]` \
+                 accepts without a certificate binding; pin an exact `issuer` on the mTLS-bound \
+                 provider, set `require_mtls_binding` on every provider, or split them into \
+                 separate plugin instances"
+            ));
         }
 
         // Scope/backend coherence is a plugin-level decision, not a per-provider
@@ -886,6 +1076,13 @@ impl JwksAuth {
                         .token_locations
                         .iter()
                         .any(|location| matches!(location, TokenLocation::Header(_))))
+        });
+        let strips_query_tokens = providers.iter().any(|provider| {
+            !provider.forward_original_token
+                && provider
+                    .token_locations
+                    .iter()
+                    .any(|location| matches!(location, TokenLocation::QueryParam(_)))
         });
         let has_custom_query_token_locations = providers.iter().any(|provider| {
             provider
@@ -919,6 +1116,19 @@ impl JwksAuth {
             })
             .map(|(idx, _)| idx)
             .collect();
+        let mut sender_constrained_issuers: Vec<String> = Vec::new();
+        for provider in &providers {
+            if !(provider.require_dpop || provider.require_mtls_binding) {
+                continue;
+            }
+            if let Some(issuer) = provider.issuer.as_ref()
+                && !sender_constrained_issuers
+                    .iter()
+                    .any(|known| known == issuer)
+            {
+                sender_constrained_issuers.push(issuer.clone());
+            }
+        }
         let mut request_headers_to_redact = Vec::new();
         for provider in &providers {
             if provider.token_locations.is_empty()
@@ -955,6 +1165,13 @@ impl JwksAuth {
             )),
         );
 
+        let advertised_challenge =
+            if !providers.is_empty() && providers.iter().all(|provider| provider.require_dpop) {
+                auth_flow::DPOP_AUTHENTICATION_CHALLENGE
+            } else {
+                auth_flow::BEARER_AUTHENTICATION_CHALLENGE
+            };
+
         Ok(Self {
             providers,
             global_scope_claim,
@@ -966,9 +1183,13 @@ impl JwksAuth {
             claim_header_destinations,
             strip_authorization_on_success,
             has_custom_query_token_locations,
+            strips_query_tokens,
             dpop_authorization_scheme_providers,
+            sender_constrained_issuers,
+            advertised_challenge,
             request_headers_to_redact,
             emit_mesh_request_principal_metadata,
+            allow_missing_token,
             http_client,
             refresh_interval,
             kid_miss_cooldown,
@@ -976,12 +1197,13 @@ impl JwksAuth {
             discovery_owner_live: Arc::new(AtomicBool::new(true)),
             discovery_owner_committed: Arc::new(AtomicBool::new(false)),
             discovery_publication_gate: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            verification_attempts: Mutex::new(Vec::new()),
         })
     }
 
     /// Eagerly fetch JWKS keys for all providers that have stores ready.
     /// Called by tests to pre-populate key stores before assertions.
-    #[allow(dead_code)]
     pub async fn warmup_jwks(&self) {
         for prov in &self.providers {
             let guard = prov.jwks_store.load();
@@ -1006,7 +1228,6 @@ impl JwksAuth {
     /// Live remote JWKS stores backing this plugin's providers. Test-only
     /// visibility for the unknown-`kid` on-demand refetch contracts.
     #[doc(hidden)]
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn remote_jwks_stores_for_test(&self) -> Vec<Arc<JwksKeyStore>> {
         self.providers
             .iter()
@@ -1027,7 +1248,6 @@ impl JwksAuth {
     /// Test-only visibility for default-contract regressions and for proving
     /// a reloaded generation enforces its own admitted cap.
     #[doc(hidden)]
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn dpop_replay_lane_capacities(&self) -> Vec<Option<usize>> {
         self.providers
             .iter()
@@ -1042,7 +1262,6 @@ impl JwksAuth {
     /// Per-provider replay-authority modes (`None` when DPoP is not required).
     /// Test-only visibility for scope/reload contracts.
     #[doc(hidden)]
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn dpop_replay_modes(&self) -> Vec<Option<&'static str>> {
         self.providers
             .iter()
@@ -1053,7 +1272,6 @@ impl JwksAuth {
     /// Whether any provider's shared Redis recovery checker has been armed.
     /// Test support for proving construction stays detached until commit.
     #[doc(hidden)]
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn shared_replay_recovery_started_for_test(&self) -> bool {
         self.providers.iter().any(|provider| {
             provider
@@ -1067,7 +1285,6 @@ impl JwksAuth {
     /// "equivalent reload / equivalent replica converge, distinct policies
     /// isolate" contracts.
     #[doc(hidden)]
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn dpop_replay_domain_markers(&self, jkt: &str, jti: &str) -> Vec<Option<[u8; 32]>> {
         self.providers
             .iter()
@@ -1080,12 +1297,7 @@ impl JwksAuth {
             .collect()
     }
 
-    fn resolve_identity(
-        &self,
-        claims: &Value,
-        provider: &JwksProvider,
-        _consumer_index: &ConsumerIndex,
-    ) -> VerifyOutcome {
+    fn resolve_identity(&self, claims: &Value, provider: &JwksProvider) -> VerifyOutcome {
         let effective_identity_claim = provider
             .consumer_identity_claim
             .as_deref()
@@ -1111,49 +1323,115 @@ impl JwksAuth {
         }
 
         // External claims are scoped to the provider that verified them. The
-        // process-wide Consumer username index is not a provider mapping.
+        // process-wide Consumer username index is not a provider mapping, so
+        // a verified identity is never resolved to a gateway Consumer.
         let consumer = None;
 
-        VerifyOutcome::success(consumer, identity, header_value)
-            .with_credential_deadline(credential_deadline_from_claims(claims, 0))
+        // The stream deadline honours the same leeway verification admitted
+        // the token under, so a token accepted inside its leeway window is not
+        // immediately expired, and the deadline never exceeds `exp + leeway`.
+        VerifyOutcome::success(consumer, identity, header_value).with_credential_deadline(
+            credential_deadline_from_claims(claims, provider.clock_skew_seconds),
+        )
+    }
+
+    /// Providers that may verify `token`, each listed once.
+    ///
+    /// A provider that pins an `issuer` rejects every token whose `iss` is not
+    /// exactly that string (presence is required and an array-valued `iss`
+    /// fails closed in `verify_jwt_with_compiled_validation`), so trying it for any other
+    /// token only spends an asymmetric verification. Candidates are therefore
+    /// the pinned providers whose issuer equals the token's unverified `iss`,
+    /// then the providers that pin no issuer, both in configuration order.
+    /// Admission ([`jwks_provider_bound_error`]) bounds this list at
+    /// [`MAX_JWKS_CANDIDATE_PROVIDERS`] for every possible `iss`; the
+    /// fixed-capacity result also stops there defensively. Provider indices are
+    /// below [`MAX_JWKS_PROVIDERS`] (64), so a `u64` mask deduplicates them
+    /// without allocating.
+    fn candidate_provider_indices(
+        &self,
+        token: &str,
+        provider_indices: &[usize],
+    ) -> CandidateProviders {
+        let any_pinned = provider_indices.iter().any(|&idx| {
+            self.providers
+                .get(idx)
+                .is_some_and(|prov| prov.issuer.is_some())
+        });
+        let unverified_issuer = if any_pinned {
+            peek_unverified_issuer(token)
+        } else {
+            None
+        };
+        let mut candidates = CandidateProviders::default();
+        let mut seen: u64 = 0;
+        for pinned_pass in [true, false] {
+            for &idx in provider_indices {
+                let Some(bit) = u32::try_from(idx).ok().and_then(|i| 1u64.checked_shl(i)) else {
+                    continue;
+                };
+                if seen & bit != 0 {
+                    continue;
+                }
+                let Some(prov) = self.providers.get(idx) else {
+                    continue;
+                };
+                let take = match prov.issuer.as_deref() {
+                    Some(issuer) => pinned_pass && unverified_issuer.as_deref() == Some(issuer),
+                    None => !pinned_pass,
+                };
+                if take {
+                    seen |= bit;
+                    if !candidates.push(idx) {
+                        return candidates;
+                    }
+                }
+            }
+        }
+        candidates
+    }
+
+    /// Test-only view of [`Self::candidate_provider_indices`] over every
+    /// configured provider.
+    pub(crate) fn candidate_provider_indices_for_test(&self, token: &str) -> Vec<usize> {
+        let provider_indices: Vec<usize> = (0..self.providers.len()).collect();
+        self.candidate_provider_indices(token, &provider_indices)
+            .as_slice()
+            .to_vec()
     }
 
     /// Try to validate a token against the allowed configured providers.
     ///
-    /// Returns `Ok((claims, provider_index))` on first successful validation,
-    /// or `Err(status_code, body)` if no provider validates the token.
+    /// Each candidate from [`Self::candidate_provider_indices`] is verified at
+    /// most once. Returns `Ok((claims, provider_index))` on the first
+    /// successful validation, or `Err(status_code, body)` if none validates it.
     async fn validate_token_for_providers(
         &self,
         token: &str,
         provider_indices: &[usize],
     ) -> Result<(Value, usize), (u16, &'static str)> {
-        if provider_indices.is_empty() {
-            return Err((401, r#"{"error":"Invalid or unrecognized JWT"}"#));
-        }
-
-        // Peek at the unverified issuer to try matching a specific provider first
-        let unverified_issuer = peek_unverified_issuer(token);
-
-        // If we have an issuer, try matching providers with that issuer first
-        if let Some(ref iss) = unverified_issuer {
-            for &idx in provider_indices {
-                let Some(prov) = self.providers.get(idx) else {
-                    continue;
-                };
-                if prov.issuer.as_deref() == Some(iss.as_str())
-                    && let Some(claims) = try_validate_with_provider(prov, token).await
-                {
-                    return Ok((claims, idx));
-                }
-            }
-        }
-
-        // Fall through: try all providers (handles no-issuer tokens or issuer mismatch)
-        for &idx in provider_indices {
+        let candidates = self.candidate_provider_indices(token, provider_indices);
+        for &idx in candidates.as_slice() {
             let Some(prov) = self.providers.get(idx) else {
                 continue;
             };
+            #[cfg(test)]
+            {
+                if let Ok(mut attempts) = self.verification_attempts.lock() {
+                    attempts.push(idx);
+                }
+            }
             if let Some(claims) = try_validate_with_provider(prov, token).await {
+                // An issuer-less provider must not vouch for a token from a
+                // sender-constrained realm: that realm's own provider is tried
+                // first (pinned candidates precede issuer-less ones), so
+                // reaching here means the token failed it, and accepting it
+                // now would drop the DPoP proof / certificate binding the
+                // realm requires. Later candidates are issuer-less too, so
+                // this ends in the generic 401.
+                if prov.issuer.is_none() && self.token_issuer_requires_sender_constraint(&claims) {
+                    continue;
+                }
                 return Ok((claims, idx));
             }
         }
@@ -1161,11 +1439,19 @@ impl JwksAuth {
         Err((401, r#"{"error":"Invalid or unrecognized JWT"}"#))
     }
 
-    /// Try to validate a token against all configured providers.
-    async fn validate_token(&self, token: &str) -> Result<(Value, usize), (u16, &'static str)> {
-        let provider_indices: Vec<usize> = (0..self.providers.len()).collect();
-        self.validate_token_for_providers(token, &provider_indices)
-            .await
+    /// Whether a verified token's `iss` is the exact issuer of a provider in
+    /// this instance that requires a sender constraint. See
+    /// [`JwksAuth::sender_constrained_issuers`].
+    fn token_issuer_requires_sender_constraint(&self, claims: &Value) -> bool {
+        if self.sender_constrained_issuers.is_empty() {
+            return false;
+        }
+        let Some(issuer) = claims.get("iss").and_then(Value::as_str) else {
+            return false;
+        };
+        self.sender_constrained_issuers
+            .iter()
+            .any(|constrained| constrained == issuer)
     }
 
     /// Check required_scopes and required_roles for a matched provider.
@@ -1210,17 +1496,34 @@ impl JwksAuth {
         claims: &Value,
         provider: &JwksProvider,
         token: &str,
-    ) -> Result<Option<ReplayMarker>, (u16, String)> {
+    ) -> Result<Option<ReplayMarker>, (u16, String, ConstraintFailure)> {
+        // RFC 8705 §3: a certificate-bound token presented without the bound
+        // certificate is an `invalid_token`.
+        const MTLS: ConstraintFailure = ConstraintFailure::Token;
+        // RFC 9449 §7.1: an absent or rejected proof is an `invalid_dpop_proof`.
+        const DPOP: ConstraintFailure = ConstraintFailure::Proof;
         if provider.require_mtls_binding {
             let Some(cert_der) = ctx.tls_client_cert_der.as_ref() else {
-                return Err((401, r#"{"error":"mTLS binding mismatch"}"#.to_string()));
+                return Err((
+                    401,
+                    r#"{"error":"mTLS binding mismatch"}"#.to_string(),
+                    MTLS,
+                ));
             };
             let Some(expected_thumbprint) = extract_claim_string(claims, "cnf.x5t#S256") else {
-                return Err((401, r#"{"error":"mTLS binding mismatch"}"#.to_string()));
+                return Err((
+                    401,
+                    r#"{"error":"mTLS binding mismatch"}"#.to_string(),
+                    MTLS,
+                ));
             };
             let actual_thumbprint = sha256_base64url_no_pad(cert_der.as_slice());
             if !constant_time_eq(actual_thumbprint.as_bytes(), expected_thumbprint.as_bytes()) {
-                return Err((401, r#"{"error":"mTLS binding mismatch"}"#.to_string()));
+                return Err((
+                    401,
+                    r#"{"error":"mTLS binding mismatch"}"#.to_string(),
+                    MTLS,
+                ));
             }
         }
 
@@ -1233,10 +1536,10 @@ impl JwksAuth {
         // material, not a missing proof.
         let proof = match lookup_configured_header(ctx, "dpop", None) {
             ConfiguredHeaderLookup::Absent => {
-                return Err((401, r#"{"error":"DPoP proof required"}"#.to_string()));
+                return Err((401, r#"{"error":"DPoP proof required"}"#.to_string(), DPOP));
             }
             ConfiguredHeaderLookup::PresentNonMaterialized => {
-                return Err((401, r#"{"error":"Invalid DPoP proof"}"#.to_string()));
+                return Err((401, r#"{"error":"Invalid DPoP proof"}"#.to_string(), DPOP));
             }
             ConfiguredHeaderLookup::Value(proof) => proof,
         };
@@ -1244,22 +1547,32 @@ impl JwksAuth {
         // construction rejects the configuration otherwise. Fail closed rather
         // than admit a proof that would not be made single-use.
         let Some(domain) = provider.dpop_replay_domain.as_ref() else {
-            return Err((401, r#"{"error":"DPoP proof required"}"#.to_string()));
+            return Err((401, r#"{"error":"DPoP proof required"}"#.to_string(), DPOP));
         };
+        // A DPoP-bound token must name its issuer and principal: missing
+        // claims fault the token, not the proof.
         let Some(issuer) = extract_claim_string(claims, "iss") else {
-            return Err((401, r#"{"error":"DPoP validation failed"}"#.to_string()));
+            return Err((
+                401,
+                r#"{"error":"DPoP validation failed"}"#.to_string(),
+                ConstraintFailure::Token,
+            ));
         };
         let Some(token_identity) = extract_claim_string(claims, "sub")
             .or_else(|| extract_claim_string(claims, "client_id"))
         else {
-            return Err((401, r#"{"error":"DPoP validation failed"}"#.to_string()));
+            return Err((
+                401,
+                r#"{"error":"DPoP validation failed"}"#.to_string(),
+                ConstraintFailure::Token,
+            ));
         };
         let Some(host) = ctx
             .headers
             .get("host")
             .or_else(|| ctx.headers.get(":authority"))
         else {
-            return Err((401, r#"{"error":"DPoP URL mismatch"}"#.to_string()));
+            return Err((401, r#"{"error":"DPoP URL mismatch"}"#.to_string(), DPOP));
         };
         let scheme = ctx
             .metadata
@@ -1267,7 +1580,7 @@ impl JwksAuth {
             .map(String::as_str)
             .unwrap_or("http");
         let Some(htu) = dpop::canonical_htu(scheme, host, &ctx.path) else {
-            return Err((401, r#"{"error":"DPoP URL mismatch"}"#.to_string()));
+            return Err((401, r#"{"error":"DPoP URL mismatch"}"#.to_string(), DPOP));
         };
         match dpop::verify(DpopVerifyInput {
             proof: &proof,
@@ -1280,7 +1593,19 @@ impl JwksAuth {
             domain,
         }) {
             Ok(marker) => Ok(Some(marker)),
-            Err(_) => Err((401, r#"{"error":"DPoP validation failed"}"#.to_string())),
+            // RFC 9449 §7.1: a token not bound to the proof's key (missing or
+            // mismatched `cnf.jkt`) is an `invalid_token`; every other proof
+            // failure is an `invalid_dpop_proof`. The client body stays the
+            // same fixed literal either way.
+            Err(reason) => Err((
+                401,
+                r#"{"error":"DPoP validation failed"}"#.to_string(),
+                if dpop::is_token_binding_failure(reason) {
+                    ConstraintFailure::Token
+                } else {
+                    DPOP
+                },
+            )),
         }
     }
 
@@ -1385,17 +1710,16 @@ impl JwksAuth {
         );
     }
 
-    async fn authenticate_request(
-        &self,
-        ctx: &mut RequestContext,
-        consumer_index: &ConsumerIndex,
-    ) -> PluginResult {
+    async fn authenticate_request(&self, ctx: &mut RequestContext) -> PluginResult {
         let credential = self.extract_jwks_credential(ctx);
 
         match credential {
             JwksExtractedCredential::Missing => {
                 debug!("jwks_auth: no credential present");
-                if self.emit_mesh_request_principal_metadata {
+                // Only the explicit `allow_missing_token` opt-in may mark a
+                // missing token as permissive; the metadata-emission flag
+                // never does.
+                if self.allow_missing_token {
                     ctx.metadata.insert(
                         "mesh_request_auth.permissive_missing_token".to_string(),
                         "true".to_string(),
@@ -1403,18 +1727,29 @@ impl JwksAuth {
                 }
                 PluginResult::Continue
             }
-            JwksExtractedCredential::InvalidFormat(body) => reject(401, body),
+            JwksExtractedCredential::InvalidFormat(body) => {
+                reject(401, body, auth_flow::BEARER_INVALID_REQUEST_CHALLENGE)
+            }
             JwksExtractedCredential::BearerToken {
                 token,
                 provider_indices,
-                ..
+                dpop_scheme,
             } => {
+                // RFC 9449 §7.1: a token presented under the `DPoP` scheme is
+                // challenged under that scheme.
+                let invalid_token = if dpop_scheme {
+                    auth_flow::DPOP_INVALID_TOKEN_CHALLENGE
+                } else {
+                    auth_flow::BEARER_INVALID_TOKEN_CHALLENGE
+                };
                 let (claims, provider_idx) = match self
                     .validate_token_for_providers(&token, &provider_indices)
                     .await
                 {
                     Ok(result) => result,
-                    Err((status, body)) => return reject(status, body.to_string()),
+                    Err((status, body)) => {
+                        return reject(status, body.to_string(), invalid_token);
+                    }
                 };
 
                 let provider = &self.providers[provider_idx];
@@ -1426,15 +1761,27 @@ impl JwksAuth {
                 let pending_dpop_marker =
                     match self.check_sender_constraints(ctx, &claims, provider, &token) {
                         Ok(marker) => marker,
-                        Err((status, body)) => return reject(status, body),
+                        Err((status, body, failure)) => {
+                            let challenge = match failure {
+                                ConstraintFailure::Proof => auth_flow::DPOP_INVALID_PROOF_CHALLENGE,
+                                // A provider that demands a proof challenges a
+                                // rejected token under `DPoP` whichever scheme
+                                // presented it.
+                                ConstraintFailure::Token if provider.require_dpop => {
+                                    auth_flow::DPOP_INVALID_TOKEN_CHALLENGE
+                                }
+                                ConstraintFailure::Token => invalid_token,
+                            };
+                            return reject(status, body, challenge);
+                        }
                     };
                 if let Err((status, body)) = self.check_claims_authorization(&claims, provider) {
-                    return reject(status, body);
+                    return reject(status, body, invalid_token);
                 }
                 if let Some(marker) = pending_dpop_marker {
                     let admission = self.admit_dpop_marker(provider, marker).await;
                     if let Err((status, body)) = admission {
-                        return reject(status, body);
+                        return reject(status, body, auth_flow::DPOP_INVALID_PROOF_CHALLENGE);
                     }
                 }
 
@@ -1464,20 +1811,39 @@ impl JwksAuth {
                     stage_original_token_stripping(&mut attempt, provider);
                 }
 
+                // RFC 9449 §7.1: a principal admitted on a DPoP-bound token is
+                // re-challenged under `DPoP` when its credential later expires.
+                let dpop_bound = dpop_scheme || provider.require_dpop;
                 match commit_authentication_attempt(
                     ctx,
                     attempt,
-                    self.resolve_identity(&claims, provider, consumer_index),
+                    self.resolve_identity(&claims, provider),
                     "jwks_auth",
                     true,
                 ) {
-                    Ok(_) => PluginResult::Continue,
-                    Err(VerifyOutcome::InvalidFormat(body))
-                    | Err(VerifyOutcome::Invalid(body))
+                    Ok(committed) => {
+                        if committed && dpop_bound && ctx.auth_method == Some("jwks_auth") {
+                            ctx.reauthentication_challenge =
+                                Some(auth_flow::DPOP_INVALID_TOKEN_CHALLENGE);
+                        }
+                        PluginResult::Continue
+                    }
+                    Err(VerifyOutcome::InvalidFormat(body)) => reject(
+                        401,
+                        body,
+                        self.rejection_challenge(CredentialRejection::InvalidFormat),
+                    ),
+                    Err(VerifyOutcome::Invalid(body))
                     | Err(VerifyOutcome::ConsumerNotFound(body))
-                    | Err(VerifyOutcome::VerificationFailed(body)) => reject(401, body),
-                    Err(VerifyOutcome::Forbidden(body)) => reject(403, body),
-                    Err(VerifyOutcome::Internal(body)) => reject(500, body),
+                    | Err(VerifyOutcome::VerificationFailed(body)) => {
+                        reject(401, body, invalid_token)
+                    }
+                    Err(VerifyOutcome::Forbidden(body)) => {
+                        reject(403, body, self.advertised_challenge)
+                    }
+                    Err(VerifyOutcome::Internal(body)) => {
+                        reject(500, body, self.advertised_challenge)
+                    }
                     Err(VerifyOutcome::Success { .. }) | Err(VerifyOutcome::NotApplicable) => {
                         PluginResult::Continue
                     }
@@ -1487,6 +1853,23 @@ impl JwksAuth {
     }
 
     fn extract_jwks_credential(&self, ctx: &RequestContext) -> JwksExtractedCredential {
+        // A `;`-aliased query token at ANY configured query location is
+        // terminal for this instance, before any header, `Authorization`, or
+        // fallback source is read (issue #6579, GHSA-c259-vchc-3vgr): a valid
+        // token elsewhere must not mask a credential Ferrum and a
+        // `;`-splitting backend read differently. With this rule, an
+        // accepted token can never leave an aliased copy behind for
+        // accepted-token stripping to miss.
+        if self.has_custom_query_token_locations
+            && query_locations_have_semicolon_alias(
+                ctx,
+                self.providers
+                    .iter()
+                    .flat_map(|provider| provider.token_locations.iter()),
+            )
+        {
+            return JwksExtractedCredential::InvalidFormat(AMBIGUOUS_QUERY_TOKEN_BODY.to_string());
+        }
         let mut first_invalid_format: Option<String> = None;
         for (idx, provider) in self.providers.iter().enumerate() {
             if provider.token_locations.is_empty() {
@@ -1502,15 +1885,38 @@ impl JwksAuth {
                     TokenLocationExtract::Credential(ExtractedCredential::BearerToken(token)) => {
                         let mut provider_indices = Vec::with_capacity(1);
                         provider_indices.push(idx);
+                        // A provider with default locations reads
+                        // `Authorization: Bearer`. When an explicit location
+                        // (for example `from_headers: [{name: Authorization}]`)
+                        // yields the identical credential, that provider is
+                        // eligible too; returning early without it would make a
+                        // valid default-location provider unreachable. The
+                        // default extraction runs at most once per request.
+                        let mut default_bearer: Option<Option<String>> = None;
                         for (other_idx, other_provider) in self.providers.iter().enumerate() {
-                            if other_idx != idx
-                                && !other_provider.token_locations.is_empty()
-                                && provider_locations_extract_token(
+                            if other_idx == idx {
+                                continue;
+                            }
+                            let extracts_same_token = if other_provider.token_locations.is_empty() {
+                                default_bearer
+                                    .get_or_insert_with(|| {
+                                        match extract_authorization_bearer(ctx) {
+                                            ExtractedCredential::BearerToken(default_token) => {
+                                                Some(default_token)
+                                            }
+                                            _ => None,
+                                        }
+                                    })
+                                    .as_deref()
+                                    == Some(token.as_str())
+                            } else {
+                                provider_locations_extract_token(
                                     &other_provider.token_locations,
                                     ctx,
                                     &token,
                                 )
-                            {
+                            };
+                            if extracts_same_token {
                                 provider_indices.push(other_idx);
                             }
                         }
@@ -1584,81 +1990,27 @@ impl JwksAuth {
     }
 }
 
-#[async_trait]
-impl AuthMechanism for JwksAuth {
-    fn mechanism_name(&self) -> &'static str {
-        "jwks_auth"
-    }
-
-    fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
-        match self.extract_jwks_credential(ctx) {
-            JwksExtractedCredential::Missing => ExtractedCredential::Missing,
-            JwksExtractedCredential::InvalidFormat(body) => {
-                ExtractedCredential::InvalidFormat(body)
-            }
-            JwksExtractedCredential::BearerToken {
-                token,
-                dpop_scheme: false,
-                ..
-            } => ExtractedCredential::BearerToken(token),
-            // This mechanism path runs no sender-constraint check, so a
-            // `DPoP`-scheme presentation must not reach it as a plain bearer
-            // token. The plugin's own `authenticate` is the only entry point
-            // that validates and claims the proof.
-            JwksExtractedCredential::BearerToken {
-                dpop_scheme: true, ..
-            } => ExtractedCredential::Missing,
+impl JwksAuth {
+    /// `WWW-Authenticate` challenge for a rejected bearer credential, with the
+    /// RFC 6750 §3.1 `error` code.
+    fn rejection_challenge(&self, rejection: CredentialRejection) -> &'static str {
+        match rejection {
+            CredentialRejection::InvalidFormat => auth_flow::BEARER_INVALID_REQUEST_CHALLENGE,
+            CredentialRejection::InvalidCredential => auth_flow::BEARER_INVALID_TOKEN_CHALLENGE,
         }
     }
+}
 
-    async fn verify(
-        &self,
-        credential: ExtractedCredential,
-        consumer_index: &ConsumerIndex,
-    ) -> VerifyOutcome {
-        let ExtractedCredential::BearerToken(token) = credential else {
-            return VerifyOutcome::NotApplicable;
-        };
-
-        let (claims, provider_idx) = match self.validate_token(&token).await {
-            Ok(result) => result,
-            Err((status, body)) => {
-                return if status == 403 {
-                    VerifyOutcome::Forbidden(body.to_string())
-                } else {
-                    VerifyOutcome::InvalidFormat(body.to_string())
-                };
-            }
-        };
-
-        let provider = &self.providers[provider_idx];
-        if let Err((status, body)) = self.check_claims_authorization(&claims, provider) {
-            return if status == 403 {
-                VerifyOutcome::Forbidden(body)
-            } else {
-                VerifyOutcome::Invalid(body)
-            };
-        }
-
-        // This generic mechanism path is not a production entry point — the
-        // plugin's own `authenticate` is — and it cannot stage the provider's
-        // identity-realm authority. It therefore never yields an external
-        // identity, which would otherwise commit under a mechanism-only realm
-        // shared by every provider: only a mapped Consumer survives here.
-        match self.resolve_identity(&claims, provider, consumer_index) {
-            VerifyOutcome::Success {
-                consumer,
-                credential_deadline,
-                ..
-            } => VerifyOutcome::Success {
-                consumer,
-                external_identity: None,
-                external_identity_header: None,
-                credential_deadline,
-            },
-            other => other,
-        }
-    }
+/// Which credential a sender-constraint rejection faults (RFC 9449 §7.1),
+/// so the `401` names the right `error` code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConstraintFailure {
+    /// The access token: a missing or mismatched certificate or proof-key
+    /// binding, or a claim the proof check requires (`invalid_token`).
+    Token,
+    /// The DPoP proof: absent, malformed, invalid, bound to another request,
+    /// or replayed (`invalid_dpop_proof`).
+    Proof,
 }
 
 enum JwksExtractedCredential {
@@ -1690,12 +2042,42 @@ impl super::Plugin for JwksAuth {
         "jwks_auth"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn is_auth_plugin(&self) -> bool {
         true
     }
 
+    fn admits_missing_credential(&self) -> bool {
+        self.allow_missing_token
+    }
+
     fn priority(&self) -> u16 {
         super::priority::JWKS_AUTH
+    }
+
+    fn supports_request_header_passthrough(&self) -> bool {
+        !self.providers.iter().any(|provider| provider.require_dpop)
+            && !self.requires_decoded_query_params()
+            && !self.modifies_request_headers()
+            && !self
+                .request_headers_to_redact()
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case("host"))
+    }
+
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        if self.modifies_request_headers() {
+            crate::plugins::PluginHooks::BEFORE_PROXY
+        } else {
+            crate::plugins::PluginHooks::NONE
+        }
+    }
+
+    fn authentication_challenge(&self) -> Option<&'static str> {
+        Some(self.advertised_challenge)
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
@@ -1726,7 +2108,7 @@ impl super::Plugin for JwksAuth {
         for provider in &self.providers {
             match &provider.jwks_source {
                 JwksSource::Inline => {}
-                JwksSource::Direct(uri) => {
+                JwksSource::Direct(uri) | JwksSource::Managed(uri) => {
                     let store = get_or_create_jwks_store(
                         uri,
                         &self.http_client,
@@ -1753,6 +2135,7 @@ impl super::Plugin for JwksAuth {
                         self.http_client.clone(),
                         discovery_url.clone(),
                         self.shared_store_requirement(provider.max_stale),
+                        self.refresh_interval,
                         Arc::clone(&self.discovery_owner_live),
                         Arc::clone(&self.discovery_owner_committed),
                         Arc::clone(&self.discovery_publication_gate),
@@ -1806,19 +2189,36 @@ impl super::Plugin for JwksAuth {
     async fn authenticate(
         &self,
         ctx: &mut RequestContext,
-        consumer_index: &ConsumerIndex,
+        _consumer_index: &ConsumerIndex,
     ) -> PluginResult {
-        self.authenticate_request(ctx, consumer_index).await
+        // External claims are scoped to the provider that verified them; a
+        // verified identity is never resolved to a gateway Consumer.
+        self.authenticate_request(ctx).await
     }
 
+    /// Mark every present query token location — in the decoded map or behind
+    /// a `;` sub-parameter — for policy redaction. A provider that does not
+    /// forward the original token also marks a `;` alias for removal here,
+    /// before multi-auth can stop at another mechanism (GHSA-c259-vchc-3vgr).
     fn mark_query_credentials_for_redaction(&self, ctx: &mut RequestContext) {
         for provider in &self.providers {
-            mark_present_query_credential_locations(ctx, &provider.token_locations);
+            mark_provider_query_credential_locations(
+                ctx,
+                &provider.token_locations,
+                provider.forward_original_token,
+            );
         }
     }
 
     fn request_headers_to_redact(&self) -> &[String] {
         &self.request_headers_to_redact
+    }
+
+    /// A provider that does not forward the original token strips its query
+    /// token locations: the accepted token on success, and a `;` alias from
+    /// the pre-authentication discovery hook, whichever mechanism wins.
+    fn modifies_request_query(&self) -> bool {
+        self.strips_query_tokens
     }
 
     fn modifies_request_headers(&self) -> bool {
@@ -1850,33 +2250,56 @@ impl super::Plugin for JwksAuth {
         ctx: &mut RequestContext,
         headers: &mut std::collections::HashMap<String, String>,
     ) -> PluginResult {
-        let strip_authorization = ctx
-            .metadata
-            .remove(STRIP_AUTHORIZATION_METADATA_KEY)
-            .is_some();
-        let strip_headers: Vec<String> = ctx
-            .metadata
-            .keys()
-            .filter_map(|key| key.strip_prefix(STRIP_HEADER_METADATA_PREFIX))
-            .map(ToOwned::to_owned)
-            .collect();
+        let any_strips_token = self
+            .providers
+            .iter()
+            .any(|provider| !provider.forward_original_token);
+        if any_strips_token {
+            let strip_authorization = ctx
+                .metadata
+                .remove(STRIP_AUTHORIZATION_METADATA_KEY)
+                .is_some();
+            let strip_headers: Vec<String> = ctx
+                .metadata
+                .keys()
+                .filter_map(|key| key.strip_prefix(STRIP_HEADER_METADATA_PREFIX))
+                .map(ToOwned::to_owned)
+                .collect();
 
-        if strip_authorization || !strip_headers.is_empty() {
-            headers.retain(|name, _| {
-                let strip_current = (strip_authorization
-                    && name.eq_ignore_ascii_case("authorization"))
-                    || strip_headers
-                        .iter()
-                        .any(|header| name.eq_ignore_ascii_case(header));
-                !strip_current
-            });
-        }
-        for header in strip_headers {
-            ctx.metadata
-                .remove(&format!("{STRIP_HEADER_METADATA_PREFIX}{header}"));
+            if strip_authorization || !strip_headers.is_empty() {
+                headers.retain(|name, _| {
+                    let strip_current = (strip_authorization
+                        && name.eq_ignore_ascii_case("authorization"))
+                        || strip_headers
+                            .iter()
+                            .any(|header| name.eq_ignore_ascii_case(header));
+                    !strip_current
+                });
+            }
+            for header in strip_headers {
+                ctx.metadata
+                    .remove(&format!("{STRIP_HEADER_METADATA_PREFIX}{header}"));
+            }
         }
         apply_claim_headers_from_context(ctx, headers, &self.claim_header_destinations);
         PluginResult::Continue
+    }
+
+    /// A trigger-skipped instance still strips its owned claim destinations,
+    /// so a client copy is never forwarded as a gateway claim assertion.
+    fn sanitize_owned_request_headers(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut std::collections::HashMap<String, String>,
+    ) {
+        sanitize_claim_header_destinations(ctx, headers, &self.claim_header_destinations);
+    }
+
+    /// Every owned claim destination, for the route's request-trailer strip
+    /// list: a trailer can never restate a gateway claim assertion.
+    fn owned_request_assertion_header_names(&self) -> Vec<String> {
+        let destinations = &self.claim_header_destinations;
+        destinations.names().map(str::to_string).collect()
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
@@ -1896,6 +2319,7 @@ impl super::Plugin for JwksAuth {
             let guard = prov.jwks_store.load();
             if let Some(ref store) = **guard
                 && store.is_refreshable()
+                && !store.is_managed()
                 && let Some(host) = hostname_from_url(store.jwks_uri())
                 && !hosts.iter().any(|known| known == &host)
             {
@@ -1918,9 +2342,21 @@ impl super::Plugin for JwksAuth {
         uris
     }
 
+    /// Static requirements for the publication snapshot.
+    ///
+    /// Discovery-backed providers are deliberately excluded. Their store can
+    /// move to a different URI while this generation is live (periodic
+    /// rediscovery), and a URI frozen into the committed publication snapshot
+    /// would keep the superseded store active — refreshing, and counted by
+    /// readiness until it expires — after the provider stopped using it.
+    /// They contribute instead through their generation-owned, replaceable
+    /// [`LateActiveRequirement`], registered at `commit_background_tasks` (or
+    /// when discovery first resolves after commit) and repointed on
+    /// rediscovery, so exactly the URI currently in use stays active.
     fn active_jwks_refresh_requirements(&self) -> Vec<(String, JwksRefreshRequirement)> {
         self.providers
             .iter()
+            .filter(|provider| !matches!(&provider.jwks_source, JwksSource::Discovery(_)))
             .filter_map(|provider| {
                 let store = provider.jwks_store.load();
                 store
@@ -1946,6 +2382,30 @@ impl super::Plugin for JwksAuth {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Outcome of applying one successful OIDC discovery result to a provider's
+/// store slot.
+enum DiscoveryApplyOutcome {
+    /// The discovered endpoint's store is the provider's verification source.
+    Published,
+    /// The discovered endpoint could not replace the current store (no usable
+    /// keys, or its fetch failed); the last-known-good store is retained.
+    Retained,
+    /// The owning plugin generation retired, or the candidate vanished; the
+    /// discovery task must stop.
+    Stop,
+}
+
+/// Resolve `discovery_url` in the background, then keep re-resolving it.
+///
+/// The first phase retries with capped exponential backoff until a usable
+/// store is published. After that the task re-runs discovery every
+/// `rediscovery_interval` (the plugin's `jwks_refresh_interval_secs`, at least
+/// one second), so an IdP that moves its `jwks_uri` is followed without a
+/// reload or restart. An unchanged result touches nothing; a changed result
+/// goes through the same replacement path as the first resolution, which
+/// retains the last-known-good store until the replacement has usable keys.
+/// A failed rediscovery keeps the current store and is retried on the next
+/// interval. Discovery success alone never refreshes key trust.
 #[allow(clippy::too_many_arguments)]
 fn spawn_discovery_task(
     runtime: &tokio::runtime::Handle,
@@ -1954,6 +2414,7 @@ fn spawn_discovery_task(
     client: PluginHttpClient,
     discovery_url: String,
     requirement: JwksRefreshRequirement,
+    rediscovery_interval: Duration,
     owner_live: Arc<AtomicBool>,
     owner_committed: Arc<AtomicBool>,
     publication_gate: Arc<Mutex<()>>,
@@ -1982,114 +2443,23 @@ fn spawn_discovery_task(
                         "jwks_auth OIDC discovery resolved a JWKS endpoint at {}",
                         redacted_jwks_uri(&uri)
                     );
-                    let mut candidate =
-                        DiscoveryStoreCandidate::acquire(&uri, &client, requirement);
-                    let Some(store) = candidate.store().cloned() else {
-                        warn!(
-                            "jwks_auth OIDC: discovery candidate disappeared before publication"
-                        );
-                        return;
-                    };
-                    let previous = slot.load().as_ref().as_ref().cloned();
-
-                    if previous
-                        .as_ref()
-                        .is_some_and(|current| current.jwks_uri() == uri)
+                    match apply_discovered_jwks_uri(
+                        &slot,
+                        &late_active,
+                        &client,
+                        &discovery_url,
+                        &uri,
+                        requirement,
+                        &owner_live,
+                        &owner_committed,
+                        &publication_gate,
+                    )
+                    .await
                     {
-                        let _publication = match publication_gate.lock() {
-                            Ok(guard) => guard,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
-                        if !owner_live.load(Ordering::Acquire) {
-                            return;
-                        }
-                        remember_discovered_jwks_uri(&discovery_url, &uri);
-                        if owner_committed.load(Ordering::Acquire) {
-                            publish_late_active_requirement(
-                                &late_active,
-                                &uri,
-                                requirement,
-                            );
-                        }
-                        candidate.publish();
-                        return;
+                        DiscoveryApplyOutcome::Published => break,
+                        DiscoveryApplyOutcome::Retained => {}
+                        DiscoveryApplyOutcome::Stop => return,
                     }
-
-                    let previous_has_keys = previous.as_ref().is_some_and(|store| store.has_keys());
-                    if previous_has_keys {
-                        match store.fetch_keys_if_empty().await {
-                            Ok(_) if store.has_keys() => {}
-                            Ok(_) => {
-                                warn!(
-                                    "jwks_auth OIDC: discovered replacement JWKS endpoint has no usable keys; retaining last-known-good store"
-                                );
-                                drop(store);
-                                attempt = attempt.saturating_add(1);
-                                continue;
-                            }
-                            Err(error) => {
-                                warn!(
-                                    "jwks_auth OIDC: replacement JWKS fetch failed: {}; retaining last-known-good store",
-                                    error
-                                );
-                                drop(store);
-                                attempt = attempt.saturating_add(1);
-                                continue;
-                            }
-                        }
-                    }
-
-                    let previous_uri = previous
-                        .as_ref()
-                        .map(|current| current.jwks_uri().to_string());
-                    {
-                        let _publication = match publication_gate.lock() {
-                            Ok(guard) => guard,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
-                        if !owner_live.load(Ordering::Acquire) {
-                            return;
-                        }
-                        slot.store(Arc::new(Some(Arc::clone(&store))));
-                        remember_discovered_jwks_uri(&discovery_url, &uri);
-                        // The store is now the authenticator's verification
-                        // source, so a committed generation must expose it —
-                        // and its exact max-stale deadline — immediately. A
-                        // replacement moves this provider's contribution off
-                        // the previous URI without touching a co-tenant.
-                        if owner_committed.load(Ordering::Acquire) {
-                            publish_late_active_requirement(
-                                &late_active,
-                                &uri,
-                                requirement,
-                            );
-                        }
-                    }
-
-                    if !previous_has_keys
-                        && let Err(error) = store.fetch_keys_if_empty().await
-                    {
-                        warn!("jwks_auth OIDC: initial JWKS fetch failed: {}", error);
-                    }
-
-                    drop(previous);
-                    if let Some(previous_uri) = previous_uri
-                        && previous_uri != uri
-                    {
-                        retire_jwks_store_if_unreferenced(&previous_uri);
-                    }
-                    let _publication = match publication_gate.lock() {
-                        Ok(guard) => guard,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                    if !owner_live.load(Ordering::Acquire) {
-                        clear_late_active_requirement(&late_active);
-                        let discarded = slot.swap(Arc::new(None));
-                        drop(discarded);
-                        return;
-                    }
-                    candidate.publish();
-                    return;
                 }
                 Err(error) => {
                     warn!(
@@ -2101,37 +2471,227 @@ fn spawn_discovery_task(
             }
             attempt = attempt.saturating_add(1);
         }
+
+        // Steady state: periodic, bounded rediscovery (one discovery request
+        // per interval per provider).
+        let rediscovery_interval = rediscovery_interval.max(Duration::from_secs(1));
+        loop {
+            tokio::time::sleep(rediscovery_interval).await;
+            if !owner_live.load(Ordering::Acquire) {
+                return;
+            }
+            let uri = match discover_jwks_uri(&client, &discovery_url).await {
+                Ok(uri) => uri,
+                Err(error) => {
+                    warn!(
+                        "jwks_auth OIDC rediscovery failed: {}; retaining the current JWKS endpoint",
+                        error
+                    );
+                    continue;
+                }
+            };
+            let unchanged = slot
+                .load()
+                .as_ref()
+                .as_ref()
+                .is_some_and(|current| current.jwks_uri() == uri);
+            if unchanged {
+                continue;
+            }
+            info!(
+                "jwks_auth OIDC rediscovery resolved a different JWKS endpoint at {}",
+                redacted_jwks_uri(&uri)
+            );
+            if let DiscoveryApplyOutcome::Stop = apply_discovered_jwks_uri(
+                &slot,
+                &late_active,
+                &client,
+                &discovery_url,
+                &uri,
+                requirement,
+                &owner_live,
+                &owner_committed,
+                &publication_gate,
+            )
+            .await
+            {
+                return;
+            }
+        }
     })
+}
+
+/// Install one validated discovery result into a provider's store slot.
+///
+/// An unchanged endpoint only refreshes the remembered discovery mapping and
+/// this generation's late-active contribution. A changed endpoint is adopted
+/// only once its store has usable keys whenever the current store still holds
+/// keys, so a broken replacement can never displace last-known-good trust;
+/// the superseded store is retired when nothing else references it. No
+/// publication-gate guard is held across an `await`.
+#[allow(clippy::too_many_arguments)]
+async fn apply_discovered_jwks_uri(
+    slot: &ArcSwap<Option<Arc<JwksKeyStore>>>,
+    late_active: &Mutex<Option<LateActiveRequirement>>,
+    client: &PluginHttpClient,
+    discovery_url: &str,
+    uri: &str,
+    requirement: JwksRefreshRequirement,
+    owner_live: &AtomicBool,
+    owner_committed: &AtomicBool,
+    publication_gate: &Mutex<()>,
+) -> DiscoveryApplyOutcome {
+    let mut candidate = DiscoveryStoreCandidate::acquire(uri, client, requirement);
+    let Some(store) = candidate.store().cloned() else {
+        warn!("jwks_auth OIDC: discovery candidate disappeared before publication");
+        return DiscoveryApplyOutcome::Stop;
+    };
+    let previous = slot.load().as_ref().as_ref().cloned();
+
+    if previous
+        .as_ref()
+        .is_some_and(|current| current.jwks_uri() == uri)
+    {
+        let _publication = match publication_gate.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if !owner_live.load(Ordering::Acquire) {
+            return DiscoveryApplyOutcome::Stop;
+        }
+        remember_discovered_jwks_uri(discovery_url, uri);
+        if owner_committed.load(Ordering::Acquire) {
+            publish_late_active_requirement(late_active, uri, requirement);
+        }
+        candidate.publish();
+        return DiscoveryApplyOutcome::Published;
+    }
+
+    let previous_has_keys = previous.as_ref().is_some_and(|store| store.has_keys());
+    if previous_has_keys {
+        match store.fetch_keys_if_empty().await {
+            Ok(_) if store.has_keys() => {}
+            Ok(_) => {
+                warn!(
+                    "jwks_auth OIDC: discovered replacement JWKS endpoint has no usable keys; retaining last-known-good store"
+                );
+                return DiscoveryApplyOutcome::Retained;
+            }
+            Err(error) => {
+                warn!(
+                    "jwks_auth OIDC: replacement JWKS fetch failed: {}; retaining last-known-good store",
+                    error
+                );
+                return DiscoveryApplyOutcome::Retained;
+            }
+        }
+    }
+
+    let previous_uri = previous
+        .as_ref()
+        .map(|current| current.jwks_uri().to_string());
+    {
+        let _publication = match publication_gate.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if !owner_live.load(Ordering::Acquire) {
+            return DiscoveryApplyOutcome::Stop;
+        }
+        slot.store(Arc::new(Some(Arc::clone(&store))));
+        remember_discovered_jwks_uri(discovery_url, uri);
+        // The store is now the authenticator's verification source, so a
+        // committed generation must expose it — and its exact max-stale
+        // deadline — immediately. A replacement moves this provider's
+        // contribution off the previous URI without touching a co-tenant.
+        if owner_committed.load(Ordering::Acquire) {
+            publish_late_active_requirement(late_active, uri, requirement);
+        }
+    }
+
+    if !previous_has_keys && let Err(error) = store.fetch_keys_if_empty().await {
+        warn!("jwks_auth OIDC: initial JWKS fetch failed: {}", error);
+    }
+
+    drop(previous);
+    if let Some(previous_uri) = previous_uri
+        && previous_uri != uri
+    {
+        retire_jwks_store_if_unreferenced(&previous_uri);
+    }
+    let _publication = match publication_gate.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if !owner_live.load(Ordering::Acquire) {
+        clear_late_active_requirement(late_active);
+        let discarded = slot.swap(Arc::new(None));
+        drop(discarded);
+        return DiscoveryApplyOutcome::Stop;
+    }
+    candidate.publish();
+    DiscoveryApplyOutcome::Published
+}
+
+/// Admission bound on how many providers one token can be verified against.
+///
+/// A token is a candidate for every provider pinning its exact `iss` plus
+/// every provider pinning none, so each issuer realm's count plus the
+/// issuer-less count must stay within [`MAX_JWKS_CANDIDATE_PROVIDERS`], and
+/// the total within [`MAX_JWKS_PROVIDERS`]. Returns the refusal reason.
+pub(crate) fn jwks_provider_bound_error<'a, I>(issuers: I) -> Option<String>
+where
+    I: IntoIterator<Item = Option<&'a str>>,
+{
+    let mut total = 0usize;
+    let mut open = 0usize;
+    let mut per_issuer: HashMap<&str, usize> = HashMap::new();
+    for issuer in issuers {
+        total += 1;
+        match issuer {
+            Some(issuer) => *per_issuer.entry(issuer).or_insert(0) += 1,
+            None => open += 1,
+        }
+    }
+    if total > MAX_JWKS_PROVIDERS {
+        return Some(format!(
+            "at most {MAX_JWKS_PROVIDERS} providers are supported in one instance"
+        ));
+    }
+    if open > MAX_JWKS_CANDIDATE_PROVIDERS {
+        return Some(format!(
+            "at most {MAX_JWKS_CANDIDATE_PROVIDERS} providers may omit `issuer`, because a token \
+             is verified against every provider without one"
+        ));
+    }
+    if per_issuer
+        .values()
+        .any(|count| count + open > MAX_JWKS_CANDIDATE_PROVIDERS)
+    {
+        return Some(format!(
+            "providers sharing one `issuer`, plus providers without an `issuer`, must total \
+             at most {MAX_JWKS_CANDIDATE_PROVIDERS}, because a token is verified against each \
+             of them"
+        ));
+    }
+    None
 }
 
 /// Try to validate a JWT against a single provider's current trusted JWKS.
 ///
-/// Key selection is the JWT header `kid` via [`verify_jwt_with_jwks`]: missing,
-/// empty, and unknown identifiers fail closed, and a matching `kid` binds
-/// verification to that one key.
+/// Key selection is the JWT header `kid` via
+/// [`verify_jwt_with_compiled_validation`]: missing, empty, and unknown
+/// identifiers fail closed, and a matching `kid` binds verification to that
+/// one key. The provider's validation policy was compiled at construction;
+/// JWT `exp`/`nbf` use its `clock_skew_seconds` leeway, while DPoP
+/// `dpop_clock_skew` is a separate proof-validation contract.
 async fn try_validate_with_provider(provider: &JwksProvider, token: &str) -> Option<Value> {
     let guard = provider.jwks_store.load();
     let store = guard.as_ref().as_ref()?;
-    verify_jwt_with_jwks(
-        token,
-        store,
-        &JwtVerifyParams {
-            issuer: provider.issuer.as_deref(),
-            audiences: &provider.audiences,
-            require_exp: provider.require_exp,
-            // JWT `exp`/`nbf` use this surface's existing 0-second leeway.
-            // DPoP `dpop_clock_skew` is a separate proof-validation contract.
-            leeway_secs: 0,
-            // `nbf` stays optional (not a required claim). When present it
-            // must be enforced so a pre-minted credential cannot authenticate
-            // before its not-before instant.
-            validate_nbf: true,
-        },
-    )
-    .await
+    verify_jwt_with_compiled_validation(token, store, &provider.validation)
 }
 
-/// Parse a JSON value as an array of strings, or empty vec if not present/valid.
+/// A validated `jwks_uri` / `discovery_url` and its hostname.
 struct ParsedEndpoint {
     url: String,
     hostname: String,
@@ -2160,32 +2720,6 @@ fn default_dpop_redis_key_prefix(namespace: &str, plugin_config_id: &str) -> Str
     prefix
 }
 
-/// Reject provider fields the shared replay authority removed, naming the
-/// replacement. See [`REMOVED_PROVIDER_FIELDS`].
-fn reject_removed_provider_fields(config: &Map<String, Value>, idx: usize) -> Result<(), String> {
-    for (removed, guidance) in REMOVED_PROVIDER_FIELDS {
-        if config.contains_key(*removed) {
-            return Err(format!(
-                "jwks_auth: `provider[{idx}].{removed}` was removed — {guidance}"
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn reject_unknown_fields(
-    config: &Map<String, Value>,
-    allowed: &[&str],
-    context: &str,
-) -> Result<(), String> {
-    for field in config.keys() {
-        if !allowed.contains(&field.as_str()) {
-            return Err(format!("jwks_auth: unknown field {field:?} in `{context}`"));
-        }
-    }
-    Ok(())
-}
-
 fn optional_u64(
     config: &Map<String, Value>,
     field: &str,
@@ -2200,6 +2734,15 @@ fn optional_u64(
             value = value.to_string()
         )
     })
+}
+
+fn validate_clock_skew_seconds(field: &str, value: u64) -> Result<(), String> {
+    if value > MAX_JWT_CLOCK_SKEW_SECONDS {
+        return Err(format!(
+            "jwks_auth: `{field}` must be <= {MAX_JWT_CLOCK_SKEW_SECONDS}"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_max_stale_seconds(field: &str, value: u64) -> Result<(), String> {
@@ -2313,7 +2856,7 @@ fn parse_url_field(
         "http" if is_local_auth_endpoint(&parsed) => {}
         "http" => {
             return Err(format!(
-                "jwks_auth: `provider[{provider_idx}].{field}` must use https except for literal loopback or localhost"
+                "jwks_auth: `provider[{provider_idx}].{field}` must use https except for a loopback IP literal"
             ));
         }
         scheme => {
@@ -2336,13 +2879,14 @@ fn parse_url_field(
     }))
 }
 
+/// `true` only for a loopback IP-literal host. A name — `localhost` included —
+/// never qualifies: DNS overrides and the resolver decide where it connects,
+/// and a cleartext key set fetched from an attacker-chosen address would let
+/// that address mint accepted tokens (the #6659 rule for cleartext endpoints).
 fn is_local_auth_endpoint(parsed: &Url) -> bool {
-    match parsed.host() {
-        Some(Host::Domain(hostname)) => hostname.eq_ignore_ascii_case("localhost"),
-        Some(Host::Ipv4(address)) => address.is_loopback(),
-        Some(Host::Ipv6(address)) => address.is_loopback(),
-        None => false,
-    }
+    parsed
+        .host_str()
+        .is_some_and(super::utils::socket_host::is_loopback_ip_literal_host)
 }
 
 fn hostname_from_parsed_url(parsed: &Url) -> Option<String> {
@@ -2541,6 +3085,62 @@ fn dpop_provider_identity(issuer: &str) -> String {
     hasher.hex()
 }
 
+/// Parse `provider[i].jwks_source`, a reference to an admin-managed JWKS
+/// record, into its canonical `managed://jwks/<id>#jwks` form.
+///
+/// Static: the record is not read here, so validation stays pure and a CP that
+/// admits the config never needs the material. Presence is checked by admin
+/// plugin admission and by plugin file-dependency validation, and enforced at
+/// runtime (a missing record verifies nothing).
+fn parse_managed_jwks_source(
+    config: &Map<String, Value>,
+    provider_idx: usize,
+) -> Result<Option<String>, String> {
+    let Some(value) = config.get("jwks_source") else {
+        return Ok(None);
+    };
+    let Some(raw) = value.as_str() else {
+        return Err(format!(
+            "jwks_auth: `provider[{provider_idx}].jwks_source` must be a `managed://jwks/<id>#jwks` string"
+        ));
+    };
+    canonical_managed_jwks_source(raw)
+        .map(Some)
+        .map_err(|error| format!("jwks_auth: `provider[{provider_idx}].jwks_source` {error}"))
+}
+
+/// Canonical managed JWKS sources referenced by an enabled `jwks_auth`
+/// config, as `(provider index, canonical source)` pairs. Malformed providers
+/// are skipped: construction reports them.
+pub fn managed_jwks_sources(config: &Value) -> Vec<(usize, String)> {
+    let Some(providers) = config.get("providers").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    providers
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, provider)| {
+            let raw = provider.get("jwks_source")?.as_str()?;
+            canonical_managed_jwks_source(raw)
+                .ok()
+                .map(|source| (idx, source))
+        })
+        .collect()
+}
+
+/// Presence check for every managed JWKS record a `jwks_auth` config names.
+/// Blocking: reads the managed TLS store. One message per unusable reference.
+pub fn managed_jwks_source_errors(config: &Value) -> Vec<String> {
+    managed_jwks_sources(config)
+        .into_iter()
+        .filter_map(|(idx, source)| {
+            check_managed_jwks_source(&source)
+                .err()
+                .map(|error| format!("jwks_auth: `provider[{idx}].jwks_source`: {error}"))
+        })
+        .collect()
+}
+
 fn parse_inline_jwks(
     config: &Map<String, Value>,
     provider_idx: usize,
@@ -2573,16 +3173,7 @@ fn parse_audiences(
     config: &Map<String, Value>,
     provider_idx: usize,
 ) -> Result<Vec<String>, String> {
-    let legacy_audience = optional_non_empty_string(config, "audience", provider_idx)?;
-    let mut audiences = parse_string_array(config, "audiences", provider_idx)?;
-
-    if let Some(audience) = legacy_audience
-        && !audiences.iter().any(|known| known == &audience)
-    {
-        audiences.push(audience);
-    }
-
-    Ok(audiences)
+    parse_string_array(config, "audiences", provider_idx)
 }
 
 fn parse_string_array(
@@ -2639,10 +3230,11 @@ fn parse_token_locations(
                     header = header.to_string()
                 )
             })?;
-            reject_unknown_fields(
+            crate::util::unknown_keys::reject_unknown_keys(
                 object,
-                &["name", "prefix"],
                 &format!("provider[{provider_idx}].from_headers[{idx}]"),
+                &["name", "prefix"],
+                &format!("jwks_auth: `provider[{provider_idx}].from_headers[{idx}]`: "),
             )?;
             let name_value = object.get("name").ok_or_else(|| {
                 format!(
@@ -2764,12 +3356,10 @@ fn optional_provider_usize(
         .map_err(|_| format!("jwks_auth: `provider[{provider_idx}].{field}` is too large"))
 }
 
-fn reject(status_code: u16, body: String) -> PluginResult {
-    PluginResult::Reject {
-        status_code,
-        body,
-        headers: std::collections::HashMap::new(),
-    }
+/// Every `jwks_auth` rejection goes through here, so a `401` always carries
+/// the challenge for the credential that failed (issue #6774).
+fn reject(status_code: u16, body: String, challenge: &'static str) -> PluginResult {
+    auth_flow::auth_rejection(status_code, body, challenge)
 }
 
 /// Fetch the OIDC discovery document and extract a validated `jwks_uri`.
@@ -3014,4 +3604,83 @@ fn hostname_from_url(url: &str) -> Option<String> {
     Url::parse(url)
         .ok()
         .and_then(|u| hostname_from_parsed_url(&u))
+}
+
+#[cfg(test)]
+mod verification_bound_tests {
+    //! The per-token verification bound is observed on the real
+    //! authentication path; the recorder exists only in test builds.
+    use super::*;
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use serde_json::json;
+
+    fn jwks() -> String {
+        // A syntactically valid 2048-bit RSA key; no token here is signed by
+        // it, so every attempted verification runs and fails.
+        json!({"keys": [{
+            "kty": "RSA",
+            "kid": "k1",
+            "alg": "RS256",
+            "use": "sig",
+            "n": URL_SAFE_NO_PAD.encode([0xC3u8; 256]),
+            "e": "AQAB"
+        }]})
+        .to_string()
+    }
+
+    fn forged(payload: &Value) -> String {
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","kid":"k1","typ":"JWT"}"#);
+        let body = URL_SAFE_NO_PAD.encode(payload.to_string());
+        format!("{header}.{body}.c2lnbmF0dXJl")
+    }
+
+    #[tokio::test]
+    async fn each_candidate_is_verified_once_and_nothing_else() {
+        let jwks = jwks();
+        let shared = "https://shared.example.com";
+        let mut providers = Vec::new();
+        for _ in 0..6 {
+            providers.push(json!({"issuer": shared, "jwks": jwks}));
+        }
+        for i in 0..50 {
+            providers
+                .push(json!({"issuer": format!("https://other{i}.example.com"), "jwks": jwks}));
+        }
+        providers.push(json!({"jwks": jwks}));
+        providers.push(json!({"jwks": jwks}));
+        let plugin = JwksAuth::new(
+            &json!({"providers": providers}),
+            PluginHttpClient::default(),
+        )
+        .expect("valid config");
+        plugin.warmup_jwks().await;
+
+        let cases: Vec<(Value, Vec<usize>)> = vec![
+            (
+                json!({"iss": shared, "sub": "x"}),
+                vec![0, 1, 2, 3, 4, 5, 56, 57],
+            ),
+            (json!({"iss": "https://unknown.example.com"}), vec![56, 57]),
+            (json!({"sub": "x"}), vec![56, 57]),
+            (
+                json!({"iss": [shared, "https://other1.example.com"]}),
+                vec![56, 57],
+            ),
+            (json!({"iss": 42}), vec![56, 57]),
+        ];
+        let all: Vec<usize> = (0..plugin.providers.len()).collect();
+        for (payload, expected) in cases {
+            let token = forged(&payload);
+            assert!(
+                plugin
+                    .validate_token_for_providers(&token, &all)
+                    .await
+                    .is_err()
+            );
+            let attempts = std::mem::take(&mut *plugin.verification_attempts.lock().unwrap());
+            assert_eq!(attempts, expected, "payload {payload}");
+            assert!(attempts.len() <= MAX_JWKS_CANDIDATE_PROVIDERS);
+        }
+    }
 }

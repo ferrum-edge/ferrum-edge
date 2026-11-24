@@ -671,6 +671,151 @@ fn write_unbound_state(registry: &std::path::Path, active: UdpPlacement) {
     .expect("write unbound durable state");
 }
 
+/// The durable record docs/node_agent.md tells an operator to write for a true abort
+/// back to `disabled` (issue #6703), extracted verbatim so the documented
+/// artifact and the runtime acceptance rule cannot drift apart.
+fn documented_disabled_abort_record() -> &'static str {
+    const NODE_AGENT_DOC: &str = include_str!("../../docs/node_agent.md");
+    NODE_AGENT_DOC
+        .split("**Abort back to `disabled`.**")
+        .nth(1)
+        .and_then(|tail| tail.split("```json").nth(1))
+        .and_then(|tail| tail.split("```").next())
+        .map(str::trim)
+        .expect("docs/node_agent.md documents the disabled abort record")
+}
+
+#[test]
+fn documented_abort_recovery_is_accepted_only_for_its_intended_target() {
+    let record = documented_disabled_abort_record();
+    let document: serde_json::Value =
+        serde_json::from_str(record).expect("documented abort record is JSON");
+    assert_eq!(document["active"], "disabled");
+
+    // The documented artifact is accepted for `disabled`, with or without a
+    // resolvable identity, and is bound once an identity resolves.
+    let registry = tempfile::tempdir().expect("registry");
+    std::fs::write(registry.path().join(".udp-placement-state-v1.json"), record)
+        .expect("write documented record");
+    assert!(matches!(
+        prepare_placement(registry.path(), &stable(UdpPlacement::Disabled)),
+        Ok(UdpPlacementDecision::RunStable)
+    ));
+    let node = identity(NODE_A, BOOT_1);
+    assert!(matches!(
+        prepare_placement(
+            registry.path(),
+            &stable_on_node(UdpPlacement::Disabled, &node)
+        ),
+        Ok(UdpPlacementDecision::RunStable)
+    ));
+
+    // The same hand-written shape naming a producer placement is exactly what
+    // the docs no longer prescribe: it is refused even with a resolvable
+    // identity, because an unbound record is not proof of node ownership.
+    for producer in [UdpPlacement::PodNetns, UdpPlacement::HostNetns] {
+        let registry = tempfile::tempdir().expect("registry");
+        let hand_written = record.replace("\"disabled\"", &format!("\"{}\"", producer.as_str()));
+        std::fs::write(
+            registry.path().join(".udp-placement-state-v1.json"),
+            hand_written,
+        )
+        .expect("write hand-written producer record");
+        let error = prepare_placement(registry.path(), &stable_on_node(producer, &node))
+            .err()
+            .expect("an unbound producer record must not start a producer");
+        assert!(
+            error.contains("names no owning Kubernetes node UID"),
+            "{error}"
+        );
+    }
+}
+
+/// The documented producer-abort procedure from docs/node_agent.md (issue #6703).
+fn documented_producer_abort_procedure() -> &'static str {
+    const NODE_AGENT_DOC: &str = include_str!("../../docs/node_agent.md");
+    NODE_AGENT_DOC
+        .split("**Abort back to `pod-netns` or `host-netns`.**")
+        .nth(1)
+        .and_then(|tail| tail.split("**Corrupt or unknown ownership.**").next())
+        .expect("docs/node_agent.md documents the producer abort procedure")
+}
+
+#[test]
+fn documented_producer_abort_recovers_through_quarantine_cleanup_and_finalize() {
+    // The documented procedure must never prescribe a hand-written record (the
+    // shape stable startup refuses), and must name the quarantine + cleanup
+    // tuple + finalize sequence this test then replays.
+    let procedure = documented_producer_abort_procedure();
+    assert!(!procedure.contains("```json"), "{procedure}");
+    assert!(!procedure.contains("\"active\""), "{procedure}");
+    for required in [
+        "Quarantine the state",
+        "tombstone",
+        "`FROM=<the aborted target>`",
+        "`TO=<the placement you are returning to>`",
+        "run `finalize` with the same",
+    ] {
+        assert!(
+            procedure.contains(required),
+            "docs/node_agent.md producer abort procedure must say {required:?}"
+        );
+    }
+
+    // Replay it for BOTH producer placements: a persisted forward cleanup
+    // `restored -> aborted` is abandoned and the node returns to `restored`.
+    for (restored, aborted) in [
+        (UdpPlacement::PodNetns, UdpPlacement::HostNetns),
+        (UdpPlacement::HostNetns, UdpPlacement::PodNetns),
+    ] {
+        let registry = tempfile::tempdir().expect("registry");
+        let node = identity(NODE_A, BOOT_1);
+        let forward = on_node(
+            transition(UdpMigrationPhase::Cleanup, "forward-1", restored, aborted),
+            &node,
+        );
+        let _ = cleanup_context(registry.path(), &forward);
+
+        // Quarantine the state outside the registry and leave the tombstone.
+        let state_path = registry.path().join(".udp-placement-state-v1.json");
+        let quarantine = tempfile::tempdir().expect("quarantine");
+        std::fs::rename(&state_path, quarantine.path().join("rejected.json"))
+            .expect("quarantine state outside the registry");
+        std::fs::write(registry.path().join(".udp-placement-quarantined"), b"")
+            .expect("quarantine tombstone");
+
+        // Restarting the restored producer before the cleanup proof is refused.
+        assert!(
+            prepare_placement(registry.path(), &stable_on_node(restored, &node)).is_err(),
+            "{restored:?} must not start before cleanup/finalize"
+        );
+
+        // Cleanup adoption FROM the aborted target TO the restored placement,
+        // then finalize with the same tuple.
+        let cleanup = on_node(
+            transition(UdpMigrationPhase::Cleanup, "abort-1", aborted, restored),
+            &node,
+        );
+        let context = cleanup_context(registry.path(), &cleanup);
+        complete_cleanup(&context);
+        assert!(matches!(
+            prepare_placement(
+                registry.path(),
+                &on_node(
+                    transition(UdpMigrationPhase::Finalize, "abort-1", aborted, restored),
+                    &node,
+                ),
+            ),
+            Ok(UdpPlacementDecision::RunStable)
+        ));
+        assert!(!registry.path().join(".udp-placement-quarantined").exists());
+        assert!(matches!(
+            prepare_placement(registry.path(), &stable_on_node(restored, &node)),
+            Ok(UdpPlacementDecision::RunStable)
+        ));
+    }
+}
+
 #[test]
 fn a_stale_same_boot_node_identity_publication_would_inherit_the_predecessor_proof() {
     // The hazard the retraction closes, stated as a live fact: a publication
@@ -754,6 +899,33 @@ fn retracting_the_publication_leaves_no_stale_identity_authorizing_adoption() {
         .err()
         .expect("a recreated node must not inherit the predecessor's proof");
     assert!(error.contains("different Kubernetes node UID"), "{error}");
+}
+
+#[test]
+fn a_set_but_invalid_explicit_node_uid_fails_closed_instead_of_using_the_publication() {
+    // `resolve` parses `FERRUM_K8S_NODE_UID` exactly as the preflight and the
+    // node-agent do: only an UNSET value falls back to the published file.
+    let registry = tempfile::tempdir().expect("registry");
+    let published = identity(NODE_A, BOOT_1);
+    publish_node_identity_for(registry.path(), &published).expect("publication");
+
+    assert_eq!(
+        UdpNodeIdentity::resolve_with_boot_id(None, registry.path(), BOOT_1).as_ref(),
+        Some(&published),
+        "an unset explicit UID uses the node-agent's publication"
+    );
+    assert_eq!(
+        UdpNodeIdentity::resolve_with_boot_id(Some(NODE_B), registry.path(), BOOT_1),
+        Some(identity(NODE_B, BOOT_1)),
+        "a valid explicit UID wins over the publication"
+    );
+    for invalid in ["", "   ", "-leading-dash", "has space", "node/uid"] {
+        assert_eq!(
+            UdpNodeIdentity::resolve_with_boot_id(Some(invalid), registry.path(), BOOT_1),
+            None,
+            "a set but invalid explicit UID {invalid:?} must resolve no identity"
+        );
+    }
 }
 
 #[cfg(unix)]

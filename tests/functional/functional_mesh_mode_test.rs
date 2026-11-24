@@ -9,13 +9,14 @@
 //! Run with:
 //!   cargo test --test functional_tests functional_mesh_mode -- --ignored --nocapture
 
+use crate::common::GatewayChildGuard;
 use crate::scaffolding::port_registry::TestSocket;
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -114,7 +115,7 @@ fn verify_mesh_grpc_auth(metadata: &tonic::metadata::MetadataMap) -> Result<(), 
         .and_then(|value| value.to_str().ok())
         .map(|value| value.strip_prefix("Bearer ").unwrap_or(value))
         .ok_or_else(|| Status::unauthenticated("missing authorization token"))?;
-    let key = DecodingKey::from_secret(GRPC_SECRET.as_bytes());
+    let key = DecodingKey::from_secret(GRPC_SECRET.as_bytes()).unwrap();
     let mut validation = Validation::new(Algorithm::HS256);
     validation.validate_exp = true;
     validation.required_spec_claims = ["exp", "iat", "sub", "iss"]
@@ -693,10 +694,16 @@ pub(crate) struct MeshGatewaySpawnOptions<'a> {
     pub(crate) env_overrides: Vec<(&'a str, String)>,
 }
 
-pub(crate) fn spawn_mesh_gateway(temp: &TempDir, options: MeshGatewaySpawnOptions<'_>) -> Child {
+/// Spawn a mesh gateway owned by a [`GatewayChildGuard`] from the instant it
+/// exists, so a panic anywhere before the fixture's explicit teardown still
+/// reaps the child and frees its ports (issue #4991).
+pub(crate) fn spawn_mesh_gateway(
+    temp: &TempDir,
+    options: MeshGatewaySpawnOptions<'_>,
+) -> GatewayChildGuard {
     let mut cmd = Command::new(crate::common::gateway_binary_path());
     configure_mesh_gateway_command(&mut cmd, temp, options);
-    cmd.spawn().expect("spawn mesh gateway")
+    GatewayChildGuard::new(cmd.spawn().expect("spawn mesh gateway"))
 }
 
 #[cfg(target_os = "linux")]
@@ -704,7 +711,7 @@ fn spawn_mesh_gateway_in_netns(
     temp: &TempDir,
     options: MeshGatewaySpawnOptions<'_>,
     netns_pid: u32,
-) -> Child {
+) -> GatewayChildGuard {
     spawn_mesh_gateway_in_netns_as_uid(temp, options, netns_pid, 1337)
 }
 
@@ -714,7 +721,7 @@ fn spawn_mesh_gateway_in_netns_as_uid(
     options: MeshGatewaySpawnOptions<'_>,
     netns_pid: u32,
     uid: u32,
-) -> Child {
+) -> GatewayChildGuard {
     let mut cmd = Command::new("nsenter");
     cmd.arg(format!("--net=/proc/{netns_pid}/ns/net"))
         .arg("--")
@@ -725,7 +732,9 @@ fn spawn_mesh_gateway_in_netns_as_uid(
         .arg(crate::common::gateway_binary_path());
     configure_mesh_gateway_command(&mut cmd, temp, options);
     make_mesh_registry_owned_by_uid(temp, uid);
-    cmd.spawn().expect("spawn mesh gateway inside pod netns")
+    // `nsenter` and `setpriv` exec the gateway, so the guarded pid is the
+    // gateway process itself.
+    GatewayChildGuard::new(cmd.spawn().expect("spawn mesh gateway inside pod netns"))
 }
 
 #[cfg(target_os = "linux")]
@@ -757,14 +766,16 @@ fn spawn_mesh_gateway_in_netns_as_root(
     temp: &TempDir,
     options: MeshGatewaySpawnOptions<'_>,
     netns_pid: u32,
-) -> Child {
+) -> GatewayChildGuard {
     let mut cmd = Command::new("nsenter");
     cmd.arg(format!("--net=/proc/{netns_pid}/ns/net"))
         .arg("--")
         .arg(crate::common::gateway_binary_path());
     configure_mesh_gateway_command(&mut cmd, temp, options);
-    cmd.spawn()
-        .expect("spawn privileged mesh gateway inside pod netns")
+    GatewayChildGuard::new(
+        cmd.spawn()
+            .expect("spawn privileged mesh gateway inside pod netns"),
+    )
 }
 
 fn configure_mesh_gateway_command(
@@ -788,6 +799,12 @@ fn configure_mesh_gateway_command(
         .env("FERRUM_NAMESPACE", "ferrum")
         .env("FERRUM_POOL_WARMUP_ENABLED", "false")
         .env("FERRUM_SHUTDOWN_DRAIN_SECONDS", "0")
+        // Keep any managed-TLS / TLS-event store out of the checkout (#5706):
+        // the binary otherwise defaults to `./ferrum-managed-tls` in its cwd.
+        .env(
+            "FERRUM_TLS_MANAGED_STORE_PATH",
+            temp.path().join("managed-tls"),
+        )
         .env("FERRUM_PROXY_HTTP_PORT", "0")
         .env("FERRUM_ADMIN_HTTP_PORT", "0")
         .env("FERRUM_CP_DP_GRPC_JWT_SECRET", GRPC_SECRET)
@@ -836,25 +853,36 @@ fn configure_mesh_gateway_command(
     }
 }
 
-pub(crate) fn kill_child(child: &mut Child) {
+/// Tear a mesh gateway down through its owning guard.
+///
+/// SIGTERM first, so the gateway flushes its non-blocking log writer (fixtures
+/// read `captured_output` afterwards) and, under the coverage shards, its LLVM
+/// profile; the guard's idempotent `shutdown` then reaps it, force-killing only
+/// a child that ignored the grace period. The guard's `Drop` performs the same
+/// reap on any panic path that never reaches this call.
+pub(crate) fn kill_child(child: &mut GatewayChildGuard) {
     #[cfg(unix)]
     {
-        let pid = child.id();
-        let _ = Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .status();
+        if let Some(pid) = child.id() {
+            let _ = Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .status();
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !child.has_exited() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = child.kill();
-    }
-    let _ = child.wait();
+    child.shutdown();
 }
 
-async fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
+async fn wait_for_child_exit(
+    child: &mut GatewayChildGuard,
+    timeout: Duration,
+) -> Option<ExitStatus> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some(status) = child.try_wait().expect("poll mesh gateway child") {
+        if let Some(status) = gateway_child_exited(child) {
             return Some(status);
         }
         if Instant::now() >= deadline {
@@ -940,8 +968,11 @@ impl GatewayListenerReadiness {
 }
 
 /// Non-blocking check for a spawned gateway that has already exited.
-fn gateway_child_exited(child: &mut Child) -> Option<ExitStatus> {
-    child.try_wait().expect("poll mesh gateway child")
+fn gateway_child_exited(child: &mut GatewayChildGuard) -> Option<ExitStatus> {
+    child
+        .child_mut()
+        .try_wait()
+        .expect("poll mesh gateway child")
 }
 
 /// The first labelled gateway in `children` that has already exited, rendered as
@@ -950,7 +981,9 @@ fn gateway_child_exited(child: &mut Child) -> Option<ExitStatus> {
 /// A fixture whose gateway died mid-run is VOID: its ports were never owned by
 /// the process the driver believed it was talking to, so any observation made
 /// against them — success, failure, or fail-closed rejection — proves nothing.
-pub(crate) fn exited_gateway_diagnostic(children: &mut [(&str, &mut Child)]) -> Option<String> {
+pub(crate) fn exited_gateway_diagnostic(
+    children: &mut [(&str, &mut GatewayChildGuard)],
+) -> Option<String> {
     for (label, child) in children.iter_mut() {
         if let Some(status) = gateway_child_exited(child) {
             return Some(format!("{label} exited during the run ({status})"));
@@ -975,7 +1008,7 @@ pub(crate) fn exited_gateway_diagnostic(children: &mut [(&str, &mut Child)]) -> 
 /// [`GatewayListenerReadiness::ChildExited`] and the caller can consume its
 /// bounded attempt and retry with fresh ports, temp dirs, and control planes.
 pub(crate) async fn wait_for_gateway_listener(
-    child: &mut Child,
+    child: &mut GatewayChildGuard,
     port: u16,
     timeout: Duration,
 ) -> GatewayListenerReadiness {
@@ -2292,8 +2325,9 @@ fn disable_peer_auth_slice(node_id: &str) -> MeshSlice {
         peer_authentications: vec![PeerAuthentication {
             name: "mesh-disable".to_string(),
             namespace: "ferrum".to_string(),
-            scope: None,
-            selector: None,
+            scope: PolicyScope::Namespace {
+                namespace: "ferrum".to_string(),
+            },
             mtls_mode: MtlsMode::Disable,
             port_overrides: HashMap::new(),
         }],
@@ -2630,8 +2664,9 @@ fn strict_peer_auth_slice(node_id: &str) -> MeshSlice {
         peer_authentications: vec![PeerAuthentication {
             name: "mesh-strict".to_string(),
             namespace: "ferrum".to_string(),
-            scope: None,
-            selector: None,
+            scope: PolicyScope::Namespace {
+                namespace: "ferrum".to_string(),
+            },
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::new(),
         }],
@@ -3605,8 +3640,9 @@ fn inbound_authz_slice(
         peer_authentications: vec![PeerAuthentication {
             name: "mesh-strict".to_string(),
             namespace: "ferrum".to_string(),
-            scope: None,
-            selector: None,
+            scope: PolicyScope::Namespace {
+                namespace: "ferrum".to_string(),
+            },
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::new(),
         }],
@@ -3873,8 +3909,9 @@ fn cross_namespace_workload_entry_inbound_slice(
         peer_authentications: vec![PeerAuthentication {
             name: "mesh-strict".to_string(),
             namespace: "vms".to_string(),
-            scope: None,
-            selector: None,
+            scope: PolicyScope::Namespace {
+                namespace: "vms".to_string(),
+            },
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::new(),
         }],
@@ -4692,8 +4729,9 @@ fn egress_service_slice(
         peer_authentications: vec![PeerAuthentication {
             name: "mesh-strict".to_string(),
             namespace: "ferrum".to_string(),
-            scope: None,
-            selector: None,
+            scope: PolicyScope::Namespace {
+                namespace: "ferrum".to_string(),
+            },
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::new(),
         }],
@@ -6899,8 +6937,9 @@ fn cross_cluster_dest_slice(
         peer_authentications: vec![PeerAuthentication {
             name: "mesh-strict".to_string(),
             namespace: "ferrum".to_string(),
-            scope: None,
-            selector: None,
+            scope: PolicyScope::Namespace {
+                namespace: "ferrum".to_string(),
+            },
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::new(),
         }],
@@ -7484,9 +7523,9 @@ async fn functional_mesh_sidecar_cross_cluster_egress_rejects_untrusted_client()
 /// capture port plus every child process / control plane / temp dir, so a driver
 /// can drive app requests against `a_outbound_port` then tear it all down.
 struct SidecarCrossClusterFixture {
-    child_a: Child,
-    child_b: Child,
-    child_c: Child,
+    child_a: GatewayChildGuard,
+    child_b: GatewayChildGuard,
+    child_c: GatewayChildGuard,
     cp_a: MeshCpHandle,
     cp_b: MeshCpHandle,
     cp_c: MeshCpHandle,
@@ -8082,8 +8121,9 @@ fn cross_cluster_ambient_dest_slice(
         peer_authentications: vec![PeerAuthentication {
             name: "mesh-strict".to_string(),
             namespace: "ferrum".to_string(),
-            scope: None,
-            selector: None,
+            scope: PolicyScope::Namespace {
+                namespace: "ferrum".to_string(),
+            },
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::new(),
         }],
@@ -8665,9 +8705,9 @@ async fn functional_mesh_ambient_cross_cluster_egress_rejects_untrusted_client()
 /// east-west B SNI-passthrough → dest C Ambient, two trust domains, federated
 /// bundle) — the Ambient counterpart of [`SidecarCrossClusterFixture`].
 struct AmbientCrossClusterFixture {
-    child_a: Child,
-    child_b: Child,
-    child_c: Child,
+    child_a: GatewayChildGuard,
+    child_b: GatewayChildGuard,
+    child_c: GatewayChildGuard,
     cp_a: MeshCpHandle,
     cp_b: MeshCpHandle,
     cp_c: MeshCpHandle,
@@ -9383,7 +9423,7 @@ async fn functional_mesh_file_source_serves_inbound_and_reloads_on_sighup() {
             inbound_authz_mesh_document(server_spiffe, client_spiffe, backend_port, false),
         )
         .expect("rewrite mesh document");
-        let pid = child.id().to_string();
+        let pid = child.child_mut().id().to_string();
         let hup = Command::new("kill")
             .args(["-HUP", &pid])
             .status()
@@ -10274,8 +10314,9 @@ fn udp_dest_slice(
         peer_authentications: vec![PeerAuthentication {
             name: "mesh-strict".to_string(),
             namespace: "ferrum".to_string(),
-            scope: None,
-            selector: None,
+            scope: PolicyScope::Namespace {
+                namespace: "ferrum".to_string(),
+            },
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::new(),
         }],
@@ -11018,8 +11059,9 @@ fn third_workload_refusal_slice(
         peer_authentications: vec![PeerAuthentication {
             name: "mesh-strict".to_string(),
             namespace: "ferrum".to_string(),
-            scope: None,
-            selector: None,
+            scope: PolicyScope::Namespace {
+                namespace: "ferrum".to_string(),
+            },
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::new(),
         }],
@@ -11711,8 +11753,9 @@ fn sidecar_ingress_stream_slice(
         peer_authentications: vec![PeerAuthentication {
             name: "mesh-strict".to_string(),
             namespace: "ferrum".to_string(),
-            scope: None,
-            selector: None,
+            scope: PolicyScope::Namespace {
+                namespace: "ferrum".to_string(),
+            },
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::new(),
         }],
@@ -11790,8 +11833,9 @@ fn sidecar_ingress_mesh_document(
         peer_authentications: vec![PeerAuthentication {
             name: "mesh-strict".to_string(),
             namespace: "ferrum".to_string(),
-            scope: None,
-            selector: None,
+            scope: PolicyScope::Namespace {
+                namespace: "ferrum".to_string(),
+            },
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::new(),
         }],
@@ -12145,7 +12189,7 @@ async fn run_sidecar_ingress_reload_phases(
     peers: &MeshPeerSvids,
     ports: &SidecarIngressReloadPorts,
     mesh_doc_path: &std::path::Path,
-    child: &mut Child,
+    child: &mut GatewayChildGuard,
 ) -> Result<(), String> {
     let server_spiffe = peers.server_spiffe.as_str();
     let workload_ports = ports.workload_ports();
@@ -12278,8 +12322,8 @@ async fn run_sidecar_ingress_reload_phases(
 }
 
 /// Deliver SIGHUP to a spawned mesh gateway so the file source reloads.
-fn sighup_mesh_gateway(child: &mut Child) -> Result<(), String> {
-    let pid = child.id().to_string();
+fn sighup_mesh_gateway(child: &mut GatewayChildGuard) -> Result<(), String> {
+    let pid = child.child_mut().id().to_string();
     let status = Command::new("kill")
         .args(["-HUP", &pid])
         .status()
@@ -12487,8 +12531,9 @@ fn target_refs_waypoint_slice(
         peer_authentications: vec![PeerAuthentication {
             name: "mesh-strict".to_string(),
             namespace: WAYPOINT_TARGET_REFS_NAMESPACE.to_string(),
-            scope: None,
-            selector: None,
+            scope: PolicyScope::Namespace {
+                namespace: WAYPOINT_TARGET_REFS_NAMESPACE.to_string(),
+            },
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::new(),
         }],
@@ -12972,28 +13017,30 @@ fn live_source_capture_prerequisites() -> bool {
 }
 
 #[cfg(target_os = "linux")]
-struct LiveGatewayChild(Option<Child>);
+struct LiveGatewayChild(Option<GatewayChildGuard>);
 
 #[cfg(target_os = "linux")]
 impl LiveGatewayChild {
-    fn new(child: Child) -> Self {
+    fn new(child: GatewayChildGuard) -> Self {
         Self(Some(child))
     }
 
+    /// SIGTERM, then the guard reaps the child (force-killing only after the
+    /// grace period, and through the coverage-aware teardown).
     fn stop(&mut self) {
         if let Some(mut child) = self.0.take() {
-            let pid = child.id();
-            let _ = Command::new("kill")
-                .args(["-TERM", &pid.to_string()])
-                .status();
-            for _ in 0..50 {
-                if child.try_wait().is_ok_and(|status| status.is_some()) {
-                    return;
+            if let Some(pid) = child.id() {
+                let _ = Command::new("kill")
+                    .args(["-TERM", &pid.to_string()])
+                    .status();
+                for _ in 0..50 {
+                    if child.has_exited() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
                 }
-                std::thread::sleep(Duration::from_millis(100));
             }
-            let _ = child.kill();
-            let _ = child.wait();
+            child.shutdown();
         }
     }
 
@@ -13009,24 +13056,28 @@ impl LiveGatewayChild {
         let Some(mut child) = self.0.take() else {
             return false;
         };
-        let pid = child.id();
+        let Some(pid) = child.id() else {
+            return false;
+        };
         let _ = Command::new("kill")
             .args(["-TERM", &pid.to_string()])
             .status();
         let deadline = Instant::now() + grace;
         while Instant::now() < deadline {
-            if child.try_wait().is_ok_and(|status| status.is_some()) {
+            if child.has_exited() {
+                child.shutdown();
                 return true;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        let _ = child.kill();
-        let _ = child.wait();
+        // The grace expired: the guard force-reaps the child, so none of its
+        // graceful-shutdown work may be assumed to have run.
+        child.shutdown();
         false
     }
 
     fn poll_status(&mut self) -> String {
-        match self.0.as_mut().map(Child::try_wait) {
+        match self.0.as_mut().map(|child| child.child_mut().try_wait()) {
             Some(Ok(Some(status))) => format!("exited with {status}"),
             Some(Ok(None)) => "still running".to_string(),
             Some(Err(error)) => format!("status check failed: {error}"),
@@ -13079,7 +13130,7 @@ fn identity_bound_registry_helpers_reject_non_uuid_pod_uid() {
 /// backend resolve `/proc/<pid>/ns/net` without mutating the runner's cgroup tree.
 #[cfg(target_os = "linux")]
 struct LivePodNetns {
-    child: Child,
+    child: std::process::Child,
     cgroup_dir: TempDir,
 }
 
@@ -13600,8 +13651,9 @@ fn live_source_capture_slice(
         peer_authentications: vec![PeerAuthentication {
             name: "mesh-strict".to_string(),
             namespace: "ferrum".to_string(),
-            scope: None,
-            selector: None,
+            scope: PolicyScope::Namespace {
+                namespace: "ferrum".to_string(),
+            },
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::new(),
         }],
@@ -14613,10 +14665,133 @@ fn capture_jump_count(rules: &str) -> usize {
         .count()
 }
 
+/// `PREROUTING` jumps into either fail-closed host-UDP guard generation
+/// (`FERRUM_MESH_UDP_HOST_GUARD_A` / `_B`). While one is installed, every
+/// enrolled pod's UDP egress on that family is DROPped, so capture is not live
+/// for that family even though its capture jump already exists.
 #[cfg(target_os = "linux")]
-fn host_udp_capture_snapshot(
-    capture_port: u16,
-) -> Result<(usize, usize, usize, usize, usize), String> {
+fn guard_jump_count(rules: &str) -> usize {
+    rules
+        .lines()
+        .filter(|line| {
+            line.starts_with("-A PREROUTING ") && line.contains("FERRUM_MESH_UDP_HOST_GUARD")
+        })
+        .count()
+}
+
+/// Ferrum-owned host-UDP objects observed in the host namespace at one instant.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HostUdpCaptureSnapshot {
+    v4_jumps: usize,
+    v6_jumps: usize,
+    v4_guards: usize,
+    v6_guards: usize,
+    v4_routes: usize,
+    v6_routes: usize,
+    listeners: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl HostUdpCaptureSnapshot {
+    /// Capture is LIVE for both families: the capture jumps, fwmark rules and
+    /// the transparent listener exist AND both fail-closed guards are released.
+    ///
+    /// `HostUdpCaptureManager::apply` installs the capture chain and binds the
+    /// listener while the DROP guard is still up, then releases the guard in one
+    /// script that removes the IPv4 guard before the IPv6 one (#7425). Treating
+    /// "jumps + listener present" as live let the test send IPv6 datagrams into
+    /// the still-installed IPv6 guard: IPv4 round trips passed, the IPv6 one was
+    /// dropped, and the client receive timed out with EAGAIN.
+    fn capture_live(&self) -> bool {
+        self.v4_jumps >= 1
+            && self.v6_jumps >= 1
+            && self.v4_guards == 0
+            && self.v6_guards == 0
+            && self.v4_routes >= 1
+            && self.v6_routes >= 1
+            && self.listeners >= 1
+    }
+
+    /// The capture path is retired: no capture jump, fwmark rule, or listener.
+    /// A retained fail-closed guard is deliberately NOT part of this predicate:
+    /// the unacknowledged shutdown branch must leave it installed, and the
+    /// caller asserts which branch was taken.
+    fn capture_absent(&self) -> bool {
+        self.v4_jumps == 0
+            && self.v6_jumps == 0
+            && self.v4_routes == 0
+            && self.v6_routes == 0
+            && self.listeners == 0
+    }
+}
+
+/// #7425: the live gate's readiness must not report capture live while a
+/// fail-closed guard jump is still installed on either family — the exact
+/// mid-release state (IPv4 guard gone, IPv6 guard still DROPping) that sent the
+/// IPv6 round trip into the guard. Runs without root: it parses
+/// `iptables-save` text shaped like the live mangle table.
+#[cfg(target_os = "linux")]
+#[test]
+fn host_udp_capture_readiness_waits_for_both_guards_released() {
+    let capture_only = "*mangle\n\
+        :PREROUTING ACCEPT [0:0]\n\
+        :FERRUM_MESH_UDP_HOST - [0:0]\n\
+        -A PREROUTING -p udp -j FERRUM_MESH_UDP_HOST\n\
+        -A FERRUM_MESH_UDP_HOST -i hu1 -p udp -j TPROXY --on-port 15002\n\
+        COMMIT\n";
+    let guarded = "*mangle\n\
+        :PREROUTING ACCEPT [0:0]\n\
+        :FERRUM_MESH_UDP_HOST - [0:0]\n\
+        :FERRUM_MESH_UDP_HOST_GUARD_B - [0:0]\n\
+        -A PREROUTING -p udp -j FERRUM_MESH_UDP_HOST_GUARD_B\n\
+        -A PREROUTING -p udp -j FERRUM_MESH_UDP_HOST\n\
+        -A FERRUM_MESH_UDP_HOST_GUARD_B -i hu1 -p udp -j DROP\n\
+        COMMIT\n";
+    assert_eq!(capture_jump_count(guarded), 1);
+    assert_eq!(guard_jump_count(guarded), 1);
+    assert_eq!(guard_jump_count(capture_only), 0);
+
+    let live = HostUdpCaptureSnapshot {
+        v4_jumps: capture_jump_count(capture_only),
+        v6_jumps: capture_jump_count(capture_only),
+        v4_guards: guard_jump_count(capture_only),
+        v6_guards: guard_jump_count(capture_only),
+        v4_routes: 1,
+        v6_routes: 1,
+        listeners: 1,
+    };
+    assert!(live.capture_live());
+
+    // IPv4 guard released, IPv6 guard still installed: NOT live.
+    let v6_still_guarded = HostUdpCaptureSnapshot {
+        v6_guards: guard_jump_count(guarded),
+        ..live
+    };
+    assert!(!v6_still_guarded.capture_live());
+    let v4_still_guarded = HostUdpCaptureSnapshot {
+        v4_guards: guard_jump_count(guarded),
+        ..live
+    };
+    assert!(!v4_still_guarded.capture_live());
+
+    // A guard retained by the unacknowledged shutdown branch does not stop the
+    // capture path from counting as retired; the test asserts that branch itself.
+    let retired_with_guard = HostUdpCaptureSnapshot {
+        v4_jumps: 0,
+        v6_jumps: 0,
+        v4_guards: 1,
+        v6_guards: 1,
+        v4_routes: 0,
+        v6_routes: 0,
+        listeners: 0,
+    };
+    assert!(retired_with_guard.capture_absent());
+    assert!(!live.capture_absent());
+}
+
+#[cfg(target_os = "linux")]
+fn host_udp_capture_snapshot(capture_port: u16) -> Result<HostUdpCaptureSnapshot, String> {
     let v4_rules = checked_command_stdout("iptables-save", &["-t", "mangle"])?;
     let v6_rules = checked_command_stdout("ip6tables-save", &["-t", "mangle"])?;
     let v4_route_rules = checked_command_stdout("ip", &["rule", "show"])?;
@@ -14644,13 +14819,46 @@ fn host_udp_capture_snapshot(
                 .is_some_and(|local| local.ends_with(&port_suffix))
         })
         .count();
-    Ok((
-        capture_jump_count(&v4_rules),
-        capture_jump_count(&v6_rules),
+    Ok(HostUdpCaptureSnapshot {
+        v4_jumps: capture_jump_count(&v4_rules),
+        v6_jumps: capture_jump_count(&v6_rules),
+        v4_guards: guard_jump_count(&v4_rules),
+        v6_guards: guard_jump_count(&v6_rules),
         v4_routes,
         v6_routes,
         listeners,
-    ))
+    })
+}
+
+/// Wait for the production readiness markers (`<registry>/.udp-ready/<pod_uid>`)
+/// of every listed pod. `HostUdpCaptureManager::apply` publishes them only after
+/// the fail-closed guard is released, i.e. once that pod's egress genuinely goes
+/// through the capture path: it is the product's own per-pod "capture is live"
+/// signal, the one the node-agent opens its BPF UDP gate on.
+#[cfg(target_os = "linux")]
+fn wait_for_host_udp_ready_markers(
+    registry_dir: &std::path::Path,
+    pod_uids: &[&str],
+    timeout: Duration,
+) -> Result<(), String> {
+    let ready_dir = registry_dir.join(".udp-ready");
+    let deadline = Instant::now() + timeout;
+    loop {
+        let missing: Vec<&str> = pod_uids
+            .iter()
+            .copied()
+            .filter(|uid| !ready_dir.join(uid).is_file())
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "host UDP readiness markers not published within {timeout:?} for {missing:?}"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -14662,28 +14870,18 @@ fn wait_for_host_udp_capture(
     let deadline = Instant::now() + timeout;
     loop {
         match host_udp_capture_snapshot(capture_port) {
-            Ok((v4_jumps, v6_jumps, v4_routes, v6_routes, listeners)) => {
+            Ok(snapshot) => {
                 let ready = if active {
-                    v4_jumps >= 1
-                        && v6_jumps >= 1
-                        && v4_routes >= 1
-                        && v6_routes >= 1
-                        && listeners >= 1
+                    snapshot.capture_live()
                 } else {
-                    v4_jumps == 0
-                        && v6_jumps == 0
-                        && v4_routes == 0
-                        && v6_routes == 0
-                        && listeners == 0
+                    snapshot.capture_absent()
                 };
                 if ready {
                     return Ok(());
                 }
                 if Instant::now() >= deadline {
                     return Err(format!(
-                        "host UDP capture did not become {} (v4_jumps={v4_jumps} \
-                         v6_jumps={v6_jumps} v4_routes={v4_routes} \
-                         v6_routes={v6_routes} listeners={listeners})",
+                        "host UDP capture did not become {} ({snapshot:?})",
                         if active { "active" } else { "absent" }
                     ));
                 }
@@ -14913,9 +15111,20 @@ async fn functional_mesh_live_host_udp_capture_proxy_backend_round_trip() {
         "host-UDP source gateway A did not start\n{}",
         captured_output(&temp_a)
     );
+    // Live means guard released on BOTH families, not merely "capture jumps and
+    // listener present": the manager builds the capture path behind its DROP
+    // guard and releases the IPv4 guard before the IPv6 one (#7425).
     if let Err(error) = wait_for_host_udp_capture(capture_port, true, Duration::from_secs(25)) {
         panic!(
             "ProxyHostUdpBackend did not install host capture: {error}\n{}",
+            captured_output(&temp_a)
+        );
+    }
+    if let Err(error) =
+        wait_for_host_udp_ready_markers(registry.path(), &[POD_A, POD_B], Duration::from_secs(10))
+    {
+        panic!(
+            "ProxyHostUdpBackend did not publish per-pod capture readiness: {error}\n{}",
             captured_output(&temp_a)
         );
     }
@@ -14964,7 +15173,8 @@ async fn functional_mesh_live_host_udp_capture_proxy_backend_round_trip() {
     )
     .unwrap_or_else(|error| {
         panic!(
-            "host-UDP pod B round trip failed: {error}\n{}",
+            "host-UDP pod B round trip failed: {error} (capture at failure: {:?})\n{}",
+            host_udp_capture_snapshot(capture_port),
             captured_output(&temp_a)
         )
     });
@@ -14987,7 +15197,8 @@ async fn functional_mesh_live_host_udp_capture_proxy_backend_round_trip() {
         )
         .unwrap_or_else(|error| {
             panic!(
-                "host-UDP IPv6 round trip failed: {error}\n{}",
+                "host-UDP IPv6 round trip failed: {error} (capture at failure: {:?})\n{}",
+                host_udp_capture_snapshot(capture_port),
                 captured_output(&temp_a)
             )
         });
@@ -15739,8 +15950,9 @@ fn live_xc_dest_slice(
         peer_authentications: vec![PeerAuthentication {
             name: "strict-live-cross-cluster".to_string(),
             namespace: "ferrum".to_string(),
-            scope: None,
-            selector: None,
+            scope: PolicyScope::Namespace {
+                namespace: "ferrum".to_string(),
+            },
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::new(),
         }],
@@ -17952,8 +18164,9 @@ fn unix_ingress_mesh_document(server_spiffe: &str, entries: &[UnixIngressEntry])
         peer_authentications: vec![PeerAuthentication {
             name: "mesh-disable".to_string(),
             namespace: "ferrum".to_string(),
-            scope: None,
-            selector: None,
+            scope: PolicyScope::Namespace {
+                namespace: "ferrum".to_string(),
+            },
             mtls_mode: MtlsMode::Disable,
             port_overrides: HashMap::new(),
         }],
@@ -18624,7 +18837,7 @@ async fn functional_mesh_sidecar_ingress_unix_socket_serves_live_traffic() {
         ),
     )
     .expect("rewrite mesh document for the update phase");
-    let pid = child.id().to_string();
+    let pid = child.child_mut().id().to_string();
     assert!(
         Command::new("kill")
             .args(["-HUP", &pid])
@@ -19643,6 +19856,20 @@ async fn h3_mesh_unary_rpc(
         .await
         .expect("send H3 gRPC request message");
     stream.finish().await.expect("half-close H3 gRPC request");
+    h3_mesh_rpc_response(&mut stream).await
+}
+
+/// Observe a pre-body refusal with the upload still open. The gateway writes
+/// the response and then STOP_SENDING(H3_NO_ERROR); sending DATA or FIN here
+/// would race that legitimate early stop (issue #6905).
+async fn h3_mesh_rpc_before_upload(https_port: u16) -> H3MeshRpcResult {
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}{H3_MESH_RPC_PATH}");
+    let mut stream = h3_mesh_open_stream(&client, &url, &[]).await;
+    h3_mesh_rpc_response(&mut stream).await
+}
+
+async fn h3_mesh_rpc_response(stream: &mut Http3GrpcStream) -> H3MeshRpcResult {
     let (status, headers) = stream
         .recv_response()
         .await
@@ -19695,8 +19922,13 @@ fn h3_mesh_hbone_tags(relay_port: u16, pinned_peer: &str) -> Vec<(&'static str, 
 /// are intact, request DATA arrives byte-for-byte, and `grpc-status` /
 /// `grpc-message` come back as REAL HTTP/2 trailers relayed onto H3 trailers.
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_h3_grpc_dispatches_over_same_cluster_sidecar_mesh_mtls() {
+#[test]
+fn functional_h3_grpc_dispatches_over_same_cluster_sidecar_mesh_mtls() {
+    crate::common::in_process_gateway_runtime(4)
+        .block_on(functional_h3_grpc_dispatches_over_same_cluster_sidecar_mesh_mtls_inner());
+}
+
+async fn functional_h3_grpc_dispatches_over_same_cluster_sidecar_mesh_mtls_inner() {
     let identities = TempDir::new().expect("h3 mesh mtls identity tempdir");
     let svids = generate_shared_ca_mesh_svid_set(
         identities.path(),
@@ -19785,8 +20017,13 @@ async fn functional_h3_grpc_dispatches_over_same_cluster_sidecar_mesh_mtls() {
 /// address actually connected to, verification is scoped to the remote trust
 /// domain with NO pod pinning, and real response trailers still arrive.
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_h3_grpc_dispatches_over_cross_cluster_sidecar_mesh_mtls() {
+#[test]
+fn functional_h3_grpc_dispatches_over_cross_cluster_sidecar_mesh_mtls() {
+    crate::common::in_process_gateway_runtime(4)
+        .block_on(functional_h3_grpc_dispatches_over_cross_cluster_sidecar_mesh_mtls_inner());
+}
+
+async fn functional_h3_grpc_dispatches_over_cross_cluster_sidecar_mesh_mtls_inner() {
     let identities = TempDir::new().expect("h3 xc mtls identity tempdir");
     let svids = generate_shared_ca_mesh_svid_set(
         identities.path(),
@@ -19865,8 +20102,13 @@ async fn functional_h3_grpc_dispatches_over_cross_cluster_sidecar_mesh_mtls() {
 /// DATA and real `grpc-status` TRAILERS end to end — the exact framing the old
 /// HTTP/1.1-inside-HBONE dispatch could not.
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_h3_grpc_dispatches_over_same_cluster_ambient_hbone() {
+#[test]
+fn functional_h3_grpc_dispatches_over_same_cluster_ambient_hbone() {
+    crate::common::in_process_gateway_runtime(4)
+        .block_on(functional_h3_grpc_dispatches_over_same_cluster_ambient_hbone_inner());
+}
+
+async fn functional_h3_grpc_dispatches_over_same_cluster_ambient_hbone_inner() {
     let identities = TempDir::new().expect("h3 hbone identity tempdir");
     let svids = generate_shared_ca_mesh_svid_set(
         identities.path(),
@@ -19947,8 +20189,13 @@ async fn functional_h3_grpc_dispatches_over_same_cluster_ambient_hbone() {
 /// ClientHello must carry the destination-FQDN SNI override with
 /// trust-domain-scoped verification instead of a pinned pod SPIFFE.
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_h3_grpc_dispatches_over_cross_cluster_ambient_hbone() {
+#[test]
+fn functional_h3_grpc_dispatches_over_cross_cluster_ambient_hbone() {
+    crate::common::in_process_gateway_runtime(4)
+        .block_on(functional_h3_grpc_dispatches_over_cross_cluster_ambient_hbone_inner());
+}
+
+async fn functional_h3_grpc_dispatches_over_cross_cluster_ambient_hbone_inner() {
     let identities = TempDir::new().expect("h3 xc hbone identity tempdir");
     let svids = generate_shared_ca_mesh_svid_set(
         identities.path(),
@@ -20034,8 +20281,13 @@ async fn functional_h3_grpc_dispatches_over_cross_cluster_ambient_hbone() {
 /// cancellation then propagates through the nested HTTP/2 connection as a reset
 /// request stream rather than being absorbed by the gateway.
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_h3_grpc_streams_and_cancels_over_ambient_hbone() {
+#[test]
+fn functional_h3_grpc_streams_and_cancels_over_ambient_hbone() {
+    crate::common::in_process_gateway_runtime(4)
+        .block_on(functional_h3_grpc_streams_and_cancels_over_ambient_hbone_inner());
+}
+
+async fn functional_h3_grpc_streams_and_cancels_over_ambient_hbone_inner() {
     let identities = TempDir::new().expect("h3 hbone streaming identity tempdir");
     let svids = generate_shared_ca_mesh_svid_set(
         identities.path(),
@@ -20109,8 +20361,13 @@ async fn functional_h3_grpc_streams_and_cancels_over_ambient_hbone() {
 /// authenticated hop, and when it never answers the H3 client gets
 /// DEADLINE_EXCEEDED (4) rather than hanging or receiving a connection error.
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_h3_grpc_propagates_the_deadline_over_sidecar_mesh_mtls() {
+#[test]
+fn functional_h3_grpc_propagates_the_deadline_over_sidecar_mesh_mtls() {
+    crate::common::in_process_gateway_runtime(4)
+        .block_on(functional_h3_grpc_propagates_the_deadline_over_sidecar_mesh_mtls_inner());
+}
+
+async fn functional_h3_grpc_propagates_the_deadline_over_sidecar_mesh_mtls_inner() {
     let identities = TempDir::new().expect("h3 mesh deadline identity tempdir");
     let svids = generate_shared_ca_mesh_svid_set(
         identities.path(),
@@ -20167,8 +20424,13 @@ async fn functional_h3_grpc_propagates_the_deadline_over_sidecar_mesh_mtls() {
 /// client gets gRPC UNAVAILABLE (14), the peer's listener is never dialed, and
 /// the refusal text leaks no SPIFFE ID, SNI name, or trust domain.
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_h3_grpc_mesh_transport_refuses_unmaterializable_metadata() {
+#[test]
+fn functional_h3_grpc_mesh_transport_refuses_unmaterializable_metadata() {
+    crate::common::in_process_gateway_runtime(4)
+        .block_on(functional_h3_grpc_mesh_transport_refuses_unmaterializable_metadata_inner());
+}
+
+async fn functional_h3_grpc_mesh_transport_refuses_unmaterializable_metadata_inner() {
     let identities = TempDir::new().expect("h3 mesh refusal identity tempdir");
     let svids = generate_shared_ca_mesh_svid_set(
         identities.path(),
@@ -20180,7 +20442,11 @@ async fn functional_h3_grpc_mesh_transport_refuses_unmaterializable_metadata() {
     let declared_app_port = h3_mesh_declared_app_port().await;
     let frontend = h3_mesh_frontend_certs();
 
-    let cases: Vec<(&str, Vec<(&'static str, String)>)> = vec![
+    let unresolvable_sidecar_identity =
+        "gRPC over the sidecar mesh mTLS transport requires a resolvable destination identity";
+    let incomplete_cross_cluster_metadata = "gRPC over cross-cluster east-west routing requires a destination SNI override \
+         and a remote trust domain";
+    let cases = [
         (
             "corrupt sidecar identity pin",
             vec![
@@ -20188,6 +20454,7 @@ async fn functional_h3_grpc_mesh_transport_refuses_unmaterializable_metadata() {
                 ("mesh.mtls_port", peer.port.to_string()),
                 ("mesh.spiffe_id", "not-a-spiffe-id".to_string()),
             ],
+            unresolvable_sidecar_identity,
         ),
         (
             "cross-cluster sidecar missing the SNI override",
@@ -20197,6 +20464,7 @@ async fn functional_h3_grpc_mesh_transport_refuses_unmaterializable_metadata() {
                 ("mesh.cross_cluster", "true".to_string()),
                 ("mesh.trust_domain", "cluster.local".to_string()),
             ],
+            incomplete_cross_cluster_metadata,
         ),
         (
             "cross-cluster sidecar missing the remote trust domain",
@@ -20206,6 +20474,7 @@ async fn functional_h3_grpc_mesh_transport_refuses_unmaterializable_metadata() {
                 ("mesh.cross_cluster", "true".to_string()),
                 ("mesh.eastwest_sni", H3_MESH_EASTWEST_SNI.to_string()),
             ],
+            incomplete_cross_cluster_metadata,
         ),
         (
             "cross-cluster with no mesh transport tag",
@@ -20214,6 +20483,7 @@ async fn functional_h3_grpc_mesh_transport_refuses_unmaterializable_metadata() {
                 ("mesh.trust_domain", "cluster.local".to_string()),
                 ("mesh.eastwest_sni", H3_MESH_EASTWEST_SNI.to_string()),
             ],
+            "gRPC over cross-cluster east-west routing requires a mesh transport tag",
         ),
         (
             "both mesh transports declared on one target",
@@ -20224,6 +20494,7 @@ async fn functional_h3_grpc_mesh_transport_refuses_unmaterializable_metadata() {
                 ("mesh.hbone_port", peer.port.to_string()),
                 ("mesh.spiffe_id", H3_MESH_PEER_SPIFFE.to_string()),
             ],
+            "gRPC dispatch refused: the selected target declares two conflicting mesh transports",
         ),
     ];
 
@@ -20235,7 +20506,7 @@ async fn functional_h3_grpc_mesh_transport_refuses_unmaterializable_metadata() {
         "not-a-spiffe-id",
     ];
 
-    for (label, tags) in cases {
+    for (label, tags, expected_message) in cases {
         let dead_backend_port = reserve_unique_mesh_port().await;
         let targets = h3_mesh_target_yaml("127.0.0.1", declared_app_port, &tags);
         let (mut gateway, https_port) = spawn_h3_mesh_gateway(
@@ -20247,10 +20518,13 @@ async fn functional_h3_grpc_mesh_transport_refuses_unmaterializable_metadata() {
         .await;
 
         let accepts_before = peer.accept_count();
-        let result = h3_mesh_unary_rpc(https_port, b"h3-refused", &[]).await;
+        // The gate must refuse without waiting for any request DATA or FIN.
+        // Read the actual response; an upload reset alone proves no refusal.
+        let result = h3_mesh_rpc_before_upload(https_port).await;
 
+        assert_eq!(result.status, http::StatusCode::OK, "{label}");
         assert_eq!(
-            result.grpc_status().as_deref(),
+            h3_mesh_header(&result.headers, "grpc-status").as_deref(),
             Some("14"),
             "{label}: an unmaterializable mesh transport must fail closed with \
              gRPC UNAVAILABLE: {:?} / {:?}",
@@ -20261,12 +20535,20 @@ async fn functional_h3_grpc_mesh_transport_refuses_unmaterializable_metadata() {
             result.body.is_empty(),
             "{label}: a pre-dial refusal must carry no response body"
         );
+        assert!(
+            result.trailers.is_empty(),
+            "{label}: expected Trailers-Only refusal"
+        );
         assert_eq!(
             peer.accept_count(),
             accepts_before,
             "{label}: the refusal must happen BEFORE any dial to the peer"
         );
         let message = result.grpc_message().unwrap_or_default();
+        assert_eq!(
+            message, expected_message,
+            "{label}: the refusal must identify the failed transport contract"
+        );
         for secret in secrets {
             assert!(
                 !message.contains(secret),
@@ -20294,8 +20576,13 @@ async fn functional_h3_grpc_mesh_transport_refuses_unmaterializable_metadata() {
 /// peer's identity pin, and refusing a mesh-tagged rotation — which this bridge
 /// did before #3284 — would fail closed with UNAVAILABLE.
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_h3_grpc_retry_rotation_re_resolves_the_mesh_transport() {
+#[test]
+fn functional_h3_grpc_retry_rotation_re_resolves_the_mesh_transport() {
+    crate::common::in_process_gateway_runtime(4)
+        .block_on(functional_h3_grpc_retry_rotation_re_resolves_the_mesh_transport_inner());
+}
+
+async fn functional_h3_grpc_retry_rotation_re_resolves_the_mesh_transport_inner() {
     let identities = TempDir::new().expect("h3 mesh rotation identity tempdir");
     let svids = generate_shared_ca_mesh_svid_set(
         identities.path(),
@@ -20388,8 +20675,13 @@ async fn functional_h3_grpc_retry_rotation_re_resolves_the_mesh_transport() {
 /// 3. the mesh target is restored but its identity pin is CORRUPTED — the RPC
 ///    must fail closed with UNAVAILABLE and dial nothing.
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_h3_grpc_mesh_transport_follows_reload_and_withdrawal() {
+#[test]
+fn functional_h3_grpc_mesh_transport_follows_reload_and_withdrawal() {
+    crate::common::in_process_gateway_runtime(4)
+        .block_on(functional_h3_grpc_mesh_transport_follows_reload_and_withdrawal_inner());
+}
+
+async fn functional_h3_grpc_mesh_transport_follows_reload_and_withdrawal_inner() {
     let identities = TempDir::new().expect("h3 mesh reload identity tempdir");
     let svids = generate_shared_ca_mesh_svid_set(
         identities.path(),
@@ -20454,12 +20746,12 @@ async fn functional_h3_grpc_mesh_transport_follows_reload_and_withdrawal() {
     //    ordinary direct-dial one, so the mesh listener must stop being reached.
     let peer_b_accepts = peer_b.accept_count();
     h3_mesh_reload(&gateway, config_for(&[], 2), &[]).await;
-    let withdrawn = h3_mesh_unary_rpc(https_port, b"h3-reload", &[]).await;
-    assert_ne!(
+    let withdrawn = h3_mesh_rpc_before_upload(https_port).await;
+    assert_eq!(
         withdrawn.grpc_status().as_deref(),
-        Some("0"),
+        Some("14"),
         "with the mesh transport withdrawn, the declared app port is not \
-         listening, so the RPC must not succeed: {:?} / {:?}",
+         listening, so the RPC must fail with UNAVAILABLE: {:?} / {:?}",
         withdrawn.headers,
         withdrawn.trailers
     );
@@ -20479,7 +20771,7 @@ async fn functional_h3_grpc_mesh_transport_follows_reload_and_withdrawal() {
         ("mesh.spiffe_id", "not-a-spiffe-id".to_string()),
     ];
     h3_mesh_reload(&gateway, config_for(&corrupted_tags, 3), &corrupted_tags).await;
-    let corrupted = h3_mesh_unary_rpc(https_port, b"h3-reload", &[]).await;
+    let corrupted = h3_mesh_rpc_before_upload(https_port).await;
     assert_eq!(
         corrupted.grpc_status().as_deref(),
         Some("14"),
@@ -20954,8 +21246,13 @@ async fn h3_mesh_plain_reload(
 
 /// Plain HTTP over same-cluster Sidecar mesh-mTLS through the H3 frontend.
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_h3_plain_dispatches_over_same_cluster_sidecar_mesh_mtls() {
+#[test]
+fn functional_h3_plain_dispatches_over_same_cluster_sidecar_mesh_mtls() {
+    crate::common::in_process_gateway_runtime(4)
+        .block_on(functional_h3_plain_dispatches_over_same_cluster_sidecar_mesh_mtls_inner());
+}
+
+async fn functional_h3_plain_dispatches_over_same_cluster_sidecar_mesh_mtls_inner() {
     let identities = TempDir::new().expect("h3 plain mtls identity tempdir");
     let svids = generate_shared_ca_mesh_svid_set(
         identities.path(),
@@ -21040,8 +21337,13 @@ async fn h3_mesh_plain_request(
 /// `503` whose `X-Gateway-Error` is the gateway's own `backend_error`, never the
 /// peer's spoofed value.
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_h3_plain_mesh_mtls_grpc_web_passthrough_and_backend_5xx_token() {
+#[test]
+fn functional_h3_plain_mesh_mtls_grpc_web_passthrough_and_backend_5xx_token() {
+    crate::common::in_process_gateway_runtime(4)
+        .block_on(functional_h3_plain_mesh_mtls_grpc_web_passthrough_and_backend_5xx_token_inner());
+}
+
+async fn functional_h3_plain_mesh_mtls_grpc_web_passthrough_and_backend_5xx_token_inner() {
     let identities = TempDir::new().expect("h3 plain mtls identity tempdir");
     let svids = generate_shared_ca_mesh_svid_set(
         identities.path(),
@@ -21185,21 +21487,7 @@ fn h3_plain_ambient_hbone_inner_app_is_http1_not_h2c() {
 #[ignore]
 #[test]
 fn functional_h3_plain_dispatches_over_same_cluster_ambient_hbone() {
-    // Production gives every worker 8 MiB (`thread_stack_size` in `src/main.rs`)
-    // because, as that comment records, "the proxy request future is deliberately
-    // broad ... and a real cross-cluster sidecar HTTP/2 request has exceeded"
-    // Rust's 2 MiB spawned-thread default on hosted Linux runners. `#[tokio::test]`
-    // silently takes that 2 MiB default, so this H3-over-HBONE dispatch — the
-    // broadest request future the gateway has — aborted the worker at
-    // `opt-level = 0` purely because the test under-provisions the stack by 4x
-    // relative to the binary under test. Match production rather than reshaping
-    // the request path to fit a budget production does not use.
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .thread_stack_size(8 * 1024 * 1024)
-        .enable_all()
-        .build()
-        .expect("build 8 MiB-stack runtime matching src/main.rs")
+    crate::common::in_process_gateway_runtime(4)
         .block_on(functional_h3_plain_dispatches_over_same_cluster_ambient_hbone_inner());
 }
 
@@ -21268,8 +21556,13 @@ async fn functional_h3_plain_dispatches_over_same_cluster_ambient_hbone_inner() 
 /// candidate after a retryable connect failure and land on the secured mesh
 /// transport.
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_h3_plain_mixed_retry_skips_unix_and_uses_mesh_mtls() {
+#[test]
+fn functional_h3_plain_mixed_retry_skips_unix_and_uses_mesh_mtls() {
+    crate::common::in_process_gateway_runtime(4)
+        .block_on(functional_h3_plain_mixed_retry_skips_unix_and_uses_mesh_mtls_inner());
+}
+
+async fn functional_h3_plain_mixed_retry_skips_unix_and_uses_mesh_mtls_inner() {
     let identities = TempDir::new().expect("h3 plain mixed retry identity tempdir");
     let svids = generate_shared_ca_mesh_svid_set(
         identities.path(),
@@ -21335,8 +21628,13 @@ async fn functional_h3_plain_mixed_retry_skips_unix_and_uses_mesh_mtls() {
 /// An upstream of only Unix-socket targets fails closed — no eligible H3
 /// transport remains.
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_h3_plain_all_unix_targets_fail_closed() {
+#[test]
+fn functional_h3_plain_all_unix_targets_fail_closed() {
+    crate::common::in_process_gateway_runtime(4)
+        .block_on(functional_h3_plain_all_unix_targets_fail_closed_inner());
+}
+
+async fn functional_h3_plain_all_unix_targets_fail_closed_inner() {
     let identities = TempDir::new().expect("h3 plain unix-only identity tempdir");
     let svids = generate_shared_ca_mesh_svid_set(identities.path(), &[H3_MESH_GATEWAY_SPIFFE]);
     let dead_backend_port = reserve_unique_mesh_port().await;
@@ -21379,8 +21677,13 @@ async fn functional_h3_plain_all_unix_targets_fail_closed() {
 
 /// Corrupted mesh identity pin fails closed with no plaintext dial.
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_h3_plain_mesh_identity_failure_fails_closed() {
+#[test]
+fn functional_h3_plain_mesh_identity_failure_fails_closed() {
+    crate::common::in_process_gateway_runtime(4)
+        .block_on(functional_h3_plain_mesh_identity_failure_fails_closed_inner());
+}
+
+async fn functional_h3_plain_mesh_identity_failure_fails_closed_inner() {
     let identities = TempDir::new().expect("h3 plain identity-fail tempdir");
     let svids = generate_shared_ca_mesh_svid_set(
         identities.path(),
@@ -21427,8 +21730,13 @@ async fn functional_h3_plain_mesh_identity_failure_fails_closed() {
 
 /// Trusted projected reload re-points plain mesh tags / withdraws / corrupts.
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_h3_plain_mesh_transport_follows_reload_and_withdrawal() {
+#[test]
+fn functional_h3_plain_mesh_transport_follows_reload_and_withdrawal() {
+    crate::common::in_process_gateway_runtime(4)
+        .block_on(functional_h3_plain_mesh_transport_follows_reload_and_withdrawal_inner());
+}
+
+async fn functional_h3_plain_mesh_transport_follows_reload_and_withdrawal_inner() {
     let identities = TempDir::new().expect("h3 plain reload identity tempdir");
     let svids = generate_shared_ca_mesh_svid_set(
         identities.path(),
@@ -21507,8 +21815,13 @@ async fn functional_h3_plain_mesh_transport_follows_reload_and_withdrawal() {
 /// H3 WebSocket over Ambient HBONE: Extended CONNECT on the frontend, byte
 /// tunnel + H1 upgrade to the destination echo app.
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_h3_websocket_dispatches_over_same_cluster_ambient_hbone() {
+#[test]
+fn functional_h3_websocket_dispatches_over_same_cluster_ambient_hbone() {
+    crate::common::in_process_gateway_runtime(4)
+        .block_on(functional_h3_websocket_dispatches_over_same_cluster_ambient_hbone_inner());
+}
+
+async fn functional_h3_websocket_dispatches_over_same_cluster_ambient_hbone_inner() {
     let identities = TempDir::new().expect("h3 ws hbone identity tempdir");
     let svids = generate_shared_ca_mesh_svid_set(
         identities.path(),
@@ -21562,6 +21875,48 @@ async fn functional_h3_websocket_dispatches_over_same_cluster_ambient_hbone() {
         "HBONE CONNECT must name the WS app; observed {connects:?}"
     );
 
+    gateway.shutdown().await;
+}
+
+/// Directional frame and accumulated-message limits survive the H3 bridge and
+/// its Ambient HBONE carrier; both endpoints must receive the policy Close.
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn functional_h3_mesh_websocket_size_limits_are_asymmetric_in_both_directions() {
+    use super::functional_ws_permessage_deflate_test::{
+        TerminateBackend, assert_h3_directional_size_limits, with_directional_size_limits,
+    };
+    let identities = TempDir::new().expect("size-limit HBONE identities");
+    let svids = generate_shared_ca_mesh_svid_set(
+        identities.path(),
+        &[H3_MESH_GATEWAY_SPIFFE, H3_MESH_PEER_SPIFFE],
+    );
+    let mut backend = TerminateBackend::start().await;
+    let relay = start_h3_mesh_hbone_relay(&svids[1]).await;
+    let dead_backend_port = reserve_unique_mesh_port().await;
+    let frontend = h3_mesh_frontend_certs();
+    let targets = h3_mesh_target_yaml(
+        "127.0.0.1",
+        backend.port,
+        &h3_mesh_hbone_tags(relay.port, H3_MESH_PEER_SPIFFE),
+    );
+    let config =
+        with_directional_size_limits(&h3_mesh_plain_config(dead_backend_port, &targets, false));
+    let (mut gateway, https_port) = spawn_h3_mesh_gateway(
+        config,
+        &svids[0],
+        &frontend,
+        &[dead_backend_port, relay.port, backend.port],
+    )
+    .await;
+    assert_h3_directional_size_limits(https_port, "/mesh/", &mut backend).await;
+    assert!(
+        relay
+            .observed_connects()
+            .iter()
+            .any(|authority| authority == &format!("127.0.0.1:{}", backend.port)),
+        "the sessions must use the secured HBONE carrier"
+    );
     gateway.shutdown().await;
 }
 

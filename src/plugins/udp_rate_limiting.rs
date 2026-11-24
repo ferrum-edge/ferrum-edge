@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use serde_json::Value;
-use std::sync::Arc;
+use std::net::IpAddr;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -11,19 +11,23 @@ use tracing::warn;
 use super::utils::rate_limit::{
     LocalStateSemantics, RATE_LIMIT_REDIS_CONFIG_KEYS, RateLimitBackend,
     STANDALONE_RATE_LIMIT_CONFIG_ID, UdpRateLimitAlgorithm, UdpRateLimitOp,
-    apply_rate_limit_cleanup, debug_assert_closed_root_keys, debug_assert_rate_limit_redis_keys,
-    validate_window_seconds,
+    debug_assert_closed_root_keys, debug_assert_rate_limit_redis_keys, validate_window_seconds,
 };
 use super::{
     Plugin, PluginHttpClient, ProxyProtocol, UDP_ONLY_PROTOCOLS, UdpDatagramContext,
-    UdpDatagramVerdict,
+    UdpDatagramDirection, UdpDatagramVerdict,
 };
 use crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter;
 use crate::util::unknown_keys::reject_unknown_keys;
 
 /// `udp_rate_limiting`-specific top-level config keys (excludes Redis fields).
-const UDP_RATE_LIMITING_POLICY_CONFIG_KEYS: &[&str] =
-    &["datagrams_per_second", "bytes_per_second", "window_seconds"];
+const UDP_RATE_LIMITING_POLICY_CONFIG_KEYS: &[&str] = &[
+    "datagrams_per_second",
+    "bytes_per_second",
+    "window_seconds",
+    "ipv6_prefix",
+    "direction",
+];
 
 /// Closed top-level key set for `udp_rate_limiting` plugin config.
 ///
@@ -35,6 +39,8 @@ pub const UDP_RATE_LIMITING_CONFIG_KEYS: &[&str] = &[
     "datagrams_per_second",
     "bytes_per_second",
     "window_seconds",
+    "ipv6_prefix",
+    "direction",
     // Shared Redis sync (see RATE_LIMIT_REDIS_CONFIG_KEYS)
     "sync_mode",
     "redis_url",
@@ -49,6 +55,8 @@ pub const UDP_RATE_LIMITING_CONFIG_KEYS: &[&str] = &[
 ];
 
 const MAX_STATE_ENTRIES: usize = 100_000;
+/// Default IPv6 grouping prefix, matching `rate_limiting`'s `ipv6_prefix`.
+const DEFAULT_IPV6_PREFIX: u8 = 64;
 const EVICTION_COOLDOWN_SECS: u64 = 1;
 const EVICTION_CHECK_INTERVAL: u64 = 100_000;
 
@@ -61,6 +69,58 @@ pub(crate) struct RejectionWarnDecisionForTest {
     pub(crate) global_suppressed: Option<u64>,
 }
 
+/// Which datagram directions a policy counts and limits.
+///
+/// `Both` (the default) is one combined per-client budget for requests and
+/// responses. A one-direction policy neither counts nor drops datagrams
+/// travelling the other way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UdpRateLimitDirection {
+    Both,
+    ClientToBackend,
+    BackendToClient,
+}
+
+impl UdpRateLimitDirection {
+    const BOTH: &'static str = "both";
+    const CLIENT_TO_BACKEND: &'static str = "client_to_backend";
+    const BACKEND_TO_CLIENT: &'static str = "backend_to_client";
+
+    fn parse(config: &Value) -> Result<Self, String> {
+        let Some(value) = config.get("direction") else {
+            return Ok(Self::Both);
+        };
+        match value.as_str() {
+            Some(Self::BOTH) => Ok(Self::Both),
+            Some(Self::CLIENT_TO_BACKEND) => Ok(Self::ClientToBackend),
+            Some(Self::BACKEND_TO_CLIENT) => Ok(Self::BackendToClient),
+            _ => Err(format!(
+                "udp_rate_limiting: `direction` must be one of `{}`, `{}`, or `{}`",
+                Self::BOTH,
+                Self::CLIENT_TO_BACKEND,
+                Self::BACKEND_TO_CLIENT
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Both => Self::BOTH,
+            Self::ClientToBackend => Self::CLIENT_TO_BACKEND,
+            Self::BackendToClient => Self::BACKEND_TO_CLIENT,
+        }
+    }
+
+    #[inline]
+    fn counts(self, direction: UdpDatagramDirection) -> bool {
+        match self {
+            Self::Both => true,
+            Self::ClientToBackend => direction == UdpDatagramDirection::ClientToBackend,
+            Self::BackendToClient => direction == UdpDatagramDirection::BackendToClient,
+        }
+    }
+}
+
 static GLOBAL_REJECTION_WARN: OnceLock<AtomicLogRateLimiter> = OnceLock::new();
 
 fn global_rejection_warn() -> &'static AtomicLogRateLimiter {
@@ -68,15 +128,19 @@ fn global_rejection_warn() -> &'static AtomicLogRateLimiter {
 }
 
 pub struct UdpRateLimiting {
-    check_counter: AtomicU64,
+    check_counter: crossbeam_utils::CachePadded<AtomicU64>,
     epoch_base: Instant,
     last_eviction_secs: AtomicU64,
     rejection_warn: AtomicLogRateLimiter,
-    limiter: RateLimitBackend<Arc<str>, UdpRateLimitAlgorithm>,
+    /// IPv6 grouping prefix for client keys; IPv4 stays host-keyed.
+    ipv6_prefix: u8,
+    direction: UdpRateLimitDirection,
+    /// Keyed by the masked client address (see
+    /// [`crate::util::client_identity::rate_limit_ip`]).
+    limiter: RateLimitBackend<IpAddr, UdpRateLimitAlgorithm>,
 }
 
 impl UdpRateLimiting {
-    #[allow(dead_code)] // direct/test construction; production factory supplies the config id
     pub fn new_with_http_client(
         config: &Value,
         http_client: PluginHttpClient,
@@ -159,24 +223,33 @@ impl UdpRateLimiting {
         };
         let datagrams_per_window = per_window_limit(datagrams_per_second, window_seconds)?;
         let bytes_per_window = per_window_limit(bytes_per_second, window_seconds)?;
+        let ipv6_prefix = parse_ipv6_prefix(config)?;
+        let direction = UdpRateLimitDirection::parse(config)?;
         // Effective enforcement semantics, not raw syntax: the per-window
         // budgets the algorithm actually enforces and the window length after
         // defaulting (`window_seconds` omitted is 1), so an omitted window and
         // an explicit `1` describe the same budget. An unset axis is encoded
-        // distinctly from any set value — unlimited is not a bound. The shared
+        // distinctly from any set value — unlimited is not a bound. The IPv6
+        // grouping prefix and the counted direction decide which datagrams
+        // share one counter, so both are effective semantics too (an omitted
+        // value and its explicit default are the same budget). The shared
         // Redis posture is added by the backend.
         let mut semantics = LocalStateSemantics::new();
         semantics.optional_u64("datagrams_per_window", datagrams_per_window);
         semantics.optional_u64("bytes_per_window", bytes_per_window);
         semantics.u64("window_seconds", window_seconds);
+        semantics.u64("ipv6_prefix", u64::from(ipv6_prefix));
+        semantics.text("direction", direction.as_str());
 
         let epoch_base = Instant::now();
 
         Ok(Self {
-            check_counter: AtomicU64::new(0),
+            check_counter: crossbeam_utils::CachePadded::new(AtomicU64::new(0)),
             epoch_base,
             last_eviction_secs: AtomicU64::new(0),
             rejection_warn: AtomicLogRateLimiter::new(),
+            ipv6_prefix,
+            direction,
             limiter: RateLimitBackend::from_plugin_config_with_policy_identity(
                 "udp_rate_limiting",
                 namespace,
@@ -253,37 +326,50 @@ impl UdpRateLimiting {
         self.limiter.map_len_for_test()
     }
 
+    /// Local/fallback key this policy uses for a client-IP literal, or `None`
+    /// for a string that is not an address. Test support only.
+    fn local_key_for_test(&self, client_ip: &str) -> Option<IpAddr> {
+        crate::util::client_identity::parse_canonical_client_ip(client_ip)
+            .map(|ip| crate::util::client_identity::rate_limit_ip(ip, self.ipv6_prefix))
+    }
+
     /// Controllable-time seed for external cleanup tests. Not a production API.
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    /// A non-address `client_ip` seeds nothing.
     pub(crate) fn seed_client_at_for_test(
         &self,
-        client_ip: Arc<str>,
+        client_ip: &str,
         datagram_size: u64,
         now: Instant,
     ) {
-        let _ = self
-            .limiter
-            .check_local_at(client_ip, &UdpRateLimitOp { datagram_size }, now);
+        if let Some(key) = self.local_key_for_test(client_ip) {
+            let _ = self
+                .limiter
+                .check_local_at(key, &UdpRateLimitOp { datagram_size }, now);
+        }
     }
 
     /// Attempt to seed one local/fallback key through the production atomic
-    /// capacity gate. Returns false only for a previously unseen key at cap.
-    #[allow(dead_code)]
+    /// capacity gate. Returns false for a previously unseen key at cap (and
+    /// for a non-address `client_ip`).
     pub(crate) fn seed_client_at_with_cap_for_test(
         &self,
-        client_ip: Arc<str>,
+        client_ip: &str,
         datagram_size: u64,
         now: Instant,
         max_entries: usize,
     ) -> bool {
+        let Some(key) = self.local_key_for_test(client_ip) else {
+            return false;
+        };
         self.limiter
-            .check_local_at_with_capacity(
-                client_ip,
-                &UdpRateLimitOp { datagram_size },
-                now,
-                max_entries,
-            )
+            .check_local_at_with_capacity(key, &UdpRateLimitOp { datagram_size }, now, max_entries)
             .is_some()
+    }
+
+    /// Exclusive entry-guard acquisitions on the local/fallback map.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn exclusive_entry_calls_for_test(&self) -> usize {
+        self.limiter.exclusive_entry_calls_for_test()
     }
 
     /// Arm the sampled periodic gate without spinning 100k hooks. Test-only.
@@ -295,7 +381,6 @@ impl UdpRateLimiting {
     }
 
     /// Force the cooldown clock so the next armed periodic sweep is blocked.
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn block_eviction_cooldown_at_for_test(&self, now: Instant) {
         let now_secs = now.saturating_duration_since(self.epoch_base).as_secs();
         self.last_eviction_secs.store(now_secs, Ordering::Relaxed);
@@ -308,7 +393,6 @@ impl UdpRateLimiting {
     }
 
     /// Exercise the production sampled/cooldown path with a testable cap.
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn maybe_evict_at_with_cap_for_test(
         &self,
         now: Instant,
@@ -317,12 +401,11 @@ impl UdpRateLimiting {
         self.maybe_evict_at_with_cap(now, max_entries)
     }
 
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
-    pub(crate) fn contains_client_for_test(&self, client_ip: &Arc<str>) -> bool {
-        self.limiter.contains_local_key(client_ip)
+    pub(crate) fn contains_client_for_test(&self, client_ip: &str) -> bool {
+        self.local_key_for_test(client_ip)
+            .is_some_and(|key| self.limiter.contains_local_key(&key))
     }
 
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn epoch_base_for_test(&self) -> Instant {
         self.epoch_base
     }
@@ -330,7 +413,6 @@ impl UdpRateLimiting {
     /// Exercise the production dual-gate decision with an isolated global
     /// limiter so parallel external tests never mutate process-global state.
     #[doc(hidden)]
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn record_rate_limit_rejection_warn_detail_for_test(
         &self,
         global: &AtomicLogRateLimiter,
@@ -343,14 +425,12 @@ impl UdpRateLimiting {
 
     /// Observed per-instance suppressed-event accumulator. Test-only.
     #[doc(hidden)]
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn rejection_warn_suppressed_count_for_test(&self) -> u64 {
         self.rejection_warn.suppressed_count_for_test()
     }
 
     /// Reset this instance's rejection diagnostic limiter. Test-only.
     #[doc(hidden)]
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn reset_rate_limit_rejection_warn_for_test(&self) {
         self.rejection_warn.reset_for_test();
     }
@@ -400,15 +480,26 @@ impl UdpRateLimiting {
         }
     }
 
-    fn redis_ip_key(client_ip: &str) -> String {
-        let mut key = String::with_capacity(3 + client_ip.len());
-        key.push_str("ip:");
-        key.push_str(client_ip);
-        key
+    /// Redis key for an already-masked client address: `ip:` plus the same
+    /// canonical text the key always used (IPv4 dotted quad, IPv6 network
+    /// address). Built only when the centralized store is consulted.
+    fn redis_ip_key(key: IpAddr) -> String {
+        let rendered = crate::util::client_identity::canonical_ip_string(key);
+        let mut redis_key = String::with_capacity(3 + rendered.len());
+        redis_key.push_str("ip:");
+        redis_key.push_str(&rendered);
+        redis_key
     }
 
     fn maybe_evict(&self) -> bool {
-        self.maybe_evict_at(Instant::now())
+        let count = self.check_counter.fetch_add(1, Ordering::Relaxed);
+        let len = self.limiter.tracked_keys_count();
+        let at_capacity = len >= MAX_STATE_ENTRIES;
+        let periodic = count > 0 && count.is_multiple_of(EVICTION_CHECK_INTERVAL) && len > 0;
+        if !at_capacity && !periodic {
+            return false;
+        }
+        self.evict_with_cap_sampled(Instant::now(), MAX_STATE_ENTRIES, at_capacity, periodic)
     }
 
     fn maybe_evict_at(&self, now: Instant) -> bool {
@@ -418,18 +509,33 @@ impl UdpRateLimiting {
     fn maybe_evict_at_with_cap(&self, now: Instant, max_entries: usize) -> bool {
         let count = self.check_counter.fetch_add(1, Ordering::Relaxed);
         let len = self.limiter.tracked_keys_count();
-        let over_capacity = len > max_entries;
+        let at_capacity = len >= max_entries;
         let periodic = count > 0 && count.is_multiple_of(EVICTION_CHECK_INTERVAL) && len > 0;
+        if !at_capacity && !periodic {
+            return false;
+        }
+        self.evict_with_cap_sampled(now, max_entries, at_capacity, periodic)
+    }
+
+    fn evict_with_cap_sampled(
+        &self,
+        now: Instant,
+        max_entries: usize,
+        at_capacity: bool,
+        periodic: bool,
+    ) -> bool {
         let now_secs = now.saturating_duration_since(self.epoch_base).as_secs();
 
-        // Keep capacity pressure visible for every over-cap observation, even
+        // Keep capacity pressure visible for every at-cap observation, even
         // when this call wins cleanup and only reclaims idle keys. That
         // preserves the caller's O(1) new-key rejection guard. Live budgets
         // are never force-evicted; hard cardinality is enforced by atomic
         // admission reservation. Reuse the periodic timestamp as a
         // once-per-second single-flight gate so attacker-controlled datagrams
-        // cannot trigger retain on every packet.
-        if over_capacity {
+        // cannot trigger retain on every packet. This runs before the
+        // datagram's own admission, so a slot reclaimed here is available to
+        // the very datagram that observed the full map.
+        if at_capacity {
             let last_sweep = self.last_eviction_secs.load(Ordering::Relaxed);
             if now_secs.saturating_sub(last_sweep) >= EVICTION_COOLDOWN_SECS
                 && self
@@ -437,7 +543,7 @@ impl UdpRateLimiting {
                     .compare_exchange(last_sweep, now_secs, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
             {
-                apply_rate_limit_cleanup(&self.limiter, max_entries, now, true);
+                self.limiter.prune_stale_at(now);
             }
             return true;
         }
@@ -451,25 +557,40 @@ impl UdpRateLimiting {
                     .is_ok()
             {
                 // Periodic sweeps prune idle keys even while the map is
-                // below the hard cap. A later over-cap observation keeps the
+                // below the hard cap. A later at-cap observation keeps the
                 // new-key guard active and reclaims idle state at most once
                 // per second after pruning.
-                apply_rate_limit_cleanup(&self.limiter, max_entries, now, false);
+                self.limiter.prune_stale_at(now);
             }
         }
 
-        self.limiter.tracked_keys_count() > max_entries
+        self.limiter.tracked_keys_count() >= max_entries
     }
 }
 
 #[async_trait]
 impl Plugin for UdpRateLimiting {
+    /// Starts the Redis failover health observer only once this generation is
+    /// installed, so validation that builds and drops the plugin spawns
+    /// nothing (issue #6616).
+    fn commit_background_tasks(&self) {
+        self.limiter.commit_background_tasks();
+    }
+
     fn name(&self) -> &str {
         "udp_rate_limiting"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::UDP_RATE_LIMITING
+    }
+
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::NONE
     }
 
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {
@@ -489,20 +610,20 @@ impl Plugin for UdpRateLimiting {
     }
 
     async fn on_udp_datagram(&self, ctx: &UdpDatagramContext<'_>) -> UdpDatagramVerdict {
+        // A one-direction policy neither counts nor limits the other way.
+        if !self.direction.counts(ctx.direction) {
+            return UdpDatagramVerdict::Forward;
+        }
         self.maybe_evict();
-        let key: Arc<str> = if !ctx.client_ip.contains(':') {
-            Arc::clone(&ctx.client_ip)
-        } else {
-            crate::util::client_identity::parse_canonical_client_ip(ctx.client_ip.as_ref())
-                .map(|ip| Arc::from(crate::util::client_identity::rate_limit_ip_string(ip, 64)))
-                .unwrap_or_else(|| Arc::clone(&ctx.client_ip))
-        };
+        // The session computed the typed canonical address once; masking it
+        // is a few integer operations — no parse, no format, no allocation.
+        let key = crate::util::client_identity::rate_limit_ip(ctx.client_ip_addr, self.ipv6_prefix);
 
         let Some(outcome) = self
             .limiter
             .check_with_redis_key_and_local_capacity(
-                Arc::clone(&key),
-                || Self::redis_ip_key(key.as_ref()),
+                key,
+                || Self::redis_ip_key(key),
                 &UdpRateLimitOp {
                     datagram_size: ctx.datagram_size as u64,
                 },
@@ -523,7 +644,11 @@ impl Plugin for UdpRateLimiting {
             // `redis_failure_policy: "fail_closed"`. A datagram has no error
             // channel, so failing closed is the drop itself. The shared backend
             // emits the bounded once-per-outage warning; per-datagram warnings
-            // here would be attacker-controlled log amplification.
+            // here would be attacker-controlled log amplification. Count the
+            // drop on the dedicated outage counter so a Redis outage is never
+            // silent traffic loss (and never mistaken for client over-limit).
+            super::prometheus_metrics::global_registry()
+                .record_rate_limit_enforcement_unavailable();
             return UdpDatagramVerdict::Drop;
         }
 
@@ -557,6 +682,20 @@ fn optional_positive_u64(config: &Value, field: &'static str) -> Result<Option<u
         ));
     }
     Ok(Some(value))
+}
+
+/// `ipv6_prefix`: an integer 1–128 (default 64), the same contract as
+/// `rate_limiting`. Explicit `null` is refused like every other optional field.
+fn parse_ipv6_prefix(config: &Value) -> Result<u8, String> {
+    const MESSAGE: &str = "udp_rate_limiting: `ipv6_prefix` must be an integer from 1 through 128";
+    let Some(value) = config.get("ipv6_prefix") else {
+        return Ok(DEFAULT_IPV6_PREFIX);
+    };
+    value
+        .as_u64()
+        .and_then(|prefix| u8::try_from(prefix).ok())
+        .filter(|prefix| (1..=128).contains(prefix))
+        .ok_or_else(|| MESSAGE.to_string())
 }
 
 fn per_window_limit(limit: Option<u64>, window_seconds: u64) -> Result<Option<u64>, String> {

@@ -37,6 +37,12 @@ case "${H1_TRACE_ACTION:?}" in
     exec /tmp/ferrum-h1-trace/perf script -i "$H1_TRACE_OUT/perf.data" --symfs "$H1_TRACE_SYMFS" \
       --no-inline --ns --show-lost-events --show-task-events --show-mmap-events \
       -F comm,pid,tid,time,event,ip,sym,dso ;;
+  perf-script-flat)
+    [[ ${H1_TRACE_OUT:?} == /* && ${H1_TRACE_SYMFS:?} == /* ]]
+    # Offline only: the sampled PC of every sample, without DWARF unwinding
+    # (-G), so samples whose unwind yields no frame still name their leaf.
+    exec /tmp/ferrum-h1-trace/perf script -i "$H1_TRACE_OUT/perf.data" --symfs "$H1_TRACE_SYMFS" \
+      --no-inline --ns -G -F comm,pid,tid,time,event,ip,sym,dso ;;
   perf-raw)
     [[ ${H1_TRACE_OUT:?} == /* ]]
     exec /tmp/ferrum-h1-trace/perf script -D -i "$H1_TRACE_OUT/perf.data" ;;

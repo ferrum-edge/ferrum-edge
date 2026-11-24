@@ -45,6 +45,7 @@ fn make_summary(
         timestamp_received: "2025-01-01T00:00:00Z".to_string(),
         client_ip: "127.0.0.1".to_string(),
         consumer_username: None,
+        principal_origin: None,
         auth_method: None,
         http_method: method.to_string(),
         request_path: "/test".to_string(),
@@ -66,12 +67,13 @@ fn make_summary(
         error_class: None,
         body_error_class: None,
         body_completed: false,
+        response_delivery: Default::default(),
         bytes_sent: 0,
         bytes_received: 0,
         grpc_request_messages: 0,
         grpc_response_messages: 0,
         mirror: false,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
         ai_usage_export: None,
         proxy_lifecycle_generation: None,
     }
@@ -86,6 +88,7 @@ fn make_stream_summary(proxy_id: &str, protocol: &str) -> StreamTransactionSumma
         proxy_name: Some("Stream Test".to_string()),
         client_ip: "127.0.0.1".to_string(),
         consumer_username: None,
+        principal_origin: None,
         auth_method: None,
         backend_target: "127.0.0.1:9000".to_string(),
         backend_resolved_ip: None,
@@ -101,7 +104,7 @@ fn make_stream_summary(proxy_id: &str, protocol: &str) -> StreamTransactionSumma
         timestamp_connected: "2025-01-01T00:00:00Z".to_string(),
         timestamp_disconnected: "2025-01-01T00:00:01Z".to_string(),
         sni_hostname: None,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
     }
 }
 
@@ -165,9 +168,10 @@ fn make_ws_summary(proxy_id: &str) -> WsDisconnectContext {
         io_side: None,
         error_class: None,
         consumer_username: None,
+        principal_origin: None,
         auth_method: None,
         connection_id: 0,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
     }
 }
 
@@ -179,6 +183,18 @@ async fn test_prometheus_plugin_creation() {
     assert_eq!(plugin.priority(), 9300);
     assert_eq!(plugin.supported_protocols(), ALL_PROTOCOLS);
     assert!(plugin.requires_ws_disconnect_hooks());
+}
+
+/// Issue #7117: terminal delivery builds the mesh RED key only for plugins that
+/// declare they read it, not by matching plugin names.
+#[test]
+fn only_mesh_observability_sinks_use_the_mesh_request_key() {
+    let prometheus = PrometheusMetrics::new(&json!({}), "ferrum").unwrap();
+    assert!(prometheus.uses_mesh_request_key());
+    let workload = WorkloadMetrics::new(&json!({})).expect("workload_metrics config");
+    assert!(workload.uses_mesh_request_key());
+    let token_metrics = AiTokenMetrics::new(&json!({})).expect("ai_token_metrics config");
+    assert!(!token_metrics.uses_mesh_request_key());
 }
 
 #[tokio::test]
@@ -478,7 +494,7 @@ async fn test_registry_ignores_mirror_summary() {
 async fn test_registry_renders_mesh_red_metrics_when_metadata_present() {
     let registry = MetricsRegistry::new();
     let mut summary = make_summary("payments-proxy", "GET", 200, 42.0, 35.0);
-    summary.metadata = HashMap::from([
+    summary.metadata = ferrum_edge::plugins::MetadataMap::from_iter([
         ("mesh.source.workload".to_string(), "frontend".to_string()),
         ("mesh.source.namespace".to_string(), "default".to_string()),
         (
@@ -545,7 +561,7 @@ async fn test_registry_distinguishes_mesh_identity_from_prometheus_observation_m
     );
 
     let mut mesh_summary = make_summary("payments-proxy", "GET", 200, 42.0, 35.0);
-    mesh_summary.metadata = HashMap::from([
+    mesh_summary.metadata = ferrum_edge::plugins::MetadataMap::from_iter([
         ("mesh.source.workload".to_string(), "frontend".to_string()),
         ("mesh.source.namespace".to_string(), "default".to_string()),
         (
@@ -809,6 +825,9 @@ async fn test_registry_renders_k8s_controller_istio_status_counters() {
         .last_reconcile_duration_ms
         .store(14, Ordering::Relaxed);
     metrics.watch_idle_relists.store(15, Ordering::Relaxed);
+    metrics
+        .watch_evidence_refresh_relists
+        .store(22, Ordering::Relaxed);
     metrics.watch_deletes.store(17, Ordering::Relaxed);
     metrics.config_publications.store(18, Ordering::Relaxed);
     metrics.watch_errors.store(19, Ordering::Relaxed);
@@ -859,6 +878,10 @@ async fn test_registry_renders_k8s_controller_istio_status_counters() {
             "16",
         ),
         ("ferrum_k8s_controller_watch_idle_relists_total", "15"),
+        (
+            "ferrum_k8s_controller_watch_evidence_refresh_relists_total",
+            "22",
+        ),
         ("ferrum_k8s_controller_watch_deletes_total", "17"),
         ("ferrum_k8s_controller_config_publications_total", "18"),
         ("ferrum_k8s_controller_watch_errors_total", "19"),
@@ -1166,14 +1189,16 @@ async fn test_registry_request_duration_histogram() {
     let sum = f64::from_bits(sum_bits);
     assert!((sum - 50.0).abs() < 0.001);
 
-    // Bucket boundaries: 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000
-    // 50ms should increment buckets for le=50 (idx 3) through le=10000 (idx 10)
-    assert_eq!(hist.counts[0].load(Ordering::Relaxed), 0); // le=5
-    assert_eq!(hist.counts[1].load(Ordering::Relaxed), 0); // le=10
-    assert_eq!(hist.counts[2].load(Ordering::Relaxed), 0); // le=25
-    assert_eq!(hist.counts[3].load(Ordering::Relaxed), 1); // le=50
-    assert_eq!(hist.counts[4].load(Ordering::Relaxed), 1); // le=100
-    assert_eq!(hist.counts[10].load(Ordering::Relaxed), 1); // le=10000
+    // Default request layout: 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000,
+    // 10000, 30000, 60000, 120000, 300000. A 50ms observation is cumulative
+    // from le=50 (idx 3) through the last finite bound (idx 14).
+    assert_eq!(hist.cumulative_count(0), 0); // le=5
+    assert_eq!(hist.cumulative_count(1), 0); // le=10
+    assert_eq!(hist.cumulative_count(2), 0); // le=25
+    assert_eq!(hist.cumulative_count(3), 1); // le=50
+    assert_eq!(hist.cumulative_count(4), 1); // le=100
+    assert_eq!(hist.cumulative_count(10), 1); // le=10000
+    assert_eq!(hist.cumulative_count(14), 1); // le=300000
 }
 
 #[tokio::test]
@@ -1457,7 +1482,15 @@ fn ai_federation_circuit_metrics_are_bounded_and_reload_safe() {
     assert!(output.contains("ferrum_ai_federation_circuits_closed_total 1"));
     assert!(output.contains("ferrum_ai_federation_circuit_half_open_probes_total 1"));
     assert!(output.contains("ferrum_ai_federation_circuit_open_skips_total 1"));
-    assert!(!output.contains("provider="));
+    // The aggregate circuit families stay provider-free; other families in the
+    // shared registry (e.g. mesh tracing span drops) may legitimately carry a
+    // `provider` label.
+    assert!(
+        output
+            .lines()
+            .filter(|line| line.starts_with("ferrum_ai_federation_circuit"))
+            .all(|line| !line.contains("provider="))
+    );
 
     registry.record_ai_federation_circuit_opened();
     registry.release_ai_federation_open_circuit();
@@ -1465,6 +1498,57 @@ fn ai_federation_circuit_metrics_are_bounded_and_reload_safe() {
     assert!(output.contains("ferrum_ai_federation_circuits_open 0"));
     assert!(output.contains("ferrum_ai_federation_circuits_opened_total 2"));
     assert!(output.contains("ferrum_ai_federation_circuits_closed_total 1"));
+}
+
+/// ai_federation-MUSE-5: the per-provider companions carry the configured
+/// provider name, refcount the open gauge across instances sharing a name,
+/// remove the gauge entry when it returns to zero, and TTL-evict the counters.
+#[test]
+fn ai_federation_provider_circuit_metrics_are_labelled_and_released() {
+    let registry = MetricsRegistry::new();
+    registry.record_ai_federation_provider_circuit_opened("primary");
+    registry.record_ai_federation_provider_circuit_opened("primary");
+    registry.record_ai_federation_provider_circuit_opened("secondary");
+
+    let output = registry.render_uncached();
+    assert!(output.contains("ferrum_ai_federation_provider_circuits_open{provider=\"primary\"} 2"));
+    assert!(
+        output.contains("ferrum_ai_federation_provider_circuits_open{provider=\"secondary\"} 1")
+    );
+    assert!(
+        output.contains(
+            "ferrum_ai_federation_provider_circuits_opened_total{provider=\"primary\"} 2"
+        )
+    );
+    // The aggregate series are independent of the labelled companions.
+    assert!(output.contains("ferrum_ai_federation_circuits_open 0"));
+
+    registry.record_ai_federation_provider_circuit_closed("primary");
+    registry.release_ai_federation_provider_open_circuit("primary");
+    registry.release_ai_federation_provider_open_circuit("secondary");
+    // Releasing a provider that never opened is a no-op, not a negative gauge.
+    registry.release_ai_federation_provider_open_circuit("never-opened");
+    let output = registry.render_uncached();
+    assert!(
+        !output.contains("ferrum_ai_federation_provider_circuits_open{"),
+        "a gauge entry back at zero must be removed: {output}"
+    );
+    assert!(!output.contains("never-opened"));
+    assert!(
+        output.contains(
+            "ferrum_ai_federation_provider_circuits_closed_total{provider=\"primary\"} 1"
+        )
+    );
+    assert!(
+        output.contains(
+            "ferrum_ai_federation_provider_circuits_opened_total{provider=\"secondary\"} 1"
+        )
+    );
+
+    registry.evict_stale(0);
+    let output = registry.render_uncached();
+    assert!(!output.contains("ferrum_ai_federation_provider_circuits_opened_total"));
+    assert!(!output.contains("ferrum_ai_federation_provider_circuits_closed_total"));
 }
 
 #[test]
@@ -1536,11 +1620,11 @@ async fn test_histogram_multiple_observations() {
     assert_eq!(hist.count.load(Ordering::Relaxed), 3);
 
     // le=5: 1 (the 3.0ms request)
-    assert_eq!(hist.counts[0].load(Ordering::Relaxed), 1);
+    assert_eq!(hist.cumulative_count(0), 1);
     // le=250: 2 (3.0 + 150.0)
-    assert_eq!(hist.counts[5].load(Ordering::Relaxed), 2);
+    assert_eq!(hist.cumulative_count(5), 2);
     // le=5000: 3 (all three)
-    assert_eq!(hist.counts[9].load(Ordering::Relaxed), 3);
+    assert_eq!(hist.cumulative_count(9), 3);
 
     let sum = f64::from_bits(hist.sum.load(Ordering::Relaxed));
     assert!((sum - 3153.0).abs() < 0.01);
@@ -1953,7 +2037,7 @@ fn test_mesh_metrics_use_distinct_gateway_namespace_label() {
     let registry = MetricsRegistry::new();
     registry.configure(5, 3600, 0, 10_000, "staging");
     let mut summary = make_summary("mesh-namespace", "GET", 200, 10.0, 5.0);
-    summary.metadata = HashMap::from([
+    summary.metadata = ferrum_edge::plugins::MetadataMap::from_iter([
         ("mesh.source.workload".to_string(), "frontend".to_string()),
         (
             "mesh.source.namespace".to_string(),
@@ -2030,6 +2114,182 @@ async fn workload_metrics_response_code_override_changes_selected_metric_family(
     assert!(duration.contains("response_flags=\"503\""), "{duration}");
 }
 
+/// Stamp `config`'s workload_metrics metadata onto a fresh request and return
+/// it as a summary for `status`.
+async fn workload_metrics_summary(config: serde_json::Value, status: u16) -> TransactionSummary {
+    let workload_metrics = WorkloadMetrics::new(&config).expect("workload_metrics config");
+    let mut ctx = RequestContext::new("10.0.0.2".to_string(), "GET".to_string(), "/".to_string());
+    let mut headers = HashMap::new();
+    let result = workload_metrics.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(
+        result,
+        ferrum_edge::plugins::PluginResult::Continue
+    ));
+    let mut summary = make_summary("response-code-canonical", "GET", status, 10.0, 5.0);
+    summary.metadata = ctx.metadata;
+    summary
+}
+
+fn mesh_family_lines<'a>(output: &'a str, prefix: &str) -> Vec<&'a str> {
+    output
+        .lines()
+        .filter(|line| line.starts_with(prefix))
+        .collect()
+}
+
+/// workload_metrics-SOL-1: a numeric response-code override equal to the
+/// response's own status, literal or `string(response.code)`, renders the
+/// same labels as no override, so it must share that series in ONE registry
+/// (one sample, combined count) instead of exposing duplicate series.
+#[tokio::test]
+async fn numeric_response_code_override_shares_the_plain_status_series() {
+    let literal = json!({
+        "metrics": {"tag_overrides": [
+            {"metric": "REQUEST_COUNT", "name": "response_code",
+             "operation": {"type": "set", "value": "200"}},
+            {"metric": "REQUEST_DURATION", "name": "response_code",
+             "operation": {"type": "set", "value": "200"}}
+        ]}
+    });
+    let cel = json!({
+        "metrics": {"tag_overrides": [
+            {"metric": "REQUEST_COUNT", "name": "response_code",
+             "operation": {"type": "set_expr", "cel": "string(response.code)"}},
+            {"metric": "REQUEST_DURATION", "name": "response_code",
+             "operation": {"type": "set_expr", "cel": "string(response.code)"}}
+        ]}
+    });
+    let registry = MetricsRegistry::new();
+    registry.record(&workload_metrics_summary(json!({}), 200).await);
+    registry.record(&workload_metrics_summary(literal, 200).await);
+    registry.record(&workload_metrics_summary(cel, 200).await);
+
+    let output = registry.render_uncached();
+    let counters = mesh_family_lines(&output, "ferrum_mesh_requests_total{");
+    assert_eq!(
+        counters.len(),
+        1,
+        "one rendered series, one sample: {counters:?}"
+    );
+    assert!(
+        counters[0].contains("response_code=\"200\""),
+        "{}",
+        counters[0]
+    );
+    assert!(counters[0].ends_with(" 3"), "{}", counters[0]);
+    let durations = mesh_family_lines(&output, "ferrum_mesh_request_duration_ms_count{");
+    assert_eq!(durations.len(), 1, "{durations:?}");
+    assert!(durations[0].ends_with(" 3"), "{}", durations[0]);
+
+    // A spelling that renders differently stays a distinct series.
+    let padded = json!({
+        "metrics": {"tag_overrides": [
+            {"metric": "REQUEST_COUNT", "name": "response_code",
+             "operation": {"type": "set", "value": "0200"}}
+        ]}
+    });
+    registry.record(&workload_metrics_summary(padded, 200).await);
+    let output = registry.render_uncached();
+    let counters = mesh_family_lines(&output, "ferrum_mesh_requests_total{");
+    assert_eq!(counters.len(), 2, "{counters:?}");
+    assert!(
+        counters
+            .iter()
+            .any(|line| line.contains("response_code=\"0200\"") && line.ends_with(" 1")),
+        "{counters:?}"
+    );
+}
+
+/// workload_metrics-SOL-3: workload RED metrics carry the finalized gRPC
+/// status as Istio `grpc_response_status`, bounded to the numeric code set,
+/// so failing RPCs behind an HTTP 200 no longer merge into the success series.
+#[tokio::test]
+async fn mesh_request_metrics_split_by_bounded_grpc_response_status() {
+    let registry = MetricsRegistry::new();
+    for status in ["0", "0", "7", "13", "99", "not-a-status"] {
+        let mut summary = workload_metrics_summary(json!({}), 200).await;
+        summary
+            .metadata
+            .insert("request_protocol".to_string(), "grpc".to_string());
+        summary
+            .metadata
+            .insert("grpc_status".to_string(), status.to_string());
+        registry.record(&summary);
+    }
+    // A gRPC request whose terminal status never reached the log is UNKNOWN.
+    let mut missing = workload_metrics_summary(json!({}), 200).await;
+    missing
+        .metadata
+        .insert("request_protocol".to_string(), "grpc".to_string());
+    registry.record(&missing);
+    registry.record(&workload_metrics_summary(json!({}), 200).await);
+
+    let output = registry.render_uncached();
+    let counters = mesh_family_lines(&output, "ferrum_mesh_requests_total{");
+    let count_for = |status: &str| {
+        counters
+            .iter()
+            .find(|line| line.contains(&format!("grpc_response_status=\"{status}\"")))
+            .map(|line| line.rsplit(' ').next().unwrap_or_default().to_string())
+    };
+    assert_eq!(count_for("0").as_deref(), Some("2"), "{counters:?}");
+    assert_eq!(count_for("7").as_deref(), Some("1"), "{counters:?}");
+    assert_eq!(count_for("13").as_deref(), Some("1"), "{counters:?}");
+    // Out-of-range, malformed, and missing statuses are UNKNOWN (2): hostile
+    // trailers cannot mint label values.
+    assert_eq!(count_for("2").as_deref(), Some("3"), "{counters:?}");
+    assert_eq!(
+        count_for("").as_deref(),
+        Some("1"),
+        "plain HTTP: {counters:?}"
+    );
+    assert_eq!(counters.len(), 5, "{counters:?}");
+    assert!(
+        !output.contains("grpc_response_status=\"99\"")
+            && !output.contains("grpc_response_status=\"not-a-status\""),
+        "{output}"
+    );
+    let durations = mesh_family_lines(&output, "ferrum_mesh_request_duration_ms_count{");
+    assert!(
+        durations
+            .iter()
+            .any(|line| line.contains("grpc_response_status=\"13\"") && line.ends_with(" 1")),
+        "{durations:?}"
+    );
+
+    // TCP families keep Istio's fixed schema: no response code, no gRPC status.
+    let stream_metadata = HashMap::from([
+        ("mesh.source.workload".to_string(), "frontend".to_string()),
+        ("mesh.request_protocol".to_string(), "tcp".to_string()),
+    ]);
+    let stream_key =
+        prometheus_helpers::mesh_stream_key_from_metadata(&stream_metadata, "tcp-proxy", None)
+            .expect("stream mesh key");
+    let stream_labels = prometheus_helpers::mesh_label_fragment(&stream_key, None);
+    assert!(
+        !stream_labels.contains("grpc_response_status") && !stream_labels.contains("response_code"),
+        "{stream_labels}"
+    );
+
+    // The label is part of the Telemetry tag-override vocabulary.
+    let removed = workload_metrics_summary(
+        json!({"metrics": {"tag_overrides": [
+            {"name": "grpc_response_status", "operation": {"type": "remove"}}
+        ]}}),
+        200,
+    )
+    .await;
+    let removed_registry = MetricsRegistry::new();
+    removed_registry.record(&removed);
+    let removed_output = removed_registry.render_uncached();
+    assert!(
+        mesh_family_lines(&removed_output, "ferrum_mesh_requests_total{")
+            .iter()
+            .all(|line| !line.contains("grpc_response_status")),
+        "{removed_output}"
+    );
+}
+
 #[tokio::test]
 async fn mesh_metrics_render_valid_labels_when_all_base_labels_are_removed() {
     let removed_labels = [
@@ -2045,6 +2305,7 @@ async fn mesh_metrics_render_valid_labels_when_all_base_labels_are_removed() {
         "destination_service",
         "request_protocol",
         "response_code",
+        "grpc_response_status",
         "response_flags",
         "connection_security_policy",
     ];
@@ -2157,6 +2418,7 @@ async fn test_namespace_label_with_stream_metrics() {
         listen_port: 9090,
         client_ip: "10.0.0.1".to_string(),
         consumer_username: None,
+        principal_origin: None,
         auth_method: None,
         backend_target: "backend.local:8080".to_string(),
         backend_resolved_ip: None,
@@ -2170,7 +2432,7 @@ async fn test_namespace_label_with_stream_metrics() {
         timestamp_connected: "2026-01-01T00:00:00Z".to_string(),
         timestamp_disconnected: "2026-01-01T00:00:01Z".to_string(),
         sni_hostname: None,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
     };
     registry.record_stream(&summary);
 
@@ -2191,7 +2453,7 @@ async fn test_namespace_label_with_stream_metrics() {
 fn test_mesh_request_key_interns_repeated_label_values() {
     fn mesh_summary() -> TransactionSummary {
         let mut summary = make_summary("payments-proxy", "GET", 200, 42.0, 35.0);
-        summary.metadata = HashMap::from([
+        summary.metadata = ferrum_edge::plugins::MetadataMap::from_iter([
             ("mesh.source.workload".to_string(), "frontend".to_string()),
             ("mesh.source.namespace".to_string(), "default".to_string()),
             (
@@ -2447,7 +2709,7 @@ fn spoofed_backend_custom_and_malformed_ai_metadata_cannot_export_usage() {
     ];
     for (index, metadata) in cases.into_iter().enumerate() {
         let mut summary = make_summary(&format!("malformed-{index}"), "POST", 200, 1.0, 1.0);
-        summary.metadata = metadata;
+        summary.metadata = metadata.into_iter().collect();
         registry.record(&summary);
     }
     let output = registry.render_uncached();
@@ -2474,7 +2736,7 @@ fn ai_usage_recording_is_concurrent_reload_safe_and_invalidates_render_cache() {
             scope.spawn(move || {
                 for _ in 0..100 {
                     let mut summary = make_summary("concurrent-ai", "POST", 200, 1.0, 1.0);
-                    summary.metadata = metadata.clone();
+                    summary.metadata = metadata.clone().into_iter().collect();
                     summary.ai_usage_export = Some(AiUsageExport {
                         prefix: Arc::from("ai"),
                         provider: "anthropic",
@@ -3314,4 +3576,836 @@ fn prometheus_metrics_parity_lists_implemented_observation_hooks() {
         cols[2], "✓",
         "stream-hook table must keep on_stream_disconnect: {stream_row}"
     );
+}
+
+// ── Production-launch review fixes (prometheus_metrics SOL-2/3/4, M1/M2/M4/M6) ──
+
+fn scraped_request_count(body: &str, proxy_id: &str) -> u64 {
+    let prefix = format!("ferrum_requests_total{{proxy_id=\"{proxy_id}\",");
+    body.lines()
+        .find(|line| line.starts_with(&prefix))
+        .and_then(|line| line.rsplit(' ').next())
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| panic!("missing ferrum_requests_total for {proxy_id} in:\n{body}"))
+}
+
+fn sample_value(body: &str, prefix: &str) -> Option<u64> {
+    body.lines()
+        .find(|line| line.starts_with(prefix))
+        .and_then(|line| line.rsplit(' ').next())
+        .and_then(|value| value.parse().ok())
+}
+
+/// SOL-3 / M1: an established series updates under a shared read guard, so a
+/// recorder is never serialized behind another holder of the same series.
+/// With the former `entry()` (exclusive write lock) update path this recorder
+/// blocks until the guards drop and the bounded wait below fails.
+#[test]
+fn established_series_updates_do_not_wait_behind_a_shared_read_guard() {
+    let registry = Arc::new(MetricsRegistry::new());
+    let summary = make_summary("hot-route", "GET", 200, 12.0, 8.0);
+    registry.record(&summary);
+
+    let key = CounterKey {
+        proxy_id: Arc::from("hot-route"),
+        method: "GET",
+        status_code: 200,
+        grpc_status: None,
+        error_class: None,
+    };
+    let counter_guard = registry
+        .request_counter
+        .get(&key)
+        .expect("established request series");
+    let histogram_guard = registry
+        .request_duration_buckets
+        .get("hot-route")
+        .expect("established request-duration series");
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let recorder = {
+        let registry = Arc::clone(&registry);
+        let summary = summary.clone();
+        std::thread::spawn(move || {
+            registry.record(&summary);
+            let _ = done_tx.send(());
+        })
+    };
+    let completed = done_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .is_ok();
+    drop(histogram_guard);
+    drop(counter_guard);
+    recorder.join().expect("recorder thread");
+
+    assert!(
+        completed,
+        "recording an established series must not wait for an exclusive shard lock"
+    );
+    assert_eq!(
+        registry
+            .request_counter
+            .get(&key)
+            .expect("request series")
+            .value
+            .load(Ordering::Relaxed),
+        2
+    );
+    assert_eq!(
+        registry
+            .request_duration_buckets
+            .get("hot-route")
+            .expect("request-duration series")
+            .count
+            .load(Ordering::Relaxed),
+        2
+    );
+}
+
+/// SOL-2 / M3: concurrent cache misses coalesce onto one serialized rebuild,
+/// so a slower renderer can never publish an older snapshot over a newer one.
+/// Every scrape must serve a value at least as large as any scrape that
+/// completed before it started; a decrease would read as a counter reset.
+#[test]
+fn concurrent_scrapes_never_observe_a_cached_counter_decrease() {
+    const THREADS: u64 = 8;
+    const ITERATIONS: u64 = 150;
+
+    let registry = Arc::new(MetricsRegistry::new());
+    // A long TTL with immediate invalidation: every record invalidates the
+    // cache, so the following scrapes race to rebuild and publish it.
+    registry.configure(60, 3600, 0, 10_000, "");
+    let summary = make_summary("scrape-race", "GET", 200, 1.0, 1.0);
+    registry.record(&summary);
+
+    let highest_served = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let scrapers: Vec<_> = (0..THREADS)
+        .map(|_| {
+            let registry = Arc::clone(&registry);
+            let highest_served = Arc::clone(&highest_served);
+            let summary = summary.clone();
+            std::thread::spawn(move || {
+                for _ in 0..ITERATIONS {
+                    registry.record(&summary);
+                    let floor = highest_served.load(Ordering::SeqCst);
+                    let served = scraped_request_count(&registry.render(), "scrape-race");
+                    assert!(
+                        served >= floor,
+                        "a scrape served {served} after an earlier completed scrape served {floor}"
+                    );
+                    highest_served.fetch_max(served, Ordering::SeqCst);
+                }
+            })
+        })
+        .collect();
+    for scraper in scrapers {
+        scraper.join().expect("scrape thread");
+    }
+
+    assert_eq!(
+        scraped_request_count(&registry.render_uncached(), "scrape-race"),
+        1 + THREADS * ITERATIONS
+    );
+}
+
+/// M2: histogram storage is non-cumulative (one bucket slot per observation)
+/// and the cumulative `le` series is the prefix sum at render. Concurrent
+/// observations must still produce exact, monotonic cumulative buckets.
+#[test]
+fn concurrent_histogram_observations_keep_exact_cumulative_buckets() {
+    const THREADS: u64 = 8;
+    const PER_THREAD: u64 = 500;
+    // le=5, le=250, le=300000 (last finite default bound), and +Inf only.
+    const VALUES: [f64; 4] = [3.0, 150.0, 200_000.0, 900_000.0];
+
+    let registry = Arc::new(MetricsRegistry::new());
+    let workers: Vec<_> = (0..THREADS)
+        .map(|_| {
+            let registry = Arc::clone(&registry);
+            std::thread::spawn(move || {
+                for n in 0..PER_THREAD {
+                    let value = VALUES[(n % 4) as usize];
+                    registry.record(&make_summary("hist-race", "GET", 200, value, -1.0));
+                }
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.join().expect("observer thread");
+    }
+
+    let per_value = THREADS * PER_THREAD / 4;
+    {
+        let hist = registry
+            .request_duration_buckets
+            .get("hist-race")
+            .expect("request-duration series");
+        assert_eq!(hist.count.load(Ordering::Relaxed), 4 * per_value);
+        assert_eq!(hist.cumulative_count(0), per_value); // le=5
+        assert_eq!(hist.cumulative_count(4), per_value); // le=100
+        assert_eq!(hist.cumulative_count(5), 2 * per_value); // le=250
+        assert_eq!(hist.cumulative_count(13), 2 * per_value); // le=120000
+        assert_eq!(hist.cumulative_count(14), 3 * per_value); // le=300000
+        let cumulative: Vec<u64> = hist.cumulative_buckets().map(|(_, count)| count).collect();
+        assert!(
+            cumulative.windows(2).all(|pair| pair[0] <= pair[1]),
+            "cumulative buckets must be monotonic: {cumulative:?}"
+        );
+        let sum = f64::from_bits(hist.sum.load(Ordering::Relaxed));
+        let expected_sum = per_value as f64 * VALUES.iter().sum::<f64>();
+        assert!(
+            (sum - expected_sum).abs() < 0.5,
+            "sum {sum} != {expected_sum}"
+        );
+    }
+
+    let output = registry.render_uncached();
+    for (le, expected) in [
+        ("5", per_value),
+        ("250", 2 * per_value),
+        ("300000", 3 * per_value),
+        ("+Inf", 4 * per_value),
+    ] {
+        let prefix =
+            format!("ferrum_request_duration_ms_bucket{{proxy_id=\"hist-race\",le=\"{le}\"}}");
+        assert_eq!(
+            sample_value(&output, &prefix),
+            Some(expected),
+            "bucket le={le} in:\n{output}"
+        );
+    }
+    assert_eq!(
+        sample_value(
+            &output,
+            "ferrum_request_duration_ms_count{proxy_id=\"hist-race\"}"
+        ),
+        Some(4 * per_value)
+    );
+}
+
+/// SOL-4: the default duration layouts extend past the former 10 s ceiling, so
+/// long requests and long-lived sessions resolve to a finite bucket instead of
+/// saturating `histogram_quantile` at `+Inf`.
+#[test]
+fn long_requests_and_sessions_land_in_finite_default_buckets() {
+    let registry = MetricsRegistry::new();
+    registry.record(&make_summary("long-ai", "POST", 200, 90_000.0, 89_000.0));
+
+    let mut stream = make_stream_summary("long-stream", "tcp");
+    stream.duration_ms = 600_000.0;
+    registry.record_stream(&stream);
+
+    let mut ws = make_ws_summary("long-ws");
+    ws.duration_ms = 1_200_000.0;
+    registry.record_ws_session(&ws);
+
+    let output = registry.render_uncached();
+    assert_eq!(
+        sample_value(
+            &output,
+            "ferrum_request_duration_ms_bucket{proxy_id=\"long-ai\",le=\"60000\"}"
+        ),
+        Some(0)
+    );
+    assert_eq!(
+        sample_value(
+            &output,
+            "ferrum_request_duration_ms_bucket{proxy_id=\"long-ai\",le=\"120000\"}"
+        ),
+        Some(1),
+        "a 90 s request must land in a finite bucket:\n{output}"
+    );
+    assert_eq!(
+        sample_value(
+            &output,
+            "ferrum_stream_duration_ms_bucket{proxy_id=\"long-stream\",le=\"300000\"}"
+        ),
+        Some(0)
+    );
+    assert_eq!(
+        sample_value(
+            &output,
+            "ferrum_stream_duration_ms_bucket{proxy_id=\"long-stream\",le=\"900000\"}"
+        ),
+        Some(1),
+        "a 10 min stream must land in a finite bucket:\n{output}"
+    );
+    let ws_bucket = |le: &str| {
+        output
+            .lines()
+            .find(|line| {
+                line.starts_with("ferrum_websocket_session_duration_ms_bucket{proxy_id=\"long-ws\"")
+                    && line.contains(&format!(",le=\"{le}\""))
+            })
+            .and_then(|line| line.rsplit(' ').next())
+            .and_then(|value| value.parse::<u64>().ok())
+    };
+    assert_eq!(ws_bucket("900000"), Some(0));
+    assert_eq!(
+        ws_bucket("1800000"),
+        Some(1),
+        "a 20 min WebSocket session must land in a finite bucket:\n{output}"
+    );
+}
+
+/// SOL-4: bucket layouts are validated at construction (shared admission).
+#[test]
+fn duration_bucket_config_is_validated() {
+    let max_bounds: Vec<u64> = (1..=64).map(|n| n * 10).collect();
+    let too_many_bounds: Vec<u64> = (1..=65).map(|n| n * 10).collect();
+    for config in [
+        json!({"request_duration_buckets_ms": [1]}),
+        json!({"request_duration_buckets_ms": [0.5, 1, 2.5, 30000, 600000]}),
+        json!({"session_duration_buckets_ms": [1000, 60000, 3600000, 86400000]}),
+        json!({ "request_duration_buckets_ms": max_bounds }),
+    ] {
+        PrometheusMetrics::new(&config, "ferrum")
+            .unwrap_or_else(|err| panic!("constructor must accept {config}: {err}"));
+        validate_plugin_config("prometheus_metrics", &config)
+            .unwrap_or_else(|err| panic!("shared admission must accept {config}: {err}"));
+    }
+
+    for (config, needle) in [
+        (
+            json!({"request_duration_buckets_ms": []}),
+            "between 1 and 64",
+        ),
+        (
+            json!({ "request_duration_buckets_ms": too_many_bounds }),
+            "between 1 and 64",
+        ),
+        (
+            json!({"request_duration_buckets_ms": 100}),
+            "must be an array",
+        ),
+        (
+            json!({"request_duration_buckets_ms": null}),
+            "must be an array",
+        ),
+        (
+            json!({"request_duration_buckets_ms": ["100"]}),
+            "must be a number",
+        ),
+        (
+            json!({"request_duration_buckets_ms": [0]}),
+            "greater than 0",
+        ),
+        (
+            json!({"session_duration_buckets_ms": [-5]}),
+            "greater than 0",
+        ),
+        (
+            json!({"request_duration_buckets_ms": [10, 10]}),
+            "strictly increasing",
+        ),
+        (
+            json!({"session_duration_buckets_ms": [100, 50]}),
+            "strictly increasing",
+        ),
+    ] {
+        let err = PrometheusMetrics::new(&config, "ferrum")
+            .err()
+            .unwrap_or_else(|| panic!("constructor must reject {config}"));
+        assert!(err.contains(needle), "{config}: unexpected error {err}");
+        assert!(
+            validate_plugin_config("prometheus_metrics", &config).is_err(),
+            "shared admission must reject {config}"
+        );
+    }
+}
+
+/// SOL-4: a configured layout is published only on commit, applies to every
+/// family it governs, and retires series recorded under the superseded layout
+/// (including their mesh series-budget reservation) so no family ever exposes
+/// two `le` layouts. Re-committing an identical layout keeps every series.
+#[test]
+fn custom_duration_buckets_publish_on_commit_and_retire_superseded_series() {
+    let registry = Arc::new(MetricsRegistry::new());
+    let mut mesh = make_summary("layout-proxy", "GET", 200, 50.0, 40.0);
+    mesh.metadata = ferrum_edge::plugins::MetadataMap::from_iter([
+        ("mesh.source.workload".to_string(), "frontend".to_string()),
+        ("mesh.source.namespace".to_string(), "default".to_string()),
+        (
+            "mesh.source.principal".to_string(),
+            "spiffe://cluster.local/ns/default/sa/frontend".to_string(),
+        ),
+        ("mesh.source.app".to_string(), "frontend".to_string()),
+        ("mesh.source.service".to_string(), "frontend".to_string()),
+        (
+            "mesh.destination.workload".to_string(),
+            "payments".to_string(),
+        ),
+        (
+            "mesh.destination.namespace".to_string(),
+            "default".to_string(),
+        ),
+        (
+            "mesh.destination.service".to_string(),
+            "payments".to_string(),
+        ),
+        ("mesh.request_protocol".to_string(), "http".to_string()),
+        (
+            "mesh.connection_security_policy".to_string(),
+            "mutual_tls".to_string(),
+        ),
+    ]);
+    registry.record(&mesh);
+    registry.record_ws_session(&make_ws_summary("layout-ws"));
+    assert_eq!(
+        registry.mesh_series_live_for_test("REQUEST_DURATION"),
+        Some(1)
+    );
+
+    let plugin = PrometheusMetrics::new_with_registry_for_test(
+        &json!({"request_duration_buckets_ms": [100, 1000]}),
+        "ferrum",
+        Arc::clone(&registry),
+    )
+    .expect("valid bucket layout");
+    assert_eq!(
+        registry.request_duration_buckets_ms_for_test(),
+        ferrum_edge::plugins::prometheus_metrics::DEFAULT_REQUEST_DURATION_BUCKETS_MS.to_vec(),
+        "construction must not publish the candidate layout"
+    );
+
+    plugin.commit_background_tasks();
+    assert_eq!(
+        registry.request_duration_buckets_ms_for_test(),
+        vec![100.0, 1000.0]
+    );
+    assert_eq!(
+        registry.session_duration_buckets_ms_for_test(),
+        ferrum_edge::plugins::prometheus_metrics::DEFAULT_SESSION_DURATION_BUCKETS_MS.to_vec(),
+        "an unchanged session layout must be left alone"
+    );
+    assert!(registry.request_duration_buckets.is_empty());
+    assert!(registry.backend_duration_buckets.is_empty());
+    assert!(registry.gateway_overhead_buckets.is_empty());
+    assert!(registry.mesh_request_duration_buckets.is_empty());
+    assert_eq!(
+        registry.mesh_series_live_for_test("REQUEST_DURATION"),
+        Some(0),
+        "retired mesh series must release their budget reservation"
+    );
+    assert_eq!(
+        registry.ws_session_duration_buckets.len(),
+        1,
+        "session-layout series are untouched by a request-layout change"
+    );
+    assert_eq!(
+        registry.request_counter.len(),
+        1,
+        "counters are not reset by a layout change"
+    );
+
+    registry.record(&mesh);
+    plugin.commit_background_tasks();
+    assert_eq!(
+        registry
+            .request_duration_buckets
+            .get("layout-proxy")
+            .expect("re-recorded series")
+            .count
+            .load(Ordering::Relaxed),
+        1,
+        "re-committing an identical layout must keep existing series"
+    );
+    assert_eq!(
+        registry.mesh_series_live_for_test("REQUEST_DURATION"),
+        Some(1)
+    );
+
+    let output = registry.render_uncached();
+    assert_eq!(
+        sample_value(
+            &output,
+            "ferrum_request_duration_ms_bucket{proxy_id=\"layout-proxy\",le=\"100\",namespace=\"ferrum\"}"
+        ),
+        Some(1),
+        "{output}"
+    );
+    assert!(
+        !output.contains("ferrum_request_duration_ms_bucket{proxy_id=\"layout-proxy\",le=\"5\""),
+        "superseded default buckets must not be rendered:\n{output}"
+    );
+    let mesh_buckets: Vec<&str> = output
+        .lines()
+        .filter(|line| line.starts_with("ferrum_mesh_request_duration_ms_bucket{"))
+        .collect();
+    assert_eq!(
+        mesh_buckets.len(),
+        3,
+        "mesh duration uses the request layout (2 finite + +Inf): {mesh_buckets:?}"
+    );
+}
+
+/// M4: HTTP-family body bandwidth is exported per proxy for ordinary
+/// (non-mesh) traffic; mirror summaries stay excluded.
+#[test]
+fn http_body_byte_counters_accumulate_per_proxy() {
+    let registry = MetricsRegistry::new();
+    let mut summary = make_summary("bandwidth", "POST", 200, 10.0, 8.0);
+    summary.bytes_sent = 100;
+    summary.bytes_received = 2048;
+    registry.record(&summary);
+    registry.record(&summary);
+
+    let mut mirror = summary.clone();
+    mirror.mirror = true;
+    registry.record(&mirror);
+
+    let output = registry.render_uncached();
+    assert!(output.contains("# TYPE ferrum_request_body_bytes_total counter"));
+    assert!(output.contains("# TYPE ferrum_response_body_bytes_total counter"));
+    assert_eq!(
+        sample_value(
+            &output,
+            "ferrum_request_body_bytes_total{proxy_id=\"bandwidth\"}"
+        ),
+        Some(200),
+        "{output}"
+    );
+    assert_eq!(
+        sample_value(
+            &output,
+            "ferrum_response_body_bytes_total{proxy_id=\"bandwidth\"}"
+        ),
+        Some(4096),
+        "{output}"
+    );
+
+    registry.evict_stale(0);
+    assert!(registry.request_body_bytes_counter.is_empty());
+    assert!(registry.response_body_bytes_counter.is_empty());
+}
+
+/// M6: requests refused before routing never reach a plugin, so they are
+/// counted on a fixed-cardinality family keyed by closed reason and status.
+#[test]
+fn unmatched_requests_are_counted_by_closed_reason_and_status() {
+    use ferrum_edge::diagnostic_ref::{MESH_REGISTRY_ONLY_PHASE, ROUTE_NOT_FOUND_PHASE};
+    use ferrum_edge::plugins::prometheus_metrics::UnmatchedRequestKey;
+
+    let registry = MetricsRegistry::new();
+    assert!(
+        !registry
+            .render_uncached()
+            .contains("ferrum_unmatched_requests_total"),
+        "the family is emitted only once a route miss occurred"
+    );
+    registry.configure(5, 3600, 0, 10_000, "edge");
+    registry.record_unmatched_request(ROUTE_NOT_FOUND_PHASE, 404);
+    registry.record_unmatched_request(ROUTE_NOT_FOUND_PHASE, 404);
+    registry.record_unmatched_request(MESH_REGISTRY_ONLY_PHASE, 502);
+    registry.record_unmatched_request("not-a-routing-phase", 700);
+
+    assert_eq!(registry.unmatched_request_counter.len(), 3);
+    assert!(
+        registry
+            .unmatched_request_counter
+            .contains_key(&UnmatchedRequestKey {
+                reason: "other",
+                status_code: 0,
+            }),
+        "unknown phases and out-of-range statuses collapse to fixed buckets"
+    );
+
+    let output = registry.render_uncached();
+    assert!(output.contains("# TYPE ferrum_unmatched_requests_total counter"));
+    assert_eq!(
+        sample_value(
+            &output,
+            "ferrum_unmatched_requests_total{reason=\"route_not_found\",status_code=\"404\",namespace=\"edge\"}"
+        ),
+        Some(2),
+        "{output}"
+    );
+    assert_eq!(
+        sample_value(
+            &output,
+            "ferrum_unmatched_requests_total{reason=\"mesh_registry_only\",status_code=\"502\",namespace=\"edge\"}"
+        ),
+        Some(1),
+        "{output}"
+    );
+    assert!(
+        !output.contains("ferrum_requests_total{proxy_id="),
+        "pre-routing rejections must not synthesize per-proxy request series"
+    );
+}
+
+/// M6: every HTTP-family route miss goes through the shared
+/// `diagnostic_ref::record_route_miss` funnel, which counts the rejection
+/// before (and independently of) the diagnostic-reference gate.
+#[test]
+fn route_miss_funnel_counts_unmatched_requests_on_every_listener() {
+    const DIAGNOSTIC_REF_SRC: &str = include_str!("../../../src/diagnostic_ref.rs");
+    const PROXY_SRC: &str = include_str!("../../../src/proxy/mod.rs");
+    const H3_SRC: &str = include_str!("../../../src/http3/server.rs");
+
+    let start = DIAGNOSTIC_REF_SRC
+        .find("pub(crate) fn record_route_miss(")
+        .expect("record_route_miss funnel");
+    let body = &DIAGNOSTIC_REF_SRC[start..];
+    let body = &body[..body.find("\n}\n").expect("funnel body end")];
+    let counted = body
+        .find(".record_unmatched_request(phase, status)")
+        .expect("route-miss funnel must count ferrum_unmatched_requests_total");
+    let gated = body
+        .find("unrouted_rejection_slot(slot)")
+        .expect("diagnostic gate");
+    assert!(
+        counted < gated,
+        "the Prometheus count must not depend on diagnostic references being enabled"
+    );
+
+    assert!(
+        PROXY_SRC
+            .matches("crate::diagnostic_ref::record_route_miss(")
+            .count()
+            >= 2,
+        "H1/H2 route-not-found and REGISTRY_ONLY misses must use the shared funnel"
+    );
+    assert!(
+        H3_SRC.contains("crate::diagnostic_ref::record_route_miss("),
+        "H3 route misses must use the shared funnel"
+    );
+}
+
+/// M1 / PR6827-SOL-2: a fresh request context is marked observed through a
+/// typed bit; the hook inserts nothing into the metadata map (no owned marker
+/// key per request), and the gRPC message scanners read that bit.
+#[tokio::test]
+async fn request_observation_is_a_typed_flag_without_metadata_insertion() {
+    let plugin = PrometheusMetrics::new_with_registry_for_test(
+        &json!({}),
+        "ferrum",
+        Arc::new(MetricsRegistry::new()),
+    )
+    .expect("default config");
+
+    let mut ctx = RequestContext::new("10.0.0.2".to_string(), "POST".to_string(), "/".to_string());
+    ctx.metadata
+        .insert("request_protocol".to_string(), "grpc".to_string());
+    let metadata_before = ctx.metadata.clone();
+    assert!(!ctx.prometheus_metrics_observed());
+    assert!(!prometheus_helpers::request_observes_grpc_messages(&ctx));
+
+    plugin.on_request_received(&mut ctx).await;
+    assert!(ctx.prometheus_metrics_observed());
+    assert_eq!(
+        ctx.metadata, metadata_before,
+        "the request hook must not insert an owned marker into metadata"
+    );
+    assert!(
+        !ctx.metadata
+            .contains_key(prometheus_helpers::MESH_PROMETHEUS_METRICS_OBSERVED_METADATA)
+    );
+    assert!(prometheus_helpers::request_observes_grpc_messages(&ctx));
+
+    // A metadata marker written by anything else no longer enables scanners
+    // for an unobserved request.
+    let mut forged =
+        RequestContext::new("10.0.0.2".to_string(), "POST".to_string(), "/".to_string());
+    forged
+        .metadata
+        .insert("request_protocol".to_string(), "grpc".to_string());
+    forged.metadata.insert(
+        prometheus_helpers::MESH_PROMETHEUS_METRICS_OBSERVED_METADATA.to_string(),
+        "1".to_string(),
+    );
+    assert!(!prometheus_helpers::request_observes_grpc_messages(&forged));
+}
+
+fn mesh_layout_summary(proxy_id: &str) -> TransactionSummary {
+    let mut summary = make_summary(proxy_id, "GET", 200, 50.0, 40.0);
+    summary.metadata = ferrum_edge::plugins::MetadataMap::from_iter([
+        ("mesh.source.workload".to_string(), "frontend".to_string()),
+        ("mesh.source.namespace".to_string(), "default".to_string()),
+        (
+            "mesh.source.principal".to_string(),
+            "spiffe://cluster.local/ns/default/sa/frontend".to_string(),
+        ),
+        ("mesh.source.app".to_string(), "frontend".to_string()),
+        ("mesh.source.service".to_string(), "frontend".to_string()),
+        (
+            "mesh.destination.workload".to_string(),
+            "payments".to_string(),
+        ),
+        (
+            "mesh.destination.namespace".to_string(),
+            "default".to_string(),
+        ),
+        (
+            "mesh.destination.service".to_string(),
+            "payments".to_string(),
+        ),
+        ("mesh.request_protocol".to_string(), "http".to_string()),
+        (
+            "mesh.connection_security_policy".to_string(),
+            "mutual_tls".to_string(),
+        ),
+    ]);
+    summary
+}
+
+/// PR6827-SOL-1: a recorder that captured the request layout before a reload
+/// (late recorder) must neither replace a current-layout histogram with the
+/// retired layout (losing its observations) nor create a retired-layout series
+/// after the retirement sweep. Covers the HTTP and mesh duration families.
+#[test]
+fn late_recorder_cannot_restore_a_retired_request_layout() {
+    const NEW_LAYOUT: [f64; 2] = [100.0, 1000.0];
+    let registry = MetricsRegistry::new();
+    let summary = mesh_layout_summary("late-http");
+
+    // Recorder A captures the default layout, then is "descheduled".
+    let stale = registry.duration_layout_snapshot_for_test();
+    // A committed reload publishes the new layout and sweeps the maps.
+    registry.configure_duration_buckets(
+        &NEW_LAYOUT,
+        ferrum_edge::plugins::prometheus_metrics::DEFAULT_SESSION_DURATION_BUCKETS_MS,
+    );
+    // Recorder B records under the new layout.
+    registry.record(&summary);
+    // A resumes with its stale capture: same series, then a never-seen proxy.
+    registry.record_with_layout_snapshot_for_test(&summary, &stale);
+    registry.record_with_layout_snapshot_for_test(&mesh_layout_summary("late-fresh"), &stale);
+
+    for (family, map) in [
+        ("request", &registry.request_duration_buckets),
+        ("backend", &registry.backend_duration_buckets),
+        ("overhead", &registry.gateway_overhead_buckets),
+    ] {
+        let established = map.get("late-http").expect("established series");
+        assert_eq!(
+            &*established.boundaries,
+            &NEW_LAYOUT[..],
+            "{family}: a late recorder must not swap in the retired layout"
+        );
+        assert_eq!(
+            established.count.load(Ordering::Relaxed),
+            2,
+            "{family}: the current-layout series must keep B's observation"
+        );
+        drop(established);
+        let fresh = map.get("late-fresh").expect("fresh series");
+        assert_eq!(
+            &*fresh.boundaries,
+            &NEW_LAYOUT[..],
+            "{family}: a late recorder must not create a retired-layout series"
+        );
+    }
+
+    assert_eq!(registry.mesh_request_duration_buckets.len(), 1);
+    {
+        let mesh = registry
+            .mesh_request_duration_buckets
+            .iter()
+            .next()
+            .expect("mesh duration series");
+        assert_eq!(&*mesh.value().boundaries, &NEW_LAYOUT[..]);
+        assert_eq!(mesh.value().count.load(Ordering::Relaxed), 3);
+    }
+    assert_eq!(
+        registry.mesh_series_live_for_test("REQUEST_DURATION"),
+        Some(1)
+    );
+
+    let output = registry.render_uncached();
+    for family in [
+        "ferrum_request_duration_ms_bucket",
+        "ferrum_backend_duration_ms_bucket",
+        "ferrum_edge_overhead_ms_bucket",
+        "ferrum_mesh_request_duration_ms_bucket",
+    ] {
+        assert!(
+            !output
+                .lines()
+                .any(|line| line.starts_with(family) && line.contains("le=\"5\"")),
+            "{family} must expose only the published layout:\n{output}"
+        );
+    }
+}
+
+/// PR6827-SOL-1: the same late-recorder fence for the session layout
+/// (`ferrum_stream_duration_ms` and `ferrum_websocket_session_duration_ms`).
+#[test]
+fn late_recorder_cannot_restore_a_retired_session_layout() {
+    const NEW_LAYOUT: [f64; 2] = [1000.0, 60000.0];
+    let registry = MetricsRegistry::new();
+    let stream = make_stream_summary("late-stream", "tcp");
+    let ws = make_ws_summary("late-ws");
+
+    let stale = registry.duration_layout_snapshot_for_test();
+    registry.configure_duration_buckets(
+        ferrum_edge::plugins::prometheus_metrics::DEFAULT_REQUEST_DURATION_BUCKETS_MS,
+        &NEW_LAYOUT,
+    );
+    registry.record_stream(&stream);
+    registry.record_ws_session(&ws);
+    registry.record_stream_with_layout_snapshot_for_test(&stream, &stale);
+    registry.record_ws_session_with_layout_snapshot_for_test(&ws, &stale);
+    registry.record_stream_with_layout_snapshot_for_test(
+        &make_stream_summary("late-stream-fresh", "tcp"),
+        &stale,
+    );
+    registry
+        .record_ws_session_with_layout_snapshot_for_test(&make_ws_summary("late-ws-fresh"), &stale);
+
+    for proxy in ["late-stream", "late-stream-fresh"] {
+        let hist = registry
+            .stream_duration_buckets
+            .get(proxy)
+            .expect("stream duration series");
+        assert_eq!(&*hist.boundaries, &NEW_LAYOUT[..], "{proxy}");
+    }
+    assert_eq!(
+        registry
+            .stream_duration_buckets
+            .get("late-stream")
+            .expect("stream duration series")
+            .count
+            .load(Ordering::Relaxed),
+        2
+    );
+    assert_eq!(registry.ws_session_duration_buckets.len(), 2);
+    for entry in registry.ws_session_duration_buckets.iter() {
+        assert_eq!(&*entry.value().boundaries, &NEW_LAYOUT[..]);
+        let expected = if &*entry.key().proxy_id == "late-ws" {
+            2
+        } else {
+            1
+        };
+        assert_eq!(entry.value().count.load(Ordering::Relaxed), expected);
+    }
+}
+
+/// PR6827-SOL-1: configuration publication is fenced against an in-flight
+/// cache rebuild, so a body rendered before a layout or namespace change can
+/// never be published after that change's cache invalidation.
+#[test]
+fn configuration_publication_is_fenced_against_cache_rebuilds() {
+    const SRC: &str = include_str!("../../../src/plugins/prometheus_metrics.rs");
+    let body_of = |signature: &str| -> &str {
+        let start = SRC.find(signature).unwrap_or_else(|| panic!("{signature}"));
+        let rest = &SRC[start..];
+        &rest[..rest.find("\n    }\n").expect("function end")]
+    };
+    for signature in [
+        "pub fn configure_duration_buckets(",
+        "pub fn configure(\n",
+        "fn cacheable_body(&self)",
+    ] {
+        let body = body_of(signature);
+        let fenced = body
+            .find("self.lock_render_rebuild()")
+            .unwrap_or_else(|| panic!("{signature} must take the render rebuild lock"));
+        if let Some(invalidate) = body.find("self.render_cache.store(Arc::new(None))") {
+            assert!(
+                fenced < invalidate,
+                "{signature} must invalidate the cache while holding the rebuild lock"
+            );
+        }
+    }
 }

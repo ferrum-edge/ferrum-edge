@@ -26,6 +26,7 @@ use serde_json::json;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -130,6 +131,39 @@ async fn spawn_gateway(backend_port: u16, direct: bool) -> GatewayHarness {
 /// Logged once per dial by the direct HTTP/1.1 pool only, so a test can prove
 /// which transport served it (the reqwest path never logs it).
 const DIRECT_H1_DIAL_MARKER: &str = "direct HTTP/1.1 pool dialed a backend connection";
+
+fn direct_h1_metric(metrics: &str, name: &str) -> Option<u64> {
+    metrics.lines().find_map(|line| {
+        let (series, value) = line.split_once(' ')?;
+        if series == name
+            || series
+                .strip_prefix(name)
+                .is_some_and(|suffix| suffix.starts_with('{'))
+        {
+            value.parse().ok()
+        } else {
+            None
+        }
+    })
+}
+
+async fn wait_for_idle_direct_h1_connection(harness: &GatewayHarness) -> String {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let metrics = harness
+            .metrics()
+            .await
+            .expect("scrape direct H1 pool metrics");
+        if direct_h1_metric(&metrics, "ferrum_connection_pool_h1_idle_connections") == Some(1) {
+            return metrics;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the completed upload must return its connection to the idle pool: {metrics}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
 
 async fn assert_transport(harness: &GatewayHarness, direct: bool) {
     let logs = if direct {
@@ -340,6 +374,28 @@ async fn direct_h1_streams_uploads_byte_exact() {
         assert!(
             body[..] == payload[..],
             "upload {i} was not forwarded byte-exact"
+        );
+
+        // Receiving the last response bytes does not mean hyper's connection
+        // driver is ready yet. The streaming lease checks the sender in off
+        // the request path once ready; observe that check-in before starting
+        // another upload so the test measures sequential keep-alive reuse.
+        let metrics = wait_for_idle_direct_h1_connection(&harness).await;
+        assert_eq!(
+            direct_h1_metric(
+                &metrics,
+                "ferrum_connection_pool_h1_connections_opened_total"
+            ),
+            Some(1),
+            "upload {i} must use the original backend connection"
+        );
+        assert_eq!(
+            direct_h1_metric(
+                &metrics,
+                "ferrum_connection_pool_h1_connections_reused_total"
+            ),
+            Some(i),
+            "upload {i} must check out the idle connection"
         );
     }
     assert_eq!(request_conns.load(Ordering::SeqCst), 1);

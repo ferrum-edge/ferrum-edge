@@ -23,6 +23,7 @@ use crate::config::types::{
 };
 use crate::config::types::{PluginAssociation, PluginConfig, PluginScope, Proxy, Upstream};
 use crate::plugins::mcp_openapi_bridge as mcp_bridge;
+use crate::plugins::utils::sse::is_text_event_stream_media_type;
 use crate::util::media_type::is_concrete_http_media_type;
 use chrono::Utc;
 use serde_json::{Map, Value, json};
@@ -33,13 +34,22 @@ use url::Url;
 use super::external_refs::{
     EffectiveExternalRefPolicy, ExternalDocumentLoader, ExternalRefProcessPolicy,
     LoadedExternalDocument, MapExternalDocumentLoader, load_external_documents,
-    parse_external_ref_extension, redact_reference,
+    parse_external_ref_extension, redact_reference, resource_uri_key, split_ref,
 };
 
 /// HTTP method keys counted when computing `operation_count`.
 const HTTP_METHODS: &[&str] = &[
     "get", "post", "put", "delete", "options", "head", "patch", "trace",
 ];
+
+/// OpenAPI 3.2 Path Item operation fields the importer does not support.
+///
+/// `query` (the QUERY method) and `additionalOperations` (arbitrary method
+/// names) are not in [`HTTP_METHODS`], so the generated validator, the MCP
+/// bridge, schema indexing and `operation_count` would all skip them. A
+/// document declaring either is refused at import instead of being accepted
+/// with those operations silently ignored (issue #7201).
+const UNSUPPORTED_PATH_ITEM_OPERATION_FIELDS: &[&str] = &["query", "additionalOperations"];
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -151,6 +161,13 @@ pub enum ExtractError {
     SchemaReferenceCycle { path: String },
     #[error("resolved schema exceeds the expansion limit while resolving '{location}'")]
     SchemaTooLarge { location: String },
+    /// A Path Item declares an OpenAPI 3.2 `query` operation or
+    /// `additionalOperations`, which the importer cannot serve or validate.
+    /// `location` names document structure only (`paths.<template>.<field>`).
+    #[error(
+        "'{location}' is not supported: OpenAPI 3.2 `query` and `additionalOperations` operations cannot be imported"
+    )]
+    UnsupportedOperationField { location: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +177,46 @@ pub enum ExtractError {
 /// Returns `true` iff `s` is a valid SemVer string for OpenAPI 3.x.
 fn is_openapi3_version(s: &str) -> bool {
     semver::Version::parse(s).is_ok_and(|version| version.major == 3)
+}
+
+/// Refuse a Path Item object that declares an unsupported operation field.
+fn reject_unsupported_path_item_operations(
+    path_item: &Map<String, Value>,
+    location: &str,
+) -> Result<(), ExtractError> {
+    match UNSUPPORTED_PATH_ITEM_OPERATION_FIELDS
+        .iter()
+        .find(|field| path_item.contains_key(**field))
+    {
+        Some(field) => Err(ExtractError::UnsupportedOperationField {
+            location: format!("{location}.{field}"),
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Refuse a document whose `paths` or `components.pathItems` entries declare
+/// an unsupported operation field. Path Items reached through an external
+/// `$ref` are checked again after resolution by the generators.
+fn reject_unsupported_operation_fields(root: &Value) -> Result<(), ExtractError> {
+    let sections = [
+        ("paths", root.get("paths")),
+        (
+            "components.pathItems",
+            root.get("components").and_then(|c| c.get("pathItems")),
+        ),
+    ];
+    for (prefix, section) in sections {
+        let Some(items) = section.and_then(Value::as_object) else {
+            continue;
+        };
+        for (name, item) in items {
+            if let Some(item) = item.as_object() {
+                reject_unsupported_path_item_operations(item, &format!("{prefix}.{name}"))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Plugin config keys that are forbidden inside a plugin's `config` value.
@@ -336,10 +393,6 @@ pub fn autodetect_format(body: &[u8]) -> SpecFormat {
 ///
 /// `(bundle, metadata)` on success, or an [`ExtractError`] describing the
 /// first problem encountered.
-// The binary target compiles this public library module privately and uses the
-// policy-aware entry point directly; integration tests retain this compatibility
-// entry point for the default fail-closed behavior.
-#[allow(dead_code)]
 pub fn extract(
     body: &[u8],
     declared_format: Option<SpecFormat>,
@@ -373,6 +426,7 @@ pub fn extract_with_external_refs(
 
     // --- Version detection -----------------------------------------------
     let version = detect_version(&root)?;
+    reject_unsupported_operation_fields(&root)?;
 
     // --- External / cross-document $ref policy ---------------------------
     let extension = parse_external_ref_extension(&root)?;
@@ -387,7 +441,7 @@ pub fn extract_with_external_refs(
     // --- info.title / info.version ---------------------------------------
     // Both fields are truncated at UTF-8 character boundaries so an operator
     // with a 25 MiB spec cannot store a 1 MiB title or version string.
-    // `description` was already bounded to 4096 bytes in `extract_spec_metadata`.
+    // `description` is bounded to 4096 bytes in `extract_spec_metadata` below.
     let title = root
         .get("info")
         .and_then(|i| i.get("title"))
@@ -602,10 +656,22 @@ pub fn extract_with_external_refs(
     let validate_ext = parse_x_ferrum_validate_extension(&root)?;
     let validate_enabled = validate_ext.is_some();
     if let Some(validate_ext) = validate_ext {
+        let reject_unsupported_parameters = match validate_ext.get("reject_unsupported_parameters")
+        {
+            None => false,
+            Some(Value::Bool(reject)) => *reject,
+            Some(_) => {
+                return Err(validator_parameter_error(
+                    "`x-ferrum-validate.reject_unsupported_parameters` must be a boolean"
+                        .to_string(),
+                ));
+            }
+        };
         let operations = extract_operation_schemas(
             &root,
             &version,
             proxy.listen_path.as_deref(),
+            reject_unsupported_parameters,
             &effective.document_base,
             &external_docs,
         )?;
@@ -650,10 +716,14 @@ pub fn extract_with_external_refs(
                     .to_string(),
             ));
         }
+        let endpoint_path = mcp_bridge_endpoint_path(&mcp_ext, listen_prefix)?;
         let operations = extract_mcp_bridge_operations(
             &root,
             &version,
-            listen_prefix,
+            McpBridgeRoute {
+                listen_prefix,
+                endpoint_scope: endpoint_path.trim_end_matches('/'),
+            },
             proxy.allowed_methods.as_deref(),
             &effective.document_base,
             &external_docs,
@@ -665,7 +735,7 @@ pub fn extract_with_external_refs(
             namespace,
             mcp_ext,
             operations,
-            listen_prefix,
+            endpoint_path,
         )?;
     }
 
@@ -901,6 +971,7 @@ const X_FERRUM_VALIDATE_KEYS: &[&str] = &[
     "bypass",
     "fail_on_unknown_operation",
     "fail_on_missing_response_schema",
+    "reject_unsupported_parameters",
     "max_body_bytes",
     "error_response",
     "error_truncate_chars",
@@ -944,6 +1015,9 @@ fn apply_validate_extension(
                 validate_openapi_validator_bypass("x-ferrum-validate", &value)?;
                 config.insert(key, value);
             }
+            // Import-only policy, already checked before extracting operations.
+            // Runtime descriptors always reject unsupported serializations.
+            "reject_unsupported_parameters" => {}
             // Enumerated above; every remaining key is a plugin config field
             // that carries the same name.
             _ => {
@@ -1505,8 +1579,52 @@ fn mcp_tool_name_slug(text: &str) -> String {
     truncate_utf8(slug, MAX_MCP_BRIDGE_TOOL_NAME_BYTES)
 }
 
+/// Most (operation, effective server base) public paths one document may
+/// make the `x-ferrum-mcp` generator check against the MCP endpoint scope.
+/// Every operation is served under every effective base, so the check is a
+/// product; without a bound, a small document with many bases and many
+/// unselected operations would cost unbounded work (each path is checked and
+/// dropped, never retained).
+const MAX_MCP_ENDPOINT_OVERLAP_CHECKS: usize = 65_536;
+
+/// Total bytes of public paths the endpoint-scope overlap check may build for
+/// one document, for the same reason as [`MAX_MCP_ENDPOINT_OVERLAP_CHECKS`].
+const MAX_MCP_ENDPOINT_OVERLAP_BYTES: usize = 16 * 1024 * 1024;
+
+/// The generated gateway's `endpoint.path`: `x-ferrum-mcp.endpoint.path`, or
+/// the listen prefix + `/mcp`. The endpoint is served by this proxy, so it
+/// must sit under the proxy's literal listen prefix.
+fn mcp_bridge_endpoint_path(
+    extension: &McpBridgeExtension,
+    listen_prefix: &str,
+) -> Result<String, ExtractError> {
+    let endpoint_path = extension
+        .endpoint_path
+        .clone()
+        .unwrap_or_else(|| format!("{listen_prefix}/mcp"));
+    if !listen_prefix.is_empty()
+        && endpoint_path != listen_prefix
+        && !endpoint_path.starts_with(&format!("{listen_prefix}/"))
+    {
+        return Err(mcp_extension_error(
+            "`x-ferrum-mcp.endpoint.path` must be under the proxy's `listen_path`".to_string(),
+        ));
+    }
+    Ok(endpoint_path)
+}
+
+/// Where the generated gateway is served: the proxy's literal listen prefix
+/// (empty for none) and the MCP endpoint scope (`endpoint.path` without a
+/// trailing slash).
+#[derive(Clone, Copy)]
+struct McpBridgeRoute<'a> {
+    listen_prefix: &'a str,
+    endpoint_scope: &'a str,
+}
+
 /// Generate one `mcp_gateway` bridge operation per selected OpenAPI 3.x
-/// operation.
+/// operation, and refuse the document when the MCP endpoint scope can claim
+/// the public path of ANY of its operations, under any effective server base.
 ///
 /// `$ref`s are resolved with the SAME resolver, depth limit, and
 /// document-scoped expansion budget the `x-ferrum-validate` generator uses,
@@ -1514,12 +1632,16 @@ fn mcp_tool_name_slug(text: &str) -> String {
 fn extract_mcp_bridge_operations(
     root: &Value,
     version: &str,
-    listen_prefix: &str,
+    route: McpBridgeRoute<'_>,
     allowed_methods: Option<&[String]>,
     document_base: &Url,
     externals: &HashMap<String, LoadedExternalDocument>,
     extension: &McpBridgeExtension,
 ) -> Result<Vec<Value>, ExtractError> {
+    let McpBridgeRoute {
+        listen_prefix,
+        endpoint_scope,
+    } = route;
     if version == "2.0" {
         return Err(mcp_extension_error(
             "`x-ferrum-mcp` requires an OpenAPI 3.x document; Swagger 2.0 is not supported"
@@ -1537,6 +1659,8 @@ fn extract_mcp_bridge_operations(
     };
     let mut resolution_state = ResolutionState::new();
     let mut operations = Vec::new();
+    let mut overlap_checks = 0usize;
+    let mut overlap_bytes = 0usize;
     let mut tool_names = HashSet::new();
     for (path_template, path_item) in paths {
         let resolved_path_item = resolve_path_item(
@@ -1551,6 +1675,7 @@ fn extract_mcp_bridge_operations(
         let Some(path_object) = resolved_path_item.as_object() else {
             continue;
         };
+        reject_unsupported_path_item_operations(path_object, &format!("paths.{path_template}"))?;
         let path_item_bases = openapi_server_bases(
             path_object.get("servers"),
             &format!("paths.{path_template}.servers"),
@@ -1560,6 +1685,52 @@ fn extract_mcp_bridge_operations(
                 continue;
             };
             let location = format!("paths.{path_template}.{method}");
+            // Operation servers > Path Item servers > root servers, exactly
+            // as the validator resolves them. The first effective base is the
+            // one the bridge dispatches under. Borrowed, not cloned: this runs
+            // for every operation, and the inherited lists can be long.
+            let operation_bases =
+                openapi_server_bases(operation.get("servers"), &format!("{location}.servers"))?;
+            let effective_bases: &[String] = match operation_bases.as_deref() {
+                Some(bases) => bases,
+                None => path_item_bases
+                    .as_deref()
+                    .unwrap_or(root_server_bases.as_slice()),
+            };
+            let public_path_under = |base: &str| -> Result<String, ExtractError> {
+                let spec_path = join_server_base_and_path(base, path_template)?;
+                Ok(if !listen_prefix.is_empty() && spec_path == "/" {
+                    listen_prefix.to_string()
+                } else {
+                    format!("{listen_prefix}{spec_path}")
+                })
+            };
+            // Every operation of the document is served on this proxy under
+            // EVERY effective server base, so the MCP endpoint's reserved
+            // subtree must miss all of those paths, bridged or not (#7406).
+            // Each path is checked as it is built and never retained, inside
+            // a document-wide budget. The bridge itself dispatches under the
+            // first base only.
+            for base in effective_bases.iter().skip(1) {
+                let path = public_path_under(base)?;
+                check_mcp_endpoint_overlap(
+                    endpoint_scope,
+                    &path,
+                    &mut overlap_checks,
+                    &mut overlap_bytes,
+                )?;
+            }
+            let base = effective_bases
+                .first()
+                .map(String::as_str)
+                .unwrap_or(SERVER_BASE_ROOT);
+            let public_path = public_path_under(base)?;
+            check_mcp_endpoint_overlap(
+                endpoint_scope,
+                &public_path,
+                &mut overlap_checks,
+                &mut overlap_bytes,
+            )?;
             let operation_extension = parse_operation_mcp_extension(operation, &location)?;
             if !mcp_operation_selected(extension, operation, &operation_extension, method) {
                 continue;
@@ -1585,28 +1756,6 @@ fn extract_mcp_bridge_operations(
                     "`{location}` is selected as an MCP tool but its method is not in `x-ferrum-proxy.allowed_methods`; exclude the operation or allow the method"
                 )));
             }
-            // Operation servers > Path Item servers > root servers, exactly
-            // as the validator resolves them. The first effective base is the
-            // one the bridge dispatches under.
-            let effective_bases = match openapi_server_bases(
-                operation.get("servers"),
-                &format!("{location}.servers"),
-            )? {
-                Some(bases) => bases,
-                None => path_item_bases
-                    .clone()
-                    .unwrap_or_else(|| root_server_bases.clone()),
-            };
-            let base = effective_bases
-                .first()
-                .map(String::as_str)
-                .unwrap_or(SERVER_BASE_ROOT);
-            let spec_path = join_server_base_and_path(base, path_template)?;
-            let public_path = if !listen_prefix.is_empty() && spec_path == "/" {
-                listen_prefix.to_string()
-            } else {
-                format!("{listen_prefix}{spec_path}")
-            };
             let generated = generate_mcp_bridge_operation(
                 &resolver,
                 &mut resolution_state,
@@ -1641,6 +1790,32 @@ fn extract_mcp_bridge_operations(
         )));
     }
     Ok(operations)
+}
+
+/// Charge one public operation path to the document's overlap budget and
+/// refuse the document when the MCP endpoint scope can claim it. Shared
+/// with `mcp_gateway`'s own load check, so import, plugin admission, and the
+/// runtime claim agree.
+fn check_mcp_endpoint_overlap(
+    endpoint_scope: &str,
+    path: &str,
+    checks: &mut usize,
+    bytes: &mut usize,
+) -> Result<(), ExtractError> {
+    *checks = checks.saturating_add(1);
+    *bytes = bytes.saturating_add(path.len());
+    if *checks > MAX_MCP_ENDPOINT_OVERLAP_CHECKS || *bytes > MAX_MCP_ENDPOINT_OVERLAP_BYTES {
+        return Err(mcp_extension_error(format!(
+            "`x-ferrum-mcp` must check every operation path under every effective server base against the MCP endpoint, and this document exceeds that budget ({MAX_MCP_ENDPOINT_OVERLAP_CHECKS} paths or {MAX_MCP_ENDPOINT_OVERLAP_BYTES} bytes); reduce the operations or `servers` entries"
+        )));
+    }
+    if crate::plugins::mcp_gateway::path_template_may_enter_endpoint_scope(endpoint_scope, path) {
+        return Err(mcp_extension_error(
+            "`x-ferrum-mcp.endpoint.path` overlaps an operation path of this document (a literal match, or a path template expression that can spell it); the MCP endpoint reserves its whole path subtree ASCII case-insensitively, so move it to a path no operation can produce"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// One selected operation, as the bridge generator reads it.
@@ -2009,7 +2184,7 @@ fn auto_inject_mcp_gateway(
     namespace: &str,
     extension: McpBridgeExtension,
     operations: Vec<Value>,
-    listen_prefix: &str,
+    endpoint_path: String,
 ) -> Result<(), ExtractError> {
     if operations.is_empty() {
         return Err(mcp_extension_error(
@@ -2017,30 +2192,8 @@ fn auto_inject_mcp_gateway(
                 .to_string(),
         ));
     }
-    let endpoint_path = extension
-        .endpoint_path
-        .unwrap_or_else(|| format!("{listen_prefix}/mcp"));
-    // The endpoint is served by this proxy, so it must sit under the proxy's
-    // literal listen prefix, and it reserves its whole subtree, so no bridged
-    // operation may live there.
-    if !listen_prefix.is_empty()
-        && endpoint_path != listen_prefix
-        && !endpoint_path.starts_with(&format!("{listen_prefix}/"))
-    {
-        return Err(mcp_extension_error(
-            "`x-ferrum-mcp.endpoint.path` must be under the proxy's `listen_path`".to_string(),
-        ));
-    }
-    let endpoint_scope = endpoint_path.trim_end_matches('/');
-    for operation in &operations {
-        let path = operation.get("path").and_then(Value::as_str).unwrap_or("");
-        if path == endpoint_scope || path.starts_with(&format!("{endpoint_scope}/")) {
-            return Err(mcp_extension_error(
-                "`x-ferrum-mcp.endpoint.path` overlaps a bridged operation path; the MCP endpoint reserves its whole path subtree"
-                    .to_string(),
-            ));
-        }
-    }
+    // `endpoint_path` was checked against the listen prefix and every
+    // operation path of the document while the operations were extracted.
 
     let mut bridge = extension.limits;
     if !extension.forward_request_headers.is_empty() {
@@ -2097,6 +2250,8 @@ fn auto_inject_mcp_gateway(
                     .to_string(),
             ));
         }
+        // The merge refuses an embedded `endpoint.path` that differs from
+        // the one validated above (GHSA-26x8-8jq5-f73p).
         let merged = merge_mcp_gateway_config(auto_config, &existing.config)?;
         validate_generated_config_budget("x-ferrum-mcp", "mcp_gateway", &merged)?;
         existing.config = merged;
@@ -2127,7 +2282,10 @@ fn auto_inject_mcp_gateway(
 ///
 /// Operator blocks replace the generated block of the same name, except
 /// `servers`, which is merged (the generated `openapi` server id is reserved),
-/// and `mode`, which must stay `aggregate_router`.
+/// `mode`, which must stay `aggregate_router`, and `endpoint`, which is merged
+/// key by key: its `path` was checked against the proxy's `listen_path` and
+/// every operation of the document, so an embedded `endpoint.path` must equal
+/// it (GHSA-26x8-8jq5-f73p); set `x-ferrum-mcp.endpoint.path` instead.
 fn merge_mcp_gateway_config(
     auto_config: Value,
     operator_config: &Value,
@@ -2148,6 +2306,29 @@ fn merge_mcp_gateway_config(
                         "the embedded `mcp_gateway` must use mode `aggregate_router` to serve `x-ferrum-mcp` tools"
                             .to_string(),
                     ));
+                }
+            }
+            "endpoint" => {
+                let Some(operator_endpoint) = value.as_object() else {
+                    return Err(mcp_extension_error(
+                        "the embedded `mcp_gateway` `endpoint` must be an object".to_string(),
+                    ));
+                };
+                let Some(Value::Object(endpoint)) = base.get_mut("endpoint") else {
+                    return Err(mcp_extension_error(
+                        "generated mcp_gateway config has no `endpoint` object".to_string(),
+                    ));
+                };
+                if let Some(path) = operator_endpoint.get("path")
+                    && endpoint.get("path") != Some(path)
+                {
+                    return Err(mcp_extension_error(
+                        "the embedded `mcp_gateway` may not set a different `endpoint.path`; set `x-ferrum-mcp.endpoint.path`, which is checked against the proxy's `listen_path` and the document's operation paths"
+                            .to_string(),
+                    ));
+                }
+                for (endpoint_key, endpoint_value) in operator_endpoint {
+                    endpoint.insert(endpoint_key.clone(), endpoint_value.clone());
                 }
             }
             "servers" => {
@@ -2212,6 +2393,7 @@ fn extract_operation_schemas(
     root: &Value,
     version: &str,
     listen_path: Option<&str>,
+    reject_unsupported_parameters: bool,
     document_base: &Url,
     externals: &HashMap<String, LoadedExternalDocument>,
 ) -> Result<Vec<Value>, ExtractError> {
@@ -2265,6 +2447,7 @@ fn extract_operation_schemas(
         let Some(path_object) = resolved_path_item.as_object() else {
             continue;
         };
+        reject_unsupported_path_item_operations(path_object, &format!("paths.{path_template}"))?;
         let path_item_bases = if version == "2.0" {
             None
         } else {
@@ -2335,6 +2518,17 @@ fn extract_operation_schemas(
                     &mut resolution_state,
                 )?
             };
+            let parameters = extract_operation_parameters(
+                resolver.primary_root(),
+                path_object,
+                operation,
+                version,
+                &format!("paths.{path_template}.{method}"),
+                reject_unsupported_parameters,
+                &resolver,
+                &mut operation_budget,
+                &mut resolution_state,
+            )?;
 
             // One matcher per distinct effective pathname. Equivalent server
             // pathnames are deduplicated while preserving document order.
@@ -2379,6 +2573,9 @@ fn extract_operation_schemas(
                 }
                 if !responses.is_empty() {
                     entry.insert("responses".to_string(), Value::Object(responses.clone()));
+                }
+                if !parameters.is_empty() {
+                    entry.insert("parameters".to_string(), Value::Array(parameters.clone()));
                 }
                 let entry = Value::Object(entry);
                 let entry_bytes = serde_json::to_vec(&entry)
@@ -2811,6 +3008,261 @@ fn resolve_path_item(
         ResolveContext::ReferenceObject,
         state,
     )
+}
+
+/// A generated parameter's request-direction schema plus any explicit
+/// `style` / `explode`, or the reason the validator cannot deserialize it.
+type ParameterSerialization = Result<(Value, Option<String>, Option<bool>), String>;
+
+fn validator_parameter_error(error: String) -> ExtractError {
+    ExtractError::MalformedExtension {
+        which: "x-ferrum-validate",
+        error,
+    }
+}
+
+/// Generate `openapi_validator` parameter descriptors for one operation.
+///
+/// Path Item parameters are inherited and overridden by operation parameters
+/// with the same `name` and `in`. Each descriptor carries `name`, `in`,
+/// `required`, the request-direction `schema`, and any explicit `style` /
+/// `explode`. A parameter whose serialization the validator cannot
+/// deserialize (a `content` map, a non-default `style`, a Swagger
+/// `collectionFormat` other than `csv` / `multi`, nested collections) is
+/// omitted with a warning when it is optional, unless strict import is enabled.
+/// Required unsupported parameters always REFUSE the import. The support rule
+/// is the plugin constructor's own
+/// ([`crate::plugins::openapi_validator::parameter_serialization_support`]).
+/// Header parameters OpenAPI says are ignored (`Accept`, `Content-Type`,
+/// `Authorization`) and Swagger `body` / `formData` parameters (the
+/// request-body contract) are not emitted.
+#[allow(clippy::too_many_arguments)]
+fn extract_operation_parameters(
+    root: &Value,
+    path_item: &Map<String, Value>,
+    operation: &Map<String, Value>,
+    version: &str,
+    location: &str,
+    reject_unsupported_parameters: bool,
+    resolver: &LocalSchemaResolver,
+    budget: &mut GeneratedOperationBudget,
+    state: &mut ResolutionState,
+) -> Result<Vec<Value>, ExtractError> {
+    let mut declared: Vec<Value> = Vec::new();
+    for parameters in [path_item.get("parameters"), operation.get("parameters")]
+        .into_iter()
+        .flatten()
+    {
+        let Some(parameters) = parameters.as_array() else {
+            return Err(validator_parameter_error(format!(
+                "`{location}` parameters must be an array"
+            )));
+        };
+        for parameter in parameters {
+            let resolved = resolve_refs(
+                root,
+                parameter,
+                "#/paths/parameters",
+                MAX_SCHEMA_REF_DEPTH,
+                resolver.document_base(),
+                resolver,
+                ResolveContext::ReferenceObject,
+                state,
+            )?;
+            let key = |value: &Value| {
+                (
+                    value.get("name").and_then(Value::as_str).map(str::to_owned),
+                    value.get("in").and_then(Value::as_str).map(str::to_owned),
+                )
+            };
+            let resolved_key = key(&resolved);
+            declared.retain(|existing| key(existing) != resolved_key);
+            declared.push(resolved);
+        }
+    }
+
+    let mut generated = Vec::with_capacity(declared.len());
+    for parameter in &declared {
+        let Some(object) = parameter.as_object() else {
+            return Err(validator_parameter_error(format!(
+                "`{location}` has a parameter that is not a Parameter Object"
+            )));
+        };
+        let (Some(name), Some(location_in)) = (
+            object.get("name").and_then(Value::as_str),
+            object.get("in").and_then(Value::as_str),
+        ) else {
+            return Err(validator_parameter_error(format!(
+                "`{location}` has a parameter without a string `name` and `in`"
+            )));
+        };
+        if version == "2.0" && matches!(location_in, "body" | "formData") {
+            continue;
+        }
+        if location_in == "header"
+            && matches!(
+                name.to_ascii_lowercase().as_str(),
+                "accept" | "content-type" | "authorization"
+            )
+        {
+            continue;
+        }
+        let required = location_in == "path"
+            || object
+                .get("required")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+        let serialization = if version == "2.0" {
+            swagger_parameter_serialization(object)
+        } else {
+            openapi_parameter_serialization(root, object, version, resolver, state)?
+        };
+        let supported = serialization.and_then(|(schema, style, explode)| {
+            crate::plugins::openapi_validator::parameter_serialization_support(
+                location_in,
+                style.as_deref(),
+                explode,
+                &schema,
+            )
+            .map(|()| (schema, style, explode))
+        });
+        let (schema, style, explode) = match supported {
+            Ok(parts) => parts,
+            Err(reason) if required => {
+                return Err(validator_parameter_error(format!(
+                    "`{location}` required {location_in} parameter {name:?} cannot be validated by openapi_validator ({reason}); the import is refused rather than leaving a required parameter unenforced"
+                )));
+            }
+            Err(reason) if reject_unsupported_parameters => {
+                return Err(validator_parameter_error(format!(
+                    "{location:?}: optional {location_in:?} parameter {name:?} cannot be validated by openapi_validator ({reason}); `reject_unsupported_parameters` is true"
+                )));
+            }
+            // An optional parameter the validator cannot deserialize stays
+            // unvalidated, exactly as before parameter validation existed.
+            // The omission is announced at import time (spec-declared names
+            // only, never request data) and documented in the guide.
+            Err(reason) => {
+                tracing::warn!(
+                    operation = %location,
+                    parameter = %name,
+                    location = %location_in,
+                    %reason,
+                    "x-ferrum-validate: optional parameter is not validated by openapi_validator"
+                );
+                continue;
+            }
+        };
+        let mut entry = Map::new();
+        entry.insert("name".to_string(), Value::String(name.to_string()));
+        entry.insert("in".to_string(), Value::String(location_in.to_string()));
+        entry.insert("required".to_string(), Value::Bool(required));
+        entry.insert("schema".to_string(), schema);
+        if let Some(style) = style {
+            entry.insert("style".to_string(), Value::String(style));
+        }
+        if let Some(explode) = explode {
+            entry.insert("explode".to_string(), Value::Bool(explode));
+        }
+        let entry = Value::Object(entry);
+        // Charged per descriptor (the repeated key is a fail-safe
+        // overestimate) before it is retained, like every generated entry.
+        budget.consume_map_entry("parameters", &entry, location)?;
+        generated.push(entry);
+    }
+    Ok(generated)
+}
+
+/// OpenAPI 3.x Parameter Object serialization: its `schema` (references
+/// resolved, request direction) and explicit `style` / `explode`.
+fn openapi_parameter_serialization(
+    root: &Value,
+    object: &Map<String, Value>,
+    version: &str,
+    resolver: &LocalSchemaResolver,
+    state: &mut ResolutionState,
+) -> Result<ParameterSerialization, ExtractError> {
+    if object.contains_key("content") {
+        return Ok(Err("it uses `content` instead of `schema`".to_string()));
+    }
+    let Some(schema) = object.get("schema") else {
+        return Ok(Err("it has no `schema`".to_string()));
+    };
+    let style = match object.get("style") {
+        None => None,
+        Some(Value::String(style)) => Some(style.clone()),
+        Some(_) => return Ok(Err("its `style` is not a string".to_string())),
+    };
+    let explode = match object.get("explode") {
+        None => None,
+        Some(Value::Bool(explode)) => Some(*explode),
+        Some(_) => return Ok(Err("its `explode` is not a boolean".to_string())),
+    };
+    let schema = resolve_refs(
+        root,
+        schema,
+        "#/paths/parameters/schema",
+        MAX_SCHEMA_REF_DEPTH,
+        resolver.document_base(),
+        resolver,
+        ResolveContext::Schema,
+        state,
+    )?;
+    let schema = normalize_schema_for_openapi(schema, version, SchemaDirection::Request);
+    Ok(Ok((schema, style, explode)))
+}
+
+/// Swagger 2.0 non-body parameter serialization. The parameter object itself
+/// carries the JSON-Schema-subset fields; `collectionFormat` maps to `explode`
+/// (`csv` → `false`, `multi` → `true`).
+fn swagger_parameter_serialization(object: &Map<String, Value>) -> ParameterSerialization {
+    let Some(kind) = object.get("type").and_then(Value::as_str) else {
+        return Err("it has no `type`".to_string());
+    };
+    if kind == "file" {
+        return Err("it is a file parameter".to_string());
+    }
+    let explode = if kind == "array" {
+        match object
+            .get("collectionFormat")
+            .and_then(Value::as_str)
+            .unwrap_or("csv")
+        {
+            "csv" => Some(false),
+            "multi" => Some(true),
+            other => return Err(format!("it uses collectionFormat {other:?}")),
+        }
+    } else {
+        None
+    };
+    let schema = normalize_schema_for_openapi(
+        swagger_parameter_schema(object, 0),
+        "2.0",
+        SchemaDirection::Request,
+    );
+    Ok((schema, None, explode))
+}
+
+/// Copy a Swagger 2.0 parameter / Items Object into a JSON Schema, dropping the
+/// parameter-only fields. Nesting is bounded like every other schema walk.
+fn swagger_parameter_schema(object: &Map<String, Value>, depth: usize) -> Value {
+    let mut schema = Map::new();
+    for (key, value) in object {
+        if matches!(
+            key.as_str(),
+            "name" | "in" | "description" | "required" | "allowEmptyValue" | "collectionFormat"
+        ) {
+            continue;
+        }
+        let value = match (key.as_str(), value.as_object()) {
+            ("items", Some(items)) if depth < MAX_SCHEMA_INDEX_DEPTH => {
+                swagger_parameter_schema(items, depth + 1)
+            }
+            _ => value.clone(),
+        };
+        schema.insert(key.clone(), value);
+    }
+    Value::Object(schema)
 }
 
 fn extract_openapi_request_body(
@@ -3576,6 +4028,14 @@ fn extract_openapi_responses(
                         normalize_schema_for_openapi(schema, version, SchemaDirection::Response);
                     budget.consume_map_entry(media_type, &schema, status)?;
                     content_schemas.insert(media_type.clone(), schema);
+                } else if is_text_event_stream_media_type(media_type) {
+                    // A declared event stream is an explicit contract even
+                    // without a schema: keep it (accept-anything schema) so the
+                    // validator can admit that status's stream instead of
+                    // refusing it as an undeclared, uninspectable response.
+                    let schema = json!({});
+                    budget.consume_map_entry(media_type, &schema, status)?;
+                    content_schemas.insert(media_type.clone(), schema);
                 }
             }
         }
@@ -3685,7 +4145,19 @@ fn extract_swagger_responses(
         };
         let mut content = Map::new();
         // As above: a declared status with no `schema` still occupies its slot
-        // so it cannot fall through to a wildcard or `default` response.
+        // so it cannot fall through to a wildcard or `default` response. A
+        // schemaless response that `produces` an event stream keeps that
+        // declaration, as in OpenAPI 3.x extraction.
+        if response_object.get("schema").is_none() {
+            for media_type in produces
+                .iter()
+                .filter(|media_type| is_text_event_stream_media_type(media_type))
+            {
+                let schema = json!({});
+                budget.consume_map_entry(media_type, &schema, status)?;
+                content.insert(media_type.clone(), schema);
+            }
+        }
         if let Some(schema) = response_object.get("schema") {
             let schema = resolve_refs(
                 root,
@@ -3767,13 +4239,6 @@ const MAX_SCHEMA_INDEX_DEPTH: usize = 64;
 /// so hostile callback chains are rejected deterministically as schema depth,
 /// while ordinary Schema Object indexing retains its larger independent cap.
 const MAX_PATH_ITEM_INDEX_DEPTH: usize = 24;
-/// Synthetic document base for local-only URI resolution when no operator
-/// `document_base` is configured. Never fetched.
-///
-/// Kept as the extractor-side name for [`super::external_refs::DEFAULT_DOCUMENT_BASE`];
-/// [`EffectiveExternalRefPolicy::document_base`] already defaults to this value.
-#[allow(dead_code)]
-const LOCAL_SCHEMA_DOCUMENT_BASE: &str = super::external_refs::DEFAULT_DOCUMENT_BASE;
 type ExtractedRequestBodySchemas = Option<(bool, Map<String, Value>)>;
 
 /// Incremental cap for all materialized request/response entries in one
@@ -4572,7 +5037,7 @@ impl LocalSchemaResolver {
         reference: &str,
         current_base: &Url,
     ) -> Result<ResolvedRef<'a>, ExtractError> {
-        let (uri_part, raw_fragment) = split_ref_uri_and_fragment(reference);
+        let (uri_part, raw_fragment) = split_ref(reference);
         let decoded_fragment = decode_uri_fragment(raw_fragment, reference)?;
 
         let target_resource = match uri_part {
@@ -4754,46 +5219,9 @@ fn unresolved_internal_ref_message(
     )
 }
 
-fn resource_uri_key(url: &Url) -> String {
-    let mut owned = url.clone();
-    owned.set_fragment(None);
-    normalize_percent_escape_case(owned.as_str())
-}
-
-fn normalize_percent_escape_case(value: &str) -> String {
-    let mut normalized = String::with_capacity(value.len());
-    let mut remaining = value;
-    while let Some(offset) = remaining.find('%') {
-        normalized.push_str(&remaining[..offset]);
-        let escape = &remaining[offset..];
-        if escape.len() >= 3
-            && escape.as_bytes()[1].is_ascii_hexdigit()
-            && escape.as_bytes()[2].is_ascii_hexdigit()
-        {
-            normalized.push('%');
-            normalized.push(char::from(escape.as_bytes()[1].to_ascii_uppercase()));
-            normalized.push(char::from(escape.as_bytes()[2].to_ascii_uppercase()));
-            remaining = &escape[3..];
-        } else {
-            normalized.push('%');
-            remaining = &escape[1..];
-        }
-    }
-    normalized.push_str(remaining);
-    normalized
-}
-
 fn append_json_pointer(base: &str, token: &str) -> String {
     let escaped = token.replace('~', "~0").replace('/', "~1");
     format!("{base}/{escaped}")
-}
-
-fn split_ref_uri_and_fragment(reference: &str) -> (Option<&str>, &str) {
-    match reference.split_once('#') {
-        None => (Some(reference), ""),
-        Some(("", fragment)) => (None, fragment),
-        Some((uri, fragment)) => (Some(uri), fragment),
-    }
 }
 
 fn decode_uri_fragment(raw: &str, reference: &str) -> Result<String, ExtractError> {
@@ -4808,12 +5236,12 @@ fn decode_uri_fragment(raw: &str, reference: &str) -> Result<String, ExtractErro
                         "malformed percent-encoding in $ref '{reference}'"
                     )));
                 }
-                let hi = hex_nibble(bytes[index + 1]).ok_or_else(|| {
+                let hi = crate::util::hex_nibble(bytes[index + 1]).ok_or_else(|| {
                     schema_reference_error(format!(
                         "malformed percent-encoding in $ref '{reference}'"
                     ))
                 })?;
-                let lo = hex_nibble(bytes[index + 2]).ok_or_else(|| {
+                let lo = crate::util::hex_nibble(bytes[index + 2]).ok_or_else(|| {
                     schema_reference_error(format!(
                         "malformed percent-encoding in $ref '{reference}'"
                     ))
@@ -4830,15 +5258,6 @@ fn decode_uri_fragment(raw: &str, reference: &str) -> Result<String, ExtractErro
     String::from_utf8(out).map_err(|_| {
         schema_reference_error(format!("malformed percent-encoding in $ref '{reference}'"))
     })
-}
-
-fn hex_nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
 }
 
 fn is_json_pointer_fragment(decoded: &str) -> bool {
@@ -5272,7 +5691,7 @@ fn opaque_value_weight(value: &Value) -> (usize, usize) {
 /// actually be serialized. Counting decoded UTF-8 bytes alone underestimates
 /// attacker-controlled quotes, backslashes, and control characters by up to
 /// six bytes each.
-fn json_string_serialized_len(value: &str) -> usize {
+pub(super) fn json_string_serialized_len(value: &str) -> usize {
     value.chars().fold(2usize, |bytes, character| {
         let encoded = match character {
             '"' | '\\' | '\u{0008}' | '\u{0009}' | '\u{000a}' | '\u{000c}' | '\u{000d}' => 2,
@@ -6126,8 +6545,9 @@ pub(crate) fn count_value_nodes(val: &serde_json::Value, budget: &mut usize) -> 
 
 /// Maximum recursion depth for [`find_forbidden_key`].
 ///
-/// serde_yaml's own parser enforces a depth limit of ~128 for the YAML
-/// document. We set an explicit, lower limit here (32) so the contract
+/// The bounded YAML parser enforces a depth limit of
+/// `bounded_yaml::MAX_YAML_DEPTH` (128) for the YAML document. We set an
+/// explicit, lower limit here (32) so the contract
 /// is documented in code rather than relying on the parser's internal
 /// behaviour.  Configs nested deeper than 32 levels are rejected with a
 /// synthetic `"__depth_exceeded__"` sentinel, causing the spec to be
@@ -7174,10 +7594,6 @@ x-ferrum-proxy:
             "got: {err}"
         );
     }
-
-    // -----------------------------------------------------------------------
-    // Counter-example: a `jwt` plugin with legitimate config is NOT flagged
-    // -----------------------------------------------------------------------
 
     // -----------------------------------------------------------------------
     // Fix 1: Upstream auto-link to proxy

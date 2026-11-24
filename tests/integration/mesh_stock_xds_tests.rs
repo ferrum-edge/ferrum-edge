@@ -16,6 +16,8 @@
 //!   wildcarded,
 //! * a structurally invalid response is NACKed with an `error_detail` and the
 //!   previously installed slice keeps serving (last-good),
+//! * a NACK-circuit-breaker trip applies the already-ACKed staged slice
+//!   before the stream closes (issue #7029),
 //! * a state-of-the-world CDS response that drops a cluster deletes it,
 //! * a PARTIAL EDS push (the by-name types may carry a subset) leaves the
 //!   assignments it did not mention dialable, and
@@ -298,6 +300,9 @@ mesh:
   peer_authentications:
     - name: strict-default
       namespace: default
+      scope:
+        kind: namespace
+        namespace: default
       mtls_mode: strict
 "#;
 
@@ -316,6 +321,14 @@ impl StockHarness {
     async fn start_with(
         script: HashMap<String, Vec<ScriptedResponse>>,
         close_on_nack: bool,
+    ) -> Self {
+        Self::start_with_timings(script, close_on_nack, MeshStreamTimings::production()).await
+    }
+
+    async fn start_with_timings(
+        script: HashMap<String, Vec<ScriptedResponse>>,
+        close_on_nack: bool,
+        timings: MeshStreamTimings,
     ) -> Self {
         let policy_dir = tempfile::tempdir().expect("temp dir");
         let policy_path = policy_dir.path().join("mesh-policy.yaml");
@@ -362,7 +375,7 @@ impl StockHarness {
             primary_retry_secs: 0,
             connect_timeout_seconds: 5,
             limits: StockXdsLimits::default(),
-            timings: MeshStreamTimings::production(),
+            timings,
         };
         let request = MeshSliceRequest {
             node_id: config.node_id.clone(),
@@ -611,6 +624,221 @@ async fn stock_invalid_response_is_nacked_and_the_last_good_slice_keeps_serving(
         .collect();
     names.sort_unstable();
     assert_eq!(names, vec!["ratings", "reviews"]);
+}
+
+/// Debounce window wide enough that the scripted NACK is guaranteed to land
+/// while the slice is still STAGED, independent of runner scheduling.
+const CONTROLLED_DEBOUNCE: Duration = Duration::from_secs(4);
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stock_nack_inside_the_debounce_window_keeps_the_staged_slice() {
+    // The ACK for the first EDS response is what completes the gating set and
+    // stages the slice; that same ACK releases this structurally invalid EDS
+    // push (two assignments sharing a name). Nothing is queued after it: a
+    // state-of-the-world control plane does not resend what it already saw
+    // ACKed, so the staged slice is the only way to converge.
+    let mut script = converged_script();
+    script
+        .get_mut(EDS_TYPE_URL)
+        .expect("EDS queue")
+        .push(ScriptedResponse {
+            type_url: EDS_TYPE_URL.to_string(),
+            version: "eds-v2".to_string(),
+            nonce: "eds-n2".to_string(),
+            resources: vec![
+                any_resource(EDS_TYPE_URL, &cla(REVIEWS_CLUSTER, "10.1.2.9", 9080)),
+                any_resource(EDS_TYPE_URL, &cla(REVIEWS_CLUSTER, "10.1.2.9", 9080)),
+            ],
+        });
+    let harness = StockHarness::start_with_timings(
+        script,
+        false,
+        MeshStreamTimings {
+            first_slice: Duration::from_secs(60),
+            apply_debounce: CONTROLLED_DEBOUNCE,
+            apply_max_delay: CONTROLLED_DEBOUNCE,
+            ..MeshStreamTimings::production()
+        },
+    )
+    .await;
+
+    // Phase 1: the server records the NACK. The client staged the slice while
+    // handling the eds-v1 response whose ACK released eds-v2, so the slice was
+    // staged before this NACK was sent...
+    let nack_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let nack = loop {
+        if let Some(request) = harness
+            .recorder
+            .for_type(EDS_TYPE_URL)
+            .into_iter()
+            .find(|request| request.error_detail.is_some())
+        {
+            break request;
+        }
+        assert!(
+            tokio::time::Instant::now() < nack_deadline,
+            "the invalid EDS push was never NACKed"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(nack.response_nonce, "eds-n2");
+    assert_eq!(nack.version_info, "eds-v1");
+    // ...and nothing has been committed yet: the NACK landed inside the
+    // debounce window, with the slice still staged.
+    assert!(
+        harness.state.snapshot().is_none(),
+        "the NACK must be observed before the debounce commits, or this test proves nothing"
+    );
+
+    // Phase 2: the staged slice commits when the debounce fires.
+    let install_deadline =
+        tokio::time::Instant::now() + CONTROLLED_DEBOUNCE + Duration::from_secs(10);
+    let slice = loop {
+        if let Some(slice) = harness.state.snapshot().as_ref().clone()
+            && slice.services.len() == 2
+        {
+            break slice;
+        }
+        assert!(
+            tokio::time::Instant::now() < install_deadline,
+            "the staged slice must survive a NACK of a later push"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let mut addresses: Vec<String> = slice
+        .workloads
+        .iter()
+        .flat_map(|workload| workload.addresses.clone())
+        .collect();
+    addresses.sort();
+    assert_eq!(
+        addresses,
+        vec!["10.1.2.3".to_string(), "10.1.2.4".to_string()],
+        "the installed slice is the ACKed eds-v1 view, never the NACKed push"
+    );
+}
+
+/// Far longer than the test's install deadline, so an install observed inside
+/// that deadline can only come from the flush-before-close, never from the
+/// debounce timer.
+const BREAKER_DEBOUNCE: Duration = Duration::from_secs(60);
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stock_nack_breaker_trip_flushes_the_staged_slice_before_closing() {
+    // Issue #7029. The ACK for eds-v1 completes the gating set and stages the
+    // slice; that ACK releases the first of five structurally invalid EDS
+    // pushes, and each NACK releases the next. The fifth consecutive NACK trips
+    // the breaker while the slice is still staged. Nothing is queued after the
+    // breaker, and a reconnect is answered with nothing (state-of-the-world
+    // does not resend an ACKed version), so the staged slice is applied only
+    // if the client flushes it before the stream closes.
+    let mut script = converged_script();
+    let eds_queue = script.get_mut(EDS_TYPE_URL).expect("EDS queue");
+    for step in 2..=6 {
+        eds_queue.push(ScriptedResponse {
+            type_url: EDS_TYPE_URL.to_string(),
+            version: format!("eds-v{step}"),
+            nonce: format!("eds-n{step}"),
+            resources: vec![
+                any_resource(EDS_TYPE_URL, &cla(REVIEWS_CLUSTER, "10.1.2.9", 9080)),
+                any_resource(EDS_TYPE_URL, &cla(REVIEWS_CLUSTER, "10.1.2.9", 9080)),
+            ],
+        });
+    }
+    let started = tokio::time::Instant::now();
+    let harness = StockHarness::start_with_timings(
+        script,
+        false,
+        MeshStreamTimings {
+            first_slice: Duration::from_secs(120),
+            apply_debounce: BREAKER_DEBOUNCE,
+            apply_max_delay: BREAKER_DEBOUNCE,
+            ..MeshStreamTimings::production()
+        },
+    )
+    .await;
+
+    // The staged slice is installed well before the debounce could fire.
+    let install_deadline = started + Duration::from_secs(20);
+    let slice = loop {
+        if let Some(slice) = harness.state.snapshot().as_ref().clone()
+            && slice.services.len() == 2
+        {
+            break slice;
+        }
+        assert!(
+            tokio::time::Instant::now() < install_deadline,
+            "the ACKed staged slice must be applied when the NACK breaker closes the stream"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(
+        started.elapsed() < BREAKER_DEBOUNCE,
+        "the install must come from the flush-before-close, not the debounce timer"
+    );
+    let mut addresses: Vec<String> = slice
+        .workloads
+        .iter()
+        .flat_map(|workload| workload.addresses.clone())
+        .collect();
+    addresses.sort();
+    assert_eq!(
+        addresses,
+        vec!["10.1.2.3".to_string(), "10.1.2.4".to_string()],
+        "the flushed slice is the ACKed eds-v1 view, never a NACKed push"
+    );
+
+    // The breaker closed the stream: the client opens a fresh one, whose first
+    // CDS request is the second node-bearing one and carries no nonce.
+    let reconnect_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let resubscribe = loop {
+        let with_node: Vec<DiscoveryRequest> = harness
+            .recorder
+            .for_type(CDS_TYPE_URL)
+            .into_iter()
+            .filter(|request| request.node.is_some())
+            .collect();
+        if with_node.len() >= 2 {
+            break with_node[1].clone();
+        }
+        assert!(
+            tokio::time::Instant::now() < reconnect_deadline,
+            "the NACK breaker must close the stream and the client must reconnect"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(resubscribe.response_nonce.is_empty());
+    assert_eq!(resubscribe.version_info, "cds-v1");
+
+    // NACK delivery. The server sends each invalid push only after recording
+    // the NACK of the previous one, so the first four NACKs were recorded
+    // before the fifth push existed, and the fifth push had to be handled
+    // before the flush could install. The fifth NACK is best-effort, as on the
+    // Ferrum `xds` client: the breaker returns right after enqueueing it, and
+    // tearing the RPC down can drop it before it is written. The closed stream
+    // and the re-subscription that asserts the accepted versions are what
+    // report the refusal. The new stream receives no EDS responses, so every
+    // recorded NACK belongs to the breaker's stream.
+    let nacks: Vec<DiscoveryRequest> = harness
+        .recorder
+        .for_type(EDS_TYPE_URL)
+        .into_iter()
+        .filter(|request| request.error_detail.is_some())
+        .collect();
+    let nack_nonces: Vec<&str> = nacks
+        .iter()
+        .map(|request| request.response_nonce.as_str())
+        .collect();
+    assert!(
+        nack_nonces == ["eds-n2", "eds-n3", "eds-n4", "eds-n5"]
+            || nack_nonces == ["eds-n2", "eds-n3", "eds-n4", "eds-n5", "eds-n6"],
+        "the first four invalid pushes are NACKed in order, the fifth (breaker) NACK at \
+         most once, got {nack_nonces:?}"
+    );
+    assert!(
+        nacks.iter().all(|request| request.version_info == "eds-v1"),
+        "every NACK re-asserts the last accepted EDS version"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -2,6 +2,18 @@
 
 pub mod env;
 
+pub use crate::scaffolding::port_registry;
+
+// The shared bespoke-spawner harness (`GatewayChildGuard`, the JWT ownership
+// barrier, coverage-aware shutdown) for `startup_smoke`, shared verbatim with
+// the functional and service-integration suites.
+#[path = "../../common/gateway_harness.rs"]
+#[allow(dead_code)] // the smoke uses a handful of the harness helpers
+pub mod gateway_harness;
+
+#[allow(unused_imports)] // shared scaffolding readiness tests use the crate-wide guard
+pub use gateway_harness::GatewayChildGuard;
+
 // Docker-backed fixtures (Vault dev server, LocalStack) — only compiled when a
 // provider that needs them is enabled.
 #[cfg(any(feature = "secrets-vault", feature = "secrets-aws"))]

@@ -81,7 +81,6 @@ fn create_test_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
@@ -131,6 +130,7 @@ fn create_test_proxy_state(proxies: Vec<Proxy>) -> ProxyState {
     let dns_cache = DnsCache::new(DnsConfig::default());
     let config = GatewayConfig {
         quarantined_plugin_configs: Vec::new(),
+        quarantined_jwt_shared_secrets: Default::default(),
         version: "1".to_string(),
         proxies,
         consumers: vec![],
@@ -730,6 +730,7 @@ fn create_test_proxy_state_with_env(
     let dns_cache = DnsCache::new(DnsConfig::default());
     let config = GatewayConfig {
         quarantined_plugin_configs: Vec::new(),
+        quarantined_jwt_shared_secrets: Default::default(),
         version: "1".to_string(),
         proxies,
         consumers: vec![],

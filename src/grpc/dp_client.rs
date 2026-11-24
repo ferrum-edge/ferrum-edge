@@ -42,13 +42,13 @@ use super::configsync_lifecycle::{
     AppliedSnapshotAuthority, CONFIGSYNC_HTTP2_KEEPALIVE_INTERVAL_SECS,
     CONFIGSYNC_HTTP2_KEEPALIVE_TIMEOUT_SECS, CONFIGSYNC_TCP_KEEPALIVE_SECS,
     ConfigSyncAttemptOutcome, ConfigSyncDivergenceMetrics, ConfigSyncStreamTimings,
-    DeltaRejectionKind, FullSnapshotStreamDisposition, GatewayTrustEquivalenceState,
-    MultiCpBackoffState, SubscriptionApplyState, advance_authority_from_committed,
-    advance_multi_cp_backoff, authoritative_snapshot_payload_matches,
-    check_config_sync_build_identity, check_peer_version_compatibility, config_sync_build_identity,
-    connection_error_outcome, delta_rejection_stream_disposition,
-    evaluate_delta_against_subscription_base, evaluate_delta_authority,
-    evaluate_snapshot_clock_skew, full_snapshot_stream_disposition,
+    DeltaRejectionKind, DeltaRejectionStreamDisposition, FullSnapshotStreamDisposition,
+    GatewayTrustEquivalenceState, MultiCpBackoffState, SnapshotFailureStreamDisposition,
+    SubscriptionApplyState, advance_authority_from_committed, advance_multi_cp_backoff,
+    authoritative_snapshot_payload_matches, check_config_sync_build_identity,
+    check_peer_version_compatibility, config_sync_build_identity, connection_error_outcome,
+    delta_rejection_stream_disposition, evaluate_delta_against_subscription_base,
+    evaluate_delta_authority, evaluate_snapshot_clock_skew, full_snapshot_stream_disposition,
     gateway_trust_equivalence_state, grow_backoff_after_failure_sleep, heartbeat_frame_admissible,
     reconcile_snapshot_version, record_applied_gateway_trust,
     resolve_authority_trust_after_snapshot, resource_delta_advances_authority,
@@ -190,7 +190,6 @@ impl GrpcJwtSecret {
     /// Used by tests and library callers; production binary code path uses
     /// [`GrpcJwtSecret::with_issuer`] so the operator-configured
     /// `FERRUM_CP_DP_GRPC_JWT_ISSUER` is honored.
-    #[allow(dead_code)]
     pub fn new(secret: String) -> Self {
         Self::with_issuer(
             secret,
@@ -410,19 +409,6 @@ pub struct DpFrontendTlsRuntime {
     /// candidate had no trust identity — H3 then falls back to its coherent
     /// configured load.
     pub h3_pairing: Option<Arc<DpFrontendH3Pairing>>,
-}
-
-impl DpFrontendTlsRuntime {
-    #[allow(dead_code)] // compatibility wrapper and external unit-test construction
-    pub fn new(listener_slot: crate::tls::SharedFrontendTls) -> Self {
-        Self {
-            listener_slot,
-            restore_source_slot: None,
-            h3_revision_tx: None,
-            cp_materialized: Arc::new(AtomicBool::new(false)),
-            h3_pairing: None,
-        }
-    }
 }
 
 /// What an operator-candidate publication should do to the H1/H2/TCP listener
@@ -724,7 +710,6 @@ impl DpFrontendH3Pairing {
     /// with its own single atomic load, which is the property
     /// `frontend_trust_binding_tests` pins. The bin target re-declares the
     /// module tree without `tests/`, so it is dead there.
-    #[allow(dead_code)]
     pub fn h3_accepted(&self) -> Option<Arc<crate::tls::AcceptedFrontendTls>> {
         self.h3_accepted_slot.load_full().as_ref().clone()
     }
@@ -825,6 +810,26 @@ pub fn build_dp_grpc_tls_config(
     }))
 }
 
+/// Rebuild the DP/mesh gRPC TLS client config for a reload revision on the
+/// blocking pool.
+///
+/// [`build_dp_grpc_tls_config`] reads files or blocks on the TLS source
+/// runtime for provider-backed schemes, so a running client loop must not
+/// call it on a Tokio worker (issue #7205). The rebuild always runs to
+/// completion: if the awaiting loop is dropped (shutdown), the blocking task
+/// finishes and its result is discarded.
+pub async fn rebuild_dp_grpc_tls_config(
+    reload: &DpGrpcTlsReload,
+    cp_urls: &[String],
+) -> Result<Option<DpGrpcTlsConfig>, anyhow::Error> {
+    let env_config = reload.env_config.clone();
+    let cp_urls = cp_urls.to_vec();
+    let label = reload.label;
+    tokio::task::spawn_blocking(move || build_dp_grpc_tls_config(&env_config, &cp_urls, label))
+        .await
+        .map_err(|_| anyhow::anyhow!("{label} gRPC TLS material rebuild task did not complete"))?
+}
+
 fn load_grpc_material(
     raw: &str,
     kind: MaterialKind,
@@ -849,7 +854,6 @@ const DP_JWT_TTL_SECONDS: i64 = 3540;
 /// the operator-configured `FERRUM_CP_DP_GRPC_JWT_ISSUER` is honored. This
 /// helper is kept for tests and library callers that want the default behavior
 /// without threading the issuer through.
-#[allow(dead_code)]
 pub fn generate_dp_jwt(secret: &str, node_id: &str) -> Result<String, anyhow::Error> {
     generate_dp_jwt_with_issuer(
         secret,
@@ -959,11 +963,10 @@ pub fn generate_dp_jwt_full_with_key_id(
         .map(str::trim)
         .filter(|kid| !kid.is_empty())
         .map(str::to_string);
-    let token = encode(
-        &header,
-        &claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
-    )?;
+    // jsonwebtoken 12 refuses an empty HMAC key, so an unset secret fails the
+    // mint here instead of producing a token no control plane would accept.
+    let key = EncodingKey::from_secret(secret.as_bytes())?;
+    let token = encode(&header, &claims, &key)?;
     Ok(token)
 }
 
@@ -1080,7 +1083,7 @@ pub async fn start_dp_client_with_stream_timings(
             let revision = *reload.revision_rx.borrow();
             if revision != last_tls_revision {
                 last_tls_revision = revision;
-                match build_dp_grpc_tls_config(&reload.env_config, &cp_urls, reload.label) {
+                match rebuild_dp_grpc_tls_config(reload, &cp_urls).await {
                     Ok(next_config) => {
                         tls_config = next_config;
                         info!(
@@ -1784,9 +1787,7 @@ fn parse_gateway_trust_bundle_update(
 /// `"unchanged"` / `"clear"` / `"replace"` label and forwards the error
 /// verbatim. Nothing here relaxes a bound — it is the production parser.
 ///
-/// Reached only from `tests/`; the `ferrum-edge` bin target compiles this
-/// module without any such caller.
-#[allow(dead_code)]
+/// Reached only from `tests/`.
 pub fn classify_gateway_trust_side_channel_for_test(
     trust_bundles_json: &str,
 ) -> Result<&'static str, String> {
@@ -1853,7 +1854,7 @@ enum FrontendTlsSnapshotUpdate {
     },
 }
 
-fn stage_frontend_tls_snapshot(
+async fn stage_frontend_tls_snapshot(
     config: &GatewayConfig,
     proxy_state: &ProxyState,
     frontend_tls_slot: Option<&crate::tls::SharedFrontendTls>,
@@ -1891,7 +1892,7 @@ fn stage_frontend_tls_snapshot(
             {
                 frontend_tls_restore_slot.store(slot.load_full());
             }
-            let Some(tls_policy) = proxy_state.tls_policy.as_deref() else {
+            let Some(tls_policy) = proxy_state.tls_policy.clone() else {
                 anyhow::bail!(
                     "frontend TLS material was provided by CP but this DP has no TLS policy"
                 );
@@ -1923,73 +1924,110 @@ fn stage_frontend_tls_snapshot(
                 .env_config
                 .frontend_tls_live_reload_enabled
                 .then_some(crate::tls::ClientTrustScope::ProxyFrontend);
-            let mut tls_config = if !certificates.is_empty() {
-                load_gateway_multi_cert_tls_config_with_handshake_scope(
-                    &certificates,
-                    proxy_state
-                        .env_config
-                        .frontend_tls_client_ca_bundle_path
-                        .as_deref(),
-                    proxy_state
-                        .env_config
-                        .frontend_tls_ocsp_response_source
-                        .as_deref(),
-                    tls_policy,
-                    proxy_state.env_config.tls_cert_expiry_warning_days,
-                    proxy_state.env_config.tls_crl_expiry_warning_days,
-                    proxy_state.crls.as_ref().as_slice(),
-                    handshake_scope,
-                )
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "failed to materialize {} Gateway frontend TLS certificate sources: {}",
-                        certificates.len(),
-                        error
-                    )
-                })?
-            } else {
-                crate::tls::load_frontend_tls_candidate_from_paths(
-                    cert_path,
-                    key_path,
-                    proxy_state
-                        .env_config
-                        .frontend_tls_client_ca_bundle_path
-                        .as_deref(),
-                    proxy_state
-                        .env_config
-                        .frontend_tls_ocsp_response_source
-                        .as_deref(),
-                    false,
-                    tls_policy,
-                    proxy_state.env_config.tls_cert_expiry_warning_days,
-                    proxy_state.env_config.tls_crl_expiry_warning_days,
-                    proxy_state.crls.as_ref().as_slice(),
-                    handshake_scope,
-                )
-                .map(|candidate| candidate.config)
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "failed to materialize frontend TLS certificate source {}: {}",
-                        cert_path,
-                        error
-                    )
-                })?
+            // Certificate, key, CA and OCSP sources are files or provider URIs
+            // that block on the TLS source runtime, and one snapshot can carry
+            // up to 256 of them. Materialize on the blocking pool so a
+            // FULL_SNAPSHOT never stalls a serving Tokio worker (issue #7205).
+            // The stream handler awaits this before applying, so apply
+            // ordering is unchanged; if the handler is dropped, the build
+            // finishes and its result is discarded.
+            let inputs = FrontendTlsMaterialInputs {
+                certificates,
+                cert_path: cert_path.to_string(),
+                key_path: key_path.to_string(),
+                env_config: proxy_state.env_config.clone(),
+                tls_policy,
+                crls: proxy_state.crls.clone(),
+                handshake_scope,
             };
-            crate::tls::enable_early_data(&mut tls_config, tls_policy);
-            if proxy_state.env_config.ktls_enabled.could_be_enabled() {
-                crate::tls::enable_secret_extraction_for_ktls(&mut tls_config);
-            }
-
-            Ok(FrontendTlsSnapshotUpdate::Replace {
-                tls_config,
-                cert_source: if !certificates.is_empty() {
-                    format!("{} Gateway certificate(s)", certificates.len())
-                } else {
-                    cert_path.to_string()
-                },
-            })
+            tokio::task::spawn_blocking(move || materialize_frontend_tls_snapshot(inputs))
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("frontend TLS materialization task did not complete")
+                })?
         }
     }
+}
+
+/// Owned inputs for [`materialize_frontend_tls_snapshot`], so the blocking
+/// build can run on the blocking pool.
+struct FrontendTlsMaterialInputs {
+    certificates: Vec<GatewayCertificateInput>,
+    cert_path: String,
+    key_path: String,
+    env_config: Arc<EnvConfig>,
+    tls_policy: Arc<crate::tls::TlsPolicy>,
+    crls: crate::tls::CrlList,
+    handshake_scope: Option<crate::tls::ClientTrustScope>,
+}
+
+/// Build the frontend TLS server config a CP snapshot asks for. Blocking:
+/// reads files and provider-backed sources.
+fn materialize_frontend_tls_snapshot(
+    inputs: FrontendTlsMaterialInputs,
+) -> Result<FrontendTlsSnapshotUpdate, anyhow::Error> {
+    let FrontendTlsMaterialInputs {
+        certificates,
+        cert_path,
+        key_path,
+        env_config,
+        tls_policy,
+        crls,
+        handshake_scope,
+    } = inputs;
+    let mut tls_config = if !certificates.is_empty() {
+        load_gateway_multi_cert_tls_config_with_handshake_scope(
+            &certificates,
+            env_config.frontend_tls_client_ca_bundle_path.as_deref(),
+            env_config.frontend_tls_ocsp_response_source.as_deref(),
+            &tls_policy,
+            env_config.tls_cert_expiry_warning_days,
+            env_config.tls_crl_expiry_warning_days,
+            crls.as_slice(),
+            handshake_scope,
+        )
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "failed to materialize {} Gateway frontend TLS certificate sources: {}",
+                certificates.len(),
+                error
+            )
+        })?
+    } else {
+        crate::tls::load_frontend_tls_candidate_from_paths(
+            &cert_path,
+            &key_path,
+            env_config.frontend_tls_client_ca_bundle_path.as_deref(),
+            env_config.frontend_tls_ocsp_response_source.as_deref(),
+            false,
+            &tls_policy,
+            env_config.tls_cert_expiry_warning_days,
+            env_config.tls_crl_expiry_warning_days,
+            crls.as_slice(),
+            handshake_scope,
+        )
+        .map(|candidate| candidate.config)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "failed to materialize frontend TLS certificate source {}: {}",
+                cert_path,
+                error
+            )
+        })?
+    };
+    crate::tls::enable_early_data(&mut tls_config, &tls_policy);
+    if env_config.ktls_enabled.could_be_enabled() {
+        crate::tls::enable_secret_extraction_for_ktls(&mut tls_config);
+    }
+
+    Ok(FrontendTlsSnapshotUpdate::Replace {
+        tls_config,
+        cert_source: if !certificates.is_empty() {
+            format!("{} Gateway certificate(s)", certificates.len())
+        } else {
+            cert_path
+        },
+    })
 }
 
 /// The Gateway certificate set this data plane must serve, in the control
@@ -2107,7 +2145,6 @@ fn bump_frontend_tls_revision(frontend_tls_runtime: Option<&DpFrontendTlsRuntime
     }
 }
 
-#[allow(dead_code)] // Used by tests and library callers; binary startup uses the startup-aware variant.
 pub async fn connect_and_subscribe(
     cp_url: &str,
     jwt_secret: &GrpcJwtSecret,
@@ -2131,64 +2168,6 @@ pub async fn connect_and_subscribe(
         None,
         Arc::new(AtomicBool::new(false)),
         Arc::new(ArcSwap::new(Arc::new(None))),
-        None,
-        None,
-        0,
-        0,
-        &mut authority,
-        &ConfigSyncDivergenceMetrics::default(),
-        Arc::new(Notify::new()),
-        ConfigSyncStreamTimings::production(),
-    )
-    .await?
-    {
-        DpStreamEnd::Shutdown | DpStreamEnd::Clean { .. } => Ok(()),
-        DpStreamEnd::PrimaryRetry | DpStreamEnd::TlsReload => Ok(()),
-        DpStreamEnd::StaleSnapshotFenced
-        | DpStreamEnd::InvalidDeltaFreshness
-        | DpStreamEnd::InvalidSubscriptionBase
-        | DpStreamEnd::ResyncAfterAcceptedConfig
-        | DpStreamEnd::BuildMismatch
-        | DpStreamEnd::TransportFailure { .. } => Ok(()),
-    }
-}
-
-/// Connect to CP and optionally flip startup readiness after the first applied snapshot.
-#[allow(clippy::too_many_arguments)]
-#[allow(dead_code)] // compatibility wrapper; production uses the lifecycle-aware inner entry point
-pub async fn connect_and_subscribe_with_startup_ready(
-    cp_url: &str,
-    jwt_secret: &GrpcJwtSecret,
-    node_id: &str,
-    proxy_state: &ProxyState,
-    tls_config: Option<&DpGrpcTlsConfig>,
-    startup_ready: Option<Arc<AtomicBool>>,
-    namespace: &str,
-    connection_state: Option<&Arc<ArcSwap<DpCpConnectionState>>>,
-    is_primary: bool,
-    frontend_tls_slot: Option<&crate::tls::SharedFrontendTls>,
-) -> Result<(), anyhow::Error> {
-    let frontend_tls_runtime =
-        frontend_tls_slot.map(|slot| DpFrontendTlsRuntime::new(slot.clone()));
-    let mut authority = None;
-    match connect_and_subscribe_with_startup_ready_inner(
-        cp_url,
-        jwt_secret,
-        node_id,
-        proxy_state,
-        tls_config,
-        startup_ready,
-        namespace,
-        connection_state,
-        is_primary,
-        frontend_tls_slot,
-        frontend_tls_runtime.as_ref(),
-        Arc::new(AtomicBool::new(false)),
-        Arc::new(ArcSwap::new(Arc::new(
-            frontend_tls_slot
-                .map(|slot| slot.load_full().as_ref().clone())
-                .unwrap_or(None),
-        ))),
         None,
         None,
         0,
@@ -2716,7 +2695,9 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                     frontend_tls_runtime,
                     cp_frontend_tls_materialized.as_ref(),
                     frontend_tls_restore_slot.as_ref(),
-                ) {
+                )
+                .await
+                {
                     Ok(update) => update,
                     Err(error) => {
                         error!(
@@ -2882,15 +2863,14 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                         "Terminating ConfigSync stream after invalid gateway trust \
                                          side-channel so later resource deltas cannot apply"
                                     );
-                                    let _ = delta_rejection_stream_disposition(
-                                        DeltaRejectionKind::InvalidTrustSideChannel,
-                                    );
                                     crate::dp_config_freshness::record_snapshot_rejected();
                                     update_state_config_diverged(
                                         connection_state,
                                         divergence_metrics,
                                     );
-                                    return Ok(DpStreamEnd::ResyncAfterAcceptedConfig);
+                                    return Ok(react_to_rejected_delta(
+                                        DeltaRejectionKind::InvalidTrustSideChannel,
+                                    ));
                                 }
                             };
                         // Defense in depth: filter cross-namespace
@@ -3124,9 +3104,6 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                     // Non-empty rejection: stop consuming this stream
                                     // so a later partial delta cannot apply against
                                     // the wrong base (issue #2394).
-                                    let _ = delta_rejection_stream_disposition(
-                                        DeltaRejectionKind::NonEmptyApplyRejected,
-                                    );
                                     error!(
                                         cp_version = %sanitize_startup_cause(
                                             format!("{cp_version:?}"),
@@ -3156,7 +3133,9 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                         connection_state,
                                         divergence_metrics,
                                     );
-                                    return Ok(DpStreamEnd::ResyncAfterAcceptedConfig);
+                                    return Ok(react_to_rejected_delta(
+                                        DeltaRejectionKind::NonEmptyApplyRejected,
+                                    ));
                                 }
                             }
                         }
@@ -3167,11 +3146,9 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                             "Failed to parse delta update: {}",
                             sanitize_startup_cause(e, &[])
                         );
-                        let _ =
-                            delta_rejection_stream_disposition(DeltaRejectionKind::ParseFailure);
                         crate::dp_config_freshness::record_snapshot_rejected();
                         update_state_config_diverged(connection_state, divergence_metrics);
-                        return Ok(DpStreamEnd::ResyncAfterAcceptedConfig);
+                        return Ok(react_to_rejected_delta(DeltaRejectionKind::ParseFailure));
                     }
                 }
             }
@@ -3205,12 +3182,32 @@ fn refuse_unusable_snapshot(subscription_base_applied: bool) -> DpStreamEnd {
 /// deltas cannot apply against a base that missed the authoritative reload.
 /// When a prior base was already accepted, reconnect for a fresh snapshot
 /// while keeping last-known-good config; otherwise fail over as an invalid base.
+///
+/// The decision comes from [`snapshot_failure_stream_disposition`], matched
+/// exhaustively so a new disposition cannot be added without the client
+/// handling it.
 fn react_to_unusable_snapshot(subscription_base_applied: bool) -> DpStreamEnd {
-    let _ = snapshot_failure_stream_disposition(subscription_base_applied);
-    if subscription_base_applied {
-        DpStreamEnd::ResyncAfterAcceptedConfig
-    } else {
-        DpStreamEnd::InvalidSubscriptionBase
+    match snapshot_failure_stream_disposition(subscription_base_applied) {
+        SnapshotFailureStreamDisposition::TerminateAndReconnect => {
+            if subscription_base_applied {
+                DpStreamEnd::ResyncAfterAcceptedConfig
+            } else {
+                DpStreamEnd::InvalidSubscriptionBase
+            }
+        }
+    }
+}
+
+/// End the stream for a rejected non-empty DELTA, as decided by
+/// [`delta_rejection_stream_disposition`] (matched exhaustively, like
+/// [`react_to_unusable_snapshot`]). Terminating forces an authoritative
+/// FULL_SNAPSHOT resync, so a later partial delta cannot apply against the
+/// wrong base (issue #2394); last-known-good config keeps serving.
+fn react_to_rejected_delta(kind: DeltaRejectionKind) -> DpStreamEnd {
+    match delta_rejection_stream_disposition(kind) {
+        DeltaRejectionStreamDisposition::TerminateAndResync => {
+            DpStreamEnd::ResyncAfterAcceptedConfig
+        }
     }
 }
 
@@ -3270,6 +3267,11 @@ fn filter_config_to_namespace(config: &mut GatewayConfig, namespace: &str) -> us
         mesh.virtual_service_cors_policies.retain(|policy| {
             crate::modes::mesh::config::virtual_service_cors_policy_exported_to_namespace(
                 policy, namespace,
+            )
+        });
+        mesh.virtual_service_http_routes.retain(|routes| {
+            crate::modes::mesh::config::virtual_service_http_routes_exported_to_namespace(
+                routes, namespace,
             )
         });
     }
@@ -3383,28 +3385,8 @@ mod tests {
     use crate::config::db_loader::NamespacedResourceId;
     use crate::dns::{DnsCache, DnsConfig};
     use crate::proxy::ProxyState;
-    use crate::util::backoff::jittered_backoff_with_entropy;
     use chrono::Utc;
     use serde_json::json;
-
-    #[test]
-    fn jittered_backoff_with_entropy_stays_within_expected_range() {
-        let samples = [0, 249, 250, 499, u64::MAX];
-
-        for entropy in samples {
-            let duration = jittered_backoff_with_entropy(1, entropy);
-            assert!(duration >= Duration::from_millis(750));
-            assert!(duration < Duration::from_millis(1250));
-        }
-    }
-
-    #[test]
-    fn jittered_backoff_never_sleeps_below_minimum() {
-        assert_eq!(
-            jittered_backoff_with_entropy(0, 0),
-            Duration::from_millis(100)
-        );
-    }
 
     fn minimal_proxy_state() -> ProxyState {
         ProxyState::new(
@@ -3478,6 +3460,7 @@ mod tests {
             client_trust: crate::tls::AcceptedClientTrust {
                 verifier: None,
                 material: crate::tls::ClientTrustMaterial::from_test_digest([marker; 32]),
+                crls_enforced: false,
             },
         })
     }
@@ -3553,31 +3536,6 @@ mod tests {
         let h3 = pairing.h3_accepted().expect("paired H3 candidate");
         assert!(Arc::ptr_eq(&h3.config, &cp));
         assert!(!Arc::ptr_eq(&h3.config, &rotated_operator.config));
-    }
-
-    #[tokio::test]
-    async fn refused_operator_trust_candidate_retains_h3_last_good_pair() {
-        let startup = test_operator_candidate(test_server_config(), 1);
-        let pairing = DpFrontendH3Pairing::from_operator_candidate(startup.clone());
-        let listener = crate::tls::empty_frontend_tls_slot();
-        let cp = test_server_config();
-        pairing
-            .publish_cp_server_config(Some(cp.clone()), Some(&listener), None)
-            .await;
-        let before = pairing.h3_accepted().expect("paired");
-
-        // A malformed/refused operator candidate never updates the accepted
-        // slot or calls publish_operator_candidate, so H3 keeps last-good
-        // config, trust, and the CP server certificate.
-        let _refused = test_operator_candidate(test_server_config(), 99);
-        let after = pairing.h3_accepted().expect("retained");
-        assert!(Arc::ptr_eq(&before, &after));
-        assert!(Arc::ptr_eq(&after.config, &cp));
-        assert_eq!(after.client_trust.material, startup.client_trust.material);
-        assert!(Arc::ptr_eq(
-            listener.load_full().as_ref().as_ref().expect("CP config"),
-            &cp
-        ));
     }
 
     #[tokio::test]
@@ -3889,6 +3847,7 @@ mod tests {
             &cp_materialized,
             &restore_slot,
         )
+        .await
         .expect("disabled HTTPS listener should not reject the whole snapshot");
 
         assert!(matches!(update, FrontendTlsSnapshotUpdate::Unchanged));
@@ -4010,6 +3969,7 @@ mod tests {
     fn filter_config_keeps_matching_namespace_only() {
         let mut cfg = GatewayConfig {
             quarantined_plugin_configs: Vec::new(),
+            quarantined_jwt_shared_secrets: Default::default(),
             version: "1".to_string(),
             proxies: vec![
                 proxy_in_namespace("p-prod", "production"),
@@ -4064,6 +4024,7 @@ mod tests {
     fn filter_config_strips_foreign_gateway_listener_tls_classification() {
         let mut cfg = GatewayConfig {
             quarantined_plugin_configs: Vec::new(),
+            quarantined_jwt_shared_secrets: Default::default(),
             version: "1".to_string(),
             proxies: vec![proxy_in_namespace("p-prod", "production")],
             consumers: Vec::new(),
@@ -4107,6 +4068,7 @@ mod tests {
     fn filter_config_returns_zero_when_clean() {
         let mut cfg = GatewayConfig {
             quarantined_plugin_configs: Vec::new(),
+            quarantined_jwt_shared_secrets: Default::default(),
             version: "1".to_string(),
             proxies: vec![proxy_in_namespace("p-prod", "production")],
             consumers: vec![],

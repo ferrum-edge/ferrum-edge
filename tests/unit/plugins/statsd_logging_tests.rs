@@ -12,17 +12,15 @@ use ferrum_edge::plugins::{
     ALL_PROTOCOLS, Direction, Plugin, PluginFailurePolicy, PluginHttpClient, PluginResult,
     StreamTransactionSummary, WsDisconnectContext, plugin_failure_policy,
     statsd_logging::{
-        MAX_UDP_PAYLOAD, STATSD_LOGGING_CONFIG_KEYS, StatsdLogging, bounded_grpc_status_tag,
-        for_each_udp_datagram, format_http_metrics, format_ws_metrics, http_body_outcome,
-        http_grpc_status_tag, is_valid_timer_sample, pack_udp_datagrams,
-        render_http_under_budget_for_test, sanitize_namespace_tag_value, sanitize_tag_value,
-        validate_tag_key,
+        MAX_UDP_PAYLOAD, STATSD_LOGGING_CONFIG_KEYS, StatsdLogging, UdpDatagramPacker,
+        bounded_grpc_status_tag, format_http_metrics, format_ws_metrics, http_body_outcome,
+        http_grpc_status_tag, is_valid_timer_sample, render_http_under_budget_for_test,
+        sanitize_namespace_tag_value, sanitize_tag_value, validate_tag_key,
     },
     validate_plugin_config,
 };
 use ferrum_edge::retry::ErrorClass;
 use serde_json::json;
-use std::collections::HashMap;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
@@ -42,6 +40,7 @@ fn make_stream_summary() -> StreamTransactionSummary {
         proxy_name: Some("TCP Test".to_string()),
         client_ip: "127.0.0.1".to_string(),
         consumer_username: None,
+        principal_origin: None,
         auth_method: None,
         backend_target: "127.0.0.1:9000".to_string(),
         backend_resolved_ip: None,
@@ -57,7 +56,7 @@ fn make_stream_summary() -> StreamTransactionSummary {
         timestamp_connected: "2025-01-01T00:00:00Z".to_string(),
         timestamp_disconnected: "2025-01-01T00:00:01Z".to_string(),
         sni_hostname: None,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
     }
 }
 
@@ -430,7 +429,7 @@ async fn test_statsd_logging_accepts_unsupported_schema_keys_with_warning() {
 async fn test_statsd_logging_rejects_one_character_misspellings_of_every_key() {
     assert_eq!(
         plugin_failure_policy("statsd_logging"),
-        Some(PluginFailurePolicy::OptionalFailOpen)
+        Some(PluginFailurePolicy::KeepLastKnownGood)
     );
 
     let typos = [
@@ -470,12 +469,9 @@ async fn test_statsd_logging_rejects_one_character_misspellings_of_every_key() {
         assert!(err.contains("unknown configuration key"), "got: {err}");
         assert!(err.contains(typo), "error must name the typo key: {err}");
         assert!(
-            err.contains("allowed keys"),
-            "error must list the allowed-key contract: {err}"
+            err.contains(&format!("did you mean `{canonical}`?")),
+            "error must suggest the intended key: {err}"
         );
-        for key in STATSD_LOGGING_CONFIG_KEYS {
-            assert!(err.contains(key), "missing allowed key {key} in: {err}");
-        }
 
         let shared = validate_plugin_config("statsd_logging", &config)
             .expect_err("shared admission must reject the same typo");
@@ -558,7 +554,7 @@ fn test_statsd_logging_disabled_config_skips_construction_validation() {
 }
 
 #[tokio::test]
-async fn test_statsd_logging_optional_fail_open_on_file_mode_load_and_cache_rebuild() {
+async fn test_statsd_logging_keeps_last_known_good_on_file_mode_load_and_cache_rebuild() {
     use ferrum_edge::config::types::Proxy;
 
     let policy = ferrum_edge::config::BackendEgressPolicy::unrestricted();
@@ -591,14 +587,13 @@ async fn test_statsd_logging_optional_fail_open_on_file_mode_load_and_cache_rebu
         plugin_configs: vec![bad_plugin.clone()],
         ..GatewayConfig::default()
     };
+    // Issue #7144: every log sink is KeepLastKnownGood, so a typo fails
+    // file-mode load instead of silently dropping the sink.
     ferrum_edge::_test_support::validate_plugin_configs_fatal_for_test(&mut bad_gateway, &policy)
-        .expect("OptionalFailOpen statsd typos warn but do not abort file-mode load");
-
-    let omitted = PluginCache::new(&bad_gateway)
-        .expect("cache construction must omit the failed optional statsd plugin");
+        .expect_err("a statsd_logging typo must fail file-mode load");
     assert!(
-        omitted.get_plugins("ferrum", "p1").is_empty(),
-        "unknown-key statsd_logging must be omitted, not silently defaulted"
+        PluginCache::new(&bad_gateway).is_err(),
+        "an unconstructible statsd_logging must reject the initial cache"
     );
 
     let valid_gateway = GatewayConfig {
@@ -618,10 +613,15 @@ async fn test_statsd_logging_optional_fail_open_on_file_mode_load_and_cache_rebu
 
     cache
         .rebuild(&bad_gateway)
-        .expect("OptionalFailOpen reload omits bad statsd rather than rejecting the generation");
-    assert!(
-        cache.get_plugins("ferrum", "p1").is_empty(),
-        "reload with unknown keys must drop the previously published statsd instance"
+        .expect_err("a reload with an unconstructible statsd_logging must be rejected");
+    assert_eq!(
+        cache.get_plugins("ferrum", "p1").len(),
+        1,
+        "the rejected reload keeps the previously published statsd instance"
+    );
+    assert_eq!(
+        cache.get_plugins("ferrum", "p1")[0].name(),
+        "statsd_logging"
     );
 }
 
@@ -658,7 +658,7 @@ fn test_statsd_metric_docs_inventory_and_byte_directions() {
         "backend_to_client",
         "max_retries",
         "retry_delay_ms",
-        "OptionalFailOpen",
+        "KeepLastKnownGood",
         "reserved runtime tags",
     ] {
         assert!(
@@ -880,9 +880,10 @@ async fn test_statsd_websocket_session_metrics_and_opt_in() {
         io_side: Some(ferrum_edge::proxy::tcp_proxy::StreamIoSide::Read),
         error_class: Some(ErrorClass::ReadWriteTimeout),
         consumer_username: None,
+        principal_origin: None,
         auth_method: None,
         connection_id: 0,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
     };
     let mut buf = String::new();
     format_ws_metrics(&ctx, "ferrum", "", None, &mut buf);
@@ -1156,11 +1157,11 @@ async fn test_statsd_udp_payload_ceiling_and_collector_capture() {
     }
 
     let over = "m".repeat(MAX_UDP_PAYLOAD + 1);
-    let (dgrams, dropped) = pack_udp_datagrams(&over, MAX_UDP_PAYLOAD);
+    let (dgrams, dropped) = pack_udp_datagrams(&over);
     assert_eq!(dropped, 1);
     assert!(dgrams.is_empty());
     let exact = "e".repeat(MAX_UDP_PAYLOAD);
-    let (dgrams, dropped) = pack_udp_datagrams(&exact, MAX_UDP_PAYLOAD);
+    let (dgrams, dropped) = pack_udp_datagrams(&exact);
     assert_eq!(dropped, 0);
     assert_eq!(dgrams[0].len(), MAX_UDP_PAYLOAD);
 }
@@ -1272,9 +1273,10 @@ async fn test_statsd_ws_disconnect_collector_emits_session_once() {
         io_side: None,
         error_class: None,
         consumer_username: None,
+        principal_origin: None,
         auth_method: None,
         connection_id: 0,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
     };
     plugin.on_ws_disconnect(&ctx).await;
 
@@ -1490,30 +1492,31 @@ async fn test_statsd_logging_failed_reserve_does_not_take_lease() {
     );
 }
 
+/// Pack `payload` with the packer production delivery uses.
+fn pack_udp_datagrams(payload: &str) -> (Vec<String>, usize) {
+    let mut packer = UdpDatagramPacker::new(MAX_UDP_PAYLOAD);
+    let mut datagrams: Vec<String> = payload
+        .lines()
+        .filter_map(|line| packer.push_line(line))
+        .collect();
+    let (last, dropped) = packer.finish();
+    datagrams.extend(last);
+    assert!(datagrams.iter().all(|d| d.len() <= MAX_UDP_PAYLOAD));
+    (datagrams, dropped)
+}
+
 #[test]
-fn test_statsd_logging_for_each_udp_datagram_stays_mtu_safe() {
+fn test_statsd_logging_udp_datagram_packer_stays_mtu_safe() {
     // Each line fits independently, while the pair plus delimiter exceeds the
-    // 1452-byte payload ceiling and therefore must visit two datagrams.
+    // 1452-byte payload ceiling and therefore must produce two datagrams.
     let line_a = "a".repeat(800);
     let line_b = "b".repeat(800);
-    let payload = format!("{line_a}\n{line_b}");
-    let mut seen = Vec::new();
-    let dropped = for_each_udp_datagram(&payload, MAX_UDP_PAYLOAD, |datagram| {
-        assert!(datagram.len() <= MAX_UDP_PAYLOAD);
-        seen.push(datagram.to_string());
-    });
+    let (seen, dropped) = pack_udp_datagrams(&format!("{line_a}\n{line_b}"));
     assert_eq!(dropped, 0);
-    assert_eq!(seen.len(), 2);
-    assert_eq!(seen[0], line_a);
-    assert_eq!(seen[1], line_b);
+    assert_eq!(seen, vec![line_a, line_b]);
 
     let over = "x".repeat(MAX_UDP_PAYLOAD + 8);
-    let mixed = format!("short:1|c\n{over}\nother:1|c");
-    let mut kept = Vec::new();
-    let dropped = for_each_udp_datagram(&mixed, MAX_UDP_PAYLOAD, |datagram| {
-        assert!(datagram.len() <= MAX_UDP_PAYLOAD);
-        kept.push(datagram.to_string());
-    });
+    let (kept, dropped) = pack_udp_datagrams(&format!("short:1|c\n{over}\nother:1|c"));
     assert_eq!(dropped, 1);
     let joined = kept.join("\n");
     assert!(joined.contains("short:1|c"));

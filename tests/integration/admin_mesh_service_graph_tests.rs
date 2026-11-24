@@ -57,7 +57,7 @@ fn generate_test_token(config: &TestConfig) -> String {
         "jti": uuid::Uuid::new_v4().to_string(),
     });
     let header = Header::new(jsonwebtoken::Algorithm::HS256);
-    let key = EncodingKey::from_secret(config.jwt_secret.as_bytes());
+    let key = EncodingKey::from_secret(config.jwt_secret.as_bytes()).unwrap();
     encode(&header, &claims, &key).unwrap()
 }
 
@@ -187,7 +187,7 @@ fn seed_service_graph_edge(source_principal: &str, destination_principal: &str) 
         proxy_name: Some("reviews".to_string()),
         response_status_code: 503,
         latency_total_ms: 7.5,
-        metadata,
+        metadata: metadata.into_iter().collect(),
         ..TransactionSummary::default()
     };
     let mesh_key = mesh_request_key(&summary);

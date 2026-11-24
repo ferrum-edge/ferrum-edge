@@ -816,7 +816,7 @@ async fn test_file_mode_reload_updates_and_deletes_runtime_resources() {
         .await
         .expect("spawn file backend b");
 
-    let initial_config = file_mode_resource_config(backend_a.port, "old-file-key");
+    let initial_config = file_mode_resource_config(backend_a.port, "old-file-key-0123456789");
     let gateway = TestGateway::builder()
         .mode_file(initial_config)
         .log_level("warn")
@@ -864,7 +864,7 @@ async fn test_file_mode_reload_updates_and_deletes_runtime_resources() {
     wait_for_server_with_key(
         &client,
         &gateway.proxy_url("/file-crud/check"),
-        Some("old-file-key"),
+        Some("old-file-key-0123456789"),
         "file-crud-a",
     )
     .await;
@@ -875,7 +875,7 @@ async fn test_file_mode_reload_updates_and_deletes_runtime_resources() {
         .expect("file-mode harness exposes config path");
     std::fs::write(
         config_path,
-        file_mode_resource_config(backend_b.port, "new-file-key"),
+        file_mode_resource_config(backend_b.port, "new-file-key-0123456789"),
     )
     .expect("rewrite file-mode config");
     send_sighup(&gateway);
@@ -883,14 +883,14 @@ async fn test_file_mode_reload_updates_and_deletes_runtime_resources() {
     wait_for_status_with_key(
         &client,
         &gateway.proxy_url("/file-crud/check"),
-        Some("old-file-key"),
+        Some("old-file-key-0123456789"),
         StatusCode::UNAUTHORIZED,
     )
     .await;
     wait_for_server_with_key(
         &client,
         &gateway.proxy_url("/file-crud/check"),
-        Some("new-file-key"),
+        Some("new-file-key-0123456789"),
         "file-crud-b",
     )
     .await;
@@ -901,7 +901,7 @@ async fn test_file_mode_reload_updates_and_deletes_runtime_resources() {
     wait_for_status_with_key(
         &client,
         &gateway.proxy_url("/file-crud/check"),
-        Some("new-file-key"),
+        Some("new-file-key-0123456789"),
         StatusCode::NOT_FOUND,
     )
     .await;
@@ -1081,7 +1081,7 @@ async fn run_admin_resource_crud_matrix(
     admin_put_json(
         &client,
         gateway,
-        &format!("/plugins/config/{plugin_id}"),
+        &format!("/plugins/config/{plugin_id}?expected_proxy_ids="),
         &auth,
         updated_plugin,
     )
@@ -1099,7 +1099,7 @@ async fn run_admin_resource_crud_matrix(
     admin_delete(
         &client,
         gateway,
-        &format!("/plugins/config/{plugin_id}"),
+        &format!("/plugins/config/{plugin_id}?expected_proxy_ids={proxy_id}"),
         &auth,
     )
     .await;
@@ -1848,7 +1848,7 @@ async fn run_available_plugin_config_crud(gateway: &TestGateway, backend_port: u
         admin_put_json(
             &client,
             gateway,
-            &format!("/plugins/config/{plugin_id}"),
+            &format!("/plugins/config/{plugin_id}?expected_proxy_ids="),
             &auth,
             update_body,
         )
@@ -1867,10 +1867,12 @@ async fn run_available_plugin_config_crud(gateway: &TestGateway, backend_port: u
     }
 
     for plugin_id in plugin_ids {
+        // The validator proxy ends up referencing catalog plugins (its spec
+        // attaches them), so name it as the expected referencing proxy.
         admin_delete(
             &client,
             gateway,
-            &format!("/plugins/config/{plugin_id}"),
+            &format!("/plugins/config/{plugin_id}?expected_proxy_ids={validator_proxy_id}"),
             &auth,
         )
         .await;
@@ -2251,7 +2253,7 @@ fn plugin_config_fixture(plugin_name: &str, dispatch_upstream_id: &str) -> Value
         }),
         "access_control" => json!({"allowed_consumers": ["testuser"]}),
         "tcp_connection_throttle" => json!({"max_connections_per_key": 10}),
-        "ip_restriction" => json!({"allow": ["0.0.0.0/0"], "mode": "allow_first"}),
+        "ip_restriction" => json!({"allow": ["0.0.0.0/0"]}),
         "correlation_id" => json!({"header_name": "x-request-id", "echo_downstream": true}),
         "request_transformer" => {
             json!({"rules": [{"operation": "add", "target": "header", "key": "x-test", "value": "1"}]})
@@ -2306,7 +2308,7 @@ fn plugin_config_fixture(plugin_name: &str, dispatch_upstream_id: &str) -> Value
                 "channels": ["ops"]
             }]
         }),
-        "otel_tracing" => json!({"endpoint": "http://localhost:4318/v1/traces"}),
+        "otel_tracing" => json!({"endpoint": "http://127.0.0.1:4318/v1/traces"}),
         "ai_request_guard" => json!({"max_messages": 100}),
         "ai_rate_limiter" => json!({"token_limit": 100000}),
         "ai_response_guard" => json!({"pii_patterns": ["ssn"], "action": "reject"}),
@@ -2322,7 +2324,7 @@ fn plugin_config_fixture(plugin_name: &str, dispatch_upstream_id: &str) -> Value
         }),
         "ai_transcript_audit" => json!({
             "sink": {
-                "endpoint_url": "http://localhost:9200/audit",
+                "endpoint_url": "http://127.0.0.1:9200/audit",
                 "allow_insecure_loopback": true
             }
         }),
@@ -2369,7 +2371,7 @@ fn plugin_config_fixture(plugin_name: &str, dispatch_upstream_id: &str) -> Value
         "udp_logging" => json!({"host": "127.0.0.1", "port": 9514}),
         "statsd_logging" => json!({"host": "127.0.0.1", "port": 8125}),
         "loki_logging" => json!({"endpoint_url": "http://localhost:3100/loki/api/v1/push"}),
-        "request_mirror" => json!({"mirror_host": "mirror.local"}),
+        "request_mirror" => json!({"allow_plaintext": true, "mirror_host": "mirror.local"}),
         "load_testing" => {
             json!({
                 "key": "test-load-key-0123456789abcdef!!",

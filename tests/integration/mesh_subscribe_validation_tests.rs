@@ -73,6 +73,7 @@ fn client_config_with_timings(
         labels: HashMap::new(),
         ambient_udp_source_scoping: false,
         node_waypoint_capture_scoping: false,
+        sidecar_http_routes: false,
         primary_retry_secs: 0,
         timings,
     }
@@ -410,6 +411,64 @@ fn apply_update_keeps_last_good_on_invalid_ext_authz_content() {
         MeshUpdateRejectReason::InvalidExtAuthzContent.as_metric_label()
     );
     assert!(!rejection.terminates_stream());
+    assert_eq!(
+        state
+            .snapshot()
+            .as_ref()
+            .as_ref()
+            .map(|slice| slice.version.as_str()),
+        Some("v-last-good"),
+        "last-good runtime state must remain untouched"
+    );
+}
+
+/// A CUSTOM policy carried only by the NodeWaypoint capture-destination
+/// AuthorizationPolicy inventory must bind a declared provider too — the same
+/// union the xDS recovery boundary checks. The frame is refused before install
+/// and last-good stays.
+#[test]
+fn apply_update_refuses_unbound_capture_inventory_custom_policy() {
+    let expected = expectation(None, None);
+    let slice = MeshSlice {
+        node_waypoint_capture_mesh_policies: vec![custom_policy("missing-provider")],
+        node_waypoint_capture_mesh_policies_resolved: true,
+        ext_authz_providers: vec![valid_ext_authz_provider("other-provider")],
+        ..bound_slice()
+    };
+    let rejection = validate_mesh_config_update(&update_for(&slice), &expected, NATIVE)
+        .expect_err("an unbound capture-inventory CUSTOM policy must be refused");
+    assert_eq!(
+        rejection.reason(),
+        MeshUpdateRejectReason::InvalidExtAuthzContent
+    );
+    assert!(!rejection.terminates_stream());
+
+    let bound = MeshSlice {
+        node_waypoint_capture_mesh_policies: vec![custom_policy("payments-authz")],
+        node_waypoint_capture_mesh_policies_resolved: true,
+        ext_authz_providers: vec![valid_ext_authz_provider("payments-authz")],
+        ..bound_slice()
+    };
+    validate_mesh_config_update(&update_for(&bound), &expected, NATIVE)
+        .expect("a bound capture-inventory CUSTOM policy is admitted");
+
+    let state = MeshRuntimeState::new();
+    let request = client_config(None, None).subscribe_request(ferrum_edge::FERRUM_VERSION);
+    let consumer = NativeMeshConfigConsumer::new(
+        state.clone(),
+        MeshUpdateExpectation::from_subscribe_request(&request),
+    );
+    state.install_slice(MeshSlice {
+        version: "v-last-good".to_string(),
+        ..bound_slice()
+    });
+    let bad = MeshSlice {
+        version: "v-unbound-capture-custom".to_string(),
+        ..slice
+    };
+    consumer
+        .apply_update(&update_for(&bad))
+        .expect_err("an unbound capture-inventory CUSTOM policy must not install");
     assert_eq!(
         state
             .snapshot()

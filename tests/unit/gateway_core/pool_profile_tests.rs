@@ -30,6 +30,19 @@ fn event_count(event: Event) -> u64 {
 }
 
 #[test]
+fn pool_profile_reports_allocator_installation_from_the_registered_flag() {
+    // This test executable links the library but registers no forwarding
+    // global allocator, so neither profile may claim allocator coverage
+    // (issue #7191: the pool profile used to report `!cfg!(windows)`).
+    assert!(!ferrum_edge::h1_profile::allocator_installed());
+    assert!(
+        profile::render_prometheus()
+            .lines()
+            .any(|line| line == "ferrum_pool_profile_allocator_installed 0")
+    );
+}
+
+#[test]
 fn pool_profile_nested_future_storage_has_only_fixed_overhead() {
     std::thread::spawn(|| {
         let before = profile::current_thread_counters();

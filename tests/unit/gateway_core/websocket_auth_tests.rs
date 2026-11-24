@@ -8,7 +8,7 @@ use ferrum_edge::config::types::{
 use ferrum_edge::plugins::{ProxyProtocol, RequestContext};
 use ferrum_edge::proxy::backend_dispatch::detect_http_flavor;
 use ferrum_edge::proxy::run_authentication_phase;
-use ferrum_edge::{ConsumerIndex, PluginCache, PluginCapabilities};
+use ferrum_edge::{ConsumerIndex, PluginCache};
 use http::Request;
 use serde_json::{Map, Value, json};
 
@@ -60,7 +60,6 @@ fn keyauth_proxy() -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
@@ -193,11 +192,6 @@ fn websocket_upgrade_uses_websocket_protocol_for_auth_plugin_lookup() {
     let auth_plugins = ws_view.auth_plugins();
     assert_eq!(auth_plugins.len(), 1);
     assert_eq!(auth_plugins[0].name(), "key_auth");
-    assert!(
-        ws_view
-            .capabilities()
-            .has(PluginCapabilities::HAS_AUTH_PLUGINS)
-    );
 
     let tcp_view = cache.request_view("ferrum", PROXY_ID, ProxyProtocol::Tcp);
     assert!(
@@ -229,7 +223,7 @@ async fn websocket_upgrade_without_api_key_rejects_before_backend() {
     assert_eq!(&body[..], br#"{"error":"Authentication required"}"#);
     assert_eq!(
         headers.get("WWW-Authenticate").map(String::as_str),
-        Some("ferrum-edge")
+        Some(r#"ApiKey realm="ferrum-edge""#)
     );
     assert!(ctx.identified_consumer.is_none());
     assert!(ctx.authenticated_identity.is_none());
@@ -257,7 +251,12 @@ async fn websocket_upgrade_with_invalid_api_key_preserves_plugin_reject() {
     let (status_code, body, headers) = result.expect("invalid key should reject");
     assert_eq!(status_code, 401);
     assert_eq!(&body[..], br#"{"error":"Invalid API key"}"#);
-    assert!(headers.is_empty());
+    // Issue #6774: the only header is the applicable `key_auth` challenge.
+    assert_eq!(headers.len(), 1, "{headers:?}");
+    assert_eq!(
+        headers.get("WWW-Authenticate").map(String::as_str),
+        Some(r#"ApiKey realm="ferrum-edge""#)
+    );
     assert!(ctx.identified_consumer.is_none());
     assert!(ctx.authenticated_identity.is_none());
     assert!(ctx.auth_method.is_none());

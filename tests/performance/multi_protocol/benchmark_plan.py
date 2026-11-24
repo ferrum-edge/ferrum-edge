@@ -192,6 +192,9 @@ def summarize(samples, expected_pairs):
     summary.pop("h3_experiment", None)
     summary.pop("pair", None)
     summary.pop("order_position", None)
+    # A sample's flags describe that sample; host_disturbance.py writes the
+    # summary's own once every pair is in.
+    summary.pop("host_disturbance", None)
     for field in ("total_requests", "total_errors", "total_bytes", "duration_secs",
                   "warmup_requests", "drain_requests", "drain_bytes"):
         summary[field] = sum(sample.get(field, 0) for sample in samples)

@@ -1369,6 +1369,29 @@ fn native_mtls_negative_control_contract_violations(run_sh: &str, helper: &str) 
     errors
 }
 
+/// Issue #7243: Sidecar identity narrowing is on by default, and the live
+/// Mesh E2E Sidecar suite is the gate that proves the default works on a real
+/// datapath. Its Sidecar-enforced data planes must therefore run with the
+/// DEFAULT, never with an explicit `FERRUM_MESH_SIDECAR_IDENTITY_NARROWING`
+/// override in either direction.
+#[test]
+fn live_contract_sidecar_suite_exercises_default_identity_narrowing() {
+    const RUN_SH: &str = include_str!("../k8s/mesh_e2e_sidecar/run.sh");
+    const MANIFESTS: &str = include_str!("../k8s/mesh_e2e_sidecar/manifests.yaml");
+
+    assert!(
+        MANIFESTS.contains("FERRUM_MESH_SIDECAR_ENFORCED"),
+        "the suite must keep Sidecar enforcement on, or identity narrowing never runs"
+    );
+    for (name, text) in [("manifests.yaml", MANIFESTS), ("run.sh", RUN_SH)] {
+        assert!(
+            !text.contains("FERRUM_MESH_SIDECAR_IDENTITY_NARROWING"),
+            "{name} must not override FERRUM_MESH_SIDECAR_IDENTITY_NARROWING; the live \
+             suite has to exercise the default"
+        );
+    }
+}
+
 /// Issue #3855 hosted Mesh E2E Sidecar: omit-client, foreign-client, and
 /// invalid-JWT were classified `connected-without-jwt-class` from the client
 /// `Connected to CP` line even though ferrum-cp had already rejected each
@@ -2403,8 +2426,21 @@ fn live_contract_multicluster_release_gate_requires_exactly_the_enforced_rows() 
         .expect("multicluster-federation-live.yml must declare a `gate` job");
     let gate_body = &WORKFLOW[gate_start..];
 
+    // Any full-commit pin: which upstream release it names is governed by the
+    // trusted action pin rotation check (docs/dependency-policy.md →
+    // "Automated action pin rotation").
+    let download_pin = gate_body
+        .split("uses: actions/download-artifact@")
+        .nth(1)
+        .map(|rest| rest.chars().take_while(char::is_ascii_hexdigit).count());
+    assert_eq!(
+        download_pin,
+        Some(40),
+        "the multicluster live release gate must download the published artifact with a \
+         full-commit-pinned `actions/download-artifact`"
+    );
+
     for pinned in [
-        "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
         "name: multicluster-federation-results",
         "python3 .github/scripts/validate_live_assertions.py --self-test",
         "--artifact multicluster-federation-artifact/live-assertions.json",

@@ -61,7 +61,7 @@ fn bench_ip_restriction(c: &mut Criterion) {
             .last()
             .expect("benchmark fixture must have a final rule")
             .clone();
-        let deny_config = json!({"deny": rules, "mode": "deny_first"});
+        let deny_config = json!({"deny": rules});
         let allow_config = json!({"allow": deny_config["deny"].clone()});
 
         for instance_count in [1usize, 4] {

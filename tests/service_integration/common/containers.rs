@@ -203,6 +203,24 @@ pub const LDAP_ADMIN_PASSWORD: &str = "adminpassword";
 /// Plaintext LDAP port inside the container.
 const LDAP_CONTAINER_PORT: u16 = 389;
 
+/// Marker the `osixia/openldap` image touches once its first-boot bootstrap is
+/// complete (`$CONTAINER_STATE_DIR/slapd-first-start-done` in the image's
+/// `service/slapd/startup.sh`).
+///
+/// The bootstrap runs a temporary `slapd -h "ldap:/// ldapi:///"` that answers
+/// on the same port as the final server, lets clients add and read entries,
+/// and is then stopped with SIGTERM before the final slapd is exec'd. Anything
+/// that talks to the directory before this marker exists is racing that
+/// restart: a bind in flight when the bootstrap slapd exits, or a dial in the
+/// gap before the final slapd listens, sees the connection closed under it
+/// (`ldap3`: "result recv error: channel closed").
+const OPENLDAP_FIRST_START_DONE_MARKER: &str = "/container/run/state/slapd-first-start-done";
+/// Upper bound on waiting for the first-boot bootstrap (TLS material
+/// generation, schema/config load, bootstrap slapd shutdown).
+const OPENLDAP_BOOTSTRAP_WAIT: Duration = Duration::from_secs(90);
+/// Poll interval while waiting for the bootstrap marker.
+const OPENLDAP_BOOTSTRAP_POLL: Duration = Duration::from_millis(500);
+
 /// A running OpenLDAP server.
 pub struct OpenLdapContainer {
     _container: ContainerAsync<GenericImage>,
@@ -222,10 +240,11 @@ pub async fn start_openldap_container() -> Result<OpenLdapContainer, BoxError> {
             GenericImage::new("osixia/openldap", "1.5.0")
                 .with_exposed_port(LDAP_CONTAINER_PORT.tcp())
                 .with_mapped_port(host_port, LDAP_CONTAINER_PORT.tcp())
-                // Readiness is confirmed by `seed_ldif`, which retries `ldapadd` until
-                // the final slapd is answering on TCP — so we do not have to match a
-                // startup log line/stream or race the first-boot bootstrap (which only
-                // serves the bootstrap directory over a private socket).
+                // Readiness is confirmed by `seed_ldif`, which first waits for the
+                // image's first-boot bootstrap to finish and then retries `ldapadd`
+                // until the final slapd is answering. The bootstrap slapd listens on
+                // `ldap:///` too, so a TCP/LDAP answer alone does not prove the final
+                // server is up (see `OPENLDAP_FIRST_START_DONE_MARKER`).
                 .with_env_var("LDAP_ORGANISATION", "Ferrum Test")
                 .with_env_var("LDAP_DOMAIN", "example.org")
                 .with_env_var("LDAP_ADMIN_PASSWORD", LDAP_ADMIN_PASSWORD)
@@ -259,9 +278,11 @@ impl OpenLdapContainer {
              -D '{LDAP_ADMIN_DN}' -w '{LDAP_ADMIN_PASSWORD}'"
         );
 
-        // Give the first-boot bootstrap a moment to hand off to the final slapd
-        // before the first attempt; the retry loop covers the rest.
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        // Never seed (or let a test authenticate) against the temporary
+        // bootstrap slapd: it is stopped and replaced once bootstrap finishes.
+        // After the marker exists only the final slapd can answer, and the
+        // retry loop below covers the short gap before it starts listening.
+        self.wait_for_bootstrap_complete().await?;
 
         let mut last = String::new();
         for _ in 0..40 {
@@ -294,6 +315,28 @@ impl OpenLdapContainer {
             .into());
         }
         Err(format!("ldapadd never succeeded; last output: {last}").into())
+    }
+
+    /// Wait until the image's first-boot bootstrap has stopped its temporary
+    /// slapd (see [`OPENLDAP_FIRST_START_DONE_MARKER`]).
+    async fn wait_for_bootstrap_complete(&self) -> Result<(), BoxError> {
+        let script = format!("test -e {OPENLDAP_FIRST_START_DONE_MARKER}");
+        let started = Instant::now();
+        loop {
+            let out = self.exec_sh(&script).await?;
+            if out.exit_code == Some(0) {
+                return Ok(());
+            }
+            if started.elapsed() >= OPENLDAP_BOOTSTRAP_WAIT {
+                return Err(format!(
+                    "OpenLDAP first-boot bootstrap did not finish within {:.0}s \
+                     ({OPENLDAP_FIRST_START_DONE_MARKER} never appeared)",
+                    OPENLDAP_BOOTSTRAP_WAIT.as_secs_f64()
+                )
+                .into());
+            }
+            tokio::time::sleep(OPENLDAP_BOOTSTRAP_POLL).await;
+        }
     }
 
     async fn exec_sh(&self, script: &str) -> Result<ExecOutput, BoxError> {

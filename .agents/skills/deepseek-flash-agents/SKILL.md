@@ -6,7 +6,7 @@ description: Dispatch and orchestrate local opencode DeepSeek V4 Flash agents vi
 # DeepSeek V4 Flash agents
 
 Act as the orchestrator. Treat local opencode processes running
-`alibaba-token-plan/deepseek-v4-flash-0731` as implementation workers. Own task decomposition,
+`alibaba-token-plan/deepseek-v4.1-flash-1017` as implementation workers. Own task decomposition,
 worktree isolation, liveness, independent diff review, and the final merge recommendation. Require
 each worker to carry its assigned scope through the stopping point in the prompt. Never accept a
 worker's report without checking the repository and GitHub state yourself.
@@ -18,9 +18,9 @@ reasoning rather than mechanical edits.
 
 **Guard: do not use this skill when you are yourself a dispatched worker.** If the session prompt
 references this skill's `agent-brief.md` or `continuation-brief.md`, says "YOU are the implementer,"
-or assigns an existing worktree and findings to fix, implement directly in the current session.
-Do not recursively dispatch another DeepSeek V4 Flash, opencode, Grok, Sol, Opus, Fable, or Composer
-worker. The orchestrator selected this session's model deliberately.
+or assigns an existing worktree and findings to fix, implement directly in the current session. Do
+not recursively dispatch another DeepSeek V4 Flash, opencode, Sol, or Opus worker. The orchestrator
+selected this session's model deliberately.
 
 ## Remote CI validation
 
@@ -52,7 +52,7 @@ prompt, including continuation prompts and any permitted nested delegation.
    - `~/.opencode/bin/opencode`, `/opt/homebrew/bin/opencode`, `/usr/local/bin/opencode`,
    - `opencode` on `PATH`.
 3. Confirm the model resolves: `<opencode> models` must list
-   `alibaba-token-plan/deepseek-v4-flash-0731`.
+   `alibaba-token-plan/deepseek-v4.1-flash-1017`.
    The model is served by the `alibaba-token-plan` provider block in the operator's
    `opencode.json`. Stop and report the exact error if the model list or a run is rejected.
 4. Confirm the credential. That provider block resolves
@@ -61,13 +61,13 @@ prompt, including continuation prompts and any permitted nested delegation.
    set `ALIBABA_TOKEN_PLAN_API_KEY_FILE` to a readable absolute path holding it, before
    dispatching. The launcher fails closed on a missing key rather than letting opencode surface a
    bare `No API-key provided` mid-run. Never echo, log, or commit the key.
-5. Use the pinned model `alibaba-token-plan/deepseek-v4-flash-0731`. This is a **hard pin**:
+5. Use the pinned model `alibaba-token-plan/deepseek-v4.1-flash-1017`. This is a **hard pin**:
    the launcher refuses `--model` (exit 2) unless it names exactly that model, so no other
    DeepSeek variant and no rolling alias is dispatchable from this skill. Do not substitute
    a different provider or model.
 6. The pin is the **dated snapshot**, not the rolling `deepseek-v4-flash` alias. On the Singapore
    token plan the rolling alias returns `Access to model denied` on every attempt while
-   `-0731` serves normally, so the snapshot is the only working flash tier today. If the rolling
+   `-1017` serves normally, so the snapshot is the only working flash tier today. If the rolling
    alias is later entitled, re-pin here and in `scripts/dispatch-agent.sh` together and re-validate
    before claiming it works.
 
@@ -107,7 +107,7 @@ one long-lived execution session:
 this provider exposes no documented effort tiers. Do not claim an effort level was applied.
 
 The launcher resolves the opencode binary, verifies the credential, verifies the worktree root,
-pins `alibaba-token-plan/deepseek-v4-flash-0731` on the write-enabled `build` agent, and runs
+pins `alibaba-token-plan/deepseek-v4.1-flash-1017` on the write-enabled `build` agent, and runs
 `opencode run --auto` with the prompt fed on stdin. Delete the temporary prompt after the worker
 exits.
 
@@ -122,15 +122,14 @@ the user sets a lower limit.
 Every prompt must contain this role instruction even though the briefs repeat it:
 
 ```text
-YOU are the implementer. Complete every task and validation the controller assigns before ending.
-Do not stop at analysis, partial implementation, or a handoff for someone else to finish. Perform
+YOU are the implementer. Complete every task and validation the controller assigns before ending. Do
+not stop at analysis, partial implementation, or a handoff for someone else to finish. Perform
 commit, push, PR, review, and CI actions only when the prompt assigns them. Do not request or wait
 for a separate review-bot pass unless explicitly assigned. After the final requested push and
 report, exit; the controller owns post-push CI and review monitoring. Do not invoke agent-dispatch
-skills or scripts (including astra-agents, sol-agents, luna-agents, opus-agents, fable-5-1-agents,
-grok-agents, composer-agents, qwen-agents, deepseek-pro-agents, deepseek-flash-agents,
-opencode-agents, or any .agents/skills/*/scripts/dispatch-agent.sh), and do not spawn nested
-workers.
+skills or scripts (including astra-agents, sol-agents, opus-agents, muse-agents, qwen-agents,
+deepseek-flash-agents, antigravity-neon-agents, or any .agents/skills/*/scripts/dispatch-agent.sh),
+and do not spawn nested workers.
 ```
 
 This prevents a worker from replacing the selected model through nested delegation.
@@ -202,4 +201,4 @@ Never put credentials, tokens, cookies, or secrets in prompts or worker logs.
 - An explicitly requested review receives no response: verify the trigger, bot identity,
   availability, and head SHA before posting another trigger.
 - Model mismatch: stop the worker, record the exact diagnostic, correct the launch contract, and
-  relaunch. Never claim `alibaba-token-plan/deepseek-v4-flash-0731` without launch evidence.
+  relaunch. Never claim `alibaba-token-plan/deepseek-v4.1-flash-1017` without launch evidence.

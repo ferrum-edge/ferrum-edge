@@ -15,17 +15,18 @@ use ferrum_edge::_test_support::{
     response_caching_shard_amount_for_test, response_caching_size_accounting_snapshot_for_test,
     response_caching_staging_metadata_key_for_test, response_caching_vary_index_snapshot_for_test,
     retry_response_decision_context_for_test, run_after_proxy_hooks_for_test,
-    run_after_proxy_hooks_reject_for_test, set_replay_credential_headers_for_test,
-    set_replay_request_body_empty_proven_for_test, set_request_wire_protocol_for_test,
+    run_after_proxy_hooks_reject_for_test, set_replay_request_body_empty_proven_for_test,
+    set_request_headers_to_redact_for_test, set_request_wire_protocol_for_test,
     set_response_presentation_policy_digest_for_test, stamp_original_response_metadata_for_test,
 };
 use ferrum_edge::config::types::{Consumer, HttpWireTransport};
 use ferrum_edge::plugins::correlation_id::CorrelationId;
+use ferrum_edge::plugins::rate_limiting::RateLimiting;
 use ferrum_edge::plugins::response_caching::{RESPONSE_CACHING_CONFIG_KEYS, ResponseCaching};
 use ferrum_edge::plugins::response_size_limiting::ResponseSizeLimiting;
 use ferrum_edge::plugins::{
-    Plugin, PluginFailurePolicy, PluginResult, RequestContext, plugin_failure_policy,
-    validate_plugin_config,
+    Plugin, PluginFailurePolicy, PluginHttpClient, PluginResult, RequestContext,
+    plugin_failure_policy, validate_plugin_config,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -339,6 +340,19 @@ fn test_zero_cache_size_config_rejected() {
 }
 
 #[test]
+fn test_max_entries_has_a_hard_admission_ceiling() {
+    // Issue #6612: a huge integer used to reach a capacity preallocation and
+    // could abort the process during a reload instead of failing validation.
+    assert!(ResponseCaching::new(&json!({"max_entries": 10_000_000})).is_ok());
+    for value in [10_000_001_u64, u64::MAX / 4, u64::MAX] {
+        let err = ResponseCaching::new(&json!({"max_entries": value}))
+            .err()
+            .unwrap_or_else(|| panic!("max_entries={value} must be rejected"));
+        assert!(err.contains("max_entries"), "got: {err}");
+    }
+}
+
+#[test]
 fn test_unknown_root_keys_are_rejected_with_path_qualified_suggestions() {
     assert_eq!(
         plugin_failure_policy("response_caching"),
@@ -347,9 +361,8 @@ fn test_unknown_root_keys_are_rejected_with_path_qualified_suggestions() {
 
     let typos = [
         ("vary_by_headers", "vary_by_header"),
+        ("ignore_request_headers", "ignore_request_header"),
         ("anonymous_caller_scope", "anonymous_caller_scop"),
-        ("cache_key_include_consumer", "cache_key_include_consumr"),
-        ("cache_key_include_query", "cache_key_include_quer"),
         ("respect_cache_control", "respect_cache_contro"),
         ("respect_no_cache", "respect_no_cach"),
         ("cacheable_status_codes", "cacheable_status_code"),
@@ -435,6 +448,23 @@ fn test_multiple_unknown_root_keys_are_sorted_and_path_qualified() {
     );
 }
 
+/// The legacy key toggles only salted the key digest; they are unknown keys
+/// now (issue #7114).
+#[test]
+fn test_legacy_cache_key_toggles_are_unknown_keys() {
+    for key in ["cache_key_include_query", "cache_key_include_consumer"] {
+        let mut config = json!({});
+        config[key] = json!(true);
+        let error = ResponseCaching::new(&config)
+            .err()
+            .unwrap_or_else(|| panic!("`{key}` must be rejected"));
+        assert!(
+            error.contains("unknown configuration key"),
+            "{key}: {error}"
+        );
+    }
+}
+
 #[test]
 fn test_recognized_field_null_and_type_behavior_is_preserved() {
     ResponseCaching::new(&json!({
@@ -444,8 +474,6 @@ fn test_recognized_field_null_and_type_behavior_is_preserved() {
         "max_total_size_bytes": null,
         "respect_cache_control": null,
         "respect_no_cache": null,
-        "cache_key_include_query": null,
-        "cache_key_include_consumer": null,
         "add_cache_status_header": null,
         "invalidate_on_unsafe_methods": null
     }))
@@ -2175,6 +2203,142 @@ async fn test_vary_wildcard_not_cached() {
     assert!(matches!(result, PluginResult::Continue));
 }
 
+/// A plugin-written response header map is not guaranteed to carry canonical
+/// lowercase keys (issue #7148): `Vary`, `ETag` and `Last-Modified` are read
+/// case-insensitively like every other header the store path consults.
+#[tokio::test]
+async fn test_mixed_case_vary_wildcard_not_cached() {
+    let plugin = default_plugin();
+    let mut response_headers = HashMap::new();
+    response_headers.insert("cache-control".to_string(), "max-age=60".to_string());
+    cache_response(
+        &plugin,
+        "GET",
+        "/api/control",
+        200,
+        &response_headers,
+        b"ok",
+    )
+    .await;
+    response_headers.insert("Vary".to_string(), "*".to_string());
+    cache_response(
+        &plugin,
+        "GET",
+        "/api/data",
+        200,
+        &response_headers,
+        b"volatile",
+    )
+    .await;
+
+    let mut ctx = make_ctx("GET", "/api/control");
+    let mut headers = HashMap::new();
+    assert!(
+        is_reject(&plugin.before_proxy(&mut ctx, &mut headers).await),
+        "the same response without Vary is stored"
+    );
+    let mut ctx = make_ctx("GET", "/api/data");
+    let mut headers = HashMap::new();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn test_mixed_case_vary_keys_variants_and_replaces_the_original_key() {
+    let plugin = default_plugin();
+    let path = "/api/mixed-case-vary";
+
+    let mut gzip_ctx = make_ctx("GET", path);
+    gzip_ctx
+        .headers
+        .insert("accept-encoding".to_string(), "gzip".to_string());
+    let mut gzip_headers = HashMap::new();
+    gzip_headers.insert("accept-encoding".to_string(), "gzip".to_string());
+    assert!(matches!(
+        plugin.before_proxy(&mut gzip_ctx, &mut gzip_headers).await,
+        PluginResult::Continue
+    ));
+    let mut response_headers = HashMap::new();
+    response_headers.insert("cache-control".to_string(), "max-age=60".to_string());
+    response_headers.insert("Vary".to_string(), "Accept-Encoding".to_string());
+    plugin
+        .after_proxy(&mut gzip_ctx, 200, &mut response_headers)
+        .await;
+    let vary_keys: Vec<&String> = response_headers
+        .keys()
+        .filter(|name| name.eq_ignore_ascii_case("vary"))
+        .collect();
+    assert_eq!(vary_keys, vec!["vary"], "one merged Vary on the miss");
+    assert!(
+        response_headers["vary"].contains("accept-encoding"),
+        "the origin dimension is kept: {}",
+        response_headers["vary"]
+    );
+    plugin
+        .on_final_response_body(&mut gzip_ctx, 200, &response_headers, b"gzip")
+        .await;
+
+    let mut plain_ctx = make_ctx("GET", path);
+    let mut plain_headers = HashMap::new();
+    assert!(
+        matches!(
+            plugin
+                .before_proxy(&mut plain_ctx, &mut plain_headers)
+                .await,
+            PluginResult::Continue
+        ),
+        "a request without the varied header must not reuse the gzip variant"
+    );
+
+    let mut hit_ctx = make_ctx("GET", path);
+    hit_ctx
+        .headers
+        .insert("accept-encoding".to_string(), "gzip".to_string());
+    let mut hit_headers = HashMap::new();
+    hit_headers.insert("accept-encoding".to_string(), "gzip".to_string());
+    let (status_code, body, headers) =
+        expect_reject(plugin.before_proxy(&mut hit_ctx, &mut hit_headers).await);
+    assert_eq!(status_code, 200);
+    assert_eq!(body, b"gzip");
+    let vary_keys: Vec<&String> = headers
+        .keys()
+        .filter(|name| name.eq_ignore_ascii_case("vary"))
+        .collect();
+    assert_eq!(vary_keys, vec!["vary"], "one merged Vary on the hit");
+}
+
+#[tokio::test]
+async fn test_mixed_case_etag_answers_conditional_hit() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = default_plugin();
+    let mut response_headers = HashMap::new();
+    response_headers.insert("ETag".to_string(), r#""mixed-7148""#.to_string());
+    response_headers.insert("cache-control".to_string(), "max-age=60".to_string());
+    cache_response(
+        &plugin,
+        "GET",
+        "/api/etag",
+        200,
+        &response_headers,
+        b"cached-body",
+    )
+    .await;
+
+    let mut ctx = make_ctx("GET", "/api/etag");
+    ctx.headers
+        .insert("if-none-match".to_string(), r#""mixed-7148""#.to_string());
+    let mut headers = HashMap::new();
+    headers.insert("if-none-match".to_string(), r#""mixed-7148""#.to_string());
+    let (status_code, body, headers) =
+        expect_reject(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status_code, 304);
+    assert!(body.is_empty());
+    assert_eq!(
+        headers.get("etag").map(String::as_str),
+        Some(r#""mixed-7148""#)
+    );
+}
+
 #[tokio::test]
 async fn test_stale_on_arrival_does_not_evict_other_vary_variants() {
     let plugin = default_plugin();
@@ -3201,13 +3365,10 @@ async fn test_x_cache_status_disabled() {
 
 #[tokio::test]
 async fn test_consumer_keyed_caching() {
-    let plugin = plugin_with_config(json!({
-        "cache_key_include_consumer": true
-    }));
+    let plugin = default_plugin();
 
-    // Authenticated principals require RFC 9111 §3.5 shared-cache opt-in.
-    // `cache_key_include_consumer` only partitions keys; it cannot authorize
-    // storage (see `test_consumer_key_partition_does_not_override_shared_cache_admission`).
+    // Authenticated principals require RFC 9111 §3.5 shared-cache opt-in;
+    // the caller partition isolates keys but does not authorize storage.
     let mut public_response = HashMap::new();
     public_response.insert(
         "cache-control".to_string(),
@@ -3242,9 +3403,7 @@ async fn test_consumer_keyed_caching() {
 
 #[tokio::test]
 async fn test_consumer_keyed_caching_uses_authenticated_identity_fallback() {
-    let plugin = plugin_with_config(json!({
-        "cache_key_include_consumer": true
-    }));
+    let plugin = default_plugin();
 
     let mut public_response = HashMap::new();
     public_response.insert(
@@ -3316,10 +3475,8 @@ async fn test_different_raw_queries_different_cache() {
 // === Complete backend-visible query partition ===
 
 #[tokio::test]
-async fn legacy_query_toggle_cannot_exclude_backend_visible_query() {
-    let plugin = plugin_with_config(json!({
-        "cache_key_include_query": false
-    }));
+async fn backend_visible_query_is_always_bound() {
+    let plugin = default_plugin();
 
     // Cache with ?page=1
     let mut ctx1 = make_ctx_with_query("GET", "/api/items", &[("page", "1")]);
@@ -3332,15 +3489,14 @@ async fn legacy_query_toggle_cannot_exclude_backend_visible_query() {
         .on_final_response_body(&mut ctx1, 200, &rh, b"same-data")
         .await;
 
-    // The legacy toggle still rotates the keyspace, but it cannot authorize
-    // cross-query replay when the origin receives and may vary on the query.
+    // The origin receives, and may vary on, the query: no replay across it.
     let mut ctx2 = make_ctx_with_query("GET", "/api/items", &[("page", "2")]);
     ctx2.matched_proxy = Some(std::sync::Arc::new(create_test_proxy()));
     let mut h2 = HashMap::new();
     let result = plugin.before_proxy(&mut ctx2, &mut h2).await;
     assert!(
         matches!(result, PluginResult::Continue),
-        "a different backend-visible query must miss even when the legacy flag is false"
+        "a different backend-visible query must miss"
     );
 }
 
@@ -4068,27 +4224,30 @@ fn test_parse_http_date_accepts_all_rfc9110_formats() {
 /// saturating subtraction floors at 0 instead.
 #[test]
 fn test_sub_total_size_saturates_instead_of_wrapping() {
-    use ferrum_edge::_test_support::response_caching_sub_total_size as sub;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use ferrum_edge::_test_support::{
+        response_caching_adjust_total_size_for_test as adjust,
+        response_caching_current_total_size_for_test as total,
+    };
 
-    let total = AtomicUsize::new(100);
+    let plugin = default_plugin();
+    adjust(&plugin, 100, 0);
+    assert_eq!(total(&plugin), 100);
 
     // Subtracting more than the current total must floor at 0, not wrap.
-    sub(&total, 250);
+    adjust(&plugin, 0, 250);
     assert_eq!(
-        total.load(Ordering::Relaxed),
+        total(&plugin),
         0,
         "underflow must saturate at 0, not wrap to usize::MAX"
     );
 
     // Subtracting from 0 stays at 0.
-    sub(&total, 10);
-    assert_eq!(total.load(Ordering::Relaxed), 0);
+    adjust(&plugin, 0, 10);
+    assert_eq!(total(&plugin), 0);
 
     // Normal subtraction still works.
-    total.store(100, Ordering::Relaxed);
-    sub(&total, 40);
-    assert_eq!(total.load(Ordering::Relaxed), 60);
+    adjust(&plugin, 100, 40);
+    assert_eq!(total(&plugin), 60);
 }
 
 /// Finding #62: under many concurrent stores plus interleaved invalidations
@@ -4242,8 +4401,6 @@ fn public_response_headers() -> HashMap<String, String> {
 async fn run_two_instance_store_isolation(a_first: bool) {
     let query_instance = plugin_with_config(json!({
         "ttl_seconds": 60,
-        "cache_key_include_query": true,
-        "cache_key_include_consumer": false,
         "vary_by_headers": [],
         "cacheable_methods": ["GET", "HEAD"],
         "cacheable_status_codes": [200],
@@ -4251,8 +4408,6 @@ async fn run_two_instance_store_isolation(a_first: bool) {
     }));
     let consumer_vary_instance = plugin_with_config(json!({
         "ttl_seconds": 60,
-        "cache_key_include_query": false,
-        "cache_key_include_consumer": true,
         "vary_by_headers": ["x-tenant"],
         "cacheable_methods": ["GET", "HEAD"],
         "cacheable_status_codes": [200, 404],
@@ -4299,9 +4454,11 @@ async fn run_two_instance_store_isolation(a_first: bool) {
         .get(&staging_key(second, "cache_base_key"))
         .cloned()
         .expect("second instance staged base key");
-    assert_ne!(
+    // The base key binds only the request and caller partitions, not instance
+    // config; each instance's staging namespace (below) keeps them apart.
+    assert_eq!(
         first_base, second_base,
-        "distinct query/consumer/Vary policies must stage independent base keys"
+        "the same request stages the same base key under each instance's namespace"
     );
     assert_ne!(
         staging_key(first, "cache_status"),
@@ -4651,8 +4808,7 @@ async fn reload_generations_do_not_share_staging_namespaces() {
     let _policy_guard = response_cache_replay_policy_guard();
     let generation_one = plugin_with_config(json!({
         "ttl_seconds": 60,
-        "vary_by_headers": ["x-tenant"],
-        "cache_key_include_query": true
+        "vary_by_headers": ["x-tenant"]
     }));
     let mut ctx = make_ctx_with_raw_query("GET", "/reload", "v=1");
     ctx.headers
@@ -4677,7 +4833,6 @@ async fn reload_generations_do_not_share_staging_namespaces() {
     let generation_two = plugin_with_config(json!({
         "ttl_seconds": 120,
         "vary_by_headers": ["x-tenant"],
-        "cache_key_include_query": false,
         "cacheable_status_codes": [200, 404]
     }));
     assert_ne!(
@@ -5176,35 +5331,6 @@ async fn test_backend_authenticated_bearer_stored_with_explicit_optin() {
     }
 }
 
-/// A local key-partition option cannot replace the origin's explicit
-/// shared-cache permission. Otherwise backend-side revocation remains masked
-/// for the entry lifetime even though credentials do not cross cache keys.
-#[tokio::test]
-async fn test_consumer_key_partition_does_not_override_shared_cache_admission() {
-    let plugin = plugin_with_config(json!({ "cache_key_include_consumer": true }));
-    let request = advisory_headers(&[("authorization", "Bearer backend-validated")]);
-    let response = advisory_headers(&[("cache-control", "max-age=300")]);
-
-    advisory_miss_cycle(
-        &plugin,
-        "/api/consumer-key-partition",
-        &request,
-        200,
-        &response,
-        b"isolated",
-    )
-    .await;
-
-    assert!(
-        response_caching_cache_keys_for_test(&plugin).is_empty(),
-        "cache_key_include_consumer only changes key partitioning and must not authorize storage"
-    );
-    assert!(matches!(
-        advisory_lookup(&plugin, "/api/consumer-key-partition", &request).await,
-        PluginResult::Continue
-    ));
-}
-
 /// The gate reads the same live/restored header view the cache key comes from,
 /// so a request-side transformer cannot move a credentialed request across the
 /// boundary in either direction.
@@ -5461,14 +5587,16 @@ async fn test_rate_limit_fields_are_not_retained() {
 /// implement cannot be configured as cacheable.
 #[test]
 fn test_unsupported_cacheable_status_codes_rejected() {
-    for status in [100, 101, 199, 206, 304] {
+    // 401 / 407 (PR #6830): only valid with an authentication challenge the
+    // shared cache cannot retain, so a stored copy would be challenge-less.
+    for status in [100, 101, 199, 206, 304, 401, 407] {
         let err = ResponseCaching::new(&json!({ "cacheable_status_codes": [200, status] }))
             .err()
             .unwrap_or_else(|| panic!("status {status} must not be configurable as cacheable"));
         assert!(err.contains("cacheable_status_codes[1]"), "got: {err}");
     }
 
-    for status in [200, 203, 204, 300, 301, 308, 404, 410, 500] {
+    for status in [200, 203, 204, 300, 301, 308, 403, 404, 410, 500] {
         ResponseCaching::new(&json!({ "cacheable_status_codes": [status] }))
             .unwrap_or_else(|error| panic!("status {status} must stay configurable: {error}"));
     }
@@ -6217,12 +6345,11 @@ async fn test_forged_public_backend_status_metadata_cannot_force_invalidation() 
 async fn test_sibling_instances_do_not_consume_each_others_pending_invalidation() {
     let _policy_guard = response_cache_replay_policy_guard();
     let instance_a = plugin_with_config(json!({
-        "invalidate_on_unsafe_methods": true,
-        "cache_key_include_query": true
+        "invalidate_on_unsafe_methods": true
     }));
     let instance_b = plugin_with_config(json!({
         "invalidate_on_unsafe_methods": true,
-        "cache_key_include_query": false
+        "ttl_seconds": 120
     }));
     assert_ne!(
         response_caching_instance_id_for_test(&instance_a),
@@ -6551,7 +6678,7 @@ fn ctx_with_stripped_custom_credential(token: &str) -> RequestContext {
     );
     ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
     ctx.authenticated_identity = Some("alice@example.com".to_string());
-    set_replay_credential_headers_for_test(&mut ctx, vec!["x-tenant-jwt".to_string()]);
+    set_request_headers_to_redact_for_test(&mut ctx, vec!["x-tenant-jwt".to_string()]);
     let mut raw = http::HeaderMap::new();
     raw.insert(
         "x-tenant-jwt",
@@ -6600,14 +6727,12 @@ fn ctx_with_query_credential(token: &str) -> RequestContext {
     ctx
 }
 
-/// Query exclusion is an origin-cache policy, not permission to erase an
-/// authentication credential from the mandatory caller partition.
+/// A query credential is bound into the mandatory caller partition.
 #[tokio::test]
-async fn replay_partition_binds_query_credentials_when_cache_key_excludes_query() {
+async fn replay_partition_binds_query_credentials() {
     let _policy_guard = response_cache_replay_policy_guard();
     let plugin = plugin_with_config(json!({
-        "ttl_seconds": 60,
-        "cache_key_include_query": false
+        "ttl_seconds": 60
     }));
 
     let mut narrow = ctx_with_query_credential("scope-read-only");
@@ -6845,8 +6970,7 @@ async fn replay_partition_binds_vary_by_headers_the_backend_never_nominates() {
 async fn replay_partition_binds_effective_transformed_query() {
     let _policy_guard = response_cache_replay_policy_guard();
     let plugin = plugin_with_config(json!({
-        "ttl_seconds": 60,
-        "cache_key_include_query": false
+        "ttl_seconds": 60
     }));
 
     let mut tenant_a = make_ctx_with_raw_query("GET", "/reports", "tenant=wire");
@@ -8711,6 +8835,347 @@ async fn generated_correlation_omit_is_identical_on_h1_h2_h3() {
     }
 }
 
+// === Forwarded `rate_limiting` telemetry is not a cache dimension ===
+//
+// `rate_limiting` (2900) with `expose_headers: true` writes the caller's
+// current `x-ratelimit-*` budget into the backend request before
+// `response_caching` (3500) builds its key. `x-ratelimit-remaining` changes on
+// every admitted request, so binding it made every entry unreachable for the
+// caller that stored it, contradicting the documented cache-HIT decoration.
+
+fn exposing_rate_limiter(expose_headers: bool) -> RateLimiting {
+    RateLimiting::new(
+        &json!({
+            "limit_by": "ip",
+            "expose_headers": expose_headers,
+            "limits": [{"scope": "default", "window_seconds": 60, "max_requests": 100}]
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap()
+}
+
+/// Charge the limiter and return the backend-visible header map exactly as
+/// its `before_proxy` leaves it for the later cache hook.
+async fn apply_rate_limit(
+    limiter: &RateLimiting,
+    ctx: &mut RequestContext,
+) -> HashMap<String, String> {
+    assert!(matches!(
+        limiter.on_request_received(ctx).await,
+        PluginResult::Continue
+    ));
+    let mut headers = ctx.headers.clone();
+    assert!(matches!(
+        limiter.before_proxy(ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    headers
+}
+
+#[tokio::test]
+async fn forwarded_rate_limit_telemetry_is_omitted_from_the_cache_key() {
+    let _guard = response_cache_replay_policy_guard();
+    let limiter = exposing_rate_limiter(true);
+    let cache = default_plugin();
+
+    let mut miss_ctx = make_ctx("GET", "/p/rl-cache");
+    let mut miss_headers = apply_rate_limit(&limiter, &mut miss_ctx).await;
+    assert_eq!(
+        miss_headers
+            .get("x-ratelimit-remaining")
+            .map(String::as_str),
+        Some("99")
+    );
+    store_public_entry(&cache, &mut miss_ctx, &mut miss_headers, b"rl-body").await;
+    assert_status(&cache, &miss_ctx, "MISS");
+
+    let mut hit_ctx = make_ctx("GET", "/p/rl-cache");
+    let mut hit_headers = apply_rate_limit(&limiter, &mut hit_ctx).await;
+    assert_eq!(
+        hit_headers.get("x-ratelimit-remaining").map(String::as_str),
+        Some("98"),
+        "the second request forwards a different budget"
+    );
+    let (status, body, mut response_headers) =
+        expect_reject(cache.before_proxy(&mut hit_ctx, &mut hit_headers).await);
+    assert_eq!(body, b"rl-body");
+    assert_status(&cache, &hit_ctx, "HIT");
+
+    // The documented contract: the HIT is decorated with THIS request's budget.
+    assert!(matches!(
+        limiter
+            .after_proxy(&mut hit_ctx, status, &mut response_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        response_headers
+            .get("x-ratelimit-remaining")
+            .map(String::as_str),
+        Some("98")
+    );
+}
+
+fn rate_limiter_with_limit(max_requests: u64) -> RateLimiting {
+    RateLimiting::new(
+        &json!({
+            "limit_by": "ip",
+            "expose_headers": true,
+            "limits": [{"scope": "default", "window_seconds": 60, "max_requests": max_requests}]
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn composed_limiters_hand_off_rate_limit_provenance_with_header_ownership() {
+    let _guard = response_cache_replay_policy_guard();
+    // Two composed limiters publish one verdict: the tightest remaining budget
+    // owns the header set whichever runs first. The provenance must follow that
+    // ownership, so a looser sibling's earlier staging can neither linger nor
+    // stop the owner's forwarded values from being recognized.
+    for loose_first in [true, false] {
+        let loose = rate_limiter_with_limit(100);
+        let tight = rate_limiter_with_limit(10);
+        let order: [&RateLimiting; 2] = if loose_first {
+            [&loose, &tight]
+        } else {
+            [&tight, &loose]
+        };
+        let cache = default_plugin();
+        let path = format!("/p/rl-composed-{loose_first}");
+
+        async fn run(
+            order: [&RateLimiting; 2],
+            ctx: &mut RequestContext,
+        ) -> HashMap<String, String> {
+            for limiter in order {
+                assert!(matches!(
+                    limiter.on_request_received(ctx).await,
+                    PluginResult::Continue
+                ));
+            }
+            let mut headers = ctx.headers.clone();
+            for limiter in order {
+                assert!(matches!(
+                    limiter.before_proxy(ctx, &mut headers).await,
+                    PluginResult::Continue
+                ));
+            }
+            headers
+        }
+
+        let mut miss_ctx = make_ctx("GET", &path);
+        let mut miss_headers = run(order, &mut miss_ctx).await;
+        assert_eq!(
+            miss_headers.get("x-ratelimit-limit").map(String::as_str),
+            Some("10"),
+            "the tighter limiter owns the published set (loose_first={loose_first})"
+        );
+        assert_eq!(
+            miss_headers
+                .get("x-ratelimit-remaining")
+                .map(String::as_str),
+            Some("9")
+        );
+        store_public_entry(&cache, &mut miss_ctx, &mut miss_headers, b"composed").await;
+
+        let mut hit_ctx = make_ctx("GET", &path);
+        let mut hit_headers = run(order, &mut hit_ctx).await;
+        assert_eq!(
+            hit_headers.get("x-ratelimit-remaining").map(String::as_str),
+            Some("8")
+        );
+        let (_, body, _) = expect_reject(cache.before_proxy(&mut hit_ctx, &mut hit_headers).await);
+        assert_eq!(body, b"composed", "loose_first={loose_first} must HIT");
+
+        // A value from the non-owning sibling is not what was published.
+        let mut stale_ctx = make_ctx("GET", &path);
+        let mut stale_headers = run(order, &mut stale_ctx).await;
+        stale_headers.insert("x-ratelimit-limit".to_string(), "100".to_string());
+        assert!(matches!(
+            cache.before_proxy(&mut stale_ctx, &mut stale_headers).await,
+            PluginResult::Continue
+        ));
+    }
+}
+
+#[tokio::test]
+async fn rewritten_rate_limit_header_remains_a_cache_dimension() {
+    let _guard = response_cache_replay_policy_guard();
+    let limiter = exposing_rate_limiter(true);
+    let cache = default_plugin();
+
+    // A later plugin replacing the forwarded value breaks provenance: the
+    // origin now sees a value the limiter did not publish, so it is bound.
+    let mut first = make_ctx("GET", "/p/rl-rewritten");
+    let mut first_headers = apply_rate_limit(&limiter, &mut first).await;
+    first_headers.insert("x-ratelimit-remaining".to_string(), "tier-a".to_string());
+    store_public_entry(&cache, &mut first, &mut first_headers, b"tier-a-body").await;
+
+    let mut other = make_ctx("GET", "/p/rl-rewritten");
+    let mut other_headers = apply_rate_limit(&limiter, &mut other).await;
+    other_headers.insert("x-ratelimit-remaining".to_string(), "tier-b".to_string());
+    assert!(matches!(
+        cache.before_proxy(&mut other, &mut other_headers).await,
+        PluginResult::Continue
+    ));
+    assert_status(&cache, &other, "MISS");
+}
+
+#[tokio::test]
+async fn case_variant_duplicate_of_a_published_rate_limit_field_stays_bound() {
+    let _guard = response_cache_replay_policy_guard();
+    let limiter = exposing_rate_limiter(true);
+    let cache = default_plugin();
+
+    let mut first = make_ctx("GET", "/p/rl-case-variant");
+    let mut first_headers = apply_rate_limit(&limiter, &mut first).await;
+    store_public_entry(&cache, &mut first, &mut first_headers, b"single-field").await;
+
+    // A second, case-variant field line carrying the same value folds into
+    // `x-ratelimit-limit: 100, 100` on egress, so the backend sees different
+    // bytes than for the limiter's single field; it must not share the entry.
+    let mut duplicated = make_ctx("GET", "/p/rl-case-variant");
+    let mut duplicated_headers = apply_rate_limit(&limiter, &mut duplicated).await;
+    assert_eq!(
+        duplicated_headers
+            .get("x-ratelimit-limit")
+            .map(String::as_str),
+        Some("100")
+    );
+    duplicated_headers.insert("X-RateLimit-Limit".to_string(), "100".to_string());
+    assert!(matches!(
+        cache
+            .before_proxy(&mut duplicated, &mut duplicated_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_status(&cache, &duplicated, "MISS");
+
+    // Nor may the limiter's own line drop out while a duplicate stands in for
+    // the field: a single rewritten `200` and `100` + `X-RateLimit-Limit: 200`
+    // (egress `200, 100`) are different backend requests.
+    let mut rewritten = make_ctx("GET", "/p/rl-case-folded");
+    let mut rewritten_headers = apply_rate_limit(&limiter, &mut rewritten).await;
+    rewritten_headers.insert("x-ratelimit-limit".to_string(), "200".to_string());
+    store_public_entry(&cache, &mut rewritten, &mut rewritten_headers, b"rewritten").await;
+    let mut folded = make_ctx("GET", "/p/rl-case-folded");
+    let mut folded_headers = apply_rate_limit(&limiter, &mut folded).await;
+    folded_headers.insert("X-RateLimit-Limit".to_string(), "200".to_string());
+    assert!(matches!(
+        cache.before_proxy(&mut folded, &mut folded_headers).await,
+        PluginResult::Continue
+    ));
+    assert_status(&cache, &folded, "MISS");
+}
+
+#[tokio::test]
+async fn metadata_laundered_rate_limit_value_remains_a_cache_dimension() {
+    let _guard = response_cache_replay_policy_guard();
+    let limiter = exposing_rate_limiter(true);
+    let cache = default_plugin();
+
+    let mut first = make_ctx("GET", "/p/rl-metadata");
+    let mut first_headers = apply_rate_limit(&limiter, &mut first).await;
+    store_public_entry(&cache, &mut first, &mut first_headers, b"meta-body").await;
+
+    // Public `ratelimit_*` metadata is plugin-writable. A value rendered from
+    // it is not what the limiter staged, so it cannot collapse partitions.
+    let mut laundered = make_ctx("GET", "/p/rl-metadata");
+    assert!(matches!(
+        limiter.on_request_received(&mut laundered).await,
+        PluginResult::Continue
+    ));
+    laundered
+        .metadata
+        .insert("ratelimit_remaining".to_string(), "attacker".to_string());
+    let mut laundered_headers = laundered.headers.clone();
+    assert!(matches!(
+        limiter
+            .before_proxy(&mut laundered, &mut laundered_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        laundered_headers
+            .get("x-ratelimit-remaining")
+            .map(String::as_str),
+        Some("attacker")
+    );
+    assert!(matches!(
+        cache
+            .before_proxy(&mut laundered, &mut laundered_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_status(&cache, &laundered, "MISS");
+}
+
+#[tokio::test]
+async fn client_supplied_rate_limit_headers_remain_cache_dimensions() {
+    let _guard = response_cache_replay_policy_guard();
+    // `expose_headers: false` forwards the client's own value untouched and
+    // stages no provenance, so distinct client values stay distinct entries.
+    let limiter = exposing_rate_limiter(false);
+    let cache = default_plugin();
+
+    let mut first = make_ctx("GET", "/p/rl-client");
+    first
+        .headers
+        .insert("x-ratelimit-remaining".to_string(), "1".to_string());
+    let mut first_headers = apply_rate_limit(&limiter, &mut first).await;
+    store_public_entry(&cache, &mut first, &mut first_headers, b"client-1").await;
+
+    let mut same = make_ctx("GET", "/p/rl-client");
+    same.headers
+        .insert("x-ratelimit-remaining".to_string(), "1".to_string());
+    let mut same_headers = apply_rate_limit(&limiter, &mut same).await;
+    let (_, body, _) = expect_reject(cache.before_proxy(&mut same, &mut same_headers).await);
+    assert_eq!(body, b"client-1");
+
+    let mut other = make_ctx("GET", "/p/rl-client");
+    other
+        .headers
+        .insert("x-ratelimit-remaining".to_string(), "2".to_string());
+    let mut other_headers = apply_rate_limit(&limiter, &mut other).await;
+    assert!(matches!(
+        cache.before_proxy(&mut other, &mut other_headers).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn origin_vary_on_forwarded_rate_limit_header_still_hits() {
+    let _guard = response_cache_replay_policy_guard();
+    let limiter = exposing_rate_limiter(true);
+    let cache = default_plugin();
+
+    let mut miss_ctx = make_ctx("GET", "/p/rl-vary");
+    let mut miss_headers = apply_rate_limit(&limiter, &mut miss_ctx).await;
+    assert!(matches!(
+        cache.before_proxy(&mut miss_ctx, &mut miss_headers).await,
+        PluginResult::Continue
+    ));
+    let mut response_headers = public_response_headers();
+    response_headers.insert("vary".to_string(), "x-ratelimit-remaining".to_string());
+    cache
+        .after_proxy(&mut miss_ctx, 200, &mut response_headers)
+        .await;
+    cache
+        .on_final_response_body(&mut miss_ctx, 200, &response_headers, b"vary-body")
+        .await;
+
+    // Same treatment as a generated correlation id named in `Vary`: the name
+    // stays in the contract, the minted per-request value does not split it.
+    let mut hit_ctx = make_ctx("GET", "/p/rl-vary");
+    let mut hit_headers = apply_rate_limit(&limiter, &mut hit_ctx).await;
+    let (_, body, _) = expect_reject(cache.before_proxy(&mut hit_ctx, &mut hit_headers).await);
+    assert_eq!(body, b"vary-body");
+}
+
 // === Issue #5147: repeated `Age` field lines arrive comma-folded ===
 
 fn age_response_headers(age: &str) -> HashMap<String, String> {
@@ -9257,4 +9722,741 @@ fn anonymous_scope_aliases_still_construct() {
             "anonymous_caller_scope must accept {value:?}"
         );
     }
+}
+
+// === Production-launch review fixes ===
+
+/// Drive one origin round trip with an explicit backend-visible request header
+/// view: MISS (or no-cache refresh) -> after_proxy -> final store.
+async fn store_with_request_headers(
+    plugin: &ResponseCaching,
+    path: &str,
+    request: &[(&str, &str)],
+    response_cache_control: &str,
+    body: &[u8],
+) -> HashMap<String, String> {
+    let mut ctx = make_ctx("GET", path);
+    let mut headers: HashMap<String, String> = request
+        .iter()
+        .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+        .collect();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let mut resp = HashMap::from([(
+        "cache-control".to_string(),
+        response_cache_control.to_string(),
+    )]);
+    plugin.after_proxy(&mut ctx, 200, &mut resp).await;
+    plugin
+        .on_final_response_body(&mut ctx, 200, &resp, body)
+        .await;
+    resp
+}
+
+/// Run a lookup with an explicit backend-visible request header view and
+/// return the status this instance recorded plus the result.
+async fn lookup_with_request_headers(
+    plugin: &ResponseCaching,
+    path: &str,
+    request: &[(&str, &str)],
+) -> (String, PluginResult) {
+    let mut ctx = make_ctx("GET", path);
+    let mut headers: HashMap<String, String> = request
+        .iter()
+        .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+        .collect();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let status = ctx
+        .metadata
+        .get(&staging_key(plugin, "cache_status"))
+        .cloned()
+        .unwrap_or_default();
+    (status, result)
+}
+
+fn ctx_for_proxy(proxy: ferrum_edge::config::types::Proxy, path: &str) -> RequestContext {
+    let mut ctx = make_ctx("GET", path);
+    ctx.matched_proxy = Some(Arc::new(proxy));
+    ctx
+}
+
+// response_caching-SOL-1: the proxy regenerates `X-Forwarded-Proto` from the
+// frontend scheme after the header view is captured, so the scheme itself must
+// partition the key.
+#[tokio::test]
+async fn replay_partition_binds_effective_frontend_scheme() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = plugin_with_config(json!({ "ttl_seconds": 60 }));
+
+    let mut https = make_ctx("GET", "/account");
+    https.request_is_secure = true;
+    https
+        .headers
+        .insert("host".to_string(), "example.com".to_string());
+    seed_public_entry(&plugin, &mut https, b"https-only-body").await;
+
+    let mut plaintext = make_ctx("GET", "/account");
+    plaintext.request_is_secure = false;
+    plaintext
+        .headers
+        .insert("host".to_string(), "example.com".to_string());
+    assert!(
+        !lookup_is_hit(&plugin, &mut plaintext).await,
+        "a plaintext request must not replay the representation stored for HTTPS"
+    );
+
+    let mut https_again = make_ctx("GET", "/account");
+    https_again.request_is_secure = true;
+    https_again
+        .headers
+        .insert("host".to_string(), "example.com".to_string());
+    assert!(
+        lookup_is_hit(&plugin, &mut https_again).await,
+        "the same scheme must still reach its own entry"
+    );
+
+    // Reverse order: an HTTP redirect stored first must not answer HTTPS.
+    let mut http_first = make_ctx("GET", "/login");
+    http_first.request_is_secure = false;
+    seed_public_entry(&plugin, &mut http_first, b"redirect-to-https").await;
+    let mut https_second = make_ctx("GET", "/login");
+    https_second.request_is_secure = true;
+    assert!(
+        !lookup_is_hit(&plugin, &mut https_second).await,
+        "an HTTPS request must not replay the representation stored for plaintext"
+    );
+}
+
+// response_caching-SOL-2: one (retained) instance must not keep replaying a
+// route whose assembled backend path or outbound Host policy changed under an
+// unchanged proxy id.
+#[tokio::test]
+async fn replay_partition_binds_matched_proxy_request_construction() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = plugin_with_config(json!({ "ttl_seconds": 60 }));
+
+    let mut blue = create_test_proxy();
+    blue.backend_path = Some("/blue".to_string());
+    let mut blue_ctx = ctx_for_proxy(blue.clone(), "/test/items");
+    seed_public_entry(&plugin, &mut blue_ctx, b"blue-items").await;
+
+    let mut blue_again = ctx_for_proxy(blue.clone(), "/test/items");
+    assert!(
+        lookup_is_hit(&plugin, &mut blue_again).await,
+        "an unchanged route must still hit"
+    );
+
+    let mut green = blue.clone();
+    green.backend_path = Some("/green".to_string());
+    let mut green_ctx = ctx_for_proxy(green, "/test/items");
+    assert!(
+        !lookup_is_hit(&plugin, &mut green_ctx).await,
+        "a changed backend_path must not replay the previous origin path"
+    );
+
+    let mut unstripped = blue.clone();
+    unstripped.strip_listen_path = !blue.strip_listen_path;
+    let mut unstripped_ctx = ctx_for_proxy(unstripped, "/test/items");
+    assert!(
+        !lookup_is_hit(&plugin, &mut unstripped_ctx).await,
+        "a changed strip_listen_path must not replay the previous origin path"
+    );
+
+    let mut preserved = blue.clone();
+    preserved.preserve_host_header = !blue.preserve_host_header;
+    let mut preserved_ctx = ctx_for_proxy(preserved, "/test/items");
+    assert!(
+        !lookup_is_hit(&plugin, &mut preserved_ctx).await,
+        "a changed preserve_host_header must not replay the previous outbound Host"
+    );
+}
+
+// response_caching-SOL-3: an honored request no-cache refresh keeps its
+// partition and stores the replacement, so its own response must carry the
+// same downstream Vary contract as the MISS and the later HIT.
+#[tokio::test]
+async fn no_cache_refresh_publishes_the_downstream_vary_contract() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    for add_status in [true, false] {
+        let plugin = plugin_with_config(json!({
+            "vary_by_headers": ["x-tenant"],
+            "add_cache_status_header": add_status
+        }));
+        let path = format!("/catalog/{add_status}");
+
+        let refresh = store_with_request_headers(
+            &plugin,
+            &path,
+            &[("x-tenant", "alpha"), ("cache-control", "no-cache")],
+            "public, max-age=300",
+            b"alpha-catalog",
+        )
+        .await;
+        let expected = vec![
+            "authorization".to_string(),
+            "cookie".to_string(),
+            "proxy-authorization".to_string(),
+            "x-tenant".to_string(),
+        ];
+        assert_eq!(
+            vary_names(&refresh),
+            expected,
+            "add_cache_status_header={add_status}: the no-cache refresh response must carry \
+             the configured and mandatory Vary dimensions"
+        );
+
+        let (status, hit) =
+            lookup_with_request_headers(&plugin, &path, &[("x-tenant", "alpha")]).await;
+        assert_eq!(status, "HIT", "the refreshed replacement must be stored");
+        let (_, _, hit_headers) = expect_reject(hit);
+        assert_eq!(
+            vary_names(&hit_headers),
+            expected,
+            "refresh and HIT must publish an identical Vary contract"
+        );
+    }
+}
+
+// response_caching-SOL-4 / MUSE-1: a lookup that never reaches the origin must
+// not stage the storage-side header delta and snapshot only to discard them.
+#[tokio::test]
+async fn non_origin_lookups_do_not_stage_store_inputs() {
+    use ferrum_edge::_test_support::request_context_has_plugin_state;
+
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = default_plugin();
+    let path = "/api/staging";
+    let mut origin = HashMap::from([
+        (
+            "cache-control".to_string(),
+            "public, max-age=60".to_string(),
+        ),
+        ("etag".to_string(), "\"v1\"".to_string()),
+    ]);
+
+    // MISS on the moved-header-map shape (`ctx.headers` empty, live map
+    // populated): the store inputs ARE staged.
+    let mut miss_ctx = make_ctx("GET", path);
+    let mut miss_headers = HashMap::from([("x-client-build".to_string(), "7".to_string())]);
+    assert!(matches!(
+        plugin.before_proxy(&mut miss_ctx, &mut miss_headers).await,
+        PluginResult::Continue
+    ));
+    assert_status(&plugin, &miss_ctx, "MISS");
+    assert!(
+        request_context_has_plugin_state(&miss_ctx),
+        "a MISS must stage the private header delta for the store path"
+    );
+    assert!(
+        miss_ctx
+            .metadata
+            .contains_key(&staging_key(&plugin, "cache_base_key"))
+    );
+    plugin.after_proxy(&mut miss_ctx, 200, &mut origin).await;
+    plugin
+        .on_final_response_body(&mut miss_ctx, 200, &origin, b"staged")
+        .await;
+
+    // HIT and REVALIDATED short-circuit without staging anything.
+    for (extra, expected_status) in [(None, "HIT"), (Some("\"v1\""), "REVALIDATED")] {
+        let mut ctx = make_ctx("GET", path);
+        let mut headers = HashMap::from([("x-client-build".to_string(), "7".to_string())]);
+        if let Some(etag) = extra {
+            headers.insert("if-none-match".to_string(), etag.to_string());
+        }
+        assert!(is_reject(
+            &plugin.before_proxy(&mut ctx, &mut headers).await
+        ));
+        assert_status(&plugin, &ctx, expected_status);
+        assert!(
+            !request_context_has_plugin_state(&ctx),
+            "{expected_status} must not build the storage-side header delta"
+        );
+        for suffix in [
+            "cache_base_key",
+            "cache_predict_key",
+            "cache_request_headers_snapshot",
+            "cache_request_started_monotonic_nanos",
+            "cache_lookup_path",
+        ] {
+            assert!(
+                !ctx.metadata.contains_key(&staging_key(&plugin, suffix)),
+                "{expected_status} must not leave {suffix} staged"
+            );
+        }
+    }
+
+    // A request no-store can never store, so it stages nothing either.
+    let mut no_store = make_ctx("GET", path);
+    let mut no_store_headers = HashMap::from([
+        ("x-client-build".to_string(), "7".to_string()),
+        ("cache-control".to_string(), "no-store".to_string()),
+    ]);
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut no_store, &mut no_store_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_status(&plugin, &no_store, "BYPASS");
+    assert!(
+        !request_context_has_plugin_state(&no_store),
+        "a request no-store must not build the storage-side header delta"
+    );
+}
+
+// response_caching-MUSE-2: request max-age / min-fresh are enforced against the
+// stored entry, not only partitioned into the key.
+#[tokio::test]
+async fn request_max_age_is_enforced_against_entry_age() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = default_plugin();
+
+    let zero = [("cache-control", "max-age=0")];
+    store_with_request_headers(&plugin, "/price", &zero, "public, max-age=300", b"p1").await;
+    advance_response_caching_clock_for_test(&plugin, std::time::Duration::from_secs(5));
+    let (status, result) = lookup_with_request_headers(&plugin, "/price", &zero).await;
+    assert_eq!(status, "MISS", "a request max-age=0 must refetch");
+    assert!(matches!(result, PluginResult::Continue));
+
+    let sixty = [("cache-control", "max-age=60")];
+    store_with_request_headers(&plugin, "/quote", &sixty, "public, max-age=300", b"q1").await;
+    advance_response_caching_clock_for_test(&plugin, std::time::Duration::from_secs(5));
+    let (status, result) = lookup_with_request_headers(&plugin, "/quote", &sixty).await;
+    assert_eq!(status, "HIT", "an entry younger than max-age is acceptable");
+    assert!(is_reject(&result));
+    advance_response_caching_clock_for_test(&plugin, std::time::Duration::from_secs(60));
+    let (status, result) = lookup_with_request_headers(&plugin, "/quote", &sixty).await;
+    assert_eq!(
+        status, "MISS",
+        "an entry older than the request max-age must refetch even while fresh"
+    );
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn request_min_fresh_is_enforced_against_remaining_freshness() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = default_plugin();
+    let min_fresh = [("cache-control", "min-fresh=30")];
+
+    store_with_request_headers(&plugin, "/feed", &min_fresh, "public, max-age=60", b"f1").await;
+    advance_response_caching_clock_for_test(&plugin, std::time::Duration::from_secs(5));
+    let (status, _) = lookup_with_request_headers(&plugin, "/feed", &min_fresh).await;
+    assert_eq!(
+        status, "HIT",
+        "55s of remaining freshness satisfies min-fresh=30"
+    );
+
+    advance_response_caching_clock_for_test(&plugin, std::time::Duration::from_secs(30));
+    let (status, result) = lookup_with_request_headers(&plugin, "/feed", &min_fresh).await;
+    assert_eq!(
+        status, "MISS",
+        "25s of remaining freshness does not satisfy min-fresh=30"
+    );
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn request_freshness_directives_are_not_acted_on_without_respect_no_cache() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = plugin_with_config(json!({ "respect_no_cache": false }));
+    let zero = [("cache-control", "max-age=0")];
+
+    store_with_request_headers(&plugin, "/static", &zero, "public, max-age=300", b"s1").await;
+    advance_response_caching_clock_for_test(&plugin, std::time::Duration::from_secs(5));
+    let (status, _) = lookup_with_request_headers(&plugin, "/static", &zero).await;
+    assert_eq!(
+        status, "HIT",
+        "with respect_no_cache disabled the request Cache-Control is only a key dimension"
+    );
+}
+
+// response_caching-MUSE-3: a plugin-written header map may carry non-canonical
+// casing, so the Set-Cookie and Content-Range refusals are case-insensitive.
+#[tokio::test]
+async fn set_cookie_and_content_range_refusals_are_case_insensitive() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    for (name, value) in [
+        ("Set-Cookie", "sid=first-client"),
+        ("SET-COOKIE", "sid=first-client"),
+        ("Content-Range", "bytes 0-4/10"),
+    ] {
+        let plugin = default_plugin();
+        let mut ctx = make_ctx("GET", "/case-variant");
+        let mut headers = HashMap::new();
+        assert!(matches!(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        let response_headers = HashMap::from([
+            (
+                "cache-control".to_string(),
+                "public, max-age=60".to_string(),
+            ),
+            (name.to_string(), value.to_string()),
+        ]);
+        plugin
+            .on_final_response_body(&mut ctx, 200, &response_headers, b"per-client")
+            .await;
+        assert!(
+            response_caching_cache_keys_for_test(&plugin).is_empty(),
+            "a response carrying {name} must never be stored"
+        );
+    }
+}
+
+// response_caching-MUSE-4: the retained copy uses the shared replay-sanitation
+// policy, so per-request trace/correlation ids and other per-response fields
+// are not replayed; the MISS response itself is untouched.
+#[tokio::test]
+async fn retained_entry_uses_shared_replay_sanitation_policy() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = default_plugin();
+    let stripped = [
+        ("x-request-id", "req-first-caller"),
+        (
+            "traceparent",
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+        ),
+        ("x-b3-traceid", "463ac35c9f6413ad"),
+        ("x-correlation-id", "corr-first-caller"),
+        ("retry-after", "120"),
+        ("set-cookie2", "legacy=1"),
+        ("www-authenticate", "Bearer realm=\"api\""),
+        ("x-ratelimit-remaining", "0"),
+    ];
+
+    let mut ctx = make_ctx("GET", "/sanitized");
+    let mut headers = HashMap::new();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let mut origin = HashMap::from([
+        (
+            "cache-control".to_string(),
+            "public, max-age=60".to_string(),
+        ),
+        ("content-type".to_string(), "application/json".to_string()),
+    ]);
+    for (name, value) in stripped {
+        origin.insert(name.to_string(), value.to_string());
+    }
+    plugin.after_proxy(&mut ctx, 200, &mut origin).await;
+    plugin
+        .on_final_response_body(&mut ctx, 200, &origin, b"{}")
+        .await;
+    for (name, value) in stripped {
+        assert_eq!(
+            origin.get(name).map(String::as_str),
+            Some(value),
+            "the MISS response must keep the origin's {name}"
+        );
+    }
+
+    let mut hit_ctx = make_ctx("GET", "/sanitized");
+    let mut hit_headers = HashMap::new();
+    let (status, _, replayed) =
+        expect_reject(plugin.before_proxy(&mut hit_ctx, &mut hit_headers).await);
+    assert_eq!(status, 200);
+    assert_eq!(
+        replayed.get("content-type").map(String::as_str),
+        Some("application/json"),
+        "representation metadata must still be replayed"
+    );
+    for (name, _) in stripped {
+        assert!(
+            !replayed.contains_key(name),
+            "a HIT must not replay the first caller's {name}"
+        );
+    }
+}
+
+fn response_cache_lookup_count(rendered: &str, status: &str) -> u64 {
+    let prefix = format!("ferrum_response_cache_lookups_total{{status=\"{status}\"");
+    rendered
+        .lines()
+        .filter(|line| line.starts_with(&prefix))
+        .find_map(|line| line.rsplit_once(' ')?.1.parse().ok())
+        .unwrap_or(0)
+}
+
+// response_caching-MUSE-8: bounded lookup-outcome counter.
+#[test]
+fn response_cache_lookup_counter_is_bounded_by_status_class() {
+    let registry = ferrum_edge::plugins::prometheus_metrics::MetricsRegistry::new();
+    registry.record_response_cache_lookup("HIT");
+    registry.record_response_cache_lookup("HIT");
+    registry.record_response_cache_lookup("MISS");
+    registry.record_response_cache_lookup("PREDICTED-BYPASS");
+    // An unknown value can never mint a new series.
+    registry.record_response_cache_lookup("/secret/path");
+    let rendered = registry.render_uncached();
+
+    assert!(rendered.contains("# TYPE ferrum_response_cache_lookups_total counter"));
+    assert_eq!(response_cache_lookup_count(&rendered, "hit"), 2);
+    assert_eq!(response_cache_lookup_count(&rendered, "miss"), 1);
+    assert_eq!(
+        response_cache_lookup_count(&rendered, "predicted_bypass"),
+        1
+    );
+    assert_eq!(response_cache_lookup_count(&rendered, "bypass"), 0);
+    assert_eq!(response_cache_lookup_count(&rendered, "revalidated"), 0);
+    let series: Vec<&str> = rendered
+        .lines()
+        .filter(|line| line.starts_with("ferrum_response_cache_lookups_total{"))
+        .collect();
+    assert_eq!(series.len(), 5, "exactly one series per fixed status class");
+    assert!(!rendered.contains("/secret/path"));
+}
+
+#[tokio::test]
+async fn cache_lookups_are_counted_in_the_process_registry() {
+    use ferrum_edge::plugins::prometheus_metrics::global_registry;
+
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = default_plugin();
+    let before = global_registry().render_uncached();
+    cache_response(&plugin, "GET", "/counted", 200, &HashMap::new(), b"body").await;
+    let mut ctx = make_ctx("GET", "/counted");
+    let mut headers = HashMap::new();
+    assert!(is_reject(
+        &plugin.before_proxy(&mut ctx, &mut headers).await
+    ));
+    let after = global_registry().render_uncached();
+
+    // Other tests share the process registry, so only monotonic growth is
+    // asserted.
+    assert!(
+        response_cache_lookup_count(&after, "miss") > response_cache_lookup_count(&before, "miss")
+    );
+    assert!(
+        response_cache_lookup_count(&after, "hit") > response_cache_lookup_count(&before, "hit")
+    );
+}
+
+// response_caching-MUSE-9: operator-attested ignored request headers are
+// stripped from the origin request before keying, so they stop fragmenting the
+// cache without becoming an unbound origin-visible dimension.
+#[tokio::test]
+async fn ignored_request_headers_are_stripped_before_keying() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = plugin_with_config(json!({
+        "ttl_seconds": 60,
+        "ignore_request_headers": ["X-Request-Id"]
+    }));
+    assert!(plugin.modifies_request_headers());
+    assert_eq!(
+        plugin.modified_request_header_names(),
+        Some(vec!["x-request-id".to_string()])
+    );
+
+    let mut first = make_ctx("GET", "/listing");
+    first
+        .headers
+        .insert("x-request-id".to_string(), "cdn-0001".to_string());
+    let mut first_headers = first.headers.clone();
+    assert!(matches!(
+        plugin.before_proxy(&mut first, &mut first_headers).await,
+        PluginResult::Continue
+    ));
+    assert!(
+        !first_headers.contains_key("x-request-id"),
+        "an ignored header must not reach the origin"
+    );
+    let response_headers = HashMap::from([(
+        "cache-control".to_string(),
+        "public, max-age=60".to_string(),
+    )]);
+    plugin
+        .on_final_response_body(&mut first, 200, &response_headers, b"listing")
+        .await;
+
+    // Different per-request id, any casing: same entry.
+    let mut second = make_ctx("GET", "/listing");
+    second
+        .headers
+        .insert("X-Request-Id".to_string(), "cdn-0002".to_string());
+    let mut second_headers = second.headers.clone();
+    let (_, body, _) = expect_reject(plugin.before_proxy(&mut second, &mut second_headers).await);
+    assert_eq!(body, b"listing");
+
+    // A header that is not ignored still partitions.
+    let mut tenant = make_ctx("GET", "/listing");
+    tenant
+        .headers
+        .insert("x-tenant".to_string(), "beta".to_string());
+    assert!(
+        !lookup_is_hit(&plugin, &mut tenant).await,
+        "a non-ignored origin-visible header must still partition the cache"
+    );
+}
+
+#[test]
+fn ignore_request_headers_default_is_not_a_header_mutator() {
+    let plugin = default_plugin();
+    assert!(!plugin.modifies_request_headers());
+    let empty = plugin_with_config(json!({ "ignore_request_headers": [] }));
+    assert!(!empty.modifies_request_headers());
+}
+
+#[test]
+fn ignore_request_headers_refuses_host_and_hop_by_hop_backend_folded_spellings() {
+    for header in [
+        "connection",
+        "host",
+        "keep-alive",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ] {
+        for spelling in [
+            header.to_string(),
+            header.to_ascii_uppercase(),
+            header.replace('-', "_"),
+            header.replace('-', "_").to_ascii_uppercase(),
+        ] {
+            let config = json!({ "ignore_request_headers": ["x-request-id", spelling.as_str()] });
+            let error = ResponseCaching::new(&config)
+                .err()
+                .unwrap_or_else(|| panic!("{spelling} must not be ignorable"));
+            assert!(
+                error.contains("`ignore_request_headers[1]`")
+                    && error.contains("names a request header the cache or the proxy interprets"),
+                "diagnostic must identify the refused transport field: {spelling}: {error}"
+            );
+            assert!(
+                validate_plugin_config("response_caching", &config).is_err(),
+                "shared admission must refuse {spelling}"
+            );
+        }
+    }
+}
+
+#[test]
+fn ignore_request_headers_allows_unrelated_underscore_names() {
+    for header in ["keep_alive_extra", "x_transfer_encoding", "x_cdn_hop"] {
+        let config = json!({ "ignore_request_headers": [header] });
+        assert!(
+            ResponseCaching::new(&config).is_ok(),
+            "unrelated field {header} must remain ignorable"
+        );
+        assert!(
+            validate_plugin_config("response_caching", &config).is_ok(),
+            "shared admission must allow {header}"
+        );
+    }
+}
+
+#[test]
+fn ignore_request_headers_refuses_names_the_cache_cannot_safely_ignore() {
+    for header in [
+        "authorization",
+        "Proxy-Authorization",
+        "cookie",
+        "x-api-key",
+        "x-auth-token",
+        "host",
+        "connection",
+        "transfer-encoding",
+        "cache-control",
+        "pragma",
+        "if-none-match",
+        "if-modified-since",
+        "range",
+        "content-length",
+        "accept",
+        "accept-encoding",
+        "x-forwarded-for",
+        "forwarded",
+        // PR6830-SOL-1: gateway-owned headers proxy core re-asserts after
+        // lookup, including the backend-folded `_` spellings.
+        "x-ferrum-hops",
+        "X_Ferrum_Hops",
+        "x-ferrum-internal",
+        "x-consumer-custom-id",
+        "x-consumer-username",
+        "x-authenticated-identity",
+        "x-geo-country",
+        "x_geo_country",
+        "x-path-param-id",
+        "max-forwards",
+        // PR6830-SOL-3: documented families are prefix refusals.
+        "content-language",
+        "content-md5",
+        "x-forwarded-prefix",
+        "X_Forwarded_For",
+        "if-schedule-tag-match",
+    ] {
+        let config = json!({ "ignore_request_headers": ["x-request-id", header] });
+        let error = ResponseCaching::new(&config)
+            .err()
+            .unwrap_or_else(|| panic!("{header} must not be ignorable"));
+        assert!(
+            error.contains("`ignore_request_headers[1]`"),
+            "diagnostic must path-qualify the refused entry: {error}"
+        );
+        assert!(
+            validate_plugin_config("response_caching", &config).is_err(),
+            "shared admission must refuse {header}"
+        );
+    }
+
+    let overlap = json!({
+        "vary_by_headers": ["x-tenant"],
+        "ignore_request_headers": ["X-Tenant"]
+    });
+    let error = ResponseCaching::new(&overlap)
+        .err()
+        .expect("a Vary dimension cannot also be ignored");
+    assert!(error.contains("vary_by_headers"), "{error}");
+
+    for invalid in [
+        json!({ "ignore_request_headers": null }),
+        json!({ "ignore_request_headers": "x-request-id" }),
+        json!({ "ignore_request_headers": [""] }),
+        json!({ "ignore_request_headers": ["bad header"] }),
+        json!({ "ignore_request_headers": [7] }),
+    ] {
+        assert!(
+            ResponseCaching::new(&invalid).is_err(),
+            "{invalid} must be rejected"
+        );
+    }
+}
+
+// PR6830-SOL-1: an accepted ignored name is gone from the outbound map even
+// after proxy core re-asserts its gateway-owned headers, while the re-asserted
+// hop count (which admission refuses to ignore) is still present.
+#[tokio::test]
+async fn accepted_ignored_header_stays_absent_after_gateway_reassertion() {
+    let plugin = plugin_with_config(json!({ "ignore_request_headers": ["x-request-id"] }));
+    let mut ctx = make_ctx("GET", "/reasserted");
+    ctx.outbound_proxy_hops = Some(1);
+    ctx.headers
+        .insert("x-request-id".to_string(), "cdn-0001".to_string());
+    let mut outbound = ctx.headers.clone();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut outbound).await,
+        PluginResult::Continue
+    ));
+    ferrum_edge::proxy::refresh_backend_gateway_assertion_headers(&ctx, &mut outbound);
+    assert!(
+        !outbound
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("x-request-id")),
+        "an accepted ignored header must never reappear on the backend request"
+    );
+    assert!(
+        outbound
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("x-ferrum-hops")),
+        "the gateway re-asserts its hop count after lookup, which is why it is not ignorable"
+    );
+    assert!(ResponseCaching::new(&json!({ "ignore_request_headers": ["x-ferrum-hops"] })).is_err());
 }

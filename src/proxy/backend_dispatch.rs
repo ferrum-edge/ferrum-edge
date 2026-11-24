@@ -29,6 +29,7 @@ use crate::plugins::{
 };
 use crate::proxy::ProxyState;
 use crate::proxy::is_valid_websocket_key;
+use crate::proxy::request_headers::RequestHeaderLookup;
 use crate::request_epoch::RequestEpoch;
 use crate::retry::ErrorClass;
 
@@ -41,6 +42,10 @@ use crate::retry::ErrorClass;
 /// Called from the hot path for every HTTP-family request. Cost:
 /// - Fast-fails on the WebSocket upgrade / Extended CONNECT signals
 ///   (4 header lookups, short-circuit).
+/// - Any other CONNECT is `Plain`: it asks for a tunnel and is never a gRPC
+///   call, whatever its Content-Type. Its refusals must stay HTTP, because a
+///   2xx answer to CONNECT (a gRPC Trailers-Only or gRPC-Web status) means
+///   "tunnel established" (RFC 9110 §9.3.6).
 /// - Falls through to a single content-type lookup + 16-byte ASCII prefix match.
 /// - Total: ~80–100ns on a non-WebSocket, non-gRPC POST; well below noise.
 ///
@@ -57,6 +62,9 @@ pub fn detect_http_flavor<B>(req: &Request<B>) -> HttpFlavor {
     // miss it.
     if is_extended_connect_websocket(req) || is_http1_websocket_upgrade(req) {
         return HttpFlavor::WebSocket;
+    }
+    if req.method() == hyper::Method::CONNECT {
+        return HttpFlavor::Plain;
     }
 
     if let Some(ct) = req.headers().get(hyper::header::CONTENT_TYPE)
@@ -268,12 +276,12 @@ pub(crate) fn h3_bridge_transport_refusal(target: Option<&UpstreamTarget>) -> Op
 /// returns a no-op selection with `lb_hash_key: None` — the key is never
 /// read without an upstream.
 ///
-pub(crate) fn select_upstream_target(
+pub(crate) fn select_upstream_target<H: RequestHeaderLookup + ?Sized>(
     proxy: &Proxy,
     state: &ProxyState,
     epoch: &RequestEpoch,
     client_ip: &str,
-    proxy_headers: &HashMap<String, String>,
+    proxy_headers: &H,
     orig_dst: Option<SocketAddr>,
 ) -> UpstreamSelection {
     let Some(upstream_id) = proxy.upstream_id.as_deref() else {
@@ -587,6 +595,112 @@ pub(crate) fn stream_health_port_scope(
     .then_some(dispatch_port)
 }
 
+/// Why a stream path refuses the per-port LB lane its effective port override
+/// asks for. Each stream path maps the refusal onto its own surface (a typed
+/// `StreamSetupError` on TCP and UDP/DTLS, a `warn!` plus close on mesh
+/// egress), so the wording and the teardown stay per protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamPortLaneRefusal {
+    /// Per-port `LEAST_LATENCY`. UDP/DTLS has no per-request RTT sample, so a
+    /// per-port latency lane would be fed on TCP and silently inert elsewhere;
+    /// it stays refused on every stream path until stream latency sampling
+    /// exists on all of them.
+    LeastLatency,
+    /// The lane engages but the effective hash key is not the source IP. Stream
+    /// paths have no request headers or cookies, so they hash only by client IP.
+    NonIpHashKey,
+}
+
+/// The per-port LB lane admission policy shared by every stream path (TCP,
+/// UDP/DTLS, mesh raw-TCP egress, mesh UDP egress).
+///
+/// `health_port_scope` is the value [`stream_health_port_scope`] returned for
+/// the upstream's single dispatch port; `None` means no lane. A lane engages
+/// only when the port's override sets a selection-affecting field (algorithm,
+/// `hash_on`, or `locality_lb_setting`); timeout-, keepalive-, idle- and
+/// passive-health-only overrides scope health without bypassing upstream LB.
+/// Checks run in a fixed order: per-port `LEAST_LATENCY` is refused before the
+/// selection-affecting test, and the source-IP hash requirement applies only
+/// once a lane engages. `LEAST_CONN` is supported: every stream connection or
+/// session holds a `LoadBalancerConnectionGuard` for its lifetime (issue
+/// #4514), which feeds the counters `select_for_port` reads.
+///
+/// `selection_subset` is the subset the caller selects from. It is explicit
+/// because the paths differ: TCP selects inside the route's `upstream_subset`,
+/// UDP/DTLS rejects `upstream_subset` at validation, and mesh relay proxies
+/// select from the entry upstream. With a subset and no per-port algorithm,
+/// `hash_on` only affects selection when the subset's effective algorithm is
+/// consistent hashing, and the hash-key lookup is subset-scoped too.
+pub(crate) fn stream_port_lane(
+    proxy: &Proxy,
+    balancers: &LoadBalancerCacheInner,
+    upstream_id: &str,
+    health_port_scope: Option<u16>,
+    selection_subset: Option<&str>,
+) -> Result<Option<u16>, StreamPortLaneRefusal> {
+    let Some(port) = health_port_scope else {
+        return Ok(None);
+    };
+    let Some(override_config) = proxy
+        .dispatch_port_overrides
+        .as_ref()
+        .and_then(|overrides| overrides.get(&port))
+    else {
+        return Ok(None);
+    };
+    if matches!(
+        override_config.algorithm,
+        Some(LoadBalancerAlgorithm::LeastLatency)
+    ) {
+        return Err(StreamPortLaneRefusal::LeastLatency);
+    }
+    if !stream_port_override_affects_selection(
+        proxy,
+        balancers,
+        upstream_id,
+        port,
+        override_config,
+        selection_subset,
+    ) {
+        return Ok(None);
+    }
+    let strategy = LoadBalancerCache::get_hash_on_strategy_for_selection_from(
+        balancers,
+        &proxy.namespace,
+        upstream_id,
+        Some(port),
+        selection_subset,
+    );
+    if !matches!(strategy, HashOnStrategy::Ip) {
+        return Err(StreamPortLaneRefusal::NonIpHashKey);
+    }
+    Ok(Some(port))
+}
+
+fn stream_port_override_affects_selection(
+    proxy: &Proxy,
+    balancers: &LoadBalancerCacheInner,
+    upstream_id: &str,
+    port: u16,
+    override_config: &crate::config::types::ResolvedPortOverride,
+    selection_subset: Option<&str>,
+) -> bool {
+    if selection_subset.is_some() && override_config.algorithm.is_none() {
+        return override_config.locality_lb_setting.is_some()
+            || (override_config.hash_on.is_some()
+                && LoadBalancerCache::effective_algorithm_from(
+                    balancers,
+                    &proxy.namespace,
+                    upstream_id,
+                    Some(port),
+                    selection_subset,
+                ) == Some(LoadBalancerAlgorithm::ConsistentHashing));
+    }
+    override_config.algorithm.is_some()
+        || override_config.hash_on.is_some()
+        || override_config.locality_lb_setting.is_some()
+}
+
 pub(crate) fn health_context_for_selection<'a>(
     proxy: &Proxy,
     health_checker: &'a HealthChecker,
@@ -821,19 +935,25 @@ pub(crate) fn concretize_wildcard_target_for_request(
 
 /// Check whether the circuit breaker allows this request to proceed.
 ///
-/// Returns `Ok((cb_target_key, is_half_open_probe))` when the request is allowed,
-/// or `Err(())` when the circuit is open and the request should be rejected with 503.
-/// The `is_half_open_probe` flag MUST be threaded into every subsequent
-/// `record_success` / `record_failure` call so the half-open in-flight counter
-/// is only decremented for requests that actually hold a probe slot.
+/// Returns `Ok((cb_target_key, admitted_breaker, probe_ticket,
+/// admission_generation))` when the request is allowed, or `Err(())` when the
+/// circuit is open and the request should be rejected with 503. The caller
+/// hands the admission to a `HalfOpenProbeGuard`, which settles the attempt's
+/// outcome and probe slot on exactly `admitted_breaker` (issue #6799) and only
+/// decrements the half-open in-flight counter for a request that holds a slot.
+///
+/// `cb_target_key` is `None` when the proxy configures no breaker: every
+/// consumer of the key (outcome recording, staleness checks, retry
+/// admission) is gated on the same captured `proxy.circuit_breaker`, so the
+/// per-request `host:port` key is built only when a breaker can use it
+/// (issues #7166, #7207).
 pub(crate) fn check_circuit_breaker(
     proxy: &Proxy,
     state: &ProxyState,
     upstream_target: Option<&UpstreamTarget>,
-) -> Result<(Option<String>, bool, u64), ()> {
-    let cb_target_key = circuit_breaker_target_key(proxy, upstream_target);
-
+) -> Result<CircuitBreakerAdmission, ()> {
     if let Some(cb_config) = &proxy.circuit_breaker {
+        let cb_target_key = circuit_breaker_target_key(proxy, upstream_target);
         // Capture the open generation at admission so a deferred streaming outcome
         // can detect that the breaker has since opened a new cycle (#1649 round-4 B)
         // and avoid healing/reopening a HALF_OPEN cycle it never probed. The epoch
@@ -841,16 +961,17 @@ pub(crate) fn check_circuit_breaker(
         // concurrent open racing this admission can only make the outcome look
         // stale, never too-new (#1649 R6 finding 3), and a probe guard bound to it
         // cannot release a later cycle's slot (#6177).
-        match state
-            .circuit_breaker_cache
-            .can_execute_with_admission_epoch(
-                &proxy.namespace,
-                &proxy.id,
-                cb_target_key.as_deref(),
-                cb_config,
-            ) {
-            Ok((_cb, is_half_open_probe, admission_open_epoch)) => {
-                return Ok((cb_target_key, is_half_open_probe, admission_open_epoch));
+        match state.circuit_breaker_cache.can_execute(
+            &proxy.namespace,
+            &proxy.id,
+            cb_target_key.as_deref(),
+            cb_config,
+        ) {
+            // Keep the admitting breaker: the attempt's outcome and probe slot
+            // settle on exactly this instance (issue #6799), never on one
+            // re-resolved later from the request's captured config.
+            Ok((cb, probe_ticket, admission_open_epoch)) => {
+                return Ok((cb_target_key, Some(cb), probe_ticket, admission_open_epoch));
             }
             Err(_) => {
                 warn!(proxy_id = %proxy.id, "Request rejected: circuit breaker open");
@@ -859,8 +980,18 @@ pub(crate) fn check_circuit_breaker(
         }
     }
 
-    Ok((cb_target_key, false, 0))
+    Ok((None, None, crate::circuit_breaker::ProbeTicket::NonProbe, 0))
 }
+
+/// What [`check_circuit_breaker`] admitted: the breaker key, the admitting
+/// breaker instance (`None` when the proxy configures none), the admission's
+/// probe ticket, and the open generation the admission was decided in.
+pub(crate) type CircuitBreakerAdmission = (
+    Option<String>,
+    Option<Arc<crate::circuit_breaker::CircuitBreaker>>,
+    crate::circuit_breaker::ProbeTicket,
+    u64,
+);
 
 fn circuit_breaker_target_key(
     proxy: &Proxy,
@@ -1044,7 +1175,7 @@ pub(crate) fn record_backend_outcome_no_conn_end(
     response_status: u16,
     connection_error: bool,
     error_class: Option<ErrorClass>,
-    is_half_open_probe: bool,
+    cb_settlement: crate::proxy::BreakerSettlement,
     skip_circuit_breaker_record: bool,
     backend_elapsed: Duration,
 ) {
@@ -1058,7 +1189,7 @@ pub(crate) fn record_backend_outcome_no_conn_end(
         response_status,
         connection_error,
         error_class,
-        is_half_open_probe,
+        cb_settlement,
         skip_circuit_breaker_record,
         backend_elapsed,
     );
@@ -1092,7 +1223,7 @@ pub(crate) fn record_backend_outcome_no_conn_end(
 ///   ceiling is the operator's own gateway-side policy, so counting it against
 ///   the destination would let a saturated cap eject a perfectly healthy
 ///   backend (and, with several targets saturated, every target at once). The
-///   raw-TCP over-cap path records `cb.record_neutral()` for exactly this
+///   raw-TCP over-cap path settles the breaker `Neutral` for exactly this
 ///   reason; this keeps the HTTP-family pooled transports identical. Unlike the
 ///   classes above it is still pre-wire, so `retry_on_connect_failure` may
 ///   rotate to another target with its own admission lane.
@@ -1154,6 +1285,58 @@ pub(crate) fn deferred_circuit_breaker_is_stale(
     }
 }
 
+/// Synchronous replacement for a deferred streaming dispatch outcome whose
+/// response body an `after_proxy` reject replaced with a buffered one: the body
+/// will never carry the deferred record, so record it now — the BACKEND's
+/// captured status/error (never the plugin reject's), as the attempt's slotless
+/// outcome (the probe slot was released at header time, #7030), on the breaker that admitted the attempt
+/// (`cb_probe`, issue #6799). The breaker record is skipped when
+/// `skip_circuit_breaker_record` is set or when the breaker opened a new cycle
+/// since `admission_open_epoch` (#1649 R5); passive health and least-latency
+/// still record.
+///
+/// Shared by the H1/H2 `StreamingH2` / `StreamingH3` reject path and the
+/// buffered-request native-gRPC streaming reject path, so neither can drop the
+/// outcome it exists to record.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_replaced_streaming_outcome(
+    state: &ProxyState,
+    proxy: &Proxy,
+    lb_snapshot: &LoadBalancerCacheInner,
+    selected_balancer: Option<&Arc<LoadBalancer>>,
+    upstream_target: Option<&UpstreamTarget>,
+    final_cb_target_key: Option<&str>,
+    response_status: u16,
+    connection_error: bool,
+    error_class: Option<ErrorClass>,
+    cb_probe: &crate::proxy::HalfOpenProbeGuard,
+    skip_circuit_breaker_record: bool,
+    admission_open_epoch: u64,
+    backend_elapsed: Duration,
+) {
+    let cb_stale = !skip_circuit_breaker_record
+        && deferred_circuit_breaker_is_stale(
+            state,
+            proxy,
+            final_cb_target_key,
+            admission_open_epoch,
+        );
+    record_backend_outcome_no_conn_end(
+        state,
+        proxy,
+        lb_snapshot,
+        selected_balancer,
+        upstream_target,
+        final_cb_target_key,
+        response_status,
+        connection_error,
+        error_class,
+        cb_probe.settlement_without_slot(),
+        skip_circuit_breaker_record || cb_stale,
+        backend_elapsed,
+    );
+}
+
 /// A post-wire backend failure: the request reached the backend's application
 /// layer (response headers already arrived) and then the response stalled, the
 /// transport broke, or the backend over-sent before the body/trailers completed.
@@ -1204,19 +1387,30 @@ pub(crate) fn apply_circuit_breaker_outcome(
     response_status: u16,
     connection_error: bool,
     error_class: Option<ErrorClass>,
-    is_half_open_probe: bool,
+    ticket: crate::circuit_breaker::ProbeTicket,
 ) {
-    if client_side_no_backend_signal(error_class) {
-        cb.record_neutral(is_half_open_probe);
+    use crate::circuit_breaker::BreakerOutcome;
+    let outcome = if client_side_no_backend_signal(error_class) {
+        BreakerOutcome::Neutral
     } else if connection_error {
-        cb.record_failure(response_status, true, is_half_open_probe);
+        BreakerOutcome::Failure {
+            status_code: response_status,
+            connection_error: true,
+        }
     } else if cb.config().failure_status_codes.contains(&response_status) {
-        cb.record_failure(response_status, false, is_half_open_probe);
+        BreakerOutcome::Failure {
+            status_code: response_status,
+            connection_error: false,
+        }
     } else if error_class_is_post_wire_backend_failure(error_class) {
-        cb.record_failure(response_status, true, is_half_open_probe);
+        BreakerOutcome::Failure {
+            status_code: response_status,
+            connection_error: true,
+        }
     } else {
-        cb.record_success(is_half_open_probe);
-    }
+        BreakerOutcome::Success
+    };
+    cb.settle(ticket, outcome);
 }
 
 /// Like [`apply_circuit_breaker_outcome`], but for a DEFERRED streaming outcome:
@@ -1231,20 +1425,14 @@ pub(crate) fn apply_deferred_circuit_breaker_outcome(
     response_status: u16,
     connection_error: bool,
     error_class: Option<ErrorClass>,
-    is_half_open_probe: bool,
+    ticket: crate::circuit_breaker::ProbeTicket,
     admission_open_epoch: u64,
 ) {
     if cb.open_epoch() != admission_open_epoch {
-        cb.record_neutral(is_half_open_probe);
+        cb.settle(ticket, crate::circuit_breaker::BreakerOutcome::Neutral);
         return;
     }
-    apply_circuit_breaker_outcome(
-        cb,
-        response_status,
-        connection_error,
-        error_class,
-        is_half_open_probe,
-    );
+    apply_circuit_breaker_outcome(cb, response_status, connection_error, error_class, ticket);
 }
 
 /// Whether [`apply_circuit_breaker_outcome`] would record a backend FAILURE (as
@@ -1278,7 +1466,7 @@ fn record_backend_outcome_inner(
     response_status: u16,
     connection_error: bool,
     error_class: Option<ErrorClass>,
-    is_half_open_probe: bool,
+    cb_settlement: crate::proxy::BreakerSettlement,
     skip_circuit_breaker_record: bool,
     backend_elapsed: Duration,
 ) {
@@ -1325,20 +1513,35 @@ fn record_backend_outcome_inner(
     // Record circuit breaker result against the final target's breaker.
     // For retries, intermediate failures were already recorded per-target inside
     // the retry loop, so this only records the final attempt's outcome.
-    if !skip_circuit_breaker_record && let Some(cb_config) = &proxy.circuit_breaker {
-        let cb = state.circuit_breaker_cache.get_or_create(
+    //
+    // The outcome settles on the breaker instance that ADMITTED this attempt
+    // (`cb_settlement`), and only while that instance is still the cached
+    // breaker for the final key. A breaker that has since been replaced by a
+    // reload (A→B, or A→B→A) or reclaimed and recreated is a different
+    // instance: the outcome is stale and is dropped, and any probe slot is
+    // returned on the admitting breaker. Resolving the breaker again from the
+    // request's captured config would instead overwrite live, possibly OPEN,
+    // state (issue #6799).
+    if !skip_circuit_breaker_record && let Some(cb) = cb_settlement.breaker.as_ref() {
+        if state.circuit_breaker_cache.is_current(
             &proxy.namespace,
             &proxy.id,
             final_cb_target_key,
-            cb_config,
-        );
-        apply_circuit_breaker_outcome(
-            &cb,
-            response_status,
-            connection_error,
-            error_class,
-            is_half_open_probe,
-        );
+            cb,
+        ) {
+            apply_circuit_breaker_outcome(
+                cb,
+                response_status,
+                connection_error,
+                error_class,
+                cb_settlement.ticket,
+            );
+        } else {
+            cb.settle(
+                cb_settlement.ticket,
+                crate::circuit_breaker::BreakerOutcome::Neutral,
+            );
+        }
     }
 
     // Passive health check reporting (O(1) upstream lookup via index).
@@ -1402,16 +1605,19 @@ pub(crate) fn passive_health_for_target<'a>(
 }
 
 /// Resolve the hash key for consistent-hashing or sticky-session load balancing.
-pub(crate) fn resolve_hash_key(
+pub(crate) fn resolve_hash_key<H: RequestHeaderLookup + ?Sized>(
     strategy: &HashOnStrategy,
     client_ip: &str,
-    headers: &HashMap<String, String>,
+    headers: &H,
 ) -> (String, bool) {
     match strategy {
         HashOnStrategy::Ip => (client_ip.to_owned(), false),
         HashOnStrategy::Header(name) => {
             // Header names in ctx.headers are stored as-is from hyper (lowercased)
-            let value = headers.get(name.as_str()).cloned().unwrap_or_default();
+            let value = headers
+                .request_header(name.as_str())
+                .map(str::to_owned)
+                .unwrap_or_default();
             if value.is_empty() {
                 (client_ip.to_owned(), false)
             } else {
@@ -1420,7 +1626,7 @@ pub(crate) fn resolve_hash_key(
         }
         HashOnStrategy::Cookie(name) => {
             // Parse the Cookie header to find the named cookie
-            if let Some(cookie_header) = headers.get("cookie") {
+            if let Some(cookie_header) = headers.request_header("cookie") {
                 for part in cookie_header.split(';') {
                     let part = part.trim();
                     if let Some((k, v)) = part.split_once('=')
@@ -1444,7 +1650,7 @@ pub(crate) fn resolve_hash_key(
 pub(crate) struct RetryTargetRequest<'a> {
     pub(crate) base_hash_key: &'a str,
     pub(crate) client_ip: &'a str,
-    pub(crate) proxy_headers: &'a HashMap<String, String>,
+    pub(crate) proxy_headers: &'a dyn RequestHeaderLookup,
     pub(crate) request_authority: Option<&'a str>,
 }
 
@@ -2548,7 +2754,7 @@ mod tests {
             200,
             false,
             None,
-            false,
+            crate::proxy::BreakerSettlement::none(),
             true,
             std::time::Duration::ZERO,
         );
@@ -2562,6 +2768,40 @@ mod tests {
         assert_eq!(active(), 1, "the guard's drop releases one count");
         drop(concurrent);
         assert_eq!(active(), 0);
+    }
+
+    #[tokio::test]
+    async fn check_circuit_breaker_builds_no_key_without_a_breaker() {
+        let mut config: crate::config::types::GatewayConfig =
+            serde_json::from_value(serde_json::json!({
+                "version": "1",
+                "consumers": [],
+                "plugin_configs": [],
+                "proxies": [{
+                    "id": "no-cb-proxy",
+                    "listen_path": "/",
+                    "backend_scheme": "http",
+                    "backend_host": "backend.local",
+                    "backend_port": 8080
+                }],
+                "upstreams": []
+            }))
+            .expect("test config should deserialize");
+        config.normalize_fields();
+        let dns_cache = crate::dns::DnsCache::new(crate::dns::DnsConfig::default());
+        let env_config = crate::config::env_config::EnvConfig::default();
+        let (state, _) = crate::proxy::ProxyState::new(config, dns_cache, env_config, None, None)
+            .expect("test proxy state should build");
+        let epoch = state.request_epoch.load();
+        let proxy = &epoch.config.proxies[0];
+        assert!(proxy.circuit_breaker.is_none());
+
+        let (key, admitted, probe_ticket, epoch_value) =
+            check_circuit_breaker(proxy, &state, None).expect("no breaker always admits");
+        assert_eq!(key, None, "no breaker means no per-request breaker key");
+        assert!(admitted.is_none());
+        assert!(!probe_ticket.is_probe());
+        assert_eq!(epoch_value, 0);
     }
 
     #[tokio::test]
@@ -2616,10 +2856,11 @@ mod tests {
         cb.record_failure(500, false, false);
         assert_eq!(cb.state_name(), "open");
 
-        let (final_cb_target_key, is_half_open_probe, _admission_open_epoch) =
+        let (final_cb_target_key, admitted, probe_ticket, _admission_open_epoch) =
             check_circuit_breaker(proxy, &state, None).expect("timeout=0 admits a probe");
+        let cb_probe = crate::proxy::HalfOpenProbeGuard::new(admitted.as_ref(), probe_ticket);
         assert!(
-            is_half_open_probe,
+            probe_ticket.is_probe(),
             "the request must own a HALF_OPEN probe slot"
         );
         assert_eq!(cb.state_name(), "half_open");
@@ -2635,7 +2876,7 @@ mod tests {
             413,
             false,
             Some(ErrorClass::RequestBodyTooLarge),
-            is_half_open_probe,
+            cb_probe.settle(),
             false,
             std::time::Duration::ZERO,
         );
@@ -2655,6 +2896,61 @@ mod tests {
             0,
             "neutral recording must release the reserved probe slot"
         );
+    }
+
+    #[tokio::test]
+    async fn breaker_key_is_built_only_for_a_proxy_with_a_breaker() {
+        // Issue #7166: every reader of the admitted key is breaker-gated, so a
+        // proxy without a breaker gets no key and pays no per-request format.
+        let mut config: crate::config::types::GatewayConfig =
+            serde_json::from_value(serde_json::json!({
+                "version": "1",
+                "consumers": [],
+                "plugin_configs": [],
+                "proxies": [
+                    {
+                        "id": "no-breaker",
+                        "listen_path": "/plain",
+                        "backend_scheme": "http",
+                        "backend_host": "backend.local",
+                        "backend_port": 8080
+                    },
+                    {
+                        "id": "with-breaker",
+                        "listen_path": "/guarded",
+                        "backend_scheme": "http",
+                        "backend_host": "backend.local",
+                        "backend_port": 8080,
+                        "circuit_breaker": {"failure_threshold": 5}
+                    }
+                ],
+                "upstreams": []
+            }))
+            .expect("test config should deserialize");
+        config.normalize_fields();
+        let dns_cache = crate::dns::DnsCache::new(crate::dns::DnsConfig::default());
+        let env_config = crate::config::env_config::EnvConfig::default();
+        let (state, _) = crate::proxy::ProxyState::new(config, dns_cache, env_config, None, None)
+            .expect("test proxy state should build");
+        let epoch = state.request_epoch.load();
+        let proxy = |id: &str| {
+            epoch
+                .config
+                .proxies
+                .iter()
+                .find(|proxy| proxy.id == id)
+                .expect("proxy fixture")
+        };
+
+        let (key, breaker, _, _) =
+            check_circuit_breaker(proxy("no-breaker"), &state, None).expect("admitted");
+        assert_eq!(key, None);
+        assert!(breaker.is_none());
+
+        let (key, breaker, _, _) =
+            check_circuit_breaker(proxy("with-breaker"), &state, None).expect("admitted");
+        assert_eq!(key.as_deref(), Some("backend.local:8080"));
+        assert!(breaker.is_some());
     }
 
     #[tokio::test]
@@ -2735,7 +3031,7 @@ mod tests {
             502,
             false,
             Some(ErrorClass::ClientDisconnect),
-            false,
+            crate::proxy::BreakerSettlement::none(),
             true,
             std::time::Duration::ZERO,
         );
@@ -2757,7 +3053,7 @@ mod tests {
             502,
             false,
             None,
-            false,
+            crate::proxy::BreakerSettlement::none(),
             true,
             std::time::Duration::ZERO,
         );
@@ -2843,7 +3139,7 @@ mod tests {
             200,
             false,
             None,
-            false,
+            crate::proxy::BreakerSettlement::none(),
             true,
             Duration::from_micros(2500),
         );
@@ -2885,7 +3181,7 @@ mod tests {
             200,
             false,
             None,
-            false,
+            crate::proxy::BreakerSettlement::none(),
             true,
             Duration::from_micros(2500),
         );

@@ -12,8 +12,8 @@ use ferrum_edge::_test_support::{
     BufferedUploadPumpProbe, BufferedUploadWaitOutcomeForTest, DtlsAuthorizationExpiryForTest,
     EarlyUploadBoundKind, GrpcBufferedUploadPumpProbe, H3AuthorizedHeadersWrite,
     H3BackendOrPeerForTest, H3UploadWaitOutcomeForTest, PrecommitPhaseOutcomeForTest,
-    ProbePumpOutcome, ProbeReplayFrame, ProbeTransportPoll, ReplayableUploadPumpProbe,
-    ResponseCollectBoundForTest, StreamIoSide, UploadPumpProbe,
+    ProbePumpOutcome, ProbeReplayFrame, ProbeTransportPoll, RelayEndReason,
+    ReplayableUploadPumpProbe, ResponseCollectBoundForTest, StreamIoSide, UploadPumpProbe,
     attribute_dispatch_phase_bound_for_test, authorization_bounded_header_deadline_for_test,
     authorization_expired_dispatch_placeholder_for_test,
     authorization_expired_pre_commitment_response_for_test,
@@ -692,6 +692,22 @@ async fn a_stalled_backend_write_cannot_starve_the_tcp_authorization_deadline() 
     assert!(
         relay_failure_is_client_facing(result.first_failure.as_ref().expect("failure")),
         "authorization expiry must stay health-neutral as a client-facing failure"
+    );
+    // Issue #7030: the typed relay ending names the authorization expiry
+    // itself, and the summary no longer reports it as an idle timeout.
+    let end_reason = RelayEndReason::from_first_failure(result.first_failure.as_ref());
+    assert_eq!(end_reason, RelayEndReason::AuthorizationExpired);
+    assert_eq!(
+        end_reason.disconnect_cause(),
+        DisconnectCause::RecvError,
+        "an authorization-lifetime relay end is the client-side decision its \
+         setup-phase and UDP/DTLS siblings report, never `idle_timeout`"
+    );
+    assert_eq!(end_reason.error_class(), Some(ErrorClass::RequestError));
+    assert_eq!(
+        end_reason.breaker_outcome(),
+        ferrum_edge::circuit_breaker::BreakerOutcome::Neutral,
+        "authorization expiry must not move the backend breaker"
     );
     assert_eq!(
         result.bytes_client_to_backend, accepted,
@@ -2093,12 +2109,13 @@ fn every_post_admission_buffered_upload_collect_carries_the_authorization_plan()
         2,
         "a post-admission buffered upload arm reverted to the unbounded collect"
     );
-    // Both buffered native-gRPC collects.
+    // The one charged, bounded native-gRPC collect (a `0` limit folds to the
+    // buffered fallback ceiling, so there is no separate unbounded arm).
     assert_eq!(
         GRPC_PROXY_SOURCE
             .matches("collect_request_body_under_authorization(")
             .count(),
-        2,
+        1,
         "a buffered gRPC upload arm reverted to the unbounded collect"
     );
     // Every authorization arm returns the health-neutral placeholder, so the
@@ -2113,10 +2130,10 @@ fn every_post_admission_buffered_upload_collect_carries_the_authorization_plan()
     // survivor could keep the deadline-aware collector while a SECOND, raw
     // collect is added beside it, or the bound could be dropped from whichever
     // arm survived. So pin it per dispatcher as well — inside each
-    // post-admission buffered region every `.collect()` must be an argument of
-    // the authorized collector, the region must never fall back to the
-    // deadline-only entry point, and the collect must stay wrapped in a
-    // fail-closed `Limited`.
+    // post-admission buffered region every collect must be an argument of the
+    // authorized collector, the region must never fall back to the
+    // deadline-only entry point, and the collect must stay bounded by the
+    // fail-closed, charged request collector.
     assert_buffered_upload_region_stays_bounded(
         "reqwest",
         "\nasync fn proxy_to_backend(",
@@ -2125,13 +2142,14 @@ fn every_post_admission_buffered_upload_collect_carries_the_authorization_plan()
     assert_buffered_upload_region_stays_bounded(
         "http3",
         "\nasync fn proxy_to_backend_http3(",
-        "\nasync fn proxy_to_backend_http3_retry(",
+        "\npub(crate) async fn proxy_to_backend_http3_retry(",
     );
 }
 
-/// Every `.collect()` inside one post-admission buffered upload region is an
+/// Every collect inside one post-admission buffered upload region is an
 /// argument of the authorized, deadline-aware collector, and the collect it
-/// feeds is bounded by the fail-closed retained ceiling (issues #3815 / #4153).
+/// feeds is bounded by the fail-closed retained ceiling and charged as it grows
+/// (issues #3815 / #4153).
 #[track_caller]
 fn assert_buffered_upload_region_stays_bounded(dispatcher: &str, open: &str, close: &str) {
     let region = PROXY_SOURCE
@@ -2150,8 +2168,15 @@ fn assert_buffered_upload_region_stays_bounded(dispatcher: &str, open: &str, clo
     );
     assert_eq!(
         region.matches(".collect()").count(),
+        0,
+        "a {dispatcher} buffered upload collect bypassed the charged collector"
+    );
+    assert_eq!(
+        region
+            .matches("collect_charged_request_body(gated, ")
+            .count(),
         authorized,
-        "a {dispatcher} buffered upload collect bypassed the authorized collector"
+        "a {dispatcher} buffered upload collect bypassed the charged collector"
     );
     assert!(
         !region.contains("collect_request_body_with_deadline("),
@@ -2164,8 +2189,9 @@ fn assert_buffered_upload_region_stays_bounded(dispatcher: &str, open: &str, clo
          retained ceiling"
     );
     assert!(
-        region.contains("http_body_util::Limited::new("),
-        "the {dispatcher} buffered upload must stay wrapped in `Limited`"
+        region.contains("response_buffer_budget::ChargedRequestCollector::new(retained_ceiling)"),
+        "the {dispatcher} buffered upload must be charged by what it retains, \
+         within the fail-closed ceiling"
     );
 }
 
@@ -2337,7 +2363,7 @@ fn every_h1h2_response_header_wait_composes_the_authorization_lifetime() {
         ("async fn proxy_to_backend_retry(", 1, 1, 3, 0),
         ("async fn proxy_to_backend(", 1, 1, 0, 6),
         ("async fn proxy_to_backend_direct_h1(", 1, 0, 0, 1),
-        ("fn direct_h1_handoff_bound_expired(", 0, 1, 0, 1),
+        ("fn direct_h1_handoff_bound_expired<", 0, 1, 0, 1),
         ("async fn proxy_to_backend_hbone(", 1, 0, 0, 0),
         ("async fn proxy_to_backend_hbone_after_ready(", 2, 1, 2, 0),
         ("async fn proxy_to_backend_unix(", 2, 1, 2, 0),
@@ -2360,8 +2386,8 @@ fn every_h1h2_response_header_wait_composes_the_authorization_lifetime() {
             0,
         ),
         ("fn direct_h2_handoff_refusal(", 1, 0, 0, 0),
-        ("fn direct_h2_sender_bound_expired(", 1, 1, 0, 1),
-        ("fn direct_h2_handoff_bound_expired(", 0, 1, 1, 0),
+        ("fn direct_h2_sender_bound_expired<", 1, 1, 0, 1),
+        ("fn direct_h2_handoff_bound_expired<", 0, 1, 1, 0),
         ("fn mesh_h1_handoff_bound_expired(", 0, 1, 1, 0),
         (
             "async fn collect_response_under_authorization<F>(",
@@ -2606,7 +2632,7 @@ fn backend_checkout_and_handoff_are_bounded_by_the_authorization_lifetime() {
     );
     let bounded_checkout = compact_code(source_region(
         PROXY_SOURCE,
-        "async fn direct_h1_bounded_checkout(",
+        "async fn direct_h1_bounded_checkout<",
         "\n/// Dispatch an HTTP/1.1 backend request on the direct hyper pool",
     ));
     let bounded_wait = concat!(
@@ -2623,7 +2649,7 @@ fn backend_checkout_and_handoff_are_bounded_by_the_authorization_lifetime() {
     );
     let settle = compact_code(source_region(
         PROXY_SOURCE,
-        "fn direct_h1_handoff_bound_expired(",
+        "fn direct_h1_handoff_bound_expired<",
         "\n}\n",
     ));
     let authorization_arm = source_region(
@@ -2949,6 +2975,121 @@ async fn the_gate_publishes_the_terminal_class_before_the_summary_is_built() {
     for value in gate.log_metadata.values() {
         assert_eq!(value, "credential_expired");
     }
+}
+
+fn route_security_policy() -> Vec<Arc<dyn ferrum_edge::plugins::Plugin>> {
+    let policy = ferrum_edge::plugins::security_headers::SecurityHeaders::new(&serde_json::json!({
+        "hsts": true,
+        "content_security_policy": "default-src 'none'",
+        "set": { "X-Policy": "required" },
+        "remove": ["server", "WWW-Authenticate"]
+    }))
+    .expect("security policy");
+    vec![Arc::new(policy)]
+}
+
+fn decorated_protected_headers() -> std::collections::HashMap<String, String> {
+    std::collections::HashMap::from([
+        ("content-type".to_string(), "text/html".to_string()),
+        ("set-cookie".to_string(), "session=protected".to_string()),
+        ("x-backend-meta".to_string(), "secret".to_string()),
+        ("x-content-type-options".to_string(), "nosniff".to_string()),
+    ])
+}
+
+/// The fixed plain-HTTP `401` carries the route's static security policy and
+/// keeps its own content type and reauthentication challenge authoritative,
+/// while nothing from the protected response survives.
+fn assert_policy_decorated_authorization_terminal(
+    status: u16,
+    headers: &std::collections::HashMap<String, String>,
+    body: &[u8],
+) {
+    assert_eq!(status, 401);
+    assert_eq!(body, br#"{"error":"Unauthorized"}"#);
+    fn header<'a>(
+        headers: &'a std::collections::HashMap<String, String>,
+        name: &str,
+    ) -> Option<&'a str> {
+        headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+    assert_eq!(header(headers, "content-type"), Some("application/json"));
+    assert!(
+        header(headers, "www-authenticate").is_some_and(|challenge| !challenge.is_empty()),
+        "a policy `remove` cannot leave the 401 without its challenge: {headers:?}"
+    );
+    assert_eq!(header(headers, "x-content-type-options"), Some("nosniff"));
+    assert_eq!(header(headers, "x-frame-options"), Some("SAMEORIGIN"));
+    assert_eq!(
+        header(headers, "referrer-policy"),
+        Some("strict-origin-when-cross-origin")
+    );
+    assert_eq!(
+        header(headers, "strict-transport-security"),
+        Some("max-age=31536000; includeSubDomains")
+    );
+    assert_eq!(
+        header(headers, "content-security-policy"),
+        Some("default-src 'none'")
+    );
+    assert_eq!(header(headers, "x-policy"), Some("required"));
+    assert_eq!(
+        header(headers, "set-cookie"),
+        None,
+        "backend cookies must not survive"
+    );
+    assert_eq!(
+        header(headers, "x-backend-meta"),
+        None,
+        "backend metadata must not survive"
+    );
+}
+
+/// security_headers-SOL-1: the final H1/H2 gate replaces the whole decorated
+/// header map after every response hook ran, so it must reapply the route's
+/// precomputed initial-response policy to the fixed terminal itself.
+#[tokio::test]
+async fn the_final_gate_reapplies_the_route_security_policy_to_its_terminal() {
+    let mut ctx = authenticated_ctx();
+    let received_at = request_received_at_for_test(&ctx);
+    set_request_credential_deadline_for_test(&mut ctx, Some(received_at));
+
+    let policy = route_security_policy();
+    let gate = ferrum_edge::_test_support::precommit_authorization_gate_with_policy_for_test(
+        &mut ctx,
+        DEFAULT_MAX,
+        false,
+        200,
+        decorated_protected_headers(),
+        b"protected",
+        &policy,
+    );
+
+    assert_eq!(
+        gate.termination,
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+    assert_policy_decorated_authorization_terminal(gate.status, &gate.headers, &gate.body);
+}
+
+/// The buffered-response terminal builder's plain-HTTP branch overwrites the
+/// map the same way and receives the same policy slice.
+#[tokio::test]
+async fn the_buffered_plain_terminal_reapplies_the_route_security_policy() {
+    let mut ctx = authenticated_ctx();
+    let policy = route_security_policy();
+    let (status, headers, body) =
+        ferrum_edge::_test_support::buffered_authorization_terminal_for_test(
+            &mut ctx,
+            StreamAuthTermination::CredentialExpired,
+            decorated_protected_headers(),
+            &policy,
+        );
+
+    assert_policy_decorated_authorization_terminal(status, &headers, &body);
 }
 
 /// The same gate on native gRPC selects the legal trailers-only terminal and
@@ -4801,20 +4942,35 @@ async fn a_buffered_collect_reports_the_earlier_protocol_bound_even_when_both_ha
 #[test]
 fn every_streaming_h1h2_upload_installs_the_gateway_owned_pump() {
     // reqwest size-limited, reqwest unlimited, the direct HTTP/1.1 pool
-    // (#5588), HBONE, Unix, mesh mTLS, direct-H2 — plus the two definitions.
+    // (#5588, using the inline-auth variant), HBONE, Unix, mesh mTLS,
+    // direct-H2 — plus the definitions.
     assert_eq!(
         PROXY_SOURCE
             .matches("install_streaming_upload_authorization(")
             .count(),
-        8,
+        7,
         "an H1/H2 streaming upload lost its gateway-owned lifecycle"
+    );
+    assert_eq!(
+        PROXY_SOURCE
+            .matches("install_streaming_upload_authorization_inline_for_direct_h1(")
+            .count(),
+        2,
+        "the direct HTTP/1.1 size-limited upload lost its gateway-owned lifecycle"
     );
     assert_eq!(
         PROXY_SOURCE
             .matches("install_counting_upload_authorization(")
             .count(),
-        3,
-        "the unlimited-size reqwest or direct HTTP/1.1 upload lost its gateway-owned lifecycle"
+        2,
+        "the unlimited-size reqwest upload lost its gateway-owned lifecycle"
+    );
+    assert_eq!(
+        PROXY_SOURCE
+            .matches("install_counting_upload_authorization_inline_for_direct_h1(")
+            .count(),
+        2,
+        "the unlimited-size direct HTTP/1.1 upload lost its gateway-owned lifecycle"
     );
     // Native gRPC keeps its own body type, so it installs the pump directly on
     // the shared upload source rather than through the H1/H2 adapters. An
@@ -4866,7 +5022,7 @@ fn every_streaming_h1h2_upload_installs_the_gateway_owned_pump() {
         .find("deadline.expired(cx)")
         .expect("native gRPC authorization deadline check");
     let bridge_poll = native_grpc_poll
-        .find("incoming.poll_frame(cx)")
+        .find("incoming.poll_frame_with_trailer_credentials(")
         .expect("native gRPC upload bridge poll");
     assert!(
         expiry_check < bridge_poll,
@@ -5114,7 +5270,7 @@ fn specialized_streaming_dispatchers_race_the_backend_write_watermark() {
             .next()
             .unwrap_or_else(|| panic!("bounded {label} streaming dispatcher"));
         assert!(
-            dispatch.contains("let (mut parts, body, mut upload_pump)")
+            dispatch.contains("let (mut parts, body, mut upload_pump, client_fault_latch")
                 && dispatch.contains("await_upload_write_watermark_first(")
                 && dispatch.contains("upload_pump.as_mut()")
                 && dispatch.contains("pump.cancel_and_join().await;")
@@ -5128,6 +5284,37 @@ fn specialized_streaming_dispatchers_race_the_backend_write_watermark() {
             "{label} must not discard the write-watermark receiver"
         );
     }
+
+    // The sidecar mesh-mTLS HTTP/2 upload keeps the pump for an authorization
+    // lifetime and otherwise lets hyper's HTTP/2 pipe bound the write from a
+    // request extension (vendored hyper patch 004), like direct-H2 and native
+    // gRPC; an expiry must still map to the pump's write-watermark terminal.
+    let mesh_mtls = PROXY_SOURCE
+        .split("async fn proxy_to_backend_mesh_mtls_after_ready(")
+        .nth(1)
+        .expect("sidecar mesh mTLS dispatcher")
+        .split("async fn proxy_to_backend_http2(")
+        .next()
+        .expect("bounded sidecar mesh mTLS dispatcher");
+    let auth_pump = mesh_mtls
+        .find("let pumped_write_timeout_ms = if upload_auth.is_some() {")
+        .expect("authorization lifetimes keep the write watermark on the pump");
+    let pipe_bound = mesh_mtls
+        .find("hyper::ext::Http2BodyWriteTimeout::new(")
+        .expect("an unauthenticated mesh mTLS upload bounds the write in hyper's pipe");
+    assert!(
+        auth_pump < pipe_bound
+            && mesh_mtls.contains("let pipe_write_timeout = (upload_auth.is_none()")
+            && mesh_mtls.contains("parts.extensions.insert(write_timeout.clone());")
+            && mesh_mtls
+                .contains("unpumped_client_fault_latch(upload_auth.as_ref(), pumped_write_timeout_ms)")
+            && mesh_mtls.contains(
+                "upload_auth.as_ref(),\n                    pumped_write_timeout_ms,\n                );"
+            )
+            && mesh_mtls.contains(".is_some_and(hyper::ext::Http2BodyWriteTimeout::expired)")
+            && mesh_mtls.contains("write_bound = \"h2_pipe\""),
+        "sidecar mesh mTLS must keep the pump for authorization lifetimes and bound the write otherwise"
+    );
 
     let native_grpc = GRPC_PROXY_SOURCE
         .split("pub async fn proxy_grpc_request_streaming(")
@@ -5251,7 +5438,7 @@ fn gateway_error_terminals_are_built_out_of_line_and_bound_the_authorization_wri
         .find("return write_plain_authorization_expired_terminal(")
         .expect("and written under the bounded post-deadline grace");
     let unbounded = writer
-        .find("write_plain_gateway_reject(")
+        .find("write_normalized_plain_gateway_reject(")
         .expect("every other terminal keeps the gateway reject writer");
     assert!(
         hooks < authorization && authorization < bounded && bounded < unbounded,
@@ -5346,11 +5533,11 @@ fn the_precommit_authorization_terminal_is_applied_out_of_line() {
         "fn request_authorization_termination(",
         "\n}\n",
     );
-    assert!(decision.contains("ctx.authorization_termination_latch.observed()"));
+    assert!(decision.contains("ctx.observed_authorization_termination()"));
     assert!(decision.contains("expired_authorization(plan)?"));
     assert!(decision.contains("record_once(elapsed, family)"));
     let observed = decision
-        .find("ctx.authorization_termination_latch.observed()")
+        .find("ctx.observed_authorization_termination()")
         .unwrap();
     let expiry = decision.find("expired_authorization(plan)?").unwrap();
     let record = decision.find("record_once(elapsed, family)").unwrap();
@@ -5581,7 +5768,7 @@ async fn the_pre_relay_gate_refuses_an_elapsed_plan_and_admits_a_live_one() {
 async fn a_relay_phase_dtls_expiry_publishes_the_bounded_class_exactly_once() {
     let _guard = counter_delta_guard().await;
     let latch = ferrum_edge::proxy::auth_lifetime::StreamAuthTerminationLatch::default();
-    let session_metadata = std::sync::Mutex::new(std::collections::HashMap::new());
+    let session_metadata = std::sync::Mutex::new(ferrum_edge::plugins::MetadataMap::default());
 
     let before = counters();
     let first = settle_dtls_relay_authorization_expiry_for_test(
@@ -5816,7 +6003,7 @@ fn native_h3_grpc_dispatch_phases_compose_the_authorization_lifetime() {
     assert!(precommit.contains("let open_auth = crate::http3::client::H3Authorization::new("));
     assert_eq!(precommit.matches("open_auth,").count(), 2);
     assert!(precommit.contains("error.authorization_expiry()"));
-    assert!(precommit.contains("attempt_span.scope(open_fut).await"));
+    assert!(precommit.contains("let scoped = attempt_span.scope(open_fut);"));
     assert!(!precommit.contains("await_deadline_first(dispatch_deadline_at,"));
     assert_eq!(
         dispatch
@@ -5919,6 +6106,49 @@ fn balanced_block_after<'a>(haystack: &'a str, marker: &str) -> Option<&'a str> 
         }
     }
     None
+}
+
+/// GHSA-3c72-7f45-wvr2: every gateway-authored `401` (authorization expiry)
+/// and `413` (oversized streamed upload) the H3 plain bridge records against
+/// backend health carries a client-side error class. With `None`, a status
+/// outside `failure_status_codes` is a breaker SUCCESS, so a client could close
+/// a HALF_OPEN breaker (and add least-latency samples) against a backend that
+/// never answered. `client_side_no_backend_signal` settles these neutrally.
+#[test]
+fn cross_protocol_plain_gateway_terminals_record_backend_health_neutrally() {
+    let cross = include_str!("../../../src/http3/cross_protocol.rs");
+    let dispatch = cross
+        .split("async fn dispatch_plain<S>(")
+        .nth(1)
+        .expect("cross-protocol plain dispatcher")
+        .split("async fn dispatch_grpc<S>(")
+        .next()
+        .expect("bounded cross-protocol plain dispatcher");
+
+    let mut checked = 0;
+    for call in dispatch
+        .split("record_backend_outcome_no_conn_end(")
+        .skip(1)
+    {
+        let args = call.split(");").next().unwrap_or_default();
+        let lines: Vec<&str> = args.lines().map(str::trim).collect();
+        let expected = if lines.contains(&"401,") {
+            "Some(ErrorClass::ClientDisconnect),"
+        } else if lines.contains(&"413,") {
+            "Some(ErrorClass::RequestBodyTooLarge),"
+        } else {
+            continue;
+        };
+        checked += 1;
+        assert!(
+            lines.contains(&expected) && !lines.contains(&"None,"),
+            "a gateway-authored terminal must record {expected} for backend health: {args}"
+        );
+    }
+    assert!(
+        checked >= 5,
+        "expected the four authorization-expiry 401 sites and the upload 413 site, found {checked}"
+    );
 }
 
 /// Cross-protocol plain pre-commitment authorization expiry writes the fixed
@@ -6690,11 +6920,6 @@ fn every_native_h3_streaming_response_headers_write_uses_the_shared_helper() {
             "async fn stream_h3_open_response_to_client(",
             "async fn run_h3_grpc_upload_pump(",
         ),
-        (
-            "proxy_to_backend_h3_streaming",
-            "async fn proxy_to_backend_h3_streaming(",
-            "async fn proxy_to_backend_h3(",
-        ),
     ] {
         let region = H3_SERVER_SOURCE
             .split(marker)
@@ -6713,6 +6938,20 @@ fn every_native_h3_streaming_response_headers_write_uses_the_shared_helper() {
             "{name} still awaits send_response unbounded"
         );
     }
+    // The buffered-request streaming path writes no HEADERS of its own: it hands
+    // the committed response to the shared relay above (issue #7190).
+    let buffered_request_streaming = H3_SERVER_SOURCE
+        .split("async fn proxy_to_backend_h3_streaming(")
+        .nth(1)
+        .expect("buffered-request streaming present")
+        .split("async fn proxy_to_backend_h3(")
+        .next()
+        .expect("buffered-request streaming bounded");
+    assert!(
+        buffered_request_streaming.contains("stream_h3_open_response_to_client(")
+            && !buffered_request_streaming.contains("send_response("),
+        "the buffered-request streaming path must relay through the shared helper"
+    );
 
     let sse_writer = H3_SERVER_SOURCE
         .split("async fn send_h3_aggregate_sse_response(")

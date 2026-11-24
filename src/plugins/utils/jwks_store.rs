@@ -1,8 +1,32 @@
 //! JWKS (JSON Web Key Set) key store with background refresh.
 //!
 //! Fetches public keys from a remote JWKS endpoint and caches them
-//! for JWT validation. Supports RSA (RS256, RS384, RS512) and
-//! EC (ES256, ES384) key types.
+//! for JWT validation. Supports RSA (RS256, RS384, RS512, PS256, PS384,
+//! PS512), EC (ES256, ES384), and OKP Ed25519 (EdDSA) key types. EdDSA keys
+//! are refused while FIPS mode is enforced (see
+//! [`crate::fips::policy::APPROVED_JWT_ALGORITHMS`]). `ES512` is not
+//! supported: the `jsonwebtoken` backend exposes no P-521 JWS path.
+//!
+//! A store has one of three origins:
+//!
+//! * **remote** — fetched over HTTP from a `jwks_uri` (directly or through
+//!   OIDC discovery). Trust follows the fresh/grace/expired model: a
+//!   validated non-empty fetch is fresh for one refresh interval, then in
+//!   grace until `max_stale`, then expired.
+//! * **inline** — parsed once from configuration; never refreshed.
+//! * **managed** — read from the admin-managed TLS store
+//!   (`managed://jwks/<id>#jwks`, issue #7277). The record is local,
+//!   authoritative material, not a cache of someone else's endpoint, so the
+//!   trust model maps onto it differently: while the record is present and
+//!   holds usable keys the store is **fresh** (no interval-based grace); a
+//!   record that is deleted, of the wrong kind, oversized, malformed, or holds
+//!   no usable signing key **withdraws** every key at once, exactly like an
+//!   expired remote set (fail closed); only a store that cannot be *read*
+//!   (shared-volume I/O, lock, or document failure) keeps the last-read keys,
+//!   in grace, for at most `max_stale`. The store re-reads the record every
+//!   refresh interval, on an unknown `kid` (subject to the same cooldown as a
+//!   remote store), and immediately after a local admin mutation of a managed
+//!   JWKS record ([`super::jwks_cache::refresh_managed_jwks_stores`]).
 
 use arc_swap::ArcSwap;
 use base64::Engine;
@@ -21,6 +45,8 @@ use url::Url;
 
 use super::PluginHttpClient;
 use super::response_body::{BoundedReadError, read_response_body_bounded};
+use crate::tls::managed::{ManagedTlsError, ManagedTlsStore};
+use crate::tls::source::{CertSource, MaterialKind, SourceScheme};
 
 const EMPTY_STORE_RETRY_1: Duration = Duration::from_secs(5);
 const EMPTY_STORE_RETRY_2: Duration = Duration::from_secs(15);
@@ -29,6 +55,8 @@ const MAX_JWKS_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_JWKS_KEYS: usize = 256;
 const MAX_JWK_ID_BYTES: usize = 1024;
 const MAX_JWK_COMPONENT_BYTES: usize = 16 * 1024;
+/// RFC 8032 §5.1.5: an Ed25519 public key is exactly 32 octets.
+const ED25519_PUBLIC_KEY_BYTES: usize = 32;
 
 /// Default maximum age of the last validated non-empty remote JWKS.
 pub const DEFAULT_JWKS_MAX_STALE_SECONDS: u64 = 3_600;
@@ -144,6 +172,248 @@ pub fn redacted_jwks_uri(raw: &str) -> String {
     url.to_string()
 }
 
+/// Scheme prefix every canonical managed JWKS source starts with.
+///
+/// The shared JWKS cache keys remote stores by their `http(s)` URL and managed
+/// stores by their canonical `managed://jwks/<id>#jwks` source, so the two key
+/// spaces cannot collide: a remote `jwks_uri` (configured or discovered) is
+/// always validated to `http`/`https` before it reaches the cache.
+pub const MANAGED_JWKS_SOURCE_PREFIX: &str = "managed://";
+
+const MANAGED_JWKS_CANONICAL_PREFIX: &str = "managed://jwks/";
+const MANAGED_JWKS_CANONICAL_SUFFIX: &str = "#jwks";
+
+/// Whether a JWKS cache key names an admin-managed JWKS record.
+pub fn is_managed_jwks_source(source: &str) -> bool {
+    source.starts_with(MANAGED_JWKS_SOURCE_PREFIX)
+}
+
+/// Validate a configured managed JWKS reference and return its canonical form,
+/// `managed://jwks/<id>#jwks`.
+///
+/// Static only — the store is not read. Accepts every spelling the generic
+/// `managed://` grammar admits for JWKS material (`managed://jwks/<id>#jwks`,
+/// `managed://jwks/<id>`, `managed://<id>#jwks`, and the `#jwks-json` /
+/// `#jwks_json` fragment aliases) and refuses:
+///
+/// * any other scheme, a file path, or inline material;
+/// * a fragment or collection that selects non-JWKS material
+///   (`managed://certificates/<id>#cert`, `managed://jwks/<id>#ca`, ...);
+/// * `?` options — the re-read cadence is the consumer's refresh interval;
+/// * an invalid record id.
+///
+/// Canonicalizing means two spellings of one record share one key store.
+/// Errors never echo the configured value.
+pub fn canonical_managed_jwks_source(raw: &str) -> Result<String, String> {
+    if raw.trim().is_empty() {
+        return Err("must not be empty".to_string());
+    }
+    if raw.trim() != raw {
+        return Err("must not carry leading or trailing whitespace".to_string());
+    }
+    let source = CertSource::parse(raw, MaterialKind::Jwks);
+    let CertSource::Uri(uri) = &source else {
+        return Err(
+            "must be a `managed://jwks/<id>#jwks` reference; file paths and inline material are \
+             not accepted here (use `jwks` for an inline key set)"
+                .to_string(),
+        );
+    };
+    if uri.scheme != SourceScheme::Managed {
+        return Err(format!(
+            "must be a `managed://jwks/<id>#jwks` reference; the `{}` scheme is not supported \
+             for JWKS material",
+            uri.scheme.as_str()
+        ));
+    }
+    if !uri.options.is_empty() {
+        return Err(
+            "takes no `?` options; the record is re-read every `jwks_refresh_interval_secs`"
+                .to_string(),
+        );
+    }
+    let id = crate::tls::managed::jwks_reference_record_id(&uri.identifier)
+        .map_err(|error| format!("is not a usable JWKS reference: {error}"))?;
+    Ok(format!(
+        "{MANAGED_JWKS_CANONICAL_PREFIX}{id}{MANAGED_JWKS_CANONICAL_SUFFIX}"
+    ))
+}
+
+/// Record id named by a canonical managed JWKS source.
+fn managed_jwks_record_id(canonical: &str) -> &str {
+    canonical
+        .strip_prefix(MANAGED_JWKS_CANONICAL_PREFIX)
+        .and_then(|rest| rest.strip_suffix(MANAGED_JWKS_CANONICAL_SUFFIX))
+        .unwrap_or(canonical)
+}
+
+/// Whether `plugin_name` is a built-in that may reference a managed JWKS
+/// record (`providers[].jwks_source`).
+pub fn plugin_may_reference_managed_jwks(plugin_name: &str) -> bool {
+    matches!(plugin_name, "jwks_auth" | "oidc_relying_party")
+}
+
+/// Presence check for every managed JWKS record a plugin config references.
+/// Empty for any other plugin, or when no reference is configured. Blocking
+/// when a reference is present: reads the managed TLS store.
+pub fn plugin_managed_jwks_source_errors(
+    plugin_name: &str,
+    config: &serde_json::Value,
+) -> Vec<String> {
+    match plugin_name {
+        "jwks_auth" => crate::plugins::jwks_auth::managed_jwks_source_errors(config),
+        "oidc_relying_party" => {
+            crate::plugins::oidc_relying_party::managed_jwks_source_errors(config)
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Where a managed store reads its record from.
+struct ManagedJwksOrigin {
+    /// Store identifier (the canonical source without its scheme), as
+    /// [`ManagedTlsStore::material`] takes it: `jwks/<id>#jwks`.
+    reference: String,
+    /// Explicit store for tests; `None` reads the process managed TLS store
+    /// (`FERRUM_TLS_MANAGED_STORE_PATH`) at every read, so a store that could
+    /// not be opened is retried rather than latched.
+    store: Option<Arc<ManagedTlsStore>>,
+}
+
+/// Outcome of one read of a managed JWKS record.
+enum ManagedJwksRead {
+    /// The record is present and holds at least one usable signing key.
+    Keys(HashMap<String, CachedJwk>),
+    /// The authoritative store says there is no usable key set: the record is
+    /// missing, of another kind, oversized, malformed, or keyless. Every key
+    /// is withdrawn.
+    Withdrawn(JwksFailureClass),
+    /// The store could not be read. The last-read keys are retained, bounded
+    /// by `max_stale`.
+    Unavailable,
+}
+
+fn read_managed_jwks(origin: &ManagedJwksOrigin) -> ManagedJwksRead {
+    let store = match origin.store.as_ref() {
+        Some(store) => Arc::clone(store),
+        None => match crate::tls::managed::global_store() {
+            Ok(store) => store,
+            Err(_) => return ManagedJwksRead::Unavailable,
+        },
+    };
+    match store.material(&origin.reference, MaterialKind::Jwks) {
+        Ok(material) => match parse_jwks_document(&material.bytes) {
+            Ok(keys) => ManagedJwksRead::Keys(keys),
+            Err(class) => ManagedJwksRead::Withdrawn(class),
+        },
+        Err(error) => match managed_read_failure_class(&error) {
+            Some(class) => ManagedJwksRead::Withdrawn(class),
+            None => ManagedJwksRead::Unavailable,
+        },
+    }
+}
+
+/// Classify a managed-store read failure: `Some(class)` when the store
+/// authoritatively holds no usable JWKS for the reference, `None` when it
+/// could not be read at all.
+fn managed_read_failure_class(error: &ManagedTlsError) -> Option<JwksFailureClass> {
+    match error {
+        ManagedTlsError::NotFound(_)
+        | ManagedTlsError::InvalidId(_)
+        | ManagedTlsError::WrongKind { .. }
+        | ManagedTlsError::MissingMaterial { .. }
+        | ManagedTlsError::IncompatibleReference(_)
+        | ManagedTlsError::KindConflict { .. }
+        | ManagedTlsError::AlreadyExists(_) => Some(JwksFailureClass::Empty),
+        ManagedTlsError::MaterialTooLarge => Some(JwksFailureClass::Oversized),
+        ManagedTlsError::InvalidPath(_)
+        | ManagedTlsError::DocumentTooLarge { .. }
+        | ManagedTlsError::RecordLimitReached
+        | ManagedTlsError::Read(_)
+        | ManagedTlsError::Write(_)
+        | ManagedTlsError::Parse(_)
+        | ManagedTlsError::InvalidConfiguration(_) => None,
+    }
+}
+
+/// Parse a complete JWKS document under the same bounds and key rules as a
+/// remote fetch. A document with no usable signing key is refused.
+fn parse_jwks_document(bytes: &[u8]) -> Result<HashMap<String, CachedJwk>, JwksFailureClass> {
+    if bytes.len() > MAX_JWKS_RESPONSE_BYTES {
+        return Err(JwksFailureClass::Oversized);
+    }
+    let jwks: JwksResponse =
+        serde_json::from_slice(bytes).map_err(|_| JwksFailureClass::Malformed)?;
+    let keys =
+        JwksKeyStore::parse_jwks_response(&jwks).map_err(|_| JwksFailureClass::UnusableKeys)?;
+    if keys.is_empty() {
+        return Err(JwksFailureClass::Empty);
+    }
+    Ok(keys)
+}
+
+/// Validate a JWKS document the way every JWKS store admits one: at most
+/// 1 MiB and 256 keys, bounded components, and at least one usable signing key
+/// (`kid` present, `use`/`key_ops` permit verification, supported algorithm,
+/// approved key strength). Returns the usable key count.
+///
+/// Shared by managed-record admission (`POST`/`PUT /admin/tls/jwks`) and the
+/// managed-source presence check, so an admitted record is exactly a record a
+/// JWKS consumer can verify with. The error is a fixed classification that
+/// never echoes document content.
+pub fn validate_jwks_document(bytes: &[u8]) -> Result<usize, String> {
+    parse_jwks_document(bytes)
+        .map(|keys| keys.len())
+        .map_err(|class| match class {
+            JwksFailureClass::Oversized => {
+                format!("JWKS document exceeds the {MAX_JWKS_RESPONSE_BYTES}-byte limit")
+            }
+            JwksFailureClass::Malformed => {
+                "JWKS document is not valid JWKS JSON (an object with a `keys` array)".to_string()
+            }
+            JwksFailureClass::UnusableKeys => {
+                "JWKS document contains no usable signing key, too many keys, or a duplicate `kid`"
+                    .to_string()
+            }
+            _ => "JWKS document contains no usable signing key".to_string(),
+        })
+}
+
+/// Check that the managed record a canonical source names is present in the
+/// process managed TLS store and holds a usable key set. Blocking: reads the
+/// store; never call on a request path.
+///
+/// Used by admin plugin admission and by the plugin file-dependency
+/// validation (file mode fatal, database mode warning). The error names the
+/// record id Debug-escaped and never echoes key material.
+pub fn check_managed_jwks_source(canonical: &str) -> Result<usize, String> {
+    let id = managed_jwks_record_id(canonical);
+    let store = crate::tls::managed::global_store()
+        .map_err(|_| "the managed TLS store could not be opened".to_string())?;
+    let reference = canonical
+        .strip_prefix(MANAGED_JWKS_SOURCE_PREFIX)
+        .unwrap_or(canonical);
+    let material = store
+        .material(reference, MaterialKind::Jwks)
+        .map_err(|error| match error {
+            ManagedTlsError::NotFound(_) => {
+                format!("managed JWKS record {id:?} does not exist; create it with `POST /admin/tls/jwks` first")
+            }
+            ManagedTlsError::WrongKind { actual, .. } => format!(
+                "managed record {id:?} has kind `{actual}`, not `jwks`"
+            ),
+            ManagedTlsError::MaterialTooLarge => format!(
+                "managed JWKS record {id:?} exceeds the configured material size limit"
+            ),
+            ManagedTlsError::MissingMaterial { .. } => {
+                format!("managed JWKS record {id:?} holds no JWKS document")
+            }
+            _ => "the managed TLS store could not be read".to_string(),
+        })?;
+    validate_jwks_document(&material.bytes)
+        .map_err(|error| format!("managed JWKS record {id:?}: {error}"))
+}
+
 /// A cached JWKS key with its algorithm and decoding key.
 #[derive(Clone)]
 pub struct CachedJwk {
@@ -233,6 +503,10 @@ pub struct JwksKeyStore {
     refresh_notify: Arc<Notify>,
     /// Rate-limited on-demand refetch trigger for an unknown JWT `kid`.
     kid_miss: Arc<KidMissTrigger>,
+    /// Set for a store backed by an admin-managed JWKS record instead of a
+    /// remote endpoint. Changes how a refresh reads and how trust is derived;
+    /// see the module documentation.
+    managed: Option<Arc<ManagedJwksOrigin>>,
 }
 
 /// Raw JWKS response from the endpoint.
@@ -246,7 +520,7 @@ struct JwksResponse {
 struct JwkKey {
     /// Key ID — used to match against the `kid` in JWT headers.
     kid: Option<String>,
-    /// Key type: "RSA" or "EC".
+    /// Key type: "RSA", "EC", or "OKP".
     kty: String,
     /// Algorithm hint: "RS256", "ES256", etc.
     alg: Option<String>,
@@ -262,10 +536,10 @@ struct JwkKey {
     /// RSA exponent (base64url-encoded).
     e: Option<String>,
 
-    // EC parameters
-    /// EC curve name: "P-256", "P-384".
+    // EC / OKP parameters
+    /// EC curve name ("P-256", "P-384") or OKP subtype ("Ed25519").
     crv: Option<String>,
-    /// EC x coordinate (base64url-encoded).
+    /// EC x coordinate, or the OKP public key (base64url-encoded).
     x: Option<String>,
     /// EC y coordinate (base64url-encoded).
     y: Option<String>,
@@ -366,7 +640,49 @@ impl JwksKeyStore {
             kid_miss: Arc::new(KidMissTrigger::new(Duration::from_secs(
                 DEFAULT_KID_MISS_REFRESH_COOLDOWN_SECONDS,
             ))),
+            managed: None,
         }
+    }
+
+    /// Create a key store backed by an admin-managed JWKS record.
+    ///
+    /// `source` must be the canonical form returned by
+    /// [`canonical_managed_jwks_source`]. Like [`Self::new`], this reads
+    /// nothing: call [`Self::fetch_keys`] or start the background refresh.
+    ///
+    /// A managed store never dials: `http_client` is the caller's existing
+    /// client (a cheap clone), held only so the store shares one shape with a
+    /// remote store. Never build a client for it here: constructing one loads
+    /// the platform trust roots, and a config-load validation sweep must build
+    /// a bounded number of clients, not one per managed provider (#4116).
+    pub fn new_managed(source: String, http_client: PluginHttpClient) -> Self {
+        Self::managed_with_store(source, None, http_client)
+    }
+
+    /// [`Self::new_managed`] reading an explicit managed TLS store instead of
+    /// the process store. Test support: lets a test own its store directory.
+    #[doc(hidden)]
+    pub fn new_managed_with_store(source: String, store: Arc<ManagedTlsStore>) -> Self {
+        Self::managed_with_store(source, Some(store), PluginHttpClient::default())
+    }
+
+    fn managed_with_store(
+        source: String,
+        store: Option<Arc<ManagedTlsStore>>,
+        http_client: PluginHttpClient,
+    ) -> Self {
+        let reference = source
+            .strip_prefix(MANAGED_JWKS_SOURCE_PREFIX)
+            .unwrap_or(&source)
+            .to_string();
+        let mut created = Self::new(source, http_client);
+        created.managed = Some(Arc::new(ManagedJwksOrigin { reference, store }));
+        created
+    }
+
+    /// Whether this store reads an admin-managed JWKS record.
+    pub fn is_managed(&self) -> bool {
+        self.managed.is_some()
     }
 
     /// Create a non-refreshing key store from inline JWKS JSON.
@@ -395,10 +711,12 @@ impl JwksKeyStore {
             refresh_notify: Arc::new(Notify::new()),
             // Inline stores never refetch; the trigger stays inert.
             kid_miss: Arc::new(KidMissTrigger::new(Duration::ZERO)),
+            managed: None,
         })
     }
 
-    /// Get the JWKS URI this store fetches keys from.
+    /// Get the JWKS URI this store fetches keys from (the canonical
+    /// `managed://jwks/<id>#jwks` source for a managed store).
     pub fn jwks_uri(&self) -> &str {
         &self.jwks_uri
     }
@@ -434,7 +752,6 @@ impl JwksKeyStore {
     }
 
     /// Currently installed on-demand refetch cooldown.
-    #[allow(dead_code)] // external unit tests assert the effective policy
     pub fn kid_miss_cooldown(&self) -> Duration {
         Duration::from_millis(self.kid_miss.cooldown_ms.load(Ordering::Acquire))
     }
@@ -484,7 +801,6 @@ impl JwksKeyStore {
     ///
     /// A count only — no key identifier, token, or claim is retained anywhere
     /// on this path.
-    #[allow(dead_code)] // external unit tests assert the rate-limit contract
     pub fn kid_miss_refresh_requests(&self) -> u64 {
         self.kid_miss.admitted.load(Ordering::Relaxed)
     }
@@ -505,7 +821,9 @@ impl JwksKeyStore {
     /// its refresh interval elapsed. Stores already in grace/expired return
     /// `None`.
     pub fn grace_deadline(&self) -> Option<Instant> {
-        if !self.refreshable {
+        // A managed record is authoritative while present: it never ages into
+        // grace on a timer, only on a failed read.
+        if !self.refreshable || self.managed.is_some() {
             return None;
         }
         let snapshot = self.snapshot.load();
@@ -524,7 +842,6 @@ impl JwksKeyStore {
     }
 
     /// Number of completed remote refresh attempts (success or failure).
-    #[allow(dead_code)] // external unit tests observe refresh sync; dead in the binary target
     pub fn refresh_completions(&self) -> u64 {
         self.refresh_completions.load(Ordering::Acquire)
     }
@@ -535,7 +852,6 @@ impl JwksKeyStore {
     /// do not need to sleep through virtual time to observe a forced refresh.
     /// Subscribe before reading the counter so a completion that races the
     /// check cannot be lost between the load and `notified().await`.
-    #[allow(dead_code)] // external unit tests observe refresh sync; dead in the binary target
     pub async fn wait_for_refresh_completion_after(&self, before: u64) {
         loop {
             let notified = self.refresh_notify.notified();
@@ -565,6 +881,18 @@ impl JwksKeyStore {
         };
         let age = now.saturating_duration_since(last_success);
         let policy = self.trust_policy.load();
+        if self.managed.is_some() {
+            // Managed material: fresh while the last read found the record;
+            // a withdrawn record leaves no keys (expired); a store that could
+            // not be read keeps the last-read keys in grace up to `max_stale`.
+            return if snapshot.keys.is_empty() || age >= policy.max_stale {
+                JwksTrustState::Expired
+            } else if snapshot.last_failure.is_some() {
+                JwksTrustState::Grace
+            } else {
+                JwksTrustState::Fresh
+            };
+        }
         if age >= policy.max_stale {
             JwksTrustState::Expired
         } else if snapshot.last_failure.is_some() || age >= policy.refresh_interval {
@@ -637,6 +965,9 @@ impl JwksKeyStore {
         if !self.refreshable {
             return Ok(self.snapshot.load().keys.len());
         }
+        if let Some(origin) = self.managed.as_ref() {
+            return self.read_managed_keys_unlocked(Arc::clone(origin)).await;
+        }
 
         let redacted_uri = redacted_jwks_uri(&self.jwks_uri);
         debug!("Fetching JWKS keys from {}", redacted_uri);
@@ -688,6 +1019,11 @@ impl JwksKeyStore {
             return self.fail_refresh(JwksFailureClass::Empty);
         }
 
+        Ok(self.publish_keys(new_keys))
+    }
+
+    /// Install a validated non-empty key map and refresh the trust deadline.
+    fn publish_keys(&self, new_keys: HashMap<String, CachedJwk>) -> usize {
         let count = new_keys.len();
         let completed_at = Instant::now();
         self.snapshot.store(Arc::new(JwksSnapshot {
@@ -699,7 +1035,50 @@ impl JwksKeyStore {
         }));
         self.note_refresh_completion();
         debug!("JWKS key store updated: {} keys cached", count);
-        Ok(count)
+        count
+    }
+
+    /// Read the managed record on the blocking pool (the store revalidates its
+    /// document against the shared file and may wait on nothing but a stat and
+    /// a bounded read).
+    async fn read_managed_keys_unlocked(
+        &self,
+        origin: Arc<ManagedJwksOrigin>,
+    ) -> Result<usize, String> {
+        let read = tokio::task::spawn_blocking(move || read_managed_jwks(&origin))
+            .await
+            .unwrap_or(ManagedJwksRead::Unavailable);
+        match read {
+            ManagedJwksRead::Keys(keys) => Ok(self.publish_keys(keys)),
+            ManagedJwksRead::Withdrawn(class) => self.withdraw_managed_keys(class),
+            ManagedJwksRead::Unavailable => self.fail_refresh(JwksFailureClass::Transport),
+        }
+    }
+
+    /// The authoritative managed store holds no usable key set: drop every key
+    /// so verification fails closed immediately, exactly like an expired
+    /// remote set. A later read that finds the record again restores trust.
+    fn withdraw_managed_keys<T>(&self, class: JwksFailureClass) -> Result<T, String> {
+        REFRESH_FAILURE_COUNTS[class.index()].fetch_add(1, Ordering::Relaxed);
+        let attempted_at = Instant::now();
+        let current = self.snapshot.load();
+        let had_keys = !current.keys.is_empty();
+        self.snapshot.store(Arc::new(JwksSnapshot {
+            keys: Arc::new(HashMap::new()),
+            last_success: None,
+            last_attempt: Some(attempted_at),
+            last_failure: Some(class),
+            consecutive_failures: current.consecutive_failures.saturating_add(1),
+        }));
+        if had_keys {
+            warn!(
+                "managed JWKS record {:?} no longer holds a usable key set ({}); its keys are withdrawn",
+                managed_jwks_record_id(&self.jwks_uri),
+                class.as_str()
+            );
+        }
+        self.note_refresh_completion();
+        Err(format!("JWKS refresh failed: {}", class.as_str()))
     }
 
     fn fail_refresh<T>(&self, class: JwksFailureClass) -> Result<T, String> {
@@ -871,6 +1250,7 @@ impl JwksKeyStore {
         match jwk.kty.as_str() {
             "RSA" => Self::parse_rsa_jwk(jwk),
             "EC" => Self::parse_ec_jwk(jwk),
+            "OKP" => Self::parse_okp_jwk(jwk),
             other => Err(format!("unsupported key type: {}", other)),
         }
     }
@@ -903,11 +1283,16 @@ impl JwksKeyStore {
         // issuer's key material. Only an absent `alg` falls back to RS256; any
         // present value must name a supported RSA signature algorithm, and it
         // then binds verification to exactly that algorithm because
-        // `build_validation` seeds `Validation::new` from it.
+        // `build_validation` seeds `Validation::new` from it. A PSS key is
+        // therefore a PSS-only verification key: a PKCS#1 v1.5 token naming
+        // its `kid` is rejected, and so is a PSS token naming an RS* key.
         let algorithm = match jwk.alg.as_deref() {
             None | Some("RS256") => Algorithm::RS256,
             Some("RS384") => Algorithm::RS384,
             Some("RS512") => Algorithm::RS512,
+            Some("PS256") => Algorithm::PS256,
+            Some("PS384") => Algorithm::PS384,
+            Some("PS512") => Algorithm::PS512,
             Some(other) => {
                 return Err(format!(
                     "JWK alg '{other}' is not a supported RSA signature algorithm"
@@ -964,6 +1349,44 @@ impl JwksKeyStore {
 
         Ok(CachedJwk {
             algorithm,
+            decoding_key,
+        })
+    }
+
+    /// Parse an RFC 8037 OKP JWK. Only `Ed25519` (verified as `EdDSA`) is
+    /// admitted; X25519/X448 are key-agreement keys and Ed448 has no verifier
+    /// in the selected backend.
+    fn parse_okp_jwk(jwk: &JwkKey) -> Result<CachedJwk, String> {
+        if jwk.crv.as_deref() != Some("Ed25519") {
+            return Err("unsupported OKP curve".to_string());
+        }
+        // RFC 8037 §3.1 registers `EdDSA` as the JWS algorithm for Ed25519.
+        // Any other present `alg` names a different purpose for the key.
+        match jwk.alg.as_deref() {
+            None | Some("EdDSA") => {}
+            Some(other) => {
+                return Err(format!(
+                    "JWK alg '{other}' is not a supported OKP signature algorithm"
+                ));
+            }
+        }
+        // Ed25519 is approved by FIPS 186-5, but it is not in the algorithm
+        // set Ferrum routes through the selected FIPS module, so an EdDSA key
+        // is refused while FIPS mode is enforced.
+        crate::fips::keys::check_jwk_okp_public_key()?;
+
+        let x = jwk.x.as_deref().ok_or("missing OKP public key 'x'")?;
+        let x_bytes = URL_SAFE_NO_PAD
+            .decode(x)
+            .map_err(|e| format!("invalid base64url in 'x': {e}"))?;
+        if x_bytes.len() != ED25519_PUBLIC_KEY_BYTES {
+            return Err("Ed25519 public key must be exactly 32 bytes".to_string());
+        }
+        let decoding_key = DecodingKey::from_ed_components(x)
+            .map_err(|e| format!("invalid OKP key components: {e}"))?;
+
+        Ok(CachedJwk {
+            algorithm: Algorithm::EdDSA,
             decoding_key,
         })
     }

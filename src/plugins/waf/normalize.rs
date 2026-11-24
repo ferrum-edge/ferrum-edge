@@ -31,9 +31,12 @@ enum Utf32Endian {
 /// raw input). Bounds body-scan cost at `O(VARIANTS × bytes × rules)` for a
 /// single inspection view; the underlying `RegexSet` matching is linear so
 /// this is a hard multiplier. A bare `charset=utf-16` / `utf-32` with no BOM
-/// may produce up to [`MAX_WIDE_CHARSET_VIEWS`] transcoded views and still
-/// scans the raw/lossy view, so that path's worst case is
-/// `O((1 + MAX_WIDE_CHARSET_VIEWS) × (1 + MAX_VARIANTS) × bytes × rules)`.
+/// may produce up to [`MAX_WIDE_CHARSET_VIEWS`] transcoded views (plus up to
+/// [`MAX_SIGNATURE_VIEWS`] more when the BOM-less wide signature, or a BOM of
+/// the other wide width, disagrees with the declared wide charset) and still
+/// scans the raw/lossy view, so
+/// that path's worst case is
+/// `O((1 + MAX_WIDE_CHARSET_VIEWS + MAX_SIGNATURE_VIEWS) × (1 + MAX_VARIANTS) × bytes × rules)`.
 /// That is a deliberate bound for an uncommon Content-Type, not an unbounded
 /// expansion — do not raise this cap to "make room" for more endians.
 ///
@@ -42,10 +45,31 @@ enum Utf32Endian {
 /// padding a value with unrelated escapes cannot push a view out of the set.
 const MAX_VARIANTS: usize = 5;
 
-/// Cap on UTF-16 / UTF-32 inspection views of one body. Explicit little/big
-/// names and BOMs resolve to one view. Bare `utf-16` / `utf-32` without a
-/// BOM tries both endiannesses; successful views are kept up to this cap.
+/// Cap on UTF-16 / UTF-32 inspection views of one body from its declared
+/// charset and BOM. Explicit little/big names and BOMs resolve to one view.
+/// Bare `utf-16` / `utf-32` without a BOM tries both endiannesses; successful
+/// views are kept up to this cap.
 const MAX_WIDE_CHARSET_VIEWS: usize = 2;
+
+/// Extra views the body's own bytes may add when they disagree with the
+/// declared wide charset in a way the declared readings do not cover:
+///
+/// - a BOM-less wide signature whose width or endianness differs from the
+///   declaration (for example `charset=utf-16` on UTF-32 bytes, or
+///   `charset=utf-16be` on UTF-16LE bytes) adds both endiannesses of the
+///   signature's width;
+/// - a BOM of the other wide width (for example `charset=utf-32le` on a body
+///   that starts with the UTF-16BE mark `FE FF`, or `charset=utf-16le` on one
+///   that starts with the UTF-32BE mark `00 00 FE FF`) adds whichever of the
+///   declared whole-body reading and the BOM-stripped BOM reading the
+///   declared path did not already produce.
+///
+/// A byte-sniffing backend reads the signature or BOM, not the header, and a
+/// declaration-honouring one reads the header, so capping at either side
+/// alone would leave the other reading unscanned. Only a disagreement pays
+/// this: a signature whose width and endianness the declaration already names
+/// adds nothing.
+const MAX_SIGNATURE_VIEWS: usize = 2;
 const MAX_NUMERIC_ENTITY_DIGITS: usize = 16;
 
 /// Maximum decode rounds in [`layered_decode_inner`]. Each round peels at most one
@@ -127,17 +151,22 @@ fn decoded_variants(text: &str, escapes: StringEscapes) -> (Vec<String>, bool) {
     (out, !layered.converged)
 }
 
-/// Zero, one, or two UTF-8 inspection views of a UTF-16 / UTF-32 body.
+/// UTF-8 inspection views of a UTF-16 / UTF-32 body.
 ///
 /// Ordinary UTF-8 produces [`WideCharsetViews::empty`] — no heap allocation.
 /// A resolved endianness (explicit `utf-16le` / `utf-32be`, or a BOM) yields
 /// one view. A reading the declaration does not settle — a bare
 /// `charset=utf-16` / `utf-32` with no BOM, an ambiguous `FF FE 00 00`
 /// prefix, or a charset that disagrees with the BOM — yields both candidate
-/// views, capped at [`MAX_WIDE_CHARSET_VIEWS`]. The scanner always keeps the
-/// raw/lossy view and its transformations alongside these additional views.
+/// views, capped at [`MAX_WIDE_CHARSET_VIEWS`]. When a BOM-less wide
+/// signature disagrees with the declared wide charset, both endiannesses of
+/// the signature's width are added on top, and when a BOM's width disagrees
+/// with the declared wide charset family, the declared whole-body reading and
+/// the BOM's reading are both kept (up to [`MAX_SIGNATURE_VIEWS`] more). The
+/// scanner always keeps the raw/lossy view and its transformations alongside
+/// these additional views.
 pub(super) struct WideCharsetViews {
-    views: [Option<String>; MAX_WIDE_CHARSET_VIEWS],
+    views: [Option<String>; MAX_WIDE_CHARSET_VIEWS + MAX_SIGNATURE_VIEWS],
     /// The body declares a charset this WAF cannot transcode at all (UTF-7,
     /// ISO-2022-*, HZ-GB-2312, EBCDIC). Its encoded form can hide ASCII text
     /// from the raw scan, so the caller reports it rather than treating the
@@ -148,14 +177,14 @@ pub(super) struct WideCharsetViews {
 impl WideCharsetViews {
     pub(super) fn empty() -> Self {
         Self {
-            views: [None, None],
+            views: [None, None, None, None],
             uninspectable_charset: false,
         }
     }
 
     fn resolved(text: String) -> Self {
         Self {
-            views: [Some(text), None],
+            views: [Some(text), None, None, None],
             uninspectable_charset: false,
         }
     }
@@ -171,8 +200,85 @@ impl WideCharsetViews {
             return Self::resolved(first);
         }
         Self {
-            views: [Some(first), Some(second)],
+            views: [Some(first), Some(second), None, None],
             uninspectable_charset: false,
+        }
+    }
+
+    /// Add one reading, skipping a duplicate of one already present. The
+    /// array is sized for the largest combination any path produces (at most
+    /// two declared readings plus at most two disagreement readings), so a
+    /// free slot always exists.
+    fn push_view(&mut self, text: String) {
+        if self.views.iter().flatten().any(|view| view == &text) {
+            return;
+        }
+        let slot = self.views.iter_mut().find(|slot| slot.is_none());
+        debug_assert!(slot.is_some(), "wide-charset view array sized too small");
+        if let Some(slot) = slot {
+            *slot = Some(text);
+        }
+    }
+
+    /// Add both endiannesses of a disagreeing BOM-less wide signature,
+    /// skipping any reading already present. Once the declaration is known
+    /// to disagree, both endians of the signature's width are candidates,
+    /// exactly as for a bare wide declaration.
+    fn add_signature_views(&mut self, body: &[u8], signature: WideSignature) {
+        match signature {
+            WideSignature::Utf16(_) => {
+                self.push_view(decode_utf16(body, Utf16Endian::Little));
+                self.push_view(decode_utf16(body, Utf16Endian::Big));
+            }
+            WideSignature::Utf32(_) => {
+                self.push_view(decode_utf32(body, Utf32Endian::Little));
+                self.push_view(decode_utf32(body, Utf32Endian::Big));
+            }
+        }
+    }
+
+    /// Add the readings of a body whose BOM's width disagrees with the
+    /// declared wide charset family. Same-width disagreements are already
+    /// [`WideEndian::Conflict`]; here the declared path produced only one side:
+    ///
+    /// - A UTF-32 declaration over a UTF-16 BOM (`FE FF`, or `FF FE` not
+    ///   followed by `00 00`) produced the declared UTF-32 reading(s) of the
+    ///   whole body; the BOM-honouring UTF-16 reading after the mark is added.
+    /// - A UTF-16 declaration over the UTF-32BE BOM `00 00 FE FF` produced the
+    ///   BOM-honouring UTF-32BE reading; the declared UTF-16 reading of the
+    ///   whole body is added (both endiannesses for a bare `utf-16`).
+    /// - A UTF-16 declaration over `FF FE 00 00` keeps the ambiguity readings
+    ///   (UTF-32LE and UTF-16LE after the mark). The UTF-16LE one is already
+    ///   what a little-endian or bare `utf-16` declaration reads, so only an
+    ///   explicit big-endian declaration adds its whole-body reading.
+    ///
+    /// A UTF-32 declaration over `FF FE 00 00` is not a width disagreement:
+    /// the declaration settles that mark as UTF-32, as before.
+    fn add_cross_width_bom_views(&mut self, body: &[u8], content_type: Option<&str>) {
+        if charset_declares_utf32_family(content_type) {
+            // `utf16_bom` defers to both UTF-32 marks, so this is never the
+            // start of `FF FE 00 00`.
+            if let Some((endian, skip)) = utf16_bom(body) {
+                self.push_view(decode_utf16(&body[skip..], endian));
+            }
+            return;
+        }
+        if !charset_declares_utf16_family(content_type) {
+            return;
+        }
+        let declared = declared_utf16_endian(content_type, None);
+        match utf32_bom(body) {
+            Some((Utf32Endian::Big, _)) => match declared {
+                Some(endian) => self.push_view(decode_utf16(body, endian)),
+                None => {
+                    self.push_view(decode_utf16(body, Utf16Endian::Little));
+                    self.push_view(decode_utf16(body, Utf16Endian::Big));
+                }
+            },
+            Some((Utf32Endian::Little, _)) if declared == Some(Utf16Endian::Big) => {
+                self.push_view(decode_utf16(body, Utf16Endian::Big));
+            }
+            Some((Utf32Endian::Little, _)) | None => {}
         }
     }
 
@@ -228,7 +334,10 @@ fn charset_is_uninspectable(content_type: Option<&str>) -> bool {
 enum WideEndian<E> {
     /// Neither a declared charset of this family nor a BOM: no view.
     Unknown,
-    /// One authoritative reading: decode `body[skip..]` with this endianness.
+    /// One authoritative reading of this width: decode `body[skip..]` with
+    /// this endianness. A BOM of the other wide width is not a disagreement
+    /// this type can express; [`WideCharsetViews::add_cross_width_bom_views`]
+    /// adds that reading afterwards.
     Resolved(E, usize),
     /// The declared charset and the BOM disagree. Neither reading can be
     /// discarded: the declaration is what a backend honouring `Content-Type`
@@ -253,9 +362,10 @@ enum WideEndian<E> {
 /// `FF FE 00 00` and would otherwise be misread as a UTF-16LE BOM. When a
 /// charset declares the UTF-16 or UTF-32 family without an endianness and
 /// without a BOM, both endiannesses are decoded. When a declared endianness
-/// disagrees with the BOM, both readings are decoded as well — dropping the
-/// views on a disagreement is exactly the bypass an attacker constructs by
-/// prefixing a `charset=utf-16le` payload with `FE FF`.
+/// or width disagrees with the BOM, both readings are decoded as well —
+/// dropping the views on a disagreement would leave unscanned the reading a
+/// backend takes when, for example, a `charset=utf-16le` payload is prefixed
+/// with `FE FF`, or a `charset=utf-32le` one with a UTF-16 BOM.
 ///
 /// Decoding itself is lossy (`U+FFFD` substitution), so a single malformed
 /// code unit cannot disable inspection of an otherwise readable body.
@@ -270,34 +380,163 @@ pub(super) fn decode_wide_charset_body_views(
     views
 }
 
+/// Whether a body's UTF-16 / UTF-32 reading is one a backend certainly
+/// takes, rather than one only the BOM-less signature (or a loosely written
+/// header) suggests: the body starts with a UTF-16 / UTF-32 byte-order mark,
+/// or the whole `Content-Type` value is the canonical
+/// `type/subtype; charset=<utf-16|utf-16le|utf-16be|utf-32|utf-32le|utf-32be>`
+/// (see [`content_type_is_canonical_wide_declaration`]).
+///
+/// The test is an allow-list on purpose. Media-type parsers disagree about
+/// empty parameters, quoted values, repeated headers and parameter order —
+/// ASP.NET Core stops reading parameters at an empty one and then defaults to
+/// UTF-8 — so any header that is not exactly canonical declares nothing, and
+/// the raw bytes are judged as the UTF-8 document a backend may read instead.
+/// Which readings are DECODED is unchanged ([`charset_value`]); this only
+/// decides whether a decoded wide reading may vouch for the raw bytes.
+pub(super) fn wide_charset_is_declared(body: &[u8], content_type: Option<&str>) -> bool {
+    utf32_bom(body).is_some()
+        || utf16_bom(body).is_some()
+        || content_type.is_some_and(content_type_is_canonical_wide_declaration)
+}
+
+/// `OWS type "/" subtype OWS ";" OWS "charset" OWS "=" OWS ( label / DQUOTE
+/// label DQUOTE ) OWS`, nothing more: one `Content-Type` value with exactly
+/// one parameter, a wide charset label (ASCII case-insensitive), no escapes.
+/// A comma-folded repeated header, a second or empty parameter, or anything
+/// after the label fails.
+fn content_type_is_canonical_wide_declaration(value: &str) -> bool {
+    const LABELS: [&str; 6] = [
+        "utf-16", "utf-16le", "utf-16be", "utf-32", "utf-32le", "utf-32be",
+    ];
+    fn trim(text: &str) -> &str {
+        text.trim_matches(|c: char| c == ' ' || c == '\t')
+    }
+    let Some((essence, parameter)) = value.split_once(';') else {
+        return false;
+    };
+    let Some((kind, subtype)) = trim(essence).split_once('/') else {
+        return false;
+    };
+    let is_token = |text: &str| !text.is_empty() && text.bytes().all(is_token_byte);
+    if !is_token(kind) || !is_token(subtype) {
+        return false;
+    }
+    let Some((name, label)) = parameter.split_once('=') else {
+        return false;
+    };
+    if !trim(name).eq_ignore_ascii_case("charset") {
+        return false;
+    }
+    let label = trim(label);
+    let label = label
+        .strip_prefix('"')
+        .and_then(|quoted| quoted.strip_suffix('"'))
+        .unwrap_or(label);
+    LABELS.iter().any(|known| label.eq_ignore_ascii_case(known))
+}
+
+/// RFC 9110 `tchar`.
+fn is_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+}
+
+/// The wide width a BOM-less body's first four octets sign, if any: the
+/// NUL placement of two ASCII UTF-16 units or one ASCII UTF-32 unit. The
+/// NUL placement also implies an endianness (a leading NUL is big-endian).
+/// That endianness only decides whether an explicit declaration already
+/// agrees with the bytes; the views a disagreeing signature adds, like the
+/// views of an undeclared signature, always cover both endiannesses.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WideSignature {
+    Utf16(Utf16Endian),
+    Utf32(Utf32Endian),
+}
+
+fn wide_signature(body: &[u8]) -> Option<WideSignature> {
+    let [a, b, c, d, ..] = body else {
+        return None;
+    };
+    let ascii = |byte: u8| byte != 0 && byte.is_ascii();
+    if *a == 0 && *b == 0 && *c == 0 && ascii(*d) {
+        Some(WideSignature::Utf32(Utf32Endian::Big))
+    } else if ascii(*a) && *b == 0 && *c == 0 && *d == 0 {
+        Some(WideSignature::Utf32(Utf32Endian::Little))
+    } else if *a == 0 && ascii(*b) && *c == 0 && ascii(*d) {
+        Some(WideSignature::Utf16(Utf16Endian::Big))
+    } else if ascii(*a) && *b == 0 && ascii(*c) && *d == 0 {
+        Some(WideSignature::Utf16(Utf16Endian::Little))
+    } else {
+        None
+    }
+}
+
+/// Whether the declared readings already cover the reading a byte-sniffing
+/// parser takes from the signature: a bare `utf-16` / `utf-32` of the same
+/// width decodes both endiannesses, and an explicit endianness of the same
+/// width that matches the signature's decodes exactly the sniffed reading.
+fn signature_pair_covered(content_type: Option<&str>, signature: WideSignature) -> bool {
+    match signature {
+        WideSignature::Utf16(endian) => {
+            charset_is_unspecified_utf16(content_type)
+                || declared_utf16_endian(content_type, None) == Some(endian)
+        }
+        WideSignature::Utf32(endian) => {
+            charset_is_unspecified_utf32(content_type)
+                || declared_utf32_endian(content_type, None) == Some(endian)
+        }
+    }
+}
+
 fn wide_charset_body_views(body: &[u8], content_type: Option<&str>) -> WideCharsetViews {
-    // With no declaration or BOM, require the NUL placement of two ASCII
-    // UTF-16 units or one ASCII UTF-32 unit in the first four octets. Do not
-    // infer a charset from arbitrary interior NULs or try every binary body.
-    // The signature selects only a width; retain both endians and raw text,
-    // using the same fixed view cap as a bare declared wide charset.
-    if charset_value(content_type).is_none()
+    let mut views = declared_wide_charset_body_views(body, content_type);
+    // A wide declaration the bytes contradict: the declared readings are
+    // what a declaration-honouring backend sees, but a byte-sniffing parser
+    // follows the BOM or the BOM-less signature instead.
+    if !charset_declares_utf16_family(content_type) && !charset_declares_utf32_family(content_type)
+    {
+        return views;
+    }
+    if utf32_bom(body).is_some() || utf16_bom(body).is_some() {
+        // A same-width declared/BOM disagreement already yields both
+        // readings (`WideEndian::Conflict`). A BOM of the other wide width
+        // yields only one side from the declared path; add the other.
+        views.add_cross_width_bom_views(body, content_type);
+    } else if let Some(signature) = wide_signature(body)
+        && !signature_pair_covered(content_type, signature)
+    {
+        // When the signature's width or endianness is not already covered
+        // by the declared readings, add both endiannesses of the signature's
+        // width so the sniffed reading is scanned too.
+        views.add_signature_views(body, signature);
+    }
+    views
+}
+
+fn declared_wide_charset_body_views(body: &[u8], content_type: Option<&str>) -> WideCharsetViews {
+    // With no wide-charset declaration or BOM, require the wide signature:
+    // do not infer a charset from arbitrary interior NULs or try every
+    // binary body. The signature selects only a width; retain both endians and
+    // raw text, using the same fixed view cap as a bare declared wide charset.
+    // A declared non-wide charset (`utf-8`, an unknown label) does not switch
+    // the sniff off: a parser that detects the encoding from the bytes still
+    // reads such a body as UTF-16 / UTF-32, whatever the header claims.
+    if !charset_declares_utf16_family(content_type)
+        && !charset_declares_utf32_family(content_type)
         && utf32_bom(body).is_none()
         && utf16_bom(body).is_none()
-        && let [a, b, c, d, ..] = body
     {
-        let ascii = |byte: u8| byte != 0 && byte.is_ascii();
-        if (*a == 0 && *b == 0 && *c == 0 && ascii(*d))
-            || (ascii(*a) && *b == 0 && *c == 0 && *d == 0)
-        {
-            return WideCharsetViews::unresolved(
+        return match wide_signature(body) {
+            Some(WideSignature::Utf32(_)) => WideCharsetViews::unresolved(
                 decode_utf32(body, Utf32Endian::Little),
                 decode_utf32(body, Utf32Endian::Big),
-            );
-        }
-        if (*a == 0 && ascii(*b) && *c == 0 && ascii(*d))
-            || (ascii(*a) && *b == 0 && ascii(*c) && *d == 0)
-        {
-            return WideCharsetViews::unresolved(
+            ),
+            Some(WideSignature::Utf16(_)) => WideCharsetViews::unresolved(
                 decode_utf16(body, Utf16Endian::Little),
                 decode_utf16(body, Utf16Endian::Big),
-            );
-        }
+            ),
+            None => WideCharsetViews::empty(),
+        };
     }
     if charset_is_unspecified_utf32(content_type) && utf32_bom(body).is_none() {
         return WideCharsetViews::unresolved(
@@ -403,9 +642,12 @@ fn resolve_utf32_body(body: &[u8], content_type: Option<&str>) -> WideEndian<Utf
     }
 }
 
-/// First `charset` parameter of a Content-Type. Duplicate `charset=`
-/// parameters are treated as unspecified (return `None`) so a conflicting
-/// pair cannot pick an endianness.
+/// First `charset` parameter of a Content-Type, read the lenient way many
+/// backends read it: split at every `;`, quotes trimmed. Duplicate
+/// `charset=` parameters are treated as unspecified (return `None`) so a
+/// conflicting pair cannot pick an endianness. This decides which wide
+/// readings are decoded (coverage), not whether one is authoritative; see
+/// [`wide_charset_is_declared`].
 fn charset_value(content_type: Option<&str>) -> Option<&str> {
     let content_type = content_type?;
     let mut declared = None;
@@ -440,7 +682,12 @@ fn declared_utf16_endian(
     content_type: Option<&str>,
     bom_endian: Option<Utf16Endian>,
 ) -> Option<Utf16Endian> {
-    let value = charset_value(content_type)?;
+    utf16_label_endian(charset_value(content_type)?, bom_endian)
+}
+
+/// The UTF-16 endianness a charset label names; `bom_endian` for the bare,
+/// endian-unspecified `utf-16`; `None` for a label outside the family.
+fn utf16_label_endian(value: &str, bom_endian: Option<Utf16Endian>) -> Option<Utf16Endian> {
     // WHATWG encoding index: every UTF-16LE label, so `charset=unicode` or
     // `charset=ucs-2` cannot slip past the transcoder that `utf-16le` hits.
     if value.eq_ignore_ascii_case("utf-16le")
@@ -486,7 +733,11 @@ fn declared_utf32_endian(
     content_type: Option<&str>,
     bom_endian: Option<Utf32Endian>,
 ) -> Option<Utf32Endian> {
-    let value = charset_value(content_type)?;
+    utf32_label_endian(charset_value(content_type)?, bom_endian)
+}
+
+/// UTF-32 counterpart of [`utf16_label_endian`].
+fn utf32_label_endian(value: &str, bom_endian: Option<Utf32Endian>) -> Option<Utf32Endian> {
     if value.eq_ignore_ascii_case("utf-32le") || value.eq_ignore_ascii_case("utf32le") {
         Some(Utf32Endian::Little)
     } else if value.eq_ignore_ascii_case("utf-32be") || value.eq_ignore_ascii_case("utf32be") {
@@ -500,6 +751,11 @@ fn declared_utf32_endian(
     } else {
         None
     }
+}
+
+/// UTF-16 counterpart of [`charset_declares_utf32_family`].
+fn charset_declares_utf16_family(content_type: Option<&str>) -> bool {
+    declared_utf16_endian(content_type, Some(Utf16Endian::Little)).is_some()
 }
 
 /// Whether the declared charset names the UTF-32 family at all (bare
@@ -803,7 +1059,19 @@ fn percent_decode_plus(text: &str) -> Cow<'_, str> {
 fn percent_decode(text: &str, plus_is_space: bool) -> Cow<'_, str> {
     let bytes = text.as_bytes();
     let mut first = 0;
-    while first < bytes.len() && !percent_decodes_at(&bytes[first..], plus_is_space) {
+    while first < bytes.len() {
+        let next = if plus_is_space {
+            memchr::memchr2(b'%', b'+', &bytes[first..])
+        } else {
+            memchr::memchr(b'%', &bytes[first..])
+        };
+        let Some(offset) = next else {
+            return Cow::Borrowed(text);
+        };
+        first += offset;
+        if percent_decodes_at(&bytes[first..], plus_is_space) {
+            break;
+        }
         first += 1;
     }
     if first == bytes.len() {
@@ -1393,7 +1661,7 @@ mod tests {
     }
 
     #[test]
-    fn run_decoders_and_prefilters_match_reference_implementations() {
+    fn run_decoders_match_reference_implementations() {
         let slash = '\\';
         let cases = vec![
             "mixed %3c%3E and plus+ signs".to_string(),
@@ -1423,29 +1691,6 @@ mod tests {
 
             let expected_html = reference_decode_runs(text, b'&', decode_entity);
             assert_eq!(html_entity_decode(text), expected_html, "{text:?}");
-        }
-
-        let patterns = [r"(?i)<script", r"union\s+select", r"%[0-9a-f]{2}"];
-        let regex_set = regex::RegexSet::new(patterns).expect("valid test patterns");
-        let regexes: Vec<_> = patterns
-            .iter()
-            .map(|pattern| regex::Regex::new(pattern).expect("valid test pattern"))
-            .collect();
-        let regex_cases = cases.iter().map(String::as_str).chain([
-            "<SCRIPT>alert(1)",
-            "1 union\tselect",
-            "literal %3c",
-            "日本語の文章",
-            "",
-        ]);
-        for text in regex_cases {
-            let reference = regexes.iter().any(|regex| regex.is_match(text));
-            assert_eq!(regex_set.is_match(text), reference, "{text:?}");
-            assert_eq!(
-                regex_set.matches(text).iter().next().is_some(),
-                reference,
-                "{text:?}"
-            );
         }
     }
 

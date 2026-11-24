@@ -196,6 +196,395 @@ async fn streaming_request_is_unaffected_by_the_buffered_ceiling() {
     backend_task.abort();
 }
 
+/// Stalled uploads that would hold every block of a two-ceiling budget if each
+/// one were still charged its whole ceiling before its first byte.
+const STALLED_UPLOADS: usize = 4;
+
+#[ignore]
+#[tokio::test]
+async fn stalled_buffered_uploads_do_not_hold_the_budget_against_other_clients() {
+    // Audit finding: every buffered upload used to reserve its whole retained
+    // ceiling before a byte arrived, so a client that opened as many uploads
+    // as the budget holds ceilings and sent no body got every other client's
+    // buffered upload refused with `503` for a whole read timeout. The budget
+    // here holds exactly two ceilings.
+    let (backend_port, backend_hits, backend_task) = spawn_counting_backend().await;
+    let mut gateway = budget_gateway_builder(backend_port)
+        .env(
+            "FERRUM_REQUEST_BUFFER_MAX_TOTAL_BYTES",
+            (2 * FALLBACK_BYTES).to_string(),
+        )
+        .spawn()
+        .await
+        .expect("start request-buffer-budget gateway");
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(5))
+        .await
+        .expect("proxy port ready");
+
+    // Each stalled upload sends its request head and a declared length within
+    // the ceiling, then no body.
+    let stalled_body = json_body(1_024);
+    let mut stalled = Vec::with_capacity(STALLED_UPLOADS);
+    for _ in 0..STALLED_UPLOADS {
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", gateway.proxy_port))
+            .await
+            .expect("connect stalled upload");
+        let head = format!(
+            "POST /buffered HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\n\r\n",
+            stalled_body.len()
+        );
+        stream
+            .write_all(head.as_bytes())
+            .await
+            .expect("write stalled request head");
+        stalled.push(stream);
+    }
+    // Give the gateway time to route the stalled requests into their buffered
+    // collects. The assertions below do not depend on this: they hold whether
+    // or not the collects have started.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let client = reqwest::Client::builder()
+        .http1_only()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .expect("http1 client");
+    let response = client
+        .post(gateway.proxy_url("/buffered"))
+        .header("content-type", "application/json")
+        .body(json_body(1_024))
+        .send()
+        .await
+        .expect("complete buffered upload");
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "stalled uploads that sent no body must not refuse another client's buffered \
+         upload; got {status} {body}"
+    );
+    assert_eq!(buffered_hits(&backend_hits), 1);
+
+    // The stalled uploads were live buffered collects all along: one that
+    // finally sends its body is forwarded.
+    let mut late = stalled.pop().expect("a stalled upload");
+    late.write_all(stalled_body.as_bytes())
+        .await
+        .expect("write late body");
+    let head = tokio::time::timeout(Duration::from_secs(10), read_response_head(&mut late))
+        .await
+        .expect("late upload answered");
+    assert!(
+        head.starts_with("HTTP/1.1 200"),
+        "a stalled upload that completes must be forwarded; got {head:?}"
+    );
+    assert_eq!(buffered_hits(&backend_hits), 2);
+
+    drop(stalled);
+    gateway.shutdown();
+    backend_task.abort();
+}
+
+/// A request-body transform growth larger than the whole request-buffer
+/// budget, so covering the replacement must be refused.
+const TRANSFORM_PADDING_BYTES: usize = 80 * 1024;
+
+#[ignore]
+#[tokio::test]
+async fn a_transform_capacity_refusal_keeps_its_503_under_a_smaller_response_limit() {
+    // Sol review (round 9): the capacity refusal a request-body transform
+    // triggers is the gateway-local terminal. A route response-size limit
+    // smaller than its fixed body must not turn it into a `502` "Response body
+    // too large" before any backend was contacted.
+    let (backend_port, backend_hits, backend_task) = spawn_counting_backend().await;
+    let mut gateway = TestGateway::builder()
+        .mode_file(transform_capacity_config(backend_port))
+        .log_level("warn")
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .env("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES", "0")
+        .env(
+            "FERRUM_REQUEST_BUFFER_FALLBACK_MAX_BYTES",
+            FALLBACK_BYTES.to_string(),
+        )
+        .env(
+            "FERRUM_REQUEST_BUFFER_MAX_TOTAL_BYTES",
+            FALLBACK_BYTES.to_string(),
+        )
+        .spawn()
+        .await
+        .expect("start transform-capacity gateway");
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(5))
+        .await
+        .expect("proxy port ready");
+
+    let client = reqwest::Client::builder()
+        .http1_only()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .expect("http1 client");
+
+    let response = client
+        .post(gateway.proxy_url("/buffered-capacity"))
+        .header("content-type", "application/json")
+        .body("{}")
+        .send()
+        .await
+        .expect("refused upload is answered");
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "the transform-capacity refusal must keep its gateway-local 503; got {status} {body}"
+    );
+    assert!(
+        body.contains("Request buffering capacity exceeded"),
+        "response policy must not replace the fixed capacity body: {body}"
+    );
+    assert_eq!(
+        buffered_hits(&backend_hits),
+        0,
+        "the refused upload must never reach the backend"
+    );
+
+    // The refusal released its charge: an admissible upload under the same
+    // response limit still succeeds.
+    let response = client
+        .post(gateway.proxy_url("/buffered-admissible"))
+        .header("content-type", "application/json")
+        .body("{}")
+        .send()
+        .await
+        .expect("admissible upload completes");
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "an admissible upload must still be forwarded; got {status} {body}"
+    );
+    assert_eq!(buffered_hits(&backend_hits), 1);
+
+    gateway.shutdown();
+    backend_task.abort();
+}
+
+fn transform_capacity_config(backend_port: u16) -> String {
+    let padding = "p".repeat(TRANSFORM_PADDING_BYTES);
+    let mut plugin_configs = Vec::from(transform_plugins("capacity-route", padding));
+    plugin_configs.extend(transform_plugins("admissible-route", "p".to_string()));
+    let config = json!({
+        "version": "1",
+        "proxies": [
+            transform_route("capacity-route", "/buffered-capacity", backend_port),
+            transform_route("admissible-route", "/buffered-admissible", backend_port)
+        ],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": plugin_configs
+    });
+    serde_yaml::to_string(&config).expect("serialize transform-capacity config")
+}
+
+/// A buffered route whose request transformer adds `padding` to the JSON body
+/// and whose strict response-size limit is smaller than any error body.
+fn transform_route(id: &str, path: &str, backend_port: u16) -> serde_json::Value {
+    json!({
+        "id": id,
+        "listen_path": path,
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": backend_port,
+        "strip_listen_path": false,
+        "pool_enable_http2": false,
+        "plugins": [
+            {"plugin_config_id": format!("{id}-transform")},
+            {"plugin_config_id": format!("{id}-response-limit")}
+        ]
+    })
+}
+
+fn transform_plugins(id: &str, padding: String) -> [serde_json::Value; 2] {
+    [
+        json!({
+            "id": format!("{id}-transform"),
+            "proxy_id": id,
+            "plugin_name": "request_transformer",
+            "scope": "proxy",
+            "enabled": true,
+            "config": {"rules": [{
+                "operation": "add",
+                "target": "body",
+                "key": "padding",
+                "value": padding
+            }]}
+        }),
+        json!({
+            "id": format!("{id}-response-limit"),
+            "proxy_id": id,
+            "plugin_name": "response_size_limiting",
+            "scope": "proxy",
+            "enabled": true,
+            "config": {"max_bytes": 16, "require_buffered_check": true}
+        }),
+    ]
+}
+
+/// A retried upload larger than the whole request-buffer budget.
+const RETRIED_UPLOAD_BYTES: usize = 100 * 1024;
+
+#[ignore]
+#[tokio::test]
+async fn a_dispatch_capacity_refusal_is_never_advertised_as_gzip() {
+    // Sol review (round 13): a dispatch-stage capacity refusal is a gateway
+    // terminal whose body transforms are skipped, so no header hook may commit
+    // a body coding for it. Retry replay buffers this PUT inside dispatch, the
+    // budget refuses it, and `compression` must not label the plaintext
+    // refusal `Content-Encoding: gzip` after `response_transformer` gave it a
+    // compressible media type.
+    let (backend_port, backend_hits, backend_task) = spawn_counting_backend().await;
+    let mut gateway = TestGateway::builder()
+        .mode_file(retry_compression_config(backend_port))
+        .log_level("warn")
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .env(
+            "FERRUM_REQUEST_BUFFER_FALLBACK_MAX_BYTES",
+            FALLBACK_BYTES.to_string(),
+        )
+        .env(
+            "FERRUM_REQUEST_BUFFER_MAX_TOTAL_BYTES",
+            FALLBACK_BYTES.to_string(),
+        )
+        .spawn()
+        .await
+        .expect("start retry-compression gateway");
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(5))
+        .await
+        .expect("proxy port ready");
+
+    let upload = vec![b'u'; RETRIED_UPLOAD_BYTES];
+    let (head, body) = raw_gzip_put(gateway.proxy_port, &upload).await;
+    assert!(
+        head.starts_with("http/1.1 503"),
+        "the retried upload must get the capacity refusal: {head}"
+    );
+    assert!(
+        !head.contains("content-encoding"),
+        "a plaintext capacity refusal must not advertise a coding: {head}"
+    );
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("Request buffering capacity exceeded"),
+        "the refusal body must stay readable: {text}"
+    );
+    assert_eq!(buffered_hits(&backend_hits), 0);
+
+    // The refusal released its charge: an admissible upload through the same
+    // route still succeeds.
+    let (head, _) = raw_gzip_put(gateway.proxy_port, b"small").await;
+    assert!(head.starts_with("http/1.1 200"), "unexpected head: {head}");
+    assert_eq!(buffered_hits(&backend_hits), 1);
+
+    gateway.shutdown();
+    backend_task.abort();
+}
+
+/// One raw HTTP/1.1 `PUT` that negotiates gzip, read until the gateway closes
+/// the connection, so the test sees the exact wire head and body with no
+/// client-side decoding. Returns the lowercased head and the body bytes.
+async fn raw_gzip_put(port: u16, body: &[u8]) -> (String, Vec<u8>) {
+    let head = format!(
+        "PUT /buffered-retry HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept-Encoding: gzip\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect gateway");
+    stream
+        .write_all(head.as_bytes())
+        .await
+        .expect("request head");
+    // The gateway may answer before it has read the whole upload.
+    let _ = stream.write_all(body).await;
+    let mut response = Vec::new();
+    let read = stream.read_to_end(&mut response);
+    let _ = tokio::time::timeout(Duration::from_secs(10), read).await;
+    let end = find_header_end(&response).expect("complete response head");
+    let head = String::from_utf8_lossy(&response[..end]);
+    (head.to_ascii_lowercase(), response[end..].to_vec())
+}
+
+fn retry_compression_config(backend_port: u16) -> String {
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "retry-route",
+            "listen_path": "/buffered-retry",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": backend_port,
+            "strip_listen_path": false,
+            "pool_enable_http2": false,
+            "retry": {
+                "max_retries": 1,
+                "retry_on_connect_failure": true,
+                "retryable_methods": ["PUT"]
+            },
+            "plugins": [
+                {"plugin_config_id": "retry-content-type"},
+                {"plugin_config_id": "retry-gzip"}
+            ]
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [
+            {
+                "id": "retry-content-type",
+                "proxy_id": "retry-route",
+                "plugin_name": "response_transformer",
+                "scope": "proxy",
+                "enabled": true,
+                "config": {"rules": [{
+                    "operation": "add",
+                    "target": "header",
+                    "key": "content-type",
+                    "value": "application/json"
+                }]}
+            },
+            {
+                "id": "retry-gzip",
+                "proxy_id": "retry-route",
+                "plugin_name": "compression",
+                "scope": "proxy",
+                "enabled": true,
+                "config": {"algorithms": ["gzip"], "min_content_length": 1}
+            }
+        ]
+    });
+    serde_yaml::to_string(&config).expect("serialize retry-compression config")
+}
+
+/// Read one HTTP/1.1 response head from `stream`.
+async fn read_response_head(stream: &mut tokio::net::TcpStream) -> String {
+    let mut buf = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 1024];
+    loop {
+        if let Some(end) = find_header_end(&buf) {
+            return String::from_utf8_lossy(&buf[..end]).into_owned();
+        }
+        match stream.read(&mut chunk).await {
+            Ok(0) | Err(_) => return String::from_utf8_lossy(&buf).into_owned(),
+            Ok(read) => buf.extend_from_slice(&chunk[..read]),
+        }
+    }
+}
+
 fn budget_gateway_builder(backend_port: u16) -> TestGatewayBuilder {
     TestGateway::builder()
         .mode_file(budget_config(backend_port))

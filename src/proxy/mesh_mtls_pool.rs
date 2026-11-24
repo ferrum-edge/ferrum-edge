@@ -24,7 +24,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use http_body::Frame;
 use hyper::client::conn::http2;
-use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use hyper_util::rt::TokioIo;
 use std::cell::RefCell;
 use std::fmt::Write;
 use std::pin::Pin;
@@ -51,7 +51,7 @@ use crate::tls::spiffe::build_spiffe_outbound_config;
 use super::hbone_pool::{
     H2ConnectTunnel, H2WsConnectTunnel, HbonePoolError, MESH_SPIFFE_ID_TAG,
     authority_for_host_port, dial_h2_connect_sender, entry_idle_expired, matches_boolish_true,
-    open_h2_connect_stream, open_h2_ws_connect_stream, svid_fingerprint,
+    open_h2_connect_stream, open_h2_ws_connect_stream_within, svid_fingerprint,
     target_expected_peer_spiffe, unix_secs, write_pool_config_key,
 };
 
@@ -76,16 +76,22 @@ pub const ISTIO_SIDECAR_INBOUND_PORT: u16 = 15006;
 /// byte-for-byte.
 pub const MESH_MTLS_AUTHORITY_PORT_TAG: &str = "mesh.mtls_authority_port";
 /// Tag carrying the destination MESH SERVICE host a Sidecar target's request
-/// `:authority` must name. Stamped ONLY by `sidecar`-topology mesh service
-/// discovery (the gateway-to-mesh bridge): a north-south gateway's client
+/// `:authority` must name. Stamped by `sidecar`-topology mesh service
+/// discovery (the gateway-to-mesh bridge) and for carried VirtualService
+/// destinations (below): a north-south gateway's client
 /// `Host` is typically a public hostname (and without `preserve_host_header`
 /// the authority falls back to the pod dial address), neither of which the
 /// destination sidecar's materialized inbound routes match — so dispatch
 /// forces this service host (`<service>.<namespace>.svc`, one of the
 /// destination's registered host variants) as the `:authority` instead. The
-/// original client `Host` still rides `x-forwarded-host`. Mesh-mode egress
-/// never stamps this tag: its outbound routes are host-routed by the service
-/// name, so the client authority is already the routing key the peer matches.
+/// original client `Host` still rides `x-forwarded-host`. Mesh-mode Sidecar
+/// egress stamps it only on the route-scoped upstream clones and split-leg
+/// targets carried VirtualService routes dial (issue #7423): such a route does
+/// not preserve the client `Host`, and on a split or dispatch branch that
+/// `Host` names the VirtualService host rather than the selected Service.
+/// The shared Service upstreams are never stamped: plain Service routes are
+/// host-routed by the service name, so the client authority is already the
+/// routing key the peer matches.
 pub const MESH_MTLS_AUTHORITY_HOST_TAG: &str = "mesh.mtls_authority_host";
 /// Outer network dial host for a Sidecar cross-cluster L4 tunnel. The target's
 /// `host` remains a scoped synthetic workload identity for LB/health maps while
@@ -671,7 +677,8 @@ pub const MESH_MTLS_GROWTH_PENDING_PER_CONNECTION: usize = 8;
 const MESH_MTLS_GROWTH_BACKOFF_SECS: u64 = 10;
 
 pub struct MeshMtlsConnectionPool {
-    entries: DashMap<String, Vec<MeshMtlsPoolEntry>>,
+    /// Shared with the periodic idle sweeper, which holds it weakly.
+    entries: Arc<DashMap<String, Vec<MeshMtlsPoolEntry>>>,
     /// key -> unix seconds before which no growth dial is attempted for the
     /// key. Written only when a growth dial fails; pruned with idle entries.
     growth_backoff_until: DashMap<String, u64>,
@@ -716,7 +723,6 @@ struct MeshMtlsSvidIdentityCache {
 }
 
 impl MeshMtlsConnectionPool {
-    #[allow(dead_code)] // Used by tests and external lib callers; binary wires the shared generation counter.
     pub fn new(
         pool_config: PoolConfig,
         dns_cache: DnsCache,
@@ -775,8 +781,10 @@ impl MeshMtlsConnectionPool {
         shard_amount: usize,
         backend_svid_generation: BackendSvidGeneration,
     ) -> Self {
+        let entries = Arc::new(DashMap::with_shard_amount(shard_amount));
+        spawn_idle_entry_sweeper(&entries, &pool_config);
         Self {
-            entries: DashMap::with_shard_amount(shard_amount),
+            entries,
             growth_backoff_until: DashMap::new(),
             creation_locks: DashMap::with_shard_amount(shard_amount),
             gateway_svid,
@@ -1459,26 +1467,19 @@ impl MeshMtlsConnectionPool {
             crate::proxy::hbone_pool::HBONE_DEFAULT_MAX_HEADER_LIST_SIZE,
         )
         .await?;
-        tokio::time::timeout(
+        // The connect budget bounds the Extended CONNECT up to the peer's
+        // response head; a refusal's optional body read runs after it, so an
+        // in-time refusal is always relayed (GHSA-7x2j-3389-2h35).
+        open_h2_ws_connect_stream_within(
             Duration::from_millis(proxy.backend_connect_timeout_ms),
-            open_h2_ws_connect_stream(
-                transport,
-                authority,
-                path_and_query,
-                ws_handshake_headers,
-                None,
-                None,
-            ),
+            transport,
+            authority,
+            path_and_query,
+            ws_handshake_headers,
+            None,
+            None,
         )
         .await
-        .map_err(|_| HbonePoolError::ConnectStream {
-            authority: authority.to_string(),
-            message: format!(
-                "timed out after {}ms waiting for sidecar mesh-mTLS WebSocket Extended CONNECT \
-                 response",
-                proxy.backend_connect_timeout_ms
-            ),
-        })?
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1590,18 +1591,26 @@ impl MeshMtlsConnectionPool {
         pool_config: &PoolConfig,
         max_entries: usize,
     ) -> Option<MeshMtlsTransport> {
-        let now = unix_secs();
         if self
             .growth_backoff_until
             .get(key)
-            .is_some_and(|until| *until.value() > now)
+            .is_some_and(|until| *until.value() > unix_secs())
         {
             return None;
         }
         let creation_slot = self.creation_slot(key);
         let creation_lease = creation_slot.try_claim()?;
-        // Re-check under the lock: another grower may have widened the key
-        // (or a prune may have narrowed it) since the fast-path read.
+        // Re-check under the lock: a grower that failed between the read above
+        // and this claim has published its backoff before releasing the lease,
+        // and another grower may have widened the key (or a prune may have
+        // narrowed it) since the fast-path read.
+        if self
+            .growth_backoff_until
+            .get(key)
+            .is_some_and(|until| *until.value() > unix_secs())
+        {
+            return None;
+        }
         let live_connections = self
             .entries
             .get(key)
@@ -1631,8 +1640,7 @@ impl MeshMtlsConnectionPool {
                 effective_connect_timeout_ms,
             )
             .await;
-        drop(creation_lease);
-        match dialed {
+        let grown = match dialed {
             Ok(transport) => {
                 debug!(
                     target_host,
@@ -1645,8 +1653,14 @@ impl MeshMtlsConnectionPool {
                 Some(transport)
             }
             Err(err) => {
+                // Measured from the failure, not the dial start, so a dial
+                // that used its whole connect timeout still backs off the full
+                // window. Recorded before the lock is released, and re-checked
+                // after every claim, so once a dial has failed no other caller
+                // starts a second one for the key in between. A dial whose
+                // future is dropped (cancellation) records no backoff.
                 self.growth_backoff_until
-                    .insert(key.to_string(), now + MESH_MTLS_GROWTH_BACKOFF_SECS);
+                    .insert(key.to_string(), unix_secs() + MESH_MTLS_GROWTH_BACKOFF_SECS);
                 debug!(
                     target_host,
                     mtls_port,
@@ -1656,7 +1670,9 @@ impl MeshMtlsConnectionPool {
                 );
                 None
             }
-        }
+        };
+        drop(creation_lease);
+        grown
     }
 
     /// Dial one physical connection for `key` while holding its creation lock,
@@ -1861,11 +1877,7 @@ impl MeshMtlsConnectionPool {
 
     fn maybe_prune_idle_entries(&self) {
         let now = unix_secs();
-        let interval = if self.pool_config.idle_timeout_seconds == 0 {
-            60
-        } else {
-            self.pool_config.idle_timeout_seconds.clamp(1, 60)
-        };
+        let interval = idle_prune_interval_secs(&self.pool_config);
         let last = self.last_idle_prune_unix_secs.load(Ordering::Relaxed);
         if now.saturating_sub(last) < interval {
             return;
@@ -2051,28 +2063,10 @@ impl MeshMtlsConnectionPool {
                     });
                 }
 
-                let mut builder = http2::Builder::new(TokioExecutor::new());
-                builder.timer(TokioTimer::new());
-                if pool_config.enable_http2 {
-                    builder
-                        .keep_alive_interval(Duration::from_secs(
-                            pool_config.http2_keep_alive_interval_seconds,
-                        ))
-                        .keep_alive_timeout(Duration::from_secs(
-                            pool_config.http2_keep_alive_timeout_seconds,
-                        ))
-                        .max_concurrent_reset_streams(4096);
-                }
-                builder
-                    .initial_stream_window_size(pool_config.http2_initial_stream_window_size)
-                    .initial_connection_window_size(
-                        pool_config.http2_initial_connection_window_size,
-                    )
-                    .adaptive_window(pool_config.http2_adaptive_window)
-                    .max_frame_size(pool_config.http2_max_frame_size);
-                if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
-                    builder.max_concurrent_streams(max_streams);
-                }
+                // The shared builder every H2 pool family uses: the DR stream
+                // cap this pool keys on bounds outbound streams from the first
+                // one, not only after the peer's SETTINGS (issue #7071).
+                let builder = crate::pool::hyper_h2_client_builder(pool_config);
 
                 let io = TokioIo::new(tls_stream);
                 let (sender, connection) =
@@ -2225,6 +2219,50 @@ fn prune_pool_entries(entries: &mut Vec<MeshMtlsPoolEntry>) -> usize {
 fn record_mesh_mtls_evictions(count: usize) {
     crate::runtime_metrics::global_ref()
         .record_pool_evictions(crate::runtime_metrics::PoolKind::MeshMtls, count as u64);
+}
+
+/// Seconds between idle sweeps: the global idle timeout clamped to `1..=60`,
+/// or 60 when idle expiry is off globally (a per-proxy timeout may still
+/// apply to individual entries).
+fn idle_prune_interval_secs(pool_config: &PoolConfig) -> u64 {
+    if pool_config.idle_timeout_seconds == 0 {
+        60
+    } else {
+        pool_config.idle_timeout_seconds.clamp(1, 60)
+    }
+}
+
+/// Periodic idle sweep for the Sidecar mesh-mTLS pool (issue #7182).
+///
+/// The rate-limited prune also runs on the cold create path, but a
+/// destination that stops receiving lookups never reaches it, so without this
+/// task its connections — sockets, DestinationRule `maxConnections` slots,
+/// trust-registry registrations — would outlive `idleTimeout` indefinitely.
+/// Holds only a `Weak` reference to the entry map, so the task ends with the
+/// pool, exactly like the direct pools' sweepers. Spawned only inside a Tokio
+/// runtime.
+fn spawn_idle_entry_sweeper(
+    entries: &Arc<DashMap<String, Vec<MeshMtlsPoolEntry>>>,
+    pool_config: &PoolConfig,
+) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let weak = Arc::downgrade(entries);
+    let interval = Duration::from_secs(idle_prune_interval_secs(pool_config));
+    handle.spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let Some(entries) = weak.upgrade() else { break };
+            entries.retain(|_, entries| {
+                record_mesh_mtls_evictions(prune_pool_entries(entries));
+                !entries.is_empty()
+            });
+        }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]

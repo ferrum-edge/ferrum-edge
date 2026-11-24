@@ -18,15 +18,18 @@ use std::time::Duration;
 use tokio::sync::OnceCell;
 use url::{Host, Url};
 
-use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
+use super::utils::body_transform::{
+    is_event_stream_content_type, is_framed_grpc_content_type, is_json_content_type,
+};
 use super::utils::plugin_secret_env::{resolve_plugin_secret_env, validate_plugin_secret_env_name};
 use super::utils::response_body::read_response_body_bounded;
+use super::utils::socket_host::is_loopback_ip_literal_endpoint;
 use super::utils::sse::{
     SseEventName, SseForwardedPrefix, SseReassembler, SseText, SseTextKind, UTF8_BOM,
-    classify_forwarded_sse_prefix, encode_sse_error_event, is_gemini_stream_frame,
-    is_tgi_stream_frame, last_paragraph_boundary, last_sentence_boundary,
-    parse_sse_data_frames_checked, sse_event_end, sse_event_end_after, sse_event_on_fresh_line,
-    sse_line_end,
+    classify_forwarded_sse_prefix, encode_sse_error_event, is_cohere_v2_stream_frame,
+    is_gemini_stream_frame, is_tgi_stream_frame, last_paragraph_boundary, last_sentence_boundary,
+    parse_sse_data_frames_checked, sse_data_payloads_are_ambiguous, sse_event_end,
+    sse_event_end_after, sse_event_on_fresh_line, sse_line_end,
 };
 use super::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext,
@@ -101,9 +104,15 @@ pub(crate) const DEFAULT_RESPONSE_JSON_PATHS: &[&str] = &[
     "$.choices[*].message.content",
     "$.choices[*].message.tool_calls[*].function.name",
     "$.choices[*].message.tool_calls[*].function.arguments",
+    // Legacy Chat Completions `function_call` (the pre-`tool_calls` shape), a
+    // buffered response and the streamed deltas `SseReassembler` folds.
+    "$.choices[*].message.function_call.name",
+    "$.choices[*].message.function_call.arguments",
     "$.choices[*].delta.content",
     "$.choices[*].delta.tool_calls[*].function.name",
     "$.choices[*].delta.tool_calls[*].function.arguments",
+    "$.choices[*].delta.function_call.name",
+    "$.choices[*].delta.function_call.arguments",
     "$.output_text",
     "$.output[*].content[*].text",
     "$.output[*].arguments",
@@ -137,12 +146,79 @@ pub(crate) const DEFAULT_RESPONSE_JSON_PATHS: &[&str] = &[
     // `/generate` response, and the document a streamed `/generate_stream`
     // response is reassembled into by `SseReassembler`.
     "$[*].generated_text",
+    // Cohere v2 `/v2/chat` (`message.content[]` text blocks, `tool_plan`,
+    // `tool_calls[]`) and Ollama `/api/chat` (`message.content` string,
+    // `message.tool_calls[]`): a buffered response, and the document a
+    // streamed Cohere v2 SSE or Ollama NDJSON response is reassembled into.
+    "$.message.content",
+    "$.message.tool_plan",
+    "$.message.tool_calls[*].function.name",
+    "$.message.tool_calls[*].function.arguments",
+    // Cohere v2 citation sources: whole tool outputs / documents returned
+    // beside the completion (buffered, and each streamed `citation-start`).
+    "$.message.citations[*].sources",
+    // Ollama reasoning text (`think: true`): `/api/chat` `message.thinking` and
+    // `/api/generate` `thinking`, returned to the caller beside the answer.
+    "$.message.thinking",
+    "$.thinking",
 ];
 
-/// Embedding-provider responses are small JSON documents in normal operation.
-/// Bound the wire body before generic JSON deserialization so a compromised or
-/// faulty provider cannot force an unbounded allocation.
-const MAX_EMBEDDING_RESPONSE_BYTES: usize = 1024 * 1024;
+/// Hard bound on one embedding-provider response body, applied before generic
+/// JSON deserialization so a compromised or faulty provider cannot force an
+/// unbounded allocation. Large enough for a first batch of
+/// [`EMBEDDING_FIRST_BATCH_INPUTS`] vectors at [`MAX_EMBEDDING_DIMENSIONS`].
+const MAX_EMBEDDING_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Conservative JSON cost of one embedding dimension on the wire (sign,
+/// digits, exponent, separator). Used only to size batches so the expected
+/// response stays well under [`MAX_EMBEDDING_RESPONSE_BYTES`].
+const EMBEDDING_JSON_BYTES_PER_DIMENSION: usize = 24;
+
+/// Inputs sent in an embedding call made before any provider response has
+/// revealed the vector dimension. Sized so even [`MAX_EMBEDDING_DIMENSIONS`]
+/// vectors fit [`MAX_EMBEDDING_RESPONSE_BYTES`].
+const EMBEDDING_FIRST_BATCH_INPUTS: usize = 8;
+
+/// Upper bound on inputs per embedding call once the dimension is known.
+const EMBEDDING_MAX_BATCH_INPUTS: usize = 128;
+
+/// Default and ceiling for `provider.max_concurrent_requests`: outbound
+/// embedding calls one instance may have in flight at once.
+const DEFAULT_PROVIDER_MAX_CONCURRENT_REQUESTS: u64 = 32;
+const MAX_PROVIDER_MAX_CONCURRENT_REQUESTS: u64 = 1024;
+
+/// Ceiling for `provider.request_timeout_ms`.
+const MAX_PROVIDER_REQUEST_TIMEOUT_MS: u64 = 60_000;
+
+/// Segments one buffered request/response may contribute to an evaluation.
+/// Every segment is normalized, tokenized, and (for semantic rules) embedded,
+/// so a body of many tiny messages would otherwise drive unbounded CPU and
+/// provider calls. Above the bound the body is uninspectable.
+const MAX_INSPECTED_SEGMENTS: usize = 1024;
+
+/// Admission ceilings for operator rule material. Every example is embedded
+/// once when the rule index is built, so these bound that work.
+const MAX_RULES_PER_LIST: usize = 64;
+const MAX_EXAMPLES_PER_RULE: usize = 64;
+const MAX_EXAMPLE_CHARS: usize = 2048;
+const MAX_TOTAL_EXAMPLES: usize = 512;
+
+/// Ceilings for the windowed streaming knobs.
+const MAX_STREAM_WINDOW_BYTES: u64 = 1024 * 1024;
+const MAX_STREAM_INSPECTIONS: u64 = 10_000;
+
+/// Header names `provider.auth_header` may not take: they frame or route the
+/// embedding request itself rather than authenticate it.
+const RESERVED_PROVIDER_AUTH_HEADERS: &[&str] = &[
+    "host",
+    "content-length",
+    "content-type",
+    "transfer-encoding",
+    "connection",
+    "x-ferrum-hops",
+];
+const MAX_PROVIDER_AUTH_HEADER_LEN: usize = 64;
+const MAX_PROVIDER_AUTH_SCHEME_LEN: usize = 32;
 
 /// Schema label for the provider credential reference in diagnostics.
 const API_KEY_ENV_FIELD: &str = "ai_semantic_firewall: `provider.api_key_env`";
@@ -198,6 +274,8 @@ const SSE_DELTA_RESPONSE_PATHS: &[&str] = &[
     "$.choices[*].delta.content",
     "$.choices[*].delta.tool_calls[*].function.name",
     "$.choices[*].delta.tool_calls[*].function.arguments",
+    "$.choices[*].delta.function_call.name",
+    "$.choices[*].delta.function_call.arguments",
     "$.content_block_delta.delta.text",
     "$.candidates[*].content.parts[*].text",
     "$.candidates[*].content.parts[*].functionCall.name",
@@ -237,6 +315,18 @@ const STREAM_INSPECT_REQUESTED_KEY: &str = "ai_semantic_firewall.stream_inspect_
 /// reader's own `self.audit_streaming_skip` so a coexisting implicit-`Skip`
 /// instance is not influenced by a marker another instance set.
 const STREAM_SKIP_REQUESTED_KEY: &str = "ai_semantic_firewall.stream_skip_requested";
+
+/// Request-path marker: THIS request carried a governed AI JSON body. Its value
+/// records whether the request DECLARED a streamed response (a body
+/// `"stream": true`, or a request target that selects streaming such as
+/// Gemini `:streamGenerateContent`). A streamed response to an UNDECLARED
+/// request — a backend that streams by default (Ollama) or unexpectedly — is
+/// still governed by `streaming_response`, keyed off this marker instead of
+/// the stream flag. Only ever widens inspection: deleting it restores the
+/// flag-only behavior, so it carries no trust.
+const GOVERNED_AI_REQUEST_KEY: &str = "ai_semantic_firewall.governed_ai_request";
+const GOVERNED_STREAM_DECLARED: &str = "stream_declared";
+const GOVERNED_STREAM_UNDECLARED: &str = "stream_undeclared";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Direction {
@@ -399,6 +489,102 @@ impl Severity {
     }
 }
 
+/// Metadata list suffixes, in [`FirewallDecisionRecord::lists`] order.
+const DECISION_LIST_SUFFIXES: [&str; 9] = [
+    "rule_ids",
+    "rule_packs",
+    "rule_descriptions",
+    "match_directions",
+    "segment_kinds",
+    "roles",
+    "json_paths",
+    "matcher_type",
+    "snippet_hashes",
+];
+
+/// One firewall instance's latest decision for one metadata scope, kept in
+/// typed request state so the published metadata can be derived from every
+/// instance's live record (see `write_decision_metadata`).
+#[derive(Debug, Clone)]
+pub(crate) struct FirewallDecisionRecord {
+    action: Action,
+    dry_run: bool,
+    /// Comma-joined lists, in [`DECISION_LIST_SUFFIXES`] order.
+    lists: [String; 9],
+    max_score: f32,
+    max_severity: Option<Severity>,
+    provider_error: Option<String>,
+}
+
+/// The published view of every live record in one scope.
+struct AggregatedDecision {
+    decision_label: &'static str,
+    client_action: &'static str,
+    would_action: Option<&'static str>,
+    lists: [String; 9],
+    max_score: f32,
+    max_severity: Option<Severity>,
+    provider_error: Option<String>,
+}
+
+fn action_rank(action: Action) -> u8 {
+    match action {
+        Action::Reject => 3,
+        Action::Warn => 2,
+        Action::Allow => 1,
+    }
+}
+
+/// Fold the live records of one scope, in instance order: the most severe
+/// decision wins (the latest of equally severe ones), lists are unioned in
+/// first-seen order, score and severity keep the maximum, and the first
+/// provider error is kept. `None` when there is no record.
+fn aggregate_decision_records<'a>(
+    records: impl Iterator<Item = &'a FirewallDecisionRecord> + Clone,
+) -> Option<AggregatedDecision> {
+    let chosen = records
+        .clone()
+        .max_by_key(|record| action_rank(record.action))?;
+    let decision_label = if chosen.dry_run {
+        match chosen.action {
+            Action::Reject => "would_reject",
+            Action::Warn => "would_warn",
+            Action::Allow => "would_allow",
+        }
+    } else {
+        chosen.action.as_str()
+    };
+    let lists = std::array::from_fn(|index| {
+        join_unique(
+            records
+                .clone()
+                .flat_map(|record| record.lists[index].split(','))
+                .collect(),
+        )
+    });
+    Some(AggregatedDecision {
+        decision_label,
+        client_action: if chosen.dry_run {
+            "allow"
+        } else {
+            chosen.action.as_str()
+        },
+        would_action: chosen.dry_run.then_some(chosen.action.as_str()),
+        lists,
+        max_score: records
+            .clone()
+            .map(|record| record.max_score)
+            .fold(0.0_f32, f32::max),
+        max_severity: records
+            .clone()
+            .filter_map(|record| record.max_severity)
+            .max_by_key(|severity| severity.rank()),
+        provider_error: records
+            .clone()
+            .find_map(|record| record.provider_error.clone()),
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MatcherType {
     Semantic,
@@ -542,10 +728,19 @@ struct ProviderConfig {
     /// admin, `ferrum-edge validate`) does not require the live secret to be
     /// present in a process that never calls the provider.
     api_key_env: Option<String>,
-    /// Fully-rendered Authorization header, initialized on the first successful
-    /// environment lookup and reused for every later provider call.
+    /// Header the provider credential is sent in (`provider.auth_header`,
+    /// default `Authorization`).
+    auth_header: String,
+    /// Scheme prefixed to the credential (`provider.auth_scheme`, default
+    /// `Bearer`); `None` sends the raw key, e.g. Azure OpenAI `api-key`.
+    auth_scheme: Option<String>,
+    /// Fully-rendered credential header value, initialized on the first
+    /// successful environment lookup and reused for every later provider call.
     authorization_header: OnceCell<String>,
     request_timeout: Duration,
+    /// Outbound embedding calls this instance may have in flight at once
+    /// (`provider.max_concurrent_requests`).
+    max_concurrent_requests: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -671,6 +866,15 @@ struct FirewallEngine {
     /// Dimension learned from the first valid provider response. Later calls
     /// must match it before their vectors enter policy evaluation.
     embedding_dimension: OnceCell<usize>,
+    /// Process-unique id of the owning plugin instance, used to tell a
+    /// sibling instance's decision metadata from this instance's own.
+    instance_id: u64,
+    /// Per-instance admission for outbound embedding calls. Inbound
+    /// concurrency must not fan out 1:1 into provider calls: a stalled
+    /// provider would otherwise pin every governed request (and its buffered
+    /// body) for the full timeout. A caller that cannot get a permit within
+    /// `provider.request_timeout_ms` follows `on_error`.
+    provider_concurrency: tokio::sync::Semaphore,
 }
 
 pub struct AiSemanticFirewall {
@@ -704,8 +908,10 @@ impl AiSemanticFirewall {
 
         let enabled = optional_bool(config, "enabled")?.unwrap_or(true);
         let inspect = optional_object(config, "inspect")?;
-        let inspect_request = optional_bool_in_object(inspect, "request")?.unwrap_or(true);
-        let inspect_response = optional_bool_in_object(inspect, "response")?.unwrap_or(true);
+        let inspect_request =
+            optional_bool_in_object(inspect, "inspect", "request")?.unwrap_or(true);
+        let inspect_response =
+            optional_bool_in_object(inspect, "inspect", "response")?.unwrap_or(true);
 
         let mode = match optional_string(config, "mode")?.unwrap_or("enforce") {
             "enforce" => EnforcementMode::Enforce,
@@ -770,22 +976,20 @@ impl AiSemanticFirewall {
         };
 
         let privacy_object = optional_object(config, "privacy")?;
-        if optional_bool_in_object(privacy_object, "log_raw_text")?.unwrap_or(false) {
-            return Err(
-                "ai_semantic_firewall: `privacy.log_raw_text` is reserved for future use and must be false"
-                    .to_string(),
-            );
-        }
         let snippet_hash_salt = match privacy_object {
-            Some(obj) => optional_string_from_object(obj, "snippet_hash_salt")?
+            Some(obj) => optional_string_from_object(obj, "privacy", "snippet_hash_salt")?
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(|value| value.as_bytes().to_vec()),
             None => None,
         };
         let privacy = PrivacyConfig {
-            include_snippet_hash: optional_bool_in_object(privacy_object, "include_snippet_hash")?
-                .unwrap_or(true),
+            include_snippet_hash: optional_bool_in_object(
+                privacy_object,
+                "privacy",
+                "include_snippet_hash",
+            )?
+            .unwrap_or(true),
             snippet_hash_salt,
         };
 
@@ -798,6 +1002,7 @@ impl AiSemanticFirewall {
         let extraction = ExtractionConfig {
             request_json_paths: optional_string_vec_in_object(
                 extraction_object,
+                "extraction",
                 "request_json_paths",
             )?
             .unwrap_or_else(|| {
@@ -808,6 +1013,7 @@ impl AiSemanticFirewall {
             }),
             response_json_paths: optional_string_vec_in_object(
                 extraction_object,
+                "extraction",
                 "response_json_paths",
             )?
             .unwrap_or_else(|| {
@@ -868,6 +1074,8 @@ impl AiSemanticFirewall {
                     metadata_direction_scoped: false,
                     rule_embeddings: OnceCell::new(),
                     embedding_dimension: OnceCell::new(),
+                    instance_id,
+                    provider_concurrency: tokio::sync::Semaphore::new(1),
                 }),
             });
         }
@@ -904,13 +1112,27 @@ impl AiSemanticFirewall {
             );
         }
 
+        let total_examples = rules
+            .iter()
+            .map(|rule| rule.examples.len())
+            .chain(allow_topics.iter().map(|topic| topic.examples.len()))
+            .fold(0_usize, usize::saturating_add);
+        if total_examples > MAX_TOTAL_EXAMPLES {
+            return Err(format!(
+                "ai_semantic_firewall: active rules carry {total_examples} examples in total; at most {MAX_TOTAL_EXAMPLES} are allowed across built-ins, allow_topics, deny_topics, and custom_rules"
+            ));
+        }
+
         let provider = parse_provider_config(config, http_client.backend_allow_ips())?;
-        if provider.is_none() {
+        let Some(provider_concurrency) = provider
+            .as_ref()
+            .map(|provider| provider.max_concurrent_requests)
+        else {
             return Err(
                 "ai_semantic_firewall: `provider` config is required when semantic rules are active"
                     .to_string(),
             );
-        }
+        };
 
         let has_request_rules = inspect_request
             && (!allow_topics.is_empty()
@@ -977,6 +1199,8 @@ impl AiSemanticFirewall {
                 metadata_direction_scoped: has_request_rules && has_response_rules,
                 rule_embeddings: OnceCell::new(),
                 embedding_dimension: OnceCell::new(),
+                instance_id,
+                provider_concurrency: tokio::sync::Semaphore::new(provider_concurrency),
             }),
         })
     }
@@ -1022,12 +1246,59 @@ impl AiSemanticFirewall {
                     && self.has_response_rules))
     }
 
+    /// Whether a streamed response to THIS request is governed by
+    /// `streaming_response` even though it is not `text/event-stream` (Ollama
+    /// NDJSON, Bedrock binary event streams): the request carried a governed AI
+    /// body and the policy is not the `skip` opt-out.
+    fn governed_stream_armed(&self, ctx: &RequestContext) -> bool {
+        self.streaming_response != StreamingResponsePolicy::Skip
+            && ctx.metadata.contains_key(GOVERNED_AI_REQUEST_KEY)
+    }
+
+    /// Whether a `text/event-stream` response to THIS request must be governed
+    /// although the request never declared a stream (so no request-path
+    /// streaming marker was written): a governed AI request whose backend
+    /// streamed by default or by a URL this build does not recognize.
+    fn undeclared_stream_armed(&self, ctx: &RequestContext) -> bool {
+        self.streaming_response != StreamingResponsePolicy::Skip
+            && ctx
+                .metadata
+                .get(GOVERNED_AI_REQUEST_KEY)
+                .map(String::as_str)
+                == Some(GOVERNED_STREAM_UNDECLARED)
+    }
+
+    /// Response media types inspected by the buffered hooks: JSON and SSE
+    /// always, and a non-SSE AI stream (NDJSON, Bedrock event stream) when it
+    /// answers a governed request.
+    fn response_content_type_is_candidate(&self, ctx: &RequestContext, content_type: &str) -> bool {
+        response_content_type_is_inspection_candidate(content_type)
+            || (is_non_sse_ai_stream_content_type(content_type) && self.governed_stream_armed(ctx))
+    }
+
     fn apply_streaming_request_policy(
         &self,
         ctx: &mut RequestContext,
         json: &Value,
     ) -> PluginResult {
-        if json.get("stream").and_then(Value::as_bool) != Some(true) {
+        let body_stream_flag = json.get("stream").and_then(Value::as_bool) == Some(true);
+        let stream_declared = body_stream_flag || request_path_selects_stream(&ctx.path);
+        // Witness for the response path: a streamed response to a governed AI
+        // request stays governed by `streaming_response` even when the request
+        // never declared one (backend default, or a URL this build does not
+        // recognize). See [`GOVERNED_AI_REQUEST_KEY`].
+        if looks_like_governed_request_json(json) {
+            ctx.metadata.insert(
+                GOVERNED_AI_REQUEST_KEY.to_string(),
+                if stream_declared {
+                    GOVERNED_STREAM_DECLARED
+                } else {
+                    GOVERNED_STREAM_UNDECLARED
+                }
+                .to_string(),
+            );
+        }
+        if !stream_declared {
             return PluginResult::Continue;
         }
 
@@ -1064,7 +1335,11 @@ impl AiSemanticFirewall {
                     status_code: 400,
                     body: rejection_body(
                         "ai_semantic_firewall_streaming_rejected",
-                        "Streaming responses are not permitted while AI semantic firewall response inspection is enabled; retry with \"stream\": false.",
+                        if body_stream_flag {
+                            "Streaming responses are not permitted while AI semantic firewall response inspection is enabled; retry with \"stream\": false."
+                        } else {
+                            "Streaming responses are not permitted while AI semantic firewall response inspection is enabled; use the provider's non-streaming endpoint."
+                        },
                         None,
                     ),
                     headers: json_headers(),
@@ -1094,11 +1369,24 @@ impl AiSemanticFirewall {
         PluginResult::Continue
     }
 
+    /// Whether request-side rules inspect request bodies. When false, the only
+    /// request-body work is the streaming policy, and no body digest is used.
+    fn inspects_request_rules(&self) -> bool {
+        self.inspect_request && self.has_request_rules
+    }
+
+    /// Apply the streaming policy, then the request rules, to one parsed
+    /// request body. `request_hash` is the caller's SHA-256 hex of the exact
+    /// body bytes (issue #7132): the final hook already computed it for its
+    /// unchanged-body skip, and `before_proxy` computes it while it still
+    /// borrows the buffered body, so neither caller copies the body or hashes
+    /// it twice. Callers pass `None` only when [`Self::inspects_request_rules`]
+    /// is false, where no digest is recorded.
     async fn inspect_request_json(
         &self,
         ctx: &mut RequestContext,
         json: &Value,
-        body: &[u8],
+        request_hash: Option<String>,
         was_governed: bool,
     ) -> PluginResult {
         let streaming_result = self.apply_streaming_request_policy(ctx, json);
@@ -1106,17 +1394,34 @@ impl AiSemanticFirewall {
             return streaming_result;
         }
 
-        if !self.inspect_request || !self.has_request_rules {
+        if !self.inspects_request_rules() {
             return PluginResult::Continue;
         }
+        let Some(request_hash) = request_hash else {
+            // Unreachable by the caller contract above. Fail closed rather
+            // than inspect without recording what was inspected.
+            return self.engine.handle_uninspectable_body(
+                ctx,
+                Direction::Request,
+                "missing_buffered_body",
+            );
+        };
 
         let segments = extract_request_segments(json, &self.engine.extraction);
+        if segments.len() > MAX_INSPECTED_SEGMENTS {
+            self.set_request_hash(ctx, request_hash);
+            return self.engine.handle_uninspectable_body(
+                ctx,
+                Direction::Request,
+                "too_many_segments",
+            );
+        }
         if segments.is_empty() {
             return if was_governed
                 || !self.engine.allow_topics.is_empty()
                 || looks_like_governed_request_json(json)
             {
-                self.set_request_hash(ctx, sha256_hex_bytes(body));
+                self.set_request_hash(ctx, request_hash);
                 self.engine.handle_uninspectable_body(
                     ctx,
                     Direction::Request,
@@ -1131,7 +1436,7 @@ impl AiSemanticFirewall {
             };
         }
 
-        self.set_request_hash(ctx, sha256_hex_bytes(body));
+        self.set_request_hash(ctx, request_hash);
 
         let outcome = self
             .engine
@@ -1168,13 +1473,16 @@ impl AiSemanticFirewall {
         &self,
         ctx: &mut RequestContext,
         content_type: &str,
-        body: &[u8],
+        digest: BodyDigest<'_>,
         was_governed: bool,
     ) -> PluginResult {
+        let body = digest.body;
         let event_stream = is_event_stream_content_type(content_type);
+        let ndjson_stream = is_ndjson_stream_content_type(content_type);
+        let amazon_eventstream = is_amazon_eventstream_content_type(content_type);
         let json_content_type = is_json_content_type(content_type);
         let json_body = json_content_type || looks_like_json(body);
-        if !event_stream && !json_body {
+        if !event_stream && !ndjson_stream && !amazon_eventstream && !json_body {
             return PluginResult::Continue;
         }
         if body.len() > MAX_INSPECTION_BODY_BYTES {
@@ -1185,18 +1493,79 @@ impl AiSemanticFirewall {
             );
         }
         let segments = if event_stream {
+            let streaming_inspection_requested = buffer_streaming_marker_set(ctx)
+                || windowed_streaming_marker_set(ctx)
+                || self.undeclared_stream_armed(ctx);
+            // Each `data:` payload is folded from the LAST duplicate member
+            // while a first-key-wins client reads the FIRST, so a
+            // duplicate-member event leaves a stream this instance governs
+            // uninspectable (GHSA-49cr-v28q-9hgp). The same scope as the
+            // unparseable-payload refusal below: an event stream this instance
+            // does not govern (an unrelated EventSource route, or one
+            // `streaming_response: skip` opted out) keeps streaming untouched.
+            if (was_governed || streaming_inspection_requested)
+                && std::str::from_utf8(body).is_ok_and(sse_data_payloads_are_ambiguous)
+            {
+                self.set_response_hash(ctx, digest.into_hex());
+                return self.engine.handle_uninspectable_body(
+                    ctx,
+                    Direction::Response,
+                    "ambiguous_json",
+                );
+            }
             let (segments, fully_parsed) =
                 reassemble_sse_response_segments(body, &self.engine.extraction);
-            let streaming_inspection_requested =
-                buffer_streaming_marker_set(ctx) || windowed_streaming_marker_set(ctx);
             if (!fully_parsed && (was_governed || streaming_inspection_requested))
                 || (segments.is_empty() && streaming_inspection_requested)
             {
-                self.set_response_hash(ctx, sha256_hex_bytes(body));
+                self.set_response_hash(ctx, digest.into_hex());
+                return self.engine.handle_uninspectable_buffered_stream(ctx);
+            }
+            segments
+        } else if amazon_eventstream {
+            // Binary event-stream framing this plugin cannot parse: a governed
+            // stream fails closed through `on_error`, anything else is out of
+            // scope.
+            if !was_governed && !self.governed_stream_armed(ctx) {
+                return PluginResult::Continue;
+            }
+            self.set_response_hash(ctx, digest.into_hex());
+            return self.engine.handle_uninspectable_buffered_stream(ctx);
+        } else if ndjson_stream {
+            // Only a stream answering a governed AI request (or a body this
+            // instance already governed) is in scope; an unrelated NDJSON
+            // feed buffered for another plugin is left alone.
+            let armed = self.governed_stream_armed(ctx);
+            if !was_governed && !armed {
+                return PluginResult::Continue;
+            }
+            if ndjson_records_are_ambiguous(body) {
+                self.set_response_hash(ctx, digest.into_hex());
+                return self.engine.handle_uninspectable_body(
+                    ctx,
+                    Direction::Response,
+                    "ambiguous_json",
+                );
+            }
+            let (segments, fully_parsed) =
+                reassemble_ndjson_response_segments(body, &self.engine.extraction);
+            if !fully_parsed || (segments.is_empty() && armed) {
+                self.set_response_hash(ctx, digest.into_hex());
                 return self.engine.handle_uninspectable_buffered_stream(ctx);
             }
             segments
         } else {
+            // The client receives these exact bytes; a duplicate member would be
+            // scored as the LAST value and read by a first-key-wins client as the
+            // FIRST (see the request-side screen in `before_proxy`).
+            if ctx.json_scan_memo.ambiguity(strip_json_bom(body)).is_some() {
+                self.set_response_hash(ctx, digest.into_hex());
+                return self.engine.handle_uninspectable_body(
+                    ctx,
+                    Direction::Response,
+                    "ambiguous_json",
+                );
+            }
             let json: Value = match serde_json::from_slice(strip_json_bom(body)) {
                 Ok(json) => json,
                 Err(_) => {
@@ -1211,7 +1580,7 @@ impl AiSemanticFirewall {
                             PluginResult::Continue
                         };
                     }
-                    self.set_response_hash(ctx, sha256_hex_bytes(body));
+                    self.set_response_hash(ctx, digest.into_hex());
                     return self.engine.handle_uninspectable_body(
                         ctx,
                         Direction::Response,
@@ -1219,6 +1588,28 @@ impl AiSemanticFirewall {
                     );
                 }
             };
+            // Gemini `streamGenerateContent` without `alt=sse` streams a JSON
+            // ARRAY of `GenerateContentResponse` frames; fold it exactly like
+            // the SSE form instead of reading only the array root.
+            if let Value::Array(frames) = &json
+                && frames.iter().any(is_gemini_stream_frame)
+            {
+                let (segments, fully_inspectable) =
+                    reassemble_json_frame_array_segments(frames, &self.engine.extraction);
+                if !fully_inspectable || segments.is_empty() {
+                    self.set_response_hash(ctx, digest.into_hex());
+                    return self.engine.handle_uninspectable_buffered_stream(ctx);
+                }
+                if segments.len() > MAX_INSPECTED_SEGMENTS {
+                    self.set_response_hash(ctx, digest.into_hex());
+                    return self.engine.handle_uninspectable_body(
+                        ctx,
+                        Direction::Response,
+                        "too_many_segments",
+                    );
+                }
+                return self.evaluate_response_segments(ctx, digest, segments).await;
+            }
             let mut segments = Vec::new();
             extract_response_segments_from_json(
                 &json,
@@ -1227,7 +1618,7 @@ impl AiSemanticFirewall {
                 &mut segments,
             );
             if segments.is_empty() && looks_like_governed_response_json(&json) {
-                self.set_response_hash(ctx, sha256_hex_bytes(body));
+                self.set_response_hash(ctx, digest.into_hex());
                 return self.engine.handle_uninspectable_body(
                     ctx,
                     Direction::Response,
@@ -1239,7 +1630,7 @@ impl AiSemanticFirewall {
 
         if segments.is_empty() {
             return if was_governed {
-                self.set_response_hash(ctx, sha256_hex_bytes(body));
+                self.set_response_hash(ctx, digest.into_hex());
                 self.engine.handle_uninspectable_body(
                     ctx,
                     Direction::Response,
@@ -1249,8 +1640,27 @@ impl AiSemanticFirewall {
                 PluginResult::Continue
             };
         }
+        if segments.len() > MAX_INSPECTED_SEGMENTS {
+            self.set_response_hash(ctx, digest.into_hex());
+            return self.engine.handle_uninspectable_body(
+                ctx,
+                Direction::Response,
+                "too_many_segments",
+            );
+        }
 
-        self.set_response_hash(ctx, sha256_hex_bytes(body));
+        self.evaluate_response_segments(ctx, digest, segments).await
+    }
+
+    /// Record the inspected representation and run the response engine over
+    /// its segments.
+    async fn evaluate_response_segments(
+        &self,
+        ctx: &mut RequestContext,
+        digest: BodyDigest<'_>,
+        segments: Vec<TextSegment>,
+    ) -> PluginResult {
+        self.set_response_hash(ctx, digest.into_hex());
 
         let outcome = self
             .engine
@@ -1420,9 +1830,9 @@ impl FirewallEngine {
             .rule_embedding_index(provider, plugin_http_call_ns, proxy_hops)
             .await?;
 
-        let segment_inputs: Vec<String> = candidate_segments
+        let segment_inputs: Vec<&str> = candidate_segments
             .iter()
-            .map(|segment| segment.text.clone())
+            .map(|segment| segment.text.as_str())
             .collect();
         let segment_embeddings = self
             .embed_texts(provider, &segment_inputs, plugin_http_call_ns, proxy_hops)
@@ -1505,14 +1915,14 @@ impl FirewallEngine {
         let mut rule_ranges = Vec::new();
         for rule in &self.rules {
             let start = inputs.len();
-            inputs.extend(rule.examples.iter().cloned());
+            inputs.extend(rule.examples.iter().map(String::as_str));
             rule_ranges.push((rule.id.clone(), start, inputs.len()));
         }
 
         let mut allow_ranges = Vec::new();
         for topic in &self.allow_topics {
             let start = inputs.len();
-            inputs.extend(topic.examples.iter().cloned());
+            inputs.extend(topic.examples.iter().map(String::as_str));
             allow_ranges.push((topic.id.clone(), start, inputs.len()));
         }
 
@@ -1535,16 +1945,84 @@ impl FirewallEngine {
         })
     }
 
+    /// Embed `texts` in order, in provider calls of at most
+    /// [`Self::embedding_batch_size`] inputs each, so a long conversation or a
+    /// large rule index never needs one response larger than
+    /// [`MAX_EMBEDDING_RESPONSE_BYTES`] at realistic dimensions.
     async fn embed_texts(
         &self,
         provider: &ProviderConfig,
-        texts: &[String],
+        texts: &[&str],
+        plugin_http_call_ns: &AtomicU64,
+        proxy_hops: Option<u8>,
+    ) -> Result<Vec<EmbeddingVector>, String> {
+        let mut embeddings = Vec::with_capacity(texts.len());
+        let mut start = 0;
+        while start < texts.len() {
+            let end = start
+                .saturating_add(self.embedding_batch_size())
+                .min(texts.len());
+            let mut batch = self
+                .embed_batch(
+                    provider,
+                    &texts[start..end],
+                    plugin_http_call_ns,
+                    proxy_hops,
+                )
+                .await?;
+            embeddings.append(&mut batch);
+            start = end;
+        }
+        Ok(embeddings)
+    }
+
+    /// Inputs per embedding call: [`EMBEDDING_FIRST_BATCH_INPUTS`] until a
+    /// response reveals the dimension, then as many as keep the expected
+    /// response within half of [`MAX_EMBEDDING_RESPONSE_BYTES`] (at least one,
+    /// at most [`EMBEDDING_MAX_BATCH_INPUTS`]).
+    fn embedding_batch_size(&self) -> usize {
+        match self.embedding_dimension.get() {
+            Some(&dimension) => {
+                let per_vector = dimension
+                    .saturating_mul(EMBEDDING_JSON_BYTES_PER_DIMENSION)
+                    .max(1);
+                (MAX_EMBEDDING_RESPONSE_BYTES / 2 / per_vector).clamp(1, EMBEDDING_MAX_BATCH_INPUTS)
+            }
+            None => EMBEDDING_FIRST_BATCH_INPUTS,
+        }
+    }
+
+    /// Wait for an outbound-call permit, bounded by the provider timeout so a
+    /// saturated or stalled provider fails the request through `on_error`
+    /// instead of queueing it indefinitely.
+    async fn acquire_provider_permit(
+        &self,
+        provider: &ProviderConfig,
+    ) -> Result<tokio::sync::SemaphorePermit<'_>, String> {
+        match tokio::time::timeout(provider.request_timeout, self.provider_concurrency.acquire())
+            .await
+        {
+            Ok(Ok(permit)) => Ok(permit),
+            Ok(Err(_)) => Err("embedding request failed: concurrency admission closed".to_string()),
+            Err(_) => Err(
+                "embedding request failed: concurrency admission wait exceeded provider.request_timeout_ms"
+                    .to_string(),
+            ),
+        }
+    }
+
+    async fn embed_batch(
+        &self,
+        provider: &ProviderConfig,
+        texts: &[&str],
         plugin_http_call_ns: &AtomicU64,
         proxy_hops: Option<u8>,
     ) -> Result<Vec<EmbeddingVector>, String> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
+        // Held for the whole call, including the bounded body read.
+        let _permit = self.acquire_provider_permit(provider).await?;
 
         let mut payload = json!({ "input": texts });
         if let Some(model) = &provider.model
@@ -1568,10 +2046,13 @@ impl FirewallEngine {
                 .authorization_header
                 .get_or_try_init(|| async {
                     let api_key = resolve_plugin_secret_env(API_KEY_ENV_FIELD, env_name)?;
-                    Ok::<String, String>(format!("Bearer {api_key}"))
+                    Ok::<String, String>(match &provider.auth_scheme {
+                        Some(scheme) => format!("{scheme} {api_key}"),
+                        None => api_key,
+                    })
                 })
                 .await?;
-            request = request.header("Authorization", authorization.as_str());
+            request = request.header(provider.auth_header.as_str(), authorization.as_str());
         }
         // An embedding endpoint that resolves back to the gateway is refused at
         // the proxy hop limit like a looping route (issue #6128). The shared
@@ -1672,26 +2153,26 @@ impl FirewallEngine {
             .filter(|m| matches!(m.action, Action::Reject | Action::Warn))
             .cloned()
             .collect();
-        if let Some(top) = negative_matches.first() {
-            let action = if negative_matches.iter().any(|m| m.action == Action::Reject) {
-                Action::Reject
-            } else {
-                top.action
-            };
+        // A rejecting rule dominates everything, allowlist admission included.
+        if negative_matches.iter().any(|m| m.action == Action::Reject) {
             return FirewallDecision {
-                action,
+                action: Action::Reject,
                 dry_run: self.mode == EnforcementMode::DryRun,
                 matches: negative_matches,
             };
         }
 
+        // Mandatory allowlist admission is evaluated INDEPENDENTLY of advisory
+        // (`warn`) matches: an advisory detector must never exempt a request
+        // from a rejecting allowlist. Warn matches are kept alongside the
+        // allowlist verdict so their diagnostics are not lost.
         if direction == Direction::Request && !self.allow_topics.is_empty() {
             let allow_matches: Vec<RuleMatch> = matches
                 .iter()
                 .filter(|m| m.action == Action::Allow)
                 .cloned()
                 .collect();
-            if !allow_matches.is_empty() {
+            if !allow_matches.is_empty() && negative_matches.is_empty() {
                 return FirewallDecision {
                     action: Action::Allow,
                     dry_run: self.mode == EnforcementMode::DryRun,
@@ -1699,7 +2180,9 @@ impl FirewallEngine {
                 };
             }
 
-            if semantic_evaluated || segments.is_empty() || self.provider.is_none() {
+            if allow_matches.is_empty()
+                && (semantic_evaluated || segments.is_empty() || self.provider.is_none())
+            {
                 let no_match_action = if self
                     .allow_topics
                     .iter()
@@ -1714,27 +2197,39 @@ impl FirewallEngine {
                     .find(|segment| segment.direction == Direction::Request)
                     .map(|segment| segment.kind)
                     .unwrap_or(SegmentKind::GenericText);
+                let mut no_match_matches = vec![RuleMatch {
+                    rule_id: "allow_topics:no_match".to_string(),
+                    rule_description: Some(
+                        "request did not match any configured allow topic".to_string(),
+                    ),
+                    severity: Severity::Medium,
+                    action: no_match_action,
+                    score: 0.0,
+                    matcher_type: MatcherType::Semantic,
+                    direction,
+                    segment_kind,
+                    role: None,
+                    json_path: None,
+                    snippet_hash: None,
+                    rule_pack: Some("allow_topics".to_string()),
+                }];
+                // Advisory matches ride along; with no rejecting match among
+                // them, the allowlist verdict is the decision.
+                no_match_matches.extend(negative_matches);
                 return FirewallDecision {
                     action: no_match_action,
                     dry_run: self.mode == EnforcementMode::DryRun,
-                    matches: vec![RuleMatch {
-                        rule_id: "allow_topics:no_match".to_string(),
-                        rule_description: Some(
-                            "request did not match any configured allow topic".to_string(),
-                        ),
-                        severity: Severity::Medium,
-                        action: no_match_action,
-                        score: 0.0,
-                        matcher_type: MatcherType::Semantic,
-                        direction,
-                        segment_kind,
-                        role: None,
-                        json_path: None,
-                        snippet_hash: None,
-                        rule_pack: Some("allow_topics".to_string()),
-                    }],
+                    matches: no_match_matches,
                 };
             }
+        }
+
+        if !negative_matches.is_empty() {
+            return FirewallDecision {
+                action: Action::Warn,
+                dry_run: self.mode == EnforcementMode::DryRun,
+                matches: negative_matches,
+            };
         }
 
         FirewallDecision {
@@ -1857,6 +2352,112 @@ impl FirewallEngine {
             }
         };
 
+        let lists = [
+            join_unique(
+                decision
+                    .matches
+                    .iter()
+                    .map(|m| m.rule_id.as_str())
+                    .collect(),
+            ),
+            join_unique(
+                decision
+                    .matches
+                    .iter()
+                    .filter_map(|m| m.rule_pack.as_deref())
+                    .collect(),
+            ),
+            join_unique(
+                decision
+                    .matches
+                    .iter()
+                    .filter_map(|m| m.rule_description.as_deref())
+                    .collect(),
+            ),
+            join_unique(
+                decision
+                    .matches
+                    .iter()
+                    .map(|m| m.direction.as_str())
+                    .collect(),
+            ),
+            join_unique(
+                decision
+                    .matches
+                    .iter()
+                    .map(|m| m.segment_kind.as_str())
+                    .collect(),
+            ),
+            join_unique(
+                decision
+                    .matches
+                    .iter()
+                    .filter_map(|m| m.role.as_deref())
+                    .collect(),
+            ),
+            join_unique(
+                decision
+                    .matches
+                    .iter()
+                    .filter_map(|m| m.json_path.as_deref())
+                    .collect(),
+            ),
+            join_unique(
+                decision
+                    .matches
+                    .iter()
+                    .map(|m| m.matcher_type.as_str())
+                    .collect(),
+            ),
+            join_unique(
+                decision
+                    .matches
+                    .iter()
+                    .filter_map(|m| m.snippet_hash.as_deref())
+                    .collect(),
+            ),
+        ];
+        let record = FirewallDecisionRecord {
+            action: decision.action,
+            dry_run: decision.dry_run,
+            lists,
+            max_score: decision
+                .matches
+                .iter()
+                .map(|m| m.score)
+                .fold(0.0_f32, f32::max),
+            max_severity: decision
+                .matches
+                .iter()
+                .map(|m| m.severity)
+                .max_by_key(|severity| severity.rank()),
+            provider_error: provider_error.map(sanitize_provider_error),
+        };
+
+        // Several instances may write the same keys in one transaction (a
+        // global and a proxy-scoped firewall). Each instance keeps its OWN
+        // private record per scope — replaced when that instance re-decides
+        // (an early pass re-evaluated on the final body) — and the published
+        // keys are derived from every live record: the most severe decision
+        // wins, lists are unioned, score/severity keep the maximum, and the
+        // first provider error is kept. A later clean instance, or a sibling's
+        // re-evaluation, can therefore never erase another instance's warn.
+        // The records are typed request state, never metadata.
+        let scope: &'static str = if scoped { direction.as_str() } else { "" };
+        let aggregate = {
+            let records = &mut ctx.plugin_state_mut().ai_semantic_firewall_decision_records;
+            records.insert((scope, self.instance_id), record);
+            aggregate_decision_records(
+                records
+                    .iter()
+                    .filter(|((record_scope, _), _)| *record_scope == scope)
+                    .map(|(_, record)| record),
+            )
+        };
+        let Some(aggregate) = aggregate else {
+            return;
+        };
+
         ctx.metadata.insert(
             "ai_semantic_firewall.enabled".to_string(),
             self.enabled.to_string(),
@@ -1867,130 +2468,34 @@ impl FirewallEngine {
         );
         ctx.metadata
             .insert(key("direction"), direction.as_str().to_string());
-
-        let decision_label = if decision.dry_run {
-            match decision.action {
-                Action::Reject => "would_reject",
-                Action::Warn => "would_warn",
-                Action::Allow => "would_allow",
+        ctx.metadata
+            .insert(key("decision"), aggregate.decision_label.to_string());
+        ctx.metadata
+            .insert(key("action"), aggregate.client_action.to_string());
+        match aggregate.would_action {
+            Some(would_action) => {
+                ctx.metadata
+                    .insert(key("would_action"), would_action.to_string());
             }
-        } else {
-            decision.action.as_str()
-        };
-        ctx.metadata
-            .insert(key("decision"), decision_label.to_string());
-        ctx.metadata.insert(
-            key("action"),
-            if decision.dry_run {
-                "allow".to_string()
-            } else {
-                decision.action.as_str().to_string()
-            },
-        );
-        if decision.dry_run {
-            ctx.metadata
-                .insert(key("would_action"), decision.action.as_str().to_string());
+            None => {
+                ctx.metadata.remove(&key("would_action"));
+            }
         }
-
-        let rule_ids = join_unique(
-            decision
-                .matches
-                .iter()
-                .map(|m| m.rule_id.as_str())
-                .collect::<Vec<_>>(),
-        );
-        let rule_packs = join_unique(
-            decision
-                .matches
-                .iter()
-                .filter_map(|m| m.rule_pack.as_deref())
-                .collect::<Vec<_>>(),
-        );
-        let rule_descriptions = join_unique(
-            decision
-                .matches
-                .iter()
-                .filter_map(|m| m.rule_description.as_deref())
-                .collect::<Vec<_>>(),
-        );
-        let match_directions = join_unique(
-            decision
-                .matches
-                .iter()
-                .map(|m| m.direction.as_str())
-                .collect::<Vec<_>>(),
-        );
-        let segment_kinds = join_unique(
-            decision
-                .matches
-                .iter()
-                .map(|m| m.segment_kind.as_str())
-                .collect::<Vec<_>>(),
-        );
-        let roles = join_unique(
-            decision
-                .matches
-                .iter()
-                .filter_map(|m| m.role.as_deref())
-                .collect::<Vec<_>>(),
-        );
-        let json_paths = join_unique(
-            decision
-                .matches
-                .iter()
-                .filter_map(|m| m.json_path.as_deref())
-                .collect::<Vec<_>>(),
-        );
-        let matcher_types = join_unique(
-            decision
-                .matches
-                .iter()
-                .map(|m| m.matcher_type.as_str())
-                .collect::<Vec<_>>(),
-        );
-        let snippet_hashes = join_unique(
-            decision
-                .matches
-                .iter()
-                .filter_map(|m| m.snippet_hash.as_deref())
-                .collect::<Vec<_>>(),
-        );
-
-        ctx.metadata.insert(key("rule_ids"), rule_ids);
-        ctx.metadata.insert(key("rule_packs"), rule_packs);
+        for (suffix, value) in DECISION_LIST_SUFFIXES.iter().zip(aggregate.lists) {
+            ctx.metadata.insert(key(suffix), value);
+        }
         ctx.metadata
-            .insert(key("rule_descriptions"), rule_descriptions);
-        ctx.metadata
-            .insert(key("match_directions"), match_directions);
-        ctx.metadata.insert(key("segment_kinds"), segment_kinds);
-        ctx.metadata.insert(key("roles"), roles);
-        ctx.metadata.insert(key("json_paths"), json_paths);
-        ctx.metadata.insert(key("matcher_type"), matcher_types);
-        ctx.metadata.insert(key("snippet_hashes"), snippet_hashes);
-
-        let max_score = decision
-            .matches
-            .iter()
-            .map(|m| m.score)
-            .fold(0.0_f32, f32::max);
-        ctx.metadata
-            .insert(key("max_score"), format!("{max_score:.6}"));
-
-        let max_severity = decision
-            .matches
-            .iter()
-            .map(|m| m.severity)
-            .max_by_key(|severity| severity.rank())
-            .map(Severity::as_str)
-            .unwrap_or("");
-        ctx.metadata
-            .insert(key("max_severity"), max_severity.to_string());
-
-        if let Some(provider_error) = provider_error {
-            ctx.metadata.insert(
-                key("provider_error"),
-                sanitize_provider_error(provider_error),
-            );
+            .insert(key("max_score"), format!("{:.6}", aggregate.max_score));
+        ctx.metadata.insert(
+            key("max_severity"),
+            aggregate
+                .max_severity
+                .map(Severity::as_str)
+                .unwrap_or("")
+                .to_string(),
+        );
+        if let Some(provider_error) = aggregate.provider_error {
+            ctx.metadata.insert(key("provider_error"), provider_error);
         }
     }
 
@@ -2156,8 +2661,17 @@ impl Plugin for AiSemanticFirewall {
         "ai_semantic_firewall"
     }
 
+    fn is_authorize_plugin(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> u16 {
         super::priority::AI_SEMANTIC_FIREWALL
+    }
+
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::BEFORE_PROXY
+            | crate::plugins::PluginHooks::ON_RESPONSE_STREAM_TERMINATED
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
@@ -2185,13 +2699,29 @@ impl Plugin for AiSemanticFirewall {
         self.needs_governed_request_body()
     }
 
+    /// Buffer every body-bearing `POST` / `PUT` / `PATCH` the instance governs,
+    /// whatever `Content-Type` the client declared: a backend that parses JSON
+    /// regardless of the header would otherwise receive a mislabeled prompt
+    /// that was never buffered, so never inspected. The hooks below sniff the
+    /// buffered bytes and leave a genuinely non-JSON body alone.
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
         self.requires_request_body_before_before_proxy()
-            && ctx.method == "POST"
-            && ctx
+            && is_inspected_request_method(&ctx.method)
+            && !ctx
                 .headers
                 .get("content-type")
-                .is_some_and(|content_type| is_json_content_type(content_type))
+                .is_some_and(|content_type| is_framed_grpc_content_type(content_type))
+    }
+
+    /// When an oversized governed body would be refused anyway (enforce mode,
+    /// `on_error: reject`, `fail_on_uninspectable_body: true`), refuse it at
+    /// collection instead of buffering past the inspection ceiling.
+    fn request_body_buffer_limit(&self) -> Option<usize> {
+        (self.needs_governed_request_body()
+            && self.engine.mode == EnforcementMode::Enforce
+            && self.engine.on_error == OnErrorAction::Reject
+            && self.engine.fail_on_uninspectable_body)
+            .then_some(MAX_INSPECTION_BODY_BYTES)
     }
 
     async fn before_proxy(
@@ -2202,15 +2732,14 @@ impl Plugin for AiSemanticFirewall {
         if !self.needs_governed_request_body() {
             return PluginResult::Continue;
         }
-        if ctx.method != "POST" {
+        if !is_inspected_request_method(&ctx.method) {
             return PluginResult::Continue;
         }
-        if !headers
-            .get("content-type")
-            .is_some_and(|content_type| is_json_content_type(content_type))
-        {
+        let content_type = headers.get("content-type").map(String::as_str);
+        if content_type.is_some_and(is_framed_grpc_content_type) {
             return PluginResult::Continue;
         }
+        let json_content_type = content_type.is_some_and(is_json_content_type);
         // Request decompression runs later in `transform_request_body`. Defer
         // encoded JSON to the final backend-visible hook, where it is either
         // plaintext and inspectable or still encoded and failed closed.
@@ -2218,7 +2747,12 @@ impl Plugin for AiSemanticFirewall {
             return PluginResult::Continue;
         }
 
-        let Some(body) = ctx.metadata.get("request_body").cloned() else {
+        let Some(buffered) = ctx.metadata.get("request_body") else {
+            // A non-UTF-8 body under a non-JSON label is an ordinary binary
+            // upload, not a mislabeled prompt.
+            if !json_content_type {
+                return PluginResult::Continue;
+            }
             return self.engine.handle_uninspectable_body(
                 ctx,
                 Direction::Request,
@@ -2229,15 +2763,54 @@ impl Plugin for AiSemanticFirewall {
                 },
             );
         };
-        if body.trim().is_empty() {
+        // Under a non-JSON label only a body that sniffs as JSON is in scope.
+        if !json_content_type && !looks_like_json(buffered.as_bytes()) {
+            return PluginResult::Continue;
+        }
+        // Enforce the inspection ceiling BEFORE copying, parsing, extracting,
+        // or embedding anything, so a body above it costs no semantic work.
+        if buffered.len() > MAX_INSPECTION_BODY_BYTES {
+            return self.engine.handle_uninspectable_body(
+                ctx,
+                Direction::Request,
+                "body_too_large",
+            );
+        }
+        if buffered.trim().is_empty() {
             return self
                 .engine
                 .handle_uninspectable_body(ctx, Direction::Request, "empty_body");
         }
-
-        let json: Value = match serde_json::from_str(&body) {
+        // Duplicate member names make the evaluated document and the forwarded
+        // bytes two different documents: `serde_json` keeps the LAST value
+        // while a first-key-wins backend acts on the FIRST, so a prompt the
+        // packs scored as benign could deliver the injection they would have
+        // caught (GHSA-c78j-5w9p-cpq6, GHSA-49cr-v28q-9hgp). Screen the exact
+        // bytes the parse below sees; ordinary malformed JSON (which this
+        // screen leaves alone) keeps its own disposition.
+        if ctx
+            .json_scan_memo
+            .ambiguity(strip_json_bom(buffered.as_bytes()))
+            .is_some()
+        {
+            return self.engine.handle_uninspectable_body(
+                ctx,
+                Direction::Request,
+                "ambiguous_json",
+            );
+        }
+        // Parse and hash while the buffered body is still borrowed from
+        // `ctx.metadata`, instead of copying the body to end that borrow
+        // (issue #7132). The digest is computed only when request rules will
+        // record it.
+        let json: Value = match serde_json::from_slice(strip_json_bom(buffered.as_bytes())) {
             Ok(json) => json,
             Err(_) => {
+                // A body that is not even JSON under a non-JSON label cannot be
+                // a JSON prompt to any backend; leave it alone.
+                if !json_content_type {
+                    return PluginResult::Continue;
+                }
                 return self.engine.handle_uninspectable_body(
                     ctx,
                     Direction::Request,
@@ -2245,7 +2818,10 @@ impl Plugin for AiSemanticFirewall {
                 );
             }
         };
-        self.inspect_request_json(ctx, &json, body.as_bytes(), false)
+        let request_hash = self
+            .inspects_request_rules()
+            .then(|| sha256_hex_bytes(buffered.as_bytes()));
+        self.inspect_request_json(ctx, &json, request_hash, false)
             .await
     }
 
@@ -2263,17 +2839,30 @@ impl Plugin for AiSemanticFirewall {
         headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        if !self.needs_governed_request_body() || !ctx.method.eq_ignore_ascii_case("POST") {
+        if !self.needs_governed_request_body() || !is_inspected_request_method(&ctx.method) {
+            return PluginResult::Continue;
+        }
+        let content_type = header_value(headers, "content-type");
+        if content_type.is_some_and(is_framed_grpc_content_type) {
             return PluginResult::Continue;
         }
 
         let was_governed = self.request_hash(ctx).is_some();
-        let json_content_type =
-            header_value(headers, "content-type").is_some_and(is_json_content_type);
+        let json_content_type = content_type.is_some_and(is_json_content_type);
         if !json_content_type && !looks_like_json(body) && !was_governed {
             return PluginResult::Continue;
         }
 
+        // The size ceiling precedes the unchanged-body hash skip: an early
+        // pass never records an over-ceiling body as inspected, and hashing it
+        // here would be wasted work.
+        if body.len() > MAX_INSPECTION_BODY_BYTES {
+            return self.engine.handle_uninspectable_body(
+                ctx,
+                Direction::Request,
+                "body_too_large",
+            );
+        }
         let final_hash = sha256_hex_bytes(body);
         if self.request_hash(ctx) == Some(final_hash.as_str()) {
             return PluginResult::Continue;
@@ -2283,22 +2872,27 @@ impl Plugin for AiSemanticFirewall {
                 .engine
                 .handle_uninspectable_body(ctx, Direction::Request, "empty_body");
         }
-        if body.len() > MAX_INSPECTION_BODY_BYTES {
-            return self.engine.handle_uninspectable_body(
-                ctx,
-                Direction::Request,
-                "body_too_large",
-            );
-        }
         if has_non_identity_content_encoding(headers) {
             return self
                 .engine
                 .handle_uninspectable_body(ctx, Direction::Request, "encoded_body");
         }
 
+        // The backend receives exactly these bytes, so they must be one
+        // unambiguous document (see the matching screen in `before_proxy`).
+        if ctx.json_scan_memo.ambiguity(strip_json_bom(body)).is_some() {
+            return self.engine.handle_uninspectable_body(
+                ctx,
+                Direction::Request,
+                "ambiguous_json",
+            );
+        }
         let json: Value = match serde_json::from_slice(strip_json_bom(body)) {
             Ok(json) => json,
             Err(_) => {
+                if !json_content_type && !was_governed {
+                    return PluginResult::Continue;
+                }
                 return self.engine.handle_uninspectable_body(
                     ctx,
                     Direction::Request,
@@ -2306,7 +2900,8 @@ impl Plugin for AiSemanticFirewall {
                 );
             }
         };
-        self.inspect_request_json(ctx, &json, body, was_governed)
+        // Reuse the digest the unchanged-body skip above already computed.
+        self.inspect_request_json(ctx, &json, Some(final_hash), was_governed)
             .await
     }
 
@@ -2407,13 +3002,39 @@ impl Plugin for AiSemanticFirewall {
             // fail-open opt-out's target: it also keeps streaming (downgrade back
             // to the uninspected path).
             // (Already-buffered bodies are still inspected in `on_response_body`.)
-            return self.streaming_response == StreamingResponsePolicy::Buffer
-                && buffer_streaming_marker_set(ctx);
+            if self.streaming_response == StreamingResponsePolicy::Buffer
+                && buffer_streaming_marker_set(ctx)
+            {
+                return true;
+            }
+            // A governed AI request that never declared a stream got one
+            // anyway (backend default, or a URL-selected stream this build
+            // does not recognize). `buffer` and `reject` cannot leave it
+            // uninspected, so it stays on the buffered path and is inspected
+            // whole; `inspect` releases it to the windowed inspector, which
+            // arms on the same witness.
+            return (200..300).contains(&response_status)
+                && matches!(
+                    self.streaming_response,
+                    StreamingResponsePolicy::Buffer | StreamingResponsePolicy::Reject
+                )
+                && self.undeclared_stream_armed(ctx)
+                && self.should_buffer_response_body(ctx);
         }
 
         let Some(content_type) = content_type else {
             return false;
         };
+
+        // Streamed AI representations that are not SSE cannot be windowed, so
+        // every non-`skip` policy keeps them buffered and inspects them whole
+        // (NDJSON is reassembled; Bedrock binary event streams fail closed as
+        // uninspectable).
+        if is_non_sse_ai_stream_content_type(content_type) {
+            return (200..300).contains(&response_status)
+                && self.governed_stream_armed(ctx)
+                && self.should_buffer_response_body(ctx);
+        }
 
         if is_json_content_type(content_type) {
             // A marked `inspect` request whose backend returned JSON (not the SSE
@@ -2486,7 +3107,10 @@ impl Plugin for AiSemanticFirewall {
         // response — a `GET` EventSource route, or a backend that unexpectedly
         // streams — must keep streaming untouched, never held or cut by AI rules,
         // mirroring the `buffer`-mode marker gate.
-        if !windowed_streaming_marker_set(ctx) {
+        let undeclared_inspected_stream = self.streaming_response
+            == StreamingResponsePolicy::Inspect
+            && self.undeclared_stream_armed(ctx);
+        if !windowed_streaming_marker_set(ctx) && !undeclared_inspected_stream {
             return None;
         }
         let config = self.streaming_config?;
@@ -2589,7 +3213,7 @@ impl Plugin for AiSemanticFirewall {
         let content_type = header_value(response_headers, "content-type").unwrap_or("");
         let encoded_body = response_content_encoding_value(ctx, response_headers).is_some()
             && !gateway_response_compression_planned(ctx, response_headers);
-        if !response_content_type_is_inspection_candidate(content_type)
+        if !self.response_content_type_is_candidate(ctx, content_type)
             && (encoded_body || !looks_like_json(body))
         {
             return PluginResult::Continue;
@@ -2608,7 +3232,7 @@ impl Plugin for AiSemanticFirewall {
             return PluginResult::Continue;
         }
 
-        self.inspect_response_bytes(ctx, content_type, body, false)
+        self.inspect_response_bytes(ctx, content_type, BodyDigest::of(body), false)
             .await
     }
 
@@ -2633,7 +3257,7 @@ impl Plugin for AiSemanticFirewall {
         }
         let content_type = header_value(response_headers, "content-type").unwrap_or("");
         let was_governed = self.response_hash(ctx).is_some();
-        let type_candidate = response_content_type_is_inspection_candidate(content_type);
+        let type_candidate = self.response_content_type_is_candidate(ctx, content_type);
         // `on_response_body` already classified this plaintext representation
         // as an ungoverned non-candidate before the compression transform ran.
         // Do not inflate a gateway-created copy merely to repeat that decision:
@@ -2685,9 +3309,13 @@ impl Plugin for AiSemanticFirewall {
             // JSON extraction. Do not rely on its first byte alone, though:
             // valid SSE may begin with an ignored JSON-looking field before
             // later `data:` frames. Preserve the SSE parser unless the entire
-            // decoded representation is one JSON document.
+            // decoded representation is one JSON document. NDJSON is a stream
+            // representation too: a multi-record body also begins with `{`,
+            // so it keeps its own parser unless it is one document.
+            let stream_representation = is_event_stream_content_type(content_type)
+                || is_non_sse_ai_stream_content_type(content_type);
             let decoded_is_json_document = decoded_looks_like_json
-                && (!is_event_stream_content_type(content_type)
+                && (!stream_representation
                     || serde_json::from_slice::<serde::de::IgnoredAny>(strip_json_bom(&decoded))
                         .is_ok());
             let decoded_content_type = if decoded_is_json_document {
@@ -2696,7 +3324,12 @@ impl Plugin for AiSemanticFirewall {
                 content_type
             };
             return self
-                .inspect_response_bytes(ctx, decoded_content_type, &decoded, was_governed)
+                .inspect_response_bytes(
+                    ctx,
+                    decoded_content_type,
+                    BodyDigest::precomputed(&decoded, decoded_hash),
+                    was_governed,
+                )
                 .await;
         }
 
@@ -2721,8 +3354,13 @@ impl Plugin for AiSemanticFirewall {
                 .handle_uninspectable_body(ctx, Direction::Response, "empty_body");
         }
 
-        self.inspect_response_bytes(ctx, content_type, body, was_governed)
-            .await
+        self.inspect_response_bytes(
+            ctx,
+            content_type,
+            BodyDigest::precomputed(body, raw_hash),
+            was_governed,
+        )
+        .await
     }
 }
 
@@ -2967,9 +3605,10 @@ fn builtin_pack_examples(
     match value {
         Value::Bool(enabled) => Ok(enabled.then(|| strings_to_vec(default_examples))),
         Value::Object(object) => {
-            let enabled = optional_bool_in_object(Some(object), "enabled")?.unwrap_or(true);
+            let path = format!("builtins.{key}");
+            let enabled = optional_bool_in_object(Some(object), &path, "enabled")?.unwrap_or(true);
             let examples_mode =
-                optional_string_from_object(object, "examples_mode")?.unwrap_or("append");
+                optional_string_from_object(object, &path, "examples_mode")?.unwrap_or("append");
             let custom_examples =
                 optional_examples_from_object(object, &format!("builtins.{key}.examples"))?;
 
@@ -3016,6 +3655,11 @@ fn optional_examples_from_object(
     if values.is_empty() {
         return Err(format!("ai_semantic_firewall: `{field}` must not be empty"));
     }
+    if values.len() > MAX_EXAMPLES_PER_RULE {
+        return Err(format!(
+            "ai_semantic_firewall: `{field}` must have at most {MAX_EXAMPLES_PER_RULE} entries"
+        ));
+    }
 
     let mut examples = Vec::with_capacity(values.len());
     for (index, value) in values.iter().enumerate() {
@@ -3024,6 +3668,11 @@ fn optional_examples_from_object(
                 "ai_semantic_firewall: `{field}[{index}]` must be a string"
             ));
         };
+        if example.chars().count() > MAX_EXAMPLE_CHARS {
+            return Err(format!(
+                "ai_semantic_firewall: `{field}[{index}]` must be at most {MAX_EXAMPLE_CHARS} characters"
+            ));
+        }
         let trimmed = example.trim();
         if trimmed.is_empty() {
             return Err(format!(
@@ -3055,6 +3704,11 @@ fn parse_allow_topics(
     let Some(items) = optional_array(config, "allow_topics")? else {
         return Ok(Vec::new());
     };
+    if items.len() > MAX_RULES_PER_LIST {
+        return Err(format!(
+            "ai_semantic_firewall: `allow_topics` must have at most {MAX_RULES_PER_LIST} entries"
+        ));
+    }
     let mut topics = Vec::new();
     for (index, item) in items.iter().enumerate() {
         let object = item.as_object().ok_or_else(|| {
@@ -3069,8 +3723,12 @@ fn parse_allow_topics(
             &format!("allow_topics[{index}].threshold"),
         )?
         .unwrap_or(0.74);
-        let action_on_no_match = match optional_string_from_object(object, "action_on_no_match")?
-            .unwrap_or("reject")
+        let action_on_no_match = match optional_string_from_object(
+            object,
+            &format!("allow_topics[{index}]"),
+            "action_on_no_match",
+        )?
+        .unwrap_or("reject")
         {
             "reject" => Action::Reject,
             "warn" => Action::Warn,
@@ -3082,7 +3740,12 @@ fn parse_allow_topics(
         };
         topics.push(AllowTopic {
             id,
-            description: optional_string_from_object(object, "description")?.map(str::to_string),
+            description: optional_string_from_object(
+                object,
+                &format!("allow_topics[{index}]"),
+                "description",
+            )?
+            .map(str::to_string),
             example_token_sets: precompute_example_token_sets(&examples),
             examples,
             threshold,
@@ -3100,6 +3763,11 @@ fn parse_deny_topics(
     let Some(items) = optional_array(config, "deny_topics")? else {
         return Ok(Vec::new());
     };
+    if items.len() > MAX_RULES_PER_LIST {
+        return Err(format!(
+            "ai_semantic_firewall: `deny_topics` must have at most {MAX_RULES_PER_LIST} entries"
+        ));
+    }
     let mut rules = Vec::new();
     for (index, item) in items.iter().enumerate() {
         let object = item.as_object().ok_or_else(|| {
@@ -3114,7 +3782,8 @@ fn parse_deny_topics(
         )?
         .unwrap_or(0.78);
         let action = parse_action(
-            optional_string_from_object(object, "action")?.unwrap_or(default_action.as_str()),
+            optional_string_from_object(object, &format!("deny_topics[{index}]"), "action")?
+                .unwrap_or(default_action.as_str()),
             &format!("deny_topics[{index}].action"),
         )?;
         if action == Action::Allow {
@@ -3124,7 +3793,12 @@ fn parse_deny_topics(
         }
         rules.push(SemanticRule {
             id,
-            description: optional_string_from_object(object, "description")?.map(str::to_string),
+            description: optional_string_from_object(
+                object,
+                &format!("deny_topics[{index}]"),
+                "description",
+            )?
+            .map(str::to_string),
             direction: DirectionScope::Both,
             severity: Severity::High,
             action,
@@ -3149,6 +3823,11 @@ fn parse_custom_rules(
     let Some(items) = optional_array(config, "custom_rules")? else {
         return Ok(Vec::new());
     };
+    if items.len() > MAX_RULES_PER_LIST {
+        return Err(format!(
+            "ai_semantic_firewall: `custom_rules` must have at most {MAX_RULES_PER_LIST} entries"
+        ));
+    }
     let mut rules = Vec::new();
     for (index, item) in items.iter().enumerate() {
         let object = item.as_object().ok_or_else(|| {
@@ -3164,15 +3843,18 @@ fn parse_custom_rules(
         )?
         .unwrap_or(0.80);
         let direction = parse_direction_scope(
-            optional_string_from_object(object, "direction")?.unwrap_or("both"),
+            optional_string_from_object(object, &format!("custom_rules[{index}]"), "direction")?
+                .unwrap_or("both"),
             &format!("custom_rules[{index}].direction"),
         )?;
         let severity = parse_severity(
-            optional_string_from_object(object, "severity")?.unwrap_or("high"),
+            optional_string_from_object(object, &format!("custom_rules[{index}]"), "severity")?
+                .unwrap_or("high"),
             &format!("custom_rules[{index}].severity"),
         )?;
         let action = parse_action(
-            optional_string_from_object(object, "action")?.unwrap_or(default_action.as_str()),
+            optional_string_from_object(object, &format!("custom_rules[{index}]"), "action")?
+                .unwrap_or(default_action.as_str()),
             &format!("custom_rules[{index}].action"),
         )?;
         if action == Action::Allow {
@@ -3182,7 +3864,12 @@ fn parse_custom_rules(
         }
         rules.push(SemanticRule {
             id,
-            description: optional_string_from_object(object, "description")?.map(str::to_string),
+            description: optional_string_from_object(
+                object,
+                &format!("custom_rules[{index}]"),
+                "description",
+            )?
+            .map(str::to_string),
             direction,
             severity,
             action,
@@ -3224,13 +3911,39 @@ fn parse_provider_config(
     }
 
     let endpoint = required_non_empty_string(provider.get("endpoint"), "provider.endpoint")?;
-    let validated_endpoint = validate_provider_endpoint(&endpoint, backend_allow_ips)?;
+    // Refuse whitespace and control characters anywhere in the configured
+    // value instead of trimming or letting URL parsing strip them, so the
+    // admitted spelling is the one the published schema pattern judges.
+    if provider
+        .get("endpoint")
+        .and_then(Value::as_str)
+        .is_some_and(|raw| {
+            raw.chars()
+                .any(|c| c.is_whitespace() || c.is_control() || c == '\u{feff}')
+        })
+    {
+        return Err(
+            "ai_semantic_firewall: `provider.endpoint` must not contain whitespace or control characters"
+                .to_string(),
+        );
+    }
+    let allow_plaintext = match provider.get("allow_plaintext") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => {
+            return Err(
+                "ai_semantic_firewall: `provider.allow_plaintext` must be a boolean".to_string(),
+            );
+        }
+    };
+    let validated_endpoint =
+        validate_provider_endpoint(&endpoint, allow_plaintext, backend_allow_ips)?;
 
-    let model = optional_string_from_object(provider, "model")?
+    let model = optional_string_from_object(provider, "provider", "model")?
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    let api_key_env = optional_string_from_object(provider, "api_key_env")?
+    let api_key_env = optional_string_from_object(provider, "provider", "api_key_env")?
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
@@ -3244,6 +3957,53 @@ fn parse_provider_config(
     // validate without the live secret.
     let request_timeout_ms =
         optional_positive_u64_from_object(provider, "request_timeout_ms")?.unwrap_or(5_000);
+    if request_timeout_ms > MAX_PROVIDER_REQUEST_TIMEOUT_MS {
+        return Err(format!(
+            "ai_semantic_firewall: `provider.request_timeout_ms` must be less than or equal to {MAX_PROVIDER_REQUEST_TIMEOUT_MS}, got \"{request_timeout_ms}\""
+        ));
+    }
+    let max_concurrent_requests =
+        optional_positive_u64_from_object(provider, "max_concurrent_requests")?
+            .unwrap_or(DEFAULT_PROVIDER_MAX_CONCURRENT_REQUESTS);
+    if max_concurrent_requests > MAX_PROVIDER_MAX_CONCURRENT_REQUESTS {
+        return Err(format!(
+            "ai_semantic_firewall: `provider.max_concurrent_requests` must be less than or equal to {MAX_PROVIDER_MAX_CONCURRENT_REQUESTS}, got \"{max_concurrent_requests}\""
+        ));
+    }
+    let max_concurrent_requests = usize::try_from(max_concurrent_requests).map_err(|_| {
+        "ai_semantic_firewall: `provider.max_concurrent_requests` is out of range".to_string()
+    })?;
+
+    let auth_header = match provider.get("auth_header") {
+        None => None,
+        Some(Value::String(name)) => Some(validate_provider_auth_header(name)?),
+        Some(_) => {
+            return Err(
+                "ai_semantic_firewall: `provider.auth_header` must be a string".to_string(),
+            );
+        }
+    };
+    let auth_scheme = match provider.get("auth_scheme") {
+        None => None,
+        Some(Value::String(scheme)) => Some(validate_provider_auth_scheme(scheme)?),
+        Some(_) => {
+            return Err(
+                "ai_semantic_firewall: `provider.auth_scheme` must be a string".to_string(),
+            );
+        }
+    };
+    if api_key_env.is_none() {
+        for (field, configured) in [
+            ("auth_header", auth_header.is_some()),
+            ("auth_scheme", auth_scheme.is_some()),
+        ] {
+            if configured {
+                return Err(format!(
+                    "ai_semantic_firewall: `provider.{field}` requires `provider.api_key_env`"
+                ));
+            }
+        }
+    }
 
     Ok(Some(ProviderConfig {
         endpoint,
@@ -3251,9 +4011,56 @@ fn parse_provider_config(
         warmup_hostname: validated_endpoint.warmup_hostname,
         model,
         api_key_env,
+        auth_header: auth_header.unwrap_or_else(|| "Authorization".to_string()),
+        // An explicit empty scheme sends the raw credential.
+        auth_scheme: match auth_scheme {
+            None => Some("Bearer".to_string()),
+            Some(scheme) if scheme.is_empty() => None,
+            Some(scheme) => Some(scheme),
+        },
         authorization_header: OnceCell::new(),
         request_timeout: Duration::from_millis(request_timeout_ms),
+        max_concurrent_requests,
     }))
+}
+
+/// RFC 9110 `tchar`: the characters an HTTP field name may contain.
+fn is_http_token_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+}
+
+/// `provider.auth_header`: a field name the credential is sent in, e.g. Azure
+/// OpenAI's `api-key`. Taken verbatim (no trimming) so the admitted spelling is
+/// the one the published schema pattern judges.
+fn validate_provider_auth_header(name: &str) -> Result<String, String> {
+    if name.is_empty()
+        || name.len() > MAX_PROVIDER_AUTH_HEADER_LEN
+        || !name.bytes().all(is_http_token_char)
+    {
+        return Err(format!(
+            "ai_semantic_firewall: `provider.auth_header` must be an HTTP header name of 1 to {MAX_PROVIDER_AUTH_HEADER_LEN} token characters"
+        ));
+    }
+    if RESERVED_PROVIDER_AUTH_HEADERS
+        .iter()
+        .any(|reserved| name.eq_ignore_ascii_case(reserved))
+    {
+        return Err(format!(
+            "ai_semantic_firewall: `provider.auth_header` must not be the reserved header {name:?}"
+        ));
+    }
+    Ok(name.to_string())
+}
+
+/// `provider.auth_scheme`: the scheme prefixed to the credential, or the empty
+/// string to send the raw key.
+fn validate_provider_auth_scheme(scheme: &str) -> Result<String, String> {
+    if scheme.len() > MAX_PROVIDER_AUTH_SCHEME_LEN || !scheme.bytes().all(is_http_token_char) {
+        return Err(format!(
+            "ai_semantic_firewall: `provider.auth_scheme` must be empty or 1 to {MAX_PROVIDER_AUTH_SCHEME_LEN} HTTP token characters"
+        ));
+    }
+    Ok(scheme.to_string())
 }
 
 struct ValidatedProviderEndpoint {
@@ -3263,6 +4070,7 @@ struct ValidatedProviderEndpoint {
 
 fn validate_provider_endpoint(
     endpoint: &str,
+    allow_plaintext: bool,
     backend_allow_ips: &crate::config::BackendEgressPolicy,
 ) -> Result<ValidatedProviderEndpoint, String> {
     let parsed = Url::parse(endpoint)
@@ -3291,6 +4099,19 @@ fn validate_provider_endpoint(
         return Err(format!(
             "ai_semantic_firewall: `provider.endpoint` IP \"{ip}\" denied by backend egress policy"
         ));
+    }
+
+    // The embedding call carries the provider API key. Cleartext is admitted
+    // without an opt-in only to a loopback IP literal (a local sidecar); any other
+    // `http://` destination needs `provider.allow_plaintext: true`.
+    if parsed.scheme() == "http"
+        && !allow_plaintext
+        && !is_loopback_ip_literal_endpoint(endpoint, parsed.host())
+    {
+        return Err(
+            "ai_semantic_firewall: `provider.endpoint` uses `http://` to a host that is not a loopback IP literal, which is rejected by default; use `https://` or set `provider.allow_plaintext: true`"
+                .to_string(),
+        );
     }
 
     Ok(ValidatedProviderEndpoint {
@@ -3408,7 +4229,7 @@ fn reassemble_sse_response_segments(
 ) -> (Vec<TextSegment>, bool) {
     let parsed = parse_sse_data_frames_checked(body);
 
-    let mut reassembler = SseReassembler::new();
+    let mut reassembler = SseReassembler::with_extended_provider_shapes();
     for (event, frame) in parsed.reassembly_frames() {
         reassembler.push_event_frame(event, frame);
     }
@@ -3448,6 +4269,168 @@ fn reassemble_sse_response_segments(
     }
 
     (dedupe_segments(segments), fully_inspectable)
+}
+
+/// Reassemble a buffered JSON ARRAY of streamed provider frames (Gemini
+/// `streamGenerateContent` without `alt=sse`) exactly like the SSE form: the
+/// incremental paths through [`SseReassembler`], the non-incremental ones per
+/// frame. Returns the segments plus whether every frame was foldable.
+fn reassemble_json_frame_array_segments(
+    frames: &[Value],
+    extraction: &ExtractionConfig,
+) -> (Vec<TextSegment>, bool) {
+    let mut reassembler = SseReassembler::with_extended_provider_shapes();
+    for frame in frames {
+        reassembler.push_frame(frame);
+    }
+    let fully_inspectable = !reassembler.provider_stream_uninspectable();
+    let mut segments: Vec<TextSegment> = reassembler
+        .into_texts()
+        .into_iter()
+        .filter_map(|text| sse_text_to_segment(text, extraction))
+        .collect();
+    let non_delta_extraction = ExtractionConfig {
+        request_json_paths: Vec::new(),
+        response_json_paths: extraction
+            .response_json_paths
+            .iter()
+            .filter(|path| !is_sse_delta_response_path(path))
+            .cloned()
+            .collect(),
+    };
+    if !non_delta_extraction.response_json_paths.is_empty() {
+        for (index, frame) in frames.iter().enumerate() {
+            extract_response_segments_from_json(
+                frame,
+                &non_delta_extraction,
+                Some(format!("$[{index}]")),
+                &mut segments,
+            );
+        }
+    }
+    (dedupe_segments(segments), fully_inspectable)
+}
+
+/// Incremental fields of an Ollama NDJSON stream: every line carries one
+/// fragment of the completion in `response` (`/api/generate`) or
+/// `message.content` (`/api/chat`), and with `think: true` one fragment of the
+/// reasoning in `thinking` / `message.thinking`.
+const NDJSON_INCREMENTAL_RESPONSE_PATHS: &[&str] = &[
+    "$.response",
+    "$.message.content",
+    "$.thinking",
+    "$.message.thinking",
+];
+
+/// Whether any NDJSON record of `body` is a duplicate-member JSON document.
+/// Records are split exactly as [`reassemble_ndjson_response_segments`] splits
+/// them (`\n`, trimmed, blank lines skipped).
+fn ndjson_records_are_ambiguous(body: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(strip_json_bom(body)) else {
+        return false;
+    };
+    text.split('\n')
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .any(|line| crate::util::json_dup_keys::str_ambiguity(line).is_some())
+}
+
+/// Reassemble a buffered newline-delimited JSON stream (Ollama
+/// `application/x-ndjson`) into response segments.
+///
+/// The incremental `response` / `message.content` fragments are concatenated
+/// into one coherent text each (scoring single fragments is meaningless and
+/// lets a phrase split across lines evade every rule); every other enabled
+/// response path is extracted per line (Ollama tool calls arrive whole).
+/// Returns the segments plus whether the body was fully inspectable: valid
+/// UTF-8, every non-empty line a JSON document, and every incremental field a
+/// string.
+fn reassemble_ndjson_response_segments(
+    body: &[u8],
+    extraction: &ExtractionConfig,
+) -> (Vec<TextSegment>, bool) {
+    let Ok(text) = std::str::from_utf8(strip_json_bom(body)) else {
+        return (Vec::new(), false);
+    };
+    let mut fully_parsed = true;
+    let mut response_text = String::new();
+    let mut message_text = String::new();
+    let mut thinking_text = String::new();
+    let mut message_thinking_text = String::new();
+    let per_line_extraction = ExtractionConfig {
+        request_json_paths: Vec::new(),
+        response_json_paths: extraction
+            .response_json_paths
+            .iter()
+            .filter(|path| !NDJSON_INCREMENTAL_RESPONSE_PATHS.contains(&path.as_str()))
+            .cloned()
+            .collect(),
+    };
+    let mut segments = Vec::new();
+    for (index, line) in text.split('\n').enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(frame) = serde_json::from_str::<Value>(line) else {
+            fully_parsed = false;
+            continue;
+        };
+        for (field, accumulator) in [
+            ("response", &mut response_text),
+            ("thinking", &mut thinking_text),
+        ] {
+            match frame.get(field) {
+                None | Some(Value::Null) => {}
+                Some(Value::String(fragment)) => accumulator.push_str(fragment),
+                Some(_) => fully_parsed = false,
+            }
+        }
+        if let Some(message) = frame.get("message").and_then(Value::as_object) {
+            for (field, accumulator) in [
+                ("content", &mut message_text),
+                ("thinking", &mut message_thinking_text),
+            ] {
+                match message.get(field) {
+                    None | Some(Value::Null) => {}
+                    Some(Value::String(fragment)) => accumulator.push_str(fragment),
+                    Some(_) => fully_parsed = false,
+                }
+            }
+        }
+        if !per_line_extraction.response_json_paths.is_empty() {
+            extract_response_segments_from_json(
+                &frame,
+                &per_line_extraction,
+                Some(format!("ndjson[{index}]")),
+                &mut segments,
+            );
+        }
+    }
+    // Answer and reasoning stay separate segments: each is model text the
+    // caller receives, and neither may hide a phrase inside the other.
+    for (path, reassembled) in [
+        ("$.response", &response_text),
+        ("$.message.content", &message_text),
+        ("$.thinking", &thinking_text),
+        ("$.message.thinking", &message_thinking_text),
+    ] {
+        if extraction
+            .response_json_paths
+            .iter()
+            .any(|configured| configured == path)
+        {
+            push_segment(
+                Direction::Response,
+                SegmentKind::AssistantMessage,
+                Some("assistant".to_string()),
+                Some(path.to_string()),
+                reassembled,
+                &mut segments,
+            );
+        }
+    }
+    (dedupe_segments(segments), fully_parsed)
 }
 
 /// Whether a response JSON path is an incremental streaming path handled by
@@ -3852,7 +4835,7 @@ impl StreamWindowEngine {
             // non-delta extraction is configured.
             store_frames: true,
             config,
-            reassembler: SseReassembler::new(),
+            reassembler: SseReassembler::with_extended_provider_shapes(),
             carry: Vec::new(),
             carry_context: 0,
             carry_continues_forced: false,
@@ -3990,6 +4973,10 @@ impl StreamWindowEngine {
             // holding rather than releasing bytes no verdict ever covered.
             let inspectable = parse == EventParse::Whole
                 && parsed.fully_parsed
+                // A duplicate-member `data:` payload was folded from its LAST
+                // member while the client reads the FIRST (GHSA-49cr-v28q-9hgp).
+                && !std::str::from_utf8(&raw[parse_from..])
+                    .is_ok_and(sse_data_payloads_are_ambiguous)
                 && !self.reassembler.provider_stream_uninspectable()
                 // Gemini candidates are independent client-visible streams, but
                 // release() retains one aggregate overlap. Until overlap is
@@ -4655,11 +5642,15 @@ fn frame_is_unmapped_governed(frame: &Value) -> bool {
     // per stream, for exactly the same reason; a frame of either that claims
     // the shape while violating it is likewise reported through
     // `provider_stream_uninspectable`, not here.
+    // Cohere v2 `/v2/chat` events are reassembled by the extended-shape
+    // reassembler this plugin uses; an unmodelled event inside such a stream
+    // is reported through `provider_stream_uninspectable`.
     if frame.get("choices").is_some()
         || responses_api_event
         || anthropic_event
         || is_gemini_stream_frame(frame)
         || is_tgi_stream_frame(frame)
+        || is_cohere_v2_stream_frame(frame)
     {
         return false;
     }
@@ -4842,7 +5833,7 @@ fn streaming_str<'a>(
     field: &str,
 ) -> Result<Option<&'a str>, String> {
     match streaming {
-        Some(obj) => optional_string_from_object(obj, field),
+        Some(obj) => optional_string_from_object(obj, "streaming", field),
         None => Ok(None),
     }
 }
@@ -5037,6 +6028,11 @@ fn parse_streaming_inspect_config(config: &Value) -> Result<StreamingInspectConf
             "ai_semantic_firewall: `streaming.max_window_bytes` must be greater than 0".to_string(),
         );
     }
+    if max_window_bytes > MAX_STREAM_WINDOW_BYTES {
+        return Err(format!(
+            "ai_semantic_firewall: `streaming.max_window_bytes` must be less than or equal to {MAX_STREAM_WINDOW_BYTES}, got \"{max_window_bytes}\""
+        ));
+    }
     let overlap_bytes = streaming_u64(streaming, "overlap_bytes")?.unwrap_or(256);
     if overlap_bytes >= max_window_bytes {
         return Err(
@@ -5050,13 +6046,21 @@ fn parse_streaming_inspect_config(config: &Value) -> Result<StreamingInspectConf
             "ai_semantic_firewall: `streaming.max_inspections` must be greater than 0".to_string(),
         );
     }
+    if max_inspections > MAX_STREAM_INSPECTIONS {
+        return Err(format!(
+            "ai_semantic_firewall: `streaming.max_inspections` must be less than or equal to {MAX_STREAM_INSPECTIONS}, got \"{max_inspections}\""
+        ));
+    }
+    let max_inspections = u32::try_from(max_inspections).map_err(|_| {
+        "ai_semantic_firewall: `streaming.max_inspections` is out of range".to_string()
+    })?;
 
     Ok(StreamingInspectConfig {
         window,
         enforcement,
         max_window_bytes: max_window_bytes as usize,
         overlap_bytes: overlap_bytes as usize,
-        max_inspections: u32::try_from(max_inspections).unwrap_or(u32::MAX),
+        max_inspections,
         cut_with_error_event,
         max_hold,
         hold_timeout,
@@ -5689,7 +6693,7 @@ impl StreamInspector {
         }
     }
 
-    async fn inspect_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn inspect_chunk(&mut self, chunk: &Bytes) -> ResponseStreamAction {
         if self.terminated {
             return ResponseStreamAction::Forward(Bytes::new());
         }
@@ -5786,7 +6790,7 @@ impl StreamInspector {
             // Release immediately; incrementally drain every ready internal
             // window so detect-mode structured state stays bounded too.
             StreamEnforcement::Detect => {
-                let out = Bytes::copy_from_slice(chunk);
+                let out = chunk.clone();
                 let mut consumed = 0usize;
                 loop {
                     let step = self.window.ingest_step(&chunk[consumed..]);
@@ -5873,7 +6877,7 @@ impl StreamInspector {
 
 #[async_trait]
 impl ResponseStreamInspector for StreamInspector {
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &Bytes) -> ResponseStreamAction {
         let action = self.inspect_chunk(chunk).await;
         self.note_forwarded(&action);
         action
@@ -5966,6 +6970,34 @@ fn sse_text_to_segment(text: SseText, extraction: &ExtractionConfig) -> Option<T
             SegmentKind::ToolArguments,
         ),
         SseTextKind::TgiGeneratedText => (&["$[*].generated_text"], SegmentKind::AssistantMessage),
+        SseTextKind::ChatFunctionCallName => (
+            &[
+                "$.choices[*].delta.function_call.name",
+                "$.choices[*].message.function_call.name",
+            ],
+            SegmentKind::ToolCall,
+        ),
+        SseTextKind::ChatFunctionCallArguments => (
+            &[
+                "$.choices[*].delta.function_call.arguments",
+                "$.choices[*].message.function_call.arguments",
+            ],
+            SegmentKind::ToolArguments,
+        ),
+        SseTextKind::CohereText => (&["$.message.content"], SegmentKind::AssistantMessage),
+        SseTextKind::CohereToolPlan => (&["$.message.tool_plan"], SegmentKind::AssistantMessage),
+        SseTextKind::CohereToolName => (
+            &["$.message.tool_calls[*].function.name"],
+            SegmentKind::ToolCall,
+        ),
+        SseTextKind::CohereToolArguments => (
+            &["$.message.tool_calls[*].function.arguments"],
+            SegmentKind::ToolArguments,
+        ),
+        SseTextKind::CohereCitationSource => (
+            &["$.message.citations[*].sources"],
+            SegmentKind::GenericText,
+        ),
     };
 
     let enabled = path_patterns.iter().any(|pattern| {
@@ -6253,6 +7285,116 @@ fn extract_known_path(
             json,
             direction,
             "message",
+            "arguments",
+            SegmentKind::ToolArguments,
+            prefix,
+            segments,
+        ),
+        "$.choices[*].message.function_call.name" => extract_choice_function_call(
+            json,
+            direction,
+            "message",
+            "name",
+            SegmentKind::ToolCall,
+            prefix,
+            segments,
+        ),
+        "$.choices[*].message.function_call.arguments" => extract_choice_function_call(
+            json,
+            direction,
+            "message",
+            "arguments",
+            SegmentKind::ToolArguments,
+            prefix,
+            segments,
+        ),
+        "$.choices[*].delta.function_call.name" => extract_choice_function_call(
+            json,
+            direction,
+            "delta",
+            "name",
+            SegmentKind::ToolCall,
+            prefix,
+            segments,
+        ),
+        "$.choices[*].delta.function_call.arguments" => extract_choice_function_call(
+            json,
+            direction,
+            "delta",
+            "arguments",
+            SegmentKind::ToolArguments,
+            prefix,
+            segments,
+        ),
+        // Cohere v2 / Ollama chat completion message. `message` is a REQUEST
+        // marker (Cohere v1 sends a string turn), so these response paths only
+        // read an OBJECT `message`; a string `message` yields nothing here.
+        "$.message.content" => {
+            if let Some(message) = json.get("message").filter(|message| message.is_object()) {
+                let role = message
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .unwrap_or("assistant");
+                extract_prose_value(
+                    message.get("content"),
+                    direction,
+                    openai_message_kind(Some(role)),
+                    Some(role.to_string()),
+                    Some(prefixed_json_path(prefix, "$.message.content".to_string())),
+                    segments,
+                );
+            }
+        }
+        "$.message.tool_plan" => {
+            if let Some(message) = json.get("message").filter(|message| message.is_object()) {
+                extract_prose_value(
+                    message.get("tool_plan"),
+                    direction,
+                    SegmentKind::AssistantMessage,
+                    Some("assistant".to_string()),
+                    Some(prefixed_json_path(
+                        prefix,
+                        "$.message.tool_plan".to_string(),
+                    )),
+                    segments,
+                );
+            }
+        }
+        "$.message.thinking" => {
+            if let Some(message) = json.get("message").filter(|message| message.is_object()) {
+                extract_prose_value(
+                    message.get("thinking"),
+                    direction,
+                    SegmentKind::AssistantMessage,
+                    Some("assistant".to_string()),
+                    Some(prefixed_json_path(prefix, "$.message.thinking".to_string())),
+                    segments,
+                );
+            }
+        }
+        // Ollama `/api/generate` reasoning. Marker-less, like `$.response`.
+        "$.thinking" => extract_prose_value(
+            json.get("thinking"),
+            direction,
+            SegmentKind::AssistantMessage,
+            Some("assistant".to_string()),
+            Some(prefixed_json_path(prefix, "$.thinking".to_string())),
+            segments,
+        ),
+        "$.message.citations[*].sources" => {
+            extract_message_citation_sources(json, direction, prefix, segments)
+        }
+        "$.message.tool_calls[*].function.name" => extract_message_object_tool_calls(
+            json,
+            direction,
+            "name",
+            SegmentKind::ToolCall,
+            prefix,
+            segments,
+        ),
+        "$.message.tool_calls[*].function.arguments" => extract_message_object_tool_calls(
+            json,
+            direction,
             "arguments",
             SegmentKind::ToolArguments,
             prefix,
@@ -6889,6 +8031,131 @@ fn extract_choice_tool_calls(
     }
 }
 
+/// Legacy Chat Completions `choices[].message.function_call` /
+/// `choices[].delta.function_call` (the pre-`tool_calls` shape).
+fn extract_choice_function_call(
+    json: &Value,
+    direction: Direction,
+    choice_field: &str,
+    call_field: &str,
+    kind: SegmentKind,
+    prefix: Option<&str>,
+    segments: &mut Vec<TextSegment>,
+) {
+    let Some(choices) = json.get("choices").and_then(Value::as_array) else {
+        return;
+    };
+    for (choice_index, choice) in choices.iter().enumerate() {
+        let Some(function_call) = choice
+            .get(choice_field)
+            .and_then(|message| message.get("function_call"))
+        else {
+            continue;
+        };
+        extract_text_value(
+            function_call.get(call_field),
+            direction,
+            kind,
+            Some("assistant".to_string()),
+            Some(prefixed_json_path(
+                prefix,
+                format!("$.choices[{choice_index}].{choice_field}.function_call.{call_field}"),
+            )),
+            segments,
+        );
+    }
+}
+
+/// Cohere v2 `message.citations[].sources[]`: each source's `tool_output` or
+/// `document` (else the whole source) as its own segment, serialized compactly
+/// when it is not a string. Kept apart from the completion text.
+fn extract_message_citation_sources(
+    json: &Value,
+    direction: Direction,
+    prefix: Option<&str>,
+    segments: &mut Vec<TextSegment>,
+) {
+    let Some(citations) = json
+        .get("message")
+        .filter(|message| message.is_object())
+        .and_then(|message| message.get("citations"))
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+    for (citation_index, citation) in citations.iter().enumerate() {
+        let Some(sources) = citation.get("sources").and_then(Value::as_array) else {
+            continue;
+        };
+        for (source_index, source) in sources.iter().enumerate() {
+            let payload = source
+                .get("tool_output")
+                .or_else(|| source.get("document"))
+                .unwrap_or(source);
+            let path = prefixed_json_path(
+                prefix,
+                format!("$.message.citations[{citation_index}].sources[{source_index}]"),
+            );
+            if payload.is_array() {
+                // An array payload is one source: serialize it whole rather
+                // than reading only elements that happen to carry `text`.
+                push_segment(
+                    direction,
+                    SegmentKind::GenericText,
+                    None,
+                    Some(path),
+                    &payload.to_string(),
+                    segments,
+                );
+            } else {
+                extract_text_value(
+                    Some(payload),
+                    direction,
+                    SegmentKind::GenericText,
+                    None,
+                    Some(path),
+                    segments,
+                );
+            }
+        }
+    }
+}
+
+/// Cohere v2 / Ollama `message.tool_calls[].function.{name, arguments}` on an
+/// object `message`. Ollama sends `arguments` as an object, which
+/// [`extract_text_value`] serializes compactly.
+fn extract_message_object_tool_calls(
+    json: &Value,
+    direction: Direction,
+    field: &str,
+    kind: SegmentKind,
+    prefix: Option<&str>,
+    segments: &mut Vec<TextSegment>,
+) {
+    let Some(tool_calls) = json
+        .get("message")
+        .filter(|message| message.is_object())
+        .and_then(|message| message.get("tool_calls"))
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+    for (call_index, call) in tool_calls.iter().enumerate() {
+        let function = call.get("function").unwrap_or(call);
+        extract_text_value(
+            function.get(field),
+            direction,
+            kind,
+            Some("assistant".to_string()),
+            Some(prefixed_json_path(
+                prefix,
+                format!("$.message.tool_calls[{call_index}].function.{field}"),
+            )),
+            segments,
+        );
+    }
+}
+
 fn prefixed_json_path(prefix: Option<&str>, suffix: String) -> String {
     match prefix {
         Some(prefix) => format!("{prefix}.{suffix}"),
@@ -7041,9 +8308,10 @@ fn document_member_is_hidden(member: &str, excluded_members: &HashSet<&str>) -> 
 /// stringifying an arbitrary business object into one segment would ship it to
 /// the embedding provider. A body whose only `documents` content is objects is
 /// then treated as uninspectable and routed through
-/// `fail_on_uninspectable_body`, which is the fail-closed direction. An entry
-/// carrying a `type` discriminator is a content *part*, not a document map, so
-/// it keeps the recognized-`text` reading.
+/// `fail_on_uninspectable_body`, which is the fail-closed direction. A `type`
+/// member is NOT a discriminator here: in a Cohere v1 document it is an
+/// ordinary model-visible key, so a document carrying one is still read
+/// member-wise (otherwise adding `"type"` would hide every other member).
 ///
 /// Bounded like every other extractor here: one level per member, no recursion.
 fn extract_cohere_documents(
@@ -7068,17 +8336,6 @@ fn extract_cohere_documents(
             );
             continue;
         };
-        if object.contains_key("type") {
-            extract_prose_value(
-                object.get("text"),
-                direction,
-                SegmentKind::Document,
-                None,
-                Some(format!("{}.text", document_path())),
-                segments,
-            );
-            continue;
-        }
         let excluded_members = document_excluded_members(object.get(DOCUMENT_EXCLUDES_MEMBER));
         for (member, value) in object {
             if document_member_is_hidden(member, &excluded_members) {
@@ -7260,6 +8517,34 @@ fn extract_text_value(
                     }
                     Value::Object(object) => {
                         let block_type = object.get("type").and_then(Value::as_str);
+                        if matches!(
+                            block_type,
+                            Some("tool_use" | "server_tool_use" | "mcp_tool_use")
+                        ) {
+                            // Anthropic tool-use block replayed in conversation
+                            // history: the assistant's invoked `name` and its
+                            // `input` document reach the model on the next turn,
+                            // so both are inspected — attributed `ToolCall` /
+                            // `ToolArguments`, matching the response-side
+                            // `$.content[*].name` / `.input` paths. A stray
+                            // `text` member is read too, so an extra field
+                            // cannot hide the block's own prose.
+                            for (field, field_kind) in [
+                                ("name", SegmentKind::ToolCall),
+                                ("input", SegmentKind::ToolArguments),
+                                ("text", kind),
+                            ] {
+                                extract_text_value(
+                                    object.get(field),
+                                    direction,
+                                    field_kind,
+                                    role.clone(),
+                                    child_path.as_ref().map(|path| format!("{path}.{field}")),
+                                    segments,
+                                );
+                            }
+                            continue;
+                        }
                         let direct_text = object.get("text").or_else(|| {
                             if block_type == Some("input_text") {
                                 object.get("content")
@@ -7388,21 +8673,29 @@ fn push_segment(
     });
 }
 
+/// Drop repeated `(direction, kind, json_path, text)` segments, keeping the
+/// first. Keys borrow the segments (issue #7132), so no extracted text is
+/// copied to deduplicate it.
 fn dedupe_segments(segments: Vec<TextSegment>) -> Vec<TextSegment> {
-    let mut seen = HashSet::new();
-    let mut deduped = Vec::new();
-    for segment in segments {
-        let key = (
-            segment.direction.as_str().to_string(),
-            segment.kind.as_str().to_string(),
-            segment.json_path.clone().unwrap_or_default(),
-            segment.text.clone(),
-        );
-        if seen.insert(key) {
-            deduped.push(segment);
-        }
-    }
-    deduped
+    let keep: Vec<bool> = {
+        let mut seen = HashSet::with_capacity(segments.len());
+        segments
+            .iter()
+            .map(|segment| {
+                seen.insert((
+                    segment.direction.as_str(),
+                    segment.kind.as_str(),
+                    segment.json_path.as_deref().unwrap_or_default(),
+                    segment.text.as_str(),
+                ))
+            })
+            .collect()
+    };
+    segments
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(segment, keep)| keep.then_some(segment))
+        .collect()
 }
 
 /// Compiled-in lexical fast path for a BUILT-IN rule pack. Keyed on the typed
@@ -7775,6 +9068,57 @@ fn skip_streaming_marker_set(ctx: &RequestContext) -> bool {
         == Some("true")
 }
 
+/// Body-bearing methods whose request bodies this plugin inspects.
+fn is_inspected_request_method(method: &str) -> bool {
+    method.eq_ignore_ascii_case("POST")
+        || method.eq_ignore_ascii_case("PUT")
+        || method.eq_ignore_ascii_case("PATCH")
+}
+
+/// Request targets that select a streamed response by URL rather than by a
+/// body `stream` flag: Google Gemini / Vertex `:streamGenerateContent`, and
+/// Amazon Bedrock `converse-stream` / `invoke-with-response-stream`.
+fn request_path_selects_stream(path: &str) -> bool {
+    // The `:` may arrive percent-encoded; Google's method names themselves
+    // are case-sensitive.
+    path.ends_with(":streamGenerateContent")
+        || path.ends_with("%3AstreamGenerateContent")
+        || path.ends_with("%3astreamGenerateContent")
+        || path.ends_with("/converse-stream")
+        || path.ends_with("/invoke-with-response-stream")
+}
+
+/// Newline-delimited JSON stream media types (Ollama streams
+/// `application/x-ndjson`).
+fn is_ndjson_stream_content_type(content_type: &str) -> bool {
+    let media_type = content_type.split(';').next().unwrap_or("").trim();
+    [
+        "application/x-ndjson",
+        "application/ndjson",
+        "application/jsonl",
+        "application/x-jsonlines",
+        "application/jsonlines",
+    ]
+    .iter()
+    .any(|candidate| media_type.eq_ignore_ascii_case(candidate))
+}
+
+/// Amazon Bedrock's binary `application/vnd.amazon.eventstream` framing, which
+/// this plugin cannot parse.
+fn is_amazon_eventstream_content_type(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .eq_ignore_ascii_case("application/vnd.amazon.eventstream")
+}
+
+/// Streamed AI response representations that are not `text/event-stream`.
+fn is_non_sse_ai_stream_content_type(content_type: &str) -> bool {
+    is_ndjson_stream_content_type(content_type) || is_amazon_eventstream_content_type(content_type)
+}
+
 fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
     headers.get(name).map(String::as_str).or_else(|| {
         headers
@@ -7833,11 +9177,13 @@ fn gateway_response_compression_planned(
     let Some(encoding) = content_encoding_value(headers) else {
         return false;
     };
-    // A later header hook may rewrite one supported gateway encoding to the
-    // other. Compression follows that final header when transforming the body,
-    // so private ownership remains authoritative even when it differs from the
-    // algorithm originally selected.
-    (encoding.eq_ignore_ascii_case("gzip") || encoding.eq_ignore_ascii_case("br"))
+    // A later header hook may rewrite one supported gateway encoding to
+    // another. Compression follows that final header when transforming the
+    // body, so private ownership remains authoritative even when it differs
+    // from the algorithm originally selected.
+    (encoding.eq_ignore_ascii_case("gzip")
+        || encoding.eq_ignore_ascii_case("br")
+        || encoding.eq_ignore_ascii_case("zstd"))
         && ctx.gateway_response_compression_algorithm().is_some()
 }
 
@@ -7937,7 +9283,11 @@ fn looks_like_governed_request_json(json: &Value) -> bool {
 ///   `outputText` or `completionReason` — the Bedrock Titan completion shape,
 ///   rather than every paginated list endpoint that answers `{"results": []}`.
 /// * A top-level ARRAY document counts only when an element carries
-///   `generated_text` — Hugging Face TGI, whose response has no object root.
+///   `generated_text` — Hugging Face TGI, whose response has no object root —
+///   or `candidates` — Gemini `streamGenerateContent` without `alt=sse`.
+/// * `message` counts only as an object whose `role` is `assistant` — the
+///   Cohere v2 and Ollama chat completion shape, not an error body's
+///   `{"message": "…"}` string.
 fn looks_like_governed_response_json(json: &Value) -> bool {
     const MARKERS: &[&str] = &[
         "choices",
@@ -7946,15 +9296,27 @@ fn looks_like_governed_response_json(json: &Value) -> bool {
         // Google Gemini / Vertex `generateContent`.
         "candidates",
     ];
-    // Hugging Face TGI: a top-level array whose elements carry `generated_text`.
+    // Hugging Face TGI: a top-level array whose elements carry `generated_text`;
+    // Gemini non-SSE `streamGenerateContent`: an array of `candidates` frames.
     if json.is_array() {
-        return array_has_object_with_any(Some(json), &["generated_text"]);
+        return array_has_object_with_any(Some(json), &["generated_text", "candidates"]);
     }
     let Some(object) = json.as_object() else {
         return false;
     };
     if MARKERS.iter().any(|key| object.contains_key(*key))
         || object.get("type").and_then(Value::as_str) == Some("content_block_delta")
+    {
+        return true;
+    }
+    // Cohere v2 `/v2/chat` and Ollama `/api/chat`: an OBJECT `message` whose
+    // `role` is `assistant`. Shape-qualified because a bare `message` string is
+    // the most common error-body field there is.
+    if object
+        .get("message")
+        .and_then(|message| message.get("role"))
+        .and_then(Value::as_str)
+        == Some("assistant")
     {
         return true;
     }
@@ -7976,6 +9338,9 @@ fn decompress_within_limit(encoding: &str, data: &[u8]) -> Option<Vec<u8>> {
     let coding = match encoding.trim().to_ascii_lowercase().as_str() {
         "gzip" | "x-gzip" => "gzip",
         "br" => "br",
+        // `compression` can emit `zstd` when an instance opts in; the charged
+        // chain decodes it under the same bounds.
+        "zstd" => "zstd",
         _ => return None,
     };
     super::charged_decode::decode_charged_content_coding_chain(
@@ -8125,6 +9490,32 @@ fn sanitize_provider_error(error: &str) -> String {
     }
 }
 
+/// An inspected body and its SHA-256 hex digest, computed at most once per
+/// hook (issue #7132). The final-body hooks hand in the digest their
+/// unchanged-body skip already computed; `on_response_body` computes it only
+/// on a path that records it.
+struct BodyDigest<'a> {
+    body: &'a [u8],
+    hex: Option<String>,
+}
+
+impl<'a> BodyDigest<'a> {
+    fn of(body: &'a [u8]) -> Self {
+        Self { body, hex: None }
+    }
+
+    fn precomputed(body: &'a [u8], hex: String) -> Self {
+        Self {
+            body,
+            hex: Some(hex),
+        }
+    }
+
+    fn into_hex(self) -> String {
+        self.hex.unwrap_or_else(|| sha256_hex_bytes(self.body))
+    }
+}
+
 fn sha256_hex_bytes(input: &[u8]) -> String {
     hex::encode(Sha256::digest(input))
 }
@@ -8170,20 +9561,6 @@ fn ensure_unique_id(ids: &mut HashSet<String>, id: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn reject_unknown_keys(
-    object: &serde_json::Map<String, Value>,
-    path: &str,
-    allowed: &[&str],
-) -> Result<(), String> {
-    if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
-        return Err(format!(
-            "ai_semantic_firewall: unknown property in `{path}`: {key:?}; allowed properties: `{}`",
-            allowed.join("`, `")
-        ));
-    }
-    Ok(())
-}
-
 /// Keep runtime admission as strict as the OpenAPI schema. This runs before
 /// ordinary type/value parsing so a valid sibling field or default built-in
 /// pack can never mask a misspelled security policy.
@@ -8216,12 +9593,22 @@ fn validate_config_keys(config: &serde_json::Map<String, Value>) -> Result<(), S
         "response_leakage",
     ];
 
-    reject_unknown_keys(config, "config", ROOT)?;
+    crate::util::unknown_keys::reject_unknown_keys(
+        config,
+        "config",
+        ROOT,
+        "ai_semantic_firewall: `config`: ",
+    )?;
     if let Some(object) = config.get("inspect").and_then(Value::as_object) {
-        reject_unknown_keys(object, "config.inspect", &["request", "response"])?;
+        crate::util::unknown_keys::reject_unknown_keys(
+            object,
+            "config.inspect",
+            &["request", "response"],
+            "ai_semantic_firewall: `config.inspect`: ",
+        )?;
     }
     if let Some(object) = config.get("streaming").and_then(Value::as_object) {
-        reject_unknown_keys(
+        crate::util::unknown_keys::reject_unknown_keys(
             object,
             "config.streaming",
             &[
@@ -8237,10 +9624,11 @@ fn validate_config_keys(config: &serde_json::Map<String, Value>) -> Result<(), S
                 "max_hold_ms",
                 "on_hold_timeout",
             ],
+            "ai_semantic_firewall: `config.streaming`: ",
         )?;
     }
     if let Some(object) = config.get("provider").and_then(Value::as_object) {
-        reject_unknown_keys(
+        crate::util::unknown_keys::reject_unknown_keys(
             object,
             "config.provider",
             &[
@@ -8248,34 +9636,47 @@ fn validate_config_keys(config: &serde_json::Map<String, Value>) -> Result<(), S
                 "endpoint",
                 "model",
                 "api_key_env",
+                "auth_header",
+                "auth_scheme",
                 "request_timeout_ms",
+                "max_concurrent_requests",
+                "allow_plaintext",
             ],
+            "ai_semantic_firewall: `config.provider`: ",
         )?;
     }
     if let Some(object) = config.get("builtins").and_then(Value::as_object) {
-        reject_unknown_keys(object, "config.builtins", BUILTIN_NAMES)?;
+        crate::util::unknown_keys::reject_unknown_keys(
+            object,
+            "config.builtins",
+            BUILTIN_NAMES,
+            "ai_semantic_firewall: `config.builtins`: ",
+        )?;
         for builtin in BUILTIN_NAMES {
             if let Some(pack) = object.get(*builtin).and_then(Value::as_object) {
-                reject_unknown_keys(
+                crate::util::unknown_keys::reject_unknown_keys(
                     pack,
                     &format!("config.builtins.{builtin}"),
                     &["enabled", "examples_mode", "examples"],
+                    &format!("ai_semantic_firewall: `config.builtins.{builtin}`: "),
                 )?;
             }
         }
     }
     if let Some(object) = config.get("extraction").and_then(Value::as_object) {
-        reject_unknown_keys(
+        crate::util::unknown_keys::reject_unknown_keys(
             object,
             "config.extraction",
             &["request_json_paths", "response_json_paths"],
+            "ai_semantic_firewall: `config.extraction`: ",
         )?;
     }
     if let Some(object) = config.get("privacy").and_then(Value::as_object) {
-        reject_unknown_keys(
+        crate::util::unknown_keys::reject_unknown_keys(
             object,
             "config.privacy",
-            &["log_raw_text", "include_snippet_hash", "snippet_hash_salt"],
+            &["include_snippet_hash", "snippet_hash_salt"],
+            "ai_semantic_firewall: `config.privacy`: ",
         )?;
     }
 
@@ -8310,7 +9711,12 @@ fn validate_config_keys(config: &serde_json::Map<String, Value>) -> Result<(), S
         if let Some(items) = config.get(field).and_then(Value::as_array) {
             for (index, item) in items.iter().enumerate() {
                 if let Some(object) = item.as_object() {
-                    reject_unknown_keys(object, &format!("config.{field}[{index}]"), allowed)?;
+                    crate::util::unknown_keys::reject_unknown_keys(
+                        object,
+                        &format!("config.{field}[{index}]"),
+                        allowed,
+                        &format!("ai_semantic_firewall: `config.{field}[{index}]`: "),
+                    )?;
                 }
             }
         }
@@ -8349,6 +9755,11 @@ fn required_examples(value: Option<&Value>, field: &str) -> Result<Vec<String>, 
             "ai_semantic_firewall: `{field}.examples` must not be empty"
         ));
     }
+    if items.len() > MAX_EXAMPLES_PER_RULE {
+        return Err(format!(
+            "ai_semantic_firewall: `{field}.examples` must have at most {MAX_EXAMPLES_PER_RULE} entries"
+        ));
+    }
     let mut examples = Vec::with_capacity(items.len());
     for (index, item) in items.iter().enumerate() {
         let Some(text) = item.as_str() else {
@@ -8356,6 +9767,11 @@ fn required_examples(value: Option<&Value>, field: &str) -> Result<Vec<String>, 
                 "ai_semantic_firewall: `{field}.examples[{index}]` must be a string"
             ));
         };
+        if text.chars().count() > MAX_EXAMPLE_CHARS {
+            return Err(format!(
+                "ai_semantic_firewall: `{field}.examples[{index}]` must be at most {MAX_EXAMPLE_CHARS} characters"
+            ));
+        }
         let trimmed = text.trim();
         if trimmed.is_empty() {
             return Err(format!(
@@ -8478,14 +9894,19 @@ fn optional_bool(config: &Value, field: &str) -> Result<Option<bool>, String> {
     }
 }
 
+/// `path` is the schema path of `object` (for example `inspect` or
+/// `custom_rules[2]`), so a nested type error names the full field path.
 fn optional_bool_in_object(
     object: Option<&serde_json::Map<String, Value>>,
+    path: &str,
     field: &str,
 ) -> Result<Option<bool>, String> {
     match object.and_then(|object| object.get(field)) {
         None => Ok(None),
         Some(Value::Bool(value)) => Ok(Some(*value)),
-        Some(_) => Err(format!("ai_semantic_firewall: `{field}` must be a boolean")),
+        Some(_) => Err(format!(
+            "ai_semantic_firewall: `{path}.{field}` must be a boolean"
+        )),
     }
 }
 
@@ -8497,19 +9918,25 @@ fn optional_string<'a>(config: &'a Value, field: &str) -> Result<Option<&'a str>
     }
 }
 
+/// `path` is the schema path of `object`; see [`optional_bool_in_object`].
 fn optional_string_from_object<'a>(
     object: &'a serde_json::Map<String, Value>,
+    path: &str,
     field: &str,
 ) -> Result<Option<&'a str>, String> {
     match object.get(field) {
         None => Ok(None),
         Some(Value::String(value)) => Ok(Some(value.as_str())),
-        Some(_) => Err(format!("ai_semantic_firewall: `{field}` must be a string")),
+        Some(_) => Err(format!(
+            "ai_semantic_firewall: `{path}.{field}` must be a string"
+        )),
     }
 }
 
+/// `path` is the schema path of `object`; see [`optional_bool_in_object`].
 fn optional_string_vec_in_object(
     object: Option<&serde_json::Map<String, Value>>,
+    path: &str,
     field: &str,
 ) -> Result<Option<Vec<String>>, String> {
     match object.and_then(|object| object.get(field)) {
@@ -8519,12 +9946,14 @@ fn optional_string_vec_in_object(
             .enumerate()
             .map(|(index, value)| {
                 value.as_str().map(str::to_string).ok_or_else(|| {
-                    format!("ai_semantic_firewall: `{field}[{index}]` must be a string")
+                    format!("ai_semantic_firewall: `{path}.{field}[{index}]` must be a string")
                 })
             })
             .collect::<Result<Vec<_>, _>>()
             .map(Some),
-        Some(_) => Err(format!("ai_semantic_firewall: `{field}` must be an array")),
+        Some(_) => Err(format!(
+            "ai_semantic_firewall: `{path}.{field}` must be an array"
+        )),
     }
 }
 

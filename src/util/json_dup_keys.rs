@@ -500,7 +500,6 @@ impl JsonScanMemo {
     }
 
     /// Retained memo entry count for deterministic external regression tests.
-    #[allow(dead_code)] // reached via `_test_support` from the external test crate
     pub(crate) fn entry_count_for_test(&self) -> usize {
         self.entries.len()
     }
@@ -553,7 +552,7 @@ fn read_member_name<'a>(
         return Err(JsonScanReject::MemberBudgetExceeded);
     }
     *member_count += 1;
-    // Compare DECODED names: `"a"` and `"a"` are the same member and must
+    // Compare DECODED names: `"a"` and `"\u0061"` are the same member and must
     // collide here, exactly as they do in every JSON object model.
     Ok(!names.insert(decode_member_name(raw, has_escape)))
 }

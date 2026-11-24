@@ -300,6 +300,29 @@ async fn h3_post_stalled_body_with_origin(
     grpc_timeout: Option<&'static str>,
     origin: Option<&'static str>,
 ) -> Result<Http3Response, Box<dyn std::error::Error + Send + Sync>> {
+    h3_post_unfinished_body(
+        url,
+        host,
+        addr,
+        content_type,
+        grpc_timeout,
+        origin,
+        Bytes::from_static(br#"{"messages":[{"role":"user","content":"hi"}"#),
+    )
+    .await
+}
+
+/// Send `body` on a fresh H3 request and never finish the stream, then read
+/// whatever response the gateway sends.
+async fn h3_post_unfinished_body(
+    url: &str,
+    host: &str,
+    addr: SocketAddr,
+    content_type: &'static str,
+    grpc_timeout: Option<&'static str>,
+    origin: Option<&'static str>,
+    body: Bytes,
+) -> Result<Http3Response, Box<dyn std::error::Error + Send + Sync>> {
     let provider = rustls::crypto::ring::default_provider();
     let mut client_tls = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
         .with_protocol_versions(&[&rustls::version::TLS13])?
@@ -333,11 +356,7 @@ async fn h3_post_stalled_body_with_origin(
     }
     let req = req.body(())?;
     let mut stream = send_request.send_request(req).await?;
-    stream
-        .send_data(Bytes::from_static(
-            br#"{"messages":[{"role":"user","content":"hi"}"#,
-        ))
-        .await?;
+    stream.send_data(body).await?;
     // Intentionally do not finish() — stall the early drain.
 
     let resp = tokio::time::timeout(Duration::from_secs(5), stream.recv_response())
@@ -688,12 +707,16 @@ async fn h3_slow_cancelled_stream_does_not_block_independent_sibling_stream() {
 // Issue #6009: native-H3 retained-request admission over real streams
 // ---------------------------------------------------------------------------
 
-/// A budget of one 64 KiB block. With the default 10 MiB body limit no
-/// buffered upload fits, so every one is refused before a byte is read.
-const NO_BUFFERED_UPLOAD_FITS: &[(&str, &str)] = &[
+/// A budget of one 64 KiB block under the default 10 MiB body limit. The
+/// budget is charged by the bytes an upload retains, so an upload is refused
+/// only once it outgrows that one block.
+const ONE_BLOCK_BUDGET: &[(&str, &str)] = &[
     ("FERRUM_REQUEST_BUFFER_FALLBACK_MAX_BYTES", "65536"),
     ("FERRUM_REQUEST_BUFFER_MAX_TOTAL_BYTES", "65536"),
 ];
+
+/// An upload body within the 10 MiB limit that outgrows the one-block budget.
+const OVER_BUDGET_UPLOAD_BYTES: usize = 2 * 65_536 + 1;
 
 /// A budget that admits exactly one buffered 64 KiB upload at a time.
 const ONE_BUFFERED_UPLOAD_FITS: &[(&str, &str)] = &[
@@ -702,15 +725,20 @@ const ONE_BUFFERED_UPLOAD_FITS: &[(&str, &str)] = &[
     ("FERRUM_REQUEST_BUFFER_MAX_TOTAL_BYTES", "65536"),
 ];
 
-/// Retry the first H3 exchange while the QUIC listener comes up.
-async fn h3_post_stalled_body_when_ready(
+/// Retry the first H3 exchange while the QUIC listener comes up. The upload
+/// outgrows the one-block budget and is never finished.
+async fn h3_post_over_budget_body_when_ready(
     url: &str,
     addr: SocketAddr,
     content_type: &'static str,
 ) -> Http3Response {
+    let body = Bytes::from(vec![b' '; OVER_BUDGET_UPLOAD_BYTES]);
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        match h3_post_stalled_body(url, "localhost", addr, content_type, None).await {
+        let upload = body.clone();
+        let attempt =
+            h3_post_unfinished_body(url, "localhost", addr, content_type, None, None, upload);
+        match attempt.await {
             Ok(response) => return response,
             Err(_) if Instant::now() < deadline => sleep(Duration::from_millis(100)).await,
             Err(error) => panic!("H3 upload failed: {error}"),
@@ -720,11 +748,11 @@ async fn h3_post_stalled_body_when_ready(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn h3_early_upload_the_budget_cannot_admit_is_refused_on_the_wire() {
+async fn h3_early_upload_the_budget_cannot_cover_is_refused_on_the_wire() {
     let (backend_port, _backend) = spawn_ok_backend().await;
     let (mut gateway, https_port) = spawn_h3_gateway_with_env(
         early_body_proxy_yaml(backend_port, 30_000),
-        NO_BUFFERED_UPLOAD_FITS,
+        ONE_BLOCK_BUDGET,
     )
     .await;
     gateway
@@ -736,7 +764,7 @@ async fn h3_early_upload_the_budget_cannot_admit_is_refused_on_the_wire() {
 
     // The client never finishes its body: the refusal must not wait for it.
     let started = Instant::now();
-    let plain = h3_post_stalled_body_when_ready(&url, addr, "application/json").await;
+    let plain = h3_post_over_budget_body_when_ready(&url, addr, "application/json").await;
     assert_eq!(plain.status, StatusCode::SERVICE_UNAVAILABLE);
     let body = String::from_utf8_lossy(&plain.body_bytes);
     assert!(
@@ -745,10 +773,10 @@ async fn h3_early_upload_the_budget_cannot_admit_is_refused_on_the_wire() {
     );
     assert!(
         started.elapsed() < Duration::from_secs(10),
-        "admission is refused before the drain, not after a read timeout"
+        "a growth the budget cannot cover is refused during the drain, not after a read timeout"
     );
 
-    let grpc = h3_post_stalled_body_when_ready(&url, addr, "application/grpc").await;
+    let grpc = h3_post_over_budget_body_when_ready(&url, addr, "application/grpc").await;
     assert_eq!(grpc.status, StatusCode::OK);
     let headers = &grpc.headers;
     let grpc_status = headers.get("grpc-status").map(|v| v.as_bytes());

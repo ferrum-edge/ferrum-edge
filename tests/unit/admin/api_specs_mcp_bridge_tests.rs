@@ -476,3 +476,236 @@ fn x_ferrum_mcp_forward_request_headers_reach_the_generated_bridge() {
     let error = extract_error(&spec(extension, pet_paths()));
     assert!(error.contains("forward_request_headers"), "{error}");
 }
+
+/// One GET operation, bridged or (with `x-ferrum-mcp: false`) left out of the
+/// generated catalog.
+fn plain_get(operation_id: &str, bridged: bool) -> Value {
+    json!({
+        "get": {
+            "operationId": operation_id,
+            "x-ferrum-mcp": bridged,
+            "responses": { "200": { "description": "ok" } }
+        }
+    })
+}
+
+#[test]
+fn x_ferrum_mcp_endpoint_scope_is_checked_like_the_runtime_claim() {
+    // Issue #7406: `mcp_gateway` claims its endpoint subtree ASCII
+    // case-insensitively and across `%`-encoded suffixes, and answers 404
+    // there, so every operation of the document (bridged or not) whose path
+    // falls inside that claim is refused at import.
+    let extension = json!({ "endpoint": { "path": "/pets-api/v1/mcp" } });
+    for (path, bridged) in [
+        ("/MCP", false),
+        ("/Mcp/status", false),
+        ("/mcp%2Fitems", false),
+        // Conservative: an expression inside a segment may be empty for a
+        // direct client of an unbridged operation.
+        ("/mcp{suffix}", false),
+        ("/mcp/", false),
+        ("/MCP/status", true),
+        // The runtime claim reads the canonical request path.
+        ("/%6d%63p", false),
+        ("/mc%70/items", false),
+        // A path parameter can spell the endpoint segment.
+        ("/{name}/status", false),
+        ("/m{rest}", false),
+        // A literal run that is not a whole segment (the `.` here) does not
+        // stop the other runs from being decoded.
+        ("/mc%70/{name}.{ext}", false),
+    ] {
+        let mut paths = pet_paths();
+        paths[path] = plain_get("shadowed", bridged);
+        let error = extract_error(&spec(extension.clone(), paths));
+        assert!(
+            error.contains("overlaps an operation path"),
+            "{path}: {error}"
+        );
+    }
+
+    // A bridged operation whose path parameter can spell the endpoint: the
+    // tool call `{"name": "MCP"}` would reach a path direct clients get 404 on.
+    let mut paths = pet_paths();
+    paths["/{name}/status"] = json!({
+        "get": {
+            "operationId": "status",
+            "parameters": [{
+                "name": "name",
+                "in": "path",
+                "required": true,
+                "schema": { "type": "string" }
+            }],
+            "responses": { "200": { "description": "ok" } }
+        }
+    });
+    let error = extract_error(&spec(extension.clone(), paths));
+    assert!(error.contains("overlaps an operation path"), "{error}");
+
+    // Disjoint siblings and an operation above the endpoint stay importable.
+    for path in ["/mcpx", "/mcp-tools/items", "/", "/v{n}", "/%41bc"] {
+        let mut paths = pet_paths();
+        paths[path] = plain_get("sibling", false);
+        let config = generated_gateway(&spec(extension.clone(), paths));
+        assert_eq!(config["endpoint"]["path"], "/pets-api/v1/mcp", "{path}");
+        assert!(create_plugin("mcp_gateway", &config).unwrap().is_some());
+    }
+}
+
+#[test]
+fn x_ferrum_mcp_embedded_gateway_cannot_move_the_validated_endpoint() {
+    // GHSA-26x8-8jq5-f73p: the generated `endpoint.path` was checked against
+    // the proxy's `listen_path` and the document's operations; an embedded
+    // `mcp_gateway` entry may not replace it with an unchecked path.
+    for override_path in ["/internal/mcp", "/pets-api/v1/pets", "/PETS-API/mcp"] {
+        let mut document = spec(json!({ "namespace": "pets" }), pet_paths());
+        document["x-ferrum-plugins"] = json!([{
+            "id": "pets-mcp",
+            "plugin_name": "mcp_gateway",
+            "config": {
+                "mode": "aggregate_router",
+                "endpoint": { "path": override_path }
+            }
+        }]);
+        let error = extract_error(&document);
+        assert!(
+            error.contains("may not set a different `endpoint.path`"),
+            "{override_path}: {error}"
+        );
+    }
+
+    let mut document = spec(json!({ "namespace": "pets" }), pet_paths());
+    document["x-ferrum-plugins"] = json!([{
+        "id": "pets-mcp",
+        "plugin_name": "mcp_gateway",
+        "config": { "mode": "aggregate_router", "endpoint": "/internal/mcp" }
+    }]);
+    let error = extract_error(&document);
+    assert!(error.contains("`endpoint` must be an object"), "{error}");
+
+    // Other endpoint keys still merge, and restating the validated path is
+    // harmless.
+    let mut document = spec(json!({ "namespace": "pets" }), pet_paths());
+    document["x-ferrum-plugins"] = json!([{
+        "id": "pets-mcp",
+        "plugin_name": "mcp_gateway",
+        "config": {
+            "mode": "aggregate_router",
+            "endpoint": { "path": "/pets-api/mcp", "protocol_versions": ["2025-11-25"] }
+        }
+    }]);
+    let plugins = extract_value(&document).unwrap();
+    let gateway = plugins
+        .iter()
+        .find(|plugin| plugin.plugin_name == "mcp_gateway")
+        .expect("merged gateway");
+    assert_eq!(gateway.config["endpoint"]["path"], "/pets-api/mcp");
+    assert_eq!(
+        gateway.config["endpoint"]["protocol_versions"],
+        json!(["2025-11-25"])
+    );
+    assert!(
+        create_plugin("mcp_gateway", &gateway.config)
+            .unwrap()
+            .is_some()
+    );
+
+    let mut document = spec(json!({ "namespace": "pets" }), pet_paths());
+    document["x-ferrum-plugins"] = json!([{
+        "id": "pets-mcp",
+        "plugin_name": "mcp_gateway",
+        "config": {
+            "mode": "aggregate_router",
+            "endpoint": { "protocol_versions": ["2025-11-25"] }
+        }
+    }]);
+    let plugins = extract_value(&document).unwrap();
+    let gateway = plugins
+        .iter()
+        .find(|plugin| plugin.plugin_name == "mcp_gateway")
+        .expect("merged gateway");
+    assert_eq!(gateway.config["endpoint"]["path"], "/pets-api/mcp");
+}
+
+#[test]
+fn x_ferrum_mcp_endpoint_overlap_checks_every_server_base() {
+    // Every effective server base exposes the operation on this proxy, so an
+    // overlap under a non-first base is refused too (the bridge itself
+    // dispatches under the first base only), whichever level declares it.
+    let servers = json!([
+        { "url": "https://pets.example.com/v1" },
+        { "url": "https://pets.example.com/mcp" }
+    ]);
+    let extension = json!({ "endpoint": { "path": "/pets-api/mcp" } });
+
+    let mut document = spec(extension.clone(), pet_paths());
+    document["servers"] = servers.clone();
+    let error = extract_error(&document);
+    assert!(
+        error.contains("overlaps an operation path"),
+        "root: {error}"
+    );
+
+    let mut paths = pet_paths();
+    paths["/status"] = plain_get("status", false);
+    paths["/status"]["servers"] = servers.clone();
+    let error = extract_error(&spec(extension.clone(), paths));
+    assert!(
+        error.contains("overlaps an operation path"),
+        "path item: {error}"
+    );
+
+    let mut paths = pet_paths();
+    paths["/status"] = plain_get("status", false);
+    paths["/status"]["get"]["servers"] = servers.clone();
+    let error = extract_error(&spec(extension.clone(), paths));
+    assert!(
+        error.contains("overlaps an operation path"),
+        "operation: {error}"
+    );
+
+    // The same document with disjoint bases imports, and the bridge keeps
+    // dispatching under the first base.
+    let mut paths = pet_paths();
+    paths["/status"] = plain_get("status", false);
+    paths["/status"]["get"]["servers"] = json!([
+        { "url": "https://pets.example.com/v1" },
+        { "url": "https://pets.example.com/v2" }
+    ]);
+    let config = generated_gateway(&spec(extension, paths));
+    assert_eq!(
+        operation(&config, "getPet")["path"],
+        "/pets-api/v1/pets/{petId}"
+    );
+}
+
+#[test]
+fn x_ferrum_mcp_endpoint_overlap_work_is_bounded() {
+    // Every operation is checked under every effective server base, so a
+    // small document can ask for a large product of paths. Past a fixed
+    // budget the import is refused instead of doing unbounded work.
+    let servers: Vec<Value> = (0..300)
+        .map(|index| json!({ "url": format!("https://pets.example.com/b{index}") }))
+        .collect();
+    let mut paths = pet_paths();
+    for index in 0..220 {
+        paths[format!("/unselected{index}").as_str()] = plain_get(&format!("op{index}"), false);
+    }
+    let mut document = spec(json!({ "namespace": "pets" }), paths);
+    document["servers"] = Value::Array(servers);
+    let error = extract_error(&document);
+    assert!(error.contains("exceeds that budget"), "{error}");
+
+    // The same shape well inside the budget imports.
+    let servers: Vec<Value> = (0..20)
+        .map(|index| json!({ "url": format!("https://pets.example.com/b{index}") }))
+        .collect();
+    let mut paths = pet_paths();
+    for index in 0..20 {
+        paths[format!("/unselected{index}").as_str()] = plain_get(&format!("op{index}"), false);
+    }
+    let mut document = spec(json!({ "namespace": "pets" }), paths);
+    document["servers"] = Value::Array(servers);
+    let config = generated_gateway(&document);
+    assert_eq!(config["endpoint"]["path"], "/pets-api/mcp");
+}

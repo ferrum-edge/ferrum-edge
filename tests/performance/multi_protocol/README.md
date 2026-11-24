@@ -171,9 +171,22 @@ Options:
   --h2-stream-window <N>  http2/grpc initial stream window (default 8388608)
   --connection-per-request
                           grpc only: a new connection (TCP, TLS, HTTP/2) per call
+  --grpc-rpc <unary|server-stream>
+                          grpc only: method per call (default unary); server-stream
+                          reads all ten echoed messages and counts one call
+  --grpc-timeout-ms <MS>  grpc only: send grpc-timeout on every call (0 = none);
+                          tonic's client bounds only the response headers by it
+  --grpc-metadata <K=V>   grpc only: extra request metadata (repeatable)
+
+proto_bench grpc-deadline-probe --target <URL> [--calls N] [--grpc-timeout-ms MS]
+                          [--grpc-metadata K=V] [--backend-stats HOST:PORT]
+                          sequential stalled ServerStream calls that only a
+                          deadline-enforcing gateway can end; with
+                          --backend-stats, checks each backend stream is
+                          released while the client connection is open; prints JSON
 ```
 
-The two measurement controls above are refused rather than silently dropped when set for a protocol that would ignore them: a non-default `--h2-stream-window` is rejected outside HTTP/2/gRPC, and `--connection-per-request` is rejected outside gRPC. Other shared options are not all validated this way — for example `--ca-cert` is documented in `--help` as ignored by HTTP/1, HTTP/3, and WebSocket runs — so check each option's help text before assuming it took effect.
+The measurement controls above are refused rather than silently dropped when set for a protocol that would ignore them: a non-default `--h2-stream-window` is rejected outside HTTP/2/gRPC, and `--connection-per-request` and the `--grpc-*` options are rejected outside gRPC (`--connection-per-request` also requires `--grpc-rpc unary`). `proto_backend` counts gRPC calls that arrive with `grpc-timeout` (`grpc_deadline_requests` in `GET /bench-stats`), and stalled `ServerStream` probes it opened and saw released (`grpc_stalled_started` / `grpc_stalled_released`). The retired gRPC deadline A/B study ([protocol_perf_regression.md](../../../docs/protocol_perf_regression.md#grpc-rpc-deadline-ab-6904)) used these counters. Other shared options are not all validated this way — for example `--ca-cert` is documented in `--help` as ignored by HTTP/1, HTTP/3, and WebSocket runs — so check each option's help text before assuming it took effect.
 
 ## Configuration
 
@@ -380,6 +393,100 @@ baseline. Two pairs are a budget-conscious diagnostic default (Student-t with
 one degree of freedom); predeclare at least **four** pairs for performance claims
 and budget that experiment separately.
 
+**First-start settle.** On GitHub-hosted runners the provisioner's job daemon
+(`/tmp/provjobd<digits>`) uses about one core for four to five seconds the first
+time a new binary or container image runs in a job, starting 2 to 12 seconds
+after that start. The runner has four vCPUs and the benchmark saturates them, so
+a cell measured in that window showed gateway and backend CPU 20-25% lower for
+those seconds. It hit whichever arm ran an image first: `direct` at the start of
+the job, `ferrum` about a minute in (18 of 18 jobs), Envoy about two minutes in
+(11 of 12), always in pair 1 and never in pair 2. That is roughly 5% off a
+two-pair 10 KiB average for `ferrum`, a bias in the same direction every run.
+Before the first measured pair the runner therefore starts every distinct
+binary/image once, drives 20 seconds of discarded load at the first payload
+size, and waits through `host_settle.py` until at least 25 seconds have passed
+since the arm was up and the host has been quiet (under 0.2 cores busy) for
+three seconds, capped at 60 seconds. The clock starts when the start returns,
+so an image pull or a slow start cannot use up the minimum. The load is that
+long because the reaction needs it: in measured cells, under continuous load,
+the burst had run its course within about 20 seconds of an arm's first start,
+whereas with a three-second load it had not begun by the release in 3 of 14
+starts of one run and landed in pair 1 after all. With 20 seconds it came
+during the settle in all 21 `ferrum` and Envoy starts of two dispatches (3.3 to
+6.0 CPU-seconds each), and none of their eleven lanes showed the dip in pair 1.
+Some images cost far more: Tyk's start drew 14 to 22 CPU-seconds, which runs
+past the load and extends that hold to as much as 30 seconds. Arms that share
+an image settle once, and the start uses the image with default arguments
+(Envoy with stream limit 100, `ferrum` without an experiment arm's
+environment): the host reacts to an image's first start, and a second container
+from an image that had already run showed no burst (0 of 6). An image already
+settled on the host since boot (iteration 2 onwards) is not held again.
+
+The settle is best effort and cannot fail a run. Each start runs in a subshell
+of its own that removes what it started however it ends and writes nothing
+into the run directory. An arm that cannot start or be held is logged as
+`[settle] <arm> was not settled`, skipped, and left for the measured pair to
+report. An interrupt during the hold takes the arm down at once; one during a
+start or the discarded load is acted on when that command returns, about 20
+seconds for the load and 90 at its timeout. `host_settle.json` in the run
+directory records, per arm, how long the hold lasted and which processes used
+CPU. `host_processes_since_before_start`
+covers the start, the load and the hold, and lists only processes that were
+already running before the arm started, so the provisioner's reaction shows
+there as `provjobd<digits>` with its CPU-seconds whether it came during the
+load or after it. `top_processes`, `busy_cpu_seconds` and the burst times
+(`first_burst_since_start_seconds`, `last_burst_since_start_seconds`) cover
+only the hold after the load. An arm with no record was not settled. An arm
+whose record shows no `provjobd` CPU beyond a few tenths of a second was not
+reacted to and may still get the burst in its first measured cell; that is
+normal for an image whose binary the host has already seen (`ferrum-baseline`
+after `ferrum`). `reason: max_wait` means the host never went quiet, and a
+burst that ends within a few seconds of the release means the 25-second minimum
+is too short for that host. In each of those cases read pair 1 with the CPU
+timelines beside it.
+
+The settle is on by default for the comparison lanes, the HTTP/3 budget lane
+included, on hosts with `/proc`. It is off for the profile, trace and
+H2-observation lanes, which keep their own fixed process accounting;
+`--settle` and `--no-settle` override the default. It removes the first-start
+window only. It neither prevents nor detects later disturbances; the
+host-disturbance flags described next mark the samples they touch.
+
+**Host-disturbance flags.** A shared runner takes CPU for its own housekeeping
+and sometimes does less work per CPU-second, and either moves a sample without
+the gateway changing. The runner marks the samples this touched. With
+`process_usage.py --host-cpu` the sampler records the host's CPU beside the
+benchmark's own processes at every tick, and names the processes outside the
+benchmark that used the most CPU during the sample. After the last pair,
+`host_disturbance.py` reads every sample and writes its findings into each
+sample's JSON (`host_disturbance`), into each summary and each row of
+`paired_comparisons.json` (the flags of every sample the row uses), and into
+`host_disturbance.json`, and prints a table at the end of the run log. It
+flags only: nothing measured changes and no sample is dropped or re-run.
+
+| Flag | Meaning | Evidence |
+|---|---|---|
+| `host_cpu_burst` | The host was busy outside the benchmark: at least 0.25 cores above the sample's own floor (its lower-quartile level) for a second or more. | Host CPU minus the sampled gateway, backend and client; `host_processes` names what ran. |
+| `cpu_dip` | Gateway plus backend CPU fell under 88% of the sample's plateau (its upper-quartile level) for a second or more. | The benchmark's own processes. With `host_cpu_burst` it is the burst's effect. Without it, on a run that recorded host CPU, the host showed no burst above its own floor and the dip is most likely the arm's own. |
+| `provisioner_burst` | The provisioner's first-start reaction reached the measurement: its job daemon used a CPU-second or more while the sample's sampler ran, and the measured window has a host burst. | `provjobd<digits>` in `host_processes`, which covers the client's warm-up and drain too; `provisioner_cpu_seconds` is recorded even when the window was untouched and the flag is not set. |
+| `provisioner_burst_suspected` | The same, inferred: the settle saw no reaction to the arm's first start (its image, or the harness binaries for `direct`) and one of the arm's first two cells in its first pair dipped. | Only for runs that did not record host CPU. It names the likeliest cause; nothing saw the provisioner. |
+| `periodic_60s` | The sample's dip or burst belongs to a series that recurs every 60 seconds. | Three or more events, each one period after the last within 2.5 seconds, are a series; an event a whole number of periods from one of them, within 3.5 seconds, belongs to it too. `periodic_activity` in `host_disturbance.json` gives the number of events marked and the longest run of consecutive periods. |
+| `cpu_per_request_drift` | For this arm and payload, gateway and backend CPU per request are both at least 6% higher in one pair than in another. Every compared pair of the arm is marked: nothing says which one is right. | CPU inside the measured window over the requests completed. Payloads of 512 KiB and above, and samples of fewer than 20,000 requests, are not compared. |
+
+The thresholds were set on 31 hosted jobs, checked on six more, and are not
+guarantees. The drift threshold in particular has no margin: arms that nothing
+else disturbed agree across pairs within 5.8%, and the mildest case marked is
+at 6.2%.
+
+`manifest.json` records the runner's CPU model (`runner_cpu_model`), which
+decides what to expect: see the known limitations below. The flags are on by
+default for the comparison lanes and off for the profile, trace and
+H2-observation lanes, whose sampler arguments and manifest are fixed;
+`--host-flags` and `--no-host-flags` override that. `host_disturbance.py
+report <run directory> <protocol>` prints the same table for any earlier run
+and writes nothing; a run from before host CPU was recorded gets the flags that
+need only the benchmark's own processes, and the table says so.
+
 For a revision experiment, make both images available on the **same hosted
 runner**, pin their digests, and run, for example:
 
@@ -486,7 +593,12 @@ this echo experiment. See the audit for evidence and keep/reject dispositions.
 For the full `http1-tls` matrix (direct + five gateways, five sizes), budget
 `iterations × pairs × 30 × (duration + 15) / 60 + 5` minutes. This conservative
 planning envelope allocates 15 seconds overhead per call and five minutes fixed
-headroom; slow starts, warmups, or failures can still exceed it. Keep at least ten
+headroom; slow starts, warmups, or failures can still exceed it. The first-start
+settle adds about 30 seconds per distinct image once per job: about three
+minutes for direct plus five gateways, which fits inside that headroom. On a
+host that never goes quiet each hold runs to its cap, about 70 seconds per
+image and seven minutes in all, which exceeds that headroom by two minutes.
+Keep at least ten
 minutes below the frozen 75-minute step. The frozen dispatcher cannot set pairs
 or adaptive flags and therefore uses **2 pairs, adaptive off**.
 
@@ -515,6 +627,54 @@ or adaptive flags and therefore uses **2 pairs, adaptive off**.
   request the full-matrix extension; its real-world frequency remains unmeasured.
 - Unmodelled order effects: equal mean position does not model drift or varying
   separation between compared arms; ratio noise can still vary across pairs.
+- Host disturbance outside the settle: the settle holds only each image's
+  first start, and nothing later in a run is prevented. It is flagged (see
+  "Host-disturbance flags" above); the flags mark a sample, they do not
+  correct it. In 37 identical-code validation jobs (an in-run build against
+  its own published image) two kinds stood out:
+  - On all twelve AMD EPYC 7763 runners, gateway and backend CPU dropped
+    together by about 20% for up to two seconds every 60 seconds, whichever
+    arm was running. In the two jobs that recorded host CPU the cause is
+    `hv_kvp_daemon`: it used 1.1 to 1.3 CPU-seconds in every flagged sample,
+    and the host was busy outside the benchmark by that much for those
+    seconds. The ten earlier jobs show the same dips without that record.
+    Flagged as `periodic_60s` in all twelve, and in none of the other 25.
+  - Gateway and backend CPU seconds per request moved together between two
+    samples of the same arm, by up to about a third, with the same number of
+    system calls per request and no dip in the timeline, so the two identical
+    arms differed by between 4% and 25% in at least one pair. Six jobs showed
+    it: five of the six on AMD EPYC 9V45 runners, and one of the twelve on
+    EPYC 9V74 runners (pairs +2.9% and -12.0%). The cause is not established.
+    Five of those six jobs are flagged as `cpu_per_request_drift` on a gateway
+    arm; in the other, the mildest (EPYC 9V45, pairs +4.0% and -2.4%), only
+    `direct` crossed the 6% threshold.
+
+  A single sample can show the second kind on other runners too: one cell on a
+  Xeon Platinum 8370C runner used 8% more gateway and backend CPU per request
+  than the same arm's other pair, cause unknown, and is flagged. The two arms
+  of that comparison are also separate builds of one commit, not one binary,
+  so a consistent difference of a percent or two in one protocol can be real.
+  In the eleven lanes run with the 20-second load the in-run arm read within
+  2% of the image arm in seven, +2.2% and +2.6% in two, and -3.4% and -4.4% in
+  two (the Xeon 8370C lane and an EPYC 7763 lane).
+- What the flags do not catch: a drift under 6%, or at payloads of 512 KiB and
+  above, which are not compared: the gateway arms complete too few requests
+  there for CPU per request to be steady, and undisturbed pairs at that size
+  differ by more than the 6% threshold; a dip of a single 0.5-second tick;
+  a provisioner reaction spread too thin to make a host burst, which is
+  recorded in `provisioner_cpu_seconds` but not flagged; and, in a run that
+  did not record host CPU, the difference between a host burst and an arm's
+  own stall (Envoy at 5 MiB in the HTTP/3 lane dips on its own). They can also
+  mark too much: a move near the drift threshold falls on
+  either side of it by chance; a run with a dozen unrelated disturbances
+  lines three of them up as a 60-second series about one time in ten; and
+  beside a real series, about one unrelated event in seven happens to share
+  its phase and is marked with it. Nor can they see
+  a difference between two arms that holds in every pair: that is what the
+  benchmark reports, and only an identical-code run shows when it is not the
+  code. One such run on an EPYC 9V74 runner read the in-run arm 3.4% and 8.1%
+  above the image arm in its two pairs with no flag, each arm agreeing with
+  itself across pairs. A comparison with no flags is not thereby proven clean.
 
 #### Window, client and revision inputs (#6038, #6022)
 
@@ -581,8 +741,11 @@ done
 **gRPC connection affinity (#5991, #6022 item 6).** Affinity has no runtime
 toggle; it applies to every gRPC pool with more than one connection per host.
 Pair the dispatched `main` against the published image of #5991's parent
-(`main-cc2499b2…`), pooled and per-RPC, at 10 KiB and 5 MiB; `http2` covers the
-direct HTTP/2 pool, which keeps round-robin:
+(`main-cc2499b2…`), pooled and per-RPC, at 10 KiB and 5 MiB. `http2` covers the
+direct HTTP/2 pool, which has used the same affinity since the pool-width
+change (see "Direct HTTP/2 Pool Width" in `docs/connection_pooling.md`); at
+that baseline it took the first ready connection, so its `http2` rows are not
+an affinity-free control for a current `main`:
 
 ```bash
 gh workflow run gateways-protocol-benchmark.yml --ref main \
@@ -1214,7 +1377,7 @@ The JSON output breaks connect failures into `refused / timeout / reset / tls_er
 
 ### Methodology + caveats
 
-- **Mostly default-config gateways, with explicit overrides listed here**. Each gateway is started with the minimum env vars required to make it function (TLS certs, basic routing), and headline capacity knobs such as Kong's `worker_connections` are deliberately left at their out-of-the-box defaults. Three launches carry explicit pool and timeout settings. Tyk reads the shared `configs/tyk/tyk.conf`, which sets its upstream and Redis pool sizes (`max_idle_connections_per_host: 500`, `max_conn_per_host: 0`, `optimisation_max_idle: 2000`, `optimisation_max_active: 4000`). KrakenD's `configs/krakend/http1_tls.json` sets `max_idle_connections` and `max_idle_connections_per_host` to `500` and `idle_timeout` to `120s`. The Ferrum launch in `run_connection_saturation_bench.sh` explicitly sets `FERRUM_MAX_CONNECTIONS=0` (disabling the connection limit; the parser default is `100_000`), `FERRUM_POOL_MAX_IDLE_PER_HOST=1024` (default `64`), and `FERRUM_TCP_IDLE_TIMEOUT_SECONDS=120` (default `300`); it also restates the defaults `FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true` and `FERRUM_POOL_WARMUP_ENABLED=true`. Ferrum's, Tyk's and KrakenD's numbers therefore measure those configured saturation setups, not bare `docker run` defaults. A separate fully "tuned" run for every gateway could be wired up later.
+- **Mostly default-config gateways, with explicit overrides listed here**. Each gateway is started with the minimum env vars required to make it function (TLS certs, basic routing), and headline capacity knobs such as Kong's `worker_connections` are deliberately left at their out-of-the-box defaults. Three launches carry explicit pool and timeout settings. Tyk reads the shared `configs/tyk/tyk.conf`, which sets its upstream and Redis pool sizes (`max_idle_connections_per_host: 500`, `max_conn_per_host: 0`, `optimisation_max_idle: 2000`, `optimisation_max_active: 4000`). KrakenD's `configs/krakend/http1_tls.json` sets `max_idle_connections` and `max_idle_connections_per_host` to `500` and `idle_timeout` to `120s`. The Ferrum launch in `run_connection_saturation_bench.sh` explicitly sets `FERRUM_MAX_CONNECTIONS=0` (disabling the connection limit; the parser default is `100_000`), `FERRUM_POOL_MAX_IDLE_PER_HOST=1024` (default `256`), and `FERRUM_TCP_IDLE_TIMEOUT_SECONDS=120` (default `300`); it also restates the defaults `FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true` and `FERRUM_POOL_WARMUP_ENABLED=true`. Ferrum's, Tyk's and KrakenD's numbers therefore measure those configured saturation setups, not bare `docker run` defaults. A separate fully "tuned" run for every gateway could be wired up later.
 - **Universal protocol = HTTP/1.1+TLS**. All five gateways speak this end-to-end with matched configs, so it's the apples-to-apples comparison. Other protocols would force per-gateway exclusions (KrakenD CE has no gRPC; Kong has no H2 upstream; etc. — see `run_gateway_protocol_bench.sh` for the full matrix).
 - **All gateways run in Docker with `--ulimit nofile=1048576:1048576`** so no gateway gets a per-container FD-cap advantage. Separately, the CI workflow validates the inherited host/client FD ceiling against the requested connection levels and tunes kernel sysctls before launching anything; it does not modify host ulimits, so the operator (or runner image) must already provide enough host FD capacity.
 - **macOS hosts hit ~12K FD ceiling and aren't suitable for headline numbers**. The benchmark runs locally for development and at small N (≤4K), but the comparison numbers should always come from the Linux CI workflow.

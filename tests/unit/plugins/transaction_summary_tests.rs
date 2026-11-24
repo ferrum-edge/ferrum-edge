@@ -15,6 +15,7 @@ fn make_full_summary() -> TransactionSummary {
         timestamp_received: "2026-03-25T12:00:00Z".to_string(),
         client_ip: "10.0.0.1".to_string(),
         consumer_username: Some("alice".to_string()),
+        principal_origin: Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer),
         auth_method: None,
         http_method: "POST".to_string(),
         request_path: "/v1/users".to_string(),
@@ -36,12 +37,13 @@ fn make_full_summary() -> TransactionSummary {
         error_class: None,
         body_error_class: None,
         body_completed: false,
+        response_delivery: Default::default(),
         bytes_sent: 0,
         bytes_received: 0,
         grpc_request_messages: 0,
         grpc_response_messages: 0,
         mirror: false,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
         ai_usage_export: None,
         proxy_lifecycle_generation: None,
     }
@@ -114,6 +116,50 @@ fn test_summary_exposes_normalized_terminal_grpc_status() {
     assert_eq!(
         value["grpc_status"], 2,
         "missing terminal status is UNKNOWN"
+    );
+}
+
+#[test]
+fn test_summary_always_states_its_delivery_observation() {
+    // Issue #6769: a buffered record is finalized before the transport takes
+    // the response, so it says so explicitly instead of implying delivery.
+    let summary = make_full_summary();
+    let parsed: serde_json::Value =
+        serde_json::to_value(&summary).expect("serialize buffered summary");
+    assert_eq!(parsed["response_delivery"], "not_observed");
+    assert!(parsed.get("client_disconnected").is_none());
+
+    let mut observed = make_full_summary();
+    observed.response_delivery = ferrum_edge::plugins::ResponseDelivery::Observed;
+    let parsed: serde_json::Value =
+        serde_json::to_value(&observed).expect("serialize observed summary");
+    assert_eq!(parsed["response_delivery"], "observed");
+    assert_eq!(
+        ferrum_edge::plugins::ResponseDelivery::Observed.as_str(),
+        "observed"
+    );
+    assert_eq!(
+        ferrum_edge::plugins::ResponseDelivery::NotObserved.as_str(),
+        "not_observed"
+    );
+}
+
+#[test]
+fn test_mirror_entry_does_not_inherit_delivery_observation() {
+    let mut summary = make_full_summary();
+    summary.response_delivery = ferrum_edge::plugins::ResponseDelivery::Observed;
+    let mirror = summary.as_mirror_entry(ferrum_edge::plugins::MirrorResponseMeta {
+        mirror_plugin_id: None,
+        mirror_target_url: "http://shadow.example/v1/users".to_string(),
+        mirror_response_status_code: Some(200),
+        mirror_response_size_bytes: None,
+        mirror_response_advertised_size_bytes: None,
+        mirror_latency_ms: 1.0,
+        mirror_error: None,
+    });
+    assert_eq!(
+        mirror.response_delivery,
+        ferrum_edge::plugins::ResponseDelivery::NotObserved
     );
 }
 
@@ -535,6 +581,7 @@ fn make_stream_summary() -> StreamTransactionSummary {
         proxy_name: Some("TCP Backend".to_string()),
         client_ip: "10.0.0.1".to_string(),
         consumer_username: None,
+        principal_origin: None,
         auth_method: None,
         backend_target: "10.0.0.50:5432".to_string(),
         backend_resolved_ip: Some("10.0.0.50".to_string()),
@@ -550,7 +597,7 @@ fn make_stream_summary() -> StreamTransactionSummary {
         timestamp_connected: "2026-03-26T12:00:00Z".to_string(),
         timestamp_disconnected: "2026-03-26T12:00:01.5Z".to_string(),
         sni_hostname: None,
-        metadata: std::collections::HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
     }
 }
 

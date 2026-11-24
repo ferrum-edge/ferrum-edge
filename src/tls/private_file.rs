@@ -790,14 +790,4 @@ mod tests {
 
         drop(retained);
     }
-
-    #[test]
-    fn fault_injection_apis_are_crate_private_test_only() {
-        // Compiling this module under `cfg(test)` is the seam: production builds
-        // omit PrivateFileFault / inject / artifact helpers entirely.
-        let _ = PrivateFileFault::None;
-        let guard = inject_private_file_fault_for_tests(PrivateFileFault::None);
-        guard.disarm();
-        let _ = private_temp_artifacts_for_tests(std::path::Path::new("."));
-    }
 }

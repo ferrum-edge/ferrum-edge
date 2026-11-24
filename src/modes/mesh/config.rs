@@ -11,8 +11,6 @@
 //! mesh subsystem will share the same `FERRUM_NAMESPACE` mechanism so a
 //! single gateway instance only loads its own namespace's mesh resources.
 
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -283,9 +281,9 @@ pub struct MeshService {
     /// stream, and a port number alone is never enough to pick a service
     /// (two services may share one). Populated by the K8s translator from
     /// the Service spec; file-source operators set it directly. Optional:
-    /// HTTP-family routing never consults it, and a TCP-family port on a
-    /// VIP-less service simply cannot be egress-routed (warned at
-    /// materialization, the captured connection fails as before).
+    /// HTTP-family routing never consults it. A TCP-family port on a VIP-less
+    /// (headless) service gets no VIP route; direct pod-IP dials to its
+    /// workloads are still routed by workload address.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cluster_ips: Vec<String>,
     /// Kubernetes Service `metadata.uid` when translated from a cluster
@@ -326,9 +324,9 @@ pub struct ServicePort {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// Kubernetes `Service.spec.ports[].targetPort` — the container port the
-    /// service forwards to, authoritative over the port name/number heuristic
-    /// when resolving the inbound backend. `IntOrString`: a numeric container
-    /// port or a named container port. Absent defaults to `port` (K8s rule).
+    /// service forwards to. `IntOrString`: a numeric container port or a named
+    /// container port. Absent means `port` on every path (K8s rule; see
+    /// [`resolve_service_backend_port`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_port: Option<ServiceTargetPort>,
 }
@@ -345,10 +343,10 @@ pub enum ServiceTargetPort {
 /// Resolve a Service port's `targetPort` to a backend (container) port when it
 /// yields a usable one: a non-zero numeric targetPort, or a named targetPort
 /// that matches one of `workload_ports`. Returns `None` when no targetPort is
-/// declared, a numeric one is zero, or a named one doesn't resolve — leaving the
-/// caller to apply its own fallback (each dialing path differs: skip, the
-/// service port, the workload's first port, ...). Shared so every path that
-/// dials a workload/endpoint address honors `targetPort` consistently.
+/// declared, a numeric one is zero, or a named one doesn't resolve. Paths that
+/// resolve a Service port against a workload use
+/// [`resolve_service_backend_port`], which adds the absent-means-service-port
+/// rule; this lower-level form is for ServiceEntry ports with no workload.
 pub(crate) fn resolve_target_port(
     target_port: Option<&ServiceTargetPort>,
     workload_ports: &[WorkloadPort],
@@ -360,6 +358,41 @@ pub(crate) fn resolve_target_port(
             .find(|wp| wp.name.as_deref() == Some(name.as_str()))
             .map(|wp| wp.port),
         _ => None,
+    }
+}
+
+/// The ONE Kubernetes rule for the backend (container) port a Service port
+/// forwards to on a given workload (issue #7236). Every path that turns a
+/// Service port into a workload dial or a local backend uses it: outbound
+/// Sidecar/Ambient targets, raw-TCP by-workload upstreams, east-west and
+/// NodeWaypoint targets, mesh authz destination scopes, and Sidecar inbound.
+///
+/// - A DECLARED `targetPort` is authoritative: a non-zero number is used
+///   as-is (no matching `containerPort` is needed), a name resolves against
+///   `workload_ports`. One that does not yield a usable port returns `None`
+///   and the caller skips the workload (fail closed) rather than guessing.
+/// - An ABSENT `targetPort` means the service port, exactly as the Kubernetes
+///   API server defaults it. The workload's container-port names or numbers are
+///   never consulted.
+///
+/// `None` also covers a zero service port. The Kubernetes API always sets
+/// `targetPort`, so only native/file/xDS-authored services reach the absent arm.
+pub(crate) fn resolve_service_backend_port(
+    service_port: u16,
+    target_port: Option<&ServiceTargetPort>,
+    workload_ports: &[WorkloadPort],
+) -> Option<u16> {
+    match target_port {
+        Some(_) => resolve_target_port(target_port, workload_ports),
+        None => Some(service_port),
+    }
+    .filter(|port| *port != 0)
+}
+
+impl ServicePort {
+    /// [`resolve_service_backend_port`] for this Service port.
+    pub(crate) fn backend_port_for(&self, workload_ports: &[WorkloadPort]) -> Option<u16> {
+        resolve_service_backend_port(self.port, self.target_port.as_ref(), workload_ports)
     }
 }
 
@@ -392,8 +425,13 @@ pub struct MeshPolicy {
     pub rules: Vec<MeshRule>,
 }
 
+/// Closed like the rest of the grammar (issue #6616): `deny_unknown_fields`
+/// rejects an unrecognized member beside a struct variant's fields, and the
+/// field-less `mesh_wide` variant rejects any member besides `kind` through
+/// `deserialize_closed_unit_variant` (serde's internally tagged unit
+/// variants otherwise drain and ignore every remaining member).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PolicyScope {
     WorkloadSelector {
         #[serde(deserialize_with = "crate::util::json_object::deserialize_object")]
@@ -422,7 +460,46 @@ pub enum PolicyScope {
         attachments: Vec<PolicyTargetAttachment>,
     },
     #[default]
+    #[serde(deserialize_with = "deserialize_closed_unit_variant")]
     MeshWide,
+}
+
+/// Deserialize the members an internally tagged unit variant carries besides
+/// its tag, refusing any. Serde hands the variant the object with its tag
+/// (`kind` for `PolicyScope`, `type` for `TagOverrideOperation`) already
+/// removed, so an empty object is the only accepted shape.
+fn deserialize_closed_unit_variant<'de, D>(deserializer: D) -> Result<(), D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct ClosedUnitVariant;
+
+    impl<'de> serde::de::Visitor<'de> for ClosedUnitVariant {
+        type Value = ();
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("an object with no members besides its tag")
+        }
+
+        fn visit_unit<E>(self) -> Result<(), E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(())
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<(), A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            match map.next_key::<String>()? {
+                Some(key) => Err(serde::de::Error::unknown_field(&key, &[])),
+                None => Ok(()),
+            }
+        }
+    }
+
+    deserializer.deserialize_any(ClosedUnitVariant)
 }
 
 /// Upper bound on `AuthorizationPolicy` / `MeshPolicy` `targetRefs` attachments
@@ -456,7 +533,7 @@ pub const MAX_POLICY_TARGET_REF_NAMESPACE_LEN: usize = crate::config::types::MAX
 /// waypoint association model, and an accepted-but-inert security policy is
 /// worse than a rejected one. See `docs/mesh.md`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PolicyTargetAttachment {
     /// `group: ""` / `core`, `kind: Service` — waypoint destination attachment.
     /// Same namespace as the owning policy (Istio contract).
@@ -542,7 +619,7 @@ pub(crate) fn is_zero_usize(value: &usize) -> bool {
 /// can never be separated by a partial clone. Evaluation helpers therefore
 /// take `&PolicyAction`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum PolicyAction {
     #[default]
     Allow,
@@ -625,7 +702,13 @@ pub const MESH_EXT_AUTHZ_PROCESS_CONCURRENT_CALLS: usize = 128;
 /// Every field here is already validated and bounded; the runtime precomputes
 /// its client state from this value at config publication and performs no
 /// per-request parsing or formatting of provider identity.
+///
+/// Closed (`deny_unknown_fields`, issue #6616) with its nested header and body
+/// objects: a misspelled `headers_to_upstream_on_allow` or
+/// `include_request_body_in_check` would otherwise build a delegation that
+/// forwards or enforces something other than what the provider declared.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshExtAuthzProvider {
     /// `extensionProviders[].name` — the value an `AuthorizationPolicy`
     /// `spec.provider.name` must equal.
@@ -683,6 +766,7 @@ pub struct MeshExtAuthzProvider {
 
 /// A fixed operator-authored header added to every check request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshExtAuthzHeader {
     pub name: String,
     pub value: String,
@@ -690,6 +774,7 @@ pub struct MeshExtAuthzHeader {
 
 /// Istio `includeRequestBodyInCheck`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshExtAuthzBodyCheck {
     /// Maximum number of request body bytes forwarded to the provider.
     pub max_request_bytes: usize,
@@ -802,6 +887,48 @@ pub fn validate_mesh_ext_authz_mutable_header(name: &str) -> Result<String, Stri
     if MESH_EXT_AUTHZ_UNMUTABLE_HEADERS.contains(&lowercase.as_str()) {
         return Err(format!(
             "{lowercase:?} controls request provenance or proxy authentication and cannot be mutated by an external authorization provider"
+        ));
+    }
+    Ok(lowercase)
+}
+
+/// Validate a `headersToUpstreamOnAllow` name: a provider response header that
+/// REPLACES the backend-bound request's same-named header on an allowed check.
+///
+/// On top of [`validate_mesh_ext_authz_mutable_header`] it refuses the
+/// gateway's own identity assertions (the `x-consumer-*` namespace, the GeoIP
+/// result, route path-param captures — a provider must not impersonate the
+/// gateway's authentication result to the backend), `content-*` fields (the
+/// backend-visible body representation is the client's, not the provider's),
+/// and `set-cookie` (a response field with no meaning on a request).
+pub fn validate_mesh_ext_authz_upstream_allow_header(name: &str) -> Result<String, String> {
+    let lowercase = validate_mesh_ext_authz_mutable_header(name)?;
+    if crate::proxy::headers::is_gateway_assertion_header(&lowercase)
+        || crate::proxy::headers::is_path_param_assertion_header(&lowercase)
+    {
+        return Err(format!(
+            "{lowercase:?} is a gateway-asserted identity header and cannot be written onto the backend request by an external authorization provider"
+        ));
+    }
+    if lowercase.starts_with("content-") || lowercase == "set-cookie" {
+        return Err(format!(
+            "{lowercase:?} describes the request body or a response and cannot be written onto the backend request by an external authorization provider"
+        ));
+    }
+    Ok(lowercase)
+}
+
+/// Validate a `headersToDownstreamOnAllow` name: a provider response header
+/// added to the client-visible response of an allowed request.
+///
+/// On top of [`validate_mesh_ext_authz_mutable_header`] it refuses `content-*`
+/// fields — the response body is the backend's, and a provider-supplied
+/// `content-type` / `content-encoding` would misdescribe it to the client.
+pub fn validate_mesh_ext_authz_downstream_allow_header(name: &str) -> Result<String, String> {
+    let lowercase = validate_mesh_ext_authz_mutable_header(name)?;
+    if lowercase.starts_with("content-") {
+        return Err(format!(
+            "{lowercase:?} describes the backend response body and cannot be written onto an allowed response by an external authorization provider"
         ));
     }
     Ok(lowercase)
@@ -1042,31 +1169,28 @@ impl MeshExtAuthzProvider {
             &self.include_request_headers_in_check,
             validate_mesh_ext_authz_forwarded_header,
         )?;
-        // Provider-driven mutation of the BACKEND request or of a SUCCESSFUL
-        // response is refused at admission rather than partially implemented.
-        // Ferrum's ext-authz check runs in the `authorize` phase, before route
-        // dispatch and before every request/response transformer, so a header
-        // written there would be re-ordered against operator-authored rules
-        // differently on each ingress path — a protocol-dependent mutation of
-        // an authenticated request is exactly the class of gap this feature
-        // must not introduce. Refusing is visible and fixable; silently
-        // dropping the field would let an operator believe a token-exchange
-        // contract is in force when it is not.
-        if !self.headers_to_upstream_on_allow.is_empty() {
-            return Err(format!(
-                "extensionProviders {:?} headersToUpstreamOnAllow is not supported: Ferrum does not let an external authorization provider mutate the backend-visible request",
-                sanitize_mesh_ext_authz_diagnostic(&self.name)
-            ));
-        }
-        if !self.headers_to_downstream_on_allow.is_empty() {
-            return Err(format!(
-                "extensionProviders {:?} headersToDownstreamOnAllow is not supported: Ferrum does not let an external authorization provider mutate an allowed response",
-                sanitize_mesh_ext_authz_diagnostic(&self.name)
-            ));
-        }
-        // `headersToDownstreamOnDeny` IS supported: those headers land only on
-        // the gateway-authored denial this plugin itself produces, so there is
-        // no ordering ambiguity and no authenticated request to alter.
+        // Allowed-request mutations. The check runs in `authorize`, but the
+        // result is applied by `mesh_authz`'s own `before_proxy` /
+        // `after_proxy` hooks at its fixed priority, so it lands at ONE
+        // defined point of the ordinary plugin chain on every HTTP-family
+        // ingress path: after authentication/authorization, before
+        // `mesh_route_dispatch` and every transformer. `headersToUpstreamOnAllow`
+        // names are provider-OWNED on an allowed check (the client's copy is
+        // always removed); see `docs/mesh.md`.
+        Self::validate_header_list(
+            &self.name,
+            "headersToUpstreamOnAllow",
+            &self.headers_to_upstream_on_allow,
+            validate_mesh_ext_authz_upstream_allow_header,
+        )?;
+        Self::validate_header_list(
+            &self.name,
+            "headersToDownstreamOnAllow",
+            &self.headers_to_downstream_on_allow,
+            validate_mesh_ext_authz_downstream_allow_header,
+        )?;
+        // `headersToDownstreamOnDeny` lands only on the gateway-authored denial
+        // this plugin itself produces.
         Self::validate_header_list(
             &self.name,
             "headersToDownstreamOnDeny",
@@ -1258,18 +1382,6 @@ pub struct PrincipalMatch {
     pub trust_domain_pattern: Option<String>,
 }
 
-/// Conjunctive source-negative / IP-block matchers for one Istio
-/// AuthorizationPolicy `from[].source`.
-///
-/// Istio ANDs every field inside a single `source` together, and a request
-/// matches the rule's `from` when **any one** source matches. The positive
-/// identity matchers (`principals` / `namespaces`) translate into the ORed
-/// [`PrincipalMatch`] list on [`MeshRule::from`]; the negative and IP-block
-/// matchers live here on [`MeshRule`] because they must AND with — not OR
-/// against — the positive set. Placing them in the ORed `from` vec would let
-/// traffic through whenever a single negative-only entry "matched", which is
-/// the opposite of Istio's deny-listing intent (fail-open).
-///
 /// Pre-parsed CIDR block for allocation-free hot-path IP matching.
 ///
 /// Constructed from a CIDR string like `"10.0.0.0/8"` or a bare IP like
@@ -1398,6 +1510,18 @@ impl<'de> Deserialize<'de> for ParsedCidr {
     }
 }
 
+/// Conjunctive source-negative / IP-block matchers for one Istio
+/// AuthorizationPolicy `from[].source`.
+///
+/// Istio ANDs every field inside a single `source` together, and a request
+/// matches the rule's `from` when **any one** source matches. The positive
+/// identity matchers (`principals` / `namespaces`) translate into the ORed
+/// [`PrincipalMatch`] list on [`MeshRule::from`]; the negative and IP-block
+/// matchers live here on [`MeshRule`] because they must AND with — not OR
+/// against — the positive set. Placing them in the ORed `from` vec would let
+/// traffic through whenever a single negative-only entry "matched", which is
+/// the opposite of Istio's deny-listing intent (fail-open).
+///
 /// IP fields are **fail-closed** when the corresponding request attribute is
 /// absent: a non-empty list with no value to test fails the match rather than
 /// admitting traffic the operator meant to gate. Negative identity and
@@ -2369,6 +2493,12 @@ pub fn workload_selector_matches<L: WorkloadLabels + ?Sized>(
 /// rejected. A valid JWT has its claims extracted and identity propagated.
 /// Enforcement (requiring a JWT) comes from `AuthorizationPolicy`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Closed with its JWT rule types (issue #6616), like the authorization
+/// grammar: a misspelled `refused` or `jwt_rules` member would otherwise drop
+/// a refusal or a token requirement. Inventory types (`Workload`,
+/// `MeshService`) deliberately stay open for forward compatibility
+/// (`unknown_mesh_fields_are_tolerated`).
+#[serde(deny_unknown_fields)]
 pub struct MeshRequestAuthentication {
     pub name: String,
     pub namespace: String,
@@ -2376,10 +2506,20 @@ pub struct MeshRequestAuthentication {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub jwt_rules: Vec<MeshJwtRule>,
+    /// Set by Kubernetes translation when Ferrum refused this
+    /// RequestAuthentication (issue #6656). A refused resource cannot be
+    /// enforced faithfully (its JWT providers, token locations or
+    /// gateway-owned claim headers are unknown), so instead of being dropped,
+    /// which would leave the selected workloads with no JWT validation at
+    /// all, it is carried with no rules and the data plane refuses every
+    /// HTTP request to those workloads until the resource is fixed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub refused: bool,
 }
 
 /// A single JWT validation rule within a [`MeshRequestAuthentication`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshJwtRule {
     pub issuer: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2411,6 +2551,7 @@ pub struct MeshJwtRule {
 /// One `outputClaimToHeaders` entry: publish `claim` into request header
 /// `header` after successful JWT validation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshJwtClaimHeader {
     /// Backend-visible request header name (normalized lowercase at
     /// translation; never a reserved/credential-bearing header).
@@ -2491,7 +2632,9 @@ pub fn validate_mesh_jwt_output_claim_headers(
     let mut seen: Vec<String> = Vec::with_capacity(entries.len());
     for entry in entries {
         let (header, _claim) = validate_mesh_jwt_claim_header(&entry.header, &entry.claim)?;
-        if seen.contains(&header) {
+        if seen.iter().any(|existing| {
+            crate::proxy::headers::field_names_equivalent_for_backends(existing, &header)
+        }) {
             return Err(format!(
                 "outputClaimToHeaders declares header {header:?} more than once; a destination may be asserted from exactly one claim"
             ));
@@ -2503,6 +2646,7 @@ pub fn validate_mesh_jwt_output_claim_headers(
 
 /// A header location from which to extract a JWT.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct JwtHeader {
     pub name: String,
     /// Prefix stripped before validation (e.g., `"Bearer "`).
@@ -2513,7 +2657,17 @@ pub struct JwtHeader {
 // ── Telemetry ─────────────────────────────────────────────────────────────
 
 /// Raw Telemetry resource from Istio CRD translation (before workload merge).
+///
+/// The whole Telemetry document is closed (`deny_unknown_fields`, issue
+/// #6616): the resource, its `config`, the tracing / metrics / access-logging
+/// sections, each tracing provider envelope and `config`, each tag override
+/// and its operation, and the access-log filter. It is operator-authored
+/// policy, not inventory, and a misspelled key would otherwise silently drop
+/// the setting it names (`tag_overides` removes every override,
+/// `filtr` logs every request). Direct `workload_metrics` plugin config
+/// reaches the same objects through its own allowlists.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshTelemetryResource {
     pub name: String,
     pub namespace: String,
@@ -2523,8 +2677,10 @@ pub struct MeshTelemetryResource {
     pub config: MeshTelemetryConfig,
 }
 
-/// Merged telemetry configuration for a workload.
+/// Merged telemetry configuration for a workload. Closed; see
+/// [`MeshTelemetryResource`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct MeshTelemetryConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
@@ -2576,6 +2732,13 @@ pub struct MeshTracingConfig {
     /// default omits the tag (Istio/Envoy semantics).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub custom_env_tags: HashMap<String, String>,
+    /// Header and environment-variable names whose values header / env custom
+    /// tags may copy verbatim. A source not listed here is emitted as
+    /// `[REDACTED]` (fail closed, issue #6619); credential-shaped names are
+    /// rejected. A more specific Telemetry resource with a non-empty list
+    /// replaces the inherited one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub safe_tag_sources: Vec<String>,
     /// Provider-specific tracing backends (Zipkin / Datadog / Lightstep / OpenTelemetry).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<TracingProvider>,
@@ -2651,8 +2814,19 @@ impl TelemetryTracingMode {
 /// shim on older DPs (serde will simply fail to deserialise an unknown
 /// variant and the slice update is rejected at slice-apply time, consistent
 /// with the rest of the mesh slice contract).
+///
+/// Closed (`deny_unknown_fields`): the envelope admits only `kind` and
+/// `config`, and each variant's `config` only its own fields. The direct
+/// `workload_metrics` plugin config also checks both with per-kind allowlists
+/// (`src/plugins/mesh/workload_metrics.rs`, `*_PROVIDER_CONFIG_KEYS`) for its
+/// own diagnostics. Adding a variant field here means adding it there too.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind", content = "config")]
+#[serde(
+    rename_all = "snake_case",
+    tag = "kind",
+    content = "config",
+    deny_unknown_fields
+)]
 pub enum TracingProvider {
     Zipkin {
         url: String,
@@ -2698,7 +2872,9 @@ impl fmt::Debug for TracingProvider {
     }
 }
 
+/// Closed; see [`MeshTelemetryResource`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshMetricsConfig {
     /// Tag overrides: rename, remove, or set custom values for metric tags.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2709,7 +2885,9 @@ pub struct MeshMetricsConfig {
     pub disabled_metrics: Vec<String>,
 }
 
+/// Closed; see [`MeshTelemetryResource`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MetricTagOverride {
     /// Metric family this override targets. `None` applies to every supported
     /// mesh metric for direct/native configurations.
@@ -2719,9 +2897,13 @@ pub struct MetricTagOverride {
     pub operation: TagOverrideOperation,
 }
 
+/// Closed like [`PolicyScope`]: each `type` admits only its own members, and
+/// the unit `remove` variant uses [`deserialize_closed_unit_variant`] because
+/// serde's internally tagged unit variants otherwise ignore extra members.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "type")]
+#[serde(rename_all = "snake_case", tag = "type", deny_unknown_fields)]
 pub enum TagOverrideOperation {
+    #[serde(deserialize_with = "deserialize_closed_unit_variant")]
     Remove,
     Rename {
         new_name: String,
@@ -2736,7 +2918,9 @@ pub enum TagOverrideOperation {
     },
 }
 
+/// Closed; see [`MeshTelemetryResource`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshAccessLoggingConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -2753,8 +2937,9 @@ fn default_true() -> bool {
 ///
 /// Pure conjunctions of supported predicates are stored in the flat fields.
 /// Expressions containing `||` compile to the optional [`AccessLogFilterExpr`]
-/// tree instead.
+/// tree instead. Closed; see [`MeshTelemetryResource`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AccessLogFilter {
     /// Only log responses with status code >= this value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2973,17 +3158,30 @@ impl DestinationRuleLookupTier {
 /// authoritative side. An empty `client_namespace`, `service_namespace`, or
 /// `root_namespace` disables that tier rather than matching every rule whose
 /// own namespace also trims to empty.
+///
+/// **Root-namespace client exception** (issue #7395, Istio
+/// `PushContext.destinationRule`): when the CLIENT itself runs in the root
+/// namespace (an egress or ingress gateway in `istio-system`), only the root
+/// namespace's PRIVATE rules ([`destination_rule_is_namespace_private`]) are
+/// its client tier. Its exported rules are the mesh-wide defaults, so they
+/// stay at the root tier, behind the target service's own rules; otherwise an
+/// exported root wildcard such as `*.example.com` would override an exact
+/// owner rule for every gateway in the root namespace.
 pub fn destination_rule_lookup_tier(
-    rule_namespace: &str,
+    rule: &MeshDestinationRule,
     client_namespace: &str,
     service_namespace: Option<&str>,
     root_namespace: &str,
 ) -> DestinationRuleLookupTier {
-    let rule_namespace = rule_namespace.trim();
+    let rule_namespace = rule.namespace.trim();
     let client_namespace = client_namespace.trim();
     let service_namespace = service_namespace.map(str::trim).filter(|ns| !ns.is_empty());
     let root_namespace = root_namespace.trim();
-    if !client_namespace.is_empty() && rule_namespace == client_namespace {
+    let client_is_root = !root_namespace.is_empty() && client_namespace == root_namespace;
+    if !client_namespace.is_empty()
+        && rule_namespace == client_namespace
+        && (!client_is_root || destination_rule_is_namespace_private(rule))
+    {
         DestinationRuleLookupTier::Client
     } else if service_namespace == Some(rule_namespace) {
         DestinationRuleLookupTier::Service
@@ -2994,25 +3192,45 @@ pub fn destination_rule_lookup_tier(
     }
 }
 
-pub fn service_entry_applies_to_workload<L: WorkloadLabels + ?Sized>(
-    entry: &ServiceEntry,
-    workload_namespace: &str,
-    _workload_labels: &L,
-) -> bool {
+/// Whether a DestinationRule is visible only inside its own namespace: an
+/// empty `exportTo` (namespace-local by Ferrum convention), or one whose every
+/// entry is `.` or the declaring namespace itself. Istio's
+/// root-namespace-local index holds exactly these rules; see
+/// [`destination_rule_lookup_tier`].
+pub fn destination_rule_is_namespace_private(rule: &MeshDestinationRule) -> bool {
+    let declaring_namespace = rule.namespace.trim();
+    rule.export_to
+        .iter()
+        .all(|target| target == "." || target == declaring_namespace)
+}
+
+/// Whether `entry` applies to a workload in `workload_namespace`: export
+/// visibility only. `ServiceEntry.workload_selector` is carried but not
+/// consumed (no endpoint selection from selected workloads), and Kubernetes
+/// status reports it as a deferred field.
+pub fn service_entry_applies_to_workload(entry: &ServiceEntry, workload_namespace: &str) -> bool {
     service_entry_exported_to_namespace(entry, workload_namespace)
 }
 
 // ── PeerAuthentication ────────────────────────────────────────────────────
 
+/// A PeerAuthentication. `scope` is its only applicability shape, the same
+/// [`PolicyScope`] every other mesh policy resource carries (issue #7243);
+/// `namespace` is the declaring namespace, as on [`MeshPolicy`].
+///
+/// Closed (`deny_unknown_fields`, issue #6616) like the authorization grammar
+/// and `MeshRequestAuthentication`: a misspelled `mtls_mode` would otherwise
+/// default the policy to `PERMISSIVE`, admitting plaintext the operator meant
+/// to refuse. The earlier scope-less `selector` form is therefore refused like
+/// any other unknown member, and a document without `scope` is refused as
+/// missing a required field; the ConfigSync revision that carries this shape
+/// is `CONFIG_SYNC_PROTOCOL_REVISION` 4.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PeerAuthentication {
     pub name: String,
     pub namespace: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scope: Option<PolicyScope>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
-    pub selector: Option<WorkloadSelector>,
+    pub scope: PolicyScope,
     #[serde(default)]
     pub mtls_mode: MtlsMode,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -3024,18 +3242,10 @@ impl PeerAuthentication {
     /// canonical predicate for PeerAuthentication scope classification and
     /// `portLevelMtls` applicability across translated and native slices.
     pub fn has_workload_selector(&self) -> bool {
-        match self.scope.as_ref() {
-            Some(PolicyScope::WorkloadSelector { selector }) => selector.has_labels(),
-            Some(
-                PolicyScope::MeshWide
-                | PolicyScope::Namespace { .. }
-                | PolicyScope::TargetRefs { .. },
-            ) => false,
-            None => self
-                .selector
-                .as_ref()
-                .is_some_and(WorkloadSelector::has_labels),
-        }
+        matches!(
+            &self.scope,
+            PolicyScope::WorkloadSelector { selector } if selector.has_labels()
+        )
     }
 }
 
@@ -3047,6 +3257,13 @@ pub enum MtlsMode {
     #[default]
     Permissive,
     Disable,
+    /// Istio `UNSET`: inherit from the next-higher PeerAuthentication tier
+    /// (workload port override -> workload mode -> namespace -> mesh-wide ->
+    /// the `Permissive` default). Only valid on a [`PeerAuthentication`]'s
+    /// `mtls_mode` / `port_overrides`; the canonical resolver in
+    /// `slice::resolve_effective_mtls_mode` folds it into a concrete mode, so
+    /// no resolved inbound posture is ever `Unset`.
+    Unset,
     // ── DestinationRule client-side modes (Istio `ClientTLSSettings.mode`) ──
     /// SIMPLE: originate TLS to the backend, verify the server certificate.
     Simple,
@@ -3060,7 +3277,10 @@ pub enum MtlsMode {
 impl MtlsMode {
     #[inline]
     pub fn is_peer_auth_mode(self) -> bool {
-        matches!(self, Self::Strict | Self::Permissive | Self::Disable)
+        matches!(
+            self,
+            Self::Strict | Self::Permissive | Self::Disable | Self::Unset
+        )
     }
 }
 
@@ -3305,9 +3525,9 @@ pub struct MeshSidecar {
     /// non-object block, or an `egressProxy` Ferrum cannot route through —
     /// resolves fail-closed to [`OutboundTrafficPolicy::RegistryOnly`] and is
     /// surfaced in the resource's `deferred_fields` status. The Sidecar itself
-    /// is never REJECTED over this field: dropping it would also drop its egress
-    /// narrowing and thereby WIDEN both the slice's service view and the derived
-    /// outbound registry.
+    /// is never REJECTED over this field: `REGISTRY_ONLY` is already its exact
+    /// fail-closed reading. (A Sidecar rejected for another reason is published
+    /// as a fail-closed marker rather than dropped, GHSA-2r85-85hh-23mw.)
     ///
     /// Applied only under `FERRUM_MESH_SIDECAR_ENFORCED && !…_DRY_RUN` (the same
     /// effective gate as `ingress[]` materialization) — see
@@ -3648,9 +3868,8 @@ pub enum IngressListenerUnsupported {
     /// `port` or the parsed endpoint port was `0`.
     ZeroPort,
     /// The listener protocol is not a modeled HTTP-family or stream-family
-    /// token (`Unknown` typo / native omitted, or `Udp`). Historical name
-    /// retained for status/test stability; stream protocols are modeled.
-    NonHttpProtocol,
+    /// token (`Unknown` typo / native omitted, `Udp`, or `Dtls`).
+    UnmodeledProtocol,
     /// The listener protocol is HTTP-family but Ferrum cannot speak it over a
     /// Unix stream, so a `unix://` `defaultEndpoint` for it is refused with a
     /// field-specific reason rather than materialized into a listener that
@@ -3748,7 +3967,7 @@ impl MeshSidecarIngress {
     /// later by the data plane.
     pub fn resolve(&self) -> Result<ResolvedIngressListener, IngressListenerUnsupported> {
         if !is_modeled_ingress_app_protocol(self.protocol) {
-            return Err(IngressListenerUnsupported::NonHttpProtocol);
+            return Err(IngressListenerUnsupported::UnmodeledProtocol);
         }
         if self.port == 0 {
             return Err(IngressListenerUnsupported::ZeroPort);
@@ -4007,7 +4226,13 @@ pub const MAX_MESH_REMOTE_CLUSTERS: usize = 256;
 /// This is intentionally control-plane neutral. Istio CRDs, Gateway API,
 /// native ConfigSync, xDS, file mode, and future CP-to-CP exchange all carry
 /// the same canonical shape instead of talking past Layer 2.
+///
+/// Closed with its `RemoteCluster` and `EastWestGateway` entries
+/// (`deny_unknown_fields`, issue #6616): this is operator-authored topology,
+/// not inventory. A misspelled `local_cluster` leaves it unset, which changes
+/// which endpoints destination policy scopes treat as local.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MultiClusterConfig {
     /// Operator-facing name for the local cluster. When set, must be a
     /// canonical identifier with no leading/trailing whitespace (same identity
@@ -4030,6 +4255,7 @@ pub struct MultiClusterConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RemoteCluster {
     /// Canonical peer-cluster identity. Doubles as the remote-discovery JWT
     /// audience suffix (`ferrum-mesh-discovery:<name>`). Must not carry
@@ -4056,6 +4282,7 @@ pub struct RemoteCluster {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EastWestGateway {
     pub name: String,
     pub namespace: String,
@@ -4079,7 +4306,7 @@ pub struct EastWestGateway {
 /// Each DestinationRule targets a service host and carries connection pool
 /// settings, outlier detection, load balancer config, and optional subsets.
 /// The mesh runtime applies these onto matching `Upstream` entries during
-/// `prepare_gateway_config_for_mesh()`.
+/// mesh config preparation (`apply_destination_rules`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MeshDestinationRule {
     pub name: String,
@@ -4228,12 +4455,6 @@ pub struct MeshTrafficPolicy {
 /// resolved slots and dispatch wiring.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeshConnectionPoolHttp {
-    /// Deprecated carrier for `maxRequestsPerConnection`. New K8s translation
-    /// validates and warns on the field, reports it as deferred, and does not
-    /// populate this slot because Ferrum has no backend close-after-N-requests
-    /// behavior.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_requests_per_connection: Option<u32>,
     /// Mapped from `idleTimeout` (parsed as an Istio duration, persisted
     /// as milliseconds). Translator rejects sub-second durations because
     /// the proxy-level `pool_idle_timeout_seconds` field is whole-second
@@ -4257,11 +4478,12 @@ pub struct MeshConnectionPoolHttp {
     pub http2_max_requests: Option<u32>,
     /// Mapped from `maxConcurrentStreams`: Istio's per-HTTP/2-connection stream
     /// limit. Projects to `Proxy.pool_http2_max_concurrent_streams` per port via
-    /// `resolve_effective_proxy_for_target` and threads into the direct-H2 /
-    /// gRPC hyper builder knobs (`max_concurrent_streams` advertises the local
-    /// SETTINGS value, `initial_max_send_streams` seeds the outbound bound until
-    /// the peer's SETTINGS arrive — a peer may raise or lower it, which is why
-    /// this can never be the destination request budget).
+    /// `resolve_effective_proxy_for_target` and threads into the shared hyper
+    /// H2 builder used by direct H2, gRPC, mesh mTLS and nested-HBONE gRPC
+    /// (`max_concurrent_streams` advertises the local SETTINGS value,
+    /// `initial_max_send_streams` seeds the outbound bound until the peer's
+    /// SETTINGS arrive — a peer may raise or lower it, which is why this can
+    /// never be the destination request budget).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent_streams: Option<u32>,
     /// Mapped from `h2UpgradePolicy`. Controls whether plain-HTTP backend
@@ -4590,6 +4812,48 @@ pub fn virtual_service_cors_policy_exported_to_namespace(
     export_visibility_admits(&policy.export_to, &policy.namespace, workload_namespace)
 }
 
+/// The mesh binding of one VirtualService's HTTP routes (issue #7233).
+///
+/// The Kubernetes translator emits a VirtualService's `http[]` routes as
+/// ordinary `GatewayConfig` proxies (`istio-vs-*`), their weighted-split
+/// upstreams (`istio-vs-upstream-*`) and route plugins (`mesh_route_dispatch`
+/// and its companions). Those resources carry no mesh visibility of their own,
+/// so this record says which of them apply to mesh data planes and to which
+/// namespaces: it is written only for a VirtualService that binds the mesh
+/// (`spec.gateways` omitted or naming `mesh`), and `export_to` is the
+/// VirtualService `exportTo` with the same semantics as
+/// [`MeshVirtualServiceCorsPolicy::export_to`]. The slice builder carries the
+/// listed routes to a NodeWaypoint subscription
+/// (`MeshSlice::http_routes`) only when the routes live in the subscription
+/// namespace and `export_to` admits it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeshVirtualServiceHttpRoutes {
+    /// Source VirtualService name.
+    pub name: String,
+    /// Source VirtualService namespace; also the namespace of every listed
+    /// proxy.
+    pub namespace: String,
+    /// VirtualService `exportTo`. EMPTY is namespace-local; the translator
+    /// writes `["*"]` for an omitted `spec.exportTo`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub export_to: Vec<String>,
+    /// Ids of the HTTP route proxies the VirtualService materialized in
+    /// `namespace`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proxy_ids: Vec<String>,
+}
+
+/// Returns true when a VirtualService HTTP route binding is visible to a
+/// workload namespace — the shared `export_visibility_admits` rules applied to
+/// its `export_to`.
+pub fn virtual_service_http_routes_exported_to_namespace(
+    routes: &MeshVirtualServiceHttpRoutes,
+    workload_namespace: &str,
+) -> bool {
+    export_visibility_admits(&routes.export_to, &routes.namespace, workload_namespace)
+}
+
 /// The Istio `corsPolicy` fields Ferrum projects onto the `cors` plugin.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MeshCorsPolicy {
@@ -4745,6 +5009,49 @@ pub fn cors_plugin_config_from_mesh_policy(policy: &MeshCorsPolicy) -> serde_jso
 
 // ── Top-level mesh config container ───────────────────────────────────────
 
+/// Provenance of a [`MeshConfig`]'s NodeWaypoint capture inventory
+/// (`node_waypoint_capture_*` fields).
+///
+/// The capture inventory must be derived from the AUTHORITATIVE, pre-narrowing
+/// mesh view: once the CP has narrowed `workloads` / `peer_authentications` /
+/// `mesh_policies` to a subscription (or a Sidecar egress import has widened
+/// `workloads` without widening policy), rebuilding the inventory from those
+/// views can resurrect a destination the CP withheld or drop that
+/// destination's own policies — and then certify the result as complete. The
+/// slice builder therefore reads this state instead of guessing from whether
+/// the dedicated fields are empty.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum NodeWaypointCaptureInventoryState {
+    /// An authority document that no CP filter has narrowed (the file/local
+    /// source, a stock-xDS baseline, or the CP's own snapshot before
+    /// filtering). The slice builder derives the inventory from the whole
+    /// document.
+    #[default]
+    Unfiltered,
+    /// The CP filter resolved the inventory BEFORE narrowing, under the
+    /// request's CP scope and bearer bounds (or a mesh-prepared DP config
+    /// back-projected a resolved slice). The dedicated fields are
+    /// authoritative even when empty; nothing is reconstructed from the
+    /// narrowed views.
+    Resolved,
+    /// The config was narrowed without resolving a capture inventory (a
+    /// non-capture request, or a slice that carried none). A capture-scoped
+    /// build from it yields an EMPTY inventory and no completeness evidence —
+    /// fail closed.
+    NotResolved,
+}
+
+impl NodeWaypointCaptureInventoryState {
+    /// Stable label (fingerprints, diagnostics).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unfiltered => "unfiltered",
+            Self::Resolved => "resolved",
+            Self::NotResolved => "not_resolved",
+        }
+    }
+}
+
 /// All mesh-specific configuration, kept in a single container so the
 /// core `GatewayConfig` struct stays lean for non-mesh deployments.
 /// Stored as `Option<Box<MeshConfig>>` on `GatewayConfig` — `None` when
@@ -4799,6 +5106,13 @@ pub struct MeshConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub virtual_service_cors_policies: Vec<MeshVirtualServiceCorsPolicy>,
+    /// Mesh bindings of VirtualService HTTP routes (issue #7233). Written by
+    /// the K8s translator for each VirtualService that binds the mesh; the
+    /// slice builder uses them to carry those routes to NodeWaypoint data
+    /// planes on `MeshSlice::http_routes`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
+    pub virtual_service_http_routes: Vec<MeshVirtualServiceHttpRoutes>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub proxy_configs: Vec<MeshProxyConfig>,
@@ -4869,6 +5183,20 @@ pub struct MeshConfig {
     /// reason.
     #[serde(skip)]
     pub node_waypoint_capture_peer_authentications: Vec<PeerAuthentication>,
+    /// Runtime-only AuthorizationPolicy (`MeshPolicy`) entries applicable to
+    /// [`Self::node_waypoint_capture_destinations`]. CP-side it is resolved
+    /// alongside that inventory, BEFORE `mesh_policies` is narrowed to the
+    /// subscription namespace, so a captured pod's own-namespace policy still
+    /// reaches its NodeWaypoint; DP-side it is back-projected from
+    /// `MeshSlice.node_waypoint_capture_mesh_policies`. Never folded into
+    /// `mesh_policies`. `serde(skip)` for the same reason as the fields above.
+    #[serde(skip)]
+    pub node_waypoint_capture_mesh_policies: Vec<MeshPolicy>,
+    /// Provenance of the three `node_waypoint_capture_*` fields above; see
+    /// [`NodeWaypointCaptureInventoryState`]. Runtime-only (`serde(skip)`):
+    /// a deserialized document is always `Unfiltered`.
+    #[serde(skip)]
+    pub node_waypoint_capture_inventory_state: NodeWaypointCaptureInventoryState,
     /// Runtime-only back-projection of the slice's narrowed **local-inbound**
     /// service view (`MeshSlice.local_inbound_services`), set by mesh
     /// preparation. `Some` exactly when Sidecar narrowing resolved the local
@@ -6306,6 +6634,7 @@ impl Default for MeshConfig {
             telemetry_resources: Vec::new(),
             destination_rules: Vec::new(),
             virtual_service_cors_policies: Vec::new(),
+            virtual_service_http_routes: Vec::new(),
             proxy_configs: Vec::new(),
             sidecars: Vec::new(),
             waypoint_bindings: Vec::new(),
@@ -6316,6 +6645,8 @@ impl Default for MeshConfig {
             node_waypoint_assertors: Vec::new(),
             node_waypoint_capture_destinations: Vec::new(),
             node_waypoint_capture_peer_authentications: Vec::new(),
+            node_waypoint_capture_mesh_policies: Vec::new(),
+            node_waypoint_capture_inventory_state: NodeWaypointCaptureInventoryState::Unfiltered,
             local_inbound_services: None,
             local_ingress_listeners: Vec::new(),
             sidecar_ingress_declared: false,
@@ -6501,6 +6832,7 @@ impl MeshConfig {
             &mut errors,
         );
         validate_virtual_service_cors_policies(&self.virtual_service_cors_policies, &mut errors);
+        validate_virtual_service_http_routes(&self.virtual_service_http_routes, &mut errors);
         validate_mesh_ext_authz_binding(
             &self.mesh_policies,
             &self.ext_authz_providers,
@@ -6526,6 +6858,9 @@ impl MeshConfig {
             &mut self.virtual_service_cors_policies,
             self.multi_cluster.as_mut(),
         );
+        for routes in &mut self.virtual_service_http_routes {
+            normalize_mesh_export_to(&mut routes.export_to);
+        }
     }
 
     /// Every namespace that owns at least one namespaced mesh object here.
@@ -6551,6 +6886,7 @@ impl MeshConfig {
         collect_ns(&self.telemetry_resources, &mut namespaces);
         collect_ns(&self.destination_rules, &mut namespaces);
         collect_ns(&self.virtual_service_cors_policies, &mut namespaces);
+        collect_ns(&self.virtual_service_http_routes, &mut namespaces);
         collect_ns(&self.proxy_configs, &mut namespaces);
         collect_ns(&self.sidecars, &mut namespaces);
         collect_ns(&self.waypoint_bindings, &mut namespaces);
@@ -6581,6 +6917,11 @@ impl MeshConfig {
         collect_ids(
             "virtual_service_cors_policies",
             &self.virtual_service_cors_policies,
+            &mut out,
+        );
+        collect_ids(
+            "virtual_service_http_routes",
+            &self.virtual_service_http_routes,
             &mut out,
         );
         collect_ids("proxy_configs", &self.proxy_configs, &mut out);
@@ -6633,6 +6974,10 @@ impl MeshConfig {
         overlay_ns(
             &mut self.virtual_service_cors_policies,
             &overlay.virtual_service_cors_policies,
+        );
+        overlay_ns(
+            &mut self.virtual_service_http_routes,
+            &overlay.virtual_service_http_routes,
         );
         overlay_ns(&mut self.proxy_configs, &overlay.proxy_configs);
         overlay_ns(&mut self.sidecars, &overlay.sidecars);
@@ -6840,6 +7185,17 @@ impl MeshNamespacedObject for MeshVirtualServiceCorsPolicy {
     }
 }
 
+impl MeshNamespacedObject for MeshVirtualServiceHttpRoutes {
+    fn object_namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    /// One VirtualService writes one binding.
+    fn object_key(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.name)
+    }
+}
+
 impl MeshNamespacedObject for MeshProxyConfig {
     fn object_namespace(&self) -> &str {
         &self.namespace
@@ -6942,6 +7298,49 @@ fn validate_mesh_extension_configs(
 /// instead of surfacing later as a plugin-construction failure on the data
 /// plane. Every origin predicate is the SHARED `plugins::cors` admission gate —
 /// do not fork it.
+/// Prefix of every VirtualService HTTP route proxy id the K8s translator
+/// derives (`istio-vs-<ns>-<name>-<suffix>`). L4 route proxies use the
+/// distinct `istio-vs-l4_` space and never appear in an HTTP route binding.
+pub const VIRTUAL_SERVICE_HTTP_ROUTE_PROXY_ID_PREFIX: &str = "istio-vs-";
+
+/// Whether `id` names a VirtualService HTTP route proxy (not an L4 one).
+pub fn is_virtual_service_http_route_proxy_id(id: &str) -> bool {
+    id.starts_with(VIRTUAL_SERVICE_HTTP_ROUTE_PROXY_ID_PREFIX)
+        && !id.starts_with(crate::proxy::stream_match::ISTIO_VS_L4_PROXY_ID_PREFIX)
+}
+
+/// Fail-closed admission for VirtualService HTTP route bindings (issue
+/// #7233). Diagnostics name the binding by ordinal and never echo a supplied
+/// name, namespace, id or `exportTo` value.
+fn validate_virtual_service_http_routes(
+    bindings: &[MeshVirtualServiceHttpRoutes],
+    errors: &mut Vec<String>,
+) {
+    let mut seen = HashSet::new();
+    for (index, binding) in bindings.iter().enumerate() {
+        let context = format!("`virtual_service_http_routes[{index}]`");
+        if binding.name.trim().is_empty() {
+            errors.push(format!("{context}: `name` must not be empty"));
+        }
+        if binding.namespace.trim().is_empty() {
+            errors.push(format!("{context}: `namespace` must not be empty"));
+        }
+        if !seen.insert((binding.namespace.as_str(), binding.name.as_str())) {
+            errors.push(format!(
+                "{context}: duplicate binding for one VirtualService"
+            ));
+        }
+        validate_mesh_export_to(&context, &binding.export_to, errors);
+        for (id_index, id) in binding.proxy_ids.iter().enumerate() {
+            if !is_virtual_service_http_route_proxy_id(id) {
+                errors.push(format!(
+                    "{context}: `proxy_ids[{id_index}]` is not a VirtualService HTTP route proxy id"
+                ));
+            }
+        }
+    }
+}
+
 fn validate_virtual_service_cors_policies(
     policies: &[MeshVirtualServiceCorsPolicy],
     errors: &mut Vec<String>,
@@ -7056,6 +7455,9 @@ fn validate_virtual_service_cors_policies(
             ),
         ];
         for (field, values, validate) in string_lists {
+            if let Err(err) = crate::plugins::cors::validate_token_list_count(field, values.len()) {
+                errors.push(format!("{context}: {err}"));
+            }
             for (index, value) in values.iter().enumerate() {
                 let trimmed = value.trim();
                 if trimmed.is_empty() {
@@ -7300,125 +7702,7 @@ fn validate_mesh_config_internal(
             &mut errors,
         );
         for (i, rule) in policy.rules.iter().enumerate() {
-            for (j, principal) in rule.from.iter().enumerate() {
-                if principal.spiffe_id_pattern.is_none()
-                    && principal.namespace_pattern.is_none()
-                    && principal.trust_domain.is_none()
-                    && principal.trust_domain_pattern.is_none()
-                {
-                    errors.push(format!(
-                        "MeshPolicy {:?}.rules[{}].from[{}]: at least one \
-                         of spiffe_id_pattern/namespace_pattern/trust_domain/\
-                         trust_domain_pattern must be set",
-                        policy.name, i, j
-                    ));
-                }
-                if let Some(pat) = principal.spiffe_id_pattern.as_ref()
-                    && glob::Pattern::new(pat).is_err()
-                {
-                    errors.push(format!(
-                        "MeshPolicy {:?}.rules[{}].from[{}].spiffe_id_pattern \
-                         {:?} is not a valid glob",
-                        policy.name, i, j, pat
-                    ));
-                }
-                if let Some(pat) = principal.namespace_pattern.as_ref()
-                    && glob::Pattern::new(pat).is_err()
-                {
-                    errors.push(format!(
-                        "MeshPolicy {:?}.rules[{}].from[{}].namespace_pattern \
-                         {:?} is not a valid glob",
-                        policy.name, i, j, pat
-                    ));
-                }
-                if let Some(pat) = principal.trust_domain_pattern.as_ref()
-                    && glob::Pattern::new(pat).is_err()
-                {
-                    errors.push(format!(
-                        "MeshPolicy {:?}.rules[{}].from[{}].trust_domain_pattern \
-                         {:?} is not a valid glob",
-                        policy.name, i, j, pat
-                    ));
-                }
-            }
-            for (j, request) in rule.to.iter().enumerate() {
-                let any_method = !request.methods.is_empty();
-                let any_path = !request.paths.is_empty();
-                let any_host = !request.hosts.is_empty();
-                let any_header = !request.headers.is_empty();
-                let any_port = !request.ports.is_empty() || !request.port_patterns.is_empty();
-                let any_not = !request.not_methods.is_empty()
-                    || !request.not_paths.is_empty()
-                    || !request.not_hosts.is_empty()
-                    || !request.not_ports.is_empty()
-                    || !request.not_port_patterns.is_empty();
-                if !(any_method || any_path || any_host || any_header || any_port || any_not) {
-                    errors.push(format!(
-                        "MeshPolicy {:?}.rules[{}].to[{}]: at least one of \
-                         methods/paths/hosts/headers/ports or their negated \
-                         counterparts must be non-empty",
-                        policy.name, i, j
-                    ));
-                }
-                for header in request.headers.keys() {
-                    if MESH_AUTHZ_PSEUDO_HEADERS
-                        .iter()
-                        .any(|pseudo_header| header.eq_ignore_ascii_case(pseudo_header))
-                    {
-                        errors.push(format!(
-                            "MeshPolicy {:?}.rules[{}].to[{}].headers contains pseudo-header \
-                             {:?}, which cannot match the HTTP request header map; use \
-                             to.methods, to.paths, or to.hosts, or use the corresponding \
-                             request.headers[:path] condition for :path",
-                            policy.name, i, j, header
-                        ));
-                    }
-                }
-                for (k, host) in request.hosts.iter().enumerate() {
-                    if !is_valid_request_match_host_pattern(host) {
-                        errors.push(format!(
-                            "MeshPolicy {:?}.rules[{}].to[{}].hosts[{}] \
-                             {:?} is not a valid host pattern \
-                             (expected hostname, [ipv6], or host:port/host:* \
-                             with u16 numeric or `*` port)",
-                            policy.name, i, j, k, host
-                        ));
-                    }
-                }
-                for (k, host) in request.not_hosts.iter().enumerate() {
-                    if !is_valid_request_match_host_pattern(host) {
-                        errors.push(format!(
-                            "MeshPolicy {:?}.rules[{}].to[{}].not_hosts[{}] \
-                             {:?} is not a valid host pattern \
-                             (expected hostname, [ipv6], or host:port/host:* \
-                             with u16 numeric or `*` port)",
-                            policy.name, i, j, k, host
-                        ));
-                    }
-                }
-                for (k, pattern) in request.port_patterns.iter().enumerate() {
-                    if !is_valid_request_match_port_pattern(pattern) {
-                        errors.push(format!(
-                            "MeshPolicy {:?}.rules[{}].to[{}].port_patterns[{}] \
-                             is not an admissible port pattern \
-                             (expected `*`, `<digits>*`, or `*<digits>` that can \
-                             match a destination/listener port in 1..=65535)",
-                            policy.name, i, j, k
-                        ));
-                    }
-                }
-                for (k, pattern) in request.not_port_patterns.iter().enumerate() {
-                    if !is_valid_request_match_port_pattern(pattern) {
-                        errors.push(format!(
-                            "MeshPolicy {:?}.rules[{}].to[{}].not_port_patterns[{}] \
-                             is not an admissible port pattern \
-                             (expected `*`, `<digits>*`, or `*<digits>` that can \
-                             match a destination/listener port in 1..=65535)",
-                            policy.name, i, j, k
-                        ));
-                    }
-                }
-            }
+            validate_mesh_rule_request_matchers(&policy.name, i, rule, &mut errors);
             if rule.when.len() > MAX_MESH_RULE_CONDITIONS {
                 errors.push(format!(
                     "MeshPolicy {:?}.rules[{}].when must have at most \
@@ -7451,14 +7735,12 @@ fn validate_mesh_config_internal(
             &pa.namespace,
             &mut errors,
         );
-        if let Some(scope) = pa.scope.as_ref() {
-            reject_unsupported_target_refs_scope(
-                "PeerAuthentication",
-                &pa.name,
-                scope,
-                &mut errors,
-            );
-        }
+        reject_unsupported_target_refs_scope(
+            "PeerAuthentication",
+            &pa.name,
+            &pa.scope,
+            &mut errors,
+        );
         for port in pa.port_overrides.keys() {
             validate_non_zero_port(
                 format!(
@@ -7535,6 +7817,14 @@ fn validate_mesh_config_internal(
     // ServiceEntries
     for se in service_entries {
         validate_non_empty_string("ServiceEntry.name".to_string(), &se.name, &mut errors);
+        // An empty namespace makes the entry visible to no workload
+        // (accepted-but-inert), so reject it like every other namespaced
+        // resource.
+        validate_non_empty_string(
+            format!("ServiceEntry {:?}.namespace", se.name),
+            &se.namespace,
+            &mut errors,
+        );
         if se.hosts.is_empty() {
             errors.push(format!(
                 "ServiceEntry {:?}: hosts must not be empty",
@@ -7660,7 +7950,7 @@ fn validate_mesh_config_internal(
         // top-level `trafficPolicy`, per-port `portLevelSettings`, and each
         // `subsets[].trafficPolicy`.
         validate_dr_connection_pool(
-            &format!("MeshDestinationRule {:?}.trafficPolicy", dr.name),
+            &format!("MeshDestinationRule {:?}.traffic_policy", dr.name),
             dr.traffic_policy.as_ref(),
             &mut errors,
         );
@@ -7683,7 +7973,7 @@ fn validate_mesh_config_internal(
             );
             validate_dr_connection_pool(
                 &format!(
-                    "MeshDestinationRule {:?}.port_level_settings[\"{}\"].trafficPolicy",
+                    "MeshDestinationRule {:?}.port_level_settings[\"{}\"]",
                     dr.name, port
                 ),
                 Some(policy),
@@ -7708,7 +7998,7 @@ fn validate_mesh_config_internal(
             }
             validate_dr_connection_pool(
                 &format!(
-                    "MeshDestinationRule {:?}.subsets[{}].trafficPolicy",
+                    "MeshDestinationRule {:?}.subsets[{}].traffic_policy",
                     dr.name, i
                 ),
                 subset.traffic_policy.as_ref(),
@@ -8047,6 +8337,165 @@ fn validate_mesh_policy_target_refs_scope(
     }
 }
 
+/// Per-rule `from` / `to` matcher validation shared by the native mesh-config
+/// boundary ([`MeshConfig::validate`]) and the `mesh_authz` plugin's own
+/// construction gate ([`validate_mesh_policy_request_matchers`]).
+///
+/// Every refusal here is a matcher that can never match a real request (an
+/// empty `from[{}]` / `to[{}]` entry, a `to.headers` pseudo-header, an invalid
+/// host pattern, an impossible port pattern). For a DENY rule that is fail-open,
+/// so the rule is refused at admission instead of being published inert.
+fn validate_mesh_rule_request_matchers(
+    policy_name: &str,
+    i: usize,
+    rule: &MeshRule,
+    errors: &mut Vec<String>,
+) {
+    for (j, principal) in rule.from.iter().enumerate() {
+        if principal.spiffe_id_pattern.is_none()
+            && principal.namespace_pattern.is_none()
+            && principal.trust_domain.is_none()
+            && principal.trust_domain_pattern.is_none()
+        {
+            errors.push(format!(
+                "MeshPolicy {:?}.rules[{}].from[{}]: at least one \
+                 of spiffe_id_pattern/namespace_pattern/trust_domain/\
+                 trust_domain_pattern must be set",
+                policy_name, i, j
+            ));
+        }
+        if let Some(pat) = principal.spiffe_id_pattern.as_ref()
+            && glob::Pattern::new(pat).is_err()
+        {
+            errors.push(format!(
+                "MeshPolicy {:?}.rules[{}].from[{}].spiffe_id_pattern \
+                 {:?} is not a valid glob",
+                policy_name, i, j, pat
+            ));
+        }
+        if let Some(pat) = principal.namespace_pattern.as_ref()
+            && glob::Pattern::new(pat).is_err()
+        {
+            errors.push(format!(
+                "MeshPolicy {:?}.rules[{}].from[{}].namespace_pattern \
+                 {:?} is not a valid glob",
+                policy_name, i, j, pat
+            ));
+        }
+        if let Some(pat) = principal.trust_domain_pattern.as_ref()
+            && glob::Pattern::new(pat).is_err()
+        {
+            errors.push(format!(
+                "MeshPolicy {:?}.rules[{}].from[{}].trust_domain_pattern \
+                 {:?} is not a valid glob",
+                policy_name, i, j, pat
+            ));
+        }
+    }
+    for (j, request) in rule.to.iter().enumerate() {
+        let any_method = !request.methods.is_empty();
+        let any_path = !request.paths.is_empty();
+        let any_host = !request.hosts.is_empty();
+        let any_header = !request.headers.is_empty();
+        let any_port = !request.ports.is_empty() || !request.port_patterns.is_empty();
+        let any_not = !request.not_methods.is_empty()
+            || !request.not_paths.is_empty()
+            || !request.not_hosts.is_empty()
+            || !request.not_ports.is_empty()
+            || !request.not_port_patterns.is_empty();
+        if !(any_method || any_path || any_host || any_header || any_port || any_not) {
+            errors.push(format!(
+                "MeshPolicy {:?}.rules[{}].to[{}]: at least one of \
+                 methods/paths/hosts/headers/ports or their negated \
+                 counterparts must be non-empty",
+                policy_name, i, j
+            ));
+        }
+        for header in request.headers.keys() {
+            if MESH_AUTHZ_PSEUDO_HEADERS
+                .iter()
+                .any(|pseudo_header| header.eq_ignore_ascii_case(pseudo_header))
+            {
+                errors.push(format!(
+                    "MeshPolicy {:?}.rules[{}].to[{}].headers contains pseudo-header \
+                     {:?}, which cannot match the HTTP request header map; use \
+                     to.methods, to.paths, or to.hosts, or use the corresponding \
+                     request.headers[:path] condition for :path",
+                    policy_name, i, j, header
+                ));
+            }
+        }
+        for (k, host) in request.hosts.iter().enumerate() {
+            if !is_valid_request_match_host_pattern(host) {
+                errors.push(format!(
+                    "MeshPolicy {:?}.rules[{}].to[{}].hosts[{}] \
+                     {:?} is not a valid host pattern \
+                     (expected hostname, [ipv6], or host:port/host:* \
+                     with u16 numeric or `*` port)",
+                    policy_name, i, j, k, host
+                ));
+            }
+        }
+        for (k, host) in request.not_hosts.iter().enumerate() {
+            if !is_valid_request_match_host_pattern(host) {
+                errors.push(format!(
+                    "MeshPolicy {:?}.rules[{}].to[{}].not_hosts[{}] \
+                     {:?} is not a valid host pattern \
+                     (expected hostname, [ipv6], or host:port/host:* \
+                     with u16 numeric or `*` port)",
+                    policy_name, i, j, k, host
+                ));
+            }
+        }
+        for (k, pattern) in request.port_patterns.iter().enumerate() {
+            if !is_valid_request_match_port_pattern(pattern) {
+                errors.push(format!(
+                    "MeshPolicy {:?}.rules[{}].to[{}].port_patterns[{}] \
+                     is not an admissible port pattern \
+                     (expected `*`, `<digits>*`, or `*<digits>` that can \
+                     match a destination/listener port in 1..=65535)",
+                    policy_name, i, j, k
+                ));
+            }
+        }
+        for (k, pattern) in request.not_port_patterns.iter().enumerate() {
+            if !is_valid_request_match_port_pattern(pattern) {
+                errors.push(format!(
+                    "MeshPolicy {:?}.rules[{}].to[{}].not_port_patterns[{}] \
+                     is not an admissible port pattern \
+                     (expected `*`, `<digits>*`, or `*<digits>` that can \
+                     match a destination/listener port in 1..=65535)",
+                    policy_name, i, j, k
+                ));
+            }
+        }
+    }
+}
+
+/// Name/namespace and request-matcher validation for policies that reach
+/// `mesh_authz` WITHOUT passing through [`MeshConfig::validate`] — the flat
+/// `mesh_policies` operator config (file/database/admin) and an embedded
+/// `mesh_slice`.
+///
+/// This is the subset of the native per-policy checks that needs no resource
+/// graph: it deliberately omits `targetRefs` resolution (which needs the
+/// slice's services and waypoint bindings) and `when:` conditions (the plugin
+/// re-runs [`validate_mesh_condition`] itself). A policy that passes the native
+/// validator always passes this one.
+pub fn validate_mesh_policy_request_matchers(policy: &MeshPolicy) -> Vec<String> {
+    let mut errors = Vec::new();
+    validate_non_empty_string("MeshPolicy.name".to_string(), &policy.name, &mut errors);
+    validate_non_empty_string(
+        format!("MeshPolicy {:?}.namespace", policy.name),
+        &policy.namespace,
+        &mut errors,
+    );
+    for (i, rule) in policy.rules.iter().enumerate() {
+        validate_mesh_rule_request_matchers(&policy.name, i, rule, &mut errors);
+    }
+    errors
+}
+
 fn validate_non_empty_string(context: String, value: &str, errors: &mut Vec<String>) {
     if value.trim().is_empty() {
         errors.push(format!("{context}: must not be empty"));
@@ -8310,28 +8759,65 @@ pub(crate) fn destination_rule_tls_reference_error(
     }
 }
 
-/// Load-time re-check of a tenant DestinationRule's local TLS files on the
-/// node that reads them: each file must still resolve, after symlinks, under
-/// one of `tenant_file_roots` (`FERRUM_MESH_TENANT_TLS_FILE_ROOTS`). A file
-/// that is missing or cannot be resolved is refused too. Root-namespace rules
-/// are exempt. Returns the first refusal as a schema path plus a fixed reason;
-/// the referenced value is never echoed.
-pub(crate) fn destination_rule_tls_file_escape_error(
-    dr: &MeshDestinationRule,
+/// Re-check and bind each tenant file reference before runtime projection.
+/// The original slice remains reference-only and unchanged; the runtime copy
+/// carries confinement through every subsequent load, cache, and file watch.
+/// Root-namespace rules retain their intentionally unrestricted references.
+pub(crate) fn bind_destination_rule_tls_files<'a>(
+    dr: &'a MeshDestinationRule,
     root_namespace: &str,
     tenant_file_roots: &[std::path::PathBuf],
-) -> Option<String> {
-    use crate::tls::source::check_tenant_file_reference_resolved;
+) -> Result<std::borrow::Cow<'a, MeshDestinationRule>, String> {
+    use crate::tls::source::{bind_tenant_file_reference, check_tenant_file_reference_resolved};
     if destination_rule_is_root_policy(&dr.namespace, root_namespace) {
-        return None;
+        return Ok(std::borrow::Cow::Borrowed(dr));
     }
     for (field, value, kind) in destination_rule_tls_references(dr) {
         let verdict = check_tenant_file_reference_resolved(value, kind, tenant_file_roots);
         if let Err(refusal) = verdict {
-            return Some(format!("{field}: {}", refusal.reason()));
+            return Err(format!("{field}: {}", refusal.reason()));
         }
     }
-    None
+    let mut bound = dr.clone();
+    let mut policies = Vec::new();
+    policies.extend(bound.traffic_policy.iter_mut());
+    policies.extend(bound.port_level_settings.values_mut());
+    policies.extend(
+        bound
+            .subsets
+            .iter_mut()
+            .filter_map(|subset| subset.traffic_policy.as_mut()),
+    );
+    for policy in policies {
+        let Some(tls) = policy.tls.as_mut() else {
+            continue;
+        };
+        for (field, value, kind) in [
+            (
+                "ca_certificates",
+                &mut tls.ca_certificates,
+                crate::tls::source::MaterialKind::CaBundle,
+            ),
+            (
+                "client_certificate",
+                &mut tls.client_certificate,
+                crate::tls::source::MaterialKind::Cert,
+            ),
+            (
+                "private_key",
+                &mut tls.private_key,
+                crate::tls::source::MaterialKind::Key,
+            ),
+        ] {
+            if let Some(original) = value.as_deref()
+                && let Some(reference) = bind_tenant_file_reference(original, kind)
+                    .map_err(|error| format!("{field}: {}", error.event_detail()))?
+            {
+                *value = Some(reference);
+            }
+        }
+    }
+    Ok(std::borrow::Cow::Owned(bound))
 }
 
 fn destination_rule_is_root_policy(rule_namespace: &str, root_namespace: &str) -> bool {
@@ -8455,7 +8941,7 @@ fn validate_mesh_traffic_policy_tls(
     }
 
     match tls.mode {
-        MtlsMode::Strict | MtlsMode::Permissive => errors.push(format!(
+        MtlsMode::Strict | MtlsMode::Permissive | MtlsMode::Unset => errors.push(format!(
             "{context}.mode: {mode:?} is invalid for DestinationRule client TLS",
             mode = tls.mode
         )),
@@ -8539,14 +9025,14 @@ fn validate_dr_connection_pool(
     };
     if policy.max_connections == Some(0) {
         errors.push(format!(
-            "{context}.connectionPool.tcp.maxConnections must be positive (0 would refuse every backend connection)"
+            "{context}.max_connections must be positive (Istio `connectionPool.tcp.maxConnections`; 0 would refuse every backend connection)"
         ));
     }
     if let Some(idle) = policy.tcp_idle_timeout_seconds
         && idle > crate::config::types::MAX_TCP_IDLE_TIMEOUT
     {
         errors.push(format!(
-            "{context}.connectionPool.tcp.idleTimeout must be between 0 and {} seconds (got \"{idle}\")",
+            "{context}.tcp_idle_timeout_seconds must be between 0 and {} seconds (Istio `connectionPool.tcp.idleTimeout`; got \"{idle}\")",
             crate::config::types::MAX_TCP_IDLE_TIMEOUT
         ));
     }
@@ -8555,17 +9041,17 @@ fn validate_dr_connection_pool(
     };
     if http.http1_max_pending_requests == Some(0) {
         errors.push(format!(
-            "{context}.connectionPool.http.http1MaxPendingRequests must be positive (0 would shed every HTTP/1.1 request)"
+            "{context}.connection_pool_http.http1_max_pending_requests must be positive (Istio `connectionPool.http.http1MaxPendingRequests`; 0 would shed every HTTP/1.1 request)"
         ));
     }
     if http.http2_max_requests == Some(0) {
         errors.push(format!(
-            "{context}.connectionPool.http.http2MaxRequests must be positive (0 would shed every request to the destination)"
+            "{context}.connection_pool_http.http2_max_requests must be positive (Istio `connectionPool.http.http2MaxRequests`; 0 would shed every request to the destination)"
         ));
     }
     if http.max_concurrent_streams == Some(0) {
         errors.push(format!(
-            "{context}.connectionPool.http.maxConcurrentStreams must be positive (0 would stall every HTTP/2 stream to the destination)"
+            "{context}.connection_pool_http.max_concurrent_streams must be positive (Istio `connectionPool.http.maxConcurrentStreams`; 0 would stall every HTTP/2 stream to the destination)"
         ));
     }
 }
@@ -8875,21 +9361,6 @@ fn mesh_service_fqdn_like(host: &str) -> bool {
         && labels.all(|label| !label.is_empty())
 }
 
-/// Lower-case in-place hostname normalisation for mesh entries — matches
-/// the existing `normalize_fields()` pattern used elsewhere in
-/// [`crate::config::types`]. Idempotent.
-pub fn normalize_mesh_fields(service_entries: &mut [ServiceEntry], workloads: &mut [Workload]) {
-    normalize_mesh_fields_internal(
-        service_entries,
-        workloads,
-        &mut [],
-        &mut [],
-        &mut [],
-        &mut [],
-        None,
-    );
-}
-
 fn normalize_mesh_fields_internal(
     service_entries: &mut [ServiceEntry],
     workloads: &mut [Workload],
@@ -8923,9 +9394,10 @@ fn normalize_mesh_fields_internal(
         normalize_mesh_export_to(&mut dr.export_to);
     }
     // Same treatment as DestinationRule hosts: synthesis matches
-    // `policy.host` against service FQDNs via `destination_rule_host_matches`
-    // (no trimming/lowercasing there), so an un-normalized native/file host
-    // like `" Svc.Default "` would silently attach no CORS plugin.
+    // `policy.host` against service FQDNs via `destination_rule_host_specificity`
+    // (exact matches only), so the recorded host must be canonical too: an
+    // un-normalized native/file host like `" Svc.Default "` must not survive
+    // into the slice.
     for policy in virtual_service_cors_policies {
         policy.host = normalize_mesh_hostname_like(&policy.host);
         normalize_mesh_export_to(&mut policy.export_to);
@@ -9205,9 +9677,8 @@ pub(crate) fn normalize_mesh_policy_header_map(headers: &mut HashMap<String, Str
 /// ([`crate::plugins::fault_injection::runtime_overlay`]). Accepted slices also
 /// fan the remaining process-wide knobs out through
 /// [`crate::modes::mesh::runtime_overlay_consumers::apply_overlay`]:
-/// request/response transformer gates
-/// ([`crate::plugins::request_transformer::runtime_overlay`],
-/// [`crate::plugins::response_transformer::runtime_overlay`]), and the
+/// the response transformer gate map
+/// ([`crate::plugins::response_transformer::runtime_overlay`]) and the
 /// gateway-wide tracing filter ([`crate::logging::runtime_overlay`]).
 ///
 /// Wire compatibility: the type is an optional field on `MeshSlice` with

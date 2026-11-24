@@ -16,7 +16,6 @@ pub enum Counter {
     PendingAborted,
     PendingAbortedDatagrams,
     PendingAbortedBytes,
-    RequestSizeStores,
     RequestBudgetCalls,
     AmplificationChargeCalls,
     FastActivityStores,
@@ -109,13 +108,13 @@ pub enum BatchField {
     DirectBytes,
     DirectError,
 }
-pub const OP_BASE: usize = 42;
+pub const OP_BASE: usize = 41;
 pub const OP_FIELDS: usize = 14;
 pub const OPS: usize = 8;
 pub const BATCH_BASE: usize = OP_BASE + OP_FIELDS * OPS;
 pub const BATCH_FIELDS: usize = 79;
 pub const POLL_BASE: usize = BATCH_BASE + 3 * BATCH_FIELDS;
-pub const COUNTERS: usize = 397;
+pub const COUNTERS: usize = 396;
 pub const NAMES: [&str; COUNTERS] = [
     "counter_overflow",
     "last_client_expired",
@@ -129,7 +128,6 @@ pub const NAMES: [&str; COUNTERS] = [
     "pending_aborted",
     "pending_aborted_datagrams",
     "pending_aborted_bytes",
-    "request_size_stores",
     "request_budget_calls",
     "amplification_charge_calls",
     "fast_activity_stores",

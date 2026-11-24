@@ -282,7 +282,6 @@ pub fn effective_discovery_staleness_policy() -> DiscoveryStalenessPolicy {
 }
 
 /// Test-only override of the process staleness policy. `None` clears it.
-#[allow(dead_code)] // reached from the external test crate; dead in the bin target
 pub fn override_discovery_staleness_policy_for_test(policy: Option<DiscoveryStalenessPolicy>) {
     if let Ok(mut guard) = STALENESS_POLICY_OVERRIDE.write() {
         *guard = policy;
@@ -370,7 +369,7 @@ pub(crate) enum FencedPublish<T> {
 
 impl<T> FencedPublish<T> {
     /// `None` when the generation was superseded.
-    #[allow(dead_code)] // reached from the external test crate; dead in the bin target
+    #[allow(dead_code)] // reached from the external test crate
     pub(crate) fn published(self) -> Option<T> {
         match self {
             Self::Published(value) => Some(value),
@@ -837,7 +836,6 @@ pub fn has_tasks() -> bool {
 
 /// Drop all registry entries. Test-only: the registry is process-global, so
 /// external suites that start managers must isolate themselves.
-#[allow(dead_code)] // reached from the external test crate; dead in the bin target
 pub fn reset_for_test() {
     registry().clear();
     refresh_coarse_aggregate();
@@ -846,7 +844,6 @@ pub fn reset_for_test() {
 /// Register a task generation directly, as a reconcile-driven replacement
 /// would. Test-only seam for proving that a superseded supervisor exits instead
 /// of restarting or publishing.
-#[allow(dead_code)] // reached from the external test crate; dead in the bin target
 pub fn register_task_for_test(
     key: &str,
     generation: u64,
@@ -858,14 +855,12 @@ pub fn register_task_for_test(
 
 /// Generation currently owning `key`, if any. Test-only observation seam: a
 /// kept task keeps its generation across reconcile, a replaced one does not.
-#[allow(dead_code)] // reached from the external test crate; dead in the bin target
 pub fn generation_for_test(key: &str) -> Option<u64> {
     registry().get(key).map(|entry| entry.generation)
 }
 
 /// Number of bounded withdrawal-publication retries for `key`.
 /// Test-only observation seam for the fail-closed retry contract.
-#[allow(dead_code)] // reached from the external test crate; dead in the bin target
 pub fn expiry_retry_attempts_for_test(key: &str) -> Option<u64> {
     registry().get(key).map(|entry| entry.expiry_retry_attempts)
 }
@@ -876,7 +871,6 @@ pub fn expiry_retry_attempts_for_test(key: &str) -> Option<u64> {
 /// concurrent [`register_task_for_test`] for the same key cannot complete.
 /// `None` means the generation was already superseded and `body` never ran.
 /// `body` must not touch this registry (see [`publish_if_current`]).
-#[allow(dead_code)] // reached from the external test crate; dead in the bin target
 pub fn publish_under_fence_for_test<T>(
     key: &str,
     generation: u64,
@@ -893,7 +887,6 @@ pub fn publish_under_fence_for_test<T>(
 /// The adapter below never aborts, so the abort outcome is unreachable here;
 /// use [`publish_withdrawal_under_fence_with_abort_for_test`] to cover a
 /// cancellation or shutdown observed inside the fence.
-#[allow(dead_code)] // reached from the external test crate; dead in the bin target
 pub fn publish_withdrawal_under_fence_for_test(
     key: &str,
     generation: u64,
@@ -914,7 +907,6 @@ pub fn publish_withdrawal_under_fence_for_test(
 
 /// Test-facing projection of a fenced staleness-withdrawal outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // reached from the external test crate; dead in the bin target
 pub enum FencedWithdrawalForTest {
     /// Static-only targets were installed; `claimed` marks the one call per
     /// episode that claimed it.
@@ -933,7 +925,6 @@ pub enum FencedWithdrawalForTest {
 /// Test-only seam for the interleaving contract of the abort path: while the
 /// closure runs, a concurrent [`register_task_for_test`] for the same key
 /// cannot complete, and an abort must claim nothing.
-#[allow(dead_code)] // reached from the external test crate; dead in the bin target
 pub fn publish_withdrawal_under_fence_with_abort_for_test(
     key: &str,
     generation: u64,
@@ -956,7 +947,6 @@ pub fn publish_withdrawal_under_fence_with_abort_for_test(
 
 /// Whether `key`'s current entry has its expiry episode applied. Test-only
 /// observation seam for the fenced withdrawal claim.
-#[allow(dead_code)] // reached from the external test crate; dead in the bin target
 pub fn expiry_applied_for_test(key: &str) -> Option<bool> {
     registry().get(key).map(|entry| entry.expiry_applied)
 }
@@ -965,7 +955,6 @@ pub fn expiry_applied_for_test(key: &str) -> Option<bool> {
 ///
 /// Test-only. Returns `false` when the key is absent, so a test cannot silently
 /// assert against an entry that was never registered.
-#[allow(dead_code)] // reached from the external test crate; dead in the bin target
 pub fn age_anchor_for_test(key: &str, age_seconds: u64) -> bool {
     let Some(mut entry) = registry().get_mut(key) else {
         return false;

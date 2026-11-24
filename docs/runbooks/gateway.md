@@ -500,16 +500,30 @@ deltas until a fenced full snapshot reconciles it.
    category and validation category.
 
 **Likely causes.** A configuration mutation that is valid at the CP but invalid
-under the DP's local validation (for example a plugin the DP build does not
-have, or a TLS reference the DP cannot resolve); a version skew between CP and
-DP images; a delta applied against a snapshot the DP had already fenced.
+under the DP's local validation (for example a plugin the DP image does not
+have, or a TLS reference the DP cannot resolve); a delta that fails the DP's freshness or authority checks (for
+example a stale delta from a lagging failover CP); a delta applied against a
+snapshot the DP had already fenced.
+
+A **ConfigSync build-identity mismatch** is not a cause of this alert. The
+identity is the crate version plus the ConfigSync protocol revision, and the
+gate refuses a peer whose identity differs at subscribe, before any snapshot or
+delta is sent, so that DP never receives a delta to reject. That is a
+connection-admission failure instead. The CP returns `FAILED_PRECONDITION` with a message starting
+`ConfigSync build mismatch` and records a failed subscription audit event. The
+DP logs the refusal and backs off, and it shows up as stale config
+([FerrumGatewayDpConfigStale](#ferrumgatewaydpconfigstale)), not as divergence. Fix it by running the same
+build on CP and DP (see
+[upgrade_guide.md](../upgrade_guide.md#build-identity-gate)). Images that share
+one identity can still differ, for example in the compiled-in custom plugin
+selection (`FERRUM_CUSTOM_PLUGINS`). Such a DP is admitted and can then reject
+a delta that enables a plugin only the CP image has. That **is** divergence, so
+compare the CP and DP plugin inventories as part of the remediation.
 
 **Remediation.** Divergence is designed to be safe: the DP keeps serving its
 last known-good configuration rather than applying a bad delta. Identify the
 rejected resource from the CP logs and repair it at the source, then let the CP
-issue a fenced full snapshot. If the cause is CP/DP version skew, align the
-images — a DP older than the configuration it is being sent will keep
-diverging.
+issue a fenced full snapshot.
 
 **Escalation.** Page the control-plane owner. Escalate to the gateway on-call
 if a fenced full snapshot is issued and the DP still refuses it, which points

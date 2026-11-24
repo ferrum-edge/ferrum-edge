@@ -9,7 +9,7 @@ use crate::config::types::CircuitBreakerConfig;
 use crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter;
 use dashmap::DashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 use tracing::{info, warn};
 
@@ -60,6 +60,122 @@ const fn packed_count(packed: u64) -> u32 {
     (packed as u32) & COUNT_MASK
 }
 
+/// Whether open generation `generation` is strictly older than `than`.
+///
+/// Generations wrap, so "older" is the wrapping distance read as signed: a
+/// generation up to 2^31 opens behind `than` is older, one up to 2^31 opens
+/// ahead is newer. Two generations a single in-flight settlement can observe
+/// are never that far apart.
+#[inline]
+const fn generation_precedes(generation: u32, than: u32) -> bool {
+    (than.wrapping_sub(generation) as i32) > 0
+}
+
+/// A breaker counter (`success_count` / `failure_count`) tagged with the open
+/// generation of the cycle it counts, in ONE `AtomicU64`: the high 32 bits are
+/// the generation, the low 32 bits the count.
+///
+/// Every increment is a compare-exchange that names the generation its caller
+/// checked the breaker in, so the check and the increment are one atomic step
+/// on this word (#7030). An increment for an OLDER cycle than the tag is
+/// refused: a settlement that checked cycle `g`, then lost the race to a
+/// sibling that reopened the breaker and started cycle `g + 1`, can no longer
+/// add one count to the new cycle. An increment for a NEWER cycle than the tag
+/// starts the new cycle at one, so a cycle never inherits a count it did not
+/// earn even before anything re-tags the counter. Lock-free and allocation-free.
+struct CycleCounter(AtomicU64);
+
+#[inline]
+const fn pack_counter(generation: u32, count: u32) -> u64 {
+    ((generation as u64) << 32) | (count as u64)
+}
+
+#[inline]
+const fn counter_generation(word: u64) -> u32 {
+    (word >> 32) as u32
+}
+
+#[inline]
+const fn counter_value(word: u64) -> u32 {
+    word as u32
+}
+
+impl CycleCounter {
+    const fn new() -> Self {
+        Self(AtomicU64::new(pack_counter(0, 0)))
+    }
+
+    /// The count, whatever cycle it is tagged with (metrics and tests).
+    #[inline]
+    fn count(&self) -> u32 {
+        counter_value(self.0.load(Ordering::Acquire))
+    }
+
+    /// The count of cycle `generation`: zero when the counter is tagged with
+    /// any other cycle.
+    #[inline]
+    fn count_in_cycle(&self, generation: u32) -> u32 {
+        let word = self.0.load(Ordering::Acquire);
+        if counter_generation(word) == generation {
+            counter_value(word)
+        } else {
+            0
+        }
+    }
+
+    /// Count one event of open cycle `generation`. Returns the cycle's new
+    /// count, or `None` when the counter already belongs to a newer cycle and
+    /// the event is stale.
+    #[inline]
+    fn increment(&self, generation: u32) -> Option<u32> {
+        let mut current = self.0.load(Ordering::Acquire);
+        loop {
+            let tag = counter_generation(current);
+            let next = if tag == generation {
+                pack_counter(generation, counter_value(current).saturating_add(1))
+            } else if generation_precedes(tag, generation) {
+                pack_counter(generation, 1)
+            } else {
+                return None;
+            };
+            match self
+                .0
+                .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return Some(counter_value(next)),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Tag the counter with a cycle that is just starting, at zero, unless it
+    /// already counts that cycle (a sibling of the new cycle may already have
+    /// counted into it) or a newer one.
+    #[inline]
+    fn start_cycle(&self, generation: u32) {
+        let _ = self
+            .0
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |word| {
+                generation_precedes(counter_generation(word), generation)
+                    .then_some(pack_counter(generation, 0))
+            });
+    }
+
+    /// Zero the count for cycle `generation`, unless the counter already
+    /// belongs to a newer cycle. Writes nothing when it is already zero for
+    /// that cycle, so the CLOSED success path stays one load.
+    #[inline]
+    fn clear(&self, generation: u32) {
+        let _ = self
+            .0
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |word| {
+                let target = pack_counter(generation, 0);
+                (word != target && !generation_precedes(generation, counter_generation(word)))
+                    .then_some(target)
+            });
+    }
+}
+
 /// Circuit breaker state for a single proxy or target.
 pub struct CircuitBreaker {
     /// Packed `(open_generation, state, half_open_in_flight)` — high 32 bits
@@ -75,8 +191,11 @@ pub struct CircuitBreaker {
     /// body completion). HALF_OPEN admission does NOT advance it — it is the same
     /// open cycle.
     packed: AtomicU64,
-    failure_count: AtomicU32,
-    success_count: AtomicU32,
+    /// CLOSED-state consecutive failures, tagged with the CLOSED cycle's open
+    /// generation (see `CycleCounter`).
+    failure_count: CycleCounter,
+    /// HALF_OPEN successes, tagged with the HALF_OPEN cycle's open generation.
+    success_count: CycleCounter,
     /// Process-relative monotonic tick of the failure that opened/reopened the
     /// breaker. This is the only timestamp consulted for state transitions.
     last_failure_tick_ms: AtomicU64,
@@ -96,12 +215,101 @@ impl std::fmt::Display for CircuitOpenError {
     }
 }
 
+/// What one admission ([`CircuitBreaker::admit`]) handed its caller: either no
+/// HALF_OPEN probe slot, or exactly one slot of exactly one open cycle (CB-1).
+///
+/// The slot and the generation it was claimed in are one value, so no caller
+/// can settle a probe without also naming its cycle. Every settlement goes
+/// through [`CircuitBreaker::settle`], which compares the generation inside the
+/// CAS that releases the slot or moves health: a probe that outlives a reopen
+/// can neither free a LATER cycle's slot (over-admitting past
+/// `half_open_max_requests`) nor close or reopen a cycle it never probed.
+///
+/// In HALF_OPEN only the cycle's own probes decide (#7030): a
+/// [`Self::NonProbe`] outcome reaching a HALF_OPEN breaker came from a request
+/// admitted in an earlier CLOSED cycle and is dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeTicket {
+    /// Admitted while CLOSED (or after a concurrent recovery): holds no slot.
+    NonProbe,
+    /// Holds one HALF_OPEN probe slot of open generation `generation`, as
+    /// published by the admitting CAS itself.
+    Probe { generation: u32 },
+    /// The OUTCOME of a HALF_OPEN probe of open generation `generation` whose
+    /// slot is returned separately: a deferred streaming record whose slot was
+    /// released at response-header time, or a record made while the request's
+    /// guard still owns the slot it will release itself. It decides its own
+    /// cycle exactly like [`Self::Probe`] but never returns a slot. Built with
+    /// [`Self::without_slot`].
+    SlotlessProbe { generation: u32 },
+}
+
+impl ProbeTicket {
+    /// Whether this admission holds a HALF_OPEN probe slot.
+    #[inline]
+    pub const fn is_probe(self) -> bool {
+        matches!(self, Self::Probe { .. })
+    }
+
+    /// Whether this ticket speaks for a HALF_OPEN probe of some cycle, with or
+    /// without its slot.
+    #[inline]
+    pub const fn is_cycle_probe(self) -> bool {
+        matches!(self, Self::Probe { .. } | Self::SlotlessProbe { .. })
+    }
+
+    /// The same admission's outcome without its slot: a probe becomes a
+    /// [`Self::SlotlessProbe`] of the same cycle, every other ticket is
+    /// returned unchanged.
+    #[inline]
+    pub const fn without_slot(self) -> Self {
+        match self {
+            Self::Probe { generation } | Self::SlotlessProbe { generation } => {
+                Self::SlotlessProbe { generation }
+            }
+            Self::NonProbe => Self::NonProbe,
+        }
+    }
+
+    /// Whether this ticket's outcome still belongs to the open cycle `packed`
+    /// is in. A non-probe carries no cycle; [`CircuitBreaker::settle`] applies
+    /// it to a CLOSED breaker and drops it in HALF_OPEN.
+    #[inline]
+    const fn in_cycle_of(self, packed: u64) -> bool {
+        match self {
+            Self::NonProbe => true,
+            Self::Probe { generation } | Self::SlotlessProbe { generation } => {
+                packed_generation(packed) == generation
+            }
+        }
+    }
+}
+
+/// The outcome a request settles its [`ProbeTicket`] with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BreakerOutcome {
+    /// The backend answered healthily.
+    Success,
+    /// The backend failed. `connection_error` marks a connection-level failure
+    /// (TCP refused, DNS, TLS handshake, connect timeout), gated by
+    /// `trip_on_connection_errors`; otherwise `status_code` is checked against
+    /// `failure_status_codes`. A failure the config does not count only returns
+    /// the slot.
+    Failure {
+        status_code: u16,
+        connection_error: bool,
+    },
+    /// No backend result exists (client abort, gateway-side refusal): return
+    /// the slot without moving health.
+    Neutral,
+}
+
 impl CircuitBreaker {
     pub fn new(config: CircuitBreakerConfig) -> Self {
         Self {
             packed: AtomicU64::new(pack_full(0, STATE_CLOSED, 0)),
-            failure_count: AtomicU32::new(0),
-            success_count: AtomicU32::new(0),
+            failure_count: CycleCounter::new(),
+            success_count: CycleCounter::new(),
             last_failure_tick_ms: AtomicU64::new(0),
             last_failure_epoch_ms: AtomicU64::new(0),
             config,
@@ -110,37 +318,39 @@ impl CircuitBreaker {
 
     /// Check if a request can proceed.
     ///
-    /// Returns `Ok(true)` if the request was admitted as a half-open probe
-    /// (the caller MUST pass `is_half_open_probe=true` to `record_success`/
-    /// `record_failure` so the in-flight counter is decremented correctly).
-    /// Returns `Ok(false)` for normal closed-state admission.
-    /// Returns `Err` if the circuit is open and the request must be rejected.
+    /// Returns `Ok(true)` if the request was admitted as a half-open probe and
+    /// `Ok(false)` for a normal closed-state admission. Returns `Err` if the
+    /// circuit is open and the request must be rejected.
+    ///
+    /// The `bool` drops the probe's open generation, so production admission
+    /// uses [`admit`](Self::admit), whose [`ProbeTicket`] carries it into
+    /// [`settle`](Self::settle).
     #[inline]
     pub fn can_execute(&self) -> Result<bool, CircuitOpenError> {
         self.can_execute_inner(None)
-            .map(|(is_half_open_probe, _)| is_half_open_probe)
+            .map(|(ticket, _)| ticket.is_probe())
     }
 
-    /// Like [`can_execute`](Self::can_execute), but also returns the open
-    /// generation the admission was decided in (#6177).
+    /// Admit a request, returning its [`ProbeTicket`] and the open generation
+    /// the admission was decided in.
     ///
-    /// For a HALF_OPEN probe this is the generation carried by the SAME CAS that
-    /// claimed the slot, so it is exact — never a pre- or post-admission
-    /// snapshot. A probe owner passes it to
-    /// [`record_neutral_for_admission`](Self::record_neutral_for_admission) so a
-    /// release that outlives a reopen cannot free a slot in a later cycle.
+    /// For a HALF_OPEN probe the ticket's generation is the one carried by the
+    /// SAME CAS that claimed the slot, so it is exact — never a pre- or
+    /// post-admission snapshot (#6177). The returned `u64` is that same
+    /// generation for a probe and, for a CLOSED admission, the generation the
+    /// admitting load observed; deferred streaming outcomes stale-check against
+    /// it (#1649).
     #[inline]
-    pub fn can_execute_with_generation(&self) -> Result<(bool, u64), CircuitOpenError> {
+    pub fn admit(&self) -> Result<(ProbeTicket, u64), CircuitOpenError> {
         self.can_execute_inner(None)
-            .map(|(is_half_open_probe, generation)| (is_half_open_probe, generation as u64))
+            .map(|(ticket, generation)| (ticket, generation as u64))
     }
 
     /// Deterministic-clock variant used by external unit tests.
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn can_execute_at_for_test(&self, monotonic_now_ms: u64) -> Result<bool, CircuitOpenError> {
         self.can_execute_inner(Some(monotonic_now_ms))
-            .map(|(is_half_open_probe, _)| is_half_open_probe)
+            .map(|(ticket, _)| ticket.is_probe())
     }
 
     /// Admission decision plus the open generation it was decided in. The
@@ -150,16 +360,16 @@ impl CircuitBreaker {
     fn can_execute_inner(
         &self,
         monotonic_now_ms: Option<u64>,
-    ) -> Result<(bool, u32), CircuitOpenError> {
-        // Acquire pairs with the Release in record_failure() when transitioning
-        // CLOSED → OPEN, ensuring visibility of last_failure_tick_ms and
+    ) -> Result<(ProbeTicket, u32), CircuitOpenError> {
+        // Acquire pairs with the release half of the AcqRel CAS that
+        // transitions CLOSED → OPEN (`trip_after_closed_failure`), ensuring visibility of last_failure_tick_ms and
         // failure_count. Using Relaxed here would risk stale reads on ARM/weak-
         // memory architectures, allowing requests to leak through after the
         // circuit opens. The ~5-15ns cost of Acquire is acceptable given that
         // circuit breaker checks are not the bottleneck at scale.
         let packed = self.packed.load(Ordering::Acquire);
         match packed_state(packed) {
-            STATE_CLOSED => Ok((false, packed_generation(packed))),
+            STATE_CLOSED => Ok((ProbeTicket::NonProbe, packed_generation(packed))),
             STATE_OPEN => {
                 // OPEN recovery is elapsed-time state, so it uses the single
                 // process-local monotonic origin. The clock is read only in
@@ -188,16 +398,19 @@ impl CircuitBreaker {
                         Ordering::Acquire,
                     ) {
                         Ok(_) => {
-                            self.success_count.store(0, Ordering::Relaxed);
+                            // Tag the success counter with this cycle. A probe
+                            // admitted right after the CAS may already have
+                            // counted into it; `start_cycle` keeps that credit.
+                            self.success_count.start_cycle(generation);
                             info!("Circuit breaker transitioning from Open to Half-Open");
-                            Ok((true, generation))
+                            Ok((ProbeTicket::Probe { generation }, generation))
                         }
                         Err(actual) => match packed_state(actual) {
                             // Another thread already opened the half-open cycle;
                             // claim a slot through the same bounded CAS.
                             STATE_HALF_OPEN => self.try_acquire_half_open_slot(),
                             // Recovered to closed in the meantime.
-                            STATE_CLOSED => Ok((false, packed_generation(actual))),
+                            STATE_CLOSED => Ok((ProbeTicket::NonProbe, packed_generation(actual))),
                             // Still open (lost the race to a concurrent reopen) —
                             // reject.
                             _ => Err(CircuitOpenError),
@@ -208,7 +421,7 @@ impl CircuitBreaker {
                 }
             }
             STATE_HALF_OPEN => self.try_acquire_half_open_slot(),
-            _ => Ok((false, packed_generation(packed))),
+            _ => Ok((ProbeTicket::NonProbe, packed_generation(packed))),
         }
     }
 
@@ -231,7 +444,7 @@ impl CircuitBreaker {
     ///
     /// Returns the generation of the state the CAS succeeded against, which is
     /// the exact open cycle the slot belongs to.
-    fn try_acquire_half_open_slot(&self) -> Result<(bool, u32), CircuitOpenError> {
+    fn try_acquire_half_open_slot(&self) -> Result<(ProbeTicket, u32), CircuitOpenError> {
         let max = self.config.half_open_max_requests.clamp(1, COUNT_MASK);
         loop {
             let packed = self.packed.load(Ordering::Acquire);
@@ -250,7 +463,7 @@ impl CircuitBreaker {
                         Ordering::AcqRel,
                         Ordering::Acquire,
                     ) {
-                        Ok(_) => return Ok((true, generation)),
+                        Ok(_) => return Ok((ProbeTicket::Probe { generation }, generation)),
                         // State or count moved under us — re-evaluate against the
                         // fresh value (which may now be OPEN/CLOSED).
                         Err(_) => continue,
@@ -259,42 +472,137 @@ impl CircuitBreaker {
                 // Reopened after the caller observed HALF_OPEN — do not admit.
                 STATE_OPEN => return Err(CircuitOpenError),
                 // Recovered to closed — normal closed-state admission.
-                STATE_CLOSED => return Ok((false, packed_generation(packed))),
-                _ => return Ok((false, packed_generation(packed))),
+                STATE_CLOSED => return Ok((ProbeTicket::NonProbe, packed_generation(packed))),
+                _ => return Ok((ProbeTicket::NonProbe, packed_generation(packed))),
             }
         }
     }
 
-    /// Record a successful response, transitioning from half-open to closed
-    /// after enough successes reach the configured threshold.
+    /// Settle one admission: the SINGLE transition entry point for every
+    /// request outcome (CB-1).
     ///
-    /// `is_half_open_probe` must be `true` when this request was admitted as a
-    /// half-open probe (i.e., `can_execute()` returned `Ok(true)`). Only probe
-    /// requests decrement the `half_open_in_flight` counter. Requests admitted
-    /// during CLOSED state that complete late (after a CLOSED->OPEN transition)
-    /// must NOT decrement the counter since they never held a slot.
-    #[allow(dead_code)] // Public API — called by retry/proxy logic when circuit is half-open
-    pub fn record_success(&self, is_half_open_probe: bool) {
-        match packed_state(self.packed.load(Ordering::Acquire)) {
-            STATE_HALF_OPEN => {
-                if is_half_open_probe {
-                    // Decrement in-flight counter so new probe requests can be admitted
-                    self.release_half_open_slot();
+    /// `ticket` is the value [`admit`](Self::admit) returned for this request.
+    /// A [`ProbeTicket::Probe`] belongs to exactly one open cycle, and every
+    /// effect it has is checked against that cycle inside the CAS that applies
+    /// it:
+    ///
+    /// * its slot release is a no-op once the breaker has left the ticket's
+    ///   generation — the reopen that advanced it already zeroed the slot with
+    ///   its cycle, so a stale release cannot free a LATER cycle's slot and
+    ///   over-admit past `half_open_max_requests`;
+    /// * a stale probe's success or failure is dropped: it cannot close, reopen,
+    ///   or count toward a cycle it never probed.
+    ///
+    /// A [`ProbeTicket::SlotlessProbe`] is the same cycle-bound outcome without
+    /// a slot to return.
+    ///
+    /// A [`ProbeTicket::NonProbe`] holds no slot and was admitted while the
+    /// breaker was CLOSED. It is applied to a CLOSED breaker (a success resets
+    /// the failure streak, a counted failure extends it) and dropped everywhere
+    /// else (#7030): in HALF_OPEN only the cycle's own probes decide, so a
+    /// straggler from an earlier CLOSED cycle can neither reopen the cycle nor
+    /// count toward closing it.
+    ///
+    /// Counters (#7030): `success_count` and `failure_count` are each tagged
+    /// with the open generation of the cycle they count (`CycleCounter`). Each
+    /// increment is a compare-exchange carrying the generation this
+    /// settlement checked the breaker in, so the check and the increment are
+    /// one atomic step on the counter word: if a sibling reopens the breaker and
+    /// a new cycle re-tags the counter between this settlement's check and its
+    /// increment, the increment is refused instead of landing in the new cycle.
+    /// The ticket's own transition CASes (slot release, close, reopen,
+    /// CLOSED→OPEN) still re-check its cycle on the packed state word.
+    ///
+    /// Settlement is one Acquire load plus at most a few CASes on the packed
+    /// state word and the counter word — no locks, no allocation.
+    pub fn settle(&self, ticket: ProbeTicket, outcome: BreakerOutcome) {
+        self.settle_inner(ticket, outcome, None);
+    }
+
+    fn settle_inner(
+        &self,
+        ticket: ProbeTicket,
+        outcome: BreakerOutcome,
+        injected_time: Option<(u64, u64)>,
+    ) {
+        match outcome {
+            // Client-caused aborts and gateway-side refusals: no backend result
+            // exists, so only the slot (if any) is returned.
+            BreakerOutcome::Neutral => self.release_slot(ticket),
+            BreakerOutcome::Success => self.settle_success(ticket),
+            BreakerOutcome::Failure {
+                status_code,
+                connection_error,
+            } => {
+                if self.failure_trips(status_code, connection_error) {
+                    self.settle_tripping_failure(ticket, injected_time);
+                } else {
+                    // Filtered failure (non-failure status, or a connection
+                    // error with `trip_on_connection_errors` off): release the
+                    // probe slot without a state transition.
+                    self.release_slot(ticket);
                 }
-                // Re-check state: another thread may have reopened the circuit
-                // between our initial load and now.
-                if packed_state(self.packed.load(Ordering::Acquire)) != STATE_HALF_OPEN {
+            }
+        }
+    }
+
+    /// Whether a failure is counted by this breaker's config. `connection_error`
+    /// indicates a connection-level failure (TCP refused, DNS, TLS handshake,
+    /// connect timeout) rather than an HTTP response from the backend; it is
+    /// gated by `trip_on_connection_errors` independently of
+    /// `failure_status_codes`.
+    #[inline]
+    fn failure_trips(&self, status_code: u16, connection_error: bool) -> bool {
+        if connection_error {
+            self.config.trip_on_connection_errors
+        } else {
+            self.config.failure_status_codes.contains(&status_code)
+        }
+    }
+
+    /// Success arm of [`settle`](Self::settle): HALF_OPEN → CLOSED after enough
+    /// successes of the ticket's own cycle reach `success_threshold`.
+    fn settle_success(&self, ticket: ProbeTicket) {
+        let packed = self.packed.load(Ordering::Acquire);
+        if !ticket.in_cycle_of(packed) {
+            // Stale probe (CB-1): its cycle ended in a reopen that already
+            // zeroed its slot. Crediting the success would let it release one of
+            // the CURRENT cycle's slots and close a cycle it never probed.
+            return;
+        }
+        match packed_state(packed) {
+            STATE_HALF_OPEN => {
+                if !ticket.is_cycle_probe() {
+                    // A CLOSED-cycle straggler (#7030): only this cycle's own
+                    // probes decide it, and a non-probe holds no slot.
                     return;
                 }
-                let successes = self.success_count.fetch_add(1, Ordering::Relaxed) + 1;
+                // Decrement in-flight counter so new probe requests can be
+                // admitted (generation-checked in the same CAS).
+                self.release_slot(ticket);
+                // Re-check state AND cycle: another thread may have reopened the
+                // circuit between our initial load and now.
+                let current = self.packed.load(Ordering::Acquire);
+                if packed_state(current) != STATE_HALF_OPEN || !ticket.in_cycle_of(current) {
+                    return;
+                }
+                // Count the success for the cycle just checked. The counter
+                // refuses it if a sibling has re-tagged the counter for a newer
+                // cycle since that check (#7030). The close CAS below
+                // re-checks the cycle on the state word.
+                let Some(successes) = self.success_count.increment(packed_generation(current))
+                else {
+                    return;
+                };
                 if successes >= self.config.success_threshold {
                     // HALF_OPEN → CLOSED, clearing the in-flight count in the
                     // SAME CAS. Loop so a concurrent admission (count change)
                     // does not abandon the close; bail if another thread already
-                    // moved the breaker out of HALF_OPEN.
+                    // moved the breaker out of HALF_OPEN or out of this probe's
+                    // cycle.
                     loop {
                         let p = self.packed.load(Ordering::Acquire);
-                        if packed_state(p) != STATE_HALF_OPEN {
+                        if packed_state(p) != STATE_HALF_OPEN || !ticket.in_cycle_of(p) {
                             break;
                         }
                         // Closing preserves the generation (recovery is not a new
@@ -310,143 +618,44 @@ impl CircuitBreaker {
                             .is_ok()
                         {
                             info!("Circuit breaker closing (recovered)");
-                            self.failure_count.store(0, Ordering::Relaxed);
-                            self.success_count.store(0, Ordering::Relaxed);
+                            // The CLOSED cycle that starts here keeps this
+                            // generation: zero both counters for it.
+                            let generation = packed_generation(p);
+                            self.failure_count.clear(generation);
+                            self.success_count.clear(generation);
                             break;
                         }
                     }
                 }
             }
-            STATE_OPEN if is_half_open_probe => {
-                // A concurrent record_failure already reopened the circuit between
-                // our can_execute() and this record_success(). We still own a slot
-                // from when the breaker was HALF_OPEN, so release it (a no-op if
-                // the reopen already cleared the count).
-                self.release_half_open_slot();
-            }
+            // Same-cycle OPEN cannot follow a probe admission (every transition
+            // into OPEN advances the generation); a non-probe holds no slot. The
+            // release is a count-0 no-op kept for symmetry.
+            STATE_OPEN => self.release_slot(ticket),
             STATE_CLOSED => {
-                // A different half-open probe can close the breaker before
-                // this probe records success. The request still owns one
-                // half-open slot from its can_execute() admission, so release
-                // it even though the state is already CLOSED (a no-op if the
-                // close already cleared the count).
-                if is_half_open_probe {
-                    self.release_half_open_slot();
-                }
-                // Reset failure count on success
-                if self.failure_count.load(Ordering::Relaxed) > 0 {
-                    self.failure_count.store(0, Ordering::Relaxed);
-                }
+                // A sibling probe of the same cycle closed the breaker before
+                // this probe settled. Release the slot it nominally holds (a
+                // no-op once the close cleared the count).
+                self.release_slot(ticket);
+                // Reset the failure streak of the CLOSED cycle this success was
+                // checked in (a no-op write-free load when it is already zero,
+                // and refused if a newer cycle has re-tagged the counter).
+                self.failure_count.clear(packed_generation(packed));
             }
             _ => {}
         }
     }
 
-    /// Record a neutral outcome that should not affect breaker health state.
-    ///
-    /// Used for client-caused aborts where no backend result exists, while
-    /// still releasing any reserved half-open probe slot.
-    ///
-    /// This release is generation-blind: if the breaker reopened and a later
-    /// HALF_OPEN cycle admitted new probes since this probe's admission, it
-    /// frees one of THOSE slots. A caller that captured the admission
-    /// generation should use
-    /// [`record_neutral_for_admission`](Self::record_neutral_for_admission).
-    pub fn record_neutral(&self, is_half_open_probe: bool) {
-        if !is_half_open_probe {
-            return;
-        }
-        self.release_half_open_slot();
-    }
-
-    /// Record a neutral outcome for a probe admitted in `admission_generation`
-    /// (from [`can_execute_with_generation`](Self::can_execute_with_generation)).
-    ///
-    /// Releases the slot only while the breaker is still in that open cycle
-    /// (#6177). Once a reopen has advanced the generation, the reopen already
-    /// zeroed this probe's slot together with its cycle, so the release is a
-    /// no-op and cannot reduce a later cycle's probe occupancy. Like
-    /// [`record_neutral`](Self::record_neutral), it never moves breaker health
-    /// and never underflows.
-    pub fn record_neutral_for_admission(
-        &self,
-        is_half_open_probe: bool,
-        admission_generation: u64,
-    ) {
-        if !is_half_open_probe {
-            return;
-        }
-        // Generations are produced from the packed u32 field, so truncation is
-        // lossless for any value `can_execute_with_generation` returned.
-        self.release_half_open_slot_in_generation(admission_generation as u32);
-    }
-
-    /// Record a failed response.
-    ///
-    /// `connection_error` indicates whether this was a connection-level failure
-    /// (TCP refused, DNS, TLS handshake, connect timeout) rather than an actual
-    /// HTTP response from the backend. When `true`, the failure is controlled by
-    /// `trip_on_connection_errors` independently of `failure_status_codes`.
-    ///
-    /// `is_half_open_probe` must be `true` when this request was admitted as a
-    /// half-open probe (i.e., `can_execute()` returned `Ok(true)`). Only probe
-    /// requests decrement the `half_open_in_flight` counter. Requests admitted
-    /// during CLOSED state that complete after the breaker has transitioned to
-    /// OPEN must NOT decrement the counter since they never held a slot.
-    pub fn record_failure(
-        &self,
-        status_code: u16,
-        connection_error: bool,
-        is_half_open_probe: bool,
-    ) {
-        self.record_failure_inner(status_code, connection_error, is_half_open_probe, None);
-    }
-
-    /// Deterministic-clock variant used by external unit tests. Wall time is
-    /// injected separately to prove it remains diagnostic-only.
-    #[doc(hidden)]
-    #[allow(dead_code)]
-    pub fn record_failure_at_for_test(
-        &self,
-        status_code: u16,
-        connection_error: bool,
-        is_half_open_probe: bool,
-        monotonic_now_ms: u64,
-        wall_epoch_ms: u64,
-    ) {
-        self.record_failure_inner(
-            status_code,
-            connection_error,
-            is_half_open_probe,
-            Some((monotonic_now_ms, wall_epoch_ms)),
-        );
-    }
-
-    fn record_failure_inner(
-        &self,
-        status_code: u16,
-        connection_error: bool,
-        is_half_open_probe: bool,
-        injected_time: Option<(u64, u64)>,
-    ) {
-        if connection_error {
-            if !self.config.trip_on_connection_errors {
-                // Filtered failure — release the probe slot without state transition
-                if is_half_open_probe {
-                    self.release_half_open_slot();
-                }
-                return;
-            }
-        } else if !self.config.failure_status_codes.contains(&status_code) {
-            // Non-failure status codes are neutral — release probe slot without
-            // state transition
-            if is_half_open_probe {
-                self.release_half_open_slot();
-            }
-            return;
-        }
-
+    /// Failure arm of [`settle`](Self::settle) for a failure the config counts.
+    fn settle_tripping_failure(&self, ticket: ProbeTicket, injected_time: Option<(u64, u64)>) {
         let packed = self.packed.load(Ordering::Acquire);
+        if !ticket.in_cycle_of(packed) {
+            // Stale probe (CB-1): the reopen that advanced the generation
+            // already zeroed its slot and restarted the recovery timeout. It
+            // must neither reopen a later HALF_OPEN cycle nor count toward a
+            // later CLOSED cycle's failure streak.
+            return;
+        }
         let (failure_tick_ms, failure_epoch_ms) = injected_time
             .unwrap_or_else(|| (crate::socket_opts::monotonic_now_ms(), wall_now_epoch_ms()));
 
@@ -456,120 +665,132 @@ impl CircuitBreaker {
                     .store(failure_tick_ms, Ordering::Relaxed);
                 self.last_failure_epoch_ms
                     .store(failure_epoch_ms, Ordering::Relaxed);
-                // A half-open probe whose failure arrives only AFTER the breaker
-                // has already left HALF_OPEN — a sibling reached the success
-                // threshold and closed it, or this is a stale straggler from a
-                // bygone half-open cycle that outlived a full reopen→close cycle —
-                // is processed against the CURRENT closed state, matching standard
-                // breaker semantics (e.g. sony/gobreaker): release the slot it
-                // nominally still holds (a no-op once the close cleared the count)
-                // and count the failure toward the closed-state failure_threshold.
-                // It is deliberately NOT special-cased into a reopen: a probe that
-                // observes CLOSED here cannot be distinguished from an
-                // arbitrarily-stale straggler without per-probe generation
-                // tracking, so reopening would let a long-hung straggler trip a
-                // breaker that has since recovered. The "any probe failure reopens"
-                // rule still holds while the breaker is HALF_OPEN (the arm below):
-                // a failure that observes HALF_OPEN is current-cycle by
-                // construction and reopens even if it then races a sibling close.
-                if is_half_open_probe {
-                    self.release_half_open_slot();
-                }
-                let failures = self.failure_count.fetch_add(1, Ordering::Relaxed) + 1;
+                // A same-cycle half-open probe whose failure arrives only AFTER
+                // a sibling reached the success threshold and closed the breaker
+                // is processed against the CURRENT closed state, matching
+                // standard breaker semantics (e.g. sony/gobreaker): release the
+                // slot it nominally still holds (a no-op once the close cleared
+                // the count) and count the failure toward the closed-state
+                // failure_threshold. A probe from an EARLIER cycle never gets
+                // here — it was dropped as stale above. The "any probe failure
+                // reopens" rule still holds while the breaker is HALF_OPEN (the
+                // arm below): a failure that observes HALF_OPEN is current-cycle
+                // by construction and reopens even if it then races a sibling
+                // close.
+                self.release_slot(ticket);
+                // Count the failure for the CLOSED cycle checked above. The
+                // counter refuses it if a sibling has since moved the breaker
+                // through a newer cycle that re-tagged the counter (#7030). The
+                // CLOSED→OPEN transition is bound to the same cycle.
+                let Some(failures) = self.failure_count.increment(packed_generation(packed)) else {
+                    return;
+                };
                 if failures >= self.config.failure_threshold {
-                    // Re-read the counter before and after the transition attempt.
-                    // A concurrent CLOSED-state success may reset failure_count
-                    // after our fetch_add; opening on that stale `failures` value
-                    // would turn a broken consecutive-failure streak into an OPEN
-                    // circuit. CAS still ensures only one thread performs the
-                    // CLOSED→OPEN transition, while the counter checks keep the
-                    // transition tied to the current consecutive-failure count.
-                    if self.failure_count.load(Ordering::Acquire) < self.config.failure_threshold {
-                        return;
-                    }
-                    // CLOSED always carries count=0, so the expected/desired values
-                    // both hold count=0; the transition flips state and advances the
-                    // generation in the SAME CAS.
-                    //
-                    // Advancing the generation atomically with the OPEN transition is
-                    // what makes the streaming-outcome accounting correct (#1649 R5
-                    // finding 2 + R7): (1) only the CAS WINNER advances the
-                    // generation — a concurrent failure that loses the CAS leaves it
-                    // untouched, so it cannot stale a valid probe that already
-                    // captured the winner's generation; and (2) the new generation is
-                    // published WITH OPEN, so any observer that sees OPEN (and can
-                    // immediately re-enter HALF_OPEN when `timeout_seconds == 0`)
-                    // reads the new generation, never the pre-open value. The
-                    // generation comes from a fresh load of the CLOSED state; if it
-                    // changed under us the CAS simply fails (a sibling opened). On the
-                    // rare rollback path below the generation stays advanced — the
-                    // only effect is that a CLOSED-admitted (non-probe) deferred
-                    // outcome captured just before this point is dropped instead of
-                    // recorded, which is negligible and conservative.
-                    let generation = packed_generation(self.packed.load(Ordering::Acquire));
-                    if self
-                        .packed
-                        .compare_exchange(
-                            pack_full(generation, STATE_CLOSED, 0),
-                            pack_full(generation.wrapping_add(1), STATE_OPEN, 0),
-                            Ordering::AcqRel,
-                            Ordering::Relaxed,
-                        )
-                        .is_ok()
-                    {
-                        let current_failures = self.failure_count.load(Ordering::Acquire);
-                        if current_failures < self.config.failure_threshold {
-                            // Roll back OPEN→CLOSED, keeping the advanced generation
-                            // (see note above).
-                            let _ = self.packed.compare_exchange(
-                                pack_full(generation.wrapping_add(1), STATE_OPEN, 0),
-                                pack_full(generation.wrapping_add(1), STATE_CLOSED, 0),
-                                Ordering::AcqRel,
-                                Ordering::Relaxed,
-                            );
-                            return;
-                        }
-                        warn!(
-                            "Circuit breaker opening after {} failures",
-                            current_failures
-                        );
-                    }
+                    self.trip_after_closed_failure(packed_generation(packed));
                 }
             }
+            // A CLOSED-cycle straggler (#7030): only this cycle's own probes
+            // decide it, so the failure neither reopens nor restarts recovery.
+            STATE_HALF_OPEN if !ticket.is_cycle_probe() => {}
             STATE_HALF_OPEN => {
                 self.last_failure_tick_ms
                     .store(failure_tick_ms, Ordering::Relaxed);
                 self.last_failure_epoch_ms
                     .store(failure_epoch_ms, Ordering::Relaxed);
-                self.reopen_after_probe_failure();
+                self.reopen_after_probe_failure(ticket);
             }
-            STATE_OPEN if is_half_open_probe => {
-                // A concurrent record_failure already reopened the circuit between
-                // our can_execute() (when it was HALF_OPEN) and now. Release our
-                // slot (a no-op if the reopen already cleared the count). Do not
-                // refresh either failure timestamp: the reopen that published OPEN
-                // already started the recovery timeout.
-                self.release_half_open_slot();
-            }
+            // Same-cycle OPEN cannot follow a probe admission; a non-probe holds
+            // no slot. Do not refresh either failure timestamp: the reopen that
+            // published OPEN already started the recovery timeout.
+            STATE_OPEN => self.release_slot(ticket),
             _ => {}
         }
     }
 
+    /// CLOSED→OPEN after a counted failure brought CLOSED cycle
+    /// `entry_generation` to `failure_threshold`. Returns whether this call
+    /// opened the breaker.
+    ///
+    /// The transition is bound to the cycle the failure was checked and
+    /// counted in (#7030). Both counter rechecks read the count of THAT cycle
+    /// (`CycleCounter::count_in_cycle`), and the CAS expects
+    /// `CLOSED(entry_generation)`, so a failure that stalled while a sibling
+    /// opened the breaker and a probe recovered it into a newer CLOSED cycle
+    /// can never open the recovered cycle, whatever the counter holds at that
+    /// instant (for example between the recovery CAS and its counter clear).
+    ///
+    /// The counter rechecks keep the transition tied to the current
+    /// consecutive-failure streak: a concurrent CLOSED-state success may reset
+    /// the count after the increment, and opening on the stale value would turn
+    /// a broken streak into an OPEN circuit.
+    ///
+    /// CLOSED always carries count=0, so the expected and desired values both
+    /// hold count=0; the transition flips state and advances the generation in
+    /// the SAME CAS. Advancing the generation atomically with the OPEN
+    /// transition is what makes the streaming-outcome accounting correct
+    /// (#1649 R5 finding 2 + R7): (1) only the CAS WINNER advances the
+    /// generation — a concurrent failure that loses the CAS leaves it
+    /// untouched, so it cannot stale a valid probe that already captured the
+    /// winner's generation; and (2) the new generation is published WITH OPEN,
+    /// so any observer that sees OPEN (and can immediately re-enter HALF_OPEN
+    /// when `timeout_seconds == 0`) reads the new generation, never the
+    /// pre-open value. On the rare rollback path the generation stays
+    /// advanced — the only effect is that a CLOSED-admitted (non-probe)
+    /// deferred outcome captured just before this point is dropped instead of
+    /// recorded, which is negligible and conservative.
+    fn trip_after_closed_failure(&self, entry_generation: u32) -> bool {
+        if self.failure_count.count_in_cycle(entry_generation) < self.config.failure_threshold {
+            return false;
+        }
+        let opened_generation = entry_generation.wrapping_add(1);
+        if self
+            .packed
+            .compare_exchange(
+                pack_full(entry_generation, STATE_CLOSED, 0),
+                pack_full(opened_generation, STATE_OPEN, 0),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            // A sibling already opened this cycle, or the breaker has moved to
+            // a newer cycle: this failure no longer decides anything.
+            return false;
+        }
+        let current_failures = self.failure_count.count_in_cycle(entry_generation);
+        if current_failures < self.config.failure_threshold {
+            // Roll back OPEN→CLOSED, keeping the advanced generation (see
+            // above).
+            let _ = self.packed.compare_exchange(
+                pack_full(opened_generation, STATE_OPEN, 0),
+                pack_full(opened_generation, STATE_CLOSED, 0),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+            return false;
+        }
+        warn!(
+            "Circuit breaker opening after {} failures",
+            current_failures
+        );
+        true
+    }
+
     /// Reopen the breaker after a failure that was observed WHILE the breaker is
-    /// HALF_OPEN (the only caller — the top-level `STATE_HALF_OPEN` arm).
-    /// Publishes OPEN and clears the in-flight count in ONE CAS — so HALF_OPEN
-    /// admissions stop at the same instant the count is zeroed (no over-admission
-    /// window during the reopen). The loop also reopens a breaker that a
-    /// concurrent sibling success closed between this failure observing HALF_OPEN
-    /// and the CAS (the sibling-close race): such a failure is current-cycle by
-    /// construction, so reopening is correct. A failure that instead observes
-    /// CLOSED at the top of `record_failure` is NOT routed here — it counts
-    /// toward the closed-state threshold — because it cannot be distinguished
-    /// from a stale straggler. Only an already-published OPEN is left alone. The
-    /// failing probe's slot is subsumed by the count reset, and a straggler from
-    /// this cycle releases as a no-op at 0.
-    fn reopen_after_probe_failure(&self) {
-        self.success_count.store(0, Ordering::Relaxed);
+    /// HALF_OPEN (the only caller — the `STATE_HALF_OPEN` arm of
+    /// [`settle_tripping_failure`](Self::settle_tripping_failure)). Publishes
+    /// OPEN and clears the in-flight count in ONE CAS — so HALF_OPEN admissions
+    /// stop at the same instant the count is zeroed (no over-admission window
+    /// during the reopen). The loop also reopens a breaker that a concurrent
+    /// sibling success closed between this failure observing HALF_OPEN and the
+    /// CAS (the sibling-close race): such a failure is current-cycle by
+    /// construction, so reopening is correct. A probe ticket stops reopening as
+    /// soon as the breaker has left its cycle. Only an already-published OPEN is
+    /// left alone. The failing probe's slot is subsumed by the count reset, and a
+    /// straggler from this cycle releases as a no-op at 0. Only the reopen
+    /// winner re-tags `success_count` for the new cycle, so a stale success of
+    /// the reopened cycle can no longer count into the next one.
+    fn reopen_after_probe_failure(&self, ticket: ProbeTicket) {
         loop {
             let p = self.packed.load(Ordering::Acquire);
             match packed_state(p) {
@@ -583,16 +804,21 @@ impl CircuitBreaker {
                 // sibling already reopened, the `STATE_OPEN` arm above leaves it
                 // alone; a stream from the superseded cycle is correctly stale.
                 _ => {
+                    if !ticket.in_cycle_of(p) {
+                        break;
+                    }
+                    let reopened_generation = packed_generation(p).wrapping_add(1);
                     if self
                         .packed
                         .compare_exchange_weak(
                             p,
-                            pack_full(packed_generation(p).wrapping_add(1), STATE_OPEN, 0),
+                            pack_full(reopened_generation, STATE_OPEN, 0),
                             Ordering::AcqRel,
                             Ordering::Relaxed,
                         )
                         .is_ok()
                     {
+                        self.success_count.start_cycle(reopened_generation);
                         warn!("Circuit breaker reopening (probe failed)");
                         break;
                     }
@@ -601,36 +827,18 @@ impl CircuitBreaker {
         }
     }
 
-    /// Release one half-open probe slot, decrementing the in-flight count while
-    /// preserving the state bits and never underflowing. A no-op once the count
-    /// is already 0 — e.g. the slot was cleared en masse by a concurrent
-    /// reopen/close — so a straggler from a previous half-open cycle can neither
-    /// drive the counter below 0 nor perturb the packed state.
-    fn release_half_open_slot(&self) {
-        let _ = self
-            .packed
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |packed| {
-                let count = packed_count(packed);
-                if count == 0 {
-                    None
-                } else {
-                    // Preserve the generation and state; only the count changes.
-                    Some(pack_full(
-                        packed_generation(packed),
-                        packed_state(packed),
-                        count - 1,
-                    ))
-                }
-            });
-    }
-
-    /// Release one half-open probe slot only if the breaker is still in
-    /// `generation`, in the same CAS that checks it. A generation mismatch means
-    /// a reopen already cleared this probe's slot with its cycle, so the
-    /// current cycle's count is left alone. Same-generation states carry the
-    /// probe's slot (HALF_OPEN) or a zeroed count (CLOSED after recovery), and
-    /// the count-0 no-op keeps the release from underflowing.
-    fn release_half_open_slot_in_generation(&self, generation: u32) {
+    /// Return a probe ticket's slot, decrementing the in-flight count only if
+    /// the breaker is still in the ticket's generation, in the same CAS that
+    /// checks it. A generation mismatch means a reopen already cleared this
+    /// probe's slot with its cycle, so the current cycle's count is left alone.
+    /// Same-generation states carry the probe's slot (HALF_OPEN) or a zeroed
+    /// count (CLOSED after recovery), and the count-0 no-op keeps the release
+    /// from underflowing. A non-probe holds no slot.
+    #[inline]
+    fn release_slot(&self, ticket: ProbeTicket) {
+        let ProbeTicket::Probe { generation } = ticket else {
+            return;
+        };
         let _ = self
             .packed
             .try_update(Ordering::AcqRel, Ordering::Acquire, |packed| {
@@ -641,6 +849,80 @@ impl CircuitBreaker {
                     Some(pack_full(generation, packed_state(packed), count - 1))
                 }
             });
+    }
+
+    /// The ticket a legacy `bool` probe flag stands for: the cycle that is
+    /// current at the call. Generation-blind by construction, so only the
+    /// `#[doc(hidden)]` test conveniences below use it.
+    fn current_cycle_ticket(&self, is_half_open_probe: bool) -> ProbeTicket {
+        if is_half_open_probe {
+            ProbeTicket::Probe {
+                generation: packed_generation(self.packed.load(Ordering::Acquire)),
+            }
+        } else {
+            ProbeTicket::NonProbe
+        }
+    }
+
+    /// Test convenience: settle a success against the cycle that is current
+    /// at the call. Production code must [`settle`](Self::settle) the ticket
+    /// its admission returned instead; this form cannot tell a stale probe
+    /// from a current one (CB-1).
+    #[doc(hidden)]
+    pub fn record_success(&self, is_half_open_probe: bool) {
+        self.settle(
+            self.current_cycle_ticket(is_half_open_probe),
+            BreakerOutcome::Success,
+        );
+    }
+
+    /// Test convenience: settle a neutral outcome against the cycle that is
+    /// current at the call. See [`record_success`](Self::record_success).
+    #[doc(hidden)]
+    pub fn record_neutral(&self, is_half_open_probe: bool) {
+        self.settle(
+            self.current_cycle_ticket(is_half_open_probe),
+            BreakerOutcome::Neutral,
+        );
+    }
+
+    /// Test convenience: settle a failure against the cycle that is current at
+    /// the call. See [`record_success`](Self::record_success).
+    #[doc(hidden)]
+    pub fn record_failure(
+        &self,
+        status_code: u16,
+        connection_error: bool,
+        is_half_open_probe: bool,
+    ) {
+        self.settle(
+            self.current_cycle_ticket(is_half_open_probe),
+            BreakerOutcome::Failure {
+                status_code,
+                connection_error,
+            },
+        );
+    }
+
+    /// Deterministic-clock variant used by external unit tests. Wall time is
+    /// injected separately to prove it remains diagnostic-only.
+    #[doc(hidden)]
+    pub fn record_failure_at_for_test(
+        &self,
+        status_code: u16,
+        connection_error: bool,
+        is_half_open_probe: bool,
+        monotonic_now_ms: u64,
+        wall_epoch_ms: u64,
+    ) {
+        self.settle_inner(
+            self.current_cycle_ticket(is_half_open_probe),
+            BreakerOutcome::Failure {
+                status_code,
+                connection_error,
+            },
+            Some((monotonic_now_ms, wall_epoch_ms)),
+        );
     }
 
     /// Get the config for this circuit breaker.
@@ -659,31 +941,67 @@ impl CircuitBreaker {
 
     /// Current failure count (for metrics).
     pub fn failure_count(&self) -> u32 {
-        self.failure_count.load(Ordering::Relaxed)
+        self.failure_count.count()
     }
 
     /// Current success count (for metrics).
     pub fn success_count(&self) -> u32 {
-        self.success_count.load(Ordering::Relaxed)
+        self.success_count.count()
+    }
+
+    /// Test seam for the counter half of a success settlement (#7030): count
+    /// one HALF_OPEN success for open cycle `generation`, exactly as
+    /// [`settle`](Self::settle) does after its state check observed that
+    /// cycle. Returns `false` when the increment is refused because the
+    /// counter already belongs to a newer cycle. Lets a test stage the
+    /// check-then-reopen-then-increment interleaving deterministically.
+    #[doc(hidden)]
+    pub fn count_success_in_cycle_for_test(&self, generation: u64) -> bool {
+        self.success_count.increment(generation as u32).is_some()
+    }
+
+    /// Test seam for the transition half of a CLOSED-state failure
+    /// settlement (#7030): attempt CLOSED→OPEN for a failure that was checked
+    /// and counted in CLOSED cycle `entry_generation`, exactly as
+    /// [`settle`](Self::settle) does once the count reached
+    /// `failure_threshold`. Returns whether the breaker opened.
+    #[doc(hidden)]
+    pub fn trip_after_closed_failure_for_test(&self, entry_generation: u64) -> bool {
+        self.trip_after_closed_failure(entry_generation as u32)
+    }
+
+    /// Test seam: overwrite the failure counter with `count` tagged for
+    /// `generation`, to stage a counter state a concurrent settlement can
+    /// leave for an instant (for example a recovery between its close CAS and
+    /// its counter clear). Never used by production code.
+    #[doc(hidden)]
+    pub fn stage_failure_count_for_test(&self, generation: u64, count: u32) {
+        self.failure_count
+            .0
+            .store(pack_counter(generation as u32, count), Ordering::Release);
+    }
+
+    /// Test seam for the counter half of a CLOSED-state failure settlement
+    /// (#7030). See [`count_success_in_cycle_for_test`](Self::count_success_in_cycle_for_test).
+    #[doc(hidden)]
+    pub fn count_failure_in_cycle_for_test(&self, generation: u64) -> bool {
+        self.failure_count.increment(generation as u32).is_some()
     }
 
     /// Current half-open in-flight counter (for testing).
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn half_open_in_flight(&self) -> u32 {
         packed_count(self.packed.load(Ordering::Acquire))
     }
 
     /// Last failure timestamp in epoch milliseconds (for testing).
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn last_failure_epoch_ms(&self) -> u64 {
         self.last_failure_epoch_ms.load(Ordering::Relaxed)
     }
 
     /// Last state-machine failure tick (for deterministic tests).
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn last_failure_tick_ms_for_test(&self) -> u64 {
         self.last_failure_tick_ms.load(Ordering::Relaxed)
     }
@@ -784,7 +1102,6 @@ impl Default for CircuitBreakerCache {
 }
 
 impl CircuitBreakerCache {
-    #[allow(dead_code)]
     pub fn new() -> Self {
         Self::with_max_entries(10_000)
     }
@@ -812,7 +1129,11 @@ impl CircuitBreakerCache {
     /// `target_key` should be `Some("host:port")` when the request resolved to
     /// a concrete upstream target or direct backend override, and `None` when a
     /// direct backend proxy should use one breaker for the proxy.
-    /// If the config has changed, replaces the breaker with a fresh one.
+    /// If the config has changed, replaces the breaker with a fresh one. That
+    /// replacement belongs to ADMISSION only: a request completion settles on
+    /// the breaker instance its admission returned, checked with
+    /// [`is_current`](Self::is_current), and never resolves a breaker again
+    /// from its captured (possibly older) config.
     ///
     /// Concurrent callers for the same key/config generation receive the same
     /// `Arc`. New distinct keys are admitted only while under `max_entries`;
@@ -929,52 +1250,62 @@ impl CircuitBreakerCache {
         })
     }
 
+    /// Whether `admitted` — the breaker instance that admitted a request — is
+    /// still the one cached for this proxy (+target), compared by identity.
+    ///
+    /// Admission ([`can_execute`](Self::can_execute)) replaces a cached breaker
+    /// whose config differs, so a configuration change starts a fresh breaker
+    /// at the next admission. A completion must settle on the exact breaker
+    /// that admitted it: resolving it again by its captured config would either
+    /// replace the live (possibly OPEN) breaker with a fresh CLOSED one (#6799)
+    /// or, after an A→B→A reload or a prune that recreated the key with the same
+    /// config, settle on a NEW instance it never ran against. A completion whose
+    /// admitting breaker is no longer cached is stale: its outcome is discarded
+    /// and any probe slot it holds is released on the admitting breaker itself.
+    ///
+    /// This is a shard read with the thread-local key buffer, like a
+    /// `get_or_create` hit: no allocation and no write lock.
+    pub fn is_current(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+        target_key: Option<&str>,
+        admitted: &Arc<CircuitBreaker>,
+    ) -> bool {
+        CB_KEY_BUF.with(|buf| {
+            let mut key = buf.borrow_mut();
+            write_circuit_breaker_key(&mut key, namespace, proxy_id, target_key);
+            self.breakers
+                .get(key.as_str())
+                .is_some_and(|entry| Arc::ptr_eq(entry.value(), admitted))
+        })
+    }
+
     /// Check if a request can proceed for a given proxy (or proxy+target).
     ///
     /// `target_key` should be `Some("host:port")` when the proxy uses an upstream,
     /// or `None` for direct backend proxies.
     ///
-    /// Returns `Ok((cb, is_half_open_probe, admission_generation))`. The caller
-    /// MUST thread `is_half_open_probe` into every subsequent `record_success` /
-    /// `record_failure` call on this breaker so that the half-open in-flight
-    /// counter is decremented only for requests that actually hold a probe slot.
+    /// Returns `Ok((cb, ticket, admission_generation))`. The caller settles
+    /// `ticket` exactly once on `cb` with [`CircuitBreaker::settle`] (in the
+    /// proxy, through `HalfOpenProbeGuard`), so a probe slot is returned only by
+    /// the request that holds it and only within the open cycle it was claimed
+    /// in (CB-1, #6177).
     ///
     /// `admission_generation` is the open generation the admission was decided
     /// in, taken from the same atomic operation that admitted the request (see
-    /// [`CircuitBreaker::can_execute_with_generation`]). A probe owner hands it
-    /// to `HalfOpenProbeGuard` so a neutral release that outlives a reopen
-    /// cannot free a later cycle's slot (#6177).
+    /// [`CircuitBreaker::admit`]). Deferred streaming outcomes stale-check
+    /// against it (#1649).
     pub fn can_execute(
         &self,
         namespace: &str,
         proxy_id: &str,
         target_key: Option<&str>,
         config: &CircuitBreakerConfig,
-    ) -> Result<(Arc<CircuitBreaker>, bool, u64), CircuitOpenError> {
+    ) -> Result<(Arc<CircuitBreaker>, ProbeTicket, u64), CircuitOpenError> {
         let cb = self.get_or_create(namespace, proxy_id, target_key, config);
-        let (is_half_open_probe, admission_generation) = cb.can_execute_with_generation()?;
-        Ok((cb, is_half_open_probe, admission_generation))
-    }
-
-    /// Like [`can_execute`](Self::can_execute); the third element is the open
-    /// generation the request is admitted under.
-    ///
-    /// The generation is the one the admitting atomic operation observed or
-    /// published, so it is exactly the admission's own cycle: a concurrent open
-    /// racing this admission can only make a later deferred streaming outcome
-    /// look *stale* (neutralized — recovered by the next probe), never *too new*
-    /// (which would let a request heal/reopen a HALF_OPEN cycle it never probed).
-    /// Used by the #1649 streaming-deferral admission sites — the initial
-    /// admission and every retry-target rotation — where the backend-health
-    /// outcome is recorded at response-body completion. (#1649 R6 finding 3)
-    pub fn can_execute_with_admission_epoch(
-        &self,
-        namespace: &str,
-        proxy_id: &str,
-        target_key: Option<&str>,
-        config: &CircuitBreakerConfig,
-    ) -> Result<(Arc<CircuitBreaker>, bool, u64), CircuitOpenError> {
-        self.can_execute(namespace, proxy_id, target_key, config)
+        let (ticket, admission_generation) = cb.admit()?;
+        Ok((cb, ticket, admission_generation))
     }
 
     /// Snapshot of all circuit breaker states for metrics.
@@ -1105,13 +1436,11 @@ impl CircuitBreakerCache {
     }
 
     /// Current number of entries in the cache.
-    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.entry_count.load(Ordering::Acquire)
     }
 
     /// Whether the cache is empty.
-    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

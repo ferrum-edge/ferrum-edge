@@ -27,6 +27,11 @@ pub const MESH_GATEWAY_TOKEN: &str = "mesh";
 /// translator's HTTP VirtualService ids.
 pub const ISTIO_VS_L4_PROXY_ID_PREFIX: &str = "istio-vs-l4_";
 
+/// Managed upstream-id prefix for the weighted backend set generated for an
+/// Istio VirtualService `tcp[]`/`tls[]` split. These upstreams ride the mesh
+/// slice next to the [`ISTIO_VS_L4_PROXY_ID_PREFIX`] proxies.
+pub const ISTIO_VS_L4_UPSTREAM_ID_PREFIX: &str = "istio-vs-l4-upstream-";
+
 /// Admission bounds for the serialized L4 matcher carrier. These limits keep
 /// hand-authored/admin/file config at parity with the public OpenAPI schema and
 /// bound cold-path compilation plus SQL/Mongo document size.

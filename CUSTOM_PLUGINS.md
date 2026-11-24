@@ -139,7 +139,9 @@ and register but never run, would still apply any `plugin_migrations()`, and
 would appear twice in `available_plugins()`.
 
 Each plugin file must export a `create_plugin` factory function that returns
-`Result` and a `failure_policy` metadata function:
+`Result`, a `failure_policy` metadata function, and a `config_contract`
+function that lists example configs (see
+[Config contract](#config-contract)):
 
 ```rust
 // custom_plugins/my_header_injector.rs
@@ -247,6 +249,14 @@ pub fn create_plugin(
 pub fn failure_policy() -> PluginFailurePolicy {
     PluginFailurePolicy::KeepLastKnownGood
 }
+
+/// Required config contract — the plugin test sweep checks these examples.
+pub fn config_contract() -> crate::plugins::PluginConfigContract {
+    crate::plugins::PluginConfigContract::closed(vec![
+        serde_json::json!({}),
+        serde_json::json!({ "header_name": "X-Powered-By", "header_value": "my-company" }),
+    ])
+}
 ```
 
 ### Config Validation Rules
@@ -255,11 +265,62 @@ Your `new()` constructor must validate the plugin config and return `Err(String)
 
 - **Required fields are missing** — if the plugin cannot function without a field, return an error (don't silently default to a no-op).
 - **Values are invalid** — reject malformed regexes, unknown enum variants, out-of-range numbers, unparseable URLs.
-- **The config shape is unexpected** — reject non-object roots, unknown keys, and present values of the wrong JSON type. Apply an optional field's default only when that field is omitted.
+- **The config shape is unexpected** — reject non-object roots, unknown keys, and present values of the wrong JSON type. Apply an optional field's default only when that field is omitted. This applies at **every depth**: each nested object the plugin reads (a rule, a provider, a `tls` block, an array element) rejects keys it does not recognize, typically with `crate::util::unknown_keys::reject_unknown_keys` against a `*_KEYS` allowlist. A misspelled nested key that is silently ignored builds a plugin that enforces something other than what the operator wrote.
 - **A value crosses a typed protocol boundary** — parse header names/values, URLs, CIDRs, and similar values in the constructor and apply an explicit size bound before retaining them.
 - **The plugin would have no effect** — e.g., a rate limiter with no rate windows, a size limiter with `max_bytes=0`, a transformer with no rules.
 
 Sensible defaults for optional fields (e.g., `limit_by` defaulting to `"ip"`) are fine — only return `Err` for fields where there is no safe default.
+
+The constructor is also the validator, so keep it free of side effects. Admin
+API writes, control-plane admission, config-file loads, and the synchronous
+`ferrum-edge validate` command all call `create_plugin` and drop the instance
+right away. `ferrum-edge validate` has no Tokio runtime, so a `tokio::spawn`
+in a constructor aborts it. In `new()` and `create_plugin`:
+
+- do not dial the network, spawn tasks or threads, or write files;
+- do not register process-global state (metrics, registries, statics) that
+  outlives the instance;
+- validate and retain the config, plus any pure in-memory state derived from it.
+
+Stage workers in `start_background_tasks()`. That runs only while a cache
+generation is built, and the workers stay dormant until
+`commit_background_tasks()` runs after the generation is installed (see
+[Transaction log hook timing](#transaction-log-hook-timing)). Built-in plugins
+whose construction needs node-local files, credentials, or workers use a
+separate shape-only validator for the same reason.
+
+### Config contract
+
+Both rules above are invisible from outside the constructor, so every custom
+plugin exports `config_contract()` returning a
+`crate::plugins::PluginConfigContract`. A plugin without it does not compile.
+The repository's plugin test sweep
+(`tests/unit/plugins/plugin_config_closure_tests.rs`) runs over built-in and
+custom plugins alike:
+
+- every example must validate on its own;
+- validating an example must neither need a Tokio runtime nor spawn a Tokio
+  task;
+- an unknown key injected into the root or any nested object of an example
+  must be rejected.
+
+The runtime check cannot see `spawn_blocking`, OS threads, synchronous dials,
+file writes, or process-global registration. The constructor rules above still
+forbid them; reviewers enforce that part.
+
+List examples that together reach every nested object your plugin reads (one
+per variant of a tagged union). Two declarations exempt parts of a config,
+using dotted paths where `[]` selects array elements and `*` matches any key:
+
+- `with_free_form_objects(&["headers"])` for objects whose keys are
+  operator-chosen names, such as a header map. The sweep still walks their
+  values.
+- `with_opaque_documents(&["json_schema"])` for embedded foreign documents,
+  such as a JSON Schema or a sample payload. The sweep skips the subtree.
+
+Each declaration must match a node in the examples. Run
+`cargo test --test unit_plugins_b_tests plugin_config_closure` after adding or
+changing a custom plugin.
 
 The `failure_policy()` return value controls cache publication when construction
 or validation fails:
@@ -269,6 +330,9 @@ or validation fails:
   keeps serving. Startup also rejects because there is no prior cache.
 - `OptionalFailOpen` logs the failure and omits the plugin from the published
   cache. Use this only for non-enforcing plugins such as best-effort telemetry.
+  The gateway takes the declared policy as given. A plugin that authenticates,
+  authorizes, or otherwise admits requests must not declare `OptionalFailOpen`,
+  because a construction failure would then publish the route without it.
 
 ### 2. Build
 
@@ -297,6 +361,31 @@ FERRUM_CUSTOM_PLUGINS=example_plugin,example_audit_plugin cargo build
 Default source, release, and Docker builds leave `FERRUM_CUSTOM_PLUGINS` unset
 so example plugins (and their migrations) do not alter the production registry
 or schema.
+
+### Trust boundary
+
+A custom plugin is ordinary Rust compiled into the gateway binary. There is no
+sandbox, capability check, or separate process:
+
+- **Who is trusted.** Anyone who can write to `custom_plugins/` (or set
+  `FERRUM_CUSTOM_PLUGINS`) for a build is trusted with the whole gateway. When
+  `FERRUM_CUSTOM_PLUGINS` is unset, every `custom_plugins/*.rs` file in the
+  source tree is compiled in.
+- **What a plugin can do.** It runs in-process with the gateway's privileges and
+  memory. It can read every request and response it is attached to, resolved
+  secrets, TLS key material held in memory, and the process environment. It can
+  make arbitrary outbound connections, and a panic aborts the process
+  (`panic = "abort"`).
+- **What the gateway takes on trust.** The plugin's own declarations, including
+  its `failure_policy()`, protocol support, auth/authorize roles, and the
+  capability methods below. The gateway enforces composition rules against
+  those declarations, but it cannot check that the code behaves as declared.
+
+Review custom plugin source the way you would review a change to the gateway
+itself. Build release images from a source tree whose `custom_plugins/`
+directory is under the same access control as the rest of the repository. The
+[threat model](docs/threat_model.md#out-of-scope) lists a malicious custom
+plugin as out of scope for the same reason.
 
 ### 3. Configure
 
@@ -333,14 +422,14 @@ Every plugin implements the `Plugin` trait from `src/plugins/mod.rs`. All method
 | `validate_client_request_body_contract(&mut ctx, &headers, &body)` | Pre-`before_proxy` client contract (phase 3c) | Yes | Decide a client-facing request-body contract over the **original** client body after gateway-owned normalization and before any `before_proxy` or `transform_request_body` hook. Read-only: admit or reject, never rewrite. Requires `validates_client_request_body_contract()` **and** `requires_request_body_before_before_proxy()`; declaring the first without the second is a **startup-fatal** plugin-cache rejection because the phase would never run. See [plugin execution order](docs/plugin_execution_order.md#lifecycle-phases). |
 | `before_proxy(&mut ctx, &mut headers)` | Pre-backend | Yes | Transform request headers, add tracing IDs. **Read request headers from `headers`, not `ctx.headers`** (see note below) |
 | `on_backend_path_resolved(&mut ctx, backend_path)` | After path assembly (phase 5a) | Yes | Run once with the backend-effective path pinned and the selected target fixed. Use for route-sensitive policy such as `grpc_method_router`. Deferred external/synthetic `before_proxy` work (phases 5b–5c) runs later — see [plugin execution order](docs/plugin_execution_order.md#lifecycle-phases). |
-| `transform_request_body(&body, content_type)` | Pre-backend (buffered) | No | Rewrite request body before sending to backend |
+| `transform_request_body(&body, content_type, &request_headers)` | Pre-backend (buffered) | No | Rewrite request body before sending to backend |
 | `on_final_request_body(&headers, &body)` | Pre-backend (post-transform) | Yes | Validate the final request body after all transforms |
 | `dispatch_finalized_request_egress(&mut ctx, &headers, &body, &mut backend_header_overlay)` | Finalized request egress (phase 5e) | Yes | Irreversible outbound request egress after request transforms and every final request-body policy hook accept the exact backend-visible bytes. Write backend header overlays into `backend_header_overlay`, not the immutable snapshot. Built-in participants include `serverless_function`, `request_mirror`, and `ai_federation`. |
 | `try_backend_admission(&ctx, &admission)` | Target-aware backend admission (phase 6) | Yes* | Called after load balancing selects a target and before dial/dispatch. Opt in with `is_backend_admission_plugin()`. Returns `BackendAdmissionDecision::Continue` or a rejection permit decision — not `PluginResult`. |
 | `after_proxy(&mut ctx, status, &mut headers)` | Post-backend | Yes | Transform response headers, reject responses |
 | `apply_websocket_handshake_response_headers(&ctx, status, &mut headers)` | Successful WebSocket handshake (H1 `101`; H2/H3 `200`) | No | Synchronously decorate successful handshake response headers in configured order. After this non-rejecting hook returns, proxy core scrubs transport-owned handshake/framing fields and reconstructs them authoritatively. |
 | `on_final_response_headers(&mut ctx, status, &headers)` | Post-`after_proxy` (phase 7b) | No | Header-only effects for the selected response on both buffered and streaming paths. Non-rejecting; streamed responses stop body hooks after this phase. Pair with `on_final_response_body()` only when both must be idempotent. |
-| `on_response_body(&mut ctx, status, &headers, &body)` | Post-backend (buffered) | Yes | Inspect buffered response body, extract metrics |
+| `on_response_body(&mut ctx, status, &mut headers, &body)` | Post-backend (buffered) | Yes | Inspect buffered response body, extract metrics |
 | `transform_response_body(&body, content_type, &headers)` | Post-backend (buffered) | No | Rewrite response body before sending to client. Runs in the semantic stage (phase 10) and may run again in the transport-encoding stage (phase 10c) for plugins such as `compression`. |
 | `on_response_body_transformed(&mut ctx, &mut response_headers)` | Immediately after this plugin replaces the buffered body | No | Synchronous metadata refresh after this plugin's `transform_response_body` returns replacement bytes. Receives only mutable request context and response headers; not called when the transform returns `None`. |
 | `finalize_client_visible_response_body(&mut ctx, status, &headers, &body)` | After semantic rewrites, before transport encoding (phase 10b) | Yes | Authoritative, rejecting policy over the final semantic representation. Opt in with `enforces_final_client_visible_response_body()`. Header policy belongs in `finalize_client_visible_response_headers()` (phase 7c). |
@@ -430,13 +519,14 @@ For TCP+TLS proxies, `on_stream_connect` runs **after** the frontend TLS handsha
 | Method | Default | Description |
 |--------|---------|-------------|
 | `fn priority(&self) -> u16` | `5000` | Execution order (lower = earlier). See priority bands below. |
+| `fn lifecycle_hooks(&self) -> PluginHooks` | `PluginHooks::ALL` | Optional. Names which of `on_request_received`, `before_proxy`, `after_proxy`, and `log` / `log_with_mesh_key` the plugin overrides, combined with `\|` (for example `PluginHooks::BEFORE_PROXY \| PluginHooks::LOG`), or `PluginHooks::NONE`. The gateway skips the omitted hooks instead of awaiting their boxed no-op defaults on every request. **The ordinary request path never calls an omitted hook** (the rarer rejection, charged-terminal, and cache-replay `after_proxy` passes still do), so leave the default unless you keep the declaration in step with the hooks you implement; an over-broad declaration only costs the skipped call. |
 | `fn supported_protocols(&self) -> &'static [ProxyProtocol]` | `HTTP_ONLY_PROTOCOLS` | Which proxy protocols this plugin supports. See protocol constants below. |
 | `fn is_auth_plugin(&self) -> bool` | `false` | Set to `true` if your plugin participates in the authentication phase. |
 | `fn modifies_request_headers(&self) -> bool` | `false` | Set to `true` if your plugin may insert, remove, or modify request headers (Host included) in **any** pre-proxy phase: `authenticate`, `authorize`, the pre-`before_proxy` body normalization, or `before_proxy`. |
 | `fn modified_request_header_names(&self) -> Option<Vec<String>>` | `None` | The lower-case names of every request header the plugin may change, when that set is fixed at construction. `None` means any header. Consulted only when `modifies_request_headers()` is `true`. |
 | `fn modifies_request_query(&self) -> bool` | `false` | Set to `true` if your plugin may rewrite the forwarded query in any pre-proxy phase. |
 | `fn modifies_request_destination(&self) -> bool` | `false` | Set to `true` if your plugin may rewrite the path, backend, upstream, or authority (including publishing route overrides) in any pre-proxy phase. |
-| `fn declares_request_input_mutations(&self) -> bool` | `false` | Return `true` once the four declarations above cover **every** header, query, path, or destination change the plugin makes in any pre-proxy phase. Until it does, the gateway treats the plugin as able to rewrite any request input in any phase, whatever its priority: a body collected before `before_proxy` then gets no early route-total bound from a `mesh_route_dispatch` rule (issue #6008), and the gateway logs that once per proxy chain at `info` on startup and reload. See [plugins.md → Route request deadline](docs/plugins.md#route-request-deadline). |
+| `fn declares_request_input_mutations(&self) -> bool` | `false` | Return `true` once the four declarations above cover **every** header, query, path, or destination change the plugin makes in any pre-proxy phase. Until it does, the gateway treats the plugin as able to rewrite any request input in any phase, whatever its priority: a body collected before `before_proxy` then gets no early route-total bound from a `mesh_route_dispatch` rule (issue #6008), and the gateway logs that once per proxy chain at `info` on startup and reload. See [mesh_route_dispatch → Route request deadline](docs/plugins/mesh_route_dispatch.md#route-request-deadline). |
 | `fn modifies_request_body(&self) -> bool` | `false` | Set to `true` if your plugin transforms the request body via `transform_request_body`. |
 | `fn egresses_request_body_before_finalization(&self) -> bool` | `false` | Set to `true` if `before_proxy` sends the buffered request body to an external service before request transforms/final hooks. Candidate admission and runtime cache construction then reject same-protocol body-transform compositions and same HTTP/gRPC-protocol final request-body policy plugins (`enforces_finalized_request_policy()`). |
 | `fn requires_prior_request_deduplication(&self) -> bool` | `false` | Set to `true` if `before_proxy` can execute an external side effect and return a terminal response. Any attached same-protocol `request_deduplication` instance must then have a strictly lower effective priority. |
@@ -447,9 +537,10 @@ For TCP+TLS proxies, `on_stream_connect` runs **after** the frontend TLS handsha
 | `fn is_backend_admission_plugin(&self) -> bool` | `false` | Set to `true` when the plugin participates in `try_backend_admission()` after load balancing (phase 6). |
 | `fn allows_hbone_inner_reuse(&self) -> bool` | `false` | Whether one admitted mesh HBONE CONNECT may carry LATER application operations without running this plugin again. A custom plugin refuses by default — no other marker on it can change that — and the destination simply stops advertising `x-ferrum-mesh-tunnel-reuse: fenced` while it is attached, costing one CONNECT per operation, never correctness. Override to `true` only when the plugin takes no per-operation decision and has no per-operation side effect, or when every decision it takes is re-issued for the tunnel's whole life by the HBONE admission fence. Anything that charges an operation (a token, a permit, a mirror, an external check) or authenticates the CONNECT with a bearer credential must leave it `false`: the fence bounds the peer's mTLS leaf and nothing else. Returning `true` is also a standing obligation, not a one-time declaration: every fence sweep re-folds this over the live chain, and a tunnel that was advertised reusable is revoked (`reuse_withdrawn`) as soon as the chain stops permitting it, so the source's next operation performs a fresh CONNECT. See [docs/mesh.md](docs/mesh.md) → "HBONE Inner Application Connection Reuse". |
 | `fn allows_hbone_inner_reuse_for(&self, admission: &HboneReuseContext) -> bool` | Delegates to `allows_hbone_inner_reuse()` | Context-aware classification with the same safety contract. `HboneReuseContext` contains the admitting listener's `mesh_direction` and `frontend_listen_port`; admission records these facts and every fence sweep reuses them unchanged with the current plugin generation. Keep this predicate pure: no request hooks, budgets, I/O, or mutable side effects. Unclassified plugins retain the literal-false default. |
+| `fn observes_mesh_label_metadata(&self) -> bool` | `true` | Whether the plugin can observe the `mesh.source.*` / `mesh.destination.*` workload labels that `workload_metrics` writes into `ctx.metadata` and `TransactionSummary.metadata` (issue #6793). Leave the default: while any plugin in a request's chain answers `true` — every custom plugin does — those keys are written for every plugin in that chain exactly as before. Only when every plugin in the chain answers `false` does `workload_metrics` keep the labels in typed request state instead of the metadata maps. Override to `false` only if the plugin never reads those keys from either map, never iterates, clones, serializes or forwards a whole metadata map, and never writes them. |
 | `fn enforces_final_client_visible_response_body(&self, &ctx) -> bool` | `false` | Per-request opt-in for `finalize_client_visible_response_body()` (phase 10b). |
 | `fn enforces_final_client_visible_response_headers(&self, &ctx) -> bool` | `false` | Per-request opt-in for `finalize_client_visible_response_headers()` (phase 7c). |
-| `fn requires_request_body_buffering(&self) -> bool` | Derived | By default returns `true` if `modifies_request_body()` or `requires_request_body_before_before_proxy()`. Override for custom logic. |
+| `fn requires_request_body_buffering(&self) -> bool` | Derived | By default returns `true` if `modifies_request_body()`, `requires_request_body_before_before_proxy()`, `requires_request_body_before_authenticate()`, or `requires_request_body_before_authorize()`. Override for custom logic. |
 | `fn should_buffer_request_body(&self, &ctx) -> bool` | Delegates | Per-request decision on whether to buffer. Defaults to `requires_request_body_buffering()`. Override for conditional buffering (e.g., only for certain content types). |
 | `fn requires_response_body_buffering(&self) -> bool` | `false` | Config-time upper bound. Set to `true` if the plugin may need the complete response body. |
 | `fn should_buffer_response_body(&self, &ctx) -> bool` | Delegates | Per-request refinement. Defaults to `requires_response_body_buffering()` and may skip buffering for irrelevant requests. |
@@ -502,11 +593,11 @@ Plugins execute in priority order (lowest number first) within each lifecycle ph
 | Authentication | 950–1999 | Identity verification | mtls_auth (950), jwks_auth (1000), jwt_auth (1100), key_auth (1200), basic_auth (1300), hmac_auth (1400), soap_ws_security (1500) |
 | Admission | 2000–2999 | Authorization, throttling, size/rate limits, body and AI validation | access_control (2000), tcp_connection_throttle (2050), request_size_limiting (2800), rate_limiting (2900), waf (2930), body_validator (2950), ai_request_guard (2975) |
 | Transform | 3000–3999 | Request shaping, response size limits, caching | request_transformer (3000), grpc_deadline (3050), response_size_limiting (3490), response_caching (3500) |
-| Response | 4000–4999 | Response transformation, compression, AI accounting | response_transformer (4000), compression (4050), ai_token_metrics (4100), ai_rate_limiter (4200) |
+| Response | 4000–4999 | Response transformation, compression, AI accounting | response_transformer (4000), compression (4050), ai_token_metrics (4070), ai_rate_limiter (4200) |
 | **Custom Default** | **5000** | **Default for custom plugins** | — |
 | Logging | 9000–9999 | Logging and metrics | stdout_logging (9000), http_logging (9100), transaction_debugger (9200), prometheus_metrics (9300) |
 
-The complete built-in list is in [docs/plugin_execution_order.md](docs/plugin_execution_order.md#priority-bands).
+The complete built-in list is in [Plugin Execution Order → Complete Execution Order](docs/plugin_execution_order.md#complete-execution-order).
 
 To set a priority, override the `priority()` method:
 
@@ -553,9 +644,10 @@ impl Plugin for MyCustomAuth {
         // Look up the consumer by credential. This linear scan is for
         // illustration; ConsumerIndex also offers O(1) lookups such as
         // find_by_api_key() and find_by_username().
+        // Credentials are configured as `custom_token: [{token: "..."}]`.
         for consumer in consumer_index.consumers().iter() {
-            if let Some(cred) = consumer.credentials.get("custom_token") {
-                if cred.as_str() == Some(token.as_str()) {
+            for entry in consumer.credential_entries("custom_token") {
+                if entry.get("token").and_then(|v| v.as_str()) == Some(token.as_str()) {
                     ctx.identified_consumer = Some(consumer.clone());
                     return PluginResult::Continue;
                 }
@@ -587,11 +679,13 @@ For auth plugins that verify external identities (e.g., OIDC/JWKS tokens) withou
 ```rust
 // When the token is valid but no Consumer mapping exists:
 ctx.authenticated_identity = Some("user@example.com".to_string());
-// Optionally set a display name for the X-Consumer-Username backend header:
+// Optionally set a display name for the X-Authenticated-Identity backend header:
 ctx.authenticated_identity_header = Some("Jane Doe".to_string());
 ```
 
 The `authenticated_identity` is treated as a first-class principal across rate-limit keys, cache keys, log summaries, and backend identity-header injection on all protocol paths.
+
+With no Consumer mapped, the backend receives `X-Authenticated-Identity: Jane Doe` (or `user@example.com` when `authenticated_identity_header` is unset or blank) and no `X-Consumer-Username`. `X-Consumer-Username` and `X-Consumer-Custom-Id` are written only when `ctx.identified_consumer` is set, and in that case `X-Authenticated-Identity` is not sent.
 
 ## Writing a Request Body Plugin
 
@@ -641,6 +735,7 @@ impl Plugin for MyBodyTransformer {
         &self,
         body: &[u8],
         content_type: Option<&str>,
+        _request_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
         // Return Some(new_body) to replace, None to leave unchanged
         if content_type == Some("application/json") {
@@ -704,7 +799,7 @@ impl Plugin for MyJsonResponseInspector {
         &self,
         _ctx: &mut RequestContext,
         _response_status: u16,
-        _response_headers: &HashMap<String, String>,
+        _response_headers: &mut HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
         // Inspect the normalized body before ordinary response transforms.
@@ -792,7 +887,7 @@ struct SseInspector {
 
 #[async_trait]
 impl ResponseStreamInspector for SseInspector {
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &Bytes) -> ResponseStreamAction {
         let mut scan = Vec::with_capacity(self.tail.len() + chunk.len());
         scan.extend_from_slice(&self.tail);
         scan.extend_from_slice(chunk);
@@ -851,7 +946,7 @@ The proxy drives inspectors on reqwest, direct HTTP/2, and native HTTP/3 respons
 
 The `ResponseStreamInspector` action contract is:
 
-- `on_chunk(&mut self, chunk)` receives each decoded body chunk. `Forward(bytes)` releases those bytes now; `Forward(Bytes::new())` emits nothing and means the inspector is holding data in its own accumulator. `Terminate(None)` ends the body, while `Terminate(Some(bytes))` emits the final bytes and then ends it.
+- `on_chunk(&mut self, chunk: &Bytes)` receives each decoded body chunk as a shared buffer. `Forward(bytes)` releases those bytes now, and an inspector that only observes returns `Forward(chunk.clone())`, which shares the buffer instead of copying it; `Forward(Bytes::new())` emits nothing and means the inspector is holding data in its own accumulator. `Terminate(None)` ends the body, while `Terminate(Some(bytes))` emits the final bytes and then ends it.
 - `on_end(&mut self)` is the clean end-of-stream flush for a trailing partial window. Its default returns an empty `Forward`. A later inspector is also flushed at an earlier inspector's deferred cut through `flush_before_cut(&mut self)`, whose default calls `on_end`; override it when a cut must discard an unfinished unit instead of governing or releasing it.
 - `on_downstream_terminated()` is also called on inspectors after the owner of a deferred cut, after they have been flushed, so they can record that the stream ended with a cut or discard state that is no longer client-visible.
 - Response headers are already committed before either hook runs. `Terminate` can only truncate the in-flight response; it cannot change the HTTP status, replace headers, or retract previously forwarded bytes.
@@ -1020,9 +1115,9 @@ impl Plugin for MyLogger {
 }
 ```
 
-`SummaryLogEntryView` and `SummaryLogEntryBatchView` are available for
-the batched / multi-variant case (mirroring `http_logging`, `tcp_logging`
-etc.). Metadata redaction is preserved on every code path. See
+Built-in loggers serialize through `SchemaView` (see
+`src/plugins/utils/summary_log_budget.rs`); batching custom loggers should wrap
+each summary the same way. Metadata redaction is preserved on every code path. See
 [docs/log_schema.md](docs/log_schema.md) for the operator-facing
 schema reference.
 
@@ -1146,15 +1241,18 @@ pub struct RequestContext {
     /// External identity set by JWKS/OIDC auth plugins when no Consumer mapping exists.
     /// Used as rate-limit key, cache key, and in transaction logs.
     pub authenticated_identity: Option<String>,
-    /// Display name for the X-Consumer-Username backend header.
-    /// Falls back to authenticated_identity when not set.
+    /// Display name for the X-Authenticated-Identity backend header, sent only
+    /// when no Consumer was identified. Falls back to authenticated_identity
+    /// when unset or blank.
     pub authenticated_identity_header: Option<String>,
     /// Authentication mechanism that succeeded (e.g., "jwt_auth", "key_auth").
     /// None when no auth plugin identified the client.
     pub auth_method: Option<&'static str>,
     pub timestamp_received: DateTime<Utc>,
-    /// Extra metadata plugins can attach (inter-plugin communication)
-    pub metadata: HashMap<String, String>,
+    /// Extra metadata plugins can attach (inter-plugin communication).
+    /// `ferrum_edge::plugins::MetadataMap`: a `HashMap<String, String>` with an
+    /// `ahash` hasher; build one with `MetadataMap::default()`.
+    pub metadata: MetadataMap,
     /// DER-encoded client certificate from mTLS handshake (first cert in chain).
     /// Shared via Arc to avoid cloning cert bytes on HTTP/2 connections.
     pub tls_client_cert_der: Option<Arc<Vec<u8>>>,
@@ -1166,18 +1264,29 @@ pub struct RequestContext {
     pub route_override_upstream_id: Option<String>,
     pub route_override_backend_host: Option<String>,
     pub route_override_backend_port: Option<u16>,
-    pub route_override_resolved_tls: Option<BackendTlsConfig>,
+    pub route_override_resolved_tls: Option<Arc<BackendTlsConfig>>,
 }
 ```
 
+**Query parameters.** `query_params` holds percent-decoded names and values,
+materialized the same way on HTTP/1.1, HTTP/2, and HTTP/3 (issue #6580), so a
+custom plugin needs no opt-in to see `/admin` rather than `%2Fadmin` on any
+frontend. The map is single-valued (a repeated name keeps its last value) and
+does not reflect what the backend will parse from `+` or `;`. A plugin that
+makes an authentication, authorization, or routing decision on the query should
+use `crate::plugins::utils::query::canonical_query_for_policy(ctx)` and reject
+when `first_ambiguity()` is `Some`, as the built-in OPA and
+`mesh_route_dispatch` plugins do.
+
 **Helper methods:**
 - `effective_identity()` — returns the stable identity (Consumer username preferred over external identity)
-- `backend_consumer_username()` — returns the identity for the `X-Consumer-Username` backend header
+- `backend_consumer_username()` — returns the mapped Consumer's username for the `X-Consumer-Username` backend header; `None` when no Consumer was identified
+- `backend_authenticated_identity()` — returns the external identity for the `X-Authenticated-Identity` backend header (`authenticated_identity_header`, falling back to `authenticated_identity`); `None` when a Consumer was identified
 - `backend_consumer_custom_id()` — returns the Consumer custom ID, if a gateway Consumer was resolved
 - `apply_route_overrides(proxy)` — returns an `Arc<Proxy>` with direct route overrides applied. This helper cannot re-resolve upstream TLS for `route_override_upstream_id`.
 - `apply_route_overrides_with_upstreams(proxy, upstreams)` — use this in custom dispatch paths that honor `route_override_upstream_id`; it re-resolves `resolved_tls` from the effective upstream snapshot and rebinds the precomputed H1 `pending_limit_scope` (clearing it on a direct-backend override).
 
-The `x-consumer-*` request-header namespace is gateway-owned. Client-supplied names beneath it never reach `ctx.headers`, and any `x-consumer-*` header a custom plugin writes into the outbound header map is scrubbed before dispatch; the gateway then writes only `X-Consumer-Username` / `X-Consumer-Custom-Id` from the values above. To pass additional consumer attributes to a backend, use a header name outside that namespace.
+The `x-consumer-*` request-header namespace is gateway-owned. Client-supplied names beneath it never reach `ctx.headers`, and any `x-consumer-*` header a custom plugin writes into the outbound header map is scrubbed before dispatch; the gateway then writes only `X-Consumer-Username` / `X-Consumer-Custom-Id` (mapped Consumer) or `X-Authenticated-Identity` (external identity) from the values above. All three are skipped when a plugin marks the request to suppress backend identity headers (for example, routing to a third-party AI provider). To pass additional consumer attributes to a backend, use a header name outside that namespace.
 
 ### Inter-Plugin Communication
 
@@ -1192,6 +1301,8 @@ if let Some(val) = ctx.metadata.get("my_custom_field") {
     // use val
 }
 ```
+
+The mesh workload labels `workload_metrics` stamps (`mesh.source.*`, `mesh.destination.*`) are always in `ctx.metadata` and `TransactionSummary.metadata` when a custom plugin is in the request's chain: a chain leaves them out only when every plugin in it declares `observes_mesh_label_metadata() == false` (issue #6793), and the default is `true`.
 
 ## Stream Connection Context
 
@@ -1262,9 +1373,21 @@ pub struct TransactionSummary {
     pub grpc_request_messages: u64,
     pub grpc_response_messages: u64,
     pub mirror: bool,
-    pub metadata: HashMap<String, String>,
+    pub metadata: MetadataMap,
 }
 ```
+
+`consumer_username` is a display string: a mapped Consumer and an unmapped
+external principal (for example a `jwks_auth` subject) with the same name
+produce the same value. Every summary also carries a hidden, non-serialized
+`principal_origin` (`Option<PrincipalOrigin>`, on `StreamTransactionSummary`
+and `WsDisconnectContext` too). A plugin that keys per-caller state or billing
+on the caller should use
+`plugins::utils::principal::Principal::with_origin(username, summary.principal_origin)`
+and its `push_key` form instead of the bare display string (GHSA-q9vj-rf66-3j58).
+Code that builds these structs field-by-field must set `principal_origin`
+(`ctx.principal_origin()` from the request or stream context, or take both
+fields together with `ctx.summary_identity()`).
 
 ## Stream Transaction Summary
 
@@ -1294,7 +1417,7 @@ pub struct StreamTransactionSummary {
     pub timestamp_connected: String,
     pub timestamp_disconnected: String,
     pub sni_hostname: Option<String>,
-    pub metadata: HashMap<String, String>,     // Carried from on_stream_connect
+    pub metadata: MetadataMap,     // Carried from on_stream_connect
 }
 ```
 
@@ -1372,7 +1495,7 @@ ferrum-edge/
 
 Custom plugins that need their own database tables can declare migrations that run alongside the gateway's core schema migrations. This uses the same `FERRUM_MODE=migrate` infrastructure, with a separate tracking table (`_ferrum_plugin_migrations`) so plugin version numbers are scoped per-plugin and never conflict with core migrations.
 
-> **MongoDB note:** The `CustomPluginMigration` system is SQL-only. When `FERRUM_DB_TYPE=mongodb`, custom plugin SQL migrations are skipped. Custom plugins that need MongoDB-specific collections or indexes should create them in their `create_plugin()` initialization function using the MongoDB driver's idempotent `createIndex` API. Prefix collection names with the plugin name to avoid collisions (e.g., `my_plugin_audit_log`).
+> **MongoDB note:** The `CustomPluginMigration` system is SQL-only. When `FERRUM_DB_TYPE=mongodb`, custom plugin SQL migrations are skipped. Custom plugins that need MongoDB-specific collections or indexes create them from their own background worker with the MongoDB driver's idempotent `createIndex` API, before the worker's first write: stage the worker in `start_background_tasks()` and let it touch the database only after `commit_background_tasks()` releases it. Never do this in `create_plugin()` or `new()`; the constructor is also the validator and must not dial the network (see [Config Validation Rules](#config-validation-rules)). Prefix collection names with the plugin name to avoid collisions (e.g., `my_plugin_audit_log`).
 
 ### How It Works
 
@@ -1688,8 +1811,10 @@ Use the gateway's test infrastructure in `tests/` to create end-to-end tests wit
 - [ ] Plugin `.rs` file created in `custom_plugins/`
 - [ ] `create_plugin()` factory function exported with signature `(config: &Value, http_client: PluginHttpClient) -> Result<Option<Arc<dyn Plugin>>, String>`
 - [ ] `failure_policy()` metadata function exported with the desired `PluginFailurePolicy`
+- [ ] `config_contract()` exported with examples reaching every nested object, and the `plugin_config_closure` sweep passes
 - [ ] `fn name()` returns the file name (without `.rs`)
-- [ ] Constructor rejects non-object roots, unknown keys, present wrong types, and invalid/oversized protocol values
+- [ ] Constructor rejects non-object roots, unknown keys at every depth, present wrong types, and invalid/oversized protocol values
+- [ ] Constructor has no side effects: no tasks, threads, dials, file writes, or process-global registration (stage them in `start_background_tasks()`)
 - [ ] `on_request_received()` logic does not assume it will observe unmatched 404 or matched 405 responses
 - [ ] Priority set appropriately for the execution phase
 - [ ] `supported_protocols()` returns the correct protocol set

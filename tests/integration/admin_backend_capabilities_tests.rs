@@ -80,7 +80,7 @@ fn generate_test_token(config: &TestConfig) -> String {
         "jti": uuid::Uuid::new_v4().to_string(),
     });
     let header = Header::new(jsonwebtoken::Algorithm::HS256);
-    let key = EncodingKey::from_secret(config.jwt_secret.as_bytes());
+    let key = EncodingKey::from_secret(config.jwt_secret.as_bytes()).unwrap();
     encode(&header, &claims, &key).unwrap()
 }
 
@@ -303,7 +303,6 @@ fn make_minimal_proxy(id: &str) -> ferrum_edge::config::types::Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
@@ -555,7 +554,7 @@ async fn get_backend_capabilities_rejects_invalid_token() {
         "jti": uuid::Uuid::new_v4().to_string(),
     });
     let header = Header::new(jsonwebtoken::Algorithm::HS256);
-    let key = EncodingKey::from_secret("a-completely-different-secret".as_bytes());
+    let key = EncodingKey::from_secret("a-completely-different-secret".as_bytes()).unwrap();
     let bad_token = encode(&header, &claims, &key).unwrap();
 
     let (status, _body) = admin_request_with_token(

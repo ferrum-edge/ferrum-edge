@@ -1422,6 +1422,16 @@ impl<B> StreamRef<B> {
         me.actions.send.capacity(&mut stream)
     }
 
+    // FERRUM PATCH 004: see `server::SendResponse::reset_is_local`.
+    pub fn reset_is_local(&self) -> Option<bool> {
+        let mut me = self.opaque.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let stream = me.store.resolve(self.opaque.key);
+
+        stream.state.reset_is_local()
+    }
+
     // FERRUM PATCH 003: see `SendStream::capacity_and_assigned`.
     pub fn capacity_and_assigned(&self) -> (WindowSize, WindowSize) {
         let mut me = self.opaque.inner.lock().unwrap();

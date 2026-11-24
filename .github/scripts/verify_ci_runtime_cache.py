@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import subprocess
 import sys
 from collections import Counter
 from pathlib import Path
@@ -39,7 +40,6 @@ from ci_runtime_plan import (
 )
 from ci_runtime_telemetry import self_test as telemetry_self_test
 from verify_cross_build_policy import (
-    CI_CACHE_PERMISSIONS,
     AMBIENT_REGISTRY_IMAGE_AGGREGATE_JOB,
     AMBIENT_REGISTRY_IMAGE_READ_JOB,
     AMBIENT_REGISTRY_IMAGE_WRITE_JOB,
@@ -47,7 +47,95 @@ from verify_cross_build_policy import (
     NODE_DEFAULT_REGISTRY_WRITE_JOB,
     NODE_WAYPOINT_IMAGE_GATE_JOB,
     extract_job_contract_block,
+    normalize_action_pins,
 )
+
+_PULL_REQUEST_PATHS_RE = re.compile(
+    r"(?ms)^  pull_request:\n    paths:\n(?P<paths>(?:      - .+\n)+)",
+)
+_TOP_LEVEL_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+:")
+_QUOTED_EVENT_KEY_RE = re.compile(r'^  ["\']')
+_INLINE_EVENT_VALUE_RE = re.compile(r"^  [A-Za-z0-9_-]+:\s*\S")
+_EVENT_LEVEL_LINE_RE = re.compile(r"^  \S")
+_JOB_IF_RE = re.compile(r"(?m)^    if:\s*(.+)\s*$")
+_JOB_IF_ALWAYS_RE = re.compile(r"(?m)^    if: always\(\)$")
+_NODE_WAYPOINT_SKIP_STEP_RE = re.compile(
+    r"(?m)^      - name: Skip NodeWaypoint eBPF live datapath for unrelated changes$",
+)
+_SKIP_STEP_NAME_RE = re.compile(r"(?m)^      - name: Skip")
+_JOB_NEEDS_LIST_RE = re.compile(r"(?m)^    needs:\n(?P<needs>(?:^      - [^\n]+\n)+)")
+_JOB_NEEDS_SCALAR_RE = re.compile(r"(?m)^    needs: ([A-Za-z0-9_-]+)$")
+_JOB_STEPS_RE = re.compile(r"(?ms)^    steps:\n(.*)\Z")
+_STEP_BOUNDARY_RE = re.compile(r"(?m)^(?=      - )")
+_STEP_IF_RE = re.compile(r"(?m)^      (?:- )?if:\s*(.+)\s*$")
+_STEP_NESTED_IF_RE = re.compile(r"(?m)^        if:\s*(.+)\s*$")
+_STEP_RUN_BLOCK_BODY_RE = re.compile(r"(?ms)^        run:[ \t]+\|[-+]?[ \t]*\n(?P<body>.*)\Z")
+_EXIT_COMMAND_RE = re.compile(r"exit\s+\d+")
+_STEP_USES_RE = re.compile(r"(?m)^      (?:- )?uses:\s*(\S+)")
+_STEP_NESTED_USES_RE = re.compile(r"(?m)^        uses:\s*(\S+)")
+_STEP_WITH_RE = re.compile(r"(?m)^        with:\n")
+_LIST_ITEM_BOUNDARY_RE = re.compile(r"(?m)^(?=[ ]{2,}- )")
+_LIST_ITEM_RE = re.compile(r"(?m)^[ ]{2,}- ")
+_WITH_BLOCK_RE = re.compile(r"(?ms)^[ \t]+with:\n((?:[ \t]+[^\n]*\n)*)")
+_RUST_ENVIRONMENT_HASH_KEY_FALSE_RE = re.compile(
+    r"(?m)^[ \t]*add-rust-environment-hash-key:\s*['\"]?false",
+)
+_JOB_ENV_BLOCK_RE = re.compile(r"(?ms)^    env:\s*\n(?P<body>(?:^      [^\n]*\n)*)")
+_JOB_ENV_RUSTC_WRAPPER_RE = re.compile(r"(?m)^      (?:RUSTC_WRAPPER|CARGO_BUILD_RUSTC_WRAPPER):")
+_STEP_EMPTY_RUSTC_WRAPPER_ENV_RE = re.compile(
+    r'(?m)^        env:\s*\n'
+    r'          RUSTC_WRAPPER: ["\']{2}\s*\n'
+    r'          CARGO_BUILD_RUSTC_WRAPPER: ["\']{2}\s*$'
+)
+_CI_PERF_SHARED_KEY_RE = re.compile(r'(?m)^          shared-key: ["\']ci-perf["\']\s*$')
+_SAVE_IF_RE = re.compile(r"(?m)^\s*save-if:([^\n]*)$")
+_CACHE_TARGETS_RE = re.compile(r"(?m)^\s*cache-targets:([^\n]*)$")
+_STEP_NAME_RE = re.compile(r"(?m)^      - name: (.+)$")
+_RUST_BUILDER_STAGE_RE = re.compile(
+    r"^FROM rust(?::[^\s@]+)?(?:@sha256:[0-9a-f]{64})? AS builder$",
+    re.M,
+)
+_FERRUM_LOG_LEVEL_ASSIGNMENT_RE = re.compile(r"\bFERRUM_LOG_LEVEL=([^\s\\]+)")
+_IMAGE_REFERENCE_LIKE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*:[^\s]+")
+_STEP_RUN_BLOCK_START_RE = re.compile(r"(?m)^        run:[ \t]+\|[ \t]*\n")
+_RESOLVE_STEP_ID_RE = re.compile(r"(?m)^        id: resolve$")
+_PERMISSION_ENTRY_RE = re.compile(r"  ([a-z][a-z-]*): (read|write|none)")
+_FIPS_FEATURE_POLICY_NAME_RE = re.compile(r"(?m)^    name: FIPS Feature Policy$")
+_FIPS_BUILD_AND_TEST_NAME_RE = re.compile(r"(?m)^    name: FIPS Build & Test$")
+_FIPS_POLICY_TESTS_COMMAND_RE = re.compile(
+    r"cargo test[^\n]*tls::fips_policy_tests[^\n]+tls::fips_key_admission_tests",
+)
+_FIPS_HANDSHAKE_TESTS_COMMAND_RE = re.compile(
+    r"cargo test[^\n]*frontend_and_backend_builders_complete_a_real_tls_handshake"
+    r"[^\n]+legitimate_data_plane_connects_once_a_permit_is_released"
+)
+_PRODUCTION_SMOKE_NAME_RE = re.compile(r"(?m)^    name: Production Dockerfile eBPF image smoke$")
+_CACHE_ON_FAILURE_RE = re.compile(r"(?m)^[ \t]+cache-on-failure:[ \t]*(.*)$")
+# The lib-unit coverage shard compiles the inline harness and all four unit
+# targets in ONE llvm-cov invocation (issue #7282: matching only `--lib` and
+# `--test unit_tests` let three of the four targets drop out unnoticed).
+_COVERAGE_UNIT_TESTS_COMMAND_RE = re.compile(
+    r"(?m)^\s*cargo llvm-cov --no-report\s+\\\n"
+    r"\s*--lib\s+\\\n"
+    r"\s*--test unit_tests\s+\\\n"
+    r"\s*--test unit_plugins_a_tests\s+\\\n"
+    r"\s*--test unit_plugins_b_tests\s+\\\n"
+    r"\s*--test unit_gateway_core_tests\s*$"
+)
+_ROOT_DESCRIPTION_BLOCK_RE = re.compile(r"(?m)^description:[^\n]*\n(?:(?:[ \t]+[^\n]*)?\n)*")
+
+
+def read_pinned(path: Path) -> str:
+    """Read a contract input with external action pins normalized.
+
+    The frozen templates shared with `verify_cross_build_policy.py` compare
+    pin-normalized text, and so does every contract here: they pin which action
+    runs and how, while the trusted action pin rotation check governs which
+    upstream release commit it is (docs/dependency-policy.md → "Automated
+    action pin rotation").
+    """
+
+    return normalize_action_pins(path.read_text(encoding="utf-8"))
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -59,12 +147,10 @@ DOCKERFILE = REPO_ROOT / "Dockerfile"
 DOCKERFILE_RELEASE = REPO_ROOT / "Dockerfile.release"
 DOCKERFILE_EBPF_TOOLS_LAYER = REPO_ROOT / "Dockerfile.ebpf-tools-layer"
 DOCKERFILE_IPROUTE2_LAYER = REPO_ROOT / "Dockerfile.iproute2-layer"
-DOCKERFILE_TEST = REPO_ROOT / "Dockerfile.test"
 SETUP_RUST = REPO_ROOT / ".github" / "actions" / "setup-rust-ci" / "action.yml"
 SETUP_SCCACHE = REPO_ROOT / ".github" / "actions" / "setup-sccache" / "action.yml"
 SETUP_FAST_LINKER = REPO_ROOT / ".github" / "actions" / "setup-fast-linker" / "action.yml"
 CI_CD_DOC = REPO_ROOT / "docs" / "ci_cd.md"
-FIPS_DOC = REPO_ROOT / "docs" / "fips.md"
 COVERAGE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "coverage.yml"
 CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 PERFORMANCE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "performance-regression.yml"
@@ -97,17 +183,15 @@ COMPLETED_CACHE_PRODUCER_JOBS = (
     ("coverage.yml", "coverage-shard"),
 )
 
-CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
-RUST_TOOLCHAIN = "dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8"
-RUST_CACHE = "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6"
-BORINGCACHE_CARGO_PREFIX = "boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile "
-BORINGCACHE_DIRECT_PROFILES = {("ci.yml", "build-binaries"): "binaries", ("ci.yml", "build-ebpf"): "ebpf"}
-BUILDX = "docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069"
-BUILD_PUSH = "docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc"
-CACHE_RESTORE = "actions/cache/restore@374a27f26986edd8c430f386d152a856e179c0ae"
-CACHE_SAVE = "actions/cache/save@374a27f26986edd8c430f386d152a856e179c0ae"
-UPLOAD_ARTIFACT = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
-DOWNLOAD_ARTIFACT = "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
+CHECKOUT = "actions/checkout@0000000000000000000000000000000000000000"
+RUST_TOOLCHAIN = "dtolnay/rust-toolchain@0000000000000000000000000000000000000000"
+RUST_CACHE = "Swatinem/rust-cache@0000000000000000000000000000000000000000"
+BUILDX = "docker/setup-buildx-action@0000000000000000000000000000000000000000"
+BUILD_PUSH = "docker/build-push-action@0000000000000000000000000000000000000000"
+CACHE_RESTORE = "actions/cache/restore@0000000000000000000000000000000000000000"
+CACHE_SAVE = "actions/cache/save@0000000000000000000000000000000000000000"
+UPLOAD_ARTIFACT = "actions/upload-artifact@0000000000000000000000000000000000000000"
+DOWNLOAD_ARTIFACT = "actions/download-artifact@0000000000000000000000000000000000000000"
 FIPS_CONTRACT_HASHFILES = (
     "hashFiles('Cargo.toml', 'Cargo.lock', '.cargo/config.toml', 'build.rs', "
     "'.github/workflows/fips-build.yml', "
@@ -142,13 +226,11 @@ SCCACHE_EXPORT_VARIABLE_TOKEN = "exportVariable"
 FIPS_ALLOWED_ACTION_COUNTS = {
     CHECKOUT: 7,
     RUST_TOOLCHAIN: 5,
-    "./.github/actions/setup-sccache": 4,
     "./.github/actions/setup-fast-linker": 4,
     RUST_CACHE: 4,
     DOWNLOAD_ARTIFACT: 5,
     UPLOAD_ARTIFACT: 2,
 }
-FIPS_ALLOWED_ACTION_USES = frozenset(FIPS_ALLOWED_ACTION_COUNTS)
 FIPS_CHECKOUT_COUNT = FIPS_ALLOWED_ACTION_COUNTS[CHECKOUT]
 # Closed checkout `with:` contract: current repo, default ref, default root.
 CHECKOUT_ALLOWED_WITH_KEYS = frozenset({"persist-credentials", "fetch-depth"})
@@ -178,6 +260,10 @@ YAML_DOUBLE_QUOTED_ESCAPES = {
 # `<<` is a YAML merge key, not an identifier. Keep it in the key token so
 # block/flow merge spellings are parsed and rejected rather than skipped.
 YAML_KEY_TOKEN = r"'(?:[^']|'')*'|\"(?:[^\"\\]|\\.)*\"|<<|[A-Za-z0-9_.+-]+"
+
+_FLOW_KEY_VALUE_RE = re.compile(rf"^({YAML_KEY_TOKEN})[ \t]*:(.*)$", re.DOTALL)
+_FLOW_KEY_PREFIX_RE = re.compile(rf"^(?:{YAML_KEY_TOKEN})[ \t]*:", re.DOTALL)
+
 YAML_MAPPING_LINE = re.compile(
     rf"^(?P<lead>[ \t]*)(?P<dash>-[ \t]+)?(?P<key>{YAML_KEY_TOKEN})[ \t]*:(?P<value>.*)$"
 )
@@ -197,9 +283,6 @@ CREDENTIAL_ASSERT_VARS = (
     "ACTIONS_RUNTIME_TOKEN",
     "ACTIONS_RESULTS_URL",
 )
-BUILDKIT_CACHE_SCHEMA = "v1"
-CACHE_KIND_EXACT = "steps.cache-kind.outputs.kind == 'exact'"
-CACHE_KIND_PUBLISH = "steps.cache-kind.outputs.publish == 'true'"
 NUL_DIFF = 'git diff --name-only --no-renames -z "${trusted_sha}...HEAD"'
 LINE_DIFF = 'git diff --name-only --no-renames "${trusted_sha}...HEAD"'
 NODE_WAYPOINT_PLANNER_OUTPUT = (
@@ -220,10 +303,7 @@ PINNED_REMOTE = re.compile(
 
 
 def extract_pull_request_paths(workflow: str) -> list[str]:
-    match = re.search(
-        r"(?ms)^  pull_request:\n    paths:\n(?P<paths>(?:      - .+\n)+)",
-        workflow,
-    )
+    match = _PULL_REQUEST_PATHS_RE.search(workflow)
     if match is None:
         return []
     paths: list[str] = []
@@ -251,7 +331,7 @@ def extract_on_block(workflow: str) -> str:
         (
             index
             for index in range(start + 1, len(lines))
-            if re.match(r"^[A-Za-z0-9_-]+:", lines[index])
+            if _TOP_LEVEL_KEY_RE.match(lines[index])
         ),
         len(lines),
     )
@@ -310,9 +390,9 @@ def parse_canonical_on_events(workflow: str) -> dict[str, tuple[str, ...]] | Non
             continue
         if current is None:
             return None
-        if re.match(r'^  ["\']', raw) or re.match(r"^  [A-Za-z0-9_-]+:\s*\S", raw):
+        if _QUOTED_EVENT_KEY_RE.match(raw) or _INLINE_EVENT_VALUE_RE.match(raw):
             return None
-        if re.match(r"^  \S", raw) and not raw.startswith("    "):
+        if _EVENT_LEVEL_LINE_RE.match(raw) and not raw.startswith("    "):
             return None
         events[current].append(raw)
     return {name: tuple(body) for name, body in events.items()}
@@ -483,7 +563,7 @@ def check_governed_live_trigger_shape(
 
 
 def job_if(job_body: str) -> str:
-    match = re.search(r"(?m)^    if:\s*(.+)\s*$", job_body)
+    match = _JOB_IF_RE.search(job_body)
     if match:
         return match.group(1).strip()
     return ""
@@ -630,9 +710,7 @@ def check_node_waypoint_live_job(
     require(bool(live_job), f"{source} node-waypoint-ebpf-live job is missing", failures)
     require(
         "node_waypoint_relevant: ${{ steps.filter.outputs.node_waypoint_relevant }}"
-        in plan_job
-        or "node_waypoint_relevant: ${{ steps.filter.outputs.node_waypoint_relevant }}"
-        in workflow,
+        in plan_job,
         f"{source} plan job must expose node_waypoint_relevant as a job output",
         failures,
     )
@@ -704,8 +782,7 @@ def check_node_waypoint_live_job(
         failures,
     )
     require(
-        'ferrum_mesh_bpf_drops_total{reason="exclude_port_hit"}' in live_job
-        or "ferrum_mesh_bpf_drops_total" in live_job,
+        'ferrum_mesh_bpf_drops_total{reason="exclude_port_hit"}' in live_job,
         f"{source} live job must still assert a real BPF bypass metric",
         failures,
     )
@@ -779,6 +856,10 @@ def check_node_waypoint_live_job(
 NODE_WAYPOINT_AGGREGATE_JOB = "node-waypoint-ebpf-live-gate"
 NODE_WAYPOINT_AGGREGATE_NAME = "NodeWaypoint eBPF Live"
 
+_NODE_WAYPOINT_AGGREGATE_NAME_LINE_RE = re.compile(
+    rf"(?m)^    name: {re.escape(NODE_WAYPOINT_AGGREGATE_NAME)}$",
+)
+
 
 def check_node_waypoint_aggregate(
     workflow: str,
@@ -795,16 +876,14 @@ def check_node_waypoint_aggregate(
     if not aggregate:
         return
     require(
-        re.search(
-            rf"(?m)^    name: {re.escape(NODE_WAYPOINT_AGGREGATE_NAME)}$", aggregate
-        )
+        _NODE_WAYPOINT_AGGREGATE_NAME_LINE_RE.search(aggregate)
         is not None,
         f"{source} aggregate must keep the check name "
         f"{NODE_WAYPOINT_AGGREGATE_NAME!r}",
         failures,
     )
     require(
-        re.search(r"(?m)^    if: always\(\)$", aggregate) is not None,
+        _JOB_IF_ALWAYS_RE.search(aggregate) is not None,
         f"{source} aggregate must run with if: always() so a skipped or failed "
         "live job still reports",
         failures,
@@ -835,10 +914,7 @@ def check_node_waypoint_aggregate(
     skip_steps = [
         step
         for step in steps
-        if re.search(
-            r"(?m)^      - name: Skip NodeWaypoint eBPF live datapath for unrelated changes$",
-            step,
-        )
+        if _NODE_WAYPOINT_SKIP_STEP_RE.search(step)
     ]
     require(
         len(skip_steps) == 1,
@@ -889,7 +965,7 @@ def check_aggregate_planner_contract(
     skip_steps = [
         step
         for step in job_steps(aggregate_body)
-        if re.search(r"(?m)^      - name: Skip", step)
+        if _SKIP_STEP_NAME_RE.search(step)
     ]
     require(
         len(skip_steps) == 1,
@@ -942,31 +1018,6 @@ def require(condition: bool, message: str, failures: list[str]) -> None:
 
 FORK_IS_TRUE = "github.event.pull_request.head.repo.fork == true"
 FORK_NOT_TRUE = "github.event.pull_request.head.repo.fork != true"
-AMBIENT_GHA_CACHE_SCOPE = "ambient-host-udp-images"
-AMBIENT_GHA_CACHE_FROM = f"type=gha,scope={AMBIENT_GHA_CACHE_SCOPE}"
-AMBIENT_GHA_CACHE_TO_EXPORT = f"type=gha,mode=max,scope={AMBIENT_GHA_CACHE_SCOPE}"
-AMBIENT_GHA_CACHE_TO = (
-    "${{ github.event_name != 'pull_request' && "
-    "github.event_name != 'merge_group' && "
-    "github.ref == 'refs/heads/main' && "
-    f"{FORK_NOT_TRUE} && "
-    f"'{AMBIENT_GHA_CACHE_TO_EXPORT}' || '' }}}}"
-)
-AMBIENT_IMAGE_BUILDS = (
-    ("Build the capture tool base stage", "capture-tools-base"),
-    (
-        "Build the production Ambient UDP lifecycle runtime",
-        "runtime-ebpf-tools",
-    ),
-    ("Build the distroless eBPF runtime", "runtime-ebpf"),
-)
-AMBIENT_IMAGE_CONTRACTS = (
-    "Prove the published runtime can execute the production tool set",
-    "Prove the `-ebpf` image keeps its distroless contract",
-)
-UNCONDITIONAL_AMBIENT_CACHE_TO = re.compile(
-    r"(?m)^[ \t]*cache-to:[ \t]*type=gha,mode=max,scope=ambient-host-udp-images\s*$"
-)
 COLD_IS_TRUE = "github.event.inputs.force_cold_cache == 'true'"
 COLD_NOT_TRUE = "github.event.inputs.force_cold_cache != 'true'"
 SAVE_IF_NON_FORK = re.compile(
@@ -1021,34 +1072,32 @@ def extract_job(workflow: str, job: str) -> str:
 
 
 def job_needs_list(job_body: str) -> set[str]:
-    list_match = re.search(
-        r"(?m)^    needs:\n(?P<needs>(?:^      - [^\n]+\n)+)", job_body
-    )
+    list_match = _JOB_NEEDS_LIST_RE.search(job_body)
     if list_match:
         return {
             line.strip().removeprefix("- ").strip()
             for line in list_match.group("needs").splitlines()
             if line.strip().startswith("- ")
         }
-    scalar_match = re.search(r"(?m)^    needs: ([A-Za-z0-9_-]+)$", job_body)
+    scalar_match = _JOB_NEEDS_SCALAR_RE.search(job_body)
     if scalar_match:
         return {scalar_match.group(1)}
     return set()
 
 
 def job_steps(job_body: str) -> list[str]:
-    match = re.search(r"(?ms)^    steps:\n(.*)\Z", job_body)
+    match = _JOB_STEPS_RE.search(job_body)
     if match is None:
         return []
-    chunks = re.split(r"(?m)^(?=      - )", match.group(1))
+    chunks = _STEP_BOUNDARY_RE.split(match.group(1))
     return [chunk for chunk in chunks if chunk.lstrip().startswith("- ")]
 
 
 def step_if(step: str) -> str:
-    match = re.search(r"(?m)^      (?:- )?if:\s*(.+)\s*$", step)
+    match = _STEP_IF_RE.search(step)
     if match:
         return match.group(1).strip()
-    match = re.search(r"(?m)^        if:\s*(.+)\s*$", step)
+    match = _STEP_NESTED_IF_RE.search(step)
     if match:
         return match.group(1).strip()
     return ""
@@ -1071,10 +1120,7 @@ def step_run_ends_with_exit(step: str, code: int) -> bool:
     if re.search(rf"(?m)^        run:[ \t]+{re.escape(expected)}[ \t]*$", step):
         return True
 
-    block = re.search(
-        r"(?ms)^        run:[ \t]+\|[-+]?[ \t]*\n(?P<body>.*)\Z",
-        step,
-    )
+    block = _STEP_RUN_BLOCK_BODY_RE.search(step)
     if block is None:
         return False
     commands = [
@@ -1084,21 +1130,21 @@ def step_run_ends_with_exit(step: str, code: int) -> bool:
     ]
     if not commands:
         return False
-    exits = [line for line in commands if re.fullmatch(r"exit\s+\d+", line)]
+    exits = [line for line in commands if _EXIT_COMMAND_RE.fullmatch(line)]
     return exits == [expected] and commands[-1] == expected
 
 
 def step_uses(step: str) -> str:
-    match = re.search(r"(?m)^      (?:- )?uses:\s*(\S+)", step)
+    match = _STEP_USES_RE.search(step)
     if match is None:
-        match = re.search(r"(?m)^        uses:\s*(\S+)", step)
+        match = _STEP_NESTED_USES_RE.search(step)
     if match is None:
         return ""
     return _yaml_strip_trailing_comment(match.group(1)).strip()
 
 
 def step_with(step: str) -> str:
-    match = re.search(r"(?m)^        with:\n", step)
+    match = _STEP_WITH_RE.search(step)
     if match is None:
         return ""
     lines: list[str] = []
@@ -1120,13 +1166,10 @@ def with_has_key(with_block: str, key: str) -> bool:
 
 def rust_cache_with_blocks(text: str) -> list[str]:
     blocks: list[str] = []
-    for chunk in re.split(r"(?m)^(?=[ ]{2,}- )", text):
-        if RUST_CACHE not in chunk or not re.search(r"(?m)^[ ]{2,}- ", chunk):
+    for chunk in _LIST_ITEM_BOUNDARY_RE.split(text):
+        if RUST_CACHE not in chunk or not _LIST_ITEM_RE.search(chunk):
             continue
-        with_match = re.search(
-            r"(?ms)^[ \t]+with:\n((?:[ \t]+[^\n]*\n)*)",
-            chunk,
-        )
+        with_match = _WITH_BLOCK_RE.search(chunk)
         blocks.append(with_match.group(1) if with_match else "")
     return blocks
 
@@ -1162,10 +1205,7 @@ def check_rust_cache_uses_shared_key_only(
         failures,
     )
     require(
-        re.search(
-            r"(?m)^[ \t]*add-rust-environment-hash-key:\s*['\"]?false",
-            with_block,
-        )
+        _RUST_ENVIRONMENT_HASH_KEY_FALSE_RE.search(with_block)
         is None,
         f"{source} must preserve automatic rust environment/manifest/lock hashing",
         failures,
@@ -1189,7 +1229,7 @@ def check_credential_absence_assertion(
             failures,
         )
     require(
-        '[ -n "${!var:-}" ]' in text or "[ -n \"${!var:-}\" ]" in text,
+        '[ -n "${!var:-}" ]' in text,
         f"{source} must test credential presence via ${{!var:-}} without "
         "printing values",
         failures,
@@ -1592,7 +1632,7 @@ def _collect_flow_mapping_pairs(flow: str) -> tuple[list[tuple[str, str]], list[
         if item.startswith("?"):
             errors.append("explicit YAML key")
             continue
-        match = re.match(rf"^({YAML_KEY_TOKEN})[ \t]*:(.*)$", item, re.DOTALL)
+        match = _FLOW_KEY_VALUE_RE.match(item)
         if match is None:
             errors.append("unreadable flow mapping entry")
             continue
@@ -1639,7 +1679,7 @@ def _collect_flow_sequence(flow: str) -> tuple[list[tuple[str, str]], list[str]]
             pairs.extend(nested)
             errors.extend(nested_errors)
             continue
-        match = re.match(rf"^({YAML_KEY_TOKEN})[ \t]*:(.*)$", item, re.DOTALL)
+        match = _FLOW_KEY_VALUE_RE.match(item)
         if match is not None:
             pairs.append((match.group(1), match.group(2)))
             _collect_nested_flow_value(match.group(2).strip(), pairs, errors)
@@ -1680,7 +1720,7 @@ def _scan_structural_text(
             pairs, flow_errors = _collect_flow_sequence(flow_text)
         _record_flow_pairs(pairs, flow_errors, uses, using, errors)
         return
-    match = re.match(rf"^({YAML_KEY_TOKEN})[ \t]*:(.*)$", item, re.DOTALL)
+    match = _FLOW_KEY_VALUE_RE.match(item)
     if match is None:
         errors.append("unreadable YAML structure")
         return
@@ -1703,7 +1743,7 @@ def _is_plain_sequence_scalar(item: str) -> bool:
     had_props, remainder = _leading_yaml_node_properties(text)
     if had_props or remainder[:1] in {"{", "[", "?"}:
         return False
-    return re.match(rf"^(?:{YAML_KEY_TOKEN})[ \t]*:", remainder, re.DOTALL) is None
+    return _FLOW_KEY_PREFIX_RE.match(remainder) is None
 
 
 def _yaml_mapping_key_indent(parsed: re.Match[str]) -> int:
@@ -2421,16 +2461,10 @@ def check_performance_cache_wrapper_key(
     )
     if not job:
         return
-    job_env_match = re.search(
-        r"(?ms)^    env:\s*\n(?P<body>(?:^      [^\n]*\n)*)",
-        job,
-    )
+    job_env_match = _JOB_ENV_BLOCK_RE.search(job)
     job_env = job_env_match.group("body") if job_env_match is not None else ""
     require(
-        re.search(
-            r"(?m)^      (?:RUSTC_WRAPPER|CARGO_BUILD_RUSTC_WRAPPER):",
-            job_env,
-        )
+        _JOB_ENV_RUSTC_WRAPPER_RE.search(job_env)
         is None,
         f"{source} performance-regression must not clear the rustc wrapper at "
         "job scope; benchmark builds need the verified sccache wrapper",
@@ -2451,12 +2485,7 @@ def check_performance_cache_wrapper_key(
         return
     setup_index, setup = setup_steps[0]
     require(
-        re.search(
-            r'(?m)^        env:\s*\n'
-            r'          RUSTC_WRAPPER: ["\']{2}\s*\n'
-            r'          CARGO_BUILD_RUSTC_WRAPPER: ["\']{2}\s*$',
-            setup,
-        )
+        _STEP_EMPTY_RUSTC_WRAPPER_ENV_RE.search(setup)
         is not None,
         f"{source} performance setup-rust-ci step must clear RUSTC_WRAPPER and "
         "CARGO_BUILD_RUSTC_WRAPPER only for the nested rust-cache key calculation",
@@ -2464,7 +2493,7 @@ def check_performance_cache_wrapper_key(
     )
     with_block = step_with(setup)
     require(
-        re.search(r'(?m)^          shared-key: ["\']ci-perf["\']\s*$', with_block)
+        _CI_PERF_SHARED_KEY_RE.search(with_block)
         is not None
         and "tests/performance/mesh -> target" in with_block,
         f"{source} performance setup-rust-ci step must retain the ci-perf shared "
@@ -2562,15 +2591,9 @@ def check_fips_producer_channel(
         'find "$target_root" -xdev -type f '
         '\\\n            -exec touch --reference="$mtime_reference" -- {} +'
     )
-    compiler_identity_step_name = (
-        "Stabilize Cargo compiler identity for exact-target reuse"
-    )
-    compiler_identity_contract = (
-        "FERRUM_SCCACHE_BIN",
-        "--stop-server",
-        "'RUSTC_WRAPPER='",
-        "'CARGO_BUILD_RUSTC_WRAPPER='",
-        '>> "$GITHUB_ENV"',
+    compiler_identity_env = (
+        '      RUSTC_WRAPPER: ""\n',
+        '      CARGO_BUILD_RUSTC_WRAPPER: ""\n',
     )
     cmake_quarantine_step_name = (
         "Quarantine restored AWS-LC FIPS CMake state"
@@ -2611,34 +2634,19 @@ def check_fips_producer_channel(
         ("fips-clippy", clippy_job),
         ("fips-test-build", test_build_job),
     ):
-        identity_steps = [
-            step
-            for step in job_steps(job_body)
-            if f"name: {compiler_identity_step_name}" in step
-        ]
+        # Cargo hashes the resolved rustc-wrapper executable into every
+        # artifact, so the exact target handoff only survives across jobs when
+        # no wrapper is active. A job-level `env` entry outranks any
+        # `GITHUB_ENV` write, so it clears the wrapper for every step.
+        job_header = job_body.split("\n    steps:\n", 1)[0] + "\n"
+        env_block = job_header.split("\n    env:\n", 1)[1] if "\n    env:\n" in job_header else ""
         require(
-            len(identity_steps) == 1,
-            f"{job_name} must stabilize the Cargo compiler identity exactly once",
-            failures,
-        )
-        setup_position = job_body.find("uses: ./.github/actions/setup-sccache")
-        identity_position = job_body.find(compiler_identity_step_name)
-        cache_position = job_body.find(
-            "Cache FIPS Rust, AWS-LC, and sccache outputs"
-        )
-        require(
-            setup_position >= 0
-            and identity_position >= 0
-            and cache_position >= 0
-            and setup_position < identity_position < cache_position
-            and bool(identity_steps)
-            and not step_if(identity_steps[0])
-            and all(
-                contract in identity_steps[0]
-                for contract in compiler_identity_contract
-            ),
-            f"{job_name} must clear the runner-unique rustc-wrapper identity "
-            "after setup-sccache and before any Cargo/cache operation",
+            all(entry in env_block for entry in compiler_identity_env)
+            and "setup-sccache" not in job_body
+            and "RUSTC_WRAPPER=" not in job_body,
+            f"{job_name} must clear RUSTC_WRAPPER and CARGO_BUILD_RUSTC_WRAPPER "
+            "at job level and install no compiler-cache wrapper, so the exact "
+            "target handoff keeps the native rustc identity",
             failures,
         )
     cmake_quarantine_steps = [
@@ -2849,7 +2857,7 @@ def check_fips_producer_channel(
         failures,
     )
     cache_position = compile_job.find(
-        "Cache FIPS Rust, AWS-LC, and sccache outputs"
+        "Cache FIPS Rust and AWS-LC outputs"
     )
     quarantine_position = compile_job.find(cmake_quarantine_step_name)
     download_position = compile_job.find(
@@ -2882,9 +2890,9 @@ def check_fips_producer_channel(
         and '[ ! -f "$archive" ] || [ -L "$archive" ]' in compile_job
         and 'tar --zstd --no-same-owner -xf "$archive" -C "$extract_root"'
         in compile_job
-        and 'for path in target .cache/sccache; do' in compile_job
+        and 'for path in target; do' in compile_job
         and '[ ! -d "$source_path" ] || [ -L "$source_path" ]' in compile_job,
-        "fips-compile must validate the tar payload and both restored directories, "
+        "fips-compile must validate the tar payload and the restored target directory, "
         "reject symlinks, and preserve archived modes",
         failures,
     )
@@ -2919,11 +2927,11 @@ def check_fips_producer_channel(
         in package_steps[0]
         and "fips-producer-identity fips-producer-source-tree"
         in package_steps[0]
-        and '-C "$GITHUB_WORKSPACE" target .cache/sccache'
+        and '-C "$GITHUB_WORKSPACE" target\n'
         in package_steps[0]
         and '[ ! -s "$archive" ] || [ -L "$archive" ]'
         in package_steps[0],
-        "fips-compile must package target, sccache, identity, and the clean "
+        "fips-compile must package target, identity, and the clean "
         "checkout tree identity into a nonempty tar.zst handoff that preserves "
         "executable modes and materializes hard-linked outputs as regular files",
         failures,
@@ -3038,7 +3046,7 @@ def check_fips_producer_channel(
         'archive="${payload_dir}/fips-producer-handoff.tar.zst"',
         '[ ! -f "$archive" ] || [ -L "$archive" ]',
         'tar --zstd --no-same-owner -xf "$archive" -C "$extract_root"',
-        "for path in target .cache/sccache; do",
+        "for path in target; do",
         '[ ! -d "$source_path" ] || [ -L "$source_path" ]',
         'tree_manifest="${extract_root}/fips-producer-source-tree"',
         '[ ! -f "$tree_manifest" ] || [ -L "$tree_manifest" ]',
@@ -3049,7 +3057,6 @@ def check_fips_producer_channel(
         "git diff --quiet --no-ext-diff",
         "git diff --cached --quiet --no-ext-diff",
         'mv "${extract_root}/target" "${GITHUB_WORKSPACE}/target"',
-        'mv "${extract_root}/.cache/sccache" "${GITHUB_WORKSPACE}/.cache/sccache"',
         'mtime_reference="${RUNNER_TEMP}/fips-target-mtime-reference"',
         'touch "$mtime_reference"',
         'rm -f "$mtime_reference"',
@@ -3204,7 +3211,7 @@ def check_fips_producer_channel(
         )
         require(
             "Drop stable target before producer promotion" in job_body,
-            f"{job_name} must drop rust-cache target/sccache before promoting "
+            f"{job_name} must drop the rust-cache target before promoting "
             "the SHA-scoped producer handoff",
             failures,
         )
@@ -3245,7 +3252,7 @@ def check_fips_producer_channel(
         failures,
     )
     require(
-        "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+        "actions/upload-artifact@0000000000000000000000000000000000000000"
         in test_build_job
         and "if-no-files-found: error" in test_build_job
         and "fips-test-binaries-${{ github.run_id }}-${{ github.run_attempt }}"
@@ -3318,7 +3325,7 @@ def check_fips_producer_channel(
     )
 
     require(
-        "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
+        "actions/download-artifact@0000000000000000000000000000000000000000"
         in test_job
         and "pattern: fips-test-binaries-${{ github.run_id }}-*" in test_job
         and "merge-multiple: false" in test_job
@@ -3377,8 +3384,15 @@ def check_rust_cache_fork_save_if(
             "restore only",
             failures,
         )
+        # Exactly one `cache-on-failure:` key whose value is `true`; "true"
+        # anywhere else in the block (a save-if expression) does not count
+        # (issue #7282).
         require(
-            "cache-on-failure:" in block and "true" in block,
+            [
+                value.split(" #", 1)[0].strip().strip("\"'")
+                for value in _CACHE_ON_FAILURE_RE.findall(block)
+            ]
+            == ["true"],
             f"{source} rust-cache site {index} must keep cache-on-failure true",
             failures,
         )
@@ -3420,38 +3434,11 @@ def check_direct_rust_cache_diet(
     failures: list[str],
     *,
     compiler_only: bool,
-    cargo_profile: str | None = None,
 ) -> None:
     blocks = rust_cache_with_blocks(job)
-    if cargo_profile is not None and BORINGCACHE_CARGO_PREFIX in job:
-        # The fallback still gets the save-if/cache-directories checks below.
-        fallback_steps = [
-            chunk for chunk in re.split(r"(?m)^(?=[ ]{2,}- )", job) if RUST_CACHE in chunk
-        ]
-        require(
-            len(fallback_steps) == 1
-            and "        if: env.CI_BORINGCACHE_ENABLED != 'true'\n" in fallback_steps[0],
-            f"{source} must gate the GitHub cache fallback", failures,
-        )
-        require(
-            job.count("uses: ./.github/actions/setup-boringcache") == 1,
-            f"{source} must install BoringCache exactly once", failures,
-        )
-        require(
-            CI_CACHE_PERMISSIONS in job,
-            f"{source} must scope cache OIDC permission to this job", failures,
-        )
-        require(
-            not re.search(r"BORINGCACHE_\w*TOKEN:", job),
-            f"{source} must use OIDC without static cache credentials", failures,
-        )
-        require(
-            job.count(BORINGCACHE_CARGO_PREFIX + cargo_profile + " ") == 2,
-            f"{source} must cache both native Cargo commands with profile {cargo_profile}", failures,
-        )
     require(len(blocks) == 1, f"{source} must keep one pinned rust-cache site", failures)
     for block in blocks:
-        saves = re.findall(r"(?m)^\s*save-if:([^\n]*)$", block)
+        saves = _SAVE_IF_RE.findall(block)
         require(
             [value.strip() for value in saves]
             in (
@@ -3463,7 +3450,7 @@ def check_direct_rust_cache_diet(
         )
         if compiler_only:
             require(
-                re.findall(r"(?m)^\s*cache-targets:([^\n]*)$", block) == [' "false"'],
+                _CACHE_TARGETS_RE.findall(block) == [' "false"'],
                 f"{source} must not archive the unused root target",
                 failures,
             )
@@ -3473,160 +3460,6 @@ def check_direct_rust_cache_diet(
                 f"{source} must not duplicate sccache alongside target dependencies",
                 failures,
             )
-
-
-def buildkit_cache_key(scope: str) -> str:
-    return (
-        f"{scope}-{BUILDKIT_CACHE_SCHEMA}-"
-        f"${{{{ runner.os }}}}-${{{{ runner.arch }}}}-${{{{ github.sha }}}}"
-    )
-
-
-def buildkit_cache_prefix(scope: str) -> str:
-    return (
-        f"{scope}-{BUILDKIT_CACHE_SCHEMA}-"
-        f"${{{{ runner.os }}}}-${{{{ runner.arch }}}}-"
-    )
-
-
-def check_buildkit_cache_boundary(
-    job_body: str,
-    source: str,
-    failures: list[str],
-) -> None:
-    steps = [
-        step
-        for step in job_steps(job_body)
-        if step_uses(step).startswith(BUILD_PUSH)
-    ]
-    trusted_publish = []
-    trusted_exact = []
-    fork_restore = []
-    cold = []
-    for step in steps:
-        condition = step_if(step)
-        with_block = step_with(step)
-        has_from = with_has_key(with_block, "cache-from")
-        has_to = with_has_key(with_block, "cache-to")
-        if FORK_IS_TRUE in condition and FORK_NOT_TRUE not in condition:
-            require(
-                COLD_NOT_TRUE in condition,
-                f"{source} fork restore-only BuildKit step must not run on "
-                "force_cold_cache",
-                failures,
-            )
-            require(
-                has_from,
-                f"{source} fork restore-only BuildKit step must restore cache-from",
-                failures,
-            )
-            require(
-                not has_to,
-                f"{source} must omit cache-to on the fork restore-only BuildKit step",
-                failures,
-            )
-            require(
-                CACHE_KIND_EXACT not in condition,
-                f"{source} fork restore-only BuildKit step must not be exact-hit-only",
-                failures,
-            )
-            fork_restore.append(step)
-        elif COLD_IS_TRUE in condition and COLD_NOT_TRUE not in condition:
-            require(
-                not has_from and not has_to,
-                f"{source} force-cold BuildKit step must omit cache-from and cache-to",
-                failures,
-            )
-            cold.append(step)
-        elif has_to:
-            require(
-                FORK_NOT_TRUE in condition and FORK_IS_TRUE not in condition,
-                f"{source} must exclude fork PRs from every cache-to BuildKit step",
-                failures,
-            )
-            require(
-                COLD_NOT_TRUE in condition,
-                f"{source} cache-to BuildKit step must not run on force_cold_cache",
-                failures,
-            )
-            require(
-                has_from,
-                f"{source} trusted-publish BuildKit step must restore cache-from",
-                failures,
-            )
-            require(
-                CACHE_KIND_PUBLISH in condition,
-                f"{source} trusted-publish BuildKit step must run only on a "
-                "partial match or miss (publish == true)",
-                failures,
-            )
-            require(
-                CACHE_KIND_EXACT not in condition,
-                f"{source} must never export cache-to on an exact github.sha hit",
-                failures,
-            )
-            trusted_publish.append(step)
-        elif has_from and not has_to:
-            require(
-                FORK_NOT_TRUE in condition and FORK_IS_TRUE not in condition,
-                f"{source} trusted exact-hit restore-only BuildKit step must "
-                "exclude fork PRs",
-                failures,
-            )
-            require(
-                COLD_NOT_TRUE in condition,
-                f"{source} trusted exact-hit restore-only BuildKit step must "
-                "not run on force_cold_cache",
-                failures,
-            )
-            require(
-                CACHE_KIND_EXACT in condition,
-                f"{source} trusted exact-hit restore-only BuildKit step must "
-                "require an exact github.sha hit",
-                failures,
-            )
-            require(
-                CACHE_KIND_PUBLISH not in condition,
-                f"{source} trusted exact-hit restore-only BuildKit step must "
-                "not be the publishing path",
-                failures,
-            )
-            trusted_exact.append(step)
-        else:
-            failures.append(
-                f"{source} has a pinned build-push step that is not a trusted "
-                "exact-hit restore-only, trusted-publish, fork restore-only, "
-                "or force-cold path"
-            )
-    require(
-        bool(trusted_exact),
-        f"{source} must provide a trusted exact-hit restore-only BuildKit step "
-        "(cache-from, no cache-to, exact github.sha hit)",
-        failures,
-    )
-    require(
-        bool(trusted_publish),
-        f"{source} must provide a trusted-publish BuildKit step "
-        "(cache-from + cache-to, excluding fork PRs and exact hits)",
-        failures,
-    )
-    require(
-        bool(fork_restore),
-        f"{source} must provide a fork restore-only BuildKit step "
-        "(cache-from, no cache-to, fork PRs only)",
-        failures,
-    )
-    require(
-        bool(cold),
-        f"{source} must provide a force-cold BuildKit step with neither cache-from "
-        "nor cache-to",
-        failures,
-    )
-    require(
-        "type=gha" not in job_body,
-        f"{source} must not use the BuildKit GHA cache backend",
-        failures,
-    )
 
 
 def with_scalar(with_block: str, key: str) -> str:
@@ -3643,120 +3476,25 @@ def with_scalar(with_block: str, key: str) -> str:
 
 
 def check_ambient_workflow_cache_budget(workflow: str, failures: list[str]) -> None:
-    """Keep the complete reader/writer generation tied to the trusted contract."""
-    image, extraction_errors = extract_job_contract_block(
-        workflow, "Ambient registry cache", "ambient-host-udp-image", required=True
-    )
-    failures.extend(extraction_errors)
-    if image == AMBIENT_REGISTRY_IMAGE_AGGREGATE_JOB:
-        for name, expected in (
-            ("ambient-host-udp-image-read", AMBIENT_REGISTRY_IMAGE_READ_JOB),
-            ("ambient-host-udp-image-write", AMBIENT_REGISTRY_IMAGE_WRITE_JOB),
-        ):
-            actual, extraction_errors = extract_job_contract_block(
-                workflow, "Ambient registry cache", name, required=True
-            )
-            failures.extend(extraction_errors)
-            require(
-                actual == expected,
-                f"{name} must preserve the complete registry cache contract",
-                failures,
-            )
-    else:
-        check_ambient_image_cache_budget(
-            extract_job(workflow, "ambient-host-udp-image"),
-            "ambient-host-udp-image",
-            failures,
-        )
+    """Hold the Ambient image recipe to the complete registry-cache generation.
 
-
-def check_ambient_image_cache_budget(
-    job_body: str,
-    source: str,
-    failures: list[str],
-) -> None:
-    require(
-        UNCONDITIONAL_AMBIENT_CACHE_TO.search(job_body) is None,
-        f"{source} must not publish the Ambient GHA BuildKit cache "
-        "unconditionally from pull requests",
-        failures,
-    )
-    steps_by_name: dict[str, str] = {}
-    for step in job_steps(job_body):
-        match = re.search(r"(?m)^      - name: (.+)$", step)
-        if match:
-            steps_by_name[match.group(1).strip()] = step
-    build_steps = [
-        step
-        for step in job_steps(job_body)
-        if step_uses(step).startswith(BUILD_PUSH)
-    ]
-    require(
-        len(build_steps) == 3,
-        f"{source} must keep exactly three pinned build-push steps, found "
-        f"{len(build_steps)}",
-        failures,
-    )
-    for name, target in AMBIENT_IMAGE_BUILDS:
-        step = steps_by_name.get(name, "")
+    The trusted Cross policy freezes the same three jobs; the retired single-job
+    `type=gha` recipe is no longer admitted by either verifier (#7281).
+    """
+    for name, expected in (
+        ("ambient-host-udp-image", AMBIENT_REGISTRY_IMAGE_AGGREGATE_JOB),
+        ("ambient-host-udp-image-read", AMBIENT_REGISTRY_IMAGE_READ_JOB),
+        ("ambient-host-udp-image-write", AMBIENT_REGISTRY_IMAGE_WRITE_JOB),
+    ):
+        actual, extraction_errors = extract_job_contract_block(
+            workflow, "Ambient registry cache", name, required=True
+        )
+        failures.extend(extraction_errors)
         require(
-            bool(step),
-            f"{source} must keep the {name!r} image build",
+            actual == expected,
+            f"{name} must preserve the complete registry cache contract",
             failures,
         )
-        if not step:
-            continue
-        require(
-            not step_if(step),
-            f"{source} must keep {name!r} unconditional; a missing/invalid "
-            "event must not skip the required image build",
-            failures,
-        )
-        require(
-            step_uses(step).startswith(BUILD_PUSH),
-            f"{source} {name!r} must keep the pinned build-push-action",
-            failures,
-        )
-        with_block = step_with(step)
-        require(
-            with_scalar(with_block, "target") == target,
-            f"{source} {name!r} must build target {target}",
-            failures,
-        )
-        require(
-            with_scalar(with_block, "load") == "true",
-            f"{source} {name!r} must load the image for contract checks",
-            failures,
-        )
-        require(
-            with_scalar(with_block, "cache-from") == AMBIENT_GHA_CACHE_FROM,
-            f"{source} {name!r} must restore the Ambient GHA BuildKit cache",
-            failures,
-        )
-        require(
-            with_scalar(with_block, "cache-to") == AMBIENT_GHA_CACHE_TO,
-            f"{source} {name!r} must publish GHA cache only from trusted "
-            "refs/heads/main, never from pull_request or merge_group, and "
-            "never from a fork",
-            failures,
-        )
-        require(
-            FORK_NOT_TRUE in with_scalar(with_block, "cache-to"),
-            f"{source} {name!r} cache-to must keep the fork publication guard",
-            failures,
-        )
-    for name in AMBIENT_IMAGE_CONTRACTS:
-        require(
-            name in steps_by_name,
-            f"{source} must keep the {name!r} contract check",
-            failures,
-        )
-        if name in steps_by_name:
-            require(
-                not step_if(steps_by_name[name]),
-                f"{source} must keep {name!r} unconditional",
-                failures,
-            )
 
 
 def check_nul_delimited_plan(plan_job: str, source: str, failures: list[str]) -> None:
@@ -3773,202 +3511,6 @@ def check_nul_delimited_plan(plan_job: str, source: str, failures: list[str]) ->
     require(
         "| sort" not in plan_job,
         f"{source} must not pass pathname bytes through sort",
-        failures,
-    )
-
-
-def check_local_cache_actions(
-    job_body: str,
-    source: str,
-    failures: list[str],
-    *,
-    scope: str,
-) -> None:
-    restore_steps = [
-        step for step in job_steps(job_body) if step_uses(step).startswith(CACHE_RESTORE)
-    ]
-    save_steps = [
-        step for step in job_steps(job_body) if step_uses(step).startswith(CACHE_SAVE)
-    ]
-    require(
-        len(restore_steps) == 1,
-        f"{source} must have exactly one pinned actions/cache/restore step, "
-        f"found {len(restore_steps)}",
-        failures,
-    )
-    require(
-        len(save_steps) == 1,
-        f"{source} must have exactly one pinned actions/cache/save step, "
-        f"found {len(save_steps)}",
-        failures,
-    )
-    key = buildkit_cache_key(scope)
-    prefix = buildkit_cache_prefix(scope)
-    if restore_steps:
-        condition = step_if(restore_steps[0])
-        with_block = step_with(restore_steps[0])
-        require(
-            COLD_NOT_TRUE in condition,
-            f"{source} cache restore must skip force_cold_cache",
-            failures,
-        )
-        require(
-            FORK_IS_TRUE not in condition or FORK_NOT_TRUE in condition,
-            f"{source} cache restore may run for forks but must not be fork-only "
-            "in a way that skips trusted restores",
-            failures,
-        )
-        require(
-            f"key: {key}" in with_block,
-            f"{source} cache restore must use exact key {key}",
-            failures,
-        )
-        require(
-            "restore-keys:" in with_block and prefix in with_block,
-            f"{source} cache restore must use restore prefix {prefix}",
-            failures,
-        )
-        require(
-            "${{ runner.arch }}" in with_block,
-            f"{source} cache restore must be architecture-scoped",
-            failures,
-        )
-        require(
-            BUILDKIT_CACHE_SCHEMA in with_block,
-            f"{source} cache restore must include schema {BUILDKIT_CACHE_SCHEMA}",
-            failures,
-        )
-    if save_steps:
-        condition = step_if(save_steps[0])
-        with_block = step_with(save_steps[0])
-        require(
-            COLD_NOT_TRUE in condition,
-            f"{source} cache save must skip force_cold_cache",
-            failures,
-        )
-        require(
-            FORK_NOT_TRUE in condition and FORK_IS_TRUE not in condition,
-            f"{source} must exclude fork PRs from cache save / publication",
-            failures,
-        )
-        require(
-            CACHE_KIND_PUBLISH in condition,
-            f"{source} cache save must run only after a partial match or miss",
-            failures,
-        )
-        require(
-            CACHE_KIND_EXACT not in condition,
-            f"{source} must never save an immutable cache on an exact github.sha hit",
-            failures,
-        )
-        require(
-            f"key: {key}" in with_block,
-            f"{source} cache save must use exact key {key}",
-            failures,
-        )
-
-
-def check_cache_save_preparation(
-    job_body: str,
-    source: str,
-    failures: list[str],
-    *,
-    scope: str,
-) -> None:
-    prepare_steps = [
-        step
-        for step in job_steps(job_body)
-        if "Prepare BuildKit cache for save" in step
-    ]
-    require(
-        len(prepare_steps) == 1,
-        f"{source} must have exactly one Prepare BuildKit cache for save step, "
-        f"found {len(prepare_steps)}",
-        failures,
-    )
-    if not prepare_steps:
-        return
-    step = prepare_steps[0]
-    condition = step_if(step)
-    require(
-        COLD_NOT_TRUE in condition,
-        f"{source} cache-save preparation must skip force_cold_cache",
-        failures,
-    )
-    require(
-        FORK_NOT_TRUE in condition and FORK_IS_TRUE not in condition,
-        f"{source} cache-save preparation must exclude fork PRs",
-        failures,
-    )
-    require(
-        CACHE_KIND_PUBLISH in condition,
-        f"{source} cache-save preparation must run only after a partial match or miss",
-        failures,
-    )
-    require(
-        CACHE_KIND_EXACT not in condition,
-        f"{source} cache-save preparation must not run on an exact github.sha hit",
-        failures,
-    )
-    out_dir = f"{scope}-out"
-    require(
-        out_dir in step,
-        f"{source} cache-save preparation must require the fresh {out_dir} directory",
-        failures,
-    )
-    require(
-        'if [ ! -d "$out" ]' in step or "if [ ! -d \"$out\" ]" in step,
-        f"{source} cache-save preparation must fail when the fresh export is absent",
-        failures,
-    )
-    require(
-        "refusing to save" in step and "stale" in step,
-        f"{source} cache-save preparation must refuse to relabel a stale restore",
-        failures,
-    )
-    require(
-        "present=true" not in step,
-        f"{source} cache-save preparation must not mark a stale destination as present",
-        failures,
-    )
-
-
-def check_cache_telemetry_evidence(job_body: str, source: str, failures: list[str]) -> None:
-    require(
-        '--hit ""' not in job_body and "--hit ''" not in job_body,
-        f"{source} must not pass empty --hit (unknown is not a miss)",
-        failures,
-    )
-    require(
-        "--hit true" not in job_body,
-        f"{source} must not fabricate a cache hit literal",
-        failures,
-    )
-    require(
-        "cache-hit" in job_body and "cache-matched-key" in job_body,
-        f"{source} must record restore evidence from action outputs",
-        failures,
-    )
-    require(
-        "classify-restore" in job_body,
-        f"{source} must classify actions/cache/restore v4 outputs via classify-restore",
-        failures,
-    )
-    require(
-        "id: cache-kind" in job_body,
-        f"{source} must expose cache-kind outputs for exact vs publish gating",
-        failures,
-    )
-    require(
-        "--path" in job_body,
-        f"{source} must measure restored bytes from the restored directory",
-        failures,
-    )
-    require(
-        "--phase cache-restore" in job_body
-        and "--phase image-build" in job_body
-        and "--phase cache-save" in job_body,
-        f"{source} must time cache-restore, image-build, and cache-save separately",
         failures,
     )
 
@@ -3998,11 +3540,7 @@ def builder_arg_features_is_after_apt(dockerfile: str) -> bool:
     # The base is digest-pinned (`rust:<tag>@sha256:...`), so match the stage
     # rather than one literal reference; a pin refresh must not silently turn
     # this contract into a no-op by failing to find its marker.
-    match = re.search(
-        r"^FROM rust(?::[^\s@]+)?(?:@sha256:[0-9a-f]{64})? AS builder$",
-        dockerfile,
-        re.M,
-    )
+    match = _RUST_BUILDER_STAGE_RE.search(dockerfile)
     if match is None:
         return False
     rest = dockerfile[match.end() :]
@@ -4023,7 +3561,7 @@ def ferrum_log_level_assignments(dockerfile: str) -> list[str]:
     the assignment token itself rather than a line that starts with `ENV`.
     """
 
-    return re.findall(r"\bFERRUM_LOG_LEVEL=([^\s\\]+)", dockerfile)
+    return _FERRUM_LOG_LEVEL_ASSIGNMENT_RE.findall(dockerfile)
 
 
 def check_dockerfile_log_level(
@@ -4071,7 +3609,7 @@ def _arg_value_looks_like_image(value: str) -> bool:
         return False
     if "/" in value:
         return True
-    return re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*:[^\s]+", value) is not None
+    return _IMAGE_REFERENCE_LIKE_RE.fullmatch(value) is not None
 
 
 def dockerfile_image_references(dockerfile: str) -> list[tuple[int, str, str]]:
@@ -4200,14 +3738,29 @@ def check_distroless_digest_consistency(
                 )
 
 
-# The refresh cannot move the distroless pin in `ci.yml`'s `main-linux-image`
-# job (frozen by the trusted Cross policy), so a rewritten distroless digest
-# would fail `check_distroless_digest_consistency` before its PR opens. The
-# refresh must hold that drift for a direct-to-main rotation instead: the
-# held arm bypasses the rewrite, the resolve step publishes `held=true` before
-# any early exit, and a final always-run step fails the run.
-BASE_IMAGE_REFRESH_HELD_ENV = "      HELD_IMAGE: gcr.io/distroless/cc-debian13\n"
-BASE_IMAGE_REFRESH_HOLD_IF = "always() && steps.resolve.outputs.held == 'true'"
+# The refresh rotates every pin, including the distroless runtime base, with its
+# own GITHUB_TOKEN. It must rewrite every non-workflow consumer of a drifted
+# reference together (so `check_distroless_digest_consistency` holds), refuse to
+# rewrite workflow files (GITHUB_TOKEN cannot change them, and `main-linux-image`
+# reads the base from `Dockerfile`) or the trusted policy, and stage every
+# rewritten consumer.
+BASE_IMAGE_REFRESH_RESOLVE_MARKERS = (
+    'for file in $(git grep -lF "${tagged}@${current}"); do',
+    ".github/workflows/*|.github/scripts/verify_cross_build_policy.py)",
+    'echo "::error::${file} pins ${tagged}@${current}; the refresh cannot rewrite workflow or trusted policy files, so move that pin into a Dockerfile it reads"',
+    "exit 1",
+    "*Dockerfile*|*.yml|*.yaml)",
+    'consumers="${consumers}${file} "',
+    "for file in ${consumers}; do",
+    'sed -i "s|${tagged}@${current}|${tagged}@${resolved}|g" "${file}"',
+    # The resolution date governing each rewritten pin moves with it (#6546).
+    "for file in ${consumers}; do",
+    """awk -v ref="${tagged}@${resolved}" -v today="$(date -u +%F)" '""",
+    "while (j >= 1 && line[j] ~ /^[[:space:]]*(FROM|ARG)[[:space:]]/) j--",
+    'if (j >= 1 && line[j] ~ ("^[[:space:]]*# Digest resolved " date)) {',
+    "sub(date, today, line[j])",
+    'cat "${file}.resolved" > "${file}"',
+)
 
 
 def named_step(steps: list[str], name: str) -> str | None:
@@ -4222,7 +3775,7 @@ def named_step(steps: list[str], name: str) -> str | None:
 def step_run_block_commands(step: str) -> list[str]:
     """Return a literal `run: |` block's non-empty, non-comment lines, stripped."""
 
-    match = re.search(r"(?m)^        run:[ \t]+\|[ \t]*\n", step)
+    match = _STEP_RUN_BLOCK_START_RE.search(step)
     if match is None:
         return []
     commands: list[str] = []
@@ -4235,98 +3788,42 @@ def step_run_block_commands(step: str) -> list[str]:
     return commands
 
 
-def base_image_refresh_hold_errors(workflow: str) -> list[str]:
-    """Return why the digest refresh fails to hold distroless drift."""
+def base_image_refresh_rotation_errors(workflow: str) -> list[str]:
+    """Return why the digest refresh does not rotate every consumer safely."""
 
     job = extract_job(workflow, "refresh")
     if not job:
         return ["the `refresh` job is missing"]
     errors: list[str] = []
-    if BASE_IMAGE_REFRESH_HELD_ENV not in job:
-        errors.append(f"missing {BASE_IMAGE_REFRESH_HELD_ENV.strip()!r}")
+    if "HELD_IMAGE" in job:
+        errors.append("the refresh must not hold any image back from rotation")
     steps = job_steps(job)
-
     resolve = named_step(steps, "Resolve current digests")
-    if resolve is None or not re.search(r"(?m)^        id: resolve$", resolve):
-        errors.append("missing one `Resolve current digests` step with `id: resolve`")
-        commands: list[str] = []
-    else:
-        commands = step_run_block_commands(resolve)
-
-    def index_of(command: str, start: int = 0) -> int:
-        for index in range(max(start, 0), len(commands)):
-            if commands[index] == command:
-                return index
-        return -1
-
-    loop = index_of("for ref in ${refs}; do")
-    case = index_of('case "${tagged}" in', loop + 1) if loop >= 0 else -1
-    arm = index_of('"${HELD_IMAGE}":*)', case + 1) if case >= 0 else -1
-    arm_end = index_of(";;", arm + 1) if arm >= 0 else -1
-    esac = index_of("esac", arm_end + 1) if arm_end >= 0 else -1
-    rewrites = [
-        index
-        for index, command in enumerate(commands)
-        if re.match(r"sed\s", command)
-    ]
-    if esac < 0:
-        errors.append(
-            "the resolve loop must match `\"${HELD_IMAGE}\":*)` in a "
-            "`case \"${tagged}\" in` arm"
-        )
-    else:
-        held_arm = commands[arm + 1 : arm_end]
-        if not held_arm or held_arm[-1] != "continue":
-            errors.append(
-                "the held distroless arm must end with `continue` to bypass the rewrite"
-            )
-        if not any(command.startswith('held="${held}') for command in held_arm):
-            errors.append("the held distroless arm must record the drift in `held`")
-        if not rewrites or any(index < esac for index in rewrites):
-            errors.append(
-                "every `sed` rewrite must follow the held distroless `case` in the "
-                "resolve loop"
-            )
-
-    publish = index_of('echo "held=true" >> "${GITHUB_OUTPUT}"')
-    early_exits = [
-        index for index, command in enumerate(commands) if command == "exit 0"
-    ]
-    if (
-        publish < 1
-        or commands[publish - 1] != 'if [ -n "${held}" ]; then'
-        or (rewrites and publish < max(rewrites))
-        or any(index < publish for index in early_exits)
-    ):
-        errors.append(
-            "the resolve step must publish `held=true` to GITHUB_OUTPUT after the "
-            "loop and before any `exit 0`"
-        )
-
-    fail = named_step(steps, "Fail on held distroless drift")
-    if (
-        fail is None
-        or steps[-1] is not fail
-        or step_if(fail) != BASE_IMAGE_REFRESH_HOLD_IF
-        or not step_run_ends_with_exit(fail, 1)
-    ):
-        errors.append(
-            "the final `Fail on held distroless drift` step must run "
-            f"`if: {BASE_IMAGE_REFRESH_HOLD_IF}` and end with `exit 1`"
-        )
+    if resolve is None or not _RESOLVE_STEP_ID_RE.search(resolve):
+        return [*errors, "missing one `Resolve current digests` step with `id: resolve`"]
+    commands = step_run_block_commands(resolve)
+    index = -1
+    for marker in BASE_IMAGE_REFRESH_RESOLVE_MARKERS:
+        try:
+            index = commands.index(marker, index + 1)
+        except ValueError:
+            errors.append(f"the resolve loop must contain, in order, `{marker}`")
+            break
+    if any(command.startswith("for file in ${DOCKERFILES}") for command in commands):
+        errors.append("the resolve loop must rewrite every consumer, not only the Dockerfiles")
+    opener = named_step(steps, "Open or update the refresh pull request")
+    if opener is None or "git add --update" not in step_run_block_commands(opener):
+        errors.append("the refresh pull request must stage every rewritten consumer")
     return errors
 
 
-def check_base_image_refresh_holds_distroless(
+def check_base_image_refresh_rotates_all_pins(
     workflow: str, failures: list[str]
 ) -> None:
-    """Require the digest refresh to hold, report, and fail on distroless drift."""
+    """Require the digest refresh to rotate every non-workflow consumer."""
 
-    for error in base_image_refresh_hold_errors(workflow):
-        failures.append(
-            "base-image-digest-refresh.yml must hold distroless drift for a "
-            f"direct-to-main rotation: {error}"
-        )
+    for error in base_image_refresh_rotation_errors(workflow):
+        failures.append(f"base-image-digest-refresh.yml: {error}")
 
 
 def workflow_permissions_are_read_only(text: str) -> bool:
@@ -4343,7 +3840,7 @@ def workflow_permissions_are_read_only(text: str) -> bool:
             break
         if not line:
             continue
-        match = re.fullmatch(r"  ([a-z][a-z-]*): (read|write|none)", line)
+        match = _PERMISSION_ENTRY_RE.fullmatch(line)
         if match is None:
             return False
         name, access = match.groups()
@@ -4363,7 +3860,10 @@ def check_common_trust(text: str, source: str, failures: list[str]) -> None:
     )
     require(
         "ACTIONS_RUNTIME_TOKEN" not in text
-        or "GITHUB_ENV" not in text.split("ACTIONS_RUNTIME_TOKEN", 1)[-1][:400],
+        or all(
+            "GITHUB_ENV" not in segment[:400]
+            for segment in text.split("ACTIONS_RUNTIME_TOKEN")[1:]
+        ),
         f"{source} must not export ACTIONS_RUNTIME_TOKEN into GITHUB_ENV",
         failures,
     )
@@ -4383,12 +3883,12 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         failures,
     )
     require(
-        re.search(r"(?m)^    name: FIPS Feature Policy$", workflow) is not None,
+        _FIPS_FEATURE_POLICY_NAME_RE.search(workflow) is not None,
         "FIPS Feature Policy job name must be preserved",
         failures,
     )
     require(
-        re.search(r"(?m)^    name: FIPS Build & Test$", workflow) is not None,
+        _FIPS_BUILD_AND_TEST_NAME_RE.search(workflow) is not None,
         "FIPS Build & Test required-check name must be preserved",
         failures,
     )
@@ -4452,21 +3952,20 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         "FIPS rust-cache must save after ordinary failures when post-job cleanup still runs",
         failures,
     )
+    # The handoff is the FIPS compiler cache (#7285): a local sccache store
+    # was never persisted, and any wrapper changes Cargo's artifact identity.
     require(
-        "./.github/actions/setup-sccache" in workflow,
-        "FIPS jobs must install sccache through the local action",
+        "setup-sccache" not in workflow
+        and "FERRUM_SCCACHE_BIN" not in workflow
+        and "command -v sccache" not in workflow
+        and ".cache/sccache" not in workflow,
+        "FIPS jobs must not install, invoke, cache or hand off sccache",
         failures,
     )
     require(
-        "command -v sccache" not in workflow,
-        "FIPS jobs must not PATH-lookup sccache after the trusted installer",
-        failures,
-    )
-    require(
-        workflow.count('sccache_bin="${FERRUM_SCCACHE_BIN:-}"') == 4
-        and workflow.count('"$sccache_bin" --show-stats') == 4,
-        "FIPS compile/claimed-checks/clippy/test-binary jobs must record sccache "
-        "stats via FERRUM_SCCACHE_BIN",
+        workflow.count("ci_runtime_telemetry.py summarize") == 5,
+        "FIPS compile/claimed-checks/clippy/test-binary/test jobs must each "
+        "summarize their runtime telemetry",
         failures,
     )
     require(
@@ -4546,10 +4045,7 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         failures,
     )
     require(
-        re.search(
-            r"cargo test[^\n]*tls::fips_policy_tests[^\n]+tls::fips_key_admission_tests",
-            workflow,
-        )
+        _FIPS_POLICY_TESTS_COMMAND_RE.search(workflow)
         is None,
         "FIPS unit tests must not pass two Cargo TESTNAME filters to one invocation",
         failures,
@@ -4570,11 +4066,7 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         failures,
     )
     require(
-        re.search(
-            r"cargo test[^\n]*frontend_and_backend_builders_complete_a_real_tls_handshake"
-            r"[^\n]+legitimate_data_plane_connects_once_a_permit_is_released",
-            workflow,
-        )
+        _FIPS_HANDSHAKE_TESTS_COMMAND_RE.search(workflow)
         is None,
         "FIPS handshake tests must not pass two Cargo TESTNAME filters to one invocation",
         failures,
@@ -4677,7 +4169,7 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         failures,
     )
     require(
-        re.search(r"(?m)^    if: always\(\)$", aggregate) is not None,
+        _JOB_IF_ALWAYS_RE.search(aggregate) is not None,
         "FIPS Build & Test aggregate must run with if: always()",
         failures,
     )
@@ -4721,11 +4213,13 @@ def check_fips(workflow: str, failures: list[str]) -> None:
             failures,
         )
         require(
-            "sccache-directory-subset" in job_body
+            "measured=restored-target-directory" in job_body
+            and '--path "${GITHUB_WORKSPACE}/target"' in job_body
             and "not exposed" in job_body
             and "layer=stable-fallback" in job_body,
-            f"{job_name} must label rust-cache as stable-fallback and state that "
-            "archive bytes are not exposed",
+            f"{job_name} must label rust-cache as stable-fallback, measure the "
+            "restored target directory, and state that registry bytes are not "
+            "exposed",
             failures,
         )
         require(
@@ -4769,6 +4263,47 @@ def check_fips(workflow: str, failures: list[str]) -> None:
     require(
         "needs.fips-test.result != 'success'" in aggregate,
         "FIPS aggregate must fail closed when tests fail",
+        failures,
+    )
+    check_fips_feature_policy_gate(aggregate, failures)
+
+
+# `FIPS Feature Policy` is not itself a required check: branch protection and
+# the publication inventory name `FIPS Build & Test`. The aggregate therefore
+# must depend on the feature-policy audit and fail unless it succeeded, in an
+# unconditional step placed before the planner's irrelevant-diff skip, so a
+# failed audit on a FIPS-irrelevant pull request still blocks the merge.
+FIPS_FEATURE_POLICY_FAIL_STEP = (
+    "      - name: Fail when FIPS feature policy did not succeed\n"
+    "        if: needs.feature-policy.result != 'success'\n"
+    "        run: exit 1\n"
+)
+
+
+def check_fips_feature_policy_gate(aggregate: str, failures: list[str]) -> None:
+    require(
+        "feature-policy" in job_needs_list(aggregate),
+        "FIPS Build & Test aggregate must depend on FIPS Feature Policy",
+        failures,
+    )
+    gate_steps = [
+        step
+        for step in job_steps(aggregate)
+        if "needs.feature-policy.result" in step
+    ]
+    require(
+        len(gate_steps) == 1
+        and gate_steps[0].rstrip("\n") + "\n" == FIPS_FEATURE_POLICY_FAIL_STEP,
+        "FIPS Build & Test aggregate must fail with exactly one unconditional "
+        "step when FIPS Feature Policy did not succeed",
+        failures,
+    )
+    gate_position = aggregate.find(FIPS_FEATURE_POLICY_FAIL_STEP)
+    skip_position = aggregate.find("needs.fips-plan.outputs.relevant == 'false'")
+    require(
+        gate_position != -1 and skip_position != -1 and gate_position < skip_position,
+        "FIPS Build & Test aggregate must check FIPS Feature Policy before the "
+        "irrelevant-diff skip",
         failures,
     )
 
@@ -4829,7 +4364,7 @@ def check_node_default_registry_jobs(workflow: str, failures: list[str]) -> None
 
 def check_production_smoke(workflow: str, failures: list[str]) -> None:
     require(
-        re.search(r"(?m)^    name: Production Dockerfile eBPF image smoke$", workflow)
+        _PRODUCTION_SMOKE_NAME_RE.search(workflow)
         is not None,
         "Production Dockerfile eBPF image smoke check name must be preserved",
         failures,
@@ -4850,7 +4385,7 @@ def check_production_smoke(workflow: str, failures: list[str]) -> None:
         failures,
     )
     require(
-        "target: runtime" in default_job or "target: runtime\n" in default_job,
+        re.search(r"(?m)^\s*target: runtime$", default_job) is not None,
         "default production-image job must build the ordinary runtime target",
         failures,
     )
@@ -4896,7 +4431,7 @@ def check_production_smoke(workflow: str, failures: list[str]) -> None:
             failures,
         )
     require(
-        re.search(r"(?m)^    if: always\(\)$", aggregate) is not None,
+        _JOB_IF_ALWAYS_RE.search(aggregate) is not None,
         "production-image aggregate must run with if: always()",
         failures,
     )
@@ -4946,7 +4481,7 @@ def check_completed_rust_cache_save(action: str, failures: list[str]) -> None:
     blocks = rust_cache_with_blocks(action)
     require(len(blocks) == 1, "setup-rust-ci must have one Rust cache step", failures)
     for block in blocks:
-        values = re.findall(r"(?m)^[ \t]+cache-on-failure:[ \t]*(.*)$", block)
+        values = _CACHE_ON_FAILURE_RE.findall(block)
         require(
             values == [COMPLETED_CACHE_ON_FAILURE],
             "setup-rust-ci must publish Rust caches only from a lane producer, "
@@ -4967,9 +4502,7 @@ def check_completed_cache_producer(job: str, source: str, failures: list[str]) -
         failures,
     )
     for step in steps:
-        values = re.findall(
-            r"(?m)^[ \t]+cache-on-failure:[ \t]*(.*)$", step_with(step)
-        )
+        values = _CACHE_ON_FAILURE_RE.findall(step_with(step))
         require(
             values == ['"false"'],
             f"{source} must save shared Rust caches only after job success",
@@ -4978,8 +4511,8 @@ def check_completed_cache_producer(job: str, source: str, failures: list[str]) -
 
 
 def check_shared_actions(failures: list[str]) -> None:
-    rust_ci = SETUP_RUST.read_text(encoding="utf-8")
-    sccache = SETUP_SCCACHE.read_text(encoding="utf-8")
+    rust_ci = read_pinned(SETUP_RUST)
+    sccache = read_pinned(SETUP_SCCACHE)
     check_completed_rust_cache_save(rust_ci, failures)
     require(
         "cache-hit:" in rust_ci,
@@ -4988,7 +4521,7 @@ def check_shared_actions(failures: list[str]) -> None:
     )
     check_shell_only_local_action(sccache, "setup-sccache", failures)
     check_shell_only_local_action(
-        SETUP_FAST_LINKER.read_text(encoding="utf-8"),
+        read_pinned(SETUP_FAST_LINKER),
         "setup-fast-linker",
         failures,
     )
@@ -5045,7 +4578,7 @@ def check_shared_actions(failures: list[str]) -> None:
         failures,
     )
     require(
-        "SCCACHE_CACHE_SIZE=2G" in sccache or "SCCACHE_CACHE_SIZE=2G" in sccache,
+        "SCCACHE_CACHE_SIZE=2G" in sccache,
         "setup-sccache must keep the 2 GiB local cache cap",
         failures,
     )
@@ -5085,9 +4618,8 @@ def check_shared_actions(failures: list[str]) -> None:
 
 
 def check_docs_and_coverage(failures: list[str]) -> None:
-    ci_cd = CI_CD_DOC.read_text(encoding="utf-8")
-    fips_doc = FIPS_DOC.read_text(encoding="utf-8")
-    coverage = COVERAGE_WORKFLOW.read_text(encoding="utf-8")
+    ci_cd = read_pinned(CI_CD_DOC)
+    coverage = read_pinned(COVERAGE_WORKFLOW)
     require(
         "`fips-build.yml`" in ci_cd or "fips-build.yml" in ci_cd,
         "docs/ci_cd.md must inventory fips-build.yml",
@@ -5156,7 +4688,7 @@ def check_docs_and_coverage(failures: list[str]) -> None:
         failures,
     )
     require(
-        "save-if: false" in ci_cd or "save-if: false" in ci_cd.replace("`", ""),
+        "save-if: false" in ci_cd.replace("`", ""),
         "docs/ci_cd.md must document that FIPS clippy/test rust-cache does not save",
         failures,
     )
@@ -5208,8 +4740,9 @@ def check_docs_and_coverage(failures: list[str]) -> None:
         failures,
     )
     require(
-        "sccache-directory" in ci_cd or "sccache directory subset" in ci_cd.lower(),
-        "docs/ci_cd.md must document that FIPS telemetry measures the sccache subset",
+        "restored `target/` directory for rust-cache" in ci_cd,
+        "docs/ci_cd.md must document that FIPS telemetry measures the restored "
+        "target directory for rust-cache",
         failures,
     )
     require(
@@ -5250,9 +4783,10 @@ def check_docs_and_coverage(failures: list[str]) -> None:
     require(
         "10 GB" in ci_cd
         and "LRU" in ci_cd
-        and "ambient-host-udp-images" in ci_cd,
-        "docs/ci_cd.md must document the Ambient GHA cache-budget policy, "
-        "10 GB quota, and LRU eviction",
+        and "target-specific GHCR registry caches" in ci_cd,
+        "docs/ci_cd.md must document the Ambient cache-budget policy: the "
+        "10 GB quota, LRU eviction, and the GHCR registry caches that replace "
+        "BuildKit `type=gha` layers",
         failures,
     )
     require(
@@ -5279,80 +4813,50 @@ def check_docs_and_coverage(failures: list[str]) -> None:
         failures,
     )
     require(
-        "trusted" in fips_doc.lower() and "cache" in fips_doc.lower(),
-        "docs/fips.md must describe the FIPS CI cache trust boundary",
+        "trusted" in ci_cd.lower() and "cache" in ci_cd.lower(),
+        "docs/ci_cd.md must describe the FIPS CI cache trust boundary",
         failures,
     )
-    require(
-        "save-if" in fips_doc,
-        "docs/fips.md must document rust-cache save-if so fork PRs cannot save",
-        failures,
-    )
-    require(
-        "fips-producer" in fips_doc
-        and "github.sha" in fips_doc
-        and "run_attempt" in fips_doc,
-        "docs/fips.md must document the exact producer cache key",
-        failures,
-    )
-    require(
-        "fips-producer-handoff" in fips_doc
-        and "inter-run" in fips_doc.lower()
-        and "artifact" in fips_doc.lower()
-        and "evict" in fips_doc.lower()
-        and "deletes" in fips_doc.lower()
-        and "zstd" in fips_doc.lower()
-        and "executable modes" in fips_doc.lower(),
-        "docs/fips.md must document the immutable FIPS inter-run artifact, "
-        "mode-preserving payload, cache eviction, and rerun deletion boundary",
-        failures,
-    )
-    require(
-        "fips-test-build" in fips_doc,
-        "docs/fips.md must document the FIPS test-binary producer job",
-        failures,
-    )
-    require(
-        "fips-test-binaries-<run_id>-*" in fips_doc
-        and "newest attempt" in fips_doc.lower()
-        and "failed-job rerun" in fips_doc.lower()
-        and "flattens" in fips_doc.lower()
-        and "fips-producer-identity" in fips_doc
-        and "fips-test-identity" in fips_doc,
-        "docs/fips.md must document attempt-wildcard FIPS test-artifact "
-        "selection for failed-job reruns, one-match flattening, and internal "
-        "attempt identity",
-        failures,
-    )
-    require(
-        "mozilla-actions/sccache-action" in fips_doc,
-        "docs/fips.md must name the rejected sccache installer",
-        failures,
-    )
-    require(
-        "shared-key" in fips_doc and "ignored" in fips_doc.lower(),
-        "docs/fips.md must document pinned rust-cache shared-key vs ignored key",
-        failures,
-    )
-    require(
-        "--lib" in coverage and "--test unit_tests" in coverage,
-        "coverage lib-unit shard must still collect lib and unit_tests coverage",
-        failures,
-    )
+    # The FIPS producer, handoff, test-artifact, installer and shared-key doc
+    # contracts are asserted once above (issue #7282 removed a second, weaker
+    # copy); the lib-unit coverage command is pinned exactly below.
     lib_unit = coverage
     require(
-        re.search(
-            r"cargo llvm-cov --no-report\s+\\\s*\n\s*--lib\s+\\\s*\n\s*--test unit_tests",
-            lib_unit,
-        )
+        _COVERAGE_UNIT_TESTS_COMMAND_RE.search(lib_unit)
         is not None,
-        "coverage lib-unit must compile lib and unit_tests in one llvm-cov invocation",
+        "coverage lib-unit must compile lib and all four unit targets in one "
+        "llvm-cov invocation",
         failures,
     )
+
+
+def tracked_repository_files(failures: list[str]) -> list[Path]:
+    """Tracked files only: never `target/`, caches, or untracked scratch.
+
+    A recursive walk of the checkout read build output and untracked files,
+    which made the scan slow and let local leftovers fail or pass it
+    (issue #7283). A `git ls-files` failure fails closed.
+    """
+
+    try:
+        listing = subprocess.run(
+            ["git", "ls-files", "-z"],
+            cwd=REPO_ROOT,
+            check=True,
+            capture_output=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as error:
+        failures.append(f"cannot enumerate tracked repository files: {error}")
+        return []
+    return [
+        REPO_ROOT / name
+        for name in listing.decode("utf-8", "surrogateescape").split("\0")
+        if name
+    ]
 
 
 def check_dockerfile(failures: list[str]) -> None:
-    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    dockerfile = read_pinned(DOCKERFILE)
     require(
         builder_arg_features_is_after_apt(dockerfile),
         "Dockerfile builder ARG FEATURES must come after apt-get so ordinary and "
@@ -5369,9 +4873,9 @@ def check_dockerfile(failures: list[str]) -> None:
         "runtime-ebpf target must remain",
         failures,
     )
-    release = DOCKERFILE_RELEASE.read_text(encoding="utf-8")
-    ebpf_tools_layer = DOCKERFILE_EBPF_TOOLS_LAYER.read_text(encoding="utf-8")
-    iproute2_layer = DOCKERFILE_IPROUTE2_LAYER.read_text(encoding="utf-8")
+    release = read_pinned(DOCKERFILE_RELEASE)
+    ebpf_tools_layer = read_pinned(DOCKERFILE_EBPF_TOOLS_LAYER)
+    iproute2_layer = read_pinned(DOCKERFILE_IPROUTE2_LAYER)
     check_dockerfile_log_level("Dockerfile", dockerfile, failures)
     check_dockerfile_log_level("Dockerfile.release", release, failures)
     check_dockerfile_log_level(
@@ -5380,13 +4884,12 @@ def check_dockerfile(failures: list[str]) -> None:
     for label, text in (
         ("Dockerfile", dockerfile),
         ("Dockerfile.release", release),
-        ("Dockerfile.test", DOCKERFILE_TEST.read_text(encoding="utf-8")),
         ("Dockerfile.ebpf-tools-layer", ebpf_tools_layer),
         ("Dockerfile.iproute2-layer", iproute2_layer),
     ):
         check_dockerfile_image_pins(label, text, failures)
     repository_files: list[tuple[str, str]] = []
-    for path in REPO_ROOT.rglob("*"):
+    for path in tracked_repository_files(failures):
         if (
             not path.is_file()
             or path.is_symlink()
@@ -5412,18 +4915,90 @@ def check_dockerfile(failures: list[str]) -> None:
         ):
             continue
         try:
-            contents = path.read_text(encoding="utf-8")
+            contents = read_pinned(path)
         except (OSError, UnicodeDecodeError):
             continue
         repository_files.append((path.relative_to(REPO_ROOT).as_posix(), contents))
     check_distroless_digest_consistency(repository_files, dockerfile, failures)
-    check_base_image_refresh_holds_distroless(
-        BASE_IMAGE_REFRESH_WORKFLOW.read_text(encoding="utf-8"), failures
+    check_base_image_refresh_rotates_all_pins(
+        read_pinned(BASE_IMAGE_REFRESH_WORKFLOW), failures
     )
 
 
 def self_test() -> int:
     failures: list[str] = []
+    tracked_failures: list[str] = []
+    tracked = tracked_repository_files(tracked_failures)
+    tracked_roots = {path.relative_to(REPO_ROOT).parts[0] for path in tracked}
+    require(
+        not tracked_failures
+        and REPO_ROOT / "Dockerfile" in tracked
+        and "target" not in tracked_roots
+        and ".git" not in tracked_roots,
+        "self-test: the Dockerfile scan must enumerate tracked files only",
+        failures,
+    )
+    for label, cache_on_failure, expected_ok in (
+        ("literal true", "true", True),
+        ("quoted true", '"true"', True),
+        ("false beside a true save-if", "false", False),
+        ("missing key", None, False),
+    ):
+        fork_block = (
+            "      - uses: Swatinem/rust-cache@0000000000000000000000000000000000000000\n"
+            "        with:\n"
+            "          save-if: ${{ github.event.pull_request.head.repo.fork != true }}\n"
+            + (
+                f"          cache-on-failure: {cache_on_failure}\n"
+                if cache_on_failure is not None
+                else ""
+            )
+        )
+        fork_failures: list[str] = []
+        check_rust_cache_fork_save_if(
+            fork_block, "self-test", fork_failures, expected_count=1
+        )
+        cache_on_failure_flagged = any(
+            "cache-on-failure" in item for item in fork_failures
+        )
+        require(
+            cache_on_failure_flagged != expected_ok,
+            f"self-test: cache-on-failure check mis-judged the {label} fixture "
+            f"({fork_failures})",
+            failures,
+        )
+    token_export_failures: list[str] = []
+    check_common_trust(
+        "permissions:\n  contents: read\n"
+        "jobs:\n  a:\n    steps:\n"
+        "      - run: echo ACTIONS_RUNTIME_TOKEN is not exported here\n"
+        + "      - run: true\n" * 20
+        + '      - run: echo "ACTIONS_RUNTIME_TOKEN=$T" >> "$GITHUB_ENV"\n',
+        "self-test",
+        token_export_failures,
+    )
+    require(
+        any("ACTIONS_RUNTIME_TOKEN" in item for item in token_export_failures),
+        "self-test: a later ACTIONS_RUNTIME_TOKEN export must be caught, not only "
+        "the first occurrence",
+        failures,
+    )
+    coverage_workflow = read_pinned(COVERAGE_WORKFLOW)
+    require(
+        _COVERAGE_UNIT_TESTS_COMMAND_RE.search(coverage_workflow) is not None,
+        "self-test: the checked-in lib-unit coverage command must match",
+        failures,
+    )
+    require(
+        _COVERAGE_UNIT_TESTS_COMMAND_RE.search(
+            coverage_workflow.replace(
+                "            --test unit_plugins_b_tests \\\n", "", 1
+            )
+        )
+        is None,
+        "self-test: dropping unit_plugins_b_tests from lib-unit coverage must fail",
+        failures,
+    )
     source_digest = "a" * 64
     other_digest = "b" * 64
     source_dockerfile = (
@@ -5454,34 +5029,60 @@ def self_test() -> int:
         "self-test: stale distroless image refs must fail with their path",
         failures,
     )
-    refresh_workflow = BASE_IMAGE_REFRESH_WORKFLOW.read_text(encoding="utf-8")
+    refresh_workflow = read_pinned(BASE_IMAGE_REFRESH_WORKFLOW)
     pin_failures = []
-    check_base_image_refresh_holds_distroless(refresh_workflow, pin_failures)
+    check_base_image_refresh_rotates_all_pins(refresh_workflow, pin_failures)
     require(
         not pin_failures,
-        "self-test: the real refresh workflow must hold distroless drift",
+        "self-test: the real refresh workflow must rotate every pin: "
+        + "; ".join(pin_failures),
         failures,
     )
     for label, original, mutation in (
         (
-            "without the held-arm `continue`",
-            "                continue\n                ;;\n",
-            "                ;;\n",
+            "that rewrites only the Dockerfiles",
+            "            for file in ${consumers}; do\n              sed -i ",
+            "            for file in ${DOCKERFILES}; do\n              sed -i ",
         ),
         (
-            "without `held=true` publication",
-            '            echo "held=true" >> "${GITHUB_OUTPUT}"\n',
+            "that may rewrite workflow files",
+            "                .github/workflows/*|.github/scripts/verify_cross_build_policy.py)\n",
+            "                .github/scripts/verify_cross_build_policy.py)\n",
+        ),
+        (
+            "that skips a refused consumer instead of failing",
+            "move that pin into a Dockerfile it reads\"\n                  exit 1\n",
+            "move that pin into a Dockerfile it reads\"\n",
+        ),
+        (
+            "that never collects a consumer",
+            '                  consumers="${consumers}${file} "\n',
+            "                  true\n",
+        ),
+        (
+            "that leaves resolution dates stale",
+            "                      sub(date, today, line[j])\n",
+            "                      true\n",
+        ),
+        (
+            "that never writes the dated file back",
+            '              cat "${file}.resolved" > "${file}"\n',
             "",
         ),
         (
-            "without the final `exit 1`",
-            'see the step summary"\n          exit 1\n',
-            'see the step summary"\n',
+            "that only redates a directly preceding comment",
+            "                    while (j >= 1 && line[j] ~ /^[[:space:]]*(FROM|ARG)[[:space:]]/) j--\n",
+            "",
         ),
         (
-            "without `always()` on the final failure",
-            "        if: always() && steps.resolve.outputs.held == 'true'\n",
-            "        if: steps.resolve.outputs.held == 'true'\n",
+            "that stages only the Dockerfiles",
+            "          git add --update\n",
+            "          git add -- ${DOCKERFILES}\n",
+        ),
+        (
+            "that holds an image back",
+            "    steps:\n      - name: Checkout\n",
+            "    env2:\n      HELD_IMAGE: x\n    steps:\n      - name: Checkout\n",
         ),
     ):
         require(
@@ -5490,7 +5091,7 @@ def self_test() -> int:
             failures,
         )
         pin_failures = []
-        check_base_image_refresh_holds_distroless(
+        check_base_image_refresh_rotates_all_pins(
             refresh_workflow.replace(original, mutation), pin_failures
         )
         require(
@@ -5499,7 +5100,7 @@ def self_test() -> int:
             failures,
         )
     for filename, job_name in COMPLETED_CACHE_PRODUCER_JOBS:
-        workflow = (CI_WORKFLOW.parent / filename).read_text(encoding="utf-8")
+        workflow = read_pinned(CI_WORKFLOW.parent / filename)
         producer = extract_job(workflow, job_name)
         producer_errors: list[str] = []
         check_completed_cache_producer(producer, job_name, producer_errors)
@@ -5527,7 +5128,7 @@ def self_test() -> int:
         producer_errors = []
         check_completed_cache_producer("", job_name, producer_errors)
         require(bool(producer_errors), "self-test: absent producer must fail", failures)
-    completed_cache = SETUP_RUST.read_text(encoding="utf-8")
+    completed_cache = read_pinned(SETUP_RUST)
     cache_errors: list[str] = []
     check_completed_rust_cache_save(completed_cache, cache_errors)
     require(not cache_errors, "self-test: completed-cache action must pass", failures)
@@ -5544,7 +5145,7 @@ def self_test() -> int:
         require(mutated != completed_cache, "self-test: cache mutation must apply", failures)
         check_completed_rust_cache_save(mutated, cache_errors)
         require(bool(cache_errors), "self-test: incomplete cache save must fail", failures)
-    node_reader = NODE_WORKFLOW.read_text(encoding="utf-8")
+    node_reader = read_pinned(NODE_WORKFLOW)
     node_reader = extract_job(node_reader, "production-dockerfile-smoke-ebpf")
     reader_errors: list[str] = []
     check_node_ebpf_registry_reader(node_reader, reader_errors)
@@ -5565,7 +5166,7 @@ def self_test() -> int:
         reader_errors = []
         check_node_ebpf_registry_reader(mutated, reader_errors)
         require(bool(reader_errors), "self-test: Node reader regression must fail", failures)
-    default_registry = NODE_WORKFLOW.read_text(encoding="utf-8")
+    default_registry = read_pinned(NODE_WORKFLOW)
     registry_errors: list[str] = []
     check_node_default_registry_jobs(default_registry, registry_errors)
     require(not registry_errors, "self-test: default registry recipes must pass", failures)
@@ -5614,40 +5215,6 @@ def self_test() -> int:
         )
         if not registry_errors:
             failures.append(f"registry-cache fixture without {label} was accepted")
-    boringcache_job = (
-        CI_CACHE_PERMISSIONS +
-        "      - uses: ./.github/actions/setup-boringcache\n"
-        f"      - run: {BORINGCACHE_CARGO_PREFIX}binaries check\n"
-        f"      - run: {BORINGCACHE_CARGO_PREFIX}binaries build\n"
-        f"      - uses: {RUST_CACHE}\n"
-        "        if: env.CI_BORINGCACHE_ENABLED != 'true'\n"
-        "        with:\n"
-        "          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}\n"
-    )
-    for mutation in (
-        None,
-        boringcache_job.replace(CI_CACHE_PERMISSIONS, "    permissions:\n      contents: read\n"),
-        boringcache_job + "      BORINGCACHE_SAVE_TOKEN: ${{ secrets.BORINGCACHE_SAVE_TOKEN }}\n",
-        boringcache_job.replace("setup-boringcache", "other-cache"),
-        boringcache_job.replace("--profile binaries", "--profile unrelated"),
-        boringcache_job + f"      - uses: {RUST_CACHE}\n        with:\n          save-if: true\n",
-        re.sub(r"save-if: [^\n]+", "save-if: true", boringcache_job),
-        boringcache_job + "          cache-directories: /\n",
-        boringcache_job.replace(
-            "        if: env.CI_BORINGCACHE_ENABLED != 'true'\n", ""
-        ).replace("      - run:", "      - if: env.CI_BORINGCACHE_ENABLED != 'true'\n        run:", 1),
-    ):
-        cache_errors: list[str] = []
-        check_direct_rust_cache_diet(
-            boringcache_job if mutation is None else mutation,
-            "self-test-boringcache", cache_errors,
-            compiler_only=False, cargo_profile="binaries",
-        )
-        require(
-            bool(cache_errors) == (mutation is not None),
-            "self-test: BoringCache must enforce scoped credentials, one cache backend and the native profile",
-            failures,
-        )
     direct_cache = (
         f"      - uses: {RUST_CACHE}\n"
         "        with:\n"
@@ -5880,7 +5447,7 @@ def self_test() -> int:
         "jobs:\n"
         "  x:\n"
         "    steps:\n"
-        f"      - uses: {CHECKOUT} # v6\n"
+        f"      - uses: {CHECKOUT}\n"
     )
     require(
         workflow_permissions_are_read_only(sample),
@@ -5911,147 +5478,9 @@ def self_test() -> int:
         failures,
     )
 
-    build_push = (
-        f"        uses: {BUILD_PUSH} # v7\n"
-        "        with:\n"
-        "          cache-from: type=local,src=/tmp/production-dockerfile-smoke-default\n"
-    )
-    good_buildkit = (
-        "    steps:\n"
-        "      - name: Build ordinary production runtime (trusted exact-hit restore-only)\n"
-        f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE} && {CACHE_KIND_EXACT}\n"
-        f"{build_push}"
-        "      - name: Build ordinary production runtime\n"
-        f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE} && {CACHE_KIND_PUBLISH}\n"
-        f"{build_push}"
-        "          cache-to: type=local,dest=/tmp/production-dockerfile-smoke-default-out,mode=max\n"
-        "      - name: Build ordinary production runtime (fork restore-only)\n"
-        f"        if: {COLD_NOT_TRUE} && {FORK_IS_TRUE}\n"
-        f"{build_push}"
-        "      - name: Build ordinary production runtime (cold cache)\n"
-        f"        if: {COLD_IS_TRUE}\n"
-        f"        uses: {BUILD_PUSH} # v7\n"
-        "        with:\n"
-        "          provenance: false\n"
-    )
-    good_buildkit_failures: list[str] = []
-    check_buildkit_cache_boundary(
-        good_buildkit,
-        "self-test-good-buildkit",
-        good_buildkit_failures,
-    )
-    require(
-        not good_buildkit_failures,
-        "self-test: structurally split BuildKit cache paths should pass: "
-        + "; ".join(good_buildkit_failures),
-        failures,
-    )
-
-    substring_false_positive = (
-        "    steps:\n"
-        "      - name: Record BuildKit cache restore policy\n"
-        "        env:\n"
-        "          FORK_PR: ${{ github.event.pull_request.head.repo.fork }}\n"
-        "        run: echo telemetry-only\n"
-        "      - name: Build ordinary production runtime\n"
-        f"        if: {COLD_NOT_TRUE}\n"
-        f"{build_push}"
-        "          cache-to: type=gha,mode=max,scope=production-dockerfile-smoke-default\n"
-        "      - name: Build ordinary production runtime (cold cache)\n"
-        f"        if: {COLD_IS_TRUE}\n"
-        f"        uses: {BUILD_PUSH} # v7\n"
-        "        with:\n"
-        "          provenance: false\n"
-    )
-    require(
-        "github.event.pull_request.head.repo.fork" in substring_false_positive,
-        "self-test fixture must include the fork substring the old check trusted",
-        failures,
-    )
-    substring_failures: list[str] = []
-    check_buildkit_cache_boundary(
-        substring_false_positive,
-        "self-test-unconditional-cache-to",
-        substring_failures,
-    )
-    require(
-        any("exclude fork PRs from every cache-to" in item for item in substring_failures)
-        and any("fork restore-only BuildKit step" in item for item in substring_failures),
-        "self-test: fork substring plus unconditional cache-to must fail structurally",
-        failures,
-    )
-
-    fork_cache_to = (
-        "    steps:\n"
-        "      - name: Build ordinary production runtime (trusted exact-hit restore-only)\n"
-        f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE} && {CACHE_KIND_EXACT}\n"
-        f"{build_push}"
-        "      - name: Build ordinary production runtime\n"
-        f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE} && {CACHE_KIND_PUBLISH}\n"
-        f"{build_push}"
-        "          cache-to: type=local,dest=/tmp/production-dockerfile-smoke-default-out,mode=max\n"
-        "      - name: Build ordinary production runtime (fork restore-only)\n"
-        f"        if: {COLD_NOT_TRUE} && {FORK_IS_TRUE}\n"
-        f"{build_push}"
-        "          cache-to: type=local,dest=/tmp/production-dockerfile-smoke-default-out,mode=max\n"
-        "      - name: Build ordinary production runtime (cold cache)\n"
-        f"        if: {COLD_IS_TRUE}\n"
-        f"        uses: {BUILD_PUSH} # v7\n"
-        "        with:\n"
-        "          provenance: false\n"
-    )
-    fork_cache_to_failures: list[str] = []
-    check_buildkit_cache_boundary(
-        fork_cache_to,
-        "self-test-fork-cache-to",
-        fork_cache_to_failures,
-    )
-    require(
-        any(
-            "omit cache-to on the fork restore-only BuildKit step" in item
-            for item in fork_cache_to_failures
-        ),
-        "self-test: reintroducing cache-to on a fork path must fail",
-        failures,
-    )
-
-    exact_hit_export = (
-        "    steps:\n"
-        "      - name: Build ordinary production runtime (trusted exact-hit restore-only)\n"
-        f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE} && {CACHE_KIND_EXACT}\n"
-        f"{build_push}"
-        "          cache-to: type=local,dest=/tmp/production-dockerfile-smoke-default-out,mode=max\n"
-        "      - name: Build ordinary production runtime\n"
-        f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE} && {CACHE_KIND_PUBLISH}\n"
-        f"{build_push}"
-        "          cache-to: type=local,dest=/tmp/production-dockerfile-smoke-default-out,mode=max\n"
-        "      - name: Build ordinary production runtime (fork restore-only)\n"
-        f"        if: {COLD_NOT_TRUE} && {FORK_IS_TRUE}\n"
-        f"{build_push}"
-        "      - name: Build ordinary production runtime (cold cache)\n"
-        f"        if: {COLD_IS_TRUE}\n"
-        f"        uses: {BUILD_PUSH} # v7\n"
-        "        with:\n"
-        "          provenance: false\n"
-    )
-    exact_hit_export_failures: list[str] = []
-    check_buildkit_cache_boundary(
-        exact_hit_export,
-        "self-test-exact-hit-export",
-        exact_hit_export_failures,
-    )
-    require(
-        any(
-            "never export cache-to on an exact github.sha hit" in item
-            for item in exact_hit_export_failures
-        ),
-        "self-test: exact-hit cache-to/export must fail",
-        failures,
-    )
-
     rust_step = (
         "      - name: Cache FIPS Rust\n"
-        f"        uses: {RUST_CACHE} # v2\n"
+        f"        uses: {RUST_CACHE}\n"
         "        with:\n"
         "          shared-key: ci-fips\n"
         "          cache-on-failure: \"true\"\n"
@@ -6240,9 +5669,9 @@ def self_test() -> int:
         failures,
     )
 
-    real_fips = FIPS_WORKFLOW.read_text(encoding="utf-8")
-    real_sccache = SETUP_SCCACHE.read_text(encoding="utf-8")
-    real_linker = SETUP_FAST_LINKER.read_text(encoding="utf-8")
+    real_fips = read_pinned(FIPS_WORKFLOW)
+    real_sccache = read_pinned(SETUP_SCCACHE)
+    real_linker = read_pinned(SETUP_FAST_LINKER)
     admitted_failures: list[str] = []
     check_fips_action_allowlist(real_fips, "fips-build.yml", admitted_failures)
     check_no_sccache_credential_exporter(real_fips, "fips-build.yml", admitted_failures)
@@ -6262,12 +5691,12 @@ def self_test() -> int:
         failures,
     )
     github_script = (
-        "actions/github-script@3d3c42e5aac5ba805825da76410c181273ba90b1"
+        "actions/github-script@0000000000000000000000000000000000000000"
     )
-    setup_step = "      - uses: ./.github/actions/setup-sccache\n"
+    setup_step = "      - uses: ./.github/actions/setup-fast-linker\n"
     require(
         setup_step in real_fips,
-        "self-test: fips-build.yml must still contain the setup-sccache step",
+        "self-test: fips-build.yml must still contain the setup-fast-linker step",
         failures,
     )
 
@@ -6294,15 +5723,15 @@ def self_test() -> int:
         "    branches:\n"
         "      - main\n"
         "      - |\n"
-        "          uses: ./.github/actions/setup-sccache\n",
+        "          uses: ./.github/actions/setup-fast-linker\n",
         1,
     ).replace(setup_step, "      - run: true\n", 1)
     require(
-        "      - |\n          uses: ./.github/actions/setup-sccache\n"
+        "      - |\n          uses: ./.github/actions/setup-fast-linker\n"
         in scalar_count_decoy
         and scalar_count_decoy.count(setup_step) == real_fips.count(setup_step) - 1,
         "self-test: sequence block-scalar decoy mutation must insert inert text "
-        "and remove exactly one real setup-sccache action",
+        "and remove exactly one real setup-fast-linker action",
         failures,
     )
     scalar_count_failures: list[str] = []
@@ -6313,7 +5742,7 @@ def self_test() -> int:
     )
     require(
         any(
-            "./.github/actions/setup-sccache observed=3 expected=4" in item
+            "./.github/actions/setup-fast-linker observed=3 expected=4" in item
             for item in scalar_count_failures
         ),
         "self-test: inert sequence block-scalar text must not replace a real "
@@ -6501,7 +5930,7 @@ def self_test() -> int:
 
     unlisted_pin = real_fips.replace(
         setup_step,
-        "      - uses: actions/setup-node@3d3c42e5aac5ba805825da76410c181273ba90b1\n"
+        "      - uses: actions/setup-node@0000000000000000000000000000000000000000\n"
         + setup_step,
         1,
     )
@@ -6531,7 +5960,7 @@ def self_test() -> int:
     )
     require(
         any("must not invoke nested actions" in item for item in nested_failures),
-        f"self-test: nested github-script in setup-sccache must fail: {nested_failures}",
+        f"self-test: nested github-script in setup-fast-linker must fail: {nested_failures}",
         failures,
     )
     require(
@@ -6575,7 +6004,7 @@ def self_test() -> int:
         require(
             setup_step in mutated and snippet.split("\n", 1)[0] in mutated,
             "self-test: FIPS carrier mutation must insert into the real workflow "
-            f"without dropping setup-sccache: {snippet!r}",
+            f"without dropping setup-fast-linker: {snippet!r}",
             failures,
         )
         return mutated
@@ -6681,13 +6110,13 @@ def self_test() -> int:
     )
     require_fips_carrier(
         "self-test-duplicate-checkout",
-        f"      - uses: {CHECKOUT} # v6\n"
+        f"      - uses: {CHECKOUT}\n"
         "        with:\n"
         "          persist-credentials: false\n",
         ("occurrence counts", "observed="),
     )
     require_fips_carrier(
-        "self-test-duplicate-setup-sccache",
+        "self-test-duplicate-setup-fast-linker",
         setup_step,
         ("occurrence counts", "observed="),
     )
@@ -6724,7 +6153,7 @@ def self_test() -> int:
     require(
         setup_step in repo_redirect and "persist-credentials: false" in repo_redirect,
         "self-test: repository redirect mutation must keep original admitted "
-        "checkout and setup-sccache text",
+        "checkout and setup-fast-linker text",
         failures,
     )
     repo_redirect_failures: list[str] = []
@@ -6740,13 +6169,13 @@ def self_test() -> int:
     )
     path_redirect = real_fips.replace(
         checkout_with,
-        checkout_with + "          path: .github/actions/setup-sccache\n",
+        checkout_with + "          path: .github/actions/setup-fast-linker\n",
         1,
     )
     require(
         setup_step in path_redirect
-        and "./.github/actions/setup-sccache" in path_redirect,
-        "self-test: path redirect mutation must keep original setup-sccache text",
+        and "./.github/actions/setup-fast-linker" in path_redirect,
+        "self-test: path redirect mutation must keep original setup-fast-linker text",
         failures,
     )
     path_redirect_failures: list[str] = []
@@ -6768,7 +6197,7 @@ def self_test() -> int:
     require(
         setup_step in duplicate_with and duplicate_with.count(checkout_with) >= 1,
         "self-test: duplicate checkout with mutation must keep the original "
-        "checkout provenance and setup-sccache text",
+        "checkout provenance and setup-fast-linker text",
         failures,
     )
     duplicate_with_failures: list[str] = []
@@ -6935,10 +6364,7 @@ def self_test() -> int:
     # The root `description:` key at column zero plus every line of its block
     # body (indented, or blank). Nothing else in the file is exempt, so every
     # occurrence of the token has to fall inside this span.
-    root_description_block = re.search(
-        r"(?m)^description:[^\n]*\n(?:(?:[ \t]+[^\n]*)?\n)*",
-        real_sccache,
-    )
+    root_description_block = _ROOT_DESCRIPTION_BLOCK_RE.search(real_sccache)
     root_description_hits = (
         0
         if root_description_block is None
@@ -7327,20 +6753,20 @@ def self_test() -> int:
         "jobs:\n"
         "  fips-compile:\n"
         "    steps:\n"
-        f"      - uses: {CACHE_SAVE} # v4.2.4\n"
+        f"      - uses: {CACHE_SAVE}\n"
         f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE}\n"
         "        with:\n"
         "          path: ${{ github.workspace }}/target\n"
         "          key: fips-producer-legacy\n"
         "  fips-clippy:\n"
         "    steps:\n"
-        f"      - uses: {CACHE_SAVE} # v4.2.4\n"
+        f"      - uses: {CACHE_SAVE}\n"
         f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE}\n"
         "        with:\n"
         "          key: fips-producer-legacy\n"
         "  fips-test:\n"
         "    steps:\n"
-        f"      - uses: {CACHE_RESTORE} # v4.2.4\n"
+        f"      - uses: {CACHE_RESTORE}\n"
         f"        if: {COLD_NOT_TRUE}\n"
         "        with:\n"
         "          key: fips-producer-legacy\n"
@@ -7394,7 +6820,7 @@ def self_test() -> int:
     consumer_download = (
         "      - name: Download FIPS producer handoff\n"
         f"        if: {COLD_NOT_TRUE}\n"
-        f"        uses: {DOWNLOAD_ARTIFACT} # v8\n"
+        f"        uses: {DOWNLOAD_ARTIFACT}\n"
         "        with:\n"
         "          pattern: ${{ env.FIPS_HANDOFF_ARTIFACT_PREFIX }}*\n"
         "          path: ${{ runner.temp }}/fips-producer-channel\n"
@@ -7484,7 +6910,7 @@ def self_test() -> int:
         "    steps:\n"
         + consumer_download
         + "      - name: Save FIPS producer compile outputs\n"
-        f"        uses: {CACHE_SAVE} # v4.2.4\n"
+        f"        uses: {CACHE_SAVE}\n"
         f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE}\n"
         "        with:\n"
         "          key: fips-producer-legacy\n",
@@ -7572,7 +6998,7 @@ def self_test() -> int:
         failures,
     )
 
-    handoff_channel = FIPS_WORKFLOW.read_text(encoding="utf-8")
+    handoff_channel = read_pinned(FIPS_WORKFLOW)
     handoff_failures: list[str] = []
     check_fips_producer_channel(handoff_channel, handoff_failures)
     require(
@@ -7749,6 +7175,59 @@ def self_test() -> int:
         failures,
     )
 
+    # GHSA-cgg3-3m23-23gx: the required aggregate must not pass while the
+    # feature-policy audit fails.
+    no_feature_policy_need = handoff_channel.replace(
+        "    needs:\n      - feature-policy\n      - fips-plan\n",
+        "    needs:\n      - fips-plan\n",
+        1,
+    )
+    no_feature_policy_gate = handoff_channel.replace(
+        FIPS_FEATURE_POLICY_FAIL_STEP + "\n", "", 1
+    )
+    late_feature_policy_gate = no_feature_policy_gate.replace(
+        "      - name: Report FIPS compile gate\n",
+        FIPS_FEATURE_POLICY_FAIL_STEP + "\n      - name: Report FIPS compile gate\n",
+        1,
+    )
+    conditional_feature_policy_gate = handoff_channel.replace(
+        "        if: needs.feature-policy.result != 'success'\n",
+        "        if: needs.fips-plan.outputs.relevant == 'true' && "
+        "needs.feature-policy.result != 'success'\n",
+        1,
+    )
+    for label, mutated, expected in (
+        ("dropped feature-policy need", no_feature_policy_need,
+         "must depend on FIPS Feature Policy"),
+        ("dropped feature-policy fail step", no_feature_policy_gate,
+         "exactly one unconditional step"),
+        ("feature-policy step after the skip", late_feature_policy_gate,
+         "before the irrelevant-diff skip"),
+        ("relevance-scoped feature-policy step", conditional_feature_policy_gate,
+         "exactly one unconditional step"),
+    ):
+        require(
+            mutated != handoff_channel,
+            f"self-test: {label} fixture must alter the workflow",
+            failures,
+        )
+        mutated_failures: list[str] = []
+        check_fips(mutated, mutated_failures)
+        require(
+            any(expected in item for item in mutated_failures),
+            f"self-test: {label} must fail the FIPS aggregate contract",
+            failures,
+        )
+    current_feature_policy_failures: list[str] = []
+    check_fips_feature_policy_gate(
+        extract_job(handoff_channel, "fips-build"), current_feature_policy_failures
+    )
+    require(
+        not current_feature_policy_failures,
+        "self-test: the checked-in FIPS aggregate must gate on FIPS Feature Policy",
+        failures,
+    )
+
     mutable_planner_path = handoff_channel.replace(
         '          git cat-file blob "$entry_object" > .github/scripts/ci_runtime_plan.py\n',
         "          filter_path=.github/scripts/ci_runtime_plan.py\n"
@@ -7813,19 +7292,19 @@ def self_test() -> int:
         failures,
     )
 
-    unstable_compiler_identity = handoff_channel.replace(
-        "      - name: Stabilize Cargo compiler identity for exact-target reuse\n",
-        "      - name: Leave runner-unique Cargo compiler identity active\n",
-        1,
-    )
+    # Drop the wrapper clear from fips-compile only (FIPS Feature Policy, which
+    # precedes it, carries the same env entry and is not a Cargo handoff job).
+    compile_start = handoff_channel.index("\n  fips-compile:\n")
+    unstable_compiler_identity = handoff_channel[:compile_start] + handoff_channel[
+        compile_start:
+    ].replace('      RUSTC_WRAPPER: ""\n', "", 1)
     unstable_compiler_identity_failures: list[str] = []
     check_fips_producer_channel(
         unstable_compiler_identity, unstable_compiler_identity_failures
     )
     require(
         any(
-            "stabilize the Cargo compiler identity" in item
-            or "clear the runner-unique rustc-wrapper identity" in item
+            "must clear RUSTC_WRAPPER and CARGO_BUILD_RUSTC_WRAPPER" in item
             for item in unstable_compiler_identity_failures
         ),
         "self-test: exact FIPS restores with a runner-unique wrapper must fail",
@@ -7849,7 +7328,7 @@ def self_test() -> int:
     )
 
     missing_handoff_upload = handoff_channel.replace(
-        f"        uses: {UPLOAD_ARTIFACT} # v7\n",
+        f"        uses: {UPLOAD_ARTIFACT}\n",
         "        uses: actions/upload-artifact@untrusted\n",
         1,
     )
@@ -7869,7 +7348,7 @@ def self_test() -> int:
     unpackaged_handoff = handoff_channel.replace(
         '          tar --zstd --hard-dereference -cf "$archive" -C "$RUNNER_TEMP" \\\n'
         "            fips-producer-identity fips-producer-source-tree \\\n"
-        '            -C "$GITHUB_WORKSPACE" target .cache/sccache\n',
+        '            -C "$GITHUB_WORKSPACE" target\n',
         "          true\n",
         1,
     )
@@ -7877,7 +7356,7 @@ def self_test() -> int:
     check_fips_producer_channel(unpackaged_handoff, unpackaged_failures)
     require(
         any(
-            "package target, sccache" in item for item in unpackaged_failures
+            "package target, identity" in item for item in unpackaged_failures
         ),
         "self-test: direct permission-losing producer upload must fail",
         failures,
@@ -7900,7 +7379,7 @@ def self_test() -> int:
     eviction_prone_restore = handoff_channel.replace(
         "      - name: Download exact inter-run FIPS handoff artifact\n",
         "      - name: Restore eviction-prone FIPS handoff cache\n"
-        f"        uses: {CACHE_RESTORE} # v4.2.4\n"
+        f"        uses: {CACHE_RESTORE}\n"
         "        with:\n"
         "          key: fips-handoff-legacy\n"
         "      - name: Download exact inter-run FIPS handoff artifact\n",
@@ -7951,10 +7430,10 @@ def self_test() -> int:
 
     tolerant_missing_artifact = handoff_channel.replace(
         "        id: inter-run-fips-handoff\n"
-        f"        uses: {DOWNLOAD_ARTIFACT} # v8\n",
+        f"        uses: {DOWNLOAD_ARTIFACT}\n",
         "        id: inter-run-fips-handoff\n"
         "        continue-on-error: true\n"
-        f"        uses: {DOWNLOAD_ARTIFACT} # v8\n",
+        f"        uses: {DOWNLOAD_ARTIFACT}\n",
         1,
     )
     tolerant_missing_failures: list[str] = []
@@ -7971,7 +7450,7 @@ def self_test() -> int:
     consumer_cache_restore = handoff_channel.replace(
         "      - name: Download FIPS producer handoff\n",
         "      - name: Restore FIPS producer compile outputs\n"
-        f"        uses: {CACHE_RESTORE} # v4.2.4\n"
+        f"        uses: {CACHE_RESTORE}\n"
         "        with:\n"
         "          key: fips-producer-legacy\n"
         "      - name: Download FIPS producer handoff\n",
@@ -7993,7 +7472,7 @@ def self_test() -> int:
     compile_cache_save = handoff_channel.replace(
         "      - name: Package FIPS producer handoff\n",
         "      - name: Save FIPS producer compile outputs\n"
-        f"        uses: {CACHE_SAVE} # v4.2.4\n"
+        f"        uses: {CACHE_SAVE}\n"
         "        with:\n"
         "          key: fips-producer-legacy\n"
         "      - name: Package FIPS producer handoff\n",
@@ -8154,242 +7633,6 @@ def self_test() -> int:
             for item in fork_gated_failures
         ),
         "self-test: fork-gated handoff promotion must fail",
-        failures,
-    )
-
-    gha_backend = good_buildkit.replace("type=local", "type=gha")
-    gha_failures: list[str] = []
-    check_buildkit_cache_boundary(
-        gha_backend,
-        "self-test-gha-backend",
-        gha_failures,
-    )
-    require(
-        any("must not use the BuildKit GHA cache backend" in item for item in gha_failures),
-        "self-test: reintroducing type=gha must fail",
-        failures,
-    )
-
-    scope = "production-dockerfile-smoke-default"
-    restore_step = (
-        "      - name: Restore BuildKit local cache\n"
-        f"        if: {COLD_NOT_TRUE}\n"
-        f"        uses: {CACHE_RESTORE} # v4.2.4\n"
-        "        with:\n"
-        f"          path: /tmp/{scope}\n"
-        f"          key: {buildkit_cache_key(scope)}\n"
-        "          restore-keys: |\n"
-        f"            {buildkit_cache_prefix(scope)}\n"
-    )
-    save_step = (
-        "      - name: Save BuildKit local cache\n"
-        f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE} && {CACHE_KIND_PUBLISH}\n"
-        f"        uses: {CACHE_SAVE} # v4.2.4\n"
-        "        with:\n"
-        f"          path: /tmp/{scope}\n"
-        f"          key: {buildkit_cache_key(scope)}\n"
-    )
-    good_local = "    steps:\n" + restore_step + save_step
-    good_local_failures: list[str] = []
-    check_local_cache_actions(
-        good_local,
-        "self-test-good-local-cache",
-        good_local_failures,
-        scope=scope,
-    )
-    require(
-        not good_local_failures,
-        "self-test: pinned restore/save should pass: "
-        + "; ".join(good_local_failures),
-        failures,
-    )
-
-    fork_save = good_local.replace(
-        f"if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE} && {CACHE_KIND_PUBLISH}\n        uses: {CACHE_SAVE}",
-        f"if: {COLD_NOT_TRUE} && {FORK_IS_TRUE} && {CACHE_KIND_PUBLISH}\n        uses: {CACHE_SAVE}",
-    )
-    fork_save_failures: list[str] = []
-    check_local_cache_actions(
-        fork_save,
-        "self-test-fork-save",
-        fork_save_failures,
-        scope=scope,
-    )
-    require(
-        any("exclude fork PRs from cache save" in item for item in fork_save_failures),
-        "self-test: fork cache publication must fail",
-        failures,
-    )
-
-    cold_restore = good_local.replace(
-        f"if: {COLD_NOT_TRUE}\n        uses: {CACHE_RESTORE}",
-        f"if: {COLD_IS_TRUE}\n        uses: {CACHE_RESTORE}",
-    )
-    cold_restore_failures: list[str] = []
-    check_local_cache_actions(
-        cold_restore,
-        "self-test-cold-restore",
-        cold_restore_failures,
-        scope=scope,
-    )
-    require(
-        any("restore must skip force_cold_cache" in item for item in cold_restore_failures),
-        "self-test: force-cold restore must fail",
-        failures,
-    )
-
-    cold_save = good_local.replace(
-        f"if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE} && {CACHE_KIND_PUBLISH}\n        uses: {CACHE_SAVE}",
-        f"if: {COLD_IS_TRUE} && {FORK_NOT_TRUE} && {CACHE_KIND_PUBLISH}\n        uses: {CACHE_SAVE}",
-    )
-    cold_save_failures: list[str] = []
-    check_local_cache_actions(
-        cold_save,
-        "self-test-cold-save",
-        cold_save_failures,
-        scope=scope,
-    )
-    require(
-        any("save must skip force_cold_cache" in item for item in cold_save_failures),
-        "self-test: force-cold save must fail",
-        failures,
-    )
-
-    exact_hit_save = good_local.replace(
-        f"if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE} && {CACHE_KIND_PUBLISH}\n        uses: {CACHE_SAVE}",
-        f"if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE} && {CACHE_KIND_EXACT}\n        uses: {CACHE_SAVE}",
-    )
-    exact_hit_save_failures: list[str] = []
-    check_local_cache_actions(
-        exact_hit_save,
-        "self-test-exact-hit-save",
-        exact_hit_save_failures,
-        scope=scope,
-    )
-    require(
-        any(
-            "never save an immutable cache on an exact github.sha hit" in item
-            or "run only after a partial match or miss" in item
-            for item in exact_hit_save_failures
-        ),
-        "self-test: exact-hit cache save must fail",
-        failures,
-    )
-
-    good_prepare = (
-        "    steps:\n"
-        "      - name: Prepare BuildKit cache for save\n"
-        f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE} && {CACHE_KIND_PUBLISH}\n"
-        "        run: |\n"
-        "          set -euo pipefail\n"
-        f'          out="${{RUNNER_TEMP}}/{scope}-out"\n'
-        f'          dest="${{RUNNER_TEMP}}/{scope}"\n'
-        '          if [ ! -d "$out" ]; then\n'
-        '            echo "::error::fresh BuildKit cache export is missing; refusing to save a stale restore" >&2\n'
-        "            exit 1\n"
-        "          fi\n"
-        '          rm -rf "$dest"\n'
-        '          mv "$out" "$dest"\n'
-    )
-    good_prepare_failures: list[str] = []
-    check_cache_save_preparation(
-        good_prepare,
-        "self-test-good-prepare",
-        good_prepare_failures,
-        scope=scope,
-    )
-    require(
-        not good_prepare_failures,
-        "self-test: fail-closed cache-save preparation should pass: "
-        + "; ".join(good_prepare_failures),
-        failures,
-    )
-
-    stale_dest_fallback = (
-        "    steps:\n"
-        "      - name: Prepare BuildKit cache for save\n"
-        f"        if: {COLD_NOT_TRUE} && {FORK_NOT_TRUE} && {CACHE_KIND_PUBLISH}\n"
-        "        run: |\n"
-        "          set -euo pipefail\n"
-        f'          out="${{RUNNER_TEMP}}/{scope}-out"\n'
-        f'          dest="${{RUNNER_TEMP}}/{scope}"\n'
-        '          if [ -d "$out" ]; then\n'
-        '            rm -rf "$dest"\n'
-        '            mv "$out" "$dest"\n'
-        "          fi\n"
-        '          if [ -d "$dest" ]; then\n'
-        '            echo "present=true" >> "$GITHUB_OUTPUT"\n'
-        "          else\n"
-        '            echo "present=false" >> "$GITHUB_OUTPUT"\n'
-        "          fi\n"
-    )
-    stale_dest_failures: list[str] = []
-    check_cache_save_preparation(
-        stale_dest_fallback,
-        "self-test-stale-destination",
-        stale_dest_failures,
-        scope=scope,
-    )
-    require(
-        any("fail when the fresh export is absent" in item for item in stale_dest_failures)
-        and any("stale destination as present" in item for item in stale_dest_failures),
-        "self-test: stale-destination fallback must fail",
-        failures,
-    )
-
-    empty_hit = (
-        "    steps:\n"
-        "      - name: Record BuildKit cache restore\n"
-        "        run: python3 .github/scripts/ci_runtime_telemetry.py cache --hit \"\"\n"
-    )
-    empty_hit_failures: list[str] = []
-    check_cache_telemetry_evidence(
-        empty_hit,
-        "self-test-empty-hit",
-        empty_hit_failures,
-    )
-    require(
-        any("must not pass empty --hit" in item for item in empty_hit_failures),
-        "self-test: empty --hit must fail",
-        failures,
-    )
-
-    fabricated_hit = (
-        "    steps:\n"
-        "      - name: Record BuildKit cache restore\n"
-        "        run: python3 .github/scripts/ci_runtime_telemetry.py cache --hit true --bytes 12\n"
-    )
-    fabricated_failures: list[str] = []
-    check_cache_telemetry_evidence(
-        fabricated_hit,
-        "self-test-fabricated-hit",
-        fabricated_failures,
-    )
-    require(
-        any("must not fabricate a cache hit literal" in item for item in fabricated_failures),
-        "self-test: fabricated --hit true must fail",
-        failures,
-    )
-
-    missing_measurement = (
-        "    steps:\n"
-        "      - name: Record BuildKit cache restore\n"
-        "        env:\n"
-        "          CACHE_HIT: ${{ steps.buildkit-cache.outputs.cache-hit }}\n"
-        "          CACHE_MATCHED: ${{ steps.buildkit-cache.outputs.cache-matched-key }}\n"
-        "        run: |\n"
-        "          python3 .github/scripts/ci_runtime_telemetry.py cache --hit \"$CACHE_HIT\"\n"
-        "          echo produced no hit/miss evidence\n"
-    )
-    missing_measurement_failures: list[str] = []
-    check_cache_telemetry_evidence(
-        missing_measurement,
-        "self-test-missing-bytes",
-        missing_measurement_failures,
-    )
-    require(
-        any("must measure restored bytes" in item for item in missing_measurement_failures),
-        "self-test: missing restored-byte measurement must fail",
         failures,
     )
 
@@ -8831,7 +8074,7 @@ def self_test() -> int:
             "    steps:\n"
             "      - run: kind create cluster --name demo\n"
             "      - run: tests/k8s/node_waypoint_ebpf_live/run.sh\n"
-            "      - run: echo ferrum_mesh_bpf_drops_total\n"
+            "      - run: echo 'ferrum_mesh_bpf_drops_total{reason=\"exclude_port_hit\"}'\n"
             "        if: always()\n"
         )
 
@@ -9139,88 +8382,6 @@ def self_test() -> int:
         failures,
     )
 
-    def _ambient_image_job(cache_to: str, extra_if: str = "") -> str:
-        if_line = f"        if: {extra_if}\n" if extra_if else ""
-        chunks: list[str] = ["    steps:\n"]
-        for name, target in AMBIENT_IMAGE_BUILDS:
-            chunks.append(
-                f"      - name: {name}\n"
-                f"{if_line}"
-                f"        uses: {BUILD_PUSH} # v7\n"
-                "        with:\n"
-                "          context: .\n"
-                "          file: Dockerfile\n"
-                f"          target: {target}\n"
-                "          load: true\n"
-                f"          cache-from: {AMBIENT_GHA_CACHE_FROM}\n"
-                f"          cache-to: {cache_to}\n"
-                "          provenance: false\n"
-            )
-        for name in AMBIENT_IMAGE_CONTRACTS:
-            chunks.append(f"      - name: {name}\n        run: echo ok\n")
-        return "".join(chunks)
-
-    good_ambient_failures: list[str] = []
-    check_ambient_image_cache_budget(
-        _ambient_image_job(AMBIENT_GHA_CACHE_TO),
-        "self-test-good-ambient-cache",
-        good_ambient_failures,
-    )
-    require(
-        not good_ambient_failures,
-        "self-test: trusted-main Ambient cache-to should pass: "
-        + "; ".join(good_ambient_failures),
-        failures,
-    )
-
-    unconditional_ambient_failures: list[str] = []
-    check_ambient_image_cache_budget(
-        _ambient_image_job(AMBIENT_GHA_CACHE_TO_EXPORT),
-        "self-test-unconditional-ambient-cache-to",
-        unconditional_ambient_failures,
-    )
-    require(
-        any(
-            "unconditionally from pull requests" in item
-            for item in unconditional_ambient_failures
-        ),
-        "self-test: restoring unconditional Ambient cache-to must fail",
-        failures,
-    )
-
-    skipped_ambient_failures: list[str] = []
-    check_ambient_image_cache_budget(
-        _ambient_image_job(
-            AMBIENT_GHA_CACHE_TO, extra_if="github.event_name == 'workflow_dispatch'"
-        ),
-        "self-test-skipped-ambient-image-build",
-        skipped_ambient_failures,
-    )
-    require(
-        any(
-            "must not skip the required image build" in item
-            for item in skipped_ambient_failures
-        ),
-        "self-test: event-gated Ambient image builds must fail",
-        failures,
-    )
-
-    fork_publish_failures: list[str] = []
-    inverted_fork = AMBIENT_GHA_CACHE_TO.replace(FORK_NOT_TRUE, FORK_IS_TRUE)
-    check_ambient_image_cache_budget(
-        _ambient_image_job(inverted_fork),
-        "self-test-ambient-fork-publish",
-        fork_publish_failures,
-    )
-    require(
-        any(
-            "never from a fork" in item or "fork publication guard" in item
-            for item in fork_publish_failures
-        ),
-        "self-test: inverted Ambient fork cache-to guard must fail",
-        failures,
-    )
-
     for failure in failures:
         print(f"::error::{failure}", file=sys.stderr)
     return 1 if failures else 0
@@ -9231,21 +8392,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args(argv)
     failures: list[str] = []
-    if self_test() != 0:
-        failures.append("verify_ci_runtime_cache internal self-test failed")
-    if plan_self_test() != 0:
-        failures.append("ci_runtime_plan.py self-test failed")
-    if telemetry_self_test() != 0:
-        failures.append("ci_runtime_telemetry.py self-test failed")
     if args.self_test:
+        # The self-tests run only when asked for. verify_required_ci.py calls
+        # `--self-test` and then the plain contract check, so each runs once
+        # (issue #7283).
+        if self_test() != 0:
+            failures.append("verify_ci_runtime_cache internal self-test failed")
+        if plan_self_test() != 0:
+            failures.append("ci_runtime_plan.py self-test failed")
+        if telemetry_self_test() != 0:
+            failures.append("ci_runtime_telemetry.py self-test failed")
         for failure in failures:
             print(f"::error::{failure}", file=sys.stderr)
         return 1 if failures else 0
 
-    fips = FIPS_WORKFLOW.read_text(encoding="utf-8")
-    node = NODE_WORKFLOW.read_text(encoding="utf-8")
-    ambient = AMBIENT_WORKFLOW.read_text(encoding="utf-8")
-    ci = PERFORMANCE_WORKFLOW.read_text(encoding="utf-8")
+    fips = read_pinned(FIPS_WORKFLOW)
+    node = read_pinned(NODE_WORKFLOW)
+    ambient = read_pinned(AMBIENT_WORKFLOW)
+    ci = read_pinned(PERFORMANCE_WORKFLOW)
     check_common_trust(fips, "fips-build.yml", failures)
     check_common_trust(node, "node-waypoint-ebpf-live.yml", failures)
     check_common_trust(ambient, "ambient-host-udp-live.yml", failures)
@@ -9254,19 +8418,18 @@ def main(argv: list[str] | None = None) -> int:
     check_ambient_workflow_cache_budget(ambient, failures)
     check_shared_actions(failures)
     for filename, job_name in COMPLETED_CACHE_PRODUCER_JOBS:
-        workflow = (CI_WORKFLOW.parent / filename).read_text(encoding="utf-8")
+        workflow = read_pinned(CI_WORKFLOW.parent / filename)
         check_completed_cache_producer(
             extract_job(workflow, job_name), f"{filename}/{job_name}", failures
         )
     check_performance_cache_wrapper_key(ci, "performance-regression.yml", failures)
     for filename, job_name, compiler_only in DIRECT_CACHE_DIET_JOBS:
-        workflow = (CI_WORKFLOW.parent / filename).read_text(encoding="utf-8")
+        workflow = read_pinned(CI_WORKFLOW.parent / filename)
         check_direct_rust_cache_diet(
             extract_job(workflow, job_name),
             f"{filename}/{job_name}",
             failures,
             compiler_only=compiler_only,
-            cargo_profile=BORINGCACHE_DIRECT_PROFILES.get((filename, job_name)),
         )
     check_docs_and_coverage(failures)
     check_dockerfile(failures)

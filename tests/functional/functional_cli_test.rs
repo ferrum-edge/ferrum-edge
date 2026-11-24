@@ -1284,7 +1284,7 @@ async fn functional_cli_validate_redacts_resolved_value_in_startup_warning() {
 /// `FERRUM_CP_NAMESPACES` is parsed as `Vec<String>`, which splits on `,` and
 /// trims each entry, and `EnvConfig::validate()` then interpolates the trimmed
 /// **entry** into a hand-written error. The staged value carries leading
-/// whitespace that `read_secret` (which only trims the *trailing* end) leaves
+/// whitespace that the `_FILE` reader (which only trims the *trailing* end) leaves
 /// intact, so the resolved environment value and the echoed entry are different
 /// strings and only a derived candidate can match.
 #[ignore]
@@ -1296,7 +1296,7 @@ async fn functional_cli_validate_redacts_transformed_list_entry() {
     let jwt_path = temp_dir.path().join("jwt-secret");
     std::fs::write(&jwt_path, "validate-file-secret-with-well-over-32-bytes").unwrap();
     let namespaces_path = temp_dir.path().join("cp-namespaces");
-    // Leading whitespace survives `read_secret`'s trailing-only trim.
+    // Leading whitespace survives the `_FILE` reader's trailing-only trim.
     std::fs::write(&namespaces_path, format!("   {ENTRY}")).unwrap();
 
     let output = validate_database_mode_command(&temp_dir)
@@ -3539,6 +3539,56 @@ async fn functional_cli_pool_shard_one_validates_and_starts_file_database_cp_and
     }
     let (mut cp, address) = start_gateway_with_one_pool_shard("cp", None).await;
     let (mut dp, _) = start_gateway_with_one_pool_shard("dp", address.as_deref()).await;
+    dp.shutdown();
+    cp.shutdown();
+}
+
+/// Issue #7251: DP mode starts the ACME renewal scheduler, as file and
+/// database mode do. The scheduler entry point warns on a build without the
+/// `acme` feature and, with the feature, logs that it started. Either line in
+/// the DP's own output proves DP mode reached it, whichever feature set CI
+/// built. The challenge type must be valid: an unparseable one is refused at
+/// startup while auto-renew is enabled (issue #7194).
+#[ignore]
+#[tokio::test]
+async fn functional_dp_starts_acme_renewal_scheduler() {
+    const NO_FEATURE: &str =
+        "FERRUM_ACME_AUTO_RENEW_ENABLED=true but this binary was built without";
+    const STARTED: &str = "ACME renewal scheduler started";
+    let (mut cp, address) = start_gateway_with_one_pool_shard("cp", None).await;
+    let cp_address = address.expect("cp fixture returns its gRPC listen address");
+    let attempts = crate::scaffolding::ports::BIND_DROP_SPAWN_ATTEMPTS;
+    let mut dp = None;
+    for attempt in 1..=attempts {
+        let builder = crate::common::TestGateway::builder()
+            .skip_auto_build()
+            .clear_env()
+            .capture_output()
+            .env("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT", "true")
+            .env("FERRUM_ACME_AUTO_RENEW_ENABLED", "true")
+            .env("FERRUM_ACME_RENEW_CHALLENGE_TYPE", "http01")
+            .mode_dp(vec![format!("http://{cp_address}")]);
+        match builder.spawn_classified().await {
+            Ok(gateway) => {
+                dp = Some(gateway);
+                break;
+            }
+            Err(error) if error.is_retryable_port_race(attempt, attempts) => {}
+            Err(error) => panic!("dp with ACME auto-renew enabled: {error}"),
+        }
+    }
+    let mut dp = dp.expect("the final failed attempt panics");
+    let output = dp
+        .wait_for_captured_output(
+            |output| output.contains(NO_FEATURE) || output.contains(STARTED),
+            Duration::from_secs(15),
+        )
+        .await
+        .expect("read dp captured output");
+    assert!(
+        output.contains(NO_FEATURE) || output.contains(STARTED),
+        "DP mode must start the ACME renewal scheduler: {output}"
+    );
     dp.shutdown();
     cp.shutdown();
 }

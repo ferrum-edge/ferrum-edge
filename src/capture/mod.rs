@@ -34,11 +34,13 @@ pub const DEFAULT_UDP_OUTBOUND_PORT: u16 = 15011;
 /// (`0x539`/`0x53a`/`0x111`/`0x222`), Cilium masked mark classes
 /// (`0x200`/`0xA00`/`0xF00`/`0x800`), and Calico (`0x10000`+) marks.
 ///
-/// Collision analysis (within Ferrum): Ferrum uses NO other packet marks
-/// anywhere (verified: the only `1337` is the proxy `--uid-owner` UID, a *socket
-/// owner* match in a disjoint namespace from `skb->mark`, and
-/// `node_agent_hbone_redirect_port` `16008` is a port, not a mark). Operators
-/// can override via `FERRUM_MESH_TPROXY_MARK`.
+/// Collision analysis (within Ferrum): Ferrum's other packet marks are the
+/// NodeWaypoint marks `NODE_WAYPOINT_INBOUND_AUTH_MARK` (`0x734`),
+/// `NODE_WAYPOINT_INGRESS_REDIRECT_MARK` (`0x735`) and
+/// [`NODE_WAYPOINT_UDP_STEER_MARK`] (`0x736`), all distinct from this default.
+/// `1337` is the proxy `--uid-owner` UID, a *socket owner* match in a disjoint
+/// namespace from `skb->mark`, and `node_agent_hbone_redirect_port` `16008` is
+/// a port, not a mark. Operators can override via `FERRUM_MESH_TPROXY_MARK`.
 pub const DEFAULT_TPROXY_MARK: u32 = 0x733;
 
 // Compile-time guards on the default mark, at MODULE level (NOT `cfg(test)`) so a
@@ -86,8 +88,8 @@ pub(crate) const TPROXY_MARK_MASK: u32 = 0xffff_ffff;
 /// Istio install owns `133`, so cleanup must never flush it. This high constant
 /// is unlikely to collide with another component's table; combined with
 /// exact-rule/exact-route teardown (never `ip route flush table`), Ferrum only
-/// ever removes routing state it created. Inert until the Stage 3 UDP listener
-/// binds.
+/// ever removes routing state it created. Used only when UDP capture is
+/// enabled.
 pub(crate) const TPROXY_ROUTE_TABLE: u16 = 33133;
 
 /// Explicit `ip rule` priority for the Ferrum UDP TPROXY fwmark selector.
@@ -147,8 +149,14 @@ pub(crate) const TPROXY_HOST_ROUTE_TABLE: u16 = 33135;
 /// `ip rule` priority for the host-netns UDP fwmark selector. Like
 /// [`TPROXY_ROUTE_RULE_PRIORITY`] it MUST sit below the kernel's `main` rule
 /// (32766) or transparent local delivery never engages; it is one above the
-/// pod-netns priority so the two rules are individually addressable for exact
-/// delete-by-priority teardown.
+/// pod-netns priority so the two rules are individually addressable.
+///
+/// The node-agent's tc ingress-redirect rule
+/// (`ferrum_ebpf_common::NODE_WAYPOINT_INGRESS_REDIRECT_RULE_PRIORITY`) also
+/// sits at `101` in the HOST netns. The shared slot is safe because both
+/// subsystems only ever add and delete their rule by `priority` AND
+/// `lookup <table>`, and the tables differ (`33135` vs `33134`); the asserts
+/// below fail the build if either side drifts. Never delete by priority alone.
 pub(crate) const TPROXY_HOST_ROUTE_RULE_PRIORITY: u32 = 101;
 
 const _: () = assert!(
@@ -162,6 +170,17 @@ const _: () = assert!(
 const _: () = assert!(
     TPROXY_HOST_ROUTE_RULE_PRIORITY < 32766,
     "host-netns UDP fwmark rule must sort below the kernel `main` table rule"
+);
+const _: () = assert!(
+    TPROXY_HOST_ROUTE_TABLE as u32 != ferrum_ebpf_common::NODE_WAYPOINT_INGRESS_REDIRECT_TABLE,
+    "host-netns UDP routing table must be distinct from the tc ingress-redirect table: both \
+     rules can share a priority in the host netns and are told apart only by their table"
+);
+const _: () = assert!(
+    TPROXY_HOST_ROUTE_RULE_PRIORITY
+        == ferrum_ebpf_common::NODE_WAYPOINT_INGRESS_REDIRECT_RULE_PRIORITY,
+    "the host UDP and tc ingress-redirect rules are documented as sharing priority 101; if one \
+     moves, update both doc comments and drop this assert"
 );
 
 /// Linux `IFNAMSIZ` is 16 bytes including the NUL terminator, so an interface
@@ -250,7 +269,8 @@ const _: () = assert!(
     "the NodeWaypoint UDP steering mark must not alias the UDP TPROXY mark"
 );
 const _: () = assert!(
-    NODE_WAYPOINT_UDP_STEER_MARK != 0x734 && NODE_WAYPOINT_UDP_STEER_MARK != 0x735,
+    NODE_WAYPOINT_UDP_STEER_MARK != ferrum_ebpf_common::NODE_WAYPOINT_INBOUND_AUTH_MARK
+        && NODE_WAYPOINT_UDP_STEER_MARK != ferrum_ebpf_common::NODE_WAYPOINT_INGRESS_REDIRECT_MARK,
     "the NodeWaypoint UDP steering mark must not alias the relay auth mark (0x734) or the tc \
      ingress-redirect mark (0x735); a steered datagram would then be routed as a relayed one"
 );
@@ -260,8 +280,17 @@ const _: () = assert!(
 );
 const _: () = assert!(
     NODE_WAYPOINT_UDP_STEER_TABLE != TPROXY_ROUTE_TABLE
-        && NODE_WAYPOINT_UDP_STEER_TABLE != TPROXY_HOST_ROUTE_TABLE,
+        && NODE_WAYPOINT_UDP_STEER_TABLE != TPROXY_HOST_ROUTE_TABLE
+        && NODE_WAYPOINT_UDP_STEER_TABLE as u32
+            != ferrum_ebpf_common::NODE_WAYPOINT_INGRESS_REDIRECT_TABLE,
     "the NodeWaypoint UDP steering table must be distinct from every other Ferrum-owned table"
+);
+const _: () = assert!(
+    NODE_WAYPOINT_UDP_STEER_RULE_PRIORITY != TPROXY_ROUTE_RULE_PRIORITY
+        && NODE_WAYPOINT_UDP_STEER_RULE_PRIORITY != TPROXY_HOST_ROUTE_RULE_PRIORITY
+        && NODE_WAYPOINT_UDP_STEER_RULE_PRIORITY
+            != ferrum_ebpf_common::NODE_WAYPOINT_INGRESS_REDIRECT_RULE_PRIORITY,
+    "the NodeWaypoint UDP steering rule priority must be distinct from every other Ferrum rule"
 );
 
 /// Upper bound on steered `(ClusterIP, port)` destinations in one plan. Each
@@ -845,9 +874,8 @@ pub struct CaptureConfig {
     /// destination and offers no per-datagram recoverable original address), so
     /// captured UDP uses TPROXY in the `mangle` table, which delivers the
     /// datagram WITHOUT rewriting its destination (recovered per-datagram from
-    /// the `IP_RECVORIGDSTADDR` cmsg by the Stage 3 listener). This stage emits
-    /// rules ONLY; the consuming UDP listener arrives in Stage 3, so leaving
-    /// this off keeps an upgraded injector from redirecting UDP into a void.
+    /// the `IP_RECVORIGDSTADDR` cmsg by the UDP capture listener or the
+    /// per-pod-netns producer).
     pub udp_capture_enabled: bool,
     /// UDP TPROXY listener port the captured datagrams are delivered to. Distinct
     /// from [`Self::outbound_port`] (the TCP REDIRECT target) because UDP+TCP
@@ -1282,8 +1310,7 @@ impl IncludeOutboundPorts {
 }
 
 /// One annotation's parse result, before two annotations get merged together.
-/// Kept private so the merge contract stays in
-/// [`include_outbound_ports_from_annotations`].
+/// The merge contract lives in [`include_outbound_ports_from_annotations`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum ParsedIncludePorts {
     Absent,
@@ -1603,40 +1630,34 @@ impl IptablesPlan {
     /// Each command uses `2>/dev/null || true` so partial cleanup (e.g.
     /// chains already removed by a previous run) does not fail the overall
     /// teardown.
+    /// Flat IPv4 cleanup for an install that may have emitted UDP rules: the
     /// TCP-chain teardown plus, when `udp_capture_enabled`, the UDP TPROXY
-    /// `mangle` chains and the Ferrum-owned routing rule/route. The UDP teardown
-    /// is gated so a non-UDP install never touches routing state it never
-    /// created (codex r1); pass the install's `udp_capture_enabled` flag.
-    /// Flat IPv4 cleanup (iptables-table teardown then raw routing teardown).
-    /// Test-only convenience; production node-agent code uses [`Self::cleanup_split`]
-    /// so it can guard only the table portion behind the `ip6tables` probe.
+    /// teardown (iptables-table teardown, then raw routing teardown). The UDP
+    /// half is gated so a non-UDP install never touches routing state it never
+    /// created (codex r1). Test-only: it backs [`Self::cleanup_script`].
     #[cfg(test)]
     pub fn cleanup_commands(udp_capture_enabled: bool) -> Vec<String> {
-        cleanup_commands_for("iptables", udp_capture_enabled).into_flat()
+        with_udp_teardown("iptables", udp_capture_enabled).into_flat()
     }
 
-    /// Flat IPv6 cleanup. Test-only; see [`Self::cleanup_v6_split`].
+    /// Flat IPv6 cleanup. Test-only; see [`Self::cleanup_commands`].
     #[cfg(test)]
     pub fn cleanup_v6_commands(udp_capture_enabled: bool) -> Vec<String> {
-        cleanup_commands_for("ip6tables", udp_capture_enabled).into_flat()
+        with_udp_teardown("ip6tables", udp_capture_enabled).into_flat()
     }
 
-    /// The IPv4 cleanup split into the iptables-table teardown vs. the raw `ip`
-    /// routing teardown. The node-agent emits the routing teardown UNCONDITIONALLY
-    /// (it is `ip`, not `iptables`/`ip6tables`); see [`Self::cleanup_v6_split`].
-    pub fn cleanup_split(udp_capture_enabled: bool) -> CleanupCommands {
-        cleanup_commands_for("iptables", udp_capture_enabled)
+    /// The IPv4 TCP-capture cleanup for the node-agent's host-netns iptables
+    /// fallback, which never installs UDP capture (only the Ambient topology
+    /// enables it, and Ambient refuses the fallback). Stale UDP state from an
+    /// earlier run is reaped by the unconditional [`Self::udp_teardown_split`].
+    pub fn cleanup_split() -> CleanupCommands {
+        cleanup_commands_for("iptables")
     }
 
-    /// The IPv6 cleanup split into the **ip6tables-table** teardown (`iptables`,
-    /// which the node-agent guards behind an `ip6tables` availability probe) and
-    /// the **raw `ip -6` routing** teardown (`ip_routing`, the fwmark rule + local
-    /// route). The routing teardown MUST be emitted UNCONDITIONALLY — `ip -6` can
-    /// remove the rule/route even when `ip6tables` is missing, so wrapping it in
-    /// the ip6tables guard would leak the fwmark rule + local route and keep
-    /// diverting marked UDP after shutdown (codex r3).
-    pub fn cleanup_v6_split(udp_capture_enabled: bool) -> CleanupCommands {
-        cleanup_commands_for("ip6tables", udp_capture_enabled)
+    /// The IPv6 counterpart of [`Self::cleanup_split`]; the node-agent guards
+    /// it behind an `ip6tables` availability probe.
+    pub fn cleanup_v6_split() -> CleanupCommands {
+        cleanup_commands_for("ip6tables")
     }
 
     /// The EXACT Ferrum-owned **IPv4** UDP TPROXY teardown (mangle chains +
@@ -1684,47 +1705,6 @@ impl CleanupCommands {
         let mut commands = self.iptables;
         commands.extend(self.ip_routing);
         commands
-    }
-}
-
-// EbpfPlan and helpers are consumed by the node-agent eBPF capture path
-// (ambient DaemonSet integration). The sidecar injector deliberately does NOT
-// inject an init container for eBPF mode — privileged capabilities would cause
-// Pod Security Baseline/Restricted admission rejection on every pod, even when
-// the script does nothing on 5.7+ kernels.
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EbpfPlan {
-    pub enabled: bool,
-    pub fallback: IptablesPlan,
-    pub required_kernel: &'static str,
-}
-
-#[allow(dead_code)]
-impl EbpfPlan {
-    pub fn for_config(config: &CaptureConfig) -> Result<Self, String> {
-        Ok(Self {
-            enabled: config.mode == CaptureMode::Ebpf,
-            fallback: IptablesPlan::for_config(config)?,
-            required_kernel: "5.7",
-        })
-    }
-
-    pub fn fallback_script(&self) -> String {
-        let fallback_cmds = self.fallback.script();
-        let (major, minor) = parse_kernel_requirement(self.required_kernel);
-        format!(
-            "MAJOR=$(uname -r | cut -d. -f1)\n\
-             MINOR=$(uname -r | cut -d. -f2)\n\
-             if [ \"$MAJOR\" -lt {major} ] || \
-             {{ [ \"$MAJOR\" -eq {major} ] && [ \"$MINOR\" -lt {minor} ]; }}; then\n\
-             echo \"Kernel $(uname -r) < {req}, falling back to iptables\"\n\
-             {fallback_cmds}\n\
-             else\n\
-             echo \"Kernel $(uname -r) supports eBPF capture, skipping iptables\"\n\
-             fi",
-            req = self.required_kernel,
-        )
     }
 }
 
@@ -2082,14 +2062,6 @@ impl IptablesPlan {
         };
         iptables_script(&v4_commands, &v6_commands, ip6tables_mode, false)
     }
-}
-
-#[allow(dead_code)]
-fn parse_kernel_requirement(version: &str) -> (u32, u32) {
-    let mut parts = version.split('.');
-    let major = parts.next().and_then(|p| p.parse().ok()).unwrap_or(5);
-    let minor = parts.next().and_then(|p| p.parse().ok()).unwrap_or(7);
-    (major, minor)
 }
 
 pub fn should_fallback_to_iptables(kernel_release: &str) -> bool {
@@ -2621,9 +2593,9 @@ fn udp_guard_switch_commands(
 /// `! --dst-type LOCAL` discriminator and be TPROXY'd by the outbound chain
 /// (bypassing inbound exclusions). There is no host-netns-safe `addrtype`-style
 /// discriminator here without per-pod IP knowledge the iptables fallback does not
-/// carry, and this path is inert (flag-gated default-off, no Stage-3 listener,
-/// eBPF is the node-agent's primary/supported UDP capture path), so the
-/// host-netns case emits NO UDP TPROXY rules rather than silently
+/// carry, and the node-agent host-netns fallback has no UDP path (host UDP
+/// capture is the separate interface-scoped generator; eBPF UDP capture is a
+/// non-goal), so the host-netns case emits NO UDP TPROXY rules rather than silently
 /// mis-capturing inbound as outbound. See [`CaptureConfig::host_netns`].
 fn udp_tproxy_commands_for_family(
     binary: &str,
@@ -2637,8 +2609,9 @@ fn udp_tproxy_commands_for_family(
     // LOCAL` direction split below is only valid in the pod netns; in the host
     // netns it mis-captures inbound-to-pod UDP as outbound. Rather than wire a
     // wrong direction split, the host-netns iptables fallback emits no UDP TPROXY
-    // rules at all — eBPF is the node-agent's supported UDP capture path. The
-    // node-agent logs the limitation once when it would otherwise emit these.
+    // rules at all — host UDP capture is the separate interface-scoped
+    // generator. The node-agent logs the limitation once when it would
+    // otherwise emit these.
     if config.host_netns {
         return Vec::new();
     }
@@ -3169,7 +3142,8 @@ fn udp_only_commands_for_family(config: &CaptureConfig, family: CidrFamily) -> V
     )
 }
 
-fn cleanup_commands_for(binary: &str, udp_capture_enabled: bool) -> CleanupCommands {
+/// TCP nat-chain teardown for one `iptables`/`ip6tables` family.
+fn cleanup_commands_for(binary: &str) -> CleanupCommands {
     let iptables = vec![
         // Step 1: remove jump rules from built-in chains
         idempotent_delete(binary, "nat", "OUTPUT", "-p tcp -j FERRUM_MESH_OUTBOUND"),
@@ -3182,22 +3156,23 @@ fn cleanup_commands_for(binary: &str, udp_capture_enabled: bool) -> CleanupComma
         delete_chain(binary, "nat", "FERRUM_MESH_OUTBOUND"),
     ];
 
-    let mut combined = CleanupCommands {
+    CleanupCommands {
         iptables,
         ip_routing: Vec::new(),
-    };
+    }
+}
 
-    // UDP TPROXY teardown is GATED on `udp_capture_enabled` HERE: when this
-    // install never emitted UDP rules, the normal shutdown/setup-failure cleanup
-    // must not touch routing state it never created. (The node-agent runs a
-    // SEPARATE UNCONDITIONAL pre-setup teardown via [`udp_teardown_for`] to reap
-    // stale state from a prior UDP-enabled-then-crashed run — codex r4.)
+/// [`cleanup_commands_for`] plus, when the install emitted UDP rules, the UDP
+/// TPROXY teardown. Gated so a non-UDP install never touches routing state it
+/// never created (codex r1).
+#[cfg(test)]
+fn with_udp_teardown(binary: &str, udp_capture_enabled: bool) -> CleanupCommands {
+    let mut combined = cleanup_commands_for(binary);
     if udp_capture_enabled {
         let udp = udp_teardown_for(binary);
         combined.iptables.extend(udp.iptables);
         combined.ip_routing.extend(udp.ip_routing);
     }
-
     combined
 }
 
@@ -3345,10 +3320,16 @@ fn udp_strict_output_jump_release_for(binary: &str, chain: &str) -> String {
 /// traverses `OUTPUT`). Only an absent chain (`-S` status 1) is tolerated; any
 /// other status is a genuine xtables error that aborts, so a caller can never
 /// report a completed release while a jump is still live.
+///
+/// The block is self-contained: a failed `-D` exits with its own status instead
+/// of relying on the caller's `set -e`. The best-effort teardown scripts and the
+/// node-agent cleanup runner execute it without `errexit`, and there a `-C` that
+/// keeps matching while `-D` keeps failing (an xtables lock held past `-w`)
+/// would otherwise spin forever.
 fn udp_strict_jump_release_for(binary: &str, hook: &str, chain: &str) -> String {
     let jump = format!("-p udp -j {chain}");
     format!(
-        "if {binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -S {chain} >/dev/null 2>&1; then\n  while true; do\n    if {binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -C {hook} {jump} 2>/dev/null; then\n      {binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -D {hook} {jump}\n    else\n      status=$?\n      if [ \"$status\" -eq 1 ]; then\n        break\n      fi\n      echo \"{binary} could not check {hook} jump {chain} (status $status)\" >&2\n      exit \"$status\"\n    fi\n  done\nelse\n  status=$?\n  if [ \"$status\" -ne 1 ]; then\n    echo \"{binary} could not inspect UDP fail-closed guard chain {chain} before release (status $status)\" >&2\n    exit \"$status\"\n  fi\nfi"
+        "if {binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -S {chain} >/dev/null 2>&1; then\n  while true; do\n    if {binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -C {hook} {jump} 2>/dev/null; then\n      {binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -D {hook} {jump} || {{\n        status=$?\n        echo \"{binary} could not delete {hook} jump {chain} (status $status)\" >&2\n        exit \"$status\"\n      }}\n    else\n      status=$?\n      if [ \"$status\" -eq 1 ]; then\n        break\n      fi\n      echo \"{binary} could not check {hook} jump {chain} (status $status)\" >&2\n      exit \"$status\"\n    fi\n  done\nelse\n  status=$?\n  if [ \"$status\" -ne 1 ]; then\n    echo \"{binary} could not inspect UDP fail-closed guard chain {chain} before release (status $status)\" >&2\n    exit \"$status\"\n  fi\nfi"
     )
 }
 
@@ -3982,12 +3963,13 @@ iptables() {{
             script.contains("could not inspect active UDP fail-closed guard"),
             "jump probe still reports and re-raises a genuine resource error:\n{script}"
         );
-        // The two outer handlers and both error paths in each of the four
-        // expanded strict-release blocks re-raise the binary's status, so
-        // `set -e` aborts and the producer keeps the fail-closed cleanup owner.
+        // The two outer handlers and all three error paths (jump delete, jump
+        // check, chain probe) in each of the four expanded strict-release
+        // blocks re-raise the binary's status, so the script aborts and the
+        // producer keeps the fail-closed cleanup owner.
         assert_eq!(
             script.matches("exit \"$status\"").count(),
-            10,
+            14,
             "every strict probe re-raises the xtables status to fail closed:\n{script}"
         );
     }
@@ -4058,62 +4040,6 @@ iptables() {{
         assert!(should_fallback_to_iptables("5.4.0"));
         assert!(!should_fallback_to_iptables("5.7.0"));
         assert!(!should_fallback_to_iptables("6.6.12"));
-    }
-
-    #[test]
-    fn ebpf_plan_carries_iptables_fallback() {
-        let mut config = CaptureConfig::explicit(15006, 15001);
-        config.mode = CaptureMode::Ebpf;
-
-        let plan = EbpfPlan::for_config(&config).unwrap();
-
-        assert!(plan.enabled);
-        assert_eq!(plan.required_kernel, "5.7");
-        assert_eq!(plan.fallback.ip6tables_mode, Ip6TablesMode::Auto);
-        assert!(
-            plan.fallback
-                .v4_commands
-                .iter()
-                .any(|cmd| cmd.contains("--uid-owner 1337"))
-        );
-        assert!(
-            plan.fallback
-                .v4_commands
-                .iter()
-                .any(|cmd| cmd.contains("--to-ports 15001"))
-        );
-    }
-
-    #[test]
-    fn ebpf_fallback_script_contains_kernel_check_and_iptables() {
-        let mut config = CaptureConfig::explicit(15006, 15001);
-        config.mode = CaptureMode::Ebpf;
-
-        let plan = EbpfPlan::for_config(&config).unwrap();
-        let script = plan.fallback_script();
-
-        assert!(script.contains("uname -r"));
-        assert!(script.contains("-lt 5"));
-        assert!(script.contains("-lt 7"));
-        assert!(script.contains("falling back to iptables"));
-        assert!(script.contains("supports eBPF"));
-        assert!(script.contains("--to-ports 15001"));
-        assert!(script.contains("--to-ports 15006"));
-    }
-
-    #[test]
-    fn ebpf_fallback_script_preserves_required_ip6tables_mode() {
-        let mut config = CaptureConfig::explicit(15006, 15001);
-        config.mode = CaptureMode::Ebpf;
-        config.ip6tables_mode = Ip6TablesMode::Required;
-        config.include_cidrs = vec!["fd00::/8".to_string()];
-
-        let plan = EbpfPlan::for_config(&config).unwrap();
-        let script = plan.fallback_script();
-
-        assert_eq!(plan.fallback.ip6tables_mode, Ip6TablesMode::Required);
-        assert!(script.contains("ip6tables is required for IPv6 mesh capture"));
-        assert!(script.contains("ip6tables nat table is required for IPv6 mesh capture"));
     }
 
     #[test]
@@ -6446,13 +6372,13 @@ iptables() {{
     }
 
     #[test]
-    fn cleanup_v6_split_separates_raw_ip_routing_from_ip6tables_tables() {
+    fn udp_teardown_v6_split_separates_raw_ip_routing_from_ip6tables_tables() {
         // codex r3: the raw `ip -6 rule/route del` teardown must be in `ip_routing`
         // (emitted unconditionally by the node-agent) and NOT in `iptables` (which
         // the node-agent guards behind an `ip6tables` availability probe). Wrapping
         // the `ip -6` teardown in that probe would leak the fwmark rule + local
         // route when `ip6tables` is missing.
-        let split = IptablesPlan::cleanup_v6_split(true);
+        let split = IptablesPlan::udp_teardown_v6_split();
 
         // The raw `ip -6` rule/route teardown lives in `ip_routing`.
         assert!(
@@ -6490,11 +6416,11 @@ iptables() {{
     }
 
     #[test]
-    fn cleanup_v6_split_routing_empty_when_udp_disabled() {
-        // When UDP capture was never enabled, there is no routing state to tear
-        // down (gated like the v4 path); both halves carry only the TCP nat-chain
-        // teardown and no `ip -6` routing.
-        let split = IptablesPlan::cleanup_v6_split(false);
+    fn cleanup_v6_split_carries_no_udp_routing_teardown() {
+        // The fallback's TCP-capture cleanup never installed UDP state, so it
+        // carries only the TCP nat-chain teardown and no `ip -6` routing; the
+        // unconditional `udp_teardown_v6_split` reaps stale UDP state instead.
+        let split = IptablesPlan::cleanup_v6_split();
         assert!(
             split.ip_routing.is_empty(),
             "UDP-disabled v6 cleanup must emit no routing teardown: {:?}",
@@ -6557,8 +6483,8 @@ iptables() {{
         // delivering to the existing outbound listener), the UDP path must SKIP the
         // unqualified IPv4 `-j TPROXY` catch-all entirely — an unqualified UDP
         // TPROXY would divert ALL IPv4 UDP (DNS included) into the marked routing
-        // table though only IPv6 was selected, black-holing it (no Stage 3 listener
-        // yet). Capturing nothing for the unselected family is the safe failure.
+        // table though only IPv6 was selected, black-holing it. Capturing
+        // nothing for the unselected family is the safe failure.
         let mut config = udp_enabled_iptables_config();
         config.include_cidrs = vec!["fd00::/8".to_string()];
         config.include_cidrs_explicit = true;

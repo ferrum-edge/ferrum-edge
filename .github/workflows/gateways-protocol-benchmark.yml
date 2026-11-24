@@ -125,15 +125,22 @@ jobs:
       - name: Skip protocol?
         id: skip_check
         run: |
+          # Whole space-delimited tokens only (#7405): `grep -w` treats `-` as
+          # a word boundary, so skipping `udp-dtls` also skipped `udp`.
           skip_list="${{ inputs.skip_protocols }}"
-          if echo " $skip_list " | grep -qw "${{ matrix.protocol }}"; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "Protocol ${{ matrix.protocol }} is in skip list — ending job."
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
+          case " $skip_list " in
+            *" ${{ matrix.protocol }} "*)
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "Protocol ${{ matrix.protocol }} is in skip list — ending job."
+              ;;
+            *)
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
 
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
         if: steps.skip_check.outputs.skip != 'true'
 
       - name: Install Rust
@@ -150,13 +157,15 @@ jobs:
 
       - name: Cache Rust dependencies
         if: steps.skip_check.outputs.skip != 'true'
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: "ci-gateways-protocol-bench"
           # Host builds use a nested workspace; root target/ has no reuse here.
           cache-targets: "false"
           cache-directories: ${{ github.workspace }}/.cache/sccache
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          # Dispatch-only lane: it never runs on a push to main, so it never
+          # saves (see docs/ci_cd.md, 10 GB quota policy).
+          save-if: "false"
 
       - name: Install system dependencies
         if: steps.skip_check.outputs.skip != 'true'
@@ -196,9 +205,10 @@ jobs:
             *)
               sizes=""
               for s in $all_sizes; do
-                if ! echo " $skip " | grep -qw "$s"; then
-                  sizes="$sizes $s"
-                fi
+                case " $skip " in
+                  *" $s "*) ;;
+                  *) sizes="$sizes $s" ;;
+                esac
               done
               ;;
           esac
@@ -239,22 +249,26 @@ jobs:
           skip="${{ inputs.skip_gateways }}"
           gws=""
           for g in $all; do
-            if ! echo " $skip " | grep -qw "$g"; then
-              gws="$gws $g"
-            fi
+            case " $skip " in
+              *" $g "*) ;;
+              *) gws="$gws $g" ;;
+            esac
           done
           gws=$(echo "$gws" | xargs)
           echo "list=$gws" >> "$GITHUB_OUTPUT"
           echo "Gateways: $gws"
 
-      # buildx with the docker-container driver is required for
-      # cache-from/cache-to type=gha — the default docker driver on
-      # ubuntu-26.04 only supports inline cache and will error out with
-      # "Cache export is not supported for the docker driver".
-      - name: Set up Docker Buildx
-        if: steps.skip_check.outputs.skip != 'true'
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-
+      # No BuildKit cache (#7398 follow-up). `cache-to: type=gha,mode=max`
+      # exported every builder-stage layer, including the release `target/`
+      # directories: about 4.2 GB of the repository's 10 GB Actions cache,
+      # which evicted the Rust CI caches (`ci-debug`, `fuzz-property-smoke`)
+      # and sent CI lanes cold. On the daily run (a new `main` SHA) it saved
+      # about 5 minutes per matrix job on the dependency layer and cost about
+      # 4 minutes per job to export (11-14 vs 11-15 udp-dtls logs); the 30-minute
+      # source compile never hits. `mode=min` would export only the runtime
+      # stage, which saves nothing in this multi-stage build. Without a cache
+      # backend the default docker driver loads the image directly, so the
+      # separate buildx (docker-container) step is gone too.
       - name: Build Ferrum Docker image
         if: steps.skip_check.outputs.skip != 'true'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -263,12 +277,8 @@ jobs:
           file: Dockerfile
           tags: ferrum-edge:bench
           # `load: true` imports the built image into the local Docker daemon
-          # so subsequent `docker run` calls in the harness can find it. The
-          # default buildx behaviour is to leave the image in the buildkit
-          # builder only, which `docker run` does not see.
+          # so subsequent `docker run` calls in the harness can find it.
           load: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
       - name: Verify Ferrum image loaded
         if: steps.skip_check.outputs.skip != 'true'
@@ -281,10 +291,10 @@ jobs:
           # must match run_gateway_protocol_bench.sh. Bump deliberately.
           gws="${{ steps.gateways.outputs.list }}"
           images=""
-          echo " $gws " | grep -qw envoy && images="$images envoyproxy/envoy:v1.39.1"
-          echo " $gws " | grep -qw kong && images="$images kong/kong-gateway:3.16.0.0"
-          echo " $gws " | grep -qw tyk && images="$images tykio/tyk-gateway:v5.15.0 redis:8.4.7-alpine"
-          echo " $gws " | grep -qw krakend && images="$images krakend:2.13.11"
+          case " $gws " in *" envoy "*) images="$images envoyproxy/envoy:v1.39.1" ;; esac
+          case " $gws " in *" kong "*) images="$images kong/kong-gateway:3.16.0.0" ;; esac
+          case " $gws " in *" tyk "*) images="$images tykio/tyk-gateway:v5.15.0 redis:8.4.7-alpine" ;; esac
+          case " $gws " in *" krakend "*) images="$images krakend:2.13.11" ;; esac
           for img in $images; do
             echo "pulling $img..."
             docker pull "$img" &
@@ -474,7 +484,7 @@ jobs:
 
       - name: Upload per-protocol artifact
         if: steps.skip_check.outputs.skip != 'true' && always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: gateways-protocol-bench-${{ matrix.protocol }}-${{ github.sha }}
           path: results/${{ matrix.protocol }}
@@ -518,10 +528,12 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Download all protocol artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: all-results
           pattern: gateways-protocol-bench-*-${{ github.sha }}
@@ -832,7 +844,7 @@ jobs:
 
       - name: Upload combined artifact
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: gateways-protocol-bench-combined-${{ github.sha }}
           path: all-results/

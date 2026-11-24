@@ -24,7 +24,7 @@
 //! own gateway-namespace series. They never carry route, backend, source,
 //! factor, or error-text labels.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crossbeam_utils::CachePadded;
 
@@ -62,12 +62,30 @@ pub const UDP_AMPLIFICATION_POLICY_KIND: &str = "UDPResponseAmplificationPolicy"
 /// Plural resource name.
 pub const UDP_AMPLIFICATION_POLICY_PLURAL: &str = "udpresponseamplificationpolicies";
 
+/// Number of cache-line-padded shards for the hot-path `RESPONSES_ALLOWED`
+/// counter. Power of two so shard lookup is a single bitmask. Eliminates
+/// cross-core cache-line bouncing across concurrent UDP reply tasks while
+/// keeping `metrics_snapshot()` exact.
+const RESPONSE_ALLOWED_SHARDS: usize = 32;
+
 /// Independently cache-line padded so allowed/drop/policy counters do not
 /// false-share on the UDP response path.
-static RESPONSES_ALLOWED: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
+static RESPONSES_ALLOWED: [CachePadded<AtomicU64>; RESPONSE_ALLOWED_SHARDS] =
+    [const { CachePadded::new(AtomicU64::new(0)) }; RESPONSE_ALLOWED_SHARDS];
+static NEXT_RESPONSE_ALLOWED_SHARD: AtomicUsize = AtomicUsize::new(0);
 static RESPONSES_DROPPED: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
 static POLICY_INVALID: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
 static POLICY_UNLIMITED: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
+
+#[inline]
+fn response_allowed_shard() -> usize {
+    thread_local! {
+        static SHARD: usize =
+            NEXT_RESPONSE_ALLOWED_SHARD.fetch_add(1, Ordering::Relaxed)
+                & (RESPONSE_ALLOWED_SHARDS - 1);
+    }
+    SHARD.with(|&shard| shard)
+}
 
 /// Snapshot of the unlabeled amplification counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,16 +98,21 @@ pub struct UdpAmplificationMetricsSnapshot {
 
 /// Process-wide unlabeled counters for Prometheus.
 pub fn metrics_snapshot() -> UdpAmplificationMetricsSnapshot {
+    let responses_allowed = RESPONSES_ALLOWED
+        .iter()
+        .map(|shard| shard.load(Ordering::Relaxed))
+        .fold(0u64, u64::wrapping_add);
     UdpAmplificationMetricsSnapshot {
-        responses_allowed: RESPONSES_ALLOWED.load(Ordering::Relaxed),
+        responses_allowed,
         responses_dropped: RESPONSES_DROPPED.load(Ordering::Relaxed),
         policy_invalid: POLICY_INVALID.load(Ordering::Relaxed),
         policy_unlimited: POLICY_UNLIMITED.load(Ordering::Relaxed),
     }
 }
 
+#[inline]
 pub fn record_response_allowed() {
-    RESPONSES_ALLOWED.fetch_add(1, Ordering::Relaxed);
+    RESPONSES_ALLOWED[response_allowed_shard()].fetch_add(1, Ordering::Relaxed);
 }
 
 /// Record a dropped response. Returns the new process-wide drop count for
@@ -111,6 +134,7 @@ pub fn record_policy_unlimited() {
 /// Deliberately excludes `0.0`: `udp_amplification_response_budget` relies on
 /// this predicate to fail closed to a zero budget, so the explicit-unlimited
 /// sentinel must never reach it as a "valid" ratio.
+#[inline]
 pub fn factor_is_valid(factor: f32) -> bool {
     factor.is_finite() && factor > 0.0 && factor <= MAX_UDP_AMPLIFICATION_FACTOR
 }
@@ -144,6 +168,7 @@ pub fn factor_is_unlimited(factor: Option<f32>) -> bool {
 /// legal datagram does not create a black-holed session. Nonempty requests keep
 /// the configured payload ratio exactly. Invalid factors fail closed to a zero
 /// budget so no response is forwarded.
+#[inline]
 pub fn udp_amplification_response_budget(request_size: u64, factor: f32) -> u64 {
     if !factor_is_valid(factor) {
         return 0;
@@ -176,6 +201,7 @@ pub fn udp_amplification_response_budget(request_size: u64, factor: f32) -> u64 
 ///
 /// Initialize `remaining` to zero, including for the first request: seeding it
 /// with that request's budget and then publishing would double its allowance.
+#[inline]
 pub fn publish_request_budget(remaining: &AtomicU64, request_size: u64, factor: f32) -> u64 {
     let budget = udp_amplification_response_budget(request_size, factor);
     if budget == 0 {
@@ -185,6 +211,9 @@ pub fn publish_request_budget(remaining: &AtomicU64, request_size: u64, factor: 
     loop {
         let current = remaining.load(Ordering::Acquire);
         let next = current.saturating_add(budget).min(cap).max(current);
+        if next == current {
+            return current;
+        }
         match remaining.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => return next,
             Err(_) => continue,
@@ -200,6 +229,7 @@ pub fn publish_request_budget(remaining: &AtomicU64, request_size: u64, factor: 
 /// admitted. The check is fail-closed: insufficient remaining refuses without
 /// partial consumption. Several in-budget datagrams still fail closed once
 /// their cumulative charge exceeds the accumulated budget.
+#[inline]
 pub fn charge_response_budget(remaining: &AtomicU64, bytes: u64) -> bool {
     let charge = bytes.max(1);
     loop {

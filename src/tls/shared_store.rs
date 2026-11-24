@@ -427,13 +427,11 @@ impl<T: VersionedStoreFile> SharedStoreFile<T> {
     }
 
     /// Configured whole-document byte ceiling for this store handle.
-    #[allow(dead_code)] // External unit tests call this through the library target.
     pub fn max_document_bytes(&self) -> usize {
         self.max_document_bytes
     }
 
     /// Fixed store kind used for observability.
-    #[allow(dead_code)] // External unit tests call this through the library target.
     pub fn store_kind(&self) -> TlsPersistentStoreKind {
         self.store_kind
     }
@@ -442,7 +440,6 @@ impl<T: VersionedStoreFile> SharedStoreFile<T> {
     ///
     /// Diagnostic surface only; the store's correctness comes from the
     /// exclusive-lock read-modify-write, not from this counter.
-    #[allow(dead_code)]
     pub fn version(&self) -> Result<u64, SharedStoreError> {
         Ok(self.snapshot()?.store_version())
     }
@@ -499,6 +496,45 @@ impl<T: VersionedStoreFile> SharedStoreFile<T> {
         candidate.set_store_version(next);
         self.persist_locked(&candidate)?;
         Ok(outcome)
+    }
+
+    /// [`Self::mutate_if`] whose committed change stands only if `confirm`
+    /// still holds once it has been persisted.
+    ///
+    /// `confirm` runs after the candidate is published, still under the
+    /// exclusive lock. If it says no, the previous document is republished
+    /// (with a newer store version) before the lock is released and the call
+    /// returns `Ok(None)`. Used where the right to make a change is an
+    /// external lease that can lapse while persistence I/O stalls (issue
+    /// #7394): a change made after the lease lapsed is never left in place.
+    /// `Ok(Some(outcome))` is returned for a confirmed change and for a
+    /// "no change" decision alike.
+    pub fn mutate_if_confirmed<R, E>(
+        &self,
+        apply: impl FnOnce(&mut T) -> Result<(bool, R), E>,
+        confirm: impl FnOnce() -> bool,
+    ) -> Result<Option<R>, E>
+    where
+        E: From<SharedStoreError>,
+    {
+        let _local = self.write_gate.lock().map_err(|_| self.poisoned())?;
+        let _lock = self.lock_exclusive()?;
+        let current = self.read_authoritative()?;
+        let mut candidate = (*current).clone();
+        let (committed, outcome) = apply(&mut candidate)?;
+        if !committed {
+            return Ok(Some(outcome));
+        }
+        let next = current.store_version().saturating_add(1);
+        candidate.set_store_version(next);
+        self.persist_locked(&candidate)?;
+        if confirm() {
+            return Ok(Some(outcome));
+        }
+        let mut restored = (*current).clone();
+        restored.set_store_version(next.saturating_add(1));
+        self.persist_locked(&restored)?;
+        Ok(None)
     }
 
     fn poisoned(&self) -> SharedStoreError {

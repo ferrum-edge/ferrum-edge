@@ -140,66 +140,6 @@ use crate::proxy::node_waypoint_udp_reply_source::{
     NodeWaypointUdpReplySourcePublisher, ReplySourceGeneration,
 };
 
-/// The steered Service destinations one mesh generation asks for.
-///
-/// Deliberately a whole-plan replacement: a generation is applied or it is not,
-/// so the datapath never mixes one generation's destinations with another's.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct NodeWaypointUdpSteerPlan {
-    /// Sorted, deduplicated `(ClusterIP, port)` pairs, one per materialized
-    /// listener address. Empty with [`Self::serving`] true is a bound
-    /// headless/VIP-less listener: nothing is steered, but the relay sender
-    /// proof stays live. Empty with serving false is a true withdrawal.
-    pub destinations: Vec<NodeWaypointUdpSteerDestination>,
-    /// Whether a generation has been published at all. An unpublished plan and
-    /// an empty published plan are the same datapath posture (nothing steered),
-    /// but only the latter is a positive statement, so they are distinguished in
-    /// diagnostics.
-    pub published: bool,
-    /// Whether at least one owned UDP/DTLS listener is actually bound and
-    /// serving. Distinct from "has ClusterIP destinations": a headless listener
-    /// is serving with an empty destination set.
-    pub serving: bool,
-}
-
-/// Process-wide diagnostic snapshot of the last serving plan a
-/// [`NodeWaypointUdpSteering`] instance installed.
-///
-/// Not a control plane. Mesh preparation must never write this; the serving
-/// manager is the only writer, and only after the accepted generation's
-/// listeners are actually bound. Kept so external tests can prove a pure
-/// preparer has no live datapath side effect.
-static PUBLISHED_PLAN: std::sync::LazyLock<ArcSwap<NodeWaypointUdpSteerPlan>> =
-    std::sync::LazyLock::new(|| ArcSwap::from_pointee(NodeWaypointUdpSteerPlan::default()));
-
-/// Publish the steered destination set for the generation being applied.
-///
-/// Production ownership is [`NodeWaypointUdpSteering::set_bound_destinations`];
-/// this remains a test/diagnostic seam.
-#[allow(dead_code)] // Test/diagnostic seam; serving writes go through the instance.
-pub fn publish_plan(destinations: Vec<NodeWaypointUdpSteerDestination>) {
-    let mut destinations = destinations;
-    destinations.sort_unstable();
-    destinations.dedup();
-    PUBLISHED_PLAN.store(Arc::new(NodeWaypointUdpSteerPlan {
-        destinations,
-        published: true,
-        serving: true,
-    }));
-}
-
-/// The currently published diagnostic plan. An unpublished plan steers nothing.
-#[allow(dead_code)] // Test/diagnostic seam for preparer side-effect proofs.
-pub fn published_plan() -> Arc<NodeWaypointUdpSteerPlan> {
-    PUBLISHED_PLAN.load_full()
-}
-
-/// Retract the published diagnostic plan.
-#[allow(dead_code)] // Test/diagnostic seam.
-pub fn retract_plan() {
-    PUBLISHED_PLAN.store(Arc::new(NodeWaypointUdpSteerPlan::default()));
-}
-
 /// Whether the steering datapath can exist on this platform at all.
 pub const fn steering_supported() -> bool {
     cfg!(target_os = "linux")
@@ -408,7 +348,6 @@ impl NodeWaypointUdpSteering {
     }
 
     /// Destinations currently owned by this serving instance.
-    #[allow(dead_code)] // External tests assert the serving plan without racing a global.
     pub fn bound_destinations(&self) -> Vec<NodeWaypointUdpSteerDestination> {
         self.bound_destinations.load_full().as_ref().clone()
     }
@@ -416,7 +355,6 @@ impl NodeWaypointUdpSteering {
     /// Whether this serving instance currently has at least one actually bound
     /// NodeWaypoint UDP/DTLS listener. Distinct from
     /// [`Self::bound_destinations`]: a headless listener is serving with none.
-    #[allow(dead_code)] // External tests assert serving independently of ClusterIP tuples.
     pub fn serving(&self) -> bool {
         self.serving.load(Ordering::Acquire)
     }
@@ -494,7 +432,6 @@ impl NodeWaypointUdpSteering {
     /// Filters the latest desired set while holding the same mutex the full
     /// plan update uses, so a concurrent `set_bound_destinations` cannot be
     /// lost to a stale load/filter/store.
-    #[allow(dead_code)] // External unit-test seam; production exit retraction is generation-fenced.
     pub fn retract_port(&self, port: u16) -> SteerReconcileOutcome {
         let mut state = self.lock_state();
         state
@@ -521,7 +458,6 @@ impl NodeWaypointUdpSteering {
 
     /// [`Self::reconcile`] against an explicit destination set. Tests drive this
     /// form so they do not depend on another task mutating this instance.
-    #[allow(dead_code)] // External unit-test seam; production uses the state-specific entry points.
     pub fn reconcile_with(
         &self,
         ifaces: &[String],

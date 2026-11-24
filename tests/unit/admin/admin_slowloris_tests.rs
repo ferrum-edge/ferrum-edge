@@ -68,7 +68,7 @@ fn token_with_role(role: &str) -> String {
         "jti": Uuid::new_v4().to_string(),
     });
     let header = Header::new(jsonwebtoken::Algorithm::HS256);
-    let key = EncodingKey::from_secret(JWT_SECRET.as_bytes());
+    let key = EncodingKey::from_secret(JWT_SECRET.as_bytes()).unwrap();
     let token = encode(&header, &claims, &key);
     token.expect("encode admin test token")
 }

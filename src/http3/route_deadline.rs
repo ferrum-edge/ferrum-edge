@@ -4,7 +4,7 @@
 //! `request_timeout_ms`, Gateway API `HTTPRoute.rules[].timeouts.request`) and
 //! a per-attempt total bound (`attempt_timeout_ms`, `timeouts.backendRequest`).
 //! Proxy core enforces both for HTTP/1.1 and HTTP/2 around every backend
-//! attempt ([`crate::proxy::await_route_request_deadline`]) and on the committed
+//! attempt ([`crate::proxy::await_backend_attempt_route_deadline`]) and on the committed
 //! response body (`ProxyBody::with_route_request_deadline`). The native HTTP/3
 //! relays write the response head and body from inside their own dispatch, so
 //! they apply the same bounds at the same phases with the helpers here:
@@ -47,6 +47,7 @@ use h3::error::Code;
 use h3::quic::SendStream;
 use h3::server::RequestStream;
 
+use crate::http3::client::H3AttemptHandoff;
 use crate::plugins::RequestContext;
 use crate::proxy::RouteDeadlineExpiry;
 use crate::retry::ErrorClass;
@@ -124,17 +125,21 @@ impl H3RouteDeadlines {
         self.total.is_some_and(|deadline| deadline <= now)
     }
 
-    /// Whether an attempt's own budget, and not the total deadline, has
-    /// expired: the ordinary backend timeout, which the rule's retry policy
-    /// may retry. The total deadline wins a tie, as in proxy core.
+    /// Whether the attempt budget owns an elapsed response-header bound that
+    /// folds it with `operator_at` and the total deadline, from the captured
+    /// instants rather than the clock at observation (issue #6976): it must be
+    /// the earliest of the three. The total deadline wins a tie, as in proxy
+    /// core, and so does the operator bound.
     #[inline]
-    pub(crate) fn attempt_budget_expired(
+    pub(crate) fn attempt_budget_owns(
         self,
         attempt_deadline: Option<tokio::time::Instant>,
+        operator_at: Option<tokio::time::Instant>,
     ) -> bool {
-        let now = tokio::time::Instant::now();
-        self.total.is_none_or(|total| now < total)
-            && attempt_deadline.is_some_and(|attempt| attempt <= now)
+        attempt_deadline.is_some_and(|attempt| {
+            self.total.is_none_or(|total| attempt < total)
+                && operator_at.is_none_or(|operator| attempt < operator)
+        })
     }
 
     /// How the committed attempt's [`Self::body_deadline`] ended it once it
@@ -151,14 +156,30 @@ impl H3RouteDeadlines {
     }
 }
 
+/// How far a native-H3 attempt that a route deadline ended got toward the
+/// backend. Every native-H3 attempt wrapper hands its attempt to the backend
+/// from its first poll. So only a total deadline already spent before that
+/// poll leaves the attempt undialed: proxy core's `handed_to_backend == false`.
+/// That case is neither on the wire nor a connection failure. Every other
+/// expiry cancelled an attempt the backend held.
+#[inline]
+pub(crate) fn expiry_handoff(expiry: RouteDeadlineExpiry) -> H3AttemptHandoff {
+    match expiry {
+        RouteDeadlineExpiry::BeforeDispatch => H3AttemptHandoff::NotDialed,
+        RouteDeadlineExpiry::InFlight | RouteDeadlineExpiry::AttemptBudget => {
+            H3AttemptHandoff::OnWire
+        }
+    }
+}
+
 /// The class a route deadline that ended an attempt is recorded under, for
-/// an attempt that was handed to the backend from its first poll (every
-/// native-H3 attempt wrapper): the health-neutral `DispatchPolicyRejected`
-/// only when the total deadline was already spent before the attempt started,
-/// otherwise `ReadWriteTimeout`, charged to the backend that held it.
+/// the handoff [`expiry_handoff`] assigns it: the health-neutral
+/// `DispatchPolicyRejected` only when the total deadline was already spent
+/// before the attempt started, otherwise `ReadWriteTimeout`, charged to the
+/// backend that held it.
 #[inline]
 pub(crate) fn expiry_error_class(expiry: RouteDeadlineExpiry) -> ErrorClass {
-    expiry.error_class(true)
+    expiry.error_class(expiry_handoff(expiry).request_on_wire())
 }
 
 /// The client-visible `504` status and body for an attempt a route deadline
@@ -179,7 +200,9 @@ pub(crate) fn expiry_status_body(expiry: RouteDeadlineExpiry) -> (u16, &'static 
 #[inline]
 pub(crate) fn mark_expiry_phase(ctx: &mut RequestContext, expiry: RouteDeadlineExpiry) {
     if expiry != RouteDeadlineExpiry::AttemptBudget {
-        ctx.mark_route_request_timeout_exceeded(expiry.phase(true));
+        ctx.mark_route_request_timeout_exceeded(
+            expiry.phase(expiry_handoff(expiry).request_on_wire()),
+        );
     }
 }
 
@@ -220,13 +243,19 @@ pub(crate) fn total_expiry_recorded(route: H3RouteDeadlines, ctx: &RequestContex
 /// proxy core's retry loop sees it (`route_deadline_expiry_response`), with a
 /// total-deadline expiry's phase recorded and the `X-Gateway-Error` token proxy
 /// core's response builder attaches to that `504`: `request_timeout` when no
-/// backend held the attempt, `backend_timeout` otherwise.
+/// backend held the attempt, `backend_timeout` otherwise. An attempt the
+/// total deadline refused before it started reports `request_on_wire: false`,
+/// as proxy core does for it.
 pub(crate) fn expiry_backend_response(
     ctx: &mut RequestContext,
     expiry: RouteDeadlineExpiry,
 ) -> crate::retry::BackendResponse {
     let mut phase = None;
-    let mut response = crate::proxy::route_deadline_expiry_response(expiry, true, &mut phase);
+    let mut response = crate::proxy::route_deadline_expiry_response(
+        expiry,
+        expiry_handoff(expiry).request_on_wire(),
+        &mut phase,
+    );
     if let Some(phase) = phase {
         ctx.mark_route_request_timeout_exceeded(phase);
     }

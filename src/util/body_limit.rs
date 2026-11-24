@@ -19,6 +19,16 @@
 use http_body_util::{BodyExt, LengthLimitError, Limited};
 use std::time::Duration;
 
+/// The one JSON body every gateway-authored request-body-size `413` carries.
+///
+/// A route ceiling is enforced in several places: the `request_size_limiting`
+/// plugin's hooks (declared `Content-Length`, buffered body, final body) and the
+/// proxy core's collectors and streaming adapters for chunked or unknown-length
+/// uploads, on H1/H2, H3, and the H3 bridge. Clients must see the same refusal
+/// for the same policy whichever of those sites fires, so they all share this
+/// body instead of each spelling its own.
+pub const REQUEST_BODY_TOO_LARGE_BODY: &str = r#"{"error":"Request body exceeds maximum size"}"#;
+
 /// Outcome of parsing a `Content-Length` field value that may be a
 /// comma-folded list of repeated values.
 ///

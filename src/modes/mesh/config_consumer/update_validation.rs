@@ -408,6 +408,17 @@ pub fn validate_mesh_config_update(
             &slice.ext_authz_providers,
             &mut errors,
         );
+        // The NodeWaypoint capture-destination AuthorizationPolicy inventory is
+        // evaluated beside `mesh_policies`, so its CUSTOM rules must bind a
+        // declared provider too (the xDS recovery boundary checks the same
+        // union).
+        if !slice.node_waypoint_capture_mesh_policies.is_empty() {
+            crate::modes::mesh::config::validate_mesh_ext_authz_binding(
+                &slice.node_waypoint_capture_mesh_policies,
+                &slice.ext_authz_providers,
+                &mut errors,
+            );
+        }
         if let Some(error) = errors.into_iter().next() {
             let detail = format!(
                 "slice ext-authz content refused: {}",

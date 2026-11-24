@@ -293,7 +293,6 @@ async fn refused_renewal_never_reclaims_the_same_generation() {
 
     assert_eq!(observed.outcome, TestLeaseRenewalOutcome::Lost);
     assert!(!observed.still_held);
-    assert_eq!(observed.reclaims, 0);
     assert_eq!(backend.counts(), (1, 0, 0));
 }
 
@@ -325,8 +324,9 @@ async fn ownership_taken_by_another_writer_fails_closed() {
         "a lost lease must never report itself as held: {observed:?}"
     );
     assert_eq!(
-        observed.reclaims, 0,
-        "a foreign owner is not reclaimable: {observed:?}"
+        backend.counts().1,
+        0,
+        "a foreign owner is not reclaimable: the renewer never re-acquires"
     );
 }
 
@@ -350,7 +350,6 @@ async fn expired_same_owner_lease_is_never_reacquired() {
 
     assert_eq!(observed.outcome, TestLeaseRenewalOutcome::Lost);
     assert!(!observed.still_held);
-    assert_eq!(observed.reclaims, 0);
     assert_eq!(backend.counts(), (1, 0, 0));
 }
 

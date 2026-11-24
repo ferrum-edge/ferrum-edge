@@ -11,16 +11,11 @@ import unittest
 LAUNCHER = Path(__file__).with_name("dispatch-agent.sh")
 EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
 LAUNCHERS = (
-    (LAUNCHER, "gpt-6.1-sol", EFFORTS),
+    (LAUNCHER, "gpt-6.2-sol", EFFORTS),
     (
         Path(__file__).parents[2] / "astra-agents" / "scripts" / "dispatch-agent.sh",
-        "gpt-6-astra",
+        "gpt-6.2-astra",
         EFFORTS,
-    ),
-    (
-        Path(__file__).parents[2] / "luna-agents" / "scripts" / "dispatch-agent.sh",
-        "gpt-6-luna",
-        EFFORTS[:-1],
     ),
 )
 

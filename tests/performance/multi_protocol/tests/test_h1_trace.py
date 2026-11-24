@@ -7,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import sys
 import tempfile
@@ -22,6 +23,10 @@ from h1_internal_profile import validate_selection
 import h1_trace as trace
 import h1_trace_preflight as preflight
 from live_contract import measurement_window
+
+
+_ADJACENT_ERROR_RE = re.compile('adjacent')
+_STALE_TEARDOWN_ERROR_RE = re.compile('stale/mismatched')
 
 
 def counter(**changes):
@@ -801,6 +806,18 @@ fixture 99/99 12.100000000: cpu-clock:u:
         self.assertEqual(result['lost_records'], 1)
         self.assertFalse(result['complete'])
 
+    def test_demangled_symbols_with_parentheses_keep_the_trailing_dso(self):
+        text = ('envoy 7/8 12.000000000: cpu-clock:uS:\n'
+                '        5000 Envoy::Buffer::Slice::drain(unsigned long) (/usr/local/bin/envoy)\n'
+                '        5100 std::__1::__function::__func<void (Envoy::Http::HeaderEntry const&)>::operator()() '
+                '(/usr/local/bin/envoy)\n'
+                '        6000 [unknown] ([unknown])\n\n')
+        frames = decode_cpu(text, '', {7})['callchains'][0]['frames']
+        self.assertEqual([f['dso'] for f in frames], ['/usr/local/bin/envoy', '/usr/local/bin/envoy', '[unknown]'])
+        self.assertEqual(frames[0]['symbol'], 'Envoy::Buffer::Slice::drain(unsigned long)')
+        self.assertEqual(frames[1]['symbol'],
+                         'std::__1::__function::__func<void (Envoy::Http::HeaderEntry const&)>::operator()()')
+
     def test_fixture_nested_proof_rejects_three_flat_samples_and_wrong_order(self):
         def decoded(groups):
             text = ''.join(f'fixture 7/{8 + i} 12.000000000: cpu-clock:u:\n' +
@@ -857,7 +874,7 @@ class H1AdmissionTests(unittest.TestCase):
                            ('namespaces', dict(owner['namespaces'], mnt=99))):
             with patch.object(trace, 'identity', return_value=dict(owner, **{key: value})), \
                     patch.object(trace, 'admit'):
-                with self.assertRaisesRegex(ValueError, 'adjacent'):
+                with self.assertRaisesRegex(ValueError, _ADJACENT_ERROR_RE):
                     trace.admit_runtime_target(runtime, owner)
 
 
@@ -1295,7 +1312,7 @@ class H1TeardownTests(unittest.TestCase):
                            ('owner', dict(self.owner, boot_id='prior-boot')), ('at', self.at(1))]:
             with self.subTest(key=key):
                 trace.write(self.out / 'teardown-request.json', dict(request, **{key: value}))
-                with self.assertRaisesRegex(ValueError, 'stale/mismatched'):
+                with self.assertRaisesRegex(ValueError, _STALE_TEARDOWN_ERROR_RE):
                     self.lifecycle.authorize_teardown()
         trace.write(self.out / 'teardown-request.json', request)
         self.raw['rps'] = 999

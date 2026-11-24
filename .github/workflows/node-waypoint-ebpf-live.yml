@@ -54,7 +54,7 @@ jobs:
       relevant: ${{ steps.filter.outputs.relevant }}
       node_waypoint_relevant: ${{ steps.filter.outputs.node_waypoint_relevant }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -209,7 +209,7 @@ jobs:
     timeout-minutes: 90
     steps:
       - name: Checkout Ferrum Edge
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -321,7 +321,7 @@ jobs:
     timeout-minutes: 90
     steps:
       - name: Checkout Ferrum Edge
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -330,7 +330,7 @@ jobs:
 
       - name: Log in to cache registry
         if: github.event.inputs.force_cold_cache != 'true'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -439,7 +439,7 @@ jobs:
     timeout-minutes: 90
     steps:
       - name: Checkout Ferrum Edge
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -603,7 +603,9 @@ jobs:
 
     steps:
       - name: Checkout Ferrum Edge
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-rust-ci
         with:
@@ -1052,7 +1054,7 @@ jobs:
 
       - name: Upload diagnostics
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: node-waypoint-ebpf-live-results
           path: node-waypoint-ebpf-live-results

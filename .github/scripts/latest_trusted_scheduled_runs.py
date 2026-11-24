@@ -14,6 +14,10 @@ from typing import Any
 
 API_ROOT = "https://api.github.com"
 
+_COMMIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
+_REPOSITORY_SLUG_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+_WORKFLOW_FILENAME_RE = re.compile(r"[A-Za-z0-9_.-]+\.ya?ml")
+
 
 def select_runs(
     payload: Any,
@@ -46,7 +50,7 @@ def select_runs(
         ):
             continue
         head_sha = run.get("head_sha")
-        if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+        if not isinstance(head_sha, str) or not _COMMIT_SHA_RE.fullmatch(head_sha):
             continue
         if head_sha == current_sha:
             continue
@@ -126,12 +130,12 @@ def main(argv: list[str]) -> int:
     if args.limit < 1 or args.limit > 100:
         parser.error("--limit must be between 1 and 100")
     repository = os.environ.get("GITHUB_REPOSITORY", "")
-    if not repository or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
+    if not repository or not _REPOSITORY_SLUG_RE.fullmatch(repository):
         raise SystemExit("GITHUB_REPOSITORY is missing or malformed")
-    if not re.fullmatch(r"[0-9a-f]{40}", args.current_sha):
+    if not _COMMIT_SHA_RE.fullmatch(args.current_sha):
         raise SystemExit("--current-sha must be a full commit id")
     workflow_path = f".github/workflows/{args.workflow}"
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+\.ya?ml", args.workflow):
+    if not _WORKFLOW_FILENAME_RE.fullmatch(args.workflow):
         raise SystemExit("--workflow must be a workflow file name")
     url = (
         f"{API_ROOT}/repos/{repository}/actions/workflows/{args.workflow}/runs"

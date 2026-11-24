@@ -16,18 +16,87 @@ use tokio::task::JoinHandle;
 const TIMEOUT: Duration = Duration::from_secs(10);
 const ROUTES: [&str; 3] = ["size", "validator", "both"];
 
-fn cases() -> Vec<(Method, &'static str, u16)> {
+/// The finite event stream the backend serves on `/200` and `/200-nolen`.
+const SSE_BODY: &[u8] = b"data: hello\n\n";
+
+/// What the client must observe for one request.
+#[derive(Clone, Copy, Debug)]
+enum Expect {
+    /// A no-content reply with this status: headers only, no body bytes.
+    Bodyless(u16),
+    /// The strict whole-body refusal (`502` before commit).
+    Refused,
+    /// A `200` event stream delivered intact.
+    Body(&'static [u8]),
+}
+
+impl Expect {
+    fn status(self) -> u16 {
+        match self {
+            Expect::Bodyless(status) => status,
+            Expect::Refused => 502,
+            Expect::Body(_) => 200,
+        }
+    }
+}
+
+/// One shared expectation table for the H1, H2, and H3 wire tests.
+fn cases(route: &str) -> Vec<(Method, &'static str, Expect)> {
     vec![
-        (Method::HEAD, "200", 200),
-        (Method::HEAD, "204", 204),
-        (Method::HEAD, "205", 205),
-        (Method::HEAD, "304", 304),
-        (Method::GET, "204", 204),
-        (Method::GET, "205", 205),
-        (Method::GET, "304", 304),
-        (Method::HEAD, "json", 200),
-        (Method::GET, "200", 502),
+        (Method::HEAD, "200", Expect::Bodyless(200)),
+        (Method::HEAD, "204", Expect::Bodyless(204)),
+        (Method::HEAD, "205", Expect::Bodyless(205)),
+        (Method::HEAD, "304", Expect::Bodyless(304)),
+        (Method::GET, "204", Expect::Bodyless(204)),
+        (Method::GET, "205", Expect::Bodyless(205)),
+        (Method::GET, "304", Expect::Bodyless(304)),
+        (Method::HEAD, "json", Expect::Bodyless(200)),
+        // `/200` declares an exact in-limit `Content-Length` and nothing on
+        // the route rewrites the stream, so strict `response_size_limiting`
+        // has proven its complete size and admits it. `body_validator`
+        // refuses every genuine backend event stream whatever its length
+        // ("event-stream responses require a bounded streaming validator").
+        (
+            Method::GET,
+            "200",
+            if route == "size" {
+                Expect::Body(SSE_BODY)
+            } else {
+                Expect::Refused
+            },
+        ),
+        // `/200-nolen` is the same stream with no declared length
+        // (close-delimited from the backend): its size cannot be proven, so
+        // both strict policies keep refusing it before commit.
+        (Method::GET, "200-nolen", Expect::Refused),
     ]
+}
+
+/// Decode an HTTP/1.1 response body read to connection close.
+fn decode_h1_body(headers: &HeaderMap, raw: &[u8]) -> Vec<u8> {
+    if !headers
+        .get("transfer-encoding")
+        .is_some_and(|value| value == "chunked")
+    {
+        return raw.to_vec();
+    }
+    let mut decoded = Vec::new();
+    let mut rest = raw;
+    loop {
+        let line_end = rest
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .expect("chunk-size line");
+        let size_line = std::str::from_utf8(&rest[..line_end]).expect("ASCII chunk size");
+        let size_text = size_line.split(';').next().unwrap_or_default().trim();
+        let size = usize::from_str_radix(size_text, 16).expect("hex chunk size");
+        rest = &rest[line_end + 2..];
+        if size == 0 {
+            return decoded;
+        }
+        decoded.extend_from_slice(&rest[..size]);
+        rest = &rest[size + 2..];
+    }
 }
 
 fn gateway_builder(port: u16) -> TestGatewayBuilder {
@@ -112,7 +181,7 @@ async fn backend() -> (u16, JoinHandle<()>) {
                     "/204" => "204 No Content",
                     "/205" => "205 Reset Content",
                     "/304" => "304 Not Modified",
-                    "/200" | "/json" => "200 OK",
+                    "/200" | "/200-nolen" | "/json" => "200 OK",
                     _ => panic!("unexpected backend path {path}"),
                 };
                 let content_type = if path == "/json" {
@@ -120,13 +189,14 @@ async fn backend() -> (u16, JoinHandle<()>) {
                 } else {
                     "text/event-stream"
                 };
-                let body = if method == "HEAD" || path != "/200" {
+                let body = if method == "HEAD" || !matches!(path, "/200" | "/200-nolen") {
                     ""
                 } else {
                     "data: hello\n\n"
                 };
                 let length = match path {
-                    "/204" | "/304" => String::new(),
+                    // No declared length: the body is delimited by close.
+                    "/204" | "/304" | "/200-nolen" => String::new(),
                     "/205" => "Content-Length: 0\r\n".into(),
                     _ if method == "HEAD" => "Content-Length: 128\r\n".into(),
                     _ => format!("Content-Length: {}\r\n", body.len()),
@@ -177,7 +247,8 @@ async fn bodyless_sse_http1_wire() {
     let (port, task) = backend().await;
     let mut gateway = gateway_builder(port).spawn().await.expect("gateway");
     for route in ROUTES {
-        for (method, path, expected) in cases() {
+        for (method, path, expect) in cases(route) {
+            let expected = expect.status();
             let mut stream = TcpStream::connect(("127.0.0.1", gateway.proxy_port))
                 .await
                 .expect("H1 connect");
@@ -201,24 +272,35 @@ async fn bodyless_sse_http1_wire() {
             let status = lines.next().expect("status line");
             assert!(
                 status.starts_with(&format!("HTTP/1.1 {expected} ")),
-                "{status}"
+                "{route}/{method}/{path}: {status}"
             );
-            if expected != 502 {
-                let mut headers = HeaderMap::new();
-                for line in lines {
-                    let (name, value) = line.split_once(':').expect("header");
-                    headers.append(
-                        http::header::HeaderName::from_bytes(name.as_bytes()).expect("name"),
-                        value.trim().parse().expect("value"),
+            let mut headers = HeaderMap::new();
+            for line in lines {
+                let (name, value) = line.split_once(':').expect("header");
+                headers.append(
+                    http::header::HeaderName::from_bytes(name.as_bytes()).expect("name"),
+                    value.trim().parse().expect("value"),
+                );
+            }
+            let trailing = &wire[end + 4..];
+            match expect {
+                Expect::Refused => {}
+                Expect::Bodyless(status) => {
+                    assert_bodyless_headers(&headers, &method, status);
+                    let chunked_empty = status == 205 && headers.contains_key("transfer-encoding");
+                    assert!(
+                        trailing.is_empty() || (chunked_empty && trailing == b"0\r\n\r\n"),
+                        "{route}/{method}/{path} sent bytes"
                     );
                 }
-                assert_bodyless_headers(&headers, &method, expected);
-                let chunked_empty = expected == 205 && headers.contains_key("transfer-encoding");
-                let trailing = &wire[end + 4..];
-                assert!(
-                    trailing.is_empty() || (chunked_empty && trailing == b"0\r\n\r\n"),
-                    "{route}/{method}/{path} sent bytes"
-                );
+                Expect::Body(body) => {
+                    assert_eq!(headers["x-bodyless-checked"], "yes");
+                    assert_eq!(
+                        decode_h1_body(&headers, trailing),
+                        body,
+                        "{route}/{method}/{path} body"
+                    );
+                }
             }
         }
     }
@@ -242,7 +324,8 @@ async fn bodyless_sse_http2_wire() {
         let _ = connection.await;
     });
     for route in ROUTES {
-        for (method, path, expected) in cases() {
+        for (method, path, expect) in cases(route) {
+            let expected = expect.status();
             let request = Request::builder()
                 .method(method.clone())
                 .uri(gateway.proxy_url(&format!("/{route}/{path}")))
@@ -257,16 +340,26 @@ async fn bodyless_sse_http2_wire() {
                 expected,
                 "{route}/{method}/{path}"
             );
-            if expected != 502 {
-                assert_bodyless_headers(response.headers(), &method, expected);
+            match expect {
+                Expect::Refused => {}
+                Expect::Bodyless(status) => {
+                    assert_bodyless_headers(response.headers(), &method, status);
+                }
+                Expect::Body(_) => assert_eq!(response.headers()["x-bodyless-checked"], "yes"),
             }
             let body = tokio::time::timeout(TIMEOUT, response.into_body().collect())
                 .await
                 .expect("H2 body deadline")
                 .expect("H2 body without reset")
                 .to_bytes();
-            if expected != 502 {
-                assert!(body.is_empty(), "{route}/{method}/{path} sent DATA");
+            match expect {
+                Expect::Refused => {}
+                Expect::Bodyless(_) => {
+                    assert!(body.is_empty(), "{route}/{method}/{path} sent DATA");
+                }
+                Expect::Body(expected_body) => {
+                    assert_eq!(&body[..], expected_body, "{route}/{method}/{path} body");
+                }
             }
         }
     }
@@ -294,7 +387,8 @@ async fn bodyless_sse_http3_wire() {
         .expect("HTTPS port");
     let client = Http3Client::insecure().expect("H3 client");
     for route in ROUTES {
-        for (method, path, expected) in cases() {
+        for (method, path, expect) in cases(route) {
+            let expected = expect.status();
             let url = format!("https://127.0.0.1:{https_port}/{route}/{path}");
             let response = tokio::time::timeout(
                 TIMEOUT,
@@ -308,12 +402,23 @@ async fn bodyless_sse_http3_wire() {
                 expected,
                 "{route}/{method}/{path}"
             );
-            if expected != 502 {
-                assert_bodyless_headers(&response.headers, &method, expected);
-                assert!(
-                    response.body_bytes.is_empty(),
-                    "{route}/{method}/{path} sent DATA"
-                );
+            match expect {
+                Expect::Refused => {}
+                Expect::Bodyless(status) => {
+                    assert_bodyless_headers(&response.headers, &method, status);
+                    assert!(
+                        response.body_bytes.is_empty(),
+                        "{route}/{method}/{path} sent DATA"
+                    );
+                }
+                Expect::Body(expected_body) => {
+                    assert_eq!(response.headers["x-bodyless-checked"], "yes");
+                    assert_eq!(
+                        &response.body_bytes[..],
+                        expected_body,
+                        "{route}/{method}/{path} body"
+                    );
+                }
             }
         }
     }

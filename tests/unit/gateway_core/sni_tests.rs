@@ -212,7 +212,6 @@ fn make_proxy(id: &str, hosts: Vec<&str>) -> ferrum_edge::config::types::Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
@@ -839,6 +838,128 @@ fn test_extract_sni_dtls_rejects_malformed_sni_extension_lengths() {
         extract_sni_from_dtls_client_hello(&data),
         DtlsSniResult::Malformed
     );
+}
+
+/// A single-fragment DTLS ClientHello record from explicit parts, so a test can
+/// shape the cipher-suite, compression and extension vectors directly.
+fn build_dtls_client_hello_from_parts(
+    cipher_suites: &[u8],
+    compression_methods: &[u8],
+    extensions: &[u8],
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&[0xfe, 0xfd]);
+    body.extend_from_slice(&[0u8; 32]);
+    body.push(0); // session_id length
+    body.push(0); // cookie length (DTLS-specific)
+    body.extend_from_slice(&(cipher_suites.len() as u16).to_be_bytes());
+    body.extend_from_slice(cipher_suites);
+    body.push(compression_methods.len() as u8);
+    body.extend_from_slice(compression_methods);
+    body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+    body.extend_from_slice(extensions);
+
+    let body_len = body.len();
+    let mut handshake = vec![0x01];
+    handshake.extend_from_slice(&(body_len as u32).to_be_bytes()[1..]);
+    handshake.extend_from_slice(&[0x00, 0x00]); // message_seq
+    handshake.extend_from_slice(&[0x00, 0x00, 0x00]); // fragment_offset
+    handshake.extend_from_slice(&(body_len as u32).to_be_bytes()[1..]);
+    handshake.extend_from_slice(&body);
+
+    let mut record = vec![0x16, 0xfe, 0xfd, 0x00, 0x00];
+    record.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
+    record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+    record.extend_from_slice(&handshake);
+    record
+}
+
+/// One extension: type (2) + length (2) + data.
+fn dtls_extension(ext_type: u16, data: &[u8]) -> Vec<u8> {
+    let mut ext = Vec::new();
+    ext.extend_from_slice(&ext_type.to_be_bytes());
+    ext.extend_from_slice(&(data.len() as u16).to_be_bytes());
+    ext.extend_from_slice(data);
+    ext
+}
+
+/// A `server_name` extension carrying the given `(name_type, name)` entries.
+fn dtls_server_name_extension(names: &[(u8, &[u8])]) -> Vec<u8> {
+    let mut list = Vec::new();
+    for (name_type, name) in names {
+        list.push(*name_type);
+        list.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        list.extend_from_slice(name);
+    }
+    let mut data = (list.len() as u16).to_be_bytes().to_vec();
+    data.extend_from_slice(&list);
+    dtls_extension(0x0000, &data)
+}
+
+// Issue #7191: the DTLS passthrough parser applies the same ClientHello shape
+// rules as the TLS classifier before it routes on a hostname.
+#[test]
+fn test_extract_sni_dtls_parts_builder_routes_a_well_formed_hello() {
+    let sni = dtls_server_name_extension(&[(0x00, b"parts.example.com")]);
+    assert_eq!(
+        extract_sni_from_dtls_client_hello(&build_dtls_client_hello_from_parts(
+            &[0x00, 0x2f],
+            &[0x00],
+            &sni,
+        )),
+        DtlsSniResult::Hostname("parts.example.com".to_string())
+    );
+}
+
+#[test]
+fn test_extract_sni_dtls_rejects_duplicate_extension_of_any_type() {
+    let mut extensions = dtls_server_name_extension(&[(0x00, b"tenant.example.com")]);
+    // supported_groups (0x000a) twice: not `server_name`, still forbidden.
+    let groups = dtls_extension(0x000a, &[0x00, 0x02, 0x00, 0x1d]);
+    extensions.extend_from_slice(&groups);
+    extensions.extend_from_slice(&groups);
+    assert_eq!(
+        extract_sni_from_dtls_client_hello(&build_dtls_client_hello_from_parts(
+            &[0x00, 0x2f],
+            &[0x00],
+            &extensions,
+        )),
+        DtlsSniResult::Malformed
+    );
+}
+
+#[test]
+fn test_extract_sni_dtls_rejects_repeated_server_name_type_of_any_kind() {
+    let extensions =
+        dtls_server_name_extension(&[(0x00, b"tenant.example.com"), (0x07, b"a"), (0x07, b"b")]);
+    assert_eq!(
+        extract_sni_from_dtls_client_hello(&build_dtls_client_hello_from_parts(
+            &[0x00, 0x2f],
+            &[0x00],
+            &extensions,
+        )),
+        DtlsSniResult::Malformed
+    );
+}
+
+#[test]
+fn test_extract_sni_dtls_rejects_empty_or_odd_cipher_suites_and_empty_compression() {
+    let sni = dtls_server_name_extension(&[(0x00, b"tenant.example.com")]);
+    for (label, cipher_suites, compression) in [
+        ("empty cipher suites", &[][..], &[0x00][..]),
+        ("odd cipher suites", &[0x00, 0x2f, 0x00][..], &[0x00][..]),
+        ("empty compression", &[0x00, 0x2f][..], &[][..]),
+    ] {
+        assert_eq!(
+            extract_sni_from_dtls_client_hello(&build_dtls_client_hello_from_parts(
+                cipher_suites,
+                compression,
+                &sni,
+            )),
+            DtlsSniResult::Malformed,
+            "{label} must not route"
+        );
+    }
 }
 
 #[test]
@@ -2178,7 +2299,6 @@ use ferrum_edge::circuit_breaker::CircuitBreaker;
 use ferrum_edge::config::types::CircuitBreakerConfig;
 use ferrum_edge::plugins::{Direction, DisconnectCause, StreamTransactionSummary};
 use ferrum_edge::retry::ErrorClass;
-use std::collections::HashMap;
 
 /// Mirror the TCP accept-loop pre-copy summary for an SNI admission
 /// refusal: no backend was selected, so `backend_target` stays empty and
@@ -2198,6 +2318,7 @@ fn sni_admission_summary(error: &anyhow::Error) -> StreamTransactionSummary {
         proxy_name: None,
         client_ip: "127.0.0.1".into(),
         consumer_username: None,
+        principal_origin: None,
         auth_method: None,
         backend_target: String::new(),
         backend_resolved_ip: None,
@@ -2213,7 +2334,7 @@ fn sni_admission_summary(error: &anyhow::Error) -> StreamTransactionSummary {
         timestamp_connected: String::new(),
         timestamp_disconnected: String::new(),
         sni_hostname: None,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
     }
 }
 
@@ -2236,7 +2357,13 @@ fn assert_sni_admission_taxonomy(error: &anyhow::Error, expected_message: &str) 
     // Defence in depth: even if a later path recorded this class, it is
     // health-neutral — including when `connection_error` is true.
     let cb = CircuitBreaker::new(CircuitBreakerConfig::default());
-    apply_circuit_breaker_outcome_for_test(&cb, 0, true, summary.error_class, false);
+    apply_circuit_breaker_outcome_for_test(
+        &cb,
+        0,
+        true,
+        summary.error_class,
+        ferrum_edge::circuit_breaker::ProbeTicket::NonProbe,
+    );
     assert_eq!(cb.failure_count(), 0);
     assert_eq!(cb.state_name(), "closed");
 }
@@ -2339,13 +2466,17 @@ fn unmatched_sni_route_classifies_as_dispatch_policy_rejected() {
 #[test]
 fn untyped_refused_substring_still_classifies_as_connection_refused() {
     // Defence: a bare anyhow whose Display contains "refused" is still a
-    // backend connect refusal. The typed SNI kind is what escapes that trap.
+    // backend connect refusal during setup. The typed SNI kind is what
+    // escapes that trap.
     let untyped =
         anyhow::anyhow!("SNI-routed stream listener on port 21582 refused connection (not_tls)");
     assert_eq!(
-        classify_stream_error(&untyped),
+        classify_stream_setup_error(&untyped),
         ErrorClass::ConnectionRefused
     );
+    // Issue #7213: the same text from the copy loop is not phase evidence and
+    // keeps the post-wire twin.
+    assert_eq!(classify_stream_error(&untyped), ErrorClass::ConnectionReset);
 }
 
 /// rustls accepts a trailing root dot in a received SNI and reports it from
@@ -2370,4 +2501,62 @@ fn normalize_received_server_name_strips_one_trailing_dot_and_lowercases() {
             "received server_name {received:?}"
         );
     }
+}
+
+// ── L4 stream_match refusals and the inspected-prefix forward (issue #7185) ──
+
+#[test]
+fn l4_stream_match_refusals_share_the_sni_admission_taxonomy() {
+    // An `__l4_{port}` refusal is the same gateway decision as an SNI
+    // admission refusal: no backend was selected, so it is
+    // DispatchPolicyRejected / GatewayPolicy / Unknown and health-neutral.
+    let unmatched = ferrum_edge::_test_support::no_matching_l4_route_error_for_test(21582);
+    assert_sni_admission_taxonomy(
+        &unmatched,
+        "No matching L4 stream_match proxy on port 21582",
+    );
+    let denied =
+        ferrum_edge::_test_support::l4_stream_match_denied_error_for_test("ferrum", "tcp-a", 21582);
+    assert_sni_admission_taxonomy(
+        &denied,
+        "Stream proxy ferrum/tcp-a stream_match denied connection on port 21582",
+    );
+}
+
+#[test]
+fn a_failed_inspected_prefix_forward_is_a_post_wire_backend_failure() {
+    let error = ferrum_edge::_test_support::backend_first_bytes_forward_error_for_test(
+        std::io::Error::new(std::io::ErrorKind::ConnectionReset, "peer reset"),
+    );
+    assert_eq!(
+        error.to_string(),
+        "failed forwarding inspected first bytes to backend: peer reset"
+    );
+    // The accept loop uses the SETUP-phase classifier, but the dial already
+    // succeeded: a reset here must stay post-wire, never `ConnectionRefused`.
+    let class = classify_stream_setup_error(&error);
+    assert_eq!(class, ErrorClass::ConnectionReset);
+    assert_eq!(
+        pre_copy_disconnect_cause_for_test(&error, &class),
+        DisconnectCause::BackendError
+    );
+    assert_eq!(
+        pre_copy_disconnect_direction_for_test(&error, &class),
+        Direction::BackendToClient
+    );
+
+    let broken_pipe = ferrum_edge::_test_support::backend_first_bytes_forward_error_for_test(
+        std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe"),
+    );
+    assert_eq!(
+        classify_stream_setup_error(&broken_pipe),
+        ErrorClass::ConnectionClosed
+    );
+    let untyped = ferrum_edge::_test_support::backend_first_bytes_forward_error_for_test(
+        std::io::Error::other("write failed"),
+    );
+    assert_eq!(
+        classify_stream_setup_error(&untyped),
+        ErrorClass::RequestError
+    );
 }

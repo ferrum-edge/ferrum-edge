@@ -7,6 +7,24 @@ plus any custom rules you supply. It can also inspect raw TCP streams and
 UDP/DTLS datagrams when a [`stream`](#stream-tcpudp-inspection) block is
 configured.
 
+**Priority:** 2930
+**Phase:** `authorize`, `on_final_request_body`, `after_proxy`,
+`finalize_client_visible_response_body`, `finalize_client_visible_response_headers`,
+`on_ws_frame`, `on_stream_connect`, `on_udp_datagram`
+**Protocol:** HTTP, gRPC, WebSocket always; TCP and UDP/DTLS when a `stream`
+block is configured
+
+The two `finalize_client_visible_*` phases are the authoritative response
+surfaces: the body scan runs after every semantic transform and before gateway
+transport encoding, and the header re-assertion is the last rejecting phase of
+the response lifecycle. `on_final_response_body` remains only as a compatibility
+alias for direct callers — the proxy skips it once the authoritative phase has
+run, so production scans once. `on_ws_frame` inspects complete WebSocket
+application messages, and `on_stream_connect` / `on_udp_datagram` are the raw
+TCP first-bytes and UDP/DTLS datagram surfaces contributed by `stream`. See
+[plugin_execution_order.md](plugin_execution_order.md) for the complete ordering
+contract.
+
 ## Scope: what the WAF does and does not do
 
 The WAF is deliberately scoped to **payload and metadata inspection**. Other
@@ -61,7 +79,7 @@ default: deploy the WAF, watch what it flags, then enforce deliberately. It
 also means that with the default monitor-only pack and no other reachable
 enforcement path, `mode: enforce` is rejected at construction. Opt rules into
 enforcement, or configure one of the separately documented enforcement paths.
-There are three ways:
+There are four ways:
 
 1. **`default_rule_action`** — bulk-set the action of built-in rules that
    inherit it. `default_rule_action: "enforce"` enforces the low-false-positive
@@ -143,11 +161,11 @@ and WebSocket application messages under `mode: enforce` even if every rule
 stays monitor-only. `fail_closed` (the default), `scan_truncated`, and `skip`
 do not count, because they cannot reject unless some other enforcing body
 policy already exists. An empty `body_methods` does not remove this path:
+a request that declares a body is governed on every method, and
 client-to-backend WebSocket messages ignore `body_methods` and still apply the
 cap. `on_unlisted_content_type: block` counts the same way when the
 request-body hook can run and some HTTP request body can be unlisted, which
-needs at least one `body_methods` entry and not both `inspect_multipart` and
-`inspect_binary_body` (see
+needs not both `inspect_multipart` and `inspect_binary_body` (see
 [Bodies outside the scan scope](#bodies-outside-the-scan-scope-on_unlisted_content_type));
 its `fail_closed` does not.
 
@@ -228,8 +246,13 @@ matching request and response bodies, the WAF also scans **decoded variants**:
 
 - UTF-16LE / UTF-16BE and UTF-32LE / UTF-32BE request and response bodies
   admitted by the direction's body content-type gates, using an explicit
-  `charset`, a byte-order mark, or an undeclared wide-text prefix signature
-  (bare `utf-16` / `utf-32` without a BOM tries both endiannesses)
+  `charset`, a byte-order mark, or a wide-text prefix signature when no
+  UTF-16 / UTF-32 charset is declared (a `utf-8` or unrecognized label does not
+  switch the signature off; bare `utf-16` / `utf-32` without a BOM tries both
+  endiannesses; and when a BOM-less wide signature disagrees with a declared
+  wide charset's width or endianness, both endiannesses of the signature's
+  width are scanned in addition to the declared readings; a BOM of the other
+  wide width likewise adds the BOM's reading to the declared one)
 - JSON / JavaScript string escapes — `\uXXXX`, `\u{...}`, `\xXX`, and the
   single-character escapes `\n`, `\t`, `\r`, `\f`, `\b`, `\v`, `\/`, `\"`,
   `\'`, `\\`. A JSON parser resolves these before the application sees the
@@ -316,6 +339,24 @@ body including the BOM bytes — which is what a backend trusting
 `Content-Type` sees, reading `FE FF` as the noncharacter `U+FFFE` — and the
 BOM-honouring reading decodes the body after the mark. The raw/lossy view is
 kept as well, so a mismatched declaration cannot hide the payload.
+
+The same holds when the BOM's **width** disagrees with the declared wide
+charset family — a UTF-16 mark under a UTF-32 declaration
+(`charset=utf-32le` on a body starting with `FE FF`) or the UTF-32BE mark
+under a UTF-16 declaration (`charset=utf-16le` on a body starting with
+`00 00 FE FF`): the declared reading of the whole body and the BOM's
+reading after the mark are both scanned (both endiannesses of the declared
+width for a bare `utf-16` / `utf-32`). `FF FE 00 00` keeps the ambiguity
+handling above: a UTF-32 charset settles it as UTF-32, and otherwise its
+UTF-32LE and UTF-16LE readings are scanned, plus the declared whole-body
+reading when the charset is explicitly `utf-16be`.
+
+Without a BOM, when the wide signature disagrees with a declared wide
+charset (`charset=utf-16be` on UTF-16LE bytes, or `charset=utf-16` on UTF-32
+bytes), both endiannesses of the signature's width are scanned in addition
+to the declared readings. A declaration whose width and endianness already
+match the signature (`charset=utf-16le` on UTF-16LE bytes) adds nothing. At
+most four wide views are scanned in a disagreement case, two otherwise.
 
 The full WHATWG UTF-16LE label set is recognized, not just `utf-16le` /
 `utf16le`: `unicode`, `unicodefeff`, `ucs-2`, `iso-10646-ucs-2`, and
@@ -417,6 +458,168 @@ Runtime aliases map onto those targets: `request_headers` → `header_values`,
 `request_body` → `body_text`. `path` is valid only on `body_json_path`;
 `names` is valid only on `header_values` / `request_headers`.
 
+A `body_json_path` rule parses every reading of the body the WAF inspects: the
+raw bytes (a leading UTF-8 byte-order mark is skipped) and each UTF-16 / UTF-32
+view described under [Decode / normalization](#decode--normalization) above, so a JSON body re-encoded in a
+wide charset is matched like its UTF-8 form. Duplicated object members are not
+collapsed: the path follows every occurrence of each member name (including a
+`\u`-escaped spelling of the same name), at the leaf and on enclosing objects,
+and the rule matches if any selected value matches. A path that selects an
+object or array is matched against its compact JSON as a last-wins parser
+reads it and, when the subtree holds duplicated members, also as a
+first-wins parser reads it and with every member kept; each reading is
+matched and false-positive-filtered on its own. A backend that keeps the
+first, the last, or every occurrence is therefore covered by the same verdict.
+
+Each reading is first parsed strictly. A reading the strict parser refuses
+only because a string holds invalid UTF-8 or a `\u` escape naming an unpaired
+UTF-16 surrogate (`\uD800`–`\uDFFF` not forming a high-then-low pair, such as
+a lone `"\ud800"` or the reversed `"\udc00\ud800"`) is parsed again the way
+lenient backends read it — JavaScript `JSON.parse`, Python `json.loads` and
+Jackson keep an unpaired surrogate, and Go `encoding/json` and
+`TextDecoder`-based readers substitute `U+FFFD` for it and for invalid bytes:
+invalid bytes become `U+FFFD`, and each unpaired surrogate escape is read as
+`\uFFFD` (an escaped backslash such as `"\\ud800"` is literal text and is not
+changed). One such string therefore cannot hide the rest of the
+document from `body_json_path` rules. Only that fallback copies the body; a
+body the strict parser accepts is read in place.
+
+The lenient reading also accepts several documents separated by whitespace
+(NDJSON, a leading scalar such as `null` followed by an object, or a document
+followed by another one). When a document cannot be read, it is judged by its
+opening (below) and reading resumes at the next whitespace-separated token or
+container after the error — as a sequence consumer that skips a bad value
+does, on the same line or the next, including a container the bad token runs
+straight into (`tru{…}`, `NaN[…]`). Every document it reads is inspected —
+before or after a part it could not read, including a JSON object embedded in
+text — so a backend that reads only the first, only the last, or each of them
+is covered by the same verdict. Nothing is re-read inside a refused container:
+a refused container that opens like JSON fails closed instead, and one that
+does not is rejected by the parser at its second token, so what follows it is
+still read.
+
+All lenient readings of one body — its raw bytes, its UTF-16 / UTF-32 views,
+and the readings of a framed RPC stream — share one work budget of four times
+the body's length plus 64 KiB, counting the bytes recovery parses and the
+bytes the opening checks examine. A body that exhausts it fails closed, so
+judging a body costs time linear in its length.
+
+A body that `body_json_path` rules cannot read **fails closed**: every
+applicable `body_json_path` rule records a hit, and that rule's own action,
+paranoia band and anomaly-score contribution decide, exactly as for a match —
+in `mode: monitor`, or for a `monitor` rule without anomaly scoring, it is
+only observed. The rule's `conditions` and request-wide exemptions still
+apply; value filters (`fp_filters`, global value exemptions) are not
+consulted because no value was selected. Backend parsers accept grammar the
+WAF's parser refuses — numbers beyond the `f64` range, nesting deeper than
+128 levels, `NaN` / `Infinity`, comments, trailing commas, unquoted names and
+values, JavaScript and Unicode whitespace, an anti-XSSI prefix, text after the
+document — so treating such a body as having nothing to select would let one
+such token switch every JSON-path rule off. A body cannot be read when part of
+a reading is refused by both the strict and the lenient parse and:
+
+- that part **opens like a JSON object or array** — any document the
+  lenient reading stopped at, however much skippable text precedes its first
+  token — whatever the `Content-Type` says and whatever the other readings
+  did. After anything lenient parsers skip before and between
+  tokens — JSON whitespace, vertical tab, form feed, U+001C–U+001F, U+0085,
+  U+00A0, U+FEFF, U+2028 / U+2029 and the other Unicode space separators,
+  `//` and `#` comments (ended by LF, CR, U+2028 or U+2029), `/* */`
+  comments, and the `)]}'` / `)]}',` anti-XSSI prefix — it holds `{`
+  followed by a quoted name, `}`, or an unquoted name (Gson-lenient literal
+  characters, so digits and `-` included) and then `:` or `=`; or `[`
+  followed by `]`, `{`, `[`, a quote, `-`, `+`, `.`, a digit, `true` /
+  `false` / `null` / `NaN` / `Infinity` ending at a delimiter or at anything
+  skippable, or an unquoted value and then `,` or `;`. Text that merely
+  starts with a bracket (`[INFO] …`, `[true-story] …`, `{{template}}`,
+  `{amount}`) does not; or
+- **no reading was read completely** and either the `Content-Type` declares
+  JSON (`*/json` or a `+json` suffix), or the part opens like a JSON
+  container once U+0000 is skipped between tokens as Json.NET does. Under a
+  JSON declaration no sniff is needed: any non-blank body none of whose
+  readings can be read completely fails closed — including plain text, a
+  form, a refused lone scalar such as `NaN` or `1e400`, or a body of only
+  JavaScript whitespace or comments sent as `application/json`.
+
+"No reading was read completely" is what keeps an ordinary UTF-16 / UTF-32
+body open: its raw bytes are refused (a NUL follows every ASCII character)
+while its transcoded reading parses. That vouching comes only from a wide
+reading the body declares — a UTF-16 / UTF-32 `charset` or a byte-order mark
+— because only then does a backend certainly read the body as wide text.
+The test is an allow-list: the body starts with a UTF-16 / UTF-32
+byte-order mark, or the whole `Content-Type` value is exactly
+`type/subtype; charset=<label>` with one of the labels `utf-16`, `utf-16le`,
+`utf-16be`, `utf-32`, `utf-32le` or `utf-32be` (any case, optionally
+double-quoted, optional whitespace around `;` and `=`), and nothing else.
+Media-type parsers disagree about empty parameters, extra parameters, quoted
+values and repeated headers — ASP.NET Core, for one, stops reading
+parameters at an empty one and then defaults to UTF-8 — so any other form
+(`application/json;;charset=utf-16le`, a second parameter, an alias such as
+`unicode`, two `Content-Type` lines) declares nothing, even though the WAF
+still decodes and inspects its wide reading. A client sending wide JSON with
+any other `Content-Type` form should start the body with a byte-order mark. A wide
+reading found only by the BOM-less signature is not what a backend that
+defaults to UTF-8 reads: when the raw bytes are refused in a way a
+NUL-skipping parser (Json.NET) reads past, the raw bytes with every NUL
+removed are read and inspected as well, and it is that reading that must be
+read completely. One body can be a benign UTF-16 document and a different
+UTF-8 document with NULs between its tokens; both are judged. Undeclared,
+BOM-less UTF-16 / UTF-32 JSON can therefore fail closed when a character's
+code unit holds a byte that breaks the NUL-removed reading — a control byte,
+`"` or `\` (for example most of U+0100–U+1FFF, or U+22xx): declare its
+`charset` or send a byte-order mark. A blank body (empty or JSON whitespace
+only) and a lone top-level scalar the parser accepts (which no non-empty path
+can select) are never judged.
+
+A body that parses as a framed RPC stream — an exact gRPC
+(`application/grpc[+codec]`), gRPC-Web (`application/grpc-web[+codec]`) or
+Connect streaming (`application/connect+codec`) media type with envelopes (a
+flags byte and a 4-byte length) that cover the body exactly, or a gRPC-Web
+text body (`application/grpc-web-text[+codec]`) whose base64 decodes to such
+envelopes — is read as its messages: each uncompressed message of a `+json`
+codec is a document of its own, and any message that cannot be read fails
+closed. A compressed message is decoded by an RPC backend but not by the WAF,
+so it fails closed too. Because the media type and the framing are both
+client-controlled and say nothing about the backend, a binary stream's raw
+bytes are also read — as sent, and with every NUL removed, which is how a
+NUL-skipping parser such as Json.NET reads them — and judged like any other
+reading: a document there that cannot be read and opens like JSON fails
+closed even though the messages parse. A genuine stream can trip this: when
+an envelope's length byte is `[` (a message of 91, 347, … bytes) and the
+envelope's bytes therefore read as `[` followed by the message, or when the
+NUL-removed bytes otherwise assemble an array or object no parser here
+accepts. Scope `body_json_path` rules away from such RPC traffic (or from
+compressed JSON-codec RPC traffic) with `conditions` if it must pass. A
+non-JSON codec (`+proto`, a bare gRPC type) has no JSON reading and is not
+inspected by `body_json_path` rules. A look-alike media type is judged as an
+ordinary body. Under a gRPC or gRPC-Web media type, a body whose framing does
+not validate is read up to its framing defect: every complete message before
+it is a document of its own, and the unreadable remainder (like a compressed
+message, or a message past the 1024-message cap) fails closed (see
+[gRPC bodies are inspected message by message](#body-and-response-inspection)).
+Only the message the `max_scan_bytes` window cuts short is not judged. A
+Connect streaming body whose framing does not validate is judged as an
+ordinary body.
+
+A body scanned only up to `max_scan_bytes` (`on_body_too_large:
+scan_truncated`, or a prefix scan in a configuration that cannot block) is cut
+short by construction and is not judged — except a complete gRPC / gRPC-Web
+message inside the window, which is a whole document of its own and fails
+closed when it cannot be read, whatever the window did to a later message.
+WebSocket messages carry no
+`Content-Type`, so only the opening rules apply to them.
+
+What remains outside `body_json_path` inspection is a part of a body that is
+not declared JSON, that could not be read as a JSON document, and that does
+not open like a JSON container as described above — for example an opening
+only a parser option beyond those listed accepts. Documents read from a
+refused reading are inspected from their own root: a value inside a refused
+container is not selected by its full path, which is why that container fails
+closed when it opens like JSON. `body_text` rules, byte
+rules and the body-scoped specials scan every body either way; pair a
+`body_json_path` rule with a `body_text` rule, or declare and validate JSON
+before it reaches the backend, when such a backend must be protected.
+
 `match_kind` is one of `regex` (default), `literal`, `contains`, `equals`,
 `luhn` (credit-card checksum; body targets only), or `cidr` (IP membership).
 Semantics:
@@ -428,7 +631,7 @@ Semantics:
 | `contains` | Case-insensitive substring (same substring semantics as `literal`, but folded). |
 | `equals` | Case-insensitive full-value match (anchored; does not prefix-match). |
 | `luhn` | Valid credit-card Luhn checksum on digit runs (body targets only). |
-| `cidr` | IP membership test. |
+| `cidr` | IP membership test. An IPv4-mapped IPv6 address (`::ffff:10.0.0.1`) is tested as the IPv4 address it carries, so an IPv4 network (or `::ffff:a.b.c.d/96`-or-longer mapped network) matches both spellings. Any other IPv6 network, including `::/0`, matches IPv6 addresses only: it never matches a native IPv4 address, so an IPv6 `global_exemptions.ips` entry cannot exempt IPv4 callers. |
 
 ## Built-in rule pack
 
@@ -444,7 +647,7 @@ and `rule_overrides`. Categories:
 | `rce` | FE-SPRING4SHELL-001-{B,Q}, FE-SHELLSHOCK-001-{H,Q,QV}, FE-OGNL-001-{B,Q,H}, FE-PHP-001-{Q,B}, FE-PHP-002-{Q,B}, FE-NODE-001-{Q,B} | Spring4Shell class-loader manipulation (CVE-2022-22965). Shellshock (CVE-2014-6271) is Critical/level 1 and anchored to the **start** of a header value or query key/value — the position bash actually imports — so `function() {` in ordinary text never matches. OGNL (Apache Struts 2, including the CVE-2017-5638 `Content-Type` vector) is Critical/level 1 across body, query, and header. PHP code injection (`<?php`, `eval($_POST…)`, `system('…')`) and Node.js execution (`require('child_process')`, `process.mainModule`, `constructor.constructor('…')`) are level 1 in query values and level 2 in bodies, where code-hosting APIs carry source. PHP stream wrappers (`php://input`, `phar://`, `zip://`, `data://text/plain`) are level 1 in query values (002-Q) and level 2 in bodies (002-B), where PHP source reads its own request body through `file_get_contents('php://input')`. |
 | `prototype_pollution` | FE-PROTO-001/002 plus FE-PROTO-{001,002}-{Q,QV} | Body `__proto__` is level 1 and body `constructor.prototype` is level 2. The level-1 `-Q`/`-QV` mirrors scan decoded keys/values for `__proto__` and `constructor[prototype]`. |
 | `ldap_injection` | FE-LDAP-001..002 | |
-| `xpath_injection` | FE-XPATH-001, FE-XPATH-002 (L3, low value) | |
+| `xpath_injection` | FE-XPATH-001, FE-XPATH-002 (L3, low value) | 001 (query values, L1) needs XPath syntax a SQL payload does not carry: a quote that closes a predicate and unions a new path (`'] \| //user/*`), an explicit axis (`descendant::node()`), or a quote-break into a boolean on an XPath-only function (`' or name()='admin`). A bare quoted tautology such as `' or '1'='1` is left to the SQLi rules, so it is not scored twice. |
 | `ssti` | FE-SSTI-001 (broad, L2), FE-SSTI-002 (arithmetic probe, L1), FE-SSTI-003 (Java/Spring EL, L2) | |
 | `xss` | FE-XSS-001..005 plus `-B`/`-Q`/`-C` body/query/cookie mirrors, FE-XSS-006-{Q,B} | script-tag and script-URL cover query, body, and cookie values. The script-URL rule (002) tolerates the ASCII tab/LF/CR that browsers delete inside a URL (`java&#x09;script:`, `jav%0Aascript:`) and covers `vbscript:`; a real space (`java script:`) is prose, not a scheme. 006 flags active-content elements (`<svg`, `<iframe`, `<object`, `<embed`, `<base`, `<meta`, `<math>`, frames) at level 1 in query values and level 2 in bodies, where rich-text APIs carry markup. |
 | `path_traversal` | FE-PATHTRAV-001..003, FE-PATHTRAV-001-{B,C} | FE-PATHTRAV-001..003 (FullUrl) also scan percent-decoded query values (including `%2f`); 001-B covers request bodies and 001-C cookie values. Category labels do not select scan targets. |
@@ -452,7 +655,7 @@ and `rule_overrides`. Categories:
 | `ssrf` | FE-SSRF-001(+ -Q), FE-SSRF-002(+ -Q), FE-SSRF-003-{Q,B} (L2) | metadata/private-IP and dangerous schemes; **level 1** across body and decoded query values (not the raw whole URI). Same dotted-IPv4 / cloud-metadata / `file|gopher|dict|jar|ldap://` claims as the body rules. Metadata endpoints are the IMDS address `169.254.169.254`, the AWS ECS credential endpoint `169.254.170.2`, the AWS IPv6 IMDS `fd00:ec2::254`, Alibaba Cloud's `100.100.100.200`, and `metadata.google.internal`. FE-SSRF-003 is **level 2** and needs a URL scheme in front, because development tooling legitimately passes `http://localhost:…` around. It covers `localhost` and `localhost.`, `0`, `0.0.0.0`, short dotted loopback (`127.1`, `127.0.1`), mixed dotted hex/octal (`0x7f.1`), and bracketed IPv6 (`[::1]`, `[::ffff:127.0.0.1]`, `[fe80::…]`). A host written as a single decimal, hex, or octal integer (`2130706433`, `0x7f000001`, `017700000001`) matches whatever address it encodes, loopback or not: legitimate URLs do not spell hosts that way, and the encoded address is exactly what the dotted-quad rules cannot see. |
 | `xxe` | FE-XXE-001 | external-entity markers; does not trip on `<!DOCTYPE html>` |
 | `deserialization` | FE-DESER-001..005 | Java (base64 `rO0AB` or hex `aced0005`) / .NET BinaryFormatter / PHP serialized markers; unsafe YAML type tags (004: PyYAML `!!python/object/apply`, SnakeYAML CVE-2022-1471 gadgets, Psych `!ruby/object`); and polymorphic JSON type discriminators naming a gadget namespace (005: Fastjson/Jackson `@type`/`@class` in `com.sun.`, `java.net.`, `org.apache.`, …, and Json.NET `$type` in `System.Windows.Data.ObjectDataProvider`, …). 005 also matches the Fastjson autoType bypass spellings (`"Lcom.sun…;"`, `"LLcom…;;"`, `"[com.sun…"`) and Jackson's `WRAPPER_ARRAY` form, `["com.sun…", {…}]`, which has no discriminator key. Spring is matched only by its gadget packages (`org.springframework.aop.`, `beans.`, `context.`, `jndi.`, `transaction.`, `expression.`, `jdbc.`, `jms.`, `jmx.`, `remoting.`, `scripting.`, `web.context.support.`), so Spring Session / Spring Security JSON — `"@class":"org.springframework.security…"`, `WRAPPER_ARRAY` `["org.springframework.security…",{…}]`, `["java.util.ArrayList",[…]]`, `["java.lang.Long",1]` — stays clean. The `WRAPPER_ARRAY` form also counts with a string argument (double-quoted and possibly holding a `'`, or single-quoted and possibly holding a `"`) when the array is exactly `[class, string]` and the first element ends in a capitalised class name — the CVE-2017-17485 payload `["org.springframework.context.support.FileSystemXmlApplicationContext","http://…/spel.xml"]` — outside the `java.*` and .NET namespaces, so a pair of package names, a longer class list, a Maven coordinate, and a JDK value type such as `["java.net.URL","https://…"]` stay clean. JSON-LD `"@type": "Product"` and application-owned type names stay clean. |
-| `header_anomaly` | FE-HEADER-001..003 | control chars, method-override, header-borne injection (L2) |
+| `header_anomaly` | FE-HEADER-001..003 | control chars, method-override, header-borne injection (L2). 002 fires only when `X-HTTP-Method-Override` names a different method than the request; an override that restates the request method is not a hit. |
 | `cookie_attack` | FE-COOKIE-001, FE-COOKIE-002 (Info, L3) | |
 | `encoding_evasion` / `parameter_pollution` / `method_abuse` | FE-ENCODING-001..002, FE-HPP-001, FE-METHOD-001 | encoding heuristics stay monitor under bulk `default_rule_action: enforce`; HPP and method-abuse inherit bulk enforce |
 | `http_response_splitting` | FE-CRLF-001 | a decoded CR/LF in a query value followed by a response header name (`Set-Cookie:`, `Location:`, …) or a status line — the shape that splits a response when an application reflects the value into a header (redirect targets, download names). Level 1. |
@@ -608,7 +811,12 @@ Exclusions do not enable enforcement.
   exclusions re-runs its own matcher over the URL rebuilt without the excluded
   pairs, and the hit counts only if it still matches. `FE-HPP-001` drops the
   excluded pairs before comparing duplicates, and the URL-side encoding
-  heuristics judge the rebuilt URL.
+  heuristics judge the rebuilt URL. `FE-HPP-001` compares duplicates under
+  both separator conventions, `&` only and `&` plus an unencoded `;` (issue
+  #6579), so `tenant=admin&x=;tenant=victim` is a conflict. Exclusions and
+  `fp_filters` apply to each convention's own retained pairs (the `;` view is
+  rendered `&`-joined for the filters), and a conflict that survives
+  suppression under either convention is enforced.
 - `headers` — header names, case-insensitive. Applies to `header_names`,
   `header_values`, and `response_headers` rules.
 - `cookies` — cookie names (the text before `=` in the raw crumb),
@@ -652,23 +860,54 @@ of the path conditions see (`/admin;x/users` is not `/admin/users`).
 
 `global_exemptions` short-circuits the entire WAF for matching requests, so keep
 the entries tight — an over-broad `paths` entry silently disables the WAF on
-unintended routes:
+unintended routes. `paths`, `methods`, `ips`, and `consumers` are combined by
+`match`:
+
+- `match: all` (default) — a request is exempt only when **every** configured
+  criterion matches it. Adding a criterion narrows the exemption:
+  `{"paths": ["/health"], "methods": ["GET"]}` exempts `GET /health`, not every
+  `GET` plus every method on `/health`.
+- `match: any` — any one configured criterion exempts the request (the
+  pre-existing behavior; use it only when each criterion is safe on its own).
+
+An exemption with no `paths`/`methods`/`ips`/`consumers` exempts nothing.
 
 - `paths` — exact, `prefix*`, or `~regex`. All three match from the **start** of
   the path: a non-wildcard entry is an exact full-path match, `prefix*` is a
   prefix match, and `~regex` is start-anchored (an implicit leading `^`). So
   `~/internal/` exempts only paths beginning with `/internal/`, not every path
   containing it. Use `~^/a|^/b` for alternation, or `~.*pattern` if you really
-  need a floating substring match.
-- `methods`, `consumers`, `ips` (CIDR)
-- `header_present` — suppress rules when a header is present/equal. **Clients
-  choose their own headers**: an entry keyed on a header the client can send
-  (for example `x-internal-scan`) lets any caller switch the WAF off for their
-  request. Key it only on a header that a trusted component in front of the
-  gateway always strips or overwrites — Ferrum's own `request_transformer`
-  runs in `before_proxy`, after the WAF has decided, so it cannot protect
-  this — or exempt authenticated callers via `consumers` instead. The same
-  caution applies to per-rule `conditions.headers`.
+  need a floating substring match. Exemptions match the canonical request path
+  just like rule conditions, so an exact or `prefix*` entry that is not itself
+  canonical (a percent escape, a `\`, a `.`/`..` segment, or `//`) is rejected
+  at construction rather than silently exempting nothing; `~regex` entries are
+  not checked this way.
+- `methods`, `consumers`, `ips` (CIDR). `consumers` lists **mapped Consumer
+  usernames**: an unmapped external identity (a `jwks_auth` subject, an LDAP
+  login, ...) never matches, even one that spells a listed username, so a
+  self-registered IdP user named like an exempted Consumer is still scanned.
+  To exempt an external principal, gate the WAF instance with an execution
+  trigger that names both the identity and its verifying authority, such as
+  `not: {all: [{match: {external_identity: ...}}, {match:
+  {external_identity_authority: [<realm digest>]}}]}`. The digest is the
+  `input.consumer.realm.authority` value `opa` reports for that provider; it
+  differs between two providers of one mechanism, so `auth_method` alone is
+  not enough when one `jwks_auth` / `oauth2_introspection` instance accepts
+  several issuers.
+- `header_present` — suppress every rule, and every disposition that would
+  otherwise refuse (`fail_closed` and `block` for `on_body_too_large`,
+  `on_unlisted_content_type`, `on_unlisted_response_content_type`, and
+  `on_scan_timeout`), for a
+  request that carries the header with **exactly** the configured value. **Clients choose their own headers**,
+  so the value is a shared secret: it must be a string of at least 16
+  characters, it is compared in constant time, and presence-only (`null`)
+  entries are rejected at admission. Have a trusted component in front of the
+  gateway inject it (and strip any client copy), and rotate it like any other
+  credential; the header is still forwarded to the backend. Ferrum's own
+  `request_transformer` runs in `before_proxy`, after the WAF has decided, so
+  it cannot inject it. Exempting authenticated Consumers via `consumers` is
+  usually the better tool. Per-rule `conditions.headers` keeps plain value
+  matching, so scope rules on client-controlled headers with the same care.
 - `fp_capture_filters` — suppress any matched value matching these patterns
   (these match anywhere in the value by design and are **not** anchored)
 
@@ -700,10 +939,104 @@ metacharacters as needed (`\\+` in JSON config for a literal `+` in
 JSON-LD `<script type="application/ld+json">…</script>` block therefore
 suppresses the hit while an ordinary `<script>…</script>` payload still blocks.
 
+**Custom rule fields:**
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `id` | string | required | Unique rule ID. |
+| `name` | string | `id` | Human-readable rule name. |
+| `category` | string | required | Category label, such as `sqli`, `xss`, or `custom`. |
+| `severity` | string | `medium` | `info`, `low`, `medium`, `high`, or `critical`. |
+| `target` | string/object | required | Scan target. Strings cover every target except `body_json_path` (object-only). Object form uses `type`; optional non-empty `names` only for `header_values`/`request_headers`; required non-empty `path` only for `body_json_path`. Aliases `request_headers`, `request_query`, `request_path`, `request_url`, `request_method`, and `request_body` are accepted. |
+| `match_kind` | string | `regex` | `regex`, `literal`, `contains`, `equals`, `luhn`, or `cidr`. `literal` is a case-sensitive substring; `contains` is the case-insensitive substring form; `equals` is a case-insensitive full-value match. For folding with `regex`, write `(?i)…` explicitly. |
+| `pattern` | string | `""` | Pattern text. Required except for `luhn` rules. CIDR rules accept an IP or CIDR range. |
+| `action` | string | global default | `enforce`, `monitor`, or `disabled`. |
+| `score` | integer | severity weight | Anomaly-score contribution when `scoring` is enabled. |
+| `fp_filters` | string[] | `[]` | Unanchored regex filters evaluated against the complete inspected target value after a rule match; if any filter matches anywhere in that value, the hit is suppressed. For `body_json_path`, this is the selected JSON scalar's string form, not only the matched substring. A body containing non-UTF-8 bytes is filtered against its lossy text view (invalid bytes become `U+FFFD`), so binary content is filtered on the same terms as text. |
+| `paranoia_min` | u8 | `1` | Minimum paranoia level required for this rule. |
+| `conditions` | object | `{}` | Optional request conditions: `paths`, `methods`, `headers`, and `consumers` (mapped Consumer usernames only; an unmapped external identity never matches). Path entries share exact-match and trailing-`*` prefix forms with `global_exemptions.paths`, but `~regex` anchoring differs: rule `conditions.paths` compile the text after `~` as an operator-authored, unanchored regex evaluated with Rust regex `is_match`, so they may match anywhere in the path unless the pattern itself is anchored (for example `~^/admin(?:/|$)`). A floating match such as `~api` therefore matches both `/api/users` and `/v1/api-keys`. Exact and prefix forms are unchanged and are not regex-anchored. |
+
+The `url_path` / `full_url` targets, `conditions.paths`, and
+`global_exemptions.paths` all evaluate the **canonical policy path**, derived
+once at the frontend boundary. A client cannot dodge a path rule by
+percent-encoding an ordinary character (`/%61dmin` is matched as `/admin`), and
+encoded separators, dot segments (literal `/a/../b` as well as escaped
+`/a/%2e%2e/b`), backslashes (literal `/a\b` as well as `%5C`), double
+encodings, and invalid escapes never reach the WAF at all — they are rejected
+with `400` first. Write path patterns against the canonical form. See
+[docs/request_path_canonicalization.md](request_path_canonicalization.md).
+
+CIDR rules on free-form body text are heuristic token scans. They are useful
+for tightly scoped private-address leakage checks, but broad response-body CIDR
+rules can match IPv6-shaped hex text from logs or diagnostics. Prefer narrow
+`conditions.paths`, header scoping, and false-positive filters for those rules.
+
+`global_exemptions` supports `paths`, `methods`, `consumers`, `ips`, `match`,
+`header_present`, and `fp_capture_filters`. `paths`, `methods`, `ips`, and
+`consumers` short-circuit the whole WAF; by default (`match: all`) a request is
+exempt only when **every** configured criterion matches it, so
+`{paths: ["/health"], methods: ["GET"]}` exempts `GET /health` and nothing
+else. `match: any` restores the looser "any one criterion" behavior.
+`header_present` maps a header name to a **shared secret** of at least 16
+characters that only a trusted hop in front of the gateway injects; the value is
+compared in constant time, and presence-only (`null`) entries are rejected at
+admission because clients choose their own headers. Path entries ending in `*` are
+prefix matches; entries starting with `~` are start-anchored regex patterns
+wrapped as `^(?:regex)` (unlike unanchored per-rule `conditions.paths`); all
+other entries are exact-path matches (so `/health` exempts only `/health`, not
+`/healthz` or `/health-admin`). Use `~.*pattern` for a floating substring match
+under these start-anchored exemption semantics. Exact and prefix entries are
+matched against the canonical request path, so one that is not itself
+canonical (a percent escape, `\`, a dot segment, or `//`) is rejected at
+construction, exactly like `conditions.paths`.
+
+```yaml
+config:
+  mode: enforce
+  include_default_rules: true
+  default_rule_action: enforce
+  paranoia_level: 1
+  rule_modes:
+    FE-XSS-001: enforce
+    FE-SQLI-002: enforce
+  max_scan_bytes: 1048576
+  response_inspection: true
+  response_body_inspection: false
+  custom_rules:
+    - id: CUSTOM-PRIVATE-IP
+      name: Private IP in forwarded header
+      category: custom
+      severity: high
+      target:
+        type: header_values
+        names: ["x-forwarded-for"]
+      match_kind: cidr
+      pattern: 10.0.0.0/8
+      action: enforce
+  global_exemptions:
+    paths: ["/health*"]
+```
+
+
 ## Body and response inspection
 
-Request-body inspection is on by default for `POST`/`PUT`/`PATCH` with an
-inspectable `Content-Type` (`body_methods`, `body_content_types`). Multipart and
+Request-body inspection is on by default for an inspectable `Content-Type`
+(`body_content_types`). Body governance is **not** a method allowlist: a
+backend that parses a body regardless of method (a servlet reading a `GET`
+body, a search API taking `GET` with JSON, WebDAV `SEARCH`/`PROPFIND`) must not
+receive a payload an enforcing rule refuses on `POST` just because the client
+picked another method. Requests on a `body_methods` method (`POST`, `PUT`,
+`PATCH`, `DELETE` by default) are always buffered for inspection; a request on
+any other method (except `CONNECT`, a tunnel) is governed whenever a body may
+follow its head — it carries a `Content-Type`, or the **transport** could not
+prove the request ended with its head — and the final decision covers any
+non-empty finalized body whatever the method. Omitting `Content-Length` and
+`Content-Type` is not proof of an empty body: an HTTP/1.1 request is governed
+when it declares framing (`Content-Length` > 0 or `Transfer-Encoding`), an
+HTTP/2 request when its HEADERS frame did not carry END_STREAM, and an HTTP/3
+request always (the request stream exposes no end-of-stream signal before the
+first read), so under an enforcing body policy HTTP/3 requests on such methods
+are buffered too (a body-less one passes as an empty body). Multipart and
 binary bodies are opt-in (`inspect_multipart`, `inspect_binary_body`).
 
 The `Content-Type` is matched on its lowercased base media type with parameters
@@ -725,6 +1058,14 @@ excluded too, and a plugin configured with only `text/plain` inspects neither.
 `text/json` is in the default allowlist as an explicit entry, since it carries no
 suffix to key off.
 
+Set `on_body_too_large: scan_truncated` for prefix-only scanning of oversize
+bodies. That is an explicit acceptance of the suffix bypass and should be
+paired with a compensating control. For high-assurance routes prefer raising
+`max_scan_bytes` to at least the effective request/response body ceiling
+(`FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` / `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES`,
+default 10 MiB each, plus any route-scoped ceiling) so no admitted body is
+oversize in the first place; `fail_closed` only rejects bodies WAF cannot scan.
+
 ### Bodies outside the scan scope: `on_unlisted_content_type`
 
 The `Content-Type` a client declares is attacker-controlled, and many backends
@@ -740,8 +1081,8 @@ while `inspect_binary_body` is off:
 
 | Value | Non-empty unlisted body |
 | --- | --- |
-| `allow` (default) | forwarded uninspected, as before |
-| `fail_closed` | rejected when an enforcing request-body policy applies to this request (an applicable `action: enforce` body rule, or anomaly scoring over one), so an enforcing rule cannot be sidestepped by relabelling; otherwise forwarded and recorded |
+| `allow` | forwarded uninspected |
+| `fail_closed` (default) | rejected when an enforcing request-body policy applies to this request (an applicable `action: enforce` body rule, or anomaly scoring over one), so an enforcing rule cannot be sidestepped by relabelling; otherwise forwarded and recorded |
 | `block` | rejected while `mode: enforce` — a strict allowlist of inspectable types |
 
 The decision is exact: when a value could refuse the request, the WAF asks the
@@ -753,15 +1094,53 @@ could not be refused keep the streaming path.
 Scope: the setting governs **HTTP request bodies only** — HTTP/1.1, HTTP/2,
 HTTP/3, native gRPC, and gRPC-Web requests — and among those only:
 
-- methods listed in `body_methods` (so `body_methods: []` turns it off, and
-  `block` then no longer satisfies `mode: enforce` admission);
+- requests that carry a body: any method in `body_methods`, and any other
+  method once the request declares a body (see
+  [Body and response inspection](#body-and-response-inspection));
 - requests no `global_exemptions` entry short-circuits;
 - instances whose request-body hook runs at all (request and request-body
   inspection on, with an active request-body rule or `FE-ENCODING-001` /
   `FE-ENCODING-002` enabled).
 
-Response bodies are never governed by it, and WebSocket messages carry no
+Response bodies are governed by the separate
+`on_unlisted_response_content_type` (below), and WebSocket messages carry no
 `Content-Type` and are always scanned.
+
+`fail_closed` is the default because the request `Content-Type` is chosen by
+the client: under an enforcing request-body policy, relabelling a payload must
+not be a way around it. Monitor-only deployments (`mode: monitor`, or no body
+rule set to enforce) never start blocking; they record
+`waf.body_uninspected=content_type` instead. Set `allow` explicitly to keep the
+old forward-uninspected behavior on routes that carry opaque uploads you cannot
+list or exempt.
+
+#### Responses: `on_unlisted_response_content_type`
+
+The same scan scope applies to response bodies when `response_inspection` and
+`response_body_inspection` are on, with one difference: on responses
+`inspect_binary_body: true` brings **every** type into scope, multipart
+included, so nothing is unlisted and every body is scanned. A non-empty response whose `Content-Type`
+falls outside it used to stream past every response-body rule (stack-trace,
+source and data-leak detection) with no record. `on_unlisted_response_content_type`
+takes the same three values:
+
+| Value | Non-empty unlisted response body |
+| --- | --- |
+| `allow` | forwarded uninspected; recorded as `waf.body_uninspected=content_type` with `waf.body_uninspected_target=response_body` when the body was buffered anyway |
+| `fail_closed` (default) | rejected when an enforcing response-body policy applies to the request (an applicable `action: enforce` response-body rule, or anomaly scoring over one) |
+| `block` | rejected while `mode: enforce` |
+
+Refusing values buffer the unlisted body and decide over the exact bytes, so an
+empty body passes. `text/event-stream` responses, bodiless responses (`HEAD`,
+1xx, 204, 304), and exempt requests are never governed. `fail_closed` is the
+default for the same reason as on requests: response-body rules exist to catch
+disclosures an origin did not intend, and an origin serving source code or a
+stack trace as `application/octet-stream` must not stream it past an enforcing
+rule. Monitor-only response policy never starts blocking. A route that
+legitimately serves images, archives, or protobuf under enforcing
+response-body rules lists those types, exempts the route, turns on
+`inspect_binary_body`, or sets `allow`. Neither value satisfies `mode: enforce`
+admission on its own.
 
 Because a refusing configuration reads the whole body before it rejects, a
 large or long-running upload receives the rejection (`reject_status_code`,
@@ -782,15 +1161,15 @@ from the request's declared framing (`Content-Length` > 0 or
 shows which routes carry unlisted bodies, but undercounts such clients.
 
 Under `mode: enforce`, `block` is itself a reachable admission enforcement
-path when the request-body hook can run (as above), `body_methods` is not
-empty, and at least one content type is left unscanned. With both
-`inspect_multipart` and `inspect_binary_body` on, every body is scanned; with
-`body_methods: []`, no HTTP request body is governed. Either way `block` can
-never fire, and it does not satisfy admission (the configuration is still
-accepted when some other enforcement path exists). `fail_closed` never
-satisfies admission.
+path when the request-body hook can run (as above) and at least one content
+type is left unscanned. With both `inspect_multipart` and
+`inspect_binary_body` on, every body is scanned, so `block` can never fire and
+does not satisfy admission (the configuration is still accepted when some
+other enforcement path exists). `body_methods: []` no longer turns the setting
+off: a request that declares a body is governed on every method.
+`fail_closed` never satisfies admission.
 
-Before switching to `block` or `fail_closed`, list every type your backends
+Before switching to `block`, or enabling enforcing body rules under the `fail_closed` default, list every type your backends
 legitimately accept: add them to `body_content_types` (scanned as text), turn
 on `inspect_multipart` for uploads, or exempt upload-only routes with
 `global_exemptions`. gRPC (`application/grpc`, `application/grpc+proto`),
@@ -806,9 +1185,36 @@ the rejection mapped to a gRPC status (`PERMISSION_DENIED` for the default
 `application/grpc-web+json` map to the JSON family through their `+json`
 suffix, so they are **scanned** as JSON whenever `application/json` is in
 `body_content_types`, not refused as unlisted.
-Bodies on methods outside `body_methods` (for example a `GET` with a body)
-are not governed; add the method to `body_methods` if a backend reads such
-bodies.
+
+**gRPC bodies are inspected message by message.** A framed gRPC or gRPC-Web
+body the WAF scans (the `+json` codecs by default, every gRPC type with
+`inspect_binary_body`) is split into its length-prefixed messages — a gRPC-Web
+text body is base64-decoded first — and the body rules run over each message
+payload: `body_json_path` rules parse each `+json` message as its own JSON
+document, and text, Luhn, and CIDR rules and the encoding specials read each
+payload **in addition to** the complete wire body (the framing and media type
+are client-controlled, so a backend that ignores them reads the raw bytes, and
+a token may straddle a frame header there). The same applies to response
+bodies. The wire bytes are never rewritten. At most 1024 non-empty messages
+are inspected per body. The WAF does not decode `grpc-encoding`, so a
+**compressed message** (frame flag 1), or a body with more messages than the
+cap, cannot be inspected: when that direction carries an enforcing body policy
+the request or response is refused (`waf.action=blocked`,
+`waf.block_reason=grpc_message_uninspectable`), and otherwise it is recorded
+(`waf.body_uninspected=grpc_compressed`, `grpc_malformed_framing`, or
+`grpc_message_count`, with
+`waf.body_uninspected_target`) while the uncompressed messages are still
+scanned. Clients of routes under enforcing body rules must therefore send
+uncompressed messages (`grpc-encoding: identity`). A governed gRPC body is
+never scanned as one document: every complete message before a **framing
+defect** — an unknown frame flag, a truncated header, a frame overrunning the
+body, or a gRPC-Web text body that is not decodable base64 — is still scanned
+(a streaming handler consumes those messages before it ever reads the defect),
+and the defect is refused under an enforcing body policy or recorded as
+`waf.body_uninspected=grpc_malformed_framing` otherwise. Bytes cut off by the
+WAF's own `max_scan_bytes` prefix scan are not a defect: the messages inside
+the window, and the retained part of the one it cuts, are scanned, and the cut
+is reported as `waf.scan_truncated`.
 
 Response inspection is **off by default**. Enable `response_inspection` (and
 `response_body_inspection` for body rules) to run the disclosure and
@@ -843,7 +1249,8 @@ body-scoped `FE-ENCODING-001` / `FE-ENCODING-002` specials when those rules
 are themselves enforce (they read both directions). A rule is applicable only
 when its path, method, header, and consumer conditions
 match the current request. A request-wide `global_exemptions.header_present`
-match also suppresses both rule hits and this fail-closed decision. Built-in
+match also suppresses both rule hits and this fail-closed decision, and the
+strict `block` value too. Built-in
 rules are monitor-only unless you set `default_rule_action` or `rule_modes`.
 Encoding-evasion specials additionally stay monitor under bulk
 `default_rule_action: enforce` until an explicit per-rule action promotes them,
@@ -886,7 +1293,7 @@ control, not a coverage control.
 | `log_and_allow` (default) | Forward, with a sampled warning and `waf.scan_timed_out` metadata |
 | `allow` | Forward silently |
 | `fail_closed` | Reject when the governed body direction carries an enforcing body policy, and log and allow otherwise |
-| `block` | Reject every over-budget scan, on every surface, independently of global mode |
+| `block` | Reject every over-budget scan, on every surface, independently of global mode — except for a request a `global_exemptions.header_present` secret exempts |
 
 `fail_closed` is the opt-in strict-latency posture, sharing the vocabulary and
 the shape of `on_body_too_large: fail_closed`. It asks the same *question* —
@@ -897,7 +1304,9 @@ well as an applicable enforcing body rule (or anomaly scoring), they count an
 `on_body_too_large: block` size cap while globally enforcing, because that cap is
 itself a blocking body disposition. `mode: monitor` and monitor-only rule sets
 without that cap therefore never start blocking. `block` rejects unconditionally,
-including when no rule in that direction could have refused anything.
+including when no rule in that direction could have refused anything; the one
+exception is a trusted hop whose `global_exemptions.header_present` secret
+matched, for which every rule and every refusing disposition is suppressed.
 
 **Size `scan_budget_ms` before reaching for `fail_closed`.** The scan cost is
 `O(active_rules × max_scan_bytes)`, and body normalization multiplies it: a
@@ -943,6 +1352,13 @@ logging enabled, WAF writes `waf.response_stream_uninspectable=true` plus either
 because no bounded scan starts. Missing, ambiguous, or later-relabeled response
 types are never treated as proven SSE; the ordinary WAF content-type eligibility
 rules still apply, including release of types outside the configured scan scope.
+In particular, a finite body that a later hook relabels `text/event-stream` —
+the `sse` plugin's `wrap_non_sse_responses`, or a response transformer — is
+judged in the final response-body phase by the scan scope of the media type
+the **origin** selected: a `text/plain` origin body wrapped into SSE events is
+scanned by the response-body rules, and an unlisted origin type gets
+`on_unlisted_response_content_type`, rather than either escaping because the
+client-visible type is an event stream.
 
 ### Detection limits
 
@@ -1116,9 +1532,9 @@ What gets scanned, by proxy type:
 | Proxy | Opening bytes seen by signatures |
 | --- | --- |
 | Plain TCP (`tcp`) | the first segment, in cleartext |
-| TLS-terminating (`tcp_tls`) | the first **decrypted** application bytes (re-encrypted to the backend) |
+| TLS-terminating (`tcp` or `tcps` with `frontend_tls: true`) | the first **decrypted** application bytes (re-encrypted to the backend only for `tcps`) |
 | Plain UDP (`udp`) | each datagram payload |
-| DTLS-terminating (`dtls`) | each **decrypted** datagram payload (re-encrypted to the backend) |
+| DTLS-terminating (`udp` or `dtls` with `frontend_tls: true`) | each **decrypted** datagram payload (re-encrypted to the backend only for `dtls`) |
 | Passthrough (`passthrough: true`) | **not L7-scanned** — the gateway never decrypts; only `tcp_require_tls` applies |
 
 Limitations and behavior to know:
@@ -1197,18 +1613,38 @@ When `log_to_metadata` is true (default), every WAF-evaluated request carries
 logging sinks are configured (stdout, http, tcp, kafka, loki, …):
 `waf.rule_hits`, `waf.target`, `waf.severity`, `waf.score` /
 `waf.instances.<id>.score` / `waf.instance_scores`, `waf.action`
-(`blocked` / `monitored` / `clean`), `waf.first_blocking_rule`,
+(`blocked` / `monitored` / `clean` / `stream_uninspected`), `waf.first_blocking_rule`,
 `waf.block_reason`, `waf.scoring_instance`, `waf.would_block_reason`,
 `waf.paranoia`, `waf.detection_rule_hits` / `waf.detection_paranoia` (see
 [Detection paranoia level](#detection-paranoia-level)), plus `waf.scan_truncated` / `waf.scan_timed_out` /
 `waf.body_too_large` / `waf.body_too_large_target` (`request_body` or
-`response_body`) / `waf.body_uninspected` (`content_type`). All of these are
-fixed-cardinality; body bytes are never logged. Blocked requests reject before
+`response_body`) / `waf.body_uninspected` (`content_type`, `grpc_compressed`,
+`grpc_malformed_framing`, or `grpc_message_count`) /
+`waf.body_uninspected_target` (`request_body` or `response_body`) /
+`waf.response_stream_uninspectable`. All of these are
+fixed-cardinality; body bytes are never logged.
+
+`waf.matched_fields` names the fields that matched rule hits came from, so a
+false positive can be tuned with `rule_overrides.<id>.exclude` without
+reproducing the request: a comma-separated list of `query:<name>`,
+`header:<name>`, `cookie:<name>`, and `response_header:<name>` entries. It
+carries field **names only — never a value**. Query parameter names are
+reported as the application reads them (percent-decoded once, the form
+`exclude.query_params` compares), header names lowercased, cookie names as
+sent. Every byte outside `A-Z a-z 0-9 - . _ ~` is percent-encoded, a name is
+cut at 128 encoded bytes and then ends in a bare `*`, and at most 16 distinct
+fields are recorded per scan. Path, method, whole-URL, and body hits have no
+field name and are not listed; the `x-http-method-override` special is listed
+as `header:x-http-method-override`. Hits of detection-only (paranoia band)
+rules are listed separately in `waf.detection_matched_fields`, beside
+`waf.detection_rule_hits`, so each list names only the fields its own rule-hit
+list came from. Blocked requests reject before
 backend dispatch and still produce a transaction summary carrying these fields,
 so blocks are visible in the same per-request log line as allowed traffic.
 
 `waf.block_reason` names why a request was blocked: `rule`, `score`,
-`body_too_large`, `content_type`, or `scan_timeout` for HTTP-family traffic, and
+`body_too_large`, `content_type`, `grpc_message_uninspectable`,
+`unbounded_response_stream`, or `scan_timeout` for HTTP-family traffic, and
 `tcp_require_tls`, `first_bytes_unavailable`, or `signature` for stream (TCP/UDP)
 traffic. Stream
 inspection additionally records `waf.would_block_reason` (the same stream value
@@ -1232,42 +1668,47 @@ The per-instance anomaly score is carried in `waf.instances.<id>.score` (and
 first, watch the logs for `waf.action="monitored"` volume and which rules
 fire, then switch to `enforce`.
 
+> **Reserved log-metadata namespace (HTTP-family):** the `waf.` prefix in `TransactionSummary.metadata` is owned by the WAF plugin. `clone_log_metadata` (called on every HTTP-family transaction-log emission path) strips all `waf.*` keys that were not written by the WAF plugin itself and re-applies only the WAF-owned values. This prevents other plugins or inbound request data from spoofing WAF transaction-log fields on HTTP-family transactions. As a result, any `waf.`-prefixed key inserted into `ctx.metadata` by a custom plugin or operator-side code will be silently dropped from HTTP-family transaction logs on every proxy, regardless of whether a WAF plugin is active. Use a different prefix for custom metadata that should coexist with WAF output.
+>
+> **Stream protocols (TCP/UDP/DTLS) use a different flow with no equivalent ownership filter.** When `stream.signatures` inspection is configured, the WAF also runs on TCP connects and UDP/DTLS datagrams and, with `log_to_metadata` enabled (the default), writes authoritative decision fields — `waf.rule_hits`, `waf.target`, `waf.severity`, `waf.action`, and `waf.block_reason` / `waf.would_block_reason` — directly into the stream connection/session metadata, so those values are emitted in stream transaction summaries. Stream summaries (TCP inline, UDP/DTLS via `build_udp_stream_summary` / `build_dtls_stream_summary`) clone their context metadata directly and do not route through `clone_log_metadata`: WAF-authored stream values survive verbatim, but `waf.*` keys written by other stream plugins are neither stripped nor re-derived, and later writes to a shared session map overwrite earlier values for the same key. Custom stream plugins must therefore treat the `waf.` prefix as reserved by convention and use their own prefix for unrelated metadata instead of relying on the HTTP-family ownership filter.
+
 ## Configuration reference
 
-| Field | Type | Default | Description |
-| --- | --- | --- | --- |
-| `mode` | enum | `enforce` | `enforce` / `monitor` / `disabled` |
-| `default_rule_action` | enum | _(unset)_ | bulk action for built-ins that inherit it; encoding heuristics stay monitor until `rule_modes`; `rule_modes` overrides win |
-| `category_modes` | map | `{}` | per-category action for built-in rules; above `default_rule_action`, below `rule_overrides.action` / `rule_modes`; unknown categories rejected |
-| `paranoia_level` | int 1–4 | `1` | activate rules with `paranoia_min <= level` |
-| `detection_paranoia_level` | int 1–4 | `paranoia_level` | also compile rules up to this level as detection-only (never block or score; reported in `waf.detection_rule_hits`); only `rule_modes: enforce` promotes one |
-| `request_inspection` | bool | `true` | scan request metadata |
-| `request_body_inspection` | bool | `true` | scan request bodies |
-| `response_inspection` | bool | `false` | scan response headers |
-| `response_body_inspection` | bool | `false` | scan response bodies |
-| `include_default_rules` | bool | `true` | load the built-in pack |
-| `disabled_default_rules` | string[] | `[]` | built-in ids to drop |
-| `rule_modes` | map | `{}` | per-rule action by id |
-| `rule_overrides` | map | `{}` | per-rule fp_filters/conditions/paranoia_min/severity/score/action/exclude (see [Field exclusions](#field-exclusions)); `action` applies to rules already enforced by level and never promotes above `paranoia_level` |
-| `custom_rules` | object[] | `[]` | additional rules |
-| `scoring` | object | _(off)_ | anomaly scoring (see above) |
-| `global_exemptions` | object | _(none)_ | request short-circuits |
-| `scan_budget_ms` | int | `50` | budget for the scan itself, measured after the body path's fairness yield (0 = unbounded) |
-| `on_scan_timeout` | enum | `log_and_allow` | `allow` / `block` / `fail_closed` / `log_and_allow` |
-| `max_scan_bytes` | int | `1048576` | body scan cap |
-| `on_body_too_large` | enum | `fail_closed` | `fail_closed` / `scan_truncated` / `skip` / `block` |
-| `on_unlisted_content_type` | enum | `allow` | `allow` / `fail_closed` / `block`; request bodies whose `Content-Type` is outside the scan scope (see [Bodies outside the scan scope](#bodies-outside-the-scan-scope-on_unlisted_content_type)) |
-| `body_methods` | string[] | `[POST,PUT,PATCH]` | methods whose HTTP request bodies are scanned and governed by `on_unlisted_content_type`; WebSocket messages ignore it |
-| `body_content_types` | string[] | `[application/json, text/json, application/x-www-form-urlencoded, application/xml, text/xml, text/plain, text/html]` | inspectable base content types; `+json` / `+xml` suffixed types match via their base family |
-| `inspect_multipart` | bool | `false` | scan multipart bodies |
-| `inspect_binary_body` | bool | `false` | scan bodies with unknown/binary type |
-| `disallowed_methods` | string[] | `[]` | methods flagged by FE-METHOD-001 |
-| `reject_status_code` | int 400–599 | `403` | status for blocked requests |
-| `reject_content_type` | string | `application/json` | blocked-response content type |
-| `reject_body` | string | `{"error":"Forbidden"}` | blocked-response body |
-| `log_to_metadata` | bool | `true` | write `waf.*` metadata |
-| `log_to_stdout` | bool | `false` | structured hit diagnostics: sampled warnings and per-hit debug detail |
-| `stream` | object | _(off)_ | raw TCP/UDP inspection (see [Stream inspection](#stream-tcpudp-inspection)) |
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `mode` | string | `enforce` | Global mode: `enforce`, `monitor`, or `disabled`. Default rules remain monitor-only unless overridden with `rule_modes`. |
+| `paranoia_level` | u8 | `1` | Enables rules whose `paranoia_min` is less than or equal to this value. Must be 1-4. |
+| `detection_paranoia_level` | u8 | `paranoia_level` | Also compiles rules up to this level as **detection-only**: they never block, never score, never make a body policy enforcing, and report through `waf.detection_rule_hits` / `waf.detection_paranoia` instead of `waf.rule_hits`, so a higher paranoia level can be measured before it is enabled. Must be 1-4 and at least `paranoia_level`. Only an explicit `rule_modes: enforce` promotes a band rule to a normal enforcing rule; `rule_overrides.<id>.action` does not. A band body rule turns on inspection of its body direction, so `on_body_too_large: block` and `on_unlisted_content_type: block` then apply to it. See [Detection paranoia level](waf.md#detection-paranoia-level). |
+| `include_default_rules` | bool | `true` | Include Ferrum's built-in seed rules. |
+| `disabled_default_rules` | string[] | `[]` | Built-in rule IDs to remove from the active ruleset. |
+| `rule_modes` | object | `{}` | Per-rule action overrides keyed by rule ID. Values: `enforce`, `monitor`, `disabled` (aliases like `block` and `off` are accepted). |
+| `category_modes` | object | `{}` | Per-category action for built-in rules, keyed by rule-pack category (`sqli`, `xss`, `encoding_evasion`, …). Precedence, lowest first: `default_rule_action`, `category_modes`, `rule_overrides.action`, `rule_modes`. Naming an opt-in category promotes it; custom rules keep their own action; unknown categories are rejected. |
+| `default_rule_action` | string | _(unset)_ | Bulk action for built-in rules that inherit it: `enforce`, `monitor`, or `disabled`. Unset keeps the safe monitor-only default. Encoding-evasion heuristics (`FE-ENCODING-001`, `FE-ENCODING-002`) stay monitor under bulk `enforce` until an explicit `rule_modes` or `rule_overrides.action` entry promotes them. |
+| `rule_overrides` | object | `{}` | Per-rule overrides keyed by rule ID (built-in or custom): `action`, `severity`, `score`, `paranoia_min`, `fp_filters`, `conditions`, and `exclude` — `{ "query_params": [...], "headers": [...], "cookies": [...] }` field exclusions that stop that one rule inspecting the named fields while it keeps inspecting everything else. `full_url` rules re-verify a whole-URL match against the URL without the excluded pairs. Exclusions that do not fit the rule's target are rejected. `rule_overrides.<id>.action` sets the action of a rule that is already enforced by level; only `rule_modes: enforce` promotes a rule above `paranoia_level` (including a detection-band rule). See [Field exclusions](waf.md#field-exclusions). |
+| `scoring` | object | _(none)_ | Optional anomaly scoring. Configure `block_threshold` and optional severity weights so multiple monitored hits can block when **that instance's** accumulated score crosses the threshold. Scores are isolated per WAF plugin-config instance; see [Anomaly scoring](waf.md#anomaly-scoring). |
+| `custom_rules` | object[] | `[]` | Additional rules. See [Custom rules](#custom-rules). |
+| `global_exemptions` | object | `{}` | Request-level exemptions and false-positive filters. |
+| `request_inspection` | bool | `true` | Inspect request path, query, headers, cookies, method, and configured request bodies. |
+| `request_body_inspection` | bool | `true` | Enable request body rules when request inspection is active. |
+| `response_inspection` | bool | `false` | Inspect response headers and, when enabled separately, response bodies. |
+| `response_body_inspection` | bool | `false` | Enable response body rules. |
+| `body_methods` | string[] | `["POST","PUT","PATCH","DELETE"]` | Methods whose HTTP request bodies are always buffered and scanned. Body governance is not a method allowlist: a request on any other method (except `CONNECT`) is buffered and scanned — and governed by `on_unlisted_content_type` — whenever a body may follow its head: it carries a `Content-Type`, declares HTTP/1.1 framing (`Content-Length` > 0 or `Transfer-Encoding`), is an HTTP/2 request whose HEADERS frame lacked END_STREAM, or is any HTTP/3 request (no end-of-stream signal is available before the first read). Any non-empty finalized body is decided whatever the method. WebSocket messages ignore it. |
+| `body_content_types` | string[] | JSON (`application/json`, `text/json`), form, XML, text, HTML | Base MIME types eligible for body scanning. Parameters such as `; charset=utf-8` are ignored and matching is case-insensitive. RFC 6839 structured-syntax suffixes map onto their base family and re-check this list: `+json` types (`application/vnd.api+json`, `application/ld+json`, …) are inspected when `application/json` is listed, and `+xml` types when either `application/xml` or `text/xml` is. The suffix rule reuses this allowlist rather than adding hidden types. |
+| `inspect_multipart` | bool | `false` | Inspect `multipart/*` bodies. |
+| `inspect_binary_body` | bool | `false` | Inspect bodies whose content type is not in `body_content_types`. |
+| `max_scan_bytes` | usize | `1048576` | Maximum bytes scanned from each body. Must be greater than zero. |
+| `on_unlisted_content_type` | string | `fail_closed` | What happens to a non-empty request body whose `Content-Type` is outside the scan scope (`body_content_types`, `inspect_multipart`, `inspect_binary_body`) — a relabelled payload a content-type-agnostic backend would still parse. `allow` forwards it uninspected; `fail_closed` (default) rejects it when an enforcing request-body policy applies and records it otherwise, so monitor-only deployments never start blocking; `block` rejects every such body in enforce mode (and satisfies `mode: enforce` admission when the request-body hook can run — request-body inspection on with an active request-body rule or `FE-ENCODING-001`/`002` — and not both `inspect_multipart` and `inspect_binary_body` are on). Bodies are governed on every method once the request declares one (see `body_methods`). It governs HTTP request bodies only (HTTP/1.1, HTTP/2, HTTP/3, gRPC, gRPC-Web), never response bodies or WebSocket messages. Refusing configurations buffer the body and decide over the finalized headers and actual bytes, so empty uploads pass and the rejection arrives at end of stream; gRPC and image bodies are unlisted by default, except the `+json` codecs (`application/grpc+json`, `application/grpc-web+json`), which are scanned as JSON one message at a time (a scanned gRPC body is split into its length-prefixed messages, each `+json` message parsed as its own document; a `grpc-encoding`-compressed message is refused when an enforcing body policy applies, `waf.block_reason=grpc_message_uninspectable`, and recorded as `waf.body_uninspected=grpc_compressed` otherwise; a framing defect after the last complete message is treated the same way as `grpc_malformed_framing`, while the complete messages before it are still scanned). Rejections set `waf.block_reason=content_type`; recorded-but-allowed bodies set `waf.body_uninspected=content_type`. See [Bodies outside the scan scope](waf.md#bodies-outside-the-scan-scope-on_unlisted_content_type). |
+| `on_unlisted_response_content_type` | string | `fail_closed` | Response-side counterpart of `on_unlisted_content_type` for non-empty response bodies outside the same scan scope: `allow` forwards them uninspected, `fail_closed` (default) rejects one when an enforcing response-body policy applies (monitor-only response policy never blocks), `block` rejects every one in enforce mode. Refusing values buffer the unlisted body and decide over the exact bytes; `text/event-stream`, bodiless responses, and exempt requests are never governed. Routes that serve images, archives, or protobuf under enforcing response-body rules list or exempt them, enable `inspect_binary_body`, or set `allow`. Neither value satisfies `mode: enforce` admission on its own. |
+| `on_body_too_large` | string | `fail_closed` | `fail_closed` rejects an oversize governed body when that direction has an enforcing body rule or anomaly scoring, and otherwise scans the first `max_scan_bytes` and records truncation; `scan_truncated` is the explicit compatibility opt-out that always scans only the prefix and forwards the complete body; `skip` skips known-oversized bodies; `block` rejects every oversize governed body in enforce mode and, when a body inspection surface can run, satisfies `mode: enforce` admission on its own; it is also a blocking disposition for the buffered-representation claim on both directions, so an origin-encoded body is decoded before the cap is measured. |
+| `scan_budget_ms` | u64 | `50` | Post-hoc deadline for metadata/header, body, and WebSocket-message scans. `0` disables the timeout wrapper. The synchronous scan cannot be cancelled mid-regex; it always runs to completion and over-budget scans are reported after the scan returns, so an enforcing hit found over budget still rejects. It bounds the scan itself: on the body path the clock starts after the fairness yield, so scheduler re-poll delay is never counted. Size it against `active_rules × max_scan_bytes`. |
+| `on_scan_timeout` | string | `log_and_allow` | Outcome for a scan that completed **clean** but over `scan_budget_ms` — a body the WAF inspected end to end and found nothing in, so this is a latency control rather than a coverage control. `log_and_allow` (default) forwards with a sampled warning and `waf.scan_timed_out` metadata; `allow` forwards silently. `fail_closed` is the opt-in strict-latency posture: it rejects when the governed body direction carries an enforcing body policy, resolved through `request_body_policy_enforces` / `response_body_policy_enforces` (the same question `on_body_too_large: fail_closed` asks, plus an `on_body_too_large: block` size cap while globally enforcing), so `monitor` mode and monitor-only rule sets without that cap never start blocking. `block` rejects every over-budget scan on every surface, independently of global mode. Request metadata/header/query/path scans are not disposition-aware under `fail_closed` — they are bounded by the frontend's header limits rather than by `max_scan_bytes` — so only `block` applies the strict deadline to them. A timeout rejection sets `waf.action=blocked` with `waf.block_reason=scan_timeout`. |
+| `disallowed_methods` | string[] | `[]` | Methods that should trigger the built-in `FE-METHOD-001` rule when that rule is active. |
+| `log_to_metadata` | bool | `true` | Write WAF metadata such as `waf.rule_hits`, `waf.action`, `waf.severity`, and `waf.matched_fields` (the `query:` / `header:` / `cookie:` / `response_header:` NAMES that matched hits came from, percent-encoded and bounded — never a value) into transaction logs. |
+| `log_to_stdout` | bool | `false` | Emit sampled warnings for rule matches (one per source site per 10 seconds across instances, with `suppressed_events` counts) and per-hit debug detail. Each event's `action` is that rule's effective direct outcome after applying the global mode (`blocked`, `monitored`, `disabled`); `rule_action` carries the configured rule action (`enforce`, `monitor`, `disabled`). Aggregate anomaly scoring can still make the final transaction `waf.action=blocked` after individual per-rule events. |
+| `reject_status_code` | u16 | `403` | HTTP status for enforced rejects. Must be 400-599. |
+| `reject_content_type` | string | `application/json` | Content-Type header for enforced rejects. |
+| `reject_body` | string | `{"error":"Forbidden"}` | Body returned for enforced rejects. |
+| `stream` | object | _(none)_ | Optional raw TCP/UDP inspection: `tcp_require_tls`, `inspect_tcp`, `inspect_udp`, `inspect_response`, and byte-regex `signatures`. Present and actionable, it attaches this WAF to TCP and UDP/DTLS proxies as well; absent, the instance stays HTTP-family only. See [Stream (TCP/UDP) inspection](waf.md#stream-tcpudp-inspection). |
 
 ### `stream` block
 
