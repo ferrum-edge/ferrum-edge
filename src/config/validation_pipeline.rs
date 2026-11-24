@@ -849,7 +849,9 @@ impl<'a> ValidationPipeline<'a> {
         }
 
         if let Some(generation) = country_mmdb_validation_generation {
+            let generation_id = generation.id();
             generation.commit().map_err(anyhow::Error::msg)?;
+            config.validated_country_mmdb_generation = Some(generation_id);
         }
 
         Ok(collected_errors)
