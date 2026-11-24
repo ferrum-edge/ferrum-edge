@@ -19,6 +19,7 @@ pub const REQUIRED_GUARD_COLLECTIONS: &[&str] = &[
     "proxy_route_locks",
     "upstream_ref_guards",
     "mtls_dns_admission_locks",
+    "config_change_counters",
 ];
 
 /// One required index in the baseline MongoDB migration plan.
@@ -130,10 +131,16 @@ pub fn required_mongo_indexes() -> Vec<RequiredMongoIndex> {
     plan.push(keys_only("consumers", doc! { "namespace": 1, "_id": 1 }));
 
     // consumer_identity_index — `_id` uniqueness is the atomic guard; the
-    // non-unique {namespace} index supports namespace wipes / cleanup filters.
+    // non-unique {namespace} index supports namespace wipes / cleanup filters,
+    // and {namespace, consumer_id} serves transactional `delete_consumer`
+    // cleanup without scanning the entire namespace.
     plan.push(keys_only(
         "consumer_identity_index",
         doc! { "namespace": 1 },
+    ));
+    plan.push(keys_only(
+        "consumer_identity_index",
+        doc! { "namespace": 1, "consumer_id": 1 },
     ));
 
     // plugin_configs
@@ -215,6 +222,7 @@ pub fn required_mongo_indexes() -> Vec<RequiredMongoIndex> {
         "api_specs",
         doc! { "namespace": 1, "created_at": -1 },
     ));
+    plan.push(keys_only("api_specs", doc! { "namespace": 1, "_id": 1 }));
     plan.push(keys_only("api_specs", doc! { "namespace": 1, "tags": 1 }));
 
     // audit_events — include `id` so list and retention prune share deterministic

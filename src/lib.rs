@@ -6957,6 +6957,18 @@ pub mod _test_support {
         })
     }
 
+    /// Convert an `anyhow::Error` back into `mongodb::error::Error`,
+    /// preserving any underlying driver error and its transaction retry labels.
+    pub fn mongo_anyhow_to_error(error: anyhow::Error) -> mongodb::error::Error {
+        crate::config::mongo_store::anyhow_to_mongo_error(error)
+    }
+
+    /// Variant preserving typed application errors inside `anyhow::Error` when
+    /// no underlying `mongodb::error::Error` is in the chain.
+    pub fn mongo_anyhow_to_error_preserving_anyhow(error: anyhow::Error) -> mongodb::error::Error {
+        crate::config::mongo_store::anyhow_to_mongo_error_preserving_anyhow(error)
+    }
+
     /// Lazy Mongo store (no live MongoDB) for topology publication tests.
     pub fn mongo_store_new_unconnected_for_test(
         failover_urls: Vec<String>,

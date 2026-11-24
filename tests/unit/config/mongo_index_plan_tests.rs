@@ -51,7 +51,22 @@ fn canonical_plan_is_non_empty_and_covers_core_collections() {
             "proxy_route_locks",
             "upstream_ref_guards",
             "mtls_dns_admission_locks",
+            "config_change_counters",
         ]
+    );
+
+    assert!(
+        plan.iter().any(|entry| {
+            entry.collection == "consumer_identity_index"
+                && entry.model.keys == doc! { "namespace": 1, "consumer_id": 1 }
+        }),
+        "consumer_identity_index must index (namespace, consumer_id) for delete_consumer"
+    );
+    assert!(
+        plan.iter().any(|entry| {
+            entry.collection == "api_specs" && entry.model.keys == doc! { "namespace": 1, "_id": 1 }
+        }),
+        "api_specs must index (namespace, _id) to avoid blocking in-memory sorts"
     );
 
     let api_specs_unique = plan
