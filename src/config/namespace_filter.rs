@@ -165,6 +165,10 @@ pub fn retain_namespace(
         // however carry the pre-overlay mesh layer, so it moves with `mesh`
         // rather than independently of it.
         k8s_mesh_overlay,
+        // Process-local MMDB validation generation ID (`#[serde(skip)]`); not
+        // tenant data. Preserve it across namespace projection so rejection
+        // cleanup can still release this exact candidate's handoff.
+        validated_country_mmdb_generation,
     } = config;
 
     let pre_filter_resources = proxies.len()
@@ -239,6 +243,7 @@ pub fn retain_namespace(
         node_waypoint_udp_steer_destinations,
         node_waypoint_udp_destination_routes,
         k8s_mesh_overlay,
+        validated_country_mmdb_generation,
     };
 
     // Ownership is the owning Gateway's namespace, never the Secret's; this

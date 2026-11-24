@@ -404,3 +404,76 @@ async fn rejected_generation_clears_the_pending_write() {
         Some(Duration::from_millis(40))
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn record_issued_cursor_advances_epoch_ahead_of_observe_topology() {
+    let apply = RuntimeConfigApply::at_epoch("ferrum", 1, 100);
+    // An admin mutation commits on topology epoch 2 before the poll loop
+    // has called observe_topology(2).
+    let cursor = LiveApplyCursor::new(2, 5);
+    apply.record_issued_cursor(cursor);
+
+    assert!(
+        apply.cursor_was_issued(cursor),
+        "issued_through must not be dropped when a write commits ahead of observe_topology"
+    );
+    // Subsequent observe_topology(2) must not erase the recorded issued_through.
+    apply.observe_topology(2);
+    assert!(
+        apply.cursor_was_issued(cursor),
+        "observe_topology for the same epoch must preserve issued_through"
+    );
+
+    // A late stale-epoch cursor must not clear or regress unapplied_writes.
+    tokio::time::advance(Duration::from_millis(25)).await;
+    apply.record_issued_cursor(LiveApplyCursor::new(1, 101));
+    assert_eq!(
+        apply.take_write_to_live(LiveApplyCursor::new(2, 5)),
+        Some(Duration::from_millis(25)),
+        "stale-epoch record_issued_cursor must not clobber newer epoch write timing"
+    );
+}
+
+#[tokio::test]
+async fn nudge_does_not_spin_on_stale_high_sequence_from_replaced_epoch() {
+    let apply = Arc::new(RuntimeConfigApply::at_epoch("ferrum", 1, 10));
+
+    // Register a high-sequence waiter on epoch 1, then replace the topology.
+    let waiter_old = apply.clone();
+    let old_handle = tokio::spawn(async move {
+        waiter_old
+            .await_committed_cursor(LiveApplyCursor::new(1, 1000))
+            .await
+    });
+    tokio::task::yield_now().await;
+
+    apply.observe_topology(2);
+    assert_eq!(
+        old_handle.await.expect("old waiter"),
+        Err(LiveApplyFailure::SequenceUnavailable)
+    );
+
+    // Register a low-sequence waiter on epoch 2, accept its sequence, and check
+    // that nudge does not fire because of the stale epoch-1 sequence 1000.
+    let waiter_new = apply.clone();
+    let new_handle = tokio::spawn(async move {
+        waiter_new
+            .await_committed_cursor(LiveApplyCursor::new(2, 5))
+            .await
+    });
+    tokio::task::yield_now().await;
+    let _ = apply.wake_signal().take_immediate();
+
+    apply.record_accepted_cursor(LiveApplyCursor::new(2, 5));
+    // Even before the waiter task wakes and drops its WaiterGuard,
+    // accepted (2, 5) already covers max_waiting (2, 5) — must NOT re-arm!
+    apply.nudge_if_waiters_pending();
+    assert!(
+        !apply.wake_signal().take_immediate(),
+        "stale high sequence from replaced epoch 1 must not trigger spurious immediate polls in epoch 2"
+    );
+    new_handle
+        .await
+        .expect("new waiter")
+        .expect("epoch 2 sequence 5 accepted");
+}

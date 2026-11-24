@@ -1659,7 +1659,7 @@ impl BatchConfigWriteMode {
 /// exposing unrelated database details. The identities themselves are not
 /// secrets, but callers should still prefer the validation messages already
 /// produced by [`GatewayConfig::validate_unique_mtls_dns_identities`].
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct MtlsDnsIdentityConflict {
     errors: Vec<String>,
 }
@@ -1702,7 +1702,7 @@ pub fn mtls_dns_identity_conflict(error: &anyhow::Error) -> Option<&MtlsDnsIdent
 /// Persistence implementations carry this typed error through the namespace
 /// admission lock/lease so admin handlers can return the same validation
 /// response as their optimistic preflight without exposing database details.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct TcpConnectionThrottleAttachmentConflict {
     errors: Vec<String>,
 }
@@ -2911,23 +2911,28 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
     // Validation queries
     // -----------------------------------------------------------------------
 
-    /// Returns `true` when the `(listen_path, hosts)` combination does not
-    /// conflict with any existing proxy in `namespace`.
+    /// Returns `true` when the `(listen_port, listen_path, hosts)` combination
+    /// does not conflict with any existing proxy in `namespace`.
     ///
-    /// Conflict semantics:
+    /// Conflict semantics (matching `GatewayConfig::validate_unique_listen_paths`):
+    /// - Distinct `listen_port` values (and `None` vs `Some(port)`) do not
+    ///   conflict.
     /// - `Some(path) + non-empty hosts` — conflict with any existing proxy with
-    ///   the same `listen_path` AND overlapping hosts (empty hosts on the
-    ///   existing row counts as catch-all and overlaps with everything).
+    ///   the same `(listen_port, listen_path)` AND overlapping hosts (empty
+    ///   hosts on the existing row counts as catch-all and overlaps with
+    ///   everything).
     /// - `Some(path) + empty hosts` — conflict with any existing proxy with the
-    ///   same `listen_path` regardless of hosts.
+    ///   same `(listen_port, listen_path)` regardless of hosts.
     /// - `None + non-empty hosts` (host-only proxy) — conflict with any
-    ///   existing proxy that has `listen_path IS NULL` AND overlapping hosts.
+    ///   existing proxy that has the same `listen_port` and `listen_path IS NULL`
+    ///   AND overlapping hosts.
     /// - `None + empty hosts` — rejected upstream of this call in
     ///   `validate_fields_inner`. Defensive implementations should return an
     ///   error or `Ok(false)` here.
     async fn check_listen_path_unique(
         &self,
         namespace: &str,
+        listen_port: Option<u16>,
         listen_path: Option<&str>,
         hosts: &[String],
         exclude_proxy_id: Option<&str>,

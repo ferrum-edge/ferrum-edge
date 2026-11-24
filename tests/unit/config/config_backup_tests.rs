@@ -922,3 +922,45 @@ fn backup_wrong_type_version_keeps_the_schema_name_when_rendered() {
     assert!(rendered.contains("field `version` must be a string or non-negative integer"));
     assert!(rendered.contains("got boolean"), "{rendered}");
 }
+
+#[test]
+fn backup_strips_conditional_envelope_field() {
+    let json = r#"{
+        "version": "1",
+        "ferrum_version": "0.9.17",
+        "exported_at": "2026-11-24T00:00:00Z",
+        "source": "database",
+        "conditional": {
+            "snapshot_digest": "sha256:0000",
+            "change_sequence": 42
+        },
+        "proxies": [],
+        "consumers": [],
+        "plugin_configs": [],
+        "upstreams": []
+    }"#;
+    let (_tmp, path) = write_tmp_file(json);
+    let loaded = load_config_backup(&path, "ferrum")
+        .expect("conditional backup export must load cleanly")
+        .expect("backup must return Some");
+    assert!(loaded.proxies.is_empty());
+}
+
+#[test]
+fn backup_rejects_duplicate_json_keys() {
+    let json = r#"{
+        "version": "1",
+        "proxies": [],
+        "proxies": [],
+        "consumers": [],
+        "plugin_configs": [],
+        "upstreams": []
+    }"#;
+    let (_tmp, path) = write_tmp_file(json);
+    let err = load_config_backup(&path, "ferrum")
+        .expect_err("duplicate JSON keys in backup must be rejected");
+    assert!(
+        err.to_string().contains("Failed to parse config backup"),
+        "expected parse error for duplicate keys, got: {err}"
+    );
+}

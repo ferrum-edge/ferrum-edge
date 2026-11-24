@@ -393,6 +393,9 @@ pub(crate) enum FullReloadReason {
     /// CP only: a standing `config_rejected` can clear only after a clean
     /// authoritative full snapshot (issue #2158).
     StandingRejection,
+    /// CP only: a failover reconnect swapped the pool, so every namespace must
+    /// reload from the replacement topology before incremental polling resumes.
+    DatabaseFailover,
 }
 
 impl FullReloadReason {
@@ -402,6 +405,7 @@ impl FullReloadReason {
             Self::DnsReconnect => "dns_reconnect",
             Self::GatewayTrustDrift => "gateway_trust_drift",
             Self::StandingRejection => "standing_rejection",
+            Self::DatabaseFailover => "database_failover",
         }
     }
 
@@ -411,6 +415,7 @@ impl FullReloadReason {
             Self::DnsReconnect => "full reload after DB DNS reconnect",
             Self::GatewayTrustDrift => "full reload after gateway trust drift",
             Self::StandingRejection => "full reload to clear a standing config rejection",
+            Self::DatabaseFailover => "full reload after database failover",
         }
     }
 
@@ -420,6 +425,7 @@ impl FullReloadReason {
             Self::DnsReconnect => "after DB DNS reconnect",
             Self::GatewayTrustDrift => "after gateway trust drift",
             Self::StandingRejection => "after a standing config rejection",
+            Self::DatabaseFailover => "after database failover",
         }
     }
 
@@ -429,6 +435,7 @@ impl FullReloadReason {
             Self::DnsReconnect => "DB DNS reconnect",
             Self::GatewayTrustDrift => "gateway trust drift",
             Self::StandingRejection => "standing config rejection",
+            Self::DatabaseFailover => "database failover",
         }
     }
 
@@ -440,6 +447,7 @@ impl FullReloadReason {
             Self::StandingRejection => {
                 "validation-rejected full load for a standing config rejection"
             }
+            Self::DatabaseFailover => "validation-rejected full load after database failover",
         }
     }
 }
@@ -971,6 +979,7 @@ mod full_reload_reason_tests {
             FullReloadReason::DnsReconnect,
             FullReloadReason::GatewayTrustDrift,
             FullReloadReason::StandingRejection,
+            FullReloadReason::DatabaseFailover,
         ];
         for reason in reasons {
             let texts = [

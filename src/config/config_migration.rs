@@ -48,11 +48,7 @@ impl ConfigMigrator {
         value: &mut serde_json::Value,
         target_version: &str,
     ) -> Result<u32, anyhow::Error> {
-        let current_version = value
-            .get("version")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Config is missing required `version` field"))?
-            .to_string();
+        let current_version = normalize_version_field(value)?;
 
         if current_version == target_version {
             return Ok(0);
@@ -173,16 +169,12 @@ impl ConfigMigrator {
 
         // Parse to serde_json::Value (works for both YAML and JSON)
         let mut value: serde_json::Value = match ext.as_str() {
-            "json" => config_decode::from_json_str(&content)?,
+            "json" => parse_json_value(&content)?,
             _ => parse_yaml_value(&content)?,
         };
         drop(content);
 
-        let from_version = value
-            .get("version")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Config is missing required `version` field"))?
-            .to_string();
+        let from_version = normalize_version_field(&mut value)?;
 
         let target = CURRENT_CONFIG_VERSION;
 
@@ -228,7 +220,7 @@ impl ConfigMigrator {
             }
         };
 
-        std::fs::write(file_path, migrated_content)?;
+        write_file_atomically(file_path, &migrated_content)?;
         info!(
             "Config file migrated from version (<redacted scalar>) to {} ({} steps)",
             target, steps
@@ -257,16 +249,12 @@ impl ConfigMigrator {
             .to_lowercase();
 
         let value: serde_json::Value = match ext.as_str() {
-            "json" => config_decode::from_json_str(&content)?,
+            "json" => parse_json_value(&content)?,
             _ => parse_yaml_value(&content)?,
         };
         drop(content);
 
-        let version = value
-            .get("version")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Config is missing required `version` field"))?
-            .to_string();
+        let version = extract_version_field(&value)?;
 
         Ok(version)
     }
@@ -276,11 +264,7 @@ impl ConfigMigrator {
     /// it was already at the current version).
     pub fn migrate_in_memory(value: &mut serde_json::Value) -> Result<u32, anyhow::Error> {
         let target = CURRENT_CONFIG_VERSION;
-        let current = value
-            .get("version")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Config is missing required `version` field"))?
-            .to_string();
+        let current = normalize_version_field(value)?;
 
         if current == target {
             return Ok(0);
@@ -306,8 +290,58 @@ fn read_config_migration_file(path: &Path) -> Result<String, anyhow::Error> {
     read_stable_file(path, options).map_err(|error| stable_file_error_anyhow(path, options, error))
 }
 
+fn parse_json_value(content: &str) -> Result<serde_json::Value, anyhow::Error> {
+    if let Some(reason) = crate::util::json_dup_keys::str_ambiguity(content) {
+        anyhow::bail!("JSON configuration rejected: {reason}");
+    }
+    Ok(config_decode::from_json_str(content)?)
+}
+
 fn parse_yaml_value(content: &str) -> Result<serde_json::Value, anyhow::Error> {
     admit_yaml_alias_expansion(content)?;
     let yaml_val: serde_yaml::Value = config_decode::from_yaml_str(content)?;
     Ok(serde_json::to_value(yaml_val)?)
+}
+
+fn extract_version_field(value: &serde_json::Value) -> Result<String, anyhow::Error> {
+    match value.get("version") {
+        None => anyhow::bail!("Config is missing required `version` field"),
+        Some(serde_json::Value::String(s)) => Ok(s.clone()),
+        Some(other) => {
+            if let Some(n) = other.as_u64() {
+                Ok(n.to_string())
+            } else {
+                anyhow::bail!("Config `version` field must be a string or unsigned integer")
+            }
+        }
+    }
+}
+
+fn normalize_version_field(value: &mut serde_json::Value) -> Result<String, anyhow::Error> {
+    let version = extract_version_field(value)?;
+    if let Some(slot) = value.get_mut("version")
+        && !slot.is_string()
+    {
+        *slot = serde_json::Value::String(version.clone());
+    }
+    Ok(version)
+}
+
+fn write_file_atomically(file_path: &Path, contents: &str) -> Result<(), anyhow::Error> {
+    use std::io::Write as _;
+
+    let parent = file_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let existing_permissions = std::fs::metadata(file_path).ok().map(|m| m.permissions());
+
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    temp.write_all(contents.as_bytes())?;
+    temp.as_file().sync_all()?;
+    if let Some(perms) = existing_permissions {
+        let _ = temp.as_file().set_permissions(perms);
+    }
+    temp.persist(file_path).map_err(|err| err.error)?;
+    Ok(())
 }

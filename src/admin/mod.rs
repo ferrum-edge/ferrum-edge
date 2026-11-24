@@ -9577,6 +9577,7 @@ async fn batch_existing_resource_conflict(
             match db
                 .check_listen_path_unique(
                     namespace,
+                    proxy.listen_port,
                     proxy.listen_path.as_deref(),
                     &proxy.hosts,
                     None,

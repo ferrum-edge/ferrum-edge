@@ -983,6 +983,7 @@ impl CpGrpcServer {
             node_waypoint_udp_steer_destinations,
             node_waypoint_udp_destination_routes,
             k8s_mesh_overlay,
+            validated_country_mmdb_generation: _,
         } = config;
         let mut filtered = GatewayConfig {
             version: version.clone(),
@@ -1040,6 +1041,8 @@ impl CpGrpcServer {
             node_waypoint_udp_steer_destinations: node_waypoint_udp_steer_destinations.clone(),
             node_waypoint_udp_destination_routes: node_waypoint_udp_destination_routes.clone(),
             k8s_mesh_overlay: k8s_mesh_overlay.clone(),
+            // Process-local MMDB handoff bookkeeping never leaves this node.
+            validated_country_mmdb_generation: None,
         };
         filter_frontend_tls_sources_to_namespace(&mut filtered, namespace);
         filtered

@@ -94,6 +94,9 @@ pub fn load_config_backup(
         }
     };
 
+    if let Some(reason) = crate::util::json_dup_keys::str_ambiguity(&content) {
+        anyhow::bail!("Failed to parse config backup at {path:?}: {reason}");
+    }
     let mut value: serde_json::Value = config_decode::from_json_str(&content)
         .map_err(|e| anyhow::anyhow!("Failed to parse config backup at {path:?}: {e}"))?;
 
@@ -108,6 +111,7 @@ pub fn load_config_backup(
             "exported_at",
             "source",
             "counts",
+            "conditional",
             "gateway_trust_bundles",
             "api_specs",
         ] {
