@@ -454,7 +454,7 @@ paths:
                   - $ref: "#/components/schemas/HealthResponse"
                   - $ref: "#/components/schemas/HealthTenantResponse"
         "503":
-          description: Gateway not ready (status `starting` during startup, `unavailable` after a supervised serving-listener failure, or `draining` while the process is terminating); `ready=false`
+          description: Gateway not ready (status `starting` during startup, `degraded` when a required listener fails readiness, `unavailable` after a supervised serving-listener failure, or `draining` while the process is terminating); `ready=false`
           content:
             application/json:
               schema:
@@ -490,7 +490,7 @@ paths:
                   - $ref: "#/components/schemas/HealthResponse"
                   - $ref: "#/components/schemas/HealthTenantResponse"
         "503":
-          description: Gateway not ready (status `starting`, `unavailable`, or `draining`, `ready=false`)
+          description: Gateway not ready (status `starting`, `degraded`, `unavailable`, or `draining`, `ready=false`)
           content:
             application/json:
               schema:
@@ -773,7 +773,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
-          $ref: "#/components/responses/Conflict"
+          $ref: "#/components/responses/TlsRecordInUseConflict"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -863,6 +863,8 @@ paths:
           $ref: "#/components/responses/InternalServerError"
         "501":
           $ref: "#/components/responses/NotImplemented"
+        "502":
+          $ref: "#/components/responses/BadGateway"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -907,8 +909,10 @@ paths:
       description: |
         Creates a replacement HTTP-01, TLS-ALPN-01, or DNS-01 ACME order for an existing
         `acme://certificates/{id}` record. Ferrum reuses persisted account
-        credentials from the latest order for the certificate when available,
-        or uses credentials supplied in the request. Finalize the returned
+        credentials from the latest order for the certificate or from the
+        persisted ACME account store (`acme-accounts.json` via
+        `certificate.account_id`) when available, or uses credentials supplied
+        in the request. Finalize the returned
         order after the selected challenge is reachable. The same HTTPS,
         same-origin, shared 30-second fresh-DNS/TCP deadline, 64-address DNS limit,
         public-egress checks, and 1 MiB streaming response cap used for initial
@@ -951,6 +955,8 @@ paths:
           $ref: "#/components/responses/InternalServerError"
         "501":
           $ref: "#/components/responses/NotImplemented"
+        "502":
+          $ref: "#/components/responses/BadGateway"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -1277,7 +1283,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
-          $ref: "#/components/responses/Conflict"
+          $ref: "#/components/responses/TlsRecordInUseConflict"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1456,7 +1462,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
-          $ref: "#/components/responses/Conflict"
+          $ref: "#/components/responses/TlsRecordInUseConflict"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1631,7 +1637,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
-          $ref: "#/components/responses/Conflict"
+          $ref: "#/components/responses/TlsRecordInUseConflict"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1806,7 +1812,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
-          $ref: "#/components/responses/Conflict"
+          $ref: "#/components/responses/TlsRecordInUseConflict"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1993,7 +1999,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
-          $ref: "#/components/responses/Conflict"
+          $ref: "#/components/responses/TlsRecordInUseConflict"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -2033,6 +2039,7 @@ paths:
             application/json:
               schema:
                 type: object
+                required: [accepted, requested_surface]
                 properties:
                   accepted:
                     type: boolean
@@ -2057,11 +2064,12 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
-          description: No active watcher is registered for the requested surface
+          description: No active watcher is registered for the requested surface (or gateway SVID sources are not configured)
           content:
             application/json:
               schema:
                 type: object
+                required: [error]
                 properties:
                   error:
                     type: string
@@ -2103,7 +2111,15 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Error"
+                type: object
+                required: [error]
+                properties:
+                  valid:
+                    type: boolean
+                    enum: [false]
+                    description: Present as `false` when TLS material validation itself fails; omitted on pre-dispatch header/body-parse rejections.
+                  error:
+                    type: string
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -2139,14 +2155,13 @@ paths:
       security: []
       responses:
         "200":
-          description: Overload state (normal or pressure)
+          description: Overload state (normal or pressure), or `{"level":"normal"}` when no proxy state exists
           content:
             application/json:
               schema:
                 oneOf:
                   - $ref: "#/components/schemas/OverloadSnapshot"
                   - $ref: "#/components/schemas/OverloadLevelOnly"
-                  - $ref: "#/components/schemas/OverloadNoProxyState"
         "503":
           description: Overload state is critical — gateway is shedding load
           content:
@@ -2469,7 +2484,7 @@ paths:
         request throughput, connection pool sizes, circuit breaker states, health
         check results, load balancer active connections, cache statistics, consumer
         index breakdowns, rate limiter tracked keys, and database rejected-delta
-        polling state in database mode. The `tcp_connection_throttle` status
+        polling state in `database` and `cp` modes. The `tcp_connection_throttle` status
         object states that its configured concurrent-connection limit is
         process-local and independently enforced per replica.
 
@@ -2575,6 +2590,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /config/export:
     parameters:
@@ -3106,6 +3123,8 @@ paths:
                   summary: Joined an in-flight refresh pass
                   value:
                     status: joined
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -3732,7 +3751,7 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [allowed, decision, host, dry_run]
+                required: [allowed, decision, host, port, dry_run]
                 properties:
                   allowed:
                     type: boolean
@@ -3771,6 +3790,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "503":
           description: Proxy state unavailable in this mode
           content:
@@ -4107,6 +4128,8 @@ paths:
                 properties:
                   error:
                     type: string
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   # ── Mesh runtime overlay (mesh mode, GAP-3E) ─────────────────────────
   /mesh/runtime-overlay:
@@ -4718,6 +4741,8 @@ paths:
                 properties:
                   error:
                     type: string
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /mesh/slice-drift:
     get:
@@ -4846,6 +4871,8 @@ paths:
                 properties:
                   error:
                     type: string
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /mesh/config-revision/reset:
     post:
@@ -4895,7 +4922,7 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [status]
+                required: [status, cleared_revision]
                 properties:
                   status:
                     type: string
@@ -5035,7 +5062,7 @@ paths:
                       Effective window in seconds after parsing.
                   limit:
                     type: integer
-                    description: Effective row limit after clamping.
+                    description: Effective row limit (values above 1000 are rejected with `400`).
                   total_denies:
                     type: integer
                     format: int64
@@ -5150,6 +5177,8 @@ paths:
                 properties:
                   error:
                     type: string
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   # ── Audit ────────────────────────────────────────────────────────────
   /audit:
@@ -5372,7 +5401,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/BatchCreateResponse"
         "400":
-          $ref: "#/components/responses/BadRequest"
+          description: Invalid request body, malformed headers/parameters, or per-resource/graph validation errors (`validation_errors`)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ValidationErrorResponse"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -5455,15 +5488,29 @@ paths:
               schema:
                 $ref: "#/components/schemas/DeploymentSnapshot"
         "400":
-          $ref: "#/components/responses/BadRequest"
+          description: Invalid `X-Ferrum-Namespace` header or unsupported query parameters on `/deployment-snapshot`
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: "#/components/schemas/Error"
+                  - $ref: "#/components/schemas/DeploymentMutationAcknowledgement"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
-          $ref: "#/components/responses/ReadOnly"
+          $ref: "#/components/responses/Forbidden"
         "501":
           description: Store topology cannot provide atomic deployment authority
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeploymentMutationAcknowledgement"
         "503":
           description: Coherent state or security audit admission unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeploymentMutationAcknowledgement"
         "507":
           $ref: "#/components/responses/NamespaceSnapshotTooLarge"
 
@@ -5615,12 +5662,14 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "501":
           description: Conditional snapshots require a transaction-capable MongoDB deployment.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Error"
+                $ref: "#/components/schemas/BatchAtomicFailureResponse"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
         "507":
@@ -5772,7 +5821,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Error"
+                $ref: "#/components/schemas/BatchAtomicFailureResponse"
         "507":
           $ref: "#/components/responses/NamespaceSnapshotTooLarge"
         "202":
@@ -5854,7 +5903,11 @@ paths:
                       and re-submit originals via POST /api-specs if missing.
                       Present only when `api_specs_not_restored` is set.
         "400":
-          $ref: "#/components/responses/BadRequest"
+          description: Missing `?confirm=true`, malformed JSON/headers, or backup validation errors (`validation_errors`)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ValidationErrorResponse"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -5882,6 +5935,10 @@ paths:
                     example: confirm_api_spec_deletion=true
         "413":
           description: Request body too large (default max 100 MiB, configurable via FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "503":
           description: >-
             Restore aborted because there is no database (file/DP mode returns
@@ -5925,6 +5982,32 @@ paths:
                     items:
                       type: string
                     description: The guard, snapshot, or connectivity error that caused the abort
+                  rollback:
+                    type: string
+                    enum: [not_needed, not_needed_after_intervening_write, skipped_after_intervening_write]
+                    description: Present when a pre-delete or intervening-write guard aborts without needing rollback.
+                  audit_unavailable_reason:
+                    type: string
+                    enum:
+                      - spool_unavailable
+                      - spool_saturated
+                      - spool_io_error
+                      - invalid_record
+                      - corrupt_record
+                      - queue_saturated
+                      - worker_unavailable
+                      - delivery_exhausted
+                      - retained_capacity
+                      - no_durable_spool
+                      - destination_mismatch
+                      - prepare_failed
+                  applied:
+                    type: boolean
+                    description: Present as `false` on committed-but-not-live database-mode reload failures.
+                  reason:
+                    type: string
+                    enum: [config_rejected, reload_timeout, sequence_unavailable]
+                    description: Closed static label for why a committed database-mode restore is not live.
 
   # ── Proxies ─────────────────────────────────────────────────────────
   /proxies:
@@ -6026,6 +6109,8 @@ paths:
                 $ref: "#/components/schemas/Error"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
@@ -6130,6 +6215,8 @@ paths:
                 $ref: "#/components/schemas/Error"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
@@ -6194,6 +6281,8 @@ paths:
           headers:
             X-Ferrum-Config-Cursor:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
+            X-Ferrum-Namespace-Unserved:
+              $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
           content:
             application/json:
               schema:
@@ -6243,6 +6332,8 @@ paths:
                 anyOf:
                   - $ref: "#/components/schemas/Error"
                   - $ref: "#/components/schemas/DeploymentMutationAcknowledgement"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "501":
           description: |
             Standalone MongoDB cannot atomically delete the proxy, scoped
@@ -6459,6 +6550,10 @@ paths:
           headers:
             ETag:
               $ref: "#/components/headers/ResourceETag"
+            Cache-Control:
+              schema:
+                type: string
+                enum: [no-store]
           content:
             application/json:
               schema:
@@ -6607,6 +6702,8 @@ paths:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
             X-Ferrum-Namespace-Unserved:
               $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -6625,6 +6722,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
@@ -6825,6 +6924,8 @@ paths:
           $ref: "#/components/responses/PreconditionFailed"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
@@ -6900,6 +7001,8 @@ paths:
           $ref: "#/components/responses/PreconditionFailed"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
@@ -7135,6 +7238,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
@@ -7265,6 +7370,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
@@ -7315,6 +7422,8 @@ paths:
           $ref: "#/components/responses/PreconditionFailed"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
@@ -7399,6 +7508,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
@@ -7498,6 +7609,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
     delete:
@@ -7526,6 +7639,8 @@ paths:
               $ref: "#/components/headers/X-Ferrum-Config-Cursor"
             X-Ferrum-Namespace-Unserved:
               $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -7545,6 +7660,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
@@ -7570,6 +7687,9 @@ paths:
       responses:
         "200":
           description: Paginated gateway trust bundle records
+          headers:
+            X-Data-Source:
+              $ref: "#/components/headers/X-Data-Source"
           content:
             application/json:
               schema:
@@ -7647,6 +7767,8 @@ paths:
                 $ref: "#/components/schemas/GatewayTrustBundleConflict"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
@@ -7661,6 +7783,9 @@ paths:
       responses:
         "200":
           description: Gateway trust bundle record
+          headers:
+            X-Data-Source:
+              $ref: "#/components/headers/X-Data-Source"
           content:
             application/json:
               schema:
@@ -7739,6 +7864,8 @@ paths:
                 $ref: "#/components/schemas/GatewayTrustBundleConflict"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
     delete:
@@ -7769,6 +7896,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
@@ -7865,6 +7994,10 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
     post:
       operationId: createNamespace
       summary: Create a namespace
@@ -7979,6 +8112,10 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
     put:
       operationId: updateNamespace
       summary: Update or rename a namespace
@@ -8268,20 +8405,21 @@ paths:
                 $ref: "#/components/schemas/ApiSpecListResponse"
         "400":
           description: |
-            Invalid query parameter — an unknown `sort_by` value, a SQL `LIKE`
-            wildcard in a text filter, or a malformed `limit`/`offset`. As on
-            every other list endpoint, malformed pagination is rejected rather
-            than silently coerced to a default; `limit=0` still means the
-            server default (50 here) and values above 200 are capped.
+            Invalid query parameter — an unknown `sort_by`/`order` value, an
+            invalid `updated_since` timestamp, a SQL `LIKE` wildcard or
+            forbidden character in `title_contains`/`has_tag`, invalid
+            percent-encoding, or a malformed `limit`/`offset`. As on every
+            other list endpoint, malformed pagination is rejected rather than
+            silently coerced to a default; `limit=0` still means the server
+            default (50 here) and values above 200 are capped.
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  error:
-                    type: string
+                $ref: "#/components/schemas/Error"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -8527,23 +8665,29 @@ paths:
         "422":
           description: |
             Spec parsed successfully but failed Ferrum policy or per-resource
-            validation. Two body shapes are possible:
+            validation. Three body shapes are possible:
 
             - **`ApiSpecParseError`** when a Ferrum extension violates a
               semantic rule (`ConsumerExtensionNotAllowed`,
               `PluginInvalidScope`, `PluginProxyIdMismatch`,
               `PluginContainsCredentials`, `ProxyUpstreamIdMismatch`,
-              `InvalidTagName`).
+              `InvalidTagName`, `UnsupportedExternalRef`, `SchemaReference`,
+              `SchemaTooDeep`, `SchemaReferenceCycle`, `SchemaTooLarge`,
+              `UnsupportedOperationField`).
             - **`ApiSpecValidationError`** when one or more extracted
               resources (proxy / upstream / plugin) failed structural
               validation or database cross-checks (duplicate `listen_path`,
               invalid plugin config, missing referenced upstream, etc.).
+            - **`Error`** for other unprocessable-entity rejections.
           content:
             application/json:
               schema:
-                oneOf:
+                anyOf:
                   - $ref: "#/components/schemas/ApiSpecValidationError"
                   - $ref: "#/components/schemas/ApiSpecParseError"
+                  - $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
@@ -8643,7 +8787,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "406":
-          description: Requested `Accept` header does not allow JSON or YAML.
+          description: Requested `Accept` header explicitly rejects every supported JSON and YAML representation with `q=0` (unrelated media types such as `text/plain` default to the stored format).
           content:
             application/json:
               schema:
@@ -8755,9 +8899,10 @@ paths:
           description: |
             New spec is structurally invalid (bad JSON/YAML, unrecognised
             OpenAPI/Swagger version, or missing/malformed `x-ferrum-*`
-            extension). See `ApiSpecParseError.code` for which structural
-            problem fired. Conditional mode also refuses invalid query
-            parameters or original deployment authority without mutation.
+            extension), or the spec ID / query / header is invalid. See
+            `ApiSpecParseError.code` for structural spec errors. Conditional
+            mode also refuses invalid query parameters or original deployment
+            authority without mutation.
           content:
             application/json:
               schema:
@@ -8806,22 +8951,28 @@ paths:
         "422":
           description: |
             New spec parsed successfully but failed Ferrum policy or
-            per-resource validation. Two body shapes are possible:
+            per-resource validation. Three body shapes are possible:
 
             - **`ApiSpecParseError`** when a Ferrum extension violates a
               semantic rule (`ConsumerExtensionNotAllowed`,
               `PluginInvalidScope`, `PluginProxyIdMismatch`,
               `PluginContainsCredentials`, `ProxyUpstreamIdMismatch`,
-              `InvalidTagName`).
+              `InvalidTagName`, `UnsupportedExternalRef`, `SchemaReference`,
+              `SchemaTooDeep`, `SchemaReferenceCycle`, `SchemaTooLarge`,
+              `UnsupportedOperationField`).
             - **`ApiSpecValidationError`** when one or more extracted
               resources failed structural validation or database
               cross-checks.
+            - **`Error`** for other unprocessable-entity rejections.
           content:
             application/json:
               schema:
-                oneOf:
+                anyOf:
                   - $ref: "#/components/schemas/ApiSpecValidationError"
                   - $ref: "#/components/schemas/ApiSpecParseError"
+                  - $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "503":
           $ref: "#/components/responses/DeploymentMutationUnavailable"
         "507":
@@ -8923,6 +9074,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ApiSpecValidationError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
@@ -8966,6 +9119,10 @@ paths:
         "200":
           description: Spec document for the given proxy
           headers:
+            Content-Type:
+              schema:
+                type: string
+                enum: [application/json, application/yaml]
             ETag:
               schema:
                 type: string
@@ -9005,7 +9162,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "406":
-          description: Requested `Accept` header does not allow JSON or YAML.
+          description: Requested `Accept` header explicitly rejects every supported JSON and YAML representation with `q=0` (unrelated media types such as `text/plain` default to the stored format).
           content:
             application/json:
               schema:
@@ -9459,6 +9616,12 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    TlsRecordInUseConflict:
+      description: Managed TLS or ACME record cannot be deleted because active process or namespace configuration still references it
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/TlsRecordInUseConflict"
     Unauthorized:
       description: Missing or invalid JWT
       headers:
@@ -9854,6 +10017,10 @@ components:
             additionalProperties: true
             required: [id, proxy_id, spec_content]
             properties:
+              id:
+                type: string
+              proxy_id:
+                type: string
               spec_content:
                 $ref: "#/components/schemas/StoredContentDigest"
               external_ref_snapshot:
@@ -10031,6 +10198,19 @@ components:
             - reload_timeout
             - sequence_unavailable
 
+    ValidationErrorResponse:
+      type: object
+      description: Error body returned by `POST /batch` and `POST /restore` on `400 Bad Request`, optionally carrying per-resource or graph `validation_errors`.
+      required: [error]
+      properties:
+        error:
+          type: string
+        validation_errors:
+          type: array
+          items:
+            type: string
+          description: Detailed per-resource or graph validation error messages when payload validation fails.
+
     ApplyStatusResponse:
       type: object
       required:
@@ -10193,6 +10373,7 @@ components:
         cert_expiry_warning_days:
           type: integer
           format: int64
+          minimum: 0
           default: 30
 
     AcmeOrderListResponse:
@@ -10232,7 +10413,7 @@ components:
           type: integer
         has_persisted_credentials:
           type: boolean
-          description: Whether at least one stored order can resume this account. The credentials are never returned.
+          description: Whether persisted credentials exist for this account in `acme-accounts.json` or in at least one stored order. The credentials are never returned.
         last_order_at:
           type: string
           format: date-time
@@ -10407,6 +10588,7 @@ components:
         cert_expiry_warning_days:
           type: integer
           format: int64
+          minimum: 0
           default: 30
 
     AcmeOrderFinalizeResponse:
@@ -10553,6 +10735,7 @@ components:
         cert_expiry_warning_days:
           type: integer
           format: int64
+          minimum: 0
           default: 30
 
     ManagedTlsCaBundleRequest:
@@ -10580,6 +10763,7 @@ components:
         cert_expiry_warning_days:
           type: integer
           format: int64
+          minimum: 0
           default: 30
 
     ManagedTlsCrlRequest:
@@ -10781,6 +10965,39 @@ components:
         field:
           type: string
 
+    TlsRecordUsage:
+      type: object
+      description: One live reference blocking deletion of a managed TLS or ACME record, including the owning `namespace` when the reference lives in a configuration store namespace.
+      required: [surface, role, resource_type, resource_id, field]
+      properties:
+        surface:
+          type: string
+        role:
+          type: string
+        resource_type:
+          type: string
+        resource_id:
+          type: string
+        field:
+          type: string
+        namespace:
+          type: string
+          description: Configuration namespace that holds the referencing resource; omitted for process-level environment references.
+
+    TlsRecordInUseConflict:
+      type: object
+      description: Conflict body returned when deleting a managed TLS or ACME record that is still referenced.
+      required: [error, id, used_by]
+      properties:
+        error:
+          type: string
+        id:
+          type: string
+        used_by:
+          type: array
+          items:
+            $ref: "#/components/schemas/TlsRecordUsage"
+
     TlsEventListResponse:
       type: object
       required: [data, pagination]
@@ -10886,6 +11103,34 @@ components:
           type: object
           additionalProperties: true
           description: Per-material validation summary.
+          properties:
+            cert_key_pair:
+              type: object
+              required: [valid, certificate_count]
+              properties:
+                valid:
+                  type: boolean
+                certificate_count:
+                  type: integer
+                  minimum: 1
+            ca_bundle:
+              type: object
+              required: [valid, certificate_count]
+              properties:
+                valid:
+                  type: boolean
+                certificate_count:
+                  type: integer
+                  minimum: 1
+            crl:
+              type: object
+              required: [valid, crl_count]
+              properties:
+                valid:
+                  type: boolean
+                crl_count:
+                  type: integer
+                  minimum: 1
 
     AuditEvent:
       type: object
@@ -15054,6 +15299,7 @@ components:
 
     GatewayTrustBundle:
       type: object
+      additionalProperties: false
       description: |
         Authoritative, namespace-keyed gateway/mesh trust-bundle resource
         (issue #3727). At most one record exists per namespace.
@@ -15061,7 +15307,9 @@ components:
       properties:
         id:
           type: string
-          maxLength: 255
+          minLength: 1
+          maxLength: 254
+          pattern: '^[a-zA-Z0-9][a-zA-Z0-9._-]*$'
           description: >-
             Stable resource identity. Defaults to the namespace when omitted on
             create.
@@ -15104,11 +15352,14 @@ components:
 
     GatewayTrustBundleCreate:
       type: object
+      additionalProperties: false
       required: [trust_domain, bundle]
       properties:
         id:
           type: string
-          maxLength: 255
+          minLength: 1
+          maxLength: 254
+          pattern: '^[a-zA-Z0-9][a-zA-Z0-9._-]*$'
           description: >-
             Optional. Defaults to the authenticated `X-Ferrum-Namespace` value;
             it is never derived from a `namespace` field in the body.
@@ -17163,7 +17414,8 @@ components:
           type: object
           description: |
             Database connectivity info. Present only when the gateway has a
-            configured database (database/cp/dp modes); absent in file mode.
+            configured database (`database` and `cp` modes); absent in `file`,
+            `dp`, `mesh`, and `node_agent` modes.
             Authenticated detail only (with the rest of the detailed health
             body).
           required: [status]
@@ -17178,9 +17430,6 @@ components:
                 - postgres
                 - mysql
                 - sqlite
-            error:
-              type: [string, "null"]
-              description: Error message when disconnected
             pool:
               type: object
               description: |
@@ -18659,19 +18908,6 @@ components:
           format: uint64
 
     # ── Overload ──────────────────────────────────────────────────
-    OverloadNoProxyState:
-      type: object
-      description: |
-        Returned in control-plane mode where no proxy state exists.
-      required: [level, message]
-      properties:
-        level:
-          type: string
-          enum: [normal]
-        message:
-          type: string
-          example: No proxy state available
-
     OverloadLevelOnly:
       type: object
       description: |
@@ -19922,8 +20158,8 @@ components:
           description: |
             Whether the configuration source (the database in `database` mode,
             the control plane's backing database in `cp` mode) is currently
-            reachable and usable. The same shared flag `/health` reports as
-            `database.available` and the admin API uses to gate writes, and the
+            reachable and usable. The same shared flag backing `/health`'s
+            `database.status` and the admin API write gate, and the
             source of the `ferrum_database_config_source_connected` gauge.
         poll_failures_by_reason:
           type: object
@@ -20032,6 +20268,8 @@ components:
         - mode
         - ferrum_version
         - uptime_seconds
+        - config_source_status
+        - config_last_updated_at
         - total_requests
         - status_codes_total
         - requests_per_second
@@ -20052,7 +20290,7 @@ components:
         ferrum_version:
           type: string
           description: Ferrum Edge binary version
-          example: "0.9.0"
+          example: "0.9.21"
         uptime_seconds:
           type: integer
           format: int64
@@ -20322,6 +20560,7 @@ components:
         Active connection counts per upstream target. Only upstreams with
         at least one active connection appear. Useful for verifying even
         distribution across targets and spotting hot targets.
+      required: [active_connections]
       properties:
         active_connections:
           type: array
@@ -21017,9 +21256,11 @@ components:
       pattern: "^hmac-sha256:[0-9a-f]{64}$"
       description: >-
         Keyed, non-reversible fingerprint of a withheld stored value, bound to
-        its resource kind, namespace, id, and field JSON pointer. Equal across
-        calls and replicas while the value (and `FERRUM_ADMIN_JWT_SECRET`) is
-        unchanged.
+        its resource kind, namespace, id, and field JSON pointer. Keyed from
+        `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET` (or a random
+        per-process key when unset), never from any admin JWT signing secret.
+        Equal across calls and replicas sharing the same configured fingerprint
+        secret while the value is unchanged.
       example: "hmac-sha256:3f1c9b0e5a7d2c4f8e6b1a0d9c7e5f3a2b4d6c8e0f1a3b5c7d9e1f2a4b6c8d0e"
 
     ConsumerExport:
@@ -21153,7 +21394,7 @@ components:
         ferrum_version:
           type: string
           description: Ferrum Edge binary version that produced this backup
-          example: "0.9.0"
+          example: "0.9.21"
         exported_at:
           type: string
           format: date-time
@@ -44417,7 +44658,8 @@ components:
           type: string
           enum: [dp]
         control_plane:
-          type: object
+          type: [object, "null"]
+          description: Control-plane connection details, or `null` when CP connection state is unavailable.
           required: [url, status, is_primary, config_diverged, config_divergence_recoveries_total]
           properties:
             url:
@@ -45229,6 +45471,18 @@ components:
         Summary record for a single API spec. Returned by `GET /api-specs`.
         The raw spec content (the OpenAPI/Swagger document) is intentionally
         omitted — use `GET /api-specs/{id}` to retrieve the full document.
+      required:
+        - id
+        - proxy_id
+        - spec_version
+        - spec_format
+        - tags
+        - server_urls
+        - operation_count
+        - uncompressed_size
+        - content_hash
+        - created_at
+        - updated_at
       properties:
         id:
           type: string
@@ -45357,6 +45611,7 @@ components:
         Response body for a successful `POST /api-specs` (201) or
         `PUT /api-specs/{id}` (200). Provides the identifiers and content hash
         of the spec that was created or replaced.
+      required: [id, proxy_id, spec_version, content_hash]
       properties:
         id:
           type: string
@@ -45384,6 +45639,7 @@ components:
         plugin composition, or the compensation snapshot contains an
         unrestorable resource. An authoritative in-transaction rejection may
         omit `spec_version` and the failure `id`.
+      required: [error, failures]
       properties:
         error:
           type: string
@@ -45396,6 +45652,7 @@ components:
           description: One entry per resource that failed validation
           items:
             type: object
+            required: [resource_type, errors]
             properties:
               resource_type:
                 type: string
@@ -45415,9 +45672,12 @@ components:
       description: |
         Response body emitted by `POST /api-specs` and `PUT /api-specs/{id}`
         when the spec document fails to parse or violates a Ferrum extension
-        rule. The body shape is identical for both 400 and 422 — the status
-        code indicates whether the problem is **structural** (400) or
-        **semantic** (422). The discriminator is the `code` field below.
+        rule (or for general 400 request errors where `code` and `details` are
+        omitted). For parse/extension errors, the body shape is identical for
+        both 400 and 422 — the status code indicates whether the problem is
+        **structural** (400) or **semantic** (422), and the discriminator is
+        the `code` field below.
+      required: [error]
       properties:
         error:
           type: string
@@ -45449,11 +45709,14 @@ components:
 
             - `InvalidJson` — body is not valid JSON, or the parsed JSON document exceeds the
               500,000-node source-tree ceiling
-            - `InvalidYaml` — body is not valid YAML, uses anchors/aliases, or the parsed YAML
-              document exceeds the same 500,000-node source-tree ceiling
+            - `InvalidYaml` — body is not valid YAML, exceeds the bounded YAML anchor/alias
+              expansion budgets (depth, alias references, expanded bytes, or work units), or the
+              parsed YAML document exceeds the 500,000-node source-tree ceiling
             - `UnknownVersion` — no recognised `swagger: "2.0"` or `openapi: "3.x.y"` at root
             - `MissingProxyExtension` — `x-ferrum-proxy` is absent
-            - `MalformedExtension` — `x-ferrum-proxy`, `x-ferrum-upstream`, or `x-ferrum-plugins` failed to deserialise
+            - `MalformedExtension` — `x-ferrum-proxy`, `x-ferrum-upstream`, `x-ferrum-plugins`,
+              `x-ferrum-validate`, `x-ferrum-mcp`, `x-ferrum-external-refs`, or `servers` failed
+              to deserialise or violated an extension structural rule
 
             **Semantic / policy violations — returned as HTTP 422 Unprocessable Entity:**
 

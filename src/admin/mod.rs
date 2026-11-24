@@ -20,7 +20,7 @@ pub mod plugin_config_projection;
 pub(crate) mod preconditions;
 pub mod provisioning;
 pub mod spec_codec;
-mod tls_management;
+pub(crate) mod tls_management;
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub use tls_management::{
@@ -513,8 +513,28 @@ impl AdminState {
 
     /// Whether admin mutations are currently blocked (same policy as
     /// [`Self::check_write_allowed`], for observe-only callers such as `/health`).
+    ///
+    /// Evaluates the exact same boolean predicates without serializing a JSON
+    /// error body or constructing a `hyper::Response`.
     pub fn admin_writes_currently_blocked(&self) -> bool {
-        self.check_write_allowed().is_some()
+        if self.read_only {
+            return true;
+        }
+        if let Some(ref flag) = self.db_available
+            && !flag.load(Ordering::Relaxed)
+        {
+            return true;
+        }
+        if self.admin_audit_enabled && audit::fail_closed_block_reason().is_some() {
+            return true;
+        }
+        if let Some(ref db) = self.db {
+            let topology = db.failover_topology_status();
+            if !topology.primary_active && !topology.allow_writes {
+                return true;
+            }
+        }
+        false
     }
 
     /// After a config-database mutation commits, capture the covering
@@ -2321,6 +2341,35 @@ fn body_consuming_route_role(method: &Method, segments: &[&str]) -> Option<Optio
     }
 }
 
+/// Required minimum role for any known mutating route (`POST`, `PUT`, `PATCH`,
+/// `DELETE`), including bodyless `POST` and `DELETE` endpoints. Used by
+/// pre-dispatch header/query refusal gates (`If-Match`, `?conditional=true`) so
+/// an unauthorized caller always receives `403 Forbidden` rather than `400 Bad
+/// Request`.
+fn mutating_route_role(method: &Method, segments: &[&str]) -> Option<AdminRole> {
+    if let Some(role) = body_consuming_route_role(method, segments).flatten() {
+        return Some(role);
+    }
+    if let Some(role) = tls_route_required_role(method, segments) {
+        return Some(role);
+    }
+    match (method, segments) {
+        (m, ["api-specs"]) if m == Method::POST => Some(AdminRole::Admin),
+        (m, ["api-specs", _]) if m == Method::PUT || m == Method::DELETE => Some(AdminRole::Admin),
+        (m, ["proxies", _]) if m == Method::DELETE => Some(AdminRole::Operator),
+        (m, ["consumers", _]) if m == Method::DELETE => Some(AdminRole::Admin),
+        (m, ["consumers", _, "credentials", _]) if m == Method::DELETE => Some(AdminRole::Admin),
+        (m, ["consumers", _, "credentials", _, _]) if m == Method::DELETE => Some(AdminRole::Admin),
+        (m, ["plugins", "config", _]) if m == Method::DELETE => Some(AdminRole::Operator),
+        (m, ["upstreams", _]) if m == Method::DELETE => Some(AdminRole::Operator),
+        (m, ["gateway-trust-bundles", _]) if m == Method::DELETE => Some(AdminRole::Admin),
+        (m, ["namespaces", _]) if m == Method::DELETE => Some(AdminRole::Admin),
+        (m, ["backend-capabilities", "refresh"]) if m == Method::POST => Some(AdminRole::Operator),
+        (m, ["mesh", "config-revision", "reset"]) if m == Method::POST => Some(AdminRole::Operator),
+        _ => None,
+    }
+}
+
 fn tls_route_required_role(method: &Method, segments: &[&str]) -> Option<AdminRole> {
     match (method, segments) {
         (
@@ -2521,11 +2570,11 @@ fn namespace_scoped_resource_kind(segments: &[&str]) -> Option<&'static str> {
         "backend-egress-policy" if segments.len() == 1 => "backend-egress-policy",
         // Only the export: `/config/apply-status` is a process-topology
         // surface, not a tenant-addressed resource.
-        "config" if segments.get(1) == Some(&"export") => "config-export",
+        "config" if segments == ["config", "export"] => "config-export",
         "restore" => "restore",
         "audit" => "audit",
         "gateway-trust-bundles" => "gateway-trust-bundles",
-        "gateway-trust" => "gateway-trust",
+        "gateway-trust" if segments == ["gateway-trust", "status"] => "gateway-trust",
         // `GET /plugins` lists available plugin *types* (global metadata);
         // `/plugins/config[...]` is the namespace-scoped PluginConfig CRUD.
         "plugins" if segments.len() > 1 => "plugins",
@@ -3360,12 +3409,12 @@ async fn handle_admin_request_inner(
 
     // Liveness probe — always unauthenticated and minimal. Never reveals any
     // operational internals; safe to expose to load balancers / orchestrators.
-    if path == "/live" {
+    if path == "/live" && method == Method::GET {
         return Ok(json_response(StatusCode::OK, &json!({"status": "ok"})));
     }
 
     // Health check (unauthenticated)
-    if path == "/health" || path == "/status" {
+    if (path == "/health" || path == "/status") && method == Method::GET {
         // The admin JWT is verified once: the detail decision and the tenant
         // tier below both derive from this actor.
         let admin_actor = verified_admin_actor(&state, auth_header.as_deref());
@@ -4014,6 +4063,17 @@ async fn handle_admin_request_inner(
     if path == "/overload" && method == Method::GET {
         let detailed = observability_detail_allowed(&state, auth_header.as_deref(), &client_ip);
         if let Some(ref proxy_state) = state.proxy_state {
+            if !detailed {
+                let level = proxy_state.overload.level();
+                let (status, level_str) = match level {
+                    crate::overload::OverloadLevel::Normal => (StatusCode::OK, "normal"),
+                    crate::overload::OverloadLevel::Pressure => (StatusCode::OK, "pressure"),
+                    crate::overload::OverloadLevel::Critical => {
+                        (StatusCode::SERVICE_UNAVAILABLE, "critical")
+                    }
+                };
+                return Ok(json_response(status, &json!({ "level": level_str })));
+            }
             let snapshot = proxy_state.overload.snapshot();
             let status = match snapshot.level {
                 crate::overload::OverloadLevel::Normal => StatusCode::OK,
@@ -4033,10 +4093,7 @@ async fn handle_admin_request_inner(
                         serde_json::to_value(failures.snapshot()).unwrap_or_default(),
                     );
                 }
-                // Aggregate buffered-request pressure (issue #4153). Inserted
-                // into the DETAIL snapshot only: the coarse unauthenticated
-                // branch below reads `level` back out and discards everything
-                // else, so this never widens the unauthenticated surface.
+                // Aggregate buffered-request pressure (issue #4153).
                 obj.insert(
                     "request_buffer".to_string(),
                     serde_json::to_value(
@@ -4045,14 +4102,7 @@ async fn handle_admin_request_inner(
                     .unwrap_or_default(),
                 );
             }
-            if detailed {
-                return Ok(json_response(status, &snapshot_value));
-            }
-            let level = snapshot_value
-                .get("level")
-                .cloned()
-                .unwrap_or_else(|| json!("normal"));
-            return Ok(json_response(status, &json!({ "level": level })));
+            return Ok(json_response(status, &snapshot_value));
         }
         return Ok(json_response(StatusCode::OK, &json!({"level": "normal"})));
     }
@@ -4062,17 +4112,26 @@ async fn handle_admin_request_inner(
     // from `FERRUM_METRICS_ALLOWED_CIDRS`. Unauthenticated scraping is an
     // explicit operator opt-in (token or CIDR), not the default.
     if path == "/metrics" && method == Method::GET {
-        // A presented namespace-bounded JWT is refused here even from an
-        // allowlisted source IP: `/metrics` is fleet-global, and the CIDR
-        // allowance authorizes only scrapes that present no such token.
-        if let Ok(token_data) = state.jwt_manager.verify_request(auth_header.as_deref())
-            && let Ok(actor) = AuditActor::from_verified(&token_data)
+        // Verify the admin JWT once: a presented namespace-bounded JWT is
+        // refused here even from an allowlisted source IP (`/metrics` is
+        // fleet-global), and passing `admin_jwt_detail` into
+        // `observability_detail_allowed_with` avoids verifying the JWT twice.
+        let admin_actor = verified_admin_actor(&state, auth_header.as_deref());
+        if let Some(ref actor) = admin_actor
             && let Some(response) =
-                authorize_namespace_bounded_global_route(&method, &["metrics"], &path, &actor)
+                authorize_namespace_bounded_global_route(&method, &["metrics"], &path, actor)
         {
             return Ok(response);
         }
-        if !observability_detail_allowed(&state, auth_header.as_deref(), &client_ip) {
+        let admin_jwt_detail = admin_actor
+            .as_ref()
+            .is_some_and(|actor| !actor.is_namespace_bounded());
+        if !observability_detail_allowed_with(
+            &state,
+            admin_jwt_detail,
+            auth_header.as_deref(),
+            &client_ip,
+        ) {
             return Ok(metrics_unauthorized_response());
         }
         let registry = admin_metrics_registry(&state);
@@ -4371,16 +4430,13 @@ async fn handle_admin_request_inner(
         )
         && !deployment_write_route
     {
-        let role = if matches!(segments_peek.as_slice(), ["api-specs", ..]) {
-            Some(AdminRole::Admin)
-        } else {
-            body_consuming_route_role(&method, segments_peek.as_slice()).flatten()
-        };
-        if let Some(role) = role
+        if let Some(role) = mutating_route_role(&method, segments_peek.as_slice())
             && let Some(response) = require_admin_role(&auth, role)
         {
+            drop(req.into_body());
             return Ok(response);
         }
+        drop(req.into_body());
         return Ok(deployment_mutations::refusal(
             "Deployment conditional mode is unsupported on this mutation route",
         ));
@@ -4619,7 +4675,7 @@ async fn handle_admin_request_inner(
         )
         && !if_match_route(&method, segments_peek.as_slice())
     {
-        if let Some(Some(role)) = body_consuming_route_role(&method, segments_peek.as_slice())
+        if let Some(role) = mutating_route_role(&method, segments_peek.as_slice())
             && let Some(resp) = require_admin_role(&auth, role)
         {
             drop(req.into_body());
@@ -6092,18 +6148,28 @@ async fn handle_mesh_config_drift_get(
     let slice_snapshot = mesh_runtime.applied_snapshot();
     let last_install_at = mesh_runtime.last_applied_at();
 
-    let resp = mesh_config_drift::build_response(mesh_config_drift::MeshConfigDriftInputs {
-        slice: slice_snapshot.as_ref().as_ref(),
-        last_install_at,
-        now: chrono::Utc::now(),
-        source_protocol: &source_protocol,
-        source_cp_url: &source_cp_url,
-        include_overlay,
-        // xDS-mode only; native mode leaves this `None` and the block is omitted.
-        convergence: mesh_runtime.xds_convergence(),
-        // Issue #2473: accepted config revision + stale-fallback quarantine.
-        revision: mesh_runtime.revision_diagnostics(),
-    });
+    let resp =
+        match mesh_config_drift::try_build_response(mesh_config_drift::MeshConfigDriftInputs {
+            slice: slice_snapshot.as_ref().as_ref(),
+            last_install_at,
+            now: chrono::Utc::now(),
+            source_protocol: &source_protocol,
+            source_cp_url: &source_cp_url,
+            include_overlay,
+            // xDS-mode only; native mode leaves this `None` and the block is omitted.
+            convergence: mesh_runtime.xds_convergence(),
+            // Issue #2473: accepted config revision + stale-fallback quarantine.
+            revision: mesh_runtime.revision_diagnostics(),
+        }) {
+            Ok(resp) => resp,
+            Err(err) => {
+                error!(error = %err, "failed to fingerprint mesh config-drift response");
+                return Ok(json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &json!({"error": "Failed to serialize mesh config-drift response"}),
+                ));
+            }
+        };
 
     // `MeshConfigDriftResponse` is fully serde-derived; treat a serialize
     // error as a 500 rather than crashing — the admin path has the same
@@ -6325,17 +6391,11 @@ fn parse_mesh_policy_denies_query(query: Option<&str>) -> Result<(Duration, usiz
     let Some(raw) = query else {
         return Ok((window, limit));
     };
-    for pair in raw.split('&') {
-        if pair.is_empty() {
-            continue;
-        }
-        let (key, value) = match pair.split_once('=') {
-            Some(kv) => kv,
-            None => continue,
-        };
-        match key {
+    for (key, value) in url::form_urlencoded::parse(raw.as_bytes()) {
+        match key.as_ref() {
             "window" => {
-                window = parse_short_duration(value).map_err(|e| format!("invalid window: {e}"))?;
+                window = parse_short_duration(value.as_ref())
+                    .map_err(|e| format!("invalid window: {e}"))?;
                 if window > MESH_POLICY_DENIES_MAX_WINDOW {
                     return Err(format!(
                         "window exceeds maximum of {} seconds",
@@ -8123,6 +8183,37 @@ fn plan_additive_rollback_api_specs(
         .map(|plugin| plugin.id.as_str())
         .collect();
 
+    let mut snapshot_proxies_by_spec: std::collections::HashMap<&str, Vec<&str>> =
+        std::collections::HashMap::new();
+    for proxy in &snapshot_payload.proxies {
+        if let Some(spec_id) = proxy.api_spec_id.as_deref() {
+            snapshot_proxies_by_spec
+                .entry(spec_id)
+                .or_default()
+                .push(proxy.id.as_str());
+        }
+    }
+    let mut snapshot_upstreams_by_spec: std::collections::HashMap<&str, Vec<&str>> =
+        std::collections::HashMap::new();
+    for upstream in &snapshot_payload.upstreams {
+        if let Some(spec_id) = upstream.api_spec_id.as_deref() {
+            snapshot_upstreams_by_spec
+                .entry(spec_id)
+                .or_default()
+                .push(upstream.id.as_str());
+        }
+    }
+    let mut snapshot_plugins_by_spec: std::collections::HashMap<&str, Vec<&str>> =
+        std::collections::HashMap::new();
+    for plugin in &snapshot_payload.plugin_configs {
+        if let Some(spec_id) = plugin.api_spec_id.as_deref() {
+            snapshot_plugins_by_spec
+                .entry(spec_id)
+                .or_default()
+                .push(plugin.id.as_str());
+        }
+    }
+
     let mut replay = Vec::new();
     let mut skipped_specs = 0usize;
     for spec in snapshot_specs {
@@ -8130,21 +8221,17 @@ fn plan_additive_rollback_api_specs(
             // The intervening writer owns this spec id; leave it untouched.
             continue;
         }
-        let owner_tagged = snapshot_payload.proxies.iter().any(|proxy| {
-            proxy.id == spec.proxy_id && proxy.api_spec_id.as_deref() == Some(spec.id.as_str())
-        });
+        let owner_tagged = snapshot_proxies_by_spec
+            .get(spec.id.as_str())
+            .is_some_and(|proxy_ids| proxy_ids.contains(&spec.proxy_id.as_str()));
         let owning_proxy_replayed =
             owner_tagged && replayed_proxy_ids.contains(spec.proxy_id.as_str());
-        let owned_upstreams_replayed = snapshot_payload
-            .upstreams
-            .iter()
-            .filter(|upstream| upstream.api_spec_id.as_deref() == Some(spec.id.as_str()))
-            .all(|upstream| replayed_upstream_ids.contains(upstream.id.as_str()));
-        let owned_plugins_replayed = snapshot_payload
-            .plugin_configs
-            .iter()
-            .filter(|plugin| plugin.api_spec_id.as_deref() == Some(spec.id.as_str()))
-            .all(|plugin| replayed_plugin_ids.contains(plugin.id.as_str()));
+        let owned_upstreams_replayed = snapshot_upstreams_by_spec
+            .get(spec.id.as_str())
+            .is_none_or(|ids| ids.iter().all(|id| replayed_upstream_ids.contains(id)));
+        let owned_plugins_replayed = snapshot_plugins_by_spec
+            .get(spec.id.as_str())
+            .is_none_or(|ids| ids.iter().all(|id| replayed_plugin_ids.contains(id)));
         if owning_proxy_replayed && owned_upstreams_replayed && owned_plugins_replayed {
             replay.push(spec.clone());
         } else {
@@ -8294,7 +8381,8 @@ async fn finish_failed_restore(
             json!({"replaced_namespace": namespace}),
             json!({"rollback": rollback_status}),
         ),
-    );
+    )
+    .with_outcome(audit::AuditOutcome::Failure);
     if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
         log_audit_enqueue_failure(&error);
     }
@@ -8403,7 +8491,8 @@ async fn finish_failed_restore_after_intervening_clear(
             json!({"replaced_namespace": namespace}),
             json!({"rollback": rollback_status}),
         ),
-    );
+    )
+    .with_outcome(audit::AuditOutcome::Failure);
     if let Err(error) = audit::record(state.admin_audit_enabled, db, event).await {
         log_audit_enqueue_failure(&error);
     }
@@ -8454,7 +8543,8 @@ async fn finish_atomic_delete_failure(
             json!({"replaced_namespace": namespace}),
             json!({"rollback": "not_needed"}),
         ),
-    );
+    )
+    .with_outcome(audit::AuditOutcome::Failure);
     if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
         log_audit_enqueue_failure(&error);
     }
@@ -8488,7 +8578,8 @@ async fn finish_unknown_atomic_delete_failure(
             json!({"replaced_namespace": namespace}),
             json!({"rollback": "unknown_outcome"}),
         ),
-    );
+    )
+    .with_outcome(audit::AuditOutcome::UnknownOutcome);
     if let Err(error) = audit::record(state.admin_audit_enabled, db, event).await {
         log_audit_enqueue_failure(&error);
     }
@@ -9273,15 +9364,25 @@ use std::sync::{Mutex, OnceLock};
 
 /// Process-global cache for the metrics JSON response.
 static METRICS_CACHE: OnceLock<arc_swap::ArcSwap<Option<(Instant, Bytes)>>> = OnceLock::new();
+static METRICS_CACHE_REFRESH: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 static RUNTIME_METRICS_CACHE: OnceLock<arc_swap::ArcSwap<Option<(Instant, Bytes)>>> =
     OnceLock::new();
+static RUNTIME_METRICS_CACHE_REFRESH: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 fn metrics_cache() -> &'static arc_swap::ArcSwap<Option<(Instant, Bytes)>> {
     METRICS_CACHE.get_or_init(|| arc_swap::ArcSwap::new(Arc::new(None)))
 }
 
+fn metrics_cache_refresh() -> &'static tokio::sync::Mutex<()> {
+    METRICS_CACHE_REFRESH.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 fn runtime_metrics_cache() -> &'static arc_swap::ArcSwap<Option<(Instant, Bytes)>> {
     RUNTIME_METRICS_CACHE.get_or_init(|| arc_swap::ArcSwap::new(Arc::new(None)))
+}
+
+fn runtime_metrics_cache_refresh() -> &'static tokio::sync::Mutex<()> {
+    RUNTIME_METRICS_CACHE_REFRESH.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 /// Cache TTL for the metrics response.
@@ -9302,8 +9403,33 @@ async fn handle_metrics(state: &AdminState) -> Result<Response<Full<Bytes>>, hyp
         return Ok(resp);
     }
 
+    // Single-flight refresh: serialize cache-miss rebuilds so concurrent
+    // scrapes wait for one collection instead of stampeding.
+    let _refresh_guard = metrics_cache_refresh().lock().await;
+    let cached = cache.load();
+    if let Some((cached_at, ref bytes)) = **cached
+        && cached_at.elapsed() < METRICS_CACHE_TTL
+    {
+        let resp = with_admin_security_headers(Response::builder())
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .header("X-Cache", "hit")
+            .body(Full::new(bytes.clone()))
+            .unwrap_or_else(|_| admin_builder_failure_response());
+        return Ok(resp);
+    }
+
     let metrics = build_metrics(state);
-    let body_str = serde_json::to_string(&metrics).unwrap_or_else(|_| "{}".into());
+    let body_str = match serde_json::to_string(&metrics) {
+        Ok(json) => json,
+        Err(err) => {
+            error!(error = %err, "failed to serialize /admin/metrics response");
+            return Ok(json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "Failed to serialize admin metrics"}),
+            ));
+        }
+    };
     let body_bytes = Bytes::from(body_str);
 
     cache.store(Arc::new(Some((Instant::now(), body_bytes.clone()))));
@@ -9345,10 +9471,25 @@ async fn handle_metrics_runtime(state: &AdminState) -> Result<Response<Full<Byte
         .as_ref()
         .map(|ps| ps.env_config.runtime_metrics_cache_ttl_ms)
         .unwrap_or_else(|| crate::runtime_metrics::global_ref().cache_ttl_ms());
+    let ttl = Duration::from_millis(ttl_ms);
     let cache = runtime_metrics_cache();
     let cached = cache.load();
     if let Some((cached_at, ref bytes)) = **cached
-        && cached_at.elapsed() < Duration::from_millis(ttl_ms)
+        && cached_at.elapsed() < ttl
+    {
+        let resp = with_admin_security_headers(Response::builder())
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .header("X-Cache", "hit")
+            .body(Full::new(bytes.clone()))
+            .unwrap_or_else(|_| admin_builder_failure_response());
+        return Ok(resp);
+    }
+
+    let _refresh_guard = runtime_metrics_cache_refresh().lock().await;
+    let cached = cache.load();
+    if let Some((cached_at, ref bytes)) = **cached
+        && cached_at.elapsed() < ttl
     {
         let resp = with_admin_security_headers(Response::builder())
             .status(StatusCode::OK)
@@ -9360,7 +9501,16 @@ async fn handle_metrics_runtime(state: &AdminState) -> Result<Response<Full<Byte
     }
 
     let snapshot = crate::runtime_metrics::build_snapshot(&state.mode, state.proxy_state.as_ref());
-    let body_str = serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".into());
+    let body_str = match serde_json::to_string(&snapshot) {
+        Ok(json) => json,
+        Err(err) => {
+            error!(error = %err, "failed to serialize /metrics/runtime response");
+            return Ok(json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "Failed to serialize runtime metrics"}),
+            ));
+        }
+    };
     let body_bytes = Bytes::from(body_str);
     cache.store(Arc::new(Some((Instant::now(), body_bytes.clone()))));
 
@@ -10323,7 +10473,7 @@ async fn handle_batch_create(
         Ok(Some(message)) => {
             return Ok(json_response(
                 StatusCode::CONFLICT,
-                &json!({"error": message}),
+                &json!({"error": message, "rollback": "not_needed"}),
             ));
         }
         Ok(None) => {}
@@ -10615,6 +10765,8 @@ enum ConsistentApiSpecsBackup {
     ConfigUnavailable,
     /// Spec documents could not be loaded after config succeeded.
     SpecsUnavailable,
+    /// Backup JSON serialization failed (fail closed rather than emitting `{}`).
+    SerializationFailed,
 }
 
 fn backup_resource_includes(resource_filter: Option<&HashSet<&str>>, name: &str) -> bool {
@@ -10630,12 +10782,14 @@ fn backup_resource_includes(resource_filter: Option<&HashSet<&str>>, name: &str)
 /// api_specs, gateway_trust_bundles)`. The trailing counts are what the backup
 /// success audit record reports, so they must describe what this payload
 /// actually carries — an omitted trust section counts `0`.
+type SerializedBackupPayload = (Vec<u8>, usize, usize, usize, usize, usize, usize);
+
 fn serialize_backup_payload(
     mut config: GatewayConfig,
     source: &'static str,
     resource_filter: Option<&HashSet<&str>>,
     api_specs_owned: Option<ApiSpecsBackupSection>,
-) -> (Vec<u8>, usize, usize, usize, usize, usize, usize) {
+) -> Result<SerializedBackupPayload, serde_json::Error> {
     let include_proxies = backup_resource_includes(resource_filter, "proxies");
     let include_consumers = backup_resource_includes(resource_filter, "consumers");
     let include_plugin_configs = backup_resource_includes(resource_filter, "plugin_configs");
@@ -10750,8 +10904,8 @@ fn serialize_backup_payload(
         conditional: None,
     };
 
-    let body_bytes = serde_json::to_vec(&backup).unwrap_or_else(|_| b"{}".to_vec());
-    (
+    let body_bytes = serde_json::to_vec(&backup)?;
+    Ok((
         body_bytes,
         proxies.len(),
         consumers.len(),
@@ -10759,7 +10913,7 @@ fn serialize_backup_payload(
         upstreams.len(),
         api_specs_count,
         gateway_trust_bundles_count,
-    )
+    ))
 }
 
 fn backup_attachment_response(body_bytes: Vec<u8>, source: &'static str) -> Response<Full<Bytes>> {
@@ -10809,12 +10963,18 @@ async fn build_consistent_api_specs_backup(
         upstream_count,
         api_specs_count,
         gateway_trust_bundles_count,
-    ) = serialize_backup_payload(
+    ) = match serialize_backup_payload(
         config,
         "database",
         resource_filter,
         Some(ApiSpecsBackupSection::from_specs(&specs)),
-    );
+    ) {
+        Ok(tuple) => tuple,
+        Err(err) => {
+            error!(error = %err, "failed to serialize consistent backup payload");
+            return ConsistentApiSpecsBackup::SerializationFailed;
+        }
+    };
 
     ConsistentApiSpecsBackup::Ready {
         body_bytes,
@@ -11048,6 +11208,22 @@ async fn handle_backup(
                     &json!({"error": "Database unavailable while exporting API specs"}),
                 ));
             }
+            ConsistentApiSpecsBackup::SerializationFailed => {
+                audit_backup_failure(
+                    state,
+                    actor,
+                    namespace,
+                    request_ctx,
+                    resource_filter.as_ref(),
+                    audit::failure_category::UNAVAILABLE,
+                    audit::AuditOutcome::Failure,
+                )
+                .await;
+                return Ok(json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &json!({"error": "Failed to serialize backup payload"}),
+                ));
+            }
             ConsistentApiSpecsBackup::ConfigUnavailable => {
                 // Ordinary config-load failure under a held lease: labeled
                 // cached fallback (without api_specs) remains semantically safe.
@@ -11144,7 +11320,26 @@ async fn handle_backup(
         upstream_count,
         api_specs_count,
         gateway_trust_bundles_count,
-    ) = serialize_backup_payload(config, source, resource_filter.as_ref(), None);
+    ) = match serialize_backup_payload(config, source, resource_filter.as_ref(), None) {
+        Ok(tuple) => tuple,
+        Err(err) => {
+            error!(error = %err, "failed to serialize backup payload");
+            audit_backup_failure(
+                state,
+                actor,
+                namespace,
+                request_ctx,
+                resource_filter.as_ref(),
+                audit::failure_category::UNAVAILABLE,
+                audit::AuditOutcome::Failure,
+            )
+            .await;
+            return Ok(json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "Failed to serialize backup payload"}),
+            ));
+        }
+    };
 
     Ok(finalize_backup_export(
         state,
@@ -13723,7 +13918,9 @@ async fn handle_service_waypoint_services_get(
             &json!({"error": "service-waypoint topology not enabled"}),
         ));
     };
-    let snapshot = mesh_runtime.snapshot();
+    // Lock-free read of the last proxy-accepted slice; received-but-rejected
+    // candidate slices must not appear as actively served waypoint services.
+    let snapshot = mesh_runtime.applied_snapshot();
     let Some(slice) = snapshot.as_ref() else {
         return Ok(json_response(
             StatusCode::NOT_FOUND,

@@ -2679,6 +2679,12 @@ pub(crate) trait AdminResource:
     const NOT_FOUND_MESSAGE: &'static str;
     const ID_CONFLICT_LABEL: &'static str = Self::RESOURCE_LABEL;
     const SERIALIZE_NAMESPACE_CONFIG_ADMISSION: bool = false;
+    /// Load the full namespace snapshot before `DELETE` only for resources
+    /// whose delete precondition or late-delete recovery actually consumes it
+    /// (`Proxy` and `PluginConfig`). Skipping this for `Upstream`, `Consumer`,
+    /// and `GatewayTrustBundleRecord` avoids an unnecessary full-namespace DB
+    /// scan on every delete.
+    const LOAD_NAMESPACE_SNAPSHOT_ON_DELETE: bool = false;
     /// Issue a strong `ETag` on `GET` and honour `If-Match` on `PUT`/`DELETE`
     /// (see `crate::admin::preconditions`). Only sound for a resource whose
     /// writers all serialize on the namespace config admission lease, because
@@ -2689,6 +2695,7 @@ pub(crate) trait AdminResource:
     fn set_id(&mut self, id: String);
     fn namespace(&self) -> &str;
     fn set_namespace(&mut self, ns: String);
+    fn created_at(&self) -> DateTime<Utc>;
     fn set_created_at(&mut self, now: DateTime<Utc>);
     fn set_updated_at(&mut self, now: DateTime<Utc>);
     fn updated_at(&self) -> DateTime<Utc>;
@@ -3581,14 +3588,15 @@ pub(crate) async fn handle_delete<R: AdminResource>(
     if let Some(response) = if_match_refusal(state, if_match, id, Some(&existing)) {
         return Ok(response);
     }
-    let previous_snapshot = if R::SERIALIZE_NAMESPACE_CONFIG_ADMISSION {
-        match db.load_namespace_snapshot(namespace).await {
-            Ok(snapshot) => Some(snapshot),
-            Err(error) => return Ok(R::map_precheck_db_error(&error)),
-        }
-    } else {
-        None
-    };
+    let previous_snapshot =
+        if R::SERIALIZE_NAMESPACE_CONFIG_ADMISSION && R::LOAD_NAMESPACE_SNAPSHOT_ON_DELETE {
+            match db.load_namespace_snapshot(namespace).await {
+                Ok(snapshot) => Some(snapshot),
+                Err(error) => return Ok(R::map_precheck_db_error(&error)),
+            }
+        } else {
+            None
+        };
     if let Err(error) =
         R::check_delete_precondition(db, namespace, id, previous_snapshot.as_ref(), &delete_query)
             .await
@@ -4211,6 +4219,10 @@ impl AdminResource for Upstream {
         self.namespace = ns;
     }
 
+    fn created_at(&self) -> DateTime<Utc> {
+        self.created_at
+    }
+
     fn set_created_at(&mut self, now: DateTime<Utc>) {
         self.created_at = now;
     }
@@ -4467,6 +4479,10 @@ impl AdminResource for GatewayTrustBundleRecord {
         self.namespace = ns;
     }
 
+    fn created_at(&self) -> DateTime<Utc> {
+        self.created_at
+    }
+
     fn set_created_at(&mut self, now: DateTime<Utc>) {
         self.created_at = now;
     }
@@ -4650,6 +4666,7 @@ impl AdminResource for PluginConfig {
     const VALIDATION_ERROR_LABEL: &'static str = "plugin config fields";
     const NOT_FOUND_MESSAGE: &'static str = "Plugin config not found";
     const SERIALIZE_NAMESPACE_CONFIG_ADMISSION: bool = true;
+    const LOAD_NAMESPACE_SNAPSHOT_ON_DELETE: bool = true;
     const SUPPORTS_IF_MATCH: bool = true;
     const ID_CONFLICT_LABEL: &'static str = "PluginConfig";
 
@@ -4689,6 +4706,10 @@ impl AdminResource for PluginConfig {
 
     fn set_namespace(&mut self, ns: String) {
         self.namespace = ns;
+    }
+
+    fn created_at(&self) -> DateTime<Utc> {
+        self.created_at
     }
 
     fn set_created_at(&mut self, now: DateTime<Utc>) {
@@ -5290,6 +5311,7 @@ impl AdminResource for Proxy {
     const VALIDATION_ERROR_LABEL: &'static str = "proxy fields";
     const NOT_FOUND_MESSAGE: &'static str = "Proxy not found";
     const SERIALIZE_NAMESPACE_CONFIG_ADMISSION: bool = true;
+    const LOAD_NAMESPACE_SNAPSHOT_ON_DELETE: bool = true;
     const SUPPORTS_IF_MATCH: bool = true;
 
     fn audit_body(resource: &Self) -> Value {
@@ -5355,6 +5377,10 @@ impl AdminResource for Proxy {
 
     fn set_namespace(&mut self, ns: String) {
         self.namespace = ns;
+    }
+
+    fn created_at(&self) -> DateTime<Utc> {
+        self.created_at
     }
 
     fn set_created_at(&mut self, now: DateTime<Utc>) {
@@ -6057,6 +6083,10 @@ impl AdminResource for Consumer {
         self.namespace = ns;
     }
 
+    fn created_at(&self) -> DateTime<Utc> {
+        self.created_at
+    }
+
     fn set_created_at(&mut self, now: DateTime<Utc>) {
         self.created_at = now;
     }
@@ -6658,6 +6688,12 @@ async fn handle_write<R: AdminResource>(
             resource.set_updated_at(now);
         }
         WriteAction::Update { .. } => {
+            // Always preserve the existing row's creation timestamp on PUT so
+            // MongoDB replace_one cannot clobber `created_at` (used for route
+            // tie-breaking) and SQL responses/audit images match the DB row.
+            if let Some(ref existing) = existing {
+                resource.set_created_at(existing.created_at());
+            }
             resource.set_updated_at(now);
         }
     }

@@ -768,6 +768,14 @@ pub struct AcmeAccountStore {
     max_accounts: usize,
 }
 
+/// Lightweight non-secret reference from a stored ACME certificate to its
+/// account: `(account_id, directory_url, updated_at)`.
+pub type AcmeCertificateAccountRef = (Option<String>, String, DateTime<Utc>);
+
+/// Lightweight non-secret metadata for a persisted ACME account:
+/// `(account_id, directory_url, last_used_at)`.
+pub type AcmeAccountMeta = (String, String, Option<DateTime<Utc>>);
+
 impl AcmeCertificateStore {
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self, AcmeError> {
         let max_material_bytes = acme_material_max_bytes()?;
@@ -826,6 +834,25 @@ impl AcmeCertificateStore {
         Ok(summaries.map(AcmeCertificateRecord::summary).collect())
     }
 
+    /// Lightweight metadata projection for `GET /admin/tls/acme/accounts` that
+    /// avoids parsing every stored certificate's X.509 PEM and SHA-256 digest.
+    pub fn list_certificate_account_refs(
+        &self,
+    ) -> Result<Vec<AcmeCertificateAccountRef>, AcmeError> {
+        let document = self.file.snapshot()?;
+        Ok(document
+            .certificates
+            .values()
+            .map(|cert| {
+                (
+                    cert.account_id.clone(),
+                    cert.directory_url.clone(),
+                    cert.updated_at,
+                )
+            })
+            .collect())
+    }
+
     #[cfg(feature = "acme")]
     pub fn list_certificate_records(&self) -> Result<Vec<AcmeCertificateRecord>, AcmeError> {
         let document = self.file.snapshot()?;
@@ -868,6 +895,32 @@ impl AcmeCertificateStore {
                 record.created_at = now;
                 record.updated_at = now;
             }
+            document
+                .certificates
+                .insert(record.id.clone(), record.clone());
+            Ok(record)
+        })?;
+        Ok(outcome)
+    }
+
+    /// Atomically replace an existing ACME certificate record under the
+    /// exclusive store lock so a concurrent delete cannot turn `PUT` into a
+    /// silent create or `409 RecordLimitReached`.
+    pub fn update_existing_certificate(
+        &self,
+        record: AcmeCertificateRecord,
+    ) -> Result<AcmeCertificateRecord, AcmeError> {
+        validate_acme_id(&record.id)?;
+        validate_acme_domains(&record.domains)?;
+        validate_acme_certificate_material_size(&record, self.max_material_bytes)?;
+        let outcome = self.file.mutate(move |document| {
+            let mut record = record;
+            let now = Utc::now();
+            let Some(existing) = document.certificates.get(&record.id) else {
+                return Err(AcmeError::NotFound(record.id));
+            };
+            record.created_at = existing.created_at;
+            record.updated_at = now;
             document
                 .certificates
                 .insert(record.id.clone(), record.clone());
@@ -1279,6 +1332,42 @@ impl AcmeOrderStore {
         }
         Ok(accounts.into_values().collect())
     }
+
+    /// Aggregate account summaries from lightweight metadata projections,
+    /// avoiding X.509 parsing of certificates and cloning of secret account
+    /// credentials.
+    pub fn list_accounts_from_meta(
+        &self,
+        certificate_refs: &[AcmeCertificateAccountRef],
+        persisted_account_metas: &[AcmeAccountMeta],
+    ) -> Result<Vec<AcmeAccountSummary>, AcmeError> {
+        let mut accounts = BTreeMap::new();
+        for (account_id, directory_url, last_used_at) in persisted_account_metas {
+            let account = account_summary_entry(&mut accounts, account_id, directory_url);
+            account.has_persisted_credentials = true;
+            account.last_order_at = max_datetime(account.last_order_at, *last_used_at);
+        }
+        for (account_id, directory_url, updated_at) in certificate_refs {
+            let Some(account_id) = account_id.as_deref() else {
+                continue;
+            };
+            let account = account_summary_entry(&mut accounts, account_id, directory_url);
+            account.certificate_count += 1;
+            account.last_certificate_updated_at =
+                max_datetime(account.last_certificate_updated_at, Some(*updated_at));
+        }
+        let document = self.file.snapshot()?;
+        for order in document.orders.values() {
+            let Some(account_id) = order.account_id.as_deref() else {
+                continue;
+            };
+            let account = account_summary_entry(&mut accounts, account_id, &order.directory_url);
+            account.order_count += 1;
+            account.has_persisted_credentials |= order.account_credentials_json.is_some();
+            account.last_order_at = max_datetime(account.last_order_at, Some(order.updated_at));
+        }
+        Ok(accounts.into_values().collect())
+    }
 }
 
 impl AcmeAccountStore {
@@ -1317,6 +1406,23 @@ impl AcmeAccountStore {
     pub fn list_accounts(&self) -> Result<Vec<AcmeAccountRecord>, AcmeError> {
         let document = self.file.snapshot()?;
         Ok(document.accounts.values().cloned().collect())
+    }
+
+    /// Lightweight non-secret metadata projection of persisted accounts so
+    /// listing accounts never clones secret `credentials_json` strings.
+    pub fn list_account_meta(&self) -> Result<Vec<AcmeAccountMeta>, AcmeError> {
+        let document = self.file.snapshot()?;
+        Ok(document
+            .accounts
+            .values()
+            .map(|account| {
+                (
+                    account.account_id.clone(),
+                    account.directory_url.clone(),
+                    account.last_used_at,
+                )
+            })
+            .collect())
     }
 
     pub fn get_credentials(

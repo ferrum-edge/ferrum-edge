@@ -928,13 +928,34 @@ fn schema_draft_for_openapi(version: &str) -> String {
     }
 }
 
+#[derive(Default)]
+struct ByteCountWriter {
+    bytes: usize,
+}
+
+impl std::io::Write for ByteCountWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self.bytes.saturating_add(buf.len());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_json_byte_len(value: &Value) -> Result<usize, serde_json::Error> {
+    let mut counter = ByteCountWriter::default();
+    serde_json::to_writer(&mut counter, value)?;
+    Ok(counter.bytes)
+}
+
 fn validate_openapi_validator_config_budget(config: &Value) -> Result<(), ExtractError> {
-    let size = serde_json::to_vec(config)
-        .map_err(|error| ExtractError::MalformedExtension {
+    let size =
+        serialized_json_byte_len(config).map_err(|error| ExtractError::MalformedExtension {
             which: "x-ferrum-validate",
             error: format!("generated openapi_validator config could not be serialized: {error}"),
-        })?
-        .len();
+        })?;
     if size > MAX_OPENAPI_VALIDATOR_CONFIG_SIZE {
         return Err(ExtractError::MalformedExtension {
             which: "x-ferrum-validate",
@@ -2363,12 +2384,11 @@ fn validate_generated_config_budget(
     plugin_name: &str,
     config: &Value,
 ) -> Result<(), ExtractError> {
-    let size = serde_json::to_vec(config)
-        .map_err(|error| ExtractError::MalformedExtension {
+    let size =
+        serialized_json_byte_len(config).map_err(|error| ExtractError::MalformedExtension {
             which,
             error: format!("generated {plugin_name} config could not be serialized: {error}"),
-        })?
-        .len();
+        })?;
     if size > MAX_OPENAPI_VALIDATOR_CONFIG_SIZE {
         return Err(ExtractError::MalformedExtension {
             which,
@@ -2578,14 +2598,14 @@ fn extract_operation_schemas(
                     entry.insert("parameters".to_string(), Value::Array(parameters.clone()));
                 }
                 let entry = Value::Object(entry);
-                let entry_bytes = serde_json::to_vec(&entry)
-                    .map_err(|error| ExtractError::MalformedExtension {
+                let entry_bytes = serialized_json_byte_len(&entry).map_err(|error| {
+                    ExtractError::MalformedExtension {
                         which: "x-ferrum-validate",
                         error: format!(
                             "generated openapi_validator operation could not be serialized: {error}"
                         ),
-                    })?
-                    .len();
+                    }
+                })?;
                 generated_operation_bytes = generated_operation_bytes
                     .checked_add(entry_bytes)
                     .ok_or_else(|| ExtractError::SchemaTooLarge {
@@ -6322,32 +6342,45 @@ fn extract_spec_metadata(root: &serde_json::Value, version: &str) -> ExtractedMe
 /// but returning `Result` ensures call sites handle the failure as an internal
 /// error rather than silently producing an empty hash that could trigger a false
 /// hash collision.
-pub fn hash_resource_bundle(bundle: &ExtractedBundle) -> Result<String, anyhow::Error> {
-    let mut buf = Vec::new();
+struct Sha256Writer<'a>(&'a mut crate::fips::approved::Sha256);
 
-    // Proxy — strip metadata then serialize
+impl std::io::Write for Sha256Writer<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+pub fn hash_resource_bundle(bundle: &ExtractedBundle) -> Result<String, anyhow::Error> {
+    let mut hasher = crate::fips::approved::Sha256::new();
+
+    // Proxy — strip metadata then stream canonical JSON straight into SHA-256
     let proxy_json = strip_metadata(
         serde_json::to_value(&bundle.proxy)
             .map_err(|e| anyhow::anyhow!("failed to serialize proxy for resource hash: {}", e))?,
     );
-    buf.extend_from_slice(&serde_json::to_vec(&proxy_json).map_err(|e| {
+    serde_json::to_writer(Sha256Writer(&mut hasher), &proxy_json).map_err(|e| {
         anyhow::anyhow!("failed to re-serialize proxy JSON for resource hash: {}", e)
-    })?);
-    buf.push(b'|');
+    })?;
+    hasher.update(b"|");
 
     // Upstream (optional)
     if let Some(u) = &bundle.upstream {
         let upstream_json = strip_metadata(serde_json::to_value(u).map_err(|e| {
             anyhow::anyhow!("failed to serialize upstream for resource hash: {}", e)
         })?);
-        buf.extend_from_slice(&serde_json::to_vec(&upstream_json).map_err(|e| {
+        serde_json::to_writer(Sha256Writer(&mut hasher), &upstream_json).map_err(|e| {
             anyhow::anyhow!(
                 "failed to re-serialize upstream JSON for resource hash: {}",
                 e
             )
-        })?);
+        })?;
     }
-    buf.push(b'|');
+    hasher.update(b"|");
 
     // Plugins sorted by id for determinism
     let mut plugins: Vec<_> = bundle.plugins.iter().collect();
@@ -6360,16 +6393,16 @@ pub fn hash_resource_bundle(bundle: &ExtractedBundle) -> Result<String, anyhow::
                 e
             )
         })?);
-        buf.extend_from_slice(&serde_json::to_vec(&pj).map_err(|e| {
+        serde_json::to_writer(Sha256Writer(&mut hasher), &pj).map_err(|e| {
             anyhow::anyhow!(
                 "failed to re-serialize plugin JSON for resource hash: {}",
                 e
             )
-        })?);
-        buf.push(b';');
+        })?;
+        hasher.update(b";");
     }
 
-    Ok(crate::admin::spec_codec::sha256_hex(&buf))
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// Remove metadata-only fields from a JSON value so they don't affect the hash.

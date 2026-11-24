@@ -416,9 +416,17 @@ impl ViewerNamespaceCeiling {
 #[derive(Clone)]
 pub struct JwtManager {
     config: JwtConfig,
+    /// Precomputed decoding key for `config.secret` (`None` if empty).
+    primary_decoding_key: Option<DecodingKey>,
+    /// Precomputed JWT validation rules for the primary key.
+    primary_validation: Validation,
     /// Optional `FERRUM_ADMIN_JWT_VIEWER_SECRET`: tokens it verifies are capped
     /// at [`AdminRole::Viewer`].
     viewer_secret: Option<String>,
+    /// Precomputed decoding key for `viewer_secret`.
+    viewer_decoding_key: Option<DecodingKey>,
+    /// Precomputed JWT validation rules for the viewer key (pinned to HS256).
+    viewer_validation: Validation,
     /// Optional `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`: the namespaces tokens
     /// verified by `viewer_secret` may read.
     viewer_namespace_ceiling: Option<ViewerNamespaceCeiling>,
@@ -429,17 +437,62 @@ pub struct JwtManager {
     /// `config_export_fingerprint_secret` when configured, otherwise random
     /// for this manager. Never derived from an admin signing secret.
     config_export_fingerprint_key: Option<crate::fips::approved::HmacSha256Key>,
+    /// Precomputed key for admin resource `ETag`s derived from `config.secret`.
+    cached_resource_etag_key: Option<crate::fips::approved::HmacSha256Key>,
+}
+
+fn build_jwt_validation(config: &JwtConfig, algorithm: Algorithm) -> Validation {
+    // `Validation::new` makes `algorithm` the only accepted `alg`, so the
+    // header cannot select a different verifier.
+    let mut validation = Validation::new(algorithm);
+    validation.validate_exp = true; // Enable expiration check
+    validation.validate_nbf = true; // Enable not-before check
+
+    // Set required claims
+    validation.required_spec_claims = {
+        let mut claims = HashSet::with_capacity(7);
+        claims.insert("iss".to_string());
+        claims.insert("sub".to_string());
+        claims.insert("exp".to_string());
+        claims.insert("iat".to_string());
+        claims.insert("nbf".to_string());
+        claims.insert("jti".to_string());
+        claims
+    };
+
+    // Validate issuer
+    validation.set_issuer(&[&config.issuer]);
+
+    // Optional audience enforcement. When an operator configures an audience,
+    // the token MUST carry a matching `aud` claim (`set_audience` +
+    // `required_spec_claims`). When unset, keep jsonwebtoken's strict
+    // `validate_aud = true` default (RFC 7519 §4.1.3).
+    if let Some(audience) = &config.audience {
+        validation.set_audience(&[audience]);
+        validation.required_spec_claims.insert("aud".to_string());
+    }
+
+    validation
 }
 
 impl JwtManager {
     /// Create new JWT manager
     pub fn new(config: JwtConfig) -> Self {
+        let primary_decoding_key = DecodingKey::from_secret(config.secret.as_bytes()).ok();
+        let primary_validation = build_jwt_validation(&config, config.algorithm);
+        let viewer_validation = build_jwt_validation(&config, Algorithm::HS256);
+        let cached_resource_etag_key = crate::admin::preconditions::etag_key(&config.secret);
         Self {
             config,
+            primary_decoding_key,
+            primary_validation,
             viewer_secret: None,
+            viewer_decoding_key: None,
+            viewer_validation,
             viewer_namespace_ceiling: None,
             config_export_fingerprint_secret: None,
             config_export_fingerprint_key: random_config_export_fingerprint_key(),
+            cached_resource_etag_key,
         }
     }
 
@@ -469,6 +522,7 @@ impl JwtManager {
                 ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET_REUSED_ERROR.to_string(),
             ));
         }
+        self.viewer_decoding_key = DecodingKey::from_secret(viewer_secret.as_bytes()).ok();
         self.viewer_secret = Some(viewer_secret);
         Ok(self)
     }
@@ -555,7 +609,7 @@ impl JwtManager {
     /// every replica that accepts the same tokens issues the same tags. `None`
     /// when no secret is configured.
     pub(crate) fn resource_etag_key(&self) -> Option<crate::fips::approved::HmacSha256Key> {
-        crate::admin::preconditions::etag_key(&self.config.secret)
+        self.cached_resource_etag_key.clone()
     }
 
     /// Verify and decode a JWT token.
@@ -566,7 +620,11 @@ impl JwtManager {
     /// (wrong algorithm, expired, bad claims) is final: the viewer key is
     /// never a second chance for a token the primary key could parse.
     pub fn verify_token(&self, token: &str) -> Result<VerifiedAdminToken, JwtEncodeError> {
-        let primary = self.verify_with_key(token, &self.config.secret, self.config.algorithm);
+        let primary = self.verify_with_precomputed(
+            token,
+            self.primary_decoding_key.as_ref(),
+            &self.primary_validation,
+        );
         let primary_error = match primary {
             Ok(data) => {
                 return Ok(VerifiedAdminToken {
@@ -578,9 +636,9 @@ impl JwtManager {
             }
             Err(error) => error,
         };
-        let Some(viewer_secret) = self.viewer_secret.as_deref() else {
+        if self.viewer_secret.is_none() {
             return Err(primary_error);
-        };
+        }
         if !matches!(
             primary_error.kind(),
             jsonwebtoken::errors::ErrorKind::InvalidSignature
@@ -589,7 +647,11 @@ impl JwtManager {
         }
         // Pinned to HS256 regardless of the primary configuration: the ceiling
         // key must never accept another algorithm.
-        let data = self.verify_with_key(token, viewer_secret, Algorithm::HS256)?;
+        let data = self.verify_with_precomputed(
+            token,
+            self.viewer_decoding_key.as_ref(),
+            &self.viewer_validation,
+        )?;
         // The viewer secret's holder chooses `sub`, and it is rendered into
         // log lines next to `key_tier`. Refuse subjects that could forge or
         // flood those lines.
@@ -606,59 +668,21 @@ impl JwtManager {
         })
     }
 
-    /// Full verification of `token` under one HMAC key and one algorithm.
-    fn verify_with_key(
+    /// Full verification of `token` under one precomputed HMAC key and validation.
+    fn verify_with_precomputed(
         &self,
         token: &str,
-        secret: &str,
-        algorithm: Algorithm,
+        key: Option<&DecodingKey>,
+        validation: &Validation,
     ) -> Result<TokenData<AdminClaims>, JwtEncodeError> {
-        // jsonwebtoken 12 refuses an empty HMAC key; that error rejects the
-        // token like any other verification failure.
-        let key = DecodingKey::from_secret(secret.as_bytes())?;
-
-        // Configure validation with required claims. `Validation::new` makes
-        // `algorithm` the only accepted `alg`, so the header cannot select a
-        // different verifier.
-        let mut validation = Validation::new(algorithm);
-        validation.validate_exp = true; // Enable expiration check
-        validation.validate_nbf = true; // Enable not-before check
-
-        // Set required claims
-        validation.required_spec_claims = {
-            let mut claims = HashSet::new();
-            claims.insert("iss".to_string());
-            claims.insert("sub".to_string());
-            claims.insert("exp".to_string());
-            claims.insert("iat".to_string());
-            claims.insert("nbf".to_string());
-            claims.insert("jti".to_string());
-            claims
-        };
-
-        // Validate issuer
-        validation.set_issuer(&[&self.config.issuer]);
-
-        // Optional audience enforcement. When an operator configures an
-        // audience, the token MUST carry a matching `aud` claim: `set_audience`
-        // rejects a *mismatching* claim, and adding `aud` to
-        // `required_spec_claims` makes its *presence* mandatory (so a token that
-        // simply omits `aud` is also rejected). When unset, we deliberately
-        // KEEP jsonwebtoken's strict `validate_aud = true` default: tokens
-        // without `aud` pass, but a token carrying `aud` is rejected because no
-        // acceptable audience is configured (RFC 7519 §4.1.3). Do NOT set
-        // `validate_aud = false` here — that would let a token minted for a
-        // different service (aud=X) authenticate against the admin API whenever
-        // the HS256 secret is shared, silently weakening the fail-closed
-        // posture. Operators whose IdP always stamps `aud` must set
-        // FERRUM_ADMIN_JWT_AUDIENCE to that value.
-        if let Some(audience) = &self.config.audience {
-            validation.set_audience(&[audience]);
-            validation.required_spec_claims.insert("aud".to_string());
-        }
+        // jsonwebtoken 12 refuses an empty HMAC key; mirror that error when
+        // no decoding key could be constructed at manager init.
+        let key = key.ok_or_else(|| {
+            jsonwebtoken::errors::Error::from(jsonwebtoken::errors::ErrorKind::InvalidKeyFormat)
+        })?;
 
         // Decode and validate
-        let token_data = decode::<AdminClaims>(token, &key, &validation)?;
+        let token_data = decode::<AdminClaims>(token, key, validation)?;
 
         // jsonwebtoken 12 rejects a number, object, or mixed-array `aud`
         // itself (`InvalidClaimFormat`, or `MissingRequiredClaim` when an

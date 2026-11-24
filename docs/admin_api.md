@@ -741,7 +741,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   http://localhost:9000/admin/tls/acme/renew/edge-cert
 ```
 
-Ferrum reuses persisted account credentials from the latest order for that certificate when available. The request accepts the same `challenge_type` values as order creation. The response is a new order whose selected challenges must become reachable before calling `/admin/tls/acme/orders/{id}/finalize`.
+Ferrum reuses persisted account credentials from `acme-accounts.json` when present for the certificate's account, falling back to the latest order for that certificate when available. The request accepts the same `challenge_type` values as order creation. The response is a new order whose selected challenges must become reachable before calling `/admin/tls/acme/orders/{id}/finalize`.
 
 Automatic renewal can be enabled with `FERRUM_ACME_AUTO_RENEW_ENABLED=true`. The scheduler reuses persisted account credentials — the certificate's own account from the shared `acme-accounts.json` store, falling back to the latest order's credentials only when that store has none for the account — renews certificates inside `FERRUM_ACME_RENEW_WHEN_REMAINING_DAYS`, and finalizes HTTP-01/TLS-ALPN-01 renewals after Ferrum stores their challenge material. For DNS-01 renewals, set `FERRUM_ACME_DNS01_HOOK_COMMAND` to an executable that creates and cleans up provider TXT records; Ferrum passes the challenge through `FERRUM_ACME_DNS01_*` environment variables, waits `FERRUM_ACME_DNS01_PROPAGATION_SECONDS`, then finalizes the order.
 
@@ -775,7 +775,7 @@ Managed certificates, CA bundles, OCSP responses, CRLs, and JWKS documents are a
 
 Record IDs are **globally unique** across those typed collections (one shared store map keyed by ID, not namespaced by kind). Create with `allow_overwrite=true` and every typed `PUT` require the existing record kind to match the route kind; a cross-kind collision returns `409 Conflict` with a stable error of the form `managed TLS record '{id}' already exists with kind {existing}, cannot overwrite with kind {requested}`. Typed `GET`/`DELETE` still reject a kind mismatch with `400 Bad Request`. Same-kind replacement is allowed even when the record is referenced: admission validates the new material before persistence, and TLS source watchers atomically activate or retain the previous runtime config.
 
-`POST`/`PUT /admin/tls/ocsp-responses` validates the decoded DER structurally: at most 64 KiB, `responseStatus` `successful(0)`, `responseType` `id-pkix-ocsp-basic`, and a well-formed `BasicOCSPResponse` with at least one `SingleResponse`. It cannot bind the response to a certificate, because the record is stored before anything says which certificate it belongs to. Storing a record is therefore not a promise it can be served: the mandatory certificate-bound validation — `CertID` match against the served leaf and issuer, responder authorization, signature verification, `thisUpdate`/`nextUpdate` with a 5-minute skew allowance, and a `good` status — runs when a frontend TLS configuration that references `managed://ocsp-responses/{id}#ocsp` is built, and a mismatch is refused there while the previous known-good configuration keeps serving. With `FERRUM_FIPS_MODE=enforce` the structural pass additionally refuses a response whose responder signature algorithm is `sha1WithRSAEncryption` or Ed25519, or that carries a responder certificate with a non-approved key, so a non-approved response cannot be stored at all. See [Stapled OCSP Responses](frontend_tls.md#stapled-ocsp-responses).
+`POST /admin/tls/ocsp-responses` and `PUT /admin/tls/ocsp-responses/{id}` validate the decoded DER structurally: at most 64 KiB, `responseStatus` `successful(0)`, `responseType` `id-pkix-ocsp-basic`, and a well-formed `BasicOCSPResponse` with at least one `SingleResponse`. It cannot bind the response to a certificate, because the record is stored before anything says which certificate it belongs to. Storing a record is therefore not a promise it can be served: the mandatory certificate-bound validation — `CertID` match against the served leaf and issuer, responder authorization, signature verification, `thisUpdate`/`nextUpdate` with a 5-minute skew allowance, and a `good` status — runs when a frontend TLS configuration that references `managed://ocsp-responses/{id}#ocsp` is built, and a mismatch is refused there while the previous known-good configuration keeps serving. With `FERRUM_FIPS_MODE=enforce` the structural pass additionally refuses a response whose responder signature algorithm is `sha1WithRSAEncryption` or Ed25519, or that carries a responder certificate with a non-approved key, so a non-approved response cannot be stored at all. See [Stapled OCSP Responses](frontend_tls.md#stapled-ocsp-responses).
 
 Responses return non-secret metadata only: source URI, subject, issuer, SANs, validity, public-material fingerprint, counts, and timestamps. Private keys are persisted in the managed store but never returned. Configure the store directory with `FERRUM_TLS_MANAGED_STORE_PATH`; on Unix, the JSON store files are written with owner-only permissions. SAN strings use the same canonical representation as [TLS Inventory](#tls-inventory).
 
@@ -2282,7 +2282,7 @@ failover policy to that independent store or operational reload.
 ### Modes without a configuration database
 
 `mesh`, `file`, and `dp` have no `audit_events` table. Their audited actions
-(for example `POST /mesh/config-revision/reset` and `POST /admin/tls/rotate`)
+(for example `POST /mesh/config-revision/reset` and `POST /admin/tls/rotate/{surface}`)
 still prepare and finalize through the spool exactly as below, but the delivery
 target is the **bounded local audit retention file**
 `admin-audit-retention.json` in `FERRUM_ADMIN_AUDIT_FALLBACK_PATH` (issue #7200):
@@ -3166,7 +3166,7 @@ namespace's Subscribe never changes this namespace's view:
   and the weakest policy is `both` until the old stream disconnects.
 - `data_planes` is sorted by `node_id`, then `connected_at`. Entries carry no
   build version: the ConfigSync build gate pins every DP to the CP's own build,
-  and `GET /cluster` (admin-only) still reports `version`. Each `policy` uses
+  and `GET /cluster` still reports `version`. Each `policy` uses
   the top-level field meanings for a local data plane: `public_only_guaranteed`
   is true exactly for `mode=public` with no allow CIDR overrides.
 - `attestation` is `reported` for a recognised report, or `unknown` (with
@@ -3456,7 +3456,7 @@ Field semantics:
 curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/mesh/config-drift
 ```
 
-Returns `404 Not Found` outside mesh mode (no `mesh_runtime_state`). Returns `200 OK` with zeroed `resources` and omitted/null `last_received_at` when mesh runtime is wired but no slice has been accepted yet — operators rely on the difference between **`404` = wrong mode** and **`200` + null `last_received_at` = mesh mode, not converged yet**. See [docs/mesh.md](mesh.md#authoritative-config-revisions-and-stale-fallback-rejection) for revision semantics and [openapi.yaml](../openapi.yaml) for the full response schema.
+Returns `404 Not Found` outside mesh mode (no `mesh_runtime_state`). Returns `200 OK` with zeroed `resources` and omitted `last_received_at` when mesh runtime is wired but no slice has been accepted yet — operators rely on the difference between **`404` = wrong mode** and **`200` + absent `last_received_at` = mesh mode, not converged yet**. See [docs/mesh.md](mesh.md#authoritative-config-revisions-and-stale-fallback-rejection) for revision semantics and [openapi.yaml](../openapi.yaml) for the full response schema.
 
 ## Mesh Config Revision Reset (mesh mode)
 

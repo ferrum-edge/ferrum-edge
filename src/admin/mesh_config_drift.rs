@@ -22,6 +22,7 @@
 //! See [docs/mesh.md](../../../docs/mesh.md) "Config drift introspection"
 //! for the operator playbook.
 
+#[cfg(test)]
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -169,7 +170,7 @@ impl MeshRuntimeOverlayDriftView {
         let mut keys: Vec<String> = overlay.fields.keys().cloned().collect();
         keys.sort();
         let fingerprint = fingerprint_value(
-            serde_json::to_value(&overlay.fields)
+            &serde_json::to_value(&overlay.fields)
                 .unwrap_or_else(|err| Value::String(format!("serialization-error:{err}"))),
         );
         Self {
@@ -239,10 +240,11 @@ pub struct MeshConfigDriftInputs<'a> {
     pub revision: MeshRevisionDiagnostics,
 }
 
-/// Build the response from staged inputs. Pure function — no I/O, no
-/// allocation beyond the JSON-bearing fields, no clock reads. Unit-tested
-/// directly to lock down the shape.
-pub fn build_response(inputs: MeshConfigDriftInputs<'_>) -> MeshConfigDriftResponse {
+/// Build the response from staged inputs, failing closed if canonical slice
+/// serialization fails instead of emitting an invalid fingerprint sentinel.
+pub fn try_build_response(
+    inputs: MeshConfigDriftInputs<'_>,
+) -> Result<MeshConfigDriftResponse, serde_json::Error> {
     let (last_received_at, age_seconds) = inputs.last_install_at.map_or((None, None), |ts| {
         // `signed_duration_since` returns a `chrono::Duration`. Clamp the
         // signed seconds to a non-negative `u64`: a slice accepted in the
@@ -259,7 +261,7 @@ pub fn build_response(inputs: MeshConfigDriftInputs<'_>) -> MeshConfigDriftRespo
             version: Some(slice.version.clone()),
             namespace: Some(slice.namespace.clone()),
             resources: MeshResourceCounts::from_slice(slice),
-            fingerprint: Some(fingerprint(slice)),
+            fingerprint: Some(try_fingerprint(slice)?),
             source_protocol: inputs.source_protocol.to_string(),
             source_cp_url: inputs.source_cp_url.to_string(),
         },
@@ -283,12 +285,37 @@ pub fn build_response(inputs: MeshConfigDriftInputs<'_>) -> MeshConfigDriftRespo
         None
     };
 
-    MeshConfigDriftResponse {
+    Ok(MeshConfigDriftResponse {
         slice: slice_view,
         runtime_overlay: overlay_view,
         convergence: inputs.convergence.map(|snapshot| snapshot.as_ref().clone()),
         revision: inputs.revision,
-    }
+    })
+}
+
+/// Build the response from staged inputs. Pure function — no I/O, no
+/// allocation beyond the JSON-bearing fields, no clock reads. Unit-tested
+/// directly to lock down the shape.
+pub fn build_response(inputs: MeshConfigDriftInputs<'_>) -> MeshConfigDriftResponse {
+    let fallback_revision = inputs.revision.clone();
+    try_build_response(inputs).unwrap_or_else(|err| {
+        tracing::error!("mesh config drift fingerprint serialization failed: {err}");
+        MeshConfigDriftResponse {
+            slice: MeshSliceDriftView {
+                last_received_at: None,
+                age_seconds: None,
+                version: None,
+                namespace: None,
+                resources: MeshResourceCounts::default(),
+                fingerprint: None,
+                source_protocol: String::new(),
+                source_cp_url: String::new(),
+            },
+            runtime_overlay: None,
+            convergence: None,
+            revision: fallback_revision,
+        }
+    })
 }
 
 /// Parse the optional `?include_overlay=...` query param. Defaults to
@@ -299,12 +326,9 @@ pub fn parse_include_overlay(query: Option<&str>) -> bool {
     let Some(query) = query else {
         return true;
     };
-    for pair in query.split('&') {
-        let mut parts = pair.splitn(2, '=');
-        if let (Some(key), Some(val)) = (parts.next(), parts.next())
-            && key == "include_overlay"
-        {
-            return match val {
+    for (key, val) in url::form_urlencoded::parse(query.as_bytes()) {
+        if key == "include_overlay" {
+            return match val.as_ref() {
                 "true" | "1" => true,
                 "false" | "0" => false,
                 // Tolerate operator typos — the default-on shape is the
@@ -328,28 +352,11 @@ pub fn parse_include_overlay(query: Option<&str>) -> bool {
 /// intentionally hot-swap without a new slice version — drift in the overlay
 /// surfaces under `runtime_overlay` instead.
 ///
-/// Algorithm: SHA-256 over a canonical JSON encoding (recursively
-/// `BTreeMap`-sorted keys, preserving array order — slices are
-/// translator-built and order is significant). Output is
-/// `sha256-<64 lowercase hex chars>`.
-///
-/// Determinism: `serde_json::to_value` is used to round-trip into
-/// `Value`, which is then walked through `canonical_json_value` to swap
-/// every `Map` for a `BTreeMap` of sorted keys before the final
-/// `to_string`. `serde_json::Map` is not sorted by default, so a direct
-/// `to_string` on the slice would produce different bytes depending on
-/// insertion order across runs.
-fn fingerprint(slice: &MeshSlice) -> String {
-    let mut value = match serde_json::to_value(slice) {
-        Ok(value) => value,
-        Err(err) => {
-            // `serde_json::to_value` only fails on map-key types that are
-            // not strings; every map in `MeshSlice` is keyed by `String`.
-            // Fall back to a recognisable sentinel rather than
-            // `.unwrap()`-ing on the hot-path-adjacent admin handler.
-            return format!("sha256-error-{}", hex_digest(err.to_string().as_bytes()));
-        }
-    };
+/// Algorithm: SHA-256 over a canonical JSON encoding (recursively key-sorted,
+/// preserving array order — slices are translator-built and order is
+/// significant). Output is `sha256-<64 lowercase hex chars>`.
+fn try_fingerprint(slice: &MeshSlice) -> Result<String, serde_json::Error> {
+    let mut value = serde_json::to_value(slice)?;
     if let Value::Object(map) = &mut value {
         // Strip transport/runtime fields that legitimately vary per DP or
         // publish even when the effective accepted resources are identical.
@@ -360,41 +367,65 @@ fn fingerprint(slice: &MeshSlice) -> String {
         map.remove("version");
         map.remove("runtime_overlay");
     }
-    fingerprint_value(value)
+    Ok(fingerprint_value(&value))
 }
 
-fn fingerprint_value(value: Value) -> String {
-    let canonical = canonical_json_value(value);
-    let serialized = canonical.to_string();
-    format!("sha256-{}", hex_digest(serialized.as_bytes()))
+#[cfg(test)]
+fn fingerprint(slice: &MeshSlice) -> String {
+    try_fingerprint(slice).expect("MeshSlice serialization is infallible for finite inputs")
 }
 
-fn hex_digest(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
+struct Sha256Writer<'a>(&'a mut Sha256);
+
+impl std::io::Write for Sha256Writer<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
-/// Recursively rewrite `serde_json::Value::Object` maps as a `BTreeMap`-backed
-/// `Map` so `Value::to_string()` produces a key-sorted, deterministic byte
-/// stream. Array order is preserved (slice translation emits ordered arrays;
-/// re-sorting them here would hide real drift).
-fn canonical_json_value(value: Value) -> Value {
+/// Stream canonical key-sorted JSON directly into `hasher` without cloning the
+/// `Value` tree or buffering a full serialized `String`.
+fn hash_canonical_json(value: &Value, hasher: &mut Sha256) {
     match value {
         Value::Object(map) => {
-            let sorted: BTreeMap<String, Value> = map
-                .into_iter()
-                .map(|(k, v)| (k, canonical_json_value(v)))
-                .collect();
-            let mut canonical = serde_json::Map::with_capacity(sorted.len());
-            for (k, v) in sorted {
-                canonical.insert(k, v);
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            hasher.update(b"{");
+            for (index, (k, v)) in entries.into_iter().enumerate() {
+                if index > 0 {
+                    hasher.update(b",");
+                }
+                let _ = serde_json::to_writer(Sha256Writer(hasher), k.as_str());
+                hasher.update(b":");
+                hash_canonical_json(v, hasher);
             }
-            Value::Object(canonical)
+            hasher.update(b"}");
         }
-        Value::Array(arr) => Value::Array(arr.into_iter().map(canonical_json_value).collect()),
-        other => other,
+        Value::Array(arr) => {
+            hasher.update(b"[");
+            for (index, item) in arr.iter().enumerate() {
+                if index > 0 {
+                    hasher.update(b",");
+                }
+                hash_canonical_json(item, hasher);
+            }
+            hasher.update(b"]");
+        }
+        scalar => {
+            let _ = serde_json::to_writer(Sha256Writer(hasher), scalar);
+        }
     }
+}
+
+fn fingerprint_value(value: &Value) -> String {
+    let mut hasher = Sha256::new();
+    hash_canonical_json(value, &mut hasher);
+    format!("sha256-{}", hex::encode(hasher.finalize()))
 }
 
 #[cfg(test)]

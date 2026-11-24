@@ -33,13 +33,26 @@ pub fn compress_gzip(input: &[u8]) -> std::io::Result<Vec<u8>> {
 /// `"spec content corrupt or oversized"` message — operators investigate via
 /// the DB directly.
 pub fn decompress_gzip_capped(input: &[u8], max_output: usize) -> std::io::Result<Vec<u8>> {
-    let decoder = GzDecoder::new(input);
+    let mut decoder = GzDecoder::new(input);
     let mut buf = Vec::new();
-    decoder.take(max_output as u64 + 1).read_to_end(&mut buf)?;
-    if buf.len() > max_output {
-        return Err(std::io::Error::other(
-            "decompressed size exceeds max_output cap",
-        ));
+    let max_u64 = u64::try_from(max_output).unwrap_or(u64::MAX);
+    if let Some(limit) = max_u64.checked_add(1) {
+        decoder.take(limit).read_to_end(&mut buf)?;
+        if buf.len() > max_output {
+            return Err(std::io::Error::other(
+                "decompressed size exceeds max_output cap",
+            ));
+        }
+    } else {
+        // `max_output == u64::MAX as usize`: read up to `max_u64` bytes without
+        // overflowing `max_u64 + 1`, then probe one additional byte.
+        (&mut decoder).take(max_u64).read_to_end(&mut buf)?;
+        let mut extra = [0u8; 1];
+        if decoder.read(&mut extra)? > 0 {
+            return Err(std::io::Error::other(
+                "decompressed size exceeds max_output cap",
+            ));
+        }
     }
     Ok(buf)
 }

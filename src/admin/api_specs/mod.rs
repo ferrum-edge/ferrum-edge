@@ -42,7 +42,13 @@ pub(crate) fn declared_proxy_plugin_association_ids_from_stored_spec(
         );
         return std::collections::HashSet::new();
     }
-    let cap = usize::try_from(spec.uncompressed_size).unwrap_or(usize::MAX);
+    /// Upper bound for best-effort decompression of stored specs during PUT
+    /// association recovery so an untrusted or corrupt `uncompressed_size` DB
+    /// value can never disable the gzip-bomb cap.
+    const MAX_STORED_SPEC_ASSOC_DECOMPRESS_BYTES: usize = 64 * 1024 * 1024;
+    let cap = usize::try_from(spec.uncompressed_size)
+        .unwrap_or(MAX_STORED_SPEC_ASSOC_DECOMPRESS_BYTES)
+        .min(MAX_STORED_SPEC_ASSOC_DECOMPRESS_BYTES);
     let body = match crate::admin::spec_codec::decompress_gzip_capped(&spec.spec_content, cap) {
         Ok(body) => body,
         Err(error) => {

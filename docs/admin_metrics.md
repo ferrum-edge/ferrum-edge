@@ -131,7 +131,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 {
   "gateway": {
     "mode": "database",
-    "ferrum_version": "0.9.0",
+    "ferrum_version": "0.9.21",
     "uptime_seconds": 86472,
     "total_requests": 2594832,
     "status_codes_total": {

@@ -21042,7 +21042,7 @@ const UNSERVED_NAMESPACE_MARKED_MUTATIONS: &[(&str, &[&str])] = &[
     ("restoreConfig", &["200"]),
     ("createProxy", &["201"]),
     ("updateProxy", &["200"]),
-    ("deleteProxy", &["204"]),
+    ("deleteProxy", &["200", "204"]),
     ("createConsumer", &["201"]),
     ("updateConsumer", &["200"]),
     ("deleteConsumer", &["204"]),
@@ -21845,6 +21845,175 @@ fn ai_embedding_plaintext_opt_in_matches_schema_and_runtime() {
             ferrum_edge::plugins::validate_plugin_config("ai_semantic_firewall", &config).is_ok(),
             valid,
             "ai_semantic_firewall runtime admission for {config}"
+        );
+    }
+}
+
+#[test]
+fn openapi_structural_alignment_invariants_hold_across_paths_and_schemas() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    // 1. No GET operation may reference ReadOnly (403 on GET is Forbidden, not write read-only).
+    // 2. Every non-204/304 inline response (without $ref) must declare `content`.
+    for (path, path_item) in spec["paths"].as_object().expect("paths object") {
+        if let Some(get_responses) = path_item
+            .get("get")
+            .and_then(|op| op.get("responses"))
+            .and_then(serde_json::Value::as_object)
+        {
+            for (code, resp) in get_responses {
+                assert_ne!(
+                    resp.get("$ref").and_then(serde_json::Value::as_str),
+                    Some("#/components/responses/ReadOnly"),
+                    "GET {path} {code} must not reference ReadOnly"
+                );
+            }
+        }
+        for method in OPENAPI_HTTP_METHODS {
+            let Some(responses) = path_item
+                .get(*method)
+                .and_then(|op| op.get("responses"))
+                .and_then(serde_json::Value::as_object)
+            else {
+                continue;
+            };
+            for (code, resp) in responses {
+                if matches!(code.as_str(), "204" | "304") || resp.get("$ref").is_some() {
+                    continue;
+                }
+                assert!(
+                    resp.get("content").is_some(),
+                    "{method} {path} {code} inline response must declare `content`"
+                );
+            }
+        }
+    }
+
+    // 3. ClusterStatusDp.control_plane allows null (emitted when cp_connection_state is None).
+    assert_eq!(
+        spec.pointer("/components/schemas/ClusterStatusDp/properties/control_plane/type"),
+        Some(&json!(["object", "null"]))
+    );
+
+    // 4. All 6 TLS/ACME delete routes wire 409 to TlsRecordInUseConflict.
+    for op_id in [
+        "deleteAcmeCertificate",
+        "deleteManagedTlsCertificate",
+        "deleteManagedTlsCaBundle",
+        "deleteManagedTlsCrl",
+        "deleteManagedTlsOcspResponse",
+        "deleteManagedTlsJwks",
+    ] {
+        let (_, _, op) = openapi_operation_by_id(&spec, op_id);
+        assert_eq!(
+            op["responses"]["409"]["$ref"],
+            json!("#/components/responses/TlsRecordInUseConflict"),
+            "{op_id} 409 must reference TlsRecordInUseConflict"
+        );
+    }
+
+    // 5. GatewayTrustBundle and GatewayTrustBundleCreate enforce 254-byte id cap and closed shape.
+    for schema in ["GatewayTrustBundle", "GatewayTrustBundleCreate"] {
+        let obj = spec
+            .pointer(&format!("/components/schemas/{schema}"))
+            .unwrap_or_else(|| panic!("missing {schema}"));
+        assert_eq!(obj["additionalProperties"], json!(false));
+        assert_eq!(
+            obj["properties"]["id"]["maxLength"],
+            json!(ferrum_edge::config::gateway_trust::MAX_TRUST_BUNDLE_ID_BYTES)
+        );
+    }
+
+    // 6. ApiSpecSummary declares its required runtime fields.
+    let required: BTreeSet<&str> = spec
+        .pointer("/components/schemas/ApiSpecSummary/required")
+        .and_then(serde_json::Value::as_array)
+        .expect("ApiSpecSummary.required array")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    for field in [
+        "id",
+        "proxy_id",
+        "spec_version",
+        "spec_format",
+        "tags",
+        "server_urls",
+        "operation_count",
+        "uncompressed_size",
+        "content_hash",
+        "created_at",
+        "updated_at",
+    ] {
+        assert!(
+            required.contains(field),
+            "ApiSpecSummary.required missing `{field}`"
+        );
+    }
+}
+
+#[test]
+fn remaining_five_builtin_plugins_have_openapi_runtime_parity() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    for (plugin, component, valid_cfg, invalid_unknown_key_cfg) in [
+        (
+            "basic_auth",
+            "BasicAuthConfig",
+            json!({"hide_credentials": true}),
+            json!({"hide_credentials": true, "unknown_key": 1}),
+        ),
+        (
+            "otel_tracing",
+            "OtelTracingConfig",
+            json!({"root_sampling": "always_on"}),
+            json!({"root_sampling": "always_on", "unknown_key": 1}),
+        ),
+        (
+            "ai_request_guard",
+            "AiRequestGuardConfig",
+            json!({"max_tokens_limit": 2048}),
+            json!({"max_tokens_limit": 2048, "unknown_key": 1}),
+        ),
+        (
+            "a2a_gateway",
+            "A2aGatewayConfig",
+            json!({"discovery": {"public_base_url": "https://gateway.example.com"}}),
+            json!({"discovery": {"public_base_url": "https://gateway.example.com"}, "unknown_key": 1}),
+        ),
+        (
+            "mcp_gateway",
+            "McpGatewayConfig",
+            json!({
+                "mode": "transparent_proxy",
+                "servers": {
+                    "primary": {
+                        "upstream_url": "https://mcp.example.com/mcp"
+                    }
+                }
+            }),
+            json!({
+                "mode": "transparent_proxy",
+                "servers": {
+                    "primary": {
+                        "upstream_url": "https://mcp.example.com/mcp"
+                    }
+                },
+                "unknown_key": 1
+            }),
+        ),
+    ] {
+        assert_component_validity(&spec, component, &valid_cfg, true);
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config(plugin, &valid_cfg).is_ok(),
+            "{plugin} valid config rejected by runtime: {valid_cfg}"
+        );
+        assert_component_validity(&spec, component, &invalid_unknown_key_cfg, false);
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config(plugin, &invalid_unknown_key_cfg).is_err(),
+            "{plugin} unknown-key config accepted by runtime: {invalid_unknown_key_cfg}"
         );
     }
 }

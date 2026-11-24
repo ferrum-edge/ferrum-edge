@@ -69,7 +69,7 @@ cat ferrum-backup.json | jq '.counts'
 ```json
 {
   "version": "1",
-  "ferrum_version": "0.9.0",
+  "ferrum_version": "0.9.21",
   "exported_at": "2025-03-26T10:30:00Z",
   "source": "database",
   "counts": {

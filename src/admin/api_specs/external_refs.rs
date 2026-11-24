@@ -1373,8 +1373,7 @@ fn content_type_allowed(content_type: &str) -> bool {
             | "text/x-yaml"
             | "text/plain"
             | "application/octet-stream"
-    ) || media.ends_with("+json")
-        || media.ends_with("+yaml")
+    ) || (media.contains('/') && (media.ends_with("+json") || media.ends_with("+yaml")))
 }
 
 fn parse_loaded_document(
@@ -1388,26 +1387,34 @@ fn parse_loaded_document(
         });
     }
     let format = detect_format(bytes);
+    // Bound external JSON and YAML trees the same way API-spec admission does.
+    const MAX_EXTERNAL_DOC_NODES: usize = super::extractor::MAX_SOURCE_DOCUMENT_NODES;
     let root = match format {
-        "json" => serde_json::from_slice(bytes).map_err(|error| {
-            ExtractError::InvalidJson(format!(
-                "external document {}: {error}",
-                redact_reference(uri.as_str())
-            ))
-        })?,
-        _ => {
-            // Bound YAML the same way API-spec admission does.
-            const MAX_EXTERNAL_DOC_NODES: usize = 500_000;
-            super::bounded_yaml::parse_yaml_to_json(bytes, MAX_EXTERNAL_DOC_NODES).map_err(
-                |error| {
-                    ExtractError::InvalidYaml(format!(
-                        "external document {}: {}",
-                        redact_reference(uri.as_str()),
-                        error.message()
-                    ))
-                },
-            )?
+        "json" => {
+            let parsed: Value = serde_json::from_slice(bytes).map_err(|error| {
+                ExtractError::InvalidJson(format!(
+                    "external document {}: {error}",
+                    redact_reference(uri.as_str())
+                ))
+            })?;
+            let mut budget = MAX_EXTERNAL_DOC_NODES;
+            if !super::extractor::count_value_nodes(&parsed, &mut budget) {
+                return Err(ExtractError::InvalidJson(format!(
+                    "external document {} exceeds expanded node limit; reduce nesting",
+                    redact_reference(uri.as_str())
+                )));
+            }
+            parsed
         }
+        _ => super::bounded_yaml::parse_yaml_to_json(bytes, MAX_EXTERNAL_DOC_NODES).map_err(
+            |error| {
+                ExtractError::InvalidYaml(format!(
+                    "external document {}: {}",
+                    redact_reference(uri.as_str()),
+                    error.message()
+                ))
+            },
+        )?,
     };
     let digest = normalized_document_digest(&root);
     let mut canonical = uri.clone();

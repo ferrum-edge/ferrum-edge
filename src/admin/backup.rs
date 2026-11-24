@@ -223,16 +223,18 @@ fn parse_query_flag(query: Option<&str>, flag: &str) -> bool {
         Some(query) => query,
         None => return false,
     };
-    for pair in query.split('&') {
-        let mut parts = pair.splitn(2, '=');
-        if let (Some(key), Some(val)) = (parts.next(), parts.next())
-            && key == flag
-            && val == "true"
-        {
-            return true;
+    let mut saw_flag = false;
+    for (key, val) in url::form_urlencoded::parse(query.as_bytes()) {
+        if key == flag {
+            saw_flag = true;
+            if val != "true" {
+                // Fail closed on conflicting or non-true repeats (e.g.
+                // `?confirm=true&confirm=false`).
+                return false;
+            }
         }
     }
-    false
+    saw_flag
 }
 
 #[derive(Serialize)]
@@ -1010,6 +1012,16 @@ fn validate_restore_api_spec_ownership_graph(
         }
     }
 
+    let mut proxies_by_upstream: HashMap<&str, Vec<&str>> = HashMap::new();
+    for proxy in proxies {
+        if let Some(upstream_id) = proxy.upstream_id.as_deref() {
+            proxies_by_upstream
+                .entry(upstream_id)
+                .or_default()
+                .push(proxy.id.as_str());
+        }
+    }
+
     for spec in specs {
         let spec_id = spec.id.as_str();
         let owning_proxy_id = spec.proxy_id.as_str();
@@ -1038,14 +1050,14 @@ fn validate_restore_api_spec_ownership_graph(
             ));
         }
         for upstream in owned_upstreams {
-            for proxy in proxies {
-                if proxy.id != owning_proxy_id
-                    && proxy.upstream_id.as_deref() == Some(upstream.id.as_str())
-                {
-                    errors.push(format!(
-                        "api_spec '{spec_id}': spec-owned upstream '{}' is referenced by proxy '{}', which this api_spec does not own",
-                        upstream.id, proxy.id
-                    ));
+            if let Some(referencing_proxies) = proxies_by_upstream.get(upstream.id.as_str()) {
+                for &proxy_id in referencing_proxies {
+                    if proxy_id != owning_proxy_id {
+                        errors.push(format!(
+                            "api_spec '{spec_id}': spec-owned upstream '{}' is referenced by proxy '{}', which this api_spec does not own",
+                            upstream.id, proxy_id
+                        ));
+                    }
                 }
             }
         }

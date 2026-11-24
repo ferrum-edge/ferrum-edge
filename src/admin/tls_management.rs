@@ -1,7 +1,8 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 #[cfg(feature = "acme")]
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use http_body_util::Full;
@@ -24,20 +25,39 @@ use crate::tls::acme::{
 };
 use crate::tls::managed::{ManagedTlsError, ManagedTlsMaterialKind, ManagedTlsRecord};
 
+/// Process-level fallback `EnvConfig` for modes that run an Admin API without a
+/// `ProxyState` (`cp` and `node_agent`), so `GET /admin/tls/inventory`,
+/// `/metrics` TLS inventory, and `DELETE /admin/tls/*` reference guards see the
+/// process's own `FERRUM_*_TLS_*` sources instead of treating `env_config` as
+/// absent.
+static PROCESS_ENV_CONFIG: OnceLock<ArcSwap<Option<Arc<crate::config::EnvConfig>>>> =
+    OnceLock::new();
+
+fn process_env_config_slot() -> &'static ArcSwap<Option<Arc<crate::config::EnvConfig>>> {
+    PROCESS_ENV_CONFIG.get_or_init(|| ArcSwap::new(Arc::new(None)))
+}
+
+/// Register the running process's resolved `EnvConfig` for modes without a
+/// `ProxyState` (`cp`, `node_agent`).
+pub(crate) fn set_process_env_config(env_config: Arc<crate::config::EnvConfig>) {
+    process_env_config_slot().store(Arc::new(Some(env_config)));
+}
+
+fn effective_env_config(state: &AdminState) -> Option<Arc<crate::config::EnvConfig>> {
+    if let Some(proxy) = state.proxy_state.as_ref() {
+        return Some(Arc::clone(&proxy.env_config));
+    }
+    if state.mode == "cp" || state.mode == "node_agent" {
+        return process_env_config_slot().load().as_ref().clone();
+    }
+    None
+}
+
 pub(super) async fn handle_inventory(
     state: &AdminState,
     pagination: &PaginationParams,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let inventory = collect_inventory(state);
-    let body = super::paginate_response(&inventory.entries, pagination);
-    Ok(super::json_response(StatusCode::OK, &body))
-}
-
-pub(super) fn collect_inventory(state: &AdminState) -> crate::tls::inventory::TlsInventory {
-    let env_config = state
-        .proxy_state
-        .as_ref()
-        .map(|proxy| proxy.env_config.as_ref());
+    let env_config = effective_env_config(state);
     let config = state
         .proxy_state
         .as_ref()
@@ -48,7 +68,40 @@ pub(super) fn collect_inventory(state: &AdminState) -> crate::tls::inventory::Tl
                 .as_ref()
                 .map(|cached| cached.load_full())
         });
-    crate::tls::inventory::TlsInventory::collect(env_config, config.as_deref())
+    // `TlsInventory::collect` performs blocking filesystem/remote-secret I/O
+    // and X.509/CRL parsing; run it off the Tokio async worker threads.
+    let inventory = match tokio::task::spawn_blocking(move || {
+        crate::tls::inventory::TlsInventory::collect(env_config.as_deref(), config.as_deref())
+    })
+    .await
+    {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            tracing::error!("TLS inventory worker failed: {error}");
+            return Ok(super::json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "TLS inventory collection failed"}),
+            ));
+        }
+    };
+    let body = super::paginate_response(&inventory.entries, pagination);
+    Ok(super::json_response(StatusCode::OK, &body))
+}
+
+#[cfg(test)]
+pub(super) fn collect_inventory(state: &AdminState) -> crate::tls::inventory::TlsInventory {
+    let env_config = effective_env_config(state);
+    let config = state
+        .proxy_state
+        .as_ref()
+        .map(|proxy| proxy.config.load_full())
+        .or_else(|| {
+            state
+                .cached_config
+                .as_ref()
+                .map(|cached| cached.load_full())
+        });
+    crate::tls::inventory::TlsInventory::collect(env_config.as_deref(), config.as_deref())
 }
 
 /// Metrics-safe inventory producer for the cached snapshot (issue #2410).
@@ -82,10 +135,7 @@ impl crate::tls::inventory_cache::TlsInventoryCollector for AdminTlsInventoryCol
 fn metrics_inventory_collector(
     state: &AdminState,
 ) -> Arc<dyn crate::tls::inventory_cache::TlsInventoryCollector> {
-    let env_config = state
-        .proxy_state
-        .as_ref()
-        .map(|proxy| Arc::clone(&proxy.env_config));
+    let env_config = effective_env_config(state);
     let config = state
         .proxy_state
         .as_ref()
@@ -223,8 +273,8 @@ pub(super) async fn handle_list_acme_accounts(
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    let certificates = match certificate_store.list_certificates() {
-        Ok(certificates) => certificates,
+    let certificate_refs = match certificate_store.list_certificate_account_refs() {
+        Ok(refs) => refs,
         Err(error) => return Ok(acme_error_response(error)),
     };
     // A *missing* account store file is already a successful empty read inside
@@ -234,17 +284,18 @@ pub(super) async fn handle_list_acme_accounts(
     // document, a malformed lock-timeout setting. Reporting any of those as
     // "no persisted credentials" tells an operator their accounts are gone when
     // in fact they are unreachable, so it fails closed here instead.
-    let persisted_accounts = match acme_account_store_response() {
-        Ok(store) => match store.list_accounts() {
+    let persisted_account_metas = match acme_account_store_response() {
+        Ok(store) => match store.list_account_meta() {
             Ok(accounts) => accounts,
             Err(error) => return Ok(acme_error_response(error)),
         },
         Err(response) => return Ok(*response),
     };
-    let accounts = match order_store.list_accounts(&certificates, &persisted_accounts) {
-        Ok(accounts) => accounts,
-        Err(error) => return Ok(acme_error_response(error)),
-    };
+    let accounts =
+        match order_store.list_accounts_from_meta(&certificate_refs, &persisted_account_metas) {
+            Ok(accounts) => accounts,
+            Err(error) => return Ok(acme_error_response(error)),
+        };
     let body = super::paginate_response(&accounts, pagination);
     Ok(super::json_response(StatusCode::OK, &body))
 }
@@ -334,7 +385,7 @@ pub(super) async fn handle_update_certificate(
             ));
         }
     };
-    Ok(respond_managed_upsert(store, record, true, StatusCode::OK).await)
+    Ok(respond_managed_update(store, record).await)
 }
 
 pub(super) async fn handle_create_ca_bundle(
@@ -393,7 +444,7 @@ pub(super) async fn handle_update_ca_bundle(
             ));
         }
     };
-    Ok(respond_managed_upsert(store, record, true, StatusCode::OK).await)
+    Ok(respond_managed_update(store, record).await)
 }
 
 pub(super) async fn handle_create_crl(
@@ -451,7 +502,7 @@ pub(super) async fn handle_update_crl(
             ));
         }
     };
-    Ok(respond_managed_upsert(store, record, true, StatusCode::OK).await)
+    Ok(respond_managed_update(store, record).await)
 }
 
 pub(super) async fn handle_create_ocsp_response(
@@ -511,7 +562,7 @@ pub(super) async fn handle_update_ocsp_response(
             ));
         }
     };
-    Ok(respond_managed_upsert(store, record, true, StatusCode::OK).await)
+    Ok(respond_managed_update(store, record).await)
 }
 
 pub(super) async fn handle_create_jwks(
@@ -539,7 +590,9 @@ pub(super) async fn handle_create_jwks(
         }
     };
     let response = respond_managed_upsert(store, record, overwrite, StatusCode::CREATED).await;
-    refresh_managed_jwks_consumers().await;
+    if response.status().is_success() {
+        refresh_managed_jwks_consumers().await;
+    }
     Ok(response)
 }
 
@@ -603,11 +656,8 @@ pub(super) async fn handle_create_acme_order(
         }
         let (record, overwrite) = match acme_order_record_from_request(state, request).await {
             Ok(value) => value,
-            Err(error) => {
-                return Ok(super::json_response(
-                    StatusCode::BAD_REQUEST,
-                    &json!({"error": error}),
-                ));
+            Err((status, error)) => {
+                return Ok(super::json_response(status, &json!({"error": error})));
             }
         };
         let stored = match offload_store_write("acme_order_upsert", move || {
@@ -981,7 +1031,13 @@ pub(super) async fn handle_finalize_acme_order(
                     )}),
                 ));
             }
-            Err(error) => return Ok(acme_error_response(error)),
+            Err(error) => {
+                // The certificate above was already persisted, so watchers
+                // must still re-pull it even though the order record update
+                // failed.
+                request_managed_source_reloads();
+                return Ok(acme_error_response(error));
+            }
         };
         persist_acme_account_credentials(&updated_order).await;
         request_managed_source_reloads();
@@ -1017,7 +1073,7 @@ pub(super) async fn handle_update_acme_certificate(
             ));
         }
     };
-    Ok(respond_acme_certificate_upsert(store, record, true, StatusCode::OK).await)
+    Ok(respond_acme_certificate_update(store, record).await)
 }
 
 pub(super) async fn handle_delete_acme_certificate(
@@ -1026,6 +1082,15 @@ pub(super) async fn handle_delete_acme_certificate(
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(response) = state.admit_non_config_db_write().await {
         return Ok(response);
+    }
+    let store = match acme_certificate_store_response() {
+        Ok(store) => store,
+        Err(response) => return Ok(*response),
+    };
+    // Validate `id` and confirm the record exists before acquiring fleet-wide
+    // namespace config admission leases and scanning every namespace.
+    if let Err(error) = store.get_certificate(id) {
+        return Ok(acme_error_response(error));
     }
     // `fence` moves into the blocking delete below, which owns it until the
     // store mutation has concluded, even if this request is cancelled.
@@ -1043,10 +1108,6 @@ pub(super) async fn handle_delete_acme_certificate(
             }),
         ));
     }
-    let store = match acme_certificate_store_response() {
-        Ok(store) => store,
-        Err(response) => return Ok(*response),
-    };
     let id = id.to_string();
     let deleted = match offload_store_write("acme_certificate_delete", move || {
         tls_store_delete_hook(&id);
@@ -1169,11 +1230,8 @@ pub(super) async fn handle_renew_acme_certificate(
         .await
         {
             Ok(value) => value,
-            Err(error) => {
-                return Ok(super::json_response(
-                    StatusCode::BAD_REQUEST,
-                    &json!({"error": error}),
-                ));
+            Err((status, error)) => {
+                return Ok(super::json_response(status, &json!({"error": error})));
             }
         };
         let stored = match offload_store_write("acme_order_upsert", move || {
@@ -1225,8 +1283,10 @@ pub(super) async fn handle_update_jwks(
             ));
         }
     };
-    let response = respond_managed_upsert(store, record, true, StatusCode::OK).await;
-    refresh_managed_jwks_consumers().await;
+    let response = respond_managed_update(store, record).await;
+    if response.status().is_success() {
+        refresh_managed_jwks_consumers().await;
+    }
     Ok(response)
 }
 
@@ -1237,6 +1297,30 @@ pub(super) async fn handle_delete_managed(
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(response) = state.admit_non_config_db_write().await {
         return Ok(response);
+    }
+    let store = match managed_store_response() {
+        Ok(store) => store,
+        Err(response) => return Ok(*response),
+    };
+    // Validate `id`, existence, and kind BEFORE acquiring fleet-wide DB
+    // namespace admission leases and scanning every namespace. The kind and
+    // existence are re-checked atomically under the store lock below.
+    match store.get(id) {
+        Ok(record) if record.kind != kind => {
+            return Ok(super::json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({
+                    "error": format!(
+                        "managed TLS record '{}' has kind {}, expected {}",
+                        id,
+                        record.kind.as_str(),
+                        kind.as_str()
+                    )
+                }),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) => return Ok(managed_error_response(error)),
     }
     // `fence` moves into the blocking delete below, which owns it until the
     // store mutation has concluded, even if this request is cancelled.
@@ -1254,53 +1338,30 @@ pub(super) async fn handle_delete_managed(
             }),
         ));
     }
-    let store = match managed_store_response() {
-        Ok(store) => store,
+    let owned_id = id.to_string();
+    let deleted = match offload_store_write("managed_tls_delete", move || {
+        tls_store_delete_hook(&owned_id);
+        let deleted =
+            store.delete_kind_if_authorized(&owned_id, kind, tls_reference_fence_check(&fence));
+        drop(fence);
+        deleted
+    })
+    .await
+    {
+        Ok(deleted) => deleted,
         Err(response) => return Ok(*response),
     };
-    // Bound before the match so the store borrow ends here: the delete arm
-    // moves the store handle onto a blocking thread.
-    let existing = store.get(id);
-    match existing {
-        Ok(record) if record.kind != kind => Ok(super::json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({
-                "error": format!(
-                    "managed TLS record '{}' has kind {}, expected {}",
-                    id,
-                    record.kind.as_str(),
-                    kind.as_str()
-                )
-            }),
-        )),
-        Ok(_) => {
-            let owned_id = id.to_string();
-            let deleted = match offload_store_write("managed_tls_delete", move || {
-                tls_store_delete_hook(&owned_id);
-                let deleted =
-                    store.delete_if_authorized(&owned_id, tls_reference_fence_check(&fence));
-                drop(fence);
-                deleted
-            })
-            .await
-            {
-                Ok(deleted) => deleted,
-                Err(response) => return Ok(*response),
-            };
-            match deleted {
-                Ok(None) => Ok(tls_reference_fence_lost_response()),
-                Ok(Some(record)) => {
-                    request_managed_source_reloads();
-                    if kind == ManagedTlsMaterialKind::Jwks {
-                        refresh_managed_jwks_consumers().await;
-                    }
-                    Ok(super::json_response(
-                        StatusCode::OK,
-                        &json!({"deleted": true, "record": record.summary()}),
-                    ))
-                }
-                Err(error) => Ok(managed_error_response(error)),
+    match deleted {
+        Ok(None) => Ok(tls_reference_fence_lost_response()),
+        Ok(Some(record)) => {
+            request_managed_source_reloads();
+            if kind == ManagedTlsMaterialKind::Jwks {
+                refresh_managed_jwks_consumers().await;
             }
+            Ok(super::json_response(
+                StatusCode::OK,
+                &json!({"deleted": true, "record": record.summary()}),
+            ))
         }
         Err(error) => Ok(managed_error_response(error)),
     }
@@ -1549,15 +1610,17 @@ pub(super) async fn handle_rotate(
     }
     match requested_surfaces(surface) {
         Ok(RotateTarget::All) => {
-            let accepted = crate::tls::source::subscription::request_all_material_set_reloads();
+            // Reload SVID before triggering all watcher reloads so an SVID
+            // failure does not enqueue un-audited partial watcher reloads.
             let svid_revision = if gateway_svid_is_configured(state) {
-                match force_reload_gateway_svid(state) {
+                match force_reload_gateway_svid(state).await {
                     Ok(revision) => Some(revision),
                     Err(response) => return Ok(*response),
                 }
             } else {
                 None
             };
+            let accepted = crate::tls::source::subscription::request_all_material_set_reloads();
             if accepted.is_empty() && svid_revision.is_none() {
                 return Ok(super::json_response(
                     StatusCode::NOT_FOUND,
@@ -1598,7 +1661,7 @@ pub(super) async fn handle_rotate(
                 }),
             ))
         }
-        Ok(RotateTarget::GatewaySvid) => match force_reload_gateway_svid(state) {
+        Ok(RotateTarget::GatewaySvid) => match force_reload_gateway_svid(state).await {
             Ok(revision) => Ok(super::json_response(
                 StatusCode::ACCEPTED,
                 &json!({
@@ -1652,19 +1715,36 @@ fn gateway_svid_is_configured(state: &AdminState) -> bool {
     })
 }
 
-fn force_reload_gateway_svid(state: &AdminState) -> Result<u64, Box<Response<Full<Bytes>>>> {
+async fn force_reload_gateway_svid(state: &AdminState) -> Result<u64, Box<Response<Full<Bytes>>>> {
     let Some(proxy_state) = state.proxy_state.as_ref() else {
         return Err(Box::new(super::json_response(
             StatusCode::NOT_FOUND,
             &json!({"error": "proxy state is unavailable in this mode; gateway SVID cannot be reloaded"}),
         )));
     };
-    proxy_state.force_reload_gateway_svid().map_err(|error| {
-        Box::new(super::json_response(
+    if !gateway_svid_is_configured(state) {
+        return Err(Box::new(super::json_response(
+            StatusCode::NOT_FOUND,
+            &json!({"error": "gateway SVID sources are not configured"}),
+        )));
+    }
+    let proxy_state = proxy_state.clone();
+    // `force_reload_gateway_svid` performs blocking filesystem/remote-secret
+    // I/O and X.509/SPIFFE verification; offload from Tokio async workers.
+    match tokio::task::spawn_blocking(move || proxy_state.force_reload_gateway_svid()).await {
+        Ok(Ok(revision)) => Ok(revision),
+        Ok(Err(error)) => Err(Box::new(super::json_response(
             StatusCode::BAD_REQUEST,
             &json!({"error": error.to_string()}),
-        ))
-    })
+        ))),
+        Err(error) => {
+            tracing::error!("gateway SVID reload worker failed: {error}");
+            Err(Box::new(super::json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "gateway SVID reload worker failed"}),
+            )))
+        }
+    }
 }
 
 fn validate_tls_material(request: &TlsValidateRequest) -> Result<Value, String> {
@@ -1930,6 +2010,28 @@ async fn respond_managed_upsert(
     }
 }
 
+/// Atomically update an existing managed TLS record off the runtime worker.
+async fn respond_managed_update(
+    store: Arc<crate::tls::managed::ManagedTlsStore>,
+    record: ManagedTlsRecord,
+) -> Response<Full<Bytes>> {
+    let outcome = match offload_store_write("managed_tls_update", move || {
+        store.update_existing(record)
+    })
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(response) => return *response,
+    };
+    match outcome {
+        Ok(record) => {
+            request_managed_source_reloads();
+            super::json_response(StatusCode::OK, &json!(record.summary()))
+        }
+        Err(error) => managed_error_response(error),
+    }
+}
+
 /// Persist an ACME certificate record off the runtime worker.
 async fn respond_acme_certificate_upsert(
     store: Arc<crate::tls::acme::AcmeCertificateStore>,
@@ -1949,6 +2051,28 @@ async fn respond_acme_certificate_upsert(
         Ok(record) => {
             request_managed_source_reloads();
             super::json_response(success, &json!(record.summary()))
+        }
+        Err(error) => acme_error_response(error),
+    }
+}
+
+/// Atomically update an existing ACME certificate record off the runtime worker.
+async fn respond_acme_certificate_update(
+    store: Arc<crate::tls::acme::AcmeCertificateStore>,
+    record: AcmeCertificateRecord,
+) -> Response<Full<Bytes>> {
+    let outcome = match offload_store_write("acme_certificate_update", move || {
+        store.update_existing_certificate(record)
+    })
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(response) => return *response,
+    };
+    match outcome {
+        Ok(record) => {
+            request_managed_source_reloads();
+            super::json_response(StatusCode::OK, &json!(record.summary()))
         }
         Err(error) => acme_error_response(error),
     }
@@ -2280,19 +2404,42 @@ fn acme_dns_cache(state: &AdminState) -> Result<crate::dns::DnsCache, String> {
 }
 
 #[cfg(feature = "acme")]
+fn classify_acme_prepare_error(
+    error: crate::tls::acme::client::AcmeClientError,
+) -> (StatusCode, String) {
+    use crate::tls::acme::client::AcmeClientError;
+    match error {
+        AcmeClientError::InvalidRequest(_) | AcmeClientError::EgressPolicy(_) => {
+            (StatusCode::BAD_REQUEST, error.to_string())
+        }
+        AcmeClientError::DeserializeCredentials(_) => (
+            StatusCode::BAD_REQUEST,
+            "failed to deserialize ACME account credentials".to_string(),
+        ),
+        AcmeClientError::SerializeCredentials(_)
+        | AcmeClientError::Client(_)
+        | AcmeClientError::UnusableFinalizationMaterial
+        | AcmeClientError::TerminalInvalidOrder => (StatusCode::BAD_GATEWAY, error.to_string()),
+    }
+}
+
+#[cfg(feature = "acme")]
 async fn acme_order_record_from_request(
     state: &AdminState,
     request: AcmeOrderRequest,
-) -> Result<(AcmeOrderRecord, bool), String> {
-    let id = managed_request_id(None, request.id.as_deref())?;
-    let certificate_id = optional_resource_id(request.certificate_id.as_deref(), "certificate_id")?;
-    let domains = normalize_acme_domains(request.domains)?;
+) -> Result<(AcmeOrderRecord, bool), (StatusCode, String)> {
+    let bad_req = |msg: String| (StatusCode::BAD_REQUEST, msg);
+    let id = managed_request_id(None, request.id.as_deref()).map_err(bad_req)?;
+    let certificate_id = optional_resource_id(request.certificate_id.as_deref(), "certificate_id")
+        .map_err(bad_req)?;
+    let domains = normalize_acme_domains(request.domains).map_err(bad_req)?;
     let directory_url =
-        validated_optional_acme_string(Some(request.directory_url), "directory_url")?
-            .ok_or_else(|| "directory_url must not be empty".to_string())?;
+        validated_optional_acme_string(Some(request.directory_url), "directory_url")
+            .map_err(bad_req)?
+            .ok_or_else(|| bad_req("directory_url must not be empty".to_string()))?;
     // The ACME client (`client::prepare_order`) validates the directory URL against
     // SSRF policy at the outbound chokepoint below, so no separate check is needed here.
-    let contact = normalize_acme_contact(request.contact)?;
+    let contact = normalize_acme_contact(request.contact).map_err(bad_req)?;
     let existing_account_credentials_json = request
         .existing_account_credentials_json
         .map(crate::tls::source::SecretString::new);
@@ -2306,21 +2453,21 @@ async fn acme_order_record_from_request(
             existing_credentials_json: existing_account_credentials_json,
         },
         domains: domains.clone(),
-        dns_cache: acme_dns_cache(state)?,
+        dns_cache: acme_dns_cache(state).map_err(|error| (StatusCode::BAD_GATEWAY, error))?,
     };
 
     let prepared = match challenge_type {
         AcmeChallengeType::Http01 => crate::tls::acme::client::prepare_http01_order(order_config)
             .await
-            .map_err(|error| error.to_string())?,
+            .map_err(classify_acme_prepare_error)?,
         AcmeChallengeType::TlsAlpn01 => {
             crate::tls::acme::client::prepare_tls_alpn01_order(order_config)
                 .await
-                .map_err(|error| error.to_string())?
+                .map_err(classify_acme_prepare_error)?
         }
         AcmeChallengeType::Dns01 => crate::tls::acme::client::prepare_dns01_order(order_config)
             .await
-            .map_err(|error| error.to_string())?,
+            .map_err(classify_acme_prepare_error)?,
     };
 
     let mut http01_challenges = Vec::new();
@@ -2919,12 +3066,8 @@ async fn tls_record_usage(
     // view in file and DP modes, and in database mode a reference the
     // running gateway still holds after it was removed from the store.
     let mut local = Vec::new();
-    if let Some(env_config) = state
-        .proxy_state
-        .as_ref()
-        .map(|proxy| proxy.env_config.as_ref())
-    {
-        local.extend(env_source_references(env_config));
+    if let Some(env_config) = effective_env_config(state) {
+        local.extend(env_source_references(&env_config));
     }
     let served = state
         .proxy_state

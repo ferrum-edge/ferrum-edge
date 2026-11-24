@@ -162,7 +162,12 @@ pub(super) async fn consumer_verification(
     .await
     .is_err()
     {
-        return Ok(super::backup_audit_admit_failed_response());
+        return Ok(json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({
+                "error": "Consumer verification aborted: security audit record could not be admitted"
+            }),
+        ));
     }
     let response = json_response(StatusCode::OK, &body);
     Ok(with_tag(response, &preconditions::quoted(&tag)))

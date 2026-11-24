@@ -290,7 +290,7 @@ External and cross-document `$ref` resolution is **explicitly opt-in** and runs 
 **Gates (both required):**
 
 1. Process: `FERRUM_ADMIN_SPEC_EXTERNAL_REFS_ENABLED=true` (default `false`). See [configuration.md](configuration.md).
-2. Per-spec: `x-ferrum-external-refs: true` or an object:
+2. Per-spec: `x-ferrum-external-refs: true` (or `false` to explicitly disable) or an object:
 
 ```yaml
 x-ferrum-external-refs:

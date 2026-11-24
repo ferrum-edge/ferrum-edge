@@ -1132,7 +1132,7 @@ fn health_detail_blocks_are_built_only_for_the_detailed_tier() {
     let source = include_str!("../../../src/admin/mod.rs");
     let health = admin_source_section(
         source,
-        "if path == \"/health\" || path == \"/status\" {",
+        "if (path == \"/health\" || path == \"/status\") && method == Method::GET {",
         "// Overload status.",
     );
     for call in [
@@ -1161,4 +1161,576 @@ fn health_detail_blocks_are_built_only_for_the_detailed_tier() {
             "{call} must be built only inside a `detailed` gate; enclosing headers: {headers:?}"
         );
     }
+}
+
+async fn send_raw_admin_request_with_headers(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    extra_headers: &[(&str, &str)],
+    body: &str,
+) -> String {
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect to admin listener");
+    let mut request = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n");
+    if let Some(tok) = token {
+        request.push_str(&format!("Authorization: Bearer {tok}\r\n"));
+    }
+    for (k, v) in extra_headers {
+        request.push_str(&format!("{k}: {v}\r\n"));
+    }
+    request.push_str(&format!(
+        "Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    ));
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write admin request");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .expect("read admin response");
+    String::from_utf8(response).expect("admin response should be utf-8")
+}
+
+fn raw_http_json_body(response: &str) -> serde_json::Value {
+    let (_, body) = response
+        .split_once("\r\n\r\n")
+        .expect("HTTP response header/body separator");
+    serde_json::from_str(body).unwrap_or_else(|e| panic!("invalid JSON body ({e}): {body}"))
+}
+
+#[tokio::test]
+async fn health_live_and_status_reject_non_get_methods() {
+    let config = TestConfig::default();
+    let admin_state = create_test_admin_state(&config);
+    let listener = tokio::net::TcpListener::bind(config.admin_addr)
+        .await
+        .expect("bind admin listener");
+    let addr = listener.local_addr().expect("admin listener addr");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let server = tokio::spawn(async move {
+        ferrum_edge::admin::serve_admin_on_listener(
+            listener,
+            admin_state,
+            shutdown_rx,
+            None,
+            ferrum_edge::admin::AdminConnLimiter::unlimited(),
+        )
+        .await
+    });
+
+    for path in ["/live", "/health", "/status"] {
+        let get_resp = send_raw_admin_request_with_headers(addr, "GET", path, None, &[], "").await;
+        assert_eq!(
+            raw_http_status(&get_resp),
+            200,
+            "GET {path} should succeed anonymously"
+        );
+
+        let post_resp =
+            send_raw_admin_request_with_headers(addr, "POST", path, None, &[], "").await;
+        assert_eq!(
+            raw_http_status(&post_resp),
+            401,
+            "unauthenticated POST {path} must not bypass auth via GET probe routes: {post_resp}"
+        );
+    }
+
+    let admin_token = generate_test_token_with_role(&config, "admin-user", "admin");
+    for path in ["/live", "/health", "/status"] {
+        let post_resp =
+            send_raw_admin_request_with_headers(addr, "POST", path, Some(&admin_token), &[], "")
+                .await;
+        assert_ne!(
+            raw_http_status(&post_resp),
+            200,
+            "authenticated POST {path} must not be treated as a GET probe: {post_resp}"
+        );
+    }
+
+    shutdown_tx.send(true).expect("signal admin shutdown");
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn if_match_and_conditional_do_not_preempt_forbidden_on_delete_and_bodyless_post() {
+    let config = TestConfig::default();
+    let admin_state = create_test_admin_state(&config);
+    let listener = tokio::net::TcpListener::bind(config.admin_addr)
+        .await
+        .expect("bind admin listener");
+    let addr = listener.local_addr().expect("admin listener addr");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let server = tokio::spawn(async move {
+        ferrum_edge::admin::serve_admin_on_listener(
+            listener,
+            admin_state,
+            shutdown_rx,
+            None,
+            ferrum_edge::admin::AdminConnLimiter::unlimited(),
+        )
+        .await
+    });
+
+    let viewer_token = generate_test_token_with_role(&config, "viewer-user", "viewer");
+    let operator_token = generate_test_token_with_role(&config, "operator-user", "operator");
+
+    for (token, method, path, headers) in [
+        (
+            &viewer_token,
+            "DELETE",
+            "/proxies/p1",
+            vec![("If-Match", "malformed")],
+        ),
+        (
+            &viewer_token,
+            "DELETE",
+            "/proxies/p1?conditional=true",
+            vec![("If-Match", "malformed")],
+        ),
+        (
+            &operator_token,
+            "DELETE",
+            "/api-specs/s1",
+            vec![("If-Match", "\"etag\"")],
+        ),
+        (
+            &operator_token,
+            "DELETE",
+            "/gateway-trust-bundles/b1",
+            vec![("If-Match", "\"etag\"")],
+        ),
+        (
+            &operator_token,
+            "POST",
+            "/namespaces",
+            vec![("If-Match", "\"etag\"")],
+        ),
+        (
+            &operator_token,
+            "POST",
+            "/restore?confirm=true",
+            vec![("If-Match", "malformed")],
+        ),
+    ] {
+        let resp =
+            send_raw_admin_request_with_headers(addr, method, path, Some(token), &headers, "{}")
+                .await;
+        assert_eq!(
+            raw_http_status(&resp),
+            403,
+            "{method} {path} with {:?} must return 403 Forbidden before precondition 400: {resp}",
+            headers
+        );
+    }
+
+    shutdown_tx.send(true).expect("signal admin shutdown");
+    let _ = server.await;
+}
+
+#[test]
+fn failed_restore_and_atomic_delete_helpers_record_failure_or_unknown_outcome() {
+    let source = include_str!("../../../src/admin/mod.rs");
+    for (fn_sig, expected_outcome) in [
+        ("async fn finish_failed_restore(", "AuditOutcome::Failure"),
+        (
+            "async fn finish_failed_restore_after_intervening_clear(",
+            "AuditOutcome::Failure",
+        ),
+        (
+            "async fn finish_atomic_delete_failure(",
+            "AuditOutcome::Failure",
+        ),
+        (
+            "async fn finish_unknown_atomic_delete_failure(",
+            "AuditOutcome::UnknownOutcome",
+        ),
+    ] {
+        let body = admin_source_section(source, fn_sig, "\nasync fn ");
+        assert!(
+            body.contains(expected_outcome),
+            "{fn_sig} must set {expected_outcome} on its audit event"
+        );
+    }
+}
+
+#[test]
+fn gateway_trust_bundle_record_validate_fields_enforces_resource_id_and_254_byte_cap() {
+    use ferrum_edge::config::gateway_trust::{GatewayTrustBundleRecord, MAX_TRUST_BUNDLE_ID_BYTES};
+    assert_eq!(MAX_TRUST_BUNDLE_ID_BYTES, 254);
+
+    let make_record = |id: &str| -> GatewayTrustBundleRecord {
+        serde_json::from_value(json!({
+            "id": id,
+            "namespace": "ferrum",
+            "trust_domain": "cluster.local",
+            "bundle": {
+                "local": {
+                    "trust_domain": "cluster.local",
+                    "x509_authorities": []
+                }
+            }
+        }))
+        .expect("deserialize GatewayTrustBundleRecord")
+    };
+
+    for invalid_id in [
+        "../escape",
+        "has space",
+        "slash/id",
+        &"a".repeat(MAX_TRUST_BUNDLE_ID_BYTES + 1),
+    ] {
+        let errs = make_record(invalid_id)
+            .validate_fields()
+            .expect_err("invalid trust bundle id must be rejected");
+        assert!(
+            errs.iter().any(|e| e.contains("id")),
+            "expected id error for {invalid_id:?}, got {errs:?}"
+        );
+    }
+
+    let valid_254 = "a".repeat(MAX_TRUST_BUNDLE_ID_BYTES);
+    let errs = make_record(&valid_254)
+        .validate_fields()
+        .expect_err("empty x509_authorities still fails material validation");
+    assert!(
+        !errs
+            .iter()
+            .any(|e| e.starts_with("id ") || e.contains("trust bundle id")),
+        "254-byte valid resource id must pass id validation: {errs:?}"
+    );
+}
+
+#[tokio::test]
+async fn restore_confirm_query_flag_fails_closed_on_repeated_false() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("restore_confirm.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store = ferrum_edge::config::db_loader::DatabaseStore::connect_with_pool_config(
+        "sqlite",
+        &db_url,
+        ferrum_edge::config::db_loader::DbPoolConfig::default(),
+    )
+    .await
+    .expect("connect sqlite store");
+
+    let config = TestConfig::default();
+    let mut admin_state = create_test_admin_state(&config);
+    admin_state.db = Some(Arc::new(store));
+    admin_state.mode = "database".to_string();
+
+    let listener = tokio::net::TcpListener::bind(config.admin_addr)
+        .await
+        .expect("bind admin listener");
+    let addr = listener.local_addr().expect("admin listener addr");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let server = tokio::spawn(async move {
+        ferrum_edge::admin::serve_admin_on_listener(
+            listener,
+            admin_state,
+            shutdown_rx,
+            None,
+            ferrum_edge::admin::AdminConnLimiter::unlimited(),
+        )
+        .await
+    });
+
+    let admin_token = generate_test_token_with_role(&config, "admin-user", "admin");
+    let resp = send_raw_admin_request_with_headers(
+        addr,
+        "POST",
+        "/restore?confirm=true&confirm=false",
+        Some(&admin_token),
+        &[],
+        "{}",
+    )
+    .await;
+    assert_eq!(
+        raw_http_status(&resp),
+        400,
+        "repeated confirm=true&confirm=false must fail closed with 400: {resp}"
+    );
+
+    shutdown_tx.send(true).expect("signal admin shutdown");
+    let _ = server.await;
+}
+
+#[test]
+fn decompress_gzip_capped_handles_usize_max_without_overflow() {
+    use flate2::{Compression, write::GzEncoder};
+    let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(b"hello ferrum").expect("write gzip payload");
+    let compressed = enc.finish().expect("finish gzip");
+
+    let out = ferrum_edge::admin::spec_codec::decompress_gzip_capped(&compressed, usize::MAX)
+        .expect("usize::MAX cap must not overflow");
+    assert_eq!(out, b"hello ferrum");
+}
+
+#[tokio::test]
+async fn crud_put_preserves_created_at_across_updates() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("crud_created_at.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store = ferrum_edge::config::db_loader::DatabaseStore::connect_with_pool_config(
+        "sqlite",
+        &db_url,
+        ferrum_edge::config::db_loader::DbPoolConfig::default(),
+    )
+    .await
+    .expect("connect sqlite store");
+
+    let config = TestConfig::default();
+    let mut admin_state = create_test_admin_state(&config);
+    admin_state.db = Some(Arc::new(store));
+    admin_state.mode = "database".to_string();
+
+    let listener = tokio::net::TcpListener::bind(config.admin_addr)
+        .await
+        .expect("bind admin listener");
+    let addr = listener.local_addr().expect("admin listener addr");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let server = tokio::spawn(async move {
+        ferrum_edge::admin::serve_admin_on_listener(
+            listener,
+            admin_state,
+            shutdown_rx,
+            None,
+            ferrum_edge::admin::AdminConnLimiter::unlimited(),
+        )
+        .await
+    });
+
+    let admin_token = generate_test_token_with_role(&config, "admin-user", "admin");
+
+    // 1. Proxy create + update
+    let create_proxy = send_raw_admin_request(
+        addr,
+        "POST",
+        "/proxies",
+        &admin_token,
+        &json!({
+            "id": "p-preserve",
+            "name": "initial",
+            "listen_path": "/preserve",
+            "backend_url": "https://example.com"
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(raw_http_status(&create_proxy), 201, "{create_proxy}");
+    let created_proxy = raw_http_json_body(&create_proxy);
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let update_proxy = send_raw_admin_request(
+        addr,
+        "PUT",
+        "/proxies/p-preserve",
+        &admin_token,
+        &json!({
+            "name": "updated",
+            "listen_path": "/preserve",
+            "backend_url": "https://example.com"
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(raw_http_status(&update_proxy), 200, "{update_proxy}");
+    let updated_proxy = raw_http_json_body(&update_proxy);
+    assert_eq!(
+        updated_proxy["created_at"], created_proxy["created_at"],
+        "PUT /proxies/{{id}} must preserve created_at"
+    );
+
+    // 2. Upstream create + update
+    let create_upstream = send_raw_admin_request(
+        addr,
+        "POST",
+        "/upstreams",
+        &admin_token,
+        &json!({
+            "id": "u-preserve",
+            "name": "initial-u",
+            "targets": [{"host": "example.com", "port": 443, "weight": 100}]
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(raw_http_status(&create_upstream), 201, "{create_upstream}");
+    let created_upstream = raw_http_json_body(&create_upstream);
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let update_upstream = send_raw_admin_request(
+        addr,
+        "PUT",
+        "/upstreams/u-preserve",
+        &admin_token,
+        &json!({
+            "name": "updated-u",
+            "targets": [{"host": "example.com", "port": 8443, "weight": 100}]
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(raw_http_status(&update_upstream), 200, "{update_upstream}");
+    let updated_upstream = raw_http_json_body(&update_upstream);
+    assert_eq!(
+        updated_upstream["created_at"], created_upstream["created_at"],
+        "PUT /upstreams/{{id}} must preserve created_at"
+    );
+
+    // 3. Consumer create + update
+    let create_consumer = send_raw_admin_request(
+        addr,
+        "POST",
+        "/consumers",
+        &admin_token,
+        &json!({
+            "id": "c-preserve",
+            "username": "alice-preserve"
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(raw_http_status(&create_consumer), 201, "{create_consumer}");
+    let created_consumer = raw_http_json_body(&create_consumer);
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let update_consumer = send_raw_admin_request(
+        addr,
+        "PUT",
+        "/consumers/c-preserve",
+        &admin_token,
+        &json!({
+            "username": "alice-preserve-updated"
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(raw_http_status(&update_consumer), 200, "{update_consumer}");
+    let updated_consumer = raw_http_json_body(&update_consumer);
+    assert_eq!(
+        updated_consumer["created_at"], created_consumer["created_at"],
+        "PUT /consumers/{{id}} must preserve created_at"
+    );
+
+    shutdown_tx.send(true).expect("signal admin shutdown");
+    let _ = server.await;
+}
+
+#[test]
+fn managed_tls_store_atomic_update_existing_and_delete_kind() {
+    use ferrum_edge::tls::managed::{
+        ManagedTlsError, ManagedTlsMaterialKind, ManagedTlsRecord, ManagedTlsStore,
+    };
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = ManagedTlsStore::open(dir.path()).expect("open managed tls store");
+
+    let jwks_v1 = ManagedTlsRecord::new_jwks(
+        "rec-1".to_string(),
+        "jwks-v1".to_string(),
+        None,
+        r#"{"keys":[]}"#.to_string(),
+    );
+
+    // update_existing fails with NotFound when absent (never silently creates)
+    assert!(matches!(
+        store.update_existing(jwks_v1.clone()),
+        Err(ManagedTlsError::NotFound(_))
+    ));
+
+    // Create initial JWKS record
+    let created = store.upsert(jwks_v1, false).expect("create jwks");
+
+    // Cross-kind update_existing fails with KindConflict
+    let ca_wrong_kind = ManagedTlsRecord::new_ca_bundle(
+        "rec-1".to_string(),
+        "ca-clash".to_string(),
+        None,
+        "dummy-ca".to_string(),
+    );
+    assert!(matches!(
+        store.update_existing(ca_wrong_kind),
+        Err(ManagedTlsError::KindConflict {
+            existing_kind: "jwks",
+            requested_kind: "ca_bundle",
+            ..
+        })
+    ));
+
+    // Same-kind update_existing succeeds and preserves created_at
+    let jwks_v2 = ManagedTlsRecord::new_jwks(
+        "rec-1".to_string(),
+        "jwks-v2".to_string(),
+        None,
+        r#"{"keys":[]}"#.to_string(),
+    );
+    let updated = store.update_existing(jwks_v2).expect("update jwks");
+    assert_eq!(updated.created_at, created.created_at);
+    assert_eq!(updated.name, "jwks-v2");
+
+    // delete_kind_if_authorized rejects wrong kind atomically without deleting
+    assert!(matches!(
+        store.delete_kind_if_authorized("rec-1", ManagedTlsMaterialKind::CaBundle, || true),
+        Err(ManagedTlsError::WrongKind { .. })
+    ));
+    assert!(
+        store.get("rec-1").is_ok(),
+        "wrong-kind delete must not remove record"
+    );
+
+    // delete_kind_if_authorized deletes matching kind when authorized
+    let deleted = store
+        .delete_kind_if_authorized("rec-1", ManagedTlsMaterialKind::Jwks, || true)
+        .expect("delete matching kind");
+    assert!(deleted.is_some());
+    assert!(matches!(
+        store.get("rec-1"),
+        Err(ManagedTlsError::NotFound(_))
+    ));
+}
+
+#[test]
+fn acme_certificate_store_update_existing_rejects_missing() {
+    use ferrum_edge::tls::acme::{
+        AcmeCertificateRecord, AcmeCertificateStore, AcmeError, AcmeIssuedCertificateInput,
+    };
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = AcmeCertificateStore::open(dir.path()).expect("open acme cert store");
+
+    let cert = rcgen::generate_simple_self_signed(vec!["example.com".to_string()])
+        .expect("generate self-signed cert");
+    let record = AcmeCertificateRecord::new_issued(AcmeIssuedCertificateInput {
+        id: "acme-missing".to_string(),
+        domains: vec!["example.com".to_string()],
+        directory_url: "https://acme-staging-v02.api.letsencrypt.org/directory".to_string(),
+        account_id: None,
+        order_url: None,
+        cert_pem: cert.cert.pem(),
+        key_pem: cert.signing_key.serialize_pem(),
+        chain_pem: None,
+    })
+    .expect("build acme cert record");
+
+    assert!(matches!(
+        store.update_existing_certificate(record.clone()),
+        Err(AcmeError::NotFound(_))
+    ));
+    store
+        .upsert_certificate(record.clone(), false)
+        .expect("insert acme cert");
+    let updated = store
+        .update_existing_certificate(record)
+        .expect("update existing acme cert");
+    assert_eq!(updated.id, "acme-missing");
 }

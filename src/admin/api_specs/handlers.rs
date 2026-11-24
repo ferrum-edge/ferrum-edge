@@ -23,7 +23,7 @@ use uuid::Uuid;
 use crate::admin::api_specs::bounded_yaml::parse_yaml_to_json;
 use crate::admin::api_specs::extractor::MAX_SOURCE_DOCUMENT_NODES;
 use crate::admin::api_specs::{
-    ExtractError, ExtractedBundle, SpecFormat, extract_with_external_refs, hash_resource_bundle,
+    ExtractError, ExtractedBundle, SpecFormat, extract_with_external_refs,
 };
 use crate::admin::audit::{self, AuditActor};
 use crate::admin::crud::{AfterValidateError, validate_stream_port_candidate};
@@ -728,9 +728,11 @@ pub(super) fn parse_content_type(headers: &hyper::HeaderMap) -> Option<SpecForma
 fn parse_accept_quality(params: &str) -> u32 {
     for param in params.split(';') {
         let p = param.trim();
-        // Parse up to 3 decimal places; clamp to [0, 1000].
+        // Parse up to 3 decimal places; clamp to [0, 1000]. Reject NaN/Inf so
+        // malformed `q=NaN` never silently casts to `0` (`q=0`).
         if let Some(rest) = p.strip_prefix("q=").or_else(|| p.strip_prefix("Q="))
             && let Ok(f) = rest.parse::<f64>()
+            && f.is_finite()
         {
             return (f * 1000.0).round().clamp(0.0, 1000.0) as u32;
         }
@@ -740,163 +742,76 @@ fn parse_accept_quality(params: &str) -> u32 {
 
 /// Resolve the response format from an `Accept` header vs the stored format.
 ///
-/// Returns the `SpecFormat` the caller should use to serialise the body.
-///
-/// Rules:
-/// - Missing, `*/*`, or matching stored format → stored format
-/// - `application/json` and stored is YAML     → Json (convert)
-/// - `application/yaml` / `text/yaml` etc. and stored is JSON → Yaml (convert)
-/// - Unknown accept types                       → stored format (best-effort)
-///
-/// Uses a small media-range parser: splits on `,`, strips `q=` quality
-/// parameters, trims whitespace, and compares exact tokens.  Wildcards
-/// (`*/*`, `application/*`) accept the stored format.  Highest-quality
-/// match wins; ties resolve to the first listed entry.
-pub(super) fn negotiate_accept(headers: &hyper::HeaderMap, stored: SpecFormat) -> SpecFormat {
-    let accept = headers
-        .get("accept")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    if accept.is_empty() {
-        return stored;
-    }
-
-    let mut best_json: Option<u32> = None;
-    let mut best_yaml: Option<u32> = None;
-    let mut best_wildcard: Option<u32> = None;
-
-    for entry in accept.split(',') {
-        // Split type/subtype from parameters.
-        let mut parts = entry.splitn(2, ';');
-        let media_type_raw = parts.next().unwrap_or("").trim();
-        let params = parts.next().unwrap_or("");
-        let q = parse_accept_quality(params);
-
-        // RFC 7231 §3.1.1.1: media type tokens (type/subtype) are
-        // case-insensitive. Normalize before matching so that headers like
-        // `Accept: Application/JSON` are recognized.
-        let media_type = media_type_raw.to_ascii_lowercase();
-
-        match media_type.as_str() {
-            "*/*" | "application/*" if best_wildcard.is_none_or(|prev| q > prev) => {
-                best_wildcard = Some(q);
-            }
-            "application/json" if best_json.is_none_or(|prev| q > prev) => {
-                best_json = Some(q);
-            }
-            "application/yaml" | "application/x-yaml" | "text/yaml" | "text/x-yaml"
-                if best_yaml.is_none_or(|prev| q > prev) =>
-            {
-                best_yaml = Some(q);
-            }
-            // Unknown media types, and lower-quality repeats of a listed
-            // one, are ignored.
-            _ => {}
-        }
-    }
-
-    // Compute effective per-format quality, honoring RFC 7231 §5.3.2:
-    //   - An explicit `q=0` for a media range means the client refuses that
-    //     representation; the wildcard fallback does NOT override it.
-    //   - An absent media range falls back to the wildcard quality if any.
-    let wildcard_q = best_wildcard.unwrap_or(0);
-
-    // For each format: explicit value (incl. q=0) wins; otherwise inherit wildcard.
-    let json_q = best_json.unwrap_or(wildcard_q);
-    let yaml_q = best_yaml.unwrap_or(wildcard_q);
-
-    // Did the client mention any of OUR buckets at all? (json/yaml/wildcard).
-    // If not, we default to stored as before — RFC permits serving any
-    // representation when no Accept rules match.
-    let saw_relevant = best_json.is_some() || best_yaml.is_some() || best_wildcard.is_some();
-    if !saw_relevant {
-        return stored;
-    }
-
-    // If the client mentioned our buckets but every effective quality is 0,
-    // they have explicitly rejected every representation we can serve. Signal
-    // this by returning the stored format — but the caller is expected to
-    // detect "all q=0" and translate to 406 Not Acceptable. Today the caller
-    // only wires 406 on conversion failure; an explicit 406-on-q=0 path lives
-    // in the public wrapper below.
-    //
-    // Pick the highest non-zero effective quality. Ties go to stored.
-    if json_q == 0 && yaml_q == 0 {
-        // Neither format is acceptable. The public wrapper interprets this
-        // by returning None instead.
-        return stored; // sentinel; the wrapper detects this case via accept_acceptable.
-    }
-
-    if json_q > yaml_q {
-        SpecFormat::Json
-    } else if yaml_q > json_q {
-        SpecFormat::Yaml
-    } else {
-        // Equal qualities — prefer stored.
-        stored
-    }
-}
-
-/// Returns `None` when the client's `Accept` header explicitly rejects every
-/// representation the server can serve (all relevant buckets at `q=0`). The
-/// caller should respond with 406 Not Acceptable in that case.
-///
-/// Returns `Some(format)` otherwise — either the negotiated format, or the
-/// stored format as a default when no relevant `Accept` entries were sent.
+/// Returns `Some(format)` when at least one representation is acceptable (or
+/// when no relevant `Accept` media ranges were supplied, defaulting to
+/// `stored`), and `None` when the client explicitly rejected every
+/// representation we can serve (`q=0`), signaling `406 Not Acceptable`.
 pub(super) fn negotiate_accept_or_406(
     headers: &hyper::HeaderMap,
     stored: SpecFormat,
 ) -> Option<SpecFormat> {
-    let accept = headers
-        .get("accept")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .trim();
-    if accept.is_empty() {
-        return Some(stored);
-    }
+    let mut best_json: Option<u32> = None;
+    let mut best_yaml: Option<u32> = None;
+    let mut best_wildcard: Option<u32> = None;
+    let mut saw_any_non_empty = false;
 
-    // Re-parse here to detect the "all explicit q=0" case without
-    // duplicating the arithmetic in `negotiate_accept`. Cheap (single
-    // pass over a short string).
-    let mut saw_relevant = false;
-    let mut json_explicit: Option<u32> = None;
-    let mut yaml_explicit: Option<u32> = None;
-    let mut wildcard_q: Option<u32> = None;
+    for raw in headers.get_all("accept") {
+        let Ok(accept) = raw.to_str() else {
+            continue;
+        };
+        let accept = accept.trim();
+        if accept.is_empty() {
+            continue;
+        }
+        saw_any_non_empty = true;
 
-    for entry in accept.split(',') {
-        let mut parts = entry.splitn(2, ';');
-        let mt = parts.next().unwrap_or("").trim().to_ascii_lowercase();
-        let q = parse_accept_quality(parts.next().unwrap_or(""));
-        match mt.as_str() {
-            "*/*" | "application/*" => {
-                saw_relevant = true;
-                wildcard_q = Some(wildcard_q.map_or(q, |p| p.max(q)));
+        for entry in accept.split(',') {
+            // Split type/subtype from parameters.
+            let mut parts = entry.splitn(2, ';');
+            let media_type_raw = parts.next().unwrap_or("").trim();
+            let params = parts.next().unwrap_or("");
+            let q = parse_accept_quality(params);
+
+            // RFC 7231 §3.1.1.1: media type tokens (type/subtype) are
+            // case-insensitive. Normalize before matching so that headers like
+            // `Accept: Application/JSON` are recognized.
+            let media_type = media_type_raw.to_ascii_lowercase();
+
+            match media_type.as_str() {
+                "*/*" | "application/*" if best_wildcard.is_none_or(|prev| q > prev) => {
+                    best_wildcard = Some(q);
+                }
+                "application/json" if best_json.is_none_or(|prev| q > prev) => {
+                    best_json = Some(q);
+                }
+                "application/yaml" | "application/x-yaml" | "text/yaml" | "text/x-yaml"
+                    if best_yaml.is_none_or(|prev| q > prev) =>
+                {
+                    best_yaml = Some(q);
+                }
+                // Unknown media types, and lower-quality repeats of a listed
+                // one, are ignored.
+                _ => {}
             }
-            "application/json" => {
-                saw_relevant = true;
-                json_explicit = Some(json_explicit.map_or(q, |p| p.max(q)));
-            }
-            "application/yaml" | "application/x-yaml" | "text/yaml" | "text/x-yaml" => {
-                saw_relevant = true;
-                yaml_explicit = Some(yaml_explicit.map_or(q, |p| p.max(q)));
-            }
-            _ => {} // unknown — ignored for relevance accounting
         }
     }
 
+    if !saw_any_non_empty {
+        return Some(stored);
+    }
+
+    let saw_relevant = best_json.is_some() || best_yaml.is_some() || best_wildcard.is_some();
     if !saw_relevant {
-        // No relevant Accept entries (e.g. `Accept: text/plain`). Use the
-        // stored format.
+        // No relevant Accept entries (e.g. `Accept: text/plain`). Default to
+        // the stored format.
         return Some(stored);
     }
 
     // Effective q per format: explicit wins (including explicit q=0), else
     // fall back to wildcard.
-    let wq = wildcard_q.unwrap_or(0);
-    let json_q = json_explicit.unwrap_or(wq);
-    let yaml_q = yaml_explicit.unwrap_or(wq);
+    let wildcard_q = best_wildcard.unwrap_or(0);
+    let json_q = best_json.unwrap_or(wildcard_q);
+    let yaml_q = best_yaml.unwrap_or(wildcard_q);
 
     if json_q == 0 && yaml_q == 0 {
         // Every representation the server can serve has been explicitly
@@ -904,7 +819,21 @@ pub(super) fn negotiate_accept_or_406(
         return None;
     }
 
-    Some(negotiate_accept(headers, stored))
+    if json_q > yaml_q {
+        Some(SpecFormat::Json)
+    } else if yaml_q > json_q {
+        Some(SpecFormat::Yaml)
+    } else {
+        // Equal qualities — prefer stored.
+        Some(stored)
+    }
+}
+
+/// Resolve the response format from an `Accept` header vs the stored format,
+/// falling back to `stored` even when every relevant bucket is `q=0`.
+#[cfg(test)]
+pub(super) fn negotiate_accept(headers: &hyper::HeaderMap, stored: SpecFormat) -> SpecFormat {
+    negotiate_accept_or_406(headers, stored).unwrap_or(stored)
 }
 
 #[cfg(test)]
@@ -1322,15 +1251,19 @@ fn assign_ids_for_put(
         });
     }
 
-    // Build a map from canonical key → FIFO queue of existing plugins.
-    // Canonical key = (plugin_name, sorted-keys config JSON, priority_override).
+    // Build a map from canonical key → FIFO queue of existing plugins only when
+    // at least one incoming plugin omits an explicit ID and needs canonical
+    // matching. Skipping this when all incoming plugins carry explicit IDs
+    // avoids cloning/sorting large generated plugin configs on PUT.
     let mut canonical_to_existing: std::collections::HashMap<
         (String, String, Option<u16>),
         std::collections::VecDeque<&crate::config::types::PluginConfig>,
     > = std::collections::HashMap::new();
-    for ep in existing_plugins.iter().copied() {
-        let key = plugin_canonical_key(ep)?;
-        canonical_to_existing.entry(key).or_default().push_back(ep);
+    if bundle.plugins.iter().any(|pc| pc.id.is_empty()) {
+        for ep in existing_plugins.iter().copied() {
+            let key = plugin_canonical_key(ep)?;
+            canonical_to_existing.entry(key).or_default().push_back(ep);
+        }
     }
 
     // Snapshot proxy_id before the mutable plugin loop to avoid split borrows.
@@ -1495,11 +1428,12 @@ async fn load_single_spec_owned_upstream(
 
 /// Maximum recursion depth for [`sort_json_keys`].
 ///
-/// Matches [`MAX_FORBIDDEN_KEY_SCAN_DEPTH`] in `extractor.rs` (32).  Plugin
-/// configs nested deeper than this are rejected rather than allowing unbounded
-/// stack growth.  A depth-32 config is already far beyond anything a real plugin
-/// would use.
-const MAX_SORT_JSON_DEPTH: usize = 32;
+/// Matches [`crate::config::types::MAX_OPENAPI_VALIDATOR_CONFIG_DEPTH`] (64)
+/// so valid generated `openapi_validator` / `mcp_gateway` configs nested up to
+/// 64 levels deep can be replaced via `PUT /api-specs/{id}` without failing
+/// canonical key sorting with 500, while still preventing unbounded stack
+/// growth.
+const MAX_SORT_JSON_DEPTH: usize = crate::config::types::MAX_OPENAPI_VALIDATOR_CONFIG_DEPTH;
 
 /// Compute the canonical matching key for a plugin during PUT id-assignment.
 ///
@@ -1557,7 +1491,7 @@ fn sort_json_keys(
     depth_remaining: usize,
 ) -> Result<serde_json::Value, &'static str> {
     if depth_remaining == 0 {
-        return Err("config nested too deeply (>32 levels) for canonical hash");
+        return Err("config nested too deeply (>64 levels) for canonical hash");
     }
     match v {
         serde_json::Value::Object(map) => {
@@ -2273,7 +2207,7 @@ fn build_spec_row(
     let spec_content = spec_codec::compress_gzip(body)
         .map_err(|e| ApiSpecError::Internal(format!("gzip compress failed: {e}")))?;
     let content_hash = spec_codec::sha256_hex(body);
-    let resource_hash = hash_resource_bundle(bundle)
+    let resource_hash = crate::config::store_policy::store_canonical_resource_hash(bundle)
         .map_err(|e| ApiSpecError::Internal(format!("resource hash failed: {e}")))?;
     let (external_ref_snapshot, external_ref_digest) = match &metadata.external_ref_snapshot {
         Some(snapshot) => {
@@ -2313,6 +2247,25 @@ fn build_spec_row(
     })
 }
 
+/// Offload gzip compression, SHA-256, and canonical bundle hashing onto the
+/// blocking pool so large spec uploads (up to 25 MiB) never stall Tokio worker
+/// threads.
+async fn build_spec_row_async(
+    id: String,
+    proxy_id: String,
+    namespace: String,
+    body: Vec<u8>,
+    metadata: crate::admin::api_specs::SpecMetadata,
+    bundle: crate::admin::api_specs::ExtractedBundle,
+) -> Result<(ApiSpec, crate::admin::api_specs::ExtractedBundle), ApiSpecError> {
+    tokio::task::spawn_blocking(move || {
+        let spec = build_spec_row(id, proxy_id, namespace, &body, &metadata, &bundle)?;
+        Ok((spec, bundle))
+    })
+    .await
+    .map_err(|_| ApiSpecError::Internal("spec row build worker failed".to_string()))?
+}
+
 // ---------------------------------------------------------------------------
 // Helper: build spec-fetch response with ETag + content negotiation
 // ---------------------------------------------------------------------------
@@ -2320,8 +2273,8 @@ fn build_spec_row(
 /// `max_decompress_bytes` is the upper bound on decompressed output bytes.
 /// Guards against corrupt or adversarially inflated DB rows.  Callers should
 /// pass `2 * admin_spec_max_body_size_mib * 1024 * 1024`.
-fn spec_content_response(
-    spec: &ApiSpec,
+async fn spec_content_response_async(
+    spec: ApiSpec,
     request_headers: &hyper::HeaderMap,
     max_decompress_bytes: usize,
 ) -> Response<Full<Bytes>> {
@@ -2346,14 +2299,18 @@ fn spec_content_response(
     };
     let etag = format!("\"{}-{}\"", spec.content_hash, fmt_suffix);
 
-    // If-None-Match check (RFC 9110 §13.1.2: comma-separated list, W/ prefix)
+    // If-None-Match check (RFC 9110 §13.1.2: comma-separated list across all
+    // header lines, W/ prefix)
     let etag_matches = request_headers
-        .get("if-none-match")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|inm| {
-            inm == "*"
-                || inm.split(',').any(|entry| {
-                    let tag = entry.trim().strip_prefix("W/").unwrap_or(entry.trim());
+        .get_all("if-none-match")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .any(|inm| {
+            let trimmed = inm.trim();
+            trimmed == "*"
+                || trimmed.split(',').any(|entry| {
+                    let entry = entry.trim();
+                    let tag = entry.strip_prefix("W/").unwrap_or(entry);
                     tag == etag
                 })
         });
@@ -2366,52 +2323,62 @@ fn spec_content_response(
             .unwrap_or_else(|_| crate::admin::admin_builder_failure_response());
     }
 
-    // Decompress with an output cap.  A corrupted or bomb-ratio row from the
-    // DB would otherwise expand to GB on every admin GET. Deferred until after
-    // the 304 check so cache hits skip decompression entirely.
-    let raw = match spec_codec::decompress_gzip_capped(&spec.spec_content, max_decompress_bytes) {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::error!(
-                "decompress_gzip_capped failed for spec {} (cap={} bytes): {}",
-                spec.id,
-                max_decompress_bytes,
-                e
-            );
-            return json_resp(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &json!({"error": "spec content corrupt or oversized"}),
-            );
-        }
-    };
-
-    let (body_bytes, ct) = if target_fmt == spec.spec_format {
-        (raw, content_type_for_format(spec.spec_format))
-    } else {
-        match convert_format(&raw, spec.spec_format, target_fmt) {
-            Ok(converted) => (converted, content_type_for_format(target_fmt)),
-            Err(e) => {
+    // Offload gzip decompression + optional YAML/JSON conversion to the
+    // blocking pool so large specs (up to 50 MiB decompressed) do not block
+    // Tokio worker threads.
+    let spec_id = spec.id;
+    let stored_format = spec.spec_format;
+    let compressed = spec.spec_content;
+    let converted = tokio::task::spawn_blocking(move || {
+        let raw =
+            spec_codec::decompress_gzip_capped(&compressed, max_decompress_bytes).map_err(|e| {
                 tracing::error!(
-                    "format conversion ({:?} → {:?}) failed for spec {}: {}",
-                    spec.spec_format,
-                    target_fmt,
-                    spec.id,
+                    "decompress_gzip_capped failed for spec {} (cap={} bytes): {}",
+                    spec_id,
+                    max_decompress_bytes,
                     e
                 );
-                let stored_fmt_str = content_type_for_format(spec.spec_format);
-                let accepted_fmt_str = content_type_for_format(target_fmt);
-                return json_resp(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &json!({
-                        "error": format!(
-                            "Cannot convert stored {} to requested {}; \
-                             the stored document may be malformed — \
-                             try retrieving in the original format ({}) instead",
-                            stored_fmt_str, accepted_fmt_str, stored_fmt_str
-                        )
-                    }),
-                );
-            }
+                "spec content corrupt or oversized".to_string()
+            })?;
+        if target_fmt == stored_format {
+            Ok((raw, content_type_for_format(stored_format)))
+        } else {
+            convert_format(&raw, stored_format, target_fmt)
+                .map(|converted| (converted, content_type_for_format(target_fmt)))
+                .map_err(|e| {
+                    tracing::error!(
+                        "format conversion ({:?} → {:?}) failed for spec {}: {}",
+                        stored_format,
+                        target_fmt,
+                        spec_id,
+                        e
+                    );
+                    let stored_fmt_str = content_type_for_format(stored_format);
+                    let accepted_fmt_str = content_type_for_format(target_fmt);
+                    format!(
+                        "Cannot convert stored {} to requested {}; \
+                         the stored document may be malformed — \
+                         try retrieving in the original format ({}) instead",
+                        stored_fmt_str, accepted_fmt_str, stored_fmt_str
+                    )
+                })
+        }
+    })
+    .await;
+
+    let (body_bytes, ct) = match converted {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(message)) => {
+            return json_resp(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": message}),
+            );
+        }
+        Err(_) => {
+            return json_resp(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "spec decompression worker failed"}),
+            );
         }
     };
 
@@ -2833,15 +2800,17 @@ pub async fn handle_post_api_spec(
     let spec_id = Uuid::new_v4().to_string();
     let proxy_id = bundle.proxy.id.clone();
 
-    let spec = match build_spec_row(
+    let (spec, bundle) = match build_spec_row_async(
         spec_id.clone(),
         proxy_id.clone(),
         namespace.to_string(),
-        &body,
-        &metadata,
-        &bundle,
-    ) {
-        Ok(s) => s,
+        body,
+        metadata,
+        bundle,
+    )
+    .await
+    {
+        Ok(pair) => pair,
         Err(e) => return Ok(error_response(e)),
     };
 
@@ -2851,13 +2820,17 @@ pub async fn handle_post_api_spec(
     let settlement_namespace = namespace.to_string();
     let persistence_bundle = bundle.clone();
     let persistence_spec = spec.clone();
-    let compensation_bundle = bundle.clone();
+    let compensation_bundle = bundle;
     let compensation_spec = spec.clone();
     let settlement_state = state.clone();
     let audit_db = db.clone();
     let audit_enabled = state.admin_audit_enabled;
     let audit_actor = actor.clone();
-    let audit_spec = spec.clone();
+    let audit_spec_id = spec.id.clone();
+    let audit_spec_namespace = spec.namespace.clone();
+    let audit_spec_proxy_id = spec.proxy_id.clone();
+    let audit_spec_content_hash = spec.content_hash.clone();
+    let audit_spec_version = spec.spec_version.clone();
     // This settlement captures the complete extracted bundle and compensation
     // graph. Keep its future frame on the heap before the task-local audit
     // wrapper moves it, so small-stack test/worker threads cannot overflow.
@@ -2881,13 +2854,13 @@ pub async fn handle_post_api_spec(
                 &audit_actor,
                 "create",
                 "api_spec",
-                &audit_spec.id,
-                &audit_spec.namespace,
+                &audit_spec_id,
+                &audit_spec_namespace,
                 audit::create_diff(json!({
-                    "id": audit_spec.id,
-                    "proxy_id": audit_spec.proxy_id,
-                    "content_hash": audit_spec.content_hash,
-                    "spec_version": audit_spec.spec_version,
+                    "id": audit_spec_id,
+                    "proxy_id": audit_spec_proxy_id,
+                    "content_hash": audit_spec_content_hash,
+                    "spec_version": audit_spec_version,
                 })),
             );
             if let Err(error) = audit::record(audit_enabled, audit_db, event).await {
@@ -3152,15 +3125,17 @@ pub async fn handle_put_api_spec(
 
     let proxy_id = bundle.proxy.id.clone();
 
-    let mut spec = match build_spec_row(
+    let (mut spec, bundle) = match build_spec_row_async(
         id.to_string(),
         proxy_id.clone(),
         namespace.to_string(),
-        &body,
-        &metadata,
-        &bundle,
-    ) {
-        Ok(s) => s,
+        body,
+        metadata,
+        bundle,
+    )
+    .await
+    {
+        Ok(pair) => pair,
         Err(e) => return Ok(error_response(e)),
     };
     // Preserve original created_at
@@ -3200,21 +3175,30 @@ pub async fn handle_put_api_spec(
         );
     }
 
+    let resp_content_hash = spec.content_hash.clone();
+    let resp_spec_version = spec.spec_version.clone();
     let settlement_db = db.clone();
     let persistence_db = db.clone();
     let compensation_db = db.clone();
     let settlement_namespace = namespace.to_string();
     let persistence_bundle = bundle.clone();
     let persistence_spec = spec.clone();
-    let compensation_bundle = bundle.clone();
-    let compensation_spec = spec.clone();
-    let compensation_previous_spec = existing_spec.clone();
+    let compensation_bundle = bundle;
+    let compensation_spec = spec;
+    let audit_spec_id = persistence_spec.id.clone();
+    let audit_spec_namespace = persistence_spec.namespace.clone();
+    let audit_spec_proxy_id = persistence_spec.proxy_id.clone();
+    let audit_spec_content_hash = persistence_spec.content_hash.clone();
+    let audit_spec_version = persistence_spec.spec_version.clone();
+    let audit_prev_id = existing_spec.id.clone();
+    let audit_prev_proxy_id = existing_spec.proxy_id.clone();
+    let audit_prev_content_hash = existing_spec.content_hash.clone();
+    let audit_prev_version = existing_spec.spec_version.clone();
+    let compensation_previous_spec = existing_spec;
     let settlement_state = state.clone();
     let audit_db = db.clone();
     let audit_enabled = state.admin_audit_enabled;
     let audit_actor = actor.clone();
-    let audit_spec = spec.clone();
-    let audit_previous_spec = existing_spec.clone();
     let persistence = audit::spawn_with_request_slot(Box::pin(async move {
         let result = run_api_spec_persistence_while_held(
             settlement_db,
@@ -3237,20 +3221,20 @@ pub async fn handle_put_api_spec(
                 &audit_actor,
                 "update",
                 "api_spec",
-                &audit_spec.id,
-                &audit_spec.namespace,
+                &audit_spec_id,
+                &audit_spec_namespace,
                 audit::update_diff(
                     json!({
-                        "id": audit_previous_spec.id,
-                        "proxy_id": audit_previous_spec.proxy_id,
-                        "content_hash": audit_previous_spec.content_hash,
-                        "spec_version": audit_previous_spec.spec_version,
+                        "id": audit_prev_id,
+                        "proxy_id": audit_prev_proxy_id,
+                        "content_hash": audit_prev_content_hash,
+                        "spec_version": audit_prev_version,
                     }),
                     json!({
-                        "id": audit_spec.id,
-                        "proxy_id": audit_spec.proxy_id,
-                        "content_hash": audit_spec.content_hash,
-                        "spec_version": audit_spec.spec_version,
+                        "id": audit_spec_id,
+                        "proxy_id": audit_spec_proxy_id,
+                        "content_hash": audit_spec_content_hash,
+                        "spec_version": audit_spec_version,
                     }),
                 ),
             );
@@ -3273,8 +3257,8 @@ pub async fn handle_put_api_spec(
     let resp_body = json!({
         "id": id,
         "proxy_id": proxy_id,
-        "content_hash": spec.content_hash,
-        "spec_version": spec.spec_version,
+        "content_hash": resp_content_hash,
+        "spec_version": resp_spec_version,
     });
 
     Ok(state
@@ -3309,7 +3293,7 @@ pub async fn handle_get_api_spec(
     };
 
     let max_decompress = max_spec_decompress_bytes(state.admin_spec_max_body_size_mib);
-    Ok(spec_content_response(&spec, req.headers(), max_decompress))
+    Ok(spec_content_response_async(spec, req.headers(), max_decompress).await)
 }
 
 // ---------------------------------------------------------------------------
@@ -3334,7 +3318,7 @@ pub async fn handle_get_api_spec_by_proxy(
     };
 
     let max_decompress = max_spec_decompress_bytes(state.admin_spec_max_body_size_mib);
-    Ok(spec_content_response(&spec, req.headers(), max_decompress))
+    Ok(spec_content_response_async(spec, req.headers(), max_decompress).await)
 }
 
 // ---------------------------------------------------------------------------
@@ -4187,10 +4171,23 @@ mod tests {
 
     #[test]
     fn test_sort_json_keys_depth_limit() {
-        // Build a 50-level-deep nested object.  sort_json_keys caps at
-        // MAX_SORT_JSON_DEPTH (32), so the call must return Err.
+        // Valid generated openapi_validator / mcp_gateway configs up to
+        // MAX_OPENAPI_VALIDATOR_CONFIG_DEPTH (64) must succeed so PUT can match
+        // them without returning 500.
+        let mut deep_valid = serde_json::json!({"leaf": "value"});
+        for _ in 0..40 {
+            deep_valid = serde_json::json!({"nested": deep_valid});
+        }
+        assert!(
+            sort_json_keys(&deep_valid, MAX_SORT_JSON_DEPTH).is_ok(),
+            "sort_json_keys must accept valid depth-40 configs up to MAX_SORT_JSON_DEPTH ({})",
+            MAX_SORT_JSON_DEPTH
+        );
+
+        // Build a 70-level-deep nested object.  sort_json_keys caps at
+        // MAX_SORT_JSON_DEPTH (64), so the call must return Err.
         let mut inner = serde_json::json!({"leaf": "value"});
-        for _ in 0..50 {
+        for _ in 0..70 {
             inner = serde_json::json!({"nested": inner});
         }
         let result = sort_json_keys(&inner, MAX_SORT_JSON_DEPTH);
