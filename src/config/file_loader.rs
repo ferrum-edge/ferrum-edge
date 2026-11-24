@@ -187,6 +187,9 @@ pub fn load_config_from_file(
         let yaml_val: serde_yaml::Value = config_decode::from_yaml_str(&content)?;
         (serde_json::to_value(&yaml_val)?, Some(yaml_val))
     } else {
+        if let Some(reason) = crate::util::json_dup_keys::str_ambiguity(&content) {
+            anyhow::bail!("JSON configuration rejected: {reason}");
+        }
         (config_decode::from_json_str(&content)?, None)
     };
     // The parsed trees own every retained value; release the bounded source
@@ -509,6 +512,9 @@ pub fn decode_and_validate_config_document(
         let yaml_val: serde_yaml::Value = config_decode::from_yaml_str(content)?;
         (serde_json::to_value(&yaml_val)?, Some(yaml_val))
     } else {
+        if let Some(reason) = crate::util::json_dup_keys::str_ambiguity(content) {
+            anyhow::bail!("JSON configuration rejected: {reason}");
+        }
         (config_decode::from_json_str(content)?, None)
     };
 

@@ -6986,6 +6986,16 @@ impl Drop for CountryMmdbValidationGeneration {
     }
 }
 
+/// Discard any committed-but-unclaimed MMDB validation handoff when a config
+/// candidate is rejected, unchanged, or fenced out before plugin-cache staging
+/// can consume it. Active in-flight validation generations are left untouched.
+pub(crate) fn discard_unclaimed_country_mmdb_validation_handoff() {
+    let mut cache = lock_country_mmdb_cache_recovering_poison(country_mmdb_snapshot_cache());
+    if let Some(generation) = cache.accepted_validation_generation.take() {
+        cache.validation_handoffs.remove(&generation);
+    }
+}
+
 /// One plugin-cache build's MMDB ownership. The accepted validation generation
 /// seeds this per-path map, so every geo instance consumes the exact snapshot
 /// that passed dependency validation without another read or record scan.

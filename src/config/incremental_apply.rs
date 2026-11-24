@@ -58,13 +58,6 @@ fn apply_incremental_resources(config: &mut GatewayConfig, result: IncrementalRe
         !removed_upstreams.contains(&(upstream.namespace.as_str(), upstream.id.as_str()))
     });
 
-    // Plugin associations are scoped by the owning proxy's namespace.
-    for proxy in &mut config.proxies {
-        proxy.plugins.retain(|assoc| {
-            !removed_plugins.contains(&(proxy.namespace.as_str(), assoc.plugin_config_id.as_str()))
-        });
-    }
-
     // IDs are unique per namespace only — key every resource-type upsert by
     // `(namespace, id)` so a tenant update cannot overwrite a same-ID resource
     // belonging to another namespace.
@@ -74,6 +67,14 @@ fn apply_incremental_resources(config: &mut GatewayConfig, result: IncrementalRe
         |proxy| proxy.namespace.as_str(),
         |proxy| proxy.id.as_str(),
     );
+    // Prune associations to removed plugin configs AFTER upserting proxies so
+    // a combined delta carrying both a modified proxy and a deleted plugin
+    // cannot leave a dangling association on the upserted proxy.
+    for proxy in &mut config.proxies {
+        proxy.plugins.retain(|assoc| {
+            !removed_plugins.contains(&(proxy.namespace.as_str(), assoc.plugin_config_id.as_str()))
+        });
+    }
     upsert_by_namespace_and_id(
         &mut config.consumers,
         result.added_or_modified_consumers,

@@ -13840,9 +13840,12 @@ impl ProxyState {
         // Resolve upstream TLS into each proxy's resolved_tls before applying.
         new_config.resolve_upstream_tls();
         // Full snapshots can arrive from sources that bypass the SQL/Mongo
-        // loaders, notably CP-to-DP config sync. Quarantine malformed, weak,
-        // or cross-Consumer duplicate HMAC credentials at the common swap
-        // boundary so none can reach the runtime ConsumerIndex.
+        // loaders, notably CP-to-DP config sync and declarative files. Sort
+        // deterministically by `(namespace, id)` so first-wins HMAC quarantine
+        // matches SQL/Mongo full-load ordering instead of input array order.
+        new_config
+            .consumers
+            .sort_by(|a, b| (&a.namespace, &a.id).cmp(&(&b.namespace, &b.id)));
         for message in new_config.quarantine_invalid_hmac_credentials() {
             error!("Config reload: {}", message);
         }
@@ -13867,12 +13870,14 @@ impl ProxyState {
         // rebuilt or swapped, so the last known-good config stays published.
         // The check is inert when FIPS mode is off.
         if let Err(error) = crate::fips::policy::check_gateway_config(&new_config) {
+            crate::config::types::discard_unclaimed_country_mmdb_validation_handoff();
             error!("Config reload rejected — FIPS policy: {}", error);
             return ConfigApplyOutcome::rejected_one(format!("FIPS policy: {error}"));
         }
 
         if let Err(errors) = self.validate_full_config_with_mesh_ids(&new_config, trusted_mesh_ids)
         {
+            crate::config::types::discard_unclaimed_country_mmdb_validation_handoff();
             for msg in &errors {
                 error!("Config reload rejected: {}", msg);
             }
@@ -13896,6 +13901,7 @@ impl ProxyState {
             {
                 Ok(inner) => inner,
                 Err(e) => {
+                    crate::config::types::discard_unclaimed_country_mmdb_validation_handoff();
                     let message = format!("security plugin validation failed: {e}");
                     error!(
                         "Config reload rejected — security plugin validation failed: {}",
@@ -13930,8 +13936,12 @@ impl ProxyState {
                 },
             ) {
                 Ok(Some(epoch)) => epoch,
-                Ok(None) => return ConfigApplyOutcome::Unchanged,
+                Ok(None) => {
+                    crate::config::types::discard_unclaimed_country_mmdb_validation_handoff();
+                    return ConfigApplyOutcome::Unchanged;
+                }
                 Err(e) => {
+                    crate::config::types::discard_unclaimed_country_mmdb_validation_handoff();
                     let message = e.to_string();
                     error!("Config reload rejected: {}", e);
                     return ConfigApplyOutcome::rejected_one(message);
@@ -14055,6 +14065,9 @@ impl ProxyState {
         // would force incompatible mutable/immutable captures across the two
         // `FnOnce` closures even though they never run concurrently.
         let route_changed = std::cell::Cell::new(false);
+        let lb_changed = std::cell::Cell::new(false);
+        let projected_routes_changed_flag = std::cell::Cell::new(false);
+        let mut projected_lb_upstreams_for_reconcile: Vec<Upstream> = Vec::new();
         let proxy_plugin_rebuild_count = std::cell::Cell::new(0usize);
         // Publish the candidate itself, not a second full copy of it: a
         // whole-config clone here held three generations of the config at
@@ -14141,6 +14154,9 @@ impl ProxyState {
                     // unless a projected DR-derived proxy field also changed.
                     let rebuild_routes = mesh_changed || projected_routes_changed;
                     route_changed.set(rebuild_routes);
+                    projected_routes_changed_flag.set(projected_routes_changed);
+                    lb_changed.set(projected_lb_changed);
+                    projected_lb_upstreams_for_reconcile = projected_lb_modified.clone();
                     Self::preserve_live_discovery_targets(
                         &current.load_balancer,
                         &current.config,
@@ -14187,6 +14203,7 @@ impl ProxyState {
                     country_mmdb_load_mode,
                 )?;
                 route_changed.set(staged.request_epoch.route_changed);
+                lb_changed.set(staged.request_epoch.lb_changed);
                 proxy_plugin_rebuild_count.set(staged.proxy_plugin_rebuild_count);
                 applied_delta = Some(delta);
                 Ok(Some(staged.request_epoch))
@@ -14198,12 +14215,14 @@ impl ProxyState {
         let published = match publish_result {
             Ok(Some(epoch)) => epoch,
             Ok(None) => {
+                crate::config::types::discard_unclaimed_country_mmdb_validation_handoff();
                 debug!("Config poll: candidate valid but unchanged, skipping update");
                 // Still update loaded_at timestamp
                 self.config.store(Arc::clone(&staged_config));
                 return ConfigApplyOutcome::Unchanged;
             }
             Err(e) => {
+                crate::config::types::discard_unclaimed_country_mmdb_validation_handoff();
                 let message = format!("configuration publication refused: {e}");
                 error!("Config reload rejected — {}", e);
                 return ConfigApplyOutcome::rejected_one(message);
@@ -14242,12 +14261,79 @@ impl ProxyState {
         // arrives here, not through the full-rebuild branch.
         self.bump_config_revision();
 
-        // Out-of-band republish (mesh-only and/or accepted MMDB-only reload):
-        // there is no resource delta to drive pruning, DNS warmup, listener
-        // reconciliation, or health-check restarts. The request epoch already
-        // carries the new mesh config and/or geo plugin snapshot, and
-        // `mirror_request_epoch_wrappers` published its wrapper views above.
+        // Out-of-band republish (mesh-only, accepted MMDB-only, or
+        // timestamp-neutral HTTP proxy / upstream edit where `updated_at` did
+        // not advance): when projected routes or upstreams changed under an
+        // unchanged `updated_at` (e.g. declarative file / GitOps / backup edit),
+        // still reconcile target health, DNS warmup, capability refresh, stream
+        // listeners (upstream TLS), service discovery, and active health checks.
         let Some(delta) = applied_delta else {
+            let projected_routes = projected_routes_changed_flag.get();
+            let projected_lb = lb_changed.get();
+            if projected_routes || projected_lb {
+                self.prune_stale_target_health(new_config);
+                let mut new_hostnames: Vec<(String, Option<String>, Option<u64>)> = Vec::new();
+                if projected_routes {
+                    for proxy in new_config
+                        .proxies
+                        .iter()
+                        .filter(|p| !p.dispatch_kind.is_stream())
+                    {
+                        new_hostnames.push((
+                            proxy.backend_host.clone(),
+                            proxy.dns_override.clone(),
+                            proxy.dns_cache_ttl_seconds,
+                        ));
+                    }
+                }
+                for upstream in &projected_lb_upstreams_for_reconcile {
+                    for target in &upstream.targets {
+                        if hbone_pool::target_hbone_cross_cluster(target) {
+                            continue;
+                        }
+                        new_hostnames.push((target.host.clone(), None, None));
+                    }
+                }
+                if !new_hostnames.is_empty() {
+                    let dns = self.dns_cache.clone();
+                    tokio::spawn(async move {
+                        dns.warmup(new_hostnames).await;
+                    });
+                }
+                warn_if_h3_backend_tls_policy_incompatible(new_config, self.tls_policy.as_deref());
+                self.spawn_backend_capability_refresh();
+                if projected_lb {
+                    let new_cfg = self.config.load_full();
+                    self.service_discovery_manager.reconcile(&new_cfg, None);
+                    self.health_checker
+                        .restart_with_shutdown(&new_cfg, self.health_check_shutdown_rx.clone());
+                }
+                if projected_lb
+                    && new_config
+                        .proxies
+                        .iter()
+                        .any(|p| p.dispatch_kind.is_stream())
+                {
+                    let slm = self.stream_listener_manager.clone();
+                    tokio::spawn(async move {
+                        let failures = slm.reconcile().await;
+                        for (proxy_id, port, err) in &failures {
+                            tracing::error!(
+                                proxy_id = %proxy_id,
+                                port = port,
+                                "Stream listener failed to bind on config update: {}",
+                                err
+                            );
+                        }
+                    });
+                } else {
+                    let slm = self.stream_listener_manager.clone();
+                    tokio::spawn(async move {
+                        slm.sync_node_waypoint_udp_steering().await;
+                    });
+                }
+                return ConfigApplyOutcome::Applied;
+            }
             debug!("Config update: out-of-band mesh/trust/MMDB generation republished");
             // ClusterIP-only mesh updates do not restart stream listeners, but
             // they can change the desired NodeWaypoint UDP steering set. Sync
@@ -14343,7 +14429,8 @@ impl ProxyState {
         // changed.
         let upstreams_changed = !delta.added_upstreams.is_empty()
             || !delta.removed_upstream_ids.is_empty()
-            || !delta.modified_upstreams.is_empty();
+            || !delta.modified_upstreams.is_empty()
+            || lb_changed.get();
         let stream_proxies_changed = delta
             .added_proxies
             .iter()
@@ -14409,10 +14496,7 @@ impl ProxyState {
         );
 
         // Reconcile service discovery tasks for changed upstreams
-        if !delta.added_upstreams.is_empty()
-            || !delta.removed_upstream_ids.is_empty()
-            || !delta.modified_upstreams.is_empty()
-        {
+        if upstreams_changed {
             let new_cfg = self.config.load_full();
             self.service_discovery_manager.reconcile(&new_cfg, None);
         }
@@ -14421,10 +14505,7 @@ impl ProxyState {
         // configuration changed. Without this, probe tasks spawned at startup
         // keep running with stale parameters, removed upstreams keep probing
         // forever, and newly added upstreams never get probes.
-        if !delta.added_upstreams.is_empty()
-            || !delta.removed_upstream_ids.is_empty()
-            || !delta.modified_upstreams.is_empty()
-        {
+        if upstreams_changed {
             let new_cfg = self.config.load_full();
             self.health_checker
                 .restart_with_shutdown(&new_cfg, self.health_check_shutdown_rx.clone());
@@ -14683,8 +14764,11 @@ impl ProxyState {
         // full snapshots quarantine weak/duplicate HMAC secrets in
         // `update_config`, but deltas from non-database or older control-plane
         // sources can still merge raw consumer rows through this separate
-        // path. Storage constraints backstop normal admin races; this boundary
-        // retains defense in depth for out-of-band data.
+        // path. Sort deterministically by `(namespace, id)` before quarantine
+        // so first-wins secret ownership matches SQL/Mongo full-load ordering.
+        new_config
+            .consumers
+            .sort_by(|a, b| (&a.namespace, &a.id).cmp(&(&b.namespace, &b.id)));
         for message in new_config.quarantine_invalid_hmac_credentials() {
             error!("Incremental config: {}", message);
         }
@@ -14769,6 +14853,7 @@ impl ProxyState {
             let permit = db.acquire_write_topology_permit().await;
             let actual_epoch = permit.topology_epoch();
             if actual_epoch != expected_epoch {
+                crate::config::types::discard_unclaimed_country_mmdb_validation_handoff();
                 return IncrementalApplyResult::TopologyChanged(actual_epoch);
             }
             Some(permit)
@@ -14780,6 +14865,7 @@ impl ProxyState {
         // See `update_config` rustdoc nearby for why this is a `Cell` and not
         // a plain `let mut bool`.
         let route_changed = std::cell::Cell::new(false);
+        let lb_changed = std::cell::Cell::new(false);
         // Publish the candidate itself, not a second full copy of it: a
         // whole-config clone here held three generations of the config at
         // once during every reload (issue #6058).
@@ -14836,6 +14922,7 @@ impl ProxyState {
                     crate::plugin_cache::CountryMmdbLoadMode::PreloadedOnly,
                 )?;
                 route_changed.set(staged.request_epoch.route_changed);
+                lb_changed.set(staged.request_epoch.lb_changed);
                 applied_delta = Some(delta);
                 Ok(Some(staged.request_epoch))
             },
@@ -14850,9 +14937,11 @@ impl ProxyState {
         let published = match publish_result {
             Ok(Some(epoch)) => epoch,
             Ok(None) => {
+                crate::config::types::discard_unclaimed_country_mmdb_validation_handoff();
                 return IncrementalApplyResult::Outcome(ConfigApplyOutcome::Unchanged);
             }
             Err(e) => {
+                crate::config::types::discard_unclaimed_country_mmdb_validation_handoff();
                 let message = format!("configuration publication refused: {e}");
                 return IncrementalApplyResult::Outcome(ConfigApplyOutcome::rejected_one(message));
             }
@@ -14983,7 +15072,8 @@ impl ProxyState {
         };
         let upstreams_changed = !delta.added_upstreams.is_empty()
             || !delta.removed_upstream_ids.is_empty()
-            || !delta.modified_upstreams.is_empty();
+            || !delta.modified_upstreams.is_empty()
+            || lb_changed.get();
         let stream_proxies_changed = delta
             .added_proxies
             .iter()

@@ -3138,6 +3138,28 @@ fn file_wrong_type_version_keeps_schema_name_when_rendered() {
     }
 }
 
+#[test]
+fn json_config_rejects_duplicate_object_keys() {
+    let policy = ferrum_edge::config::BackendEgressPolicy::unrestricted();
+    let json = r#"{
+        "version": "1",
+        "proxies": [],
+        "proxies": [],
+        "consumers": [],
+        "plugin_configs": [],
+        "upstreams": []
+    }"#;
+    let mut file = NamedTempFile::with_suffix(".json").unwrap();
+    write!(file, "{json}").unwrap();
+    let err = load_config_from_file(file.path().to_str().unwrap(), 30, &policy, "ferrum")
+        .expect_err("duplicate JSON object keys must be rejected");
+    assert!(
+        err.to_string().contains("duplicate")
+            || err.to_string().contains("JSON configuration rejected"),
+        "expected duplicate-key rejection, got: {err}"
+    );
+}
+
 #[cfg(feature = "fuzzing")]
 #[test]
 fn memory_wrong_type_version_keeps_schema_name_when_rendered() {

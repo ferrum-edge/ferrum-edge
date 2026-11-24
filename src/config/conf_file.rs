@@ -126,6 +126,7 @@ impl ConfFile {
     /// - Unquoted values end at the first ` #` inline comment
     pub fn parse(contents: &str) -> Result<Self, String> {
         let mut values = HashMap::new();
+        let contents = contents.strip_prefix('\u{feff}').unwrap_or(contents);
 
         for (line_num, line) in contents.lines().enumerate() {
             let trimmed = line.trim();
@@ -200,6 +201,8 @@ impl ConfFile {
                     ));
                 }
                 &quoted[..end]
+            } else if value.starts_with('#') {
+                ""
             } else if let Some(comment_pos) = value.find(" #") {
                 value[..comment_pos].trim_end()
             } else {

@@ -371,10 +371,19 @@ pub(crate) fn read_stable_file_with_between_probes(
 ) -> Result<String, StableFileError> {
     let display_path = path.display();
     let mut last_reason = "unknown instability";
+    let mut seen_path = false;
 
     for attempt in 1..=options.max_attempts {
         match (|| -> Result<String, StableFileError> {
-            let (first_identity, first_bytes) = read_snapshot(path, options.max_bytes)?;
+            let (first_identity, first_bytes) =
+                read_snapshot(path, options.max_bytes).map_err(|err| {
+                    if seen_path {
+                        classify_error_after_first_probe(err)
+                    } else {
+                        err
+                    }
+                })?;
+            seen_path = true;
             // Consecutive probes must span the settle interval. Back-to-back
             // reads can both complete inside one torn publication window and
             // accept identical partial bytes as a "stable" generation. The
