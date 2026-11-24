@@ -1186,6 +1186,26 @@ async fn load_full_config_multi_with_sequence(
     // only boundaries whose corresponding snapshots actually refreshed.
     sequences.retain(|namespace, _| outcome.refreshed_namespaces.contains(namespace));
 
+    // When every namespace failed outright (zero refreshed and zero
+    // validation-rejected), the backing store is unreachable or unusable
+    // rather than experiencing an isolated tenant failure. Returning Err lets
+    // the poll loop mark the config source unavailable, attempt failover
+    // reconnects, and avoid falsely flipping `db_available` back to true,
+    // while keeping per-namespace LKG continuation whenever at least one
+    // namespace refreshed or was validation-rejected.
+    if outcome.refreshed_namespaces.is_empty()
+        && outcome.rejected_namespaces.is_empty()
+        && !outcome.failed_namespaces.is_empty()
+    {
+        if !load_namespaces.is_empty() {
+            forget_consumer_quarantine_states(db, &load_namespaces);
+        }
+        anyhow::bail!(
+            "CP full reload failed for all {} namespace(s); retaining prior snapshot and cursors",
+            outcome.failed_namespaces.len()
+        );
+    }
+
     // Sequence domain is scope-dependent (issue #2473 / #4130):
     // - Explicit Single/Set: saturating sum of the same per-namespace durable
     //   cursors incremental polling advances from, so an unrelated namespace
@@ -1494,6 +1514,139 @@ fn trust_publication_scope(
         TrustPublicationScope::Complete
     } else {
         TrustPublicationScope::Partial
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CpFailoverFullReloadOutcome {
+    Recovered,
+    MigrationGateBlocked,
+    ValidationRejected,
+    ConnectivityUnavailable,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn attempt_cp_failover_full_reload(
+    db_poll: &Arc<dyn DatabaseBackend>,
+    db_url_for_reconnect: &str,
+    nslist: &[String],
+    config_poll: &Arc<ArcSwap<GatewayConfig>>,
+    poll_scope: &CpScope,
+    poll_mesh_config_authority: Option<&str>,
+    db_available_poll: &Arc<AtomicBool>,
+    config_rejected_poll: &Arc<AtomicBool>,
+    poll_auto_apply_plugin_migrations: bool,
+    plugin_migrations_need_reconcile: &mut bool,
+    last_polled_namespaces: &mut Vec<String>,
+    last_change_sequences: &mut HashMap<String, u64>,
+    rejected_delta_tracker: &mut CpRejectedDeltaTracker,
+    publication_gate_poll: &CpPublicationGate,
+    overlay_poll: &K8sOverlaySlot,
+    poll_broadcasts: &crate::grpc::cp_server::NamespaceBroadcasts,
+    dp_registry_poll: &crate::grpc::cp_server::DpNodeRegistry,
+    mesh_update_tx: &tokio::sync::broadcast::Sender<crate::grpc::mesh_server::MeshConfigBroadcast>,
+    mesh_registry_poll: &crate::grpc::mesh_registry::MeshNodeRegistry,
+    poll_slow_threshold_ms: Option<u64>,
+    database_delta_poll_metrics_for_poll: &crate::modes::database::DatabaseDeltaPollMetrics,
+    reconnect_failure_warning: &str,
+) -> CpFailoverFullReloadOutcome {
+    match db_poll.try_failover_reconnect(db_url_for_reconnect).await {
+        Ok(_url) => {
+            *plugin_migrations_need_reconcile = true;
+            db_available_poll.store(false, Ordering::Relaxed);
+            match load_full_config_multi_with_sequence(
+                db_poll.as_ref(),
+                nslist,
+                config_poll.load_full().as_ref(),
+                poll_scope,
+                poll_mesh_config_authority,
+                published_mesh_sequence(config_poll),
+            )
+            .await
+            {
+                Ok((outcome, sequences)) => {
+                    if !reconcile_plugin_migrations_after_cp_reconnect(
+                        db_poll,
+                        db_available_poll,
+                        poll_auto_apply_plugin_migrations,
+                        plugin_migrations_need_reconcile,
+                        "database failover",
+                    )
+                    .await
+                    {
+                        return CpFailoverFullReloadOutcome::MigrationGateBlocked;
+                    }
+                    db_available_poll.store(true, Ordering::Relaxed);
+                    *last_polled_namespaces = nslist.to_vec();
+                    merge_refreshed_change_sequences(last_change_sequences, sequences);
+                    rejected_delta_tracker.record_accepted();
+                    publish_cp_full_reload(
+                        publication_gate_poll,
+                        config_poll.as_ref(),
+                        overlay_poll,
+                        outcome.config,
+                        &outcome.refreshed_namespaces,
+                        trust_publication_scope(
+                            &outcome.rejected_namespaces,
+                            &outcome.failed_namespaces,
+                        ),
+                        poll_broadcasts,
+                        dp_registry_poll,
+                        poll_scope,
+                        mesh_update_tx,
+                        mesh_registry_poll,
+                        poll_slow_threshold_ms,
+                    );
+                    settle_full_reload_rejection_state(
+                        db_poll,
+                        db_available_poll,
+                        config_rejected_poll,
+                        &outcome.rejected_namespaces,
+                        &outcome.failed_namespaces,
+                        "failover full reload",
+                    )
+                    .await;
+                    info!(
+                        "Configuration reloaded from database (failover) and pushed to DPs and mesh nodes"
+                    );
+                    CpFailoverFullReloadOutcome::Recovered
+                }
+                Err(e3) => {
+                    if crate::modes::is_poll_validation_rejection(&e3) {
+                        if !reconcile_plugin_migrations_after_cp_reconnect(
+                            db_poll,
+                            db_available_poll,
+                            poll_auto_apply_plugin_migrations,
+                            plugin_migrations_need_reconcile,
+                            "validation-rejected database failover load",
+                        )
+                        .await
+                        {
+                            return CpFailoverFullReloadOutcome::MigrationGateBlocked;
+                        }
+                        crate::modes::record_config_validation_rejection(
+                            db_poll,
+                            db_available_poll,
+                            config_rejected_poll,
+                            &e3,
+                            "failover full reload",
+                        )
+                        .await;
+                        database_delta_poll_metrics_for_poll.record_poll_failure(
+                            crate::modes::database::DatabasePollFailureReason::ValidationRejected,
+                        );
+                        CpFailoverFullReloadOutcome::ValidationRejected
+                    } else {
+                        warn!("Authoritative primary failover reload also failed (serving cached)");
+                        CpFailoverFullReloadOutcome::ConnectivityUnavailable
+                    }
+                }
+            }
+        }
+        Err(_) => {
+            warn!("{reconnect_failure_warning}");
+            CpFailoverFullReloadOutcome::ConnectivityUnavailable
+        }
     }
 }
 
@@ -3374,12 +3527,46 @@ pub async fn run(
                                     );
                                 } else {
                                     error!(
-                                        "Authoritative primary full config reload failed after DB DNS reconnect; keeping existing config and retrying"
+                                        "Authoritative primary full config reload failed after DB DNS reconnect; attempting failover reconnect"
                                     );
-                                    database_delta_poll_metrics_for_poll
-                                        .record_config_source_unavailable(
-                                            crate::modes::database::DatabasePollFailureReason::Connectivity,
-                                        );
+                                    match attempt_cp_failover_full_reload(
+                                        &db_poll,
+                                        &db_url_for_reconnect,
+                                        &nslist,
+                                        &config_poll,
+                                        &poll_scope,
+                                        poll_mesh_config_authority.as_deref(),
+                                        &db_available_poll,
+                                        &config_rejected_poll,
+                                        poll_auto_apply_plugin_migrations,
+                                        &mut plugin_migrations_need_reconcile,
+                                        &mut last_polled_namespaces,
+                                        &mut last_change_sequences,
+                                        &mut rejected_delta_tracker,
+                                        &publication_gate_poll,
+                                        &overlay_poll,
+                                        poll_broadcasts.as_ref(),
+                                        &dp_registry_poll,
+                                        &mesh_update_tx,
+                                        &mesh_registry_poll,
+                                        poll_slow_threshold_ms,
+                                        &database_delta_poll_metrics_for_poll,
+                                        "Authoritative primary full config reload failed after DB DNS reconnect; keeping existing config and retrying",
+                                    )
+                                    .await
+                                    {
+                                        CpFailoverFullReloadOutcome::Recovered => {
+                                            force_full_reload = false;
+                                        }
+                                        CpFailoverFullReloadOutcome::ConnectivityUnavailable => {
+                                            database_delta_poll_metrics_for_poll
+                                                .record_config_source_unavailable(
+                                                    crate::modes::database::DatabasePollFailureReason::Connectivity,
+                                                );
+                                        }
+                                        CpFailoverFullReloadOutcome::MigrationGateBlocked
+                                        | CpFailoverFullReloadOutcome::ValidationRejected => {}
+                                    }
                                 }
                                 database_delta_poll_metrics_for_poll.record_poll_completed();
                                 continue;
@@ -3689,8 +3876,41 @@ pub async fn run(
                                                     );
                                                 } else {
                                                     warn!(
-                                                        "Authoritative full reload failed after repeated CP delta rejection; keeping the last accepted cursors and cached config"
+                                                        "Authoritative full reload failed after repeated CP delta rejection; attempting failover reconnect"
                                                     );
+                                                    if matches!(
+                                                        attempt_cp_failover_full_reload(
+                                                            &db_poll,
+                                                            &db_url_for_reconnect,
+                                                            &nslist,
+                                                            &config_poll,
+                                                            &poll_scope,
+                                                            poll_mesh_config_authority.as_deref(),
+                                                            &db_available_poll,
+                                                            &config_rejected_poll,
+                                                            poll_auto_apply_plugin_migrations,
+                                                            &mut plugin_migrations_need_reconcile,
+                                                            &mut last_polled_namespaces,
+                                                            &mut last_change_sequences,
+                                                            &mut rejected_delta_tracker,
+                                                            &publication_gate_poll,
+                                                            &overlay_poll,
+                                                            poll_broadcasts.as_ref(),
+                                                            &dp_registry_poll,
+                                                            &mesh_update_tx,
+                                                            &mesh_registry_poll,
+                                                            poll_slow_threshold_ms,
+                                                            &database_delta_poll_metrics_for_poll,
+                                                            "Authoritative full reload failed after repeated CP delta rejection; keeping the last accepted cursors and cached config",
+                                                        )
+                                                        .await,
+                                                        CpFailoverFullReloadOutcome::ConnectivityUnavailable
+                                                    ) {
+                                                        database_delta_poll_metrics_for_poll
+                                                            .record_config_source_unavailable(
+                                                                crate::modes::database::DatabasePollFailureReason::Connectivity,
+                                                            );
+                                                    }
                                                 }
                                             }
                                         }
@@ -3854,114 +4074,38 @@ pub async fn run(
                                         }
                                         // Both incremental and full reload failed —
                                         // try failover URLs before giving up.
-                                        match db_poll.try_failover_reconnect(&db_url_for_reconnect).await {
-                                            Ok(_url) => {
-                                                plugin_migrations_need_reconcile = true;
-                                                db_available_poll.store(false, Ordering::Relaxed);
-                                                match load_full_config_multi_with_sequence(
-                                                    db_poll.as_ref(),
-                                                    &nslist,
-                                                    config_poll.load_full().as_ref(),
-                                                    &poll_scope,
-                                                    poll_mesh_config_authority.as_deref(),
-                                                    published_mesh_sequence(&config_poll),
-                                                )
-                                                .await
-                                                {
-                                                    Ok((outcome, sequences)) => {
-                                                        if !reconcile_plugin_migrations_after_cp_reconnect(
-                                                            &db_poll,
-                                                            &db_available_poll,
-                                                            poll_auto_apply_plugin_migrations,
-                                                            &mut plugin_migrations_need_reconcile,
-                                                            "database failover",
-                                                        )
-                                                        .await
-                                                        {
-                                                            database_delta_poll_metrics_for_poll.record_poll_completed();
-                                                            continue;
-                                                        }
-                                                        db_available_poll.store(true, Ordering::Relaxed);
-                                                        last_polled_namespaces = nslist.clone();
-                                                        merge_refreshed_change_sequences(
-                                                            &mut last_change_sequences,
-                                                            sequences,
-                                                        );
-                                                        rejected_delta_tracker.record_accepted();
-                                                        publish_cp_full_reload(
-                                                            &publication_gate_poll,
-                                                            config_poll.as_ref(),
-                                                            &overlay_poll,
-                                                            outcome.config,
-                                                            &outcome.refreshed_namespaces,
-                                                            trust_publication_scope(
-                                                                &outcome.rejected_namespaces,
-                                                                &outcome.failed_namespaces,
-                                                            ),
-                                                            poll_broadcasts.as_ref(),
-                                                            &dp_registry_poll,
-                                                            &poll_scope,
-                                                            &mesh_update_tx,
-                                                            &mesh_registry_poll,
-                                                            poll_slow_threshold_ms,
-                                                        );
-                                                        settle_full_reload_rejection_state(
-                                                            &db_poll,
-                                                            &db_available_poll,
-                                                            &config_rejected_poll,
-                                                            &outcome.rejected_namespaces,
-                                                            &outcome.failed_namespaces,
-                                                            "failover full reload",
-                                                        )
-                                                        .await;
-                                                        info!("Configuration reloaded from database (failover) and pushed to DPs and mesh nodes");
-                                                    }
-                                                    Err(e3) => {
-                                                        if crate::modes::is_poll_validation_rejection(&e3) {
-                                                            if !reconcile_plugin_migrations_after_cp_reconnect(
-                                                                &db_poll,
-                                                                &db_available_poll,
-                                                                poll_auto_apply_plugin_migrations,
-                                                                &mut plugin_migrations_need_reconcile,
-                                                                "validation-rejected database failover load",
-                                                            )
-                                                            .await
-                                                            {
-                                                                database_delta_poll_metrics_for_poll.record_poll_completed();
-                                                                continue;
-                                                            }
-                                                            crate::modes::record_config_validation_rejection(
-                                                                &db_poll,
-                                                                &db_available_poll,
-                                                                &config_rejected_poll,
-                                                                &e3,
-                                                                "failover full reload",
-                                                            )
-                                                            .await;
-                                                            database_delta_poll_metrics_for_poll.record_poll_failure(
-                                                                crate::modes::database::DatabasePollFailureReason::ValidationRejected,
-                                                            );
-                                                        } else {
-                                                            database_delta_poll_metrics_for_poll
-                                                                .record_config_source_unavailable(
-                                                                    crate::modes::database::DatabasePollFailureReason::Connectivity,
-                                                                );
-                                                            warn!(
-                                                                "Authoritative primary failover reload also failed (serving cached)"
-                                                            );
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            Err(_) => {
-                                                database_delta_poll_metrics_for_poll
-                                                    .record_config_source_unavailable(
-                                                        crate::modes::database::DatabasePollFailureReason::Connectivity,
-                                                    );
-                                                warn!(
-                                                    "Authoritative primary full config reload also failed (serving cached)"
+                                        if matches!(
+                                            attempt_cp_failover_full_reload(
+                                                &db_poll,
+                                                &db_url_for_reconnect,
+                                                &nslist,
+                                                &config_poll,
+                                                &poll_scope,
+                                                poll_mesh_config_authority.as_deref(),
+                                                &db_available_poll,
+                                                &config_rejected_poll,
+                                                poll_auto_apply_plugin_migrations,
+                                                &mut plugin_migrations_need_reconcile,
+                                                &mut last_polled_namespaces,
+                                                &mut last_change_sequences,
+                                                &mut rejected_delta_tracker,
+                                                &publication_gate_poll,
+                                                &overlay_poll,
+                                                poll_broadcasts.as_ref(),
+                                                &dp_registry_poll,
+                                                &mesh_update_tx,
+                                                &mesh_registry_poll,
+                                                poll_slow_threshold_ms,
+                                                &database_delta_poll_metrics_for_poll,
+                                                "Authoritative primary full config reload also failed (serving cached)",
+                                            )
+                                            .await,
+                                            CpFailoverFullReloadOutcome::ConnectivityUnavailable
+                                        ) {
+                                            database_delta_poll_metrics_for_poll
+                                                .record_config_source_unavailable(
+                                                    crate::modes::database::DatabasePollFailureReason::Connectivity,
                                                 );
-                                            }
                                         }
                                     }
                                 }

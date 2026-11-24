@@ -569,11 +569,11 @@ fn control_plane_poll_tick_records_on_every_normal_exit_without_async_wrapper() 
 
     let continue_count = tick.lines().filter(|l| l.trim() == "continue;").count();
     // 11 in base main, plus the two exits per-namespace isolation added
-    // (#2983/#2984): a delta whose namespaces all rejected, and a non-empty
-    // delta that partitioned to no attributable namespace. Both still record
-    // completion, which `assert_every_continue_records_completion` above proves.
+    // (#2983/#2984), minus two redundant end-of-tick failover migration-gate
+    // continues unified into `attempt_cp_failover_full_reload` (which fall
+    // straight through to the end-of-tick `record_poll_completed()`).
     assert_eq!(
-        continue_count, 13,
+        continue_count, 11,
         "control-plane poll tick handled-continue exit count drifted"
     );
     let record_count = tick.matches("record_poll_completed()").count();
@@ -670,10 +670,11 @@ fn database_poll_respawn_delay_remains_one_second() {
 /// `ferrum_database_config_source_connected` and
 /// `ferrum_database_poll_failures_total` cannot drift apart.
 ///
-/// The two remaining bare `store(false)` calls in the control-plane tick are
-/// deliberate and are NOT failures: both follow a *successful* pool reconnect
-/// and mark "a full reload is pending" for one cycle. Counting them would
-/// report a poll failure every time database DNS changes.
+/// The remaining bare `store(false)` in the control-plane tick (plus the
+/// matching one inside `attempt_cp_failover_full_reload`) are deliberate and
+/// are NOT failures: both follow a *successful* pool reconnect and mark
+/// "a full reload is pending" for one cycle. Counting them would report a
+/// poll failure every time database DNS changes or failover succeeds.
 #[test]
 fn poll_loop_availability_writes_go_through_the_counting_helper() {
     for (label, source, wake_marker, shutdown_marker, expected_bare_stores) in [
@@ -689,7 +690,7 @@ fn poll_loop_availability_writes_go_through_the_counting_helper() {
             include_str!("../../../src/modes/control_plane.rs"),
             "_ = interval.tick() => {",
             "_ = cp_poll_shutdown.changed() => {",
-            2usize,
+            1usize,
         ),
     ] {
         let tick = poll_attempt_body(source, wake_marker, shutdown_marker);

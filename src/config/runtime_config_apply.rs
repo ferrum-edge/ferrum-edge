@@ -21,7 +21,7 @@
 //!   applies any rows they committed.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::watch;
@@ -220,8 +220,7 @@ pub struct RuntimeConfigApply {
     wake: Arc<ConfigChangeWakeSignal>,
     snapshot: watch::Sender<ApplySnapshot>,
     waiter_count: AtomicUsize,
-    max_waiting_epoch: AtomicU64,
-    max_waiting: AtomicU64,
+    max_waiting: std::sync::Mutex<LiveApplyCursor>,
     /// Admin writes this process issued cursors for that no accepted
     /// generation covers yet, and when each committed. Lets the poll loop
     /// report write-to-live latency per change (issue #6057).
@@ -302,9 +301,11 @@ impl RuntimeConfigApply {
             wake: Arc::new(ConfigChangeWakeSignal::new()),
             snapshot,
             waiter_count: AtomicUsize::new(0),
-            max_waiting_epoch: AtomicU64::new(topology_epoch),
-            max_waiting: AtomicU64::new(0),
-            unapplied_writes: std::sync::Mutex::new(UnappliedWrites::default()),
+            max_waiting: std::sync::Mutex::new(LiveApplyCursor::new(topology_epoch, 0)),
+            unapplied_writes: std::sync::Mutex::new(UnappliedWrites {
+                topology_epoch,
+                committed_at: std::collections::BTreeMap::new(),
+            }),
         }
     }
 
@@ -337,11 +338,13 @@ impl RuntimeConfigApply {
     /// preserving the covering-cursor semantics for concurrent mutations.
     pub fn record_issued_cursor(&self, cursor: LiveApplyCursor) {
         if let Ok(mut writes) = self.unapplied_writes.lock() {
-            if writes.topology_epoch != cursor.topology_epoch {
+            if cursor.topology_epoch > writes.topology_epoch {
                 writes.topology_epoch = cursor.topology_epoch;
                 writes.committed_at.clear();
             }
-            if writes.committed_at.len() < MAX_UNAPPLIED_WRITES {
+            if cursor.topology_epoch == writes.topology_epoch
+                && writes.committed_at.len() < MAX_UNAPPLIED_WRITES
+            {
                 writes
                     .committed_at
                     .entry(cursor.sequence)
@@ -349,7 +352,12 @@ impl RuntimeConfigApply {
             }
         }
         self.snapshot.send_modify(|snap| {
-            if cursor.topology_epoch == snap.topology_epoch {
+            if cursor.topology_epoch > snap.topology_epoch {
+                snap.topology_epoch = cursor.topology_epoch;
+                snap.accepted = 0;
+                snap.rejected_through = 0;
+                snap.issued_through = Some(cursor.sequence);
+            } else if cursor.topology_epoch == snap.topology_epoch {
                 snap.issued_through = Some(
                     snap.issued_through
                         .map_or(cursor.sequence, |issued| issued.max(cursor.sequence)),
@@ -450,11 +458,14 @@ impl RuntimeConfigApply {
         if self.waiter_count.load(Ordering::Acquire) == 0 {
             return;
         }
-        let waiting_epoch = self.max_waiting_epoch.load(Ordering::Acquire);
-        let waiting = self.max_waiting.load(Ordering::Acquire);
+        let waiting = *self
+            .max_waiting
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let snapshot = *self.snapshot.borrow();
-        if snapshot.topology_epoch < waiting_epoch
-            || (snapshot.topology_epoch == waiting_epoch && snapshot.accepted < waiting)
+        if snapshot.topology_epoch < waiting.topology_epoch
+            || (snapshot.topology_epoch == waiting.topology_epoch
+                && snapshot.accepted < waiting.sequence)
         {
             self.wake.signal_immediate();
         }
@@ -505,10 +516,19 @@ impl RuntimeConfigApply {
             return result;
         }
 
-        self.max_waiting_epoch
-            .fetch_max(cursor.topology_epoch, Ordering::AcqRel);
-        self.max_waiting
-            .fetch_max(cursor.sequence, Ordering::AcqRel);
+        {
+            let mut max_waiting = self
+                .max_waiting
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if cursor.topology_epoch > max_waiting.topology_epoch {
+                *max_waiting = cursor;
+            } else if cursor.topology_epoch == max_waiting.topology_epoch
+                && cursor.sequence > max_waiting.sequence
+            {
+                max_waiting.sequence = cursor.sequence;
+            }
+        }
         self.waiter_count.fetch_add(1, Ordering::AcqRel);
         struct WaiterGuard<'a>(&'a RuntimeConfigApply);
         impl Drop for WaiterGuard<'_> {

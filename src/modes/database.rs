@@ -2672,12 +2672,40 @@ pub async fn run(
                                             .record_poll_failure(DatabasePollFailureReason::ValidationRejected);
                                     } else {
                                         error!(
-                                            "Authoritative primary full config reload failed after DB DNS reconnect; keeping existing config and retrying"
+                                            "Authoritative primary full config reload failed after DB DNS reconnect; attempting failover reconnect"
                                         );
-                                        database_delta_poll_metrics_for_poll
-                                            .record_config_source_unavailable(
-                                                DatabasePollFailureReason::Connectivity,
-                                            );
+                                        match attempt_database_failover_full_reload(
+                                            &db_poll,
+                                            &db_url_for_reconnect,
+                                            &poll_namespace,
+                                            &db_available_poll,
+                                            &proxy_state_poll,
+                                            auto_apply_plugin_migrations_poll,
+                                            &plugin_migration_reconcile_state_poll,
+                                            &mut last_change_cursor,
+                                            &config_rejected_poll,
+                                            &runtime_config_apply_poll,
+                                            &mut rejected_delta_tracker,
+                                            &database_delta_poll_metrics_for_poll,
+                                            "failover full reload",
+                                            "failover",
+                                            "Authoritative primary failover reload also failed after DB DNS reconnect (using cached)",
+                                            "Authoritative primary full config reload failed after DB DNS reconnect; keeping existing config and retrying",
+                                        )
+                                        .await
+                                        {
+                                            DatabaseFailoverFullReloadOutcome::Recovered => {
+                                                force_full_reload = false;
+                                            }
+                                            DatabaseFailoverFullReloadOutcome::ConnectivityUnavailable => {
+                                                database_delta_poll_metrics_for_poll
+                                                    .record_config_source_unavailable(
+                                                        DatabasePollFailureReason::Connectivity,
+                                                    );
+                                            }
+                                            DatabaseFailoverFullReloadOutcome::MigrationGateBlocked
+                                            | DatabaseFailoverFullReloadOutcome::ValidationRejected => {}
+                                        }
                                     }
                                     runtime_config_apply_poll.nudge_if_waiters_pending();
                                     database_delta_poll_metrics_for_poll.record_poll_completed();
@@ -2896,96 +2924,44 @@ pub async fn run(
                                                             warn!(
                                                                 "Authoritative primary full reload failed after repeated rejected delta; keeping last known-good runtime config"
                                                             );
-                                                            match db_poll
-                                                                .try_failover_reconnect(
-                                                                    &db_url_for_reconnect,
-                                                                )
-                                                                .await
+                                                            match attempt_database_failover_full_reload(
+                                                                &db_poll,
+                                                                &db_url_for_reconnect,
+                                                                &poll_namespace,
+                                                                &db_available_poll,
+                                                                &proxy_state_poll,
+                                                                auto_apply_plugin_migrations_poll,
+                                                                &plugin_migration_reconcile_state_poll,
+                                                                &mut last_change_cursor,
+                                                                &config_rejected_poll,
+                                                                &runtime_config_apply_poll,
+                                                                &mut rejected_delta_tracker,
+                                                                &database_delta_poll_metrics_for_poll,
+                                                                "rejected-delta escalation failover reload",
+                                                                "rejected delta escalation failover",
+                                                                "Authoritative failover full reload also failed after repeated rejected delta; keeping last known-good runtime config",
+                                                                "Database failover reconnect failed after rejected-delta escalation reload error",
+                                                            )
+                                                            .await
                                                             {
-                                                                Ok(_url) => {
-                                                                    let topology_epoch =
-                                                                        db_poll.config_topology_epoch();
-                                                                    runtime_config_apply_poll
-                                                                        .observe_topology(topology_epoch);
-                                                                    last_change_cursor = None;
-                                                                    plugin_migration_reconcile_state_poll
-                                                                        .store(PLUGIN_MIGRATIONS_NEED_RECONCILE, Ordering::Release);
-                                                                    match load_full_config_with_sequence(
-                                                                        &db_poll,
-                                                                        &poll_namespace,
-                                                                    )
-                                                                    .await
-                                                                    {
-                                                                        Ok((new_config, cursor)) => {
-                                                                            match try_publish_full_reload_after_gate(
-                                                                                &db_poll,
-                                                                                &poll_namespace,
-                                                                                &db_available_poll,
-                                                                                &proxy_state_poll,
-                                                                                new_config,
-                                                                                "rejected-delta escalation failover reload",
-                                                                                "rejected delta escalation failover",
-                                                                                auto_apply_plugin_migrations_poll,
-                                                                                &plugin_migration_reconcile_state_poll,
-                                                                                &mut last_change_cursor,
-                                                                                cursor,
-                                                                                &config_rejected_poll,
-                                                                                &runtime_config_apply_poll,
-                                                                            )
-                                                                            .await
-                                                                            {
-                                                                                None => {
-                                                                                    runtime_config_apply_poll.nudge_if_waiters_pending();
-                                                                                    database_delta_poll_metrics_for_poll.record_poll_completed();
-                                                                                    continue;
-                                                                                }
-                                                                                Some(true) => {
-                                                                                    rejected_delta_tracker
-                                                                                        .record_accepted();
-                                                                                    recovered_by_full_reload =
-                                                                                        true;
-                                                                                    info!(
-                                                                                        "Rejected database delta recovered by authoritative failover full reload"
-                                                                                    );
-                                                                                }
-                                                                                Some(false) => {}
-                                                                            }
-                                                                        }
-                                                                        Err(e2) => {
-                                                                            if crate::modes::is_poll_validation_rejection(&e2) {
-                                                                                record_config_validation_rejection_after_recovery_migration_gate(
-                                                                                    &db_poll,
-                                                                                    &db_available_poll,
-                                                                                    &config_rejected_poll,
-                                                                                    auto_apply_plugin_migrations_poll,
-                                                                                    &plugin_migration_reconcile_state_poll,
-                                                                                    &e2,
-                                                                                    "rejected-delta escalation failover reload",
-                                                                                )
-                                                                                .await;
-                                                                                database_delta_poll_metrics_for_poll
-                                                                                    .record_poll_failure(DatabasePollFailureReason::ValidationRejected);
-                                                                            } else {
-                                                                                database_delta_poll_metrics_for_poll
-                                                                                    .record_config_source_unavailable(
-                                                                                        DatabasePollFailureReason::Connectivity,
-                                                                                    );
-                                                                                warn!(
-                                                                                    "Authoritative failover full reload also failed after repeated rejected delta; keeping last known-good runtime config"
-                                                                                );
-                                                                            }
-                                                                        }
-                                                                    }
+                                                                DatabaseFailoverFullReloadOutcome::MigrationGateBlocked => {
+                                                                    runtime_config_apply_poll.nudge_if_waiters_pending();
+                                                                    database_delta_poll_metrics_for_poll.record_poll_completed();
+                                                                    continue;
                                                                 }
-                                                                Err(_error) => {
+                                                                DatabaseFailoverFullReloadOutcome::Recovered => {
+                                                                    recovered_by_full_reload = true;
+                                                                    info!(
+                                                                        "Rejected database delta recovered by authoritative failover full reload"
+                                                                    );
+                                                                }
+                                                                DatabaseFailoverFullReloadOutcome::ConnectivityUnavailable => {
                                                                     database_delta_poll_metrics_for_poll
                                                                         .record_config_source_unavailable(
                                                                             DatabasePollFailureReason::Connectivity,
                                                                         );
-                                                                    warn!(
-                                                                        "Database failover reconnect failed after rejected-delta escalation reload error"
-                                                                    );
                                                                 }
+                                                                DatabaseFailoverFullReloadOutcome::ValidationRejected => {}
                                                             }
                                                         }
                                                     }
@@ -3084,88 +3060,39 @@ pub async fn run(
                                                 database_delta_poll_metrics_for_poll
                                                     .record_poll_failure(DatabasePollFailureReason::ValidationRejected);
                                             } else {
-                                                match db_poll
-                                                    .try_failover_reconnect(&db_url_for_reconnect)
-                                                    .await
+                                                match attempt_database_failover_full_reload(
+                                                    &db_poll,
+                                                    &db_url_for_reconnect,
+                                                    &poll_namespace,
+                                                    &db_available_poll,
+                                                    &proxy_state_poll,
+                                                    auto_apply_plugin_migrations_poll,
+                                                    &plugin_migration_reconcile_state_poll,
+                                                    &mut last_change_cursor,
+                                                    &config_rejected_poll,
+                                                    &runtime_config_apply_poll,
+                                                    &mut rejected_delta_tracker,
+                                                    &database_delta_poll_metrics_for_poll,
+                                                    "failover full reload",
+                                                    "failover",
+                                                    "Authoritative primary failover reload also failed (using cached)",
+                                                    "Authoritative primary full config reload also failed (using cached)",
+                                                )
+                                                .await
                                                 {
-                                                    Ok(_url) => {
-                                                        let topology_epoch =
-                                                            db_poll.config_topology_epoch();
-                                                        runtime_config_apply_poll
-                                                            .observe_topology(topology_epoch);
-                                                        last_change_cursor = None;
-                                                        plugin_migration_reconcile_state_poll
-                                                            .store(PLUGIN_MIGRATIONS_NEED_RECONCILE, Ordering::Release);
-                                                        match load_full_config_with_sequence(
-                                                            &db_poll,
-                                                            &poll_namespace,
-                                                        )
-                                                        .await
-                                                        {
-                                                            Ok((new_config, cursor)) => {
-                                                                match try_publish_full_reload_after_gate(
-                                                                    &db_poll,
-                                                                    &poll_namespace,
-                                                                    &db_available_poll,
-                                                                    &proxy_state_poll,
-                                                                    new_config,
-                                                                    "failover full reload",
-                                                                    "failover",
-                                                                    auto_apply_plugin_migrations_poll,
-                                                                    &plugin_migration_reconcile_state_poll,
-                                                                    &mut last_change_cursor,
-                                                                    cursor,
-                                                                    &config_rejected_poll,
-                                                                    &runtime_config_apply_poll,
-                                                                )
-                                                                .await
-                                                                {
-                                                                    None => {
-                                                                        runtime_config_apply_poll.nudge_if_waiters_pending();
-                                                                        database_delta_poll_metrics_for_poll.record_poll_completed();
-                                                                        continue;
-                                                                    }
-                                                                    Some(true) => {
-                                                                        rejected_delta_tracker.record_accepted();
-                                                                    }
-                                                                    Some(false) => {}
-                                                                }
-                                                            }
-                                                            Err(e3) => {
-                                                                if crate::modes::is_poll_validation_rejection(&e3) {
-                                                                    record_config_validation_rejection_after_recovery_migration_gate(
-                                                                        &db_poll,
-                                                                        &db_available_poll,
-                                                                        &config_rejected_poll,
-                                                                        auto_apply_plugin_migrations_poll,
-                                                                        &plugin_migration_reconcile_state_poll,
-                                                                        &e3,
-                                                                        "failover full reload",
-                                                                    )
-                                                                    .await;
-                                                                    database_delta_poll_metrics_for_poll
-                                                                        .record_poll_failure(DatabasePollFailureReason::ValidationRejected);
-                                                                } else {
-                                                                    database_delta_poll_metrics_for_poll
-                                                                        .record_config_source_unavailable(
-                                                                            DatabasePollFailureReason::Connectivity,
-                                                                        );
-                                                                    warn!(
-                                                                        "Authoritative primary failover reload also failed (using cached)"
-                                                                    );
-                                                                }
-                                                            }
-                                                        }
+                                                    DatabaseFailoverFullReloadOutcome::MigrationGateBlocked => {
+                                                        runtime_config_apply_poll.nudge_if_waiters_pending();
+                                                        database_delta_poll_metrics_for_poll.record_poll_completed();
+                                                        continue;
                                                     }
-                                                    Err(_) => {
+                                                    DatabaseFailoverFullReloadOutcome::ConnectivityUnavailable => {
                                                         database_delta_poll_metrics_for_poll
                                                             .record_config_source_unavailable(
                                                                 DatabasePollFailureReason::Connectivity,
                                                             );
-                                                        warn!(
-                                                            "Authoritative primary full config reload also failed (using cached)"
-                                                        );
                                                     }
+                                                    DatabaseFailoverFullReloadOutcome::Recovered
+                                                    | DatabaseFailoverFullReloadOutcome::ValidationRejected => {}
                                                 }
                                             }
                                         }
@@ -3217,14 +3144,32 @@ pub async fn run(
                                         .await;
                                         database_delta_poll_metrics_for_poll
                                             .record_poll_failure(DatabasePollFailureReason::ValidationRejected);
-                                    } else {
+                                    } else if matches!(
+                                        attempt_database_failover_full_reload(
+                                            &db_poll,
+                                            &db_url_for_reconnect,
+                                            &poll_namespace,
+                                            &db_available_poll,
+                                            &proxy_state_poll,
+                                            auto_apply_plugin_migrations_poll,
+                                            &plugin_migration_reconcile_state_poll,
+                                            &mut last_change_cursor,
+                                            &config_rejected_poll,
+                                            &runtime_config_apply_poll,
+                                            &mut rejected_delta_tracker,
+                                            &database_delta_poll_metrics_for_poll,
+                                            "initial failover full reload",
+                                            "initial failover",
+                                            "Authoritative primary failover reload also failed (using cached)",
+                                            "Authoritative primary full config reload failed (using cached)",
+                                        )
+                                        .await,
+                                        DatabaseFailoverFullReloadOutcome::ConnectivityUnavailable
+                                    ) {
                                         database_delta_poll_metrics_for_poll
                                             .record_config_source_unavailable(
                                                 DatabasePollFailureReason::Connectivity,
                                             );
-                                        warn!(
-                                            "Authoritative primary full config reload failed (using cached)"
-                                        );
                                     }
                                 }
                             }
@@ -3496,6 +3441,96 @@ pub(crate) fn log_config_change_applied(
             apply_ms = stages.apply.as_millis() as u64,
             "Config change published"
         );
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DatabaseFailoverFullReloadOutcome {
+    Recovered,
+    MigrationGateBlocked,
+    ValidationRejected,
+    ConnectivityUnavailable,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn attempt_database_failover_full_reload(
+    db_poll: &Arc<dyn DatabaseBackend>,
+    db_url_for_reconnect: &str,
+    poll_namespace: &str,
+    db_available_poll: &AtomicBool,
+    proxy_state_poll: &ProxyState,
+    auto_apply_plugin_migrations_poll: bool,
+    plugin_migration_reconcile_state_poll: &AtomicU8,
+    last_change_cursor: &mut Option<LiveApplyCursor>,
+    config_rejected_poll: &AtomicBool,
+    runtime_config_apply_poll: &RuntimeConfigApply,
+    rejected_delta_tracker: &mut RejectedDeltaTracker,
+    database_delta_poll_metrics_for_poll: &DatabaseDeltaPollMetrics,
+    gate_context: &str,
+    commit_context: &str,
+    failover_reload_failure_warning: &str,
+    reconnect_failure_warning: &str,
+) -> DatabaseFailoverFullReloadOutcome {
+    match db_poll.try_failover_reconnect(db_url_for_reconnect).await {
+        Ok(_url) => {
+            let topology_epoch = db_poll.config_topology_epoch();
+            runtime_config_apply_poll.observe_topology(topology_epoch);
+            *last_change_cursor = None;
+            plugin_migration_reconcile_state_poll
+                .store(PLUGIN_MIGRATIONS_NEED_RECONCILE, Ordering::Release);
+            match load_full_config_with_sequence(db_poll, poll_namespace).await {
+                Ok((new_config, cursor)) => {
+                    match try_publish_full_reload_after_gate(
+                        db_poll,
+                        poll_namespace,
+                        db_available_poll,
+                        proxy_state_poll,
+                        new_config,
+                        gate_context,
+                        commit_context,
+                        auto_apply_plugin_migrations_poll,
+                        plugin_migration_reconcile_state_poll,
+                        last_change_cursor,
+                        cursor,
+                        config_rejected_poll,
+                        runtime_config_apply_poll,
+                    )
+                    .await
+                    {
+                        None => DatabaseFailoverFullReloadOutcome::MigrationGateBlocked,
+                        Some(true) => {
+                            rejected_delta_tracker.record_accepted();
+                            DatabaseFailoverFullReloadOutcome::Recovered
+                        }
+                        Some(false) => DatabaseFailoverFullReloadOutcome::ValidationRejected,
+                    }
+                }
+                Err(e3) => {
+                    if crate::modes::is_poll_validation_rejection(&e3) {
+                        record_config_validation_rejection_after_recovery_migration_gate(
+                            db_poll,
+                            db_available_poll,
+                            config_rejected_poll,
+                            auto_apply_plugin_migrations_poll,
+                            plugin_migration_reconcile_state_poll,
+                            &e3,
+                            gate_context,
+                        )
+                        .await;
+                        database_delta_poll_metrics_for_poll
+                            .record_poll_failure(DatabasePollFailureReason::ValidationRejected);
+                        DatabaseFailoverFullReloadOutcome::ValidationRejected
+                    } else {
+                        warn!("{failover_reload_failure_warning}");
+                        DatabaseFailoverFullReloadOutcome::ConnectivityUnavailable
+                    }
+                }
+            }
+        }
+        Err(_) => {
+            warn!("{reconnect_failure_warning}");
+            DatabaseFailoverFullReloadOutcome::ConnectivityUnavailable
+        }
     }
 }
 

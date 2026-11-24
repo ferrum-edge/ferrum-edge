@@ -75,6 +75,8 @@ enum ApiSpecError {
     PluginComposition(Vec<String>),
     /// No DB configured (503)
     NoDatabase,
+    /// Backing database is transiently unreachable / pool unavailable (503)
+    DatabaseUnavailable,
     /// Namespace admission is currently fenced (503)
     AdmissionUnavailable(String),
     /// Generic DB or internal error (500)
@@ -109,6 +111,9 @@ fn classify_db_error(e: anyhow::Error) -> ApiSpecError {
     }
     if let Some(conflict) = tcp_connection_throttle_attachment_conflict(&e) {
         return ApiSpecError::PluginComposition(conflict.errors().to_vec());
+    }
+    if crate::config::db_loader::is_transient_database_error(&e) {
+        return ApiSpecError::DatabaseUnavailable;
     }
     if e.chain().any(|cause| {
         cause
@@ -613,6 +618,13 @@ fn error_response(err: ApiSpecError) -> Response<Full<Bytes>> {
             StatusCode::SERVICE_UNAVAILABLE,
             &json!({"error": "No database configured"}),
         ),
+        ApiSpecError::DatabaseUnavailable => {
+            crate::admin::warn_persistence_failure_redacted("api_spec_database_unavailable");
+            json_resp(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({"error": "Database temporarily unavailable"}),
+            )
+        }
         ApiSpecError::AdmissionUnavailable(_detail) => {
             crate::admin::warn_persistence_failure_redacted("api_spec_admission_unavailable");
             crate::admin::mtls_dns_admission_unavailable_response()
@@ -4132,6 +4144,26 @@ mod tests {
             classify_db_error(anyhow::Error::new(sqlx::Error::RowNotFound)),
             ApiSpecError::NotFound
         ));
+    }
+
+    #[test]
+    fn classify_transient_db_connectivity_as_service_unavailable() {
+        for err in [
+            sqlx::Error::PoolTimedOut,
+            sqlx::Error::PoolClosed,
+            sqlx::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "connection refused",
+            )),
+        ] {
+            let classified = classify_db_error(anyhow::Error::new(err));
+            assert!(
+                matches!(classified, ApiSpecError::DatabaseUnavailable),
+                "expected DatabaseUnavailable, got {classified:?}"
+            );
+            let resp = error_response(classified);
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
     }
 
     #[test]

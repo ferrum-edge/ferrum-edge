@@ -626,6 +626,73 @@ async fn explicit_scope_boundary_failure_demotes_only_that_namespace() {
     );
 }
 
+#[tokio::test]
+async fn all_namespaces_failed_returns_err_across_scopes() {
+    let previous = full_load_consumer_config("alpha", "last-good", 10);
+    let source = ScriptedFullLoadSource::new(
+        HashMap::from([
+            (
+                "alpha".to_string(),
+                full_load_consumer_config("alpha", "fresh", 20),
+            ),
+            (
+                "beta".to_string(),
+                full_load_consumer_config("beta", "fresh", 20),
+            ),
+        ]),
+        HashMap::from([("alpha".to_string(), 20), ("beta".to_string(), 30)]),
+        30,
+    )
+    .fail_sequence_for("alpha")
+    .fail_sequence_for("beta");
+
+    // Default Single scope
+    let single_res = load_full_config_multi_with_sequence_for_test(
+        &source,
+        &["alpha".to_string()],
+        &previous,
+        &CpScope::Single("alpha".to_string()),
+        None,
+        0,
+    )
+    .await;
+    assert!(
+        single_res.is_err(),
+        "Single scope must return Err when the database fails for the namespace"
+    );
+
+    // Explicit Set scope where every namespace fails
+    let set_scope = CpScope::Set(HashSet::from(["alpha".to_string(), "beta".to_string()]));
+    let set_res = load_full_config_multi_with_sequence_for_test(
+        &source,
+        &["alpha".to_string(), "beta".to_string()],
+        &previous,
+        &set_scope,
+        Some("db"),
+        0,
+    )
+    .await;
+    assert!(
+        set_res.is_err(),
+        "Set scope must return Err when every namespace fails so CP marks DB unavailable and attempts failover"
+    );
+
+    // Unsequenced All scope where every namespace fails
+    let all_res = load_full_config_multi_with_sequence_for_test(
+        &source,
+        &["alpha".to_string(), "beta".to_string()],
+        &previous,
+        &CpScope::All,
+        None,
+        0,
+    )
+    .await;
+    assert!(
+        all_res.is_err(),
+        "Unsequenced All scope must return Err when every namespace fails"
+    );
+}
+
 // ── Comparison contract ────────────────────────────────────────────────────
 
 #[test]
