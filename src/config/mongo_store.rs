@@ -7227,7 +7227,14 @@ mod inner {
                         .iter()
                         .find(|s| s.id == spec.id)
                         .ok_or(DeploymentGraphInvalid)?;
-                    if snapshot.replacement_is_noop(bundle, spec)? {
+                    let declared =
+                        crate::admin::api_specs::declared_proxy_plugin_association_ids_from_stored_spec_async(
+                            previous_spec.clone(),
+                            None,
+                        )
+                        .await
+                        .map_err(anyhow::Error::msg)?;
+                    if snapshot.replacement_is_noop_with_declared(bundle, spec, &declared)? {
                         validate_deployment_candidate(
                             &snapshot.snapshot().config,
                             precondition.validation_http_client,
@@ -7294,13 +7301,6 @@ mod inner {
                         .iter()
                         .find(|p| p.id == id)
                         .ok_or(DeploymentGraphInvalid)?;
-                    let declared =
-                        crate::admin::api_specs::declared_proxy_plugin_association_ids_from_stored_spec_async(
-                            previous_spec.clone(),
-                            None,
-                        )
-                        .await
-                        .map_err(anyhow::Error::msg)?;
                     let old_plugins: HashSet<_> = candidate
                         .plugin_configs
                         .iter()

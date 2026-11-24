@@ -725,18 +725,67 @@ pub(super) fn parse_content_type(headers: &hyper::HeaderMap) -> Option<SpecForma
 ///
 /// Module-level so both `negotiate_accept` and `negotiate_accept_or_406`
 /// share the same parser (avoids duplication).
+/// Split an HTTP header value on `delim` only outside double-quoted strings,
+/// honoring RFC 9110 §5.6.4 `\` quoted-pair escapes so quoted commas or
+/// semicolons cannot inject spurious media ranges or parameters.
+fn split_outside_quotes(input: &str, delim: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (idx, ch) in input.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_quotes {
+            match ch {
+                '\\' => escaped = true,
+                '"' => in_quotes = false,
+                _ => {}
+            }
+        } else if ch == '"' {
+            in_quotes = true;
+        } else if ch == delim {
+            parts.push(&input[start..idx]);
+            start = idx + ch.len_utf8();
+        }
+    }
+    parts.push(&input[start..]);
+    parts
+}
+
+/// Return `true` when `param` is a non-constraining `charset=utf-8` media-type
+/// parameter (case-insensitive, unquoted or quoted `"utf-8"`), matching RFC
+/// 8259 §11 and common HTTP clients sending `Accept: application/json; charset=utf-8`.
+fn is_utf8_charset_param(param: &str) -> bool {
+    let Some((name, value)) = param.split_once('=') else {
+        return false;
+    };
+    if !name.trim().eq_ignore_ascii_case("charset") {
+        return false;
+    }
+    let val = value.trim();
+    let unquoted = val
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or(val);
+    unquoted.eq_ignore_ascii_case("utf-8")
+}
+
 /// Parse an `Accept` media-range's parameter tail (`;...`) for our
-/// unparameterized JSON/YAML representations (RFC 9110 §12.5.1).
+/// unparameterized UTF-8 JSON/YAML representations (RFC 9110 §12.5.1).
 ///
 /// Media-type parameters appear before `;q=` and narrow which representations a
-/// media-range matches; because this server offers bare `application/json` and
-/// `application/yaml` without media parameters, any non-`q` parameter before
-/// `;q=` (such as `profile=v2` in `application/*;profile=v2;q=0`) does not
-/// match our offered representations and returns `None` so the entry is
-/// ignored rather than falsely shadowing a less-specific wildcard. Parameters
-/// after `;q=` are accept-ext and do not constrain media matching.
+/// media-range matches; because this server offers UTF-8 `application/json` and
+/// `application/yaml` without custom media parameters, `charset=utf-8` is
+/// accepted as non-constraining while any other media parameter before `;q=`
+/// (such as `profile=v2` in `application/*;profile=v2;q=0`) does not match our
+/// offered representations and returns `None` so the entry is ignored rather
+/// than falsely shadowing a less-specific wildcard. Parameters after `;q=` are
+/// accept-ext and do not constrain media matching.
 fn parse_accept_media_range_params(params: &str) -> Option<u32> {
-    for param in params.split(';') {
+    for param in split_outside_quotes(params, ';') {
         let p = param.trim();
         if p.is_empty() {
             continue;
@@ -751,8 +800,11 @@ fn parse_accept_media_range_params(params: &str) -> Option<u32> {
             }
             return Some(1000);
         }
-        // A media-type parameter before `;q=` does not match our unparameterized
-        // `application/json` / `application/yaml` representations.
+        if is_utf8_charset_param(p) {
+            continue;
+        }
+        // Any other media-type parameter before `;q=` does not match our
+        // offered representations.
         return None;
     }
     Some(1000) // default q=1.0
@@ -784,7 +836,7 @@ pub(super) fn negotiate_accept_or_406(
         }
         saw_any_non_empty = true;
 
-        for entry in accept.split(',') {
+        for entry in split_outside_quotes(accept, ',') {
             // Split type/subtype from parameters.
             let mut parts = entry.splitn(2, ';');
             let media_type_raw = parts.next().unwrap_or("").trim();
@@ -1055,6 +1107,34 @@ mod negotiate_accept_tests {
             negotiate_accept_or_406(&h_accept_ext, SpecFormat::Json),
             Some(SpecFormat::Yaml),
             "accept-ext after ;q= must not suppress matching of application/json;q=0"
+        );
+        let h_charset_json = headers_with_accept("application/json; charset=utf-8");
+        assert_eq!(
+            negotiate_accept_or_406(&h_charset_json, SpecFormat::Yaml),
+            Some(SpecFormat::Json),
+            "application/json; charset=utf-8 must still select JSON for a YAML-stored spec"
+        );
+        let h_charset_with_q0 =
+            headers_with_accept("application/json; charset=utf-8, application/yaml;q=0");
+        assert_eq!(
+            negotiate_accept_or_406(&h_charset_with_q0, SpecFormat::Yaml),
+            Some(SpecFormat::Json),
+            "application/json; charset=utf-8 must not yield 406 when application/yaml is q=0"
+        );
+        let h_quoted_comma = headers_with_accept(
+            r#"text/plain;foo="bar,application/json", application/json;q=0, application/yaml;q=0"#,
+        );
+        assert_eq!(
+            negotiate_accept_or_406(&h_quoted_comma, SpecFormat::Json),
+            None,
+            "comma inside quoted media parameter must not inject a spurious application/json range"
+        );
+        let h_quoted_escape =
+            headers_with_accept(r#"text/plain;foo="a\"b,application/json", */*;q=0"#);
+        assert_eq!(
+            negotiate_accept_or_406(&h_quoted_escape, SpecFormat::Json),
+            None,
+            "escaped quote inside quoted parameter must not break comma splitting"
         );
     }
 }
@@ -2355,6 +2435,7 @@ async fn spec_content_response_async(
     spec: ApiSpec,
     request_headers: &hyper::HeaderMap,
     max_decompress_bytes: usize,
+    read_permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Response<Full<Bytes>> {
     // Content negotiation FIRST — the ETag must be representation-specific so
     // a cached YAML ETag does not produce a false 304 when the client requests
@@ -2417,19 +2498,14 @@ async fn spec_content_response_async(
     }
 
     // Offload gzip decompression + optional YAML/JSON conversion to the
-    // blocking pool under the read codec semaphore so large spec reads cannot
-    // saturate Tokio worker threads or starve write-side spec codec work.
-    let Ok(permit) = Arc::clone(&SPEC_READ_CODEC_SLOTS).acquire_owned().await else {
-        return json_resp(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &json!({"error": "Spec codec admission unavailable"}),
-        );
-    };
+    // blocking pool while holding the pre-acquired read codec permit so large
+    // spec reads cannot saturate Tokio worker threads or retain unbounded blobs
+    // while waiting in the queue.
     let spec_id = spec.id;
     let stored_format = spec.spec_format;
     let compressed = spec.spec_content;
     let converted = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
+        let _permit = read_permit;
         let raw =
             spec_codec::decompress_gzip_capped(&compressed, max_decompress_bytes).map_err(|e| {
                 tracing::error!(
@@ -3398,6 +3474,16 @@ pub async fn handle_get_api_spec(
         Err(e) => return Ok(error_response(e)),
     };
 
+    // Acquire read codec capacity BEFORE loading the full compressed spec blob
+    // from the database so bursts of concurrent reads cannot hold unbounded
+    // multi-MiB rows in memory while queued.
+    let Ok(read_permit) = Arc::clone(&SPEC_READ_CODEC_SLOTS).acquire_owned().await else {
+        return Ok(json_resp(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({"error": "Spec codec admission unavailable"}),
+        ));
+    };
+
     let spec = match db.get_api_spec(namespace, id).await {
         Ok(Some(s)) => s,
         Ok(None) => return Ok(error_response(ApiSpecError::NotFound)),
@@ -3405,7 +3491,7 @@ pub async fn handle_get_api_spec(
     };
 
     let max_decompress = max_spec_decompress_bytes(state.admin_spec_max_body_size_mib);
-    Ok(spec_content_response_async(spec, req.headers(), max_decompress).await)
+    Ok(spec_content_response_async(spec, req.headers(), max_decompress, read_permit).await)
 }
 
 // ---------------------------------------------------------------------------
@@ -3423,6 +3509,13 @@ pub async fn handle_get_api_spec_by_proxy(
         Err(e) => return Ok(error_response(e)),
     };
 
+    let Ok(read_permit) = Arc::clone(&SPEC_READ_CODEC_SLOTS).acquire_owned().await else {
+        return Ok(json_resp(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({"error": "Spec codec admission unavailable"}),
+        ));
+    };
+
     let spec = match db.get_api_spec_by_proxy(namespace, proxy_id).await {
         Ok(Some(s)) => s,
         Ok(None) => return Ok(error_response(ApiSpecError::NotFound)),
@@ -3430,7 +3523,7 @@ pub async fn handle_get_api_spec_by_proxy(
     };
 
     let max_decompress = max_spec_decompress_bytes(state.admin_spec_max_body_size_mib);
-    Ok(spec_content_response_async(spec, req.headers(), max_decompress).await)
+    Ok(spec_content_response_async(spec, req.headers(), max_decompress, read_permit).await)
 }
 
 // ---------------------------------------------------------------------------

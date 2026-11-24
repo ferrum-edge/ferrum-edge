@@ -53,6 +53,19 @@ fn effective_env_config(state: &AdminState) -> Option<Arc<crate::config::EnvConf
     None
 }
 
+/// Concurrent live `GET /admin/tls/inventory` collections admitted onto the
+/// blocking pool process-wide so bursts of slow remote/filesystem inventory
+/// probes cannot saturate the shared blocking pool and delay TLS mutations or
+/// spec writes.
+const MAX_CONCURRENT_TLS_INVENTORY_JOBS: usize = 4;
+
+static TLS_INVENTORY_SLOTS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| {
+        Arc::new(tokio::sync::Semaphore::new(
+            MAX_CONCURRENT_TLS_INVENTORY_JOBS,
+        ))
+    });
+
 pub(super) async fn handle_inventory(
     state: &AdminState,
     pagination: &PaginationParams,
@@ -68,9 +81,17 @@ pub(super) async fn handle_inventory(
                 .as_ref()
                 .map(|cached| cached.load_full())
         });
+    let Ok(permit) = Arc::clone(&TLS_INVENTORY_SLOTS).acquire_owned().await else {
+        return Ok(super::json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({"error": "TLS inventory worker admission unavailable"}),
+        ));
+    };
     // `TlsInventory::collect` performs blocking filesystem/remote-secret I/O
-    // and X.509/CRL parsing; run it off the Tokio async worker threads.
+    // and X.509/CRL parsing; run it off the Tokio async worker threads while
+    // holding the bounded inventory permit until collection exits.
     let inventory = match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         crate::tls::inventory::TlsInventory::collect(env_config.as_deref(), config.as_deref())
     })
     .await
@@ -341,6 +362,7 @@ pub(super) async fn handle_create_certificate(
 
 pub(super) async fn handle_update_certificate(
     state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     id: &str,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
@@ -369,7 +391,7 @@ pub(super) async fn handle_update_certificate(
             ));
         }
     };
-    Ok(respond_managed_update(store, record).await)
+    Ok(respond_managed_update(state, actor, store, record).await)
 }
 
 pub(super) async fn handle_create_ca_bundle(
@@ -401,6 +423,7 @@ pub(super) async fn handle_create_ca_bundle(
 
 pub(super) async fn handle_update_ca_bundle(
     state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     id: &str,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
@@ -428,7 +451,7 @@ pub(super) async fn handle_update_ca_bundle(
             ));
         }
     };
-    Ok(respond_managed_update(store, record).await)
+    Ok(respond_managed_update(state, actor, store, record).await)
 }
 
 pub(super) async fn handle_create_crl(
@@ -460,6 +483,7 @@ pub(super) async fn handle_create_crl(
 
 pub(super) async fn handle_update_crl(
     state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     id: &str,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
@@ -486,7 +510,7 @@ pub(super) async fn handle_update_crl(
             ));
         }
     };
-    Ok(respond_managed_update(store, record).await)
+    Ok(respond_managed_update(state, actor, store, record).await)
 }
 
 pub(super) async fn handle_create_ocsp_response(
@@ -518,6 +542,7 @@ pub(super) async fn handle_create_ocsp_response(
 
 pub(super) async fn handle_update_ocsp_response(
     state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     id: &str,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
@@ -546,7 +571,7 @@ pub(super) async fn handle_update_ocsp_response(
             ));
         }
     };
-    Ok(respond_managed_update(store, record).await)
+    Ok(respond_managed_update(state, actor, store, record).await)
 }
 
 pub(super) async fn handle_create_jwks(
@@ -1155,6 +1180,7 @@ pub(super) async fn handle_finalize_acme_order(
 
 pub(super) async fn handle_update_acme_certificate(
     state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     id: &str,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
@@ -1193,7 +1219,7 @@ pub(super) async fn handle_update_acme_certificate(
             ));
         }
     };
-    Ok(respond_acme_certificate_update(store, record).await)
+    Ok(respond_acme_certificate_update(state, actor, store, record).await)
 }
 
 pub(super) async fn handle_delete_acme_certificate(
@@ -1392,6 +1418,7 @@ pub(super) async fn handle_renew_acme_certificate(
 
 pub(super) async fn handle_update_jwks(
     state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     id: &str,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
@@ -1418,11 +1445,7 @@ pub(super) async fn handle_update_jwks(
             ));
         }
     };
-    let response = respond_managed_update(store, record).await;
-    if response.status().is_success() {
-        refresh_managed_jwks_consumers().await;
-    }
-    Ok(response)
+    Ok(respond_managed_update(state, actor, store, record).await)
 }
 
 pub(super) async fn handle_delete_managed(
@@ -2236,25 +2259,63 @@ async fn respond_managed_upsert(
     }
 }
 
-/// Atomically update an existing managed TLS record off the runtime worker.
+/// Atomically update an existing managed TLS record off the runtime worker
+/// inside a detached settlement task so client cancellation cannot drop
+/// watcher reload notification, JWKS consumer refresh, or the success audit.
 async fn respond_managed_update(
+    state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     store: Arc<crate::tls::managed::ManagedTlsStore>,
     record: ManagedTlsRecord,
 ) -> Response<Full<Bytes>> {
-    let outcome = match offload_store_write("managed_tls_update", move || {
-        store.update_existing(record)
-    })
-    .await
-    {
-        Ok(outcome) => outcome,
-        Err(response) => return *response,
+    let (resource_type, path_segment, refresh_jwks) = match record.kind {
+        ManagedTlsMaterialKind::Certificate => ("tls_certificate", "certificates", false),
+        ManagedTlsMaterialKind::CaBundle => ("tls_ca_bundle", "ca-bundles", false),
+        ManagedTlsMaterialKind::Crl => ("tls_crl", "crls", false),
+        ManagedTlsMaterialKind::OcspResponse => ("tls_ocsp_response", "ocsp-responses", false),
+        ManagedTlsMaterialKind::Jwks => ("tls_jwks", "jwks", true),
     };
-    match outcome {
-        Ok(record) => {
-            request_managed_source_reloads();
-            super::json_response(StatusCode::OK, &json!(record.summary()))
+    let settlement_state = state.clone();
+    let settlement_actor = actor.clone();
+    let settlement = crate::admin::audit::spawn_with_request_slot(async move {
+        let outcome =
+            match offload_store_write("managed_tls_update", move || store.update_existing(record))
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(response) => return *response,
+            };
+        match outcome {
+            Ok(record) => {
+                request_managed_source_reloads();
+                if refresh_jwks {
+                    refresh_managed_jwks_consumers().await;
+                }
+                if settlement_state.admin_audit_enabled {
+                    let event = crate::admin::audit::AuditEvent::new(
+                        &settlement_actor,
+                        "update",
+                        resource_type,
+                        &record.id,
+                        crate::config::types::DEFAULT_NAMESPACE,
+                        json!({"path": format!("/admin/tls/{path_segment}/{}", record.id)}),
+                    );
+                    super::record_operation_audit(&settlement_state, event).await;
+                }
+                super::json_response(StatusCode::OK, &json!(record.summary()))
+            }
+            Err(error) => managed_error_response(error),
         }
-        Err(error) => managed_error_response(error),
+    });
+    match settlement.await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::error!("managed TLS update settlement task failed: {error}");
+            super::json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "managed TLS update settlement failed"}),
+            )
+        }
     }
 }
 
@@ -2282,25 +2343,54 @@ async fn respond_acme_certificate_upsert(
     }
 }
 
-/// Atomically update an existing ACME certificate record off the runtime worker.
+/// Atomically update an existing ACME certificate record off the runtime worker
+/// inside a detached settlement task so client cancellation cannot drop
+/// watcher reload notification or the success audit.
 async fn respond_acme_certificate_update(
+    state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     store: Arc<crate::tls::acme::AcmeCertificateStore>,
     record: AcmeCertificateRecord,
 ) -> Response<Full<Bytes>> {
-    let outcome = match offload_store_write("acme_certificate_update", move || {
-        store.update_existing_certificate(record)
-    })
-    .await
-    {
-        Ok(outcome) => outcome,
-        Err(response) => return *response,
-    };
-    match outcome {
-        Ok(record) => {
-            request_managed_source_reloads();
-            super::json_response(StatusCode::OK, &json!(record.summary()))
+    let settlement_state = state.clone();
+    let settlement_actor = actor.clone();
+    let settlement = crate::admin::audit::spawn_with_request_slot(async move {
+        let outcome = match offload_store_write("acme_certificate_update", move || {
+            store.update_existing_certificate(record)
+        })
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(response) => return *response,
+        };
+        match outcome {
+            Ok(record) => {
+                request_managed_source_reloads();
+                if settlement_state.admin_audit_enabled {
+                    let event = crate::admin::audit::AuditEvent::new(
+                        &settlement_actor,
+                        "update",
+                        "tls_acme",
+                        &record.id,
+                        crate::config::types::DEFAULT_NAMESPACE,
+                        json!({"path": format!("/admin/tls/acme/certificates/{}", record.id)}),
+                    );
+                    super::record_operation_audit(&settlement_state, event).await;
+                }
+                super::json_response(StatusCode::OK, &json!(record.summary()))
+            }
+            Err(error) => acme_error_response(error),
         }
-        Err(error) => acme_error_response(error),
+    });
+    match settlement.await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::error!("ACME certificate update settlement task failed: {error}");
+            super::json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "ACME certificate update settlement failed"}),
+            )
+        }
     }
 }
 
@@ -2323,11 +2413,11 @@ fn require_existing_managed_kind(
     id: &str,
     kind: ManagedTlsMaterialKind,
 ) -> Result<(), ManagedTlsError> {
-    let existing = store.get(id)?;
-    if existing.kind != kind {
+    let existing_kind = store.record_kind(id)?;
+    if existing_kind != kind {
         return Err(ManagedTlsError::KindConflict {
             id: id.to_string(),
-            existing_kind: existing.kind.as_str(),
+            existing_kind: existing_kind.as_str(),
             requested_kind: kind.as_str(),
         });
     }

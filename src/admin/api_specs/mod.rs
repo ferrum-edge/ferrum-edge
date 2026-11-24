@@ -98,18 +98,18 @@ struct StoredSpecAssocCacheKey {
 
 const STORED_SPEC_ASSOC_CACHE_CAPACITY: usize = 64;
 
-static STORED_SPEC_ASSOC_CACHE: std::sync::LazyLock<
-    std::sync::Mutex<
-        std::collections::VecDeque<(
-            StoredSpecAssocCacheKey,
-            std::sync::Arc<std::collections::HashSet<String>>,
-        )>,
-    >,
-> = std::sync::LazyLock::new(|| {
-    std::sync::Mutex::new(std::collections::VecDeque::with_capacity(
-        STORED_SPEC_ASSOC_CACHE_CAPACITY,
-    ))
-});
+type StoredSpecAssocCacheEntry = (
+    StoredSpecAssocCacheKey,
+    std::sync::Arc<std::collections::HashSet<String>>,
+);
+type StoredSpecAssocCache = std::sync::Mutex<std::collections::VecDeque<StoredSpecAssocCacheEntry>>;
+
+static STORED_SPEC_ASSOC_CACHE: std::sync::LazyLock<StoredSpecAssocCache> =
+    std::sync::LazyLock::new(|| {
+        std::sync::Mutex::new(std::collections::VecDeque::with_capacity(
+            STORED_SPEC_ASSOC_CACHE_CAPACITY,
+        ))
+    });
 
 fn stored_spec_assoc_cache_key(
     spec: &crate::config::types::ApiSpec,
@@ -214,22 +214,30 @@ pub(crate) fn declared_proxy_plugin_association_ids_from_stored_spec(
 /// Async, bounded blocking-pool version of
 /// [`declared_proxy_plugin_association_ids_from_stored_spec_with_cap`].
 ///
-/// Uses the verified result cache when the authoritative spec row was already
-/// recovered earlier in the same PUT flow, and otherwise acquires a permit from
-/// [`SPEC_WRITE_CODEC_SLOTS`] and runs decompression + parsing on
-/// `tokio::task::spawn_blocking` so Tokio workers never stall on large specs.
+/// Acquires a permit from [`SPEC_WRITE_CODEC_SLOTS`] and computes the cache
+/// key, verified cache lookup, and any required gzip decompression + parsing
+/// inside `tokio::task::spawn_blocking` so Tokio workers never hash,
+/// decompress, or parse large specs inline.
 pub(crate) async fn declared_proxy_plugin_association_ids_from_stored_spec_async(
     spec: crate::config::types::ApiSpec,
     max_cap: Option<usize>,
 ) -> Result<std::collections::HashSet<String>, String> {
+    if spec.content_encoding != "gzip" {
+        return Err(format!(
+            "api_spec '{}' uses unsupported content_encoding '{}'",
+            spec.id, spec.content_encoding
+        ));
+    }
+    if usize::try_from(spec.uncompressed_size).is_err() {
+        return Err(format!(
+            "api_spec '{}' has invalid uncompressed_size {}",
+            spec.id, spec.uncompressed_size
+        ));
+    }
     let max_cap = match max_cap {
         Some(cap) => cap,
         None => resolve_stored_spec_assoc_decompress_cap_bytes()?,
     };
-    let (cache_key, _) = stored_spec_assoc_cache_key(&spec, max_cap)?;
-    if let Some(cached) = lookup_cached_stored_spec_assoc(&cache_key) {
-        return Ok(cached);
-    }
     let permit = std::sync::Arc::clone(&SPEC_WRITE_CODEC_SLOTS)
         .acquire_owned()
         .await

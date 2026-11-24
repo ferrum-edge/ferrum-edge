@@ -1935,40 +1935,8 @@ fn external_ref_error(message: &str) -> ExtractError {
     ExtractError::SchemaReference(message.to_string())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::content_type_allowed;
-
-    #[test]
-    fn content_type_allowed_enforces_concrete_rfc9110_media_types() {
-        for allowed in [
-            "application/json",
-            "application/json; charset=utf-8",
-            "application/yaml",
-            "application/vnd.oai.openapi+json",
-            "application/vnd.oai.openapi+yaml; charset=\"utf-8\"",
-            "text/plain",
-        ] {
-            assert!(
-                content_type_allowed(allowed),
-                "expected allowed media type: {allowed:?}"
-            );
-        }
-
-        for rejected in [
-            "application/json; charset=",
-            "application/json;",
-            "*/vendor+json",
-            "*/*",
-            "application/*",
-            "application/foo/bar+json",
-            "application/+json",
-            "text/html",
-        ] {
-            assert!(
-                !content_type_allowed(rejected),
-                "expected rejected media type: {rejected:?}"
-            );
-        }
-    }
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn content_type_allowed_for_test(content_type: &str) -> bool {
+    content_type_allowed(content_type)
 }

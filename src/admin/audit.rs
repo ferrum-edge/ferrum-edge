@@ -2126,16 +2126,18 @@ async fn scope_request_with_cancellation_ownership<F: std::future::Future>(
     output
 }
 
+/// Return `true` when the current request's audit slot has transferred
+/// cancellation and finalization ownership to a detached settlement task.
+pub(crate) fn current_slot_has_transferred_settlement() -> bool {
+    current_slot().is_some_and(|slot| slot.cancellation_transferred.load(Ordering::Acquire))
+}
+
 /// Spawn mutation-owned work with the current request's audit slot installed.
 ///
 /// Tokio task-local state is not inherited by `tokio::spawn`. Admin CRUD and
 /// API-spec persistence deliberately outlive cancellation of the request task,
 /// so they must carry this slot explicitly or their successful audit event
 /// cannot adopt the pre-mutation intent's stable id.
-pub(crate) fn current_slot_has_transferred_settlement() -> bool {
-    current_slot().is_some_and(|slot| slot.cancellation_transferred.load(Ordering::Acquire))
-}
-
 pub fn spawn_with_request_slot<F>(future: F) -> JoinHandle<F::Output>
 where
     F: std::future::Future + Send + 'static,

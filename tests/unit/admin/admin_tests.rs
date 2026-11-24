@@ -1343,6 +1343,10 @@ async fn head_probes_return_empty_body_and_end_stream_over_http2() {
             content_length > 0,
             "HTTP/2 HEAD {path} Content-Length should reflect GET payload size"
         );
+        assert!(
+            hyper::body::Body::is_end_stream(resp.body()),
+            "HTTP/2 HEAD {path} must signal END_STREAM on HEADERS frame without DATA frames"
+        );
         let body = resp
             .into_body()
             .collect()
@@ -1356,10 +1360,141 @@ async fn head_probes_return_empty_body_and_end_stream_over_http2() {
         );
     }
 
+    // Unauthenticated HEAD on a protected route returns 401 with END_STREAM on
+    // the HEADERS frame and zero body bytes.
+    let unauth_req = hyper::Request::builder()
+        .method(hyper::Method::HEAD)
+        .uri("http://localhost/proxies")
+        .body(http_body_util::Empty::<bytes::Bytes>::new())
+        .expect("build HEAD /proxies request");
+    let unauth_resp = sender
+        .send_request(unauth_req)
+        .await
+        .expect("HTTP/2 HEAD /proxies failed");
+    assert_eq!(unauth_resp.status(), hyper::StatusCode::UNAUTHORIZED);
+    assert!(
+        hyper::body::Body::is_end_stream(unauth_resp.body()),
+        "HTTP/2 HEAD 401 must signal END_STREAM on HEADERS frame"
+    );
+    let unauth_body = unauth_resp
+        .into_body()
+        .collect()
+        .await
+        .expect("HTTP/2 HEAD /proxies body collection failed")
+        .to_bytes();
+    assert!(
+        unauth_body.is_empty(),
+        "HTTP/2 HEAD 401 must carry zero body bytes"
+    );
+
     drop(sender);
     let _ = conn_task.await;
     shutdown_tx.send(true).expect("signal admin shutdown");
     let _ = server.await;
+}
+
+#[test]
+fn content_type_allowed_enforces_concrete_rfc9110_media_types() {
+    use ferrum_edge::admin::api_specs::external_refs::content_type_allowed_for_test;
+
+    for allowed in [
+        "application/json",
+        "application/json; charset=utf-8",
+        "application/yaml",
+        "application/vnd.oai.openapi+json",
+        "application/vnd.oai.openapi+yaml; charset=\"utf-8\"",
+        "text/plain",
+    ] {
+        assert!(
+            content_type_allowed_for_test(allowed),
+            "expected allowed media type: {allowed:?}"
+        );
+    }
+
+    for rejected in [
+        "application/json; charset=",
+        "application/json;",
+        "*/vendor+json",
+        "*/*",
+        "application/*",
+        "application/foo/bar+json",
+        "application/+json",
+        "text/html",
+    ] {
+        assert!(
+            !content_type_allowed_for_test(rejected),
+            "expected rejected media type: {rejected:?}"
+        );
+    }
+}
+
+#[test]
+fn head_withdrawn_trust_401_restore_partial_clear_and_tls_settlement_invariants() {
+    let admin_source = include_str!("../../../src/admin/mod.rs");
+    let retired_at = admin_source
+        .find("session.is_retired()")
+        .expect("withdrawn client trust guard");
+    let wrap_at = retired_at
+        + admin_source[retired_at..]
+            .find("GuardedAdminBody::wrap_response(response, guard)")
+            .expect("GuardedAdminBody convergence point");
+    let transport_tail = &admin_source[retired_at..wrap_at];
+    assert!(
+        transport_tail.contains("strip_head_response_body(&mut response)"),
+        "withdrawn-trust 401 and dispatched responses must converge before HEAD body stripping"
+    );
+
+    let restore_at = admin_source
+        .find("if clear_may_be_partial")
+        .expect("non-atomic potentially partial clear branch");
+    let restore_end = restore_at
+        + admin_source[restore_at..]
+            .find("};")
+            .expect("end of rollback status selection");
+    let restore_slice = &admin_source[restore_at..restore_end];
+    assert!(
+        restore_slice.contains("\"skipped_after_intervening_write\""),
+        "potentially partial non-atomic restore clear with intervening write must report skipped_after_intervening_write"
+    );
+
+    let tls_source = include_str!("../../../src/admin/tls_management.rs");
+    for helper in [
+        "async fn respond_managed_update(",
+        "async fn respond_acme_certificate_update(",
+    ] {
+        let start = tls_source
+            .find(helper)
+            .unwrap_or_else(|| panic!("missing {helper}"));
+        let end = start
+            + tls_source[start..]
+                .find("\n}\n")
+                .unwrap_or_else(|| panic!("end of {helper}"));
+        let body = &tls_source[start..end];
+        assert!(
+            body.contains("spawn_with_request_slot("),
+            "{helper} must transfer settlement and audit to spawn_with_request_slot"
+        );
+        assert!(
+            body.contains("request_managed_source_reloads()"),
+            "{helper} must trigger watcher reloads inside detached settlement"
+        );
+        assert!(
+            body.contains("super::record_operation_audit("),
+            "{helper} must record its success audit inside detached settlement"
+        );
+    }
+    let inv_start = tls_source
+        .find("pub(super) async fn handle_inventory(")
+        .expect("handle_inventory");
+    let inv_end = inv_start
+        + tls_source[inv_start..]
+            .find("\n}\n")
+            .expect("end of handle_inventory");
+    let inv_body = &tls_source[inv_start..inv_end];
+    assert!(
+        inv_body.contains("TLS_INVENTORY_SLOTS"),
+        "handle_inventory must bound blocking concurrency with TLS_INVENTORY_SLOTS"
+    );
 }
 
 #[test]

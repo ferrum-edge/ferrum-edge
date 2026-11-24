@@ -1485,14 +1485,9 @@ impl GuardedAdminBody {
         let delivery_ack = parts
             .extensions
             .remove::<plugins::api_chargeback::ChargesDeliveryAck>();
-        Response::from_parts(
-            parts,
-            Self {
-                inner,
-                delivery_ack,
-                _guard: guard,
-            },
-        )
+        let mut body = Self::new(inner, guard);
+        body.delivery_ack = delivery_ack;
+        Response::from_parts(parts, body)
     }
 }
 
@@ -1601,21 +1596,24 @@ async fn serve_admin_io<I>(
             // the graceful shutdown below is still draining. The body is a
             // compiled-in literal naming no serial, subject, issuer,
             // fingerprint, path, or generation.
-            if let Some(session) = client_trust.as_ref()
+            let is_head = req.method() == Method::HEAD;
+            let mut response = if let Some(session) = client_trust.as_ref()
                 && session.is_retired()
             {
                 session.record_fenced();
-                let response = with_admin_challenge(
+                with_admin_challenge(
                     json_response(
                         StatusCode::UNAUTHORIZED,
                         &json!({ "error": "Client certificate trust withdrawn" }),
                     ),
                     crate::plugins::utils::auth_flow::CLIENT_CERTIFICATE_AUTHENTICATION_CHALLENGE,
-                );
-                let guarded = response.map(|inner| GuardedAdminBody::new(inner, guard));
-                return Ok::<_, hyper::Error>(guarded);
+                )
+            } else {
+                handle_admin_request(req, state, client_ip).await?
+            };
+            if is_head {
+                strip_head_response_body(&mut response);
             }
-            let response = handle_admin_request(req, state, client_ip).await?;
             let guarded = GuardedAdminBody::wrap_response(response, guard);
             Ok::<_, hyper::Error>(guarded)
         }
@@ -3364,26 +3362,30 @@ pub async fn handle_admin_request(
         );
         note_unserved_namespace_mutation(marker);
     }
-    // RFC 9110 §9.3.2: HEAD responses MUST NOT contain a message body. Strip
-    // the body at the transport boundary while preserving status and
-    // representation metadata (including Content-Length) so both HTTP/1.1 and
-    // HTTP/2 emit END_STREAM without sending DATA frames.
     if is_head && let Ok(response) = result.as_mut() {
-        let status = response.status();
-        if !matches!(status, StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED)
-            && !response
-                .headers()
-                .contains_key(hyper::header::CONTENT_LENGTH)
-            && let Some(len) =
-                <Full<Bytes> as hyper::body::Body>::size_hint(response.body()).exact()
-        {
-            response
-                .headers_mut()
-                .insert(hyper::header::CONTENT_LENGTH, HeaderValue::from(len));
-        }
-        *response.body_mut() = Full::new(Bytes::new());
+        strip_head_response_body(response);
     }
     result
+}
+
+/// RFC 9110 §9.3.2: HEAD responses MUST NOT contain a message body. Strip
+/// the body at the transport boundary while preserving status and
+/// representation metadata (including `Content-Length`) so both HTTP/1.1 and
+/// HTTP/2 emit `END_STREAM` on the `HEADERS` frame without sending `DATA`
+/// frames.
+fn strip_head_response_body(response: &mut Response<Full<Bytes>>) {
+    let status = response.status();
+    if !matches!(status, StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED)
+        && !response
+            .headers()
+            .contains_key(hyper::header::CONTENT_LENGTH)
+        && let Some(len) = <Full<Bytes> as hyper::body::Body>::size_hint(response.body()).exact()
+    {
+        response
+            .headers_mut()
+            .insert(hyper::header::CONTENT_LENGTH, HeaderValue::from(len));
+    }
+    *response.body_mut() = Full::new(Bytes::new());
 }
 
 type BoxedAdminResponseFuture = std::pin::Pin<
@@ -5418,7 +5420,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_update_acme_certificate(&state, id, &body_bytes).await
+            tls_management::handle_update_acme_certificate(&state, &auth, id, &body_bytes).await
         }
         (Method::DELETE, ["admin", "tls", "acme", "certificates", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
@@ -5494,7 +5496,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_update_certificate(&state, id, &body_bytes).await
+            tls_management::handle_update_certificate(&state, &auth, id, &body_bytes).await
         }
         (Method::DELETE, ["admin", "tls", "certificates", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
@@ -5526,7 +5528,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_update_ca_bundle(&state, id, &body_bytes).await
+            tls_management::handle_update_ca_bundle(&state, &auth, id, &body_bytes).await
         }
         (Method::DELETE, ["admin", "tls", "ca-bundles", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
@@ -5558,7 +5560,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_update_crl(&state, id, &body_bytes).await
+            tls_management::handle_update_crl(&state, &auth, id, &body_bytes).await
         }
         (Method::DELETE, ["admin", "tls", "crls", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
@@ -5590,7 +5592,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_update_ocsp_response(&state, id, &body_bytes).await
+            tls_management::handle_update_ocsp_response(&state, &auth, id, &body_bytes).await
         }
         (Method::DELETE, ["admin", "tls", "ocsp-responses", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
@@ -5622,7 +5624,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_update_jwks(&state, id, &body_bytes).await
+            tls_management::handle_update_jwks(&state, &auth, id, &body_bytes).await
         }
         (Method::DELETE, ["admin", "tls", "jwks", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
@@ -12088,6 +12090,9 @@ async fn handle_restore(
         let clear_commit_unknown = delete_result
             .as_ref()
             .is_err_and(|error| error.has_unknown_commit_result());
+        let clear_may_be_partial = delete_result
+            .as_ref()
+            .is_err_and(|error| !error.mode().is_atomic() && !error.has_unknown_commit_result());
         if let Err(error) = delete_result.as_ref()
             && (!error.mode().is_atomic() || error.has_unknown_commit_result())
         {
@@ -12231,6 +12236,11 @@ async fn handle_restore(
                 (
                     "Config admission was lost during an ambiguous restore clear (clear commit outcome unknown) after another writer acquired the namespace lease",
                     "unknown_clear_outcome",
+                )
+            } else if clear_may_be_partial {
+                (
+                    "Config admission was lost during a potentially partial non-atomic restore clear after another writer acquired the namespace lease; rollback skipped",
+                    "skipped_after_intervening_write",
                 )
             } else {
                 (

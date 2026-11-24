@@ -22206,6 +22206,11 @@ fn restore_503_schema_accepts_unknown_clear_outcome_bodies() {
             "rollback": "unknown_clear_outcome"
         }),
         json!({
+            "error": "Config admission was lost during a potentially partial non-atomic restore clear after another writer acquired the namespace lease; rollback skipped",
+            "restore_errors": ["namespace admission lease lost"],
+            "rollback": "skipped_after_intervening_write"
+        }),
+        json!({
             "error": "Config admission was lost during a failed restore clear after another writer acquired the namespace lease",
             "restore_errors": ["namespace admission lease lost"],
             "rollback": "not_needed_after_intervening_write"

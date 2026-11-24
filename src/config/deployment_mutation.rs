@@ -141,15 +141,33 @@ impl DeploymentSnapshot {
         out.write_all(CANONICAL_TAIL)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn replacement_is_noop(
         &self,
         bundle: &crate::admin::api_specs::ExtractedBundle,
         spec: &crate::config::types::ApiSpec,
     ) -> Result<bool, anyhow::Error> {
-        let config = &self.snapshot.config;
         let Some(previous_spec) = self.snapshot.api_specs.iter().find(|s| s.id == spec.id) else {
             return Ok(false);
         };
+        let declared =
+            crate::admin::api_specs::declared_proxy_plugin_association_ids_from_stored_spec(
+                previous_spec,
+            )
+            .map_err(anyhow::Error::msg)?;
+        self.replacement_is_noop_with_declared(bundle, spec, &declared)
+    }
+
+    pub(crate) fn replacement_is_noop_with_declared(
+        &self,
+        bundle: &crate::admin::api_specs::ExtractedBundle,
+        spec: &crate::config::types::ApiSpec,
+        declared: &HashSet<String>,
+    ) -> Result<bool, anyhow::Error> {
+        let config = &self.snapshot.config;
+        if !self.snapshot.api_specs.iter().any(|s| s.id == spec.id) {
+            return Ok(false);
+        }
         let Some(mut proxy) = config
             .proxies
             .iter()
@@ -173,11 +191,6 @@ impl DeploymentSnapshot {
         if upstreams.len() > 1 {
             return Ok(false);
         }
-        let declared =
-            crate::admin::api_specs::declared_proxy_plugin_association_ids_from_stored_spec(
-                previous_spec,
-            )
-            .map_err(anyhow::Error::msg)?;
         let desired: HashSet<_> = bundle
             .proxy
             .plugins
