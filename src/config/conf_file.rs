@@ -175,6 +175,7 @@ impl ConfFile {
     /// - Unquoted values end at the first ` #` inline comment
     pub fn parse(contents: &str) -> Result<Self, String> {
         let mut values = HashMap::new();
+        let contents = contents.strip_prefix('\u{feff}').unwrap_or(contents);
 
         for (line_num, line) in contents.lines().enumerate() {
             let trimmed = line.trim();
@@ -230,7 +231,8 @@ impl ConfFile {
                 });
             }
 
-            let value = trimmed[eq_pos + 1..].trim();
+            let raw_value = &trimmed[eq_pos + 1..];
+            let value = raw_value.trim();
             let value = if let Some(quote @ ('"' | '\'')) = value.chars().next() {
                 // Both delimiters are ASCII; find the first matching quote without escapes.
                 let quoted = &value[1..];
@@ -249,6 +251,11 @@ impl ConfFile {
                     ));
                 }
                 &quoted[..end]
+            } else if raw_value.starts_with(' ') && value.starts_with('#') {
+                // `KEY = # comment` starts with the documented ` #` inline
+                // comment delimiter after an empty value; `KEY=#secret` has no
+                // preceding space and remains a literal value.
+                ""
             } else if let Some(comment_pos) = value.find(" #") {
                 value[..comment_pos].trim_end()
             } else {

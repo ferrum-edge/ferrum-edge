@@ -126,6 +126,7 @@ fn prepared_mesh_plugin_configs(
         node_waypoint_udp_steer_destinations: Vec::new(),
         node_waypoint_udp_destination_routes: Vec::new(),
         k8s_mesh_overlay: Default::default(),
+        validated_country_mmdb_generation: None,
         gateway_trust_bundles: Vec::new(),
     };
     prepare_gateway_config_via_mesh_slice(config, runtime)
@@ -1924,6 +1925,7 @@ async fn trust_domain_alias_accepts_baggage_principal_from_aliased_domain() {
         node_waypoint_udp_steer_destinations: Vec::new(),
         node_waypoint_udp_destination_routes: Vec::new(),
         k8s_mesh_overlay: Default::default(),
+        validated_country_mmdb_generation: None,
         gateway_trust_bundles: Vec::new(),
     };
     let prepared = prepare_gateway_config_via_mesh_slice(config, &runtime).expect("mesh-prepared");

@@ -182,6 +182,7 @@ fn create_mesh_proxy_state_with_upstreams(
         node_waypoint_udp_steer_destinations: Vec::new(),
         node_waypoint_udp_destination_routes: Vec::new(),
         k8s_mesh_overlay: Default::default(),
+        validated_country_mmdb_generation: None,
         gateway_trust_bundles: Vec::new(),
     };
     ProxyState::new(
@@ -1368,6 +1369,7 @@ fn create_inbound_relay_gateway_state(mesh: Option<MeshConfig>) -> ProxyState {
         node_waypoint_udp_steer_destinations: Vec::new(),
         node_waypoint_udp_destination_routes: Vec::new(),
         k8s_mesh_overlay: Default::default(),
+        validated_country_mmdb_generation: None,
         gateway_trust_bundles: Vec::new(),
     };
     let env_config = EnvConfig {
@@ -2167,6 +2169,7 @@ fn materialize_source_side_external_udp(
         node_waypoint_udp_steer_destinations: Vec::new(),
         node_waypoint_udp_destination_routes: Vec::new(),
         k8s_mesh_overlay: Default::default(),
+        validated_country_mmdb_generation: None,
         gateway_trust_bundles: Vec::new(),
     };
 
@@ -5429,6 +5432,7 @@ fn create_post_plugin_third_workload_state(
         node_waypoint_udp_steer_destinations: Vec::new(),
         node_waypoint_udp_destination_routes: Vec::new(),
         k8s_mesh_overlay: Default::default(),
+        validated_country_mmdb_generation: None,
         gateway_trust_bundles: Vec::new(),
     };
     let env_config = EnvConfig {

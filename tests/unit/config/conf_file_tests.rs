@@ -720,3 +720,16 @@ fn gateway_listener_bindings_include_tls_and_only_active_modes() {
     config.cp_grpc_listen_addr = Some("0.0.0.0:0".into());
     assert!(config.validate_gateway_listener_bindings().is_ok());
 }
+
+#[test]
+fn test_parse_bom_and_empty_value_comment() {
+    let input = "\u{feff}FERRUM_MODE = file # space inline comment\nFERRUM_NAMESPACE = # empty with comment\nFERRUM_ADMIN_JWT_SECRET=#literal-hash-secret-value-123456\nFERRUM_LOG_LEVEL = info\n";
+    let conf = ConfFile::parse(input).unwrap();
+    assert_eq!(conf.get("FERRUM_MODE"), Some("file"));
+    assert_eq!(conf.get("FERRUM_NAMESPACE"), Some(""));
+    assert_eq!(
+        conf.get("FERRUM_ADMIN_JWT_SECRET"),
+        Some("#literal-hash-secret-value-123456")
+    );
+    assert_eq!(conf.get("FERRUM_LOG_LEVEL"), Some("info"));
+}
