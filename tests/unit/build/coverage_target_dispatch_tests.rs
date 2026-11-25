@@ -36,6 +36,10 @@ const OUTSIDE_DEFAULT_COVERAGE_BASELINE: &[&str] = &[
     // Live kind-cluster proof driven by `.github/workflows/istio-status-cas-live.yml`;
     // never part of the deterministic llvm-cov denominator.
     "k8s_istio_status_cas_live",
+    // Windows-only (`#![cfg(windows)]`) tenant-file confinement suite driven by
+    // `.github/workflows/windows-confinement.yml`; compiles out on Linux where
+    // llvm-cov runs.
+    "windows_confinement_tests",
 ];
 
 fn is_cargo_target_name(name: &str) -> bool {
