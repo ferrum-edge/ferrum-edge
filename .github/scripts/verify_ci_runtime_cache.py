@@ -5745,14 +5745,15 @@ def _tokenize_shell_script(run_text: str) -> tuple[list[list[str]], bool]:
     pending_heredocs: list[tuple[str, bool]] = []
     expecting_heredoc_delim: tuple[bool, bool] | None = None  # (active, strip_tabs)
     expecting_redir_operand = False
-    arith_depth = 0
-    paren_depth = 0
+    arith_paren_stack: list[int] = []
+    word_paren_depth = 0
+    ansi_bytes = bytearray()
     malformed = False
     idx = 0
     n = len(run_text)
 
     def _flush_word() -> None:
-        nonlocal cur, has_token, cur_had_quote, expecting_heredoc_delim, expecting_redir_operand
+        nonlocal cur, has_token, cur_had_quote, expecting_heredoc_delim, expecting_redir_operand, word_paren_depth
         if not has_token:
             return
         word = "".join(cur)
@@ -5765,6 +5766,7 @@ def _tokenize_shell_script(run_text: str) -> tuple[list[list[str]], bool]:
         cur = []
         has_token = False
         cur_had_quote = False
+        word_paren_depth = 0
 
     def _flush_command() -> None:
         nonlocal typed_words, expecting_heredoc_delim, expecting_redir_operand, malformed
@@ -5825,44 +5827,65 @@ def _tokenize_shell_script(run_text: str) -> tuple[list[list[str]], bool]:
             if ch == "$" and idx + 1 < n and run_text[idx + 1] == "'":
                 # Bash ANSI-C quoting `$'...'`.
                 quote = "$'"
+                ansi_bytes.clear()
                 has_token = True
                 cur_had_quote = True
                 idx += 2
                 continue
-            # Track arithmetic expansions `$(( ... ))` / `(( ... ))` so bitwise
-            # shifts (`<<`, `<<=`, `>>`) inside arithmetic are not treated as heredocs.
+            # Track arithmetic expansions `$(( ... ))` / `(( ... ))` with inner
+            # parenthesis nesting so bitwise shifts (`<<`, `<<=`, `>>`) inside
+            # arithmetic (including `$(( (1 + (2)) << attempt ))`) are not treated
+            # as heredocs.
             if run_text[idx : idx + 3] == "$((":
-                arith_depth += 1
+                arith_paren_stack.append(0)
                 cur.append("$((")
                 has_token = True
                 idx += 3
                 continue
-            if run_text[idx : idx + 2] == "((":
-                arith_depth += 1
+            if not arith_paren_stack and not has_token and run_text[idx : idx + 2] == "((":
+                arith_paren_stack.append(0)
                 cur.append("((")
                 has_token = True
                 idx += 2
                 continue
-            if arith_depth > 0 and run_text[idx : idx + 2] == "))":
-                arith_depth -= 1
-                cur.append("))")
-                has_token = True
-                idx += 2
-                continue
-            if ch == "(" and arith_depth == 0:
-                paren_depth += 1
-                cur.append(ch)
-                has_token = True
+            if arith_paren_stack:
+                if ch == "(":
+                    arith_paren_stack[-1] += 1
+                    cur.append(ch)
+                    has_token = True
+                    idx += 1
+                    continue
+                if ch == ")":
+                    if arith_paren_stack[-1] > 0:
+                        arith_paren_stack[-1] -= 1
+                        cur.append(ch)
+                        has_token = True
+                        idx += 1
+                        continue
+                    if run_text[idx : idx + 2] == "))":
+                        arith_paren_stack.pop()
+                        cur.append("))")
+                        has_token = True
+                        idx += 2
+                        continue
+            if ch == "(" and not arith_paren_stack:
+                if has_token:
+                    word_paren_depth += 1
+                    cur.append(ch)
+                else:
+                    # Leading unquoted `(` starts a subshell (`(cargo ...)`) or
+                    # optional Bash `case` pattern prefix (`(stable)cargo ...`).
+                    typed_words.append(("word", "("))
                 idx += 1
                 continue
-            if ch == ")" and arith_depth == 0:
-                if paren_depth > 0:
-                    paren_depth -= 1
+            if ch == ")" and not arith_paren_stack:
+                if word_paren_depth > 0:
+                    word_paren_depth -= 1
                     cur.append(ch)
                     has_token = True
                 else:
-                    # Unmatched `)` outside `(...)` is a Bash `case` arm terminator
-                    # (e.g. `stable)cargo ...` or `stable ) cargo ...`).
+                    # Unmatched `)` closes a subshell or Bash `case` arm
+                    # (e.g. `stable)cargo ...`, `(stable)cargo ...`, `(cargo ...)`).
                     _flush_word()
                     typed_words.append(("word", ")"))
                 idx += 1
@@ -5874,7 +5897,7 @@ def _tokenize_shell_script(run_text: str) -> tuple[list[list[str]], bool]:
             # Emit unquoted redirection operators as typed `("redir", op)` tokens.
             # When a redirection operand is already pending (e.g. `1` in `2>&1>/dev/null`),
             # flush it as the operand word instead of treating it as the next fd prefix.
-            if ch in (">", "<") and arith_depth == 0:
+            if ch in (">", "<") and not arith_paren_stack:
                 fd_prefix = ""
                 if has_token:
                     word_so_far = "".join(cur)
@@ -5887,8 +5910,12 @@ def _tokenize_shell_script(run_text: str) -> tuple[list[list[str]], bool]:
                         cur = []
                         has_token = False
                         cur_had_quote = False
+                        word_paren_depth = 0
                     else:
                         _flush_word()
+                if expecting_heredoc_delim is not None:
+                    malformed = True
+                    expecting_heredoc_delim = None
                 if ch == "<":
                     if run_text[idx : idx + 3] in ("<<<", "<<-"):
                         op = run_text[idx : idx + 3]
@@ -5909,15 +5936,18 @@ def _tokenize_shell_script(run_text: str) -> tuple[list[list[str]], bool]:
                     expecting_heredoc_delim = None
                 idx += len(op)
                 continue
-            if ch == "&" and idx + 1 < n and run_text[idx + 1] == ">":
+            if ch == "&" and not arith_paren_stack and idx + 1 < n and run_text[idx + 1] == ">":
                 _flush_word()
+                if expecting_heredoc_delim is not None:
+                    malformed = True
+                    expecting_heredoc_delim = None
                 op = "&>>" if run_text[idx : idx + 3] == "&>>" else "&>"
                 typed_words.append(("redir", op))
                 expecting_redir_operand = True
                 expecting_heredoc_delim = None
                 idx += len(op)
                 continue
-            if ch in ("\n", ";", "|", "&"):
+            if ch == "\n" or (not arith_paren_stack and ch in (";", "|", "&")):
                 _flush_command()
                 if ch == "\n":
                     idx += 1
@@ -5949,7 +5979,7 @@ def _tokenize_shell_script(run_text: str) -> tuple[list[list[str]], bool]:
                 if nxt == "x":
                     hex_m = re.match(r"[0-9A-Fa-f]{1,2}", run_text[idx + 2 : idx + 4])
                     if hex_m:
-                        cur.append(chr(int(hex_m.group(0), 16)))
+                        ansi_bytes.append(int(hex_m.group(0), 16))
                         idx += 2 + len(hex_m.group(0))
                         continue
                 if nxt in ("u", "U"):
@@ -5959,23 +5989,45 @@ def _tokenize_shell_script(run_text: str) -> tuple[list[list[str]], bool]:
                         run_text[idx + 2 : idx + 2 + max_digits],
                     )
                     if hex_m:
-                        cur.append(chr(int(hex_m.group(0), 16)))
+                        cp = int(hex_m.group(0), 16)
+                        if 0 <= cp <= 0x10FFFF and not (0xD800 <= cp <= 0xDFFF):
+                            ansi_bytes.extend(chr(cp).encode("utf-8"))
+                        else:
+                            ansi_bytes.extend(
+                                run_text[idx : idx + 2 + len(hex_m.group(0))].encode("utf-8")
+                            )
                         idx += 2 + len(hex_m.group(0))
                         continue
                 if nxt in "01234567":
                     oct_m = re.match(r"[0-7]{1,3}", run_text[idx + 1 : idx + 4])
                     if oct_m:
-                        cur.append(chr(int(oct_m.group(0), 8) & 0xFF))
+                        ansi_bytes.append(int(oct_m.group(0), 8) & 0xFF)
                         idx += 1 + len(oct_m.group(0))
                         continue
-                esc_map = {"n": "\n", "r": "\r", "t": "\t", "'": "'", '"': '"', "\\": "\\"}
-                cur.append(esc_map.get(nxt, nxt))
+                esc_map = {
+                    "a": "\a",
+                    "b": "\b",
+                    "e": "\x1b",
+                    "E": "\x1b",
+                    "f": "\f",
+                    "n": "\n",
+                    "r": "\r",
+                    "t": "\t",
+                    "v": "\v",
+                    "'": "'",
+                    '"': '"',
+                    "\\": "\\",
+                    "?": "?",
+                }
+                ansi_bytes.extend(esc_map.get(nxt, "\\" + nxt).encode("utf-8"))
                 idx += 2
                 continue
             if ch == "'":
+                cur.append(ansi_bytes.decode("utf-8", errors="surrogateescape"))
+                ansi_bytes.clear()
                 quote = None
             else:
-                cur.append(ch)
+                ansi_bytes.extend(ch.encode("utf-8", errors="surrogateescape"))
             idx += 1
         else:  # double quote
             if ch == "\\" and idx + 1 < n:
@@ -6005,7 +6057,7 @@ def _tokenize_shell_script(run_text: str) -> tuple[list[list[str]], bool]:
 
 
 _CI_DEBUG_SHELL_KEYWORDS = frozenset(
-    {"if", "then", "elif", "else", "do", "while", "until", "!", "{"}
+    {"if", "then", "elif", "else", "do", "while", "until", "!", "{", "("}
 )
 # Map wrapper basename -> (options taking a separate operand, takes_leading_positional_arg)
 _CI_DEBUG_SHELL_WRAPPERS: dict[str, tuple[frozenset[str], bool]] = {
@@ -6758,34 +6810,54 @@ def _has_unsupported_fallback_yaml_syntax(workflow_text: str) -> str | None:
             return f"unsupported explicit YAML key or node property in fallback parser: {line.strip()!r}"
         # Reject inline flow explicit keys like `on: { ? workflow_dispatch : {} }`
         # only when `{` opens an actual YAML flow mapping at a node boundary
-        # (not inside plain scalar text such as `name: CI {build, ? debug}`).
+        # (not inside plain scalar text such as `name: CI matrix - {build, ? debug}`).
         in_quote: str | None = None
         brace_depth = 0
+        bracket_depth = 0
         for pos, ch in enumerate(line):
             if in_quote is None:
                 if ch == "#":
                     break
                 if ch in ("'", '"'):
                     in_quote = ch
-                elif ch == "{":
+                elif ch in ("{", "["):
                     before = line[:pos].rstrip(" \t")
                     is_node_start = (
                         brace_depth > 0
+                        or bracket_depth > 0
                         or not before
-                        or before.endswith((":", "-", "[", ","))
+                        or bool(re.match(r"^[ \t]*-(?:[ \t]+-)*$", before))
+                        or (
+                            before.endswith(":")
+                            and ": " not in before[:-1]
+                            and ":\t" not in before[:-1]
+                        )
                     )
                     if is_node_start:
-                        brace_depth += 1
-                        rest = line[pos + 1 :].lstrip(" \t")
-                        if rest == "?" or rest.startswith(("? ", "?\t")):
-                            return f"unsupported flow explicit `?` YAML key in fallback parser: {line.strip()!r}"
+                        if ch == "{":
+                            brace_depth += 1
+                            rest = line[pos + 1 :].lstrip(" \t")
+                            if rest == "?" or rest.startswith(("? ", "?\t")):
+                                return f"unsupported flow explicit `?` YAML key in fallback parser: {line.strip()!r}"
+                        else:
+                            bracket_depth += 1
                 elif ch == "}" and brace_depth > 0:
                     brace_depth -= 1
+                elif ch == "]" and bracket_depth > 0:
+                    bracket_depth -= 1
                 elif ch == "," and brace_depth > 0:
                     rest = line[pos + 1 :].lstrip(" \t")
                     if rest == "?" or rest.startswith(("? ", "?\t")):
                         return f"unsupported flow explicit `?` YAML key in fallback parser: {line.strip()!r}"
             elif ch == in_quote:
+                if in_quote == '"':
+                    bs = 0
+                    k = pos - 1
+                    while k >= 0 and line[k] == "\\":
+                        bs += 1
+                        k -= 1
+                    if bs % 2 == 1:
+                        continue
                 in_quote = None
     return None
 
@@ -11665,7 +11737,10 @@ def self_test() -> int:
             ("single-line case statement", "case stable in stable) cargo test --no-run --config profile.test.debug=2 ;; esac"),
             ("tight case arm stable)cargo", "case stable in stable)cargo test --no-run --config profile.test.debug=2 ;; esac"),
             ("spaced case arm stable ) cargo", "case stable in stable ) cargo test --no-run --config profile.test.debug=2 ;; esac"),
+            ("parenthesized tight case arm (stable)cargo", "case stable in (stable)cargo test --no-run --config profile.test.debug=2 ;; esac"),
+            ("subshell (cargo --config)", "(cargo test --no-run --config profile.test.debug=2)"),
             ("bare heredoc missing delimiter", "cat <<"),
+            ("missing heredoc delimiter before redirect", "cat << >/dev/null"),
             ("unclosed single quote fail closed", "echo 'unterminated"),
             ("function keyword header", "function f() { cargo test --no-run --config profile.test.debug=2; }; f"),
             ("assignment value ending in paren", "RUSTFLAGS=-L/tmp/dir(1) cargo test --no-run"),
@@ -11903,7 +11978,7 @@ def self_test() -> int:
                 "          EOF\n",
             ),
             (
-                "harmless ANSI-C heredoc <<$'EOF' and hex escape <<$'\\x45OF'",
+                "harmless ANSI-C heredoc <<$'EOF', hex/octal UTF-8, and out-of-range \\U escape",
                 "        run: |\n"
                 "          cat <<$'EOF' > /tmp/a.txt\n"
                 "          hello\n"
@@ -11911,15 +11986,23 @@ def self_test() -> int:
                 "          cat <<$'\\x45OF' > /tmp/b.txt\n"
                 "          hello\n"
                 "          EOF\n"
+                "          cat <<$'\\xC3\\xA9' > /tmp/c.txt\n"
+                "          hello\n"
+                "          é\n"
+                "          cat <<$'\\303\\251' > /tmp/d.txt\n"
+                "          hello\n"
+                "          é\n"
+                "          printf '%s' $'\\U00110000'\n"
                 "          echo $'don\\'t'\n",
             ),
             (
-                "shell arithmetic bitwise shift << and <<=",
+                "shell arithmetic bitwise shift <<, <<=, and nested parens",
                 "        run: |\n"
                 "          attempt=2\n"
                 "          delay=$((1 << attempt))\n"
+                "          nested=$(( (1 + (2)) << attempt ))\n"
                 "          (( delay <<= 1 ))\n"
-                "          echo \"$delay\"\n",
+                "          echo \"$delay $nested\"\n",
             ),
             (
                 "folded scalar paragraph break separating cargo and kind --config",
@@ -11942,9 +12025,9 @@ def self_test() -> int:
                 failures,
             )
         # Direct Swatinem/rust-cache with quoted '*scratch' shared-key, plain ', ? debug'
-        # and literal braces in workflow name must NOT false-positive.
+        # and literal dashes/braces in workflow name must NOT false-positive.
         quoted_star_wf = (
-            "name: CI {build, ? debug}\non:\n  workflow_dispatch:\njobs:\n"
+            "name: CI matrix - {build, ? debug}\non:\n  workflow_dispatch:\njobs:\n"
             "  scratch-job:\n"
             "    runs-on: ubuntu-26.04\n"
             "    steps:\n"
