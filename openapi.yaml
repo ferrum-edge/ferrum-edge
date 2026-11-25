@@ -6038,14 +6038,19 @@ paths:
                     type: string
                     enum: [not_needed, not_needed_after_intervening_write, skipped_after_intervening_write, unknown_clear_outcome]
                     description: >-
-                      Present when a pre-delete or intervening-write guard aborts
-                      without needing rollback (`not_needed`,
-                      `not_needed_after_intervening_write`,
-                      `skipped_after_intervening_write`), or
-                      `unknown_clear_outcome` when the clear transaction had an
+                      `not_needed` / `not_needed_after_intervening_write`: a
+                      pre-delete guard or definitive atomic abort left prior
+                      state untouched without needing rollback.
+                      `skipped_after_intervening_write`: a non-atomic clear may
+                      have partially removed rows, rollback was skipped because
+                      another writer acquired the namespace lease, and the
+                      namespace admission guard remains held so manual recovery
+                      is required.
+                      `unknown_clear_outcome`: the clear transaction had an
                       ambiguous commit outcome and namespace admission could not
                       be reacquired (or was taken by another writer) before
-                      recovery could inspect or restore the namespace.
+                      recovery could inspect or restore the namespace; the guard
+                      remains held.
                   audit_unavailable_reason:
                     type: string
                     enum:

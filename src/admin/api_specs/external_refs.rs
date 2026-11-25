@@ -1935,8 +1935,6 @@ fn external_ref_error(message: &str) -> ExtractError {
     ExtractError::SchemaReference(message.to_string())
 }
 
-#[doc(hidden)]
-#[allow(dead_code)]
-pub fn content_type_allowed_for_test(content_type: &str) -> bool {
+pub(crate) fn content_type_allowed_for_test(content_type: &str) -> bool {
     content_type_allowed(content_type)
 }

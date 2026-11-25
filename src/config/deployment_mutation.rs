@@ -141,24 +141,7 @@ impl DeploymentSnapshot {
         out.write_all(CANONICAL_TAIL)
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn replacement_is_noop(
-        &self,
-        bundle: &crate::admin::api_specs::ExtractedBundle,
-        spec: &crate::config::types::ApiSpec,
-    ) -> Result<bool, anyhow::Error> {
-        let Some(previous_spec) = self.snapshot.api_specs.iter().find(|s| s.id == spec.id) else {
-            return Ok(false);
-        };
-        let declared =
-            crate::admin::api_specs::declared_proxy_plugin_association_ids_from_stored_spec(
-                previous_spec,
-            )
-            .map_err(anyhow::Error::msg)?;
-        self.replacement_is_noop_with_declared(bundle, spec, &declared)
-    }
-
-    pub(crate) fn replacement_is_noop_with_declared(
+    pub(crate) async fn replacement_is_noop_with_declared_async(
         &self,
         bundle: &crate::admin::api_specs::ExtractedBundle,
         spec: &crate::config::types::ApiSpec,
@@ -206,7 +189,7 @@ impl DeploymentSnapshot {
             .filter(|a| relevant.contains(&a.plugin_config_id))
             .map(|a| &a.plugin_config_id)
             .collect();
-        if current != desired {
+        if current != desired || spec.resource_hash.is_empty() {
             return Ok(false);
         }
         proxy.plugins = bundle.proxy.plugins.clone();
@@ -215,9 +198,18 @@ impl DeploymentSnapshot {
             upstream: upstreams.into_iter().next(),
             plugins,
         };
-        Ok(!spec.resource_hash.is_empty()
-            && crate::admin::api_specs::hash_resource_bundle(&current)?
-                == crate::admin::api_specs::hash_resource_bundle(bundle)?)
+        let incoming = bundle.clone();
+        let permit = std::sync::Arc::clone(&crate::admin::api_specs::SPEC_WRITE_CODEC_SLOTS)
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("spec codec admission unavailable"))?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            Ok(crate::admin::api_specs::hash_resource_bundle(&current)?
+                == crate::admin::api_specs::hash_resource_bundle(&incoming)?)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("replacement no-op hash worker failed: {error}"))?
     }
 
     /// Reject incomplete or inconsistent ownership before any selected mutation.

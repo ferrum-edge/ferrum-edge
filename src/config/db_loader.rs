@@ -46,7 +46,7 @@ use crate::config::policy_graph_scope::PolicyGraphScope;
 use crate::config::store_policy::{
     access_control_plugin_allows_consumer, consumer_identity_values,
     consumer_identity_values_from_fields, mesh_route_dispatch_referenced_upstream,
-    mesh_route_dispatch_references_upstream_id, store_canonical_resource_hash,
+    mesh_route_dispatch_references_upstream_id, store_canonical_resource_hash_async,
 };
 use crate::config::types::{
     AuthMode, BackendScheme, CircuitBreakerConfig, Consumer, DispatchKind, GatewayConfig,
@@ -11022,7 +11022,7 @@ impl DatabaseStore {
             }
             None => HashSet::new(),
         };
-        let desired_resource_hash = store_canonical_resource_hash(bundle)?;
+        let desired_resource_hash = store_canonical_resource_hash_async(bundle.clone()).await?;
 
         let current_resource_hash = if !spec.resource_hash.is_empty() {
             self.current_api_spec_resource_hash_tx(
@@ -11794,7 +11794,9 @@ impl DatabaseStore {
             upstream,
             plugins,
         };
-        crate::admin::api_specs::hash_resource_bundle(&current).map(Some)
+        crate::admin::api_specs::hash_resource_bundle_async(current)
+            .await
+            .map(Some)
     }
 
     async fn ensure_no_external_spec_upstream_refs_tx(

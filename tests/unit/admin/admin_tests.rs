@@ -1393,9 +1393,174 @@ async fn head_probes_return_empty_body_and_end_stream_over_http2() {
     let _ = server.await;
 }
 
+#[tokio::test]
+async fn head_withdrawn_client_trust_returns_401_end_stream_over_http2() {
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll, Waker};
+
+    struct PausedReadIo {
+        inner: tokio::io::DuplexStream,
+        paused: Arc<AtomicBool>,
+        read_waker: Arc<std::sync::Mutex<Option<Waker>>>,
+        wrote_while_paused: Arc<tokio::sync::Notify>,
+    }
+
+    impl tokio::io::AsyncRead for PausedReadIo {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.paused.load(Ordering::Acquire) {
+                *self.read_waker.lock().expect("read waker lock") = Some(cx.waker().clone());
+                if self.paused.load(Ordering::Acquire) {
+                    return Poll::Pending;
+                }
+            }
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for PausedReadIo {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
+            if matches!(poll, Poll::Ready(Ok(n)) if n > 0) && self.paused.load(Ordering::Acquire) {
+                self.wrote_while_paused.notify_waiters();
+            }
+            poll
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    let config = TestConfig::default();
+    let admin_state = create_test_admin_state(&config);
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let paused = Arc::new(AtomicBool::new(false));
+    let read_waker = Arc::new(std::sync::Mutex::new(None));
+    let wrote_while_paused = Arc::new(tokio::sync::Notify::new());
+    let gated_client_io = PausedReadIo {
+        inner: client_io,
+        paused: Arc::clone(&paused),
+        read_waker: Arc::clone(&read_waker),
+        wrote_while_paused: Arc::clone(&wrote_while_paused),
+    };
+
+    let trust_session = ferrum_edge::_test_support::new_admin_client_trust_session_for_test();
+    let server_session = trust_session.clone();
+    let server = tokio::spawn(async move {
+        ferrum_edge::_test_support::serve_admin_io_with_client_trust_for_test(
+            server_io,
+            admin_state,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            server_session,
+        )
+        .await;
+    });
+
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(
+        hyper_util::rt::TokioExecutor::new(),
+        hyper_util::rt::TokioIo::new(gated_client_io),
+    )
+    .await
+    .expect("HTTP/2 h2c handshake");
+    let conn_task = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    // Confirm the connection is established while client trust is live.
+    let get_req = hyper::Request::builder()
+        .method(hyper::Method::GET)
+        .uri("http://localhost/live")
+        .body(http_body_util::Empty::<bytes::Bytes>::new())
+        .expect("build GET /live request");
+    let get_resp = sender
+        .send_request(get_req)
+        .await
+        .expect("HTTP/2 GET /live while live");
+    assert_eq!(get_resp.status(), hyper::StatusCode::OK);
+    let _ = get_resp
+        .into_body()
+        .collect()
+        .await
+        .expect("collect GET body");
+
+    // Pause client reads so the client flushes stream 3's HEADERS frame before
+    // it can read and ACK the server's graceful-shutdown GOAWAY+PING; retire
+    // trust synchronously before yielding so `session.is_retired()` is
+    // guaranteed true when `serve_admin_io` dispatches the HEAD stream.
+    let write_seen = wrote_while_paused.notified();
+    tokio::pin!(write_seen);
+    write_seen.as_mut().enable();
+    paused.store(true, Ordering::Release);
+
+    let head_req = hyper::Request::builder()
+        .method(hyper::Method::HEAD)
+        .uri("http://localhost/live")
+        .body(http_body_util::Empty::<bytes::Bytes>::new())
+        .expect("build HEAD /live request");
+    let head_fut = sender.send_request(head_req);
+    trust_session.cancellation_token().cancel();
+
+    write_seen.await;
+    paused.store(false, Ordering::Release);
+    if let Some(waker) = read_waker.lock().expect("read waker lock").take() {
+        waker.wake();
+    }
+
+    let head_resp = head_fut
+        .await
+        .expect("HTTP/2 HEAD /live after trust withdrawal");
+    assert_eq!(
+        head_resp.status(),
+        hyper::StatusCode::UNAUTHORIZED,
+        "retired client-trust HEAD must return 401"
+    );
+    assert!(
+        head_resp
+            .headers()
+            .get(hyper::header::WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.contains("ClientCertificate")),
+        "retired client-trust 401 must carry client-certificate challenge"
+    );
+    assert!(
+        hyper::body::Body::is_end_stream(head_resp.body()),
+        "retired client-trust HTTP/2 HEAD 401 must signal END_STREAM on HEADERS frame"
+    );
+    let head_body = head_resp
+        .into_body()
+        .collect()
+        .await
+        .expect("collect retired HEAD body")
+        .to_bytes();
+    assert!(
+        head_body.is_empty(),
+        "retired client-trust HTTP/2 HEAD 401 must carry zero body bytes"
+    );
+
+    drop(sender);
+    let _ = conn_task.await;
+    let _ = server.await;
+}
+
 #[test]
 fn content_type_allowed_enforces_concrete_rfc9110_media_types() {
-    use ferrum_edge::admin::api_specs::external_refs::content_type_allowed_for_test;
+    use ferrum_edge::_test_support::api_spec_external_ref_content_type_allowed_for_test as content_type_allowed;
 
     for allowed in [
         "application/json",
@@ -1406,7 +1571,7 @@ fn content_type_allowed_enforces_concrete_rfc9110_media_types() {
         "text/plain",
     ] {
         assert!(
-            content_type_allowed_for_test(allowed),
+            content_type_allowed(allowed),
             "expected allowed media type: {allowed:?}"
         );
     }
@@ -1422,7 +1587,7 @@ fn content_type_allowed_enforces_concrete_rfc9110_media_types() {
         "text/html",
     ] {
         assert!(
-            !content_type_allowed_for_test(rejected),
+            !content_type_allowed(rejected),
             "expected rejected media type: {rejected:?}"
         );
     }
@@ -1459,8 +1624,12 @@ fn head_withdrawn_trust_401_restore_partial_clear_and_tls_settlement_invariants(
 
     let tls_source = include_str!("../../../src/admin/tls_management.rs");
     for helper in [
+        "async fn respond_managed_upsert(",
         "async fn respond_managed_update(",
+        "async fn respond_acme_certificate_upsert(",
         "async fn respond_acme_certificate_update(",
+        "pub(super) async fn handle_delete_managed(",
+        "pub(super) async fn handle_delete_acme_certificate(",
     ] {
         let start = tls_source
             .find(helper)

@@ -100,6 +100,35 @@ pub use router_cache::RouterCache;
 /// The leading underscore signals that this module is not part of the public API.
 #[doc(hidden)]
 pub mod _test_support {
+    /// Test helper exposing external-ref media-type allowlist validation
+    /// without widening the public API surface of `api_specs::external_refs`.
+    pub fn api_spec_external_ref_content_type_allowed_for_test(content_type: &str) -> bool {
+        crate::admin::api_specs::external_refs::content_type_allowed_for_test(content_type)
+    }
+
+    /// Construct an unregistered admin client-trust session handle for HTTP/2
+    /// trust-withdrawal transport tests.
+    pub fn new_admin_client_trust_session_for_test() -> crate::tls::ClientTrustSession {
+        crate::tls::ClientTrustSession::new_unregistered_for_test(
+            crate::tls::ClientTrustScope::AdminHttps,
+        )
+    }
+
+    /// Drive one admin connection with an explicit `ClientTrustSession`
+    /// so transport tests can verify HTTP/2 `HEAD` behavior when client trust
+    /// is withdrawn.
+    pub async fn serve_admin_io_with_client_trust_for_test<I>(
+        io: I,
+        state: crate::admin::AdminState,
+        client_ip: std::net::IpAddr,
+        client_trust: crate::tls::ClientTrustSession,
+    ) where
+        I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        crate::admin::serve_admin_io_with_client_trust_for_test(io, state, client_ip, client_trust)
+            .await;
+    }
+
     /// Signature schemes the mesh app-probe loopback HTTPS verifier
     /// advertises when its client is built from `provider` (issue #7075).
     pub fn mesh_app_probe_loopback_verifier_schemes_for_test(

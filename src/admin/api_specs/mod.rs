@@ -202,13 +202,24 @@ pub(crate) fn declared_proxy_plugin_association_ids_from_stored_spec_with_cap(
     Ok(ids)
 }
 
-/// Recover the proxy/plugin associations explicitly declared by a stored API
-/// spec, resolving `FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB` from env / `ferrum.conf`.
-pub(crate) fn declared_proxy_plugin_association_ids_from_stored_spec(
-    spec: &crate::config::types::ApiSpec,
-) -> Result<std::collections::HashSet<String>, String> {
-    let max_cap = resolve_stored_spec_assoc_decompress_cap_bytes()?;
-    declared_proxy_plugin_association_ids_from_stored_spec_with_cap(spec, max_cap)
+/// Async, bounded blocking-pool version of [`hash_resource_bundle`].
+///
+/// Runs canonical serialization and SHA-256 hashing of an extracted bundle on
+/// `tokio::task::spawn_blocking` under [`SPEC_WRITE_CODEC_SLOTS`] so Tokio
+/// workers never stall hashing large generated plugin configurations.
+pub(crate) async fn hash_resource_bundle_async(
+    bundle: ExtractedBundle,
+) -> Result<String, anyhow::Error> {
+    let permit = std::sync::Arc::clone(&SPEC_WRITE_CODEC_SLOTS)
+        .acquire_owned()
+        .await
+        .map_err(|_| anyhow::anyhow!("spec codec admission unavailable"))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        hash_resource_bundle(&bundle)
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("resource bundle hash worker failed: {error}"))?
 }
 
 /// Async, bounded blocking-pool version of

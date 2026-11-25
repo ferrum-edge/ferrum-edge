@@ -335,6 +335,7 @@ pub(super) async fn handle_get_managed(
 
 pub(super) async fn handle_create_certificate(
     state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(response) = state.admit_non_config_db_write().await {
@@ -344,7 +345,7 @@ pub(super) async fn handle_create_certificate(
         Ok(request) => request,
         Err(response) => return Ok(*response),
     };
-    let store = match managed_store_response() {
+    let store = match managed_store_response_async().await {
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
@@ -357,7 +358,7 @@ pub(super) async fn handle_create_certificate(
             ));
         }
     };
-    Ok(respond_managed_upsert(store, record, overwrite, StatusCode::CREATED).await)
+    Ok(respond_managed_upsert(state, actor, store, record, overwrite, StatusCode::CREATED).await)
 }
 
 pub(super) async fn handle_update_certificate(
@@ -373,15 +374,11 @@ pub(super) async fn handle_update_certificate(
         Ok(request) => request,
         Err(response) => return Ok(*response),
     };
-    let store = match managed_store_response() {
-        Ok(store) => store,
-        Err(response) => return Ok(*response),
-    };
-    if let Err(error) =
-        require_existing_managed_kind(&store, id, ManagedTlsMaterialKind::Certificate)
-    {
-        return Ok(managed_error_response(error));
-    }
+    let store =
+        match preflight_managed_store_kind(id, ManagedTlsMaterialKind::Certificate, true).await {
+            Ok(store) => store,
+            Err(response) => return Ok(*response),
+        };
     let (record, _) = match certificate_record_from_request(Some(id), request, true) {
         Ok(value) => value,
         Err(error) => {
@@ -396,6 +393,7 @@ pub(super) async fn handle_update_certificate(
 
 pub(super) async fn handle_create_ca_bundle(
     state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(response) = state.admit_non_config_db_write().await {
@@ -405,7 +403,7 @@ pub(super) async fn handle_create_ca_bundle(
         Ok(request) => request,
         Err(response) => return Ok(*response),
     };
-    let store = match managed_store_response() {
+    let store = match managed_store_response_async().await {
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
@@ -418,7 +416,7 @@ pub(super) async fn handle_create_ca_bundle(
             ));
         }
     };
-    Ok(respond_managed_upsert(store, record, overwrite, StatusCode::CREATED).await)
+    Ok(respond_managed_upsert(state, actor, store, record, overwrite, StatusCode::CREATED).await)
 }
 
 pub(super) async fn handle_update_ca_bundle(
@@ -434,14 +432,11 @@ pub(super) async fn handle_update_ca_bundle(
         Ok(request) => request,
         Err(response) => return Ok(*response),
     };
-    let store = match managed_store_response() {
+    let store = match preflight_managed_store_kind(id, ManagedTlsMaterialKind::CaBundle, true).await
+    {
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    if let Err(error) = require_existing_managed_kind(&store, id, ManagedTlsMaterialKind::CaBundle)
-    {
-        return Ok(managed_error_response(error));
-    }
     let (record, _) = match ca_bundle_record_from_request(Some(id), request, true) {
         Ok(value) => value,
         Err(error) => {
@@ -456,6 +451,7 @@ pub(super) async fn handle_update_ca_bundle(
 
 pub(super) async fn handle_create_crl(
     state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(response) = state.admit_non_config_db_write().await {
@@ -465,7 +461,7 @@ pub(super) async fn handle_create_crl(
         Ok(request) => request,
         Err(response) => return Ok(*response),
     };
-    let store = match managed_store_response() {
+    let store = match managed_store_response_async().await {
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
@@ -478,7 +474,7 @@ pub(super) async fn handle_create_crl(
             ));
         }
     };
-    Ok(respond_managed_upsert(store, record, overwrite, StatusCode::CREATED).await)
+    Ok(respond_managed_upsert(state, actor, store, record, overwrite, StatusCode::CREATED).await)
 }
 
 pub(super) async fn handle_update_crl(
@@ -494,13 +490,10 @@ pub(super) async fn handle_update_crl(
         Ok(request) => request,
         Err(response) => return Ok(*response),
     };
-    let store = match managed_store_response() {
+    let store = match preflight_managed_store_kind(id, ManagedTlsMaterialKind::Crl, true).await {
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    if let Err(error) = require_existing_managed_kind(&store, id, ManagedTlsMaterialKind::Crl) {
-        return Ok(managed_error_response(error));
-    }
     let (record, _) = match crl_record_from_request(Some(id), request, true) {
         Ok(value) => value,
         Err(error) => {
@@ -515,6 +508,7 @@ pub(super) async fn handle_update_crl(
 
 pub(super) async fn handle_create_ocsp_response(
     state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(response) = state.admit_non_config_db_write().await {
@@ -524,7 +518,7 @@ pub(super) async fn handle_create_ocsp_response(
         Ok(request) => request,
         Err(response) => return Ok(*response),
     };
-    let store = match managed_store_response() {
+    let store = match managed_store_response_async().await {
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
@@ -537,7 +531,7 @@ pub(super) async fn handle_create_ocsp_response(
             ));
         }
     };
-    Ok(respond_managed_upsert(store, record, overwrite, StatusCode::CREATED).await)
+    Ok(respond_managed_upsert(state, actor, store, record, overwrite, StatusCode::CREATED).await)
 }
 
 pub(super) async fn handle_update_ocsp_response(
@@ -553,15 +547,11 @@ pub(super) async fn handle_update_ocsp_response(
         Ok(request) => request,
         Err(response) => return Ok(*response),
     };
-    let store = match managed_store_response() {
-        Ok(store) => store,
-        Err(response) => return Ok(*response),
-    };
-    if let Err(error) =
-        require_existing_managed_kind(&store, id, ManagedTlsMaterialKind::OcspResponse)
-    {
-        return Ok(managed_error_response(error));
-    }
+    let store =
+        match preflight_managed_store_kind(id, ManagedTlsMaterialKind::OcspResponse, true).await {
+            Ok(store) => store,
+            Err(response) => return Ok(*response),
+        };
     let (record, _) = match ocsp_response_record_from_request(Some(id), request, true) {
         Ok(value) => value,
         Err(error) => {
@@ -576,6 +566,7 @@ pub(super) async fn handle_update_ocsp_response(
 
 pub(super) async fn handle_create_jwks(
     state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(response) = state.admit_non_config_db_write().await {
@@ -585,7 +576,7 @@ pub(super) async fn handle_create_jwks(
         Ok(request) => request,
         Err(response) => return Ok(*response),
     };
-    let store = match managed_store_response() {
+    let store = match managed_store_response_async().await {
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
@@ -598,15 +589,12 @@ pub(super) async fn handle_create_jwks(
             ));
         }
     };
-    let response = respond_managed_upsert(store, record, overwrite, StatusCode::CREATED).await;
-    if response.status().is_success() {
-        refresh_managed_jwks_consumers().await;
-    }
-    Ok(response)
+    Ok(respond_managed_upsert(state, actor, store, record, overwrite, StatusCode::CREATED).await)
 }
 
 pub(super) async fn handle_create_acme_certificate(
     state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(response) = state.admit_non_config_db_write().await {
@@ -616,7 +604,7 @@ pub(super) async fn handle_create_acme_certificate(
         Ok(request) => request,
         Err(response) => return Ok(*response),
     };
-    let store = match acme_certificate_store_response() {
+    let store = match acme_certificate_store_response_async().await {
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
@@ -629,7 +617,17 @@ pub(super) async fn handle_create_acme_certificate(
             ));
         }
     };
-    Ok(respond_acme_certificate_upsert(store, record, overwrite, StatusCode::CREATED).await)
+    Ok(
+        respond_acme_certificate_upsert(
+            state,
+            actor,
+            store,
+            record,
+            overwrite,
+            StatusCode::CREATED,
+        )
+        .await,
+    )
 }
 
 pub(super) async fn handle_create_acme_order(
@@ -1191,25 +1189,10 @@ pub(super) async fn handle_update_acme_certificate(
         Ok(request) => request,
         Err(response) => return Ok(*response),
     };
-    let store = match acme_certificate_store_response() {
+    let store = match preflight_acme_certificate_store_exists(id).await {
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    let preflight_store = Arc::clone(&store);
-    let preflight_id = id.to_string();
-    match tokio::task::spawn_blocking(move || preflight_store.certificate_exists(&preflight_id))
-        .await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => return Ok(acme_error_response(error)),
-        Err(error) => {
-            tracing::error!("ACME certificate preflight worker failed: {error}");
-            return Ok(super::json_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &json!({"error": "ACME certificate store preflight failed"}),
-            ));
-        }
-    }
     let (record, _) = match acme_certificate_record_from_request(Some(id), request, true) {
         Ok(value) => value,
         Err(error) => {
@@ -1224,37 +1207,24 @@ pub(super) async fn handle_update_acme_certificate(
 
 pub(super) async fn handle_delete_acme_certificate(
     state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     id: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(response) = state.admit_non_config_db_write().await {
         return Ok(response);
     }
-    let store = match acme_certificate_store_response() {
-        Ok(store) => store,
-        Err(response) => return Ok(*response),
-    };
     // Validate `id` and confirm the record exists (metadata-only, offloaded
     // from Tokio workers without cloning private keys) before acquiring
     // fleet-wide namespace config admission leases and scanning every
     // namespace. The authoritative existence check remains inside the locked
     // delete below.
-    let preflight_store = Arc::clone(&store);
-    let preflight_id = id.to_string();
-    match tokio::task::spawn_blocking(move || preflight_store.certificate_exists(&preflight_id))
-        .await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => return Ok(acme_error_response(error)),
-        Err(error) => {
-            tracing::error!("ACME certificate delete preflight worker failed: {error}");
-            return Ok(super::json_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &json!({"error": "ACME certificate store preflight failed"}),
-            ));
-        }
-    }
-    // `fence` moves into the blocking delete below, which owns it until the
-    // store mutation has concluded, even if this request is cancelled.
+    let store = match preflight_acme_certificate_store_exists(id).await {
+        Ok(store) => store,
+        Err(response) => return Ok(*response),
+    };
+    // `fence` moves into the detached settlement task and then into the
+    // blocking delete below, owning it until persistence concludes even if
+    // this request is cancelled.
     let (usage, fence) = match tls_record_usage(state, "acme", id).await {
         Ok(found) => found,
         Err(response) => return Ok(*response),
@@ -1269,29 +1239,55 @@ pub(super) async fn handle_delete_acme_certificate(
             }),
         ));
     }
-    let id = id.to_string();
-    let deleted = match offload_store_write("acme_certificate_delete", move || {
-        tls_store_delete_hook(&id);
-        let deleted =
-            store.delete_certificate_if_authorized(&id, tls_reference_fence_check(&fence));
-        drop(fence);
-        deleted
-    })
-    .await
-    {
-        Ok(deleted) => deleted,
-        Err(response) => return Ok(*response),
-    };
-    match deleted {
-        Ok(None) => Ok(tls_reference_fence_lost_response()),
-        Ok(Some(record)) => {
-            request_managed_source_reloads();
+    let owned_id = id.to_string();
+    let settlement_state = state.clone();
+    let settlement_actor = actor.clone();
+    let settlement = crate::admin::audit::spawn_with_request_slot(async move {
+        let delete_id = owned_id.clone();
+        let deleted = match offload_store_write("acme_certificate_delete", move || {
+            tls_store_delete_hook(&delete_id);
+            let deleted = store
+                .delete_certificate_if_authorized(&delete_id, tls_reference_fence_check(&fence));
+            drop(fence);
+            deleted
+        })
+        .await
+        {
+            Ok(deleted) => deleted,
+            Err(response) => return *response,
+        };
+        match deleted {
+            Ok(None) => tls_reference_fence_lost_response(),
+            Ok(Some(record)) => {
+                request_managed_source_reloads();
+                if settlement_state.admin_audit_enabled {
+                    let event = crate::admin::audit::AuditEvent::new(
+                        &settlement_actor,
+                        "delete",
+                        "tls_acme",
+                        &owned_id,
+                        crate::config::types::DEFAULT_NAMESPACE,
+                        json!({"path": format!("/admin/tls/acme/certificates/{owned_id}")}),
+                    );
+                    super::record_operation_audit(&settlement_state, event).await;
+                }
+                super::json_response(
+                    StatusCode::OK,
+                    &json!({"deleted": true, "record": record.summary()}),
+                )
+            }
+            Err(error) => acme_error_response(error),
+        }
+    });
+    match settlement.await {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            tracing::error!("ACME certificate delete settlement task failed: {error}");
             Ok(super::json_response(
-                StatusCode::OK,
-                &json!({"deleted": true, "record": record.summary()}),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "ACME certificate delete settlement failed"}),
             ))
         }
-        Err(error) => Ok(acme_error_response(error)),
     }
 }
 
@@ -1429,13 +1425,10 @@ pub(super) async fn handle_update_jwks(
         Ok(request) => request,
         Err(response) => return Ok(*response),
     };
-    let store = match managed_store_response() {
+    let store = match preflight_managed_store_kind(id, ManagedTlsMaterialKind::Jwks, true).await {
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    if let Err(error) = require_existing_managed_kind(&store, id, ManagedTlsMaterialKind::Jwks) {
-        return Ok(managed_error_response(error));
-    }
     let (record, _) = match jwks_record_from_request(Some(id), request, true) {
         Ok(value) => value,
         Err(error) => {
@@ -1450,48 +1443,24 @@ pub(super) async fn handle_update_jwks(
 
 pub(super) async fn handle_delete_managed(
     state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     kind: ManagedTlsMaterialKind,
     id: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(response) = state.admit_non_config_db_write().await {
         return Ok(response);
     }
-    let store = match managed_store_response() {
-        Ok(store) => store,
-        Err(response) => return Ok(*response),
-    };
     // Validate `id`, existence, and kind (metadata-only, offloaded from Tokio
     // workers without cloning PEM/DER/private-key material) BEFORE acquiring
     // fleet-wide DB namespace admission leases and scanning every namespace.
     // The kind and existence are re-checked atomically under the store lock below.
-    let preflight_store = Arc::clone(&store);
-    let preflight_id = id.to_string();
-    match tokio::task::spawn_blocking(move || preflight_store.record_kind(&preflight_id)).await {
-        Ok(Ok(existing_kind)) if existing_kind != kind => {
-            return Ok(super::json_response(
-                StatusCode::BAD_REQUEST,
-                &json!({
-                    "error": format!(
-                        "managed TLS record '{}' has kind {}, expected {}",
-                        id,
-                        existing_kind.as_str(),
-                        kind.as_str()
-                    )
-                }),
-            ));
-        }
-        Ok(Ok(_)) => {}
-        Ok(Err(error)) => return Ok(managed_error_response(error)),
-        Err(error) => {
-            tracing::error!("managed TLS delete preflight worker failed: {error}");
-            return Ok(super::json_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &json!({"error": "managed TLS store preflight failed"}),
-            ));
-        }
-    }
-    // `fence` moves into the blocking delete below, which owns it until the
-    // store mutation has concluded, even if this request is cancelled.
+    let store = match preflight_managed_store_kind(id, kind, false).await {
+        Ok(store) => store,
+        Err(response) => return Ok(*response),
+    };
+    // `fence` moves into the detached settlement task and then into the
+    // blocking delete below, owning it until persistence concludes even if
+    // this request is cancelled.
     let (usage, fence) = match tls_record_usage(state, "managed", id).await {
         Ok(found) => found,
         Err(response) => return Ok(*response),
@@ -1506,32 +1475,62 @@ pub(super) async fn handle_delete_managed(
             }),
         ));
     }
+    let (resource_type, path_segment, refresh_jwks) = managed_tls_audit_metadata(kind);
     let owned_id = id.to_string();
-    let deleted = match offload_store_write("managed_tls_delete", move || {
-        tls_store_delete_hook(&owned_id);
-        let deleted =
-            store.delete_kind_if_authorized(&owned_id, kind, tls_reference_fence_check(&fence));
-        drop(fence);
-        deleted
-    })
-    .await
-    {
-        Ok(deleted) => deleted,
-        Err(response) => return Ok(*response),
-    };
-    match deleted {
-        Ok(None) => Ok(tls_reference_fence_lost_response()),
-        Ok(Some(record)) => {
-            request_managed_source_reloads();
-            if kind == ManagedTlsMaterialKind::Jwks {
-                refresh_managed_jwks_consumers().await;
+    let settlement_state = state.clone();
+    let settlement_actor = actor.clone();
+    let settlement = crate::admin::audit::spawn_with_request_slot(async move {
+        let delete_id = owned_id.clone();
+        let deleted = match offload_store_write("managed_tls_delete", move || {
+            tls_store_delete_hook(&delete_id);
+            let deleted = store.delete_kind_if_authorized(
+                &delete_id,
+                kind,
+                tls_reference_fence_check(&fence),
+            );
+            drop(fence);
+            deleted
+        })
+        .await
+        {
+            Ok(deleted) => deleted,
+            Err(response) => return *response,
+        };
+        match deleted {
+            Ok(None) => tls_reference_fence_lost_response(),
+            Ok(Some(record)) => {
+                request_managed_source_reloads();
+                if refresh_jwks {
+                    refresh_managed_jwks_consumers().await;
+                }
+                if settlement_state.admin_audit_enabled {
+                    let event = crate::admin::audit::AuditEvent::new(
+                        &settlement_actor,
+                        "delete",
+                        resource_type,
+                        &owned_id,
+                        crate::config::types::DEFAULT_NAMESPACE,
+                        json!({"path": format!("/admin/tls/{path_segment}/{owned_id}")}),
+                    );
+                    super::record_operation_audit(&settlement_state, event).await;
+                }
+                super::json_response(
+                    StatusCode::OK,
+                    &json!({"deleted": true, "record": record.summary()}),
+                )
             }
+            Err(error) => managed_error_response(error),
+        }
+    });
+    match settlement.await {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            tracing::error!("managed TLS delete settlement task failed: {error}");
             Ok(super::json_response(
-                StatusCode::OK,
-                &json!({"deleted": true, "record": record.summary()}),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "managed TLS delete settlement failed"}),
             ))
         }
-        Err(error) => Ok(managed_error_response(error)),
     }
 }
 
@@ -2232,30 +2231,70 @@ where
     }
 }
 
-/// Persist a managed TLS record off the runtime worker and render the response.
-///
-/// Every managed create/update handler funnels through here, so the offload and
-/// the fail-closed join handling exist once rather than at ten call sites.
+fn managed_tls_audit_metadata(kind: ManagedTlsMaterialKind) -> (&'static str, &'static str, bool) {
+    match kind {
+        ManagedTlsMaterialKind::Certificate => ("tls_certificate", "certificates", false),
+        ManagedTlsMaterialKind::CaBundle => ("tls_ca_bundle", "ca-bundles", false),
+        ManagedTlsMaterialKind::Crl => ("tls_crl", "crls", false),
+        ManagedTlsMaterialKind::OcspResponse => ("tls_ocsp_response", "ocsp-responses", false),
+        ManagedTlsMaterialKind::Jwks => ("tls_jwks", "jwks", true),
+    }
+}
+
+/// Persist a managed TLS record off the runtime worker inside a detached
+/// settlement task so client cancellation cannot drop watcher reload
+/// notification, JWKS consumer refresh, or the success audit.
 async fn respond_managed_upsert(
+    state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     store: Arc<crate::tls::managed::ManagedTlsStore>,
     record: ManagedTlsRecord,
     overwrite: bool,
     success: StatusCode,
 ) -> Response<Full<Bytes>> {
-    let outcome = match offload_store_write("managed_tls_upsert", move || {
-        store.upsert(record, overwrite)
-    })
-    .await
-    {
-        Ok(outcome) => outcome,
-        Err(response) => return *response,
-    };
-    match outcome {
-        Ok(record) => {
-            request_managed_source_reloads();
-            super::json_response(success, &json!(record.summary()))
+    let (resource_type, path_segment, refresh_jwks) = managed_tls_audit_metadata(record.kind);
+    let settlement_state = state.clone();
+    let settlement_actor = actor.clone();
+    let settlement = crate::admin::audit::spawn_with_request_slot(async move {
+        let outcome = match offload_store_write("managed_tls_upsert", move || {
+            store.upsert(record, overwrite)
+        })
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(response) => return *response,
+        };
+        match outcome {
+            Ok(record) => {
+                request_managed_source_reloads();
+                if refresh_jwks {
+                    refresh_managed_jwks_consumers().await;
+                }
+                if settlement_state.admin_audit_enabled {
+                    let event = crate::admin::audit::AuditEvent::new(
+                        &settlement_actor,
+                        "create",
+                        resource_type,
+                        &record.id,
+                        crate::config::types::DEFAULT_NAMESPACE,
+                        json!({"path": format!("/admin/tls/{path_segment}")}),
+                    );
+                    super::record_operation_audit(&settlement_state, event).await;
+                }
+                super::json_response(success, &json!(record.summary()))
+            }
+            Err(error) => managed_error_response(error),
         }
-        Err(error) => managed_error_response(error),
+    });
+    match settlement.await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::error!("managed TLS upsert settlement task failed: {error}");
+            super::json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "managed TLS upsert settlement failed"}),
+            )
+        }
     }
 }
 
@@ -2268,13 +2307,7 @@ async fn respond_managed_update(
     store: Arc<crate::tls::managed::ManagedTlsStore>,
     record: ManagedTlsRecord,
 ) -> Response<Full<Bytes>> {
-    let (resource_type, path_segment, refresh_jwks) = match record.kind {
-        ManagedTlsMaterialKind::Certificate => ("tls_certificate", "certificates", false),
-        ManagedTlsMaterialKind::CaBundle => ("tls_ca_bundle", "ca-bundles", false),
-        ManagedTlsMaterialKind::Crl => ("tls_crl", "crls", false),
-        ManagedTlsMaterialKind::OcspResponse => ("tls_ocsp_response", "ocsp-responses", false),
-        ManagedTlsMaterialKind::Jwks => ("tls_jwks", "jwks", true),
-    };
+    let (resource_type, path_segment, refresh_jwks) = managed_tls_audit_metadata(record.kind);
     let settlement_state = state.clone();
     let settlement_actor = actor.clone();
     let settlement = crate::admin::audit::spawn_with_request_slot(async move {
@@ -2319,27 +2352,56 @@ async fn respond_managed_update(
     }
 }
 
-/// Persist an ACME certificate record off the runtime worker.
+/// Persist an ACME certificate record off the runtime worker inside a detached
+/// settlement task so client cancellation cannot drop watcher reload
+/// notification or the success audit.
 async fn respond_acme_certificate_upsert(
+    state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     store: Arc<crate::tls::acme::AcmeCertificateStore>,
     record: AcmeCertificateRecord,
     overwrite: bool,
     success: StatusCode,
 ) -> Response<Full<Bytes>> {
-    let outcome = match offload_store_write("acme_certificate_upsert", move || {
-        store.upsert_certificate(record, overwrite)
-    })
-    .await
-    {
-        Ok(outcome) => outcome,
-        Err(response) => return *response,
-    };
-    match outcome {
-        Ok(record) => {
-            request_managed_source_reloads();
-            super::json_response(success, &json!(record.summary()))
+    let settlement_state = state.clone();
+    let settlement_actor = actor.clone();
+    let settlement = crate::admin::audit::spawn_with_request_slot(async move {
+        let outcome = match offload_store_write("acme_certificate_upsert", move || {
+            store.upsert_certificate(record, overwrite)
+        })
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(response) => return *response,
+        };
+        match outcome {
+            Ok(record) => {
+                request_managed_source_reloads();
+                if settlement_state.admin_audit_enabled {
+                    let event = crate::admin::audit::AuditEvent::new(
+                        &settlement_actor,
+                        "create",
+                        "tls_acme",
+                        &record.id,
+                        crate::config::types::DEFAULT_NAMESPACE,
+                        json!({"path": "/admin/tls/acme/certificates"}),
+                    );
+                    super::record_operation_audit(&settlement_state, event).await;
+                }
+                super::json_response(success, &json!(record.summary()))
+            }
+            Err(error) => acme_error_response(error),
         }
-        Err(error) => acme_error_response(error),
+    });
+    match settlement.await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::error!("ACME certificate upsert settlement task failed: {error}");
+            super::json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "ACME certificate upsert settlement failed"}),
+            )
+        }
     }
 }
 
@@ -2404,24 +2466,87 @@ fn managed_store_response()
     })
 }
 
-/// Typed PUT requires an existing record whose kind matches the route collection.
+/// Acquire the managed TLS store off the Tokio runtime worker so cold store
+/// initialization or backing I/O cannot stall async workers.
+async fn managed_store_response_async()
+-> Result<Arc<crate::tls::managed::ManagedTlsStore>, Box<Response<Full<Bytes>>>> {
+    match tokio::task::spawn_blocking(crate::tls::managed::global_store).await {
+        Ok(Ok(store)) => Ok(store),
+        Ok(Err(error)) => Err(Box::new(super::json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({"error": format!("managed TLS store is unavailable: {error}")}),
+        ))),
+        Err(error) => {
+            tracing::error!("managed TLS store worker failed: {error}");
+            Err(Box::new(super::json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "managed TLS store initialization failed"}),
+            )))
+        }
+    }
+}
+
+/// Acquire the managed TLS store and confirm `id` exists with matching `kind`
+/// in one `spawn_blocking` call.
 ///
-/// IDs are globally unique across managed TLS collections; a cross-kind hit is a
-/// stable `409 Conflict` (`KindConflict`), matching create-with-overwrite.
-fn require_existing_managed_kind(
-    store: &crate::tls::managed::ManagedTlsStore,
+/// Typed PUT passes `conflict_on_mismatch = true` so a cross-kind ID returns
+/// `409 Conflict` (`KindConflict`); typed DELETE passes `false` to preserve
+/// its `400 Bad Request` kind-mismatch response.
+async fn preflight_managed_store_kind(
     id: &str,
     kind: ManagedTlsMaterialKind,
-) -> Result<(), ManagedTlsError> {
-    let existing_kind = store.record_kind(id)?;
-    if existing_kind != kind {
-        return Err(ManagedTlsError::KindConflict {
-            id: id.to_string(),
-            existing_kind: existing_kind.as_str(),
-            requested_kind: kind.as_str(),
-        });
+    conflict_on_mismatch: bool,
+) -> Result<Arc<crate::tls::managed::ManagedTlsStore>, Box<Response<Full<Bytes>>>> {
+    let owned_id = id.to_string();
+    match tokio::task::spawn_blocking(move || {
+        let store = match crate::tls::managed::global_store() {
+            Ok(store) => store,
+            Err(error) => {
+                return Err(Box::new(super::json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &json!({"error": format!("managed TLS store is unavailable: {error}")}),
+                )));
+            }
+        };
+        match store.record_kind(&owned_id) {
+            Ok(existing_kind) if existing_kind != kind => {
+                if conflict_on_mismatch {
+                    Err(Box::new(managed_error_response(
+                        ManagedTlsError::KindConflict {
+                            id: owned_id,
+                            existing_kind: existing_kind.as_str(),
+                            requested_kind: kind.as_str(),
+                        },
+                    )))
+                } else {
+                    Err(Box::new(super::json_response(
+                        StatusCode::BAD_REQUEST,
+                        &json!({
+                            "error": format!(
+                                "managed TLS record '{}' has kind {}, expected {}",
+                                owned_id,
+                                existing_kind.as_str(),
+                                kind.as_str()
+                            )
+                        }),
+                    )))
+                }
+            }
+            Ok(_) => Ok(store),
+            Err(error) => Err(Box::new(managed_error_response(error))),
+        }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::error!("managed TLS preflight worker failed: {error}");
+            Err(Box::new(super::json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "managed TLS store preflight failed"}),
+            )))
+        }
     }
-    Ok(())
 }
 
 fn acme_certificate_store_response()
@@ -2432,6 +2557,59 @@ fn acme_certificate_store_response()
             &json!({"error": format!("ACME certificate store is unavailable: {error}")}),
         ))
     })
+}
+
+/// Acquire the ACME certificate store off the Tokio runtime worker.
+async fn acme_certificate_store_response_async()
+-> Result<Arc<crate::tls::acme::AcmeCertificateStore>, Box<Response<Full<Bytes>>>> {
+    match tokio::task::spawn_blocking(crate::tls::acme::global_certificate_store).await {
+        Ok(Ok(store)) => Ok(store),
+        Ok(Err(error)) => Err(Box::new(super::json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({"error": format!("ACME certificate store is unavailable: {error}")}),
+        ))),
+        Err(error) => {
+            tracing::error!("ACME certificate store worker failed: {error}");
+            Err(Box::new(super::json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "ACME certificate store initialization failed"}),
+            )))
+        }
+    }
+}
+
+/// Acquire the ACME certificate store and verify `id` exists (metadata-only)
+/// in one `spawn_blocking` call.
+async fn preflight_acme_certificate_store_exists(
+    id: &str,
+) -> Result<Arc<crate::tls::acme::AcmeCertificateStore>, Box<Response<Full<Bytes>>>> {
+    let owned_id = id.to_string();
+    match tokio::task::spawn_blocking(move || {
+        let store = match crate::tls::acme::global_certificate_store() {
+            Ok(store) => store,
+            Err(error) => {
+                return Err(Box::new(super::json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &json!({"error": format!("ACME certificate store is unavailable: {error}")}),
+                )));
+            }
+        };
+        match store.certificate_exists(&owned_id) {
+            Ok(()) => Ok(store),
+            Err(error) => Err(Box::new(acme_error_response(error))),
+        }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::error!("ACME certificate preflight worker failed: {error}");
+            Err(Box::new(super::json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "ACME certificate store preflight failed"}),
+            )))
+        }
+    }
 }
 
 fn acme_order_store_response()

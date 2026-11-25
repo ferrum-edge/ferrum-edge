@@ -720,11 +720,6 @@ pub(super) fn parse_content_type(headers: &hyper::HeaderMap) -> Option<SpecForma
 // Helper: Accept header negotiation for GET responses
 // ---------------------------------------------------------------------------
 
-/// Quality weight for a media range, parsed from `;q=N.NNN`.
-/// Returns a value in `[0, 1000]` (1000 = q=1.0, default).
-///
-/// Module-level so both `negotiate_accept` and `negotiate_accept_or_406`
-/// share the same parser (avoids duplication).
 /// Split an HTTP header value on `delim` only outside double-quoted strings,
 /// honoring RFC 9110 §5.6.4 `\` quoted-pair escapes so quoted commas or
 /// semicolons cannot inject spurious media ranges or parameters.
@@ -755,9 +750,38 @@ fn split_outside_quotes(input: &str, delim: char) -> Vec<&str> {
     parts
 }
 
+/// Unquote an RFC 9110 §5.6.4 quoted-string parameter value, decoding `\`
+/// quoted-pairs (e.g. `"utf\-8"` -> `"utf-8"`). Unquoted tokens are returned
+/// verbatim.
+fn unquote_http_param_value(val: &str) -> std::borrow::Cow<'_, str> {
+    let Some(inner) = val
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    else {
+        return std::borrow::Cow::Borrowed(val);
+    };
+    if !inner.contains('\\') {
+        return std::borrow::Cow::Borrowed(inner);
+    }
+    let mut out = String::with_capacity(inner.len());
+    let mut escaped = false;
+    for ch in inner.chars() {
+        if escaped {
+            out.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else {
+            out.push(ch);
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// Return `true` when `param` is a non-constraining `charset=utf-8` media-type
-/// parameter (case-insensitive, unquoted or quoted `"utf-8"`), matching RFC
-/// 8259 §11 and common HTTP clients sending `Accept: application/json; charset=utf-8`.
+/// parameter (case-insensitive, unquoted or quoted with RFC 9110 quoted-pair
+/// decoding), matching RFC 8259 §11 and common HTTP clients sending
+/// `Accept: application/json; charset=utf-8`.
 fn is_utf8_charset_param(param: &str) -> bool {
     let Some((name, value)) = param.split_once('=') else {
         return false;
@@ -765,25 +789,23 @@ fn is_utf8_charset_param(param: &str) -> bool {
     if !name.trim().eq_ignore_ascii_case("charset") {
         return false;
     }
-    let val = value.trim();
-    let unquoted = val
-        .strip_prefix('"')
-        .and_then(|rest| rest.strip_suffix('"'))
-        .unwrap_or(val);
-    unquoted.eq_ignore_ascii_case("utf-8")
+    unquote_http_param_value(value.trim()).eq_ignore_ascii_case("utf-8")
 }
 
-/// Parse an `Accept` media-range's parameter tail (`;...`) for our
-/// unparameterized UTF-8 JSON/YAML representations (RFC 9110 §12.5.1).
+/// Quality weight for a media range, parsed from `;q=N.NNN`, returning a value
+/// in `[0, 1000]` (`1000` = `q=1.0`, default) for our unparameterized UTF-8
+/// JSON/YAML representations (RFC 9110 §12.5.1).
 ///
-/// Media-type parameters appear before `;q=` and narrow which representations a
-/// media-range matches; because this server offers UTF-8 `application/json` and
-/// `application/yaml` without custom media parameters, `charset=utf-8` is
-/// accepted as non-constraining while any other media parameter before `;q=`
-/// (such as `profile=v2` in `application/*;profile=v2;q=0`) does not match our
-/// offered representations and returns `None` so the entry is ignored rather
-/// than falsely shadowing a less-specific wildcard. Parameters after `;q=` are
-/// accept-ext and do not constrain media matching.
+/// Module-level so both `negotiate_accept` and `negotiate_accept_or_406` share
+/// the same parser. Media-type parameters appear before `;q=` and narrow which
+/// representations a media-range matches; because this server offers UTF-8
+/// `application/json` and `application/yaml` without custom media parameters,
+/// `charset=utf-8` is accepted as non-constraining while any other media
+/// parameter before `;q=` (such as `profile=v2` in
+/// `application/*;profile=v2;q=0`) does not match our offered representations
+/// and returns `None` so the entry is ignored rather than falsely shadowing a
+/// less-specific wildcard. Parameters after `;q=` are accept-ext and do not
+/// constrain media matching.
 fn parse_accept_media_range_params(params: &str) -> Option<u32> {
     for param in split_outside_quotes(params, ';') {
         let p = param.trim();
@@ -1121,8 +1143,18 @@ mod negotiate_accept_tests {
             Some(SpecFormat::Json),
             "application/json; charset=utf-8 must not yield 406 when application/yaml is q=0"
         );
+        let h_charset_quoted_pair =
+            headers_with_accept(r#"application/json; charset="utf\-8", application/yaml;q=0"#);
+        assert_eq!(
+            negotiate_accept_or_406(&h_charset_quoted_pair, SpecFormat::Yaml),
+            Some(SpecFormat::Json),
+            "quoted-pair charset=\"utf\\-8\" must decode to utf-8 and select JSON"
+        );
+        // Put commas on BOTH sides of `application/json` inside quotes so a
+        // naive `.split(',')` would isolate a bare `application/json` token at
+        // q=1.0 and wrongly override `application/json;q=0`.
         let h_quoted_comma = headers_with_accept(
-            r#"text/plain;foo="bar,application/json", application/json;q=0, application/yaml;q=0"#,
+            r#"text/plain;foo="bar,application/json,baz", application/json;q=0, application/yaml;q=0"#,
         );
         assert_eq!(
             negotiate_accept_or_406(&h_quoted_comma, SpecFormat::Json),
@@ -1130,7 +1162,7 @@ mod negotiate_accept_tests {
             "comma inside quoted media parameter must not inject a spurious application/json range"
         );
         let h_quoted_escape =
-            headers_with_accept(r#"text/plain;foo="a\"b,application/json", */*;q=0"#);
+            headers_with_accept(r#"text/plain;foo="a\"b,application/json,c", */*;q=0"#);
         assert_eq!(
             negotiate_accept_or_406(&h_quoted_escape, SpecFormat::Json),
             None,
@@ -2498,16 +2530,15 @@ async fn spec_content_response_async(
     }
 
     // Offload gzip decompression + optional YAML/JSON conversion to the
-    // blocking pool while holding the pre-acquired read codec permit so large
-    // spec reads cannot saturate Tokio worker threads or retain unbounded blobs
-    // while waiting in the queue.
+    // blocking pool while holding the pre-acquired read codec permit, then
+    // attach the permit to the response extensions so `GuardedAdminBody` keeps
+    // it until response transmission completes or the client disconnects.
     let spec_id = spec.id;
     let stored_format = spec.spec_format;
     let compressed = spec.spec_content;
     let converted = tokio::task::spawn_blocking(move || {
-        let _permit = read_permit;
-        let raw =
-            spec_codec::decompress_gzip_capped(&compressed, max_decompress_bytes).map_err(|e| {
+        let result = spec_codec::decompress_gzip_capped(&compressed, max_decompress_bytes)
+            .map_err(|e| {
                 tracing::error!(
                     "decompress_gzip_capped failed for spec {} (cap={} bytes): {}",
                     spec_id,
@@ -2515,36 +2546,39 @@ async fn spec_content_response_async(
                     e
                 );
                 "spec content corrupt or oversized".to_string()
-            })?;
-        if target_fmt == stored_format {
-            Ok((raw, content_type_for_format(stored_format)))
-        } else {
-            convert_format(&raw, stored_format, target_fmt)
-                .map(|converted| (converted, content_type_for_format(target_fmt)))
-                .map_err(|e| {
-                    tracing::error!(
-                        "format conversion ({:?} → {:?}) failed for spec {}: {}",
-                        stored_format,
-                        target_fmt,
-                        spec_id,
-                        e
-                    );
-                    let stored_fmt_str = content_type_for_format(stored_format);
-                    let accepted_fmt_str = content_type_for_format(target_fmt);
-                    format!(
-                        "Cannot convert stored {} to requested {}; \
-                         the stored document may be malformed — \
-                         try retrieving in the original format ({}) instead",
-                        stored_fmt_str, accepted_fmt_str, stored_fmt_str
-                    )
-                })
-        }
+            })
+            .and_then(|raw| {
+                if target_fmt == stored_format {
+                    Ok((raw, content_type_for_format(stored_format)))
+                } else {
+                    convert_format(&raw, stored_format, target_fmt)
+                        .map(|converted| (converted, content_type_for_format(target_fmt)))
+                        .map_err(|e| {
+                            tracing::error!(
+                                "format conversion ({:?} → {:?}) failed for spec {}: {}",
+                                stored_format,
+                                target_fmt,
+                                spec_id,
+                                e
+                            );
+                            let stored_fmt_str = content_type_for_format(stored_format);
+                            let accepted_fmt_str = content_type_for_format(target_fmt);
+                            format!(
+                                "Cannot convert stored {} to requested {}; \
+                                 the stored document may be malformed — \
+                                 try retrieving in the original format ({}) instead",
+                                stored_fmt_str, accepted_fmt_str, stored_fmt_str
+                            )
+                        })
+                }
+            });
+        (result, read_permit)
     })
     .await;
 
-    let (body_bytes, ct) = match converted {
-        Ok(Ok(pair)) => pair,
-        Ok(Err(message)) => {
+    let (body_bytes, ct, read_permit) = match converted {
+        Ok((Ok((body_bytes, ct)), read_permit)) => (body_bytes, ct, read_permit),
+        Ok((Err(message), _permit)) => {
             return json_resp(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &json!({"error": message}),
@@ -2559,14 +2593,18 @@ async fn spec_content_response_async(
     };
 
     let len = body_bytes.len();
-    crate::admin::with_admin_security_headers(Response::builder())
+    let mut response = crate::admin::with_admin_security_headers(Response::builder())
         .status(StatusCode::OK)
         .header("Content-Type", ct)
         .header("Content-Length", len.to_string())
         .header("ETag", &etag)
         .header("Vary", "Accept")
         .body(Full::new(Bytes::from(body_bytes)))
-        .unwrap_or_else(|_| crate::admin::admin_builder_failure_response())
+        .unwrap_or_else(|_| crate::admin::admin_builder_failure_response());
+    response
+        .extensions_mut()
+        .insert(crate::admin::ResponseLifetimePermit::new(read_permit));
+    response
 }
 
 // ---------------------------------------------------------------------------

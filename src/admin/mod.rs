@@ -1454,6 +1454,17 @@ impl Drop for AdminActivityGuard {
     }
 }
 
+/// Semaphore permit attached to a response via `Extensions` and moved into
+/// [`GuardedAdminBody`] so bounded read/codec capacity stays held until the
+/// buffered response body finishes transmitting or is dropped on disconnect.
+pub(crate) struct ResponseLifetimePermit(#[allow(dead_code)] tokio::sync::OwnedSemaphorePermit);
+
+impl ResponseLifetimePermit {
+    pub(crate) fn new(permit: tokio::sync::OwnedSemaphorePermit) -> Self {
+        Self(permit)
+    }
+}
+
 /// Admin response body that keeps its [`AdminActivityGuard`] alive until hyper
 /// has finished writing the response and dropped the body.
 struct GuardedAdminBody {
@@ -1465,6 +1476,7 @@ struct GuardedAdminBody {
     /// the body is not proof the peer received it, so the registry confirms
     /// collection only after two such deliveries.
     delivery_ack: Option<plugins::api_chargeback::ChargesDeliveryAck>,
+    _lifetime_permit: Option<ResponseLifetimePermit>,
     _guard: AdminActivityGuard,
 }
 
@@ -1473,20 +1485,23 @@ impl GuardedAdminBody {
         Self {
             inner,
             delivery_ack: None,
+            _lifetime_permit: None,
             _guard: guard,
         }
     }
 
     /// Wrap a dispatched admin response, moving a `/charges` delivery
-    /// acknowledgement out of the response extensions into the body so it
-    /// fires only once the body has been taken.
+    /// acknowledgement and any response-lifetime permit out of the response
+    /// extensions into the body so they live until the body is taken/dropped.
     fn wrap_response(response: Response<Full<Bytes>>, guard: AdminActivityGuard) -> Response<Self> {
         let (mut parts, inner) = response.into_parts();
         let delivery_ack = parts
             .extensions
             .remove::<plugins::api_chargeback::ChargesDeliveryAck>();
+        let lifetime_permit = parts.extensions.remove::<ResponseLifetimePermit>();
         let mut body = Self::new(inner, guard);
         body.delivery_ack = delivery_ack;
+        body._lifetime_permit = lifetime_permit;
         Response::from_parts(parts, body)
     }
 }
@@ -1522,6 +1537,21 @@ impl http_body::Body for GuardedAdminBody {
     fn size_hint(&self) -> http_body::SizeHint {
         http_body::Body::size_hint(&self.inner)
     }
+}
+
+/// Drive one admin connection through [`serve_admin_io`] with an explicit
+/// [`crate::tls::ClientTrustSession`] so transport tests can exercise client
+/// certificate trust withdrawal over HTTP/2 deterministically. Reached through
+/// `_test_support`.
+pub(crate) async fn serve_admin_io_with_client_trust_for_test<I>(
+    io: I,
+    state: AdminState,
+    client_ip: std::net::IpAddr,
+    client_trust: crate::tls::ClientTrustSession,
+) where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    serve_admin_io(TokioIo::new(io), state, client_ip, Some(client_trust)).await;
 }
 
 /// Drive an admin response through the connection body wrapper exactly as
@@ -5408,7 +5438,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_create_acme_certificate(&state, &body_bytes).await
+            tls_management::handle_create_acme_certificate(&state, &auth, &body_bytes).await
         }
         (Method::GET, ["admin", "tls", "acme", "certificates", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -5426,7 +5456,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_delete_acme_certificate(&state, id).await
+            tls_management::handle_delete_acme_certificate(&state, &auth, id).await
         }
         (Method::GET, ["admin", "tls", "acme", "accounts"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -5484,7 +5514,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_create_certificate(&state, &body_bytes).await
+            tls_management::handle_create_certificate(&state, &auth, &body_bytes).await
         }
         (Method::GET, ["admin", "tls", "certificates", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -5502,8 +5532,13 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_delete_managed(&state, ManagedTlsMaterialKind::Certificate, id)
-                .await
+            tls_management::handle_delete_managed(
+                &state,
+                &auth,
+                ManagedTlsMaterialKind::Certificate,
+                id,
+            )
+            .await
         }
         (Method::GET, ["admin", "tls", "ca-bundles"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -5516,7 +5551,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_create_ca_bundle(&state, &body_bytes).await
+            tls_management::handle_create_ca_bundle(&state, &auth, &body_bytes).await
         }
         (Method::GET, ["admin", "tls", "ca-bundles", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -5534,8 +5569,13 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_delete_managed(&state, ManagedTlsMaterialKind::CaBundle, id)
-                .await
+            tls_management::handle_delete_managed(
+                &state,
+                &auth,
+                ManagedTlsMaterialKind::CaBundle,
+                id,
+            )
+            .await
         }
         (Method::GET, ["admin", "tls", "crls"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -5548,7 +5588,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_create_crl(&state, &body_bytes).await
+            tls_management::handle_create_crl(&state, &auth, &body_bytes).await
         }
         (Method::GET, ["admin", "tls", "crls", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -5566,7 +5606,8 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_delete_managed(&state, ManagedTlsMaterialKind::Crl, id).await
+            tls_management::handle_delete_managed(&state, &auth, ManagedTlsMaterialKind::Crl, id)
+                .await
         }
         (Method::GET, ["admin", "tls", "ocsp-responses"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -5580,7 +5621,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_create_ocsp_response(&state, &body_bytes).await
+            tls_management::handle_create_ocsp_response(&state, &auth, &body_bytes).await
         }
         (Method::GET, ["admin", "tls", "ocsp-responses", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -5598,8 +5639,13 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_delete_managed(&state, ManagedTlsMaterialKind::OcspResponse, id)
-                .await
+            tls_management::handle_delete_managed(
+                &state,
+                &auth,
+                ManagedTlsMaterialKind::OcspResponse,
+                id,
+            )
+            .await
         }
         (Method::GET, ["admin", "tls", "jwks"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -5612,7 +5658,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_create_jwks(&state, &body_bytes).await
+            tls_management::handle_create_jwks(&state, &auth, &body_bytes).await
         }
         (Method::GET, ["admin", "tls", "jwks", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -5630,7 +5676,8 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_delete_managed(&state, ManagedTlsMaterialKind::Jwks, id).await
+            tls_management::handle_delete_managed(&state, &auth, ManagedTlsMaterialKind::Jwks, id)
+                .await
         }
         (Method::POST, ["admin", "tls", "rotate", surface]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {

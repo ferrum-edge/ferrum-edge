@@ -77,7 +77,7 @@ mod inner {
     use crate::config::gateway_trust::{GatewayTrustBundleIdentity, GatewayTrustBundleRecord};
     use crate::config::store_policy::{
         access_control_plugin_allows_consumer, mesh_route_dispatch_referenced_upstream,
-        mesh_route_dispatch_references_upstream_id, store_canonical_resource_hash,
+        mesh_route_dispatch_references_upstream_id, store_canonical_resource_hash_async,
     };
     use crate::config::types::{
         ApiSpec, Consumer, GatewayConfig, PluginAssociation, PluginConfig, PluginScope, Proxy,
@@ -6638,7 +6638,9 @@ mod inner {
                 upstream: upstreams.into_iter().next(),
                 plugins,
             };
-            crate::admin::api_specs::hash_resource_bundle(&current).map(Some)
+            crate::admin::api_specs::hash_resource_bundle_async(current)
+                .await
+                .map(Some)
         }
 
         async fn ensure_no_external_spec_upstream_refs(
@@ -7234,7 +7236,10 @@ mod inner {
                         )
                         .await
                         .map_err(anyhow::Error::msg)?;
-                    if snapshot.replacement_is_noop_with_declared(bundle, spec, &declared)? {
+                    if snapshot
+                        .replacement_is_noop_with_declared_async(bundle, spec, &declared)
+                        .await?
+                    {
                         validate_deployment_candidate(
                             &snapshot.snapshot().config,
                             precondition.validation_http_client,
@@ -16920,7 +16925,7 @@ mod inner {
                 }
                 None => HashSet::new(),
             };
-            let desired_resource_hash = store_canonical_resource_hash(bundle)?;
+            let desired_resource_hash = store_canonical_resource_hash_async(bundle.clone()).await?;
 
             // --- Resource no-op shortcut (Wave 5 Feature A) ------------------
             // If the current spec-owned resource graph already matches the

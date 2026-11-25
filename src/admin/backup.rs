@@ -896,6 +896,21 @@ pub(crate) fn validate_restore_api_specs_section_with_total_limit(
             ));
             continue;
         }
+        // Validate any `x-ferrum-proxy.plugins` association declaration with
+        // the same parser `PUT /api-specs/{id}` uses for fail-closed ownership
+        // recovery so restore cannot admit a spec that later PUTs cannot replace.
+        if crate::admin::api_specs::extract_declared_proxy_plugin_association_ids(
+            &decompressed,
+            Some(spec.spec_format),
+        )
+        .is_err()
+        {
+            errors.push(format!(
+                "api_spec '{}': x-ferrum-proxy.plugins declaration is malformed",
+                item.id
+            ));
+            continue;
+        }
         match proxy_by_id.get(spec.proxy_id.as_str()) {
             Some(proxy) if proxy.api_spec_id.as_deref() == Some(spec.id.as_str()) => {}
             Some(_) => {

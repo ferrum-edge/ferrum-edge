@@ -1193,6 +1193,20 @@ impl std::fmt::Debug for ClientTrustSession {
 }
 
 impl ClientTrustSession {
+    /// Construct an unregistered live session handle for transport tests that
+    /// drive [`crate::admin::serve_admin_io_with_client_trust_for_test`].
+    pub(crate) fn new_unregistered_for_test(scope: ClientTrustScope) -> Self {
+        Self {
+            inner: Arc::new(ClientTrustSessionInner {
+                id: 0,
+                scope,
+                generation: 1,
+                token: CancellationToken::new(),
+                retired: AtomicBool::new(false),
+            }),
+        }
+    }
+
     /// The scope this transport was admitted under.
     pub fn scope(&self) -> ClientTrustScope {
         self.inner.scope
