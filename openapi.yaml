@@ -6071,7 +6071,7 @@ paths:
                     type: string
                     example: confirm_api_spec_deletion=true
         "413":
-          description: Request body too large (default max 100 MiB, configurable via FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB)
+          description: Request body too large (default max 100 MiB, configurable via FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB), or on MongoDB backends a serialized `api_specs` document in a conditional restore exceeds the ~15 MiB BSON preflight limit
           content:
             application/json:
               schema:

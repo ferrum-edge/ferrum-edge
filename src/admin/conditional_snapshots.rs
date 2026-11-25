@@ -16,7 +16,7 @@ use super::crud::{self, AdminResource};
 use super::preconditions::{self, IfMatch};
 use super::{AdminState, BackupExportPayload, json_response};
 use crate::config::db_backend::{
-    AtomicBatchGraph, BatchConfigWriteMode, ConditionalNamespaceRestore,
+    ApiSpecDocumentTooLarge, AtomicBatchGraph, BatchConfigWriteMode, ConditionalNamespaceRestore,
     ConditionalNamespaceSnapshot, DatabaseBackend, NamespacePreconditionFailed,
     NamespaceSnapshotTooLarge, SnapshotDigest, is_namespace_snapshot_too_large,
 };
@@ -93,6 +93,15 @@ pub(super) fn snapshot_too_large() -> Response<Full<Bytes>> {
 fn store_error(error: &anyhow::Error) -> Response<Full<Bytes>> {
     if is_namespace_snapshot_too_large(error) {
         return snapshot_too_large();
+    }
+    if error
+        .chain()
+        .any(|cause| cause.is::<ApiSpecDocumentTooLarge>())
+    {
+        return json_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            &json!({"error": ApiSpecDocumentTooLarge.to_string()}),
+        );
     }
     if let Some(unsupported) = crate::config::db_backend::atomic_batch_unsupported(error) {
         return super::atomic_batch_unsupported_response(unsupported);

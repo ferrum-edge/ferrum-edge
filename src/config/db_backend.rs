@@ -473,6 +473,19 @@ impl std::fmt::Display for NamespacePreconditionFailed {
 
 impl std::error::Error for NamespacePreconditionFailed {}
 
+/// A restored `api_specs` document exceeds the storage backend's per-document
+/// size limit (for example MongoDB's ~15 MiB BSON preflight cap).
+#[derive(Debug, Clone, Copy)]
+pub struct ApiSpecDocumentTooLarge;
+
+impl std::fmt::Display for ApiSpecDocumentTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MongoDB API spec document exceeds restore limit")
+    }
+}
+
+impl std::error::Error for ApiSpecDocumentTooLarge {}
+
 /// Bounded, credential-free snapshot of sticky DB failover topology.
 ///
 /// Exposed on authenticated `/health` detail and used by admin write gating so

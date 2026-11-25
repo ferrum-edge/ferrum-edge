@@ -56,13 +56,14 @@ mod inner {
         config_change_watch_backoff_after_session, next_config_change_watch_backoff_secs,
     };
     use crate::config::db_backend::{
-        ApiSpecListFilter, ApiSpecSortBy, BatchConfigWriteMode, ConditionalNamespaceRestore,
-        ConditionalNamespaceSnapshot, DatabaseBackend, DeleteAllResourcesError, DeleteMode,
-        FullConfigLoadPurpose, IncrementalResult, MtlsDnsAdmissionUnavailable,
-        MtlsDnsIdentityConflict, NamespaceConfigAdmissionLeaseBackend, NamespacePreconditionFailed,
-        NamespaceResourceCounts, NamespaceSnapshotTooLarge, NamespacedResourceId,
-        PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, PluginAssociationPreconditionFailed,
-        ProxyDeleteAtomicityUnsupported, SnapshotDataIntegrityError, SnapshotDigest, SortOrder,
+        ApiSpecDocumentTooLarge, ApiSpecListFilter, ApiSpecSortBy, BatchConfigWriteMode,
+        ConditionalNamespaceRestore, ConditionalNamespaceSnapshot, DatabaseBackend,
+        DeleteAllResourcesError, DeleteMode, FullConfigLoadPurpose, IncrementalResult,
+        MtlsDnsAdmissionUnavailable, MtlsDnsIdentityConflict, NamespaceConfigAdmissionLeaseBackend,
+        NamespacePreconditionFailed, NamespaceResourceCounts, NamespaceSnapshotTooLarge,
+        NamespacedResourceId, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult,
+        PluginAssociationPreconditionFailed, ProxyDeleteAtomicityUnsupported,
+        SnapshotDataIntegrityError, SnapshotDigest, SortOrder,
         TcpConnectionThrottleAttachmentConflict, is_namespace_snapshot_too_large,
     };
     use crate::config::db_loader::{
@@ -7781,6 +7782,23 @@ mod inner {
             mode: &BatchConfigWriteMode,
         ) -> Result<(), anyhow::Error> {
             let graph = &restore.graph;
+            if !self.replica_set_configured() {
+                return Err(anyhow::Error::new(Self::atomic_batch_standalone_refusal()));
+            }
+            // Validate and build `api_specs` BSON documents BEFORE acquiring the
+            // connection-generation pin or mTLS admission leases so codec-slot
+            // waits never delay reconnect publication or hold admission leases.
+            let mut spec_docs = Vec::with_capacity(restore.api_specs.len());
+            for spec in restore.api_specs {
+                if api_spec_raw_blobs_exceed_mongo_limit(spec) {
+                    return Err(anyhow::Error::new(ApiSpecDocumentTooLarge));
+                }
+                let doc = api_spec_to_doc_async(spec).await?;
+                if !spec_doc_fits_mongo_bson_limit(&doc)? {
+                    return Err(anyhow::Error::new(ApiSpecDocumentTooLarge));
+                }
+                spec_docs.push(doc);
+            }
             let _generation_pin = self.connection_generation.clone().read_owned().await;
             if !self.replica_set_configured() {
                 return Err(anyhow::Error::new(Self::atomic_batch_standalone_refusal()));
@@ -7791,17 +7809,6 @@ mod inner {
             let (fault, chunk_size) =
                 crate::config::batch_atomicity::atomic_batch_test_overrides(graph.namespace);
             let chunk_size = chunk_size.unwrap_or(MONGO_ATOMIC_BATCH_CHUNK_SIZE).max(1);
-            let mut spec_docs = Vec::with_capacity(restore.api_specs.len());
-            for spec in restore.api_specs {
-                if api_spec_raw_blobs_exceed_mongo_limit(spec) {
-                    anyhow::bail!("MongoDB API spec document exceeds restore limit");
-                }
-                let doc = api_spec_to_doc_async(spec).await?;
-                if !spec_doc_fits_mongo_bson_limit(&doc)? {
-                    anyhow::bail!("MongoDB API spec document exceeds restore limit");
-                }
-                spec_docs.push(doc);
-            }
             let replacement = MongoConditionalRestorePlan {
                 expected: restore.expected,
                 spec_docs,
