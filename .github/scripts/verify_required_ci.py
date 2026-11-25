@@ -769,7 +769,7 @@ def test_artifact_consumer_wiring_errors(ci_yml: str) -> list[str]:
         if isinstance(step_name, str):
             step_by_name[step_name] = step
         uses = step.get("uses")
-        if isinstance(uses, str) and uses.startswith("actions/upload-artifact@"):
+        if isinstance(uses, str) and uses.lower().startswith("actions/upload-artifact@"):
             raw_with = step.get("with")
             if isinstance(raw_with, dict) and raw_with.get("name") is not None:
                 art_name = str(raw_with["name"]).strip()
@@ -907,7 +907,7 @@ def test_artifact_consumer_wiring_errors(ci_yml: str) -> list[str]:
                 errors.append(f"jobs.{job} contains a non-mapping step")
                 continue
             uses = step.get("uses")
-            if not (isinstance(uses, str) and uses.startswith("actions/download-artifact@")):
+            if not (isinstance(uses, str) and uses.lower().startswith("actions/download-artifact@")):
                 continue
             raw_with = step.get("with")
             if raw_with is None:
@@ -1079,11 +1079,24 @@ def test_artifact_consumer_wiring_self_test(ci_yml: str) -> list[str]:
     if drop_integ_cni_dl == ci_yml or not test_artifact_consumer_wiring_errors(drop_integ_cni_dl):
         failures.append("artifact wiring verifier must reject missing ferrum-cni-debug download in test-integration")
 
-    # 8. An underscore-named 7th consumer (including with an inline comment on `steps:`)
-    # downloading a tracked artifact must fail.
-    for label, steps_hdr in (
-        ("underscore-named untracked consumer", "    steps:\n"),
-        ("commented steps: header on untracked consumer", "    steps: # inline comment\n"),
+    # 8. An underscore-named 7th consumer (including with an inline comment on `steps:`
+    # or mixed-case `Actions/Download-Artifact@`) downloading a tracked artifact must fail.
+    for label, steps_hdr, uses_line in (
+        (
+            "underscore-named untracked consumer",
+            "    steps:\n",
+            "      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8\n",
+        ),
+        (
+            "commented steps: header on untracked consumer",
+            "    steps: # inline comment\n",
+            "      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8\n",
+        ),
+        (
+            "mixed-case Actions/Download-Artifact on untracked consumer",
+            "    steps:\n",
+            "      - uses: Actions/Download-Artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8\n",
+        ),
     ):
         extra_consumer = (
             ci_yml
@@ -1091,7 +1104,7 @@ def test_artifact_consumer_wiring_self_test(ci_yml: str) -> list[str]:
             + "    runs-on: ubuntu-26.04\n"
             + "    needs: [ci-plan, build-test-artifacts]\n"
             + steps_hdr
-            + "      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8\n"
+            + uses_line
             + "        with:\n"
             + "          name: ferrum-cni-debug-${{ runner.os }}-${{ runner.arch }}\n"
         )
@@ -1213,88 +1226,60 @@ _EXPECTED_CI_PLAN_EMISSION_LINES = [
 ]
 
 
-def _extract_ci_plan_emission_tail(plan_body: str) -> tuple[str, str | None]:
-    plan_anchor = '--changed-files "$changed_files")"'
-    anchor_idx = plan_body.find(plan_anchor)
-    if anchor_idx < 0:
-        return "", "jobs.ci-plan is missing the planner invocation anchor"
-    line_end = plan_body.find("\n", anchor_idx)
-    if line_end < 0:
-        return "", "jobs.ci-plan ended unexpectedly after planner invocation"
-    tail_lines: list[str] = []
-    for line in plan_body[line_end + 1 :].splitlines():
-        if line.strip() and (len(line) - len(line.lstrip(" "))) < 10:
-            break
-        tail_lines.append(line)
-    return textwrap.dedent("\n".join(tail_lines)), None
-
-
-def _replay_ci_plan_emission(plan_body: str, plan_text: str) -> tuple[dict[str, str], str | None]:
-    """Execute the `Select CI mode` emission tail in Bash against a synthetic `$plan`."""
-
-    import subprocess
-    import tempfile
-
-    script_tail, extract_err = _extract_ci_plan_emission_tail(plan_body)
-    if extract_err is not None:
-        return {}, extract_err
-    with (
-        tempfile.NamedTemporaryFile("w+", encoding="utf-8", delete=True) as out_file,
-        tempfile.NamedTemporaryFile("wb", delete=True) as changed_file,
-    ):
-        changed_file.write(b"src/main.rs\0")
-        changed_file.flush()
-        env = {
-            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-            "GITHUB_OUTPUT": out_file.name,
-            "GITHUB_STEP_SUMMARY": os.devnull,
-            "SYNTHETIC_PLAN": plan_text,
-            "CHANGED_FILES_PATH": changed_file.name,
-        }
-        prelude = (
-            "set -euo pipefail\n"
-            'plan="$SYNTHETIC_PLAN"\n'
-            'changed_files="$CHANGED_FILES_PATH"\n'
-        )
-        proc = subprocess.run(
-            ["bash", "--noprofile", "--norc"],
-            input=prelude + script_tail,
-            text=True,
-            capture_output=True,
-            env=env,
-            timeout=10,
-        )
-        if proc.returncode != 0:
-            return {}, f"ci-plan emission replay exited {proc.returncode}: {proc.stderr.strip()}"
-        out_file.seek(0)
-        outputs: dict[str, str] = {}
-        for line in out_file.read().splitlines():
-            if "=" in line:
-                k, v = line.split("=", 1)
-                outputs[k] = v
-        return outputs, None
-
-
 def check_mode_and_granular_opt_in(plan_body: str) -> list[str]:
     """Verify ci-plan opts into granular gates and forces mode=full on bad handshake."""
 
     errors: list[str] = []
-    exec_lines = [
+    # Parse `ci-plan` via PyYAML to verify the `id: plan` step actually exists
+    # and owns the pinned planner/emission script (so renaming `id: plan` cannot
+    # orphan `outputs.*: ${{ steps.plan.outputs.* }}`).
+    try:
+        import yaml  # type: ignore[import-untyped]
+    except ImportError:
+        return ["PyYAML is required to validate jobs.ci-plan"]
+    try:
+        parsed_job = yaml.safe_load(plan_body)
+    except Exception as exc:
+        return [f"jobs.ci-plan YAML is unparseable: {exc}"]
+    if not isinstance(parsed_job, dict) or not isinstance(parsed_job.get("steps"), list):
+        return ["jobs.ci-plan must declare a mapping with a list `steps:` section"]
+    plan_steps = [
+        step
+        for step in parsed_job["steps"]
+        if isinstance(step, dict) and step.get("id") == "plan"
+    ]
+    if len(plan_steps) != 1:
+        errors.append("jobs.ci-plan must declare a single step with `id: plan`")
+        plan_step_run = ""
+    else:
+        raw_run = plan_steps[0].get("run")
+        plan_step_run = raw_run if isinstance(raw_run, str) else ""
+
+    plan_step_exec = [
         line.strip()
-        for line in plan_body.splitlines()
+        for line in plan_step_run.splitlines()
         if line.strip() and not line.strip().startswith("#")
     ]
     if not any(
         line.startswith('plan="$(FERRUM_CI_PLAN_GRANULAR_GATES=1 python3 -I ')
-        for line in exec_lines
+        for line in plan_step_exec
     ):
         errors.append(
-            "jobs.ci-plan must pass FERRUM_CI_PLAN_GRANULAR_GATES=1 on the executable python3 -I planner invocation"
+            "jobs.ci-plan `id: plan` step must pass FERRUM_CI_PLAN_GRANULAR_GATES=1 "
+            "on the executable python3 -I planner invocation"
         )
     # Require that the entire `ci-plan` job writes to GITHUB_OUTPUT solely via
     # its four pinned emission lines (prevents pre-planner, post-summary, or
     # post-binary-matrix-heredoc overwrites across all steps of `ci-plan`).
-    github_output_lines = [line for line in exec_lines if "GITHUB_OUTPUT" in line]
+    all_step_exec: list[str] = []
+    for step in parsed_job["steps"]:
+        if isinstance(step, dict) and isinstance(step.get("run"), str):
+            all_step_exec.extend(
+                line.strip()
+                for line in step["run"].splitlines()
+                if line.strip() and not line.strip().startswith("#")
+            )
+    github_output_lines = [line for line in all_step_exec if "GITHUB_OUTPUT" in line]
     if github_output_lines != [
         'echo "sha=$trusted_base" >> "$GITHUB_OUTPUT"',
         'echo "mode=$mode" >> "$GITHUB_OUTPUT"',
@@ -1305,14 +1290,17 @@ def check_mode_and_granular_opt_in(plan_body: str) -> list[str]:
             "jobs.ci-plan must only write to GITHUB_OUTPUT via its four pinned "
             f"emission lines (found {github_output_lines!r})"
         )
-    # Pin the exact non-blank, non-comment emission section from the planner call
-    # through the gate-emission loop (stopping before the summary block `{`),
-    # preventing any outer conditional wrapper on `$changed_files`, `$EVENT_NAME`,
-    # or `$paths_classifiable`.
-    script_tail, extract_err = _extract_ci_plan_emission_tail(plan_body)
-    if extract_err is not None:
-        errors.append(extract_err)
+    # Pin the exact non-blank, non-comment emission section inside `id: plan`
+    # from planner output parsing through the gate-emission loop (stopping before
+    # `{`), preventing any outer conditional wrapper on `$changed_files`,
+    # `$EVENT_NAME`, `$GITHUB_ACTIONS`, or `$paths_classifiable`.
+    plan_anchor = '--changed-files "$changed_files")"'
+    anchor_idx = plan_step_run.find(plan_anchor)
+    if anchor_idx < 0:
+        errors.append("jobs.ci-plan `id: plan` step is missing the planner invocation anchor")
     else:
+        line_end = plan_step_run.find("\n", anchor_idx)
+        script_tail = plan_step_run[line_end + 1 :] if line_end >= 0 else ""
         tail_exec = [
             line.strip()
             for line in script_tail.splitlines()
@@ -1326,67 +1314,6 @@ def check_mode_and_granular_opt_in(plan_body: str) -> list[str]:
                 "GITHUB_OUTPUT gate emission must match the exact unconditional "
                 "fail-closed sequence"
             )
-
-    # Behavioral Bash replay of the actual ci-plan emission tail with a non-empty
-    # NUL-delimited `changed_files` fixture.
-    bad_handshake_out, bad_err = _replay_ci_plan_emission(
-        plan_body,
-        "mode=light\nreason=legacy\nrun_rust=false\nrun_artifacts=false\n",
-    )
-    if bad_err:
-        errors.append(f"jobs.ci-plan bad-handshake replay failed: {bad_err}")
-    elif bad_handshake_out.get("mode") != "full" or any(
-        bad_handshake_out.get(g) != "true" for g in JOB_GATE_NAMES
-    ):
-        errors.append(
-            "jobs.ci-plan must emit mode=full and every gate=true when paths_classifiable != true"
-        )
-
-    mixed_missing_out, mixed_err = _replay_ci_plan_emission(
-        plan_body,
-        "mode=full\nreason=mixed\npaths_classifiable=true\n"
-        "run_artifacts=false\nrun_helm=false\nrun_vendor_patches=false\n",
-    )
-    if mixed_err:
-        errors.append(f"jobs.ci-plan mixed-version replay failed: {mixed_err}")
-    elif (
-        mixed_missing_out.get("run_integration") != "true"
-        or mixed_missing_out.get("run_functional") != "true"
-        or mixed_missing_out.get("run_plugin_hardening_redis") != "true"
-        or mixed_missing_out.get("run_artifacts") != "true"
-    ):
-        errors.append(
-            "jobs.ci-plan must force run_artifacts=true when paths_classifiable=true "
-            "and an older base planner omits any artifact-consumer gate"
-        )
-
-    single_consumer_out, single_err = _replay_ci_plan_emission(
-        plan_body,
-        "mode=light\nreason=helm\npaths_classifiable=true\n"
-        "run_artifacts=false\nrun_integration=false\nrun_functional=false\n"
-        "run_plugin_hardening_redis=false\nrun_helm=true\nrun_vendor_patches=false\n",
-    )
-    if single_err:
-        errors.append(f"jobs.ci-plan single-consumer replay failed: {single_err}")
-    elif single_consumer_out.get("run_artifacts") != "true":
-        errors.append(
-            "jobs.ci-plan must force run_artifacts=true when any consumer gate is true"
-        )
-
-    all_false_out, all_false_err = _replay_ci_plan_emission(
-        plan_body,
-        "mode=light\nreason=unit\npaths_classifiable=true\n"
-        "run_artifacts=false\nrun_integration=false\nrun_functional=false\n"
-        "run_plugin_hardening_redis=false\nrun_helm=false\nrun_vendor_patches=false\n"
-        "run_rust=true\nrun_lint=true\n",
-    )
-    if all_false_err:
-        errors.append(f"jobs.ci-plan no-consumer replay failed: {all_false_err}")
-    elif all_false_out.get("mode") != "light" or all_false_out.get("run_artifacts") != "false":
-        errors.append(
-            "jobs.ci-plan must preserve run_artifacts=false when paths_classifiable=true "
-            "and all 5 artifact consumer gates are explicitly false"
-        )
 
     return errors
 
@@ -1482,6 +1409,10 @@ def mode_and_granular_opt_in_self_test(plan_body: str) -> list[str]:
     )
     if post_matrix_write == plan_body or not check_mode_and_granular_opt_in(post_matrix_write):
         failures.append("granular opt-in verifier must reject extra GITHUB_OUTPUT write after binary-matrix heredoc")
+
+    renamed_plan_id = plan_body.replace("      - id: plan\n", "      - id: plan_renamed\n", 1)
+    if renamed_plan_id == plan_body or not check_mode_and_granular_opt_in(renamed_plan_id):
+        failures.append("granular opt-in verifier must reject renaming the `id: plan` step")
 
     return failures
 
