@@ -721,7 +721,9 @@ pub fn extract_with_external_refs(
     }
 
     // --- x-ferrum-mcp (optional): operations as mcp_gateway tools ----------
-    if let Some(mcp_ext) = parse_x_ferrum_mcp_extension(&root)? {
+    let mcp_ext = parse_x_ferrum_mcp_extension(&root)?;
+    let mcp_enabled = mcp_ext.is_some();
+    if let Some(mcp_ext) = mcp_ext {
         // A bridged call reaches the backend under the operation's path while
         // the client request targets the MCP endpoint, so the generated
         // validator would judge the endpoint as an unknown operation. The
@@ -772,6 +774,26 @@ pub fn extract_with_external_refs(
             operations,
             endpoint_path,
         )?;
+    }
+
+    // Final defense-in-depth across every extracted/generated/merged plugin
+    // config so `$serde_json::private::RawValue` (e.g. inside an object-valued
+    // schema `const` resolved from a local or external `$ref`) can never enter
+    // persisted plugin configs and change meaning or fail on SQL/Mongo reload.
+    for pc in &plugins {
+        if contains_reserved_serde_raw_value_key(&pc.config) {
+            let which = match pc.plugin_name.as_str() {
+                "openapi_validator" if validate_enabled => "x-ferrum-validate",
+                "mcp_gateway" if mcp_enabled => "x-ferrum-mcp",
+                _ => "x-ferrum-plugins",
+            };
+            return Err(ExtractError::MalformedExtension {
+                which,
+                error: format!(
+                    "plugin config must not contain reserved key \"{SERDE_JSON_RAW_VALUE_KEY}\""
+                ),
+            });
+        }
     }
 
     // --- Build proxy.plugins association list (Fix 2) -----------------------
@@ -6930,6 +6952,100 @@ pub(crate) fn check_json_duplicate_member_limit_parity_for_test() -> Result<(), 
         ) {
             return Err("plugin config containing RawValue marker was not rejected");
         }
+    }
+
+    // Generated `x-ferrum-validate` and `x-ferrum-mcp` plugin configs resolving
+    // an external `$ref` schema whose `const` object carries the reserved
+    // RawValue marker must also fail closed with 400 MalformedExtension.
+    let mut ext_docs = HashMap::new();
+    ext_docs.insert(
+        "https://schemas.example.com/shared.json".to_string(),
+        br#"{"components":{"schemas":{"EvilConst":{"type":"object","const":{"$serde_json::private::RawValue":"[1,2,3]"}}}}}"#.to_vec(),
+    );
+    let loader = MapExternalDocumentLoader { docs: ext_docs };
+    let policy = ExternalRefProcessPolicy {
+        enabled: true,
+        allowed_origins: vec!["https://schemas.example.com".to_string()],
+        ..ExternalRefProcessPolicy::default()
+    };
+    let validate_ext_spec = br#"{
+        "openapi": "3.1.0",
+        "info": {"title": "val-ext", "version": "1.0.0"},
+        "x-ferrum-proxy": {"id": "val-ext-proxy", "backend_host": "api.example.com", "backend_port": 443, "listen_path": "/api"},
+        "x-ferrum-external-refs": true,
+        "x-ferrum-validate": true,
+        "paths": {
+            "/items": {
+                "post": {
+                    "operationId": "createItem",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "https://schemas.example.com/shared.json#/components/schemas/EvilConst"}
+                            }
+                        }
+                    },
+                    "responses": {"200": {"description": "ok"}}
+                }
+            }
+        }
+    }"#;
+    if !matches!(
+        extract_with_external_refs(
+            validate_ext_spec,
+            Some(SpecFormat::Json),
+            "ferrum",
+            &policy,
+            &loader,
+        ),
+        Err(ExtractError::MalformedExtension {
+            which: "x-ferrum-validate",
+            ..
+        })
+    ) {
+        return Err(
+            "x-ferrum-validate generated config with external RawValue const was not rejected",
+        );
+    }
+
+    let mcp_ext_spec = br#"{
+        "openapi": "3.1.0",
+        "info": {"title": "mcp-ext", "version": "1.0.0"},
+        "x-ferrum-proxy": {"id": "mcp-ext-proxy", "backend_host": "api.example.com", "backend_port": 443, "listen_path": "/api"},
+        "x-ferrum-external-refs": true,
+        "x-ferrum-mcp": true,
+        "paths": {
+            "/items": {
+                "post": {
+                    "operationId": "createItem",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "https://schemas.example.com/shared.json#/components/schemas/EvilConst"}
+                            }
+                        }
+                    },
+                    "responses": {"200": {"description": "ok"}}
+                }
+            }
+        }
+    }"#;
+    if !matches!(
+        extract_with_external_refs(
+            mcp_ext_spec,
+            Some(SpecFormat::Json),
+            "ferrum",
+            &policy,
+            &loader,
+        ),
+        Err(ExtractError::MalformedExtension {
+            which: "x-ferrum-mcp",
+            ..
+        })
+    ) {
+        return Err("x-ferrum-mcp generated config with external RawValue const was not rejected");
     }
     Ok(())
 }

@@ -8673,9 +8673,14 @@ paths:
           resolution when the process gate is also enabled. Admitted
           external documents are snapshotted at import (`external_ref_digest`
           / stored snapshot bytes); runtime validation never re-fetches. A
-          present external response Content-Type must be valid UTF-8 and on
-          the documented OpenAPI media allowlist; only an absent header uses
-          bounded JSON/YAML format detection.
+          present external response `Content-Type` must appear at most once,
+          be valid UTF-8, and match the documented OpenAPI media allowlist;
+          whether the header was present and allowed or absent, the body is
+          parsed under bounded first-byte JSON/YAML detection enforcing the
+          500,000-node ceiling and a 120-container nesting depth limit
+          (returning `400 InvalidJson` / `InvalidYaml` when exceeded).
+          Aggregate normalized (128 MiB) and compressed (64 MiB) snapshot
+          ceilings fail closed with `422 SchemaTooLarge`.
 
         **Forbidden**: `x-ferrum-consumers` is rejected — use `POST /consumers`
         separately. Plugin `config` values must not contain credential or
@@ -45956,17 +45961,22 @@ components:
 
             **Parse-time / structural — returned as HTTP 400 Bad Request:**
 
-            - `InvalidJson` — body is not valid JSON, or the JSON document (root spec or
+            - `InvalidJson` — body is not valid JSON, the JSON document (root spec or
               external `$ref` document) exceeds the 500,000-node ceiling counted during
-              deserialization before duplicate object keys collapse
+              deserialization before duplicate object keys collapse, or an external JSON
+              `$ref` document exceeds the 120-container nesting depth limit
             - `InvalidYaml` — body is not valid YAML, exceeds the bounded YAML anchor/alias
-              expansion budgets (depth, alias references, expanded bytes, or work units), or the
-              parsed YAML document exceeds the 500,000-node source-tree ceiling
+              expansion budgets (depth, alias references, expanded bytes, or work units),
+              exceeds the 500,000-node source-tree ceiling, or an external YAML `$ref`
+              document exceeds the 120-container nesting depth limit
             - `UnknownVersion` — no recognised `swagger: "2.0"` or `openapi: "3.x.y"` at root
             - `MissingProxyExtension` — `x-ferrum-proxy` is absent
             - `MalformedExtension` — `x-ferrum-proxy`, `x-ferrum-upstream`, `x-ferrum-plugins`,
               `x-ferrum-validate`, `x-ferrum-mcp`, `x-ferrum-external-refs`, or `servers` failed
-              to deserialise or violated an extension structural rule
+              to deserialise or violated an extension structural rule (including non-object
+              positional `x-ferrum-plugins` entries or the reserved
+              `$serde_json::private::RawValue` key at any depth of a declared or generated
+              plugin `config`)
 
             **Semantic / policy violations — returned as HTTP 422 Unprocessable Entity:**
 
