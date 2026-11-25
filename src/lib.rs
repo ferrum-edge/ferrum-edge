@@ -106,6 +106,39 @@ pub mod _test_support {
         crate::admin::api_specs::external_refs::content_type_allowed_for_test(content_type)
     }
 
+    /// Test helper exposing bounded API-spec format conversion.
+    pub fn api_spec_convert_format_capped_for_test(
+        body: &[u8],
+        from: crate::config::types::SpecFormat,
+        to: crate::config::types::SpecFormat,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, String> {
+        crate::admin::api_specs::handlers::convert_format_capped_for_test(body, from, to, max_bytes)
+    }
+
+    /// Test helper exercising budgeted `GuardedAdminBody` 64 KiB chunking,
+    /// mid-stream permit retention, drop release, and HEAD stripping.
+    pub async fn exercise_admin_response_budget_wrapper_for_test(
+        capacity_kib: u32,
+        body_bytes: usize,
+    ) -> Result<(usize, usize, usize, usize, bool), &'static str> {
+        crate::admin::exercise_response_budget_wrapper_for_test(capacity_kib, body_bytes).await
+    }
+
+    /// Test helper verifying strict per-connection response budget enforcement
+    /// without clamping oversized payloads.
+    pub fn check_admin_response_budget_limits_for_test(
+        capacity_kib: u32,
+        oversized_bytes: usize,
+        fitting_bytes: usize,
+    ) -> (bool, bool, bool) {
+        crate::admin::check_response_budget_limits_for_test(
+            capacity_kib,
+            oversized_bytes,
+            fitting_bytes,
+        )
+    }
+
     /// Construct an unregistered admin client-trust session handle for HTTP/2
     /// trust-withdrawal transport tests.
     pub fn new_admin_client_trust_session_for_test() -> crate::tls::ClientTrustSession {

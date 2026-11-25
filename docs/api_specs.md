@@ -834,7 +834,19 @@ curl "https://gateway/api-specs/$SPEC_ID" \
 # Look up spec by proxy ID
 curl "https://gateway/api-specs/by-proxy/orders-proxy" \
   -H "Authorization: Bearer $JWT"
+```
 
+> **Note (read backpressure & conditional caching):** `GET /api-specs/{id}` and
+> `GET /api-specs/by-proxy/{proxy_id}` enforce a per-connection buffered
+> response byte budget (at least 64 MiB, or the configured single-spec
+> decompression cap). If one connection stacks more unread spec bodies than its
+> budget allows (for example across multiplexed HTTP/2 streams), excess reads
+> fail fast with `503 Service Unavailable` and `Retry-After: 1` without
+> starving other connections. Conditional `If-None-Match` hits (`304 Not
+> Modified`) read only `(spec_format, content_hash)` metadata and consume
+> neither read codec slots nor connection response budget.
+
+```bash
 # Replace a spec
 curl -X PUT "https://gateway/api-specs/$SPEC_ID" \
   -H "Authorization: Bearer $JWT" \

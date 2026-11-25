@@ -12038,6 +12038,47 @@ impl DatabaseStore {
         }
     }
 
+    /// Fetch only `(spec_format, content_hash)` by namespace + id for
+    /// conditional `If-None-Match` (`304`) checks without transferring blobs.
+    pub async fn get_api_spec_conditional_meta(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<crate::config::db_backend::ApiSpecConditionalMeta>, anyhow::Error> {
+        let row: Option<AnyRow> =
+            sqlx::query(self.q(
+                "SELECT spec_format, content_hash FROM api_specs WHERE namespace = ? AND id = ?",
+            ))
+            .bind(namespace)
+            .bind(id)
+            .fetch_optional(&self.pool())
+            .await?;
+        match row {
+            Some(r) => Ok(Some(row_to_api_spec_conditional_meta(&r)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Fetch only `(spec_format, content_hash)` by namespace + proxy_id for
+    /// conditional `If-None-Match` (`304`) checks without transferring blobs.
+    pub async fn get_api_spec_conditional_meta_by_proxy(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+    ) -> Result<Option<crate::config::db_backend::ApiSpecConditionalMeta>, anyhow::Error> {
+        let row: Option<AnyRow> = sqlx::query(self.q(
+            "SELECT spec_format, content_hash FROM api_specs WHERE namespace = ? AND proxy_id = ?",
+        ))
+        .bind(namespace)
+        .bind(proxy_id)
+        .fetch_optional(&self.pool())
+        .await?;
+        match row {
+            Some(r) => Ok(Some(row_to_api_spec_conditional_meta(&r)?)),
+            None => Ok(None),
+        }
+    }
+
     /// List ApiSpecs in a namespace with optional filtering, sorting, and pagination.
     ///
     /// Returns a [`PaginatedResult`] that includes the filtered `total` row count
@@ -13725,6 +13766,22 @@ impl DatabaseBackend for DatabaseStore {
         DatabaseStore::get_api_spec_content_by_proxy(self, namespace, proxy_id).await
     }
 
+    async fn get_api_spec_conditional_meta(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<crate::config::db_backend::ApiSpecConditionalMeta>, anyhow::Error> {
+        DatabaseStore::get_api_spec_conditional_meta(self, namespace, id).await
+    }
+
+    async fn get_api_spec_conditional_meta_by_proxy(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+    ) -> Result<Option<crate::config::db_backend::ApiSpecConditionalMeta>, anyhow::Error> {
+        DatabaseStore::get_api_spec_conditional_meta_by_proxy(self, namespace, proxy_id).await
+    }
+
     async fn list_api_specs(
         &self,
         namespace: &str,
@@ -14781,6 +14838,24 @@ fn row_to_api_spec(row: &AnyRow) -> Result<crate::config::types::ApiSpec, anyhow
 fn row_to_api_spec_content(row: &AnyRow) -> Result<crate::config::types::ApiSpec, anyhow::Error> {
     let spec_content: Vec<u8> = row.try_get("spec_content")?;
     row_to_api_spec_with_content(row, spec_content, false)
+}
+
+fn row_to_api_spec_conditional_meta(
+    row: &AnyRow,
+) -> Result<crate::config::db_backend::ApiSpecConditionalMeta, anyhow::Error> {
+    use crate::config::types::SpecFormat;
+
+    let spec_format_str: String = row.try_get("spec_format")?;
+    let spec_format = match spec_format_str.as_str() {
+        "json" => SpecFormat::Json,
+        "yaml" => SpecFormat::Yaml,
+        _ => anyhow::bail!("unsupported api_specs.spec_format (expected one of: json, yaml)"),
+    };
+    let content_hash: String = row.try_get("content_hash")?;
+    Ok(crate::config::db_backend::ApiSpecConditionalMeta {
+        spec_format,
+        content_hash,
+    })
 }
 
 /// Parse an api_specs list row into an [`ApiSpec`] summary.

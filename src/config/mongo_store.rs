@@ -10063,6 +10063,27 @@ mod inner {
         doc_to_api_spec_inner(doc, false)
     }
 
+    fn doc_to_api_spec_conditional_meta(
+        doc: Document,
+    ) -> Result<crate::config::db_backend::ApiSpecConditionalMeta, anyhow::Error> {
+        let spec_format_str = doc
+            .get_str("spec_format")
+            .map_err(|_| anyhow::anyhow!("api_specs.spec_format missing or non-string"))?;
+        let spec_format = match spec_format_str {
+            "json" => crate::config::types::SpecFormat::Json,
+            "yaml" => crate::config::types::SpecFormat::Yaml,
+            _ => anyhow::bail!("unsupported api_specs.spec_format (expected one of: json, yaml)"),
+        };
+        let content_hash = doc
+            .get_str("content_hash")
+            .map_err(|_| anyhow::anyhow!("api_specs.content_hash missing or non-string"))?
+            .to_string();
+        Ok(crate::config::db_backend::ApiSpecConditionalMeta {
+            spec_format,
+            content_hash,
+        })
+    }
+
     fn doc_to_api_spec_inner(
         mut doc: Document,
         snapshot_projected: bool,
@@ -17554,6 +17575,47 @@ mod inner {
             self.check_slow_query("get_api_spec_content_by_proxy", start);
             match result {
                 Some(doc) => Ok(Some(doc_to_api_spec_content(doc)?)),
+                None => Ok(None),
+            }
+        }
+
+        async fn get_api_spec_conditional_meta(
+            &self,
+            namespace: &str,
+            id: &str,
+        ) -> Result<Option<crate::config::db_backend::ApiSpecConditionalMeta>, anyhow::Error>
+        {
+            let start = std::time::Instant::now();
+            let result = self
+                .api_specs()
+                .find_one(doc! {
+                    "_id": namespaced_doc_id(namespace, id),
+                    "namespace": namespace,
+                })
+                .projection(doc! { "_id": 0, "spec_format": 1, "content_hash": 1 })
+                .await?;
+            self.check_slow_query("get_api_spec_conditional_meta", start);
+            match result {
+                Some(doc) => Ok(Some(doc_to_api_spec_conditional_meta(doc)?)),
+                None => Ok(None),
+            }
+        }
+
+        async fn get_api_spec_conditional_meta_by_proxy(
+            &self,
+            namespace: &str,
+            proxy_id: &str,
+        ) -> Result<Option<crate::config::db_backend::ApiSpecConditionalMeta>, anyhow::Error>
+        {
+            let start = std::time::Instant::now();
+            let result = self
+                .api_specs()
+                .find_one(doc! { "proxy_id": proxy_id, "namespace": namespace })
+                .projection(doc! { "_id": 0, "spec_format": 1, "content_hash": 1 })
+                .await?;
+            self.check_slow_query("get_api_spec_conditional_meta_by_proxy", start);
+            match result {
+                Some(doc) => Ok(Some(doc_to_api_spec_conditional_meta(doc)?)),
                 None => Ok(None),
             }
         }

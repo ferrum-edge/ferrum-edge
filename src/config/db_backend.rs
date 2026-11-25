@@ -1761,6 +1761,15 @@ pub enum SortOrder {
     Asc,
 }
 
+/// Minimal metadata required to evaluate `Accept` negotiation and
+/// `If-None-Match` (`304 Not Modified`) without reading `spec_content` or
+/// `external_ref_snapshot` from the database.
+#[derive(Debug, Clone)]
+pub struct ApiSpecConditionalMeta {
+    pub spec_format: crate::config::types::SpecFormat,
+    pub content_hash: String,
+}
+
 /// Filter parameters for `list_api_specs`.
 #[derive(Debug, Clone)]
 pub struct ApiSpecListFilter {
@@ -3432,6 +3441,39 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         proxy_id: &str,
     ) -> Result<Option<ApiSpec>, anyhow::Error> {
         self.get_api_spec_by_proxy(namespace, proxy_id).await
+    }
+
+    /// Fetch only `(spec_format, content_hash)` for a conditional GET
+    /// (`If-None-Match`) so `304 Not Modified` hits bypass `SPEC_READ_CODEC_SLOTS`
+    /// and never transfer `spec_content` or `external_ref_snapshot`.
+    async fn get_api_spec_conditional_meta(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<ApiSpecConditionalMeta>, anyhow::Error> {
+        Ok(self
+            .get_api_spec_content(namespace, id)
+            .await?
+            .map(|spec| ApiSpecConditionalMeta {
+                spec_format: spec.spec_format,
+                content_hash: spec.content_hash,
+            }))
+    }
+
+    /// Fetch only `(spec_format, content_hash)` by proxy_id for conditional GET
+    /// (`If-None-Match`).
+    async fn get_api_spec_conditional_meta_by_proxy(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+    ) -> Result<Option<ApiSpecConditionalMeta>, anyhow::Error> {
+        Ok(self
+            .get_api_spec_content_by_proxy(namespace, proxy_id)
+            .await?
+            .map(|spec| ApiSpecConditionalMeta {
+                spec_format: spec.spec_format,
+                content_hash: spec.content_hash,
+            }))
     }
 
     /// List ApiSpecs in a namespace, with filtering, sorting, and pagination.

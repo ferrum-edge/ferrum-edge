@@ -1182,30 +1182,85 @@ fn content_type_for_format(fmt: SpecFormat) -> &'static str {
 /// Convert spec bytes between formats.
 ///
 /// Returns `Err` if the conversion fails (malformed source document).
-fn convert_format(body: &[u8], from: SpecFormat, to: SpecFormat) -> Result<Vec<u8>, String> {
+struct LimitedWriter {
+    buf: Vec<u8>,
+    limit: usize,
+}
+
+impl LimitedWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            buf: Vec::new(),
+            limit,
+        }
+    }
+}
+
+impl std::io::Write for LimitedWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.buf.len().saturating_add(data.len()) > self.limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "converted spec exceeds maximum size limit",
+            ));
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn convert_format_capped(
+    body: &[u8],
+    from: SpecFormat,
+    to: SpecFormat,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
     if from == to {
+        if body.len() > max_bytes {
+            return Err("spec exceeds maximum size limit".to_string());
+        }
         return Ok(body.to_vec());
     }
     match (from, to) {
         (SpecFormat::Yaml, SpecFormat::Json) => {
             let jv = parse_yaml_to_json(body, MAX_SOURCE_DOCUMENT_NODES)
                 .map_err(|e| format!("YAML parse error during conversion: {}", e.message()))?;
-            // Keep the negotiated representation within the same 32 MiB
-            // compact-JSON ceiling enforced during bounded YAML expansion.
-            serde_json::to_vec(&jv).map_err(|e| format!("JSON serialization error: {e}"))
+            let mut writer = LimitedWriter::new(max_bytes);
+            serde_json::to_writer(&mut writer, &jv)
+                .map_err(|e| format!("JSON serialization error: {e}"))?;
+            Ok(writer.buf)
         }
         (SpecFormat::Json, SpecFormat::Yaml) => {
             let jv: serde_json::Value = serde_json::from_slice(body)
                 .map_err(|e| format!("JSON parse error during conversion: {e}"))?;
-            serde_yaml::to_string(&jv)
-                .map(|s| s.into_bytes())
-                .map_err(|e| format!("YAML serialization error: {e}"))
+            let mut writer = LimitedWriter::new(max_bytes);
+            serde_yaml::to_writer(&mut writer, &jv)
+                .map_err(|e| format!("YAML serialization error: {e}"))?;
+            Ok(writer.buf)
         }
         _ => Err(format!(
             "unsupported format conversion {:?} → {:?}",
             from, to
         )),
     }
+}
+
+#[cfg(test)]
+fn convert_format(body: &[u8], from: SpecFormat, to: SpecFormat) -> Result<Vec<u8>, String> {
+    convert_format_capped(body, from, to, usize::MAX)
+}
+
+pub(crate) fn convert_format_capped_for_test(
+    body: &[u8],
+    from: SpecFormat,
+    to: SpecFormat,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    convert_format_capped(body, from, to, max_bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -2463,6 +2518,83 @@ async fn build_spec_row_async(
 /// `max_decompress_bytes` is the upper bound on decompressed output bytes.
 /// Guards against corrupt or adversarially inflated DB rows.  Callers should
 /// pass `2 * admin_spec_max_body_size_mib * 1024 * 1024`.
+fn spec_representation_etag(
+    content_hash: &str,
+    stored_format: SpecFormat,
+    target_format: SpecFormat,
+) -> String {
+    let fmt_suffix = match target_format {
+        SpecFormat::Json => "json",
+        SpecFormat::Yaml => "yaml",
+    };
+    let stored_suffix = match stored_format {
+        SpecFormat::Json => "json",
+        SpecFormat::Yaml => "yaml",
+    };
+    // Verbatim stored-format responses keep the canonical `"<hash>-<fmt>"` tag;
+    // converted representations include the stored format and conversion tag so
+    // resubmitting identical bytes under a different Content-Type cannot yield
+    // a false 304 when conversion changes the serialized bytes.
+    if target_format == stored_format {
+        format!("\"{content_hash}-{fmt_suffix}\"")
+    } else {
+        format!("\"{content_hash}-{fmt_suffix}-from-{stored_suffix}-v1\"")
+    }
+}
+
+fn if_none_match_matches(request_headers: &hyper::HeaderMap, etag: &str) -> bool {
+    request_headers
+        .get_all("if-none-match")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .any(|inm| {
+            let trimmed = inm.trim();
+            trimmed == "*"
+                || trimmed.split(',').any(|entry| {
+                    let entry = entry.trim();
+                    let tag = entry.strip_prefix("W/").unwrap_or(entry);
+                    tag == etag
+                })
+        })
+}
+
+fn try_conditional_not_modified_response(
+    meta: &crate::config::db_backend::ApiSpecConditionalMeta,
+    request_headers: &hyper::HeaderMap,
+) -> Option<Response<Full<Bytes>>> {
+    let Some(target_fmt) = negotiate_accept_or_406(request_headers, meta.spec_format) else {
+        return Some(json_resp(
+            StatusCode::NOT_ACCEPTABLE,
+            &json!({
+                "error": "No representation acceptable per Accept header (all formats explicitly q=0)"
+            }),
+        ));
+    };
+    let etag = spec_representation_etag(&meta.content_hash, meta.spec_format, target_fmt);
+    if if_none_match_matches(request_headers, &etag) {
+        return Some(
+            crate::admin::with_admin_security_headers(Response::builder())
+                .status(StatusCode::NOT_MODIFIED)
+                .header("ETag", &etag)
+                .header("Vary", "Accept")
+                .body(Full::new(Bytes::new()))
+                .unwrap_or_else(|_| crate::admin::admin_builder_failure_response()),
+        );
+    }
+    None
+}
+
+fn spec_response_budget_unavailable_response() -> Response<Full<Bytes>> {
+    crate::admin::with_admin_security_headers(Response::builder())
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header("Content-Type", "application/json")
+        .header("Retry-After", "1")
+        .body(Full::new(Bytes::from(
+            r#"{"error":"Too many buffered spec responses in flight on this connection"}"#,
+        )))
+        .unwrap_or_else(|_| crate::admin::admin_builder_failure_response())
+}
+
 async fn spec_content_response_async(
     spec: ApiSpec,
     request_headers: &hyper::HeaderMap,
@@ -2485,43 +2617,11 @@ async fn spec_content_response_async(
         }
     };
 
-    let fmt_suffix = match target_fmt {
-        SpecFormat::Json => "json",
-        SpecFormat::Yaml => "yaml",
-    };
-    let stored_suffix = match spec.spec_format {
-        SpecFormat::Json => "json",
-        SpecFormat::Yaml => "yaml",
-    };
-    // Verbatim stored-format responses keep the canonical `"<hash>-<fmt>"` tag;
-    // converted representations include the stored format and conversion tag so
-    // resubmitting identical bytes under a different Content-Type cannot yield
-    // a false 304 when conversion changes the serialized bytes.
-    let etag = if target_fmt == spec.spec_format {
-        format!("\"{}-{}\"", spec.content_hash, fmt_suffix)
-    } else {
-        format!(
-            "\"{}-{}-from-{}-v1\"",
-            spec.content_hash, fmt_suffix, stored_suffix
-        )
-    };
+    let etag = spec_representation_etag(&spec.content_hash, spec.spec_format, target_fmt);
 
     // If-None-Match check (RFC 9110 §13.1.2: comma-separated list across all
     // header lines, W/ prefix)
-    let etag_matches = request_headers
-        .get_all("if-none-match")
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .any(|inm| {
-            let trimmed = inm.trim();
-            trimmed == "*"
-                || trimmed.split(',').any(|entry| {
-                    let entry = entry.trim();
-                    let tag = entry.strip_prefix("W/").unwrap_or(entry);
-                    tag == etag
-                })
-        });
-    if etag_matches {
+    if if_none_match_matches(request_headers, &etag) {
         return crate::admin::with_admin_security_headers(Response::builder())
             .status(StatusCode::NOT_MODIFIED)
             .header("ETag", &etag)
@@ -2530,17 +2630,20 @@ async fn spec_content_response_async(
             .unwrap_or_else(|_| crate::admin::admin_builder_failure_response());
     }
 
-    if let Some(budget) = response_budget.as_ref()
-        && budget.is_exhausted()
-    {
-        return crate::admin::with_admin_security_headers(Response::builder())
-            .status(StatusCode::SERVICE_UNAVAILABLE)
-            .header("Content-Type", "application/json")
-            .header("Retry-After", "1")
-            .body(Full::new(Bytes::from(
-                r#"{"error":"Too many buffered spec responses in flight on this connection"}"#,
-            )))
-            .unwrap_or_else(|_| crate::admin::admin_builder_failure_response());
+    // Fail fast before decompressing when this connection already lacks budget
+    // for the expected response size (or is completely exhausted for converted
+    // responses).
+    if let Some(budget) = response_budget.as_ref() {
+        let precheck_failed = if target_fmt == spec.spec_format && spec.uncompressed_size > 0 {
+            usize::try_from(spec.uncompressed_size)
+                .map(|bytes| !budget.has_capacity_for_bytes(bytes))
+                .unwrap_or(true)
+        } else {
+            budget.is_exhausted()
+        };
+        if precheck_failed {
+            return spec_response_budget_unavailable_response();
+        }
     }
 
     // Offload gzip decompression + optional YAML/JSON conversion to the
@@ -2568,7 +2671,7 @@ async fn spec_content_response_async(
         if target_fmt == stored_format {
             Ok((raw, content_type_for_format(stored_format)))
         } else {
-            convert_format(&raw, stored_format, target_fmt)
+            convert_format_capped(&raw, stored_format, target_fmt, max_decompress_bytes)
                 .map(|converted| (converted, content_type_for_format(target_fmt)))
                 .map_err(|e| {
                     tracing::error!(
@@ -2582,7 +2685,7 @@ async fn spec_content_response_async(
                     let accepted_fmt_str = content_type_for_format(target_fmt);
                     format!(
                         "Cannot convert stored {} to requested {}; \
-                         the stored document may be malformed — \
+                         the stored document may be malformed or exceeds the size limit — \
                          try retrieving in the original format ({}) instead",
                         stored_fmt_str, accepted_fmt_str, stored_fmt_str
                     )
@@ -2611,16 +2714,7 @@ async fn spec_content_response_async(
     let budget_permit = if let Some(budget) = response_budget.as_ref() {
         match budget.try_acquire_bytes(len) {
             Some(permit) => Some(permit),
-            None => {
-                return crate::admin::with_admin_security_headers(Response::builder())
-                    .status(StatusCode::SERVICE_UNAVAILABLE)
-                    .header("Content-Type", "application/json")
-                    .header("Retry-After", "1")
-                    .body(Full::new(Bytes::from(
-                        r#"{"error":"Too many buffered spec responses in flight on this connection"}"#,
-                    )))
-                    .unwrap_or_else(|_| crate::admin::admin_builder_failure_response());
-            }
+            None => return spec_response_budget_unavailable_response(),
         }
     } else {
         None
@@ -3545,6 +3639,21 @@ pub async fn handle_get_api_spec(
         Err(e) => return Ok(error_response(e)),
     };
 
+    // Fast path for conditional GET (`If-None-Match`): read only `(spec_format,
+    // content_hash)` without acquiring a global read codec slot or loading any
+    // compressed blobs so `304 Not Modified` hits never queue behind active
+    // decompression/conversion work on other connections.
+    if req.headers().contains_key(hyper::header::IF_NONE_MATCH) {
+        let meta = match db.get_api_spec_conditional_meta(namespace, id).await {
+            Ok(Some(meta)) => meta,
+            Ok(None) => return Ok(error_response(ApiSpecError::NotFound)),
+            Err(e) => return Ok(error_response(classify_db_error(e))),
+        };
+        if let Some(response) = try_conditional_not_modified_response(&meta, req.headers()) {
+            return Ok(response);
+        }
+    }
+
     // Acquire read codec capacity BEFORE loading the full compressed spec blob
     // from the database so bursts of concurrent reads cannot hold unbounded
     // multi-MiB rows in memory while queued.
@@ -3590,6 +3699,20 @@ pub async fn handle_get_api_spec_by_proxy(
         Ok(db) => db,
         Err(e) => return Ok(error_response(e)),
     };
+
+    if req.headers().contains_key(hyper::header::IF_NONE_MATCH) {
+        let meta = match db
+            .get_api_spec_conditional_meta_by_proxy(namespace, proxy_id)
+            .await
+        {
+            Ok(Some(meta)) => meta,
+            Ok(None) => return Ok(error_response(ApiSpecError::NotFound)),
+            Err(e) => return Ok(error_response(classify_db_error(e))),
+        };
+        if let Some(response) = try_conditional_not_modified_response(&meta, req.headers()) {
+            return Ok(response);
+        }
+    }
 
     let Ok(read_permit) = Arc::clone(&SPEC_READ_CODEC_SLOTS).acquire_owned().await else {
         return Ok(json_resp(

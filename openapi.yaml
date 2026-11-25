@@ -8904,7 +8904,7 @@ paths:
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/ApiSpecReadServiceUnavailable"
 
     put:
       operationId: replaceApiSpec
@@ -9279,7 +9279,7 @@ paths:
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/ApiSpecReadServiceUnavailable"
 
 # ════════════════════════════════════════════════════════════════════════
 components:
@@ -9852,6 +9852,26 @@ components:
         could not durably record the pre-mutation intent, in which case the body
         carries a closed-set `audit_unavailable_reason`. The mutation was not
         performed.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    ApiSpecReadServiceUnavailable:
+      description: >-
+        Database backend unavailable, spec read codec admission unavailable, or
+        the per-connection buffered spec response budget is temporarily full.
+        When the per-connection buffered response budget is exceeded, the
+        response includes `Retry-After: 1` so the caller can retry once
+        in-flight responses drain.
+      headers:
+        Retry-After:
+          description: >-
+            Present when the per-connection buffered spec response budget is
+            exhausted (`1` second).
+          schema:
+            type: integer
+            minimum: 1
+            example: 1
       content:
         application/json:
           schema:

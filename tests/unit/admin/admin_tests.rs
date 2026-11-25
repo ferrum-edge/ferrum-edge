@@ -1688,6 +1688,77 @@ fn head_withdrawn_trust_401_restore_partial_clear_and_tls_settlement_invariants(
     );
 }
 
+#[tokio::test]
+async fn admin_response_budget_chunks_holds_permit_and_rejects_oversized_payloads() {
+    // Oversized payloads (> budget capacity) must be refused rather than clamped
+    // down to fit, and concurrent bodies exceeding remaining budget must fail fast.
+    let (oversized_refused, first_admitted, second_refused) =
+        ferrum_edge::_test_support::check_admin_response_budget_limits_for_test(
+            256,
+            300 * 1024,
+            180 * 1024,
+        );
+    assert!(
+        oversized_refused,
+        "payload exceeding per-connection budget must be rejected without clamping"
+    );
+    assert!(
+        first_admitted,
+        "first fitting payload must be admitted by pre-check"
+    );
+    assert!(
+        second_refused,
+        "second payload exceeding remaining budget must be rejected"
+    );
+
+    // A 200 KiB budgeted body must yield multiple <= 64 KiB frames, keep the
+    // permit reserved across intermediate frames, release on drop, and drop
+    // immediately when stripped for HEAD.
+    let (
+        frame_count,
+        available_after_acquire,
+        available_mid_stream,
+        available_after_drop,
+        head_released,
+    ) = ferrum_edge::_test_support::exercise_admin_response_budget_wrapper_for_test(
+        256,
+        200 * 1024,
+    )
+    .await
+    .expect("budgeted response wrapper test helper");
+    assert_eq!(
+        frame_count, 4,
+        "200 KiB body must stream as four <=64 KiB chunks"
+    );
+    assert_eq!(available_after_acquire, 56);
+    assert_eq!(
+        available_mid_stream, 56,
+        "budget permit must remain held while subsequent chunks are still pending"
+    );
+    assert_eq!(
+        available_after_drop, 256,
+        "budget permit must release completely once GuardedAdminBody drops"
+    );
+    assert!(
+        head_released,
+        "strip_head_response_body must release response budget immediately"
+    );
+
+    // Bounded format conversion must abort before materializing oversized output.
+    let json_payload =
+        br#"{"openapi":"3.1.0","info":{"title":"Example","version":"1.0.0"},"paths":{}}"#;
+    assert!(
+        ferrum_edge::_test_support::api_spec_convert_format_capped_for_test(
+            json_payload,
+            ferrum_edge::config::types::SpecFormat::Json,
+            ferrum_edge::config::types::SpecFormat::Yaml,
+            16,
+        )
+        .is_err(),
+        "capped JSON->YAML conversion must fail closed when output exceeds max_bytes"
+    );
+}
+
 #[test]
 fn stored_spec_assoc_decompress_cap_honors_conf_file_and_rejects_invalid_values() {
     use ferrum_edge::admin::api_specs::stored_spec_assoc_decompress_cap_from_resolved;
