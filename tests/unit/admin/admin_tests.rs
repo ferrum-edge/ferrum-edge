@@ -1782,6 +1782,48 @@ async fn admin_response_budget_chunks_holds_permit_and_rejects_oversized_payload
     );
     assert_eq!(remaining_after_oversized, 256);
 
+    // Mid-stream gzip decompression and cross-format conversion must classify
+    // connection-budget exhaustion as 503 while preserving 500 when output
+    // exceeds max_bytes.
+    let large_json = format!(
+        r#"{{"openapi":"3.1.0","info":{{"title":"{}","version":"1.0.0"}},"paths":{{}}}}"#,
+        "a".repeat(20 * 1024)
+    );
+    let (budget_503_decode, budget_503_convert) =
+        ferrum_edge::_test_support::check_api_spec_budgeted_decode_and_convert_for_test(
+            large_json.as_bytes(),
+            64 * 1024,
+            64,
+            60 * 1024,
+        );
+    assert_eq!(
+        budget_503_decode,
+        Some(503),
+        "streaming gzip decode exceeding remaining connection budget must abort with 503"
+    );
+    assert_eq!(
+        budget_503_convert,
+        Some(503),
+        "streaming format conversion exceeding remaining connection budget must abort with 503"
+    );
+    let (cap_500_decode, cap_500_convert) =
+        ferrum_edge::_test_support::check_api_spec_budgeted_decode_and_convert_for_test(
+            large_json.as_bytes(),
+            4 * 1024,
+            64,
+            0,
+        );
+    assert_eq!(
+        cap_500_decode,
+        Some(500),
+        "streaming gzip decode exceeding max_bytes must still fail closed with 500"
+    );
+    assert_eq!(
+        cap_500_convert,
+        Some(500),
+        "streaming format conversion exceeding max_bytes must still fail closed with 500"
+    );
+
     // A 200 KiB budgeted body must yield multiple <= 64 KiB chunks, keep the
     // permit reserved across intermediate frames AND while queued frames remain
     // held after `GuardedAdminBody` drops, release on frame drop or early

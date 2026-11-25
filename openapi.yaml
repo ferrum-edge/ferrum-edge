@@ -8951,7 +8951,12 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "406":
-          description: Requested `Accept` header explicitly rejects every supported JSON and YAML representation with `q=0` (unrelated media types such as `text/plain` default to the stored format).
+          description: >-
+            Requested `Accept` header explicitly rejects offered JSON/YAML
+            representation(s) with `q=0` (including rejecting one format with
+            `q=0` without matching the other, such as
+            `Accept: application/json;q=0`; unrelated media types without any
+            `q=0` rejection default to the stored format).
           content:
             application/json:
               schema:
@@ -9326,7 +9331,12 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "406":
-          description: Requested `Accept` header explicitly rejects every supported JSON and YAML representation with `q=0` (unrelated media types such as `text/plain` default to the stored format).
+          description: >-
+            Requested `Accept` header explicitly rejects offered JSON/YAML
+            representation(s) with `q=0` (including rejecting one format with
+            `q=0` without matching the other, such as
+            `Accept: application/json;q=0`; unrelated media types without any
+            `q=0` rejection default to the stored format).
           content:
             application/json:
               schema:

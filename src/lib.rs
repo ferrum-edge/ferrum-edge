@@ -150,6 +150,23 @@ pub mod _test_support {
         )
     }
 
+    /// Test helper verifying that streaming gzip decompression and cross-format
+    /// conversion classify mid-stream connection-budget exhaustion as `503`
+    /// while preserving `500` when output exceeds `max_bytes`.
+    pub fn check_api_spec_budgeted_decode_and_convert_for_test(
+        raw_json: &[u8],
+        max_bytes: usize,
+        budget_capacity_kib: u32,
+        already_held_bytes: usize,
+    ) -> (Option<u16>, Option<u16>) {
+        crate::admin::api_specs::handlers::check_budgeted_decode_and_convert_for_test(
+            raw_json,
+            max_bytes,
+            budget_capacity_kib,
+            already_held_bytes,
+        )
+    }
+
     /// Test helper verifying API-spec read preflight reservation and
     /// `If-None-Match: *` conversion parity.
     pub fn check_api_spec_read_preflight_for_test(

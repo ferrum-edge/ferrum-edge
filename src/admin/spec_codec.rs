@@ -57,6 +57,33 @@ pub fn decompress_gzip_capped(input: &[u8], max_output: usize) -> std::io::Resul
     Ok(buf)
 }
 
+/// Stream gzip-decompressed `input` bytes into `writer` in bounded 8 KiB
+/// chunks, failing with `ErrorKind::Other` before writing past `max_output`
+/// bytes so callers can enforce live per-connection byte budgets during
+/// decompression rather than only after buffering the full output.
+pub(crate) fn decompress_gzip_capped_to_writer<W: Write>(
+    input: &[u8],
+    max_output: usize,
+    writer: &mut W,
+) -> std::io::Result<()> {
+    let mut decoder = GzDecoder::new(input);
+    let mut chunk = [0u8; 8 * 1024];
+    let mut total: usize = 0;
+    loop {
+        let read = decoder.read(&mut chunk)?;
+        if read == 0 {
+            return Ok(());
+        }
+        total = total.saturating_add(read);
+        if total > max_output {
+            return Err(std::io::Error::other(
+                "decompressed size exceeds max_output cap",
+            ));
+        }
+        writer.write_all(&chunk[..read])?;
+    }
+}
+
 /// Compute the SHA-256 digest of `input` and return it as a lowercase hex
 /// string (64 characters).
 ///

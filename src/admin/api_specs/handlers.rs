@@ -1240,11 +1240,15 @@ enum ConvertFormatError {
 /// Convert spec bytes between formats under an explicit `max_bytes` cap and
 /// optional live per-connection budget reservation.
 ///
+/// Consumes `body` by value and drops the decompressed input immediately after
+/// parsing so the decompressed source buffer and serialized output buffer
+/// never coexist against the connection's buffered-memory budget.
+///
 /// Returns `Err(ConvertFormatError::BudgetExceeded)` if serialized output
 /// grows past the connection's remaining budget, or `Err(ConvertFormatError::Format)`
 /// if the source document is malformed or exceeds `max_bytes`.
 fn convert_format_capped_with_budget(
-    body: &[u8],
+    body: Vec<u8>,
     from: SpecFormat,
     to: SpecFormat,
     max_bytes: usize,
@@ -1262,16 +1266,20 @@ fn convert_format_capped_with_budget(
         {
             return Err(ConvertFormatError::BudgetExceeded);
         }
-        return Ok(body.to_vec());
+        let mut out = body;
+        out.shrink_to_fit();
+        return Ok(out);
     }
     match (from, to) {
         (SpecFormat::Yaml, SpecFormat::Json) => {
-            let jv = parse_yaml_to_json(body, MAX_SOURCE_DOCUMENT_NODES).map_err(|e| {
+            let jv = parse_yaml_to_json(&body, MAX_SOURCE_DOCUMENT_NODES).map_err(|e| {
                 ConvertFormatError::Format(format!(
                     "YAML parse error during conversion: {}",
                     e.message()
                 ))
             })?;
+            // Release the decompressed source buffer before allocating output.
+            drop(body);
             let mut writer = LimitedWriter::new(max_bytes, reservation);
             if let Err(e) = serde_json::to_writer(&mut writer, &jv) {
                 if writer.budget_exceeded {
@@ -1281,12 +1289,16 @@ fn convert_format_capped_with_budget(
                     "JSON serialization error: {e}"
                 )));
             }
+            drop(jv);
+            writer.buf.shrink_to_fit();
             Ok(writer.buf)
         }
         (SpecFormat::Json, SpecFormat::Yaml) => {
-            let jv: serde_json::Value = serde_json::from_slice(body).map_err(|e| {
+            let jv: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
                 ConvertFormatError::Format(format!("JSON parse error during conversion: {e}"))
             })?;
+            // Release the decompressed source buffer before allocating output.
+            drop(body);
             let mut writer = LimitedWriter::new(max_bytes, reservation);
             if let Err(e) = serde_yaml::to_writer(&mut writer, &jv) {
                 if writer.budget_exceeded {
@@ -1296,6 +1308,8 @@ fn convert_format_capped_with_budget(
                     "YAML serialization error: {e}"
                 )));
             }
+            drop(jv);
+            writer.buf.shrink_to_fit();
             Ok(writer.buf)
         }
         _ => Err(ConvertFormatError::Format(format!(
@@ -1311,10 +1325,60 @@ fn convert_format_capped(
     to: SpecFormat,
     max_bytes: usize,
 ) -> Result<Vec<u8>, String> {
-    convert_format_capped_with_budget(body, from, to, max_bytes, None).map_err(|err| match err {
-        ConvertFormatError::BudgetExceeded => "connection response budget exceeded".to_string(),
-        ConvertFormatError::Format(msg) => msg,
+    convert_format_capped_with_budget(body.to_vec(), from, to, max_bytes, None).map_err(|err| {
+        match err {
+            ConvertFormatError::BudgetExceeded => "connection response budget exceeded".to_string(),
+            ConvertFormatError::Format(msg) => msg,
+        }
     })
+}
+
+/// Test helper verifying that streaming gzip decompression and cross-format
+/// conversion both classify mid-stream connection-budget exhaustion as `503`
+/// while preserving `500` when output exceeds `max_bytes`.
+pub(crate) fn check_budgeted_decode_and_convert_for_test(
+    raw_json: &[u8],
+    max_bytes: usize,
+    budget_capacity_kib: u32,
+    already_held_bytes: usize,
+) -> (Option<u16>, Option<u16>) {
+    let budget = crate::admin::AdminConnResponseBudget::new(budget_capacity_kib);
+    let _held = if already_held_bytes > 0 {
+        budget.try_acquire_bytes(already_held_bytes)
+    } else {
+        None
+    };
+
+    let decompress_status = match spec_codec::compress_gzip(raw_json) {
+        Ok(compressed) => {
+            let mut res = budget.try_reserve_bytes(1024);
+            let mut writer = LimitedWriter::new(max_bytes, res.as_mut());
+            match spec_codec::decompress_gzip_capped_to_writer(&compressed, max_bytes, &mut writer)
+            {
+                Ok(()) => None,
+                Err(_) if writer.budget_exceeded => Some(503),
+                Err(_) => Some(500),
+            }
+        }
+        Err(_) => Some(500),
+    };
+
+    let convert_status = {
+        let mut res = budget.try_reserve_bytes(1024);
+        match convert_format_capped_with_budget(
+            raw_json.to_vec(),
+            SpecFormat::Json,
+            SpecFormat::Yaml,
+            max_bytes,
+            res.as_mut(),
+        ) {
+            Ok(_) => None,
+            Err(ConvertFormatError::BudgetExceeded) => Some(503),
+            Err(ConvertFormatError::Format(_)) => Some(500),
+        }
+    };
+
+    (decompress_status, convert_status)
 }
 
 #[cfg(test)]
@@ -2829,56 +2893,65 @@ async fn spec_content_response_async(
     let compressed = spec.spec_content;
     let converted = tokio::task::spawn_blocking(move || {
         let _permit = read_permit;
-        let result = spec_codec::decompress_gzip_capped(&compressed, max_decompress_bytes)
-            .map_err(|e| {
-                tracing::error!(
-                    "decompress_gzip_capped failed for spec {} (cap={} bytes): {}",
-                    spec_id,
-                    max_decompress_bytes,
-                    e
-                );
-                SpecDecodeError::Internal("spec content corrupt or oversized".to_string())
-            })
-            .and_then(|raw| {
-                if let Some(res) = budget_reservation.as_mut()
-                    && !raw.is_empty()
-                    && !res.try_grow_to_bytes(raw.len())
-                {
-                    return Err(SpecDecodeError::BudgetExceeded);
+        let decompressed = {
+            let mut writer = LimitedWriter::new(max_decompress_bytes, budget_reservation.as_mut());
+            match spec_codec::decompress_gzip_capped_to_writer(
+                &compressed,
+                max_decompress_bytes,
+                &mut writer,
+            ) {
+                Ok(()) => {
+                    writer.buf.shrink_to_fit();
+                    Ok(writer.buf)
                 }
-                if target_fmt == stored_format {
-                    Ok((raw, content_type_for_format(stored_format)))
-                } else {
-                    convert_format_capped_with_budget(
-                        &raw,
-                        stored_format,
-                        target_fmt,
+                Err(_) if writer.budget_exceeded => Err(SpecDecodeError::BudgetExceeded),
+                Err(e) => {
+                    tracing::error!(
+                        "decompress_gzip_capped_to_writer failed for spec {} (cap={} bytes): {}",
+                        spec_id,
                         max_decompress_bytes,
-                        budget_reservation.as_mut(),
-                    )
-                    .map(|converted| (converted, content_type_for_format(target_fmt)))
-                    .map_err(|err| match err {
-                        ConvertFormatError::BudgetExceeded => SpecDecodeError::BudgetExceeded,
-                        ConvertFormatError::Format(e) => {
-                            tracing::error!(
-                                "format conversion ({:?} → {:?}) failed for spec {}: {}",
-                                stored_format,
-                                target_fmt,
-                                spec_id,
-                                e
-                            );
-                            let stored_fmt_str = content_type_for_format(stored_format);
-                            let accepted_fmt_str = content_type_for_format(target_fmt);
-                            SpecDecodeError::Internal(format!(
-                                "Cannot convert stored {} to requested {}; \
-                                 the stored document may be malformed or exceeds the size limit — \
-                                 try retrieving in the original format ({}) instead",
-                                stored_fmt_str, accepted_fmt_str, stored_fmt_str
-                            ))
-                        }
-                    })
+                        e
+                    );
+                    Err(SpecDecodeError::Internal(
+                        "spec content corrupt or oversized".to_string(),
+                    ))
                 }
-            });
+            }
+        };
+        let result = decompressed.and_then(|raw| {
+            if target_fmt == stored_format {
+                Ok((raw, content_type_for_format(stored_format)))
+            } else {
+                convert_format_capped_with_budget(
+                    raw,
+                    stored_format,
+                    target_fmt,
+                    max_decompress_bytes,
+                    budget_reservation.as_mut(),
+                )
+                .map(|converted| (converted, content_type_for_format(target_fmt)))
+                .map_err(|err| match err {
+                    ConvertFormatError::BudgetExceeded => SpecDecodeError::BudgetExceeded,
+                    ConvertFormatError::Format(e) => {
+                        tracing::error!(
+                            "format conversion ({:?} → {:?}) failed for spec {}: {}",
+                            stored_format,
+                            target_fmt,
+                            spec_id,
+                            e
+                        );
+                        let stored_fmt_str = content_type_for_format(stored_format);
+                        let accepted_fmt_str = content_type_for_format(target_fmt);
+                        SpecDecodeError::Internal(format!(
+                            "Cannot convert stored {} to requested {}; \
+                             the stored document may be malformed or exceeds the size limit — \
+                             try retrieving in the original format ({}) instead",
+                            stored_fmt_str, accepted_fmt_str, stored_fmt_str
+                        ))
+                    }
+                })
+            }
+        });
         (result, budget_reservation)
     })
     .await;
