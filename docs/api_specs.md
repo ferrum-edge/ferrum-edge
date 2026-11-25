@@ -842,9 +842,13 @@ curl "https://gateway/api-specs/by-proxy/orders-proxy" \
 > decompression cap). If one connection stacks more unread spec bodies than its
 > budget allows (for example across multiplexed HTTP/2 streams), excess reads
 > fail fast with `503 Service Unavailable` and `Retry-After: 1` without
-> starving other connections. Conditional `If-None-Match` hits (`304 Not
-> Modified`) read only `(spec_format, content_hash)` metadata and consume
-> neither read codec slots nor connection response budget.
+> starving other connections. Conditional `If-None-Match` hits matching an exact
+> ETag (or `*` for a verbatim format within the decompression cap) read only
+> `(spec_format, content_hash, uncompressed_size)` metadata and consume neither
+> read codec slots nor connection response budget; `If-None-Match: *` on a
+> cross-format conversion validates the bounded conversion first (holding a
+> codec slot and connection reservation) so an oversized or malformed conversion
+> returns `500` consistently with an unconditional `GET`.
 
 ```bash
 # Replace a spec

@@ -1765,6 +1765,22 @@ async fn admin_response_budget_chunks_holds_permit_and_rejects_oversized_payload
         "verbatim If-None-Match: * within cap must still fast-path 304 on a full connection"
     );
     assert_eq!(remaining_after_verbatim_304, 0);
+    let (oversized_star_status, remaining_after_oversized) =
+        ferrum_edge::_test_support::check_api_spec_read_preflight_for_test(
+            ferrum_edge::config::types::SpecFormat::Json,
+            600 * 1024,
+            512 * 1024,
+            "application/json",
+            Some("*"),
+            256,
+            0,
+        );
+    assert_eq!(
+        oversized_star_status,
+        Some(500),
+        "stored row exceeding max_decompress_bytes must fail closed with 500 rather than retryable 503"
+    );
+    assert_eq!(remaining_after_oversized, 256);
 
     // A 200 KiB budgeted body must yield multiple <= 64 KiB chunks, keep the
     // permit reserved across intermediate frames AND while queued frames remain

@@ -1504,20 +1504,6 @@ impl AdminConnResponseBudget {
             })
     }
 
-    /// Atomically reserve the full connection budget on an idle connection so
-    /// an unconditional read can skip a separate metadata preflight query and
-    /// shrink the reservation to the exact response size once decoded.
-    pub(crate) fn try_reserve_full(&self) -> Option<ResponseBodyBudgetReservation> {
-        self.semaphore
-            .clone()
-            .try_acquire_many_owned(self.capacity_kib)
-            .ok()
-            .map(|permit| ResponseBodyBudgetReservation {
-                budget: self.clone(),
-                permit,
-            })
-    }
-
     pub(crate) fn try_acquire_bytes(&self, bytes: usize) -> Option<ResponseBodyBudgetPermit> {
         self.try_reserve_bytes(bytes)
             .map(|res| ResponseBodyBudgetPermit(Arc::new(res.permit)))
@@ -1884,26 +1870,39 @@ pub(crate) fn check_response_budget_limits_for_test(
         && budget.try_acquire_bytes(fitting_bytes).is_none();
     drop(held);
 
-    // Provisional full reservation shrinks cleanly to actual size and releases
-    // excess KiB immediately; attempting to grow beyond remaining budget fails.
-    let shrink_and_grow_ok = if let Some(full) = budget.try_reserve_full() {
-        let locked_while_full =
-            budget.available_kib() == 0 && budget.try_reserve_bytes(1024).is_none();
-        let shrunk = full.adjust_to_bytes(50 * 1024);
-        let released_excess = shrunk.is_some()
-            && budget.available_kib() == (capacity_kib as usize).saturating_sub(50);
-        let second_small = budget.try_reserve_bytes(100 * 1024);
-        let grow_beyond_refused = second_small
-            .and_then(|res| res.adjust_to_bytes((capacity_kib as usize) * 1024))
-            .is_none();
+    // Verify shrink (180 KiB -> 50 KiB), successful grow (50 KiB -> 120 KiB),
+    // and overflow grow rejection (50 KiB -> 200 KiB when only 36 KiB remain),
+    // ensuring each prerequisite reservation actually succeeded.
+    let shrink_and_grow_ok = (|| {
+        let initial = budget.try_reserve_bytes(180 * 1024)?;
+        if budget.available_kib() != (capacity_kib as usize).saturating_sub(180) {
+            return None;
+        }
+        let shrunk = initial.adjust_to_bytes(50 * 1024)?;
+        if budget.available_kib() != (capacity_kib as usize).saturating_sub(50) {
+            return None;
+        }
+        let growable = budget.try_reserve_bytes(50 * 1024)?;
+        let grown = growable.adjust_to_bytes(120 * 1024)?;
+        if budget.available_kib() != (capacity_kib as usize).saturating_sub(170) {
+            return None;
+        }
+        let overflow_candidate = budget.try_reserve_bytes(50 * 1024)?;
+        if budget.available_kib() != (capacity_kib as usize).saturating_sub(220) {
+            return None;
+        }
+        if overflow_candidate.adjust_to_bytes(200 * 1024).is_some() {
+            return None;
+        }
+        // Failed grow must release the 50 KiB candidate reservation immediately.
+        if budget.available_kib() != (capacity_kib as usize).saturating_sub(170) {
+            return None;
+        }
+        drop(grown);
         drop(shrunk);
-        locked_while_full
-            && released_excess
-            && grow_beyond_refused
-            && budget.available_kib() == capacity_kib as usize
-    } else {
-        false
-    };
+        (budget.available_kib() == capacity_kib as usize).then_some(())
+    })()
+    .is_some();
 
     (
         oversized_refused,

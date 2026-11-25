@@ -2640,6 +2640,16 @@ fn preflight_spec_read_from_meta(
             return SpecReadPreflight::Respond(not_modified_response(&etag));
         }
     }
+    // Fail closed with 500 before checking connection budget if the stored row
+    // already exceeds the decompression ceiling, so neither unconditional GET
+    // nor `If-None-Match: *` ever returns a misleading retryable `503` for a
+    // permanently oversized stored document.
+    if meta.uncompressed_size > max_decompress_bytes as u64 {
+        return SpecReadPreflight::Respond(json_resp(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({"error": "spec content corrupt or oversized"}),
+        ));
+    }
     let Some(budget) = response_budget else {
         return SpecReadPreflight::Proceed(None);
     };
@@ -2650,7 +2660,10 @@ fn preflight_spec_read_from_meta(
         match usize::try_from(meta.uncompressed_size) {
             Ok(bytes) => bytes,
             Err(_) => {
-                return SpecReadPreflight::Respond(spec_response_budget_unavailable_response());
+                return SpecReadPreflight::Respond(json_resp(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &json!({"error": "spec content corrupt or oversized"}),
+                ));
             }
         }
     } else {
@@ -2718,19 +2731,19 @@ async fn spec_content_response_async(
     }
 
     // Offload gzip decompression + optional YAML/JSON conversion to the
-    // blocking pool while holding the pre-acquired read codec permit so large
-    // spec reads cannot saturate Tokio worker threads or retain unbounded blobs
-    // while waiting in the queue. The codec permit is released as soon as the
-    // codec phase finishes (never held across network transmission) so stalled
-    // HTTP/2 readers cannot starve other connections; per-connection buffered
-    // response memory is bounded separately by `AdminConnResponseBudget`.
+    // blocking pool while holding both the pre-acquired read codec permit AND
+    // the connection budget reservation so an HTTP/2 stream reset mid-decode
+    // cannot release the connection budget while the blocking decode is still
+    // running. The codec permit is released as soon as the codec phase finishes
+    // (never held across network transmission), while the budget reservation is
+    // returned and adjusted to the exact response length for `GuardedAdminBody`.
     let spec_id = spec.id;
     let stored_format = spec.spec_format;
     let compressed = spec.spec_content;
     let converted = tokio::task::spawn_blocking(move || {
         let _permit = read_permit;
-        let raw =
-            spec_codec::decompress_gzip_capped(&compressed, max_decompress_bytes).map_err(|e| {
+        let result = spec_codec::decompress_gzip_capped(&compressed, max_decompress_bytes)
+            .map_err(|e| {
                 tracing::error!(
                     "decompress_gzip_capped failed for spec {} (cap={} bytes): {}",
                     spec_id,
@@ -2738,36 +2751,39 @@ async fn spec_content_response_async(
                     e
                 );
                 "spec content corrupt or oversized".to_string()
-            })?;
-        if target_fmt == stored_format {
-            Ok((raw, content_type_for_format(stored_format)))
-        } else {
-            convert_format_capped(&raw, stored_format, target_fmt, max_decompress_bytes)
-                .map(|converted| (converted, content_type_for_format(target_fmt)))
-                .map_err(|e| {
-                    tracing::error!(
-                        "format conversion ({:?} → {:?}) failed for spec {}: {}",
-                        stored_format,
-                        target_fmt,
-                        spec_id,
-                        e
-                    );
-                    let stored_fmt_str = content_type_for_format(stored_format);
-                    let accepted_fmt_str = content_type_for_format(target_fmt);
-                    format!(
-                        "Cannot convert stored {} to requested {}; \
-                         the stored document may be malformed or exceeds the size limit — \
-                         try retrieving in the original format ({}) instead",
-                        stored_fmt_str, accepted_fmt_str, stored_fmt_str
-                    )
-                })
-        }
+            })
+            .and_then(|raw| {
+                if target_fmt == stored_format {
+                    Ok((raw, content_type_for_format(stored_format)))
+                } else {
+                    convert_format_capped(&raw, stored_format, target_fmt, max_decompress_bytes)
+                        .map(|converted| (converted, content_type_for_format(target_fmt)))
+                        .map_err(|e| {
+                            tracing::error!(
+                                "format conversion ({:?} → {:?}) failed for spec {}: {}",
+                                stored_format,
+                                target_fmt,
+                                spec_id,
+                                e
+                            );
+                            let stored_fmt_str = content_type_for_format(stored_format);
+                            let accepted_fmt_str = content_type_for_format(target_fmt);
+                            format!(
+                                "Cannot convert stored {} to requested {}; \
+                                 the stored document may be malformed or exceeds the size limit — \
+                                 try retrieving in the original format ({}) instead",
+                                stored_fmt_str, accepted_fmt_str, stored_fmt_str
+                            )
+                        })
+                }
+            });
+        (result, budget_reservation)
     })
     .await;
 
-    let (body_bytes, ct) = match converted {
-        Ok(Ok(pair)) => pair,
-        Ok(Err(message)) => {
+    let (body_bytes, ct, budget_reservation) = match converted {
+        Ok((Ok((body_bytes, ct)), reservation)) => (body_bytes, ct, reservation),
+        Ok((Err(message), _reservation)) => {
             return json_resp(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &json!({"error": message}),
@@ -3769,42 +3785,23 @@ pub async fn handle_get_api_spec(
         .cloned();
     let max_decompress = max_spec_decompress_bytes(state.admin_spec_max_body_size_mib);
 
-    // Atomically reserve per-connection buffered response budget BEFORE
-    // acquiring one of the four process-wide read codec slots or fetching the
-    // compressed blob:
-    // - On an idle connection without `If-None-Match`, reserve the full budget
-    //   provisionally (0 extra DB queries) and shrink to exact body length once
-    //   decoded.
-    // - Otherwise (conditional GET or connection with responses already in
-    //   flight), run the lightweight metadata query to short-circuit `304`/`406`
-    //   and atomically reserve `uncompressed_size` before entering the codec.
-    let budget_reservation = if !has_if_none_match {
-        if let Some(budget) = response_budget.as_ref() {
-            if let Some(reservation) = budget.try_reserve_full() {
-                Some(reservation)
-            } else if budget.is_exhausted() {
-                return Ok(spec_response_budget_unavailable_response());
-            } else {
-                let meta = match db.get_api_spec_conditional_meta(namespace, id).await {
-                    Ok(Some(meta)) => meta,
-                    Ok(None) => return Ok(error_response(ApiSpecError::NotFound)),
-                    Err(e) => return Ok(error_response(classify_db_error(e))),
-                };
-                match preflight_spec_read_from_meta(
-                    &meta,
-                    req.headers(),
-                    false,
-                    max_decompress,
-                    Some(budget),
-                ) {
-                    SpecReadPreflight::Respond(response) => return Ok(response),
-                    SpecReadPreflight::Proceed(reservation) => reservation,
-                }
-            }
-        } else {
-            None
-        }
-    } else {
+    // Preflight lightweight metadata (`spec_format`, `content_hash`,
+    // `uncompressed_size`) BEFORE acquiring one of the four process-wide read
+    // codec slots or loading the compressed blob:
+    // - Short-circuits `404`, `406`, `304` (exact ETag or verbatim `*` within
+    //   cap), and `500` (stored row above decompression cap).
+    // - Atomically reserves only this spec's `uncompressed_size` from the
+    //   connection budget so concurrent small spec reads over one HTTP/2
+    //   connection proceed in parallel while reads exceeding remaining budget
+    //   fail fast with `503` without occupying global codec slots.
+    if !has_if_none_match
+        && response_budget
+            .as_ref()
+            .is_some_and(crate::admin::AdminConnResponseBudget::is_exhausted)
+    {
+        return Ok(spec_response_budget_unavailable_response());
+    }
+    let budget_reservation = if has_if_none_match || response_budget.is_some() {
         let meta = match db.get_api_spec_conditional_meta(namespace, id).await {
             Ok(Some(meta)) => meta,
             Ok(None) => return Ok(error_response(ApiSpecError::NotFound)),
@@ -3813,13 +3810,15 @@ pub async fn handle_get_api_spec(
         match preflight_spec_read_from_meta(
             &meta,
             req.headers(),
-            true,
+            has_if_none_match,
             max_decompress,
             response_budget.as_ref(),
         ) {
             SpecReadPreflight::Respond(response) => return Ok(response),
             SpecReadPreflight::Proceed(reservation) => reservation,
         }
+    } else {
+        None
     };
 
     // Acquire read codec capacity BEFORE loading the full compressed spec blob
@@ -3870,36 +3869,14 @@ pub async fn handle_get_api_spec_by_proxy(
         .cloned();
     let max_decompress = max_spec_decompress_bytes(state.admin_spec_max_body_size_mib);
 
-    let budget_reservation = if !has_if_none_match {
-        if let Some(budget) = response_budget.as_ref() {
-            if let Some(reservation) = budget.try_reserve_full() {
-                Some(reservation)
-            } else if budget.is_exhausted() {
-                return Ok(spec_response_budget_unavailable_response());
-            } else {
-                let meta = match db
-                    .get_api_spec_conditional_meta_by_proxy(namespace, proxy_id)
-                    .await
-                {
-                    Ok(Some(meta)) => meta,
-                    Ok(None) => return Ok(error_response(ApiSpecError::NotFound)),
-                    Err(e) => return Ok(error_response(classify_db_error(e))),
-                };
-                match preflight_spec_read_from_meta(
-                    &meta,
-                    req.headers(),
-                    false,
-                    max_decompress,
-                    Some(budget),
-                ) {
-                    SpecReadPreflight::Respond(response) => return Ok(response),
-                    SpecReadPreflight::Proceed(reservation) => reservation,
-                }
-            }
-        } else {
-            None
-        }
-    } else {
+    if !has_if_none_match
+        && response_budget
+            .as_ref()
+            .is_some_and(crate::admin::AdminConnResponseBudget::is_exhausted)
+    {
+        return Ok(spec_response_budget_unavailable_response());
+    }
+    let budget_reservation = if has_if_none_match || response_budget.is_some() {
         let meta = match db
             .get_api_spec_conditional_meta_by_proxy(namespace, proxy_id)
             .await
@@ -3911,13 +3888,15 @@ pub async fn handle_get_api_spec_by_proxy(
         match preflight_spec_read_from_meta(
             &meta,
             req.headers(),
-            true,
+            has_if_none_match,
             max_decompress,
             response_budget.as_ref(),
         ) {
             SpecReadPreflight::Respond(response) => return Ok(response),
             SpecReadPreflight::Proceed(reservation) => reservation,
         }
+    } else {
+        None
     };
 
     let Ok(read_permit) = Arc::clone(&SPEC_READ_CODEC_SLOTS).acquire_owned().await else {
