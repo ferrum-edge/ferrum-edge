@@ -308,6 +308,12 @@ paths:
             `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH`). The request is refused
             before it enters admin routing and the connection is closed. Never
             reached on a plaintext or anonymous-TLS admin connection.
+          headers:
+            WWW-Authenticate:
+              description: Client certificate authentication challenge (`ClientCertificate`).
+              schema:
+                type: string
+                example: ClientCertificate
           content:
             application/json:
               schema:
@@ -325,6 +331,12 @@ paths:
           description: Process is alive (empty body)
         "401":
           description: Admin HTTPS client certificate trust was withdrawn (empty body)
+          headers:
+            WWW-Authenticate:
+              description: Client certificate authentication challenge (`ClientCertificate`).
+              schema:
+                type: string
+                example: ClientCertificate
 
   /health:
     get:
@@ -485,6 +497,12 @@ paths:
             `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH`). The request is refused
             before it enters admin routing and the connection is closed. Never
             reached on a plaintext or anonymous-TLS admin connection.
+          headers:
+            WWW-Authenticate:
+              description: Client certificate authentication challenge (`ClientCertificate`).
+              schema:
+                type: string
+                example: ClientCertificate
           content:
             application/json:
               schema:
@@ -504,6 +522,12 @@ paths:
           description: Gateway not ready (empty body)
         "401":
           description: Admin HTTPS client certificate trust was withdrawn (empty body)
+          headers:
+            WWW-Authenticate:
+              description: Client certificate authentication challenge (`ClientCertificate`).
+              schema:
+                type: string
+                example: ClientCertificate
 
   /status:
     get:
@@ -537,6 +561,12 @@ paths:
             `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH`). The request is refused
             before it enters admin routing and the connection is closed. Never
             reached on a plaintext or anonymous-TLS admin connection.
+          headers:
+            WWW-Authenticate:
+              description: Client certificate authentication challenge (`ClientCertificate`).
+              schema:
+                type: string
+                example: ClientCertificate
           content:
             application/json:
               schema:
@@ -554,6 +584,12 @@ paths:
           description: Gateway not ready (empty body)
         "401":
           description: Admin HTTPS client certificate trust was withdrawn (empty body)
+          headers:
+            WWW-Authenticate:
+              description: Client certificate authentication challenge (`ClientCertificate`).
+              schema:
+                type: string
+                example: ClientCertificate
 
   /admin/tls/inventory:
     get:
@@ -2226,6 +2262,12 @@ paths:
             `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH`). The request is refused
             before it enters admin routing and the connection is closed. Never
             reached on a plaintext or anonymous-TLS admin connection.
+          headers:
+            WWW-Authenticate:
+              description: Client certificate authentication challenge (`ClientCertificate`).
+              schema:
+                type: string
+                example: ClientCertificate
           content:
             application/json:
               schema:
@@ -15424,12 +15466,12 @@ components:
       properties:
         id:
           type: string
-          minLength: 1
           maxLength: 254
-          pattern: '^[a-zA-Z0-9][a-zA-Z0-9._-]*$'
+          pattern: '^$|^[a-zA-Z0-9][a-zA-Z0-9._-]*$'
           description: >-
-            Optional. Defaults to the authenticated `X-Ferrum-Namespace` value;
-            it is never derived from a `namespace` field in the body.
+            Optional (or empty string). Defaults to the authenticated
+            `X-Ferrum-Namespace` value when omitted or empty; it is never
+            derived from a `namespace` field in the body.
         trust_domain:
           type: string
         bundle:

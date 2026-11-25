@@ -2530,15 +2530,20 @@ async fn spec_content_response_async(
     }
 
     // Offload gzip decompression + optional YAML/JSON conversion to the
-    // blocking pool while holding the pre-acquired read codec permit, then
-    // attach the permit to the response extensions so `GuardedAdminBody` keeps
-    // it until response transmission completes or the client disconnects.
+    // blocking pool while holding the pre-acquired read codec permit so large
+    // spec reads cannot saturate Tokio worker threads or retain unbounded blobs
+    // while waiting in the queue. The permit is released as soon as the codec
+    // phase finishes (never held across network transmission) so stalled HTTP/2
+    // readers cannot pin the process-wide read slots indefinitely and starve
+    // other viewers; concurrent admin connections are bounded separately by
+    // `AdminConnLimiter`.
     let spec_id = spec.id;
     let stored_format = spec.spec_format;
     let compressed = spec.spec_content;
     let converted = tokio::task::spawn_blocking(move || {
-        let result = spec_codec::decompress_gzip_capped(&compressed, max_decompress_bytes)
-            .map_err(|e| {
+        let _permit = read_permit;
+        let raw =
+            spec_codec::decompress_gzip_capped(&compressed, max_decompress_bytes).map_err(|e| {
                 tracing::error!(
                     "decompress_gzip_capped failed for spec {} (cap={} bytes): {}",
                     spec_id,
@@ -2546,39 +2551,36 @@ async fn spec_content_response_async(
                     e
                 );
                 "spec content corrupt or oversized".to_string()
-            })
-            .and_then(|raw| {
-                if target_fmt == stored_format {
-                    Ok((raw, content_type_for_format(stored_format)))
-                } else {
-                    convert_format(&raw, stored_format, target_fmt)
-                        .map(|converted| (converted, content_type_for_format(target_fmt)))
-                        .map_err(|e| {
-                            tracing::error!(
-                                "format conversion ({:?} → {:?}) failed for spec {}: {}",
-                                stored_format,
-                                target_fmt,
-                                spec_id,
-                                e
-                            );
-                            let stored_fmt_str = content_type_for_format(stored_format);
-                            let accepted_fmt_str = content_type_for_format(target_fmt);
-                            format!(
-                                "Cannot convert stored {} to requested {}; \
-                                 the stored document may be malformed — \
-                                 try retrieving in the original format ({}) instead",
-                                stored_fmt_str, accepted_fmt_str, stored_fmt_str
-                            )
-                        })
-                }
-            });
-        (result, read_permit)
+            })?;
+        if target_fmt == stored_format {
+            Ok((raw, content_type_for_format(stored_format)))
+        } else {
+            convert_format(&raw, stored_format, target_fmt)
+                .map(|converted| (converted, content_type_for_format(target_fmt)))
+                .map_err(|e| {
+                    tracing::error!(
+                        "format conversion ({:?} → {:?}) failed for spec {}: {}",
+                        stored_format,
+                        target_fmt,
+                        spec_id,
+                        e
+                    );
+                    let stored_fmt_str = content_type_for_format(stored_format);
+                    let accepted_fmt_str = content_type_for_format(target_fmt);
+                    format!(
+                        "Cannot convert stored {} to requested {}; \
+                         the stored document may be malformed — \
+                         try retrieving in the original format ({}) instead",
+                        stored_fmt_str, accepted_fmt_str, stored_fmt_str
+                    )
+                })
+        }
     })
     .await;
 
-    let (body_bytes, ct, read_permit) = match converted {
-        Ok((Ok((body_bytes, ct)), read_permit)) => (body_bytes, ct, read_permit),
-        Ok((Err(message), _permit)) => {
+    let (body_bytes, ct) = match converted {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(message)) => {
             return json_resp(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &json!({"error": message}),
@@ -2593,18 +2595,14 @@ async fn spec_content_response_async(
     };
 
     let len = body_bytes.len();
-    let mut response = crate::admin::with_admin_security_headers(Response::builder())
+    crate::admin::with_admin_security_headers(Response::builder())
         .status(StatusCode::OK)
         .header("Content-Type", ct)
         .header("Content-Length", len.to_string())
         .header("ETag", &etag)
         .header("Vary", "Accept")
         .body(Full::new(Bytes::from(body_bytes)))
-        .unwrap_or_else(|_| crate::admin::admin_builder_failure_response());
-    response
-        .extensions_mut()
-        .insert(crate::admin::ResponseLifetimePermit::new(read_permit));
-    response
+        .unwrap_or_else(|_| crate::admin::admin_builder_failure_response())
 }
 
 // ---------------------------------------------------------------------------

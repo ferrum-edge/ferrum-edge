@@ -808,6 +808,7 @@ pub fn extract_declared_proxy_plugin_association_ids(
         })?;
 
     let mut out = Vec::with_capacity(arr.len());
+    let mut seen = std::collections::HashSet::with_capacity(arr.len());
     for entry in arr {
         let assoc: PluginAssociation = serde_json::from_value(entry.clone()).map_err(|e| {
             ExtractError::MalformedExtension {
@@ -815,8 +816,7 @@ pub fn extract_declared_proxy_plugin_association_ids(
                 error: e.to_string(),
             }
         })?;
-        if !assoc.plugin_config_id.is_empty() && !out.iter().any(|id| id == &assoc.plugin_config_id)
-        {
+        if !assoc.plugin_config_id.is_empty() && seen.insert(assoc.plugin_config_id.clone()) {
             out.push(assoc.plugin_config_id);
         }
     }

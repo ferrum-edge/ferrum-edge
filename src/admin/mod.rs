@@ -1454,17 +1454,6 @@ impl Drop for AdminActivityGuard {
     }
 }
 
-/// Semaphore permit attached to a response via `Extensions` and moved into
-/// [`GuardedAdminBody`] so bounded read/codec capacity stays held until the
-/// buffered response body finishes transmitting or is dropped on disconnect.
-pub(crate) struct ResponseLifetimePermit(#[allow(dead_code)] tokio::sync::OwnedSemaphorePermit);
-
-impl ResponseLifetimePermit {
-    pub(crate) fn new(permit: tokio::sync::OwnedSemaphorePermit) -> Self {
-        Self(permit)
-    }
-}
-
 /// Admin response body that keeps its [`AdminActivityGuard`] alive until hyper
 /// has finished writing the response and dropped the body.
 struct GuardedAdminBody {
@@ -1476,7 +1465,6 @@ struct GuardedAdminBody {
     /// the body is not proof the peer received it, so the registry confirms
     /// collection only after two such deliveries.
     delivery_ack: Option<plugins::api_chargeback::ChargesDeliveryAck>,
-    _lifetime_permit: Option<ResponseLifetimePermit>,
     _guard: AdminActivityGuard,
 }
 
@@ -1485,23 +1473,20 @@ impl GuardedAdminBody {
         Self {
             inner,
             delivery_ack: None,
-            _lifetime_permit: None,
             _guard: guard,
         }
     }
 
     /// Wrap a dispatched admin response, moving a `/charges` delivery
-    /// acknowledgement and any response-lifetime permit out of the response
-    /// extensions into the body so they live until the body is taken/dropped.
+    /// acknowledgement out of the response extensions into the body so it
+    /// fires only once the body has been taken.
     fn wrap_response(response: Response<Full<Bytes>>, guard: AdminActivityGuard) -> Response<Self> {
         let (mut parts, inner) = response.into_parts();
         let delivery_ack = parts
             .extensions
             .remove::<plugins::api_chargeback::ChargesDeliveryAck>();
-        let lifetime_permit = parts.extensions.remove::<ResponseLifetimePermit>();
         let mut body = Self::new(inner, guard);
         body.delivery_ack = delivery_ack;
-        body._lifetime_permit = lifetime_permit;
         Response::from_parts(parts, body)
     }
 }
