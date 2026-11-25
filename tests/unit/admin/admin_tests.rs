@@ -1692,7 +1692,7 @@ fn head_withdrawn_trust_401_restore_partial_clear_and_tls_settlement_invariants(
 async fn admin_response_budget_chunks_holds_permit_and_rejects_oversized_payloads() {
     // Oversized payloads (> budget capacity) must be refused rather than clamped
     // down to fit, concurrent bodies exceeding remaining budget must fail fast,
-    // and provisional full reservations must shrink/grow atomically.
+    // and budget reservations must shrink/grow atomically.
     let (oversized_refused, first_admitted, second_refused, shrink_and_grow_ok) =
         ferrum_edge::_test_support::check_admin_response_budget_limits_for_test(
             256,

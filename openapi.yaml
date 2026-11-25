@@ -8948,8 +8948,6 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
-        "403":
-          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "406":
@@ -9325,8 +9323,6 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
-        "403":
-          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "406":
@@ -45762,7 +45758,14 @@ components:
           description: Size in bytes of the uncompressed spec content
         content_hash:
           type: string
-          description: Lowercase hex SHA-256 digest of the uncompressed spec content. Used as ETag value.
+          description: >-
+            Lowercase hex SHA-256 digest of the uncompressed spec content. Forms
+            the hash prefix of the representation-specific quoted `ETag`
+            returned by `GET /api-specs/{id}` and
+            `GET /api-specs/by-proxy/{proxy_id}` (`"<content_hash>-json"`,
+            `"<content_hash>-yaml"`, or
+            `"<content_hash>-<target>-from-<stored>-v1"`); do not replay the
+            bare hash as `If-None-Match`.
         external_ref_digest:
           type: [string, "null"]
           description: |

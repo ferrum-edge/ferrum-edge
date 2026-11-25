@@ -1180,28 +1180,47 @@ fn content_type_for_format(fmt: SpecFormat) -> &'static str {
 }
 
 /// Bounded `Write` adapter that aborts serialization once output would exceed
-/// `limit` bytes, preventing JSON/YAML format conversion from materializing an
-/// unbounded response buffer.
-struct LimitedWriter {
+/// `limit` bytes or the per-connection buffered response budget, preventing
+/// JSON/YAML format conversion from materializing an unbounded or over-budget
+/// response buffer.
+struct LimitedWriter<'a> {
     buf: Vec<u8>,
     limit: usize,
+    reservation: Option<&'a mut crate::admin::ResponseBodyBudgetReservation>,
+    budget_exceeded: bool,
 }
 
-impl LimitedWriter {
-    fn new(limit: usize) -> Self {
+impl<'a> LimitedWriter<'a> {
+    fn new(
+        limit: usize,
+        reservation: Option<&'a mut crate::admin::ResponseBodyBudgetReservation>,
+    ) -> Self {
         Self {
             buf: Vec::new(),
             limit,
+            reservation,
+            budget_exceeded: false,
         }
     }
 }
 
-impl std::io::Write for LimitedWriter {
+impl std::io::Write for LimitedWriter<'_> {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        if self.buf.len().saturating_add(data.len()) > self.limit {
+        let new_len = self.buf.len().saturating_add(data.len());
+        if new_len > self.limit {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "converted spec exceeds maximum size limit",
+            ));
+        }
+        if let Some(reservation) = self.reservation.as_mut()
+            && new_len > 0
+            && !reservation.try_grow_to_bytes(new_len)
+        {
+            self.budget_exceeded = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "connection response budget exceeded",
             ));
         }
         self.buf.extend_from_slice(data);
@@ -1213,44 +1232,89 @@ impl std::io::Write for LimitedWriter {
     }
 }
 
-/// Convert spec bytes between formats under an explicit `max_bytes` cap.
+enum ConvertFormatError {
+    BudgetExceeded,
+    Format(String),
+}
+
+/// Convert spec bytes between formats under an explicit `max_bytes` cap and
+/// optional live per-connection budget reservation.
 ///
-/// Returns `Err` if the conversion fails (malformed source document or
-/// serialized output exceeding `max_bytes`).
+/// Returns `Err(ConvertFormatError::BudgetExceeded)` if serialized output
+/// grows past the connection's remaining budget, or `Err(ConvertFormatError::Format)`
+/// if the source document is malformed or exceeds `max_bytes`.
+fn convert_format_capped_with_budget(
+    body: &[u8],
+    from: SpecFormat,
+    to: SpecFormat,
+    max_bytes: usize,
+    reservation: Option<&mut crate::admin::ResponseBodyBudgetReservation>,
+) -> Result<Vec<u8>, ConvertFormatError> {
+    if from == to {
+        if body.len() > max_bytes {
+            return Err(ConvertFormatError::Format(
+                "spec exceeds maximum size limit".to_string(),
+            ));
+        }
+        if let Some(res) = reservation
+            && !body.is_empty()
+            && !res.try_grow_to_bytes(body.len())
+        {
+            return Err(ConvertFormatError::BudgetExceeded);
+        }
+        return Ok(body.to_vec());
+    }
+    match (from, to) {
+        (SpecFormat::Yaml, SpecFormat::Json) => {
+            let jv = parse_yaml_to_json(body, MAX_SOURCE_DOCUMENT_NODES).map_err(|e| {
+                ConvertFormatError::Format(format!(
+                    "YAML parse error during conversion: {}",
+                    e.message()
+                ))
+            })?;
+            let mut writer = LimitedWriter::new(max_bytes, reservation);
+            if let Err(e) = serde_json::to_writer(&mut writer, &jv) {
+                if writer.budget_exceeded {
+                    return Err(ConvertFormatError::BudgetExceeded);
+                }
+                return Err(ConvertFormatError::Format(format!(
+                    "JSON serialization error: {e}"
+                )));
+            }
+            Ok(writer.buf)
+        }
+        (SpecFormat::Json, SpecFormat::Yaml) => {
+            let jv: serde_json::Value = serde_json::from_slice(body).map_err(|e| {
+                ConvertFormatError::Format(format!("JSON parse error during conversion: {e}"))
+            })?;
+            let mut writer = LimitedWriter::new(max_bytes, reservation);
+            if let Err(e) = serde_yaml::to_writer(&mut writer, &jv) {
+                if writer.budget_exceeded {
+                    return Err(ConvertFormatError::BudgetExceeded);
+                }
+                return Err(ConvertFormatError::Format(format!(
+                    "YAML serialization error: {e}"
+                )));
+            }
+            Ok(writer.buf)
+        }
+        _ => Err(ConvertFormatError::Format(format!(
+            "unsupported format conversion {:?} → {:?}",
+            from, to
+        ))),
+    }
+}
+
 fn convert_format_capped(
     body: &[u8],
     from: SpecFormat,
     to: SpecFormat,
     max_bytes: usize,
 ) -> Result<Vec<u8>, String> {
-    if from == to {
-        if body.len() > max_bytes {
-            return Err("spec exceeds maximum size limit".to_string());
-        }
-        return Ok(body.to_vec());
-    }
-    match (from, to) {
-        (SpecFormat::Yaml, SpecFormat::Json) => {
-            let jv = parse_yaml_to_json(body, MAX_SOURCE_DOCUMENT_NODES)
-                .map_err(|e| format!("YAML parse error during conversion: {}", e.message()))?;
-            let mut writer = LimitedWriter::new(max_bytes);
-            serde_json::to_writer(&mut writer, &jv)
-                .map_err(|e| format!("JSON serialization error: {e}"))?;
-            Ok(writer.buf)
-        }
-        (SpecFormat::Json, SpecFormat::Yaml) => {
-            let jv: serde_json::Value = serde_json::from_slice(body)
-                .map_err(|e| format!("JSON parse error during conversion: {e}"))?;
-            let mut writer = LimitedWriter::new(max_bytes);
-            serde_yaml::to_writer(&mut writer, &jv)
-                .map_err(|e| format!("YAML serialization error: {e}"))?;
-            Ok(writer.buf)
-        }
-        _ => Err(format!(
-            "unsupported format conversion {:?} → {:?}",
-            from, to
-        )),
-    }
+    convert_format_capped_with_budget(body, from, to, max_bytes, None).map_err(|err| match err {
+        ConvertFormatError::BudgetExceeded => "connection response budget exceeded".to_string(),
+        ConvertFormatError::Format(msg) => msg,
+    })
 }
 
 #[cfg(test)]
@@ -2755,6 +2819,11 @@ async fn spec_content_response_async(
     // running. The codec permit is released as soon as the codec phase finishes
     // (never held across network transmission), while the budget reservation is
     // returned and adjusted to the exact response length for `GuardedAdminBody`.
+    enum SpecDecodeError {
+        BudgetExceeded,
+        Internal(String),
+    }
+
     let spec_id = spec.id;
     let stored_format = spec.spec_format;
     let compressed = spec.spec_content;
@@ -2768,15 +2837,29 @@ async fn spec_content_response_async(
                     max_decompress_bytes,
                     e
                 );
-                "spec content corrupt or oversized".to_string()
+                SpecDecodeError::Internal("spec content corrupt or oversized".to_string())
             })
             .and_then(|raw| {
+                if let Some(res) = budget_reservation.as_mut()
+                    && !raw.is_empty()
+                    && !res.try_grow_to_bytes(raw.len())
+                {
+                    return Err(SpecDecodeError::BudgetExceeded);
+                }
                 if target_fmt == stored_format {
                     Ok((raw, content_type_for_format(stored_format)))
                 } else {
-                    convert_format_capped(&raw, stored_format, target_fmt, max_decompress_bytes)
-                        .map(|converted| (converted, content_type_for_format(target_fmt)))
-                        .map_err(|e| {
+                    convert_format_capped_with_budget(
+                        &raw,
+                        stored_format,
+                        target_fmt,
+                        max_decompress_bytes,
+                        budget_reservation.as_mut(),
+                    )
+                    .map(|converted| (converted, content_type_for_format(target_fmt)))
+                    .map_err(|err| match err {
+                        ConvertFormatError::BudgetExceeded => SpecDecodeError::BudgetExceeded,
+                        ConvertFormatError::Format(e) => {
                             tracing::error!(
                                 "format conversion ({:?} → {:?}) failed for spec {}: {}",
                                 stored_format,
@@ -2786,13 +2869,14 @@ async fn spec_content_response_async(
                             );
                             let stored_fmt_str = content_type_for_format(stored_format);
                             let accepted_fmt_str = content_type_for_format(target_fmt);
-                            format!(
+                            SpecDecodeError::Internal(format!(
                                 "Cannot convert stored {} to requested {}; \
                                  the stored document may be malformed or exceeds the size limit — \
                                  try retrieving in the original format ({}) instead",
                                 stored_fmt_str, accepted_fmt_str, stored_fmt_str
-                            )
-                        })
+                            ))
+                        }
+                    })
                 }
             });
         (result, budget_reservation)
@@ -2801,7 +2885,10 @@ async fn spec_content_response_async(
 
     let (body_bytes, ct, budget_reservation) = match converted {
         Ok((Ok((body_bytes, ct)), reservation)) => (body_bytes, ct, reservation),
-        Ok((Err(message), _reservation)) => {
+        Ok((Err(SpecDecodeError::BudgetExceeded), _reservation)) => {
+            return spec_response_budget_unavailable_response();
+        }
+        Ok((Err(SpecDecodeError::Internal(message)), _reservation)) => {
             return json_resp(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &json!({"error": message}),
