@@ -3637,10 +3637,16 @@ impl DatabaseStore {
             // rollback snapshots) holds namespace admission; validate under
             // write codec slots so viewer GET bursts cannot stall namespace
             // admission.
-            specs.push(
-                row_to_api_spec_async(row, &crate::admin::api_specs::SPEC_WRITE_CODEC_SLOTS)
-                    .await?,
-            );
+            let spec_id = row
+                .try_get::<String, _>("id")
+                .ok()
+                .filter(|id| !id.is_empty());
+            let spec = row_to_api_spec_async(row, &crate::admin::api_specs::SPEC_WRITE_CODEC_SLOTS)
+                .await
+                .map_err(|error| {
+                    anyhow::Error::new(SnapshotDataIntegrityError::new("api_spec", spec_id, error))
+                })?;
+            specs.push(spec);
         }
         self.check_slow_query("list_api_specs_with_content", start);
         Ok(specs)

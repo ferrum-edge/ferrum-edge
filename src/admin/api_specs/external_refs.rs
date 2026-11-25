@@ -586,7 +586,11 @@ pub async fn validate_api_spec_snapshots_async(
         )
         .await
         .map_err(|_| {
-            anyhow::anyhow!("api_specs external-ref snapshot integrity validation failed")
+            anyhow::Error::new(crate::config::db_backend::SnapshotDataIntegrityError::new(
+                "api_spec",
+                (!spec.id.is_empty()).then(|| spec.id.clone()),
+                anyhow::anyhow!("api_specs external-ref snapshot integrity validation failed"),
+            ))
         })?;
     }
     Ok(())

@@ -5851,9 +5851,12 @@ paths:
         corrupt/undecodable stored resources return `500` with
         `failure_class: data_integrity` and a safe resource type/id when
         available. On conditional restores (with `If-Match`), no compensating
-        clear/replay is used — the store rolls back the single transaction on
-        any error, and snapshot read failures (including corrupt or undecodable
-        stored resources) return `503`. API specs are included in the
+        clear/replay is used — the store aborts and rolls back the single
+        transaction on any pre-commit error (while an ambiguous commit or
+        acknowledgement loss, or a post-commit guard-release failure, returns
+        `503` and requires verifying authoritative state before retrying), and
+        snapshot read failures (including corrupt or undecodable stored
+        resources) return `503`. API specs are included in the
         versioned backup section and are restored (and rolled back) with config
         resources. Legacy backups that omit `api_specs` while the target
         namespace holds specs require `?confirm_api_spec_deletion=true` in

@@ -18153,7 +18153,15 @@ mod inner {
             let mut specs = Vec::new();
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
-                specs.push(doc_to_api_spec_inner(doc, true, false)?);
+                let spec_id = doc
+                    .get_str("id")
+                    .ok()
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string);
+                let spec = doc_to_api_spec_inner(doc, true, false).map_err(|error| {
+                    anyhow::Error::new(SnapshotDataIntegrityError::new("api_spec", spec_id, error))
+                })?;
+                specs.push(spec);
             }
             drop(cursor);
             crate::admin::api_specs::external_refs::validate_api_spec_snapshots_async(
