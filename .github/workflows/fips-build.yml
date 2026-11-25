@@ -212,6 +212,7 @@ jobs:
     runs-on: ubuntu-26.04
     outputs:
       relevant: ${{ steps.filter.outputs.relevant }}
+      scope: ${{ steps.filter.outputs.scope }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -293,6 +294,7 @@ jobs:
 
           if ! git cat-file -e "${trusted_sha}:.github/scripts/ci_runtime_plan.py" 2>/dev/null; then
             echo "relevant=true" >> "$GITHUB_OUTPUT"
+            echo "scope=full" >> "$GITHUB_OUTPUT"
             echo "trusted base has not adopted .github/scripts/ci_runtime_plan.py; running the full gate." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
@@ -350,6 +352,7 @@ jobs:
           python3 -I .github/scripts/ci_runtime_plan.py --self-test
           plan="$(python3 -I .github/scripts/ci_runtime_plan.py "${filter_args[@]}")"
           relevant="$(printf '%s\n' "$plan" | sed -n 's/^relevant=//p')"
+          scope="$(printf '%s\n' "$plan" | sed -n 's/^scope=//p')"
           case "$relevant" in
             true|false) ;;
             *)
@@ -357,7 +360,29 @@ jobs:
               exit 1
               ;;
           esac
+          # Fail closed if an older base planner omits `scope=`: run the full gate
+          # when relevant, or `none` when irrelevant.
+          if [ -z "$scope" ]; then
+            if [ "$relevant" = "false" ]; then
+              scope="none"
+            else
+              scope="full"
+            fi
+          fi
+          case "$scope" in
+            full|compile|none) ;;
+            *)
+              echo "::error::trusted relevance filter produced no usable scope (${scope})" >&2
+              exit 1
+              ;;
+          esac
+          if { [ "$relevant" = "false" ] && [ "$scope" != "none" ]; } \
+            || { [ "$relevant" = "true" ] && [ "$scope" = "none" ]; }; then
+            echo "::error::trusted relevance filter emitted inconsistent relevant=${relevant} and scope=${scope}" >&2
+            exit 1
+          fi
           echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
+          echo "scope=$scope" >> "$GITHUB_OUTPUT"
           echo "Relevance decided by trusted base ${trusted_sha}." >> "$GITHUB_STEP_SUMMARY"
           printf '%s\n' "$plan" | sed -n '/^## /,$p' >> "$GITHUB_STEP_SUMMARY"
 
@@ -372,9 +397,21 @@ jobs:
     # so a runner- or user-level wrapper would invalidate the exact target
     # handoff across jobs; clear both inputs. The handoff is this gate's
     # compiler cache (#7285 removed a never-useful local sccache store).
+    # Keep Cargo's build/profile settings identical across fips-compile,
+    # fips-claimed-checks, fips-clippy, and fips-test-build so Swatinem/rust-cache
+    # keys and the exact target/ producer handoff stay fingerprint-compatible,
+    # while debug=0 + split-debuginfo=off + codegen-units=256 maximize build speed
+    # and shrink the handoff artifact.
     env:
       RUSTC_WRAPPER: ""
       CARGO_BUILD_RUSTC_WRAPPER: ""
+      CARGO_BUILD_JOBS: "3"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: "off"
+      CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: "off"
+      CARGO_PROFILE_DEV_CODEGEN_UNITS: "256"
+      CARGO_PROFILE_TEST_CODEGEN_UNITS: "256"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -832,7 +869,10 @@ jobs:
 
   fips-claimed-checks:
     name: FIPS claimed feature combinations (${{ matrix.shard_name }})
-    needs: fips-compile
+    needs:
+      - fips-plan
+      - fips-compile
+    if: needs.fips-plan.outputs.relevant == 'true' && needs.fips-plan.outputs.scope != 'compile'
     runs-on: ubuntu-26.04
     timeout-minutes: 60
     strategy:
@@ -850,9 +890,21 @@ jobs:
     # so a runner- or user-level wrapper would invalidate the exact target
     # handoff across jobs; clear both inputs. The handoff is this gate's
     # compiler cache (#7285 removed a never-useful local sccache store).
+    # Keep Cargo's build/profile settings identical across fips-compile,
+    # fips-claimed-checks, fips-clippy, and fips-test-build so Swatinem/rust-cache
+    # keys and the exact target/ producer handoff stay fingerprint-compatible,
+    # while debug=0 + split-debuginfo=off + codegen-units=256 maximize build speed
+    # and shrink the handoff artifact.
     env:
       RUSTC_WRAPPER: ""
       CARGO_BUILD_RUSTC_WRAPPER: ""
+      CARGO_BUILD_JOBS: "3"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: "off"
+      CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: "off"
+      CARGO_PROFILE_DEV_CODEGEN_UNITS: "256"
+      CARGO_PROFILE_TEST_CODEGEN_UNITS: "256"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1411,6 +1463,12 @@ jobs:
       RUSTC_WRAPPER: ""
       CARGO_BUILD_RUSTC_WRAPPER: ""
       CARGO_BUILD_JOBS: "3"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: "off"
+      CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: "off"
+      CARGO_PROFILE_DEV_CODEGEN_UNITS: "256"
+      CARGO_PROFILE_TEST_CODEGEN_UNITS: "256"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1931,7 +1989,10 @@ jobs:
 
   fips-test-build:
     name: FIPS test binaries
-    needs: fips-compile
+    needs:
+      - fips-plan
+      - fips-compile
+    if: needs.fips-plan.outputs.relevant == 'true' && needs.fips-plan.outputs.scope != 'compile'
     runs-on: ubuntu-26.04
     timeout-minutes: 90
     # Issue #4018: the precompile step below is killed with
@@ -1953,10 +2014,12 @@ jobs:
     # parallelism WITHIN those two crates — which is where the tail is — and not
     # merely the number of crates built side by side.
     #
-    # `line-tables-only` keeps file and line in backtraces and drops only
-    # variable-level debuginfo. These binaries exist to be executed under exact
-    # test filters by the downstream FIPS consumers; nothing symbolicates locals
-    # from them.
+    # `debug = 0` with `split-debuginfo = off` eliminates DWARF generation peak
+    # memory and shrink-wraps the compile/test artifacts, while matching
+    # `fips-compile`, `fips-claimed-checks`, and `fips-clippy` identically so
+    # `Swatinem/rust-cache` keys and the exact `target/` producer handoff stay
+    # fingerprint-compatible without rebuilding `aws-lc-fips-sys` or workspace
+    # crates.
     env:
       # No compiler-cache wrapper: Cargo hashes the resolved rustc-wrapper
       # executable into every artifact, so a runner- or user-level wrapper
@@ -1964,11 +2027,15 @@ jobs:
       RUSTC_WRAPPER: ""
       CARGO_BUILD_RUSTC_WRAPPER: ""
       CARGO_BUILD_JOBS: "3"
-      # Set on BOTH profiles rather than relying on `test` inheriting from
-      # `dev`, so the override cannot silently miss the profile that actually
-      # builds these binaries.
-      CARGO_PROFILE_DEV_DEBUG: line-tables-only
-      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      # Set on BOTH profiles identically to fips-compile, fips-claimed-checks,
+      # and fips-clippy so rust-cache and the exact producer handoff stay
+      # fingerprint-compatible while minimizing build time and memory.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: "off"
+      CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: "off"
+      CARGO_PROFILE_DEV_CODEGEN_UNITS: "256"
+      CARGO_PROFILE_TEST_CODEGEN_UNITS: "256"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -2598,7 +2665,10 @@ jobs:
 
   fips-test:
     name: FIPS tests
-    needs: fips-test-build
+    needs:
+      - fips-plan
+      - fips-test-build
+    if: needs.fips-plan.outputs.relevant == 'true' && needs.fips-plan.outputs.scope != 'compile'
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
@@ -2881,6 +2951,10 @@ jobs:
         if: needs.fips-plan.result == 'success' && needs.fips-plan.outputs.relevant != 'true' && needs.fips-plan.outputs.relevant != 'false'
         run: exit 1
 
+      - name: Fail when FIPS planner scope is unusable
+        if: needs.fips-plan.result == 'success' && ((needs.fips-plan.outputs.scope != 'full' && needs.fips-plan.outputs.scope != 'compile' && needs.fips-plan.outputs.scope != 'none') || (needs.fips-plan.outputs.relevant == 'false' && needs.fips-plan.outputs.scope != 'none') || (needs.fips-plan.outputs.relevant == 'true' && needs.fips-plan.outputs.scope == 'none'))
+        run: exit 1
+
       - name: Skip expensive FIPS compile for unrelated changes
         if: needs.fips-plan.outputs.relevant == 'false'
         run: |
@@ -2896,7 +2970,7 @@ jobs:
         run: exit 1
 
       - name: Fail when FIPS claimed-profile checks did not succeed
-        if: needs.fips-plan.outputs.relevant == 'true' && needs.fips-claimed-checks.result != 'success'
+        if: needs.fips-plan.outputs.relevant == 'true' && ((needs.fips-plan.outputs.scope != 'compile' && needs.fips-claimed-checks.result != 'success') || (needs.fips-plan.outputs.scope == 'compile' && needs.fips-claimed-checks.result != 'skipped' && needs.fips-claimed-checks.result != 'success'))
         run: exit 1
 
       - name: Fail when FIPS clippy did not succeed
@@ -2904,29 +2978,40 @@ jobs:
         run: exit 1
 
       - name: Fail when FIPS test-binary compile did not succeed
-        if: needs.fips-plan.outputs.relevant == 'true' && needs.fips-test-build.result != 'success'
+        if: needs.fips-plan.outputs.relevant == 'true' && ((needs.fips-plan.outputs.scope != 'compile' && needs.fips-test-build.result != 'success') || (needs.fips-plan.outputs.scope == 'compile' && needs.fips-test-build.result != 'skipped' && needs.fips-test-build.result != 'success'))
         run: exit 1
 
       - name: Fail when FIPS tests did not succeed
-        if: needs.fips-plan.outputs.relevant == 'true' && needs.fips-test.result != 'success'
+        if: needs.fips-plan.outputs.relevant == 'true' && ((needs.fips-plan.outputs.scope != 'compile' && needs.fips-test.result != 'success') || (needs.fips-plan.outputs.scope == 'compile' && needs.fips-test.result != 'skipped' && needs.fips-test.result != 'success'))
         run: exit 1
 
       - name: Report FIPS compile gate
         if: needs.fips-plan.outputs.relevant == 'true'
+        env:
+          FIPS_SCOPE: ${{ needs.fips-plan.outputs.scope }}
         run: |
           {
             echo "## FIPS Build & Test"
             echo ""
-            echo "Compile, claimed-profile checks, clippy \`-D warnings\`, "
-            echo "test-binary precompile, and policy/key-admission/handshake "
-            echo "tests passed."
+            if [ "$FIPS_SCOPE" = "compile" ]; then
+              echo "Scope: **compile** (ordinary Rust PR without FIPS/TLS/build-graph edits)."
+              echo ""
+              echo "Feature policy, locked FIPS compile, and FIPS clippy \`-D warnings\` "
+              echo "passed. Claimed optional-feature combinations and FIPS handshake/policy "
+              echo "tests run on FIPS-sensitive PRs (\`scope=full\`) and every push to \`main\`."
+            else
+              echo "Scope: **${FIPS_SCOPE}**"
+              echo ""
+              echo "Compile, claimed-profile checks, clippy \`-D warnings\`, "
+              echo "test-binary precompile, and policy/key-admission/handshake "
+              echo "tests passed."
+            fi
             echo ""
             echo "Compile published its exact producer tree as the immutable "
             echo "one-day handoff artifact (sha + run_id + run_attempt) after "
-            echo "the locked fips profile build. Claimed checks, clippy, and "
-            echo "test-binary compile promoted that same-run artifact in "
-            echo "parallel, preferring the newest attempt so failed-job reruns "
-            echo "reuse a prior attempt's producer. The same artifact serves an "
+            echo "the locked fips profile build. Consumers promoted that same-run "
+            echo "artifact in parallel, preferring the newest attempt so failed-job "
+            echo "reruns reuse a prior attempt's producer. The same artifact serves an "
             echo "explicitly chained same-SHA workflow dispatch as its inter-run "
             echo "warm source. Tests executed digest-bound binaries from the "
             echo "immutable same-run artifact published by fips-test-build. "

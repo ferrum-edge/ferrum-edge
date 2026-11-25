@@ -321,16 +321,36 @@ DEDICATED_REQUIRED_CHECKS = {
             "needs.fips-plan.result == 'success' && "
             "needs.fips-plan.outputs.relevant != 'true' && "
             "needs.fips-plan.outputs.relevant != 'false'",
+            "needs.fips-plan.result == 'success' && "
+            "((needs.fips-plan.outputs.scope != 'full' && "
+            "needs.fips-plan.outputs.scope != 'compile' && "
+            "needs.fips-plan.outputs.scope != 'none') || "
+            "(needs.fips-plan.outputs.relevant == 'false' && "
+            "needs.fips-plan.outputs.scope != 'none') || "
+            "(needs.fips-plan.outputs.relevant == 'true' && "
+            "needs.fips-plan.outputs.scope == 'none'))",
             "needs.fips-plan.outputs.relevant == 'true' && "
             "needs.fips-compile.result != 'success'",
             "needs.fips-plan.outputs.relevant == 'true' && "
-            "needs.fips-claimed-checks.result != 'success'",
+            "((needs.fips-plan.outputs.scope != 'compile' && "
+            "needs.fips-claimed-checks.result != 'success') || "
+            "(needs.fips-plan.outputs.scope == 'compile' && "
+            "needs.fips-claimed-checks.result != 'skipped' && "
+            "needs.fips-claimed-checks.result != 'success'))",
             "needs.fips-plan.outputs.relevant == 'true' && "
             "needs.fips-clippy.result != 'success'",
             "needs.fips-plan.outputs.relevant == 'true' && "
-            "needs.fips-test-build.result != 'success'",
+            "((needs.fips-plan.outputs.scope != 'compile' && "
+            "needs.fips-test-build.result != 'success') || "
+            "(needs.fips-plan.outputs.scope == 'compile' && "
+            "needs.fips-test-build.result != 'skipped' && "
+            "needs.fips-test-build.result != 'success'))",
             "needs.fips-plan.outputs.relevant == 'true' && "
-            "needs.fips-test.result != 'success'",
+            "((needs.fips-plan.outputs.scope != 'compile' && "
+            "needs.fips-test.result != 'success') || "
+            "(needs.fips-plan.outputs.scope == 'compile' && "
+            "needs.fips-test.result != 'skipped' && "
+            "needs.fips-test.result != 'success'))",
         },
     },
 }

@@ -3319,8 +3319,12 @@ def check_fips_producer_channel(
         failures,
     )
     require(
-        "needs.fips-test-build.result != 'success'" in aggregate,
-        "FIPS aggregate must fail closed when the test-binary producer fails",
+        "needs.fips-plan.outputs.scope != 'compile' && needs.fips-test-build.result != 'success'"
+        in aggregate
+        and "needs.fips-plan.outputs.scope == 'compile' && needs.fips-test-build.result != 'skipped' && needs.fips-test-build.result != 'success'"
+        in aggregate,
+        "FIPS aggregate must fail closed when the test-binary producer fails "
+        "or is unexpectedly skipped outside scope=compile",
         failures,
     )
 
@@ -4137,10 +4141,61 @@ def check_fips(workflow: str, failures: list[str]) -> None:
     require(bool(test_build_job), "fips-test-build job is missing", failures)
     require(bool(test_job), "fips-test job is missing", failures)
     require(
+        "scope: ${{ steps.filter.outputs.scope }}" in plan_job
+        and 'echo "scope=full" >> "$GITHUB_OUTPUT"' in plan_job
+        and 'echo "scope=$scope" >> "$GITHUB_OUTPUT"' in plan_job,
+        "FIPS planner must export its fail-closed scope output",
+        failures,
+    )
+    require(
         "needs.fips-plan.outputs.relevant == 'true'" in compile_job,
         "fips-compile must be bound to the trusted planner",
         failures,
     )
+    expected_full_scope_if = (
+        "needs.fips-plan.outputs.relevant == 'true' && "
+        "needs.fips-plan.outputs.scope != 'compile'"
+    )
+    for scoped_job, scoped_name in (
+        (claimed_job, "fips-claimed-checks"),
+        (test_build_job, "fips-test-build"),
+        (test_job, "fips-test"),
+    ):
+        require(
+            "fips-plan" in job_needs_list(scoped_job),
+            f"{scoped_name} must depend on fips-plan for scope gating",
+            failures,
+        )
+        require(
+            job_if(scoped_job) == expected_full_scope_if,
+            f"{scoped_name} must skip only on exact scope == 'compile' "
+            f"(expected `{expected_full_scope_if}`, got `{job_if(scoped_job)}`)",
+            failures,
+        )
+    expected_fips_cargo_env = (
+        ('CARGO_BUILD_JOBS: "3"', "CARGO_BUILD_JOBS"),
+        ('CARGO_PROFILE_DEV_DEBUG: "0"', "CARGO_PROFILE_DEV_DEBUG"),
+        ('CARGO_PROFILE_TEST_DEBUG: "0"', "CARGO_PROFILE_TEST_DEBUG"),
+        ('CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: "off"', "CARGO_PROFILE_DEV_SPLIT_DEBUGINFO"),
+        ('CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: "off"', "CARGO_PROFILE_TEST_SPLIT_DEBUGINFO"),
+        ('CARGO_PROFILE_DEV_CODEGEN_UNITS: "256"', "CARGO_PROFILE_DEV_CODEGEN_UNITS"),
+        ('CARGO_PROFILE_TEST_CODEGEN_UNITS: "256"', "CARGO_PROFILE_TEST_CODEGEN_UNITS"),
+    )
+    for cargo_job, cargo_name in (
+        (compile_job, "fips-compile"),
+        (claimed_job, "fips-claimed-checks"),
+        (clippy_job, "fips-clippy"),
+        (test_build_job, "fips-test-build"),
+    ):
+        env_match = _JOB_ENV_BLOCK_RE.search(cargo_job)
+        env_body = env_match.group("body") if env_match else ""
+        for expected_entry, env_key in expected_fips_cargo_env:
+            require(
+                f"      {expected_entry}\n" in env_body,
+                f"{cargo_name} must pin uniform {env_key} across FIPS compile/consumer "
+                "jobs so rust-cache and the exact producer handoff stay compatible",
+                failures,
+            )
     require(
         "fips-compile" in job_needs_list(claimed_job),
         "fips-claimed-checks must wait for the compile producer handoff to be published",
@@ -4241,13 +4296,30 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         failures,
     )
     require(
+        "needs.fips-plan.result == 'success' && "
+        "((needs.fips-plan.outputs.scope != 'full' && "
+        "needs.fips-plan.outputs.scope != 'compile' && "
+        "needs.fips-plan.outputs.scope != 'none') || "
+        "(needs.fips-plan.outputs.relevant == 'false' && "
+        "needs.fips-plan.outputs.scope != 'none') || "
+        "(needs.fips-plan.outputs.relevant == 'true' && "
+        "needs.fips-plan.outputs.scope == 'none'))"
+        in aggregate,
+        "FIPS aggregate must fail closed when planner scope is unusable or inconsistent",
+        failures,
+    )
+    require(
         "needs.fips-compile.result != 'success'" in aggregate,
         "FIPS aggregate must fail closed when compile fails",
         failures,
     )
     require(
-        "needs.fips-claimed-checks.result != 'success'" in aggregate,
-        "FIPS aggregate must fail closed when claimed-profile checks fail",
+        "needs.fips-plan.outputs.scope != 'compile' && needs.fips-claimed-checks.result != 'success'"
+        in aggregate
+        and "needs.fips-plan.outputs.scope == 'compile' && needs.fips-claimed-checks.result != 'skipped' && needs.fips-claimed-checks.result != 'success'"
+        in aggregate,
+        "FIPS aggregate must fail closed when claimed-profile checks fail "
+        "or skip outside scope=compile",
         failures,
     )
     require(
@@ -4256,13 +4328,20 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         failures,
     )
     require(
-        "needs.fips-test-build.result != 'success'" in aggregate,
-        "FIPS aggregate must fail closed when the test-binary producer fails",
+        "needs.fips-plan.outputs.scope != 'compile' && needs.fips-test-build.result != 'success'"
+        in aggregate
+        and "needs.fips-plan.outputs.scope == 'compile' && needs.fips-test-build.result != 'skipped' && needs.fips-test-build.result != 'success'"
+        in aggregate,
+        "FIPS aggregate must fail closed when the test-binary producer fails "
+        "or is unexpectedly skipped outside scope=compile",
         failures,
     )
     require(
-        "needs.fips-test.result != 'success'" in aggregate,
-        "FIPS aggregate must fail closed when tests fail",
+        "needs.fips-plan.outputs.scope != 'compile' && needs.fips-test.result != 'success'"
+        in aggregate
+        and "needs.fips-plan.outputs.scope == 'compile' && needs.fips-test.result != 'skipped' && needs.fips-test.result != 'success'"
+        in aggregate,
+        "FIPS aggregate must fail closed when tests fail or skip outside scope=compile",
         failures,
     )
     check_fips_feature_policy_gate(aggregate, failures)
@@ -6874,7 +6953,7 @@ def self_test() -> int:
         "      - fips-test-build\n"
         "    steps:\n"
         "      - name: Fail when FIPS test-binary compile did not succeed\n"
-        "        if: needs.fips-plan.outputs.relevant == 'true' && needs.fips-test-build.result != 'success'\n"
+        "        if: needs.fips-plan.outputs.relevant == 'true' && ((needs.fips-plan.outputs.scope != 'compile' && needs.fips-test-build.result != 'success') || (needs.fips-plan.outputs.scope == 'compile' && needs.fips-test-build.result != 'skipped' && needs.fips-test-build.result != 'success'))\n"
         "        run: exit 1\n"
     )
     serial_failures: list[str] = []
@@ -6958,7 +7037,7 @@ def self_test() -> int:
     )
 
     missing_result = build_only_producer.replace(
-        "        if: needs.fips-plan.outputs.relevant == 'true' && needs.fips-test-build.result != 'success'\n",
+        "        if: needs.fips-plan.outputs.relevant == 'true' && ((needs.fips-plan.outputs.scope != 'compile' && needs.fips-test-build.result != 'success') || (needs.fips-plan.outputs.scope == 'compile' && needs.fips-test-build.result != 'skipped' && needs.fips-test-build.result != 'success'))\n",
         "        if: needs.fips-plan.outputs.relevant == 'true' && needs.fips-compile.result != 'success'\n",
         1,
     )
@@ -7248,6 +7327,33 @@ def self_test() -> int:
             for item in mutable_planner_path_failures
         ),
         "self-test: a mutable FIPS planner path must fail the literal-path gate",
+        failures,
+    )
+
+    # Scope-gating and uniform Cargo-profile self-tests.
+    bad_scope_if = handoff_channel.replace(
+        "    if: needs.fips-plan.outputs.relevant == 'true' && needs.fips-plan.outputs.scope != 'compile'\n",
+        "    if: needs.fips-plan.outputs.relevant == 'true' && needs.fips-plan.outputs.scope == 'full'\n",
+        1,
+    )
+    bad_scope_if_failures: list[str] = []
+    check_fips(bad_scope_if, bad_scope_if_failures)
+    require(
+        any("must skip only on exact scope == 'compile'" in item for item in bad_scope_if_failures),
+        "self-test: non-fail-closed scope == 'full' gating must fail",
+        failures,
+    )
+
+    drifted_profile_env = handoff_channel.replace(
+        '      CARGO_PROFILE_DEV_DEBUG: "0"\n',
+        '      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"\n',
+        1,
+    )
+    drifted_profile_env_failures: list[str] = []
+    check_fips(drifted_profile_env, drifted_profile_env_failures)
+    require(
+        any("must pin uniform CARGO_PROFILE_DEV_DEBUG" in item for item in drifted_profile_env_failures),
+        "self-test: drifted CARGO_PROFILE_DEV_DEBUG across FIPS compile jobs must fail",
         failures,
     )
 

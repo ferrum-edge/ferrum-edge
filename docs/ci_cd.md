@@ -391,9 +391,29 @@ inside `<code>` so a hostile name cannot break Markdown.
 
 **FIPS.** `FIPS Feature Policy` stays a cheap always-on graph audit; the
 required `FIPS Build & Test` aggregate needs it and fails unless it succeeded.
-Compile, claimed-profile `cargo check`, clippy `-D warnings`, and the
-policy/key-admission/handshake tests share one cache layer plus an immutable
-artifact handoff:
+The trusted-base planner (`ci_runtime_plan.py`) classifies each PR diff into
+one of three scopes:
+
+- `none`: non-Rust/non-FIPS changes skip the expensive compile/clippy/test
+  jobs while `FIPS Feature Policy` and the aggregate still run.
+- `compile`: ordinary Rust/test changes outside FIPS/TLS/build-graph surfaces
+  run `fips-compile` and `fips-clippy` (`--lib --tests -D warnings`) to catch
+  FIPS feature-gate compile errors, while offloading the three
+  `fips-claimed-checks` shards, `fips-test-build`, and `fips-test` to
+  FIPS-sensitive PRs and every `push` to `main`.
+- `full`: FIPS/TLS/DTLS/build-graph/workflow changes, `push` to `main`,
+  `workflow_dispatch`, and any unknown or unclassifiable diff run the full
+  matrix (compile, claimed-profile checks, clippy, test-binary precompile, and
+  policy/key-admission/handshake tests).
+
+All four Cargo jobs (`fips-compile`, `fips-claimed-checks`, `fips-clippy`, and
+`fips-test-build`) pin identical build settings (`CARGO_BUILD_JOBS=3`,
+`CARGO_PROFILE_{DEV,TEST}_DEBUG=0`, `CARGO_PROFILE_{DEV,TEST}_SPLIT_DEBUGINFO=off`,
+`CARGO_PROFILE_{DEV,TEST}_CODEGEN_UNITS=256`) so `Swatinem/rust-cache` keys and
+the exact `target/` producer handoff stay fingerprint-compatible without
+recompiling `aws-lc-fips-sys` or workspace crates. Compile, claimed-profile
+`cargo check`, clippy `-D warnings`, and the policy/key-admission/handshake
+tests share one cache layer plus an immutable artifact handoff:
 
 - **Stable rust-cache fallback.** `shared-key` is
   `ci-fips-contract-${{ hashFiles(...) }}` over the manifest/lockfile, Cargo
