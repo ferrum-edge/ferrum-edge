@@ -1652,6 +1652,28 @@ fn head_withdrawn_trust_401_restore_partial_clear_and_tls_settlement_invariants(
             "{helper} must record its success audit inside detached settlement"
         );
     }
+    for helper in [
+        "pub(super) async fn handle_create_acme_order(",
+        "pub(super) async fn handle_delete_acme_order(",
+        "pub(super) async fn handle_renew_acme_certificate(",
+    ] {
+        let start = tls_source
+            .find(helper)
+            .unwrap_or_else(|| panic!("missing {helper}"));
+        let end = start
+            + tls_source[start..]
+                .find("\n}\n")
+                .unwrap_or_else(|| panic!("end of {helper}"));
+        let body = &tls_source[start..end];
+        assert!(
+            body.contains("spawn_with_request_slot("),
+            "{helper} must transfer settlement and audit to spawn_with_request_slot"
+        );
+        assert!(
+            body.contains("super::record_operation_audit("),
+            "{helper} must record its success audit inside detached settlement"
+        );
+    }
     let inv_start = tls_source
         .find("pub(super) async fn handle_inventory(")
         .expect("handle_inventory");

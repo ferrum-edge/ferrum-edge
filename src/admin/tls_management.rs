@@ -632,6 +632,7 @@ pub(super) async fn handle_create_acme_certificate(
 
 pub(super) async fn handle_create_acme_order(
     state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(response) = state.admit_non_config_db_write().await {
@@ -639,7 +640,7 @@ pub(super) async fn handle_create_acme_order(
     }
     #[cfg(not(feature = "acme"))]
     {
-        let _ = body_bytes;
+        let _ = (actor, body_bytes);
         Ok(super::json_response(
             StatusCode::NOT_IMPLEMENTED,
             &json!({"error": "ACME order creation requires the 'acme' Cargo feature"}),
@@ -667,29 +668,52 @@ pub(super) async fn handle_create_acme_order(
                 return Ok(super::json_response(status, &json!({"error": error})));
             }
         };
-        let stored = match offload_store_write("acme_order_upsert", move || {
-            store.upsert_order(record, overwrite)
-        })
-        .await
-        {
-            Ok(stored) => stored,
-            Err(response) => return Ok(*response),
-        };
-        match stored {
-            Ok(record) => {
-                persist_acme_account_credentials(&record).await;
+        let settlement_state = state.clone();
+        let settlement_actor = actor.clone();
+        let settlement = crate::admin::audit::spawn_with_request_slot(async move {
+            let stored = match offload_store_write("acme_order_upsert", move || {
+                store.upsert_order(record, overwrite)
+            })
+            .await
+            {
+                Ok(stored) => stored,
+                Err(response) => return *response,
+            };
+            match stored {
+                Ok(record) => {
+                    persist_acme_account_credentials(&record).await;
+                    if settlement_state.admin_audit_enabled {
+                        let event = crate::admin::audit::AuditEvent::new(
+                            &settlement_actor,
+                            "create",
+                            "tls_acme",
+                            &record.id,
+                            crate::config::types::DEFAULT_NAMESPACE,
+                            json!({"path": "/admin/tls/acme/orders"}),
+                        );
+                        super::record_operation_audit(&settlement_state, event).await;
+                    }
+                    super::json_response(StatusCode::CREATED, &json!(record.summary()))
+                }
+                Err(error) => acme_error_response(error),
+            }
+        });
+        match settlement.await {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                tracing::error!("ACME order create settlement task failed: {error}");
                 Ok(super::json_response(
-                    StatusCode::CREATED,
-                    &json!(record.summary()),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &json!({"error": "ACME order create settlement failed"}),
                 ))
             }
-            Err(error) => Ok(acme_error_response(error)),
         }
     }
 }
 
 pub(super) async fn handle_delete_acme_order(
     state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     id: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(response) = state.admit_non_config_db_write().await {
@@ -699,18 +723,48 @@ pub(super) async fn handle_delete_acme_order(
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    let id = id.to_string();
-    let deleted =
-        match offload_store_write("acme_order_delete", move || store.delete_order(&id)).await {
-            Ok(deleted) => deleted,
-            Err(response) => return Ok(*response),
-        };
-    match deleted {
-        Ok(record) => Ok(super::json_response(
-            StatusCode::OK,
-            &json!({"deleted": true, "record": record.summary()}),
-        )),
-        Err(error) => Ok(acme_error_response(error)),
+    let owned_id = id.to_string();
+    let settlement_state = state.clone();
+    let settlement_actor = actor.clone();
+    let settlement = crate::admin::audit::spawn_with_request_slot(async move {
+        let delete_id = owned_id.clone();
+        let deleted =
+            match offload_store_write("acme_order_delete", move || store.delete_order(&delete_id))
+                .await
+            {
+                Ok(deleted) => deleted,
+                Err(response) => return *response,
+            };
+        match deleted {
+            Ok(record) => {
+                if settlement_state.admin_audit_enabled {
+                    let event = crate::admin::audit::AuditEvent::new(
+                        &settlement_actor,
+                        "delete",
+                        "tls_acme",
+                        &owned_id,
+                        crate::config::types::DEFAULT_NAMESPACE,
+                        json!({"path": format!("/admin/tls/acme/orders/{owned_id}")}),
+                    );
+                    super::record_operation_audit(&settlement_state, event).await;
+                }
+                super::json_response(
+                    StatusCode::OK,
+                    &json!({"deleted": true, "record": record.summary()}),
+                )
+            }
+            Err(error) => acme_error_response(error),
+        }
+    });
+    match settlement.await {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            tracing::error!("ACME order delete settlement task failed: {error}");
+            Ok(super::json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "ACME order delete settlement failed"}),
+            ))
+        }
     }
 }
 
@@ -1293,6 +1347,7 @@ pub(super) async fn handle_delete_acme_certificate(
 
 pub(super) async fn handle_renew_acme_certificate(
     state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     certificate_id: &str,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
@@ -1301,7 +1356,7 @@ pub(super) async fn handle_renew_acme_certificate(
     }
     #[cfg(not(feature = "acme"))]
     {
-        let _ = (certificate_id, body_bytes);
+        let _ = (actor, certificate_id, body_bytes);
         Ok(super::json_response(
             StatusCode::NOT_IMPLEMENTED,
             &json!({"error": "ACME renewal requires the 'acme' Cargo feature"}),
@@ -1391,23 +1446,46 @@ pub(super) async fn handle_renew_acme_certificate(
                 return Ok(super::json_response(status, &json!({"error": error})));
             }
         };
-        let stored = match offload_store_write("acme_order_upsert", move || {
-            order_store.upsert_order(record, overwrite)
-        })
-        .await
-        {
-            Ok(stored) => stored,
-            Err(response) => return Ok(*response),
-        };
-        match stored {
-            Ok(record) => {
-                persist_acme_account_credentials(&record).await;
+        let owned_certificate_id = certificate_id.to_string();
+        let settlement_state = state.clone();
+        let settlement_actor = actor.clone();
+        let settlement = crate::admin::audit::spawn_with_request_slot(async move {
+            let stored = match offload_store_write("acme_order_upsert", move || {
+                order_store.upsert_order(record, overwrite)
+            })
+            .await
+            {
+                Ok(stored) => stored,
+                Err(response) => return *response,
+            };
+            match stored {
+                Ok(record) => {
+                    persist_acme_account_credentials(&record).await;
+                    if settlement_state.admin_audit_enabled {
+                        let event = crate::admin::audit::AuditEvent::new(
+                            &settlement_actor,
+                            "renew",
+                            "tls_acme",
+                            &owned_certificate_id,
+                            crate::config::types::DEFAULT_NAMESPACE,
+                            json!({"path": format!("/admin/tls/acme/renew/{owned_certificate_id}")}),
+                        );
+                        super::record_operation_audit(&settlement_state, event).await;
+                    }
+                    super::json_response(StatusCode::CREATED, &json!(record.summary()))
+                }
+                Err(error) => acme_error_response(error),
+            }
+        });
+        match settlement.await {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                tracing::error!("ACME renewal settlement task failed: {error}");
                 Ok(super::json_response(
-                    StatusCode::CREATED,
-                    &json!(record.summary()),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &json!({"error": "ACME renewal settlement failed"}),
                 ))
             }
-            Err(error) => Ok(acme_error_response(error)),
         }
     }
 }

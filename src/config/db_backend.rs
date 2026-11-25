@@ -3413,6 +3413,27 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         proxy_id: &str,
     ) -> Result<Option<ApiSpec>, anyhow::Error>;
 
+    /// Fetch an ApiSpec for content retrieval (`GET /api-specs/{id}`),
+    /// omitting `external_ref_snapshot` so read paths (including `304`) never
+    /// transfer, decompress, or hash the snapshot blob on Tokio workers.
+    async fn get_api_spec_content(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<ApiSpec>, anyhow::Error> {
+        self.get_api_spec(namespace, id).await
+    }
+
+    /// Fetch an ApiSpec by proxy for content retrieval
+    /// (`GET /api-specs/by-proxy/{proxy_id}`), omitting `external_ref_snapshot`.
+    async fn get_api_spec_content_by_proxy(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+    ) -> Result<Option<ApiSpec>, anyhow::Error> {
+        self.get_api_spec_by_proxy(namespace, proxy_id).await
+    }
+
     /// List ApiSpecs in a namespace, with filtering, sorting, and pagination.
     ///
     /// This is a summary path: implementations must not hydrate the

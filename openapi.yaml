@@ -310,10 +310,10 @@ paths:
             reached on a plaintext or anonymous-TLS admin connection.
           headers:
             WWW-Authenticate:
-              description: Client certificate authentication challenge (`ClientCertificate`).
+              description: Client certificate authentication challenge (`ClientCertificate realm="ferrum-edge"`).
               schema:
                 type: string
-                example: ClientCertificate
+                example: 'ClientCertificate realm="ferrum-edge"'
           content:
             application/json:
               schema:
@@ -333,10 +333,10 @@ paths:
           description: Admin HTTPS client certificate trust was withdrawn (empty body)
           headers:
             WWW-Authenticate:
-              description: Client certificate authentication challenge (`ClientCertificate`).
+              description: Client certificate authentication challenge (`ClientCertificate realm="ferrum-edge"`).
               schema:
                 type: string
-                example: ClientCertificate
+                example: 'ClientCertificate realm="ferrum-edge"'
 
   /health:
     get:
@@ -499,10 +499,10 @@ paths:
             reached on a plaintext or anonymous-TLS admin connection.
           headers:
             WWW-Authenticate:
-              description: Client certificate authentication challenge (`ClientCertificate`).
+              description: Client certificate authentication challenge (`ClientCertificate realm="ferrum-edge"`).
               schema:
                 type: string
-                example: ClientCertificate
+                example: 'ClientCertificate realm="ferrum-edge"'
           content:
             application/json:
               schema:
@@ -524,10 +524,10 @@ paths:
           description: Admin HTTPS client certificate trust was withdrawn (empty body)
           headers:
             WWW-Authenticate:
-              description: Client certificate authentication challenge (`ClientCertificate`).
+              description: Client certificate authentication challenge (`ClientCertificate realm="ferrum-edge"`).
               schema:
                 type: string
-                example: ClientCertificate
+                example: 'ClientCertificate realm="ferrum-edge"'
 
   /status:
     get:
@@ -563,10 +563,10 @@ paths:
             reached on a plaintext or anonymous-TLS admin connection.
           headers:
             WWW-Authenticate:
-              description: Client certificate authentication challenge (`ClientCertificate`).
+              description: Client certificate authentication challenge (`ClientCertificate realm="ferrum-edge"`).
               schema:
                 type: string
-                example: ClientCertificate
+                example: 'ClientCertificate realm="ferrum-edge"'
           content:
             application/json:
               schema:
@@ -586,10 +586,10 @@ paths:
           description: Admin HTTPS client certificate trust was withdrawn (empty body)
           headers:
             WWW-Authenticate:
-              description: Client certificate authentication challenge (`ClientCertificate`).
+              description: Client certificate authentication challenge (`ClientCertificate realm="ferrum-edge"`).
               schema:
                 type: string
-                example: ClientCertificate
+                example: 'ClientCertificate realm="ferrum-edge"'
 
   /admin/tls/inventory:
     get:
@@ -2264,10 +2264,10 @@ paths:
             reached on a plaintext or anonymous-TLS admin connection.
           headers:
             WWW-Authenticate:
-              description: Client certificate authentication challenge (`ClientCertificate`).
+              description: Client certificate authentication challenge (`ClientCertificate realm="ferrum-edge"`).
               schema:
                 type: string
-                example: ClientCertificate
+                example: 'ClientCertificate realm="ferrum-edge"'
           content:
             application/json:
               schema:

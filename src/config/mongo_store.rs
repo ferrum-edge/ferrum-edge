@@ -10059,6 +10059,10 @@ mod inner {
         doc_to_api_spec_inner(doc, true)
     }
 
+    fn doc_to_api_spec_content(doc: Document) -> Result<ApiSpec, anyhow::Error> {
+        doc_to_api_spec_inner(doc, false)
+    }
+
     fn doc_to_api_spec_inner(
         mut doc: Document,
         snapshot_projected: bool,
@@ -17511,6 +17515,45 @@ mod inner {
             self.check_slow_query("get_api_spec_by_proxy", start);
             match result {
                 Some(doc) => Ok(Some(doc_to_api_spec(doc)?)),
+                None => Ok(None),
+            }
+        }
+
+        async fn get_api_spec_content(
+            &self,
+            namespace: &str,
+            id: &str,
+        ) -> Result<Option<ApiSpec>, anyhow::Error> {
+            let start = std::time::Instant::now();
+            let result = self
+                .api_specs()
+                .find_one(doc! {
+                    "_id": namespaced_doc_id(namespace, id),
+                    "namespace": namespace,
+                })
+                .projection(doc! { "external_ref_snapshot": 0 })
+                .await?;
+            self.check_slow_query("get_api_spec_content", start);
+            match result {
+                Some(doc) => Ok(Some(doc_to_api_spec_content(doc)?)),
+                None => Ok(None),
+            }
+        }
+
+        async fn get_api_spec_content_by_proxy(
+            &self,
+            namespace: &str,
+            proxy_id: &str,
+        ) -> Result<Option<ApiSpec>, anyhow::Error> {
+            let start = std::time::Instant::now();
+            let result = self
+                .api_specs()
+                .find_one(doc! { "proxy_id": proxy_id, "namespace": namespace })
+                .projection(doc! { "external_ref_snapshot": 0 })
+                .await?;
+            self.check_slow_query("get_api_spec_content_by_proxy", start);
+            match result {
+                Some(doc) => Ok(Some(doc_to_api_spec_content(doc)?)),
                 None => Ok(None),
             }
         }

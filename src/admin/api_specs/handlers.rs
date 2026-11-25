@@ -2468,6 +2468,7 @@ async fn spec_content_response_async(
     request_headers: &hyper::HeaderMap,
     max_decompress_bytes: usize,
     read_permit: tokio::sync::OwnedSemaphorePermit,
+    response_budget: Option<crate::admin::AdminConnResponseBudget>,
 ) -> Response<Full<Bytes>> {
     // Content negotiation FIRST — the ETag must be representation-specific so
     // a cached YAML ETag does not produce a false 304 when the client requests
@@ -2529,14 +2530,26 @@ async fn spec_content_response_async(
             .unwrap_or_else(|_| crate::admin::admin_builder_failure_response());
     }
 
+    if let Some(budget) = response_budget.as_ref()
+        && budget.is_exhausted()
+    {
+        return crate::admin::with_admin_security_headers(Response::builder())
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .header("Content-Type", "application/json")
+            .header("Retry-After", "1")
+            .body(Full::new(Bytes::from(
+                r#"{"error":"Too many buffered spec responses in flight on this connection"}"#,
+            )))
+            .unwrap_or_else(|_| crate::admin::admin_builder_failure_response());
+    }
+
     // Offload gzip decompression + optional YAML/JSON conversion to the
     // blocking pool while holding the pre-acquired read codec permit so large
     // spec reads cannot saturate Tokio worker threads or retain unbounded blobs
-    // while waiting in the queue. The permit is released as soon as the codec
-    // phase finishes (never held across network transmission) so stalled HTTP/2
-    // readers cannot pin the process-wide read slots indefinitely and starve
-    // other viewers; concurrent admin connections are bounded separately by
-    // `AdminConnLimiter`.
+    // while waiting in the queue. The codec permit is released as soon as the
+    // codec phase finishes (never held across network transmission) so stalled
+    // HTTP/2 readers cannot starve other connections; per-connection buffered
+    // response memory is bounded separately by `AdminConnResponseBudget`.
     let spec_id = spec.id;
     let stored_format = spec.spec_format;
     let compressed = spec.spec_content;
@@ -2595,14 +2608,36 @@ async fn spec_content_response_async(
     };
 
     let len = body_bytes.len();
-    crate::admin::with_admin_security_headers(Response::builder())
+    let budget_permit = if let Some(budget) = response_budget.as_ref() {
+        match budget.try_acquire_bytes(len) {
+            Some(permit) => Some(permit),
+            None => {
+                return crate::admin::with_admin_security_headers(Response::builder())
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .header("Content-Type", "application/json")
+                    .header("Retry-After", "1")
+                    .body(Full::new(Bytes::from(
+                        r#"{"error":"Too many buffered spec responses in flight on this connection"}"#,
+                    )))
+                    .unwrap_or_else(|_| crate::admin::admin_builder_failure_response());
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut response = crate::admin::with_admin_security_headers(Response::builder())
         .status(StatusCode::OK)
         .header("Content-Type", ct)
         .header("Content-Length", len.to_string())
         .header("ETag", &etag)
         .header("Vary", "Accept")
         .body(Full::new(Bytes::from(body_bytes)))
-        .unwrap_or_else(|_| crate::admin::admin_builder_failure_response())
+        .unwrap_or_else(|_| crate::admin::admin_builder_failure_response());
+    if let Some(permit) = budget_permit {
+        response.extensions_mut().insert(permit);
+    }
+    response
 }
 
 // ---------------------------------------------------------------------------
@@ -2814,7 +2849,7 @@ fn parse_list_filter(uri: &hyper::Uri) -> Result<ApiSpecListFilter, ApiSpecError
     Ok(filter)
 }
 
-fn max_spec_decompress_bytes(max_mib: usize) -> usize {
+pub(crate) fn max_spec_decompress_bytes(max_mib: usize) -> usize {
     max_mib
         .saturating_mul(2)
         .saturating_mul(1024)
@@ -3520,14 +3555,25 @@ pub async fn handle_get_api_spec(
         ));
     };
 
-    let spec = match db.get_api_spec(namespace, id).await {
+    let spec = match db.get_api_spec_content(namespace, id).await {
         Ok(Some(s)) => s,
         Ok(None) => return Ok(error_response(ApiSpecError::NotFound)),
         Err(e) => return Ok(error_response(classify_db_error(e))),
     };
 
+    let response_budget = req
+        .extensions()
+        .get::<crate::admin::AdminConnResponseBudget>()
+        .cloned();
     let max_decompress = max_spec_decompress_bytes(state.admin_spec_max_body_size_mib);
-    Ok(spec_content_response_async(spec, req.headers(), max_decompress, read_permit).await)
+    Ok(spec_content_response_async(
+        spec,
+        req.headers(),
+        max_decompress,
+        read_permit,
+        response_budget,
+    )
+    .await)
 }
 
 // ---------------------------------------------------------------------------
@@ -3552,14 +3598,25 @@ pub async fn handle_get_api_spec_by_proxy(
         ));
     };
 
-    let spec = match db.get_api_spec_by_proxy(namespace, proxy_id).await {
+    let spec = match db.get_api_spec_content_by_proxy(namespace, proxy_id).await {
         Ok(Some(s)) => s,
         Ok(None) => return Ok(error_response(ApiSpecError::NotFound)),
         Err(e) => return Ok(error_response(classify_db_error(e))),
     };
 
+    let response_budget = req
+        .extensions()
+        .get::<crate::admin::AdminConnResponseBudget>()
+        .cloned();
     let max_decompress = max_spec_decompress_bytes(state.admin_spec_max_body_size_mib);
-    Ok(spec_content_response_async(spec, req.headers(), max_decompress, read_permit).await)
+    Ok(spec_content_response_async(
+        spec,
+        req.headers(),
+        max_decompress,
+        read_permit,
+        response_budget,
+    )
+    .await)
 }
 
 // ---------------------------------------------------------------------------

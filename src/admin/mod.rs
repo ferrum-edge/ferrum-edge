@@ -1454,6 +1454,49 @@ impl Drop for AdminActivityGuard {
     }
 }
 
+/// Per-connection byte budget (in KiB units) limiting buffered spec response
+/// body memory held across multiplexed HTTP/2 streams on one admin connection.
+///
+/// Using a per-connection non-blocking semaphore prevents one stalled HTTP/2
+/// reader from stacking dozens of multi-MiB spec responses while avoiding any
+/// cross-connection or cross-namespace starvation.
+#[derive(Clone)]
+pub(crate) struct AdminConnResponseBudget {
+    semaphore: Arc<tokio::sync::Semaphore>,
+    capacity_kib: u32,
+}
+
+impl AdminConnResponseBudget {
+    fn new(capacity_kib: u32) -> Self {
+        let capacity_kib = capacity_kib.max(1);
+        Self {
+            semaphore: Arc::new(tokio::sync::Semaphore::new(capacity_kib as usize)),
+            capacity_kib,
+        }
+    }
+
+    pub(crate) fn is_exhausted(&self) -> bool {
+        self.semaphore.available_permits() == 0
+    }
+
+    pub(crate) fn try_acquire_bytes(&self, bytes: usize) -> Option<ResponseBodyBudgetPermit> {
+        let cost_kib = bytes.div_ceil(1024).max(1).min(self.capacity_kib as usize) as u32;
+        self.semaphore
+            .clone()
+            .try_acquire_many_owned(cost_kib)
+            .ok()
+            .map(|permit| ResponseBodyBudgetPermit(Arc::new(permit)))
+    }
+}
+
+/// Cloneable RAII permit moved from response extensions into
+/// [`GuardedAdminBody`] so per-connection buffered response memory stays
+/// accounted until the body finishes transmitting or drops.
+#[derive(Clone)]
+pub(crate) struct ResponseBodyBudgetPermit(
+    #[allow(dead_code)] Arc<tokio::sync::OwnedSemaphorePermit>,
+);
+
 /// Admin response body that keeps its [`AdminActivityGuard`] alive until hyper
 /// has finished writing the response and dropped the body.
 struct GuardedAdminBody {
@@ -1465,6 +1508,7 @@ struct GuardedAdminBody {
     /// the body is not proof the peer received it, so the registry confirms
     /// collection only after two such deliveries.
     delivery_ack: Option<plugins::api_chargeback::ChargesDeliveryAck>,
+    _budget_permit: Option<ResponseBodyBudgetPermit>,
     _guard: AdminActivityGuard,
 }
 
@@ -1473,20 +1517,23 @@ impl GuardedAdminBody {
         Self {
             inner,
             delivery_ack: None,
+            _budget_permit: None,
             _guard: guard,
         }
     }
 
     /// Wrap a dispatched admin response, moving a `/charges` delivery
-    /// acknowledgement out of the response extensions into the body so it
-    /// fires only once the body has been taken.
+    /// acknowledgement and any response-body budget permit out of the response
+    /// extensions into the body so they live until the body is taken/dropped.
     fn wrap_response(response: Response<Full<Bytes>>, guard: AdminActivityGuard) -> Response<Self> {
         let (mut parts, inner) = response.into_parts();
         let delivery_ack = parts
             .extensions
             .remove::<plugins::api_chargeback::ChargesDeliveryAck>();
+        let budget_permit = parts.extensions.remove::<ResponseBodyBudgetPermit>();
         let mut body = Self::new(inner, guard);
         body.delivery_ack = delivery_ack;
+        body._budget_permit = budget_permit;
         Response::from_parts(parts, body)
     }
 }
@@ -1592,13 +1639,19 @@ async fn serve_admin_io<I>(
 
     let activity = Arc::new(AdminConnActivity::new());
     let service_activity = Arc::clone(&activity);
+    let conn_budget_kib =
+        (api_specs::handlers::max_spec_decompress_bytes(state.admin_spec_max_body_size_mib) / 1024)
+            .max(64 * 1024)
+            .min(u32::MAX as usize) as u32;
+    let conn_response_budget = AdminConnResponseBudget::new(conn_budget_kib);
     // Kept out of the service closure so the connection-level select below can
     // still observe retirement after the closure has taken its own handle.
     let connection_trust = client_trust.clone();
-    let svc = service_fn(move |req: Request<Incoming>| {
+    let svc = service_fn(move |mut req: Request<Incoming>| {
         let state = state.clone();
         let guard = AdminActivityGuard::new(Arc::clone(&service_activity));
         let client_trust = client_trust.clone();
+        let conn_response_budget = conn_response_budget.clone();
         async move {
             // Frontend client-trust admission fence (issue #3857). One relaxed
             // atomic read of connection-local state, and only for a connection
@@ -1624,6 +1677,7 @@ async fn serve_admin_io<I>(
                     crate::plugins::utils::auth_flow::CLIENT_CERTIFICATE_AUTHENTICATION_CHALLENGE,
                 )
             } else {
+                req.extensions_mut().insert(conn_response_budget);
                 handle_admin_request(req, state, client_ip).await?
             };
             if is_head {
@@ -3400,6 +3454,9 @@ fn strip_head_response_body(response: &mut Response<Full<Bytes>>) {
             .headers_mut()
             .insert(hyper::header::CONTENT_LENGTH, HeaderValue::from(len));
     }
+    response
+        .extensions_mut()
+        .remove::<ResponseBodyBudgetPermit>();
     *response.body_mut() = Full::new(Bytes::new());
 }
 
@@ -5454,7 +5511,13 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_renew_acme_certificate(&state, certificate_id, &body_bytes).await
+            tls_management::handle_renew_acme_certificate(
+                &state,
+                &auth,
+                certificate_id,
+                &body_bytes,
+            )
+            .await
         }
         (Method::GET, ["admin", "tls", "acme", "orders"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -5467,7 +5530,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_create_acme_order(&state, &body_bytes).await
+            tls_management::handle_create_acme_order(&state, &auth, &body_bytes).await
         }
         (Method::GET, ["admin", "tls", "acme", "orders", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -5485,7 +5548,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_delete_acme_order(&state, id).await
+            tls_management::handle_delete_acme_order(&state, &auth, id).await
         }
         (Method::GET, ["admin", "tls", "certificates"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {

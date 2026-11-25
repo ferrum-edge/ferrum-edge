@@ -11987,6 +11987,57 @@ impl DatabaseStore {
         }
     }
 
+    /// Fetch a single ApiSpec by namespace + id for content retrieval without
+    /// projecting `external_ref_snapshot`, avoiding snapshot gzip decompression
+    /// and SHA-256 verification on Tokio workers during `GET` / `304` reads.
+    pub async fn get_api_spec_content(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<crate::config::types::ApiSpec>, anyhow::Error> {
+        let row: Option<AnyRow> = sqlx::query(self.q(
+            "SELECT id, namespace, proxy_id, spec_version, spec_format, spec_content, \
+             content_encoding, uncompressed_size, content_hash, title, info_version, \
+             description, contact_name, contact_email, license_name, license_identifier, \
+             tags, server_urls, operation_count, resource_hash, external_ref_digest, \
+             created_at, updated_at \
+             FROM api_specs WHERE namespace = ? AND id = ?",
+        ))
+        .bind(namespace)
+        .bind(id)
+        .fetch_optional(&self.pool())
+        .await?;
+        match row {
+            Some(r) => Ok(Some(row_to_api_spec_content(&r)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Fetch an ApiSpec by proxy_id for content retrieval without projecting
+    /// `external_ref_snapshot`.
+    pub async fn get_api_spec_content_by_proxy(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+    ) -> Result<Option<crate::config::types::ApiSpec>, anyhow::Error> {
+        let row: Option<AnyRow> = sqlx::query(self.q(
+            "SELECT id, namespace, proxy_id, spec_version, spec_format, spec_content, \
+             content_encoding, uncompressed_size, content_hash, title, info_version, \
+             description, contact_name, contact_email, license_name, license_identifier, \
+             tags, server_urls, operation_count, resource_hash, external_ref_digest, \
+             created_at, updated_at \
+             FROM api_specs WHERE namespace = ? AND proxy_id = ?",
+        ))
+        .bind(namespace)
+        .bind(proxy_id)
+        .fetch_optional(&self.pool())
+        .await?;
+        match row {
+            Some(r) => Ok(Some(row_to_api_spec_content(&r)?)),
+            None => Ok(None),
+        }
+    }
+
     /// List ApiSpecs in a namespace with optional filtering, sorting, and pagination.
     ///
     /// Returns a [`PaginatedResult`] that includes the filtered `total` row count
@@ -13658,6 +13709,22 @@ impl DatabaseBackend for DatabaseStore {
         DatabaseStore::get_api_spec_by_proxy(self, namespace, proxy_id).await
     }
 
+    async fn get_api_spec_content(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<crate::config::types::ApiSpec>, anyhow::Error> {
+        DatabaseStore::get_api_spec_content(self, namespace, id).await
+    }
+
+    async fn get_api_spec_content_by_proxy(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+    ) -> Result<Option<crate::config::types::ApiSpec>, anyhow::Error> {
+        DatabaseStore::get_api_spec_content_by_proxy(self, namespace, proxy_id).await
+    }
+
     async fn list_api_specs(
         &self,
         namespace: &str,
@@ -14706,6 +14773,14 @@ fn row_to_api_spec(row: &AnyRow) -> Result<crate::config::types::ApiSpec, anyhow
     // spec_content is stored as BLOB/BYTEA — sqlx returns Vec<u8>.
     let spec_content: Vec<u8> = row.try_get("spec_content")?;
     row_to_api_spec_with_content(row, spec_content, true)
+}
+
+/// Parse an api_specs content-read row whose query intentionally omitted
+/// `external_ref_snapshot`, keeping `spec_content` while validating only the
+/// summary digest format in O(1).
+fn row_to_api_spec_content(row: &AnyRow) -> Result<crate::config::types::ApiSpec, anyhow::Error> {
+    let spec_content: Vec<u8> = row.try_get("spec_content")?;
+    row_to_api_spec_with_content(row, spec_content, false)
 }
 
 /// Parse an api_specs list row into an [`ApiSpec`] summary.
