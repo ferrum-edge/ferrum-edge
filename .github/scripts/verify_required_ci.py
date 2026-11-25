@@ -99,6 +99,7 @@ from verify_ci_runtime_cache import (
     CANONICAL_MERGE_GROUP_BODY,
     CANONICAL_PULL_REQUEST_BODY,
     CANONICAL_PUSH_MAIN_BODY,
+    check_fips_aggregate_guards,
     extract_job,
     job_if,
     job_steps,
@@ -2283,41 +2284,36 @@ def main() -> int:
                     f"{workflow_path} jobs.{job} is missing fail-closed contract `{contract}`"
                 )
         if workflow_path == ".github/workflows/fips-build.yml":
-            if re.search(r"(?m)^defaults:", workflow_yml) or re.search(r"(?m)^    defaults:", body):
-                planner_errors.append(
-                    f"{workflow_path} must not define workflow- or aggregate-level `defaults:`"
-                )
-            if "continue-on-error" in workflow_yml:
-                planner_errors.append(
-                    f"{workflow_path} must not use continue-on-error"
-                )
-            steps_marker = "\n    steps:\n"
-            steps_text = body.split(steps_marker, 1)[1] if steps_marker in body else ""
-            step_starts = [m.start() for m in re.finditer(r"(?m)^      - ", steps_text)]
-            agg_steps = [
-                steps_text[step_starts[i] : (step_starts[i + 1] if i + 1 < len(step_starts) else len(steps_text))]
-                for i in range(len(step_starts))
-            ]
-            for contract in sorted(required_check["contract"]):
-                if not contract.startswith("        if: "):
-                    continue
-                target_if = contract.rstrip("\n")
-                valid_steps = []
-                for step in agg_steps:
-                    step_lines = step.splitlines()
-                    if target_if not in step_lines:
-                        continue
-                    keys = {
-                        re.match(r"^(?:      - |        )([A-Za-z0-9_\"'-]+):", line).group(1).strip("\"'")
-                        for line in step_lines
-                        if re.match(r"^(?:      - |        )[A-Za-z0-9_\"'-]+:", line)
-                    }
-                    if keys == {"name", "if", "run"} and "        run: exit 1" in step_lines:
-                        valid_steps.append(step)
-                if len(valid_steps) != 1:
+            check_fips_aggregate_guards(workflow_yml, planner_errors)
+            # Self-test the shared structural FIPS guard verifier against
+            # quoted defaults, spaced shell override, and escaped continue-on-error.
+            for label, mutated in (
+                (
+                    "quoted workflow defaults",
+                    '"defaults":\n  run:\n    shell: bash -c true {0}\n' + workflow_yml,
+                ),
+                (
+                    "spaced shell key on guard",
+                    workflow_yml.replace(
+                        "      - name: Fail when FIPS compile did not succeed\n",
+                        "      - name: Fail when FIPS compile did not succeed\n        shell : bash -c true {0}\n",
+                        1,
+                    ),
+                ),
+                (
+                    "escaped continue-on-error on guard",
+                    workflow_yml.replace(
+                        "      - name: Fail when FIPS compile did not succeed\n",
+                        '      - name: Fail when FIPS compile did not succeed\n        "\\u0063ontinue-on-error": true\n',
+                        1,
+                    ),
+                ),
+            ):
+                probe_errors: list[str] = []
+                check_fips_aggregate_guards(mutated, probe_errors)
+                if mutated == workflow_yml or not probe_errors:
                     planner_errors.append(
-                        f"{workflow_path} jobs.{job} guard `{target_if.strip()}` must be a "
-                        "pure name/if/run step executing `run: exit 1` with no shell/env/defaults overrides"
+                        f"FIPS aggregate guard self-test must reject {label}"
                     )
 
     for workflow_path, required_name in sorted(REQUIRED_MERGE_GROUP_WORKFLOWS.items()):

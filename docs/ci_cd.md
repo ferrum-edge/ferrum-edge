@@ -947,7 +947,10 @@ runner-minutes a gate change saves.
 
 Every workflow that runs on `push` to `main` keys its concurrency group on
 the ref with `cancel-in-progress` **false** for pushes (superseded
-`pull_request` / `merge_group` runs are still cancelled). A run in flight
+`pull_request` / `merge_group` runs are still cancelled) — with two intentional
+exceptions: `fuzz-smoke-main.yml` (`queue: max`) and `fips-build.yml`, which
+keys `push` to `main` on `github.run_id` so overlapping pushes never evict a
+pending exact-SHA FIPS run. For the ref-keyed workflows, a run in flight
 finishes and at most one newer push waits behind it, so `main` converges on a
 complete exact-SHA validation set instead of cancelling almost every run
 before it can finish. Intermediate SHAs skipped by that coalescing carry no
