@@ -1401,6 +1401,14 @@ fn parse_loaded_document(
     )
 }
 
+fn value_container_depth(val: &Value) -> usize {
+    match val {
+        Value::Array(arr) => 1 + arr.iter().map(value_container_depth).max().unwrap_or(0),
+        Value::Object(map) => 1 + map.values().map(value_container_depth).max().unwrap_or(0),
+        _ => 0,
+    }
+}
+
 fn parse_loaded_document_with_limits(
     uri: &Url,
     bytes: &[u8],
@@ -1415,33 +1423,51 @@ fn parse_loaded_document_with_limits(
     let format = detect_format(bytes);
     // Bound external JSON and YAML trees the exact same way root API-spec
     // admission and GET cross-format conversion do (counting JSON object member
-    // values mid-parse before duplicate keys collapse).
+    // values mid-parse before duplicate keys collapse), and enforce the shared
+    // storage-compatible depth ceiling (`MAX_EXTERNAL_DOCUMENT_DEPTH = 120`) so
+    // every admitted document fits inside `ExternalRefSnapshot`'s 3 enclosing
+    // JSON containers under `serde_json`'s 128-level recursion limit.
     let root = match format {
-        "json" => {
-            super::extractor::parse_json_slice_bounded(bytes, max_nodes).map_err(|error| {
-                match error {
-                    super::extractor::BoundedJsonError::NodeLimitExceeded => {
-                        ExtractError::InvalidJson(format!(
-                            "external document {} exceeds expanded node limit; reduce nesting",
-                            redact_reference(uri.as_str())
-                        ))
-                    }
-                    super::extractor::BoundedJsonError::Parse(msg) => {
-                        ExtractError::InvalidJson(format!(
-                            "external document {}: {msg}",
-                            redact_reference(uri.as_str())
-                        ))
-                    }
-                }
-            })?
-        }
-        _ => super::bounded_yaml::parse_yaml_to_json(bytes, max_nodes).map_err(|error| {
-            ExtractError::InvalidYaml(format!(
-                "external document {}: {}",
-                redact_reference(uri.as_str()),
-                error.message()
-            ))
+        "json" => super::extractor::parse_json_slice_bounded_with_depth(
+            bytes,
+            max_nodes,
+            Some(super::extractor::MAX_EXTERNAL_DOCUMENT_DEPTH),
+        )
+        .map_err(|error| match error {
+            super::extractor::BoundedJsonError::NodeLimitExceeded => {
+                ExtractError::InvalidJson(format!(
+                    "external document {} exceeds expanded node limit; reduce nesting",
+                    redact_reference(uri.as_str())
+                ))
+            }
+            super::extractor::BoundedJsonError::DepthLimitExceeded => {
+                ExtractError::InvalidJson(format!(
+                    "external document {} exceeds maximum nesting depth",
+                    redact_reference(uri.as_str())
+                ))
+            }
+            super::extractor::BoundedJsonError::Parse(msg) => ExtractError::InvalidJson(format!(
+                "external document {}: {msg}",
+                redact_reference(uri.as_str())
+            )),
         })?,
+        _ => {
+            let parsed =
+                super::bounded_yaml::parse_yaml_to_json(bytes, max_nodes).map_err(|error| {
+                    ExtractError::InvalidYaml(format!(
+                        "external document {}: {}",
+                        redact_reference(uri.as_str()),
+                        error.message()
+                    ))
+                })?;
+            if value_container_depth(&parsed) > super::extractor::MAX_EXTERNAL_DOCUMENT_DEPTH {
+                return Err(ExtractError::InvalidYaml(format!(
+                    "external document {} exceeds maximum nesting depth",
+                    redact_reference(uri.as_str())
+                )));
+            }
+            parsed
+        }
     };
     let digest = normalized_document_digest(&root);
     let mut canonical = uri.clone();
@@ -1516,6 +1542,59 @@ pub(crate) fn check_external_json_duplicate_member_limit_for_test() -> Result<()
         != Some("[1,2,3]")
     {
         return Err("external-ref snapshot decode reinterpreted RawValue marker");
+    }
+
+    // Nesting-depth boundary: external JSON at `MAX_EXTERNAL_DOCUMENT_DEPTH`
+    // (120 nested containers) must pass admission AND snapshot validation
+    // round-trip (3 wrapper containers + 120 = 123 < 128), while 121 levels
+    // must fail closed at admission for both JSON and YAML.
+    let depth_limit = super::extractor::MAX_EXTERNAL_DOCUMENT_DEPTH;
+    let exact_depth_json = format!("{}0{}", "[".repeat(depth_limit), "]".repeat(depth_limit));
+    let loaded_deep =
+        parse_loaded_document_with_limits(&uri, exact_depth_json.as_bytes(), 4096, 1024)
+            .map_err(|_| "external JSON at exact depth limit failed admission")?;
+    let mut deep_snap = ExternalRefSnapshot {
+        policy_digest: "0".repeat(64),
+        root_document_base: "https://schemas.example.com/root.json".to_string(),
+        documents: vec![ExternalRefSnapshotDocument {
+            canonical_uri: loaded_deep.canonical_uri.to_string(),
+            content_digest: loaded_deep.content_digest,
+            format: loaded_deep.format.to_string(),
+            document: loaded_deep.root,
+        }],
+        snapshot_digest: String::new(),
+    };
+    deep_snap.snapshot_digest = deep_snap.compute_digest();
+    let deep_gz = deep_snap
+        .gzip_bytes()
+        .map_err(|_| "failed to gzip exact-depth snapshot")?;
+    validate_external_ref_snapshot_pair(Some(&deep_gz), Some(&deep_snap.snapshot_digest))
+        .map_err(|_| "exact-depth external JSON snapshot failed validation round-trip")?;
+
+    let over_depth_json = format!(
+        "{}0{}",
+        "[".repeat(depth_limit + 1),
+        "]".repeat(depth_limit + 1)
+    );
+    if !matches!(
+        parse_loaded_document_with_limits(&uri, over_depth_json.as_bytes(), 4096, 1024),
+        Err(ExtractError::InvalidJson(_))
+    ) {
+        return Err("external JSON exceeding depth limit was not rejected with InvalidJson");
+    }
+
+    let mut over_depth_yaml = String::new();
+    for i in 0..=depth_limit {
+        over_depth_yaml.push_str(&" ".repeat(i * 2));
+        over_depth_yaml.push_str("a:\n");
+    }
+    over_depth_yaml.push_str(&" ".repeat((depth_limit + 1) * 2));
+    over_depth_yaml.push_str("1\n");
+    if !matches!(
+        parse_loaded_document_with_limits(&uri, over_depth_yaml.as_bytes(), 64 * 1024, 1024),
+        Err(ExtractError::InvalidYaml(_))
+    ) {
+        return Err("external YAML exceeding depth limit was not rejected with InvalidYaml");
     }
     Ok(())
 }
