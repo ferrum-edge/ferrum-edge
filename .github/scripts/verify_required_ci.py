@@ -835,8 +835,17 @@ def test_artifact_consumer_wiring_errors(ci_yml: str) -> list[str]:
             "ferrum-cni-debug-${{ runner.os }}-${{ runner.arch }}",
         },
     }
-    all_ci_jobs = set(re.findall(r"(?m)^  ([a-z0-9-]+):$", ci_yml))
+    # Scan all jobs in `ci.yml` (allowing any valid GitHub Actions job ID,
+    # including underscores and uppercase letters).
+    jobs_section = ci_yml.split("\njobs:\n", 1)[1] if "\njobs:\n" in ci_yml else ci_yml
+    all_ci_jobs = set(re.findall(r"(?m)^  ([A-Za-z_][A-Za-z0-9_-]*):$", jobs_section))
     discovered_consumers: set[str] = set()
+    producer_prefixes = (
+        "ferrum-edge-debug",
+        "ferrum-cni-debug",
+        "integration-tests-archive",
+        "functional-tests-archive",
+    )
 
     for job in sorted(all_ci_jobs | set(expected_consumer_artifacts)):
         if job == "build-test-artifacts":
@@ -852,7 +861,18 @@ def test_artifact_consumer_wiring_errors(ci_yml: str) -> list[str]:
             if "uses: actions/download-artifact@" not in step:
                 continue
             art_m = re.search(r"(?m)^\s+name:\s*(.+?)\s*$", step)
+            pat_m = re.search(r"(?m)^\s+pattern:\s*(.+?)\s*$", step)
             if not art_m:
+                if pat_m:
+                    raw_pat = pat_m.group(1).strip("\"'")
+                    if any(raw_pat.startswith(prefix) or prefix in raw_pat for prefix in producer_prefixes) or "*" in raw_pat:
+                        errors.append(
+                            f"jobs.{job} downloads artifacts via wildcard `pattern: {raw_pat}` instead of an explicit tracked `name:`"
+                        )
+                else:
+                    errors.append(
+                        f"jobs.{job} invokes actions/download-artifact without an explicit `name:`"
+                    )
                 continue
             raw_name = art_m.group(1)
             canonical_name = main_linux_aliases.get(raw_name, raw_name)
@@ -996,7 +1016,35 @@ def test_artifact_consumer_wiring_self_test(ci_yml: str) -> list[str]:
     if drop_integ_cni_dl == ci_yml or not test_artifact_consumer_wiring_errors(drop_integ_cni_dl):
         failures.append("artifact wiring verifier must reject missing ferrum-cni-debug download in test-integration")
 
-    # 8. Equivalent reversed `||` operands must still pass.
+    # 8. An underscore-named 7th consumer downloading a tracked artifact must fail.
+    extra_underscore_job = (
+        ci_yml
+        + "\n  extra_consumer:\n"
+        + "    runs-on: ubuntu-26.04\n"
+        + "    needs: [ci-plan, build-test-artifacts]\n"
+        + "    steps:\n"
+        + "      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8\n"
+        + "        with:\n"
+        + "          name: ferrum-cni-debug-${{ runner.os }}-${{ runner.arch }}\n"
+    )
+    if not test_artifact_consumer_wiring_errors(extra_underscore_job):
+        failures.append("artifact wiring verifier must reject an underscore-named untracked consumer job")
+
+    # 9. A consumer downloading via `pattern:` must fail.
+    pattern_download_job = (
+        ci_yml
+        + "\n  pattern-consumer:\n"
+        + "    runs-on: ubuntu-26.04\n"
+        + "    needs: [ci-plan, build-test-artifacts]\n"
+        + "    steps:\n"
+        + "      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8\n"
+        + "        with:\n"
+        + "          pattern: ferrum-cni-debug-*\n"
+    )
+    if not test_artifact_consumer_wiring_errors(pattern_download_job):
+        failures.append("artifact wiring verifier must reject a consumer using wildcard pattern: downloads")
+
+    # 10. Equivalent reversed `||` operands must still pass.
     reversed_if = ci_yml.replace(
         "if: needs.ci-plan.outputs.run_integration == 'true' || needs.ci-plan.outputs.run_vendor_patches == 'true'",
         "if: needs.ci-plan.outputs.run_vendor_patches == 'true' || needs.ci-plan.outputs.run_integration == 'true'",
@@ -1032,20 +1080,23 @@ def check_mode_and_granular_opt_in(plan_body: str) -> list[str]:
             "jobs.ci-plan must force mode=full when paths_classifiable != true "
             "before emitting mode to GITHUB_OUTPUT"
         )
-    expected_consumer_loop = (
-        "for consumer_gate in run_integration run_functional "
-        "run_plugin_hardening_redis run_helm run_vendor_patches; do"
-    )
-    if expected_consumer_loop not in exec_lines:
-        errors.append(
-            f"jobs.ci-plan must iterate over all five artifact-consumer gates (`{expected_consumer_loop}`)"
-        )
-    if (
-        'plan="$(printf \'%s\\n\' "$plan" | grep -v \'^run_artifacts=\'; echo "run_artifacts=true")"'
-        not in exec_lines
+    expected_fallback_sequence = [
+        "for consumer_gate in run_integration run_functional run_plugin_hardening_redis run_helm run_vendor_patches; do",
+        'consumer_val="$(printf \'%s\\n\' "$plan" | sed -n "s/^${consumer_gate}=//p")"',
+        'if [ "$consumer_val" != "false" ]; then',
+        'plan="$(printf \'%s\\n\' "$plan" | grep -v \'^run_artifacts=\'; echo "run_artifacts=true")"',
+        "break",
+        "fi",
+        "done",
+    ]
+    seq_len = len(expected_fallback_sequence)
+    if not any(
+        exec_lines[i : i + seq_len] == expected_fallback_sequence
+        for i in range(max(0, len(exec_lines) - seq_len + 1))
     ):
         errors.append(
-            "jobs.ci-plan must force run_artifacts=true whenever any artifact-consumer gate falls back"
+            "jobs.ci-plan must execute the complete mixed-version transition guard "
+            "(for all 5 consumer gates, forcing run_artifacts=true whenever consumer_val != false)"
         )
     return errors
 
@@ -1088,6 +1139,14 @@ def mode_and_granular_opt_in_self_test(plan_body: str) -> list[str]:
     )
     if dropped_consumer == plan_body or not check_mode_and_granular_opt_in(dropped_consumer):
         failures.append("granular opt-in verifier must reject dropping a consumer gate from the transition guard loop")
+
+    explicit_true_only = plan_body.replace(
+        'if [ "$consumer_val" != "false" ]; then',
+        'if [ "$consumer_val" = "true" ]; then',
+        1,
+    )
+    if explicit_true_only == plan_body or not check_mode_and_granular_opt_in(explicit_true_only):
+        failures.append("granular opt-in verifier must reject changing consumer_val != false to = true")
 
     return failures
 
