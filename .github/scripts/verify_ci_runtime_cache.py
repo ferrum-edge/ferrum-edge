@@ -5723,14 +5723,17 @@ def _strip_redirections(typed_words: list[tuple[str, str]]) -> list[str]:
     return out
 
 
-def _tokenize_shell_script(run_text: str) -> list[list[str]]:
-    """POSIX-aware single-pass shell lexer splitting `run_text` into per-command unquoted word lists.
+def _tokenize_shell_script(run_text: str) -> tuple[list[list[str]], bool]:
+    """POSIX/Bash-aware single-pass shell lexer returning `(commands, malformed)`.
 
-    Handles single/double quotes, backslash line-continuation deletion (`\\`+newline
-    outside single quotes, never inside `#` comments), `#` comments ending at newline,
-    quoted here-document body skipping (`<<'EOF'`, `<<"EOF"`, `<<-'EOF'`), distinct
-    unquoted redirection operator stripping (`>`, `>>`, `2>&`, `>|`, `<<<`, `&>`,
-    `{fd}>`, etc.), and command separators (`\\n`, `;`, `&&`, `||`, `|`).
+    Handles single/double/ANSI-C (`$'...'`) quotes, backslash line-continuation
+    deletion (`\\`+newline outside single quotes, never inside `#` comments),
+    `#` comments ending at newline, here-document body skipping (`<<EOF`, `<<'EOF'`,
+    `<<"EOF"`, `<<$'EOF'`, `<<-'EOF'`), distinct unquoted redirection operator
+    stripping (`>`, `>>`, `2>&`, `2>&1>/dev/null`, `>|`, `<<<`, `&>`, `{fd}>`),
+    and command separators (`\\n`, `;`, `&&`, `||`, `|`).
+    Returns `malformed=True` (fail closed) if the script ends inside an unclosed
+    quote or with an unmatched here-document delimiter.
     """
 
     commands: list[list[str]] = []
@@ -5738,32 +5741,34 @@ def _tokenize_shell_script(run_text: str) -> list[list[str]]:
     cur: list[str] = []
     has_token = False
     cur_had_quote = False
-    quote: str | None = None
-    # Pending quoted here-docs queued on the current line: list of (delimiter, strip_tabs).
+    quote: str | None = None  # "'" | '"' | "$'"
     pending_heredocs: list[tuple[str, bool]] = []
     expecting_heredoc_delim: tuple[bool, bool] | None = None  # (active, strip_tabs)
+    expecting_redir_operand = False
+    malformed = False
     idx = 0
     n = len(run_text)
 
     def _flush_word() -> None:
-        nonlocal cur, has_token, cur_had_quote, expecting_heredoc_delim
+        nonlocal cur, has_token, cur_had_quote, expecting_heredoc_delim, expecting_redir_operand
         if not has_token:
             return
         word = "".join(cur)
         typed_words.append(("word", word))
+        expecting_redir_operand = False
         if expecting_heredoc_delim is not None:
             _active, strip_tabs = expecting_heredoc_delim
-            if cur_had_quote:
-                pending_heredocs.append((word, strip_tabs))
+            pending_heredocs.append((word, strip_tabs))
             expecting_heredoc_delim = None
         cur = []
         has_token = False
         cur_had_quote = False
 
     def _flush_command() -> None:
-        nonlocal typed_words, expecting_heredoc_delim
+        nonlocal typed_words, expecting_heredoc_delim, expecting_redir_operand
         _flush_word()
         expecting_heredoc_delim = None
+        expecting_redir_operand = False
         if typed_words:
             stripped = _strip_redirections(typed_words)
             if stripped:
@@ -5771,9 +5776,10 @@ def _tokenize_shell_script(run_text: str) -> list[list[str]]:
             typed_words = []
 
     def _consume_pending_heredocs(pos: int) -> int:
-        nonlocal pending_heredocs
-        while pending_heredocs and pos < n:
+        nonlocal pending_heredocs, malformed
+        while pending_heredocs:
             delim, strip_tabs = pending_heredocs.pop(0)
+            matched = False
             while pos < n:
                 nl = run_text.find("\n", pos)
                 if nl < 0:
@@ -5786,7 +5792,10 @@ def _tokenize_shell_script(run_text: str) -> list[list[str]]:
                     line = line[:-1]
                 cand = line.lstrip("\t") if strip_tabs else line
                 if cand == delim:
+                    matched = True
                     break
+            if not matched:
+                malformed = True
         return pos
 
     while idx < n:
@@ -5809,18 +5818,29 @@ def _tokenize_shell_script(run_text: str) -> list[list[str]]:
                 cur_had_quote = True
                 idx += 2
                 continue
+            if ch == "$" and idx + 1 < n and run_text[idx + 1] == "'":
+                # Bash ANSI-C quoting `$'...'`.
+                quote = "$'"
+                has_token = True
+                cur_had_quote = True
+                idx += 2
+                continue
             if ch in (" ", "\t", "\r"):
                 _flush_word()
                 idx += 1
                 continue
-            # Emit unquoted redirection operators as typed `("redir", op)` tokens so
-            # both operators and operands (even `--` after `<<<` or redirections
-            # inside `env >/dev/null --unset`) are stripped cleanly before scanning.
+            # Emit unquoted redirection operators as typed `("redir", op)` tokens.
+            # When a redirection operand is already pending (e.g. `1` in `2>&1>/dev/null`),
+            # flush it as the operand word instead of treating it as the next fd prefix.
             if ch in (">", "<"):
                 fd_prefix = ""
                 if has_token:
                     word_so_far = "".join(cur)
-                    if not cur_had_quote and _CI_DEBUG_SHELL_FD_PREFIX_RE.match(word_so_far):
+                    if (
+                        not expecting_redir_operand
+                        and not cur_had_quote
+                        and _CI_DEBUG_SHELL_FD_PREFIX_RE.match(word_so_far)
+                    ):
                         fd_prefix = word_so_far
                         cur = []
                         has_token = False
@@ -5840,6 +5860,7 @@ def _tokenize_shell_script(run_text: str) -> list[list[str]]:
                     else:
                         op = ">"
                 typed_words.append(("redir", fd_prefix + op))
+                expecting_redir_operand = True
                 if op in ("<<", "<<-"):
                     expecting_heredoc_delim = (True, op == "<<-")
                 else:
@@ -5850,6 +5871,7 @@ def _tokenize_shell_script(run_text: str) -> list[list[str]]:
                 _flush_word()
                 op = "&>>" if run_text[idx : idx + 3] == "&>>" else "&>"
                 typed_words.append(("redir", op))
+                expecting_redir_operand = True
                 expecting_heredoc_delim = None
                 idx += len(op)
                 continue
@@ -5879,6 +5901,18 @@ def _tokenize_shell_script(run_text: str) -> list[list[str]]:
             else:
                 cur.append(ch)
             idx += 1
+        elif quote == "$'":
+            if ch == "\\" and idx + 1 < n:
+                nxt = run_text[idx + 1]
+                esc_map = {"n": "\n", "r": "\r", "t": "\t", "'": "'", '"': '"', "\\": "\\"}
+                cur.append(esc_map.get(nxt, nxt))
+                idx += 2
+                continue
+            if ch == "'":
+                quote = None
+            else:
+                cur.append(ch)
+            idx += 1
         else:  # double quote
             if ch == "\\" and idx + 1 < n:
                 nxt = run_text[idx + 1]
@@ -5901,14 +5935,13 @@ def _tokenize_shell_script(run_text: str) -> list[list[str]]:
                 cur.append(ch)
             idx += 1
     _flush_command()
-    return commands
+    if quote is not None or pending_heredocs:
+        malformed = True
+    return commands, malformed
 
 
 _CI_DEBUG_SHELL_KEYWORDS = frozenset(
     {"if", "then", "elif", "else", "do", "while", "until", "!", "{"}
-)
-_CI_DEBUG_SHELL_REDIR_OP_ONLY_RE = re.compile(
-    r"^(?:(?:\d+|\{[A-Za-z_][A-Za-z0-9_]*\})?(?:>>?|<<<|<<-?|<>|<&?|>&|>\|)|&>>?)$"
 )
 # Map wrapper basename -> (options taking a separate operand, takes_leading_positional_arg)
 _CI_DEBUG_SHELL_WRAPPERS: dict[str, tuple[frozenset[str], bool]] = {
@@ -5922,6 +5955,7 @@ _CI_DEBUG_SHELL_WRAPPERS: dict[str, tuple[frozenset[str], bool]] = {
     "chrt": (frozenset({"-p"}), False),
     "setsid": (frozenset(), False),
     "command": (frozenset(), False),
+    "builtin": (frozenset(), False),
     "exec": (frozenset({"-a"}), False),
     "nohup": (frozenset(), False),
     "xargs": (frozenset({"-I", "-L", "-n", "-P", "-s", "-d", "-E", "-a"}), False),
@@ -5933,7 +5967,8 @@ def _split_gnu_env_s_string(split_arg: str) -> list[str]:
 
     # In GNU coreutils `env -S`, `\_` splits arguments like a space outside single quotes.
     expanded = split_arg.replace(r"\_", " ")
-    return [w for sub in _tokenize_shell_script(expanded) for w in sub]
+    cmds, _malformed = _tokenize_shell_script(expanded)
+    return [w for sub in cmds for w in sub]
 
 
 _GNU_ENV_LONG_OPTIONS = (
@@ -5970,9 +6005,11 @@ def _scan_shell_command_tokens(tokens: list[str]) -> bool:
         if tok in _CI_DEBUG_SHELL_KEYWORDS:
             idx += 1
             continue
-        if tok.endswith(")") and not tok.startswith("-"):
-            # Skip `case` pattern arms (`a)`) and one-line function headers (`f()`).
-            idx += 1
+        if tok == "case" and idx + 2 < len(tokens) and tokens[idx + 2] == "in":
+            idx += 3
+            continue
+        if tok == "function" and idx + 1 < len(tokens):
+            idx += 2
             continue
         if "=" in tok and not tok.startswith("-"):
             var_name = tok.split("=", 1)[0].removesuffix("+")
@@ -5980,11 +6017,17 @@ def _scan_shell_command_tokens(tokens: list[str]) -> bool:
                 return True
             idx += 1
             continue
+        if tok.endswith(")") and not tok.startswith("-"):
+            # Skip `case` pattern arms (`a)`) and one-line function headers (`f()`).
+            idx += 1
+            continue
         base = tok.rsplit("/", 1)[-1]
-        if base == "rustup" and idx + 2 < len(tokens) and tokens[idx + 1] == "run":
-            idx += 3
+        if base == "rustup" and idx + 1 < len(tokens) and tokens[idx + 1] == "run":
+            idx += 2
             while idx < len(tokens) and tokens[idx].startswith("-"):
                 idx += 1
+            if idx < len(tokens):
+                idx += 1  # consume <toolchain>
             continue
         if base == "env":
             idx += 1
@@ -6126,7 +6169,10 @@ def _step_run_has_ci_debug_override(run_text: str) -> bool:
         if _CI_DEBUG_GITHUB_ENV_VAR_RE.search("\n".join(non_comment_lines)):
             return True
 
-    for tokens in _tokenize_shell_script(run_text):
+    commands, malformed = _tokenize_shell_script(run_text)
+    if malformed:
+        return True
+    for tokens in commands:
         if _scan_shell_command_tokens(tokens):
             return True
     return False
@@ -6404,15 +6450,29 @@ def _extract_step_run_text_fallback(step: str) -> tuple[str, str | None]:
             while cont_items and cont_items[-1] is None:
                 cont_items.pop()
             if cont_items:
-                raw_first = decoded[2].strip()
+                raw_first = _yaml_strip_trailing_comment(decoded[2]).strip()
                 if not raw_first:
-                    # Value starts on the next indented line (`run:\n  ...`).
-                    first_non_blank = next((c for c in cont_items if c is not None), "")
-                    if first_non_blank.startswith(("'", '"', "*", "&", "!")):
-                        return "", "unsupported next-line tagged/anchored/quoted `run:` scalar in fallback parser"
+                    # Value starts on a subsequent indented line (`run:\n  ...`);
+                    # skip YAML comment-only lines before inspecting the value.
+                    filtered_items: list[str | None] = []
+                    seen_value = False
+                    for item in cont_items:
+                        if item is None:
+                            if seen_value:
+                                filtered_items.append(None)
+                        elif not seen_value and item.startswith("#"):
+                            continue
+                        else:
+                            seen_value = True
+                            filtered_items.append(item)
+                    if not filtered_items:
+                        return "", None
+                    first_non_blank = next((c for c in filtered_items if c is not None), "")
+                    if first_non_blank.startswith(("'", '"', "*", "&", "!", "|", ">")):
+                        return "", "unsupported next-line block/tagged/anchored/quoted `run:` scalar in fallback parser"
                     parts: list[str] = []
                     blank_run = 0
-                    for item in cont_items:
+                    for item in filtered_items:
                         if item is None:
                             if parts:
                                 blank_run += 1
@@ -6620,15 +6680,24 @@ def _has_unsupported_fallback_yaml_syntax(workflow_text: str) -> str | None:
         # sequence items like `- ?literal`.
         if re.match(r"^[ \t]*(?:-[ \t]+)?(?:[&!*]|\?(?:[ \t]+|$))", line):
             return f"unsupported explicit YAML key or node property in fallback parser: {line.strip()!r}"
-        # Reject inline flow explicit keys like `on: { ? workflow_dispatch : {} }` outside quotes.
+        # Reject inline flow explicit keys like `on: { ? workflow_dispatch : {} }`
+        # only when actually inside `{ ... }` braces outside quotes.
         in_quote: str | None = None
+        brace_depth = 0
         for pos, ch in enumerate(line):
             if in_quote is None:
                 if ch == "#":
                     break
                 if ch in ("'", '"'):
                     in_quote = ch
-                elif ch in ("{", ","):
+                elif ch == "{":
+                    brace_depth += 1
+                    rest = line[pos + 1 :].lstrip(" \t")
+                    if rest == "?" or rest.startswith(("? ", "?\t")):
+                        return f"unsupported flow explicit `?` YAML key in fallback parser: {line.strip()!r}"
+                elif ch == "}":
+                    brace_depth = max(0, brace_depth - 1)
+                elif ch == "," and brace_depth > 0:
                     rest = line[pos + 1 :].lstrip(" \t")
                     if rest == "?" or rest.startswith(("? ", "?\t")):
                         return f"unsupported flow explicit `?` YAML key in fallback parser: {line.strip()!r}"
@@ -11504,8 +11573,14 @@ def self_test() -> int:
             ("here-string <<< before cargo", "<<< x cargo test --no-run --config profile.dev.debug=2"),
             ("here-string <<< -- before --config", "cargo test --no-run <<< -- --config profile.test.debug=2"),
             ("redirection between env and --unset", "env >/dev/null --unset CARGO_PROFILE_DEV_DEBUG cargo test --no-run"),
+            ("adjacent 2>&1>/dev/null before env --unset", "env 2>&1>/dev/null --unset CARGO_PROFILE_DEV_DEBUG cargo test --no-run"),
             ("rustup run wrapper", "rustup run stable cargo test --no-run --config profile.test.debug=2"),
+            ("rustup run --install wrapper", "rustup run --install stable cargo test --no-run --config profile.test.debug=2"),
+            ("builtin export", "builtin export CARGO_PROFILE_DEV_DEBUG=2"),
             ("case arm prefix", "a) CARGO_PROFILE_DEV_DEBUG=2 cargo test --no-run;;"),
+            ("single-line case statement", "case stable in stable) cargo test --no-run --config profile.test.debug=2 ;; esac"),
+            ("function keyword header", "function f() { cargo test --no-run --config profile.test.debug=2; }; f"),
+            ("assignment value ending in paren", "RUSTFLAGS=-L/tmp/dir(1) cargo test --no-run"),
             ("one-line function body", "f() { cargo test --no-run --config profile.test.debug=2; }; f"),
             ("named fd {fd}> before inline env", "{fd}>/tmp/x CARGO_PROFILE_DEV_DEBUG=2 cargo test --no-run"),
             ("quoted > then & cargo", 'echo ">"& cargo test --no-run --config profile.dev.debug=2'),
@@ -11624,6 +11699,14 @@ def self_test() -> int:
                 "            --config profile.test.debug=2\n",
             ),
             (
+                "ANSI-C heredoc <<$'EOF' followed by cargo --config",
+                "        run: |\n"
+                "          cat <<$'EOF' > /tmp/msg\n"
+                "          hello\n"
+                "          EOF\n"
+                "          cargo test --no-run --config profile.test.debug=2\n",
+            ),
+            (
                 "folded block more-indented whitespace line after backslash",
                 "        run: >\n"
                 "          echo pre \\\n"
@@ -11738,10 +11821,10 @@ def self_test() -> int:
                 f"self-test ({mode_label}): {label} must not be falsely flagged (got {ok_errs!r})",
                 failures,
             )
-        # Direct Swatinem/rust-cache with quoted '*scratch' shared-key and plain '?literal'
-        # list items must NOT trigger false-positive anchor/explicit-key errors.
+        # Direct Swatinem/rust-cache with quoted '*scratch' shared-key, plain ', ? debug'
+        # in workflow name, and plain '- ?literal' list items must NOT false-positive.
         quoted_star_wf = (
-            "name: QuotedStar\non:\n  workflow_dispatch:\njobs:\n"
+            "name: Build widgets, ? debug\non:\n  workflow_dispatch:\njobs:\n"
             "  scratch-job:\n"
             "    runs-on: ubuntu-26.04\n"
             "    steps:\n"
@@ -12090,6 +12173,22 @@ def self_test() -> int:
                 ci_live_text.replace(
                     "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
                     "        run:\n          !!str cargo test --no-run --config profile.dev.debug=2\n",
+                    1,
+                ),
+            ),
+            (
+                "next-line comment before plain run: override",
+                ci_live_text.replace(
+                    "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
+                    "        run:\n          # comment before value\n          cargo test --no-run --config profile.dev.debug=2\n",
+                    1,
+                ),
+            ),
+            (
+                "next-line block indicator | on run:",
+                ci_live_text.replace(
+                    "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
+                    "        run:\n          |\n            cargo test --no-run --config profile.dev.debug=2\n",
                     1,
                 ),
             ),
