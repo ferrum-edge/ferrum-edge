@@ -267,7 +267,7 @@ async fn stored_api_spec_bundle_matches(
     bundle: &ExtractedBundle,
     spec: &ApiSpec,
 ) -> Result<bool, anyhow::Error> {
-    let Some(current_spec) = db.get_api_spec(&spec.namespace, &spec.id).await? else {
+    let Some(current_spec) = db.get_api_spec_for_write(&spec.namespace, &spec.id).await? else {
         return Ok(false);
     };
     if current_spec.updated_at != spec.updated_at || current_spec.content_hash != spec.content_hash
@@ -461,7 +461,7 @@ async fn compensate_late_api_spec_delete(
     .await?
     {
         let remains_deleted = db
-            .get_api_spec(&previous_spec.namespace, &previous_spec.id)
+            .get_api_spec_conditional_meta(&previous_spec.namespace, &previous_spec.id)
             .await?
             .is_none()
             && db
@@ -475,7 +475,7 @@ async fn compensate_late_api_spec_delete(
         });
     }
     if db
-        .get_api_spec(&previous_spec.namespace, &previous_spec.id)
+        .get_api_spec_conditional_meta(&previous_spec.namespace, &previous_spec.id)
         .await?
         .is_some()
         || db
@@ -4698,7 +4698,7 @@ pub async fn handle_put_api_spec(
     // potentially large body. The spec is re-read under the namespace
     // admission guard below before any prospective validation uses it.
     if deployment_original.is_none() {
-        match db.get_api_spec(namespace, id).await {
+        match db.get_api_spec_conditional_meta(namespace, id).await {
             Ok(Some(_)) => {}
             Ok(None) => return Ok(error_response(ApiSpecError::NotFound)),
             Err(e) => return Ok(error_response(classify_db_error(e))),

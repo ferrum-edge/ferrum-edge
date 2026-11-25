@@ -7106,12 +7106,41 @@ mod inner {
             Ok(stored.finish())
         }
 
+        async fn load_deployment_snapshot_with_slots(
+            &self,
+            namespace: &str,
+            codec_slots: &std::sync::Arc<tokio::sync::Semaphore>,
+        ) -> Result<DeploymentSnapshot, anyhow::Error> {
+            let _generation_pin = self.connection_generation.clone().read_owned().await;
+            if !self.replica_set_configured() {
+                return Err(anyhow::Error::new(Self::atomic_batch_standalone_refusal()));
+            }
+            let connection = self.connection();
+            let mut session = connection.client.start_session().await?;
+            session
+                .start_transaction()
+                .read_concern(ReadConcern::snapshot())
+                .write_concern(WriteConcern::majority())
+                .await?;
+            let snapshot = self
+                .deployment_snapshot_in_session(&mut session, namespace, None)
+                .await?;
+            session.commit_transaction().await?;
+            crate::admin::api_specs::external_refs::validate_api_spec_snapshots_async(
+                &snapshot.snapshot().api_specs,
+                codec_slots,
+            )
+            .await?;
+            Ok(snapshot)
+        }
+
         async fn mutate_deployment_in_session(
             &self,
             session: &mut ClientSession,
             id: &str,
             precondition: &DeploymentPrecondition<'_>,
             replacement: Option<(&crate::admin::api_specs::ExtractedBundle, &ApiSpec)>,
+            prevalidated_spec_doc: Option<&Document>,
         ) -> Result<(), anyhow::Error> {
             let namespace = precondition.namespace;
             let generation = i64::try_from(precondition.lease.generation)?;
@@ -7270,11 +7299,18 @@ mod inner {
                             .session(&mut *session)
                             .await?
                             .ok_or(DeploymentGraphInvalid)?;
+                        let desired_spec_doc = match prevalidated_spec_doc {
+                            Some(doc) => doc.clone(),
+                            None => api_spec_to_doc_async(spec).await?,
+                        };
                         let document = merge_deployment_document(
                             old,
-                            api_spec_to_doc_async(previous_spec).await?,
-                            api_spec_to_doc_async(spec).await?,
+                            api_spec_to_doc_unchecked(previous_spec)?,
+                            desired_spec_doc,
                         );
+                        if mongodb::bson::to_vec(&document)?.len() > 15 * 1024 * 1024 {
+                            return Err(DeploymentGraphInvalid.into());
+                        }
                         let replaced = self
                             .api_specs()
                             .replace_one(
@@ -7328,7 +7364,9 @@ mod inner {
                         .filter(|p| p.api_spec_id.as_deref() == Some(spec.id.as_str()))
                         .map(|p| p.id.clone())
                         .collect();
-                    let prepared = prepare_api_spec_bundle_docs(bundle, spec, None).await?;
+                    let prepared =
+                        prepare_api_spec_bundle_docs(bundle, spec, prevalidated_spec_doc.cloned())
+                            .await?;
                     let previous_doc = self
                         .proxies()
                         .find_one(doc! {
@@ -7512,9 +7550,12 @@ mod inner {
                         .ok_or(DeploymentGraphInvalid)?;
                     let spec_doc = merge_deployment_document(
                         old_spec_doc,
-                        api_spec_to_doc_async(previous_spec).await?,
+                        api_spec_to_doc_unchecked(previous_spec)?,
                         prepared.spec,
                     );
+                    if mongodb::bson::to_vec(&spec_doc)?.len() > 15 * 1024 * 1024 {
+                        return Err(DeploymentGraphInvalid.into());
+                    }
                     let replaced = self
                         .api_specs()
                         .replace_one(
@@ -7579,12 +7620,17 @@ mod inner {
             if !self.replica_set_configured() {
                 return Err(anyhow::Error::new(Self::atomic_batch_standalone_refusal()));
             }
-            if let Some((_, spec)) = replacement {
-                let encoded = mongodb::bson::to_vec(&api_spec_to_doc_async(spec).await?)?;
-                if encoded.len() > 15 * 1024 * 1024 {
-                    return Err(DeploymentGraphInvalid.into());
+            let prevalidated_spec_doc = match replacement {
+                Some((_, spec)) => {
+                    let doc = api_spec_to_doc_async(spec).await?;
+                    let encoded = mongodb::bson::to_vec(&doc)?;
+                    if encoded.len() > 15 * 1024 * 1024 {
+                        return Err(DeploymentGraphInvalid.into());
+                    }
+                    Some(doc)
                 }
-            }
+                None => None,
+            };
             let mut mtls_leases = self
                 .acquire_mtls_dns_admission_leases([precondition.namespace])
                 .await
@@ -7615,9 +7661,18 @@ mod inner {
                             id,
                             precondition,
                             replacement,
+                            prevalidated_spec_doc.as_ref(),
                             Arc::clone(&callback_failed),
                         ),
-                        |session, (this, id, precondition, replacement, callback_failed)| {
+                        |session,
+                         (
+                            this,
+                            id,
+                            precondition,
+                            replacement,
+                            prevalidated_spec_doc,
+                            callback_failed,
+                        )| {
                             Box::pin(async move {
                                 callback_failed.store(false, Ordering::Release);
                                 this.mutate_deployment_in_session(
@@ -7625,6 +7680,7 @@ mod inner {
                                     id,
                                     precondition,
                                     *replacement,
+                                    *prevalidated_spec_doc,
                                 )
                                 .await
                                 .map_err(|error| {
@@ -9995,7 +10051,7 @@ mod inner {
 
     /// Convert an [`ApiSpec`] into a BSON `Document` for storage without
     /// running external-ref snapshot validation. Callers must validate through
-    /// [`api_spec_to_doc_async`] (or [`api_spec_to_doc`] in unit tests).
+    /// [`api_spec_to_doc_async`] (or `api_spec_to_doc` in unit tests).
     fn api_spec_to_doc_unchecked(spec: &ApiSpec) -> Result<Document, anyhow::Error> {
         let mut doc = mongodb::bson::to_document(spec)?;
         // Composite `_id` ("{namespace}:{id}") — issue #4627.
@@ -11046,27 +11102,22 @@ mod inner {
             &self,
             namespace: &str,
         ) -> Result<DeploymentSnapshot, anyhow::Error> {
-            let _generation_pin = self.connection_generation.clone().read_owned().await;
-            if !self.replica_set_configured() {
-                return Err(anyhow::Error::new(Self::atomic_batch_standalone_refusal()));
-            }
-            let connection = self.connection();
-            let mut session = connection.client.start_session().await?;
-            session
-                .start_transaction()
-                .read_concern(ReadConcern::snapshot())
-                .write_concern(WriteConcern::majority())
-                .await?;
-            let snapshot = self
-                .deployment_snapshot_in_session(&mut session, namespace, None)
-                .await?;
-            session.commit_transaction().await?;
-            crate::admin::api_specs::external_refs::validate_api_spec_snapshots_async(
-                &snapshot.snapshot().api_specs,
+            self.load_deployment_snapshot_with_slots(
+                namespace,
                 &crate::admin::api_specs::SPEC_READ_CODEC_SLOTS,
             )
-            .await?;
-            Ok(snapshot)
+            .await
+        }
+
+        async fn load_deployment_snapshot_for_write(
+            &self,
+            namespace: &str,
+        ) -> Result<DeploymentSnapshot, anyhow::Error> {
+            self.load_deployment_snapshot_with_slots(
+                namespace,
+                &crate::admin::api_specs::SPEC_WRITE_CODEC_SLOTS,
+            )
+            .await
         }
 
         async fn remove_deployment_conditionally(

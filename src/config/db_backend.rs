@@ -2648,6 +2648,16 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         Err(anyhow::anyhow!("Deployment authority unavailable"))
     }
 
+    /// Write-side deployment snapshot preflight validated under
+    /// `SPEC_WRITE_CODEC_SLOTS` so viewer `GET` bursts cannot delay conditional
+    /// `PUT`/`DELETE` admission.
+    async fn load_deployment_snapshot_for_write(
+        &self,
+        namespace: &str,
+    ) -> Result<crate::config::deployment_mutation::DeploymentSnapshot, anyhow::Error> {
+        self.load_deployment_snapshot(namespace).await
+    }
+
     /// Compare original evidence and remove only the selected cascade atomically.
     async fn remove_deployment_conditionally(
         &self,

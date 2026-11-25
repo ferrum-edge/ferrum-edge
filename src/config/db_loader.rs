@@ -3452,6 +3452,7 @@ impl DatabaseStore {
     async fn load_deployment_snapshot_inner(
         &self,
         namespace: &str,
+        codec_slots: &std::sync::Arc<tokio::sync::Semaphore>,
     ) -> Result<DeploymentSnapshot, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
         self.configure_full_load_snapshot(&mut tx).await?;
@@ -3461,7 +3462,7 @@ impl DatabaseStore {
         tx.commit().await?;
         crate::admin::api_specs::external_refs::validate_api_spec_snapshots_async(
             &snapshot.snapshot().api_specs,
-            &crate::admin::api_specs::SPEC_READ_CODEC_SLOTS,
+            codec_slots,
         )
         .await?;
         Ok(snapshot)
@@ -13152,7 +13153,22 @@ impl DatabaseBackend for DatabaseStore {
         &self,
         namespace: &str,
     ) -> Result<DeploymentSnapshot, anyhow::Error> {
-        self.load_deployment_snapshot_inner(namespace).await
+        self.load_deployment_snapshot_inner(
+            namespace,
+            &crate::admin::api_specs::SPEC_READ_CODEC_SLOTS,
+        )
+        .await
+    }
+
+    async fn load_deployment_snapshot_for_write(
+        &self,
+        namespace: &str,
+    ) -> Result<DeploymentSnapshot, anyhow::Error> {
+        self.load_deployment_snapshot_inner(
+            namespace,
+            &crate::admin::api_specs::SPEC_WRITE_CODEC_SLOTS,
+        )
+        .await
     }
 
     async fn remove_deployment_conditionally(
