@@ -508,18 +508,23 @@ mod windows_confined_files {
     fn windows_repeated_success_and_refusal_do_not_grow_process_handles() {
         const CHILD_ENV: &str = "FERRUM_WINDOWS_HANDLE_LEAK_CHILD";
         const TEST_FILTER: &str = "windows_confined_files::windows_repeated_success_and_refusal_do_not_grow_process_handles";
+        const CHILD_ARGS: [&str; 4] = ["--exact", TEST_FILTER, "--test-threads=1", "--nocapture"];
         // `GetProcessHandleCount` observes every handle in the current process.
         // Re-execute this test alone in a dedicated child process unless invoked
-        // via our exact single-test child command (`CHILD_ENV=1` + `--exact`) so
+        // via our exact single-test child command (`CHILD_ENV=1` + exact args) so
         // sibling test threads or an inherited env var cannot skew the count.
+        let actual_args: Vec<String> = std::env::args().skip(1).collect();
         let is_isolated_child = std::env::var(CHILD_ENV).as_deref() == Ok("1")
-            && std::env::args().any(|arg| arg == "--exact")
-            && std::env::args().any(|arg| arg == TEST_FILTER);
+            && actual_args.len() == CHILD_ARGS.len()
+            && actual_args
+                .iter()
+                .zip(CHILD_ARGS.iter())
+                .all(|(actual, expected)| actual == expected);
         if !is_isolated_child {
             let exe = std::env::current_exe().unwrap();
             let output = std::process::Command::new(exe)
                 .env(CHILD_ENV, "1")
-                .args(["--exact", TEST_FILTER, "--test-threads=1", "--nocapture"])
+                .args(CHILD_ARGS)
                 .output()
                 .unwrap();
             let stdout = String::from_utf8_lossy(&output.stdout);

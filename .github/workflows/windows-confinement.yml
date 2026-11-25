@@ -103,9 +103,12 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $perlVersion = & $env:OPENSSL_SRC_PERL -e 'print $^V'
+          if ($env:OPENSSL_SRC_PERL -ne 'C:\Strawberry\perl\bin\perl.exe') {
+            throw "OPENSSL_SRC_PERL drifted from the probed Strawberry Perl path: $env:OPENSSL_SRC_PERL"
+          }
+          $perlVersion = & 'C:\Strawberry\perl\bin\perl.exe' -e 'print $^V'
           if ([string]::IsNullOrWhiteSpace($perlVersion)) {
-            throw "could not detect Strawberry Perl version at $env:OPENSSL_SRC_PERL"
+            throw "could not detect Strawberry Perl version at C:\Strawberry\perl\bin\perl.exe"
           }
           "OPENSSL_SRC_PERL_VERSION=$perlVersion" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
 
