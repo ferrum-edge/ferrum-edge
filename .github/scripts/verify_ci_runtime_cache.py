@@ -6295,31 +6295,46 @@ def _split_shell_pipelines(run_text: str) -> list[str]:
     pipelines: list[str] = []
     buf: list[str] = []
     quote: str | None = None
-    pending_heredocs: list[tuple[str, bool]] = []
+    # Each pending heredoc tracks `(delimiter, strip_tabs, owner_pipeline_idx)` where
+    # `owner_pipeline_idx is None` means it belongs to the currently open `buf`.
+    pending_heredocs: list[tuple[str, bool, int | None]] = []
     expecting_heredoc_delim: tuple[bool, bool] | None = None
-    delim_buf: list[str] = []
+    delim_bytes = bytearray()
     delim_has_token = False
     arith_paren_stack: list[int] = []
     idx = 0
     n = len(run_text)
 
+    def _delim_append(text: str) -> None:
+        delim_bytes.extend(text.encode("utf-8", errors="surrogateescape"))
+
     def _finish_delim() -> None:
-        nonlocal expecting_heredoc_delim, delim_buf, delim_has_token
+        nonlocal expecting_heredoc_delim, delim_has_token
         if expecting_heredoc_delim is not None and delim_has_token:
-            pending_heredocs.append(("".join(delim_buf), expecting_heredoc_delim[1]))
+            pending_heredocs.append(
+                (
+                    delim_bytes.decode("utf-8", errors="surrogateescape"),
+                    expecting_heredoc_delim[1],
+                    None,
+                )
+            )
             expecting_heredoc_delim = None
-            delim_buf = []
+            delim_bytes.clear()
             delim_has_token = False
 
     def _flush_pipeline() -> None:
-        nonlocal buf, expecting_heredoc_delim, delim_buf, delim_has_token
+        nonlocal buf, expecting_heredoc_delim, delim_has_token
         _finish_delim()
         expecting_heredoc_delim = None
-        delim_buf = []
+        delim_bytes.clear()
         delim_has_token = False
         text = "".join(buf).strip()
         if text:
+            owner_idx = len(pipelines)
             pipelines.append(text)
+            for pos_hd, (d, st, prev_owner) in enumerate(pending_heredocs):
+                if prev_owner is None:
+                    pending_heredocs[pos_hd] = (d, st, owner_idx)
         buf = []
 
     def _ends_with_pipe(parts: list[str]) -> bool:
@@ -6348,7 +6363,7 @@ def _split_shell_pipelines(run_text: str) -> list[str]:
                     continue
                 buf.append(run_text[idx : idx + 2])
                 if expecting_heredoc_delim is not None:
-                    delim_buf.append(run_text[idx + 1])
+                    _delim_append(run_text[idx + 1])
                     delim_has_token = True
                 idx += 2
                 continue
@@ -6400,12 +6415,12 @@ def _split_shell_pipelines(run_text: str) -> list[str]:
                 buf.append(ch)
                 idx += 1
                 continue
-            if (
-                not arith_paren_stack
-                and ch == "<"
-                and run_text[idx : idx + 2] == "<<"
-                and run_text[idx : idx + 3] != "<<<"
-            ):
+            if not arith_paren_stack and run_text[idx : idx + 3] == "<<<":
+                _finish_delim()
+                buf.append("<<<")
+                idx += 3
+                continue
+            if not arith_paren_stack and ch == "<" and run_text[idx : idx + 2] == "<<":
                 _finish_delim()
                 op = "<<-" if run_text[idx : idx + 3] == "<<-" else "<<"
                 buf.append(op)
@@ -6433,11 +6448,14 @@ def _split_shell_pipelines(run_text: str) -> list[str]:
                 continue
             if ch == "\n":
                 _finish_delim()
+                # Determine pipe continuation BEFORE appending heredoc bodies so
+                # `cat <<'EOF' |\n...\nEOF\n  tee -a "$GITHUB_ENV"` stays one pipeline.
+                continues_pipe = _ends_with_pipe(buf)
                 idx += 1
                 if pending_heredocs:
-                    buf.append("\n")
                     while pending_heredocs and idx < n:
-                        delim, strip_tabs = pending_heredocs.pop(0)
+                        delim, strip_tabs, owner_idx = pending_heredocs.pop(0)
+                        body_chunks: list[str] = []
                         while idx < n:
                             nl = run_text.find("\n", idx)
                             if nl < 0:
@@ -6446,13 +6464,18 @@ def _split_shell_pipelines(run_text: str) -> list[str]:
                             else:
                                 hd_line = run_text[idx:nl]
                                 idx = nl + 1
-                            buf.append(hd_line + "\n")
+                            body_chunks.append(hd_line + "\n")
                             cand = hd_line.rstrip("\r")
                             if strip_tabs:
                                 cand = cand.lstrip("\t")
                             if cand == delim:
                                 break
-                if not _ends_with_pipe(buf):
+                        body_text = "\n" + "".join(body_chunks)
+                        if owner_idx is not None:
+                            pipelines[owner_idx] += body_text
+                        else:
+                            buf.append(body_text)
+                if not continues_pipe:
                     _flush_pipeline()
                 else:
                     buf.append("\n")
@@ -6462,7 +6485,7 @@ def _split_shell_pipelines(run_text: str) -> list[str]:
                 if ch in (">", "<"):
                     _finish_delim()
                 else:
-                    delim_buf.append(ch)
+                    _delim_append(ch)
                     delim_has_token = True
             idx += 1
         elif quote == "'":
@@ -6470,33 +6493,81 @@ def _split_shell_pipelines(run_text: str) -> list[str]:
             if ch == "'":
                 quote = None
             elif expecting_heredoc_delim is not None:
-                delim_buf.append(ch)
+                _delim_append(ch)
             idx += 1
         elif quote == "$'":
             if ch == "\\" and idx + 1 < n:
+                nxt = run_text[idx + 1]
+                if nxt == "x":
+                    hex_m = re.match(r"[0-9A-Fa-f]{1,2}", run_text[idx + 2 : idx + 4])
+                    if hex_m:
+                        buf.append(run_text[idx : idx + 2 + len(hex_m.group(0))])
+                        if expecting_heredoc_delim is not None:
+                            delim_bytes.append(int(hex_m.group(0), 16))
+                        idx += 2 + len(hex_m.group(0))
+                        continue
+                if nxt in ("u", "U"):
+                    max_digits = 4 if nxt == "u" else 8
+                    hex_m = re.match(
+                        rf"[0-9A-Fa-f]{{1,{max_digits}}}",
+                        run_text[idx + 2 : idx + 2 + max_digits],
+                    )
+                    if hex_m:
+                        buf.append(run_text[idx : idx + 2 + len(hex_m.group(0))])
+                        if expecting_heredoc_delim is not None:
+                            cp = int(hex_m.group(0), 16)
+                            if 0 <= cp <= 0x10FFFF and not (0xD800 <= cp <= 0xDFFF):
+                                _delim_append(chr(cp))
+                            else:
+                                _delim_append(run_text[idx : idx + 2 + len(hex_m.group(0))])
+                        idx += 2 + len(hex_m.group(0))
+                        continue
+                if nxt in "01234567":
+                    oct_m = re.match(r"[0-7]{1,3}", run_text[idx + 1 : idx + 4])
+                    if oct_m:
+                        buf.append(run_text[idx : idx + 1 + len(oct_m.group(0))])
+                        if expecting_heredoc_delim is not None:
+                            delim_bytes.append(int(oct_m.group(0), 8) & 0xFF)
+                        idx += 1 + len(oct_m.group(0))
+                        continue
                 buf.append(run_text[idx : idx + 2])
                 if expecting_heredoc_delim is not None:
-                    delim_buf.append(run_text[idx + 1])
+                    esc_map = {
+                        "a": "\a",
+                        "b": "\b",
+                        "e": "\x1b",
+                        "E": "\x1b",
+                        "f": "\f",
+                        "n": "\n",
+                        "r": "\r",
+                        "t": "\t",
+                        "v": "\v",
+                        "'": "'",
+                        '"': '"',
+                        "\\": "\\",
+                        "?": "?",
+                    }
+                    _delim_append(esc_map.get(nxt, "\\" + nxt))
                 idx += 2
                 continue
             buf.append(ch)
             if ch == "'":
                 quote = None
             elif expecting_heredoc_delim is not None:
-                delim_buf.append(ch)
+                _delim_append(ch)
             idx += 1
         else:  # double quote
             if ch == "\\" and idx + 1 < n:
                 buf.append(run_text[idx : idx + 2])
                 if expecting_heredoc_delim is not None:
-                    delim_buf.append(run_text[idx + 1])
+                    _delim_append(run_text[idx + 1])
                 idx += 2
                 continue
             buf.append(ch)
             if ch == '"':
                 quote = None
             elif expecting_heredoc_delim is not None:
-                delim_buf.append(ch)
+                _delim_append(ch)
             idx += 1
     _flush_pipeline()
     return pipelines
@@ -12242,6 +12313,21 @@ def self_test() -> int:
                 "          EOF\n",
             ),
             (
+                "heredoc write to GITHUB_ENV followed by semicolon command",
+                "        run: |\n"
+                "          cat <<'EOF' >> \"$GITHUB_ENV\"; echo done\n"
+                "          CARGO_PROFILE_TEST_DEBUG=2\n"
+                "          EOF\n",
+            ),
+            (
+                "heredoc feeding wrapped tee pipeline to GITHUB_ENV",
+                "        run: |\n"
+                "          cat <<'EOF' |\n"
+                "          CARGO_PROFILE_TEST_DEBUG=2\n"
+                "          EOF\n"
+                '            tee -a "$GITHUB_ENV"\n',
+            ),
+            (
                 "plain multiline scalar blank-line break before cargo --config",
                 "        run: echo hi\n"
                 "\n"
@@ -12368,6 +12454,13 @@ def self_test() -> int:
             (
                 "semicolon-separated CARGO_TARGET_DIR log and unrelated GITHUB_ENV write",
                 '        run: echo "CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-target}"; echo "FERRUM_TEST_MODE=1" >> "$GITHUB_ENV"\n',
+            ),
+            (
+                "here-string <<< followed by CARGO_TARGET_DIR log and unrelated GITHUB_ENV write",
+                "        run: |\n"
+                "          cat <<< 'ready'\n"
+                '          echo "CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-target}"\n'
+                '          echo "FERRUM_TEST_MODE=1" >> "$GITHUB_ENV"\n',
             ),
             (
                 "folded scalar paragraph break separating cargo and kind --config",
