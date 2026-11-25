@@ -68,7 +68,7 @@ no-op) is asserted in
 [`gateway_trust_runtime_publication_tests.rs`](../tests/unit/gateway_core/gateway_trust_runtime_publication_tests.rs).
 
 Live, backend-by-backend acceptance runs in the hosted `Functional Tests
-(data-plane)` job through
+(data-plane-runtime)` job through
 [`functional_gateway_trust_bundle_ha_test.rs`](../tests/functional/functional_gateway_trust_bundle_ha_test.rs):
 
 | Acceptance criterion | Where it is proved live |

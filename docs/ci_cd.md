@@ -4126,10 +4126,13 @@ This heading is historical: no job produces or restores a
 - **Netns Source Capture** and **Two-Cluster Mesh Live** (in `ci.yml`) and the
   **Ambient host-UDP live-kernel** job (`ambient-host-udp-live.yml`) call
   `setup-rust-ci` with shared key `ci-debug` and the default `save: "false"`,
-  and compile with `CARGO_BUILD_JOBS=3` and
-  `CARGO_PROFILE_DEV_DEBUG=line-tables-only`. They restore through
+  and compile with `CARGO_BUILD_JOBS=3`, `CARGO_PROFILE_DEV_DEBUG=0`,
+  `CARGO_PROFILE_TEST_DEBUG=0`, `CARGO_PROFILE_DEV_SPLIT_DEBUGINFO=off`, and
+  `CARGO_PROFILE_TEST_SPLIT_DEBUGINFO=off`. They restore through
   `Swatinem/rust-cache` the archive Unit Tests (`core` shard) saves on main,
-  and never save.
+  and never save. All 12 `ci-debug` lane members share those exact profile
+  settings (while `coverage.yml` and `fuzz-smoke` keep `line-tables-only`
+  under their own cache keys).
 
 Matching `ubuntu-26.04` runner labels and Cargo download variables do not by
 themselves establish a shared archive: the rust-cache key also hashes every

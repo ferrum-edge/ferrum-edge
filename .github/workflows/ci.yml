@@ -558,12 +558,16 @@ jobs:
     env:
       # Cold-cache full-workspace compiles repeatedly kill this hosted runner
       # ("The runner has received a shutdown signal" + exit 143) when several
-      # full-debuginfo link jobs overlap. Cap cargo's parallelism and shrink
-      # debuginfo to line tables (backtraces keep file:line) so a cold compile
-      # fits the runner's memory/disk. Same values on every job sharing the
-      # `ci-debug` rust-cache lane so cached artifact fingerprints stay uniform.
+      # debuginfo-heavy link jobs overlap. Cap cargo's parallelism and omit
+      # DWARF debuginfo (`debug=0`, `split-debuginfo=off`) so compiles, linking,
+      # rust-cache archives, and nextest test archives stay fast and compact.
+      # Same values on every job sharing the `ci-debug` rust-cache lane so
+      # cached artifact fingerprints stay uniform.
       CARGO_BUILD_JOBS: "3"
-      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: "off"
+      CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: "off"
       UNIT_SHARD: ${{ matrix.shard }}
       UNIT_TARGET: ${{ matrix.target }}
       UNIT_PRECOMPILE_TARGETS: ${{ matrix.precompile }}
@@ -794,7 +798,10 @@ jobs:
       # identical profile settings so restored dependency artifacts stay
       # fingerprint-compatible. The lane is produced by Unit Tests on main.
       CARGO_BUILD_JOBS: "3"
-      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: "off"
+      CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: "off"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -915,7 +922,10 @@ jobs:
       # identical profile settings so restored dependency artifacts stay
       # fingerprint-compatible. The lane is produced by Unit Tests on main.
       CARGO_BUILD_JOBS: "3"
-      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: "off"
+      CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: "off"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1003,7 +1013,10 @@ jobs:
       # identical profile settings so restored dependency artifacts stay
       # fingerprint-compatible. The lane is produced by Unit Tests on main.
       CARGO_BUILD_JOBS: "3"
-      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: "off"
+      CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: "off"
     # Issue #4600: the job normally finishes in 16-19 minutes. Without a bound a
     # single hung testcontainers case (a stalled image pull or a ClickHouse HTTP
     # call with no deadline) held the job for the 6-hour default and, inside the
@@ -1048,7 +1061,10 @@ jobs:
       # same repeated exit-143 runner loss during the pkcs11 double-target
       # precompile).
       CARGO_BUILD_JOBS: "3"
-      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: "off"
+      CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: "off"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1160,7 +1176,10 @@ jobs:
       # identical profile settings so restored dependency artifacts stay
       # fingerprint-compatible. The lane is produced by Unit Tests on main.
       CARGO_BUILD_JOBS: "3"
-      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: "off"
+      CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: "off"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1698,7 +1717,10 @@ jobs:
       # compile settings so cached artifact fingerprints stay uniform across
       # the shared key.
       CARGO_BUILD_JOBS: "3"
-      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: "off"
+      CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: "off"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -7183,7 +7205,10 @@ jobs:
       # identical profile settings so restored dependency artifacts stay
       # fingerprint-compatible. The lane is produced by Unit Tests on main.
       CARGO_BUILD_JOBS: "3"
-      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: "off"
+      CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: "off"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -7216,7 +7241,10 @@ jobs:
       # identical profile settings so restored dependency artifacts stay
       # fingerprint-compatible. The lane is produced by Unit Tests on main.
       CARGO_BUILD_JOBS: "3"
-      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: "off"
+      CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: "off"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -7340,7 +7368,10 @@ jobs:
       # identical profile settings so restored dependency artifacts stay
       # fingerprint-compatible. The lane is produced by Unit Tests on main.
       CARGO_BUILD_JOBS: "3"
-      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: "off"
+      CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: "off"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -7493,7 +7524,10 @@ jobs:
       # identical profile settings so restored dependency artifacts stay
       # fingerprint-compatible. The lane is produced by Unit Tests on main.
       CARGO_BUILD_JOBS: "3"
-      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: "off"
+      CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: "off"
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

@@ -5574,6 +5574,122 @@ def check_shared_actions(failures: list[str]) -> None:
     )
 
 
+EXPECTED_CI_DEBUG_PROFILE_ENV = {
+    "CARGO_BUILD_JOBS": "3",
+    "CARGO_PROFILE_DEV_DEBUG": "0",
+    "CARGO_PROFILE_TEST_DEBUG": "0",
+    "CARGO_PROFILE_DEV_SPLIT_DEBUGINFO": "off",
+    "CARGO_PROFILE_TEST_SPLIT_DEBUGINFO": "off",
+}
+CI_DEBUG_LANE_JOBS: tuple[tuple[str, str], ...] = (
+    ("ci.yml", "test-unit"),
+    ("ci.yml", "test-acme"),
+    ("ci.yml", "test-secrets"),
+    ("ci.yml", "test-service-integration"),
+    ("ci.yml", "test-pkcs11-softhsm"),
+    ("ci.yml", "build-test-artifacts"),
+    ("ci.yml", "test-conformance"),
+    ("ci.yml", "build-ebpf-userspace"),
+    ("ci.yml", "ebpf-live"),
+    ("ci.yml", "netns-capture-live"),
+    ("ci.yml", "two-cluster-mesh-live"),
+    ("ambient-host-udp-live.yml", "ambient-host-udp-live"),
+)
+_CI_DEBUG_FINGERPRINT_ENV_PREFIXES = (
+    "CARGO_BUILD_",
+    "CARGO_PROFILE_",
+    "CARGO_INCREMENTAL",
+    "CARGO_ENCODED_RUSTFLAGS",
+    "RUSTFLAGS",
+    "RUSTDOCFLAGS",
+)
+
+
+def _discover_ci_debug_jobs(workflow_text: str, filename: str) -> set[tuple[str, str]]:
+    """Return every `(filename, job_id)` whose steps reference `shared-key: "ci-debug"`."""
+
+    parsed, yaml_avail, yaml_err = _try_yaml_safe_load(workflow_text)
+    discovered: set[tuple[str, str]] = set()
+    if yaml_avail and yaml_err is None and isinstance(parsed, dict):
+        jobs = parsed.get("jobs")
+        if isinstance(jobs, dict):
+            for job_id, job_obj in jobs.items():
+                if not isinstance(job_obj, dict):
+                    continue
+                steps = job_obj.get("steps")
+                if not isinstance(steps, list):
+                    continue
+                for step in steps:
+                    if not isinstance(step, dict):
+                        continue
+                    with_obj = step.get("with")
+                    if isinstance(with_obj, dict) and str(with_obj.get("shared-key", "")) == "ci-debug":
+                        discovered.add((filename, str(job_id)))
+                        break
+        return discovered
+
+    jobs_section = (
+        workflow_text.split("\njobs:\n", 1)[1]
+        if "\njobs:\n" in workflow_text
+        else workflow_text
+    )
+    for job_id in re.findall(r"(?m)^  ([A-Za-z_][A-Za-z0-9_-]*):$", jobs_section):
+        body = extract_job(workflow_text, job_id)
+        if re.search(r"""(?m)^[ \t]+['"]?shared-key['"]?[ \t]*:[ \t]*['"]?ci-debug['"]?[ \t]*(?:#.*)?$""", body):
+            discovered.add((filename, job_id))
+    return discovered
+
+
+def check_ci_debug_lane_profile_uniformity(
+    ci_workflow: str,
+    ambient_workflow: str,
+    failures: list[str],
+) -> None:
+    """Verify every `ci-debug` rust-cache lane member compiles with uniform debug=0 profile env."""
+
+    workflows = {
+        "ci.yml": ci_workflow,
+        "ambient-host-udp-live.yml": ambient_workflow,
+    }
+    discovered = (
+        _discover_ci_debug_jobs(ci_workflow, "ci.yml")
+        | _discover_ci_debug_jobs(ambient_workflow, "ambient-host-udp-live.yml")
+    )
+    expected_set = set(CI_DEBUG_LANE_JOBS)
+    require(
+        discovered == expected_set,
+        f"ci-debug rust-cache lane job inventory drifted: discovered={sorted(discovered)!r}, "
+        f"expected={sorted(expected_set)!r}",
+        failures,
+    )
+    for filename, job_id in CI_DEBUG_LANE_JOBS:
+        body = extract_job(workflows[filename], job_id)
+        require(
+            bool(body),
+            f"ci-debug lane member {filename}/{job_id} is missing",
+            failures,
+        )
+        if not body:
+            continue
+        job_env, env_err = _extract_job_cargo_env(body)
+        require(
+            env_err is None,
+            f"ci-debug lane member {filename}/{job_id} has invalid job env: {env_err}",
+            failures,
+        )
+        fingerprint_env = {
+            k: v
+            for k, v in job_env.items()
+            if k.startswith(_CI_DEBUG_FINGERPRINT_ENV_PREFIXES)
+        }
+        require(
+            fingerprint_env == EXPECTED_CI_DEBUG_PROFILE_ENV,
+            f"ci-debug lane member {filename}/{job_id} must declare uniform fast-build profile env "
+            f"{EXPECTED_CI_DEBUG_PROFILE_ENV!r} (got {fingerprint_env!r})",
+            failures,
+        )
+
+
 def check_docs_and_coverage(failures: list[str]) -> None:
     ci_cd = read_pinned(CI_CD_DOC)
     coverage = read_pinned(COVERAGE_WORKFLOW)
@@ -9833,6 +9949,48 @@ def self_test() -> int:
         failures,
     )
 
+    ci_live_text = read_pinned(CI_WORKFLOW)
+    ambient_live_text = read_pinned(AMBIENT_WORKFLOW)
+    ci_debug_ok: list[str] = []
+    check_ci_debug_lane_profile_uniformity(
+        ci_live_text, ambient_live_text, ci_debug_ok
+    )
+    require(
+        not ci_debug_ok,
+        f"self-test: checked-in ci-debug lane uniformity must pass (got {ci_debug_ok!r})",
+        failures,
+    )
+    drifted_ci = ci_live_text.replace(
+        '      CARGO_PROFILE_DEV_DEBUG: "0"\n',
+        '      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"\n',
+        1,
+    )
+    drifted_ci_errs: list[str] = []
+    check_ci_debug_lane_profile_uniformity(
+        drifted_ci, ambient_live_text, drifted_ci_errs
+    )
+    require(
+        drifted_ci != ci_live_text
+        and any("uniform fast-build profile env" in item for item in drifted_ci_errs),
+        "self-test: drifting CARGO_PROFILE_DEV_DEBUG on a ci.yml ci-debug member must fail",
+        failures,
+    )
+    drifted_ambient = ambient_live_text.replace(
+        '      CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: "off"\n',
+        "",
+        1,
+    )
+    drifted_ambient_errs: list[str] = []
+    check_ci_debug_lane_profile_uniformity(
+        ci_live_text, drifted_ambient, drifted_ambient_errs
+    )
+    require(
+        drifted_ambient != ambient_live_text
+        and any("ambient-host-udp-live" in item for item in drifted_ambient_errs),
+        "self-test: missing CARGO_PROFILE_TEST_SPLIT_DEBUGINFO on ambient-host-udp-live must fail",
+        failures,
+    )
+
     for failure in failures:
         print(f"::error::{failure}", file=sys.stderr)
     return 1 if failures else 0
@@ -9867,6 +10025,9 @@ def main(argv: list[str] | None = None) -> int:
     check_fips(fips, failures)
     check_production_smoke(node, failures)
     check_ambient_workflow_cache_budget(ambient, failures)
+    check_ci_debug_lane_profile_uniformity(
+        read_pinned(CI_WORKFLOW), ambient, failures
+    )
     check_shared_actions(failures)
     for filename, job_name in COMPLETED_CACHE_PRODUCER_JOBS:
         workflow = read_pinned(CI_WORKFLOW.parent / filename)

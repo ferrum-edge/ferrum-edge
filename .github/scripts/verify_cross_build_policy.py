@@ -1839,13 +1839,16 @@ AMBIENT_HOST_UDP_LIVE_JOB = (
       CARGO_NET_RETRY: "10"
       CARGO_HTTP_MULTIPLEXING: "false"
       # Restore-only member of the `ci-debug` rust-cache lane, which Unit
-      # Tests produces on main. Every lane member compiles with these two
+      # Tests produces on main. Every lane member compiles with these profile
       # values so the restored dependency artifacts stay fingerprint-
       # compatible. They also keep the compile inside the 16 GB hosted
-      # runner: with full debuginfo and no job cap, this build was killed
+      # runner: with debuginfo and no job cap, this build was killed
       # mid-`cargo test --lib` (exit 143) or hung past the timeout.
       CARGO_BUILD_JOBS: "3"
-      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: "off"
+      CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: "off"
 
     steps:
       - name: Checkout Ferrum Edge
