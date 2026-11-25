@@ -45948,8 +45948,9 @@ components:
 
             **Parse-time / structural — returned as HTTP 400 Bad Request:**
 
-            - `InvalidJson` — body is not valid JSON, or the parsed JSON document exceeds the
-              500,000-node source-tree ceiling
+            - `InvalidJson` — body is not valid JSON, or the JSON document (root spec or
+              external `$ref` document) exceeds the 500,000-node ceiling counted during
+              deserialization before duplicate object keys collapse
             - `InvalidYaml` — body is not valid YAML, exceeds the bounded YAML anchor/alias
               expansion budgets (depth, alias references, expanded bytes, or work units), or the
               parsed YAML document exceeds the 500,000-node source-tree ceiling

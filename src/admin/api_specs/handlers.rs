@@ -3814,6 +3814,8 @@ pub(crate) async fn exercise_spec_content_response_limits_for_test() -> Result<(
             return Err("bounded JSON parser failed to reject trailing tokens");
         }
         check_json_duplicate_member_limit_parity_for_test()?;
+        crate::admin::api_specs::external_refs::check_external_json_duplicate_member_limit_for_test(
+        )?;
     }
 
     // Scenario F: multi-chunk (> 64 KiB) YAML->JSON conversion streams through

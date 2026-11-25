@@ -1390,40 +1390,55 @@ fn parse_loaded_document(
     bytes: &[u8],
     policy: &EffectiveExternalRefPolicy,
 ) -> Result<LoadedExternalDocument, ExtractError> {
-    if bytes.len() > policy.max_document_bytes {
+    parse_loaded_document_with_limits(
+        uri,
+        bytes,
+        policy.max_document_bytes,
+        super::extractor::MAX_SOURCE_DOCUMENT_NODES,
+    )
+}
+
+fn parse_loaded_document_with_limits(
+    uri: &Url,
+    bytes: &[u8],
+    max_document_bytes: usize,
+    max_nodes: usize,
+) -> Result<LoadedExternalDocument, ExtractError> {
+    if bytes.len() > max_document_bytes {
         return Err(ExtractError::SchemaTooLarge {
             location: "x-ferrum-external-refs".to_string(),
         });
     }
     let format = detect_format(bytes);
-    // Bound external JSON and YAML trees the same way API-spec admission does.
-    const MAX_EXTERNAL_DOC_NODES: usize = super::extractor::MAX_SOURCE_DOCUMENT_NODES;
+    // Bound external JSON and YAML trees the exact same way root API-spec
+    // admission and GET cross-format conversion do (counting JSON object member
+    // values mid-parse before duplicate keys collapse).
     let root = match format {
         "json" => {
-            let parsed: Value = serde_json::from_slice(bytes).map_err(|error| {
-                ExtractError::InvalidJson(format!(
-                    "external document {}: {error}",
-                    redact_reference(uri.as_str())
-                ))
-            })?;
-            let mut budget = MAX_EXTERNAL_DOC_NODES;
-            if !super::extractor::count_value_nodes(&parsed, &mut budget) {
-                return Err(ExtractError::InvalidJson(format!(
-                    "external document {} exceeds expanded node limit; reduce nesting",
-                    redact_reference(uri.as_str())
-                )));
-            }
-            parsed
+            super::extractor::parse_json_slice_bounded(bytes, max_nodes).map_err(|error| {
+                match error {
+                    super::extractor::BoundedJsonError::NodeLimitExceeded => {
+                        ExtractError::InvalidJson(format!(
+                            "external document {} exceeds expanded node limit; reduce nesting",
+                            redact_reference(uri.as_str())
+                        ))
+                    }
+                    super::extractor::BoundedJsonError::Parse(msg) => {
+                        ExtractError::InvalidJson(format!(
+                            "external document {}: {msg}",
+                            redact_reference(uri.as_str())
+                        ))
+                    }
+                }
+            })?
         }
-        _ => super::bounded_yaml::parse_yaml_to_json(bytes, MAX_EXTERNAL_DOC_NODES).map_err(
-            |error| {
-                ExtractError::InvalidYaml(format!(
-                    "external document {}: {}",
-                    redact_reference(uri.as_str()),
-                    error.message()
-                ))
-            },
-        )?,
+        _ => super::bounded_yaml::parse_yaml_to_json(bytes, max_nodes).map_err(|error| {
+            ExtractError::InvalidYaml(format!(
+                "external document {}: {}",
+                redact_reference(uri.as_str()),
+                error.message()
+            ))
+        })?,
     };
     let digest = normalized_document_digest(&root);
     let mut canonical = uri.clone();
@@ -1436,6 +1451,34 @@ fn parse_loaded_document(
         root,
         raw_len: bytes.len(),
     })
+}
+
+/// Test helper verifying that external JSON `$ref` document loading enforces
+/// the same pre-collapse duplicate-member node limit as root admission and GET
+/// conversion, preserves redacted URI diagnostics, and accepts exact-limit docs.
+pub(crate) fn check_external_json_duplicate_member_limit_for_test() -> Result<(), &'static str> {
+    let uri = Url::parse("https://user:secret@schemas.example.com/common.json?token=xyz")
+        .map_err(|_| "failed to parse test external ref URI")?;
+    // 1 object + 5 duplicate member values = 6 nodes pre-collapse, 2 post-collapse.
+    let dup_json = br#"{"a":0,"a":1,"a":2,"a":3,"a":4}"#;
+    match parse_loaded_document_with_limits(&uri, dup_json, 4096, 5) {
+        Err(ExtractError::InvalidJson(msg)) => {
+            if !msg.contains("exceeds expanded node limit")
+                || !msg.contains("schemas.example.com/common.json")
+                || msg.contains("secret")
+                || msg.contains("token=xyz")
+            {
+                return Err("external JSON node-limit error did not preserve redacted URI");
+            }
+        }
+        _ => {
+            return Err("external JSON loader failed to reject duplicate members above node cap");
+        }
+    }
+    if parse_loaded_document_with_limits(&uri, dup_json, 4096, 6).is_err() {
+        return Err("external JSON loader rejected duplicate members at exact node cap");
+    }
+    Ok(())
 }
 
 fn detect_format(bytes: &[u8]) -> &'static str {

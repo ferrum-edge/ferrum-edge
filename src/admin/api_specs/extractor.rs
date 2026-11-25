@@ -6539,6 +6539,8 @@ fn parse_root_document_with_limit(
     Ok((root, actual_format))
 }
 
+const JSON_NODE_LIMIT_ERROR: &str = "JSON document exceeds expanded node limit; reduce nesting";
+
 /// Errors returned by [`parse_json_slice_bounded`] and
 /// [`parse_json_reader_bounded`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6550,9 +6552,7 @@ pub(crate) enum BoundedJsonError {
 impl BoundedJsonError {
     pub(crate) fn message(&self) -> String {
         match self {
-            Self::NodeLimitExceeded => {
-                "JSON document exceeds expanded node limit; reduce nesting".to_string()
-            }
+            Self::NodeLimitExceeded => JSON_NODE_LIMIT_ERROR.to_string(),
             Self::Parse(msg) => msg.clone(),
         }
     }
@@ -6561,7 +6561,8 @@ impl BoundedJsonError {
 /// Node-bounded `serde::de::DeserializeSeed` for `serde_json::Value` that
 /// enforces `max_nodes` **during** deserialization (counting every scalar,
 /// array element, and object member value before duplicate-key collapse),
-/// shared across upload/restore admission and GET cross-format conversion.
+/// shared across upload/restore admission, external `$ref` loading, and GET
+/// cross-format conversion.
 struct BoundedJsonValueSeed<'a> {
     remaining_nodes: &'a mut usize,
     node_limit_exceeded: &'a mut bool,
@@ -6571,9 +6572,7 @@ impl BoundedJsonValueSeed<'_> {
     fn charge_node<E: serde::de::Error>(&mut self) -> Result<(), E> {
         if *self.remaining_nodes == 0 {
             *self.node_limit_exceeded = true;
-            return Err(E::custom(
-                "JSON document exceeds expanded node limit; reduce nesting",
-            ));
+            return Err(E::custom(JSON_NODE_LIMIT_ERROR));
         }
         *self.remaining_nodes -= 1;
         Ok(())
