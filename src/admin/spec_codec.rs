@@ -89,6 +89,38 @@ pub(crate) fn decompress_gzip_capped_to_writer<W: Write>(
     }
 }
 
+/// Streaming `Read` adapter over `GzDecoder<R>` that fails closed with
+/// `ErrorKind::Other` if decompressed output exceeds `max_output` bytes.
+pub(crate) struct CappedGzipReader<R: Read> {
+    decoder: GzDecoder<R>,
+    remaining: usize,
+}
+
+impl<R: Read> CappedGzipReader<R> {
+    pub(crate) fn new(input: R, max_output: usize) -> Self {
+        Self {
+            decoder: GzDecoder::new(input),
+            remaining: max_output,
+        }
+    }
+}
+
+impl<R: Read> Read for CappedGzipReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let read = self.decoder.read(buf)?;
+        if read > self.remaining {
+            return Err(std::io::Error::other(
+                "decompressed size exceeds max_output cap",
+            ));
+        }
+        self.remaining -= read;
+        Ok(read)
+    }
+}
+
 /// Compute the SHA-256 digest of `input` and return it as a lowercase hex
 /// string (64 characters).
 ///
