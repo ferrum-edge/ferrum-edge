@@ -3661,6 +3661,20 @@ pub async fn handle_get_api_spec(
         }
     }
 
+    // Fail fast BEFORE acquiring one of the four process-wide read codec slots
+    // or loading compressed blobs from the database when this connection's
+    // buffered response budget is already exhausted.
+    let response_budget = req
+        .extensions()
+        .get::<crate::admin::AdminConnResponseBudget>()
+        .cloned();
+    if response_budget
+        .as_ref()
+        .is_some_and(crate::admin::AdminConnResponseBudget::is_exhausted)
+    {
+        return Ok(spec_response_budget_unavailable_response());
+    }
+
     // Acquire read codec capacity BEFORE loading the full compressed spec blob
     // from the database so bursts of concurrent reads cannot hold unbounded
     // multi-MiB rows in memory while queued.
@@ -3677,10 +3691,6 @@ pub async fn handle_get_api_spec(
         Err(e) => return Ok(error_response(classify_db_error(e))),
     };
 
-    let response_budget = req
-        .extensions()
-        .get::<crate::admin::AdminConnResponseBudget>()
-        .cloned();
     let max_decompress = max_spec_decompress_bytes(state.admin_spec_max_body_size_mib);
     Ok(spec_content_response_async(
         spec,
@@ -3721,6 +3731,17 @@ pub async fn handle_get_api_spec_by_proxy(
         }
     }
 
+    let response_budget = req
+        .extensions()
+        .get::<crate::admin::AdminConnResponseBudget>()
+        .cloned();
+    if response_budget
+        .as_ref()
+        .is_some_and(crate::admin::AdminConnResponseBudget::is_exhausted)
+    {
+        return Ok(spec_response_budget_unavailable_response());
+    }
+
     let Ok(read_permit) = Arc::clone(&SPEC_READ_CODEC_SLOTS).acquire_owned().await else {
         return Ok(json_resp(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -3734,10 +3755,6 @@ pub async fn handle_get_api_spec_by_proxy(
         Err(e) => return Ok(error_response(classify_db_error(e))),
     };
 
-    let response_budget = req
-        .extensions()
-        .get::<crate::admin::AdminConnResponseBudget>()
-        .cloned();
     let max_decompress = max_spec_decompress_bytes(state.admin_spec_max_body_size_mib);
     Ok(spec_content_response_async(
         spec,

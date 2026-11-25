@@ -1865,12 +1865,16 @@ pub(super) async fn handle_rotate(
                 let requested_surface = surface.to_string();
                 let audit_path = format!("/admin/tls/rotate/{surface}");
                 let settlement = crate::admin::audit::spawn_with_request_slot(async move {
+                    // Queue independent certificate/trust-material watcher
+                    // reloads immediately before awaiting gateway SVID reload
+                    // so a failed or stalled SVID refresh cannot block
+                    // unrelated TLS surfaces.
+                    let accepted =
+                        crate::tls::source::subscription::request_all_material_set_reloads();
                     let svid_revision = match force_reload_gateway_svid(&settlement_state).await {
                         Ok(revision) => Some(revision),
                         Err(response) => return *response,
                     };
-                    let accepted =
-                        crate::tls::source::subscription::request_all_material_set_reloads();
                     if settlement_state.admin_audit_enabled {
                         let event = crate::admin::audit::AuditEvent::new(
                             &settlement_actor,

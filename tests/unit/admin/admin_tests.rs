@@ -1747,6 +1747,14 @@ async fn admin_response_budget_chunks_holds_permit_and_rejects_oversized_payload
         "strip_head_response_body must release response budget immediately"
     );
 
+    // Real HTTP/2 transport proof: when a client stops reading mid-body on a
+    // 256 KiB connection budget, h2 saturates its 64 KiB send buffer while
+    // keeping Stream 1's 200 KiB permit reserved, forcing a concurrent 200 KiB
+    // stream to fail fast with 503 + Retry-After: 1 until Stream 1 drains.
+    ferrum_edge::_test_support::exercise_http2_stalled_response_budget_for_test()
+        .await
+        .expect("HTTP/2 stalled response budget transport test");
+
     // Bounded format conversion must abort before materializing oversized output.
     let json_payload =
         br#"{"openapi":"3.1.0","info":{"title":"Example","version":"1.0.0"},"paths":{}}"#;

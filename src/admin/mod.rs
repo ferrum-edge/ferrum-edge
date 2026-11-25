@@ -1696,7 +1696,8 @@ impl http_body::Body for GuardedAdminBody {
     }
 }
 
-/// Structured result returned by [`exercise_response_budget_wrapper_for_test`].
+/// Structured result returned by the response-budget wrapper test helper.
+#[doc(hidden)]
 pub struct ResponseBudgetWrapperAudit {
     pub frame_count: usize,
     pub available_after_acquire: usize,
@@ -1823,6 +1824,253 @@ pub(crate) fn check_response_budget_limits_for_test(
         && budget.try_acquire_bytes(fitting_bytes).is_none();
     drop(held);
     (oversized_refused, first_admitted, second_refused)
+}
+
+/// Exercise a real HTTP/2 server (`max_send_buf_size = BUDGETED_BODY_CHUNK_BYTES`)
+/// and client over a small paused duplex pipe so `h2`'s send buffer saturates
+/// mid-stream on a 200 KiB budgeted response while the connection budget is
+/// 256 KiB. Verifies that a concurrent 200 KiB request receives `503` with
+/// `Retry-After: 1` while Stream 1 is stalled, and that a follow-up request
+/// succeeds with `200` once Stream 1 drains. Reached through `_test_support`.
+pub(crate) async fn exercise_http2_stalled_response_budget_for_test() -> Result<(), &'static str> {
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll, Waker};
+
+    struct PausedReadIo {
+        inner: tokio::io::DuplexStream,
+        paused: Arc<AtomicBool>,
+        read_waker: Arc<std::sync::Mutex<Option<Waker>>>,
+    }
+
+    impl tokio::io::AsyncRead for PausedReadIo {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.paused.load(Ordering::Acquire) {
+                if let Ok(mut guard) = self.read_waker.lock() {
+                    *guard = Some(cx.waker().clone());
+                }
+                if self.paused.load(Ordering::Acquire) {
+                    return Poll::Pending;
+                }
+            }
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for PausedReadIo {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    const CAPACITY_KIB: u32 = 256;
+    const BODY_BYTES: usize = 200 * 1024;
+    // 16 KiB duplex pipe + 64 KiB h2 max_send_buf_size = 80 KiB < 200 KiB,
+    // guaranteeing Stream 1 stalls mid-body while client reads are paused.
+    let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+    let paused = Arc::new(AtomicBool::new(false));
+    let read_waker = Arc::new(std::sync::Mutex::new(None));
+    let gated_client = PausedReadIo {
+        inner: client_io,
+        paused: Arc::clone(&paused),
+        read_waker: Arc::clone(&read_waker),
+    };
+
+    let budget = AdminConnResponseBudget::new(CAPACITY_KIB);
+    let stream1_dispatched = Arc::new(tokio::sync::Notify::new());
+    let stream2_dispatched = Arc::new(tokio::sync::Notify::new());
+    let server_budget = budget.clone();
+    let s1_notify = Arc::clone(&stream1_dispatched);
+    let s2_notify = Arc::clone(&stream2_dispatched);
+    let activity = Arc::new(AdminConnActivity::new());
+
+    let server = tokio::spawn(async move {
+        let svc = service_fn(move |req: Request<Incoming>| {
+            let budget = server_budget.clone();
+            let guard = AdminActivityGuard::new(Arc::clone(&activity));
+            let s1_notify = Arc::clone(&s1_notify);
+            let s2_notify = Arc::clone(&s2_notify);
+            async move {
+                let path = req.uri().path().to_string();
+                let resp = if path == "/ping" {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Full::new(Bytes::from_static(b"ok")))
+                        .unwrap_or_else(|_| admin_builder_failure_response())
+                } else if let Some(permit) = budget.try_acquire_bytes(BODY_BYTES) {
+                    let mut resp = Response::builder()
+                        .status(StatusCode::OK)
+                        .header("Content-Length", BODY_BYTES.to_string())
+                        .body(Full::new(Bytes::from(vec![b'a'; BODY_BYTES])))
+                        .unwrap_or_else(|_| admin_builder_failure_response());
+                    resp.extensions_mut().insert(permit);
+                    resp
+                } else {
+                    Response::builder()
+                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                        .header("Retry-After", "1")
+                        .body(Full::new(Bytes::from_static(b"budget full")))
+                        .unwrap_or_else(|_| admin_builder_failure_response())
+                };
+                if path == "/stream1" {
+                    s1_notify.notify_waiters();
+                } else if path == "/stream2" {
+                    s2_notify.notify_waiters();
+                }
+                Ok::<_, hyper::Error>(GuardedAdminBody::wrap_response(resp, guard))
+            }
+        });
+        let mut builder =
+            hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+        builder
+            .http2()
+            .timer(hyper_util::rt::TokioTimer::new())
+            .max_send_buf_size(BUDGETED_BODY_CHUNK_BYTES);
+        let _ = builder.serve_connection(TokioIo::new(server_io), svc).await;
+    });
+
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(
+        hyper_util::rt::TokioExecutor::new(),
+        TokioIo::new(gated_client),
+    )
+    .await
+    .map_err(|_| "h2 handshake failed")?;
+    let conn_task = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    // Complete handshake with a tiny ping before pausing reads.
+    let ping_req = Request::builder()
+        .method(Method::GET)
+        .uri("http://localhost/ping")
+        .body(http_body_util::Empty::<Bytes>::new())
+        .map_err(|_| "build ping req")?;
+    let ping_resp = sender
+        .send_request(ping_req)
+        .await
+        .map_err(|_| "send ping")?;
+    if ping_resp.status() != StatusCode::OK {
+        return Err("ping did not return 200");
+    }
+    let _ = ping_resp.into_body().collect().await;
+
+    // Pause client reads so Stream 1 stalls inside the real Hyper/h2 send path.
+    let s1_wait = stream1_dispatched.notified();
+    tokio::pin!(s1_wait);
+    s1_wait.as_mut().enable();
+    paused.store(true, Ordering::Release);
+
+    let req1 = Request::builder()
+        .method(Method::GET)
+        .uri("http://localhost/stream1")
+        .body(http_body_util::Empty::<Bytes>::new())
+        .map_err(|_| "build req1")?;
+    let resp1_fut = sender.send_request(req1);
+    s1_wait.await;
+
+    // Yield a few times so h2 actively pumps Stream 1 into its 64 KiB send
+    // buffer + 16 KiB duplex pipe and hits backpressure.
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    if budget.available_kib() != 56 {
+        return Err("h2 released response budget before stalled Stream 1 drained");
+    }
+
+    // Stream 2 arrives while Stream 1 is stalled and must fail fast with 503.
+    let s2_wait = stream2_dispatched.notified();
+    tokio::pin!(s2_wait);
+    s2_wait.as_mut().enable();
+    let req2 = Request::builder()
+        .method(Method::GET)
+        .uri("http://localhost/stream2")
+        .body(http_body_util::Empty::<Bytes>::new())
+        .map_err(|_| "build req2")?;
+    let resp2_fut = sender.send_request(req2);
+    s2_wait.await;
+
+    // Resume reads so both Stream 1 (200) and Stream 2 (503) deliver to client.
+    paused.store(false, Ordering::Release);
+    if let Ok(mut guard) = read_waker.lock()
+        && let Some(waker) = guard.take()
+    {
+        waker.wake();
+    }
+
+    let resp2 = resp2_fut.await.map_err(|_| "await resp2")?;
+    if resp2.status() != StatusCode::SERVICE_UNAVAILABLE {
+        return Err("stalled Stream 2 did not receive 503");
+    }
+    if resp2
+        .headers()
+        .get("Retry-After")
+        .and_then(|v| v.to_str().ok())
+        != Some("1")
+    {
+        return Err("stalled Stream 2 missing Retry-After: 1");
+    }
+    let _ = resp2.into_body().collect().await;
+
+    let resp1 = resp1_fut.await.map_err(|_| "await resp1")?;
+    if resp1.status() != StatusCode::OK {
+        return Err("Stream 1 did not return 200");
+    }
+    let body1 = resp1
+        .into_body()
+        .collect()
+        .await
+        .map_err(|_| "collect Stream 1")?
+        .to_bytes();
+    if body1.len() != BODY_BYTES {
+        return Err("Stream 1 body length mismatch");
+    }
+
+    // Once Stream 1 drains, Stream 3 must be admitted with 200 OK.
+    let req3 = Request::builder()
+        .method(Method::GET)
+        .uri("http://localhost/stream3")
+        .body(http_body_util::Empty::<Bytes>::new())
+        .map_err(|_| "build req3")?;
+    let resp3 = sender
+        .send_request(req3)
+        .await
+        .map_err(|_| "send Stream 3")?;
+    if resp3.status() != StatusCode::OK {
+        return Err("Stream 3 was not admitted after Stream 1 drained");
+    }
+    let body3 = resp3
+        .into_body()
+        .collect()
+        .await
+        .map_err(|_| "collect Stream 3")?
+        .to_bytes();
+    if body3.len() != BODY_BYTES {
+        return Err("Stream 3 body length mismatch");
+    }
+
+    drop(sender);
+    let _ = conn_task.await;
+    let _ = server.await;
+    Ok(())
 }
 
 /// Drive one admin connection through [`serve_admin_io`] with an explicit
@@ -1957,7 +2205,8 @@ async fn serve_admin_io<I>(
         .http2()
         .timer(hyper_util::rt::TokioTimer::new())
         .max_concurrent_streams(limits.http2_max_concurrent_streams)
-        .max_header_list_size(limits.http2_max_header_list_size_bytes);
+        .max_header_list_size(limits.http2_max_header_list_size_bytes)
+        .max_send_buf_size(BUDGETED_BODY_CHUNK_BYTES);
 
     let conn = builder.serve_connection(io, svc);
     tokio::pin!(conn);
@@ -12470,8 +12719,8 @@ async fn handle_restore(
                     let event = audit::AuditEvent::new(
                         actor,
                         "restore",
-                        "config",
-                        "namespace",
+                        "gateway_config",
+                        namespace,
                         namespace,
                         json!({
                             "rollback": "unknown_clear_outcome",
@@ -12570,8 +12819,8 @@ async fn handle_restore(
                 let event = audit::AuditEvent::new(
                     actor,
                     "restore",
-                    "config",
-                    "namespace",
+                    "gateway_config",
+                    namespace,
                     namespace,
                     json!({
                         "rollback": "unknown_clear_outcome",

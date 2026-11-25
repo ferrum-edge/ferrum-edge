@@ -128,6 +128,13 @@ pub mod _test_support {
         crate::admin::exercise_response_budget_wrapper_for_test(capacity_kib, body_bytes).await
     }
 
+    /// Test helper exercising a real HTTP/2 server (`max_send_buf_size = 64 KiB`)
+    /// and stalled client to verify response budget retention across `h2`
+    /// backpressure and recovery after drain.
+    pub async fn exercise_http2_stalled_response_budget_for_test() -> Result<(), &'static str> {
+        crate::admin::exercise_http2_stalled_response_budget_for_test().await
+    }
+
     /// Test helper verifying strict per-connection response budget enforcement
     /// without clamping oversized payloads.
     pub fn check_admin_response_budget_limits_for_test(
