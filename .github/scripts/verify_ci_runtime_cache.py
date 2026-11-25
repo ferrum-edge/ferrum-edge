@@ -4842,7 +4842,7 @@ def _cargo_steps_have_env_override(cargo_job: str, steps_section: str) -> bool:
         return False
     for _indent, line in _iter_non_block_scalar_lines(steps_section):
         decoded = _decode_mapping_line(line)
-        if decoded is not None and decoded[0] == 8 and decoded[1] == "env":
+        if decoded is not None and decoded[1] == "env":
             val_stripped = _yaml_strip_trailing_comment(decoded[2]).strip()
             if val_stripped and not val_stripped.startswith("{"):
                 return True
@@ -8648,6 +8648,15 @@ def self_test() -> int:
             handoff_channel.replace(
                 "      - name: Build the FIPS profile\n",
                 '      - name: Build the FIPS profile\n        env: ${{ fromJSON(\'{"CARGO_PROFILE_DEV_DEBUG":"1"}\') }}\n',
+                1,
+            ),
+        ),
+        (
+            "alternate-indented step-level expression env on compile step",
+            "must not override CARGO_*/RUST* build/profile settings at step level",
+            handoff_channel.replace(
+                "      - name: Build the FIPS profile\n",
+                '      -  name: Build the FIPS profile\n         env: ${{ fromJSON(\'{"CARGO_PROFILE_DEV_DEBUG":"1"}\') }}\n',
                 1,
             ),
         ),
