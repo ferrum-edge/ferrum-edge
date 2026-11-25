@@ -2908,6 +2908,21 @@ jobs:
           echo "parity backends: sqlite,postgres,mysql,mongodb,redis"
           echo "parity behaviors: admin-crud,polling-delete,namespace-isolation,migrate-idempotent,concurrent-mutations,connectivity-recovery,tls-modes"
 
+      - name: Verify functional shard coverage guard
+        # Run the shard-coverage drift guard unconditionally with an explicit
+        # nextest selector independent of `matrix.filters`, so removing
+        # `functional_ci_shard_coverage_test` from the matrix can never
+        # silently disable the guard itself.
+        if: matrix.shard == 'application'
+        run: |
+          set -e
+          archive_file="functional-tests-${RUNNER_OS}-${RUNNER_ARCH}.tar.zst"
+          cargo nextest run \
+            --archive-file "$archive_file" \
+            --workspace-remap . \
+            --no-tests=fail \
+            -E 'test(=functional::functional_ci_shard_coverage_test::ci_workflow_assigns_every_functional_test_to_a_shard)'
+
       - name: Run functional test shard
         # ── Single nextest invocation per shard ───────────────────────────
         # The old loop ran `cargo test` once per filter line, paying cargo's

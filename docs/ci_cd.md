@@ -1519,9 +1519,10 @@ stripped of newlines and backticks before they are written.
   `FERRUM_SKIP_GATEWAY_BUILD=1`. The two data-plane shards (`data_services:
   true`) remain serialized with `nextest_jobs: 1` and are the only shards that
   start the Redis/MongoDB/PostgreSQL/MySQL containers; each runner owns its own
-  set. See
+  set. `data-plane` isolates `functional_admin_crud_resources_test` alone while
+  `data-plane-runtime` runs the remaining database-backed modules (see
   [ci_pr_validation_review_2026_09_24.md](ci_pr_validation_review_2026_09_24.md)
-  for why the data-plane modules are split in two.
+  for the original two-shard split history).
 
 **Output**:
 - Test pass/fail status

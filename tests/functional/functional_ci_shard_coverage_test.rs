@@ -8,10 +8,12 @@
 //! filter list will compile and link into the binary but never run in CI.
 //!
 //! This test parses the workflow, enumerates the test files on disk, and
-//! fails if any file's module name does not appear as a substring in some
-//! shard's filter block. Runs without the gateway binary, so it is NOT
-//! `#[ignore]` — it runs in the application shard alongside the other smoke
-//! checks.
+//! enforces that every discovered module appears as an exact canonical filter
+//! in exactly one shard (no missing, duplicate, non-canonical, or
+//! substring-colliding filters; non-module filters are restricted to the
+//! explicit harness namespaces). Runs without the gateway binary, so it is NOT
+//! `#[ignore]` — CI runs it in a dedicated matrix-filter-independent step in
+//! the `application` shard as well as alongside the other smoke checks.
 //!
 //! See PR #696 for the original parallelization that made this guard
 //! necessary.
@@ -24,6 +26,7 @@ use std::path::Path;
 
 const WORKFLOW_PATH: &str = ".github/workflows/ci.yml";
 const FUNCTIONAL_TESTS_DIR: &str = "tests/functional";
+const ALLOWED_HARNESS_FILTERS: &[&str] = &["common::", "scaffolding::", "scenarios::"];
 
 fn workspace_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -93,9 +96,31 @@ fn discover_test_modules() -> BTreeSet<String> {
 fn ci_workflow_assigns_every_functional_test_to_a_shard() {
     let shards = read_shard_filters();
     let modules = discover_test_modules();
+    let allowed_harness: BTreeSet<&str> = ALLOWED_HARNESS_FILTERS.iter().copied().collect();
+
+    // Reject any non-canonical filter token (e.g., `functional_grpc_test::`,
+    // partial prefixes, typos, or stale module names) that could cause
+    // nextest substring matching to silently rerun or miss modules.
+    let mut unexpected_tokens = Vec::new();
+    for (shard, tokens) in &shards {
+        for token in tokens {
+            if !modules.contains(token.as_str()) && !allowed_harness.contains(token.as_str()) {
+                unexpected_tokens.push((shard.as_str(), token.as_str()));
+            }
+        }
+    }
+    assert!(
+        unexpected_tokens.is_empty(),
+        "Non-canonical or unknown functional shard filter tokens in {}: {:?}\n\
+         Every filter must be either an exact discovered module name or one of {:?}.",
+        WORKFLOW_PATH,
+        unexpected_tokens,
+        ALLOWED_HARNESS_FILTERS
+    );
 
     let mut missing = Vec::new();
     let mut duplicates = Vec::new();
+    let mut substring_overlaps = Vec::new();
     for module in &modules {
         let assigned_shards: Vec<&str> = shards
             .iter()
@@ -110,6 +135,27 @@ fn ci_workflow_assigns_every_functional_test_to_a_shard() {
             0 => missing.push(module.as_str()),
             1 => {}
             _ => duplicates.push((module.as_str(), assigned_shards)),
+        }
+        // Nextest matches positional filters as substrings of full test paths;
+        // verify no other filter token is a substring of this module name.
+        for (shard, tokens) in &shards {
+            for token in tokens {
+                if token.as_str() != module.as_str() && module.contains(token.as_str()) {
+                    substring_overlaps.push((module.as_str(), shard.as_str(), token.as_str()));
+                }
+            }
+        }
+    }
+
+    let mut harness_issues = Vec::new();
+    for harness in ALLOWED_HARNESS_FILTERS {
+        let count: usize = shards
+            .iter()
+            .flat_map(|(_, tokens)| tokens.iter())
+            .filter(|token| token.as_str() == *harness)
+            .count();
+        if count != 1 {
+            harness_issues.push((*harness, count));
         }
     }
 
@@ -126,5 +172,18 @@ fn ci_workflow_assigns_every_functional_test_to_a_shard() {
         "These test modules are assigned more than once across CI shards in {}: {:?}",
         WORKFLOW_PATH,
         duplicates
+    );
+    assert!(
+        substring_overlaps.is_empty(),
+        "These shard filters are substrings of another functional module name in {} \
+         (would double-run under nextest substring matching): {:?}",
+        WORKFLOW_PATH,
+        substring_overlaps
+    );
+    assert!(
+        harness_issues.is_empty(),
+        "Each allowed harness filter in {} must be assigned exactly once: {:?}",
+        WORKFLOW_PATH,
+        harness_issues
     );
 }
