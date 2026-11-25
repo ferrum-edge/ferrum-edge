@@ -5771,9 +5771,145 @@ def _tokenize_shell_script(run_text: str) -> list[list[str]]:
     return commands
 
 
-_CI_DEBUG_SHELL_PASS_THROUGH_WRAPPERS = frozenset(
-    {"command", "exec", "nohup", "time", "sudo"}
+_CI_DEBUG_SHELL_KEYWORDS = frozenset(
+    {"if", "then", "elif", "else", "do", "while", "until", "!", "{"}
 )
+# Map wrapper basename -> (options taking a separate operand, takes_leading_positional_arg)
+_CI_DEBUG_SHELL_WRAPPERS: dict[str, tuple[frozenset[str], bool]] = {
+    "time": (frozenset({"-o", "--output", "-f", "--format"}), False),
+    "sudo": (frozenset({"-u", "-g", "-C", "-D", "-h", "-p", "-R", "-T", "-t", "-r"}), False),
+    "timeout": (frozenset({"-k", "--kill-after", "-s", "--signal"}), True),
+    "nice": (frozenset({"-n", "--adjustment"}), False),
+    "stdbuf": (frozenset({"-i", "-o", "-e"}), False),
+    "ionice": (frozenset({"-c", "-n", "-p", "-P", "-u"}), False),
+    "command": (frozenset(), False),
+    "exec": (frozenset({"-a"}), False),
+    "nohup": (frozenset(), False),
+    "xargs": (frozenset({"-I", "-L", "-n", "-P", "-s", "-d", "-E", "-a"}), False),
+}
+
+
+def _scan_shell_command_tokens(tokens: list[str]) -> bool:
+    """Return True if a single simple shell command overrides Cargo/Rust/C build or profile settings."""
+
+    idx = 0
+    n = len(tokens)
+    while idx < n:
+        tok = tokens[idx]
+        if tok in _CI_DEBUG_SHELL_KEYWORDS:
+            idx += 1
+            continue
+        if "=" in tok and not tok.startswith("-"):
+            var_name = tok.split("=", 1)[0].removesuffix("+")
+            if _CI_DEBUG_SHELL_VAR_NAME_RE.match(var_name):
+                return True
+            idx += 1
+            continue
+        base = tok.rsplit("/", 1)[-1]
+        if base == "env":
+            idx += 1
+            while idx < n:
+                arg = tokens[idx]
+                if arg in ("-i", "--ignore-environment", "-"):
+                    return True
+                if arg in ("-u", "--unset") and idx + 1 < n:
+                    if _CI_DEBUG_SHELL_VAR_NAME_RE.match(tokens[idx + 1]):
+                        return True
+                    idx += 2
+                    continue
+                if arg.startswith("-u") and len(arg) > 2:
+                    if _CI_DEBUG_SHELL_VAR_NAME_RE.match(arg[2:]):
+                        return True
+                    idx += 1
+                    continue
+                if arg.startswith("--unset="):
+                    if _CI_DEBUG_SHELL_VAR_NAME_RE.match(arg.split("=", 1)[1]):
+                        return True
+                    idx += 1
+                    continue
+                if arg in ("-C", "--chdir") and idx + 1 < n:
+                    idx += 2
+                    continue
+                if arg in ("-S", "--split-string") and idx + 1 < n:
+                    for sub_cmd in _tokenize_shell_script(tokens[idx + 1]):
+                        if _scan_shell_command_tokens(sub_cmd):
+                            return True
+                    idx += 2
+                    continue
+                if arg.startswith("--split-string="):
+                    for sub_cmd in _tokenize_shell_script(arg.split("=", 1)[1]):
+                        if _scan_shell_command_tokens(sub_cmd):
+                            return True
+                    idx += 1
+                    continue
+                if arg == "--":
+                    idx += 1
+                    break
+                if arg.startswith("-"):
+                    idx += 1
+                    continue
+                if "=" in arg:
+                    var_name = arg.split("=", 1)[0].removesuffix("+")
+                    if _CI_DEBUG_SHELL_VAR_NAME_RE.match(var_name):
+                        return True
+                    idx += 1
+                    continue
+                break
+            continue
+        if base in _CI_DEBUG_SHELL_WRAPPERS:
+            opt_with_arg, takes_pos = _CI_DEBUG_SHELL_WRAPPERS[base]
+            idx += 1
+            while idx < n and tokens[idx].startswith("-"):
+                arg = tokens[idx]
+                if arg == "--":
+                    idx += 1
+                    break
+                if arg in opt_with_arg and idx + 1 < n:
+                    idx += 2
+                else:
+                    idx += 1
+            if takes_pos and idx < n:
+                idx += 1
+            continue
+        break
+
+    if idx >= n:
+        return False
+    cmd = tokens[idx]
+    cmd_base = cmd.rsplit("/", 1)[-1]
+    if cmd_base in ("export", "declare", "typeset", "readonly", "local"):
+        for arg in tokens[idx + 1 :]:
+            if arg.startswith("-"):
+                continue
+            var_name = arg.split("=", 1)[0].removesuffix("+")
+            if _CI_DEBUG_SHELL_VAR_NAME_RE.match(var_name):
+                return True
+        return False
+    if cmd_base == "unset":
+        for arg in tokens[idx + 1 :]:
+            if arg.startswith("-"):
+                continue
+            if _CI_DEBUG_SHELL_VAR_NAME_RE.match(arg):
+                return True
+        return False
+    if cmd_base == "cargo":
+        for arg in tokens[idx + 1 :]:
+            if arg == "--":
+                break
+            if arg == "--config" or arg.startswith("--config="):
+                return True
+        return False
+    # Fail-closed backstop for unrecognized wrapper commands (excluding echo/printf):
+    # if a later token is `cargo` / `*/cargo`, check its args up to `--` for `--config`.
+    if cmd_base not in ("echo", "printf"):
+        for pos in range(idx + 1, n):
+            if tokens[pos].rsplit("/", 1)[-1] == "cargo":
+                for arg in tokens[pos + 1 :]:
+                    if arg == "--":
+                        break
+                    if arg == "--config" or arg.startswith("--config="):
+                        return True
+    return False
 
 
 def _step_run_has_ci_debug_override(run_text: str) -> bool:
@@ -5791,84 +5927,8 @@ def _step_run_has_ci_debug_override(run_text: str) -> bool:
             return True
 
     for tokens in _tokenize_shell_script(run_text):
-        idx = 0
-        n = len(tokens)
-        # Walk leading env assignments and wrapper commands (env, /usr/bin/env, sudo, etc.).
-        while idx < n:
-            tok = tokens[idx]
-            if "=" in tok and not tok.startswith("-"):
-                var_name = tok.split("=", 1)[0]
-                if _CI_DEBUG_SHELL_VAR_NAME_RE.match(var_name):
-                    return True
-                idx += 1
-                continue
-            if tok == "env" or tok.endswith("/env"):
-                idx += 1
-                while idx < n:
-                    arg = tokens[idx]
-                    if arg in ("-i", "--ignore-environment", "-"):
-                        return True
-                    if arg in ("-u", "--unset") and idx + 1 < n:
-                        if _CI_DEBUG_SHELL_VAR_NAME_RE.match(tokens[idx + 1]):
-                            return True
-                        idx += 2
-                        continue
-                    if arg.startswith("-u") and len(arg) > 2:
-                        if _CI_DEBUG_SHELL_VAR_NAME_RE.match(arg[2:]):
-                            return True
-                        idx += 1
-                        continue
-                    if arg.startswith("--unset="):
-                        if _CI_DEBUG_SHELL_VAR_NAME_RE.match(arg.split("=", 1)[1]):
-                            return True
-                        idx += 1
-                        continue
-                    if arg == "--":
-                        idx += 1
-                        break
-                    if arg.startswith("-"):
-                        idx += 1
-                        continue
-                    if "=" in arg:
-                        var_name = arg.split("=", 1)[0]
-                        if _CI_DEBUG_SHELL_VAR_NAME_RE.match(var_name):
-                            return True
-                        idx += 1
-                        continue
-                    break
-                continue
-            if tok in _CI_DEBUG_SHELL_PASS_THROUGH_WRAPPERS:
-                idx += 1
-                while idx < n and tokens[idx].startswith("-"):
-                    if tokens[idx] == "--":
-                        idx += 1
-                        break
-                    idx += 1
-                continue
-            break
-
-        if idx >= n:
-            continue
-        cmd = tokens[idx]
-        if cmd in ("export", "declare", "typeset"):
-            for arg in tokens[idx + 1 :]:
-                if arg.startswith("-"):
-                    continue
-                var_name = arg.split("=", 1)[0]
-                if _CI_DEBUG_SHELL_VAR_NAME_RE.match(var_name):
-                    return True
-        elif cmd == "unset":
-            for arg in tokens[idx + 1 :]:
-                if arg.startswith("-"):
-                    continue
-                if _CI_DEBUG_SHELL_VAR_NAME_RE.match(arg):
-                    return True
-        elif cmd == "cargo" or cmd.endswith("/cargo"):
-            for arg in tokens[idx + 1 :]:
-                if arg == "--":
-                    break
-                if arg == "--config" or arg.startswith("--config="):
-                    return True
+        if _scan_shell_command_tokens(tokens):
+            return True
     return False
 
 
@@ -5979,8 +6039,8 @@ def _iter_non_block_scalar_lines_indexed(lines: list[str]) -> list[tuple[int, tu
     return out
 
 
-def _iter_fallback_jobs(workflow_text: str) -> list[tuple[str, str]]:
-    """Return `(job_id, job_body)` pairs in fallback mode, supporting quoted job IDs and trailing comments."""
+def _iter_fallback_jobs(workflow_text: str) -> tuple[list[tuple[str, str]], list[str]]:
+    """Return `((job_id, job_body) list, layout_errors)` in fallback mode, rejecting non-2-space job indents."""
 
     lines = workflow_text.splitlines()
     indexed = _iter_non_block_scalar_lines_indexed(lines)
@@ -5988,18 +6048,30 @@ def _iter_fallback_jobs(workflow_text: str) -> list[tuple[str, str]]:
     for idx, (indent, line) in indexed:
         decoded = _decode_mapping_line(line)
         if decoded is not None and indent == 0 and decoded[1] == "jobs":
+            inline_val = _yaml_strip_trailing_comment(decoded[2]).strip()
+            if inline_val and inline_val != "{}":
+                return [], [f"unsupported inline `jobs:` syntax in fallback parser ({inline_val!r})"]
             jobs_start = idx + 1
             break
     if jobs_start is None:
-        return []
+        return [], []
     job_starts: list[tuple[str, int]] = []
+    layout_errors: list[str] = []
     jobs_end = len(lines)
+    first_job_indent: int | None = None
     for idx, (indent, line) in indexed:
         if idx < jobs_start:
             continue
         if indent == 0:
             jobs_end = idx
             break
+        if first_job_indent is None:
+            first_job_indent = indent
+            if first_job_indent != 2:
+                layout_errors.append(
+                    f"unsupported non-2-space job indentation ({first_job_indent} spaces) under `jobs:` in fallback parser"
+                )
+                return [], layout_errors
         if indent == 2:
             decoded = _decode_mapping_line(line)
             if decoded is not None and decoded[0] == 2:
@@ -6013,11 +6085,11 @@ def _iter_fallback_jobs(workflow_text: str) -> list[tuple[str, str]]:
         if body:
             body += "\n"
         result.append((job_id, body))
-    return result
+    return result, layout_errors
 
 
 def _extract_step_run_text_fallback(step: str) -> tuple[str, str | None]:
-    """Extract shell text from a fallback step, handling literal/folded block scalars and multiline scalars."""
+    """Extract shell text from a fallback step, preserving YAML 1.2 line-folding and blank-line breaks."""
 
     lines = step.splitlines()
     for idx, line in enumerate(lines):
@@ -6029,42 +6101,81 @@ def _extract_step_run_text_fallback(step: str) -> tuple[str, str | None]:
                 block_lines = lines[idx + 1 : end_idx]
                 if val_no_comment.startswith("|"):
                     return "\n".join(ln.lstrip(" \t") for ln in block_lines), None
-                # YAML folded scalar (`>`): consecutive non-blank lines fold with a space,
-                # while blank lines separate paragraphs with a newline.
-                paragraphs: list[str] = []
+                # YAML 1.2.2 §6.5 folded scalar (`>`):
+                # - base indent is the explicit indent indicator (if given) or the first non-empty line's indent.
+                # - lines indented MORE than base indent keep their surrounding line breaks (never folded).
+                # - blank lines separate folded paragraphs with `\n`.
+                explicit_m = re.search(r"([1-9])", val_no_comment)
+                base_indent = (
+                    8 + int(explicit_m.group(1))
+                    if explicit_m
+                    else next(
+                        (
+                            len(bl) - len(bl.lstrip(" \t"))
+                            for bl in block_lines
+                            if bl.strip()
+                        ),
+                        10,
+                    )
+                )
+                out_lines: list[str] = []
                 cur_para: list[str] = []
                 for bl in block_lines:
                     stripped = bl.strip()
                     if not stripped:
                         if cur_para:
-                            paragraphs.append(" ".join(cur_para))
+                            out_lines.append(" ".join(cur_para))
                             cur_para = []
+                        continue
+                    bl_indent = len(bl) - len(bl.lstrip(" \t"))
+                    if bl_indent > base_indent:
+                        if cur_para:
+                            out_lines.append(" ".join(cur_para))
+                            cur_para = []
+                        out_lines.append(stripped)
                     else:
                         cur_para.append(stripped)
                 if cur_para:
-                    paragraphs.append(" ".join(cur_para))
-                return "\n".join(paragraphs), None
+                    out_lines.append(" ".join(cur_para))
+                return "\n".join(out_lines), None
             # Single-line or multiline plain/quoted scalar.
-            cont_lines: list[str] = []
+            cont_items: list[str | None] = []
             j = idx + 1
             while j < len(lines):
                 nxt = lines[j]
                 if not nxt.strip():
+                    cont_items.append(None)
                     j += 1
                     continue
                 nxt_indent = len(nxt) - len(nxt.lstrip(" \t"))
                 if nxt_indent <= 8:
                     break
-                cont_lines.append(nxt.strip())
+                cont_items.append(nxt.strip())
                 j += 1
-            if cont_lines:
+            # Drop trailing blank lines after the scalar.
+            while cont_items and cont_items[-1] is None:
+                cont_items.pop()
+            if cont_items:
                 raw_first = decoded[2].strip()
                 if raw_first.startswith(("'", '"')):
                     return "", "unsupported multiline quoted `run:` scalar in fallback parser"
                 first_scalar = _decode_yaml_value_scalar(decoded[2])
                 if first_scalar is None:
                     return "", "unparseable multiline `run:` scalar in fallback parser"
-                return " ".join([first_scalar, *cont_lines]), None
+                # YAML 1.2.2 §6.5: blank lines in a plain multiline scalar produce `\n`,
+                # while adjacent non-blank lines fold with a single space.
+                paragraphs: list[str] = []
+                cur_para = [first_scalar]
+                for item in cont_items:
+                    if item is None:
+                        if cur_para:
+                            paragraphs.append(" ".join(cur_para))
+                            cur_para = []
+                    else:
+                        cur_para.append(item)
+                if cur_para:
+                    paragraphs.append(" ".join(cur_para))
+                return "\n".join(paragraphs), None
             scalar = _decode_yaml_value_scalar(decoded[2])
             if scalar is None:
                 return "", "unparseable `run:` scalar in fallback parser"
@@ -6127,18 +6238,21 @@ def _extract_job_steps_structural(job_body: str) -> tuple[list[str], list[str]]:
         raw_chunk = step_lines[step_starts[i] : end]
         normalized: list[str] = []
         for ln in raw_chunk:
-            if not ln.strip() or ln.lstrip().startswith("#"):
+            if not ln.strip():
                 normalized.append(ln)
             elif delta > 0:
                 normalized.append((" " * delta) + ln)
             elif delta < 0:
                 trim = -delta
-                if not ln.startswith(" " * trim):
+                if ln.startswith(" " * trim):
+                    normalized.append(ln[trim:])
+                elif ln.lstrip().startswith("#"):
+                    normalized.append(ln)
+                else:
                     layout_errors.append(
                         "inconsistent step indentation in fallback parser"
                     )
                     return [], layout_errors
-                normalized.append(ln[trim:])
             else:
                 normalized.append(ln)
         chunks.append("\n".join(normalized) + "\n")
@@ -6153,32 +6267,53 @@ def _check_shared_key_value(
     discovered: set[tuple[str, str]],
     errors: list[str],
 ) -> None:
+    """Compute effective Swatinem/rust-cache@d1527c8 namespace and discover `ci-debug` members."""
+
     sk = _normalize_yaml_scalar(with_map.get("shared-key")).strip()
-    if "${{" in sk:
-        if _is_setup_rust_ci_action(uses):
+    if _is_setup_rust_ci_action(uses):
+        if "${{" in sk:
             errors.append(
                 f"{filename}/{job_id} setup-rust-ci step must use a literal "
                 f"shared-key (got {sk!r})"
             )
-        elif _is_direct_rust_cache_action(uses) and not sk.startswith(
-            _CI_DEBUG_ALLOWED_DIRECT_COMPUTED_KEY_PREFIXES
-        ):
-            errors.append(
-                f"{filename}/{job_id} Swatinem/rust-cache step uses an unadmitted "
-                f"computed shared-key that could alias ci-debug (got {sk!r})"
-            )
-    if sk == "ci-debug":
-        discovered.add((filename, job_id))
-    elif not sk and _is_direct_rust_cache_action(uses):
-        # Direct Swatinem/rust-cache without shared-key can still collide with
-        # `v0-rust-ci-debug` via `prefix-key` or `key: ci-debug` + `add-job-id-key: false`.
-        prefix_key = _normalize_yaml_scalar(with_map.get("prefix-key")).strip()
-        bare_key = _normalize_yaml_scalar(with_map.get("key")).strip()
-        add_job_id = _normalize_yaml_scalar(with_map.get("add-job-id-key")).strip().lower()
-        if prefix_key == "v0-rust-ci-debug" or (
-            bare_key == "ci-debug" and add_job_id == "false"
-        ):
+        if sk == "ci-debug":
             discovered.add((filename, job_id))
+        return
+
+    # Direct Swatinem/rust-cache@d1527c8 (src/config.ts):
+    #   prefixKey = input("prefix-key") or "v0-rust"
+    #   sharedKey = input("shared-key")
+    #   if sharedKey:
+    #     namespace = f"{prefixKey}-{sharedKey}"
+    #   else:
+    #     parts = [prefixKey]
+    #     if key: parts.append(key)
+    #     if add_job_id_key != "false": parts.append(job_id)
+    #     namespace = "-".join(parts)
+    prefix_key = _normalize_yaml_scalar(with_map.get("prefix-key")).strip() or "v0-rust"
+    bare_key = _normalize_yaml_scalar(with_map.get("key")).strip()
+    add_job_id = _normalize_yaml_scalar(with_map.get("add-job-id-key")).strip().lower()
+    if "${{" in sk and not sk.startswith(_CI_DEBUG_ALLOWED_DIRECT_COMPUTED_KEY_PREFIXES):
+        errors.append(
+            f"{filename}/{job_id} Swatinem/rust-cache step uses an unadmitted "
+            f"computed shared-key that could alias ci-debug (got {sk!r})"
+        )
+    if "${{" in prefix_key or (not sk and "${{" in bare_key):
+        errors.append(
+            f"{filename}/{job_id} Swatinem/rust-cache step uses an unadmitted "
+            f"computed prefix-key/key that could alias ci-debug"
+        )
+    if sk:
+        namespace = f"{prefix_key}-{sk}"
+    else:
+        parts = [prefix_key]
+        if bare_key:
+            parts.append(bare_key)
+        if add_job_id != "false":
+            parts.append(job_id)
+        namespace = "-".join(parts)
+    if namespace == "v0-rust-ci-debug":
+        discovered.add((filename, job_id))
 
 
 def _discover_ci_debug_jobs(
@@ -6211,8 +6346,8 @@ def _discover_ci_debug_jobs(
                         continue
                     with_obj = step.get("with")
                     if with_obj is None:
-                        continue
-                    if not isinstance(with_obj, dict):
+                        with_obj = {}
+                    elif not isinstance(with_obj, dict):
                         errors.append(
                             f"{filename}/{job_id} rust-cache step has non-mapping `with:`"
                         )
@@ -6227,7 +6362,10 @@ def _discover_ci_debug_jobs(
                     )
         return discovered, errors
 
-    for job_id, body in _iter_fallback_jobs(workflow_text):
+    fallback_jobs, job_layout_errs = _iter_fallback_jobs(workflow_text)
+    for jerr in job_layout_errs:
+        errors.append(f"{filename}: {jerr}")
+    for job_id, body in fallback_jobs:
         raw_steps, step_layout_errs = _extract_job_steps_structural(body)
         for layout_err in step_layout_errs:
             errors.append(f"{filename}/{job_id}: {layout_err}")
@@ -6344,7 +6482,10 @@ def check_ci_debug_lane_profile_uniformity(
             parsed_workflows[filename] = parsed_wf
         else:
             parsed_workflows[filename] = None
-            fallback_jobs_by_wf[filename] = dict(_iter_fallback_jobs(wf_text))
+            fb_jobs, fb_job_errs = _iter_fallback_jobs(wf_text)
+            for jerr in fb_job_errs:
+                failures.append(f"{filename}: {jerr}")
+            fallback_jobs_by_wf[filename] = dict(fb_jobs)
         wf_env, wf_err = _extract_env_mapping(
             wf_text,
             key_indent=0,
@@ -11022,7 +11163,14 @@ def self_test() -> int:
             ("env -u profile", "env -u CARGO_PROFILE_TEST_DEBUG cargo test --no-run"),
             ("env -uVAR compact", "env -uCARGO_PROFILE_DEV_DEBUG cargo test --no-run"),
             ("path-qualified /usr/bin/env", "/usr/bin/env -uCARGO_PROFILE_DEV_DEBUG cargo test --no-run"),
+            ("env -C override", "env -C /tmp CARGO_PROFILE_DEV_DEBUG=2 cargo test --no-run"),
             ("env -i clear", "env -i cargo test --no-run"),
+            ("sudo -u wrapper", "sudo -u runner cargo test --no-run --config profile.dev.debug=2"),
+            ("timeout wrapper", "timeout 600 cargo test --no-run --config profile.dev.debug=2"),
+            ("if/then keyword cargo", "if ! cargo test --no-run --config profile.dev.debug=2; then exit 1; fi"),
+            ("readonly override", "readonly CARGO_PROFILE_DEV_DEBUG=2"),
+            ("export += append", 'export RUSTFLAGS+=" -Cdebuginfo=2"'),
+            ("inline += append", 'RUSTFLAGS+=" -Cdebuginfo=2" cargo test --no-run'),
             ("quoted --config", "cargo '--config' profile.dev.debug=2 --version"),
             ("quoted --config=", 'cargo "--config=profile.dev.debug=2" test --no-run'),
         ):
@@ -11037,6 +11185,27 @@ def self_test() -> int:
                 mut_ci != ci_live_text
                 and any("GITHUB_ENV, or --config" in item for item in mut_errs),
                 f"self-test ({mode_label}): {label} shell override must fail",
+                failures,
+            )
+        # Verify the real `/usr/bin/time ... cargo test --lib` producer line is guarded.
+        real_time_anchor = 'default-lib.time" cargo test --lib 2>&1'
+        for label, time_replacement in (
+            (
+                "real /usr/bin/time cargo --config",
+                'default-lib.time" cargo test --lib --config profile.dev.debug=2 2>&1',
+            ),
+            (
+                "real /usr/bin/time env CARGO_PROFILE override",
+                'default-lib.time" env CARGO_PROFILE_DEV_DEBUG=2 cargo test --lib 2>&1',
+            ),
+        ):
+            time_ci = ci_live_text.replace(real_time_anchor, time_replacement, 1)
+            time_errs: list[str] = []
+            check_ci_debug_lane_profile_uniformity(time_ci, ambient_live_text, time_errs)
+            require(
+                time_ci != ci_live_text
+                and any("GITHUB_ENV, or --config" in item for item in time_errs),
+                f"self-test ({mode_label}): {label} must fail (got {time_errs!r})",
                 failures,
             )
         for label, multiline_run in (
@@ -11072,6 +11241,12 @@ def self_test() -> int:
                 "          --config profile.test.debug=2\n",
             ),
             (
+                "folded YAML more-indented cargo --config after echo",
+                "        run: >\n"
+                "          echo hi\n"
+                "            cargo test --no-run --config profile.test.debug=2\n",
+            ),
+            (
                 "folded YAML >-2 cargo --config",
                 "        run: >-2\n"
                 "          cargo test --no-run\n"
@@ -11087,6 +11262,12 @@ def self_test() -> int:
                 "        run: cargo test --no-run\n"
                 "          --config profile.test.debug=2\n",
             ),
+            (
+                "plain multiline scalar blank-line break before cargo --config",
+                "        run: echo hi\n"
+                "\n"
+                "          cargo test --no-run --config profile.test.debug=2\n",
+            ),
         ):
             ml_ci = ci_live_text.replace(
                 "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
@@ -11101,6 +11282,36 @@ def self_test() -> int:
                 f"self-test ({mode_label}): {label} must fail (got {ml_errs!r})",
                 failures,
             )
+        # Verify 4-space compact steps with an internal comment inside `run: |` still scan lines after `#`.
+        amb_head, amb_tail = ambient_live_text.split("\n  ambient-host-udp-live:\n", 1)
+        amb_job_body, amb_rest = amb_tail.split("\n  ambient-host-udp-image-read:\n", 1)
+        amb_job_head = amb_job_body.split("\n    steps:\n", 1)[0]
+        compact_comment_ambient = (
+            amb_head
+            + "\n  ambient-host-udp-live:\n"
+            + amb_job_head
+            + "\n    steps:\n"
+            + "    - name: Compact step with comment\n"
+            + "      run: |\n"
+            + "        echo start\n"
+            + "        # comment inside compact step\n"
+            + "        cargo test --lib --config profile.dev.debug=2\n"
+            + "    - uses: ./.github/actions/setup-rust-ci\n"
+            + "      with:\n"
+            + '        shared-key: "ci-debug"\n'
+            + "\n  ambient-host-udp-image-read:\n"
+            + amb_rest
+        )
+        compact_comment_errs: list[str] = []
+        check_ci_debug_lane_profile_uniformity(
+            ci_live_text, compact_comment_ambient, compact_comment_errs
+        )
+        require(
+            compact_comment_ambient != ambient_live_text
+            and any("GITHUB_ENV, or --config" in item for item in compact_comment_errs),
+            f"self-test ({mode_label}): 4-space compact step comment must not hide following cargo --config (got {compact_comment_errs!r})",
+            failures,
+        )
         for label, ok_run_block in (
             ("non-cargo echo --config", '        run: echo "--config"\n'),
             ("echo mentioning cargo and --config", '        run: echo cargo --config foo\n'),
@@ -11129,6 +11340,29 @@ def self_test() -> int:
                 f"self-test ({mode_label}): {label} must not be falsely flagged (got {ok_errs!r})",
                 failures,
             )
+        # Direct Swatinem/rust-cache with prefix-key: v0-rust-ci-debug on an unrelated job
+        # appends its job ID by default (v0-rust-ci-debug-unrelated), so it must NOT be falsely flagged.
+        unrelated_prefix_wf = (
+            "name: UnrelatedPrefix\non:\n  workflow_dispatch:\njobs:\n"
+            "  unrelated-job:\n"
+            "    runs-on: ubuntu-26.04\n"
+            "    steps:\n"
+            "      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0\n"
+            "        with:\n"
+            '          prefix-key: "v0-rust-ci-debug"\n'
+        )
+        unrelated_prefix_errs: list[str] = []
+        check_ci_debug_lane_profile_uniformity(
+            ci_live_text,
+            ambient_live_text,
+            unrelated_prefix_errs,
+            extra_workflows={"unrelated-prefix.yml": unrelated_prefix_wf},
+        )
+        require(
+            not unrelated_prefix_errs,
+            f"self-test ({mode_label}): direct rust-cache with default add-job-id-key appends job ID and must not be flagged (got {unrelated_prefix_errs!r})",
+            failures,
+        )
         for label, wf_name, wf_body, expected_substr in (
             (
                 "4-space compact steps",
@@ -11168,6 +11402,16 @@ def self_test() -> int:
                 '          add-job-id-key: "false"\n',
                 "('direct-alias.yml', 'alias-key')",
             ),
+            (
+                "direct rust-cache omitted with on job named ci-debug",
+                "default-job-id.yml",
+                "name: DefaultJobId\non:\n  workflow_dispatch:\njobs:\n"
+                "  ci-debug:\n"
+                "    runs-on: ubuntu-26.04\n"
+                "    steps:\n"
+                "      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0\n",
+                "('default-job-id.yml', 'ci-debug')",
+            ),
         ):
             norm_errs: list[str] = []
             check_ci_debug_lane_profile_uniformity(
@@ -11182,6 +11426,17 @@ def self_test() -> int:
                 failures,
             )
         for label, wf_name, wf_body in (
+            (
+                "4-space indented jobs under jobs:",
+                "indent4-jobs.yml",
+                "name: Indent4Jobs\non:\n  workflow_dispatch:\njobs:\n"
+                "    extra-debug:\n"
+                "      runs-on: ubuntu-26.04\n"
+                "      steps:\n"
+                "        - uses: ./.github/actions/setup-rust-ci\n"
+                "          with:\n"
+                "            shared-key: ci-debug\n",
+            ),
             (
                 "inline flow steps sequence",
                 "inline-steps.yml",
