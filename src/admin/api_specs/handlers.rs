@@ -2543,30 +2543,84 @@ fn spec_representation_etag(
     }
 }
 
-fn if_none_match_matches(request_headers: &hyper::HeaderMap, etag: &str) -> bool {
-    request_headers
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IfNoneMatchOutcome {
+    NoMatch,
+    MatchedExactTag,
+    MatchedWildcard,
+}
+
+fn evaluate_if_none_match(request_headers: &hyper::HeaderMap, etag: &str) -> IfNoneMatchOutcome {
+    let mut matched_wildcard = false;
+    for inm in request_headers
         .get_all("if-none-match")
         .iter()
         .filter_map(|v| v.to_str().ok())
-        .any(|inm| {
-            let trimmed = inm.trim();
-            trimmed == "*"
-                || trimmed.split(',').any(|entry| {
-                    let entry = entry.trim();
-                    let tag = entry.strip_prefix("W/").unwrap_or(entry);
-                    tag == etag
-                })
-        })
+    {
+        let trimmed = inm.trim();
+        if trimmed == "*" {
+            matched_wildcard = true;
+            continue;
+        }
+        for entry in trimmed.split(',') {
+            let entry = entry.trim();
+            let tag = entry.strip_prefix("W/").unwrap_or(entry);
+            if tag == etag {
+                return IfNoneMatchOutcome::MatchedExactTag;
+            }
+        }
+    }
+    if matched_wildcard {
+        IfNoneMatchOutcome::MatchedWildcard
+    } else {
+        IfNoneMatchOutcome::NoMatch
+    }
 }
 
-fn try_preflight_spec_read_response(
+fn can_fast_path_not_modified(
+    outcome: IfNoneMatchOutcome,
+    stored_format: SpecFormat,
+    target_format: SpecFormat,
+    uncompressed_size: u64,
+    max_decompress_bytes: usize,
+) -> bool {
+    match outcome {
+        IfNoneMatchOutcome::NoMatch => false,
+        IfNoneMatchOutcome::MatchedExactTag => true,
+        // `If-None-Match: *` may only short-circuit before decoding when the
+        // selected representation is verbatim and within the decompression cap;
+        // cross-format conversions (or oversized rows) must validate that the
+        // converted output fits under `max_decompress_bytes` so `GET` with `*`
+        // never returns `304` for a representation that would return `500`.
+        IfNoneMatchOutcome::MatchedWildcard => {
+            target_format == stored_format && uncompressed_size <= max_decompress_bytes as u64
+        }
+    }
+}
+
+fn not_modified_response(etag: &str) -> Response<Full<Bytes>> {
+    crate::admin::with_admin_security_headers(Response::builder())
+        .status(StatusCode::NOT_MODIFIED)
+        .header("ETag", etag)
+        .header("Vary", "Accept")
+        .body(Full::new(Bytes::new()))
+        .unwrap_or_else(|_| crate::admin::admin_builder_failure_response())
+}
+
+enum SpecReadPreflight {
+    Respond(Response<Full<Bytes>>),
+    Proceed(Option<crate::admin::ResponseBodyBudgetReservation>),
+}
+
+fn preflight_spec_read_from_meta(
     meta: &crate::config::db_backend::ApiSpecConditionalMeta,
     request_headers: &hyper::HeaderMap,
     check_if_none_match: bool,
+    max_decompress_bytes: usize,
     response_budget: Option<&crate::admin::AdminConnResponseBudget>,
-) -> Option<Response<Full<Bytes>>> {
+) -> SpecReadPreflight {
     let Some(target_fmt) = negotiate_accept_or_406(request_headers, meta.spec_format) else {
-        return Some(json_resp(
+        return SpecReadPreflight::Respond(json_resp(
             StatusCode::NOT_ACCEPTABLE,
             &json!({
                 "error": "No representation acceptable per Accept header (all formats explicitly q=0)"
@@ -2575,30 +2629,37 @@ fn try_preflight_spec_read_response(
     };
     if check_if_none_match {
         let etag = spec_representation_etag(&meta.content_hash, meta.spec_format, target_fmt);
-        if if_none_match_matches(request_headers, &etag) {
-            return Some(
-                crate::admin::with_admin_security_headers(Response::builder())
-                    .status(StatusCode::NOT_MODIFIED)
-                    .header("ETag", &etag)
-                    .header("Vary", "Accept")
-                    .body(Full::new(Bytes::new()))
-                    .unwrap_or_else(|_| crate::admin::admin_builder_failure_response()),
-            );
+        let outcome = evaluate_if_none_match(request_headers, &etag);
+        if can_fast_path_not_modified(
+            outcome,
+            meta.spec_format,
+            target_fmt,
+            meta.uncompressed_size,
+            max_decompress_bytes,
+        ) {
+            return SpecReadPreflight::Respond(not_modified_response(&etag));
         }
     }
-    if let Some(budget) = response_budget {
-        let budget_insufficient = if target_fmt == meta.spec_format && meta.uncompressed_size > 0 {
-            usize::try_from(meta.uncompressed_size)
-                .map(|bytes| !budget.has_capacity_for_bytes(bytes))
-                .unwrap_or(true)
-        } else {
-            budget.is_exhausted()
-        };
-        if budget_insufficient {
-            return Some(spec_response_budget_unavailable_response());
+    let Some(budget) = response_budget else {
+        return SpecReadPreflight::Proceed(None);
+    };
+    // Atomically reserve the expected response size BEFORE acquiring one of the
+    // four global read codec slots so concurrent requests on this connection
+    // cannot race past the check against the same capacity.
+    let expected_bytes = if meta.uncompressed_size > 0 {
+        match usize::try_from(meta.uncompressed_size) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return SpecReadPreflight::Respond(spec_response_budget_unavailable_response());
+            }
         }
+    } else {
+        1
+    };
+    match budget.try_reserve_bytes(expected_bytes) {
+        Some(reservation) => SpecReadPreflight::Proceed(Some(reservation)),
+        None => SpecReadPreflight::Respond(spec_response_budget_unavailable_response()),
     }
-    None
 }
 
 fn spec_response_budget_unavailable_response() -> Response<Full<Bytes>> {
@@ -2623,7 +2684,7 @@ async fn spec_content_response_async(
     request_headers: &hyper::HeaderMap,
     max_decompress_bytes: usize,
     read_permit: tokio::sync::OwnedSemaphorePermit,
-    response_budget: Option<crate::admin::AdminConnResponseBudget>,
+    budget_reservation: Option<crate::admin::ResponseBodyBudgetReservation>,
 ) -> Response<Full<Bytes>> {
     // Content negotiation FIRST — the ETag must be representation-specific so
     // a cached YAML ETag does not produce a false 304 when the client requests
@@ -2643,30 +2704,17 @@ async fn spec_content_response_async(
     let etag = spec_representation_etag(&spec.content_hash, spec.spec_format, target_fmt);
 
     // If-None-Match check (RFC 9110 §13.1.2: comma-separated list across all
-    // header lines, W/ prefix)
-    if if_none_match_matches(request_headers, &etag) {
-        return crate::admin::with_admin_security_headers(Response::builder())
-            .status(StatusCode::NOT_MODIFIED)
-            .header("ETag", &etag)
-            .header("Vary", "Accept")
-            .body(Full::new(Bytes::new()))
-            .unwrap_or_else(|_| crate::admin::admin_builder_failure_response());
-    }
-
-    // Fail fast before decompressing when this connection already lacks budget
-    // for the expected response size (or is completely exhausted for converted
-    // responses).
-    if let Some(budget) = response_budget.as_ref() {
-        let precheck_failed = if target_fmt == spec.spec_format && spec.uncompressed_size > 0 {
-            usize::try_from(spec.uncompressed_size)
-                .map(|bytes| !budget.has_capacity_for_bytes(bytes))
-                .unwrap_or(true)
-        } else {
-            budget.is_exhausted()
-        };
-        if precheck_failed {
-            return spec_response_budget_unavailable_response();
-        }
+    // header lines, W/ prefix). Wildcard `*` on cross-format conversions (or
+    // oversized rows) defers `304` until bounded decode/conversion succeeds.
+    let inm_outcome = evaluate_if_none_match(request_headers, &etag);
+    if can_fast_path_not_modified(
+        inm_outcome,
+        spec.spec_format,
+        target_fmt,
+        spec.uncompressed_size,
+        max_decompress_bytes,
+    ) {
+        return not_modified_response(&etag);
     }
 
     // Offload gzip decompression + optional YAML/JSON conversion to the
@@ -2733,9 +2781,13 @@ async fn spec_content_response_async(
         }
     };
 
+    if inm_outcome == IfNoneMatchOutcome::MatchedWildcard {
+        return not_modified_response(&etag);
+    }
+
     let len = body_bytes.len();
-    let budget_permit = if let Some(budget) = response_budget.as_ref() {
-        match budget.try_acquire_bytes(len) {
+    let budget_permit = if let Some(reservation) = budget_reservation {
+        match reservation.adjust_to_bytes(len) {
             Some(permit) => Some(permit),
             None => return spec_response_budget_unavailable_response(),
         }
@@ -2755,6 +2807,54 @@ async fn spec_content_response_async(
         response.extensions_mut().insert(permit);
     }
     response
+}
+
+/// Test helper verifying that `If-None-Match: *` does not short-circuit `304`
+/// for cross-format conversions (preserving `500` parity when conversion fails
+/// or exceeds the output cap) while preflight reserves or rejects budget
+/// atomically before codec admission.
+pub(crate) fn check_spec_read_preflight_for_test(
+    stored_format: SpecFormat,
+    uncompressed_size: u64,
+    max_decompress_bytes: usize,
+    accept: &str,
+    if_none_match: Option<&str>,
+    budget_capacity_kib: u32,
+    already_held_bytes: usize,
+) -> (Option<u16>, usize) {
+    let meta = crate::config::db_backend::ApiSpecConditionalMeta {
+        spec_format: stored_format,
+        content_hash: "deadbeef".to_string(),
+        uncompressed_size,
+    };
+    let mut headers = hyper::HeaderMap::new();
+    if let Ok(val) = hyper::header::HeaderValue::from_str(accept) {
+        headers.insert(hyper::header::ACCEPT, val);
+    }
+    let check_inm = if let Some(inm) = if_none_match {
+        if let Ok(val) = hyper::header::HeaderValue::from_str(inm) {
+            headers.insert(hyper::header::IF_NONE_MATCH, val);
+        }
+        true
+    } else {
+        false
+    };
+    let budget = crate::admin::AdminConnResponseBudget::new(budget_capacity_kib);
+    let _held = if already_held_bytes > 0 {
+        budget.try_acquire_bytes(already_held_bytes)
+    } else {
+        None
+    };
+    match preflight_spec_read_from_meta(
+        &meta,
+        &headers,
+        check_inm,
+        max_decompress_bytes,
+        Some(&budget),
+    ) {
+        SpecReadPreflight::Respond(resp) => (Some(resp.status().as_u16()), budget.available_kib()),
+        SpecReadPreflight::Proceed(_res) => (None, budget.available_kib()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3667,38 +3767,60 @@ pub async fn handle_get_api_spec(
         .extensions()
         .get::<crate::admin::AdminConnResponseBudget>()
         .cloned();
-    if !has_if_none_match
-        && response_budget
-            .as_ref()
-            .is_some_and(crate::admin::AdminConnResponseBudget::is_exhausted)
-    {
-        return Ok(spec_response_budget_unavailable_response());
-    }
+    let max_decompress = max_spec_decompress_bytes(state.admin_spec_max_body_size_mib);
 
-    // Fast path for conditional GET (`If-None-Match`) or a connection that
-    // already has buffered spec responses in flight: read only `(spec_format,
-    // content_hash, uncompressed_size)` without acquiring a global read codec
-    // slot or loading compressed blobs so `304` hits and doomed `503` reads
-    // never queue behind or occupy `SPEC_READ_CODEC_SLOTS`.
-    if has_if_none_match
-        || response_budget
-            .as_ref()
-            .is_some_and(crate::admin::AdminConnResponseBudget::has_in_flight)
-    {
+    // Atomically reserve per-connection buffered response budget BEFORE
+    // acquiring one of the four process-wide read codec slots or fetching the
+    // compressed blob:
+    // - On an idle connection without `If-None-Match`, reserve the full budget
+    //   provisionally (0 extra DB queries) and shrink to exact body length once
+    //   decoded.
+    // - Otherwise (conditional GET or connection with responses already in
+    //   flight), run the lightweight metadata query to short-circuit `304`/`406`
+    //   and atomically reserve `uncompressed_size` before entering the codec.
+    let budget_reservation = if !has_if_none_match {
+        if let Some(budget) = response_budget.as_ref() {
+            if let Some(reservation) = budget.try_reserve_full() {
+                Some(reservation)
+            } else if budget.is_exhausted() {
+                return Ok(spec_response_budget_unavailable_response());
+            } else {
+                let meta = match db.get_api_spec_conditional_meta(namespace, id).await {
+                    Ok(Some(meta)) => meta,
+                    Ok(None) => return Ok(error_response(ApiSpecError::NotFound)),
+                    Err(e) => return Ok(error_response(classify_db_error(e))),
+                };
+                match preflight_spec_read_from_meta(
+                    &meta,
+                    req.headers(),
+                    false,
+                    max_decompress,
+                    Some(budget),
+                ) {
+                    SpecReadPreflight::Respond(response) => return Ok(response),
+                    SpecReadPreflight::Proceed(reservation) => reservation,
+                }
+            }
+        } else {
+            None
+        }
+    } else {
         let meta = match db.get_api_spec_conditional_meta(namespace, id).await {
             Ok(Some(meta)) => meta,
             Ok(None) => return Ok(error_response(ApiSpecError::NotFound)),
             Err(e) => return Ok(error_response(classify_db_error(e))),
         };
-        if let Some(response) = try_preflight_spec_read_response(
+        match preflight_spec_read_from_meta(
             &meta,
             req.headers(),
-            has_if_none_match,
+            true,
+            max_decompress,
             response_budget.as_ref(),
         ) {
-            return Ok(response);
+            SpecReadPreflight::Respond(response) => return Ok(response),
+            SpecReadPreflight::Proceed(reservation) => reservation,
         }
-    }
+    };
 
     // Acquire read codec capacity BEFORE loading the full compressed spec blob
     // from the database so bursts of concurrent reads cannot hold unbounded
@@ -3716,13 +3838,12 @@ pub async fn handle_get_api_spec(
         Err(e) => return Ok(error_response(classify_db_error(e))),
     };
 
-    let max_decompress = max_spec_decompress_bytes(state.admin_spec_max_body_size_mib);
     Ok(spec_content_response_async(
         spec,
         req.headers(),
         max_decompress,
         read_permit,
-        response_budget,
+        budget_reservation,
     )
     .await)
 }
@@ -3747,19 +3868,38 @@ pub async fn handle_get_api_spec_by_proxy(
         .extensions()
         .get::<crate::admin::AdminConnResponseBudget>()
         .cloned();
-    if !has_if_none_match
-        && response_budget
-            .as_ref()
-            .is_some_and(crate::admin::AdminConnResponseBudget::is_exhausted)
-    {
-        return Ok(spec_response_budget_unavailable_response());
-    }
+    let max_decompress = max_spec_decompress_bytes(state.admin_spec_max_body_size_mib);
 
-    if has_if_none_match
-        || response_budget
-            .as_ref()
-            .is_some_and(crate::admin::AdminConnResponseBudget::has_in_flight)
-    {
+    let budget_reservation = if !has_if_none_match {
+        if let Some(budget) = response_budget.as_ref() {
+            if let Some(reservation) = budget.try_reserve_full() {
+                Some(reservation)
+            } else if budget.is_exhausted() {
+                return Ok(spec_response_budget_unavailable_response());
+            } else {
+                let meta = match db
+                    .get_api_spec_conditional_meta_by_proxy(namespace, proxy_id)
+                    .await
+                {
+                    Ok(Some(meta)) => meta,
+                    Ok(None) => return Ok(error_response(ApiSpecError::NotFound)),
+                    Err(e) => return Ok(error_response(classify_db_error(e))),
+                };
+                match preflight_spec_read_from_meta(
+                    &meta,
+                    req.headers(),
+                    false,
+                    max_decompress,
+                    Some(budget),
+                ) {
+                    SpecReadPreflight::Respond(response) => return Ok(response),
+                    SpecReadPreflight::Proceed(reservation) => reservation,
+                }
+            }
+        } else {
+            None
+        }
+    } else {
         let meta = match db
             .get_api_spec_conditional_meta_by_proxy(namespace, proxy_id)
             .await
@@ -3768,15 +3908,17 @@ pub async fn handle_get_api_spec_by_proxy(
             Ok(None) => return Ok(error_response(ApiSpecError::NotFound)),
             Err(e) => return Ok(error_response(classify_db_error(e))),
         };
-        if let Some(response) = try_preflight_spec_read_response(
+        match preflight_spec_read_from_meta(
             &meta,
             req.headers(),
-            has_if_none_match,
+            true,
+            max_decompress,
             response_budget.as_ref(),
         ) {
-            return Ok(response);
+            SpecReadPreflight::Respond(response) => return Ok(response),
+            SpecReadPreflight::Proceed(reservation) => reservation,
         }
-    }
+    };
 
     let Ok(read_permit) = Arc::clone(&SPEC_READ_CODEC_SLOTS).acquire_owned().await else {
         return Ok(json_resp(
@@ -3791,13 +3933,12 @@ pub async fn handle_get_api_spec_by_proxy(
         Err(e) => return Ok(error_response(classify_db_error(e))),
     };
 
-    let max_decompress = max_spec_decompress_bytes(state.admin_spec_max_body_size_mib);
     Ok(spec_content_response_async(
         spec,
         req.headers(),
         max_decompress,
         read_permit,
-        response_budget,
+        budget_reservation,
     )
     .await)
 }

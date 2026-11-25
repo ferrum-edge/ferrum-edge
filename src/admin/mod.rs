@@ -1485,26 +1485,81 @@ impl AdminConnResponseBudget {
         self.semaphore.available_permits() == 0
     }
 
-    pub(crate) fn has_in_flight(&self) -> bool {
-        self.semaphore.available_permits() < self.capacity_kib as usize
-    }
-
     pub(crate) fn has_capacity_for_bytes(&self, bytes: usize) -> bool {
         self.cost_kib(bytes)
             .is_some_and(|cost| self.semaphore.available_permits() >= cost as usize)
     }
 
-    pub(crate) fn try_acquire_bytes(&self, bytes: usize) -> Option<ResponseBodyBudgetPermit> {
+    /// Atomically reserve `bytes` from this connection's budget before
+    /// acquiring global read codec slots or loading compressed spec blobs.
+    pub(crate) fn try_reserve_bytes(&self, bytes: usize) -> Option<ResponseBodyBudgetReservation> {
         let cost_kib = self.cost_kib(bytes)?;
         self.semaphore
             .clone()
             .try_acquire_many_owned(cost_kib)
             .ok()
-            .map(|permit| ResponseBodyBudgetPermit(Arc::new(permit)))
+            .map(|permit| ResponseBodyBudgetReservation {
+                budget: self.clone(),
+                permit,
+            })
+    }
+
+    /// Atomically reserve the full connection budget on an idle connection so
+    /// an unconditional read can skip a separate metadata preflight query and
+    /// shrink the reservation to the exact response size once decoded.
+    pub(crate) fn try_reserve_full(&self) -> Option<ResponseBodyBudgetReservation> {
+        self.semaphore
+            .clone()
+            .try_acquire_many_owned(self.capacity_kib)
+            .ok()
+            .map(|permit| ResponseBodyBudgetReservation {
+                budget: self.clone(),
+                permit,
+            })
+    }
+
+    pub(crate) fn try_acquire_bytes(&self, bytes: usize) -> Option<ResponseBodyBudgetPermit> {
+        self.try_reserve_bytes(bytes)
+            .map(|res| ResponseBodyBudgetPermit(Arc::new(res.permit)))
     }
 
     pub(crate) fn available_kib(&self) -> usize {
         self.semaphore.available_permits()
+    }
+}
+
+/// Exclusive pre-response budget reservation held while fetching and decoding
+/// a spec body, then adjusted to the exact final response size and converted
+/// into a cloneable [`ResponseBodyBudgetPermit`].
+pub(crate) struct ResponseBodyBudgetReservation {
+    budget: AdminConnResponseBudget,
+    permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl ResponseBodyBudgetReservation {
+    /// Adjust this reservation to `actual_bytes`, releasing excess KiB
+    /// immediately or atomically acquiring any positive delta without blocking.
+    pub(crate) fn adjust_to_bytes(
+        mut self,
+        actual_bytes: usize,
+    ) -> Option<ResponseBodyBudgetPermit> {
+        let desired_kib = self.budget.cost_kib(actual_bytes)? as usize;
+        let current_kib = self.permit.num_permits();
+        if desired_kib < current_kib {
+            if let Some(excess) = self.permit.split(current_kib - desired_kib) {
+                drop(excess);
+            }
+        } else if desired_kib > current_kib {
+            let delta = u32::try_from(desired_kib - current_kib).ok()?;
+            let extra = self
+                .budget
+                .semaphore
+                .clone()
+                .try_acquire_many_owned(delta)
+                .ok()?;
+            self.permit.merge(extra);
+        }
+        Some(ResponseBodyBudgetPermit(Arc::new(self.permit)))
     }
 }
 
@@ -1812,12 +1867,13 @@ pub(crate) async fn exercise_response_budget_wrapper_for_test(
 }
 
 /// Test helper verifying strict budget refusal when `bytes` exceeds capacity
-/// (no clamping bypass) and `has_capacity_for_bytes` pre-check behavior.
+/// (no clamping bypass), provisional reservation shrink/grow adjustment, and
+/// `has_capacity_for_bytes` pre-check behavior.
 pub(crate) fn check_response_budget_limits_for_test(
     capacity_kib: u32,
     oversized_bytes: usize,
     fitting_bytes: usize,
-) -> (bool, bool, bool) {
+) -> (bool, bool, bool, bool) {
     let budget = AdminConnResponseBudget::new(capacity_kib);
     let oversized_refused = !budget.has_capacity_for_bytes(oversized_bytes)
         && budget.try_acquire_bytes(oversized_bytes).is_none();
@@ -1827,15 +1883,44 @@ pub(crate) fn check_response_budget_limits_for_test(
         && !budget.has_capacity_for_bytes(fitting_bytes)
         && budget.try_acquire_bytes(fitting_bytes).is_none();
     drop(held);
-    (oversized_refused, first_admitted, second_refused)
+
+    // Provisional full reservation shrinks cleanly to actual size and releases
+    // excess KiB immediately; attempting to grow beyond remaining budget fails.
+    let shrink_and_grow_ok = if let Some(full) = budget.try_reserve_full() {
+        let locked_while_full =
+            budget.available_kib() == 0 && budget.try_reserve_bytes(1024).is_none();
+        let shrunk = full.adjust_to_bytes(50 * 1024);
+        let released_excess = shrunk.is_some()
+            && budget.available_kib() == (capacity_kib as usize).saturating_sub(50);
+        let second_small = budget.try_reserve_bytes(100 * 1024);
+        let grow_beyond_refused = second_small
+            .and_then(|res| res.adjust_to_bytes((capacity_kib as usize) * 1024))
+            .is_none();
+        drop(shrunk);
+        locked_while_full
+            && released_excess
+            && grow_beyond_refused
+            && budget.available_kib() == capacity_kib as usize
+    } else {
+        false
+    };
+
+    (
+        oversized_refused,
+        first_admitted,
+        second_refused,
+        shrink_and_grow_ok,
+    )
 }
 
 /// Apply the shared admin HTTP/2 transport settings used by [`serve_admin_io`]
 /// and transport tests.
 ///
-/// Setting `max_send_buf_size(BUDGETED_BODY_CHUNK_BYTES)` caps `h2`'s
-/// **per-stream** send buffer at 64 KiB (down from ~400 KiB), while `h2`'s
-/// `FramedWrite` connection encoder buffer stays bounded by `COALESCE_LIMIT`.
+/// Setting `max_send_buf_size(BUDGETED_BODY_CHUNK_BYTES)` sets `h2`'s
+/// per-stream send-buffer threshold to 64 KiB (down from ~400 KiB), while
+/// `h2`'s `FramedWrite` uses `COALESCE_LIMIT` (64 KiB) as its data-coalescing
+/// target (control frames or a single queued chunk may transiently exceed
+/// those thresholds).
 fn configure_admin_http2_builder(
     builder: &mut hyper_util::server::conn::auto::Builder<hyper_util::rt::TokioExecutor>,
     limits: AdminRequestLimits,
@@ -1850,8 +1935,8 @@ fn configure_admin_http2_builder(
 
 /// Exercise a real HTTP/2 server using [`configure_admin_http2_builder`] and a
 /// client over a small paused duplex pipe so `h2` actively encodes Stream 1
-/// until the duplex pipe saturates mid-body on a 200 KiB budgeted response
-/// while the connection budget is 256 KiB. Verifies that a concurrent 200 KiB
+/// until the duplex pipe saturates mid-body on a 512 KiB budgeted response
+/// while the connection budget is 640 KiB. Verifies that a concurrent 512 KiB
 /// request receives `503` with `Retry-After: 1` while Stream 1 is stalled, and
 /// that a follow-up request succeeds with `200` once Stream 1 drains. Reached
 /// through `_test_support`.
@@ -1954,12 +2039,12 @@ pub(crate) async fn exercise_http2_stalled_response_budget_for_test() -> Result<
         }
     }
 
-    const CAPACITY_KIB: u32 = 256;
-    const BODY_BYTES: usize = 200 * 1024;
+    const CAPACITY_KIB: u32 = 640;
+    const BODY_BYTES: usize = 512 * 1024;
     const DUPLEX_BYTES: usize = 16 * 1024;
-    // 16 KiB duplex pipe + 64 KiB per-stream h2 send buffer + 64 KiB h2
-    // FramedWrite coalesce limit = 144 KiB < 200 KiB, guaranteeing Stream 1
-    // stalls mid-body while client reads are paused.
+    // 512 KiB leaves wide headroom above the 16 KiB duplex pipe, h2's 64 KiB
+    // per-stream send-buffer threshold, and FramedWrite's 64 KiB coalescing
+    // target so Stream 1 reliably stalls mid-body while client reads are paused.
     let (client_io, server_io) = tokio::io::duplex(DUPLEX_BYTES);
     let paused = Arc::new(AtomicBool::new(false));
     let read_waker = Arc::new(std::sync::Mutex::new(None));
@@ -2071,9 +2156,13 @@ pub(crate) async fn exercise_http2_stalled_response_budget_for_test() -> Result<
         .body(http_body_util::Empty::<Bytes>::new())
         .map_err(|_| "build req1")?;
     let resp1_fut = sender.send_request(req1);
-    s1_wait.await;
-    pipe_wait.await;
-    if budget.available_kib() != 56 {
+    tokio::time::timeout(Duration::from_secs(5), s1_wait)
+        .await
+        .map_err(|_| "timed out waiting for Stream 1 dispatch")?;
+    tokio::time::timeout(Duration::from_secs(5), pipe_wait)
+        .await
+        .map_err(|_| "timed out waiting for h2 to saturate duplex pipe")?;
+    if budget.available_kib() != (CAPACITY_KIB as usize - BODY_BYTES / 1024) {
         return Err("h2 released response budget before stalled Stream 1 drained");
     }
 
@@ -2087,7 +2176,9 @@ pub(crate) async fn exercise_http2_stalled_response_budget_for_test() -> Result<
         .body(http_body_util::Empty::<Bytes>::new())
         .map_err(|_| "build req2")?;
     let resp2_fut = sender.send_request(req2);
-    s2_wait.await;
+    tokio::time::timeout(Duration::from_secs(5), s2_wait)
+        .await
+        .map_err(|_| "timed out waiting for Stream 2 dispatch")?;
 
     // Resume reads so both Stream 1 (200) and Stream 2 (503) deliver to client.
     paused.store(false, Ordering::Release);

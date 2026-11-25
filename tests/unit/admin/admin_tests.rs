@@ -1691,8 +1691,9 @@ fn head_withdrawn_trust_401_restore_partial_clear_and_tls_settlement_invariants(
 #[tokio::test]
 async fn admin_response_budget_chunks_holds_permit_and_rejects_oversized_payloads() {
     // Oversized payloads (> budget capacity) must be refused rather than clamped
-    // down to fit, and concurrent bodies exceeding remaining budget must fail fast.
-    let (oversized_refused, first_admitted, second_refused) =
+    // down to fit, concurrent bodies exceeding remaining budget must fail fast,
+    // and provisional full reservations must shrink/grow atomically.
+    let (oversized_refused, first_admitted, second_refused, shrink_and_grow_ok) =
         ferrum_edge::_test_support::check_admin_response_budget_limits_for_test(
             256,
             300 * 1024,
@@ -1710,6 +1711,60 @@ async fn admin_response_budget_chunks_holds_permit_and_rejects_oversized_payload
         second_refused,
         "second payload exceeding remaining budget must be rejected"
     );
+    assert!(
+        shrink_and_grow_ok,
+        "provisional reservation must shrink cleanly and reject overflow growth"
+    );
+
+    // Preflight must atomically reserve budget (returning 503 when remaining
+    // budget is below uncompressed_size) and must NOT short-circuit
+    // `If-None-Match: *` to 304 when cross-format conversion is requested.
+    let (partial_503, remaining_after_503) =
+        ferrum_edge::_test_support::check_api_spec_read_preflight_for_test(
+            ferrum_edge::config::types::SpecFormat::Json,
+            200 * 1024,
+            512 * 1024,
+            "application/json",
+            None,
+            256,
+            100 * 1024,
+        );
+    assert_eq!(partial_503, Some(503));
+    assert_eq!(remaining_after_503, 156);
+    let (star_convert_status, remaining_after_star_reserve) =
+        ferrum_edge::_test_support::check_api_spec_read_preflight_for_test(
+            ferrum_edge::config::types::SpecFormat::Json,
+            100 * 1024,
+            512 * 1024,
+            "application/yaml",
+            Some("*"),
+            256,
+            0,
+        );
+    assert_eq!(
+        star_convert_status, None,
+        "If-None-Match: * must not bypass capped format conversion"
+    );
+    assert_eq!(
+        remaining_after_star_reserve, 156,
+        "preflight proceed must atomically reserve expected bytes before codec admission"
+    );
+    let (star_verbatim_status, remaining_after_verbatim_304) =
+        ferrum_edge::_test_support::check_api_spec_read_preflight_for_test(
+            ferrum_edge::config::types::SpecFormat::Json,
+            100 * 1024,
+            512 * 1024,
+            "application/json",
+            Some("*"),
+            256,
+            256 * 1024,
+        );
+    assert_eq!(
+        star_verbatim_status,
+        Some(304),
+        "verbatim If-None-Match: * within cap must still fast-path 304 on a full connection"
+    );
+    assert_eq!(remaining_after_verbatim_304, 0);
 
     // A 200 KiB budgeted body must yield multiple <= 64 KiB chunks, keep the
     // permit reserved across intermediate frames AND while queued frames remain

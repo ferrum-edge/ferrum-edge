@@ -136,16 +136,39 @@ pub mod _test_support {
     }
 
     /// Test helper verifying strict per-connection response budget enforcement
-    /// without clamping oversized payloads.
+    /// without clamping oversized payloads, plus provisional reservation
+    /// shrink/grow adjustments.
     pub fn check_admin_response_budget_limits_for_test(
         capacity_kib: u32,
         oversized_bytes: usize,
         fitting_bytes: usize,
-    ) -> (bool, bool, bool) {
+    ) -> (bool, bool, bool, bool) {
         crate::admin::check_response_budget_limits_for_test(
             capacity_kib,
             oversized_bytes,
             fitting_bytes,
+        )
+    }
+
+    /// Test helper verifying API-spec read preflight reservation and
+    /// `If-None-Match: *` conversion parity.
+    pub fn check_api_spec_read_preflight_for_test(
+        stored_format: crate::config::types::SpecFormat,
+        uncompressed_size: u64,
+        max_decompress_bytes: usize,
+        accept: &str,
+        if_none_match: Option<&str>,
+        budget_capacity_kib: u32,
+        already_held_bytes: usize,
+    ) -> (Option<u16>, usize) {
+        crate::admin::api_specs::handlers::check_spec_read_preflight_for_test(
+            stored_format,
+            uncompressed_size,
+            max_decompress_bytes,
+            accept,
+            if_none_match,
+            budget_capacity_kib,
+            already_held_bytes,
         )
     }
 

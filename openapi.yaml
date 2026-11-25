@@ -20363,9 +20363,11 @@ components:
           description: |
             Whether the configuration source (the database in `database` mode,
             the control plane's backing database in `cp` mode) is currently
-            reachable and usable. The same shared flag backing `/health`'s
-            `database.status` and the admin API write gate, and the
-            source of the `ferrum_database_config_source_connected` gauge.
+            reachable and usable. The shared poll-loop availability flag backing
+            the admin API write gate (`admin_writes_enabled`) and the
+            `ferrum_database_config_source_connected` gauge (distinct from
+            `/health`'s `database.status`, which reflects a separately cached
+            database probe).
         poll_failures_by_reason:
           type: object
           description: |
