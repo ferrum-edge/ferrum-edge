@@ -8383,30 +8383,6 @@ impl RestoreSnapshot {
     fn api_specs_total(&self) -> usize {
         self.api_specs.len()
     }
-
-    fn restore_payload_with_api_specs(&self) -> RestorePayload {
-        let mut payload = RestorePayload {
-            version: self.payload.version.clone(),
-            proxies: self.payload.proxies.clone(),
-            consumers: self.payload.consumers.clone(),
-            plugin_configs: self.payload.plugin_configs.clone(),
-            upstreams: self.payload.upstreams.clone(),
-            api_specs: None,
-            gateway_trust_bundles: self.payload.gateway_trust_bundles.clone(),
-            // Accepted-and-ignored `GET /backup` metadata. Listed explicitly
-            // rather than spread from `Default` so the literal stays exhaustive:
-            // a new `RestorePayload` section must make a deliberate choice here.
-            _ferrum_version: None,
-            _exported_at: None,
-            _source: None,
-            _counts: None,
-            _conditional: None,
-        };
-        if !self.api_specs.is_empty() || self.payload.api_specs.is_some() {
-            payload.api_specs = Some(ApiSpecsBackupSection::from_specs(&self.api_specs));
-        }
-        payload
-    }
 }
 
 /// Capture an authoritative snapshot of `namespace` for restore rollback.
@@ -8517,6 +8493,7 @@ pub(crate) fn payload_persist_error_message(error: &anyhow::Error) -> String {
 async fn persist_payload_resources(
     db: &dyn DatabaseBackend,
     payload: &RestorePayload,
+    api_specs: &[crate::config::types::ApiSpec],
     // The AUTHENTICATED target namespace. Gateway trust bundles are keyed by
     // namespace and are a singleton, so the target cannot be inferred from the
     // payload — it is passed explicitly (issue #3727).
@@ -8588,36 +8565,28 @@ async fn persist_payload_resources(
 
     // API specs must be inserted after proxies so the FK holds. Ordinary batch
     // inserts omit api_spec_id; stamp ownership from the backup payload next.
-    if should_continue(&errors)
-        && let Some(section) = payload.api_specs.as_ref()
-        && !section.items.is_empty()
-    {
-        match section.to_api_specs() {
-            Ok(specs) => {
-                match db.batch_insert_api_specs(&specs, mode).await {
-                    Ok(n) => counts.api_specs = n,
-                    Err(e) => {
-                        admission_unavailable |= is_mtls_dns_admission_unavailable(&e);
-                        let message = payload_persist_error_message(&e);
-                        errors.push(format!("api_specs: {message}"));
-                    }
-                }
-                if should_continue(&errors)
-                    && let Err(e) = db
-                        .apply_api_spec_ownership_from_resources(
-                            &payload.proxies,
-                            &payload.upstreams,
-                            &payload.plugin_configs,
-                            mode,
-                        )
-                        .await
-                {
-                    admission_unavailable |= is_mtls_dns_admission_unavailable(&e);
-                    let message = payload_persist_error_message(&e);
-                    errors.push(format!("api_spec_ownership: {message}"));
-                }
+    if should_continue(&errors) && !api_specs.is_empty() {
+        match db.batch_insert_api_specs(api_specs, mode).await {
+            Ok(n) => counts.api_specs = n,
+            Err(e) => {
+                admission_unavailable |= is_mtls_dns_admission_unavailable(&e);
+                let message = payload_persist_error_message(&e);
+                errors.push(format!("api_specs: {message}"));
             }
-            Err(message) => errors.push(format!("api_specs: {message}")),
+        }
+        if should_continue(&errors)
+            && let Err(e) = db
+                .apply_api_spec_ownership_from_resources(
+                    &payload.proxies,
+                    &payload.upstreams,
+                    &payload.plugin_configs,
+                    mode,
+                )
+                .await
+        {
+            admission_unavailable |= is_mtls_dns_admission_unavailable(&e);
+            let message = payload_persist_error_message(&e);
+            errors.push(format!("api_spec_ownership: {message}"));
         }
     }
 
@@ -8827,9 +8796,15 @@ async fn rollback_failed_restore(
             &error,
         ));
     } else {
-        let payload = snapshot.restore_payload_with_api_specs();
-        let (_, persist_errors, _) =
-            persist_payload_resources(db, &payload, namespace, false, &mode).await;
+        let (_, persist_errors, _) = persist_payload_resources(
+            db,
+            &snapshot.payload,
+            &snapshot.api_specs,
+            namespace,
+            false,
+            &mode,
+        )
+        .await;
         errors.extend(persist_errors);
     }
     if errors.is_empty() {
@@ -9022,14 +8997,11 @@ async fn restore_snapshot_after_intervening_clear(
         &current_spec_ids,
         &mut missing,
     );
-    if !plan.replay.is_empty() {
-        missing.api_specs = Some(ApiSpecsBackupSection::from_specs(&plan.replay));
-    }
-
     let mode = BatchConfigWriteMode::RestoreRollbackReplay {
         guard_owner: guard_owner.to_string(),
     };
-    let (_, mut errors, _) = persist_payload_resources(db, &missing, namespace, false, &mode).await;
+    let (_, mut errors, _) =
+        persist_payload_resources(db, &missing, &plan.replay, namespace, false, &mode).await;
     // Report an incomplete recovery rather than a silent success: the operator
     // must reconcile these by hand. Counts only — no resource ids, which may be
     // attacker-influenced payload values.
@@ -12721,7 +12693,7 @@ async fn handle_restore(
     // the admin body ceiling per item; run them on the blocking pool so the
     // async runtime stays responsive. Validation still completes before any
     // delete/write.
-    match payload.api_specs.take() {
+    let validated_api_specs: Vec<crate::config::types::ApiSpec> = match payload.api_specs.take() {
         Some(section) => {
             // Move the canonical resource vectors through the blocking task and
             // take them back out of its result, so the ownership graph the API
@@ -12769,12 +12741,11 @@ async fn handle_restore(
                     for spec in &mut specs {
                         spec.namespace = namespace.to_string();
                     }
-                    // Persist the namespace-stamped section so insert uses the
-                    // request namespace, not a hostile payload namespace.
-                    // `persist_payload_resources` decodes it again at write
-                    // time, so the validated copy is dropped here rather than
-                    // held alongside it for the rest of the restore.
-                    payload.api_specs = Some(ApiSpecsBackupSection::from_specs(&specs));
+                    // Reuse the already-validated, namespace-stamped `Vec<ApiSpec>`
+                    // directly on both conditional and unconditional restore
+                    // paths instead of re-encoding to base64 and synchronously
+                    // re-validating external-ref snapshots on Tokio workers.
+                    specs
                 }
                 Err(api_spec_errors) => {
                     return Ok(json_response(
@@ -12816,8 +12787,9 @@ async fn handle_restore(
             // Legacy backup: strip ownership tags so restored resources become
             // hand-managed rather than pointing at deleted specs.
             clear_api_spec_ownership_tags(&mut payload);
+            Vec::new()
         }
-    }
+    };
 
     // Complete all fallible payload preparation before changing durable state.
     let mut preparation_errors = Vec::new();
@@ -12870,6 +12842,7 @@ async fn handle_restore(
             db.as_ref(),
             namespace,
             &payload,
+            &validated_api_specs,
             if_match,
             &restore_mode,
             &mut namespace_config_admission_guard,
@@ -13229,7 +13202,14 @@ async fn handle_restore(
     let import_operation = restore_guard.operation();
     let import_completion = match namespace_config_admission_guard
         .run_to_completion_while_held(import_operation.run_restore_import(
-            persist_payload_resources(db.as_ref(), &payload, namespace, false, &restore_mode),
+            persist_payload_resources(
+                db.as_ref(),
+                &payload,
+                &validated_api_specs,
+                namespace,
+                false,
+                &restore_mode,
+            ),
             |(_, errors, _): &(PersistCounts, Vec<String>, bool)| errors.is_empty(),
         ))
         .await

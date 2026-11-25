@@ -425,7 +425,7 @@ For deployments exceeding the body limit, use partial backups via `?resources=` 
 
 **Restore** deserializes the request body directly into typed structs — again skipping the `Value` intermediate. Peak memory is body bytes + parsed structs.
 
-**Database inserts** are chunked into 1,000-record transactions to keep WAL/redo log size bounded and avoid prolonged lock holds. A 90,000-plugin restore runs as 90 separate transactions rather than one massive transaction.
+**Database inserts** during unconditional restores (without `If-Match`) use backend- and resource-dependent batching: SQL backends chunk independent resources into 1,000-record transactions while keeping graph-dependent plugin batches coherent, replica-set MongoDB imports plugin batches atomically in a transaction, and standalone MongoDB uses bulk writes. Conditional restores (with `If-Match`) commit the complete namespace replacement in one atomic transaction without chunked fallback.
 
 ### Example: Backup & Restore Workflow
 

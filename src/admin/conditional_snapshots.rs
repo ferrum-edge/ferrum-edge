@@ -326,6 +326,7 @@ pub(super) async fn restore(
     db: &dyn DatabaseBackend,
     namespace: &str,
     payload: &RestorePayload,
+    validated_api_specs: &[crate::config::types::ApiSpec],
     if_match: &IfMatch,
     mode: &BatchConfigWriteMode,
     admission: &mut crud::NamespaceConfigAdmissionGuard,
@@ -350,15 +351,6 @@ pub(super) async fn restore(
     if !if_match.matches(Some(&tag)) {
         return store_error(&anyhow::Error::new(NamespacePreconditionFailed));
     }
-    let specs = match payload
-        .api_specs
-        .as_ref()
-        .map(|section| section.to_api_specs())
-        .transpose()
-    {
-        Ok(specs) => specs.unwrap_or_default(),
-        Err(_) => return unavailable(),
-    };
     if admission.hand_off_to_restore_transaction().await.is_err() {
         return unavailable();
     }
@@ -372,7 +364,7 @@ pub(super) async fn restore(
             admission_lease: Some(admission.lease_ref()),
         },
         expected,
-        api_specs: &specs,
+        api_specs: validated_api_specs,
         gateway_trust_bundles: payload.gateway_trust_bundles.as_deref(),
     };
     if let Err(error) = db.restore_namespace_conditionally(&restore, mode).await {
@@ -383,7 +375,7 @@ pub(super) async fn restore(
         "consumers": payload.consumers.len(),
         "plugin_configs": payload.plugin_configs.len(),
         "upstreams": payload.upstreams.len(),
-        "api_specs": specs.len(),
+        "api_specs": validated_api_specs.len(),
         "gateway_trust_bundles": payload.gateway_trust_bundles.as_ref().map_or(0, Vec::len),
     }});
     let event = audit::AuditEvent::new(

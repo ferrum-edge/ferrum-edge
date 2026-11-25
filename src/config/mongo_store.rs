@@ -10135,8 +10135,9 @@ mod inner {
     /// Pre-checks the raw binary/string payload lower bound before calling
     /// `mongodb::bson::to_vec`, and treats BSON's internal 16 MiB binary-field
     /// cap as `Ok(false)` rather than an unclassified serialization error so
-    /// handlers consistently return `413` (unconditional POST/PUT and
-    /// conditional restore) or `409` (conditional deployment PUT).
+    /// callers consistently return `413` (unconditional POST/PUT and
+    /// conditional restore), `409` (conditional deployment PUT), or an
+    /// `api_specs:` restore error (unconditional restore).
     fn spec_doc_fits_mongo_bson_limit(doc: &Document) -> Result<bool, anyhow::Error> {
         if approx_bson_doc_bytes(doc) > MONGO_API_SPEC_BSON_LIMIT_BYTES {
             return Ok(false);

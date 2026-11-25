@@ -309,13 +309,6 @@ impl ApiSpecsBackupSection {
             items: specs.iter().map(ApiSpecBackupItem::from_api_spec).collect(),
         }
     }
-
-    pub(crate) fn to_api_specs(&self) -> Result<Vec<ApiSpec>, String> {
-        self.items
-            .iter()
-            .map(ApiSpecBackupItem::to_api_spec)
-            .collect()
-    }
 }
 
 /// Wire form of one API spec in a backup/restore payload.
