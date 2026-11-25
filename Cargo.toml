@@ -359,12 +359,12 @@ google-cloud-secretmanager-v1 = { version = "=1.14.0", optional = true }
 # direct `with_credentials(..)` call site has a declared dependency.
 # 1.16.0+ replaced chrono with jiff (issue #7419); 1.17.0 pairs with gaxi 0.7.19
 # on the vendored reqwest 0.13.4 and opentelemetry_sdk 0.32.x lines.
-google-cloud-auth = { version = "=1.17.0", optional = true }
+google-cloud-auth = { version = "=1.19.0", optional = true }
 # Security and dependency-chain constraints (#5912, #7419). GAX 0.7.19 stays on
 # the vendored reqwest 0.13.4 and OpenTelemetry 0.32.x lines (0.7.20+ moves to
 # opentelemetry_sdk 0.33) while pairing with google-cloud-auth 1.17.0 (chrono-free).
 # These pins add no provider features beyond the existing GCP client graph.
-google-cloud-gax-internal = { version = "=0.7.19", default-features = false, optional = true }
+google-cloud-gax-internal = { version = "=0.7.22", default-features = false, optional = true }
 google-cloud-gax = { version = "=1.15.0", default-features = false, optional = true }
 google-cloud-wkt = { version = "=1.11.0", default-features = false, optional = true }
 opentelemetry_sdk = { version = "0.32.1", default-features = false, optional = true }
