@@ -3319,6 +3319,7 @@ impl DatabaseStore {
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
+        codec_slots: Option<&std::sync::Arc<tokio::sync::Semaphore>>,
     ) -> Result<ConditionalNamespaceSnapshot, anyhow::Error> {
         let purpose = FullLoadPurpose::RestoreSnapshot;
         let mut config = GatewayConfig {
@@ -3341,9 +3342,14 @@ impl DatabaseStore {
             .await?;
         let mut api_specs = Vec::with_capacity(rows.len());
         for row in &rows {
-            api_specs.push(
-                row_to_api_spec_async(row, &crate::admin::api_specs::SPEC_READ_CODEC_SLOTS).await?,
-            );
+            let spec = match codec_slots {
+                Some(slots) => row_to_api_spec_async(row, slots).await?,
+                None => {
+                    let spec_content: Vec<u8> = row.try_get("spec_content")?;
+                    row_to_api_spec_with_content(row, spec_content, true)?
+                }
+            };
+            api_specs.push(spec);
         }
         // Release the driver copy of every stored spec document now that each
         // is decoded, rather than holding both until the snapshot returns.
@@ -3386,9 +3392,17 @@ impl DatabaseStore {
         let mut tx = self.pool().begin().await?;
         self.configure_full_load_snapshot(&mut tx).await?;
         let snapshot = self
-            .conditional_namespace_snapshot_tx(&mut tx, namespace)
+            .conditional_namespace_snapshot_tx(&mut tx, namespace, None)
             .await?;
         tx.commit().await?;
+        // Validate external-ref snapshots only after releasing the SQL pool
+        // connection so read-side snapshot exports cannot invert lock ordering
+        // against `GET /api-specs/{id}` handlers holding `SPEC_READ_CODEC_SLOTS`.
+        crate::admin::api_specs::external_refs::validate_api_spec_snapshots_async(
+            &snapshot.api_specs,
+            &crate::admin::api_specs::SPEC_READ_CODEC_SLOTS,
+        )
+        .await?;
         Ok(snapshot)
     }
 
@@ -3396,11 +3410,12 @@ impl DatabaseStore {
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
+        codec_slots: Option<&std::sync::Arc<tokio::sync::Semaphore>>,
     ) -> Result<DeploymentSnapshot, anyhow::Error> {
         use futures_util::TryStreamExt;
 
         let snapshot = self
-            .conditional_namespace_snapshot_tx(tx, namespace)
+            .conditional_namespace_snapshot_tx(tx, namespace, codec_slots)
             .await?;
         // Refuses an over-bound typed snapshot before any raw row is read.
         let mut stored = StoredEvidence::for_snapshot(snapshot)?;
@@ -3440,8 +3455,15 @@ impl DatabaseStore {
     ) -> Result<DeploymentSnapshot, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
         self.configure_full_load_snapshot(&mut tx).await?;
-        let snapshot = self.deployment_snapshot_tx(&mut tx, namespace).await?;
+        let snapshot = self
+            .deployment_snapshot_tx(&mut tx, namespace, None)
+            .await?;
         tx.commit().await?;
+        crate::admin::api_specs::external_refs::validate_api_spec_snapshots_async(
+            &snapshot.snapshot().api_specs,
+            &crate::admin::api_specs::SPEC_READ_CODEC_SLOTS,
+        )
+        .await?;
         Ok(snapshot)
     }
 
@@ -3478,7 +3500,11 @@ impl DatabaseStore {
         self.lock_config_change_sequence_tx(tx, precondition.namespace)
             .await?;
         let snapshot = self
-            .deployment_snapshot_tx(tx, precondition.namespace)
+            .deployment_snapshot_tx(
+                tx,
+                precondition.namespace,
+                Some(&crate::admin::api_specs::SPEC_WRITE_CODEC_SLOTS),
+            )
             .await?;
         if snapshot.digest()? != precondition.expected {
             return Err(NamespacePreconditionFailed.into());
@@ -8539,7 +8565,11 @@ impl DatabaseStore {
             .await?;
         if let Some(restore) = restore {
             let current = self
-                .conditional_namespace_snapshot_tx(&mut tx, graph.namespace)
+                .conditional_namespace_snapshot_tx(
+                    &mut tx,
+                    graph.namespace,
+                    Some(&crate::admin::api_specs::SPEC_WRITE_CODEC_SLOTS),
+                )
                 .await?;
             if current.digest()? != restore.expected {
                 return Err(anyhow::Error::new(NamespacePreconditionFailed));
@@ -11107,7 +11137,11 @@ impl DatabaseStore {
             .await?;
             if let Some(precondition) = precondition {
                 let candidate = self
-                    .conditional_namespace_snapshot_tx(&mut tx, &spec.namespace)
+                    .conditional_namespace_snapshot_tx(
+                        &mut tx,
+                        &spec.namespace,
+                        Some(&crate::admin::api_specs::SPEC_WRITE_CODEC_SLOTS),
+                    )
                     .await?;
                 validate_deployment_candidate(
                     &candidate.config,
@@ -11574,7 +11608,11 @@ impl DatabaseStore {
         }
         if let Some(precondition) = precondition {
             let candidate = self
-                .conditional_namespace_snapshot_tx(&mut tx, &spec.namespace)
+                .conditional_namespace_snapshot_tx(
+                    &mut tx,
+                    &spec.namespace,
+                    Some(&crate::admin::api_specs::SPEC_WRITE_CODEC_SLOTS),
+                )
                 .await?;
             validate_deployment_candidate(&candidate.config, precondition.validation_http_client)
                 .await?;
@@ -11979,6 +12017,27 @@ impl DatabaseStore {
         match row {
             Some(r) => Ok(Some(
                 row_to_api_spec_async(&r, &crate::admin::api_specs::SPEC_READ_CODEC_SLOTS).await?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// Fetch a single ApiSpec by namespace + id for write-side admission (`PUT` /
+    /// `DELETE`), validating any persisted snapshot under `SPEC_WRITE_CODEC_SLOTS`.
+    pub async fn get_api_spec_for_write(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<crate::config::types::ApiSpec>, anyhow::Error> {
+        let row: Option<AnyRow> =
+            sqlx::query(self.q("SELECT * FROM api_specs WHERE namespace = ? AND id = ?"))
+                .bind(namespace)
+                .bind(id)
+                .fetch_optional(&self.pool())
+                .await?;
+        match row {
+            Some(r) => Ok(Some(
+                row_to_api_spec_async(&r, &crate::admin::api_specs::SPEC_WRITE_CODEC_SLOTS).await?,
             )),
             None => Ok(None),
         }
@@ -13760,6 +13819,14 @@ impl DatabaseBackend for DatabaseStore {
         id: &str,
     ) -> Result<Option<crate::config::types::ApiSpec>, anyhow::Error> {
         DatabaseStore::get_api_spec(self, namespace, id).await
+    }
+
+    async fn get_api_spec_for_write(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<crate::config::types::ApiSpec>, anyhow::Error> {
+        DatabaseStore::get_api_spec_for_write(self, namespace, id).await
     }
 
     async fn get_api_spec_by_proxy(

@@ -9118,8 +9118,9 @@ paths:
             A resource name / listen_path in the new spec conflicts with an
             existing resource outside this bundle, or the replacement would
             make mTLS DNS identities ambiguous. Conditional mode also refuses
-            missing or inconsistent deployment dependencies or ownership
-            before mutation.
+            missing or inconsistent deployment dependencies or ownership, or a
+            replacement document that exceeds MongoDB's ~15 MiB BSON preflight
+            limit, before mutation.
           content:
             application/json:
               schema:
@@ -9139,7 +9140,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/DeploymentMutationAcknowledgement"
         "413":
-          description: Request body exceeds `FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB` (default 25 MiB), or on MongoDB backends the serialized `api_specs` document (including any persisted external-ref snapshot) exceeds the ~15 MiB BSON preflight limit
+          description: Request body exceeds `FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB` (default 25 MiB), or on unconditional MongoDB replacements the serialized `api_specs` document (including any persisted external-ref snapshot) exceeds the ~15 MiB BSON preflight limit
           content:
             application/json:
               schema:

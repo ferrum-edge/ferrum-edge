@@ -572,6 +572,26 @@ pub async fn validate_external_ref_snapshot_pair_async(
     }
 }
 
+/// Validate the persisted external-ref snapshot/digest pairs of a slice of
+/// loaded [`crate::config::types::ApiSpec`] rows under `codec_slots`.
+pub async fn validate_api_spec_snapshots_async(
+    specs: &[crate::config::types::ApiSpec],
+    codec_slots: &std::sync::Arc<tokio::sync::Semaphore>,
+) -> Result<(), anyhow::Error> {
+    for spec in specs {
+        validate_external_ref_snapshot_pair_async(
+            spec.external_ref_snapshot.as_deref(),
+            spec.external_ref_digest.as_deref(),
+            codec_slots,
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("api_specs external-ref snapshot integrity validation failed")
+        })?;
+    }
+    Ok(())
+}
+
 pub fn validate_external_ref_summary_digest(digest: Option<&str>) -> Result<(), String> {
     if let Some(value) = digest
         && (value.len() != 64

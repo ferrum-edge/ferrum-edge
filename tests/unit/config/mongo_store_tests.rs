@@ -311,7 +311,7 @@ fn namespaced_resource_documents_use_composite_durable_keys() {
         "fn proxy_to_doc(",
         "fn plugin_config_to_doc(",
         "fn upstream_to_doc(",
-        "fn api_spec_to_doc(",
+        "fn api_spec_to_doc_unchecked(",
         "fn consumer_to_doc(",
     ] {
         let start = MONGO_STORE_SOURCE

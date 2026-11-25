@@ -4754,7 +4754,7 @@ pub async fn handle_put_api_spec(
     } else {
         None
     };
-    let existing_spec = match db.get_api_spec(namespace, id).await {
+    let existing_spec = match db.get_api_spec_for_write(namespace, id).await {
         Ok(Some(spec)) => spec,
         Ok(None) if deployment_expected.is_some() => {
             return Ok(crate::admin::deployment_mutations::store_error(
@@ -5285,7 +5285,7 @@ pub async fn handle_delete_api_spec(
             }
         };
 
-    let existing = match db.get_api_spec(namespace, id).await {
+    let existing = match db.get_api_spec_for_write(namespace, id).await {
         Ok(Some(spec)) => spec,
         Ok(None) => return Ok(error_response(ApiSpecError::NotFound)),
         Err(e) => return Ok(error_response(classify_db_error(e))),

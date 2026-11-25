@@ -6938,6 +6938,7 @@ mod inner {
             session: &mut ClientSession,
             connection: &MongoConnectionBundle,
             namespace: &str,
+            codec_slots: Option<&std::sync::Arc<tokio::sync::Semaphore>>,
         ) -> Result<ConditionalNamespaceSnapshot, anyhow::Error> {
             let mut config = GatewayConfig {
                 version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
@@ -6992,13 +6993,12 @@ mod inner {
                 .await?;
             let mut api_specs = Vec::new();
             while cursor.advance(&mut *session).await? {
-                api_specs.push(
-                    doc_to_api_spec_async(
-                        cursor.deserialize_current()?,
-                        &crate::admin::api_specs::SPEC_READ_CODEC_SLOTS,
-                    )
-                    .await?,
-                );
+                let raw = cursor.deserialize_current()?;
+                let spec = match codec_slots {
+                    Some(slots) => doc_to_api_spec_async(raw, slots).await?,
+                    None => doc_to_api_spec_inner(raw, true, false)?,
+                };
+                api_specs.push(spec);
             }
             let namespace_record = self
                 .get_namespace_in_session(&mut *session, namespace)
@@ -7041,10 +7041,16 @@ mod inner {
             &self,
             session: &mut ClientSession,
             namespace: &str,
+            codec_slots: Option<&std::sync::Arc<tokio::sync::Semaphore>>,
         ) -> Result<DeploymentSnapshot, anyhow::Error> {
             let connection = self.connection();
             let snapshot = self
-                .conditional_namespace_snapshot_in_session(session, connection.as_ref(), namespace)
+                .conditional_namespace_snapshot_in_session(
+                    session,
+                    connection.as_ref(),
+                    namespace,
+                    codec_slots,
+                )
                 .await?;
             // Refuses an over-bound typed snapshot before any raw document is
             // read; each document is charged as it is converted.
@@ -7130,7 +7136,11 @@ mod inner {
                 return Err(BatchAdmissionLeaseLost.into());
             }
             let snapshot = self
-                .deployment_snapshot_in_session(session, namespace)
+                .deployment_snapshot_in_session(
+                    session,
+                    namespace,
+                    Some(&crate::admin::api_specs::SPEC_WRITE_CODEC_SLOTS),
+                )
                 .await?;
             if snapshot.digest()? != precondition.expected {
                 return Err(NamespacePreconditionFailed.into());
@@ -7318,7 +7328,7 @@ mod inner {
                         .filter(|p| p.api_spec_id.as_deref() == Some(spec.id.as_str()))
                         .map(|p| p.id.clone())
                         .collect();
-                    let prepared = prepare_api_spec_bundle_docs(bundle, spec).await?;
+                    let prepared = prepare_api_spec_bundle_docs(bundle, spec, None).await?;
                     let previous_doc = self
                         .proxies()
                         .find_one(doc! {
@@ -7683,11 +7693,10 @@ mod inner {
             let (fault, chunk_size) =
                 crate::config::batch_atomicity::atomic_batch_test_overrides(graph.namespace);
             let chunk_size = chunk_size.unwrap_or(MONGO_ATOMIC_BATCH_CHUNK_SIZE).max(1);
-            let spec_docs = restore
-                .api_specs
-                .iter()
-                .map(api_spec_to_doc)
-                .collect::<Result<Vec<_>, _>>()?;
+            let mut spec_docs = Vec::with_capacity(restore.api_specs.len());
+            for spec in restore.api_specs {
+                spec_docs.push(api_spec_to_doc_async(spec).await?);
+            }
             for doc in &spec_docs {
                 if mongodb::bson::to_vec(doc)?.len() > 15 * 1024 * 1024 {
                     anyhow::bail!("MongoDB API spec document exceeds restore limit");
@@ -7861,6 +7870,7 @@ mod inner {
                         &mut *session,
                         connection.as_ref(),
                         &plan.lease_namespace,
+                        Some(&crate::admin::api_specs::SPEC_WRITE_CODEC_SLOTS),
                     )
                     .await
                     .map_err(|error| {
@@ -10214,6 +10224,7 @@ mod inner {
     async fn prepare_api_spec_bundle_docs(
         bundle: &crate::admin::api_specs::ExtractedBundle,
         spec: &ApiSpec,
+        prevalidated_spec_doc: Option<Document>,
     ) -> Result<PreparedApiSpecBundleDocs, anyhow::Error> {
         let upstream = bundle
             .upstream
@@ -10234,7 +10245,10 @@ mod inner {
 
         let mut proxy_doc = proxy_to_doc(&bundle.proxy)?;
         proxy_doc.insert("api_spec_id", spec.id.as_str());
-        let spec_doc = api_spec_to_doc_async(spec).await?;
+        let spec_doc = match prevalidated_spec_doc {
+            Some(doc) => doc,
+            None => api_spec_to_doc_async(spec).await?,
+        };
 
         Ok(PreparedApiSpecBundleDocs {
             upstream,
@@ -10250,8 +10264,10 @@ mod inner {
         spec: &ApiSpec,
         additional_upstreams: &[Upstream],
         additional_plugins: &[PluginConfig],
+        prevalidated_spec_doc: Option<Document>,
     ) -> Result<PreparedApiSpecBundleDocs, anyhow::Error> {
-        let mut prepared = prepare_api_spec_bundle_docs(bundle, spec).await?;
+        let mut prepared =
+            prepare_api_spec_bundle_docs(bundle, spec, prevalidated_spec_doc).await?;
         prepared
             .additional_upstreams
             .reserve(additional_upstreams.len());
@@ -11042,9 +11058,14 @@ mod inner {
                 .write_concern(WriteConcern::majority())
                 .await?;
             let snapshot = self
-                .deployment_snapshot_in_session(&mut session, namespace)
+                .deployment_snapshot_in_session(&mut session, namespace, None)
                 .await?;
             session.commit_transaction().await?;
+            crate::admin::api_specs::external_refs::validate_api_spec_snapshots_async(
+                &snapshot.snapshot().api_specs,
+                &crate::admin::api_specs::SPEC_READ_CODEC_SLOTS,
+            )
+            .await?;
             Ok(snapshot)
         }
 
@@ -11086,9 +11107,15 @@ mod inner {
                     &mut session,
                     connection.as_ref(),
                     namespace,
+                    None,
                 )
                 .await?;
             session.commit_transaction().await?;
+            crate::admin::api_specs::external_refs::validate_api_spec_snapshots_async(
+                &snapshot.api_specs,
+                &crate::admin::api_specs::SPEC_READ_CODEC_SLOTS,
+            )
+            .await?;
             Ok(snapshot)
         }
 
@@ -16520,7 +16547,8 @@ mod inner {
                     // With a replica set: use a multi-document transaction.
                     let connection = self.connection();
                     let mut session = connection.client.start_session().await?;
-                    let prepared_docs = prepare_api_spec_bundle_docs(bundle, spec).await?;
+                    let prepared_docs =
+                        prepare_api_spec_bundle_docs(bundle, spec, Some(spec_doc)).await?;
                     let mut upsert_changes: Vec<(String, &'static str, String)> = Vec::new();
                     if let Some(u) = &bundle.upstream {
                         upsert_changes.push((u.namespace.clone(), "upstream", u.id.clone()));
@@ -16637,7 +16665,6 @@ mod inner {
                             inserted_proxy = Some(bundle.proxy.id.clone());
                         }
 
-                        let spec_doc = api_spec_to_doc_async(spec).await?;
                         self.api_specs().insert_one(spec_doc).await?;
                         inserted_spec = true;
 
@@ -16765,6 +16792,7 @@ mod inner {
                     spec,
                     additional_upstreams,
                     additional_plugins,
+                    Some(spec_doc),
                 )
                 .await?;
                 let guard_params = ProxyWriteGuardParams::from_proxy(&bundle.proxy);
@@ -17203,7 +17231,12 @@ mod inner {
             let orphaned_proxy_group_plugin_deletes = if use_replica_set {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
-                let prepared_docs = prepare_api_spec_bundle_docs(effective_bundle, spec).await?;
+                let prepared_docs = prepare_api_spec_bundle_docs(
+                    effective_bundle,
+                    spec,
+                    Some(spec_doc_check),
+                )
+                .await?;
                 let guard_params = ProxyWriteGuardParams::from_proxy(&effective_bundle.proxy);
                 let mut upsert_changes: Vec<(String, &'static str, String)> = Vec::new();
                 if let Some(u) = &effective_bundle.upstream {
@@ -17367,7 +17400,12 @@ mod inner {
             } else {
                 // No replica set: best-effort delete then re-insert with
                 // compensating rollback on re-insert failure.
-                let prepared_docs = prepare_api_spec_bundle_docs(effective_bundle, spec).await?;
+                let prepared_docs = prepare_api_spec_bundle_docs(
+                    effective_bundle,
+                    spec,
+                    Some(spec_doc_check),
+                )
+                .await?;
                 self.ensure_api_spec_standalone_replace_ids_available(&prepared_docs, spec)
                     .await?;
 
@@ -17580,6 +17618,29 @@ mod inner {
             match result {
                 Some(doc) => Ok(Some(
                     doc_to_api_spec_async(doc, &crate::admin::api_specs::SPEC_READ_CODEC_SLOTS)
+                        .await?,
+                )),
+                None => Ok(None),
+            }
+        }
+
+        async fn get_api_spec_for_write(
+            &self,
+            namespace: &str,
+            id: &str,
+        ) -> Result<Option<ApiSpec>, anyhow::Error> {
+            let start = std::time::Instant::now();
+            let result = self
+                .api_specs()
+                .find_one(doc! {
+                    "_id": namespaced_doc_id(namespace, id),
+                    "namespace": namespace,
+                })
+                .await?;
+            self.check_slow_query("get_api_spec_for_write", start);
+            match result {
+                Some(doc) => Ok(Some(
+                    doc_to_api_spec_async(doc, &crate::admin::api_specs::SPEC_WRITE_CODEC_SLOTS)
                         .await?,
                 )),
                 None => Ok(None),
@@ -17879,11 +17940,14 @@ mod inner {
             let mut specs = Vec::new();
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
-                specs.push(
-                    doc_to_api_spec_async(doc, &crate::admin::api_specs::SPEC_READ_CODEC_SLOTS)
-                        .await?,
-                );
+                specs.push(doc_to_api_spec_inner(doc, true, false)?);
             }
+            drop(cursor);
+            crate::admin::api_specs::external_refs::validate_api_spec_snapshots_async(
+                &specs,
+                &crate::admin::api_specs::SPEC_READ_CODEC_SLOTS,
+            )
+            .await?;
             self.check_slow_query("list_api_specs_with_content", start);
             Ok(specs)
         }

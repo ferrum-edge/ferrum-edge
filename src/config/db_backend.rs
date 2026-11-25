@@ -3417,6 +3417,15 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         id: &str,
     ) -> Result<Option<ApiSpec>, anyhow::Error>;
 
+    /// Fetch a single ApiSpec by namespace + id for write-side admission (`PUT` /
+    /// `DELETE`), validating any persisted `external_ref_snapshot` under
+    /// `SPEC_WRITE_CODEC_SLOTS` so viewer `GET` bursts cannot starve writers.
+    async fn get_api_spec_for_write(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<ApiSpec>, anyhow::Error>;
+
     /// Fetch the ApiSpec that owns a given proxy (by proxy_id), if any.
     async fn get_api_spec_by_proxy(
         &self,
@@ -3426,14 +3435,13 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
 
     /// Fetch an ApiSpec for content retrieval (`GET /api-specs/{id}`),
     /// omitting `external_ref_snapshot` so read paths (including `304`) never
-    /// transfer, decompress, or hash the snapshot blob on Tokio workers.
+    /// transfer, decompress, or hash the snapshot blob or re-acquire
+    /// `SPEC_READ_CODEC_SLOTS` while the handler already holds a read permit.
     async fn get_api_spec_content(
         &self,
         namespace: &str,
         id: &str,
-    ) -> Result<Option<ApiSpec>, anyhow::Error> {
-        self.get_api_spec(namespace, id).await
-    }
+    ) -> Result<Option<ApiSpec>, anyhow::Error>;
 
     /// Fetch an ApiSpec by proxy for content retrieval
     /// (`GET /api-specs/by-proxy/{proxy_id}`), omitting `external_ref_snapshot`.
@@ -3441,9 +3449,7 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         &self,
         namespace: &str,
         proxy_id: &str,
-    ) -> Result<Option<ApiSpec>, anyhow::Error> {
-        self.get_api_spec_by_proxy(namespace, proxy_id).await
-    }
+    ) -> Result<Option<ApiSpec>, anyhow::Error>;
 
     /// Fetch only `(spec_format, content_hash, uncompressed_size)` for a
     /// conditional GET (`If-None-Match`) or partial-budget preflight so `304`
