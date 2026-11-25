@@ -1343,11 +1343,14 @@ cargo nextest archive --test integration_tests ...
 cargo nextest archive --test functional_tests ...
 
 # test-functional-{application,protocols-a,protocols-b,data-plane,data-plane-runtime}
+# Pass the shard's `filters:` entries as positional filter args (and `-j 1` for
+# the serialized `data_services: true` shards).
 cargo nextest run --archive-file functional-tests-*.tar.zst \
   --workspace-remap . \
   --run-ignored=all \
   --no-fail-fast \
-  -E 'not test(/test_scale_perf_30k_proxies/) and not test(/test_load_stress_10k_proxies/)'
+  -E 'not test(/test_scale_perf_30k_proxies/) and not test(/test_load_stress_10k_proxies/) and not test(/test_scale_reload_under_load/)' \
+  <shard-filters...>
 ```
 
 Every Unit Tests shard and every Integration Tests shard ends with **Check the

@@ -29,7 +29,7 @@ fn workspace_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn read_shard_filter_text() -> String {
+fn read_shard_filters() -> Vec<(String, Vec<String>)> {
     let workflow = workspace_root().join(WORKFLOW_PATH);
     let raw =
         std::fs::read_to_string(&workflow).expect("read .github/workflows/ci.yml from repo root");
@@ -44,18 +44,28 @@ fn read_shard_filter_text() -> String {
         .and_then(|i| i.as_sequence())
         .expect("jobs.test-functional.strategy.matrix.include must be a sequence");
 
-    let mut combined = String::new();
+    let mut shards = Vec::new();
     for entry in include {
+        let shard = entry
+            .get("shard")
+            .and_then(|s| s.as_str())
+            .expect("each functional shard entry must declare a string `shard` name")
+            .to_string();
         if let Some(filters) = entry.get("filters").and_then(|f| f.as_str()) {
-            combined.push_str(filters);
-            combined.push('\n');
+            let tokens: Vec<String> = filters
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .map(ToString::to_string)
+                .collect();
+            shards.push((shard, tokens));
         }
     }
     assert!(
-        !combined.trim().is_empty(),
+        shards.iter().any(|(_, tokens)| !tokens.is_empty()),
         "no filters: blocks found under jobs.test-functional.strategy.matrix.include"
     );
-    combined
+    shards
 }
 
 fn discover_test_modules() -> BTreeSet<String> {
@@ -81,14 +91,27 @@ fn discover_test_modules() -> BTreeSet<String> {
 
 #[test]
 fn ci_workflow_assigns_every_functional_test_to_a_shard() {
-    let filter_text = read_shard_filter_text();
+    let shards = read_shard_filters();
     let modules = discover_test_modules();
 
-    let missing: Vec<&str> = modules
-        .iter()
-        .filter(|m| !filter_text.contains(m.as_str()))
-        .map(|s| s.as_str())
-        .collect();
+    let mut missing = Vec::new();
+    let mut duplicates = Vec::new();
+    for module in &modules {
+        let assigned_shards: Vec<&str> = shards
+            .iter()
+            .flat_map(|(shard, tokens)| {
+                tokens
+                    .iter()
+                    .filter(move |token| token.as_str() == module.as_str())
+                    .map(move |_| shard.as_str())
+            })
+            .collect();
+        match assigned_shards.len() {
+            0 => missing.push(module.as_str()),
+            1 => {}
+            _ => duplicates.push((module.as_str(), assigned_shards)),
+        }
+    }
 
     assert!(
         missing.is_empty(),
@@ -97,5 +120,11 @@ fn ci_workflow_assigns_every_functional_test_to_a_shard() {
          jobs.test-functional.strategy.matrix.include in the workflow.",
         WORKFLOW_PATH,
         missing
+    );
+    assert!(
+        duplicates.is_empty(),
+        "These test modules are assigned more than once across CI shards in {}: {:?}",
+        WORKFLOW_PATH,
+        duplicates
     );
 }

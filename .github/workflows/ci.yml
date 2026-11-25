@@ -2246,9 +2246,10 @@ jobs:
               functional_tls_only_test
               functional_client_ip_env_test
           # Split the protocol-heavy functional suites into two balanced shards
-          # (`protocols-a` and `protocols-b`), balancing both total runtime and
-          # the serial HTTP/3 nextest group (~4.4 min H3 time each) so each
-          # protocol shard finishes in ~6–8 min instead of ~16 min.
+          # (`protocols-a` and `protocols-b`), balancing both total test CPU
+          # (~740–781s vs ~786–835s across recent hosted runs) and the serial
+          # `http3-serial` nextest group (~4.2–4.5m vs ~4.6–4.7m) so each
+          # protocol test step finishes in ~7.5–8.3 min instead of ~16 min.
           # (`data-plane` remains bounded on slow runs by
           # `test_admin_mongodb_runtime_resource_crud_matrix`.)
           - shard: protocols-a
@@ -2350,39 +2351,40 @@ jobs:
               scripted_backend_tests
           # The service-backed shards run serially (`nextest_jobs: 1`) against
           # one set of Redis/MongoDB/PostgreSQL/MySQL containers per runner, so
-          # the old single data-plane shard was the functional critical path
-          # (~15 min of serial test time after Build Test Artifacts). Two
-          # runners, each with its own containers, halve it. Balance by the
-          # hosted per-module durations recorded in
-          # docs/ci_pr_validation_review_2026_09_24.md; `data_services` (not
+          # the old single data-plane shard was the functional critical path.
+          # Two runners, each with its own containers, reduce the imbalance:
+          # `functional_admin_crud_resources_test` runs alone in `data-plane`
+          # (~457–763s, dominated by `test_admin_mongodb_runtime_resource_crud_matrix`
+          # at ~436–741s on recent hosted runs) while the remaining DB/runtime
+          # suites share `data-plane-runtime` (~530–560s). `data_services` (not
           # the shard name) gates the containers and backend URLs.
           - shard: data-plane
             # Serialized because DP functional tests bind exclusive ports and
-            # race when nextest runs this shard in parallel. Hosts the required
-            # PostgreSQL/MySQL/MongoDB/Redis persistence-parity cells documented
-            # in docs/functional_testing_database.md.
+            # race when nextest runs this shard in parallel. Runs
+            # `functional_admin_crud_resources_test` alone so no other module
+            # stacks on top of `test_admin_mongodb_runtime_resource_crud_matrix`.
             nextest_jobs: 1
             data_services: true
             filters: |
               functional_admin_crud_resources_test
-              functional_database_parity_test
-              functional_database_test
-              functional_db_failover_test
-              functional_db_upstream_test
           - shard: data-plane-runtime
             # Same serialization and service containers as `data-plane`: DB
-            # outage/pause, TLS, MongoDB, Redis rate limiting, namespace, CP/DP
-            # and mesh-mode suites. Moving `functional_mongodb_test` and
-            # `functional_db_tls_test` here balances runtime against
-            # `functional_admin_crud_resources_test` in `data-plane`.
+            # persistence-parity/failover/outage/TLS/MongoDB/upstream suites,
+            # Redis rate limiting, namespace, CP/DP, and mesh-mode suites.
+            # Hosts the required PostgreSQL/MySQL/MongoDB/Redis persistence-
+            # parity cells documented in docs/functional_testing_database.md.
             nextest_jobs: 1
             data_services: true
             filters: |
               functional_capability_registry_test
               functional_cp_dp_resilience_test
               functional_cp_dp_test
+              functional_database_parity_test
+              functional_database_test
+              functional_db_failover_test
               functional_db_outage_test
               functional_db_tls_test
+              functional_db_upstream_test
               functional_gateway_trust_bundle_ha_test
               functional_mesh_mode_test
               functional_mesh_stock_xds_test
@@ -6985,8 +6987,8 @@ jobs:
         # cold caches (2026-09-17 recorded four consecutive exit-143 kills at
         # two jobs on a cold cache). Clippy does not need DWARF, so omit
         # debuginfo to lower per-process RSS, and keep CARGO_BUILD_JOBS=1 so
-        # large integration targets never overlap. Lint still completes ahead
-        # of the functional shards on full runs.
+        # large integration targets never overlap. Lint stays off the critical
+        # path on warm runs; on cold runs it finishes close to `data-plane`.
         env:
           CARGO_BUILD_JOBS: 1
         run: |
