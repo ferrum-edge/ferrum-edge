@@ -987,7 +987,8 @@ lane producer (`save: "true"`) on a trusted `refs/heads/main` run; the
 sccache local store is not persisted (the restored `target/` already
 skips dependency compilation). Lanes: `ci-debug` (produced by Unit Tests;
 shared by all 12 debug-profile jobs across `ci.yml` and
-`ambient-host-udp-live.yml` through identical `CARGO_BUILD_JOBS=3`,
+`ambient-host-udp-live.yml` through identical `CARGO_TERM_COLOR=always`,
+`CARGO_NET_RETRY=10`, `CARGO_HTTP_MULTIPLEXING=false`, `CARGO_BUILD_JOBS=3`,
 `CARGO_PROFILE_DEV_DEBUG=0`, `CARGO_PROFILE_TEST_DEBUG=0`,
 `CARGO_PROFILE_DEV_SPLIT_DEBUGINFO=off`, and
 `CARGO_PROFILE_TEST_SPLIT_DEBUGINFO=off` env enforced by
@@ -4173,10 +4174,11 @@ Netns/Two-Cluster used `08f74bf7`. The main CI workflow exports
 `CARGO_NET_RETRY=10` and `CARGO_HTTP_MULTIPLEXING=false`; Ambient previously
 relied on the same values in `.cargo/config.toml`. The pinned Rust cache
 hashes the exported variables even though these two settings only affect
-downloading. Ambient was changed to explicitly export the same values and
-use the then-existing Netns namespace, so the complete key could match.
-Merely changing the shared-key label without matching those inputs would
-still have created two archives.
+downloading. Ambient was changed to explicitly export the same values (and now
+also exports `CARGO_TERM_COLOR=always`, which `Swatinem/rust-cache` hashes
+too) and use the shared lane namespace, so the complete key matches without
+relying on toolchain side effects. Merely changing the shared-key label without
+matching those inputs would still have created two archives.
 
 The completed Ambient/Netns archives at that time were 2,637,841,434 /
 2,637,871,806 bytes, and sharing then removed another roughly 2.64 GB
