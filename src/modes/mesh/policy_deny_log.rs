@@ -175,43 +175,41 @@ impl PolicyDenyRecorder {
             };
         }
 
+        type PolicyDenyGroupKey = (String, Option<String>, Option<String>, String, bool);
         let mut grouped: Vec<PolicyDenyGroup> = Vec::new();
-        // Linear-scan grouping. The expected snapshot is at most
-        // `FERRUM_MESH_POLICY_DENY_LOG_CAPACITY` records (default 10k); the
-        // unique 4-tuple cardinality is typically far smaller, so a flat
-        // walk avoids allocating per-key hashes for what is otherwise a
-        // throwaway admin response. Operators with pathological churn can
-        // shrink the cap.
+        let mut index_by_key: std::collections::HashMap<PolicyDenyGroupKey, usize> =
+            std::collections::HashMap::new();
         for event in snapshot {
-            let existing = grouped.iter_mut().find(|group| {
-                group.rule == event.rule
-                    && group.source == event.source
-                    && group.destination == event.destination
-                    && group.reason == event.reason
-                    && group.reevaluation == event.reevaluation
-            });
-            match existing {
-                Some(group) => {
-                    group.count = group.count.saturating_add(1);
-                    if event.at < group.first_at {
-                        group.first_at = event.at;
-                    }
-                    if event.at > group.last_at {
-                        group.last_at = event.at;
-                    }
+            let key = (
+                event.rule,
+                event.source,
+                event.destination,
+                event.reason,
+                event.reevaluation,
+            );
+            if let Some(&idx) = index_by_key.get(&key) {
+                let group = &mut grouped[idx];
+                group.count = group.count.saturating_add(1);
+                if event.at < group.first_at {
+                    group.first_at = event.at;
                 }
-                None => {
-                    grouped.push(PolicyDenyGroup {
-                        rule: event.rule.clone(),
-                        source: event.source.clone(),
-                        destination: event.destination.clone(),
-                        reason: event.reason.clone(),
-                        reevaluation: event.reevaluation,
-                        count: 1,
-                        first_at: event.at,
-                        last_at: event.at,
-                    });
+                if event.at > group.last_at {
+                    group.last_at = event.at;
                 }
+            } else {
+                let idx = grouped.len();
+                let (rule, source, destination, reason, reevaluation) = key.clone();
+                index_by_key.insert(key, idx);
+                grouped.push(PolicyDenyGroup {
+                    rule,
+                    source,
+                    destination,
+                    reason,
+                    reevaluation,
+                    count: 1,
+                    first_at: event.at,
+                    last_at: event.at,
+                });
             }
         }
 

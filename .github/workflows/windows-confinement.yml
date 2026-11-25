@@ -2,44 +2,53 @@ name: Windows File Confinement
 
 # Windows is a shipped release target (`ferrum-edge-windows-x86_64.exe`), but
 # every unit-test shard runs on Linux, so the Windows tenant-file confinement
-# tests (`windows_confined_files` in
-# tests/unit/tls/scoped_material_reference_tests.rs, exercising
-# src/tls/source/windows_file.rs) compile out everywhere else. This workflow
-# runs them natively on the paths that can change them (issue #6540): the
-# confinement code and tests, the test-registration chain that could compile
-# them out, the shared crate root, and the build configuration.
+# tests (`windows_confined_files` in `tests/windows_confinement_tests.rs`,
+# exercising `src/tls/source/windows_file.rs`) compile out everywhere else.
+# This workflow builds only that dedicated target natively on `windows-latest`
+# on the paths that can change it (issue #6540): the confinement code and
+# tests, the shared crate root (`_test_support`), and the build configuration.
 
 on:
   pull_request:
     paths:
       - .github/workflows/windows-confinement.yml
       - src/tls/source/**
+      - src/tls/mod.rs
       - src/lib.rs
       - src/config/file_loader.rs
-      - tests/unit_tests.rs
-      - tests/unit/mod.rs
-      - tests/unit/tls/mod.rs
-      - tests/unit/tls/scoped_material_reference_tests.rs
+      - src/config/env_config.rs
+      - src/config/conf_file.rs
+      - src/plugins/mod.rs
+      - custom_plugins/**
+      - tests/windows_confinement_tests.rs
       - Cargo.toml
       - Cargo.lock
       - .cargo/**
       - build.rs
+      - build/**
+      - proto/**
+      - vendor/**
       - rust-toolchain.toml
   push:
     branches: [main]
     paths:
       - .github/workflows/windows-confinement.yml
       - src/tls/source/**
+      - src/tls/mod.rs
       - src/lib.rs
       - src/config/file_loader.rs
-      - tests/unit_tests.rs
-      - tests/unit/mod.rs
-      - tests/unit/tls/mod.rs
-      - tests/unit/tls/scoped_material_reference_tests.rs
+      - src/config/env_config.rs
+      - src/config/conf_file.rs
+      - src/plugins/mod.rs
+      - custom_plugins/**
+      - tests/windows_confinement_tests.rs
       - Cargo.toml
       - Cargo.lock
       - .cargo/**
       - build.rs
+      - build/**
+      - proto/**
+      - vendor/**
       - rust-toolchain.toml
   workflow_dispatch:
 
@@ -48,8 +57,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # Clear any user-level sccache wrapper; this workflow builds without a
-  # compiler cache.
+  # Clear any user-level sccache wrapper; this workflow uses no sccache
+  # (dependency artifacts are cached via Swatinem/rust-cache below).
   RUSTC_WRAPPER: ""
   CARGO_BUILD_RUSTC_WRAPPER: ""
 
@@ -65,14 +74,22 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 180
     env:
-      # The aggregated unit_tests target is large; keep debug info small so the
-      # cold compile fits the hosted runner.
+      # Optimize the Windows test build for compile speed: omit Rust debuginfo
+      # (panic locations still print) and keep full parallel codegen units
+      # (rustc drops default codegen-units from 256 to 16 when incremental=0).
       CARGO_INCREMENTAL: "0"
-      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_CODEGEN_UNITS: "256"
+      CARGO_PROFILE_TEST_CODEGEN_UNITS: "256"
       RUST_BACKTRACE: "1"
       # Git Bash puts its own msys perl first on PATH, which lacks the modules
       # vendored OpenSSL's Configure needs. Use the image's Strawberry Perl.
       OPENSSL_SRC_PERL: C:\Strawberry\perl\bin\perl.exe
+      # Checksum-pinned NASM used by vendored OpenSSL on Windows; folded into
+      # the rust-cache shared-key so tool/pin bumps invalidate cached artifacts.
+      NASM_VERSION: "3.02"
+      NASM_SHA256: "161d0bfaff53c2f9e9f3e69fd0672323ebabafd1268976a5cec11be92a19aee7"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -81,6 +98,33 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: stable
+
+      - name: Record Strawberry Perl version for cache key
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:OPENSSL_SRC_PERL -ne 'C:\Strawberry\perl\bin\perl.exe') {
+            throw "OPENSSL_SRC_PERL drifted from the probed Strawberry Perl path: $env:OPENSSL_SRC_PERL"
+          }
+          $perlVersion = & 'C:\Strawberry\perl\bin\perl.exe' -e 'print $^V'
+          if ([string]::IsNullOrWhiteSpace($perlVersion)) {
+            throw "could not detect Strawberry Perl version at C:\Strawberry\perl\bin\perl.exe"
+          }
+          "OPENSSL_SRC_PERL_VERSION=$perlVersion" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+
+      # Main-only-save Rust cache so PRs restore precompiled Windows dependencies
+      # (including vendored OpenSSL and the `ferrum-edge` dependency graph)
+      # without spending the repository's 10 GB Actions cache quota on PR saves.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: "ci-windows-confinement-nasm-${{ env.NASM_VERSION }}-${{ env.NASM_SHA256 }}"
+          env-vars: |
+            OPENSSL_SRC_PERL
+            OPENSSL_SRC_PERL_VERSION
+            NASM_VERSION
+            NASM_SHA256
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          cache-on-failure: "false"
 
       # Same checksum-pinned protoc and NASM the native release builds use.
       # Vendored OpenSSL needs NASM on Windows.
@@ -106,13 +150,13 @@ jobs:
           }
           "PROTOC=$protocExe" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
 
-          $nasmVersion = "3.02"
+          $nasmVersion = $env:NASM_VERSION
           $nasmZip = Join-Path $env:RUNNER_TEMP "nasm-$nasmVersion-win64.zip"
           $nasmRoot = Join-Path $env:RUNNER_TEMP "nasm"
           Invoke-WebRequest `
             -Uri "https://www.nasm.us/pub/nasm/releasebuilds/$nasmVersion/win64/nasm-$nasmVersion-win64.zip" `
             -OutFile $nasmZip
-          $expectedNasmSha256 = "161d0bfaff53c2f9e9f3e69fd0672323ebabafd1268976a5cec11be92a19aee7"
+          $expectedNasmSha256 = $env:NASM_SHA256
           $actualNasmSha256 = (Get-FileHash -Algorithm SHA256 $nasmZip).Hash.ToLowerInvariant()
           if ($actualNasmSha256 -ne $expectedNasmSha256) {
             throw "NASM archive SHA-256 mismatch: expected $expectedNasmSha256, got $actualNasmSha256"
@@ -124,19 +168,20 @@ jobs:
           }
           $nasmBin | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
 
-      - name: Compile the unit test binary
+      - name: Compile the Windows confinement test binary
         shell: bash
-        run: cargo test --test unit_tests --no-run
+        run: cargo test --test windows_confinement_tests --no-run
 
       # A renamed module would otherwise match zero tests and pass. The module
-      # holds ten ordinary tests; require at least that many to pass. Run them
-      # serially: the handle-leak test counts every handle in the process.
+      # holds ten ordinary tests; require at least that many to pass. Keep
+      # `--test-threads=1` for deterministic filesystem fixtures (the
+      # handle-leak test also isolates itself in a child process).
       - name: Run Windows confinement tests
         shell: bash
         run: |
           set -euo pipefail
           log="$RUNNER_TEMP/windows-confinement.log"
-          cargo test --test unit_tests unit::tls::scoped_material_reference_tests::windows_confined_files:: -- --test-threads=1 2>&1 | tee "$log"
+          cargo test --test windows_confinement_tests windows_confined_files:: -- --test-threads=1 2>&1 | tee "$log"
           grep -Eq 'test result: ok\. ([1-9][0-9]+) passed' "$log"
 
       # The case-sensitive NTFS directory fixture needs an elevated process on
@@ -149,5 +194,5 @@ jobs:
         run: |
           set -euo pipefail
           log="$RUNNER_TEMP/windows-case-sensitive.log"
-          cargo test --test unit_tests unit::tls::scoped_material_reference_tests::windows_confined_files::windows_case_sensitive_sibling_is_not_an_allowed_root_alias -- --ignored --exact 2>&1 | tee "$log"
+          cargo test --test windows_confinement_tests windows_confined_files::windows_case_sensitive_sibling_is_not_an_allowed_root_alias -- --ignored --exact 2>&1 | tee "$log"
           grep -Eq 'test result: ok\. 1 passed' "$log"

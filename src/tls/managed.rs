@@ -351,6 +351,19 @@ impl ManagedTlsStore {
         record.ok_or_else(|| ManagedTlsError::NotFound(id.to_string()))
     }
 
+    /// Lightweight metadata-only lookup for route preflights that validates
+    /// `id` and returns only the stored material kind without cloning PEM/DER
+    /// or private-key bytes.
+    pub fn record_kind(&self, id: &str) -> Result<ManagedTlsMaterialKind, ManagedTlsError> {
+        validate_managed_id(id)?;
+        let document = self.file.snapshot()?;
+        document
+            .records
+            .get(id)
+            .map(|record| record.kind)
+            .ok_or_else(|| ManagedTlsError::NotFound(id.to_string()))
+    }
+
     pub fn upsert(
         &self,
         record: ManagedTlsRecord,
@@ -397,6 +410,38 @@ impl ManagedTlsStore {
         Ok(outcome)
     }
 
+    /// Atomically replace an existing managed TLS record of the same kind.
+    ///
+    /// Unlike `upsert(..., true)`, this checks both existence (`NotFound`) and
+    /// matching kind (`KindConflict`) under the exclusive store lock so a
+    /// concurrent delete cannot turn `PUT` into a silent create.
+    pub fn update_existing(
+        &self,
+        record: ManagedTlsRecord,
+    ) -> Result<ManagedTlsRecord, ManagedTlsError> {
+        validate_managed_id(&record.id)?;
+        validate_managed_record_material_size(&record, self.max_material_bytes)?;
+        let outcome = self.file.mutate(move |document| {
+            let mut record = record;
+            let now = Utc::now();
+            let Some(existing) = document.records.get(&record.id) else {
+                return Err(ManagedTlsError::NotFound(record.id));
+            };
+            if existing.kind != record.kind {
+                return Err(ManagedTlsError::KindConflict {
+                    id: record.id,
+                    existing_kind: existing.kind.as_str(),
+                    requested_kind: record.kind.as_str(),
+                });
+            }
+            record.created_at = existing.created_at;
+            record.updated_at = now;
+            document.records.insert(record.id.clone(), record.clone());
+            Ok(record)
+        })?;
+        Ok(outcome)
+    }
+
     pub fn delete(&self, id: &str) -> Result<ManagedTlsRecord, ManagedTlsError> {
         validate_managed_id(id)?;
         let id = id.to_string();
@@ -422,12 +467,43 @@ impl ManagedTlsStore {
         id: &str,
         still_authorized: impl Fn() -> bool,
     ) -> Result<Option<ManagedTlsRecord>, ManagedTlsError> {
+        self.delete_if_authorized_inner(id, None, still_authorized)
+    }
+
+    /// Delete `id` only when its stored kind matches `expected_kind` and
+    /// `still_authorized` holds, checked atomically under the exclusive store
+    /// lock so a concurrent delete+recreate with a different kind cannot be
+    /// removed through the wrong collection route.
+    pub fn delete_kind_if_authorized(
+        &self,
+        id: &str,
+        expected_kind: ManagedTlsMaterialKind,
+        still_authorized: impl Fn() -> bool,
+    ) -> Result<Option<ManagedTlsRecord>, ManagedTlsError> {
+        self.delete_if_authorized_inner(id, Some(expected_kind), still_authorized)
+    }
+
+    fn delete_if_authorized_inner(
+        &self,
+        id: &str,
+        expected_kind: Option<ManagedTlsMaterialKind>,
+        still_authorized: impl Fn() -> bool,
+    ) -> Result<Option<ManagedTlsRecord>, ManagedTlsError> {
         validate_managed_id(id)?;
         let id = id.to_string();
         let outcome = self.file.mutate_if_confirmed(
             |document| {
-                if !document.records.contains_key(&id) {
+                let Some(existing) = document.records.get(&id) else {
                     return Err(ManagedTlsError::NotFound(id.clone()));
+                };
+                if let Some(expected) = expected_kind
+                    && existing.kind != expected
+                {
+                    return Err(ManagedTlsError::WrongKind {
+                        id: id.clone(),
+                        expected: expected.as_str(),
+                        actual: existing.kind.as_str(),
+                    });
                 }
                 if !still_authorized() {
                     return Ok((false, None));

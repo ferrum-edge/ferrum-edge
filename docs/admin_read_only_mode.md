@@ -31,7 +31,9 @@ Configuration and database mutations are blocked and return `403 Forbidden`, for
 - `DELETE /plugins/config/{id}` - Delete plugin configuration
 
 The same applies to every other persisted-config write: upstreams, consumer
-credentials, namespaces, API specs, `POST /batch`, and `POST /restore`
+credentials, namespaces, gateway trust bundles, API specs, managed TLS and ACME
+store writes (`/admin/tls/*` other than `validate` and `rotate/{surface}`),
+`POST /batch`, and `POST /restore`
 (in file and DP modes, which have no database, `POST /restore` returns
 `503 Service Unavailable` instead). A request refused for its shape before
 write admission, such as `If-Match` on a route that does not evaluate it
@@ -40,7 +42,8 @@ rejection.
 
 Operational POST endpoints that do not persist configuration remain available
 with their normal JWT and role checks. These include
-`POST /mesh/egress-scope/test`, `POST /backend-capabilities/refresh`, and
+`POST /mesh/egress-scope/test`, `POST /mesh/config-revision/reset`,
+`POST /backend-capabilities/refresh`, `POST /admin/tls/validate`, and
 `POST /admin/tls/rotate/{surface}`.
 
 ### Error Response

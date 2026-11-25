@@ -400,7 +400,10 @@ pub struct ExternalRefSnapshotDocument {
     pub content_digest: String,
     /// `json` or `yaml`.
     pub format: String,
-    /// Normalized JSON value of the document.
+    /// Normalized JSON value of the document (deserialized through the shared
+    /// node-bounded literal JSON visitor so `$serde_json::private::RawValue`
+    /// keys remain literal objects and snapshot validation matches admission).
+    #[serde(deserialize_with = "super::extractor::deserialize_bounded_json_value")]
     pub document: Value,
 }
 
@@ -447,16 +450,39 @@ impl ExternalRefSnapshot {
     }
 
     pub fn gzip_bytes(&self) -> Result<Vec<u8>, ExtractError> {
-        let json = serde_json::to_vec(self).map_err(|error| {
+        self.gzip_bytes_with_limits(
+            MAX_EXTERNAL_REF_SNAPSHOT_DECOMPRESSED_BYTES,
+            MAX_EXTERNAL_REF_SNAPSHOT_COMPRESSED_BYTES,
+        )
+    }
+
+    pub(crate) fn gzip_bytes_with_limits(
+        &self,
+        max_decompressed: usize,
+        max_compressed: usize,
+    ) -> Result<Vec<u8>, ExtractError> {
+        let mut compressed_sink = CappedVecWriter::new(max_compressed);
+        let input_exceeded;
+        let serialize_result = {
+            let encoder =
+                flate2::write::GzEncoder::new(&mut compressed_sink, flate2::Compression::default());
+            let mut input_sink = CappedWrite::new(encoder, max_decompressed);
+            let res = serde_json::to_writer(&mut input_sink, self);
+            input_exceeded = input_sink.cap_exceeded;
+            match res {
+                Ok(()) => input_sink.inner.finish().map(|_| ()),
+                Err(error) => Err(std::io::Error::other(error)),
+            }
+        };
+        if input_exceeded || compressed_sink.cap_exceeded {
+            return Err(external_document_too_large());
+        }
+        serialize_result.map_err(|error| {
             ExtractError::SchemaReference(format!(
                 "failed to serialize external-ref snapshot: {error}"
             ))
         })?;
-        crate::admin::spec_codec::compress_gzip(&json).map_err(|error| {
-            ExtractError::SchemaReference(format!(
-                "failed to compress external-ref snapshot: {error}"
-            ))
-        })
+        Ok(compressed_sink.buf)
     }
 
     pub fn from_gzip_bytes(bytes: &[u8], max_bytes: usize) -> Result<Self, String> {
@@ -504,6 +530,70 @@ pub fn validate_external_ref_snapshot_pair(
             Ok(())
         }
     }
+}
+
+/// Async persistence/read wrapper around [`validate_external_ref_snapshot_pair`]
+/// that offloads gzip decompression, bounded JSON parsing, and SHA-256
+/// verification onto Tokio's blocking pool under `codec_slots` so large
+/// snapshots (up to 64 MiB compressed / 128 MiB decompressed) never stall
+/// async worker threads.
+///
+/// The `(None, None)` fast path and O(1) pre-checks (missing pair, compressed
+/// size cap, and SHA-256 hex format) execute inline without acquiring a slot
+/// or cloning the snapshot blob.
+pub async fn validate_external_ref_snapshot_pair_async(
+    snapshot: Option<&[u8]>,
+    digest: Option<&str>,
+    codec_slots: &std::sync::Arc<tokio::sync::Semaphore>,
+) -> Result<(), String> {
+    match (snapshot, digest) {
+        (None, None) => Ok(()),
+        (Some(_), None) | (None, Some(_)) => {
+            Err("external_ref snapshot and digest must be present together".to_string())
+        }
+        (Some(bytes), Some(stored_digest)) => {
+            if bytes.len() > MAX_EXTERNAL_REF_SNAPSHOT_COMPRESSED_BYTES {
+                return Err("external_ref snapshot exceeds persistence size limit".to_string());
+            }
+            validate_external_ref_summary_digest(Some(stored_digest))?;
+            let permit = std::sync::Arc::clone(codec_slots)
+                .acquire_owned()
+                .await
+                .map_err(|_| "external_ref snapshot validation unavailable".to_string())?;
+            let owned_bytes = bytes.to_vec();
+            let owned_digest = stored_digest.to_string();
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                validate_external_ref_snapshot_pair(Some(&owned_bytes), Some(&owned_digest))
+            })
+            .await
+            .map_err(|_| "external_ref snapshot validation worker failed".to_string())?
+        }
+    }
+}
+
+/// Validate the persisted external-ref snapshot/digest pairs of a slice of
+/// loaded [`crate::config::types::ApiSpec`] rows under `codec_slots`.
+pub async fn validate_api_spec_snapshots_async(
+    specs: &[crate::config::types::ApiSpec],
+    codec_slots: &std::sync::Arc<tokio::sync::Semaphore>,
+) -> Result<(), anyhow::Error> {
+    for spec in specs {
+        validate_external_ref_snapshot_pair_async(
+            spec.external_ref_snapshot.as_deref(),
+            spec.external_ref_digest.as_deref(),
+            codec_slots,
+        )
+        .await
+        .map_err(|_| {
+            anyhow::Error::new(crate::config::db_backend::SnapshotDataIntegrityError::new(
+                "api_spec",
+                (!spec.id.is_empty()).then(|| spec.id.clone()),
+                anyhow::anyhow!("api_specs external-ref snapshot integrity validation failed"),
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 pub fn validate_external_ref_summary_digest(digest: Option<&str>) -> Result<(), String> {
@@ -721,6 +811,7 @@ pub fn load_external_documents(
     let mut pending: VecDeque<(Url, usize)> = VecDeque::new();
     let mut seen_refs = 0usize;
     let mut aggregate_bytes = 0usize;
+    let mut aggregate_normalized_bytes = 0usize;
     // In-document `$id` resources are resolved locally; never fetch them.
     let mut local_resources = HashSet::new();
     local_resources.insert(resource_uri_key(&policy.document_base));
@@ -761,6 +852,11 @@ pub fn load_external_documents(
                 location: "x-ferrum-external-refs".to_string(),
             });
         }
+        let remaining_norm =
+            MAX_EXTERNAL_REF_SNAPSHOT_DECOMPRESSED_BYTES.saturating_sub(aggregate_normalized_bytes);
+        let norm_len = bounded_json_serialized_len(&doc.root, remaining_norm)
+            .ok_or_else(external_document_too_large)?;
+        aggregate_normalized_bytes = aggregate_normalized_bytes.saturating_add(norm_len);
         let doc_root = doc.root.clone();
         let doc_base = doc.canonical_uri.clone();
         collect_local_resource_ids(&doc_root, &doc_base, &mut local_resources)?;
@@ -816,7 +912,114 @@ pub fn load_external_documents(
         snapshot_digest: String::new(),
     };
     snapshot.snapshot_digest = snapshot.compute_digest();
+    if bounded_json_serialized_len(&snapshot, MAX_EXTERNAL_REF_SNAPSHOT_DECOMPRESSED_BYTES)
+        .is_none()
+    {
+        return Err(external_document_too_large());
+    }
     Ok((loaded, snapshot))
+}
+
+struct CountingJsonWriter {
+    count: usize,
+    limit: usize,
+}
+
+impl std::io::Write for CountingJsonWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let next = self.count.saturating_add(buf.len());
+        if next > self.limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "serialized snapshot exceeds size limit",
+            ));
+        }
+        self.count = next;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn bounded_json_serialized_len<T: Serialize>(value: &T, limit: usize) -> Option<usize> {
+    let mut writer = CountingJsonWriter { count: 0, limit };
+    serde_json::to_writer(&mut writer, value).ok()?;
+    Some(writer.count)
+}
+
+struct CappedWrite<W: std::io::Write> {
+    inner: W,
+    written: usize,
+    limit: usize,
+    cap_exceeded: bool,
+}
+
+impl<W: std::io::Write> CappedWrite<W> {
+    fn new(inner: W, limit: usize) -> Self {
+        Self {
+            inner,
+            written: 0,
+            limit,
+            cap_exceeded: false,
+        }
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for CappedWrite<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let next = self.written.saturating_add(buf.len());
+        if next > self.limit {
+            self.cap_exceeded = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "snapshot input exceeds decompressed size limit",
+            ));
+        }
+        let n = self.inner.write(buf)?;
+        self.written = self.written.saturating_add(n);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+struct CappedVecWriter {
+    buf: Vec<u8>,
+    limit: usize,
+    cap_exceeded: bool,
+}
+
+impl CappedVecWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            buf: Vec::new(),
+            limit,
+            cap_exceeded: false,
+        }
+    }
+}
+
+impl std::io::Write for CappedVecWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let next = self.buf.len().saturating_add(buf.len());
+        if next > self.limit {
+            self.cap_exceeded = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "snapshot output exceeds compressed size limit",
+            ));
+        }
+        self.buf.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn collect_local_resource_ids(
@@ -1196,18 +1399,7 @@ async fn load_http_document(
                 "external $ref HTTP fetch returned a non-success status",
             ));
         }
-        if let Some(value) = response.headers().get(reqwest::header::CONTENT_TYPE) {
-            let content_type = value.to_str().map_err(|_| {
-                external_ref_error(
-                    "external $ref response Content-Type is not an allowed OpenAPI media type",
-                )
-            })?;
-            if !content_type_allowed(content_type) {
-                return Err(external_ref_error(
-                    "external $ref response Content-Type is not an allowed OpenAPI media type",
-                ));
-            }
-        }
+        validate_external_response_content_type(response.headers())?;
         if response
             .content_length()
             .is_some_and(|length| length > policy.max_document_bytes as u64)
@@ -1358,23 +1550,31 @@ fn external_document_too_large() -> ExtractError {
 }
 
 fn content_type_allowed(content_type: &str) -> bool {
-    let media = content_type
-        .split(';')
-        .next()
-        .unwrap_or(content_type)
-        .trim()
+    let trimmed = content_type.trim();
+    if !crate::util::media_type::is_concrete_http_media_type(trimmed) {
+        return false;
+    }
+    let essence = trimmed
+        .split_once(';')
+        .map_or(trimmed, |(base, _)| base)
+        .trim_end_matches([' ', '\t'])
         .to_ascii_lowercase();
+    let Some((media_type, subtype)) = essence.split_once('/') else {
+        return false;
+    };
     matches!(
-        media.as_str(),
-        "application/json"
-            | "application/yaml"
-            | "application/x-yaml"
-            | "text/yaml"
-            | "text/x-yaml"
-            | "text/plain"
-            | "application/octet-stream"
-    ) || media.ends_with("+json")
-        || media.ends_with("+yaml")
+        (media_type, subtype),
+        ("application", "json")
+            | ("application", "yaml")
+            | ("application", "x-yaml")
+            | ("text", "yaml")
+            | ("text", "x-yaml")
+            | ("text", "plain")
+            | ("application", "octet-stream")
+    ) || subtype
+        .strip_suffix("+json")
+        .or_else(|| subtype.strip_suffix("+yaml"))
+        .is_some_and(|prefix| !prefix.is_empty())
 }
 
 fn parse_loaded_document(
@@ -1382,31 +1582,105 @@ fn parse_loaded_document(
     bytes: &[u8],
     policy: &EffectiveExternalRefPolicy,
 ) -> Result<LoadedExternalDocument, ExtractError> {
-    if bytes.len() > policy.max_document_bytes {
+    parse_loaded_document_with_limits(
+        uri,
+        bytes,
+        policy.max_document_bytes,
+        super::extractor::MAX_SOURCE_DOCUMENT_NODES,
+    )
+}
+
+fn validate_external_response_content_type(
+    headers: &reqwest::header::HeaderMap,
+) -> Result<(), ExtractError> {
+    let mut values = headers.get_all(reqwest::header::CONTENT_TYPE).iter();
+    let Some(first) = values.next() else {
+        return Ok(());
+    };
+    if values.next().is_some() {
+        return Err(external_ref_error(
+            "external $ref response Content-Type is not an allowed OpenAPI media type",
+        ));
+    }
+    let content_type = first.to_str().map_err(|_| {
+        external_ref_error(
+            "external $ref response Content-Type is not an allowed OpenAPI media type",
+        )
+    })?;
+    if !content_type_allowed(content_type) {
+        return Err(external_ref_error(
+            "external $ref response Content-Type is not an allowed OpenAPI media type",
+        ));
+    }
+    Ok(())
+}
+
+fn value_container_depth(val: &Value) -> usize {
+    match val {
+        Value::Array(arr) => 1 + arr.iter().map(value_container_depth).max().unwrap_or(0),
+        Value::Object(map) => 1 + map.values().map(value_container_depth).max().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn parse_loaded_document_with_limits(
+    uri: &Url,
+    bytes: &[u8],
+    max_document_bytes: usize,
+    max_nodes: usize,
+) -> Result<LoadedExternalDocument, ExtractError> {
+    if bytes.len() > max_document_bytes {
         return Err(ExtractError::SchemaTooLarge {
             location: "x-ferrum-external-refs".to_string(),
         });
     }
     let format = detect_format(bytes);
+    // Bound external JSON and YAML trees the exact same way root API-spec
+    // admission and GET cross-format conversion do (counting JSON object member
+    // values mid-parse before duplicate keys collapse), and enforce the shared
+    // storage-compatible depth ceiling (`MAX_EXTERNAL_DOCUMENT_DEPTH = 120`) so
+    // every admitted document fits inside `ExternalRefSnapshot`'s 3 enclosing
+    // JSON containers under `serde_json`'s 128-level recursion limit.
     let root = match format {
-        "json" => serde_json::from_slice(bytes).map_err(|error| {
-            ExtractError::InvalidJson(format!(
-                "external document {}: {error}",
+        "json" => super::extractor::parse_json_slice_bounded_with_depth(
+            bytes,
+            max_nodes,
+            Some(super::extractor::MAX_EXTERNAL_DOCUMENT_DEPTH),
+        )
+        .map_err(|error| match error {
+            super::extractor::BoundedJsonError::NodeLimitExceeded => {
+                ExtractError::InvalidJson(format!(
+                    "external document {} exceeds expanded node limit; reduce nesting",
+                    redact_reference(uri.as_str())
+                ))
+            }
+            super::extractor::BoundedJsonError::DepthLimitExceeded => {
+                ExtractError::InvalidJson(format!(
+                    "external document {} exceeds maximum nesting depth",
+                    redact_reference(uri.as_str())
+                ))
+            }
+            super::extractor::BoundedJsonError::Parse(msg) => ExtractError::InvalidJson(format!(
+                "external document {}: {msg}",
                 redact_reference(uri.as_str())
-            ))
+            )),
         })?,
         _ => {
-            // Bound YAML the same way API-spec admission does.
-            const MAX_EXTERNAL_DOC_NODES: usize = 500_000;
-            super::bounded_yaml::parse_yaml_to_json(bytes, MAX_EXTERNAL_DOC_NODES).map_err(
-                |error| {
+            let parsed =
+                super::bounded_yaml::parse_yaml_to_json(bytes, max_nodes).map_err(|error| {
                     ExtractError::InvalidYaml(format!(
                         "external document {}: {}",
                         redact_reference(uri.as_str()),
                         error.message()
                     ))
-                },
-            )?
+                })?;
+            if value_container_depth(&parsed) > super::extractor::MAX_EXTERNAL_DOCUMENT_DEPTH {
+                return Err(ExtractError::InvalidYaml(format!(
+                    "external document {} exceeds maximum nesting depth",
+                    redact_reference(uri.as_str())
+                )));
+            }
+            parsed
         }
     };
     let digest = normalized_document_digest(&root);
@@ -1420,6 +1694,213 @@ fn parse_loaded_document(
         root,
         raw_len: bytes.len(),
     })
+}
+
+/// Test helper verifying that external JSON `$ref` document loading enforces
+/// the same pre-collapse duplicate-member node limit as root admission and GET
+/// conversion, preserves redacted URI diagnostics, and accepts exact-limit docs.
+pub(crate) fn check_external_json_duplicate_member_limit_for_test() -> Result<(), &'static str> {
+    let uri = Url::parse("https://user:secret@schemas.example.com/common.json?token=xyz")
+        .map_err(|_| "failed to parse test external ref URI")?;
+    // 1 object + 5 duplicate member values = 6 nodes pre-collapse, 2 post-collapse.
+    let dup_json = br#"{"a":0,"a":1,"a":2,"a":3,"a":4}"#;
+    match parse_loaded_document_with_limits(&uri, dup_json, 4096, 5) {
+        Err(ExtractError::InvalidJson(msg)) => {
+            if !msg.contains("exceeds expanded node limit")
+                || !msg.contains("schemas.example.com/common.json")
+                || msg.contains("secret")
+                || msg.contains("token=xyz")
+            {
+                return Err("external JSON node-limit error did not preserve redacted URI");
+            }
+        }
+        _ => {
+            return Err("external JSON loader failed to reject duplicate members above node cap");
+        }
+    }
+    if parse_loaded_document_with_limits(&uri, dup_json, 4096, 6).is_err() {
+        return Err("external JSON loader rejected duplicate members at exact node cap");
+    }
+
+    // Persistence round-trip must preserve literal `$serde_json::private::RawValue`
+    // keys across `parse_loaded_document_with_limits` -> `ExternalRefSnapshot::gzip_bytes`
+    // -> `validate_external_ref_snapshot_pair` / `from_gzip_bytes`.
+    let raw_marker_json = br#"{"$serde_json::private::RawValue":"[1,2,3]"}"#;
+    let loaded = parse_loaded_document_with_limits(&uri, raw_marker_json, 4096, 16)
+        .map_err(|_| "external JSON loader rejected literal RawValue marker object")?;
+    let mut snap = ExternalRefSnapshot {
+        policy_digest: "0".repeat(64),
+        root_document_base: "https://schemas.example.com/root.json".to_string(),
+        documents: vec![ExternalRefSnapshotDocument {
+            canonical_uri: loaded.canonical_uri.to_string(),
+            content_digest: loaded.content_digest,
+            format: loaded.format.to_string(),
+            document: loaded.root,
+        }],
+        snapshot_digest: String::new(),
+    };
+    snap.snapshot_digest = snap.compute_digest();
+    let gz = snap
+        .gzip_bytes()
+        .map_err(|_| "failed to gzip external-ref snapshot")?;
+    validate_external_ref_snapshot_pair(Some(&gz), Some(&snap.snapshot_digest))
+        .map_err(|_| "external-ref snapshot validation failed for literal RawValue marker")?;
+    let decoded = ExternalRefSnapshot::from_gzip_bytes(&gz, 64 * 1024)
+        .map_err(|_| "failed to decode external-ref snapshot")?;
+    if decoded
+        .documents
+        .first()
+        .and_then(|d| d.document.as_object())
+        .and_then(|m| m.get("$serde_json::private::RawValue"))
+        .and_then(Value::as_str)
+        != Some("[1,2,3]")
+    {
+        return Err("external-ref snapshot decode reinterpreted RawValue marker");
+    }
+
+    // Nesting-depth boundary: external JSON at `MAX_EXTERNAL_DOCUMENT_DEPTH`
+    // (120 nested containers) must pass admission AND snapshot validation
+    // round-trip (3 wrapper containers + 120 = 123 < 128), while 121 levels
+    // must fail closed at admission for both JSON and YAML.
+    let depth_limit = super::extractor::MAX_EXTERNAL_DOCUMENT_DEPTH;
+    let exact_depth_json = format!("{}0{}", "[".repeat(depth_limit), "]".repeat(depth_limit));
+    let loaded_deep =
+        parse_loaded_document_with_limits(&uri, exact_depth_json.as_bytes(), 4096, 1024)
+            .map_err(|_| "external JSON at exact depth limit failed admission")?;
+    let mut deep_snap = ExternalRefSnapshot {
+        policy_digest: "0".repeat(64),
+        root_document_base: "https://schemas.example.com/root.json".to_string(),
+        documents: vec![ExternalRefSnapshotDocument {
+            canonical_uri: loaded_deep.canonical_uri.to_string(),
+            content_digest: loaded_deep.content_digest,
+            format: loaded_deep.format.to_string(),
+            document: loaded_deep.root,
+        }],
+        snapshot_digest: String::new(),
+    };
+    deep_snap.snapshot_digest = deep_snap.compute_digest();
+    let deep_gz = deep_snap
+        .gzip_bytes()
+        .map_err(|_| "failed to gzip exact-depth snapshot")?;
+    validate_external_ref_snapshot_pair(Some(&deep_gz), Some(&deep_snap.snapshot_digest))
+        .map_err(|_| "exact-depth external JSON snapshot failed validation round-trip")?;
+
+    let over_depth_json = format!(
+        "{}0{}",
+        "[".repeat(depth_limit + 1),
+        "]".repeat(depth_limit + 1)
+    );
+    if !matches!(
+        parse_loaded_document_with_limits(&uri, over_depth_json.as_bytes(), 4096, 1024),
+        Err(ExtractError::InvalidJson(_))
+    ) {
+        return Err("external JSON exceeding depth limit was not rejected with InvalidJson");
+    }
+
+    let mut over_depth_yaml = String::new();
+    for i in 0..=depth_limit {
+        over_depth_yaml.push_str(&" ".repeat(i * 2));
+        over_depth_yaml.push_str("a:\n");
+    }
+    over_depth_yaml.push_str(&" ".repeat((depth_limit + 1) * 2));
+    over_depth_yaml.push_str("1\n");
+    if !matches!(
+        parse_loaded_document_with_limits(&uri, over_depth_yaml.as_bytes(), 64 * 1024, 1024),
+        Err(ExtractError::InvalidYaml(_))
+    ) {
+        return Err("external YAML exceeding depth limit was not rejected with InvalidYaml");
+    }
+
+    // 120-container YAML must pass admission AND snapshot validation round-trip.
+    let mut exact_depth_yaml = String::new();
+    for i in 0..depth_limit {
+        exact_depth_yaml.push_str(&" ".repeat(i * 2));
+        exact_depth_yaml.push_str("a:\n");
+    }
+    exact_depth_yaml.push_str(&" ".repeat(depth_limit * 2));
+    exact_depth_yaml.push_str("1\n");
+    let loaded_deep_yaml =
+        parse_loaded_document_with_limits(&uri, exact_depth_yaml.as_bytes(), 64 * 1024, 1024)
+            .map_err(|_| "external YAML at exact depth limit failed admission")?;
+    let mut deep_yaml_snap = ExternalRefSnapshot {
+        policy_digest: "0".repeat(64),
+        root_document_base: "https://schemas.example.com/root.json".to_string(),
+        documents: vec![ExternalRefSnapshotDocument {
+            canonical_uri: loaded_deep_yaml.canonical_uri.to_string(),
+            content_digest: loaded_deep_yaml.content_digest,
+            format: loaded_deep_yaml.format.to_string(),
+            document: loaded_deep_yaml.root,
+        }],
+        snapshot_digest: String::new(),
+    };
+    deep_yaml_snap.snapshot_digest = deep_yaml_snap.compute_digest();
+    let deep_yaml_gz = deep_yaml_snap
+        .gzip_bytes()
+        .map_err(|_| "failed to gzip exact-depth YAML snapshot")?;
+    validate_external_ref_snapshot_pair(Some(&deep_yaml_gz), Some(&deep_yaml_snap.snapshot_digest))
+        .map_err(|_| "exact-depth external YAML snapshot failed validation round-trip")?;
+
+    // A 121-container snapshot with valid matching digests must be rejected
+    // directly by snapshot decoding / validation.
+    let mut over_val = Value::from(0);
+    for _ in 0..=depth_limit {
+        over_val = Value::Array(vec![over_val]);
+    }
+    let mut over_snap = ExternalRefSnapshot {
+        policy_digest: "0".repeat(64),
+        root_document_base: "https://schemas.example.com/root.json".to_string(),
+        documents: vec![ExternalRefSnapshotDocument {
+            canonical_uri: "https://schemas.example.com/deep.json".to_string(),
+            content_digest: normalized_document_digest(&over_val),
+            format: "json".to_string(),
+            document: over_val,
+        }],
+        snapshot_digest: String::new(),
+    };
+    over_snap.snapshot_digest = over_snap.compute_digest();
+    let over_gz = over_snap
+        .gzip_bytes()
+        .map_err(|_| "failed to gzip 121-depth snapshot fixture")?;
+    if ExternalRefSnapshot::from_gzip_bytes(&over_gz, 64 * 1024).is_ok()
+        || validate_external_ref_snapshot_pair(Some(&over_gz), Some(&over_snap.snapshot_digest))
+            .is_ok()
+    {
+        return Err("121-container snapshot with matching digests was not rejected");
+    }
+
+    // Repeated Content-Type headers must fail closed even when the first value
+    // is an allowed OpenAPI media type.
+    let mut dup_ct_headers = reqwest::header::HeaderMap::new();
+    dup_ct_headers.append(
+        reqwest::header::CONTENT_TYPE,
+        reqwest::header::HeaderValue::from_static("application/json"),
+    );
+    dup_ct_headers.append(
+        reqwest::header::CONTENT_TYPE,
+        reqwest::header::HeaderValue::from_static("text/html"),
+    );
+    if validate_external_response_content_type(&dup_ct_headers).is_ok() {
+        return Err("repeated Content-Type header with allowed first value was not rejected");
+    }
+
+    // Snapshot gzip serialization must enforce both decompressed and compressed
+    // size caps and map either violation to 422 SchemaTooLarge.
+    if !matches!(
+        deep_snap.gzip_bytes_with_limits(32, 64 * 1024),
+        Err(ExtractError::SchemaTooLarge { .. })
+    ) {
+        return Err("snapshot exceeding decompressed cap did not return SchemaTooLarge");
+    }
+    if !matches!(
+        deep_snap.gzip_bytes_with_limits(64 * 1024, 16),
+        Err(ExtractError::SchemaTooLarge { .. })
+    ) {
+        return Err("snapshot exceeding compressed cap did not return SchemaTooLarge");
+    }
+    if bounded_json_serialized_len(&deep_snap, 32).is_some() {
+        return Err("bounded_json_serialized_len failed to reject oversized snapshot");
+    }
+    Ok(())
 }
 
 fn detect_format(bytes: &[u8]) -> &'static str {
@@ -1917,4 +2398,8 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> String {
 
 fn external_ref_error(message: &str) -> ExtractError {
     ExtractError::SchemaReference(message.to_string())
+}
+
+pub(crate) fn content_type_allowed_for_test(content_type: &str) -> bool {
+    content_type_allowed(content_type)
 }

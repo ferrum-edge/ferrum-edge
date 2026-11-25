@@ -130,8 +130,10 @@ pub const MAX_JWT_AUTHORITY_KEY_ID_BYTES: usize = 256;
 /// gRPC message.
 pub const MAX_TRUST_BUNDLE_JSON_BYTES: usize = 512 * 1024;
 
-/// Maximum length of the resource id.
-pub const MAX_TRUST_BUNDLE_ID_BYTES: usize = 255;
+/// Maximum length of the resource id, matching the shared Admin API resource ID
+/// limit (`MAX_ID_LENGTH`, 254) so restored bundles are always addressable via
+/// `/gateway-trust-bundles/{id}`.
+pub const MAX_TRUST_BUNDLE_ID_BYTES: usize = crate::config::types::MAX_ID_LENGTH;
 
 /// Maximum Unicode scalar-value length of a server-assigned audit actor
 /// (`updated_by`).
@@ -280,6 +282,8 @@ impl GatewayTrustBundleRecord {
             errors.push(format!(
                 "gateway trust bundle id exceeds {MAX_TRUST_BUNDLE_ID_BYTES} bytes"
             ));
+        } else if let Err(reason) = crate::config::types::validate_resource_id(&self.id) {
+            errors.push(format!("gateway trust bundle id is invalid: {reason}"));
         }
         if self.namespace.trim().is_empty() {
             errors.push("gateway trust bundle namespace is required".to_string());

@@ -2874,6 +2874,7 @@ pub async fn run(
         shutdown_tx.subscribe(),
     );
 
+    crate::admin::tls_management::set_process_env_config(Arc::new(env_config.clone()));
     let admin_state = AdminState {
         db: Some(db.clone()),
         jwt_manager,

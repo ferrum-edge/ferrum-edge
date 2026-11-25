@@ -120,3 +120,24 @@ pub fn store_canonical_resource_hash(bundle: &ExtractedBundle) -> Result<String,
         plugins,
     })
 }
+
+/// Async, bounded blocking-pool version of [`store_canonical_resource_hash`].
+///
+/// Offloads bundle normalization and canonical SHA-256 hashing onto
+/// `tokio::task::spawn_blocking` under `SPEC_WRITE_CODEC_SLOTS` so store-side
+/// API-spec replacement never stalls Tokio async workers on large generated
+/// plugin configurations.
+pub(crate) async fn store_canonical_resource_hash_async(
+    bundle: ExtractedBundle,
+) -> Result<String, anyhow::Error> {
+    let permit = std::sync::Arc::clone(&crate::admin::api_specs::SPEC_WRITE_CODEC_SLOTS)
+        .acquire_owned()
+        .await
+        .map_err(|_| anyhow::anyhow!("spec codec admission unavailable"))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        store_canonical_resource_hash(&bundle)
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("canonical resource hash worker failed: {error}"))?
+}

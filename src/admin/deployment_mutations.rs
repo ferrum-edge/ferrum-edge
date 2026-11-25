@@ -205,7 +205,7 @@ pub(super) async fn expected(
     original: &str,
 ) -> Result<SnapshotDigest, Response<Full<Bytes>>> {
     let digest = db
-        .load_deployment_snapshot(namespace)
+        .load_deployment_snapshot_for_write(namespace)
         .await
         .and_then(|snapshot| snapshot.digest())
         .map_err(|e| read_error(&e))?;

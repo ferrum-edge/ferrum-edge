@@ -20,7 +20,7 @@ pub mod plugin_config_projection;
 pub(crate) mod preconditions;
 pub mod provisioning;
 pub mod spec_codec;
-mod tls_management;
+pub(crate) mod tls_management;
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub use tls_management::{
@@ -513,8 +513,28 @@ impl AdminState {
 
     /// Whether admin mutations are currently blocked (same policy as
     /// [`Self::check_write_allowed`], for observe-only callers such as `/health`).
+    ///
+    /// Evaluates the exact same boolean predicates without serializing a JSON
+    /// error body or constructing a `hyper::Response`.
     pub fn admin_writes_currently_blocked(&self) -> bool {
-        self.check_write_allowed().is_some()
+        if self.read_only {
+            return true;
+        }
+        if let Some(ref flag) = self.db_available
+            && !flag.load(Ordering::Relaxed)
+        {
+            return true;
+        }
+        if self.admin_audit_enabled && audit::fail_closed_block_reason().is_some() {
+            return true;
+        }
+        if let Some(ref db) = self.db {
+            let topology = db.failover_topology_status();
+            if !topology.primary_active && !topology.allow_writes {
+                return true;
+            }
+        }
+        false
     }
 
     /// After a config-database mutation commits, capture the covering
@@ -1434,10 +1454,241 @@ impl Drop for AdminActivityGuard {
     }
 }
 
+/// Per-connection byte budget (in KiB units) limiting buffered spec response
+/// body memory held across multiplexed HTTP/2 streams on one admin connection.
+///
+/// Using a per-connection non-blocking semaphore prevents one stalled HTTP/2
+/// reader from stacking dozens of multi-MiB spec responses while avoiding any
+/// cross-connection or cross-namespace starvation.
+#[derive(Clone)]
+pub(crate) struct AdminConnResponseBudget {
+    semaphore: Arc<tokio::sync::Semaphore>,
+    capacity_kib: u32,
+}
+
+impl AdminConnResponseBudget {
+    pub(crate) fn new(capacity_kib: u32) -> Self {
+        let capacity_kib = capacity_kib.max(1);
+        Self {
+            semaphore: Arc::new(tokio::sync::Semaphore::new(capacity_kib as usize)),
+            capacity_kib,
+        }
+    }
+
+    fn cost_kib(&self, bytes: usize) -> Option<u32> {
+        let kib = bytes.div_ceil(1024).max(1);
+        let kib = u32::try_from(kib).ok()?;
+        (kib <= self.capacity_kib).then_some(kib)
+    }
+
+    pub(crate) fn has_capacity_for_bytes(&self, bytes: usize) -> bool {
+        self.cost_kib(bytes)
+            .is_some_and(|cost| self.semaphore.available_permits() >= cost as usize)
+    }
+
+    /// Atomically reserve `bytes` from this connection's budget before
+    /// acquiring global read codec slots or loading compressed spec blobs.
+    pub(crate) fn try_reserve_bytes(&self, bytes: usize) -> Option<ResponseBodyBudgetReservation> {
+        let cost_kib = self.cost_kib(bytes)?;
+        self.semaphore
+            .clone()
+            .try_acquire_many_owned(cost_kib)
+            .ok()
+            .map(|permit| ResponseBodyBudgetReservation {
+                budget: self.clone(),
+                permit,
+            })
+    }
+
+    pub(crate) fn try_acquire_bytes(&self, bytes: usize) -> Option<ResponseBodyBudgetPermit> {
+        self.try_reserve_bytes(bytes)
+            .map(|res| ResponseBodyBudgetPermit(Arc::new(res.permit)))
+    }
+
+    pub(crate) fn available_kib(&self) -> usize {
+        self.semaphore.available_permits()
+    }
+}
+
+/// Exclusive pre-response budget reservation held while fetching and decoding
+/// a spec body, then adjusted to the exact final response size and converted
+/// into a cloneable [`ResponseBodyBudgetPermit`].
+pub(crate) struct ResponseBodyBudgetReservation {
+    budget: AdminConnResponseBudget,
+    permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl ResponseBodyBudgetReservation {
+    /// Currently reserved KiB held by this reservation.
+    pub(crate) fn reserved_kib(&self) -> usize {
+        self.permit.num_permits()
+    }
+
+    /// Best-effort advisory upper bound (in bytes) on the total capacity
+    /// currently reachable by this reservation without blocking. Callers still
+    /// enforce exact limits atomically via [`Self::try_grow_to_bytes`].
+    pub(crate) fn max_available_bytes_hint(&self) -> usize {
+        self.permit
+            .num_permits()
+            .saturating_add(self.budget.available_kib())
+            .saturating_mul(1024)
+    }
+
+    /// Atomically grow this reservation up to `expected_bytes` before entering
+    /// the blocking decode step (for example if a concurrent `PUT` replaced a
+    /// small spec with a larger one between metadata preflight and content
+    /// fetch). Returns `false` if `expected_bytes` exceeds the connection
+    /// budget or the additional KiB are unavailable.
+    pub(crate) fn try_grow_to_bytes(&mut self, expected_bytes: usize) -> bool {
+        let Some(desired_kib) = self.budget.cost_kib(expected_bytes).map(|k| k as usize) else {
+            return false;
+        };
+        let current_kib = self.permit.num_permits();
+        if desired_kib <= current_kib {
+            return true;
+        }
+        let Ok(delta) = u32::try_from(desired_kib - current_kib) else {
+            return false;
+        };
+        let Ok(extra) = self.budget.semaphore.clone().try_acquire_many_owned(delta) else {
+            return false;
+        };
+        self.permit.merge(extra);
+        true
+    }
+
+    /// Adjust this reservation to `actual_bytes`, releasing excess KiB
+    /// immediately or atomically acquiring any positive delta without blocking.
+    pub(crate) fn adjust_to_bytes(
+        mut self,
+        actual_bytes: usize,
+    ) -> Option<ResponseBodyBudgetPermit> {
+        let desired_kib = self.budget.cost_kib(actual_bytes)? as usize;
+        let current_kib = self.permit.num_permits();
+        if desired_kib < current_kib {
+            if let Some(excess) = self.permit.split(current_kib - desired_kib) {
+                drop(excess);
+            }
+        } else if desired_kib > current_kib && !self.try_grow_to_bytes(actual_bytes) {
+            return None;
+        }
+        Some(ResponseBodyBudgetPermit(Arc::new(self.permit)))
+    }
+}
+
+/// Maximum chunk size allocated by budgeted writers and yielded per
+/// `poll_frame` for budgeted responses. Each chunk is an independently
+/// allocated `<= 64 KiB` buffer already accounted under its
+/// [`ResponseBodyBudgetPermit`], so `GuardedAdminBody` moves chunks straight
+/// into `GuardedAdminData` frames without copying or pinning a full-document
+/// backing allocation.
+pub(crate) const BUDGETED_BODY_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Cloneable RAII permit carried inside [`BudgetedResponseBody`] and cloned
+/// onto every yielded [`GuardedAdminData`] frame so per-connection buffered
+/// response memory stays accounted until both the body and all frames queued
+/// in Hyper/`h2` have drained or dropped.
+#[derive(Clone)]
+pub(crate) struct ResponseBodyBudgetPermit(
+    #[allow(dead_code)] Arc<tokio::sync::OwnedSemaphorePermit>,
+);
+
+/// Independently allocated `<= BUDGETED_BODY_CHUNK_BYTES` response chunks
+/// paired with their per-connection [`ResponseBodyBudgetPermit`].
+///
+/// Moved out of response extensions by [`GuardedAdminBody::wrap_response`] (or
+/// dropped immediately by [`strip_head_response_body`]) so outgoing HTTP/1 and
+/// HTTP/2 frames move pre-budgeted chunks with zero extra copies.
+#[derive(Clone)]
+pub(crate) struct BudgetedResponseBody {
+    chunks: std::collections::VecDeque<Bytes>,
+    remaining_bytes: usize,
+    permit: ResponseBodyBudgetPermit,
+}
+
+/// Backing owner for a single `<= BUDGETED_BODY_CHUNK_BYTES` chunk wrapped in
+/// [`Bytes::from_owner`].
+///
+/// Field declaration order guarantees `bytes` is freed before `_permit` drops.
+/// Because [`Bytes::split_to`] / [`bytes::Buf::copy_to_bytes`] shares this
+/// owner via refcounting, any split prefix queued in `h2` after a stream reset
+/// keeps the connection budget permit reserved until the last slice drops.
+struct BudgetedChunkOwner {
+    bytes: Vec<u8>,
+    _permit: ResponseBodyBudgetPermit,
+}
+
+impl AsRef<[u8]> for BudgetedChunkOwner {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl BudgetedResponseBody {
+    pub(crate) fn from_chunks(chunks: Vec<Vec<u8>>, permit: ResponseBodyBudgetPermit) -> Self {
+        let mut queue = std::collections::VecDeque::with_capacity(chunks.len());
+        let mut remaining_bytes = 0usize;
+        for chunk in chunks {
+            if chunk.is_empty() {
+                continue;
+            }
+            remaining_bytes = remaining_bytes.saturating_add(chunk.len());
+            queue.push_back(Bytes::from_owner(BudgetedChunkOwner {
+                bytes: chunk,
+                _permit: permit.clone(),
+            }));
+        }
+        Self {
+            chunks: queue,
+            remaining_bytes,
+            permit,
+        }
+    }
+
+    pub(crate) fn total_len(&self) -> usize {
+        self.remaining_bytes
+    }
+
+    pub(crate) fn chunks(&self) -> &std::collections::VecDeque<Bytes> {
+        &self.chunks
+    }
+}
+
+/// `bytes::Buf` frame yielded by [`GuardedAdminBody`]. Carries an optional
+/// [`ResponseBodyBudgetPermit`] so the permit stays alive while the frame sits
+/// in Hyper/`h2` send buffers awaiting socket write or flow-control window.
+struct GuardedAdminData {
+    bytes: Bytes,
+    _budget_permit: Option<ResponseBodyBudgetPermit>,
+}
+
+impl bytes::Buf for GuardedAdminData {
+    fn remaining(&self) -> usize {
+        bytes::Buf::remaining(&self.bytes)
+    }
+
+    fn chunk(&self) -> &[u8] {
+        bytes::Buf::chunk(&self.bytes)
+    }
+
+    fn advance(&mut self, cnt: usize) {
+        bytes::Buf::advance(&mut self.bytes, cnt);
+    }
+
+    fn copy_to_bytes(&mut self, len: usize) -> Bytes {
+        bytes::Buf::copy_to_bytes(&mut self.bytes, len)
+    }
+}
+
 /// Admin response body that keeps its [`AdminActivityGuard`] alive until hyper
 /// has finished writing the response and dropped the body.
 struct GuardedAdminBody {
     inner: Full<Bytes>,
+    /// Pre-chunked budgeted response moved out of response extensions. Each
+    /// chunk is an independently allocated `<= 64 KiB` `Bytes` buffer already
+    /// accounted under `budgeted.permit`, so `poll_frame` moves chunks directly
+    /// into [`GuardedAdminData`] with zero extra copies.
+    budgeted: Option<BudgetedResponseBody>,
     /// `GET /charges` delivery acknowledgement, fired once hyper has taken
     /// the complete document from this body (issue #5276). A response dropped
     /// before then — a scrape cancelled while the registry was rendering, or a
@@ -1452,39 +1703,48 @@ impl GuardedAdminBody {
     fn new(inner: Full<Bytes>, guard: AdminActivityGuard) -> Self {
         Self {
             inner,
+            budgeted: None,
             delivery_ack: None,
             _guard: guard,
         }
     }
 
     /// Wrap a dispatched admin response, moving a `/charges` delivery
-    /// acknowledgement out of the response extensions into the body so it
-    /// fires only once the body has been taken.
+    /// acknowledgement and any pre-chunked budgeted body out of response
+    /// extensions into the body so they live until the body is taken/dropped.
     fn wrap_response(response: Response<Full<Bytes>>, guard: AdminActivityGuard) -> Response<Self> {
         let (mut parts, inner) = response.into_parts();
         let delivery_ack = parts
             .extensions
             .remove::<plugins::api_chargeback::ChargesDeliveryAck>();
-        Response::from_parts(
-            parts,
-            Self {
-                inner,
-                delivery_ack,
-                _guard: guard,
-            },
-        )
+        let budgeted = parts.extensions.remove::<BudgetedResponseBody>();
+        let mut body = Self::new(inner, guard);
+        body.delivery_ack = delivery_ack;
+        body.budgeted = budgeted;
+        Response::from_parts(parts, body)
     }
 }
 
 impl http_body::Body for GuardedAdminBody {
-    type Data = Bytes;
+    type Data = GuardedAdminData;
     type Error = std::convert::Infallible;
 
     fn poll_frame(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
+        if let Some(budgeted) = this.budgeted.as_mut() {
+            let Some(chunk) = budgeted.chunks.pop_front() else {
+                return std::task::Poll::Ready(None);
+            };
+            budgeted.remaining_bytes = budgeted.remaining_bytes.saturating_sub(chunk.len());
+            let permit = budgeted.permit.clone();
+            return std::task::Poll::Ready(Some(Ok(http_body::Frame::data(GuardedAdminData {
+                bytes: chunk,
+                _budget_permit: Some(permit),
+            }))));
+        }
         // `Full<Bytes>` is `Unpin`, so the projection is a plain reborrow.
         let polled = http_body::Body::poll_frame(std::pin::Pin::new(&mut this.inner), cx);
         if this.delivery_ack.is_some() {
@@ -1497,16 +1757,629 @@ impl http_body::Body for GuardedAdminBody {
                 ack.acknowledge();
             }
         }
-        polled
+        polled.map(|opt| {
+            opt.map(|res| {
+                res.map(|frame| match frame.into_data() {
+                    Ok(bytes) => http_body::Frame::data(GuardedAdminData {
+                        bytes,
+                        _budget_permit: None,
+                    }),
+                    Err(frame) => match frame.into_trailers() {
+                        Ok(trailers) => http_body::Frame::trailers(trailers),
+                        Err(_) => http_body::Frame::data(GuardedAdminData {
+                            bytes: Bytes::new(),
+                            _budget_permit: None,
+                        }),
+                    },
+                })
+            })
+        })
     }
 
     fn is_end_stream(&self) -> bool {
-        http_body::Body::is_end_stream(&self.inner)
+        if let Some(budgeted) = &self.budgeted {
+            budgeted.chunks.is_empty()
+        } else {
+            http_body::Body::is_end_stream(&self.inner)
+        }
     }
 
     fn size_hint(&self) -> http_body::SizeHint {
-        http_body::Body::size_hint(&self.inner)
+        if let Some(budgeted) = &self.budgeted {
+            http_body::SizeHint::with_exact(budgeted.remaining_bytes as u64)
+        } else {
+            http_body::Body::size_hint(&self.inner)
+        }
     }
+}
+
+fn budgeted_test_chunks(total_bytes: usize, fill: u8) -> Vec<Vec<u8>> {
+    let mut chunks = Vec::new();
+    let mut remaining = total_bytes;
+    while remaining > 0 {
+        let len = remaining.min(BUDGETED_BODY_CHUNK_BYTES);
+        chunks.push(vec![fill; len]);
+        remaining -= len;
+    }
+    chunks
+}
+
+/// Structured result returned by the response-budget wrapper test helper.
+#[doc(hidden)]
+pub struct ResponseBudgetWrapperAudit {
+    pub frame_count: usize,
+    pub available_after_acquire: usize,
+    pub available_mid_stream: usize,
+    pub available_while_frame_queued: usize,
+    pub available_after_frames_dropped: usize,
+    pub early_drop_released: bool,
+    pub head_released: bool,
+}
+
+/// Exercise budgeted `GuardedAdminBody` chunking, permit retention across
+/// intermediate frames and queued `GuardedAdminData` frames after body drop,
+/// early-drop release, and HEAD body stripping. Reached through `_test_support`.
+pub(crate) async fn exercise_response_budget_wrapper_for_test(
+    capacity_kib: u32,
+    body_bytes: usize,
+) -> Result<ResponseBudgetWrapperAudit, &'static str> {
+    let build_budgeted_response = |bytes: usize, permit: ResponseBodyBudgetPermit| {
+        let mut resp = Response::builder()
+            .status(StatusCode::OK)
+            .body(Full::new(Bytes::new()))
+            .unwrap_or_else(|_| admin_builder_failure_response());
+        resp.extensions_mut()
+            .insert(BudgetedResponseBody::from_chunks(
+                budgeted_test_chunks(bytes, b'x'),
+                permit,
+            ));
+        resp
+    };
+
+    let budget = AdminConnResponseBudget::new(capacity_kib);
+    let Some(permit) = budget.try_acquire_bytes(body_bytes) else {
+        return Err("initial body did not fit budget");
+    };
+    let available_after_acquire = budget.available_kib();
+
+    let response = build_budgeted_response(body_bytes, permit);
+
+    let activity = Arc::new(AdminConnActivity::new());
+    let wrapped = GuardedAdminBody::wrap_response(response, AdminActivityGuard::new(activity));
+    let mut body = wrapped.into_body();
+    if http_body::Body::size_hint(&body).exact() != Some(body_bytes as u64) {
+        return Err("initial size_hint did not match budgeted body length");
+    }
+    let mut frame_count = 0usize;
+    let mut total_emitted = 0usize;
+    let mut available_mid_stream = None;
+    let mut queued_frames = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(never) => match never {},
+        };
+        let Ok(data) = frame.into_data() else {
+            return Err("unexpected non-data frame");
+        };
+        let chunk_len = bytes::Buf::remaining(&data);
+        if chunk_len > BUDGETED_BODY_CHUNK_BYTES {
+            return Err("budgeted chunk exceeded 64 KiB");
+        }
+        total_emitted += chunk_len;
+        if http_body::Body::size_hint(&body).exact() != Some((body_bytes - total_emitted) as u64) {
+            return Err("remaining size_hint did not track popped chunk");
+        }
+        frame_count += 1;
+        if frame_count == 1 {
+            if http_body::Body::is_end_stream(&body) {
+                return Err("multi-chunk body unexpectedly reported end_stream after first chunk");
+            }
+            available_mid_stream = Some(budget.available_kib());
+        }
+        queued_frames.push(data);
+    }
+    if total_emitted != body_bytes {
+        return Err("emitted bytes did not equal budgeted body length");
+    }
+    let Some(available_mid_stream) = available_mid_stream else {
+        return Err("body produced zero frames");
+    };
+
+    // Dropping `GuardedAdminBody` while Hyper/h2 still owns queued
+    // `GuardedAdminData` frames must keep the connection budget reserved.
+    drop(body);
+    let available_while_frame_queued = budget.available_kib();
+    drop(queued_frames);
+    let available_after_frames_dropped = budget.available_kib();
+
+    // Early drop (disconnect after one chunk, without draining the remaining
+    // chunks) must release the connection budget immediately.
+    let Some(early_permit) = budget.try_acquire_bytes(body_bytes) else {
+        return Err("budget was not reusable after queued frames dropped");
+    };
+    let early_response = build_budgeted_response(body_bytes, early_permit);
+    let early_activity = Arc::new(AdminConnActivity::new());
+    let mut early_body =
+        GuardedAdminBody::wrap_response(early_response, AdminActivityGuard::new(early_activity))
+            .into_body();
+    let first_frame = early_body.frame().await;
+    if first_frame.is_none() || http_body::Body::is_end_stream(&early_body) {
+        return Err("early-drop body did not pause mid-stream");
+    }
+    drop(first_frame);
+    drop(early_body);
+    let early_drop_released = budget.available_kib() == capacity_kib as usize;
+
+    // Stream reset while h2 still holds a `copy_to_bytes`-split prefix for a
+    // pending socket write: dropping both the remaining frame and body must
+    // keep the budget reserved until the split `Bytes` prefix itself drops.
+    if body_bytes < 1024 {
+        return Err("split-prefix check requires body_bytes >= 1024");
+    }
+    let Some(split_permit) = budget.try_acquire_bytes(body_bytes) else {
+        return Err("budget was not reusable before split-prefix check");
+    };
+    let split_response = build_budgeted_response(body_bytes, split_permit);
+    let split_activity = Arc::new(AdminConnActivity::new());
+    let mut split_body =
+        GuardedAdminBody::wrap_response(split_response, AdminActivityGuard::new(split_activity))
+            .into_body();
+    let Some(Ok(split_frame)) = split_body.frame().await else {
+        return Err("split-prefix body did not yield first frame");
+    };
+    let Ok(mut split_data) = split_frame.into_data() else {
+        return Err("split-prefix frame was not data");
+    };
+    let split_prefix = bytes::Buf::copy_to_bytes(&mut split_data, 1024);
+    if split_prefix.len() != 1024 {
+        return Err("split prefix had unexpected length");
+    }
+    drop(split_data);
+    drop(split_body);
+    if budget.available_kib() != available_after_acquire {
+        return Err("dropping frame and body released budget while split prefix remained live");
+    }
+    drop(split_prefix);
+    if budget.available_kib() != capacity_kib as usize {
+        return Err("dropping split prefix did not release connection budget");
+    }
+
+    // HEAD stripping drops the budgeted chunks + permit immediately while
+    // preserving Content-Length from the pre-chunked body length.
+    let Some(head_permit) = budget.try_acquire_bytes(body_bytes) else {
+        return Err("budget was not reusable after early drop");
+    };
+    let mut head_response = build_budgeted_response(body_bytes, head_permit);
+    strip_head_response_body(&mut head_response);
+    let expected_cl = body_bytes.to_string();
+    let head_cl_ok = head_response
+        .headers()
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        == Some(expected_cl.as_str());
+    let head_released = head_cl_ok && budget.available_kib() == capacity_kib as usize;
+
+    Ok(ResponseBudgetWrapperAudit {
+        frame_count,
+        available_after_acquire,
+        available_mid_stream,
+        available_while_frame_queued,
+        available_after_frames_dropped,
+        early_drop_released,
+        head_released,
+    })
+}
+
+/// Test helper verifying strict budget refusal when `bytes` exceeds capacity
+/// (no clamping bypass), reservation shrink/grow adjustment, and
+/// `has_capacity_for_bytes` pre-check behavior.
+pub(crate) fn check_response_budget_limits_for_test(
+    capacity_kib: u32,
+    oversized_bytes: usize,
+    fitting_bytes: usize,
+) -> (bool, bool, bool, bool) {
+    let budget = AdminConnResponseBudget::new(capacity_kib);
+    let oversized_refused = !budget.has_capacity_for_bytes(oversized_bytes)
+        && budget.try_acquire_bytes(oversized_bytes).is_none();
+    let first_admitted = budget.has_capacity_for_bytes(fitting_bytes);
+    let held = budget.try_acquire_bytes(fitting_bytes);
+    let second_refused = held.is_some()
+        && !budget.has_capacity_for_bytes(fitting_bytes)
+        && budget.try_acquire_bytes(fitting_bytes).is_none();
+    drop(held);
+
+    // Verify shrink (180 KiB -> 50 KiB), successful grow (50 KiB -> 120 KiB),
+    // and overflow grow rejection (50 KiB -> 200 KiB when only 36 KiB remain),
+    // ensuring each prerequisite reservation actually succeeded.
+    let shrink_and_grow_ok = (|| {
+        let initial = budget.try_reserve_bytes(180 * 1024)?;
+        if budget.available_kib() != (capacity_kib as usize).saturating_sub(180) {
+            return None;
+        }
+        let shrunk = initial.adjust_to_bytes(50 * 1024)?;
+        if budget.available_kib() != (capacity_kib as usize).saturating_sub(50) {
+            return None;
+        }
+        let growable = budget.try_reserve_bytes(50 * 1024)?;
+        let grown = growable.adjust_to_bytes(120 * 1024)?;
+        if budget.available_kib() != (capacity_kib as usize).saturating_sub(170) {
+            return None;
+        }
+        let overflow_candidate = budget.try_reserve_bytes(50 * 1024)?;
+        if budget.available_kib() != (capacity_kib as usize).saturating_sub(220) {
+            return None;
+        }
+        if overflow_candidate.adjust_to_bytes(200 * 1024).is_some() {
+            return None;
+        }
+        // Failed grow must release the 50 KiB candidate reservation immediately.
+        if budget.available_kib() != (capacity_kib as usize).saturating_sub(170) {
+            return None;
+        }
+        drop(grown);
+        drop(shrunk);
+        (budget.available_kib() == capacity_kib as usize).then_some(())
+    })()
+    .is_some();
+
+    (
+        oversized_refused,
+        first_admitted,
+        second_refused,
+        shrink_and_grow_ok,
+    )
+}
+
+/// Apply the shared admin HTTP/2 transport settings used by [`serve_admin_io`]
+/// and transport tests.
+///
+/// Setting `max_send_buf_size(BUDGETED_BODY_CHUNK_BYTES)` sets `h2`'s
+/// per-stream send-buffer threshold to 64 KiB (down from ~400 KiB), while
+/// `h2`'s `FramedWrite` uses `COALESCE_LIMIT` (64 KiB) as its data-coalescing
+/// target (control frames or a single queued chunk may transiently exceed
+/// those thresholds).
+fn configure_admin_http2_builder(
+    builder: &mut hyper_util::server::conn::auto::Builder<hyper_util::rt::TokioExecutor>,
+    limits: AdminRequestLimits,
+) {
+    builder
+        .http2()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .max_concurrent_streams(limits.http2_max_concurrent_streams)
+        .max_header_list_size(limits.http2_max_header_list_size_bytes)
+        .max_send_buf_size(BUDGETED_BODY_CHUNK_BYTES);
+}
+
+/// Exercise a real HTTP/2 server using [`configure_admin_http2_builder`] and a
+/// client over a small paused duplex pipe so `h2` actively encodes Stream 1
+/// until the duplex pipe saturates mid-body on a 512 KiB budgeted response
+/// while the connection budget is 640 KiB. Verifies that a concurrent 512 KiB
+/// request receives `503` with `Retry-After: 1` while Stream 1 is stalled, and
+/// that a follow-up request succeeds with `200` once Stream 1 drains. Reached
+/// through `_test_support`.
+pub(crate) async fn exercise_http2_stalled_response_budget_for_test() -> Result<(), &'static str> {
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::task::{Context, Poll, Waker};
+
+    struct PausedReadIo {
+        inner: tokio::io::DuplexStream,
+        paused: Arc<AtomicBool>,
+        read_waker: Arc<std::sync::Mutex<Option<Waker>>>,
+    }
+
+    impl tokio::io::AsyncRead for PausedReadIo {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.paused.load(Ordering::Acquire) {
+                if let Ok(mut guard) = self.read_waker.lock() {
+                    *guard = Some(cx.waker().clone());
+                }
+                if self.paused.load(Ordering::Acquire) {
+                    return Poll::Pending;
+                }
+            }
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for PausedReadIo {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    struct CountingWriteIo {
+        inner: tokio::io::DuplexStream,
+        counting: Arc<AtomicBool>,
+        bytes_written: Arc<AtomicUsize>,
+        threshold: usize,
+        reached: Arc<tokio::sync::Notify>,
+    }
+
+    impl tokio::io::AsyncRead for CountingWriteIo {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for CountingWriteIo {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
+            if let Poll::Ready(Ok(n)) = poll
+                && n > 0
+                && self.counting.load(Ordering::Acquire)
+            {
+                let total = self.bytes_written.fetch_add(n, Ordering::AcqRel) + n;
+                if total >= self.threshold {
+                    self.reached.notify_waiters();
+                }
+            }
+            poll
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    const CAPACITY_KIB: u32 = 640;
+    const BODY_BYTES: usize = 512 * 1024;
+    const DUPLEX_BYTES: usize = 16 * 1024;
+    // 512 KiB leaves wide headroom above the 16 KiB duplex pipe, h2's 64 KiB
+    // per-stream send-buffer threshold, and FramedWrite's 64 KiB coalescing
+    // target so Stream 1 reliably stalls mid-body while client reads are paused.
+    let (client_io, server_io) = tokio::io::duplex(DUPLEX_BYTES);
+    let paused = Arc::new(AtomicBool::new(false));
+    let read_waker = Arc::new(std::sync::Mutex::new(None));
+    let gated_client = PausedReadIo {
+        inner: client_io,
+        paused: Arc::clone(&paused),
+        read_waker: Arc::clone(&read_waker),
+    };
+    let server_bytes_written = Arc::new(AtomicUsize::new(0));
+    let pipe_saturated = Arc::new(tokio::sync::Notify::new());
+    let counted_server = CountingWriteIo {
+        inner: server_io,
+        counting: Arc::clone(&paused),
+        bytes_written: Arc::clone(&server_bytes_written),
+        threshold: DUPLEX_BYTES,
+        reached: Arc::clone(&pipe_saturated),
+    };
+
+    let budget = AdminConnResponseBudget::new(CAPACITY_KIB);
+    let stream1_dispatched = Arc::new(tokio::sync::Notify::new());
+    let stream2_dispatched = Arc::new(tokio::sync::Notify::new());
+    let server_budget = budget.clone();
+    let s1_notify = Arc::clone(&stream1_dispatched);
+    let s2_notify = Arc::clone(&stream2_dispatched);
+    let activity = Arc::new(AdminConnActivity::new());
+
+    let server = tokio::spawn(async move {
+        let svc = service_fn(move |req: Request<Incoming>| {
+            let budget = server_budget.clone();
+            let guard = AdminActivityGuard::new(Arc::clone(&activity));
+            let s1_notify = Arc::clone(&s1_notify);
+            let s2_notify = Arc::clone(&s2_notify);
+            async move {
+                let path = req.uri().path().to_string();
+                let resp = if path == "/ping" {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Full::new(Bytes::from_static(b"ok")))
+                        .unwrap_or_else(|_| admin_builder_failure_response())
+                } else if let Some(permit) = budget.try_acquire_bytes(BODY_BYTES) {
+                    let mut resp = Response::builder()
+                        .status(StatusCode::OK)
+                        .header("Content-Length", BODY_BYTES.to_string())
+                        .body(Full::new(Bytes::new()))
+                        .unwrap_or_else(|_| admin_builder_failure_response());
+                    resp.extensions_mut()
+                        .insert(BudgetedResponseBody::from_chunks(
+                            budgeted_test_chunks(BODY_BYTES, b'a'),
+                            permit,
+                        ));
+                    resp
+                } else {
+                    Response::builder()
+                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                        .header("Retry-After", "1")
+                        .body(Full::new(Bytes::from_static(b"budget full")))
+                        .unwrap_or_else(|_| admin_builder_failure_response())
+                };
+                if path == "/stream1" {
+                    s1_notify.notify_waiters();
+                } else if path == "/stream2" {
+                    s2_notify.notify_waiters();
+                }
+                Ok::<_, hyper::Error>(GuardedAdminBody::wrap_response(resp, guard))
+            }
+        });
+        let mut builder =
+            hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+        configure_admin_http2_builder(&mut builder, AdminRequestLimits::default());
+        let _ = builder
+            .serve_connection(TokioIo::new(counted_server), svc)
+            .await;
+    });
+
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(
+        hyper_util::rt::TokioExecutor::new(),
+        TokioIo::new(gated_client),
+    )
+    .await
+    .map_err(|_| "h2 handshake failed")?;
+    let conn_task = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    // Complete handshake with a tiny ping before pausing reads.
+    let ping_req = Request::builder()
+        .method(Method::GET)
+        .uri("http://localhost/ping")
+        .body(http_body_util::Empty::<Bytes>::new())
+        .map_err(|_| "build ping req")?;
+    let ping_resp = sender
+        .send_request(ping_req)
+        .await
+        .map_err(|_| "send ping")?;
+    if ping_resp.status() != StatusCode::OK {
+        return Err("ping did not return 200");
+    }
+    let _ = ping_resp.into_body().collect().await;
+
+    // Pause client reads so Stream 1 actively pumps frames into h2 and fills
+    // the 16 KiB duplex pipe before stalling mid-body.
+    let s1_wait = stream1_dispatched.notified();
+    tokio::pin!(s1_wait);
+    s1_wait.as_mut().enable();
+    let pipe_wait = pipe_saturated.notified();
+    tokio::pin!(pipe_wait);
+    pipe_wait.as_mut().enable();
+    paused.store(true, Ordering::Release);
+
+    let req1 = Request::builder()
+        .method(Method::GET)
+        .uri("http://localhost/stream1")
+        .body(http_body_util::Empty::<Bytes>::new())
+        .map_err(|_| "build req1")?;
+    let resp1_fut = sender.send_request(req1);
+    tokio::time::timeout(Duration::from_secs(5), s1_wait)
+        .await
+        .map_err(|_| "timed out waiting for Stream 1 dispatch")?;
+    tokio::time::timeout(Duration::from_secs(5), pipe_wait)
+        .await
+        .map_err(|_| "timed out waiting for h2 to saturate duplex pipe")?;
+    if budget.available_kib() != (CAPACITY_KIB as usize - BODY_BYTES / 1024) {
+        return Err("h2 released response budget before stalled Stream 1 drained");
+    }
+
+    // Stream 2 arrives while Stream 1 is stalled and must fail fast with 503.
+    let s2_wait = stream2_dispatched.notified();
+    tokio::pin!(s2_wait);
+    s2_wait.as_mut().enable();
+    let req2 = Request::builder()
+        .method(Method::GET)
+        .uri("http://localhost/stream2")
+        .body(http_body_util::Empty::<Bytes>::new())
+        .map_err(|_| "build req2")?;
+    let resp2_fut = sender.send_request(req2);
+    tokio::time::timeout(Duration::from_secs(5), s2_wait)
+        .await
+        .map_err(|_| "timed out waiting for Stream 2 dispatch")?;
+
+    // Resume reads so both Stream 1 (200) and Stream 2 (503) deliver to client.
+    paused.store(false, Ordering::Release);
+    if let Ok(mut guard) = read_waker.lock()
+        && let Some(waker) = guard.take()
+    {
+        waker.wake();
+    }
+
+    let resp2 = resp2_fut.await.map_err(|_| "await resp2")?;
+    if resp2.status() != StatusCode::SERVICE_UNAVAILABLE {
+        return Err("stalled Stream 2 did not receive 503");
+    }
+    if resp2
+        .headers()
+        .get("Retry-After")
+        .and_then(|v| v.to_str().ok())
+        != Some("1")
+    {
+        return Err("stalled Stream 2 missing Retry-After: 1");
+    }
+    let _ = resp2.into_body().collect().await;
+
+    let resp1 = resp1_fut.await.map_err(|_| "await resp1")?;
+    if resp1.status() != StatusCode::OK {
+        return Err("Stream 1 did not return 200");
+    }
+    let body1 = resp1
+        .into_body()
+        .collect()
+        .await
+        .map_err(|_| "collect Stream 1")?
+        .to_bytes();
+    if body1.len() != BODY_BYTES {
+        return Err("Stream 1 body length mismatch");
+    }
+
+    // Once Stream 1 drains, Stream 3 must be admitted with 200 OK.
+    let req3 = Request::builder()
+        .method(Method::GET)
+        .uri("http://localhost/stream3")
+        .body(http_body_util::Empty::<Bytes>::new())
+        .map_err(|_| "build req3")?;
+    let resp3 = sender
+        .send_request(req3)
+        .await
+        .map_err(|_| "send Stream 3")?;
+    if resp3.status() != StatusCode::OK {
+        return Err("Stream 3 was not admitted after Stream 1 drained");
+    }
+    let body3 = resp3
+        .into_body()
+        .collect()
+        .await
+        .map_err(|_| "collect Stream 3")?
+        .to_bytes();
+    if body3.len() != BODY_BYTES {
+        return Err("Stream 3 body length mismatch");
+    }
+
+    drop(sender);
+    let _ = conn_task.await;
+    let _ = server.await;
+    Ok(())
+}
+
+/// Drive one admin connection through [`serve_admin_io`] with an explicit
+/// [`crate::tls::ClientTrustSession`] so transport tests can exercise client
+/// certificate trust withdrawal over HTTP/2 deterministically. Reached through
+/// `_test_support`.
+pub(crate) async fn serve_admin_io_with_client_trust_for_test<I>(
+    io: I,
+    state: AdminState,
+    client_ip: std::net::IpAddr,
+    client_trust: crate::tls::ClientTrustSession,
+) where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    serve_admin_io(TokioIo::new(io), state, client_ip, Some(client_trust)).await;
 }
 
 /// Drive an admin response through the connection body wrapper exactly as
@@ -1562,13 +2435,20 @@ async fn serve_admin_io<I>(
 
     let activity = Arc::new(AdminConnActivity::new());
     let service_activity = Arc::clone(&activity);
+    let conn_budget_kib =
+        api_specs::handlers::max_spec_decompress_bytes(state.admin_spec_max_body_size_mib)
+            .div_ceil(1024)
+            .max(64 * 1024)
+            .min(u32::MAX as usize) as u32;
+    let conn_response_budget = AdminConnResponseBudget::new(conn_budget_kib);
     // Kept out of the service closure so the connection-level select below can
     // still observe retirement after the closure has taken its own handle.
     let connection_trust = client_trust.clone();
-    let svc = service_fn(move |req: Request<Incoming>| {
+    let svc = service_fn(move |mut req: Request<Incoming>| {
         let state = state.clone();
         let guard = AdminActivityGuard::new(Arc::clone(&service_activity));
         let client_trust = client_trust.clone();
+        let conn_response_budget = conn_response_budget.clone();
         async move {
             // Frontend client-trust admission fence (issue #3857). One relaxed
             // atomic read of connection-local state, and only for a connection
@@ -1581,21 +2461,25 @@ async fn serve_admin_io<I>(
             // the graceful shutdown below is still draining. The body is a
             // compiled-in literal naming no serial, subject, issuer,
             // fingerprint, path, or generation.
-            if let Some(session) = client_trust.as_ref()
+            let is_head = req.method() == Method::HEAD;
+            let mut response = if let Some(session) = client_trust.as_ref()
                 && session.is_retired()
             {
                 session.record_fenced();
-                let response = with_admin_challenge(
+                with_admin_challenge(
                     json_response(
                         StatusCode::UNAUTHORIZED,
                         &json!({ "error": "Client certificate trust withdrawn" }),
                     ),
                     crate::plugins::utils::auth_flow::CLIENT_CERTIFICATE_AUTHENTICATION_CHALLENGE,
-                );
-                let guarded = response.map(|inner| GuardedAdminBody::new(inner, guard));
-                return Ok::<_, hyper::Error>(guarded);
+                )
+            } else {
+                req.extensions_mut().insert(conn_response_budget);
+                handle_admin_request(req, state, client_ip).await?
+            };
+            if is_head {
+                strip_head_response_body(&mut response);
             }
-            let response = handle_admin_request(req, state, client_ip).await?;
             let guarded = GuardedAdminBody::wrap_response(response, guard);
             Ok::<_, hyper::Error>(guarded)
         }
@@ -1611,11 +2495,7 @@ async fn serve_admin_io<I>(
         http1.timer(hyper_util::rt::TokioTimer::new());
         http1.header_read_timeout(Duration::from_secs(header_read_timeout_seconds));
     }
-    builder
-        .http2()
-        .timer(hyper_util::rt::TokioTimer::new())
-        .max_concurrent_streams(limits.http2_max_concurrent_streams)
-        .max_header_list_size(limits.http2_max_header_list_size_bytes);
+    configure_admin_http2_builder(&mut builder, limits);
 
     let conn = builder.serve_connection(io, svc);
     tokio::pin!(conn);
@@ -2321,6 +3201,35 @@ fn body_consuming_route_role(method: &Method, segments: &[&str]) -> Option<Optio
     }
 }
 
+/// Required minimum role for any known mutating route (`POST`, `PUT`, `PATCH`,
+/// `DELETE`), including bodyless `POST` and `DELETE` endpoints. Used by
+/// pre-dispatch header/query refusal gates (`If-Match`, `?conditional=true`) so
+/// an unauthorized caller always receives `403 Forbidden` rather than `400 Bad
+/// Request`.
+fn mutating_route_role(method: &Method, segments: &[&str]) -> Option<AdminRole> {
+    if let Some(role) = body_consuming_route_role(method, segments).flatten() {
+        return Some(role);
+    }
+    if let Some(role) = tls_route_required_role(method, segments) {
+        return Some(role);
+    }
+    match (method, segments) {
+        (m, ["api-specs"]) if m == Method::POST => Some(AdminRole::Admin),
+        (m, ["api-specs", _]) if m == Method::PUT || m == Method::DELETE => Some(AdminRole::Admin),
+        (m, ["proxies", _]) if m == Method::DELETE => Some(AdminRole::Operator),
+        (m, ["consumers", _]) if m == Method::DELETE => Some(AdminRole::Admin),
+        (m, ["consumers", _, "credentials", _]) if m == Method::DELETE => Some(AdminRole::Admin),
+        (m, ["consumers", _, "credentials", _, _]) if m == Method::DELETE => Some(AdminRole::Admin),
+        (m, ["plugins", "config", _]) if m == Method::DELETE => Some(AdminRole::Operator),
+        (m, ["upstreams", _]) if m == Method::DELETE => Some(AdminRole::Operator),
+        (m, ["gateway-trust-bundles", _]) if m == Method::DELETE => Some(AdminRole::Admin),
+        (m, ["namespaces", _]) if m == Method::DELETE => Some(AdminRole::Admin),
+        (m, ["backend-capabilities", "refresh"]) if m == Method::POST => Some(AdminRole::Operator),
+        (m, ["mesh", "config-revision", "reset"]) if m == Method::POST => Some(AdminRole::Operator),
+        _ => None,
+    }
+}
+
 fn tls_route_required_role(method: &Method, segments: &[&str]) -> Option<AdminRole> {
     match (method, segments) {
         (
@@ -2521,11 +3430,11 @@ fn namespace_scoped_resource_kind(segments: &[&str]) -> Option<&'static str> {
         "backend-egress-policy" if segments.len() == 1 => "backend-egress-policy",
         // Only the export: `/config/apply-status` is a process-topology
         // surface, not a tenant-addressed resource.
-        "config" if segments.get(1) == Some(&"export") => "config-export",
+        "config" if segments == ["config", "export"] => "config-export",
         "restore" => "restore",
         "audit" => "audit",
         "gateway-trust-bundles" => "gateway-trust-bundles",
-        "gateway-trust" => "gateway-trust",
+        "gateway-trust" if segments == ["gateway-trust", "status"] => "gateway-trust",
         // `GET /plugins` lists available plugin *types* (global metadata);
         // `/plugins/config[...]` is the namespace-scoped PluginConfig CRUD.
         "plugins" if segments.len() > 1 => "plugins",
@@ -3273,6 +4182,7 @@ pub async fn handle_admin_request(
         request_segments.as_slice(),
         req.headers(),
     );
+    let is_head = req.method() == Method::HEAD;
     let slot = audit::new_request_slot(
         req.method().as_str(),
         request_path,
@@ -3314,7 +4224,37 @@ pub async fn handle_admin_request(
         );
         note_unserved_namespace_mutation(marker);
     }
+    if is_head && let Ok(response) = result.as_mut() {
+        strip_head_response_body(response);
+    }
     result
+}
+
+/// RFC 9110 §9.3.2: HEAD responses MUST NOT contain a message body. Strip
+/// the body at the transport boundary while preserving status and
+/// representation metadata (including `Content-Length`) so both HTTP/1.1 and
+/// HTTP/2 emit `END_STREAM` on the `HEADERS` frame without sending `DATA`
+/// frames.
+fn strip_head_response_body(response: &mut Response<Full<Bytes>>) {
+    let status = response.status();
+    let budgeted = response.extensions_mut().remove::<BudgetedResponseBody>();
+    if !matches!(status, StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED)
+        && !response
+            .headers()
+            .contains_key(hyper::header::CONTENT_LENGTH)
+    {
+        let exact_len = budgeted
+            .as_ref()
+            .map(|b| b.total_len() as u64)
+            .or_else(|| <Full<Bytes> as hyper::body::Body>::size_hint(response.body()).exact());
+        if let Some(len) = exact_len {
+            response
+                .headers_mut()
+                .insert(hyper::header::CONTENT_LENGTH, HeaderValue::from(len));
+        }
+    }
+    drop(budgeted);
+    *response.body_mut() = Full::new(Bytes::new());
 }
 
 type BoxedAdminResponseFuture = std::pin::Pin<
@@ -3360,12 +4300,12 @@ async fn handle_admin_request_inner(
 
     // Liveness probe — always unauthenticated and minimal. Never reveals any
     // operational internals; safe to expose to load balancers / orchestrators.
-    if path == "/live" {
+    if path == "/live" && matches!(method, Method::GET | Method::HEAD) {
         return Ok(json_response(StatusCode::OK, &json!({"status": "ok"})));
     }
 
     // Health check (unauthenticated)
-    if path == "/health" || path == "/status" {
+    if (path == "/health" || path == "/status") && matches!(method, Method::GET | Method::HEAD) {
         // The admin JWT is verified once: the detail decision and the tenant
         // tier below both derive from this actor.
         let admin_actor = verified_admin_actor(&state, auth_header.as_deref());
@@ -4014,6 +4954,17 @@ async fn handle_admin_request_inner(
     if path == "/overload" && method == Method::GET {
         let detailed = observability_detail_allowed(&state, auth_header.as_deref(), &client_ip);
         if let Some(ref proxy_state) = state.proxy_state {
+            if !detailed {
+                let level = proxy_state.overload.level();
+                let (status, level_str) = match level {
+                    crate::overload::OverloadLevel::Normal => (StatusCode::OK, "normal"),
+                    crate::overload::OverloadLevel::Pressure => (StatusCode::OK, "pressure"),
+                    crate::overload::OverloadLevel::Critical => {
+                        (StatusCode::SERVICE_UNAVAILABLE, "critical")
+                    }
+                };
+                return Ok(json_response(status, &json!({ "level": level_str })));
+            }
             let snapshot = proxy_state.overload.snapshot();
             let status = match snapshot.level {
                 crate::overload::OverloadLevel::Normal => StatusCode::OK,
@@ -4033,10 +4984,7 @@ async fn handle_admin_request_inner(
                         serde_json::to_value(failures.snapshot()).unwrap_or_default(),
                     );
                 }
-                // Aggregate buffered-request pressure (issue #4153). Inserted
-                // into the DETAIL snapshot only: the coarse unauthenticated
-                // branch below reads `level` back out and discards everything
-                // else, so this never widens the unauthenticated surface.
+                // Aggregate buffered-request pressure (issue #4153).
                 obj.insert(
                     "request_buffer".to_string(),
                     serde_json::to_value(
@@ -4045,14 +4993,7 @@ async fn handle_admin_request_inner(
                     .unwrap_or_default(),
                 );
             }
-            if detailed {
-                return Ok(json_response(status, &snapshot_value));
-            }
-            let level = snapshot_value
-                .get("level")
-                .cloned()
-                .unwrap_or_else(|| json!("normal"));
-            return Ok(json_response(status, &json!({ "level": level })));
+            return Ok(json_response(status, &snapshot_value));
         }
         return Ok(json_response(StatusCode::OK, &json!({"level": "normal"})));
     }
@@ -4062,17 +5003,26 @@ async fn handle_admin_request_inner(
     // from `FERRUM_METRICS_ALLOWED_CIDRS`. Unauthenticated scraping is an
     // explicit operator opt-in (token or CIDR), not the default.
     if path == "/metrics" && method == Method::GET {
-        // A presented namespace-bounded JWT is refused here even from an
-        // allowlisted source IP: `/metrics` is fleet-global, and the CIDR
-        // allowance authorizes only scrapes that present no such token.
-        if let Ok(token_data) = state.jwt_manager.verify_request(auth_header.as_deref())
-            && let Ok(actor) = AuditActor::from_verified(&token_data)
+        // Verify the admin JWT once: a presented namespace-bounded JWT is
+        // refused here even from an allowlisted source IP (`/metrics` is
+        // fleet-global), and passing `admin_jwt_detail` into
+        // `observability_detail_allowed_with` avoids verifying the JWT twice.
+        let admin_actor = verified_admin_actor(&state, auth_header.as_deref());
+        if let Some(ref actor) = admin_actor
             && let Some(response) =
-                authorize_namespace_bounded_global_route(&method, &["metrics"], &path, &actor)
+                authorize_namespace_bounded_global_route(&method, &["metrics"], &path, actor)
         {
             return Ok(response);
         }
-        if !observability_detail_allowed(&state, auth_header.as_deref(), &client_ip) {
+        let admin_jwt_detail = admin_actor
+            .as_ref()
+            .is_some_and(|actor| !actor.is_namespace_bounded());
+        if !observability_detail_allowed_with(
+            &state,
+            admin_jwt_detail,
+            auth_header.as_deref(),
+            &client_ip,
+        ) {
             return Ok(metrics_unauthorized_response());
         }
         let registry = admin_metrics_registry(&state);
@@ -4371,16 +5321,13 @@ async fn handle_admin_request_inner(
         )
         && !deployment_write_route
     {
-        let role = if matches!(segments_peek.as_slice(), ["api-specs", ..]) {
-            Some(AdminRole::Admin)
-        } else {
-            body_consuming_route_role(&method, segments_peek.as_slice()).flatten()
-        };
-        if let Some(role) = role
+        if let Some(role) = mutating_route_role(&method, segments_peek.as_slice())
             && let Some(response) = require_admin_role(&auth, role)
         {
+            drop(req.into_body());
             return Ok(response);
         }
+        drop(req.into_body());
         return Ok(deployment_mutations::refusal(
             "Deployment conditional mode is unsupported on this mutation route",
         ));
@@ -4619,7 +5566,7 @@ async fn handle_admin_request_inner(
         )
         && !if_match_route(&method, segments_peek.as_slice())
     {
-        if let Some(Some(role)) = body_consuming_route_role(&method, segments_peek.as_slice())
+        if let Some(role) = mutating_route_role(&method, segments_peek.as_slice())
             && let Some(resp) = require_admin_role(&auth, role)
         {
             drop(req.into_body());
@@ -5330,7 +6277,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_create_acme_certificate(&state, &body_bytes).await
+            tls_management::handle_create_acme_certificate(&state, &auth, &body_bytes).await
         }
         (Method::GET, ["admin", "tls", "acme", "certificates", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -5342,13 +6289,13 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_update_acme_certificate(&state, id, &body_bytes).await
+            tls_management::handle_update_acme_certificate(&state, &auth, id, &body_bytes).await
         }
         (Method::DELETE, ["admin", "tls", "acme", "certificates", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_delete_acme_certificate(&state, id).await
+            tls_management::handle_delete_acme_certificate(&state, &auth, id).await
         }
         (Method::GET, ["admin", "tls", "acme", "accounts"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -5361,7 +6308,13 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_renew_acme_certificate(&state, certificate_id, &body_bytes).await
+            tls_management::handle_renew_acme_certificate(
+                &state,
+                &auth,
+                certificate_id,
+                &body_bytes,
+            )
+            .await
         }
         (Method::GET, ["admin", "tls", "acme", "orders"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -5374,7 +6327,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_create_acme_order(&state, &body_bytes).await
+            tls_management::handle_create_acme_order(&state, &auth, &body_bytes).await
         }
         (Method::GET, ["admin", "tls", "acme", "orders", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -5386,13 +6339,13 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_finalize_acme_order(&state, id, &body_bytes).await
+            tls_management::handle_finalize_acme_order(&state, &auth, id, &body_bytes).await
         }
         (Method::DELETE, ["admin", "tls", "acme", "orders", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_delete_acme_order(&state, id).await
+            tls_management::handle_delete_acme_order(&state, &auth, id).await
         }
         (Method::GET, ["admin", "tls", "certificates"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -5406,7 +6359,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_create_certificate(&state, &body_bytes).await
+            tls_management::handle_create_certificate(&state, &auth, &body_bytes).await
         }
         (Method::GET, ["admin", "tls", "certificates", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -5418,14 +6371,19 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_update_certificate(&state, id, &body_bytes).await
+            tls_management::handle_update_certificate(&state, &auth, id, &body_bytes).await
         }
         (Method::DELETE, ["admin", "tls", "certificates", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_delete_managed(&state, ManagedTlsMaterialKind::Certificate, id)
-                .await
+            tls_management::handle_delete_managed(
+                &state,
+                &auth,
+                ManagedTlsMaterialKind::Certificate,
+                id,
+            )
+            .await
         }
         (Method::GET, ["admin", "tls", "ca-bundles"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -5438,7 +6396,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_create_ca_bundle(&state, &body_bytes).await
+            tls_management::handle_create_ca_bundle(&state, &auth, &body_bytes).await
         }
         (Method::GET, ["admin", "tls", "ca-bundles", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -5450,14 +6408,19 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_update_ca_bundle(&state, id, &body_bytes).await
+            tls_management::handle_update_ca_bundle(&state, &auth, id, &body_bytes).await
         }
         (Method::DELETE, ["admin", "tls", "ca-bundles", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_delete_managed(&state, ManagedTlsMaterialKind::CaBundle, id)
-                .await
+            tls_management::handle_delete_managed(
+                &state,
+                &auth,
+                ManagedTlsMaterialKind::CaBundle,
+                id,
+            )
+            .await
         }
         (Method::GET, ["admin", "tls", "crls"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -5470,7 +6433,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_create_crl(&state, &body_bytes).await
+            tls_management::handle_create_crl(&state, &auth, &body_bytes).await
         }
         (Method::GET, ["admin", "tls", "crls", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -5482,13 +6445,14 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_update_crl(&state, id, &body_bytes).await
+            tls_management::handle_update_crl(&state, &auth, id, &body_bytes).await
         }
         (Method::DELETE, ["admin", "tls", "crls", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_delete_managed(&state, ManagedTlsMaterialKind::Crl, id).await
+            tls_management::handle_delete_managed(&state, &auth, ManagedTlsMaterialKind::Crl, id)
+                .await
         }
         (Method::GET, ["admin", "tls", "ocsp-responses"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -5502,7 +6466,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_create_ocsp_response(&state, &body_bytes).await
+            tls_management::handle_create_ocsp_response(&state, &auth, &body_bytes).await
         }
         (Method::GET, ["admin", "tls", "ocsp-responses", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -5514,14 +6478,19 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_update_ocsp_response(&state, id, &body_bytes).await
+            tls_management::handle_update_ocsp_response(&state, &auth, id, &body_bytes).await
         }
         (Method::DELETE, ["admin", "tls", "ocsp-responses", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_delete_managed(&state, ManagedTlsMaterialKind::OcspResponse, id)
-                .await
+            tls_management::handle_delete_managed(
+                &state,
+                &auth,
+                ManagedTlsMaterialKind::OcspResponse,
+                id,
+            )
+            .await
         }
         (Method::GET, ["admin", "tls", "jwks"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -5534,7 +6503,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_create_jwks(&state, &body_bytes).await
+            tls_management::handle_create_jwks(&state, &auth, &body_bytes).await
         }
         (Method::GET, ["admin", "tls", "jwks", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -5546,19 +6515,20 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_update_jwks(&state, id, &body_bytes).await
+            tls_management::handle_update_jwks(&state, &auth, id, &body_bytes).await
         }
         (Method::DELETE, ["admin", "tls", "jwks", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_delete_managed(&state, ManagedTlsMaterialKind::Jwks, id).await
+            tls_management::handle_delete_managed(&state, &auth, ManagedTlsMaterialKind::Jwks, id)
+                .await
         }
         (Method::POST, ["admin", "tls", "rotate", surface]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
-            tls_management::handle_rotate(&state, surface).await
+            tls_management::handle_rotate(&state, &auth, surface).await
         }
         (Method::POST, ["admin", "tls", "validate"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -5708,6 +6678,7 @@ async fn handle_admin_request_inner(
     // DP and mesh modes too, and `record_operation_audit` finalizes the
     // admitted intent through the spool when there is no database (#7216).
     if state.admin_audit_enabled
+        && !audit::current_slot_has_transferred_settlement()
         && let Ok(http_response) = response.as_ref()
         && http_response.status().is_success()
         && tls_mutation_audit_descriptor(&method, segments.as_slice(), None).is_some()
@@ -6092,18 +7063,28 @@ async fn handle_mesh_config_drift_get(
     let slice_snapshot = mesh_runtime.applied_snapshot();
     let last_install_at = mesh_runtime.last_applied_at();
 
-    let resp = mesh_config_drift::build_response(mesh_config_drift::MeshConfigDriftInputs {
-        slice: slice_snapshot.as_ref().as_ref(),
-        last_install_at,
-        now: chrono::Utc::now(),
-        source_protocol: &source_protocol,
-        source_cp_url: &source_cp_url,
-        include_overlay,
-        // xDS-mode only; native mode leaves this `None` and the block is omitted.
-        convergence: mesh_runtime.xds_convergence(),
-        // Issue #2473: accepted config revision + stale-fallback quarantine.
-        revision: mesh_runtime.revision_diagnostics(),
-    });
+    let resp =
+        match mesh_config_drift::try_build_response(mesh_config_drift::MeshConfigDriftInputs {
+            slice: slice_snapshot.as_ref().as_ref(),
+            last_install_at,
+            now: chrono::Utc::now(),
+            source_protocol: &source_protocol,
+            source_cp_url: &source_cp_url,
+            include_overlay,
+            // xDS-mode only; native mode leaves this `None` and the block is omitted.
+            convergence: mesh_runtime.xds_convergence(),
+            // Issue #2473: accepted config revision + stale-fallback quarantine.
+            revision: mesh_runtime.revision_diagnostics(),
+        }) {
+            Ok(resp) => resp,
+            Err(err) => {
+                error!(error = %err, "failed to fingerprint mesh config-drift response");
+                return Ok(json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &json!({"error": "Failed to serialize mesh config-drift response"}),
+                ));
+            }
+        };
 
     // `MeshConfigDriftResponse` is fully serde-derived; treat a serialize
     // error as a 500 rather than crashing — the admin path has the same
@@ -6325,17 +7306,11 @@ fn parse_mesh_policy_denies_query(query: Option<&str>) -> Result<(Duration, usiz
     let Some(raw) = query else {
         return Ok((window, limit));
     };
-    for pair in raw.split('&') {
-        if pair.is_empty() {
-            continue;
-        }
-        let (key, value) = match pair.split_once('=') {
-            Some(kv) => kv,
-            None => continue,
-        };
-        match key {
+    for (key, value) in url::form_urlencoded::parse(raw.as_bytes()) {
+        match key.as_ref() {
             "window" => {
-                window = parse_short_duration(value).map_err(|e| format!("invalid window: {e}"))?;
+                window = parse_short_duration(value.as_ref())
+                    .map_err(|e| format!("invalid window: {e}"))?;
                 if window > MESH_POLICY_DENIES_MAX_WINDOW {
                     return Err(format!(
                         "window exceeds maximum of {} seconds",
@@ -7408,30 +8383,6 @@ impl RestoreSnapshot {
     fn api_specs_total(&self) -> usize {
         self.api_specs.len()
     }
-
-    fn restore_payload_with_api_specs(&self) -> RestorePayload {
-        let mut payload = RestorePayload {
-            version: self.payload.version.clone(),
-            proxies: self.payload.proxies.clone(),
-            consumers: self.payload.consumers.clone(),
-            plugin_configs: self.payload.plugin_configs.clone(),
-            upstreams: self.payload.upstreams.clone(),
-            api_specs: None,
-            gateway_trust_bundles: self.payload.gateway_trust_bundles.clone(),
-            // Accepted-and-ignored `GET /backup` metadata. Listed explicitly
-            // rather than spread from `Default` so the literal stays exhaustive:
-            // a new `RestorePayload` section must make a deliberate choice here.
-            _ferrum_version: None,
-            _exported_at: None,
-            _source: None,
-            _counts: None,
-            _conditional: None,
-        };
-        if !self.api_specs.is_empty() || self.payload.api_specs.is_some() {
-            payload.api_specs = Some(ApiSpecsBackupSection::from_specs(&self.api_specs));
-        }
-        payload
-    }
 }
 
 /// Capture an authoritative snapshot of `namespace` for restore rollback.
@@ -7542,6 +8493,7 @@ pub(crate) fn payload_persist_error_message(error: &anyhow::Error) -> String {
 async fn persist_payload_resources(
     db: &dyn DatabaseBackend,
     payload: &RestorePayload,
+    api_specs: &[crate::config::types::ApiSpec],
     // The AUTHENTICATED target namespace. Gateway trust bundles are keyed by
     // namespace and are a singleton, so the target cannot be inferred from the
     // payload — it is passed explicitly (issue #3727).
@@ -7613,36 +8565,28 @@ async fn persist_payload_resources(
 
     // API specs must be inserted after proxies so the FK holds. Ordinary batch
     // inserts omit api_spec_id; stamp ownership from the backup payload next.
-    if should_continue(&errors)
-        && let Some(section) = payload.api_specs.as_ref()
-        && !section.items.is_empty()
-    {
-        match section.to_api_specs() {
-            Ok(specs) => {
-                match db.batch_insert_api_specs(&specs, mode).await {
-                    Ok(n) => counts.api_specs = n,
-                    Err(e) => {
-                        admission_unavailable |= is_mtls_dns_admission_unavailable(&e);
-                        let message = payload_persist_error_message(&e);
-                        errors.push(format!("api_specs: {message}"));
-                    }
-                }
-                if should_continue(&errors)
-                    && let Err(e) = db
-                        .apply_api_spec_ownership_from_resources(
-                            &payload.proxies,
-                            &payload.upstreams,
-                            &payload.plugin_configs,
-                            mode,
-                        )
-                        .await
-                {
-                    admission_unavailable |= is_mtls_dns_admission_unavailable(&e);
-                    let message = payload_persist_error_message(&e);
-                    errors.push(format!("api_spec_ownership: {message}"));
-                }
+    if should_continue(&errors) && !api_specs.is_empty() {
+        match db.batch_insert_api_specs(api_specs, mode).await {
+            Ok(n) => counts.api_specs = n,
+            Err(e) => {
+                admission_unavailable |= is_mtls_dns_admission_unavailable(&e);
+                let message = payload_persist_error_message(&e);
+                errors.push(format!("api_specs: {message}"));
             }
-            Err(message) => errors.push(format!("api_specs: {message}")),
+        }
+        if should_continue(&errors)
+            && let Err(e) = db
+                .apply_api_spec_ownership_from_resources(
+                    &payload.proxies,
+                    &payload.upstreams,
+                    &payload.plugin_configs,
+                    mode,
+                )
+                .await
+        {
+            admission_unavailable |= is_mtls_dns_admission_unavailable(&e);
+            let message = payload_persist_error_message(&e);
+            errors.push(format!("api_spec_ownership: {message}"));
         }
     }
 
@@ -7852,9 +8796,15 @@ async fn rollback_failed_restore(
             &error,
         ));
     } else {
-        let payload = snapshot.restore_payload_with_api_specs();
-        let (_, persist_errors, _) =
-            persist_payload_resources(db, &payload, namespace, false, &mode).await;
+        let (_, persist_errors, _) = persist_payload_resources(
+            db,
+            &snapshot.payload,
+            &snapshot.api_specs,
+            namespace,
+            false,
+            &mode,
+        )
+        .await;
         errors.extend(persist_errors);
     }
     if errors.is_empty() {
@@ -8047,14 +8997,11 @@ async fn restore_snapshot_after_intervening_clear(
         &current_spec_ids,
         &mut missing,
     );
-    if !plan.replay.is_empty() {
-        missing.api_specs = Some(ApiSpecsBackupSection::from_specs(&plan.replay));
-    }
-
     let mode = BatchConfigWriteMode::RestoreRollbackReplay {
         guard_owner: guard_owner.to_string(),
     };
-    let (_, mut errors, _) = persist_payload_resources(db, &missing, namespace, false, &mode).await;
+    let (_, mut errors, _) =
+        persist_payload_resources(db, &missing, &plan.replay, namespace, false, &mode).await;
     // Report an incomplete recovery rather than a silent success: the operator
     // must reconcile these by hand. Counts only — no resource ids, which may be
     // attacker-influenced payload values.
@@ -8123,6 +9070,37 @@ fn plan_additive_rollback_api_specs(
         .map(|plugin| plugin.id.as_str())
         .collect();
 
+    let mut snapshot_proxies_by_spec: std::collections::HashMap<&str, Vec<&str>> =
+        std::collections::HashMap::new();
+    for proxy in &snapshot_payload.proxies {
+        if let Some(spec_id) = proxy.api_spec_id.as_deref() {
+            snapshot_proxies_by_spec
+                .entry(spec_id)
+                .or_default()
+                .push(proxy.id.as_str());
+        }
+    }
+    let mut snapshot_upstreams_by_spec: std::collections::HashMap<&str, Vec<&str>> =
+        std::collections::HashMap::new();
+    for upstream in &snapshot_payload.upstreams {
+        if let Some(spec_id) = upstream.api_spec_id.as_deref() {
+            snapshot_upstreams_by_spec
+                .entry(spec_id)
+                .or_default()
+                .push(upstream.id.as_str());
+        }
+    }
+    let mut snapshot_plugins_by_spec: std::collections::HashMap<&str, Vec<&str>> =
+        std::collections::HashMap::new();
+    for plugin in &snapshot_payload.plugin_configs {
+        if let Some(spec_id) = plugin.api_spec_id.as_deref() {
+            snapshot_plugins_by_spec
+                .entry(spec_id)
+                .or_default()
+                .push(plugin.id.as_str());
+        }
+    }
+
     let mut replay = Vec::new();
     let mut skipped_specs = 0usize;
     for spec in snapshot_specs {
@@ -8130,21 +9108,17 @@ fn plan_additive_rollback_api_specs(
             // The intervening writer owns this spec id; leave it untouched.
             continue;
         }
-        let owner_tagged = snapshot_payload.proxies.iter().any(|proxy| {
-            proxy.id == spec.proxy_id && proxy.api_spec_id.as_deref() == Some(spec.id.as_str())
-        });
+        let owner_tagged = snapshot_proxies_by_spec
+            .get(spec.id.as_str())
+            .is_some_and(|proxy_ids| proxy_ids.contains(&spec.proxy_id.as_str()));
         let owning_proxy_replayed =
             owner_tagged && replayed_proxy_ids.contains(spec.proxy_id.as_str());
-        let owned_upstreams_replayed = snapshot_payload
-            .upstreams
-            .iter()
-            .filter(|upstream| upstream.api_spec_id.as_deref() == Some(spec.id.as_str()))
-            .all(|upstream| replayed_upstream_ids.contains(upstream.id.as_str()));
-        let owned_plugins_replayed = snapshot_payload
-            .plugin_configs
-            .iter()
-            .filter(|plugin| plugin.api_spec_id.as_deref() == Some(spec.id.as_str()))
-            .all(|plugin| replayed_plugin_ids.contains(plugin.id.as_str()));
+        let owned_upstreams_replayed = snapshot_upstreams_by_spec
+            .get(spec.id.as_str())
+            .is_none_or(|ids| ids.iter().all(|id| replayed_upstream_ids.contains(id)));
+        let owned_plugins_replayed = snapshot_plugins_by_spec
+            .get(spec.id.as_str())
+            .is_none_or(|ids| ids.iter().all(|id| replayed_plugin_ids.contains(id)));
         if owning_proxy_replayed && owned_upstreams_replayed && owned_plugins_replayed {
             replay.push(spec.clone());
         } else {
@@ -8294,7 +9268,8 @@ async fn finish_failed_restore(
             json!({"replaced_namespace": namespace}),
             json!({"rollback": rollback_status}),
         ),
-    );
+    )
+    .with_outcome(audit::AuditOutcome::Failure);
     if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
         log_audit_enqueue_failure(&error);
     }
@@ -8403,7 +9378,8 @@ async fn finish_failed_restore_after_intervening_clear(
             json!({"replaced_namespace": namespace}),
             json!({"rollback": rollback_status}),
         ),
-    );
+    )
+    .with_outcome(audit::AuditOutcome::Failure);
     if let Err(error) = audit::record(state.admin_audit_enabled, db, event).await {
         log_audit_enqueue_failure(&error);
     }
@@ -8454,7 +9430,8 @@ async fn finish_atomic_delete_failure(
             json!({"replaced_namespace": namespace}),
             json!({"rollback": "not_needed"}),
         ),
-    );
+    )
+    .with_outcome(audit::AuditOutcome::Failure);
     if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
         log_audit_enqueue_failure(&error);
     }
@@ -8488,7 +9465,8 @@ async fn finish_unknown_atomic_delete_failure(
             json!({"replaced_namespace": namespace}),
             json!({"rollback": "unknown_outcome"}),
         ),
-    );
+    )
+    .with_outcome(audit::AuditOutcome::UnknownOutcome);
     if let Err(error) = audit::record(state.admin_audit_enabled, db, event).await {
         log_audit_enqueue_failure(&error);
     }
@@ -9273,15 +10251,25 @@ use std::sync::{Mutex, OnceLock};
 
 /// Process-global cache for the metrics JSON response.
 static METRICS_CACHE: OnceLock<arc_swap::ArcSwap<Option<(Instant, Bytes)>>> = OnceLock::new();
+static METRICS_CACHE_REFRESH: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 static RUNTIME_METRICS_CACHE: OnceLock<arc_swap::ArcSwap<Option<(Instant, Bytes)>>> =
     OnceLock::new();
+static RUNTIME_METRICS_CACHE_REFRESH: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 fn metrics_cache() -> &'static arc_swap::ArcSwap<Option<(Instant, Bytes)>> {
     METRICS_CACHE.get_or_init(|| arc_swap::ArcSwap::new(Arc::new(None)))
 }
 
+fn metrics_cache_refresh() -> &'static tokio::sync::Mutex<()> {
+    METRICS_CACHE_REFRESH.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 fn runtime_metrics_cache() -> &'static arc_swap::ArcSwap<Option<(Instant, Bytes)>> {
     RUNTIME_METRICS_CACHE.get_or_init(|| arc_swap::ArcSwap::new(Arc::new(None)))
+}
+
+fn runtime_metrics_cache_refresh() -> &'static tokio::sync::Mutex<()> {
+    RUNTIME_METRICS_CACHE_REFRESH.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 /// Cache TTL for the metrics response.
@@ -9302,8 +10290,33 @@ async fn handle_metrics(state: &AdminState) -> Result<Response<Full<Bytes>>, hyp
         return Ok(resp);
     }
 
+    // Single-flight refresh: serialize cache-miss rebuilds so concurrent
+    // scrapes wait for one collection instead of stampeding.
+    let _refresh_guard = metrics_cache_refresh().lock().await;
+    let cached = cache.load();
+    if let Some((cached_at, ref bytes)) = **cached
+        && cached_at.elapsed() < METRICS_CACHE_TTL
+    {
+        let resp = with_admin_security_headers(Response::builder())
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .header("X-Cache", "hit")
+            .body(Full::new(bytes.clone()))
+            .unwrap_or_else(|_| admin_builder_failure_response());
+        return Ok(resp);
+    }
+
     let metrics = build_metrics(state);
-    let body_str = serde_json::to_string(&metrics).unwrap_or_else(|_| "{}".into());
+    let body_str = match serde_json::to_string(&metrics) {
+        Ok(json) => json,
+        Err(err) => {
+            error!(error = %err, "failed to serialize /admin/metrics response");
+            return Ok(json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "Failed to serialize admin metrics"}),
+            ));
+        }
+    };
     let body_bytes = Bytes::from(body_str);
 
     cache.store(Arc::new(Some((Instant::now(), body_bytes.clone()))));
@@ -9345,10 +10358,25 @@ async fn handle_metrics_runtime(state: &AdminState) -> Result<Response<Full<Byte
         .as_ref()
         .map(|ps| ps.env_config.runtime_metrics_cache_ttl_ms)
         .unwrap_or_else(|| crate::runtime_metrics::global_ref().cache_ttl_ms());
+    let ttl = Duration::from_millis(ttl_ms);
     let cache = runtime_metrics_cache();
     let cached = cache.load();
     if let Some((cached_at, ref bytes)) = **cached
-        && cached_at.elapsed() < Duration::from_millis(ttl_ms)
+        && cached_at.elapsed() < ttl
+    {
+        let resp = with_admin_security_headers(Response::builder())
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .header("X-Cache", "hit")
+            .body(Full::new(bytes.clone()))
+            .unwrap_or_else(|_| admin_builder_failure_response());
+        return Ok(resp);
+    }
+
+    let _refresh_guard = runtime_metrics_cache_refresh().lock().await;
+    let cached = cache.load();
+    if let Some((cached_at, ref bytes)) = **cached
+        && cached_at.elapsed() < ttl
     {
         let resp = with_admin_security_headers(Response::builder())
             .status(StatusCode::OK)
@@ -9360,7 +10388,16 @@ async fn handle_metrics_runtime(state: &AdminState) -> Result<Response<Full<Byte
     }
 
     let snapshot = crate::runtime_metrics::build_snapshot(&state.mode, state.proxy_state.as_ref());
-    let body_str = serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".into());
+    let body_str = match serde_json::to_string(&snapshot) {
+        Ok(json) => json,
+        Err(err) => {
+            error!(error = %err, "failed to serialize /metrics/runtime response");
+            return Ok(json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "Failed to serialize runtime metrics"}),
+            ));
+        }
+    };
     let body_bytes = Bytes::from(body_str);
     cache.store(Arc::new(Some((Instant::now(), body_bytes.clone()))));
 
@@ -10323,7 +11360,7 @@ async fn handle_batch_create(
         Ok(Some(message)) => {
             return Ok(json_response(
                 StatusCode::CONFLICT,
-                &json!({"error": message}),
+                &json!({"error": message, "rollback": "not_needed"}),
             ));
         }
         Ok(None) => {}
@@ -10615,6 +11652,8 @@ enum ConsistentApiSpecsBackup {
     ConfigUnavailable,
     /// Spec documents could not be loaded after config succeeded.
     SpecsUnavailable,
+    /// Backup JSON serialization failed (fail closed rather than emitting `{}`).
+    SerializationFailed,
 }
 
 fn backup_resource_includes(resource_filter: Option<&HashSet<&str>>, name: &str) -> bool {
@@ -10630,12 +11669,14 @@ fn backup_resource_includes(resource_filter: Option<&HashSet<&str>>, name: &str)
 /// api_specs, gateway_trust_bundles)`. The trailing counts are what the backup
 /// success audit record reports, so they must describe what this payload
 /// actually carries — an omitted trust section counts `0`.
+type SerializedBackupPayload = (Vec<u8>, usize, usize, usize, usize, usize, usize);
+
 fn serialize_backup_payload(
     mut config: GatewayConfig,
     source: &'static str,
     resource_filter: Option<&HashSet<&str>>,
     api_specs_owned: Option<ApiSpecsBackupSection>,
-) -> (Vec<u8>, usize, usize, usize, usize, usize, usize) {
+) -> Result<SerializedBackupPayload, serde_json::Error> {
     let include_proxies = backup_resource_includes(resource_filter, "proxies");
     let include_consumers = backup_resource_includes(resource_filter, "consumers");
     let include_plugin_configs = backup_resource_includes(resource_filter, "plugin_configs");
@@ -10750,8 +11791,8 @@ fn serialize_backup_payload(
         conditional: None,
     };
 
-    let body_bytes = serde_json::to_vec(&backup).unwrap_or_else(|_| b"{}".to_vec());
-    (
+    let body_bytes = serde_json::to_vec(&backup)?;
+    Ok((
         body_bytes,
         proxies.len(),
         consumers.len(),
@@ -10759,7 +11800,7 @@ fn serialize_backup_payload(
         upstreams.len(),
         api_specs_count,
         gateway_trust_bundles_count,
-    )
+    ))
 }
 
 fn backup_attachment_response(body_bytes: Vec<u8>, source: &'static str) -> Response<Full<Bytes>> {
@@ -10809,12 +11850,18 @@ async fn build_consistent_api_specs_backup(
         upstream_count,
         api_specs_count,
         gateway_trust_bundles_count,
-    ) = serialize_backup_payload(
+    ) = match serialize_backup_payload(
         config,
         "database",
         resource_filter,
         Some(ApiSpecsBackupSection::from_specs(&specs)),
-    );
+    ) {
+        Ok(tuple) => tuple,
+        Err(err) => {
+            error!(error = %err, "failed to serialize consistent backup payload");
+            return ConsistentApiSpecsBackup::SerializationFailed;
+        }
+    };
 
     ConsistentApiSpecsBackup::Ready {
         body_bytes,
@@ -11048,6 +12095,22 @@ async fn handle_backup(
                     &json!({"error": "Database unavailable while exporting API specs"}),
                 ));
             }
+            ConsistentApiSpecsBackup::SerializationFailed => {
+                audit_backup_failure(
+                    state,
+                    actor,
+                    namespace,
+                    request_ctx,
+                    resource_filter.as_ref(),
+                    audit::failure_category::UNAVAILABLE,
+                    audit::AuditOutcome::Failure,
+                )
+                .await;
+                return Ok(json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &json!({"error": "Failed to serialize backup payload"}),
+                ));
+            }
             ConsistentApiSpecsBackup::ConfigUnavailable => {
                 // Ordinary config-load failure under a held lease: labeled
                 // cached fallback (without api_specs) remains semantically safe.
@@ -11144,7 +12207,26 @@ async fn handle_backup(
         upstream_count,
         api_specs_count,
         gateway_trust_bundles_count,
-    ) = serialize_backup_payload(config, source, resource_filter.as_ref(), None);
+    ) = match serialize_backup_payload(config, source, resource_filter.as_ref(), None) {
+        Ok(tuple) => tuple,
+        Err(err) => {
+            error!(error = %err, "failed to serialize backup payload");
+            audit_backup_failure(
+                state,
+                actor,
+                namespace,
+                request_ctx,
+                resource_filter.as_ref(),
+                audit::failure_category::UNAVAILABLE,
+                audit::AuditOutcome::Failure,
+            )
+            .await;
+            return Ok(json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "Failed to serialize backup payload"}),
+            ));
+        }
+    };
 
     Ok(finalize_backup_export(
         state,
@@ -11611,7 +12693,7 @@ async fn handle_restore(
     // the admin body ceiling per item; run them on the blocking pool so the
     // async runtime stays responsive. Validation still completes before any
     // delete/write.
-    match payload.api_specs.take() {
+    let validated_api_specs: Vec<crate::config::types::ApiSpec> = match payload.api_specs.take() {
         Some(section) => {
             // Move the canonical resource vectors through the blocking task and
             // take them back out of its result, so the ownership graph the API
@@ -11659,12 +12741,11 @@ async fn handle_restore(
                     for spec in &mut specs {
                         spec.namespace = namespace.to_string();
                     }
-                    // Persist the namespace-stamped section so insert uses the
-                    // request namespace, not a hostile payload namespace.
-                    // `persist_payload_resources` decodes it again at write
-                    // time, so the validated copy is dropped here rather than
-                    // held alongside it for the rest of the restore.
-                    payload.api_specs = Some(ApiSpecsBackupSection::from_specs(&specs));
+                    // Reuse the already-validated, namespace-stamped `Vec<ApiSpec>`
+                    // directly on both conditional and unconditional restore
+                    // paths instead of re-encoding to base64 and synchronously
+                    // re-validating external-ref snapshots on Tokio workers.
+                    specs
                 }
                 Err(api_spec_errors) => {
                     return Ok(json_response(
@@ -11706,8 +12787,9 @@ async fn handle_restore(
             // Legacy backup: strip ownership tags so restored resources become
             // hand-managed rather than pointing at deleted specs.
             clear_api_spec_ownership_tags(&mut payload);
+            Vec::new()
         }
-    }
+    };
 
     // Complete all fallible payload preparation before changing durable state.
     let mut preparation_errors = Vec::new();
@@ -11760,6 +12842,7 @@ async fn handle_restore(
             db.as_ref(),
             namespace,
             &payload,
+            &validated_api_specs,
             if_match,
             &restore_mode,
             &mut namespace_config_admission_guard,
@@ -11869,6 +12952,12 @@ async fn handle_restore(
         // and its Drop retains the fence. A clear that failed without a
         // definitive atomic abort may have removed some rows, so it is
         // incomplete too.
+        let clear_commit_unknown = delete_result
+            .as_ref()
+            .is_err_and(|error| error.has_unknown_commit_result());
+        let clear_may_be_partial = delete_result
+            .as_ref()
+            .is_err_and(|error| !error.mode().is_atomic() && !error.has_unknown_commit_result());
         if let Err(error) = delete_result.as_ref()
             && (!error.mode().is_atomic() || error.has_unknown_commit_result())
         {
@@ -11885,20 +12974,41 @@ async fn handle_restore(
             Err(recovery_error) => {
                 let response_error = redacted_recovery_error_message(
                     "restore_namespace_admission_reacquire_after_clear",
-                    "Config admission was lost during restore clear and could not be reacquired for recovery",
+                    if clear_commit_unknown {
+                        "Config admission was lost during an ambiguous restore clear (clear commit outcome unknown) and could not be reacquired for recovery"
+                    } else {
+                        "Config admission was lost during restore clear and could not be reacquired for recovery"
+                    },
                     &recovery_error,
                 );
-                return Ok(json_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    &json!({
-                        "error": response_error,
-                        "restore_errors": restore_recovery_errors(
-                            &restore_guard,
-                            namespace,
-                            vec![NAMESPACE_ADMISSION_LOST_MESSAGE.to_string()],
-                        ),
-                    }),
-                ));
+                if clear_commit_unknown && state.admin_audit_enabled {
+                    let event = audit::AuditEvent::new(
+                        actor,
+                        "restore",
+                        "gateway_config",
+                        namespace,
+                        namespace,
+                        json!({
+                            "rollback": "unknown_clear_outcome",
+                            "clear_commit_unknown": true,
+                            "admission_reacquire_failed": true,
+                        }),
+                    )
+                    .with_outcome(audit::AuditOutcome::UnknownOutcome);
+                    record_operation_audit(state, event).await;
+                }
+                let mut body = json!({
+                    "error": response_error,
+                    "restore_errors": restore_recovery_errors(
+                        &restore_guard,
+                        namespace,
+                        vec![NAMESPACE_ADMISSION_LOST_MESSAGE.to_string()],
+                    ),
+                });
+                if clear_commit_unknown {
+                    body["rollback"] = json!("unknown_clear_outcome");
+                }
+                return Ok(json_response(StatusCode::SERVICE_UNAVAILABLE, &body));
             }
         };
         let intervening_write =
@@ -11971,12 +13081,44 @@ async fn handle_restore(
                 namespace,
                 vec![NAMESPACE_ADMISSION_LOST_MESSAGE.to_string()],
             );
+            if clear_commit_unknown && state.admin_audit_enabled {
+                let event = audit::AuditEvent::new(
+                    actor,
+                    "restore",
+                    "gateway_config",
+                    namespace,
+                    namespace,
+                    json!({
+                        "rollback": "unknown_clear_outcome",
+                        "clear_commit_unknown": true,
+                        "intervening_write": true,
+                    }),
+                )
+                .with_outcome(audit::AuditOutcome::UnknownOutcome);
+                record_operation_audit(state, event).await;
+            }
+            let (error_msg, rollback_status) = if clear_commit_unknown {
+                (
+                    "Config admission was lost during an ambiguous restore clear (clear commit outcome unknown) after another writer acquired the namespace lease",
+                    "unknown_clear_outcome",
+                )
+            } else if clear_may_be_partial {
+                (
+                    "Config admission was lost during a potentially partial non-atomic restore clear after another writer acquired the namespace lease; rollback skipped",
+                    "skipped_after_intervening_write",
+                )
+            } else {
+                (
+                    "Config admission was lost during a failed restore clear after another writer acquired the namespace lease",
+                    "not_needed_after_intervening_write",
+                )
+            };
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &json!({
-                    "error": "Config admission was lost during a failed restore clear after another writer acquired the namespace lease",
+                    "error": error_msg,
                     "restore_errors": restore_errors,
-                    "rollback": "not_needed_after_intervening_write",
+                    "rollback": rollback_status,
                 }),
             ));
         }
@@ -12060,7 +13202,14 @@ async fn handle_restore(
     let import_operation = restore_guard.operation();
     let import_completion = match namespace_config_admission_guard
         .run_to_completion_while_held(import_operation.run_restore_import(
-            persist_payload_resources(db.as_ref(), &payload, namespace, false, &restore_mode),
+            persist_payload_resources(
+                db.as_ref(),
+                &payload,
+                &validated_api_specs,
+                namespace,
+                false,
+                &restore_mode,
+            ),
             |(_, errors, _): &(PersistCounts, Vec<String>, bool)| errors.is_empty(),
         ))
         .await
@@ -12068,9 +13217,19 @@ async fn handle_restore(
         Ok(result) => result,
         Err(_error) => {
             warn_persistence_failure_redacted("restore_namespace_admission_before_import");
+            // Phase 2 already committed the namespace clear; returning drops
+            // `restore_guard` in the cleared phase, retaining the durable
+            // admission fence, so signal the retained guard explicitly.
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
-                &json!({"error": CONFIG_ADMISSION_UNAVAILABLE_MESSAGE}),
+                &json!({
+                    "error": "Config admission was lost after restore clear before import could begin; namespace admission guard retained for manual recovery",
+                    "restore_errors": restore_recovery_errors(
+                        &restore_guard,
+                        namespace,
+                        vec![NAMESPACE_ADMISSION_LOST_MESSAGE.to_string()],
+                    ),
+                }),
             ));
         }
     };
@@ -13723,7 +14882,9 @@ async fn handle_service_waypoint_services_get(
             &json!({"error": "service-waypoint topology not enabled"}),
         ));
     };
-    let snapshot = mesh_runtime.snapshot();
+    // Lock-free read of the last proxy-accepted slice; received-but-rejected
+    // candidate slices must not appear as actively served waypoint services.
+    let snapshot = mesh_runtime.applied_snapshot();
     let Some(slice) = snapshot.as_ref() else {
         return Ok(json_response(
             StatusCode::NOT_FOUND,

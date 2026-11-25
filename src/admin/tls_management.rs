@@ -1,7 +1,8 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 #[cfg(feature = "acme")]
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use http_body_util::Full;
@@ -24,20 +25,52 @@ use crate::tls::acme::{
 };
 use crate::tls::managed::{ManagedTlsError, ManagedTlsMaterialKind, ManagedTlsRecord};
 
+/// Process-level fallback `EnvConfig` for modes that run an Admin API without a
+/// `ProxyState` (`cp` and `node_agent`), so `GET /admin/tls/inventory`,
+/// `/metrics` TLS inventory, and `DELETE /admin/tls/*` reference guards see the
+/// process's own `FERRUM_*_TLS_*` sources instead of treating `env_config` as
+/// absent.
+static PROCESS_ENV_CONFIG: OnceLock<ArcSwap<Option<Arc<crate::config::EnvConfig>>>> =
+    OnceLock::new();
+
+fn process_env_config_slot() -> &'static ArcSwap<Option<Arc<crate::config::EnvConfig>>> {
+    PROCESS_ENV_CONFIG.get_or_init(|| ArcSwap::new(Arc::new(None)))
+}
+
+/// Register the running process's resolved `EnvConfig` for modes without a
+/// `ProxyState` (`cp`, `node_agent`).
+pub(crate) fn set_process_env_config(env_config: Arc<crate::config::EnvConfig>) {
+    process_env_config_slot().store(Arc::new(Some(env_config)));
+}
+
+fn effective_env_config(state: &AdminState) -> Option<Arc<crate::config::EnvConfig>> {
+    if let Some(proxy) = state.proxy_state.as_ref() {
+        return Some(Arc::clone(&proxy.env_config));
+    }
+    if state.mode == "cp" || state.mode == "node_agent" {
+        return process_env_config_slot().load().as_ref().clone();
+    }
+    None
+}
+
+/// Concurrent live `GET /admin/tls/inventory` collections admitted onto the
+/// blocking pool process-wide so bursts of slow remote/filesystem inventory
+/// probes cannot saturate the shared blocking pool and delay TLS mutations or
+/// spec writes.
+const MAX_CONCURRENT_TLS_INVENTORY_JOBS: usize = 4;
+
+static TLS_INVENTORY_SLOTS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| {
+        Arc::new(tokio::sync::Semaphore::new(
+            MAX_CONCURRENT_TLS_INVENTORY_JOBS,
+        ))
+    });
+
 pub(super) async fn handle_inventory(
     state: &AdminState,
     pagination: &PaginationParams,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let inventory = collect_inventory(state);
-    let body = super::paginate_response(&inventory.entries, pagination);
-    Ok(super::json_response(StatusCode::OK, &body))
-}
-
-pub(super) fn collect_inventory(state: &AdminState) -> crate::tls::inventory::TlsInventory {
-    let env_config = state
-        .proxy_state
-        .as_ref()
-        .map(|proxy| proxy.env_config.as_ref());
+    let env_config = effective_env_config(state);
     let config = state
         .proxy_state
         .as_ref()
@@ -48,7 +81,32 @@ pub(super) fn collect_inventory(state: &AdminState) -> crate::tls::inventory::Tl
                 .as_ref()
                 .map(|cached| cached.load_full())
         });
-    crate::tls::inventory::TlsInventory::collect(env_config, config.as_deref())
+    let Ok(permit) = Arc::clone(&TLS_INVENTORY_SLOTS).acquire_owned().await else {
+        return Ok(super::json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({"error": "TLS inventory worker admission unavailable"}),
+        ));
+    };
+    // `TlsInventory::collect` performs blocking filesystem/remote-secret I/O
+    // and X.509/CRL parsing; run it off the Tokio async worker threads while
+    // holding the bounded inventory permit until collection exits.
+    let inventory = match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        crate::tls::inventory::TlsInventory::collect(env_config.as_deref(), config.as_deref())
+    })
+    .await
+    {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            tracing::error!("TLS inventory worker failed: {error}");
+            return Ok(super::json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "TLS inventory collection failed"}),
+            ));
+        }
+    };
+    let body = super::paginate_response(&inventory.entries, pagination);
+    Ok(super::json_response(StatusCode::OK, &body))
 }
 
 /// Metrics-safe inventory producer for the cached snapshot (issue #2410).
@@ -82,10 +140,7 @@ impl crate::tls::inventory_cache::TlsInventoryCollector for AdminTlsInventoryCol
 fn metrics_inventory_collector(
     state: &AdminState,
 ) -> Arc<dyn crate::tls::inventory_cache::TlsInventoryCollector> {
-    let env_config = state
-        .proxy_state
-        .as_ref()
-        .map(|proxy| Arc::clone(&proxy.env_config));
+    let env_config = effective_env_config(state);
     let config = state
         .proxy_state
         .as_ref()
@@ -223,8 +278,8 @@ pub(super) async fn handle_list_acme_accounts(
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    let certificates = match certificate_store.list_certificates() {
-        Ok(certificates) => certificates,
+    let certificate_refs = match certificate_store.list_certificate_account_refs() {
+        Ok(refs) => refs,
         Err(error) => return Ok(acme_error_response(error)),
     };
     // A *missing* account store file is already a successful empty read inside
@@ -234,17 +289,18 @@ pub(super) async fn handle_list_acme_accounts(
     // document, a malformed lock-timeout setting. Reporting any of those as
     // "no persisted credentials" tells an operator their accounts are gone when
     // in fact they are unreachable, so it fails closed here instead.
-    let persisted_accounts = match acme_account_store_response() {
-        Ok(store) => match store.list_accounts() {
+    let persisted_account_metas = match acme_account_store_response() {
+        Ok(store) => match store.list_account_meta() {
             Ok(accounts) => accounts,
             Err(error) => return Ok(acme_error_response(error)),
         },
         Err(response) => return Ok(*response),
     };
-    let accounts = match order_store.list_accounts(&certificates, &persisted_accounts) {
-        Ok(accounts) => accounts,
-        Err(error) => return Ok(acme_error_response(error)),
-    };
+    let accounts =
+        match order_store.list_accounts_from_meta(&certificate_refs, &persisted_account_metas) {
+            Ok(accounts) => accounts,
+            Err(error) => return Ok(acme_error_response(error)),
+        };
     let body = super::paginate_response(&accounts, pagination);
     Ok(super::json_response(StatusCode::OK, &body))
 }
@@ -279,6 +335,7 @@ pub(super) async fn handle_get_managed(
 
 pub(super) async fn handle_create_certificate(
     state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(response) = state.admit_non_config_db_write().await {
@@ -288,7 +345,7 @@ pub(super) async fn handle_create_certificate(
         Ok(request) => request,
         Err(response) => return Ok(*response),
     };
-    let store = match managed_store_response() {
+    let store = match managed_store_response_async().await {
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
@@ -301,11 +358,12 @@ pub(super) async fn handle_create_certificate(
             ));
         }
     };
-    Ok(respond_managed_upsert(store, record, overwrite, StatusCode::CREATED).await)
+    Ok(respond_managed_upsert(state, actor, store, record, overwrite, StatusCode::CREATED).await)
 }
 
 pub(super) async fn handle_update_certificate(
     state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     id: &str,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
@@ -316,15 +374,11 @@ pub(super) async fn handle_update_certificate(
         Ok(request) => request,
         Err(response) => return Ok(*response),
     };
-    let store = match managed_store_response() {
-        Ok(store) => store,
-        Err(response) => return Ok(*response),
-    };
-    if let Err(error) =
-        require_existing_managed_kind(&store, id, ManagedTlsMaterialKind::Certificate)
-    {
-        return Ok(managed_error_response(error));
-    }
+    let store =
+        match preflight_managed_store_kind(id, ManagedTlsMaterialKind::Certificate, true).await {
+            Ok(store) => store,
+            Err(response) => return Ok(*response),
+        };
     let (record, _) = match certificate_record_from_request(Some(id), request, true) {
         Ok(value) => value,
         Err(error) => {
@@ -334,11 +388,12 @@ pub(super) async fn handle_update_certificate(
             ));
         }
     };
-    Ok(respond_managed_upsert(store, record, true, StatusCode::OK).await)
+    Ok(respond_managed_update(state, actor, store, record).await)
 }
 
 pub(super) async fn handle_create_ca_bundle(
     state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(response) = state.admit_non_config_db_write().await {
@@ -348,7 +403,7 @@ pub(super) async fn handle_create_ca_bundle(
         Ok(request) => request,
         Err(response) => return Ok(*response),
     };
-    let store = match managed_store_response() {
+    let store = match managed_store_response_async().await {
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
@@ -361,11 +416,12 @@ pub(super) async fn handle_create_ca_bundle(
             ));
         }
     };
-    Ok(respond_managed_upsert(store, record, overwrite, StatusCode::CREATED).await)
+    Ok(respond_managed_upsert(state, actor, store, record, overwrite, StatusCode::CREATED).await)
 }
 
 pub(super) async fn handle_update_ca_bundle(
     state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     id: &str,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
@@ -376,14 +432,11 @@ pub(super) async fn handle_update_ca_bundle(
         Ok(request) => request,
         Err(response) => return Ok(*response),
     };
-    let store = match managed_store_response() {
+    let store = match preflight_managed_store_kind(id, ManagedTlsMaterialKind::CaBundle, true).await
+    {
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    if let Err(error) = require_existing_managed_kind(&store, id, ManagedTlsMaterialKind::CaBundle)
-    {
-        return Ok(managed_error_response(error));
-    }
     let (record, _) = match ca_bundle_record_from_request(Some(id), request, true) {
         Ok(value) => value,
         Err(error) => {
@@ -393,11 +446,12 @@ pub(super) async fn handle_update_ca_bundle(
             ));
         }
     };
-    Ok(respond_managed_upsert(store, record, true, StatusCode::OK).await)
+    Ok(respond_managed_update(state, actor, store, record).await)
 }
 
 pub(super) async fn handle_create_crl(
     state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(response) = state.admit_non_config_db_write().await {
@@ -407,7 +461,7 @@ pub(super) async fn handle_create_crl(
         Ok(request) => request,
         Err(response) => return Ok(*response),
     };
-    let store = match managed_store_response() {
+    let store = match managed_store_response_async().await {
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
@@ -420,11 +474,12 @@ pub(super) async fn handle_create_crl(
             ));
         }
     };
-    Ok(respond_managed_upsert(store, record, overwrite, StatusCode::CREATED).await)
+    Ok(respond_managed_upsert(state, actor, store, record, overwrite, StatusCode::CREATED).await)
 }
 
 pub(super) async fn handle_update_crl(
     state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     id: &str,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
@@ -435,13 +490,10 @@ pub(super) async fn handle_update_crl(
         Ok(request) => request,
         Err(response) => return Ok(*response),
     };
-    let store = match managed_store_response() {
+    let store = match preflight_managed_store_kind(id, ManagedTlsMaterialKind::Crl, true).await {
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    if let Err(error) = require_existing_managed_kind(&store, id, ManagedTlsMaterialKind::Crl) {
-        return Ok(managed_error_response(error));
-    }
     let (record, _) = match crl_record_from_request(Some(id), request, true) {
         Ok(value) => value,
         Err(error) => {
@@ -451,11 +503,12 @@ pub(super) async fn handle_update_crl(
             ));
         }
     };
-    Ok(respond_managed_upsert(store, record, true, StatusCode::OK).await)
+    Ok(respond_managed_update(state, actor, store, record).await)
 }
 
 pub(super) async fn handle_create_ocsp_response(
     state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(response) = state.admit_non_config_db_write().await {
@@ -465,7 +518,7 @@ pub(super) async fn handle_create_ocsp_response(
         Ok(request) => request,
         Err(response) => return Ok(*response),
     };
-    let store = match managed_store_response() {
+    let store = match managed_store_response_async().await {
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
@@ -478,11 +531,12 @@ pub(super) async fn handle_create_ocsp_response(
             ));
         }
     };
-    Ok(respond_managed_upsert(store, record, overwrite, StatusCode::CREATED).await)
+    Ok(respond_managed_upsert(state, actor, store, record, overwrite, StatusCode::CREATED).await)
 }
 
 pub(super) async fn handle_update_ocsp_response(
     state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     id: &str,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
@@ -493,15 +547,11 @@ pub(super) async fn handle_update_ocsp_response(
         Ok(request) => request,
         Err(response) => return Ok(*response),
     };
-    let store = match managed_store_response() {
-        Ok(store) => store,
-        Err(response) => return Ok(*response),
-    };
-    if let Err(error) =
-        require_existing_managed_kind(&store, id, ManagedTlsMaterialKind::OcspResponse)
-    {
-        return Ok(managed_error_response(error));
-    }
+    let store =
+        match preflight_managed_store_kind(id, ManagedTlsMaterialKind::OcspResponse, true).await {
+            Ok(store) => store,
+            Err(response) => return Ok(*response),
+        };
     let (record, _) = match ocsp_response_record_from_request(Some(id), request, true) {
         Ok(value) => value,
         Err(error) => {
@@ -511,11 +561,12 @@ pub(super) async fn handle_update_ocsp_response(
             ));
         }
     };
-    Ok(respond_managed_upsert(store, record, true, StatusCode::OK).await)
+    Ok(respond_managed_update(state, actor, store, record).await)
 }
 
 pub(super) async fn handle_create_jwks(
     state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(response) = state.admit_non_config_db_write().await {
@@ -525,7 +576,7 @@ pub(super) async fn handle_create_jwks(
         Ok(request) => request,
         Err(response) => return Ok(*response),
     };
-    let store = match managed_store_response() {
+    let store = match managed_store_response_async().await {
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
@@ -538,13 +589,12 @@ pub(super) async fn handle_create_jwks(
             ));
         }
     };
-    let response = respond_managed_upsert(store, record, overwrite, StatusCode::CREATED).await;
-    refresh_managed_jwks_consumers().await;
-    Ok(response)
+    Ok(respond_managed_upsert(state, actor, store, record, overwrite, StatusCode::CREATED).await)
 }
 
 pub(super) async fn handle_create_acme_certificate(
     state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(response) = state.admit_non_config_db_write().await {
@@ -554,7 +604,7 @@ pub(super) async fn handle_create_acme_certificate(
         Ok(request) => request,
         Err(response) => return Ok(*response),
     };
-    let store = match acme_certificate_store_response() {
+    let store = match acme_certificate_store_response_async().await {
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
@@ -567,11 +617,22 @@ pub(super) async fn handle_create_acme_certificate(
             ));
         }
     };
-    Ok(respond_acme_certificate_upsert(store, record, overwrite, StatusCode::CREATED).await)
+    Ok(
+        respond_acme_certificate_upsert(
+            state,
+            actor,
+            store,
+            record,
+            overwrite,
+            StatusCode::CREATED,
+        )
+        .await,
+    )
 }
 
 pub(super) async fn handle_create_acme_order(
     state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(response) = state.admit_non_config_db_write().await {
@@ -579,7 +640,7 @@ pub(super) async fn handle_create_acme_order(
     }
     #[cfg(not(feature = "acme"))]
     {
-        let _ = body_bytes;
+        let _ = (actor, body_bytes);
         Ok(super::json_response(
             StatusCode::NOT_IMPLEMENTED,
             &json!({"error": "ACME order creation requires the 'acme' Cargo feature"}),
@@ -603,36 +664,56 @@ pub(super) async fn handle_create_acme_order(
         }
         let (record, overwrite) = match acme_order_record_from_request(state, request).await {
             Ok(value) => value,
-            Err(error) => {
-                return Ok(super::json_response(
-                    StatusCode::BAD_REQUEST,
-                    &json!({"error": error}),
-                ));
+            Err((status, error)) => {
+                return Ok(super::json_response(status, &json!({"error": error})));
             }
         };
-        let stored = match offload_store_write("acme_order_upsert", move || {
-            store.upsert_order(record, overwrite)
-        })
-        .await
-        {
-            Ok(stored) => stored,
-            Err(response) => return Ok(*response),
-        };
-        match stored {
-            Ok(record) => {
-                persist_acme_account_credentials(&record).await;
+        let settlement_state = state.clone();
+        let settlement_actor = actor.clone();
+        let settlement = crate::admin::audit::spawn_with_request_slot(async move {
+            let stored = match offload_store_write("acme_order_upsert", move || {
+                store.upsert_order(record, overwrite)
+            })
+            .await
+            {
+                Ok(stored) => stored,
+                Err(response) => return *response,
+            };
+            match stored {
+                Ok(record) => {
+                    persist_acme_account_credentials(&record).await;
+                    if settlement_state.admin_audit_enabled {
+                        let event = crate::admin::audit::AuditEvent::new(
+                            &settlement_actor,
+                            "create",
+                            "tls_acme",
+                            &record.id,
+                            crate::config::types::DEFAULT_NAMESPACE,
+                            json!({"path": "/admin/tls/acme/orders"}),
+                        );
+                        super::record_operation_audit(&settlement_state, event).await;
+                    }
+                    super::json_response(StatusCode::CREATED, &json!(record.summary()))
+                }
+                Err(error) => acme_error_response(error),
+            }
+        });
+        match settlement.await {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                tracing::error!("ACME order create settlement task failed: {error}");
                 Ok(super::json_response(
-                    StatusCode::CREATED,
-                    &json!(record.summary()),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &json!({"error": "ACME order create settlement failed"}),
                 ))
             }
-            Err(error) => Ok(acme_error_response(error)),
         }
     }
 }
 
 pub(super) async fn handle_delete_acme_order(
     state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     id: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(response) = state.admit_non_config_db_write().await {
@@ -642,23 +723,54 @@ pub(super) async fn handle_delete_acme_order(
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    let id = id.to_string();
-    let deleted =
-        match offload_store_write("acme_order_delete", move || store.delete_order(&id)).await {
-            Ok(deleted) => deleted,
-            Err(response) => return Ok(*response),
-        };
-    match deleted {
-        Ok(record) => Ok(super::json_response(
-            StatusCode::OK,
-            &json!({"deleted": true, "record": record.summary()}),
-        )),
-        Err(error) => Ok(acme_error_response(error)),
+    let owned_id = id.to_string();
+    let settlement_state = state.clone();
+    let settlement_actor = actor.clone();
+    let settlement = crate::admin::audit::spawn_with_request_slot(async move {
+        let delete_id = owned_id.clone();
+        let deleted =
+            match offload_store_write("acme_order_delete", move || store.delete_order(&delete_id))
+                .await
+            {
+                Ok(deleted) => deleted,
+                Err(response) => return *response,
+            };
+        match deleted {
+            Ok(record) => {
+                if settlement_state.admin_audit_enabled {
+                    let event = crate::admin::audit::AuditEvent::new(
+                        &settlement_actor,
+                        "delete",
+                        "tls_acme",
+                        &owned_id,
+                        crate::config::types::DEFAULT_NAMESPACE,
+                        json!({"path": format!("/admin/tls/acme/orders/{owned_id}")}),
+                    );
+                    super::record_operation_audit(&settlement_state, event).await;
+                }
+                super::json_response(
+                    StatusCode::OK,
+                    &json!({"deleted": true, "record": record.summary()}),
+                )
+            }
+            Err(error) => acme_error_response(error),
+        }
+    });
+    match settlement.await {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            tracing::error!("ACME order delete settlement task failed: {error}");
+            Ok(super::json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "ACME order delete settlement failed"}),
+            ))
+        }
     }
 }
 
 pub(super) async fn handle_finalize_acme_order(
     state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     id: &str,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
@@ -667,7 +779,7 @@ pub(super) async fn handle_finalize_acme_order(
     }
     #[cfg(not(feature = "acme"))]
     {
-        let _ = (id, body_bytes);
+        let _ = (actor, id, body_bytes);
         Ok(super::json_response(
             StatusCode::NOT_IMPLEMENTED,
             &json!({"error": "ACME order finalization requires the 'acme' Cargo feature"}),
@@ -891,106 +1003,236 @@ pub(super) async fn handle_finalize_acme_order(
             }
         };
         let allow_overwrite = request.allow_overwrite;
-        let completed_certificate_store = Arc::clone(&certificate_store);
-        let stored_certificate = match offload_store_write("acme_certificate_upsert", move || {
-            certificate_store.upsert_certificate(certificate, allow_overwrite)
-        })
-        .await
-        {
-            Ok(stored) => stored,
-            Err(response) => return Ok(*response),
-        };
-        let certificate = match stored_certificate {
-            Ok(record) => record,
-            Err(AcmeError::AlreadyExists(existing_id)) => {
-                // Without `allow_overwrite` a certificate record that is already
-                // there is a conflict — unless it is this very CA order's
-                // certificate: a renewal (or a concurrent finalize) completed
-                // the same order and published it while this request was in
-                // CA I/O. That is the outcome this request asked for, so it is
-                // answered as the same success; unrelated material stays `409`.
-                return Ok(
-                    match crate::tls::acme::completed_finalize(
+        let settlement_state = state.clone();
+        let settlement_actor = actor.clone();
+        let settlement = crate::admin::audit::spawn_with_request_slot(async move {
+            let order_id = order.id.clone();
+            let audit_path = format!("/admin/tls/acme/orders/{order_id}/finalize");
+            let finalized_order_url = order.order_url.clone();
+            let published_certificate_id = certificate_id.clone();
+            let completed_certificate_store = Arc::clone(&certificate_store);
+            let stored_certificate =
+                match offload_store_write("acme_certificate_upsert", move || {
+                    certificate_store.upsert_certificate(certificate, allow_overwrite)
+                })
+                .await
+                {
+                    Ok(stored) => stored,
+                    Err(response) => return *response,
+                };
+            let certificate = match stored_certificate {
+                Ok(record) => record,
+                Err(AcmeError::AlreadyExists(existing_id)) => {
+                    // Without `allow_overwrite` a certificate record that is already
+                    // there is a conflict — unless it is this very CA order's
+                    // certificate: a renewal (or a concurrent finalize) completed
+                    // the same order and published it while this request was in
+                    // CA I/O. That is the outcome this request asked for, so it is
+                    // answered as the same success; unrelated material stays `409`.
+                    return match crate::tls::acme::completed_finalize(
                         &order_store,
                         &completed_certificate_store,
-                        &order.id,
-                        &certificate_id,
-                        order.order_url.as_deref(),
+                        &order_id,
+                        &published_certificate_id,
+                        finalized_order_url.as_deref(),
                     ) {
                         Ok(Some((current, certificate))) => {
                             persist_acme_account_credentials(&current).await;
+                            if settlement_state.admin_audit_enabled {
+                                let event = crate::admin::audit::AuditEvent::new(
+                                    &settlement_actor,
+                                    "finalize",
+                                    "tls_acme",
+                                    &order_id,
+                                    crate::config::types::DEFAULT_NAMESPACE,
+                                    json!({"path": audit_path}),
+                                );
+                                super::record_operation_audit(&settlement_state, event).await;
+                            }
                             acme_finalize_success_response(&current, &certificate)
                         }
                         Ok(None) => acme_error_response(AcmeError::AlreadyExists(existing_id)),
                         Err(error) => acme_error_response(error),
-                    },
-                );
-            }
-            Err(error) => return Ok(acme_error_response(error)),
-        };
-
-        // Compare-and-set against the snapshot read before the CA I/O: a
-        // renewal that completed this order meanwhile, an operator delete, or
-        // any other write wins, and the order is left as it is. The store
-        // clears the finalization material in the same `valid` write, the same
-        // retention rule as the renewal path.
-        let order_id = order.id.clone();
-        let finalized_order_url = order.order_url.clone();
-        let published_certificate_id = certificate_id.clone();
-        let completed_order_store = Arc::clone(&order_store);
-        let stored_order = match offload_store_write("acme_order_upsert", move || {
-            order_store.complete_order_if_current(&order, certificate_id)
-        })
-        .await
-        {
-            Ok(stored) => stored,
-            Err(response) => return Ok(*response),
-        };
-        let updated_order = match stored_order {
-            Ok(Some(record)) => record,
-            Ok(None) => {
-                // The certificate above is published, so watchers must still
-                // re-pull it; only the order record was left untouched.
-                request_managed_source_reloads();
-                // A renewal that completed this same CA order while this
-                // request was in flight is the outcome this request asked for:
-                // the order is `valid` with the `order_url` finalized here, and
-                // the stored certificate is the one it produced. Anything else
-                // (a delete, a rewrite, a different order) stays a conflict.
-                match crate::tls::acme::completed_finalize(
-                    &completed_order_store,
-                    &completed_certificate_store,
-                    &order_id,
-                    &published_certificate_id,
-                    finalized_order_url.as_deref(),
-                ) {
-                    Ok(Some((current, certificate))) => {
-                        persist_acme_account_credentials(&current).await;
-                        return Ok(acme_finalize_success_response(&current, &certificate));
-                    }
-                    Ok(None) => {}
-                    Err(error) => return Ok(acme_error_response(error)),
+                    };
                 }
-                return Ok(super::json_response(
-                    StatusCode::CONFLICT,
-                    &json!({"error": format!(
-                        "ACME order '{order_id}' changed, or certificate \
-                         '{published_certificate_id}' gained another active order, while \
-                         finalization was in flight; the certificate was stored, but the order \
-                         record was left unchanged"
-                    )}),
-                ));
+                Err(error) => return acme_error_response(error),
+            };
+
+            // Compare-and-set against the snapshot read before the CA I/O: a
+            // renewal that completed this order meanwhile, an operator delete, or
+            // any other write wins, and the order is left as it is. The store
+            // clears the finalization material in the same `valid` write, the same
+            // retention rule as the renewal path.
+            let completed_order_store = Arc::clone(&order_store);
+            let stored_order = match offload_store_write("acme_order_upsert", move || {
+                order_store.complete_order_if_current(&order, certificate_id)
+            })
+            .await
+            {
+                Ok(stored) => stored,
+                Err(response) => {
+                    // The certificate above was already persisted, so watchers
+                    // must re-pull it and the audit record must reflect that
+                    // partial completion / uncertain order-update state.
+                    request_managed_source_reloads();
+                    if settlement_state.admin_audit_enabled {
+                        let event = crate::admin::audit::AuditEvent::new(
+                            &settlement_actor,
+                            "finalize",
+                            "tls_acme",
+                            &order_id,
+                            crate::config::types::DEFAULT_NAMESPACE,
+                            json!({
+                                "path": audit_path,
+                                "certificate_persisted": true,
+                                "certificate_id": published_certificate_id,
+                                "order_update_outcome": "worker_failed",
+                            }),
+                        )
+                        .with_outcome(crate::admin::audit::AuditOutcome::UnknownOutcome);
+                        super::record_operation_audit(&settlement_state, event).await;
+                    }
+                    return *response;
+                }
+            };
+            let updated_order = match stored_order {
+                Ok(Some(record)) => record,
+                Ok(None) => {
+                    // The certificate above is published, so watchers must still
+                    // re-pull it; only the order record was left untouched.
+                    request_managed_source_reloads();
+                    // A renewal that completed this same CA order while this
+                    // request was in flight is the outcome this request asked for:
+                    // the order is `valid` with the `order_url` finalized here, and
+                    // the stored certificate is the one it produced. Anything else
+                    // (a delete, a rewrite, a different order) stays a conflict.
+                    match crate::tls::acme::completed_finalize(
+                        &completed_order_store,
+                        &completed_certificate_store,
+                        &order_id,
+                        &published_certificate_id,
+                        finalized_order_url.as_deref(),
+                    ) {
+                        Ok(Some((current, certificate))) => {
+                            persist_acme_account_credentials(&current).await;
+                            if settlement_state.admin_audit_enabled {
+                                let event = crate::admin::audit::AuditEvent::new(
+                                    &settlement_actor,
+                                    "finalize",
+                                    "tls_acme",
+                                    &order_id,
+                                    crate::config::types::DEFAULT_NAMESPACE,
+                                    json!({"path": audit_path}),
+                                );
+                                super::record_operation_audit(&settlement_state, event).await;
+                            }
+                            return acme_finalize_success_response(&current, &certificate);
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            if settlement_state.admin_audit_enabled {
+                                let event = crate::admin::audit::AuditEvent::new(
+                                    &settlement_actor,
+                                    "finalize",
+                                    "tls_acme",
+                                    &order_id,
+                                    crate::config::types::DEFAULT_NAMESPACE,
+                                    json!({
+                                        "path": audit_path,
+                                        "certificate_persisted": true,
+                                        "certificate_id": published_certificate_id,
+                                        "order_update_outcome": "verification_failed",
+                                    }),
+                                )
+                                .with_outcome(crate::admin::audit::AuditOutcome::UnknownOutcome);
+                                super::record_operation_audit(&settlement_state, event).await;
+                            }
+                            return acme_error_response(error);
+                        }
+                    }
+                    if settlement_state.admin_audit_enabled {
+                        let event = crate::admin::audit::AuditEvent::new(
+                            &settlement_actor,
+                            "finalize",
+                            "tls_acme",
+                            &order_id,
+                            crate::config::types::DEFAULT_NAMESPACE,
+                            json!({
+                                "path": audit_path,
+                                "certificate_persisted": true,
+                                "certificate_id": published_certificate_id,
+                                "order_update_outcome": "conflict_unchanged",
+                            }),
+                        )
+                        .with_outcome(crate::admin::audit::AuditOutcome::Failure);
+                        super::record_operation_audit(&settlement_state, event).await;
+                    }
+                    return super::json_response(
+                        StatusCode::CONFLICT,
+                        &json!({"error": format!(
+                            "ACME order '{order_id}' changed, or certificate \
+                             '{published_certificate_id}' gained another active order, while \
+                             finalization was in flight; the certificate was stored, but the order \
+                             record was left unchanged"
+                        )}),
+                    );
+                }
+                Err(error) => {
+                    // The certificate above was already persisted, so watchers
+                    // must still re-pull it even though the order record update
+                    // failed, and the audit record must note the partial publish.
+                    request_managed_source_reloads();
+                    if settlement_state.admin_audit_enabled {
+                        let event = crate::admin::audit::AuditEvent::new(
+                            &settlement_actor,
+                            "finalize",
+                            "tls_acme",
+                            &order_id,
+                            crate::config::types::DEFAULT_NAMESPACE,
+                            json!({
+                                "path": audit_path,
+                                "certificate_persisted": true,
+                                "certificate_id": published_certificate_id,
+                                "order_update_outcome": "store_error",
+                            }),
+                        )
+                        .with_outcome(crate::admin::audit::AuditOutcome::UnknownOutcome);
+                        super::record_operation_audit(&settlement_state, event).await;
+                    }
+                    return acme_error_response(error);
+                }
+            };
+            persist_acme_account_credentials(&updated_order).await;
+            request_managed_source_reloads();
+            if settlement_state.admin_audit_enabled {
+                let event = crate::admin::audit::AuditEvent::new(
+                    &settlement_actor,
+                    "finalize",
+                    "tls_acme",
+                    &order_id,
+                    crate::config::types::DEFAULT_NAMESPACE,
+                    json!({"path": audit_path}),
+                );
+                super::record_operation_audit(&settlement_state, event).await;
             }
-            Err(error) => return Ok(acme_error_response(error)),
-        };
-        persist_acme_account_credentials(&updated_order).await;
-        request_managed_source_reloads();
-        Ok(acme_finalize_success_response(&updated_order, &certificate))
+            acme_finalize_success_response(&updated_order, &certificate)
+        });
+        match settlement.await {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                tracing::error!("ACME order finalization settlement task failed: {error}");
+                Ok(super::json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &json!({"error": "ACME order finalization settlement failed"}),
+                ))
+            }
+        }
     }
 }
 
 pub(super) async fn handle_update_acme_certificate(
     state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     id: &str,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
@@ -1001,13 +1243,10 @@ pub(super) async fn handle_update_acme_certificate(
         Ok(request) => request,
         Err(response) => return Ok(*response),
     };
-    let store = match acme_certificate_store_response() {
+    let store = match preflight_acme_certificate_store_exists(id).await {
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    if let Err(error) = store.get_certificate(id) {
-        return Ok(acme_error_response(error));
-    }
     let (record, _) = match acme_certificate_record_from_request(Some(id), request, true) {
         Ok(value) => value,
         Err(error) => {
@@ -1017,18 +1256,29 @@ pub(super) async fn handle_update_acme_certificate(
             ));
         }
     };
-    Ok(respond_acme_certificate_upsert(store, record, true, StatusCode::OK).await)
+    Ok(respond_acme_certificate_update(state, actor, store, record).await)
 }
 
 pub(super) async fn handle_delete_acme_certificate(
     state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     id: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(response) = state.admit_non_config_db_write().await {
         return Ok(response);
     }
-    // `fence` moves into the blocking delete below, which owns it until the
-    // store mutation has concluded, even if this request is cancelled.
+    // Validate `id` and confirm the record exists (metadata-only, offloaded
+    // from Tokio workers without cloning private keys) before acquiring
+    // fleet-wide namespace config admission leases and scanning every
+    // namespace. The authoritative existence check remains inside the locked
+    // delete below.
+    let store = match preflight_acme_certificate_store_exists(id).await {
+        Ok(store) => store,
+        Err(response) => return Ok(*response),
+    };
+    // `fence` moves into the detached settlement task and then into the
+    // blocking delete below, owning it until persistence concludes even if
+    // this request is cancelled.
     let (usage, fence) = match tls_record_usage(state, "acme", id).await {
         Ok(found) => found,
         Err(response) => return Ok(*response),
@@ -1043,38 +1293,61 @@ pub(super) async fn handle_delete_acme_certificate(
             }),
         ));
     }
-    let store = match acme_certificate_store_response() {
-        Ok(store) => store,
-        Err(response) => return Ok(*response),
-    };
-    let id = id.to_string();
-    let deleted = match offload_store_write("acme_certificate_delete", move || {
-        tls_store_delete_hook(&id);
-        let deleted =
-            store.delete_certificate_if_authorized(&id, tls_reference_fence_check(&fence));
-        drop(fence);
-        deleted
-    })
-    .await
-    {
-        Ok(deleted) => deleted,
-        Err(response) => return Ok(*response),
-    };
-    match deleted {
-        Ok(None) => Ok(tls_reference_fence_lost_response()),
-        Ok(Some(record)) => {
-            request_managed_source_reloads();
+    let owned_id = id.to_string();
+    let settlement_state = state.clone();
+    let settlement_actor = actor.clone();
+    let settlement = crate::admin::audit::spawn_with_request_slot(async move {
+        let delete_id = owned_id.clone();
+        let deleted = match offload_store_write("acme_certificate_delete", move || {
+            tls_store_delete_hook(&delete_id);
+            let deleted = store
+                .delete_certificate_if_authorized(&delete_id, tls_reference_fence_check(&fence));
+            drop(fence);
+            deleted
+        })
+        .await
+        {
+            Ok(deleted) => deleted,
+            Err(response) => return *response,
+        };
+        match deleted {
+            Ok(None) => tls_reference_fence_lost_response(),
+            Ok(Some(record)) => {
+                request_managed_source_reloads();
+                if settlement_state.admin_audit_enabled {
+                    let event = crate::admin::audit::AuditEvent::new(
+                        &settlement_actor,
+                        "delete",
+                        "tls_acme",
+                        &owned_id,
+                        crate::config::types::DEFAULT_NAMESPACE,
+                        json!({"path": format!("/admin/tls/acme/certificates/{owned_id}")}),
+                    );
+                    super::record_operation_audit(&settlement_state, event).await;
+                }
+                super::json_response(
+                    StatusCode::OK,
+                    &json!({"deleted": true, "record": record.summary()}),
+                )
+            }
+            Err(error) => acme_error_response(error),
+        }
+    });
+    match settlement.await {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            tracing::error!("ACME certificate delete settlement task failed: {error}");
             Ok(super::json_response(
-                StatusCode::OK,
-                &json!({"deleted": true, "record": record.summary()}),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "ACME certificate delete settlement failed"}),
             ))
         }
-        Err(error) => Ok(acme_error_response(error)),
     }
 }
 
 pub(super) async fn handle_renew_acme_certificate(
     state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     certificate_id: &str,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
@@ -1083,7 +1356,7 @@ pub(super) async fn handle_renew_acme_certificate(
     }
     #[cfg(not(feature = "acme"))]
     {
-        let _ = (certificate_id, body_bytes);
+        let _ = (actor, certificate_id, body_bytes);
         Ok(super::json_response(
             StatusCode::NOT_IMPLEMENTED,
             &json!({"error": "ACME renewal requires the 'acme' Cargo feature"}),
@@ -1169,36 +1442,57 @@ pub(super) async fn handle_renew_acme_certificate(
         .await
         {
             Ok(value) => value,
-            Err(error) => {
-                return Ok(super::json_response(
-                    StatusCode::BAD_REQUEST,
-                    &json!({"error": error}),
-                ));
+            Err((status, error)) => {
+                return Ok(super::json_response(status, &json!({"error": error})));
             }
         };
-        let stored = match offload_store_write("acme_order_upsert", move || {
-            order_store.upsert_order(record, overwrite)
-        })
-        .await
-        {
-            Ok(stored) => stored,
-            Err(response) => return Ok(*response),
-        };
-        match stored {
-            Ok(record) => {
-                persist_acme_account_credentials(&record).await;
+        let owned_certificate_id = certificate_id.to_string();
+        let settlement_state = state.clone();
+        let settlement_actor = actor.clone();
+        let settlement = crate::admin::audit::spawn_with_request_slot(async move {
+            let stored = match offload_store_write("acme_order_upsert", move || {
+                order_store.upsert_order(record, overwrite)
+            })
+            .await
+            {
+                Ok(stored) => stored,
+                Err(response) => return *response,
+            };
+            match stored {
+                Ok(record) => {
+                    persist_acme_account_credentials(&record).await;
+                    if settlement_state.admin_audit_enabled {
+                        let event = crate::admin::audit::AuditEvent::new(
+                            &settlement_actor,
+                            "renew",
+                            "tls_acme",
+                            &owned_certificate_id,
+                            crate::config::types::DEFAULT_NAMESPACE,
+                            json!({"path": format!("/admin/tls/acme/renew/{owned_certificate_id}")}),
+                        );
+                        super::record_operation_audit(&settlement_state, event).await;
+                    }
+                    super::json_response(StatusCode::CREATED, &json!(record.summary()))
+                }
+                Err(error) => acme_error_response(error),
+            }
+        });
+        match settlement.await {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                tracing::error!("ACME renewal settlement task failed: {error}");
                 Ok(super::json_response(
-                    StatusCode::CREATED,
-                    &json!(record.summary()),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &json!({"error": "ACME renewal settlement failed"}),
                 ))
             }
-            Err(error) => Ok(acme_error_response(error)),
         }
     }
 }
 
 pub(super) async fn handle_update_jwks(
     state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     id: &str,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
@@ -1209,13 +1503,10 @@ pub(super) async fn handle_update_jwks(
         Ok(request) => request,
         Err(response) => return Ok(*response),
     };
-    let store = match managed_store_response() {
+    let store = match preflight_managed_store_kind(id, ManagedTlsMaterialKind::Jwks, true).await {
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    if let Err(error) = require_existing_managed_kind(&store, id, ManagedTlsMaterialKind::Jwks) {
-        return Ok(managed_error_response(error));
-    }
     let (record, _) = match jwks_record_from_request(Some(id), request, true) {
         Ok(value) => value,
         Err(error) => {
@@ -1225,21 +1516,29 @@ pub(super) async fn handle_update_jwks(
             ));
         }
     };
-    let response = respond_managed_upsert(store, record, true, StatusCode::OK).await;
-    refresh_managed_jwks_consumers().await;
-    Ok(response)
+    Ok(respond_managed_update(state, actor, store, record).await)
 }
 
 pub(super) async fn handle_delete_managed(
     state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     kind: ManagedTlsMaterialKind,
     id: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(response) = state.admit_non_config_db_write().await {
         return Ok(response);
     }
-    // `fence` moves into the blocking delete below, which owns it until the
-    // store mutation has concluded, even if this request is cancelled.
+    // Validate `id`, existence, and kind (metadata-only, offloaded from Tokio
+    // workers without cloning PEM/DER/private-key material) BEFORE acquiring
+    // fleet-wide DB namespace admission leases and scanning every namespace.
+    // The kind and existence are re-checked atomically under the store lock below.
+    let store = match preflight_managed_store_kind(id, kind, false).await {
+        Ok(store) => store,
+        Err(response) => return Ok(*response),
+    };
+    // `fence` moves into the detached settlement task and then into the
+    // blocking delete below, owning it until persistence concludes even if
+    // this request is cancelled.
     let (usage, fence) = match tls_record_usage(state, "managed", id).await {
         Ok(found) => found,
         Err(response) => return Ok(*response),
@@ -1254,55 +1553,62 @@ pub(super) async fn handle_delete_managed(
             }),
         ));
     }
-    let store = match managed_store_response() {
-        Ok(store) => store,
-        Err(response) => return Ok(*response),
-    };
-    // Bound before the match so the store borrow ends here: the delete arm
-    // moves the store handle onto a blocking thread.
-    let existing = store.get(id);
-    match existing {
-        Ok(record) if record.kind != kind => Ok(super::json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({
-                "error": format!(
-                    "managed TLS record '{}' has kind {}, expected {}",
-                    id,
-                    record.kind.as_str(),
-                    kind.as_str()
-                )
-            }),
-        )),
-        Ok(_) => {
-            let owned_id = id.to_string();
-            let deleted = match offload_store_write("managed_tls_delete", move || {
-                tls_store_delete_hook(&owned_id);
-                let deleted =
-                    store.delete_if_authorized(&owned_id, tls_reference_fence_check(&fence));
-                drop(fence);
-                deleted
-            })
-            .await
-            {
-                Ok(deleted) => deleted,
-                Err(response) => return Ok(*response),
-            };
-            match deleted {
-                Ok(None) => Ok(tls_reference_fence_lost_response()),
-                Ok(Some(record)) => {
-                    request_managed_source_reloads();
-                    if kind == ManagedTlsMaterialKind::Jwks {
-                        refresh_managed_jwks_consumers().await;
-                    }
-                    Ok(super::json_response(
-                        StatusCode::OK,
-                        &json!({"deleted": true, "record": record.summary()}),
-                    ))
+    let (resource_type, path_segment, refresh_jwks) = managed_tls_audit_metadata(kind);
+    let owned_id = id.to_string();
+    let settlement_state = state.clone();
+    let settlement_actor = actor.clone();
+    let settlement = crate::admin::audit::spawn_with_request_slot(async move {
+        let delete_id = owned_id.clone();
+        let deleted = match offload_store_write("managed_tls_delete", move || {
+            tls_store_delete_hook(&delete_id);
+            let deleted = store.delete_kind_if_authorized(
+                &delete_id,
+                kind,
+                tls_reference_fence_check(&fence),
+            );
+            drop(fence);
+            deleted
+        })
+        .await
+        {
+            Ok(deleted) => deleted,
+            Err(response) => return *response,
+        };
+        match deleted {
+            Ok(None) => tls_reference_fence_lost_response(),
+            Ok(Some(record)) => {
+                request_managed_source_reloads();
+                if refresh_jwks {
+                    refresh_managed_jwks_consumers().await;
                 }
-                Err(error) => Ok(managed_error_response(error)),
+                if settlement_state.admin_audit_enabled {
+                    let event = crate::admin::audit::AuditEvent::new(
+                        &settlement_actor,
+                        "delete",
+                        resource_type,
+                        &owned_id,
+                        crate::config::types::DEFAULT_NAMESPACE,
+                        json!({"path": format!("/admin/tls/{path_segment}/{owned_id}")}),
+                    );
+                    super::record_operation_audit(&settlement_state, event).await;
+                }
+                super::json_response(
+                    StatusCode::OK,
+                    &json!({"deleted": true, "record": record.summary()}),
+                )
             }
+            Err(error) => managed_error_response(error),
         }
-        Err(error) => Ok(managed_error_response(error)),
+    });
+    match settlement.await {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            tracing::error!("managed TLS delete settlement task failed: {error}");
+            Ok(super::json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "managed TLS delete settlement failed"}),
+            ))
+        }
     }
 }
 
@@ -1542,6 +1848,7 @@ pub(super) async fn handle_validate(
 
 pub(super) async fn handle_rotate(
     state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     surface: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(response) = state.admit_audited_operation().await {
@@ -1549,16 +1856,82 @@ pub(super) async fn handle_rotate(
     }
     match requested_surfaces(surface) {
         Ok(RotateTarget::All) => {
+            if gateway_svid_is_configured(state) {
+                // Reload SVID and trigger all watcher reloads inside a detached
+                // settlement task so client cancellation cannot leave a newly
+                // installed SVID audited as a generic cancellation.
+                let settlement_state = state.clone();
+                let settlement_actor = actor.clone();
+                let requested_surface = surface.to_string();
+                let audit_path = format!("/admin/tls/rotate/{surface}");
+                let settlement = crate::admin::audit::spawn_with_request_slot(async move {
+                    // Queue independent certificate/trust-material watcher
+                    // reloads immediately before awaiting gateway SVID reload
+                    // so a failed or stalled SVID refresh cannot block
+                    // unrelated TLS surfaces.
+                    let accepted =
+                        crate::tls::source::subscription::request_all_material_set_reloads();
+                    let svid_revision =
+                        match force_reload_gateway_svid_result(&settlement_state).await {
+                            Ok(revision) => Some(revision),
+                            Err((status, error)) => {
+                                if settlement_state.admin_audit_enabled {
+                                    let event = crate::admin::audit::AuditEvent::new(
+                                        &settlement_actor,
+                                        "rotate",
+                                        "tls_rotation",
+                                        &requested_surface,
+                                        crate::config::types::DEFAULT_NAMESPACE,
+                                        json!({
+                                            "path": audit_path,
+                                            "accepted_surfaces": &accepted,
+                                            "svid_reload_failed": true,
+                                        }),
+                                    )
+                                    .with_outcome(crate::admin::audit::AuditOutcome::Failure);
+                                    super::record_operation_audit(&settlement_state, event).await;
+                                }
+                                let mut body = json!({"error": error});
+                                if !accepted.is_empty() {
+                                    body["accepted_surfaces"] = json!(accepted);
+                                }
+                                return super::json_response(status, &body);
+                            }
+                        };
+                    if settlement_state.admin_audit_enabled {
+                        let event = crate::admin::audit::AuditEvent::new(
+                            &settlement_actor,
+                            "rotate",
+                            "tls_rotation",
+                            &requested_surface,
+                            crate::config::types::DEFAULT_NAMESPACE,
+                            json!({"path": audit_path}),
+                        );
+                        super::record_operation_audit(&settlement_state, event).await;
+                    }
+                    super::json_response(
+                        StatusCode::ACCEPTED,
+                        &json!({
+                            "accepted": true,
+                            "requested_surface": requested_surface,
+                            "surfaces": accepted,
+                            "gateway_svid_revision": svid_revision,
+                        }),
+                    )
+                });
+                return match settlement.await {
+                    Ok(response) => Ok(response),
+                    Err(error) => {
+                        tracing::error!("TLS rotation settlement task failed: {error}");
+                        Ok(super::json_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            &json!({"error": "TLS rotation settlement task failed"}),
+                        ))
+                    }
+                };
+            }
             let accepted = crate::tls::source::subscription::request_all_material_set_reloads();
-            let svid_revision = if gateway_svid_is_configured(state) {
-                match force_reload_gateway_svid(state) {
-                    Ok(revision) => Some(revision),
-                    Err(response) => return Ok(*response),
-                }
-            } else {
-                None
-            };
-            if accepted.is_empty() && svid_revision.is_none() {
+            if accepted.is_empty() {
                 return Ok(super::json_response(
                     StatusCode::NOT_FOUND,
                     &json!({
@@ -1573,7 +1946,7 @@ pub(super) async fn handle_rotate(
                     "accepted": true,
                     "requested_surface": surface,
                     "surfaces": accepted,
-                    "gateway_svid_revision": svid_revision,
+                    "gateway_svid_revision": Option::<u64>::None,
                 }),
             ))
         }
@@ -1598,18 +1971,61 @@ pub(super) async fn handle_rotate(
                 }),
             ))
         }
-        Ok(RotateTarget::GatewaySvid) => match force_reload_gateway_svid(state) {
-            Ok(revision) => Ok(super::json_response(
-                StatusCode::ACCEPTED,
-                &json!({
-                    "accepted": true,
-                    "requested_surface": surface,
-                    "surface": "svid",
-                    "gateway_svid_revision": revision,
-                }),
-            )),
-            Err(response) => Ok(*response),
-        },
+        Ok(RotateTarget::GatewaySvid) => {
+            if state.proxy_state.is_none() {
+                return Ok(super::json_response(
+                    StatusCode::NOT_FOUND,
+                    &json!({"error": "proxy state is unavailable in this mode; gateway SVID cannot be reloaded"}),
+                ));
+            }
+            if !gateway_svid_is_configured(state) {
+                return Ok(super::json_response(
+                    StatusCode::NOT_FOUND,
+                    &json!({"error": "gateway SVID sources are not configured"}),
+                ));
+            }
+            let settlement_state = state.clone();
+            let settlement_actor = actor.clone();
+            let requested_surface = surface.to_string();
+            let audit_path = format!("/admin/tls/rotate/{surface}");
+            let settlement = crate::admin::audit::spawn_with_request_slot(async move {
+                match force_reload_gateway_svid(&settlement_state).await {
+                    Ok(revision) => {
+                        if settlement_state.admin_audit_enabled {
+                            let event = crate::admin::audit::AuditEvent::new(
+                                &settlement_actor,
+                                "rotate",
+                                "tls_rotation",
+                                "svid",
+                                crate::config::types::DEFAULT_NAMESPACE,
+                                json!({"path": audit_path}),
+                            );
+                            super::record_operation_audit(&settlement_state, event).await;
+                        }
+                        super::json_response(
+                            StatusCode::ACCEPTED,
+                            &json!({
+                                "accepted": true,
+                                "requested_surface": requested_surface,
+                                "surface": "svid",
+                                "gateway_svid_revision": revision,
+                            }),
+                        )
+                    }
+                    Err(response) => *response,
+                }
+            });
+            match settlement.await {
+                Ok(response) => Ok(response),
+                Err(error) => {
+                    tracing::error!("gateway SVID rotation settlement task failed: {error}");
+                    Ok(super::json_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &json!({"error": "gateway SVID rotation settlement task failed"}),
+                    ))
+                }
+            }
+        }
         Err(error) => Ok(super::json_response(
             StatusCode::BAD_REQUEST,
             &json!({"error": error}),
@@ -1652,19 +2068,39 @@ fn gateway_svid_is_configured(state: &AdminState) -> bool {
     })
 }
 
-fn force_reload_gateway_svid(state: &AdminState) -> Result<u64, Box<Response<Full<Bytes>>>> {
+async fn force_reload_gateway_svid_result(state: &AdminState) -> Result<u64, (StatusCode, String)> {
     let Some(proxy_state) = state.proxy_state.as_ref() else {
-        return Err(Box::new(super::json_response(
+        return Err((
             StatusCode::NOT_FOUND,
-            &json!({"error": "proxy state is unavailable in this mode; gateway SVID cannot be reloaded"}),
-        )));
+            "proxy state is unavailable in this mode; gateway SVID cannot be reloaded".to_string(),
+        ));
     };
-    proxy_state.force_reload_gateway_svid().map_err(|error| {
-        Box::new(super::json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": error.to_string()}),
-        ))
-    })
+    if !gateway_svid_is_configured(state) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "gateway SVID sources are not configured".to_string(),
+        ));
+    }
+    let proxy_state = proxy_state.clone();
+    // `force_reload_gateway_svid` performs blocking filesystem/remote-secret
+    // I/O and X.509/SPIFFE verification; offload from Tokio async workers.
+    match tokio::task::spawn_blocking(move || proxy_state.force_reload_gateway_svid()).await {
+        Ok(Ok(revision)) => Ok(revision),
+        Ok(Err(error)) => Err((StatusCode::BAD_REQUEST, error.to_string())),
+        Err(error) => {
+            tracing::error!("gateway SVID reload worker failed: {error}");
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "gateway SVID reload worker failed".to_string(),
+            ))
+        }
+    }
+}
+
+async fn force_reload_gateway_svid(state: &AdminState) -> Result<u64, Box<Response<Full<Bytes>>>> {
+    force_reload_gateway_svid_result(state)
+        .await
+        .map_err(|(status, error)| Box::new(super::json_response(status, &json!({"error": error}))))
 }
 
 fn validate_tls_material(request: &TlsValidateRequest) -> Result<Value, String> {
@@ -1903,54 +2339,228 @@ where
     }
 }
 
-/// Persist a managed TLS record off the runtime worker and render the response.
-///
-/// Every managed create/update handler funnels through here, so the offload and
-/// the fail-closed join handling exist once rather than at ten call sites.
+fn managed_tls_audit_metadata(kind: ManagedTlsMaterialKind) -> (&'static str, &'static str, bool) {
+    match kind {
+        ManagedTlsMaterialKind::Certificate => ("tls_certificate", "certificates", false),
+        ManagedTlsMaterialKind::CaBundle => ("tls_ca_bundle", "ca-bundles", false),
+        ManagedTlsMaterialKind::Crl => ("tls_crl", "crls", false),
+        ManagedTlsMaterialKind::OcspResponse => ("tls_ocsp_response", "ocsp-responses", false),
+        ManagedTlsMaterialKind::Jwks => ("tls_jwks", "jwks", true),
+    }
+}
+
+/// Persist a managed TLS record off the runtime worker inside a detached
+/// settlement task so client cancellation cannot drop watcher reload
+/// notification, JWKS consumer refresh, or the success audit.
 async fn respond_managed_upsert(
+    state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     store: Arc<crate::tls::managed::ManagedTlsStore>,
     record: ManagedTlsRecord,
     overwrite: bool,
     success: StatusCode,
 ) -> Response<Full<Bytes>> {
-    let outcome = match offload_store_write("managed_tls_upsert", move || {
-        store.upsert(record, overwrite)
-    })
-    .await
-    {
-        Ok(outcome) => outcome,
-        Err(response) => return *response,
-    };
-    match outcome {
-        Ok(record) => {
-            request_managed_source_reloads();
-            super::json_response(success, &json!(record.summary()))
+    let (resource_type, path_segment, refresh_jwks) = managed_tls_audit_metadata(record.kind);
+    let settlement_state = state.clone();
+    let settlement_actor = actor.clone();
+    let settlement = crate::admin::audit::spawn_with_request_slot(async move {
+        let outcome = match offload_store_write("managed_tls_upsert", move || {
+            store.upsert(record, overwrite)
+        })
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(response) => return *response,
+        };
+        match outcome {
+            Ok(record) => {
+                request_managed_source_reloads();
+                if refresh_jwks {
+                    refresh_managed_jwks_consumers().await;
+                }
+                if settlement_state.admin_audit_enabled {
+                    let event = crate::admin::audit::AuditEvent::new(
+                        &settlement_actor,
+                        "create",
+                        resource_type,
+                        &record.id,
+                        crate::config::types::DEFAULT_NAMESPACE,
+                        json!({"path": format!("/admin/tls/{path_segment}")}),
+                    );
+                    super::record_operation_audit(&settlement_state, event).await;
+                }
+                super::json_response(success, &json!(record.summary()))
+            }
+            Err(error) => managed_error_response(error),
         }
-        Err(error) => managed_error_response(error),
+    });
+    match settlement.await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::error!("managed TLS upsert settlement task failed: {error}");
+            super::json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "managed TLS upsert settlement failed"}),
+            )
+        }
     }
 }
 
-/// Persist an ACME certificate record off the runtime worker.
+/// Atomically update an existing managed TLS record off the runtime worker
+/// inside a detached settlement task so client cancellation cannot drop
+/// watcher reload notification, JWKS consumer refresh, or the success audit.
+async fn respond_managed_update(
+    state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
+    store: Arc<crate::tls::managed::ManagedTlsStore>,
+    record: ManagedTlsRecord,
+) -> Response<Full<Bytes>> {
+    let (resource_type, path_segment, refresh_jwks) = managed_tls_audit_metadata(record.kind);
+    let settlement_state = state.clone();
+    let settlement_actor = actor.clone();
+    let settlement = crate::admin::audit::spawn_with_request_slot(async move {
+        let outcome =
+            match offload_store_write("managed_tls_update", move || store.update_existing(record))
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(response) => return *response,
+            };
+        match outcome {
+            Ok(record) => {
+                request_managed_source_reloads();
+                if refresh_jwks {
+                    refresh_managed_jwks_consumers().await;
+                }
+                if settlement_state.admin_audit_enabled {
+                    let event = crate::admin::audit::AuditEvent::new(
+                        &settlement_actor,
+                        "update",
+                        resource_type,
+                        &record.id,
+                        crate::config::types::DEFAULT_NAMESPACE,
+                        json!({"path": format!("/admin/tls/{path_segment}/{}", record.id)}),
+                    );
+                    super::record_operation_audit(&settlement_state, event).await;
+                }
+                super::json_response(StatusCode::OK, &json!(record.summary()))
+            }
+            Err(error) => managed_error_response(error),
+        }
+    });
+    match settlement.await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::error!("managed TLS update settlement task failed: {error}");
+            super::json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "managed TLS update settlement failed"}),
+            )
+        }
+    }
+}
+
+/// Persist an ACME certificate record off the runtime worker inside a detached
+/// settlement task so client cancellation cannot drop watcher reload
+/// notification or the success audit.
 async fn respond_acme_certificate_upsert(
+    state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
     store: Arc<crate::tls::acme::AcmeCertificateStore>,
     record: AcmeCertificateRecord,
     overwrite: bool,
     success: StatusCode,
 ) -> Response<Full<Bytes>> {
-    let outcome = match offload_store_write("acme_certificate_upsert", move || {
-        store.upsert_certificate(record, overwrite)
-    })
-    .await
-    {
-        Ok(outcome) => outcome,
-        Err(response) => return *response,
-    };
-    match outcome {
-        Ok(record) => {
-            request_managed_source_reloads();
-            super::json_response(success, &json!(record.summary()))
+    let settlement_state = state.clone();
+    let settlement_actor = actor.clone();
+    let settlement = crate::admin::audit::spawn_with_request_slot(async move {
+        let outcome = match offload_store_write("acme_certificate_upsert", move || {
+            store.upsert_certificate(record, overwrite)
+        })
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(response) => return *response,
+        };
+        match outcome {
+            Ok(record) => {
+                request_managed_source_reloads();
+                if settlement_state.admin_audit_enabled {
+                    let event = crate::admin::audit::AuditEvent::new(
+                        &settlement_actor,
+                        "create",
+                        "tls_acme",
+                        &record.id,
+                        crate::config::types::DEFAULT_NAMESPACE,
+                        json!({"path": "/admin/tls/acme/certificates"}),
+                    );
+                    super::record_operation_audit(&settlement_state, event).await;
+                }
+                super::json_response(success, &json!(record.summary()))
+            }
+            Err(error) => acme_error_response(error),
         }
-        Err(error) => acme_error_response(error),
+    });
+    match settlement.await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::error!("ACME certificate upsert settlement task failed: {error}");
+            super::json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "ACME certificate upsert settlement failed"}),
+            )
+        }
+    }
+}
+
+/// Atomically update an existing ACME certificate record off the runtime worker
+/// inside a detached settlement task so client cancellation cannot drop
+/// watcher reload notification or the success audit.
+async fn respond_acme_certificate_update(
+    state: &AdminState,
+    actor: &crate::admin::audit::AuditActor,
+    store: Arc<crate::tls::acme::AcmeCertificateStore>,
+    record: AcmeCertificateRecord,
+) -> Response<Full<Bytes>> {
+    let settlement_state = state.clone();
+    let settlement_actor = actor.clone();
+    let settlement = crate::admin::audit::spawn_with_request_slot(async move {
+        let outcome = match offload_store_write("acme_certificate_update", move || {
+            store.update_existing_certificate(record)
+        })
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(response) => return *response,
+        };
+        match outcome {
+            Ok(record) => {
+                request_managed_source_reloads();
+                if settlement_state.admin_audit_enabled {
+                    let event = crate::admin::audit::AuditEvent::new(
+                        &settlement_actor,
+                        "update",
+                        "tls_acme",
+                        &record.id,
+                        crate::config::types::DEFAULT_NAMESPACE,
+                        json!({"path": format!("/admin/tls/acme/certificates/{}", record.id)}),
+                    );
+                    super::record_operation_audit(&settlement_state, event).await;
+                }
+                super::json_response(StatusCode::OK, &json!(record.summary()))
+            }
+            Err(error) => acme_error_response(error),
+        }
+    });
+    match settlement.await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::error!("ACME certificate update settlement task failed: {error}");
+            super::json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "ACME certificate update settlement failed"}),
+            )
+        }
     }
 }
 
@@ -1964,24 +2574,87 @@ fn managed_store_response()
     })
 }
 
-/// Typed PUT requires an existing record whose kind matches the route collection.
+/// Acquire the managed TLS store off the Tokio runtime worker so cold store
+/// initialization or backing I/O cannot stall async workers.
+async fn managed_store_response_async()
+-> Result<Arc<crate::tls::managed::ManagedTlsStore>, Box<Response<Full<Bytes>>>> {
+    match tokio::task::spawn_blocking(crate::tls::managed::global_store).await {
+        Ok(Ok(store)) => Ok(store),
+        Ok(Err(error)) => Err(Box::new(super::json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({"error": format!("managed TLS store is unavailable: {error}")}),
+        ))),
+        Err(error) => {
+            tracing::error!("managed TLS store worker failed: {error}");
+            Err(Box::new(super::json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "managed TLS store initialization failed"}),
+            )))
+        }
+    }
+}
+
+/// Acquire the managed TLS store and confirm `id` exists with matching `kind`
+/// in one `spawn_blocking` call.
 ///
-/// IDs are globally unique across managed TLS collections; a cross-kind hit is a
-/// stable `409 Conflict` (`KindConflict`), matching create-with-overwrite.
-fn require_existing_managed_kind(
-    store: &crate::tls::managed::ManagedTlsStore,
+/// Typed PUT passes `conflict_on_mismatch = true` so a cross-kind ID returns
+/// `409 Conflict` (`KindConflict`); typed DELETE passes `false` to preserve
+/// its `400 Bad Request` kind-mismatch response.
+async fn preflight_managed_store_kind(
     id: &str,
     kind: ManagedTlsMaterialKind,
-) -> Result<(), ManagedTlsError> {
-    let existing = store.get(id)?;
-    if existing.kind != kind {
-        return Err(ManagedTlsError::KindConflict {
-            id: id.to_string(),
-            existing_kind: existing.kind.as_str(),
-            requested_kind: kind.as_str(),
-        });
+    conflict_on_mismatch: bool,
+) -> Result<Arc<crate::tls::managed::ManagedTlsStore>, Box<Response<Full<Bytes>>>> {
+    let owned_id = id.to_string();
+    match tokio::task::spawn_blocking(move || {
+        let store = match crate::tls::managed::global_store() {
+            Ok(store) => store,
+            Err(error) => {
+                return Err(Box::new(super::json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &json!({"error": format!("managed TLS store is unavailable: {error}")}),
+                )));
+            }
+        };
+        match store.record_kind(&owned_id) {
+            Ok(existing_kind) if existing_kind != kind => {
+                if conflict_on_mismatch {
+                    Err(Box::new(managed_error_response(
+                        ManagedTlsError::KindConflict {
+                            id: owned_id,
+                            existing_kind: existing_kind.as_str(),
+                            requested_kind: kind.as_str(),
+                        },
+                    )))
+                } else {
+                    Err(Box::new(super::json_response(
+                        StatusCode::BAD_REQUEST,
+                        &json!({
+                            "error": format!(
+                                "managed TLS record '{}' has kind {}, expected {}",
+                                owned_id,
+                                existing_kind.as_str(),
+                                kind.as_str()
+                            )
+                        }),
+                    )))
+                }
+            }
+            Ok(_) => Ok(store),
+            Err(error) => Err(Box::new(managed_error_response(error))),
+        }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::error!("managed TLS preflight worker failed: {error}");
+            Err(Box::new(super::json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "managed TLS store preflight failed"}),
+            )))
+        }
     }
-    Ok(())
 }
 
 fn acme_certificate_store_response()
@@ -1992,6 +2665,59 @@ fn acme_certificate_store_response()
             &json!({"error": format!("ACME certificate store is unavailable: {error}")}),
         ))
     })
+}
+
+/// Acquire the ACME certificate store off the Tokio runtime worker.
+async fn acme_certificate_store_response_async()
+-> Result<Arc<crate::tls::acme::AcmeCertificateStore>, Box<Response<Full<Bytes>>>> {
+    match tokio::task::spawn_blocking(crate::tls::acme::global_certificate_store).await {
+        Ok(Ok(store)) => Ok(store),
+        Ok(Err(error)) => Err(Box::new(super::json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({"error": format!("ACME certificate store is unavailable: {error}")}),
+        ))),
+        Err(error) => {
+            tracing::error!("ACME certificate store worker failed: {error}");
+            Err(Box::new(super::json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "ACME certificate store initialization failed"}),
+            )))
+        }
+    }
+}
+
+/// Acquire the ACME certificate store and verify `id` exists (metadata-only)
+/// in one `spawn_blocking` call.
+async fn preflight_acme_certificate_store_exists(
+    id: &str,
+) -> Result<Arc<crate::tls::acme::AcmeCertificateStore>, Box<Response<Full<Bytes>>>> {
+    let owned_id = id.to_string();
+    match tokio::task::spawn_blocking(move || {
+        let store = match crate::tls::acme::global_certificate_store() {
+            Ok(store) => store,
+            Err(error) => {
+                return Err(Box::new(super::json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &json!({"error": format!("ACME certificate store is unavailable: {error}")}),
+                )));
+            }
+        };
+        match store.certificate_exists(&owned_id) {
+            Ok(()) => Ok(store),
+            Err(error) => Err(Box::new(acme_error_response(error))),
+        }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::error!("ACME certificate preflight worker failed: {error}");
+            Err(Box::new(super::json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "ACME certificate store preflight failed"}),
+            )))
+        }
+    }
 }
 
 fn acme_order_store_response()
@@ -2280,19 +3006,42 @@ fn acme_dns_cache(state: &AdminState) -> Result<crate::dns::DnsCache, String> {
 }
 
 #[cfg(feature = "acme")]
+fn classify_acme_prepare_error(
+    error: crate::tls::acme::client::AcmeClientError,
+) -> (StatusCode, String) {
+    use crate::tls::acme::client::AcmeClientError;
+    match error {
+        AcmeClientError::InvalidRequest(_) | AcmeClientError::EgressPolicy(_) => {
+            (StatusCode::BAD_REQUEST, error.to_string())
+        }
+        AcmeClientError::DeserializeCredentials(_) => (
+            StatusCode::BAD_REQUEST,
+            "failed to deserialize ACME account credentials".to_string(),
+        ),
+        AcmeClientError::SerializeCredentials(_)
+        | AcmeClientError::Client(_)
+        | AcmeClientError::UnusableFinalizationMaterial
+        | AcmeClientError::TerminalInvalidOrder => (StatusCode::BAD_GATEWAY, error.to_string()),
+    }
+}
+
+#[cfg(feature = "acme")]
 async fn acme_order_record_from_request(
     state: &AdminState,
     request: AcmeOrderRequest,
-) -> Result<(AcmeOrderRecord, bool), String> {
-    let id = managed_request_id(None, request.id.as_deref())?;
-    let certificate_id = optional_resource_id(request.certificate_id.as_deref(), "certificate_id")?;
-    let domains = normalize_acme_domains(request.domains)?;
+) -> Result<(AcmeOrderRecord, bool), (StatusCode, String)> {
+    let bad_req = |msg: String| (StatusCode::BAD_REQUEST, msg);
+    let id = managed_request_id(None, request.id.as_deref()).map_err(bad_req)?;
+    let certificate_id = optional_resource_id(request.certificate_id.as_deref(), "certificate_id")
+        .map_err(bad_req)?;
+    let domains = normalize_acme_domains(request.domains).map_err(bad_req)?;
     let directory_url =
-        validated_optional_acme_string(Some(request.directory_url), "directory_url")?
-            .ok_or_else(|| "directory_url must not be empty".to_string())?;
+        validated_optional_acme_string(Some(request.directory_url), "directory_url")
+            .map_err(bad_req)?
+            .ok_or_else(|| bad_req("directory_url must not be empty".to_string()))?;
     // The ACME client (`client::prepare_order`) validates the directory URL against
     // SSRF policy at the outbound chokepoint below, so no separate check is needed here.
-    let contact = normalize_acme_contact(request.contact)?;
+    let contact = normalize_acme_contact(request.contact).map_err(bad_req)?;
     let existing_account_credentials_json = request
         .existing_account_credentials_json
         .map(crate::tls::source::SecretString::new);
@@ -2306,21 +3055,21 @@ async fn acme_order_record_from_request(
             existing_credentials_json: existing_account_credentials_json,
         },
         domains: domains.clone(),
-        dns_cache: acme_dns_cache(state)?,
+        dns_cache: acme_dns_cache(state).map_err(|error| (StatusCode::BAD_GATEWAY, error))?,
     };
 
     let prepared = match challenge_type {
         AcmeChallengeType::Http01 => crate::tls::acme::client::prepare_http01_order(order_config)
             .await
-            .map_err(|error| error.to_string())?,
+            .map_err(classify_acme_prepare_error)?,
         AcmeChallengeType::TlsAlpn01 => {
             crate::tls::acme::client::prepare_tls_alpn01_order(order_config)
                 .await
-                .map_err(|error| error.to_string())?
+                .map_err(classify_acme_prepare_error)?
         }
         AcmeChallengeType::Dns01 => crate::tls::acme::client::prepare_dns01_order(order_config)
             .await
-            .map_err(|error| error.to_string())?,
+            .map_err(classify_acme_prepare_error)?,
     };
 
     let mut http01_challenges = Vec::new();
@@ -2371,7 +3120,7 @@ async fn acme_order_record_from_request(
             finalization: Some(prepared.finalization),
             error: None,
         })
-        .map_err(|error| error.to_string())?,
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?,
         allow_overwrite,
     ))
 }
@@ -2919,12 +3668,8 @@ async fn tls_record_usage(
     // view in file and DP modes, and in database mode a reference the
     // running gateway still holds after it was removed from the store.
     let mut local = Vec::new();
-    if let Some(env_config) = state
-        .proxy_state
-        .as_ref()
-        .map(|proxy| proxy.env_config.as_ref())
-    {
-        local.extend(env_source_references(env_config));
+    if let Some(env_config) = effective_env_config(state) {
+        local.extend(env_source_references(&env_config));
     }
     let served = state
         .proxy_state

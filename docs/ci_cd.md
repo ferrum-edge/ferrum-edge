@@ -100,7 +100,7 @@ adding, removing, or materially changing a workflow.
 | `h3-live-comparison.yml` | H3 Live Comparison | PRs on its own paths, manual | H3 feature contracts and fixtures on PRs; manual dispatch runs the calibrated H3 payload campaign. Optional. |
 | `rr-build-comparison.yml` | RoundRobin Build Comparison | PRs and push to `main` on its own paths, manual | Evidence-contract checks; manual dispatch runs a paired RoundRobin comparison against a chosen ancestor SHA. Optional. |
 | `plugin-request-view-comparison.yml` | Plugin Request View Comparison | Manual; PRs on its own paths | Paired same-runner Criterion comparison of `PluginCache::request_view` (the per-request plugin-chain lookup) at 1 and 8 threads, candidate vs. a baseline commit (the PR base, or a dispatched ancestor), interleaved rounds; Markdown summary in the job summary ([#7207](https://github.com/ferrum-edge/ferrum-edge/issues/7207)). Informational, no budget. Optional. |
-| `windows-confinement.yml` | Windows File Confinement | PRs and push to `main` on `src/tls/source/**`, the confinement tests and their registration chain (`tests/unit_tests.rs`, `tests/unit/mod.rs`, `tests/unit/tls/mod.rs`), `src/lib.rs`, `src/config/file_loader.rs`, Cargo/toolchain/build configuration, or its own file; manual | Runs the Windows-only tenant-file confinement unit tests (`windows_confined_files`) natively on `windows-latest`, including the elevated case-sensitive NTFS directory test that is `#[ignore]`d elsewhere. Every unit shard runs on Linux, where these tests compile out ([#6540](https://github.com/ferrum-edge/ferrum-edge/issues/6540)). Fails when fewer tests run than the module holds. Optional. |
+| `windows-confinement.yml` | Windows File Confinement | PRs and push to `main` on `src/tls/source/**`, `src/tls/mod.rs`, `tests/windows_confinement_tests.rs`, `src/lib.rs`, `src/config/{file_loader,env_config,conf_file}.rs`, `src/plugins/mod.rs`, `custom_plugins/**`, `build/**`, `proto/**`, `vendor/**`, Cargo/toolchain/build configuration, or its own file; manual | Runs the dedicated `windows_confinement_tests` target (`windows_confined_files`) natively on `windows-latest` with a main-only-save `Swatinem/rust-cache` (`ci-windows-confinement`) and fast dev/test profile settings, including the elevated case-sensitive NTFS directory test that is `#[ignore]`d elsewhere. Every unit shard runs on Linux, where these tests compile out ([#6540](https://github.com/ferrum-edge/ferrum-edge/issues/6540)). Fails when fewer tests run than the module holds. Optional. |
 | `codeql.yml` | CodeQL | PRs and pushes to `main` (actions, c-cpp, python); daily 01:11 UTC and manual (all four languages, including Rust) | CodeQL advanced setup replacing default setup. The ~2h Rust analysis runs only on the daily schedule and manual dispatch, never on PRs. Optional. |
 | `codeql-extraction-diagnostic.yml` | CodeQL Rust Extraction Diagnostic | Manual | Extraction-only default vs FIPS feature comparison; see [codeql-extraction-diagnostic.md](codeql-extraction-diagnostic.md). |
 | `compose-fixture-qualification.yml` | Compose Fixture Qualification | PRs on `docker-compose.yml`, `docker-compose.tls-test.yml`, `setup_db_tls.sh`, `check_compose_fixtures.sh`, and the workflow itself; manual | Disposable Compose fixture boundary checks. Optional. |
@@ -391,9 +391,33 @@ inside `<code>` so a hostile name cannot break Markdown.
 
 **FIPS.** `FIPS Feature Policy` stays a cheap always-on graph audit; the
 required `FIPS Build & Test` aggregate needs it and fails unless it succeeded.
-Compile, claimed-profile `cargo check`, clippy `-D warnings`, and the
-policy/key-admission/handshake tests share one cache layer plus an immutable
-artifact handoff:
+The trusted-base planner (`ci_runtime_plan.py`) classifies each PR diff into
+one of three scopes:
+
+- `none`: non-Rust/non-FIPS changes skip the expensive compile/clippy/test
+  jobs while `FIPS Feature Policy` and the aggregate still run.
+- `compile`: ordinary `pull_request` Rust/test changes outside
+  FIPS/TLS/build-graph surfaces run `fips-compile` and `fips-clippy`
+  (`--lib --tests -D warnings`) to catch FIPS feature-gate compile errors,
+  while offloading the three `fips-claimed-checks` shards, `fips-test-build`,
+  and `fips-test` to FIPS-sensitive PRs, `merge_group`, every `push` to
+  `main`, and `workflow_dispatch`.
+- `full`: FIPS/TLS/DTLS/build-graph/workflow changes, `merge_group`, `push` to
+  `main`, `workflow_dispatch`, and any unknown or unclassifiable diff run the
+  full matrix (compile, claimed-profile checks, clippy, test-binary precompile,
+  and policy/key-admission/handshake tests).
+
+All four Cargo jobs (`fips-compile`, `fips-claimed-checks`, `fips-clippy`, and
+`fips-test-build`) pin identical build settings (`CARGO_BUILD_JOBS=3`,
+`CARGO_PROFILE_{DEV,TEST}_DEBUG=0`, `CARGO_PROFILE_{DEV,TEST}_SPLIT_DEBUGINFO=off`,
+`CARGO_PROFILE_{DEV,TEST}_CODEGEN_UNITS=256`) so `Swatinem/rust-cache` keys
+stay aligned (`CARGO_BUILD_JOBS` feeds the cache key) and matching Cargo
+dependency units (`aws-lc-fips-sys` and shared non-dev crates) stay
+fingerprint-compatible across the exact `target/` producer handoff (test and
+claimed-profile jobs still compile their own feature/dev-dependency units).
+Compile, claimed-profile
+`cargo check`, clippy `-D warnings`, and the policy/key-admission/handshake
+tests share one cache layer plus an immutable artifact handoff:
 
 - **Stable rust-cache fallback.** `shared-key` is
   `ci-fips-contract-${{ hashFiles(...) }}` over the manifest/lockfile, Cargo
@@ -527,7 +551,8 @@ hit). Measured restored bytes are the restored `target/` directory for rust-cach
 directory for the promoted producer handoff. The
 required `FIPS Build & Test`
 aggregate depends on `fips-test-build` and fails closed if that test-binary
-producer does not succeed.
+producer does not succeed (accepting a skip only on `pull_request` when the
+trusted planner selected `scope=compile`).
 
 **Trust boundary.** Untrusted `run:` steps never receive GitHub Actions cache
 write credentials. `setup-sccache` installs a checksum-pinned
@@ -802,19 +827,20 @@ below only when `ci.yml` passes `FERRUM_CI_PLAN_GRANULAR_GATES=1`:
 The same principle governs the dedicated workflows. `fips-build.yml` compiles
 the FIPS profile on a pull request whenever a compiled Rust input changes. The
 trusted `ci_runtime_plan.py` `fips-build` suite prints `scope=full` for
-FIPS-specific logic (`src/fips/`, `src/tls/`, `src/dtls/`, the
-provider-installing listeners, the FIPS-aware tests, the Cargo feature graph,
-`docs/fips.md`, and the gate's own workflow/scripts) and `scope=compile` for
+FIPS-specific logic (`src/fips/`, `src/tls/`, `src/dtls/`, `src/cli.rs`,
+`src/gateway_entry.rs`, `src/config/env_config.rs`, `src/modes/control_plane.rs`,
+the provider-installing listeners, the FIPS-aware tests and unit/integration
+test registration files, the Cargo feature graph, `docs/fips.md`, and the
+gate's own workflow/scripts) and `scope=compile` for
 every other compiled Rust input (`src/`, `tests/` outside `tests/k8s/` and
 `tests/performance/`, `benches/`, `proto/`, `custom_plugins/`). Both print
 `relevant=true`. Issue #5828: PR #5825 added inline test code under
 `src/http3/` that used quinn constructors missing under
 `--no-default-features --features fips`, skipped every FIPS lane, and broke
-`FIPS clippy` on `main`. A `compile` scope needs at least the FIPS compile
-producer and FIPS clippy over the lib and test targets. The workflow reads only
-`relevant` today, so it runs the full gate for both scopes; narrowing a
-`compile` diff to compile + clippy is a `fips-build.yml` change. That file is
-digest-frozen, so this is a direct-to-`main` change.
+`FIPS clippy` on `main`. A `compile` scope runs the FIPS compile producer and
+FIPS clippy over the lib and test targets, while `fips-claimed-checks`,
+`fips-test-build`, and `fips-test` run on `scope=full` PRs, `merge_group`,
+every `push` to `main`, and `workflow_dispatch`.
 
 `coverage.yml` skips every instrumented shard on a pull
 request unless the coverage controllers themselves change; the Kind live
@@ -928,7 +954,10 @@ runner-minutes a gate change saves.
 
 Every workflow that runs on `push` to `main` keys its concurrency group on
 the ref with `cancel-in-progress` **false** for pushes (superseded
-`pull_request` / `merge_group` runs are still cancelled). A run in flight
+`pull_request` / `merge_group` runs are still cancelled) — with two intentional
+exceptions: `fuzz-smoke-main.yml` (`queue: max`) and `fips-build.yml`, which
+keys `push` to `main` on `github.run_id` so overlapping pushes never evict a
+pending exact-SHA FIPS run. For the ref-keyed workflows, a run in flight
 finishes and at most one newer push waits behind it, so `main` converges on a
 complete exact-SHA validation set instead of cancelling almost every run
 before it can finish. Intermediate SHAs skipped by that coalescing carry no
@@ -970,6 +999,7 @@ shared by every debug-profile job through identical `CARGO_BUILD_JOBS` /
 `fuzz-property-smoke` lane (Fuzz Smoke's property build, line-tables-only
 debuginfo), the registry-only `fuzz-sanitizer-smoke` lane
 (`cache-targets: "false"`), `ci-coverage` (produced by the coverage `unit-core` shard, formerly `lib-unit`),
+`ci-windows-confinement` (main-only save on `windows-latest` for `windows-confinement.yml`, keyed on NASM pin + detected `OPENSSL_SRC_PERL` path and version via `env-vars`),
 and the separately governed FIPS contract lane. The direct eBPF-program cache also retains its main-push writer;
 binary and benchmark sites are restore-only (`save-if: "false"`).
 
@@ -1353,12 +1383,15 @@ cargo test --no-run --test integration_tests --test functional_tests   # both ne
 cargo nextest archive --test integration_tests ...                     # when integration/vendor needed
 cargo nextest archive --test functional_tests ...                      # when functional/Redis needed
 
-# test-functional-{application,protocols,data-plane,data-plane-runtime}
+# test-functional-{application,protocols-a,protocols-b,data-plane,data-plane-runtime}
+# Pass the shard's `filters:` entries as positional filter args (and `-j 1` for
+# the serialized `data_services: true` shards).
 cargo nextest run --archive-file functional-tests-*.tar.zst \
   --workspace-remap . \
   --run-ignored=all \
   --no-fail-fast \
-  -E 'not test(/test_scale_perf_30k_proxies/) and not test(/test_load_stress_10k_proxies/)'
+  -E 'not test(/test_scale_perf_30k_proxies/) and not test(/test_load_stress_10k_proxies/) and not test(/test_scale_reload_under_load/)' \
+  <shard-filters...>
 ```
 
 Every Unit Tests shard and every Integration Tests shard ends with **Check the
@@ -1518,20 +1551,21 @@ stripped of newlines and backticks before they are written.
 - The `CI Plan` job diffs `ls tests/integration/*.rs` against the union of
   declared shard filters in `ci.yml`. Adding a new `mod foo_tests` without
   wiring it into a shard fails this silent-skip guard.
-- Functional tests split across four shards (`application`, `protocols`,
-  `data-plane`, `data-plane-runtime`). `build-test-artifacts` compiles only the
-  test targets required by active downstream consumers in one Cargo invocation
-  (both `integration_tests` and `functional_tests` when both lanes are active
-  or on `push` to `main`/`workflow_dispatch`, which also builds the gateway and
-  CNI binaries), then packages only the needed nextest archives in the same
-  job/cache. Each
+- Functional tests split across five shards (`application`, `protocols-a`,
+  `protocols-b`, `data-plane`, `data-plane-runtime`). `build-test-artifacts`
+  compiles only the test targets required by active downstream consumers in one
+  Cargo invocation (both `integration_tests` and `functional_tests` when both
+  lanes are active or on `push` to `main`/`workflow_dispatch`, which also
+  builds the gateway and CNI binaries), then packages only the needed nextest
+  archives in the same job/cache. Each
   functional shard downloads the existing OS/architecture-keyed artifacts with
   `FERRUM_SKIP_GATEWAY_BUILD=1`. The two data-plane shards (`data_services:
   true`) remain serialized with `nextest_jobs: 1` and are the only shards that
   start the Redis/MongoDB/PostgreSQL/MySQL containers; each runner owns its own
-  set. See
+  set. `data-plane` isolates `functional_admin_crud_resources_test` alone while
+  `data-plane-runtime` runs the remaining database-backed modules (see
   [ci_pr_validation_review_2026_09_24.md](ci_pr_validation_review_2026_09_24.md)
-  for why the data-plane modules are split in two.
+  for the original two-shard split history).
 
 **Output**:
 - Test pass/fail status
@@ -1540,10 +1574,12 @@ stripped of newlines and backticks before they are written.
 
 #### 3. Lint Job
 
-**Runs**: `ubuntu-26.04`
+**Runs**: `ubuntu-26.04` (`timeout-minutes: 45`)
 
-Enforces code quality. Clippy omits DWARF (`profile.test.debug=0` and
-`profile.dev.debug=0`) and compiles with a single job (`CARGO_BUILD_JOBS=1`)
+Enforces code quality. Before running Clippy, the job adds a best-effort
+12 GiB `/mnt/ferrum-swapfile` for paging headroom (continuing with a warning
+on image swap if allocation fails). Clippy omits DWARF (`profile.test.debug=0`
+and `profile.dev.debug=0`) and compiles with a single job (`CARGO_BUILD_JOBS=1`)
 so large integration targets stay within hosted-runner memory: even two
 parallel jobs could overlap two large integration-target clippy processes on
 a cold cache and starve the runner, so one job removes that overlap at the
@@ -2597,15 +2633,16 @@ ceilings. The repair lowers peak compile concurrency and raises the job
 deadline; it does not drop `--lib` or `--test unit_tests`, and it does not split
 the combined llvm-cov invocation.
 
-The `coverage-shard` job therefore mirrors the **safe** FIPS knobs that do not
-require a Cross generation transition; this subsection admits no
-`WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS` pair.
+The `coverage-shard` job therefore uses the **safe** memory-capping knobs that
+do not require a Cross generation transition (retaining `line-tables-only`
+debuginfo while FIPS `fips-test-build` uses `debug=0`); this subsection admits
+no `WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS` pair.
 
 | Knob | FIPS `fips-test-build` (#4018) | Coverage `coverage-shard` (#4099 / #4368) |
 |---|---|---|
 | `CARGO_BUILD_JOBS` | Job-level env `3`; caps rustc codegen threads inside the large crates | Job-level env **`2`**. `#4099` kept `3`; `#4368` lowered it after PR #4336 run `33219849557` job `99020110238` reproduced the compile-phase exit-143 stall at `Compiling testcontainers v0.27.3` with jobs=3, line-tables, and additive swap already on |
 | `timeout-minutes` | Job-specific (FIPS compile/test budget) | **`timeout-minutes: 120`**. The `#4099` comment claimed the combined lib+`unit_tests` invocation fit 75 minutes; PR #4347 run `33223661366` attempt 1 job `99027333486` was still passing tests when that deadline canceled it. GitHub cannot set per-matrix-row timeouts, so the shared `coverage-shard` job carries the lib-unit budget; integration shards still finish far earlier |
-| `line-tables-only` on `dev` **and** `test` | `CARGO_PROFILE_{DEV,TEST}_DEBUG` | Added in `#4099`. Drops variable-level DWARF only. Line/region attribution comes from `-C instrument-coverage` mapping, not DWARF locals, so `cargo llvm-cov` reports stay equivalent |
+| Debuginfo on `dev` **and** `test` | `CARGO_PROFILE_{DEV,TEST}_DEBUG=0` (with `SPLIT_DEBUGINFO=off`, `CODEGEN_UNITS=256` across all 4 FIPS Cargo jobs; `#4018` previously used `line-tables-only`) | `line-tables-only` added in `#4099`. Drops variable-level DWARF only. Line/region attribution comes from `-C instrument-coverage` mapping, not DWARF locals, so `cargo llvm-cov` reports stay equivalent |
 | Additive swapfile | Best-effort 8 GiB `/mnt/ferrum-fips-swapfile` (workflow is digest-frozen, so the step must not fail-close) | **Not added.** `coverage-shard` already enlarges swap with a fail-closed 12 GiB `/mnt/ferrum-swapfile` (same pattern as `ci.yml` `test-unit`). A second Ferrum swapfile would be redundant; converting the existing step to best-effort would not lower compile memory |
 
 Instrumentation, shard matrix, test filters, and `cargo llvm-cov` /

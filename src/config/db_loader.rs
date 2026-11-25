@@ -46,7 +46,7 @@ use crate::config::policy_graph_scope::PolicyGraphScope;
 use crate::config::store_policy::{
     access_control_plugin_allows_consumer, consumer_identity_values,
     consumer_identity_values_from_fields, mesh_route_dispatch_referenced_upstream,
-    mesh_route_dispatch_references_upstream_id, store_canonical_resource_hash,
+    mesh_route_dispatch_references_upstream_id, store_canonical_resource_hash_async,
 };
 use crate::config::types::{
     AuthMode, BackendScheme, CircuitBreakerConfig, Consumer, DispatchKind, GatewayConfig,
@@ -3319,6 +3319,7 @@ impl DatabaseStore {
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
+        codec_slots: Option<&std::sync::Arc<tokio::sync::Semaphore>>,
     ) -> Result<ConditionalNamespaceSnapshot, anyhow::Error> {
         let purpose = FullLoadPurpose::RestoreSnapshot;
         let mut config = GatewayConfig {
@@ -3339,10 +3340,17 @@ impl DatabaseStore {
             .bind(namespace)
             .fetch_all(&mut **tx)
             .await?;
-        let api_specs = rows
-            .iter()
-            .map(row_to_api_spec)
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut api_specs = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let spec = match codec_slots {
+                Some(slots) => row_to_api_spec_async(row, slots).await?,
+                None => {
+                    let spec_content: Vec<u8> = row.try_get("spec_content")?;
+                    row_to_api_spec_with_content(row, spec_content, true)?
+                }
+            };
+            api_specs.push(spec);
+        }
         // Release the driver copy of every stored spec document now that each
         // is decoded, rather than holding both until the snapshot returns.
         drop(rows);
@@ -3381,12 +3389,32 @@ impl DatabaseStore {
         &self,
         namespace: &str,
     ) -> Result<ConditionalNamespaceSnapshot, anyhow::Error> {
+        self.load_conditional_namespace_snapshot_with_slots(
+            namespace,
+            &crate::admin::api_specs::SPEC_READ_CODEC_SLOTS,
+        )
+        .await
+    }
+
+    async fn load_conditional_namespace_snapshot_with_slots(
+        &self,
+        namespace: &str,
+        codec_slots: &std::sync::Arc<tokio::sync::Semaphore>,
+    ) -> Result<ConditionalNamespaceSnapshot, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
         self.configure_full_load_snapshot(&mut tx).await?;
         let snapshot = self
-            .conditional_namespace_snapshot_tx(&mut tx, namespace)
+            .conditional_namespace_snapshot_tx(&mut tx, namespace, None)
             .await?;
         tx.commit().await?;
+        // Validate external-ref snapshots only after releasing the SQL pool
+        // connection so read-side snapshot exports cannot invert lock ordering
+        // against `GET /api-specs/{id}` handlers holding `SPEC_READ_CODEC_SLOTS`.
+        crate::admin::api_specs::external_refs::validate_api_spec_snapshots_async(
+            &snapshot.api_specs,
+            codec_slots,
+        )
+        .await?;
         Ok(snapshot)
     }
 
@@ -3394,11 +3422,12 @@ impl DatabaseStore {
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
+        codec_slots: Option<&std::sync::Arc<tokio::sync::Semaphore>>,
     ) -> Result<DeploymentSnapshot, anyhow::Error> {
         use futures_util::TryStreamExt;
 
         let snapshot = self
-            .conditional_namespace_snapshot_tx(tx, namespace)
+            .conditional_namespace_snapshot_tx(tx, namespace, codec_slots)
             .await?;
         // Refuses an over-bound typed snapshot before any raw row is read.
         let mut stored = StoredEvidence::for_snapshot(snapshot)?;
@@ -3435,11 +3464,19 @@ impl DatabaseStore {
     async fn load_deployment_snapshot_inner(
         &self,
         namespace: &str,
+        codec_slots: &std::sync::Arc<tokio::sync::Semaphore>,
     ) -> Result<DeploymentSnapshot, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
         self.configure_full_load_snapshot(&mut tx).await?;
-        let snapshot = self.deployment_snapshot_tx(&mut tx, namespace).await?;
+        let snapshot = self
+            .deployment_snapshot_tx(&mut tx, namespace, None)
+            .await?;
         tx.commit().await?;
+        crate::admin::api_specs::external_refs::validate_api_spec_snapshots_async(
+            &snapshot.snapshot().api_specs,
+            codec_slots,
+        )
+        .await?;
         Ok(snapshot)
     }
 
@@ -3476,7 +3513,11 @@ impl DatabaseStore {
         self.lock_config_change_sequence_tx(tx, precondition.namespace)
             .await?;
         let snapshot = self
-            .deployment_snapshot_tx(tx, precondition.namespace)
+            .deployment_snapshot_tx(
+                tx,
+                precondition.namespace,
+                Some(&crate::admin::api_specs::SPEC_WRITE_CODEC_SLOTS),
+            )
             .await?;
         if snapshot.digest()? != precondition.expected {
             return Err(NamespacePreconditionFailed.into());
@@ -3589,10 +3630,33 @@ impl DatabaseStore {
             sqlx::query(self.q("SELECT * FROM api_specs WHERE namespace = ? ORDER BY id ASC"))
                 .bind(namespace)
                 .fetch_all(&self.pool())
-                .await?;
+                .await
+                .map_err(|error| match &error {
+                    sqlx::Error::Decode(_)
+                    | sqlx::Error::ColumnDecode { .. }
+                    | sqlx::Error::ColumnIndexOutOfBounds { .. }
+                    | sqlx::Error::ColumnNotFound(_)
+                    | sqlx::Error::TypeNotFound { .. } => anyhow::Error::new(
+                        SnapshotDataIntegrityError::new("api_spec", None, error.into()),
+                    ),
+                    _ => error.into(),
+                })?;
         let mut specs = Vec::with_capacity(rows.len());
         for row in &rows {
-            specs.push(row_to_api_spec(row)?);
+            // Every production caller (consistent backup export and restore
+            // rollback snapshots) holds namespace admission; validate under
+            // write codec slots so viewer GET bursts cannot stall namespace
+            // admission.
+            let spec_id = row
+                .try_get::<String, _>("id")
+                .ok()
+                .filter(|id| !id.is_empty());
+            let spec = row_to_api_spec_async(row, &crate::admin::api_specs::SPEC_WRITE_CODEC_SLOTS)
+                .await
+                .map_err(|error| {
+                    anyhow::Error::new(SnapshotDataIntegrityError::new("api_spec", spec_id, error))
+                })?;
+            specs.push(spec);
         }
         self.check_slow_query("list_api_specs_with_content", start);
         Ok(specs)
@@ -8535,7 +8599,11 @@ impl DatabaseStore {
             .await?;
         if let Some(restore) = restore {
             let current = self
-                .conditional_namespace_snapshot_tx(&mut tx, graph.namespace)
+                .conditional_namespace_snapshot_tx(
+                    &mut tx,
+                    graph.namespace,
+                    Some(&crate::admin::api_specs::SPEC_WRITE_CODEC_SLOTS),
+                )
                 .await?;
             if current.digest()? != restore.expected {
                 return Err(anyhow::Error::new(NamespacePreconditionFailed));
@@ -10937,10 +11005,12 @@ impl DatabaseStore {
     ) -> Result<(), anyhow::Error> {
         use crate::config::types::{AuthMode, ResponseBodyMode};
 
-        crate::admin::api_specs::external_refs::validate_external_ref_snapshot_pair(
+        crate::admin::api_specs::external_refs::validate_external_ref_snapshot_pair_async(
             spec.external_ref_snapshot.as_deref(),
             spec.external_ref_digest.as_deref(),
+            &crate::admin::api_specs::SPEC_WRITE_CODEC_SLOTS,
         )
+        .await
         .map_err(|_| {
             anyhow::anyhow!("api_specs external-ref snapshot integrity validation failed")
         })?;
@@ -11004,18 +11074,30 @@ impl DatabaseStore {
         } else {
             self.q("SELECT * FROM api_specs WHERE namespace = ? AND id = ? FOR UPDATE")
         };
-        let existing_spec: Option<crate::config::types::ApiSpec> = sqlx::query(&existing_spec_sql)
+        let existing_spec_row = sqlx::query(&existing_spec_sql)
             .bind(&spec.namespace)
             .bind(&spec.id)
             .fetch_optional(&mut *tx)
-            .await?
-            .map(|row| row_to_api_spec(&row))
-            .transpose()?;
-        let previous_declared_assoc_ids = existing_spec
-            .as_ref()
-            .map(crate::admin::api_specs::declared_proxy_plugin_association_ids_from_stored_spec)
-            .unwrap_or_default();
-        let desired_resource_hash = store_canonical_resource_hash(bundle)?;
+            .await?;
+        let existing_spec: Option<crate::config::types::ApiSpec> = match existing_spec_row {
+            Some(row) => Some(
+                row_to_api_spec_async(&row, &crate::admin::api_specs::SPEC_WRITE_CODEC_SLOTS)
+                    .await?,
+            ),
+            None => None,
+        };
+        let previous_declared_assoc_ids = match existing_spec.as_ref() {
+            Some(existing) => {
+                crate::admin::api_specs::declared_proxy_plugin_association_ids_from_stored_spec_async(
+                    existing.clone(),
+                    None,
+                )
+                .await
+                .map_err(anyhow::Error::msg)?
+            }
+            None => HashSet::new(),
+        };
+        let desired_resource_hash = store_canonical_resource_hash_async(bundle.clone()).await?;
 
         let current_resource_hash = if !spec.resource_hash.is_empty() {
             self.current_api_spec_resource_hash_tx(
@@ -11089,7 +11171,11 @@ impl DatabaseStore {
             .await?;
             if let Some(precondition) = precondition {
                 let candidate = self
-                    .conditional_namespace_snapshot_tx(&mut tx, &spec.namespace)
+                    .conditional_namespace_snapshot_tx(
+                        &mut tx,
+                        &spec.namespace,
+                        Some(&crate::admin::api_specs::SPEC_WRITE_CODEC_SLOTS),
+                    )
                     .await?;
                 validate_deployment_candidate(
                     &candidate.config,
@@ -11556,7 +11642,11 @@ impl DatabaseStore {
         }
         if let Some(precondition) = precondition {
             let candidate = self
-                .conditional_namespace_snapshot_tx(&mut tx, &spec.namespace)
+                .conditional_namespace_snapshot_tx(
+                    &mut tx,
+                    &spec.namespace,
+                    Some(&crate::admin::api_specs::SPEC_WRITE_CODEC_SLOTS),
+                )
                 .await?;
             validate_deployment_candidate(&candidate.config, precondition.validation_http_client)
                 .await?;
@@ -11787,7 +11877,9 @@ impl DatabaseStore {
             upstream,
             plugins,
         };
-        crate::admin::api_specs::hash_resource_bundle(&current).map(Some)
+        crate::admin::api_specs::hash_resource_bundle_async(current)
+            .await
+            .map(Some)
     }
 
     async fn ensure_no_external_spec_upstream_refs_tx(
@@ -11891,10 +11983,12 @@ impl DatabaseStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         spec: &crate::config::types::ApiSpec,
     ) -> Result<(), anyhow::Error> {
-        crate::admin::api_specs::external_refs::validate_external_ref_snapshot_pair(
+        crate::admin::api_specs::external_refs::validate_external_ref_snapshot_pair_async(
             spec.external_ref_snapshot.as_deref(),
             spec.external_ref_digest.as_deref(),
+            &crate::admin::api_specs::SPEC_WRITE_CODEC_SLOTS,
         )
+        .await
         .map_err(|_| {
             anyhow::anyhow!("api_specs external-ref snapshot integrity validation failed")
         })?;
@@ -11955,12 +12049,40 @@ impl DatabaseStore {
                 .fetch_optional(&self.pool())
                 .await?;
         match row {
-            Some(r) => Ok(Some(row_to_api_spec(&r)?)),
+            Some(r) => Ok(Some(
+                row_to_api_spec_async(&r, &crate::admin::api_specs::SPEC_READ_CODEC_SLOTS).await?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// Fetch a single ApiSpec by namespace + id for write-side admission (`PUT` /
+    /// `DELETE`), validating any persisted snapshot under `SPEC_WRITE_CODEC_SLOTS`.
+    pub async fn get_api_spec_for_write(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<crate::config::types::ApiSpec>, anyhow::Error> {
+        let row: Option<AnyRow> =
+            sqlx::query(self.q("SELECT * FROM api_specs WHERE namespace = ? AND id = ?"))
+                .bind(namespace)
+                .bind(id)
+                .fetch_optional(&self.pool())
+                .await?;
+        match row {
+            Some(r) => Ok(Some(
+                row_to_api_spec_async(&r, &crate::admin::api_specs::SPEC_WRITE_CODEC_SLOTS).await?,
+            )),
             None => Ok(None),
         }
     }
 
     /// Fetch the ApiSpec that owns a given proxy_id.
+    ///
+    /// Content GETs use [`Self::get_api_spec_content_by_proxy`]; production
+    /// callers of this full-row lookup run under namespace admission (direct
+    /// proxy delete recovery/ownership checks), so snapshot validation uses
+    /// `SPEC_WRITE_CODEC_SLOTS`.
     pub async fn get_api_spec_by_proxy(
         &self,
         namespace: &str,
@@ -11973,7 +12095,104 @@ impl DatabaseStore {
                 .fetch_optional(&self.pool())
                 .await?;
         match row {
-            Some(r) => Ok(Some(row_to_api_spec(&r)?)),
+            Some(r) => Ok(Some(
+                row_to_api_spec_async(&r, &crate::admin::api_specs::SPEC_WRITE_CODEC_SLOTS).await?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// Fetch a single ApiSpec by namespace + id for content retrieval without
+    /// projecting `external_ref_snapshot`, avoiding snapshot gzip decompression
+    /// and SHA-256 verification on Tokio workers during `GET` / `304` reads.
+    pub async fn get_api_spec_content(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<crate::config::types::ApiSpec>, anyhow::Error> {
+        let row: Option<AnyRow> = sqlx::query(self.q(
+            "SELECT id, namespace, proxy_id, spec_version, spec_format, spec_content, \
+             content_encoding, uncompressed_size, content_hash, title, info_version, \
+             description, contact_name, contact_email, license_name, license_identifier, \
+             tags, server_urls, operation_count, resource_hash, external_ref_digest, \
+             created_at, updated_at \
+             FROM api_specs WHERE namespace = ? AND id = ?",
+        ))
+        .bind(namespace)
+        .bind(id)
+        .fetch_optional(&self.pool())
+        .await?;
+        match row {
+            Some(r) => Ok(Some(row_to_api_spec_content(&r)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Fetch an ApiSpec by proxy_id for content retrieval without projecting
+    /// `external_ref_snapshot`.
+    pub async fn get_api_spec_content_by_proxy(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+    ) -> Result<Option<crate::config::types::ApiSpec>, anyhow::Error> {
+        let row: Option<AnyRow> = sqlx::query(self.q(
+            "SELECT id, namespace, proxy_id, spec_version, spec_format, spec_content, \
+             content_encoding, uncompressed_size, content_hash, title, info_version, \
+             description, contact_name, contact_email, license_name, license_identifier, \
+             tags, server_urls, operation_count, resource_hash, external_ref_digest, \
+             created_at, updated_at \
+             FROM api_specs WHERE namespace = ? AND proxy_id = ?",
+        ))
+        .bind(namespace)
+        .bind(proxy_id)
+        .fetch_optional(&self.pool())
+        .await?;
+        match row {
+            Some(r) => Ok(Some(row_to_api_spec_content(&r)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Fetch only `(spec_format, content_hash, uncompressed_size)` by
+    /// namespace + id for conditional `If-None-Match` (`304`) or budget
+    /// preflight checks without transferring blobs.
+    pub async fn get_api_spec_conditional_meta(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<crate::config::db_backend::ApiSpecConditionalMeta>, anyhow::Error> {
+        let row: Option<AnyRow> = sqlx::query(
+            self.q("SELECT spec_format, content_hash, uncompressed_size \
+             FROM api_specs WHERE namespace = ? AND id = ?"),
+        )
+        .bind(namespace)
+        .bind(id)
+        .fetch_optional(&self.pool())
+        .await?;
+        match row {
+            Some(r) => Ok(Some(row_to_api_spec_conditional_meta(&r)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Fetch only `(spec_format, content_hash, uncompressed_size)` by
+    /// namespace + proxy_id for conditional `If-None-Match` (`304`) or budget
+    /// preflight checks without transferring blobs.
+    pub async fn get_api_spec_conditional_meta_by_proxy(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+    ) -> Result<Option<crate::config::db_backend::ApiSpecConditionalMeta>, anyhow::Error> {
+        let row: Option<AnyRow> = sqlx::query(
+            self.q("SELECT spec_format, content_hash, uncompressed_size \
+             FROM api_specs WHERE namespace = ? AND proxy_id = ?"),
+        )
+        .bind(namespace)
+        .bind(proxy_id)
+        .fetch_optional(&self.pool())
+        .await?;
+        match row {
+            Some(r) => Ok(Some(row_to_api_spec_conditional_meta(&r)?)),
             None => Ok(None),
         }
     }
@@ -12972,7 +13191,22 @@ impl DatabaseBackend for DatabaseStore {
         &self,
         namespace: &str,
     ) -> Result<DeploymentSnapshot, anyhow::Error> {
-        self.load_deployment_snapshot_inner(namespace).await
+        self.load_deployment_snapshot_inner(
+            namespace,
+            &crate::admin::api_specs::SPEC_READ_CODEC_SLOTS,
+        )
+        .await
+    }
+
+    async fn load_deployment_snapshot_for_write(
+        &self,
+        namespace: &str,
+    ) -> Result<DeploymentSnapshot, anyhow::Error> {
+        self.load_deployment_snapshot_inner(
+            namespace,
+            &crate::admin::api_specs::SPEC_WRITE_CODEC_SLOTS,
+        )
+        .await
     }
 
     async fn remove_deployment_conditionally(
@@ -12998,6 +13232,17 @@ impl DatabaseBackend for DatabaseStore {
         namespace: &str,
     ) -> Result<ConditionalNamespaceSnapshot, anyhow::Error> {
         DatabaseStore::load_conditional_namespace_snapshot(self, namespace).await
+    }
+
+    async fn load_conditional_namespace_snapshot_for_write(
+        &self,
+        namespace: &str,
+    ) -> Result<ConditionalNamespaceSnapshot, anyhow::Error> {
+        self.load_conditional_namespace_snapshot_with_slots(
+            namespace,
+            &crate::admin::api_specs::SPEC_WRITE_CODEC_SLOTS,
+        )
+        .await
     }
 
     async fn restore_namespace_conditionally(
@@ -13641,12 +13886,52 @@ impl DatabaseBackend for DatabaseStore {
         DatabaseStore::get_api_spec(self, namespace, id).await
     }
 
+    async fn get_api_spec_for_write(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<crate::config::types::ApiSpec>, anyhow::Error> {
+        DatabaseStore::get_api_spec_for_write(self, namespace, id).await
+    }
+
     async fn get_api_spec_by_proxy(
         &self,
         namespace: &str,
         proxy_id: &str,
     ) -> Result<Option<crate::config::types::ApiSpec>, anyhow::Error> {
         DatabaseStore::get_api_spec_by_proxy(self, namespace, proxy_id).await
+    }
+
+    async fn get_api_spec_content(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<crate::config::types::ApiSpec>, anyhow::Error> {
+        DatabaseStore::get_api_spec_content(self, namespace, id).await
+    }
+
+    async fn get_api_spec_content_by_proxy(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+    ) -> Result<Option<crate::config::types::ApiSpec>, anyhow::Error> {
+        DatabaseStore::get_api_spec_content_by_proxy(self, namespace, proxy_id).await
+    }
+
+    async fn get_api_spec_conditional_meta(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<crate::config::db_backend::ApiSpecConditionalMeta>, anyhow::Error> {
+        DatabaseStore::get_api_spec_conditional_meta(self, namespace, id).await
+    }
+
+    async fn get_api_spec_conditional_meta_by_proxy(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+    ) -> Result<Option<crate::config::db_backend::ApiSpecConditionalMeta>, anyhow::Error> {
+        DatabaseStore::get_api_spec_conditional_meta_by_proxy(self, namespace, proxy_id).await
     }
 
     async fn list_api_specs(
@@ -14693,17 +14978,56 @@ pub(crate) fn strip_api_spec_id_from_runtime_config(config: &mut GatewayConfig) 
 ///
 /// This function is used exclusively by the admin-layer api_spec methods.
 /// It must NEVER be called from runtime polling paths.
-fn row_to_api_spec(row: &AnyRow) -> Result<crate::config::types::ApiSpec, anyhow::Error> {
+async fn row_to_api_spec_async(
+    row: &AnyRow,
+    codec_slots: &std::sync::Arc<tokio::sync::Semaphore>,
+) -> Result<crate::config::types::ApiSpec, anyhow::Error> {
     // spec_content is stored as BLOB/BYTEA — sqlx returns Vec<u8>.
     let spec_content: Vec<u8> = row.try_get("spec_content")?;
-    row_to_api_spec_with_content(row, spec_content, true)
+    let spec = row_to_api_spec_with_content(row, spec_content, true)?;
+    crate::admin::api_specs::external_refs::validate_external_ref_snapshot_pair_async(
+        spec.external_ref_snapshot.as_deref(),
+        spec.external_ref_digest.as_deref(),
+        codec_slots,
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("api_specs external-ref snapshot integrity validation failed"))?;
+    Ok(spec)
+}
+
+/// Parse an api_specs content-read row whose query intentionally omitted
+/// `external_ref_snapshot`, keeping `spec_content` while validating only the
+/// summary digest format in O(1).
+fn row_to_api_spec_content(row: &AnyRow) -> Result<crate::config::types::ApiSpec, anyhow::Error> {
+    let spec_content: Vec<u8> = row.try_get("spec_content")?;
+    row_to_api_spec_with_content(row, spec_content, false)
+}
+
+fn row_to_api_spec_conditional_meta(
+    row: &AnyRow,
+) -> Result<crate::config::db_backend::ApiSpecConditionalMeta, anyhow::Error> {
+    use crate::config::types::SpecFormat;
+
+    let spec_format_str: String = row.try_get("spec_format")?;
+    let spec_format = match spec_format_str.as_str() {
+        "json" => SpecFormat::Json,
+        "yaml" => SpecFormat::Yaml,
+        _ => anyhow::bail!("unsupported api_specs.spec_format (expected one of: json, yaml)"),
+    };
+    let content_hash: String = row.try_get("content_hash")?;
+    let uncompressed_size: i64 = row.try_get("uncompressed_size")?;
+    Ok(crate::config::db_backend::ApiSpecConditionalMeta {
+        spec_format,
+        content_hash,
+        uncompressed_size: uncompressed_size.max(0) as u64,
+    })
 }
 
 /// Parse an api_specs list row into an [`ApiSpec`] summary.
 ///
 /// The list endpoint must not pull the compressed `spec_content` blob for
 /// every row. Keep `spec_content` empty here; full document retrieval goes
-/// through [`row_to_api_spec`].
+/// through [`row_to_api_spec_async`].
 fn row_to_api_spec_summary(row: &AnyRow) -> Result<crate::config::types::ApiSpec, anyhow::Error> {
     row_to_api_spec_with_content(row, Vec::new(), false)
 }
@@ -14744,15 +15068,7 @@ fn row_to_api_spec_with_content(
         None
     };
     let external_ref_digest: Option<String> = row.try_get("external_ref_digest")?;
-    if snapshot_projected {
-        crate::admin::api_specs::external_refs::validate_external_ref_snapshot_pair(
-            external_ref_snapshot.as_deref(),
-            external_ref_digest.as_deref(),
-        )
-        .map_err(|_| {
-            anyhow::anyhow!("api_specs external-ref snapshot integrity validation failed")
-        })?;
-    } else {
+    if !snapshot_projected {
         crate::admin::api_specs::external_refs::validate_external_ref_summary_digest(
             external_ref_digest.as_deref(),
         )

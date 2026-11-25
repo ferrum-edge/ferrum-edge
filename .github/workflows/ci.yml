@@ -2212,7 +2212,7 @@ jobs:
         include:
           - shard: application
             # Harness, admin/routing, plugins, and resilience share one runner;
-            # together their measured runtime balances the protocol-heavy shard.
+            # together their measured runtime balances the split protocol shards.
             filters: |
               common::
               scaffolding::
@@ -2287,138 +2287,150 @@ jobs:
               functional_tls_lifecycle_test
               functional_tls_only_test
               functional_client_ip_env_test
-          - shard: protocols
+          # Split the protocol-heavy functional suites into two balanced shards
+          # (`protocols-a` and `protocols-b`), balancing both total test CPU
+          # (~740–781s vs ~786–835s across recent hosted runs) and the serial
+          # `http3-serial` nextest group (~4.2–4.5m vs ~4.6–4.7m) so each
+          # protocol test step finishes in ~7.5–8.3 min instead of ~16 min.
+          # (`data-plane` remains bounded on slow runs by
+          # `test_admin_mongodb_runtime_resource_crud_matrix`.)
+          - shard: protocols-a
             filters: |
-              functional_cors_protocol_test
+              functional_ai_stream_router_boundary_test
+              functional_allowed_methods_logging_test
+              functional_body_size_limits_test
+              functional_chunked_response_size_limits_test
+              functional_consumer_assertion_namespace_test
+              functional_destination_active_requests_grpc_test
+              functional_destination_active_requests_test
+              functional_early_upload_deadline_test
               functional_grpc_message_metrics_test
-              functional_grpc_test
               functional_grpc_web_passthrough_test
+              functional_h1_h2_auth_lifetime_test
               functional_h2_response_trailers_test
+              functional_h3_early_data_classification_test
+              functional_h3_grpc_web_test
+              functional_h3_mtls_early_data_test
               functional_h3_soap_utf16_test
+              functional_header_read_timeout_test
+              functional_header_size_limits_test
+              functional_http1_direct_pool_test
               functional_http3_connect_udp_test
+              functional_injector_serving_test
               functional_key_auth_query_test
               functional_max_forwards_test
+              functional_mcp_gateway_admission_test
+              functional_otel_attempt_spans_protocols_test
+              functional_passthrough_test
+              functional_policy_path_canonicalization_test
+              functional_protocol_h2_body_limit_config_test
+              functional_protocol_h3_body_limit_config_test
               functional_proxy_hop_limit_test
+              functional_request_body_limits_test
               functional_request_mirror_admission_test
+              functional_request_termination_h3_test
+              functional_response_body_limits_test
+              functional_response_mock_grpc_exclusion_test
+              functional_route_miss_correlation_test
+              functional_stream_listener_failure_test
+              functional_streaming_outcome_accounting_test
+              functional_streaming_request_body_limits_test
+              functional_streaming_response_body_limits_test
+              functional_tcp_proxy_test
+              functional_transaction_debugger_body_capture_test
+              functional_udp_proxy_test
+              functional_url_query_limits_test
+              functional_websocket_test
+              scripted_backend_h3_tests
+              scripted_backend_udp_tests
+          - shard: protocols-b
+            filters: |
+              functional_allowed_methods_test
+              functional_chunked_request_size_limits_test
+              functional_client_write_timeout_test
+              functional_cors_protocol_test
+              functional_destination_active_requests_h3_test
+              functional_early_data_test
+              functional_forwarded_via_headers_test
+              functional_grpc_test
+              functional_h3_auth_lifetime_test
+              functional_h3_authority_validation_test
+              functional_h3_drain_refusal_hooks_test
+              functional_h3_grpc_streaming_test
+              functional_h3_local_policy_test
+              functional_header_limits_test
+              functional_load_testing_replay_test
+              functional_mcp_aggregate_sse_test
+              functional_openapi_client_contract_test
+              functional_pre_routing_refusal_framing_test
+              functional_protocol_body_limit_config_test
+              functional_protocol_h3_request_body_test
+              functional_query_param_limits_test
+              functional_request_buffer_budget_test
               functional_request_mirror_query_parity_test
               functional_request_transformer_query_test
-              functional_consumer_assertion_namespace_test
-              functional_ai_stream_router_boundary_test
-              functional_openapi_client_contract_test
-              functional_load_testing_replay_test
-              functional_passthrough_test
+              functional_response_caching_conditional_test
+              functional_response_mock_semantics_test
+              functional_response_protocol_managed_headers_test
+              functional_soap_preauth_deadline_matrix_test
               functional_sse_test
-              functional_mcp_aggregate_sse_test
-              functional_mcp_gateway_admission_test
-              functional_stream_listener_failure_test
-              functional_tcp_proxy_test
+              functional_streaming_latency_tracking_test
+              functional_subset_http_policy_test
+              functional_tcp_idle_timeout_env_test
               functional_tcp_splice_backend_timeout_test
-              functional_udp_proxy_test
               functional_unix_backend_test
-              functional_http1_direct_pool_test
-              functional_websocket_test
+              functional_waf_unlisted_content_type_grpc_test
+              functional_waf_unlisted_content_type_h3_test
+              functional_websocket_connection_limit_test
+              functional_websocket_frame_limit_test
+              functional_websocket_limits_test
+              functional_ws_origin_test
+              functional_ws_permessage_deflate_test
               scripted_backend_h2_tests
-              scripted_backend_h3_tests
               scripted_backend_matrix_tests
               scripted_backend_network_sim_tests
               scripted_backend_streaming_latency_tests
               scripted_backend_tests
-              scripted_backend_udp_tests
-              functional_query_param_limits_test
-              functional_streaming_request_body_limits_test
-              functional_streaming_response_body_limits_test
-              functional_tcp_idle_timeout_env_test
-              functional_websocket_frame_limit_test
-              functional_websocket_connection_limit_test
-              functional_header_read_timeout_test
-              functional_client_write_timeout_test
-              functional_injector_serving_test
-              functional_response_body_limits_test
-              functional_request_body_limits_test
-              functional_request_buffer_budget_test
-              functional_header_limits_test
-              functional_early_data_test
-              functional_ws_origin_test
-              functional_ws_permessage_deflate_test
-              functional_allowed_methods_test
-              functional_allowed_methods_logging_test
-              functional_route_miss_correlation_test
-              functional_transaction_debugger_body_capture_test
-              functional_forwarded_via_headers_test
-              functional_streaming_latency_tracking_test
-              functional_streaming_outcome_accounting_test
-              functional_chunked_request_size_limits_test
-              functional_chunked_response_size_limits_test
-              functional_body_size_limits_test
-              functional_url_query_limits_test
-              functional_pre_routing_refusal_framing_test
-              functional_header_size_limits_test
-              functional_protocol_h3_request_body_test
-              functional_protocol_h3_body_limit_config_test
-              functional_protocol_h2_body_limit_config_test
-              functional_protocol_body_limit_config_test
-              functional_early_upload_deadline_test
-              functional_soap_preauth_deadline_matrix_test
-              functional_h1_h2_auth_lifetime_test
-              functional_h3_auth_lifetime_test
-              functional_h3_authority_validation_test
-              functional_h3_drain_refusal_hooks_test
-              functional_h3_local_policy_test
-              functional_subset_http_policy_test
-              functional_destination_active_requests_test
-              functional_destination_active_requests_grpc_test
-              functional_destination_active_requests_h3_test
-              functional_h3_grpc_web_test
-              functional_h3_grpc_streaming_test
-              functional_h3_early_data_classification_test
-              functional_h3_mtls_early_data_test
-              functional_request_termination_h3_test
-              functional_policy_path_canonicalization_test
-              functional_response_caching_conditional_test
-              functional_response_mock_grpc_exclusion_test
-              functional_response_mock_semantics_test
-              functional_response_protocol_managed_headers_test
-              functional_waf_unlisted_content_type_grpc_test
-              functional_waf_unlisted_content_type_h3_test
-              functional_websocket_limits_test
-              functional_otel_attempt_spans_protocols_test
           # The service-backed shards run serially (`nextest_jobs: 1`) against
           # one set of Redis/MongoDB/PostgreSQL/MySQL containers per runner, so
-          # the old single data-plane shard was the functional critical path
-          # (~15 min of serial test time after Build Test Artifacts). Two
-          # runners, each with its own containers, halve it. Balance by the
-          # hosted per-module durations recorded in
-          # docs/ci_pr_validation_review_2026_09_24.md; `data_services` (not
+          # the old single data-plane shard was the functional critical path.
+          # Two runners, each with its own containers, reduce the imbalance:
+          # `functional_admin_crud_resources_test` runs alone in `data-plane`
+          # (~457–763s, dominated by `test_admin_mongodb_runtime_resource_crud_matrix`
+          # at ~436–741s on recent hosted runs) while the remaining DB/runtime
+          # suites share `data-plane-runtime` (~530–560s). `data_services` (not
           # the shard name) gates the containers and backend URLs.
           - shard: data-plane
             # Serialized because DP functional tests bind exclusive ports and
-            # race when nextest runs this shard in parallel. Hosts the required
-            # PostgreSQL/MySQL/MongoDB/Redis persistence-parity cells documented
-            # in docs/functional_testing_database.md.
+            # race when nextest runs this shard in parallel. Runs
+            # `functional_admin_crud_resources_test` alone so no other module
+            # stacks on top of `test_admin_mongodb_runtime_resource_crud_matrix`.
             nextest_jobs: 1
             data_services: true
             filters: |
               functional_admin_crud_resources_test
-              functional_database_parity_test
-              functional_database_test
-              functional_db_failover_test
-              functional_db_tls_test
-              functional_db_upstream_test
-              functional_mongodb_test
           - shard: data-plane-runtime
             # Same serialization and service containers as `data-plane`: DB
-            # outage/pause, Redis rate limiting, namespace, CP/DP and mesh-mode
-            # suites.
+            # persistence-parity/failover/outage/TLS/MongoDB/upstream suites,
+            # Redis rate limiting, namespace, CP/DP, and mesh-mode suites.
+            # Hosts the required PostgreSQL/MySQL/MongoDB/Redis persistence-
+            # parity cells documented in docs/functional_testing_database.md.
             nextest_jobs: 1
             data_services: true
             filters: |
               functional_capability_registry_test
               functional_cp_dp_resilience_test
               functional_cp_dp_test
+              functional_database_parity_test
+              functional_database_test
+              functional_db_failover_test
               functional_db_outage_test
+              functional_db_tls_test
+              functional_db_upstream_test
               functional_gateway_trust_bundle_ha_test
               functional_mesh_mode_test
               functional_mesh_stock_xds_test
+              functional_mongodb_test
               functional_namespace_test
               functional_plugin_quarantine_test
               functional_redis_rate_limiting_test
@@ -2937,6 +2949,21 @@ jobs:
           echo "data-plane services ready (redis:6379, mongo:27017, mongo-rs:27020, mongo-tls:27018, mongo-mtls:27019, postgres:5432, mysql:3306, pg-tls:15432, mysql-tls:13306)"
           echo "parity backends: sqlite,postgres,mysql,mongodb,redis"
           echo "parity behaviors: admin-crud,polling-delete,namespace-isolation,migrate-idempotent,concurrent-mutations,connectivity-recovery,tls-modes"
+
+      - name: Verify functional shard coverage guard
+        # Run the shard-coverage drift guard unconditionally with an explicit
+        # nextest selector independent of `matrix.filters`, so removing
+        # `functional_ci_shard_coverage_test` from the matrix can never
+        # silently disable the guard itself.
+        if: matrix.shard == 'application'
+        run: |
+          set -e
+          archive_file="functional-tests-${RUNNER_OS}-${RUNNER_ARCH}.tar.zst"
+          cargo nextest run \
+            --archive-file "$archive_file" \
+            --workspace-remap . \
+            --no-tests=fail \
+            -E 'test(=functional::functional_ci_shard_coverage_test::ci_workflow_assigns_every_functional_test_to_a_shard)'
 
       - name: Run functional test shard
         # ── Single nextest invocation per shard ───────────────────────────
@@ -6979,6 +7006,7 @@ jobs:
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_lint == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-26.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -6992,19 +7020,32 @@ jobs:
           cache-on-failure: "false"
           components: clippy
 
+      # Best-effort, additive swap headroom (matching fips-clippy / fips-test-build):
+      # gives `--all-targets` clippy paging headroom against future crate growth
+      # without making swap creation a hard prerequisite for Lint.
+      - name: Extend runner swap for the all-targets clippy lint
+        run: |
+          set -uo pipefail
+          ferrum_swap="/mnt/ferrum-swapfile"
+          if sudo fallocate -l 12G "$ferrum_swap" \
+            && sudo chmod 600 "$ferrum_swap" \
+            && sudo mkswap "$ferrum_swap" \
+            && sudo swapon "$ferrum_swap"; then
+            echo "Runner swap enlarged for Lint (additive 12 GiB Ferrum swapfile)."
+          else
+            echo "::warning::could not enlarge runner swap; continuing on image swap with CARGO_BUILD_JOBS=1" >&2
+            sudo swapoff "$ferrum_swap" 2>/dev/null || true
+            sudo rm -f "$ferrum_swap" || true
+          fi
+          free -h
+
       - name: Run clippy
         # Keep all-target lint below the hosted runner's peak-memory limit on
-        # cold caches. Large integration targets can otherwise overlap several
-        # clippy-driver processes and starve the runner heartbeat before Cargo
-        # has a chance to emit a diagnostic (the step then dies with exit 143
-        # and no output). Clippy does not need DWARF, so omit debuginfo (same
-        # as the test-artifact archives) to lower per-process RSS. Two parallel
-        # jobs were still enough to overlap two large integration targets on a
-        # cold cache once the test tree grew (2026-09-17: four consecutive
-        # kills on one branch, none on branches with a warm `ci-lint` cache),
-        # and the cache is only saved on success, so a cold branch never
-        # warmed. One job removes the overlap entirely; the cost is wall
-        # clock, not coverage.
+        # cold caches (2026-09-17 recorded four consecutive exit-143 kills at
+        # two jobs on a cold cache). Clippy does not need DWARF, so omit
+        # debuginfo to lower per-process RSS, and keep CARGO_BUILD_JOBS=1 so
+        # large integration targets never overlap. Lint stays off the critical
+        # path on warm runs; on cold runs it finishes close to `data-plane`.
         env:
           CARGO_BUILD_JOBS: 1
         run: |

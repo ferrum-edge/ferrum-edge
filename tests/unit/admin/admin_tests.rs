@@ -1132,7 +1132,7 @@ fn health_detail_blocks_are_built_only_for_the_detailed_tier() {
     let source = include_str!("../../../src/admin/mod.rs");
     let health = admin_source_section(
         source,
-        "if path == \"/health\" || path == \"/status\" {",
+        "if (path == \"/health\" || path == \"/status\") && matches!(method, Method::GET | Method::HEAD) {",
         "// Overload status.",
     );
     for call in [
@@ -1161,4 +1161,1265 @@ fn health_detail_blocks_are_built_only_for_the_detailed_tier() {
             "{call} must be built only inside a `detailed` gate; enclosing headers: {headers:?}"
         );
     }
+}
+
+async fn send_raw_admin_request_with_headers(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    extra_headers: &[(&str, &str)],
+    body: &str,
+) -> String {
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect to admin listener");
+    let mut request = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n");
+    if let Some(tok) = token {
+        request.push_str(&format!("Authorization: Bearer {tok}\r\n"));
+    }
+    for (k, v) in extra_headers {
+        request.push_str(&format!("{k}: {v}\r\n"));
+    }
+    request.push_str(&format!(
+        "Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    ));
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write admin request");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .expect("read admin response");
+    String::from_utf8(response).expect("admin response should be utf-8")
+}
+
+fn raw_http_json_body(response: &str) -> serde_json::Value {
+    let (_, body) = response
+        .split_once("\r\n\r\n")
+        .expect("HTTP response header/body separator");
+    serde_json::from_str(body).unwrap_or_else(|e| panic!("invalid JSON body ({e}): {body}"))
+}
+
+#[tokio::test]
+async fn health_live_and_status_reject_non_get_methods() {
+    let config = TestConfig::default();
+    let admin_state = create_test_admin_state(&config);
+    let listener = tokio::net::TcpListener::bind(config.admin_addr)
+        .await
+        .expect("bind admin listener");
+    let addr = listener.local_addr().expect("admin listener addr");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let server = tokio::spawn(async move {
+        ferrum_edge::admin::serve_admin_on_listener(
+            listener,
+            admin_state,
+            shutdown_rx,
+            None,
+            ferrum_edge::admin::AdminConnLimiter::unlimited(),
+        )
+        .await
+    });
+
+    for path in ["/live", "/health", "/status"] {
+        let get_resp = send_raw_admin_request_with_headers(addr, "GET", path, None, &[], "").await;
+        assert_eq!(
+            raw_http_status(&get_resp),
+            200,
+            "GET {path} should succeed anonymously"
+        );
+
+        let head_resp =
+            send_raw_admin_request_with_headers(addr, "HEAD", path, None, &[], "").await;
+        assert_eq!(
+            raw_http_status(&head_resp),
+            200,
+            "HEAD {path} should succeed anonymously"
+        );
+        let (head_headers, head_body) = head_resp
+            .split_once("\r\n\r\n")
+            .expect("HTTP response header/body separator");
+        assert!(
+            head_body.is_empty(),
+            "HEAD {path} must return an empty HTTP/1.1 body, got: {head_body:?}"
+        );
+        assert!(
+            head_headers
+                .lines()
+                .any(|line| line.to_ascii_lowercase().starts_with("content-length:")),
+            "HEAD {path} must preserve Content-Length header: {head_headers}"
+        );
+
+        let post_resp =
+            send_raw_admin_request_with_headers(addr, "POST", path, None, &[], "").await;
+        assert_eq!(
+            raw_http_status(&post_resp),
+            401,
+            "unauthenticated POST {path} must not bypass auth via GET/HEAD probe routes: {post_resp}"
+        );
+    }
+
+    let admin_token = generate_test_token_with_role(&config, "admin-user", "admin");
+    for path in ["/live", "/health", "/status"] {
+        let post_resp =
+            send_raw_admin_request_with_headers(addr, "POST", path, Some(&admin_token), &[], "")
+                .await;
+        assert_ne!(
+            raw_http_status(&post_resp),
+            200,
+            "authenticated POST {path} must not be treated as a GET probe: {post_resp}"
+        );
+    }
+
+    shutdown_tx.send(true).expect("signal admin shutdown");
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn head_probes_return_empty_body_and_end_stream_over_http2() {
+    let config = TestConfig::default();
+    let admin_state = create_test_admin_state(&config);
+    let listener = tokio::net::TcpListener::bind(config.admin_addr)
+        .await
+        .expect("bind admin listener");
+    let addr = listener.local_addr().expect("admin listener addr");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let server = tokio::spawn(async move {
+        ferrum_edge::admin::serve_admin_on_listener(
+            listener,
+            admin_state,
+            shutdown_rx,
+            None,
+            ferrum_edge::admin::AdminConnLimiter::unlimited(),
+        )
+        .await
+    });
+
+    let stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect to admin listener over HTTP/2");
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(
+        hyper_util::rt::TokioExecutor::new(),
+        hyper_util::rt::TokioIo::new(stream),
+    )
+    .await
+    .expect("HTTP/2 h2c handshake");
+    let conn_task = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    for path in ["/live", "/health", "/status"] {
+        let req = hyper::Request::builder()
+            .method(hyper::Method::HEAD)
+            .uri(format!("http://localhost{path}"))
+            .body(http_body_util::Empty::<bytes::Bytes>::new())
+            .expect("build HEAD request");
+        let resp = sender
+            .send_request(req)
+            .await
+            .unwrap_or_else(|e| panic!("HTTP/2 HEAD {path} failed: {e}"));
+        assert_eq!(
+            resp.status(),
+            hyper::StatusCode::OK,
+            "HTTP/2 HEAD {path} should return 200"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(hyper::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json"),
+            "HTTP/2 HEAD {path} must preserve Content-Type"
+        );
+        let content_length: usize = resp
+            .headers()
+            .get(hyper::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("HTTP/2 HEAD {path} must preserve numeric Content-Length"));
+        assert!(
+            content_length > 0,
+            "HTTP/2 HEAD {path} Content-Length should reflect GET payload size"
+        );
+        assert!(
+            hyper::body::Body::is_end_stream(resp.body()),
+            "HTTP/2 HEAD {path} must signal END_STREAM on HEADERS frame without DATA frames"
+        );
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .unwrap_or_else(|e| panic!("HTTP/2 HEAD {path} body collection failed: {e}"))
+            .to_bytes();
+        assert!(
+            body.is_empty(),
+            "HTTP/2 HEAD {path} must terminate with END_STREAM and zero body bytes, got {} bytes",
+            body.len()
+        );
+    }
+
+    // Unauthenticated HEAD on a protected route returns 401 with END_STREAM on
+    // the HEADERS frame and zero body bytes.
+    let unauth_req = hyper::Request::builder()
+        .method(hyper::Method::HEAD)
+        .uri("http://localhost/proxies")
+        .body(http_body_util::Empty::<bytes::Bytes>::new())
+        .expect("build HEAD /proxies request");
+    let unauth_resp = sender
+        .send_request(unauth_req)
+        .await
+        .expect("HTTP/2 HEAD /proxies failed");
+    assert_eq!(unauth_resp.status(), hyper::StatusCode::UNAUTHORIZED);
+    assert!(
+        hyper::body::Body::is_end_stream(unauth_resp.body()),
+        "HTTP/2 HEAD 401 must signal END_STREAM on HEADERS frame"
+    );
+    let unauth_body = unauth_resp
+        .into_body()
+        .collect()
+        .await
+        .expect("HTTP/2 HEAD /proxies body collection failed")
+        .to_bytes();
+    assert!(
+        unauth_body.is_empty(),
+        "HTTP/2 HEAD 401 must carry zero body bytes"
+    );
+
+    drop(sender);
+    let _ = conn_task.await;
+    shutdown_tx.send(true).expect("signal admin shutdown");
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn head_withdrawn_client_trust_returns_401_end_stream_over_http2() {
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll, Waker};
+
+    struct PausedReadIo {
+        inner: tokio::io::DuplexStream,
+        paused: Arc<AtomicBool>,
+        read_waker: Arc<std::sync::Mutex<Option<Waker>>>,
+        wrote_while_paused: Arc<tokio::sync::Notify>,
+    }
+
+    impl tokio::io::AsyncRead for PausedReadIo {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.paused.load(Ordering::Acquire) {
+                *self.read_waker.lock().expect("read waker lock") = Some(cx.waker().clone());
+                if self.paused.load(Ordering::Acquire) {
+                    return Poll::Pending;
+                }
+            }
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for PausedReadIo {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
+            if matches!(poll, Poll::Ready(Ok(n)) if n > 0) && self.paused.load(Ordering::Acquire) {
+                self.wrote_while_paused.notify_waiters();
+            }
+            poll
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    let config = TestConfig::default();
+    let admin_state = create_test_admin_state(&config);
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let paused = Arc::new(AtomicBool::new(false));
+    let read_waker = Arc::new(std::sync::Mutex::new(None));
+    let wrote_while_paused = Arc::new(tokio::sync::Notify::new());
+    let gated_client_io = PausedReadIo {
+        inner: client_io,
+        paused: Arc::clone(&paused),
+        read_waker: Arc::clone(&read_waker),
+        wrote_while_paused: Arc::clone(&wrote_while_paused),
+    };
+
+    let trust_session = ferrum_edge::_test_support::new_admin_client_trust_session_for_test();
+    let server_session = trust_session.clone();
+    let server = tokio::spawn(async move {
+        ferrum_edge::_test_support::serve_admin_io_with_client_trust_for_test(
+            server_io,
+            admin_state,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            server_session,
+        )
+        .await;
+    });
+
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(
+        hyper_util::rt::TokioExecutor::new(),
+        hyper_util::rt::TokioIo::new(gated_client_io),
+    )
+    .await
+    .expect("HTTP/2 h2c handshake");
+    let conn_task = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    // Confirm the connection is established while client trust is live.
+    let get_req = hyper::Request::builder()
+        .method(hyper::Method::GET)
+        .uri("http://localhost/live")
+        .body(http_body_util::Empty::<bytes::Bytes>::new())
+        .expect("build GET /live request");
+    let get_resp = sender
+        .send_request(get_req)
+        .await
+        .expect("HTTP/2 GET /live while live");
+    assert_eq!(get_resp.status(), hyper::StatusCode::OK);
+    let _ = get_resp
+        .into_body()
+        .collect()
+        .await
+        .expect("collect GET body");
+
+    // Pause client reads so the client flushes stream 3's HEADERS frame before
+    // it can read and ACK the server's graceful-shutdown GOAWAY+PING; retire
+    // trust synchronously before yielding so `session.is_retired()` is
+    // guaranteed true when `serve_admin_io` dispatches the HEAD stream.
+    let write_seen = wrote_while_paused.notified();
+    tokio::pin!(write_seen);
+    write_seen.as_mut().enable();
+    paused.store(true, Ordering::Release);
+
+    let head_req = hyper::Request::builder()
+        .method(hyper::Method::HEAD)
+        .uri("http://localhost/live")
+        .body(http_body_util::Empty::<bytes::Bytes>::new())
+        .expect("build HEAD /live request");
+    let head_fut = sender.send_request(head_req);
+    trust_session.cancellation_token().cancel();
+
+    write_seen.await;
+    paused.store(false, Ordering::Release);
+    if let Some(waker) = read_waker.lock().expect("read waker lock").take() {
+        waker.wake();
+    }
+
+    let head_resp = head_fut
+        .await
+        .expect("HTTP/2 HEAD /live after trust withdrawal");
+    assert_eq!(
+        head_resp.status(),
+        hyper::StatusCode::UNAUTHORIZED,
+        "retired client-trust HEAD must return 401"
+    );
+    assert!(
+        head_resp
+            .headers()
+            .get(hyper::header::WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.contains("ClientCertificate")),
+        "retired client-trust 401 must carry client-certificate challenge"
+    );
+    assert!(
+        hyper::body::Body::is_end_stream(head_resp.body()),
+        "retired client-trust HTTP/2 HEAD 401 must signal END_STREAM on HEADERS frame"
+    );
+    let head_body = head_resp
+        .into_body()
+        .collect()
+        .await
+        .expect("collect retired HEAD body")
+        .to_bytes();
+    assert!(
+        head_body.is_empty(),
+        "retired client-trust HTTP/2 HEAD 401 must carry zero body bytes"
+    );
+
+    drop(sender);
+    let _ = conn_task.await;
+    let _ = server.await;
+}
+
+#[test]
+fn content_type_allowed_enforces_concrete_rfc9110_media_types() {
+    use ferrum_edge::_test_support::api_spec_external_ref_content_type_allowed_for_test as content_type_allowed;
+
+    for allowed in [
+        "application/json",
+        "application/json; charset=utf-8",
+        "application/yaml",
+        "application/vnd.oai.openapi+json",
+        "application/vnd.oai.openapi+yaml; charset=\"utf-8\"",
+        "text/plain",
+    ] {
+        assert!(
+            content_type_allowed(allowed),
+            "expected allowed media type: {allowed:?}"
+        );
+    }
+
+    for rejected in [
+        "application/json; charset=",
+        "application/json;",
+        "*/vendor+json",
+        "*/*",
+        "application/*",
+        "application/foo/bar+json",
+        "application/+json",
+        "text/html",
+    ] {
+        assert!(
+            !content_type_allowed(rejected),
+            "expected rejected media type: {rejected:?}"
+        );
+    }
+}
+
+#[test]
+fn head_withdrawn_trust_401_restore_partial_clear_and_tls_settlement_invariants() {
+    let admin_source = include_str!("../../../src/admin/mod.rs");
+    let retired_at = admin_source
+        .find("session.is_retired()")
+        .expect("withdrawn client trust guard");
+    let wrap_at = retired_at
+        + admin_source[retired_at..]
+            .find("GuardedAdminBody::wrap_response(response, guard)")
+            .expect("GuardedAdminBody convergence point");
+    let transport_tail = &admin_source[retired_at..wrap_at];
+    assert!(
+        transport_tail.contains("strip_head_response_body(&mut response)"),
+        "withdrawn-trust 401 and dispatched responses must converge before HEAD body stripping"
+    );
+
+    let restore_at = admin_source
+        .find("if clear_may_be_partial")
+        .expect("non-atomic potentially partial clear branch");
+    let restore_end = restore_at
+        + admin_source[restore_at..]
+            .find("};")
+            .expect("end of rollback status selection");
+    let restore_slice = &admin_source[restore_at..restore_end];
+    assert!(
+        restore_slice.contains("\"skipped_after_intervening_write\""),
+        "potentially partial non-atomic restore clear with intervening write must report skipped_after_intervening_write"
+    );
+
+    let tls_source = include_str!("../../../src/admin/tls_management.rs");
+    for helper in [
+        "async fn respond_managed_upsert(",
+        "async fn respond_managed_update(",
+        "async fn respond_acme_certificate_upsert(",
+        "async fn respond_acme_certificate_update(",
+        "pub(super) async fn handle_delete_managed(",
+        "pub(super) async fn handle_delete_acme_certificate(",
+    ] {
+        let start = tls_source
+            .find(helper)
+            .unwrap_or_else(|| panic!("missing {helper}"));
+        let end = start
+            + tls_source[start..]
+                .find("\n}\n")
+                .unwrap_or_else(|| panic!("end of {helper}"));
+        let body = &tls_source[start..end];
+        assert!(
+            body.contains("spawn_with_request_slot("),
+            "{helper} must transfer settlement and audit to spawn_with_request_slot"
+        );
+        assert!(
+            body.contains("request_managed_source_reloads()"),
+            "{helper} must trigger watcher reloads inside detached settlement"
+        );
+        assert!(
+            body.contains("super::record_operation_audit("),
+            "{helper} must record its success audit inside detached settlement"
+        );
+    }
+    for helper in [
+        "pub(super) async fn handle_create_acme_order(",
+        "pub(super) async fn handle_delete_acme_order(",
+        "pub(super) async fn handle_renew_acme_certificate(",
+    ] {
+        let start = tls_source
+            .find(helper)
+            .unwrap_or_else(|| panic!("missing {helper}"));
+        let end = start
+            + tls_source[start..]
+                .find("\n}\n")
+                .unwrap_or_else(|| panic!("end of {helper}"));
+        let body = &tls_source[start..end];
+        assert!(
+            body.contains("spawn_with_request_slot("),
+            "{helper} must transfer settlement and audit to spawn_with_request_slot"
+        );
+        assert!(
+            body.contains("super::record_operation_audit("),
+            "{helper} must record its success audit inside detached settlement"
+        );
+    }
+    let inv_start = tls_source
+        .find("pub(super) async fn handle_inventory(")
+        .expect("handle_inventory");
+    let inv_end = inv_start
+        + tls_source[inv_start..]
+            .find("\n}\n")
+            .expect("end of handle_inventory");
+    let inv_body = &tls_source[inv_start..inv_end];
+    assert!(
+        inv_body.contains("TLS_INVENTORY_SLOTS"),
+        "handle_inventory must bound blocking concurrency with TLS_INVENTORY_SLOTS"
+    );
+}
+
+#[tokio::test]
+async fn admin_response_budget_chunks_holds_permit_and_rejects_oversized_payloads() {
+    // Oversized payloads (> budget capacity) must be refused rather than clamped
+    // down to fit, concurrent bodies exceeding remaining budget must fail fast,
+    // and budget reservations must shrink/grow atomically.
+    let (oversized_refused, first_admitted, second_refused, shrink_and_grow_ok) =
+        ferrum_edge::_test_support::check_admin_response_budget_limits_for_test(
+            256,
+            300 * 1024,
+            180 * 1024,
+        );
+    assert!(
+        oversized_refused,
+        "payload exceeding per-connection budget must be rejected without clamping"
+    );
+    assert!(
+        first_admitted,
+        "first fitting payload must be admitted by pre-check"
+    );
+    assert!(
+        second_refused,
+        "second payload exceeding remaining budget must be rejected"
+    );
+    assert!(
+        shrink_and_grow_ok,
+        "budget reservation must shrink/grow cleanly and reject overflow growth"
+    );
+
+    // Preflight must atomically reserve budget (returning 503 when remaining
+    // budget is below uncompressed_size) and must NOT short-circuit
+    // `If-None-Match: *` to 304 when cross-format conversion is requested.
+    let (partial_503, remaining_after_503) =
+        ferrum_edge::_test_support::check_api_spec_read_preflight_for_test(
+            ferrum_edge::config::types::SpecFormat::Json,
+            200 * 1024,
+            512 * 1024,
+            "application/json",
+            None,
+            256,
+            100 * 1024,
+        );
+    assert_eq!(partial_503, Some(503));
+    assert_eq!(remaining_after_503, 156);
+    let (star_convert_status, remaining_after_star_reserve) =
+        ferrum_edge::_test_support::check_api_spec_read_preflight_for_test(
+            ferrum_edge::config::types::SpecFormat::Json,
+            100 * 1024,
+            512 * 1024,
+            "application/yaml",
+            Some("*"),
+            256,
+            0,
+        );
+    assert_eq!(
+        star_convert_status, None,
+        "If-None-Match: * must not bypass capped format conversion"
+    );
+    assert_eq!(
+        remaining_after_star_reserve, 156,
+        "preflight proceed must atomically reserve expected bytes before codec admission"
+    );
+    let (star_verbatim_status, remaining_after_verbatim_304) =
+        ferrum_edge::_test_support::check_api_spec_read_preflight_for_test(
+            ferrum_edge::config::types::SpecFormat::Json,
+            100 * 1024,
+            512 * 1024,
+            "application/json",
+            Some("*"),
+            256,
+            256 * 1024,
+        );
+    assert_eq!(
+        star_verbatim_status,
+        Some(304),
+        "verbatim If-None-Match: * within cap must still fast-path 304 on a full connection"
+    );
+    assert_eq!(remaining_after_verbatim_304, 0);
+    let (oversized_star_status, remaining_after_oversized) =
+        ferrum_edge::_test_support::check_api_spec_read_preflight_for_test(
+            ferrum_edge::config::types::SpecFormat::Json,
+            600 * 1024,
+            512 * 1024,
+            "application/json",
+            Some("*"),
+            256,
+            0,
+        );
+    assert_eq!(
+        oversized_star_status,
+        Some(500),
+        "stored row exceeding max_decompress_bytes must fail closed with 500 rather than retryable 503"
+    );
+    assert_eq!(remaining_after_oversized, 256);
+
+    // Mid-stream gzip decompression and cross-format conversion must classify
+    // connection-budget exhaustion as 503 while preserving 500 when output
+    // exceeds max_bytes.
+    let large_json = format!(
+        r#"{{"openapi":"3.1.0","info":{{"title":"{}","version":"1.0.0"}},"paths":{{}}}}"#,
+        "a".repeat(20 * 1024)
+    );
+    let (budget_503_decode, budget_503_convert) =
+        ferrum_edge::_test_support::check_api_spec_budgeted_decode_and_convert_for_test(
+            large_json.as_bytes(),
+            64 * 1024,
+            64,
+            60 * 1024,
+        );
+    assert_eq!(
+        budget_503_decode,
+        Some(503),
+        "streaming gzip decode exceeding remaining connection budget must abort with 503"
+    );
+    assert_eq!(
+        budget_503_convert,
+        Some(503),
+        "streaming format conversion exceeding remaining connection budget must abort with 503"
+    );
+    let (cap_500_decode, cap_500_convert) =
+        ferrum_edge::_test_support::check_api_spec_budgeted_decode_and_convert_for_test(
+            large_json.as_bytes(),
+            4 * 1024,
+            64,
+            0,
+        );
+    assert_eq!(
+        cap_500_decode,
+        Some(500),
+        "streaming gzip decode exceeding max_bytes must still fail closed with 500"
+    );
+    assert_eq!(
+        cap_500_convert,
+        Some(500),
+        "streaming format conversion exceeding max_bytes must still fail closed with 500"
+    );
+
+    // Multi-write LimitedWriter capacity and permit accounting must never
+    // allocate beyond reserved connection-budget permits.
+    ferrum_edge::_test_support::check_api_spec_limited_writer_capacity_for_test()
+        .expect("LimitedWriter multi-write capacity/permit accounting");
+
+    // End-to-end HTTP response verification through spec_content_response_async
+    // with both max_decompress_bytes and connection budget active (including
+    // understated gzip size, cross-format If-None-Match: *, multi-chunk
+    // YAML->JSON streaming, and 406 single-format q=0 wording).
+    ferrum_edge::_test_support::exercise_api_spec_content_response_limits_for_test()
+        .await
+        .expect("spec_content_response_async dual-limit and streaming checks");
+
+    // A 200 KiB budgeted body must yield multiple <= 64 KiB chunks, keep the
+    // permit reserved across intermediate frames AND while queued frames remain
+    // held after `GuardedAdminBody` drops, release on frame drop or early
+    // mid-stream drop, and release immediately when stripped for HEAD.
+    let audit = ferrum_edge::_test_support::exercise_admin_response_budget_wrapper_for_test(
+        256,
+        200 * 1024,
+    )
+    .await
+    .expect("budgeted response wrapper test helper");
+    assert_eq!(
+        audit.frame_count, 4,
+        "200 KiB body must stream as four <=64 KiB chunks"
+    );
+    assert_eq!(audit.available_after_acquire, 56);
+    assert_eq!(
+        audit.available_mid_stream, 56,
+        "budget permit must remain held while subsequent chunks are still pending"
+    );
+    assert_eq!(
+        audit.available_while_frame_queued, 56,
+        "budget permit must remain held while queued GuardedAdminData frames are still in flight"
+    );
+    assert_eq!(
+        audit.available_after_frames_dropped, 256,
+        "budget permit must release completely once all queued frames drop"
+    );
+    assert!(
+        audit.early_drop_released,
+        "early mid-stream drop must release response budget immediately"
+    );
+    assert!(
+        audit.head_released,
+        "strip_head_response_body must release response budget immediately"
+    );
+
+    // Real HTTP/2 transport proof: when a client stops reading mid-body on a
+    // 256 KiB connection budget, h2 saturates its 64 KiB send buffer while
+    // keeping Stream 1's 200 KiB permit reserved, forcing a concurrent 200 KiB
+    // stream to fail fast with 503 + Retry-After: 1 until Stream 1 drains.
+    ferrum_edge::_test_support::exercise_http2_stalled_response_budget_for_test()
+        .await
+        .expect("HTTP/2 stalled response budget transport test");
+
+    // Bounded format conversion must abort before materializing oversized output.
+    let json_payload =
+        br#"{"openapi":"3.1.0","info":{"title":"Example","version":"1.0.0"},"paths":{}}"#;
+    assert!(
+        ferrum_edge::_test_support::api_spec_convert_format_capped_for_test(
+            json_payload,
+            ferrum_edge::config::types::SpecFormat::Json,
+            ferrum_edge::config::types::SpecFormat::Yaml,
+            16,
+        )
+        .is_err(),
+        "capped JSON->YAML conversion must fail closed when output exceeds max_bytes"
+    );
+}
+
+#[test]
+fn stored_spec_assoc_decompress_cap_honors_conf_file_and_rejects_invalid_values() {
+    use ferrum_edge::admin::api_specs::stored_spec_assoc_decompress_cap_from_resolved;
+    use ferrum_edge::config::conf_file::{ConfFile, resolve_ferrum_var_checked_from};
+
+    let conf = ConfFile::parse("FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB = 100\n")
+        .expect("conf file with raised spec body limit parses");
+    let resolved =
+        resolve_ferrum_var_checked_from(None, &Ok(conf), "FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB")
+            .expect("conf lookup succeeds");
+    assert_eq!(
+        stored_spec_assoc_decompress_cap_from_resolved(resolved.as_deref())
+            .expect("100 MiB conf value parses"),
+        200 * 1024 * 1024,
+        "conf-file 100 MiB limit must yield a 200 MiB stored-spec association recovery cap"
+    );
+
+    // Default (unset) stays at the 64 MiB floor.
+    assert_eq!(
+        stored_spec_assoc_decompress_cap_from_resolved(None).expect("default cap"),
+        64 * 1024 * 1024
+    );
+
+    // Invalid or zero values fail closed instead of silently falling back to 25 MiB.
+    assert!(stored_spec_assoc_decompress_cap_from_resolved(Some("0")).is_err());
+    assert!(stored_spec_assoc_decompress_cap_from_resolved(Some("not-a-number")).is_err());
+}
+
+#[tokio::test]
+async fn if_match_and_conditional_do_not_preempt_forbidden_on_delete_and_bodyless_post() {
+    let config = TestConfig::default();
+    let admin_state = create_test_admin_state(&config);
+    let listener = tokio::net::TcpListener::bind(config.admin_addr)
+        .await
+        .expect("bind admin listener");
+    let addr = listener.local_addr().expect("admin listener addr");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let server = tokio::spawn(async move {
+        ferrum_edge::admin::serve_admin_on_listener(
+            listener,
+            admin_state,
+            shutdown_rx,
+            None,
+            ferrum_edge::admin::AdminConnLimiter::unlimited(),
+        )
+        .await
+    });
+
+    let viewer_token = generate_test_token_with_role(&config, "viewer-user", "viewer");
+    let operator_token = generate_test_token_with_role(&config, "operator-user", "operator");
+
+    for (token, method, path, headers, body) in [
+        (
+            &viewer_token,
+            "DELETE",
+            "/proxies/p1",
+            vec![("If-Match", "malformed")],
+            "{}",
+        ),
+        (
+            &viewer_token,
+            "DELETE",
+            "/proxies/p1?conditional=true",
+            vec![("If-Match", "malformed")],
+            "{}",
+        ),
+        (
+            &viewer_token,
+            "POST",
+            "/backend-capabilities/refresh",
+            vec![("If-Match", "\"etag\"")],
+            "",
+        ),
+        (
+            &viewer_token,
+            "POST",
+            "/backend-capabilities/refresh?conditional=true",
+            vec![],
+            "",
+        ),
+        (
+            &operator_token,
+            "DELETE",
+            "/api-specs/s1",
+            vec![("If-Match", "\"etag\"")],
+            "{}",
+        ),
+        (
+            &operator_token,
+            "DELETE",
+            "/gateway-trust-bundles/b1",
+            vec![("If-Match", "\"etag\"")],
+            "{}",
+        ),
+        (
+            &operator_token,
+            "POST",
+            "/namespaces",
+            vec![("If-Match", "\"etag\"")],
+            "{}",
+        ),
+        (
+            &operator_token,
+            "POST",
+            "/restore?confirm=true",
+            vec![("If-Match", "malformed")],
+            "{}",
+        ),
+    ] {
+        let resp =
+            send_raw_admin_request_with_headers(addr, method, path, Some(token), &headers, body)
+                .await;
+        assert_eq!(
+            raw_http_status(&resp),
+            403,
+            "{method} {path} with {:?} must return 403 Forbidden before precondition 400: {resp}",
+            headers
+        );
+    }
+
+    shutdown_tx.send(true).expect("signal admin shutdown");
+    let _ = server.await;
+}
+
+#[test]
+fn failed_restore_and_atomic_delete_helpers_record_failure_or_unknown_outcome() {
+    let source = include_str!("../../../src/admin/mod.rs");
+    for (fn_sig, expected_outcome) in [
+        ("async fn finish_failed_restore(", "AuditOutcome::Failure"),
+        (
+            "async fn finish_failed_restore_after_intervening_clear(",
+            "AuditOutcome::Failure",
+        ),
+        (
+            "async fn finish_atomic_delete_failure(",
+            "AuditOutcome::Failure",
+        ),
+        (
+            "async fn finish_unknown_atomic_delete_failure(",
+            "AuditOutcome::UnknownOutcome",
+        ),
+    ] {
+        let body = admin_source_section(source, fn_sig, "\nasync fn ");
+        assert!(
+            body.contains(expected_outcome),
+            "{fn_sig} must set {expected_outcome} on its audit event"
+        );
+    }
+}
+
+#[test]
+fn gateway_trust_bundle_record_validate_fields_enforces_resource_id_and_254_byte_cap() {
+    use ferrum_edge::config::gateway_trust::{GatewayTrustBundleRecord, MAX_TRUST_BUNDLE_ID_BYTES};
+    assert_eq!(MAX_TRUST_BUNDLE_ID_BYTES, 254);
+
+    let make_record = |id: &str| -> GatewayTrustBundleRecord {
+        serde_json::from_value(json!({
+            "id": id,
+            "namespace": "ferrum",
+            "trust_domain": "cluster.local",
+            "bundle": {
+                "local": {
+                    "trust_domain": "cluster.local",
+                    "x509_authorities": []
+                }
+            }
+        }))
+        .expect("deserialize GatewayTrustBundleRecord")
+    };
+
+    for invalid_id in [
+        "../escape",
+        "has space",
+        "slash/id",
+        &"a".repeat(MAX_TRUST_BUNDLE_ID_BYTES + 1),
+    ] {
+        let errs = make_record(invalid_id)
+            .validate_fields()
+            .expect_err("invalid trust bundle id must be rejected");
+        assert!(
+            errs.iter().any(|e| e.contains("id")),
+            "expected id error for {invalid_id:?}, got {errs:?}"
+        );
+    }
+
+    let valid_254 = "a".repeat(MAX_TRUST_BUNDLE_ID_BYTES);
+    let errs = make_record(&valid_254)
+        .validate_fields()
+        .expect_err("empty x509_authorities still fails material validation");
+    assert!(
+        !errs
+            .iter()
+            .any(|e| e.starts_with("id ") || e.contains("trust bundle id")),
+        "254-byte valid resource id must pass id validation: {errs:?}"
+    );
+}
+
+#[tokio::test]
+async fn restore_confirm_query_flag_fails_closed_on_repeated_false() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("restore_confirm.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store = ferrum_edge::config::db_loader::DatabaseStore::connect_with_pool_config(
+        "sqlite",
+        &db_url,
+        ferrum_edge::config::db_loader::DbPoolConfig::default(),
+    )
+    .await
+    .expect("connect sqlite store");
+
+    let config = TestConfig::default();
+    let mut admin_state = create_test_admin_state(&config);
+    admin_state.db = Some(Arc::new(store));
+    admin_state.mode = "database".to_string();
+
+    let listener = tokio::net::TcpListener::bind(config.admin_addr)
+        .await
+        .expect("bind admin listener");
+    let addr = listener.local_addr().expect("admin listener addr");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let server = tokio::spawn(async move {
+        ferrum_edge::admin::serve_admin_on_listener(
+            listener,
+            admin_state,
+            shutdown_rx,
+            None,
+            ferrum_edge::admin::AdminConnLimiter::unlimited(),
+        )
+        .await
+    });
+
+    let admin_token = generate_test_token_with_role(&config, "admin-user", "admin");
+    let resp = send_raw_admin_request_with_headers(
+        addr,
+        "POST",
+        "/restore?confirm=true&confirm=false",
+        Some(&admin_token),
+        &[],
+        "{}",
+    )
+    .await;
+    assert_eq!(
+        raw_http_status(&resp),
+        400,
+        "repeated confirm=true&confirm=false must fail closed with 400: {resp}"
+    );
+
+    shutdown_tx.send(true).expect("signal admin shutdown");
+    let _ = server.await;
+}
+
+#[test]
+fn decompress_gzip_capped_handles_usize_max_without_overflow() {
+    use flate2::{Compression, write::GzEncoder};
+    let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(b"hello ferrum").expect("write gzip payload");
+    let compressed = enc.finish().expect("finish gzip");
+
+    let out = ferrum_edge::admin::spec_codec::decompress_gzip_capped(&compressed, usize::MAX)
+        .expect("usize::MAX cap must not overflow");
+    assert_eq!(out, b"hello ferrum");
+}
+
+#[tokio::test]
+async fn crud_put_preserves_created_at_across_updates() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("crud_created_at.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store = ferrum_edge::config::db_loader::DatabaseStore::connect_with_pool_config(
+        "sqlite",
+        &db_url,
+        ferrum_edge::config::db_loader::DbPoolConfig::default(),
+    )
+    .await
+    .expect("connect sqlite store");
+
+    let config = TestConfig::default();
+    let mut admin_state = create_test_admin_state(&config);
+    admin_state.db = Some(Arc::new(store));
+    admin_state.mode = "database".to_string();
+
+    let listener = tokio::net::TcpListener::bind(config.admin_addr)
+        .await
+        .expect("bind admin listener");
+    let addr = listener.local_addr().expect("admin listener addr");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let server = tokio::spawn(async move {
+        ferrum_edge::admin::serve_admin_on_listener(
+            listener,
+            admin_state,
+            shutdown_rx,
+            None,
+            ferrum_edge::admin::AdminConnLimiter::unlimited(),
+        )
+        .await
+    });
+
+    let admin_token = generate_test_token_with_role(&config, "admin-user", "admin");
+
+    // 1. Proxy create + update
+    let create_proxy = send_raw_admin_request(
+        addr,
+        "POST",
+        "/proxies",
+        &admin_token,
+        &json!({
+            "id": "p-preserve",
+            "name": "initial",
+            "listen_path": "/preserve",
+            "backend_host": "example.com",
+            "backend_port": 443
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(raw_http_status(&create_proxy), 201, "{create_proxy}");
+    let created_proxy = raw_http_json_body(&create_proxy);
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let update_proxy = send_raw_admin_request(
+        addr,
+        "PUT",
+        "/proxies/p-preserve",
+        &admin_token,
+        &json!({
+            "name": "updated",
+            "listen_path": "/preserve",
+            "backend_host": "example.com",
+            "backend_port": 443
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(raw_http_status(&update_proxy), 200, "{update_proxy}");
+    let updated_proxy = raw_http_json_body(&update_proxy);
+    assert_eq!(
+        updated_proxy["created_at"], created_proxy["created_at"],
+        "PUT /proxies/{{id}} must preserve created_at"
+    );
+
+    // 2. Upstream create + update
+    let create_upstream = send_raw_admin_request(
+        addr,
+        "POST",
+        "/upstreams",
+        &admin_token,
+        &json!({
+            "id": "u-preserve",
+            "name": "initial-u",
+            "targets": [{"host": "example.com", "port": 443, "weight": 100}]
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(raw_http_status(&create_upstream), 201, "{create_upstream}");
+    let created_upstream = raw_http_json_body(&create_upstream);
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let update_upstream = send_raw_admin_request(
+        addr,
+        "PUT",
+        "/upstreams/u-preserve",
+        &admin_token,
+        &json!({
+            "name": "updated-u",
+            "targets": [{"host": "example.com", "port": 8443, "weight": 100}]
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(raw_http_status(&update_upstream), 200, "{update_upstream}");
+    let updated_upstream = raw_http_json_body(&update_upstream);
+    assert_eq!(
+        updated_upstream["created_at"], created_upstream["created_at"],
+        "PUT /upstreams/{{id}} must preserve created_at"
+    );
+
+    // 3. Consumer create + update
+    let create_consumer = send_raw_admin_request(
+        addr,
+        "POST",
+        "/consumers",
+        &admin_token,
+        &json!({
+            "id": "c-preserve",
+            "username": "alice-preserve"
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(raw_http_status(&create_consumer), 201, "{create_consumer}");
+    let created_consumer = raw_http_json_body(&create_consumer);
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let update_consumer = send_raw_admin_request(
+        addr,
+        "PUT",
+        "/consumers/c-preserve",
+        &admin_token,
+        &json!({
+            "username": "alice-preserve-updated"
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(raw_http_status(&update_consumer), 200, "{update_consumer}");
+    let updated_consumer = raw_http_json_body(&update_consumer);
+    assert_eq!(
+        updated_consumer["created_at"], created_consumer["created_at"],
+        "PUT /consumers/{{id}} must preserve created_at"
+    );
+
+    shutdown_tx.send(true).expect("signal admin shutdown");
+    let _ = server.await;
+}
+
+#[test]
+fn managed_tls_store_atomic_update_existing_and_delete_kind() {
+    use ferrum_edge::tls::managed::{
+        ManagedTlsError, ManagedTlsMaterialKind, ManagedTlsRecord, ManagedTlsStore,
+    };
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = ManagedTlsStore::open(dir.path()).expect("open managed tls store");
+
+    let jwks_v1 = ManagedTlsRecord::new_jwks(
+        "rec-1".to_string(),
+        "jwks-v1".to_string(),
+        None,
+        r#"{"keys":[]}"#.to_string(),
+    );
+
+    // update_existing fails with NotFound when absent (never silently creates)
+    assert!(matches!(
+        store.update_existing(jwks_v1.clone()),
+        Err(ManagedTlsError::NotFound(_))
+    ));
+
+    // Create initial JWKS record
+    let created = store.upsert(jwks_v1, false).expect("create jwks");
+
+    // Cross-kind update_existing fails with KindConflict
+    let ca_wrong_kind = ManagedTlsRecord::new_ca_bundle(
+        "rec-1".to_string(),
+        "ca-clash".to_string(),
+        None,
+        "dummy-ca".to_string(),
+    );
+    assert!(matches!(
+        store.update_existing(ca_wrong_kind),
+        Err(ManagedTlsError::KindConflict {
+            existing_kind: "jwks",
+            requested_kind: "ca_bundle",
+            ..
+        })
+    ));
+
+    // Same-kind update_existing succeeds and preserves created_at
+    let jwks_v2 = ManagedTlsRecord::new_jwks(
+        "rec-1".to_string(),
+        "jwks-v2".to_string(),
+        None,
+        r#"{"keys":[]}"#.to_string(),
+    );
+    let updated = store.update_existing(jwks_v2).expect("update jwks");
+    assert_eq!(updated.created_at, created.created_at);
+    assert_eq!(updated.name, "jwks-v2");
+
+    // delete_kind_if_authorized rejects wrong kind atomically without deleting
+    assert!(matches!(
+        store.delete_kind_if_authorized("rec-1", ManagedTlsMaterialKind::CaBundle, || true),
+        Err(ManagedTlsError::WrongKind { .. })
+    ));
+    assert!(
+        store.get("rec-1").is_ok(),
+        "wrong-kind delete must not remove record"
+    );
+
+    // delete_kind_if_authorized deletes matching kind when authorized
+    let deleted = store
+        .delete_kind_if_authorized("rec-1", ManagedTlsMaterialKind::Jwks, || true)
+        .expect("delete matching kind");
+    assert!(deleted.is_some());
+    assert!(matches!(
+        store.get("rec-1"),
+        Err(ManagedTlsError::NotFound(_))
+    ));
+}
+
+#[test]
+fn acme_certificate_store_update_existing_rejects_missing() {
+    use ferrum_edge::tls::acme::{
+        AcmeCertificateRecord, AcmeCertificateStore, AcmeError, AcmeIssuedCertificateInput,
+    };
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = AcmeCertificateStore::open(dir.path()).expect("open acme cert store");
+
+    let cert = rcgen::generate_simple_self_signed(vec!["example.com".to_string()])
+        .expect("generate self-signed cert");
+    let record = AcmeCertificateRecord::new_issued(AcmeIssuedCertificateInput {
+        id: "acme-missing".to_string(),
+        domains: vec!["example.com".to_string()],
+        directory_url: "https://acme-staging-v02.api.letsencrypt.org/directory".to_string(),
+        account_id: None,
+        order_url: None,
+        cert_pem: cert.cert.pem(),
+        key_pem: cert.signing_key.serialize_pem(),
+        chain_pem: None,
+    })
+    .expect("build acme cert record");
+
+    assert!(matches!(
+        store.update_existing_certificate(record.clone()),
+        Err(AcmeError::NotFound(_))
+    ));
+    store
+        .upsert_certificate(record.clone(), false)
+        .expect("insert acme cert");
+    let updated = store
+        .update_existing_certificate(record)
+        .expect("update existing acme cert");
+    assert_eq!(updated.id, "acme-missing");
 }

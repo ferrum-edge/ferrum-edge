@@ -556,6 +556,10 @@ ebpf = ["dep:aya", "dep:aya-log", "ferrum-ebpf-common/userspace"]
 opt-level = 0
 debug = true            # full debuginfo for local development
 incremental = true      # incremental compilation for faster rebuilds
+# Keep full parallel LLVM codegen when `.cargo/config.toml` sets
+# `incremental = false` (Cargo otherwise silently drops codegen-units from 256
+# to 16 across both local and CI dev/test builds).
+codegen-units = 256
 # Split debuginfo to speed up linking (macOS/Linux)
 split-debuginfo = "unpacked"
 

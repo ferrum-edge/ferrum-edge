@@ -68,10 +68,11 @@ On Kubernetes, map each mode to its chart or external contract in
   the native build even with `-DWITH_CURL=0`.
 - **Database** (optional): PostgreSQL, MySQL, SQLite, or MongoDB (for database and CP modes)
 
-A full-debuginfo `codegen-units=1` `dev` build can OOM rustc on a 15 GiB host
-with no swap. If rustc is killed for memory, retry with `CARGO_PROFILE_DEV_DEBUG=0`
-and more codegen units (for example `CARGO_PROFILE_DEV_CODEGEN_UNITS=16`). That is
-host sizing, not a missing package; do not change `[profile.dev]` for it.
+A full-debuginfo `dev` build can OOM rustc on a 15 GiB host with no swap
+(`[profile.dev]` already sets `codegen-units = 256`). If rustc is killed for
+memory, retry with `CARGO_PROFILE_DEV_DEBUG=0` and/or a lower
+`CARGO_BUILD_JOBS` (for example `CARGO_BUILD_JOBS=2`). That is host sizing, not
+a missing package; do not change `[profile.dev]` for it.
 
 ## Installation
 
