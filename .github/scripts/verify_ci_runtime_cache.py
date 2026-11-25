@@ -5582,6 +5582,7 @@ def check_shared_actions(failures: list[str]) -> None:
 
 
 EXPECTED_CI_DEBUG_EFFECTIVE_ENV = {
+    "CARGO_TERM_COLOR": "always",
     "CARGO_NET_RETRY": "10",
     "CARGO_HTTP_MULTIPLEXING": "false",
     "CARGO_BUILD_JOBS": "3",
@@ -5594,6 +5595,11 @@ _CI_DEBUG_ALLOWED_WORKFLOW_ENV_KEYS = frozenset(
     {"CARGO_TERM_COLOR", "CARGO_NET_RETRY", "CARGO_HTTP_MULTIPLEXING"}
 )
 _CI_DEBUG_ALLOWED_STEP_ENV_KEYS = frozenset({"RUST_BACKTRACE"})
+_CI_DEBUG_ALLOWED_DIRECT_COMPUTED_KEY_PREFIXES = (
+    "build-",
+    "ci-fips-contract-",
+    "ci-windows-confinement-",
+)
 CI_DEBUG_LANE_JOBS: tuple[tuple[str, str], ...] = (
     ("ci.yml", "test-unit"),
     ("ci.yml", "test-acme"),
@@ -5608,8 +5614,8 @@ CI_DEBUG_LANE_JOBS: tuple[tuple[str, str], ...] = (
     ("ci.yml", "two-cluster-mesh-live"),
     ("ambient-host-udp-live.yml", "ambient-host-udp-live"),
 )
-# Swatinem/rust-cache hashes every non-empty env var matching these prefixes
-# (minus blacklisted keys like CARGO_TERM_COLOR) into the restore/save key.
+# Pinned Swatinem/rust-cache hashes every non-empty env var matching these
+# prefixes (including CARGO_TERM_COLOR) into the restore/save key.
 _CI_DEBUG_HASHED_ENV_PREFIXES = (
     "CARGO",
     "RUST",
@@ -5618,22 +5624,43 @@ _CI_DEBUG_HASHED_ENV_PREFIXES = (
     "CXX",
     "CMAKE",
 )
-_CI_DEBUG_SHELL_ENV_OVERRIDE_RE = re.compile(
-    r"(?m)(?:"
-    r"\bexport\s+(?:CARGO|RUST(?!_BACKTRACE=)|CC|CFLAGS|CXX|CMAKE)[A-Z0-9_]*="
-    r"|\b(?:CARGO_(?:PROFILE|BUILD|INCREMENTAL|TARGET|ENCODED_RUSTFLAGS|NET|HTTP)|RUSTFLAGS|RUSTDOCFLAGS|RUSTC_WRAPPER|CC|CFLAGS|CXX|CMAKE)[A-Z0-9_]*="
-    r"|--config(?:=|\s+)"
-    r")"
+_CI_DEBUG_SHELL_DISALLOWED_VAR_RE = re.compile(
+    r"\b(?:"
+    r"CARGO(?:_[A-Z0-9_]+)?"
+    r"|RUST(?:FLAGS|DOCFLAGS|C(?:_[A-Z0-9_]+)?)"
+    r"|CC(?:_[A-Z0-9_]+)?"
+    r"|CFLAGS(?:_[A-Z0-9_]+)?"
+    r"|CXX(?:_[A-Z0-9_]+)?"
+    r"|CMAKE(?:_[A-Z0-9_]+)?"
+    r")\b"
 )
+_CI_DEBUG_SHELL_INLINE_ASSIGN_RE = re.compile(
+    r"^(?:"
+    r"CARGO_(?:PROFILE|BUILD|INCREMENTAL|TARGET|ENCODED_RUSTFLAGS|NET|HTTP|TERM_COLOR)[A-Z0-9_]*"
+    r"|RUSTFLAGS|RUSTDOCFLAGS|RUSTC(?:_[A-Z0-9_]+)?"
+    r"|CC(?:_[A-Z0-9_]+)?"
+    r"|CFLAGS(?:_[A-Z0-9_]+)?"
+    r"|CXX(?:_[A-Z0-9_]+)?"
+    r"|CMAKE(?:_[A-Z0-9_]+)?"
+    r")="
+)
+_CI_DEBUG_SHELL_EXPORT_VAR_RE = re.compile(
+    r"^(?:CARGO|RUST(?!_BACKTRACE(?:=|$)|_LOG(?:=|$))|CC|CFLAGS|CXX|CMAKE)[A-Z0-9_]*(?:=|$)"
+)
+
+
+def _is_setup_rust_ci_action(uses: str) -> bool:
+    return uses.strip().rstrip("/").lower() == "./.github/actions/setup-rust-ci"
+
+
+def _is_direct_rust_cache_action(uses: str) -> bool:
+    return uses.strip().lower().startswith("swatinem/rust-cache@")
 
 
 def _is_rust_cache_action(uses: str) -> bool:
     """Return True if a step `uses:` value invokes setup-rust-ci or Swatinem/rust-cache."""
 
-    cleaned = uses.strip()
-    return cleaned == "./.github/actions/setup-rust-ci" or cleaned.startswith(
-        "Swatinem/rust-cache@"
-    )
+    return _is_setup_rust_ci_action(uses) or _is_direct_rust_cache_action(uses)
 
 
 def _normalize_yaml_scalar(value: object) -> str:
@@ -5642,6 +5669,119 @@ def _normalize_yaml_scalar(value: object) -> str:
     if isinstance(value, bool):
         return str(value).lower()
     return str(value)
+
+
+def _load_extra_workflow_texts() -> dict[str, str]:
+    """Load every workflow under `.github/workflows/*.{yml,yaml}` except ci.yml and ambient-host-udp-live.yml."""
+
+    wf_dir = CI_WORKFLOW.parent
+    paths = sorted(
+        {*wf_dir.glob("*.yml"), *wf_dir.glob("*.yaml")},
+        key=lambda p: p.name,
+    )
+    return {
+        p.name: read_pinned(p)
+        for p in paths
+        if p.name not in {"ci.yml", "ambient-host-udp-live.yml"}
+    }
+
+
+def _strip_shell_quotes(token: str) -> str:
+    """Remove simple single/double quote pairs from a shell word for token inspection."""
+
+    out: list[str] = []
+    quote: str | None = None
+    idx = 0
+    while idx < len(token):
+        ch = token[idx]
+        if quote is None:
+            if ch in ("'", '"'):
+                quote = ch
+            elif ch == "\\" and idx + 1 < len(token):
+                idx += 1
+                out.append(token[idx])
+            else:
+                out.append(ch)
+        elif ch == quote:
+            quote = None
+        elif quote == '"' and ch == "\\" and idx + 1 < len(token):
+            idx += 1
+            out.append(token[idx])
+        else:
+            out.append(ch)
+        idx += 1
+    return "".join(out)
+
+
+def _tokenize_shell_words(line: str) -> list[str]:
+    """Split a shell line into unquoted words, tolerating unmatched quotes fail-closed."""
+
+    words: list[str] = []
+    cur: list[str] = []
+    quote: str | None = None
+    idx = 0
+    while idx < len(line):
+        ch = line[idx]
+        if quote is None:
+            if ch == "#" and not cur:
+                break
+            if ch in " \t;|&\n":
+                if cur:
+                    words.append("".join(cur))
+                    cur = []
+                idx += 1
+                continue
+            if ch in ("'", '"'):
+                quote = ch
+                cur.append(ch)
+            elif ch == "\\" and idx + 1 < len(line):
+                cur.append(ch)
+                idx += 1
+                cur.append(line[idx])
+            else:
+                cur.append(ch)
+        else:
+            cur.append(ch)
+            if ch == quote:
+                quote = None
+            elif quote == '"' and ch == "\\" and idx + 1 < len(line):
+                idx += 1
+                cur.append(line[idx])
+        idx += 1
+    if cur:
+        words.append("".join(cur))
+    return [_strip_shell_quotes(w) for w in words]
+
+
+def _step_run_has_ci_debug_override(run_text: str) -> bool:
+    """Detect shell exports, inline compiler env assignments, GITHUB_ENV writes, or cargo --config."""
+
+    raw_lines = [
+        ln.strip()
+        for ln in run_text.splitlines()
+        if ln.strip() and not ln.lstrip().startswith("#")
+    ]
+    if not raw_lines:
+        return False
+    step_touches_github_env = any("GITHUB_ENV" in ln for ln in raw_lines)
+    if step_touches_github_env:
+        joined = "\n".join(raw_lines)
+        if _CI_DEBUG_SHELL_DISALLOWED_VAR_RE.search(joined):
+            return True
+    for ln in raw_lines:
+        tokens = _tokenize_shell_words(ln)
+        for idx, tok in enumerate(tokens):
+            if tok == "export":
+                for arg in tokens[idx + 1 :]:
+                    if arg.startswith("-"):
+                        continue
+                    if _CI_DEBUG_SHELL_EXPORT_VAR_RE.match(arg):
+                        return True
+            if _CI_DEBUG_SHELL_INLINE_ASSIGN_RE.match(tok):
+                return True
+            if tok == "--config" or tok.startswith("--config="):
+                return True
+    return False
 
 
 def _extract_env_mapping(
@@ -5751,6 +5891,108 @@ def _iter_non_block_scalar_lines_indexed(lines: list[str]) -> list[tuple[int, tu
     return out
 
 
+def _iter_fallback_jobs(workflow_text: str) -> list[tuple[str, str]]:
+    """Return `(job_id, job_body)` pairs in fallback mode, supporting quoted job IDs and trailing comments."""
+
+    lines = workflow_text.splitlines()
+    indexed = _iter_non_block_scalar_lines_indexed(lines)
+    jobs_start = None
+    for idx, (indent, line) in indexed:
+        decoded = _decode_mapping_line(line)
+        if decoded is not None and indent == 0 and decoded[1] == "jobs":
+            jobs_start = idx + 1
+            break
+    if jobs_start is None:
+        return []
+    job_starts: list[tuple[str, int]] = []
+    jobs_end = len(lines)
+    for idx, (indent, line) in indexed:
+        if idx < jobs_start:
+            continue
+        if indent == 0:
+            jobs_end = idx
+            break
+        if indent == 2:
+            decoded = _decode_mapping_line(line)
+            if decoded is not None and decoded[0] == 2:
+                val_no_comment = _yaml_strip_trailing_comment(decoded[2]).strip()
+                if not val_no_comment:
+                    job_starts.append((decoded[1], idx))
+    result: list[tuple[str, str]] = []
+    for pos, (job_id, start_idx) in enumerate(job_starts):
+        end_idx = job_starts[pos + 1][1] if pos + 1 < len(job_starts) else jobs_end
+        body = "\n".join(lines[start_idx + 1 : end_idx])
+        if body:
+            body += "\n"
+        result.append((job_id, body))
+    return result
+
+
+def _extract_job_steps_structural(job_body: str) -> list[str]:
+    """Extract raw step YAML chunks from a job body, tolerating trailing comments on `steps:`."""
+
+    lines = job_body.splitlines()
+    indexed = _iter_non_block_scalar_lines_indexed(lines)
+    steps_start = None
+    steps_end = len(lines)
+    for idx, (indent, line) in indexed:
+        if steps_start is None:
+            decoded = _decode_mapping_line(line)
+            if decoded is not None and indent == 4 and decoded[1] == "steps":
+                steps_start = idx + 1
+        elif indent <= 4:
+            steps_end = idx
+            break
+    if steps_start is None:
+        return []
+    step_lines = lines[steps_start:steps_end]
+    non_block_set = {
+        idx for idx, _ in _iter_non_block_scalar_lines_indexed(step_lines)
+    }
+    step_starts = [
+        idx
+        for idx, line in enumerate(step_lines)
+        if idx in non_block_set and re.match(r"^(?:      |    )- ", line)
+    ]
+    return [
+        "\n".join(
+            step_lines[
+                step_starts[i] : (
+                    step_starts[i + 1] if i + 1 < len(step_starts) else len(step_lines)
+                )
+            ]
+        )
+        + "\n"
+        for i in range(len(step_starts))
+    ]
+
+
+def _check_shared_key_value(
+    filename: str,
+    job_id: str,
+    uses: str,
+    raw_sk: object,
+    discovered: set[tuple[str, str]],
+    errors: list[str],
+) -> None:
+    sk = _normalize_yaml_scalar(raw_sk).strip()
+    if "${{" in sk:
+        if _is_setup_rust_ci_action(uses):
+            errors.append(
+                f"{filename}/{job_id} setup-rust-ci step must use a literal "
+                f"shared-key (got {sk!r})"
+            )
+        elif _is_direct_rust_cache_action(uses) and not sk.startswith(
+            _CI_DEBUG_ALLOWED_DIRECT_COMPUTED_KEY_PREFIXES
+        ):
+            errors.append(
+                f"{filename}/{job_id} Swatinem/rust-cache step uses an unadmitted "
+                f"computed shared-key that could alias ci-debug (got {sk!r})"
+            )
+    if sk == "ci-debug":
+        discovered.add((filename, job_id))
+
+
 def _discover_ci_debug_jobs(
     workflow_text: str,
     filename: str,
@@ -5776,7 +6018,7 @@ def _discover_ci_debug_jobs(
                 for step in steps:
                     if not isinstance(step, dict):
                         continue
-                    uses = str(step.get("uses", "")).strip()
+                    uses = _normalize_yaml_scalar(step.get("uses"))
                     if not _is_rust_cache_action(uses):
                         continue
                     with_obj = step.get("with")
@@ -5787,45 +6029,33 @@ def _discover_ci_debug_jobs(
                             f"{filename}/{job_id} rust-cache step has non-mapping `with:`"
                         )
                         continue
-                    raw_sk = with_obj.get("shared-key")
-                    sk = _normalize_yaml_scalar(raw_sk)
-                    if uses == "./.github/actions/setup-rust-ci" and "${{" in sk:
-                        errors.append(
-                            f"{filename}/{job_id} setup-rust-ci step must use a literal "
-                            f"shared-key (got {sk!r})"
-                        )
-                    if sk == "ci-debug":
-                        discovered.add((filename, str(job_id)))
+                    _check_shared_key_value(
+                        filename,
+                        str(job_id),
+                        uses,
+                        with_obj.get("shared-key"),
+                        discovered,
+                        errors,
+                    )
         return discovered, errors
 
-    lines = workflow_text.splitlines()
-    jobs_start = None
-    for idx, (indent, line) in _iter_non_block_scalar_lines_indexed(lines):
-        decoded = _decode_mapping_line(line)
-        if decoded is not None and indent == 0 and decoded[1] == "jobs":
-            jobs_start = idx + 1
-            break
-    if jobs_start is None:
-        return discovered, errors
-    job_ids: list[str] = []
-    for idx, (indent, line) in _iter_non_block_scalar_lines_indexed(lines[jobs_start:]):
-        if indent == 0:
-            break
-        if indent == 2:
-            m = re.match(r"^  ([A-Za-z_][A-Za-z0-9_-]*):[ \t]*(?:#.*)?$", line)
-            if m:
-                job_ids.append(m.group(1))
-    for job_id in job_ids:
-        body = extract_job(workflow_text, job_id)
-        for step in extract_job_steps(body):
+    for job_id, body in _iter_fallback_jobs(workflow_text):
+        for step in _extract_job_steps_structural(body):
             _keys, scalars, step_err = _extract_step_keys_and_scalars(step)
-            if step_err is not None:
-                if "setup-rust-ci" in step or "Swatinem/rust-cache@" in step:
-                    errors.append(
-                        f"{filename}/{job_id} has unparseable rust-cache step: {step_err}"
-                    )
-                continue
             uses = scalars.get("uses", "").strip()
+            if step_err is not None:
+                # Classify only from a step-level `uses:` line, never from unrelated `env:`/`run:` text.
+                uses_match = re.search(
+                    r"(?m)^(?:      - |        |    - |      )uses:[ \t]*(.+)$",
+                    step,
+                )
+                if uses_match:
+                    cand_uses = _decode_yaml_value_scalar(uses_match.group(1)) or ""
+                    if _is_rust_cache_action(cand_uses):
+                        errors.append(
+                            f"{filename}/{job_id} has unparseable rust-cache step: {step_err}"
+                        )
+                continue
             if not _is_rust_cache_action(uses):
                 continue
             with_map, with_err = _extract_step_with_decoded(step)
@@ -5834,14 +6064,14 @@ def _discover_ci_debug_jobs(
                     f"{filename}/{job_id} rust-cache step has invalid `with:` mapping: {with_err}"
                 )
                 continue
-            sk = with_map.get("shared-key", "")
-            if uses == "./.github/actions/setup-rust-ci" and "${{" in sk:
-                errors.append(
-                    f"{filename}/{job_id} setup-rust-ci step must use a literal "
-                    f"shared-key (got {sk!r})"
-                )
-            if sk == "ci-debug":
-                discovered.add((filename, job_id))
+            _check_shared_key_value(
+                filename,
+                job_id,
+                uses,
+                with_map.get("shared-key"),
+                discovered,
+                errors,
+            )
     return discovered, errors
 
 
@@ -5877,10 +6107,19 @@ def check_ci_debug_lane_profile_uniformity(
     )
 
     workflow_envs: dict[str, dict[str, str]] = {}
+    parsed_workflows: dict[str, dict[str, object] | None] = {}
+    fallback_jobs_by_wf: dict[str, dict[str, str]] = {}
     lane_filenames = {filename for filename, _ in CI_DEBUG_LANE_JOBS}
     for filename in sorted(lane_filenames):
+        wf_text = workflows[filename]
+        parsed_wf, yaml_avail, yaml_err = _try_yaml_safe_load(wf_text)
+        if yaml_avail and yaml_err is None and isinstance(parsed_wf, dict):
+            parsed_workflows[filename] = parsed_wf
+        else:
+            parsed_workflows[filename] = None
+            fallback_jobs_by_wf[filename] = dict(_iter_fallback_jobs(wf_text))
         wf_env, wf_err = _extract_env_mapping(
-            workflows[filename],
+            wf_text,
             key_indent=0,
             prefixes=_CI_DEBUG_HASHED_ENV_PREFIXES,
         )
@@ -5901,53 +6140,120 @@ def check_ci_debug_lane_profile_uniformity(
         workflow_envs[filename] = wf_env
 
     for filename, job_id in CI_DEBUG_LANE_JOBS:
-        body = extract_job(workflows[filename], job_id)
-        require(
-            bool(body),
-            f"ci-debug lane member {filename}/{job_id} is missing",
-            failures,
-        )
-        if not body:
-            continue
-        job_env, env_err = _extract_env_mapping(
-            body,
-            key_indent=4,
-            prefixes=_CI_DEBUG_HASHED_ENV_PREFIXES,
-        )
+        parsed_wf = parsed_workflows.get(filename)
+        if parsed_wf is not None:
+            jobs_obj = parsed_wf.get("jobs")
+            job_obj = jobs_obj.get(job_id) if isinstance(jobs_obj, dict) else None
+            require(
+                isinstance(job_obj, dict),
+                f"ci-debug lane member {filename}/{job_id} is missing",
+                failures,
+            )
+            if not isinstance(job_obj, dict):
+                continue
+            raw_job_env = job_obj.get("env")
+            if raw_job_env is None:
+                job_env: dict[str, str] = {}
+                env_err: str | None = None
+            elif not isinstance(raw_job_env, dict):
+                job_env = {}
+                env_err = "`env:` must be a mapping"
+            else:
+                job_env = {
+                    str(k): _normalize_yaml_scalar(v)
+                    for k, v in raw_job_env.items()
+                    if str(k).startswith(_CI_DEBUG_HASHED_ENV_PREFIXES)
+                }
+                env_err = None
+            parsed_steps = job_obj.get("steps")
+            require(
+                isinstance(parsed_steps, list) and len(parsed_steps) > 0,
+                f"ci-debug lane member {filename}/{job_id} must define non-empty steps",
+                failures,
+            )
+            step_records: list[tuple[str, dict[str, str], str | None, str]] = []
+            if isinstance(parsed_steps, list):
+                for st in parsed_steps:
+                    if not isinstance(st, dict):
+                        step_records.append(("", {}, "step is not a mapping", ""))
+                        continue
+                    uses = _normalize_yaml_scalar(st.get("uses"))
+                    raw_st_env = st.get("env")
+                    if raw_st_env is None:
+                        st_env: dict[str, str] = {}
+                        st_env_err: str | None = None
+                    elif not isinstance(raw_st_env, dict):
+                        st_env = {}
+                        st_env_err = "`env:` must be a mapping"
+                    else:
+                        st_env = {
+                            str(k): _normalize_yaml_scalar(v)
+                            for k, v in raw_st_env.items()
+                        }
+                        st_env_err = None
+                    raw_run = st.get("run")
+                    run_text = raw_run if isinstance(raw_run, str) else ""
+                    step_records.append((uses, st_env, st_env_err, run_text))
+        else:
+            body = fallback_jobs_by_wf.get(filename, {}).get(job_id, "")
+            require(
+                bool(body),
+                f"ci-debug lane member {filename}/{job_id} is missing",
+                failures,
+            )
+            if not body:
+                continue
+            job_env, env_err = _extract_env_mapping(
+                body,
+                key_indent=4,
+                prefixes=_CI_DEBUG_HASHED_ENV_PREFIXES,
+            )
+            raw_steps = _extract_job_steps_structural(body)
+            require(
+                len(raw_steps) > 0,
+                f"ci-debug lane member {filename}/{job_id} must define non-empty steps",
+                failures,
+            )
+            step_records = []
+            for step in raw_steps:
+                _k, scalars, _se = _extract_step_keys_and_scalars(step)
+                uses = scalars.get("uses", "")
+                st_env, st_env_err = _extract_step_submap(step, "env")
+                exec_lines = _extract_step_run_exec_lines(step)
+                if exec_lines is not None:
+                    run_text = "\n".join(exec_lines)
+                elif re.search(r"(?m)^(?:      - |        |    - |      )run:", step):
+                    run_text = step
+                else:
+                    run_text = ""
+                step_records.append((uses, st_env, st_env_err, run_text))
+
         require(
             env_err is None,
             f"ci-debug lane member {filename}/{job_id} has invalid job env: {env_err}",
             failures,
         )
         effective_env = {**workflow_envs.get(filename, {}), **job_env}
-        if "CARGO_TERM_COLOR" in effective_env:
-            require(
-                effective_env["CARGO_TERM_COLOR"] == "always",
-                f"ci-debug lane member {filename}/{job_id} CARGO_TERM_COLOR must be 'always' "
-                f"(got {effective_env['CARGO_TERM_COLOR']!r})",
-                failures,
-            )
-        compared_env = {
-            k: v for k, v in effective_env.items() if k != "CARGO_TERM_COLOR"
-        }
         require(
-            compared_env == EXPECTED_CI_DEBUG_EFFECTIVE_ENV,
+            effective_env == EXPECTED_CI_DEBUG_EFFECTIVE_ENV,
             f"ci-debug lane member {filename}/{job_id} must declare uniform fast-build profile env "
-            f"{EXPECTED_CI_DEBUG_EFFECTIVE_ENV!r} (got {compared_env!r})",
+            f"{EXPECTED_CI_DEBUG_EFFECTIVE_ENV!r} (got {effective_env!r})",
             failures,
         )
-        for step_idx, step in enumerate(extract_job_steps(body)):
-            step_env, step_env_err = _extract_step_submap(step, "env")
+        for step_idx, (uses, step_env, step_env_err, run_text) in enumerate(step_records):
             require(
                 step_env_err is None,
                 f"ci-debug lane member {filename}/{job_id} step #{step_idx} has invalid step env: {step_env_err}",
                 failures,
             )
+            allowed_keys = (
+                frozenset() if _is_rust_cache_action(uses) else _CI_DEBUG_ALLOWED_STEP_ENV_KEYS
+            )
             disallowed_step_env = sorted(
                 k
                 for k in step_env
                 if k.startswith(_CI_DEBUG_HASHED_ENV_PREFIXES)
-                and k not in _CI_DEBUG_ALLOWED_STEP_ENV_KEYS
+                and k not in allowed_keys
             )
             require(
                 not disallowed_step_env,
@@ -5955,16 +6261,9 @@ def check_ci_debug_lane_profile_uniformity(
                 f"env at step level (found {disallowed_step_env!r})",
                 failures,
             )
-            exec_lines = _extract_step_run_exec_lines(step)
-            if exec_lines is not None:
-                shell_text = "\n".join(exec_lines)
-            elif re.search(r"(?m)^(?:      - |        )run:", step):
-                shell_text = step
-            else:
-                shell_text = ""
-            if shell_text:
+            if run_text:
                 require(
-                    _CI_DEBUG_SHELL_ENV_OVERRIDE_RE.search(shell_text) is None,
+                    not _step_run_has_ci_debug_override(run_text),
                     f"ci-debug lane member {filename}/{job_id} must not override Cargo/Rust/C build/profile "
                     "settings via shell exports, inline assignments, GITHUB_ENV, or --config",
                     failures,
@@ -10232,11 +10531,7 @@ def self_test() -> int:
 
     ci_live_text = read_pinned(CI_WORKFLOW)
     ambient_live_text = read_pinned(AMBIENT_WORKFLOW)
-    extra_live_workflows = {
-        p.name: read_pinned(p)
-        for p in sorted(CI_WORKFLOW.parent.glob("*.yml"))
-        if p.name not in {"ci.yml", "ambient-host-udp-live.yml"}
-    }
+    extra_live_workflows = _load_extra_workflow_texts()
 
     def _run_ci_debug_self_tests(mode_label: str) -> None:
         ci_debug_ok: list[str] = []
@@ -10411,6 +10706,147 @@ def self_test() -> int:
             f"self-test ({mode_label}): shell heredoc and unrelated action shared-key must not be counted (got {unrelated_errs!r})",
             failures,
         )
+        # Round 3 regressions: CARGO_TERM_COLOR drift, RUST_BACKTRACE on cache step,
+        # trailing comment on `steps:`, quoted job IDs + whitespace/case/slash variants,
+        # printf GITHUB_ENV / RUSTC= / quoted '--config', direct computed key, multiline env text.
+        missing_color_ambient = ambient_live_text.replace(
+            "      CARGO_TERM_COLOR: always\n", "", 1
+        )
+        missing_color_errs: list[str] = []
+        check_ci_debug_lane_profile_uniformity(
+            ci_live_text, missing_color_ambient, missing_color_errs
+        )
+        require(
+            missing_color_ambient != ambient_live_text
+            and any(
+                "ambient-host-udp-live.yml/ambient-host-udp-live must declare" in item
+                for item in missing_color_errs
+            ),
+            f"self-test ({mode_label}): missing CARGO_TERM_COLOR on ambient-host-udp-live must fail",
+            failures,
+        )
+        backtrace_on_cache = ambient_live_text.replace(
+            "      - uses: ./.github/actions/setup-rust-ci\n",
+            '      - uses: ./.github/actions/setup-rust-ci\n        env:\n          RUST_BACKTRACE: "1"\n',
+            1,
+        )
+        backtrace_on_cache_errs: list[str] = []
+        check_ci_debug_lane_profile_uniformity(
+            ci_live_text, backtrace_on_cache, backtrace_on_cache_errs
+        )
+        require(
+            backtrace_on_cache != ambient_live_text
+            and any("at step level" in item for item in backtrace_on_cache_errs),
+            f"self-test ({mode_label}): RUST_BACKTRACE on rust-cache step must fail",
+            failures,
+        )
+        commented_steps_ambient = ambient_live_text.replace(
+            "    steps:\n", "    steps: # trailing comment\n", 1
+        ).replace(
+            "      - name: Build live test binaries\n",
+            '      - name: Build live test binaries\n        env:\n          CARGO_PROFILE_DEV_DEBUG: "2"\n',
+            1,
+        )
+        commented_steps_errs: list[str] = []
+        check_ci_debug_lane_profile_uniformity(
+            ci_live_text, commented_steps_ambient, commented_steps_errs
+        )
+        require(
+            any("at step level" in item for item in commented_steps_errs),
+            f"self-test ({mode_label}): trailing comment on steps: must not bypass step validation",
+            failures,
+        )
+        quoted_and_trimmed_wf = (
+            "name: Quoted\non:\n  workflow_dispatch:\njobs:\n"
+            '  "extra-quoted": # comment\n'
+            "    runs-on: ubuntu-26.04\n"
+            "    steps: # comment\n"
+            "      - uses: ./.github/actions/setup-rust-ci/\n"
+            '        with: {shared-key: " ci-debug "}\n'
+            "  extra-lower:\n"
+            "    runs-on: ubuntu-26.04\n"
+            "    steps:\n"
+            "      - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0\n"
+            '        with:\n          shared-key: "ci-debug"\n'
+        )
+        quoted_errs: list[str] = []
+        check_ci_debug_lane_profile_uniformity(
+            ci_live_text,
+            ambient_live_text,
+            quoted_errs,
+            extra_workflows={"quoted.yaml": quoted_and_trimmed_wf},
+        )
+        require(
+            any(
+                "('quoted.yaml', 'extra-quoted')" in item
+                and "('quoted.yaml', 'extra-lower')" in item
+                for item in quoted_errs
+            ),
+            f"self-test ({mode_label}): quoted job IDs, trailing slash, case-insensitive rust-cache, and trimmed shared-key must be discovered (got {quoted_errs!r})",
+            failures,
+        )
+        for label, bad_run in (
+            ("printf GITHUB_ENV", 'printf "%s=%s\\n" CARGO_PROFILE_DEV_DEBUG 2 >> "$GITHUB_ENV"'),
+            ("multiline GITHUB_ENV", 'echo "RUSTFLAGS<<EOF" >> "$GITHUB_ENV"'),
+            ("inline RUSTC", "RUSTC=rustc cargo test --no-run"),
+            ("quoted --config", "cargo '--config' profile.dev.debug=2 --version"),
+        ):
+            mut_ci = ci_live_text.replace(
+                "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
+                f"        run: {bad_run}\n",
+                1,
+            )
+            mut_errs: list[str] = []
+            check_ci_debug_lane_profile_uniformity(mut_ci, ambient_live_text, mut_errs)
+            require(
+                mut_ci != ci_live_text
+                and any("GITHUB_ENV, or --config" in item for item in mut_errs),
+                f"self-test ({mode_label}): {label} shell override must fail",
+                failures,
+            )
+        direct_computed_wf = (
+            "name: DirectComputed\non:\n  workflow_dispatch:\njobs:\n"
+            "  alias-job:\n"
+            "    runs-on: ubuntu-26.04\n"
+            "    steps:\n"
+            "      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0\n"
+            "        with:\n"
+            "          shared-key: ${{ 'ci-debug' }}\n"
+        )
+        direct_computed_errs: list[str] = []
+        check_ci_debug_lane_profile_uniformity(
+            ci_live_text,
+            ambient_live_text,
+            direct_computed_errs,
+            extra_workflows={"direct-computed.yml": direct_computed_wf},
+        )
+        require(
+            any("unadmitted computed shared-key" in item for item in direct_computed_errs),
+            f"self-test ({mode_label}): direct Swatinem/rust-cache computed key aliasing ci-debug must fail",
+            failures,
+        )
+        multiline_env_unrelated_wf = (
+            "name: MultilineEnv\non:\n  workflow_dispatch:\njobs:\n"
+            "  other-job:\n"
+            "    runs-on: ubuntu-26.04\n"
+            "    steps:\n"
+            "      - uses: example/other@0123456789abcdef0123456789abcdef01234567\n"
+            "        env:\n"
+            "          NOTE: |\n"
+            "            ./.github/actions/setup-rust-ci\n"
+        )
+        multiline_env_errs: list[str] = []
+        check_ci_debug_lane_profile_uniformity(
+            ci_live_text,
+            ambient_live_text,
+            multiline_env_errs,
+            extra_workflows={"multiline-env.yml": multiline_env_unrelated_wf},
+        )
+        require(
+            not multiline_env_errs,
+            f"self-test ({mode_label}): multiline env mentioning setup-rust-ci on unrelated action must not fail (got {multiline_env_errs!r})",
+            failures,
+        )
 
     _run_ci_debug_self_tests("default")
     global _try_yaml_safe_load
@@ -10455,16 +10891,11 @@ def main(argv: list[str] | None = None) -> int:
     check_fips(fips, failures)
     check_production_smoke(node, failures)
     check_ambient_workflow_cache_budget(ambient, failures)
-    extra_workflows = {
-        p.name: read_pinned(p)
-        for p in sorted(CI_WORKFLOW.parent.glob("*.yml"))
-        if p.name not in {"ci.yml", "ambient-host-udp-live.yml"}
-    }
     check_ci_debug_lane_profile_uniformity(
         read_pinned(CI_WORKFLOW),
         ambient,
         failures,
-        extra_workflows=extra_workflows,
+        extra_workflows=_load_extra_workflow_texts(),
     )
     check_shared_actions(failures)
     for filename, job_name in COMPLETED_CACHE_PRODUCER_JOBS:

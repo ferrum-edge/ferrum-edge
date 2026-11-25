@@ -1836,6 +1836,7 @@ AMBIENT_HOST_UDP_LIVE_JOB = (
     runs-on: ubuntu-26.04
     timeout-minutes: 45
     env:
+      CARGO_TERM_COLOR: always
       CARGO_NET_RETRY: "10"
       CARGO_HTTP_MULTIPLEXING: "false"
       # Restore-only member of the `ci-debug` rust-cache lane, which Unit
