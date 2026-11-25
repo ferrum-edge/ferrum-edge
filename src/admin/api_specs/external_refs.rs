@@ -1839,6 +1839,29 @@ pub(crate) fn check_external_json_duplicate_member_limit_for_test() -> Result<()
     Ok(())
 }
 
+/// Produce a real `ExtractError::SchemaTooLarge` from `gzip_bytes_with_limits`
+/// exceeding its compressed cap so handler-level error mapping can verify HTTP
+/// `422` + `code: "SchemaTooLarge"`.
+pub(crate) fn sample_compressed_snapshot_too_large_error_for_test()
+-> Result<ExtractError, &'static str> {
+    let mut snap = ExternalRefSnapshot {
+        policy_digest: "0".repeat(64),
+        root_document_base: "https://schemas.example.com/root.json".to_string(),
+        documents: vec![ExternalRefSnapshotDocument {
+            canonical_uri: "https://schemas.example.com/common.json".to_string(),
+            content_digest: normalized_document_digest(&serde_json::json!({"ok": true})),
+            format: "json".to_string(),
+            document: serde_json::json!({"ok": true}),
+        }],
+        snapshot_digest: String::new(),
+    };
+    snap.snapshot_digest = snap.compute_digest();
+    match snap.gzip_bytes_with_limits(64 * 1024, 16) {
+        Err(err) => Ok(err),
+        Ok(_) => Err("gzip_bytes_with_limits unexpectedly succeeded under 16-byte compressed cap"),
+    }
+}
+
 fn detect_format(bytes: &[u8]) -> &'static str {
     match bytes.iter().find(|&&b| !b.is_ascii_whitespace()) {
         Some(b'{') | Some(b'[') => "json",

@@ -6956,11 +6956,13 @@ pub(crate) fn check_json_duplicate_member_limit_parity_for_test() -> Result<(), 
 
     // Generated `x-ferrum-validate` and `x-ferrum-mcp` plugin configs resolving
     // an external `$ref` schema whose `const` object carries the reserved
-    // RawValue marker must also fail closed with 400 MalformedExtension.
+    // RawValue marker must also fail closed with 400 MalformedExtension naming
+    // the reserved key, while companion fixtures with an ordinary `const` key
+    // extract cleanly.
     let mut ext_docs = HashMap::new();
     ext_docs.insert(
         "https://schemas.example.com/shared.json".to_string(),
-        br#"{"components":{"schemas":{"EvilConst":{"type":"object","const":{"$serde_json::private::RawValue":"[1,2,3]"}}}}}"#.to_vec(),
+        br#"{"components":{"schemas":{"EvilConst":{"type":"object","const":{"$serde_json::private::RawValue":"[1,2,3]"}},"GoodConst":{"type":"object","const":{"ordinary_key":"[1,2,3]"}}}}}"#.to_vec(),
     );
     let loader = MapExternalDocumentLoader { docs: ext_docs };
     let policy = ExternalRefProcessPolicy {
@@ -6968,32 +6970,49 @@ pub(crate) fn check_json_duplicate_member_limit_parity_for_test() -> Result<(), 
         allowed_origins: vec!["https://schemas.example.com".to_string()],
         ..ExternalRefProcessPolicy::default()
     };
-    let validate_ext_spec = br#"{
-        "openapi": "3.1.0",
-        "info": {"title": "val-ext", "version": "1.0.0"},
-        "x-ferrum-proxy": {"id": "val-ext-proxy", "backend_host": "api.example.com", "backend_port": 443, "listen_path": "/api"},
-        "x-ferrum-external-refs": true,
-        "x-ferrum-validate": true,
-        "paths": {
-            "/items": {
-                "post": {
-                    "operationId": "createItem",
-                    "requestBody": {
-                        "required": true,
-                        "content": {
-                            "application/json": {
-                                "schema": {"$ref": "https://schemas.example.com/shared.json#/components/schemas/EvilConst"}
-                            }
-                        }
-                    },
-                    "responses": {"200": {"description": "ok"}}
-                }
-            }
-        }
-    }"#;
+    let make_validate_spec = |schema_name: &str| {
+        format!(
+            r#"{{
+                "openapi": "3.1.0",
+                "info": {{"title": "val-ext", "version": "1.0.0"}},
+                "x-ferrum-proxy": {{"id": "val-ext-proxy", "backend_host": "api.example.com", "backend_port": 443, "listen_path": "/api"}},
+                "x-ferrum-external-refs": true,
+                "x-ferrum-validate": true,
+                "paths": {{
+                    "/items": {{
+                        "post": {{
+                            "operationId": "createItem",
+                            "requestBody": {{
+                                "required": true,
+                                "content": {{
+                                    "application/json": {{
+                                        "schema": {{"$ref": "https://schemas.example.com/shared.json#/components/schemas/{schema_name}"}}
+                                    }}
+                                }}
+                            }},
+                            "responses": {{"200": {{"description": "ok"}}}}
+                        }}
+                    }}
+                }}
+            }}"#
+        )
+    };
+    let validate_good = make_validate_spec("GoodConst");
+    if extract_with_external_refs(
+        validate_good.as_bytes(),
+        Some(SpecFormat::Json),
+        "ferrum",
+        &policy,
+        &loader,
+    )
+    .is_err()
+    {
+        return Err("x-ferrum-validate companion fixture with ordinary const failed extraction");
+    }
+    let validate_evil = make_validate_spec("EvilConst");
     if !matches!(
         extract_with_external_refs(
-            validate_ext_spec,
+            validate_evil.as_bytes(),
             Some(SpecFormat::Json),
             "ferrum",
             &policy,
@@ -7001,40 +7020,58 @@ pub(crate) fn check_json_duplicate_member_limit_parity_for_test() -> Result<(), 
         ),
         Err(ExtractError::MalformedExtension {
             which: "x-ferrum-validate",
-            ..
-        })
+            error,
+        }) if error.contains(SERDE_JSON_RAW_VALUE_KEY)
     ) {
         return Err(
-            "x-ferrum-validate generated config with external RawValue const was not rejected",
+            "x-ferrum-validate generated config with external RawValue const was not rejected by reserved-key guard",
         );
     }
 
-    let mcp_ext_spec = br#"{
-        "openapi": "3.1.0",
-        "info": {"title": "mcp-ext", "version": "1.0.0"},
-        "x-ferrum-proxy": {"id": "mcp-ext-proxy", "backend_host": "api.example.com", "backend_port": 443, "listen_path": "/api"},
-        "x-ferrum-external-refs": true,
-        "x-ferrum-mcp": true,
-        "paths": {
-            "/items": {
-                "post": {
-                    "operationId": "createItem",
-                    "requestBody": {
-                        "required": true,
-                        "content": {
-                            "application/json": {
-                                "schema": {"$ref": "https://schemas.example.com/shared.json#/components/schemas/EvilConst"}
-                            }
-                        }
-                    },
-                    "responses": {"200": {"description": "ok"}}
-                }
-            }
-        }
-    }"#;
+    let make_mcp_spec = |schema_name: &str| {
+        format!(
+            r#"{{
+                "openapi": "3.1.0",
+                "info": {{"title": "mcp-ext", "version": "1.0.0"}},
+                "x-ferrum-proxy": {{"id": "mcp-ext-proxy", "backend_host": "api.example.com", "backend_port": 443, "listen_path": "/api"}},
+                "x-ferrum-external-refs": true,
+                "x-ferrum-mcp": true,
+                "paths": {{
+                    "/items": {{
+                        "post": {{
+                            "operationId": "createItem",
+                            "x-ferrum-mcp": true,
+                            "requestBody": {{
+                                "required": true,
+                                "content": {{
+                                    "application/json": {{
+                                        "schema": {{"$ref": "https://schemas.example.com/shared.json#/components/schemas/{schema_name}"}}
+                                    }}
+                                }}
+                            }},
+                            "responses": {{"200": {{"description": "ok"}}}}
+                        }}
+                    }}
+                }}
+            }}"#
+        )
+    };
+    let mcp_good = make_mcp_spec("GoodConst");
+    if extract_with_external_refs(
+        mcp_good.as_bytes(),
+        Some(SpecFormat::Json),
+        "ferrum",
+        &policy,
+        &loader,
+    )
+    .is_err()
+    {
+        return Err("x-ferrum-mcp companion fixture with ordinary const failed extraction");
+    }
+    let mcp_evil = make_mcp_spec("EvilConst");
     if !matches!(
         extract_with_external_refs(
-            mcp_ext_spec,
+            mcp_evil.as_bytes(),
             Some(SpecFormat::Json),
             "ferrum",
             &policy,
@@ -7042,10 +7079,12 @@ pub(crate) fn check_json_duplicate_member_limit_parity_for_test() -> Result<(), 
         ),
         Err(ExtractError::MalformedExtension {
             which: "x-ferrum-mcp",
-            ..
-        })
+            error,
+        }) if error.contains(SERDE_JSON_RAW_VALUE_KEY)
     ) {
-        return Err("x-ferrum-mcp generated config with external RawValue const was not rejected");
+        return Err(
+            "x-ferrum-mcp generated config with external RawValue const was not rejected by reserved-key guard",
+        );
     }
     Ok(())
 }

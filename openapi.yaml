@@ -8693,7 +8693,10 @@ paths:
         **Content-Type detection**: `application/json` → JSON parser;
         `application/yaml` / `application/x-yaml` / `text/yaml` / `text/x-yaml` → YAML parser;
         other or missing Content-Type → autodetect by first non-whitespace byte
-        (`{` → JSON, else YAML).
+        (`{` or `[` → JSON parser first, with syntax-only fallback to YAML for
+        flow-style YAML documents; any other leading byte → YAML parser).
+        External `$ref` documents use `{` or `[` → JSON, else YAML without the
+        syntax fallback.
 
         **YAML anchors and aliases**: supported under bounded expansion. The
         importer composes a libyaml event graph that preserves alias edges, then
@@ -45994,8 +45997,10 @@ components:
               re-entry rather than after exhausting the depth limit; `details` carries the chain of
               `$ref` literals that closed the cycle
             - `SchemaTooLarge` — reference expansion exceeded the per-expansion or cumulative
-              per-document materialized-node / byte budget, or the generated operation table
-              exceeded the generated-config byte ceiling
+              per-document materialized-node / byte budget, an external `$ref` document exceeded
+              its per-document or aggregate byte budget, the persisted external-ref snapshot
+              exceeded the 128 MiB normalized or 64 MiB compressed ceiling, or the generated
+              operation table exceeded the generated-config byte ceiling
             - `UnsupportedOperationField` — a Path Item declares an OpenAPI 3.2 `query`
               operation or `additionalOperations`, which the importer does not support
         details:

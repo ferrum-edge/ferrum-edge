@@ -2901,6 +2901,13 @@ async fn validate_bundle(
     Ok(ValidatedBundle { bundle, metadata })
 }
 
+fn map_snapshot_gzip_error(e: ExtractError) -> ApiSpecError {
+    match e {
+        e @ ExtractError::SchemaTooLarge { .. } => ApiSpecError::Extract(e),
+        other => ApiSpecError::Internal(format!("external_ref_snapshot compress failed: {other}")),
+    }
+}
+
 /// Build an `ApiSpec` row from body bytes, metadata, and bundle.
 fn build_spec_row(
     id: String,
@@ -2917,9 +2924,7 @@ fn build_spec_row(
         .map_err(|e| ApiSpecError::Internal(format!("resource hash failed: {e}")))?;
     let (external_ref_snapshot, external_ref_digest) = match &metadata.external_ref_snapshot {
         Some(snapshot) => {
-            let bytes = snapshot.gzip_bytes().map_err(|e| {
-                ApiSpecError::Internal(format!("external_ref_snapshot compress failed: {e}"))
-            })?;
+            let bytes = snapshot.gzip_bytes().map_err(map_snapshot_gzip_error)?;
             (Some(bytes), Some(snapshot.snapshot_digest.clone()))
         }
         None => (None, None),
@@ -3816,6 +3821,27 @@ pub(crate) async fn exercise_spec_content_response_limits_for_test() -> Result<(
         check_json_duplicate_member_limit_parity_for_test()?;
         crate::admin::api_specs::external_refs::check_external_json_duplicate_member_limit_for_test(
         )?;
+
+        // Handler-level mapping: a compressed external-ref snapshot exceeding
+        // its gzip cap must surface as HTTP 422 with `code: "SchemaTooLarge"`
+        // rather than HTTP 500 Internal Server Error.
+        let oversized_err =
+            crate::admin::api_specs::external_refs::sample_compressed_snapshot_too_large_error_for_test()?;
+        let resp_422 = error_response(map_snapshot_gzip_error(oversized_err));
+        if resp_422.status() != StatusCode::UNPROCESSABLE_ENTITY {
+            return Err("compressed snapshot SchemaTooLarge did not map to HTTP 422");
+        }
+        let body_422 = resp_422
+            .into_body()
+            .collect()
+            .await
+            .map_err(|_| "failed collecting 422 SchemaTooLarge body")?
+            .to_bytes();
+        let parsed_422: Value = serde_json::from_slice(&body_422)
+            .map_err(|_| "422 SchemaTooLarge body was not valid JSON")?;
+        if parsed_422.get("code").and_then(Value::as_str) != Some("SchemaTooLarge") {
+            return Err("422 response body did not carry code=SchemaTooLarge");
+        }
     }
 
     // Scenario F: multi-chunk (> 64 KiB) YAML->JSON conversion streams through
