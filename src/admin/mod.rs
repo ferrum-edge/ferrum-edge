@@ -1606,6 +1606,24 @@ pub(crate) struct BudgetedResponseBody {
     permit: ResponseBodyBudgetPermit,
 }
 
+/// Backing owner for a single `<= BUDGETED_BODY_CHUNK_BYTES` chunk wrapped in
+/// [`Bytes::from_owner`].
+///
+/// Field declaration order guarantees `bytes` is freed before `_permit` drops.
+/// Because [`Bytes::split_to`] / [`bytes::Buf::copy_to_bytes`] shares this
+/// owner via refcounting, any split prefix queued in `h2` after a stream reset
+/// keeps the connection budget permit reserved until the last slice drops.
+struct BudgetedChunkOwner {
+    bytes: Vec<u8>,
+    _permit: ResponseBodyBudgetPermit,
+}
+
+impl AsRef<[u8]> for BudgetedChunkOwner {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 impl BudgetedResponseBody {
     pub(crate) fn from_chunks(chunks: Vec<Vec<u8>>, permit: ResponseBodyBudgetPermit) -> Self {
         let mut queue = std::collections::VecDeque::with_capacity(chunks.len());
@@ -1615,7 +1633,10 @@ impl BudgetedResponseBody {
                 continue;
             }
             remaining_bytes = remaining_bytes.saturating_add(chunk.len());
-            queue.push_back(Bytes::from(chunk));
+            queue.push_back(Bytes::from_owner(BudgetedChunkOwner {
+                bytes: chunk,
+                _permit: permit.clone(),
+            }));
         }
         Self {
             chunks: queue,
@@ -1889,6 +1910,37 @@ pub(crate) async fn exercise_response_budget_wrapper_for_test(
     drop(first_frame);
     drop(early_body);
     let early_drop_released = budget.available_kib() == capacity_kib as usize;
+
+    // Stream reset while h2 still holds a `copy_to_bytes`-split prefix for a
+    // pending socket write: dropping both the remaining frame and body must
+    // keep the budget reserved until the split `Bytes` prefix itself drops.
+    let Some(split_permit) = budget.try_acquire_bytes(body_bytes) else {
+        return Err("budget was not reusable before split-prefix check");
+    };
+    let split_response = build_budgeted_response(body_bytes, split_permit);
+    let split_activity = Arc::new(AdminConnActivity::new());
+    let mut split_body =
+        GuardedAdminBody::wrap_response(split_response, AdminActivityGuard::new(split_activity))
+            .into_body();
+    let Some(Ok(split_frame)) = split_body.frame().await else {
+        return Err("split-prefix body did not yield first frame");
+    };
+    let Ok(mut split_data) = split_frame.into_data() else {
+        return Err("split-prefix frame was not data");
+    };
+    let split_prefix = bytes::Buf::copy_to_bytes(&mut split_data, 1024);
+    if split_prefix.len() != 1024 {
+        return Err("split prefix had unexpected length");
+    }
+    drop(split_data);
+    drop(split_body);
+    if budget.available_kib() != available_after_acquire {
+        return Err("dropping frame and body released budget while split prefix remained live");
+    }
+    drop(split_prefix);
+    if budget.available_kib() != capacity_kib as usize {
+        return Err("dropping split prefix did not release connection budget");
+    }
 
     // HEAD stripping drops the budgeted chunks + permit immediately while
     // preserving Content-Length from the pre-chunked body length.

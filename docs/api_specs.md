@@ -846,9 +846,12 @@ curl "https://gateway/api-specs/by-proxy/orders-proxy" \
 > ETag (or `*` for a verbatim format within the decompression cap) read only
 > `(spec_format, content_hash, uncompressed_size)` metadata and consume neither
 > read codec slots nor connection response budget; `If-None-Match: *` on a
-> cross-format conversion validates the bounded conversion first (holding a
-> codec slot and connection reservation) so an oversized or malformed conversion
-> returns `500` consistently with an unconditional `GET`.
+> cross-format conversion defers `304` until bounded codec validation succeeds
+> (admission preflight or post-fetch reservation growth can still fail fast with
+> `503` before codec work begins if the connection budget is already saturated,
+> whereas once codec work begins, a malformed document or output exceeding the
+> decompression cap returns `500` even if the connection budget is exhausted
+> mid-decode or mid-conversion).
 
 ```bash
 # Replace a spec
