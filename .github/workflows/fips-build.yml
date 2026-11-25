@@ -126,9 +126,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: fips-build-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}
-  # Pushes to main are never cancelled: at most one newer push waits behind
-  # the run in flight, so main converges on a complete exact-SHA FIPS verdict.
+  group: fips-build-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.run_id }}
+  # Pushes to main each get a unique per-run concurrency group and are never
+  # cancelled, so overlapping pushes never evict a pending exact-SHA FIPS run.
   cancel-in-progress: ${{ github.event_name != 'push' }}
 
 env:
@@ -195,9 +195,15 @@ jobs:
         # an implicit support claim, which is exactly what this gate refuses.
         run: |
           set -euo pipefail
+          profiles_file="$(mktemp)"
+          trap 'rm -f "$profiles_file"' EXIT
+          python3 .github/scripts/check_fips_feature_policy.py \
+            --list-claimed-profiles > "$profiles_file"
           status=0
+          audited=0
           while IFS=$'\t' read -r label features; do
             [ -n "$features" ] || continue
+            audited=$((audited + 1))
             echo "::group::FIPS feature graph — ${label}"
             slug="$(printf '%s' "$features" | tr ',' '-')"
             cargo tree --color never -e normal,build --prefix none \
@@ -210,7 +216,11 @@ jobs:
               status=1
             fi
             echo "::endgroup::"
-          done < <(python3 .github/scripts/check_fips_feature_policy.py --list-claimed-profiles)
+          done < "$profiles_file"
+          if [ "$audited" -eq 0 ]; then
+            echo "::error::FIPS feature-graph audit enumerated zero claimed profiles" >&2
+            status=1
+          fi
           exit "$status"
 
   fips-plan:
@@ -361,6 +371,11 @@ jobs:
 
           python3 -I .github/scripts/ci_runtime_plan.py --self-test
           plan="$(python3 -I .github/scripts/ci_runtime_plan.py "${filter_args[@]}")"
+          relevant_count="$(printf '%s\n' "$plan" | grep -c '^relevant=' || true)"
+          if [ "$relevant_count" -ne 1 ]; then
+            echo "::error::trusted relevance filter emitted ${relevant_count} relevant lines (expected 1)" >&2
+            exit 1
+          fi
           relevant="$(printf '%s\n' "$plan" | sed -n 's/^relevant=//p')"
           scope_count="$(printf '%s\n' "$plan" | grep -c '^scope=' || true)"
           scope="$(printf '%s\n' "$plan" | sed -n 's/^scope=//p')"

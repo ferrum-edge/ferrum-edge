@@ -820,9 +820,11 @@ aggregate accepts a skipped job only when its gate was `false`:
 The same principle governs the dedicated workflows. `fips-build.yml` compiles
 the FIPS profile on a pull request whenever a compiled Rust input changes. The
 trusted `ci_runtime_plan.py` `fips-build` suite prints `scope=full` for
-FIPS-specific logic (`src/fips/`, `src/tls/`, `src/dtls/`, the
-provider-installing listeners, the FIPS-aware tests, the Cargo feature graph,
-`docs/fips.md`, and the gate's own workflow/scripts) and `scope=compile` for
+FIPS-specific logic (`src/fips/`, `src/tls/`, `src/dtls/`, `src/cli.rs`,
+`src/gateway_entry.rs`, `src/config/env_config.rs`, `src/modes/control_plane.rs`,
+the provider-installing listeners, the FIPS-aware tests and unit/integration
+test registration files, the Cargo feature graph, `docs/fips.md`, and the
+gate's own workflow/scripts) and `scope=compile` for
 every other compiled Rust input (`src/`, `tests/` outside `tests/k8s/` and
 `tests/performance/`, `benches/`, `proto/`, `custom_plugins/`). Both print
 `relevant=true`. Issue #5828: PR #5825 added inline test code under
@@ -2607,9 +2609,10 @@ ceilings. The repair lowers peak compile concurrency and raises the job
 deadline; it does not drop `--lib` or `--test unit_tests`, and it does not split
 the combined llvm-cov invocation.
 
-The `coverage-shard` job therefore mirrors the **safe** FIPS knobs that do not
-require a Cross generation transition; this subsection admits no
-`WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS` pair.
+The `coverage-shard` job therefore uses the **safe** memory-capping knobs that
+do not require a Cross generation transition (retaining `line-tables-only`
+debuginfo while FIPS `fips-test-build` uses `debug=0`); this subsection admits
+no `WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS` pair.
 
 | Knob | FIPS `fips-test-build` (#4018) | Coverage `coverage-shard` (#4099 / #4368) |
 |---|---|---|

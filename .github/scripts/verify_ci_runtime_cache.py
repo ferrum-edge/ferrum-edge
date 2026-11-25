@@ -1181,19 +1181,18 @@ def check_rust_cache_uses_shared_key_only(
     *,
     expected_shared_key: str,
 ) -> None:
+    expected_line_re = re.compile(
+        rf"(?m)^[ \t]*['\"]?shared-key['\"]?:\s*['\"]?{re.escape(expected_shared_key)}['\"]?[ \t]*(?:#.*)?$"
+    )
     require(
-        expected_shared_key in with_block,
-        f"{source} rust-cache shared-key must be {expected_shared_key}",
+        expected_line_re.search(with_block) is not None,
+        f"{source} rust-cache shared-key must be exact `{expected_shared_key}`",
         failures,
     )
     require(
-        RUST_CACHE_BARE_KEY.search(with_block) is None,
-        f"{source} must not set rust-cache `key:` (ignored when shared-key is set)",
-        failures,
-    )
-    require(
-        RUST_CACHE_ADD_JOB_ID.search(with_block) is None,
-        f"{source} must not set rust-cache add-job-id-key (unused with shared-key)",
+        RUST_CACHE_BARE_KEY.search(with_block) is None
+        and re.search(r"(?m)^[ \t]*['\"]?(?:key|prefix-key|add-job-id-key)['\"]?:", with_block) is None,
+        f"{source} must not set rust-cache `key:`, `prefix-key:`, or `add-job-id-key:` (ignored or drifts with shared-key)",
         failures,
     )
     require(
@@ -4145,14 +4144,44 @@ def check_fips(workflow: str, failures: list[str]) -> None:
     require(bool(clippy_job), "fips-clippy job is missing", failures)
     require(bool(test_build_job), "fips-test-build job is missing", failures)
     require(bool(test_job), "fips-test job is missing", failures)
+    feature_policy_job = extract_job(workflow, "feature-policy")
+    require(
+        bool(feature_policy_job)
+        and "< <(python3 .github/scripts/check_fips_feature_policy.py --list-claimed-profiles)"
+        not in feature_policy_job
+        and 'if [ "$audited" -eq 0 ]; then' in feature_policy_job,
+        "feature-policy must capture --list-claimed-profiles before looping (not process substitution) "
+        "and fail closed when zero profiles are audited",
+        failures,
+    )
+    require(
+        "github.event.pull_request.number || github.event.merge_group.head_sha || github.run_id"
+        in workflow,
+        "fips-build.yml concurrency.group must key non-PR/non-merge_group pushes by github.run_id "
+        "so overlapping pushes to main never evict pending exact-SHA FIPS runs",
+        failures,
+    )
+    require(
+        re.search(r"(?m)^defaults:", workflow) is None
+        and re.search(r"(?m)^    defaults:", aggregate) is None,
+        "fips-build.yml must not define workflow-level or aggregate-level `defaults:`",
+        failures,
+    )
+    require(
+        "continue-on-error" not in workflow,
+        "fips-build.yml must not use continue-on-error in any job or step",
+        failures,
+    )
     require(
         "scope: ${{ steps.filter.outputs.scope }}" in plan_job
         and 'echo "scope=full" >> "$GITHUB_OUTPUT"' in plan_job
         and 'echo "scope=$scope" >> "$GITHUB_OUTPUT"' in plan_job
+        and "grep -c '^relevant='" in plan_job
+        and '[ "$relevant_count" -ne 1 ]' in plan_job
         and "grep -c '^scope='" in plan_job
         and '[ "$scope_count" -eq 0 ]' in plan_job
         and '[ "$EVENT_NAME" != "pull_request" ] && { [ "$relevant" != "true" ] || [ "$scope" != "full" ]; }' in plan_job,
-        "FIPS planner must export its fail-closed scope output, reject duplicate/empty scope lines, "
+        "FIPS planner must export its fail-closed scope output, reject duplicate/empty relevant or scope lines, "
         "fail closed to relevant=true/scope=full on pre-scope planners, and enforce scope=full on non-PR events",
         failures,
     )
@@ -4193,6 +4222,7 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         "CARGO_PROFILE_TEST_CODEGEN_UNITS": '"256"',
     }
     observed_cargo_envs: dict[str, dict[str, str]] = {}
+    observed_cache_with: dict[str, dict[str, str]] = {}
     for cargo_job, cargo_name in (
         (compile_job, "fips-compile"),
         (claimed_job, "fips-claimed-checks"),
@@ -4203,7 +4233,7 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         env_body = env_match.group("body") if env_match else ""
         job_cargo_env: dict[str, str] = {}
         for line in env_body.splitlines():
-            kv = re.match(r"^      ((?:CARGO|RUST)[A-Z0-9_]*):\s*(.+?)\s*$", line)
+            kv = re.match(r"^      ['\"]?((?:CARGO|RUST)[A-Z0-9_]*)['\"]?:\s*(.+?)\s*$", line)
             if kv:
                 job_cargo_env[kv.group(1)] = kv.group(2)
         observed_cargo_envs[cargo_name] = job_cargo_env
@@ -4215,25 +4245,47 @@ def check_fips(workflow: str, failures: list[str]) -> None:
                 failures,
             )
         steps_section = cargo_job.split("\n    steps:\n", 1)[1] if "\n    steps:\n" in cargo_job else ""
+        # Reject block-style, flow-map, quoted, exported, inline, or --config
+        # CARGO_*/RUST* overrides at step level that could drift cache keys or
+        # Cargo fingerprints across the handoff.
         require(
             not re.search(
-                r"(?m)(?:^\s+CARGO_(?:PROFILE|BUILD)_[A-Z0-9_]*:|export\s+CARGO_(?:PROFILE|BUILD)_|CARGO_(?:PROFILE|BUILD)_[A-Z0-9_]*=.*GITHUB_ENV)",
+                r"(?m)(?:"
+                r"^\s+['\"]?(?:CARGO|RUST)[A-Z0-9_]*['\"]?:"
+                r"|\{[^}\n]*['\"]?(?:CARGO|RUST)[A-Z0-9_]*['\"]?\s*:"
+                r"|\bexport\s+(?:CARGO|RUST)[A-Z0-9_]*="
+                r"|\b(?:CARGO_(?:PROFILE|BUILD|INCREMENTAL|TARGET)|RUSTFLAGS)[A-Z0-9_]*="
+                r"|--config\s+['\"]?profile\."
+                r")",
                 steps_section,
             ),
-            f"{cargo_name} must not override CARGO_PROFILE_* or CARGO_BUILD_* at step level",
+            f"{cargo_name} must not override CARGO_*/RUST* build/profile settings at step level",
             failures,
         )
         for step in extract_job_steps(cargo_job):
             if RUST_CACHE in step:
                 require(
-                    not re.search(r"(?m)^\s+(?:prefix-key|key|add-job-id-key):", step),
+                    not re.search(r"(?m)^\s+['\"]?(?:prefix-key|key|add-job-id-key)['\"]?:", step),
                     f"{cargo_name} rust-cache step must not set prefix-key, key, or add-job-id-key",
                     failures,
                 )
+                with_m = _WITH_BLOCK_RE.search(step)
+                with_map: dict[str, str] = {}
+                if with_m:
+                    for wline in with_m.group(1).splitlines():
+                        wkv = re.match(r"^[ \t]+['\"]?([A-Za-z0-9_-]+)['\"]?:\s*(.+?)\s*$", wline)
+                        if wkv and wkv.group(1) != "save-if":
+                            with_map[wkv.group(1)] = wkv.group(2)
+                observed_cache_with[cargo_name] = with_map
     if len(set(tuple(sorted(v.items())) for v in observed_cargo_envs.values())) != 1:
         failures.append(
             "all four FIPS Cargo jobs must declare the exact same set of CARGO_* and RUST* job env vars: "
             f"{observed_cargo_envs!r}"
+        )
+    if len(set(tuple(sorted(v.items())) for v in observed_cache_with.values())) != 1:
+        failures.append(
+            "all four FIPS Cargo jobs must declare identical Swatinem/rust-cache `with:` inputs "
+            f"(excluding save-if): {observed_cache_with!r}"
         )
     require(
         "fips-compile" in job_needs_list(claimed_job),
@@ -4327,16 +4379,57 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         "fips-test must execute the immutable artifact without invoking Cargo",
         failures,
     )
+    test_exec_steps = [
+        step
+        for step in extract_job_steps(test_job)
+        if "      - name: FIPS policy, key-admission, and handshake tests\n" in step
+    ]
     require(
-        "test result: ok\\. [1-9][0-9]* passed; 0 failed;" in test_job
-        and "^test .*tls::fips_policy_tests::.* \\.\\.\\. ok$" in test_job
-        and "^test .*tls::fips_key_admission_tests::.* \\.\\.\\. ok$" in test_job
-        and test_job.count("test result: ok\\. 1 passed; 0 failed; 0 ignored;") >= 2
-        and test_job.count("--exact") >= 2,
-        "fips-test must assert non-zero passing FIPS policy/key-admission unit tests "
-        "and exact 1-passed counts for both handshake integration tests",
+        len(test_exec_steps) == 1,
+        "fips-test must contain the unconditional `FIPS policy, key-admission, and handshake tests` step",
         failures,
     )
+    if len(test_exec_steps) == 1:
+        exec_step = test_exec_steps[0]
+        exec_keys = {
+            m.group(1).strip("\"'")
+            for line in exec_step.splitlines()
+            if (m := re.match(r"^(?:      - |        )(['\"]?[A-Za-z0-9_-]+['\"]?):", line))
+        }
+        require(
+            exec_keys == {"name", "env", "run"},
+            f"fips-test execution step must be unconditional with no if/shell/continue-on-error (keys={sorted(exec_keys)})",
+            failures,
+        )
+        require(
+            re.search(r"(?m)^\s*exit\s+0\b", exec_step) is None,
+            "fips-test execution step must not contain an early `exit 0`",
+            failures,
+        )
+        cmd1_idx = exec_step.find('"$unit_test_binary" tls::fips_ 2>&1 | tee "$unit_log"')
+        chk1_idx = exec_step.find("test result: ok\\. [1-9][0-9]* passed; 0 failed;")
+        pol1_idx = exec_step.find("^test .*tls::fips_policy_tests::.* \\.\\.\\. ok$")
+        key1_idx = exec_step.find("^test .*tls::fips_key_admission_tests::.* \\.\\.\\. ok$")
+        exit1_idx = exec_step.find('[ "$status" -eq 0 ] || exit "$status"', max(0, cmd1_idx))
+        cmd2_idx = exec_step.find(
+            "integration::cp_grpc_handshake_admission_tests::frontend_and_backend_builders_complete_a_real_tls_handshake"
+        )
+        chk2_idx = exec_step.find("test result: ok\\. 1 passed; 0 failed; 0 ignored;", max(0, cmd2_idx))
+        exit2_idx = exec_step.find('[ "$status" -eq 0 ] || exit "$status"', max(0, cmd2_idx))
+        cmd3_idx = exec_step.find(
+            "integration::cp_grpc_handshake_admission_tests::legitimate_data_plane_connects_once_a_permit_is_released"
+        )
+        chk3_idx = exec_step.find("test result: ok\\. 1 passed; 0 failed; 0 ignored;", max(0, cmd3_idx))
+        exit3_idx = exec_step.find('exit "$status"', max(0, cmd3_idx))
+        require(
+            min(cmd1_idx, chk1_idx, pol1_idx, key1_idx, exit1_idx, cmd2_idx, chk2_idx, exit2_idx, cmd3_idx, chk3_idx, exit3_idx) >= 0
+            and cmd1_idx < chk1_idx < exit1_idx < cmd2_idx < chk2_idx < exit2_idx < cmd3_idx < chk3_idx < exit3_idx
+            and exec_step.count("status=${PIPESTATUS[0]}") == 3
+            and exec_step.count("--exact") >= 2,
+            "fips-test execution step must bind each test invocation in order to its PIPESTATUS[0], "
+            "non-zero/exact-1 pass-count assertion, and failure propagation",
+            failures,
+        )
     require(
         {"fips-plan", "fips-compile", "fips-claimed-checks", "fips-clippy",
          "fips-test-build", "fips-test"} <= job_needs_list(aggregate),
@@ -4344,9 +4437,24 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         "including the test-binary producer",
         failures,
     )
-    require(
-        "continue-on-error" not in aggregate,
-        "FIPS Build & Test aggregate must not use continue-on-error",
+    require_fips_aggregate_fail_step(
+        aggregate,
+        "needs.feature-policy.result != 'success'",
+        "FIPS aggregate must fail closed when feature-policy fails",
+        failures,
+    )
+    require_fips_aggregate_fail_step(
+        aggregate,
+        "needs.fips-plan.result != 'success'",
+        "FIPS aggregate must fail closed when fips-plan fails",
+        failures,
+    )
+    require_fips_aggregate_fail_step(
+        aggregate,
+        "needs.fips-plan.result == 'success' && "
+        "needs.fips-plan.outputs.relevant != 'true' && "
+        "needs.fips-plan.outputs.relevant != 'false'",
+        "FIPS aggregate must fail closed when planner relevant output is unusable",
         failures,
     )
     require_fips_aggregate_fail_step(
@@ -4439,16 +4547,21 @@ def require_fips_aggregate_fail_step(
     message: str,
     failures: list[str],
 ) -> None:
-    """Require an executable fail-closed `exit 1` step with exact `if:` line."""
+    """Require a pure name/if/run `exit 1` step with exact `if:` line and no shell/env overrides."""
 
     exact_if_line = f"        if: {expected_if}"
-    matching = [
-        step
-        for step in extract_job_steps(aggregate)
-        if exact_if_line in step.splitlines()
-        and "continue-on-error" not in step
-        and step_run_ends_with_exit(step, 1)
-    ]
+    matching = []
+    for step in extract_job_steps(aggregate):
+        lines = step.splitlines()
+        if exact_if_line not in lines:
+            continue
+        keys = {
+            m.group(1).strip("\"'")
+            for line in lines
+            if (m := re.match(r"^(?:      - |        )(['\"]?[A-Za-z0-9_-]+['\"]?):", line))
+        }
+        if keys == {"name", "if", "run"} and step_run_ends_with_exit(step, 1):
+            matching.append(step)
     require(len(matching) == 1, message, failures)
 
 
@@ -7470,21 +7583,86 @@ def self_test() -> int:
     step_env_override_failures: list[str] = []
     check_fips(step_env_override, step_env_override_failures)
     require(
-        any("must not override CARGO_PROFILE_* or CARGO_BUILD_* at step level" in item for item in step_env_override_failures),
+        any("must not override CARGO_*/RUST* build/profile settings at step level" in item for item in step_env_override_failures),
         "self-test: step-level CARGO_PROFILE_* override in FIPS job must fail",
+        failures,
+    )
+
+    flow_step_env_override = handoff_channel.replace(
+        "      - name: Cache FIPS Rust and AWS-LC outputs\n",
+        '      - name: Override flow\n        env: { CARGO_PROFILE_DEV_DEBUG: "1" }\n        run: "true"\n      - name: Cache FIPS Rust and AWS-LC outputs\n',
+        1,
+    )
+    flow_step_env_failures: list[str] = []
+    check_fips(flow_step_env_override, flow_step_env_failures)
+    require(
+        any("must not override CARGO_*/RUST* build/profile settings at step level" in item for item in flow_step_env_failures),
+        "self-test: flow-map step-level CARGO_PROFILE_* override in FIPS job must fail",
         failures,
     )
 
     prefix_key_drift = handoff_channel.replace(
         '          cache-on-failure: "true"\n',
-        '          prefix-key: drifted-prefix\n          cache-on-failure: "true"\n',
+        '          "prefix-key": drifted-prefix\n          cache-on-failure: "true"\n',
         1,
     )
     prefix_key_failures: list[str] = []
     check_fips(prefix_key_drift, prefix_key_failures)
     require(
-        any("must not set prefix-key" in item for item in prefix_key_failures),
-        "self-test: rust-cache prefix-key override in FIPS job must fail",
+        any("prefix-key" in item for item in prefix_key_failures),
+        "self-test: quoted rust-cache prefix-key override in FIPS job must fail",
+        failures,
+    )
+
+    suffixed_shared_key = handoff_channel.replace(
+        "shared-key: ci-fips-contract-${{ hashFiles('Cargo.toml', 'Cargo.lock', '.cargo/config.toml', 'build.rs', '.github/workflows/fips-build.yml', '.github/scripts/check_fips_feature_policy.py', 'src/fips/**', 'vendor/**') }}\n",
+        "shared-key: ci-fips-contract-${{ hashFiles('Cargo.toml', 'Cargo.lock', '.cargo/config.toml', 'build.rs', '.github/workflows/fips-build.yml', '.github/scripts/check_fips_feature_policy.py', 'src/fips/**', 'vendor/**') }}-extra\n",
+        1,
+    )
+    suffixed_shared_key_failures: list[str] = []
+    check_fips(suffixed_shared_key, suffixed_shared_key_failures)
+    require(
+        any("must be exact" in item or "identical Swatinem/rust-cache" in item for item in suffixed_shared_key_failures),
+        "self-test: suffixed shared-key in one FIPS job must fail",
+        failures,
+    )
+
+    shell_override_guard = handoff_channel.replace(
+        "      - name: Fail when FIPS tests did not succeed\n",
+        "      - name: Fail when FIPS tests did not succeed\n        shell: bash -c true {0}\n",
+        1,
+    )
+    shell_override_failures: list[str] = []
+    check_fips(shell_override_guard, shell_override_failures)
+    require(
+        any("when tests fail" in item for item in shell_override_failures),
+        "self-test: FIPS aggregate guard with shell override must fail",
+        failures,
+    )
+
+    defaults_override_agg = handoff_channel.replace(
+        "  fips-build:\n    name: FIPS Build & Test\n",
+        "  fips-build:\n    name: FIPS Build & Test\n    defaults:\n      run:\n        shell: true {0}\n",
+        1,
+    )
+    defaults_override_failures: list[str] = []
+    check_fips(defaults_override_agg, defaults_override_failures)
+    require(
+        any("defaults:" in item for item in defaults_override_failures),
+        "self-test: job-level defaults: override on fips-build must fail",
+        failures,
+    )
+
+    disabled_plan_guard = handoff_channel.replace(
+        "        if: needs.fips-plan.result != 'success'\n",
+        "        if: false && needs.fips-plan.result != 'success'\n",
+        1,
+    )
+    disabled_plan_failures: list[str] = []
+    check_fips(disabled_plan_guard, disabled_plan_failures)
+    require(
+        any("when fips-plan fails" in item for item in disabled_plan_failures),
+        "self-test: disabled fips-plan failure guard must fail",
         failures,
     )
 
@@ -7536,6 +7714,45 @@ def self_test() -> int:
         failures,
     )
 
+    disabled_test_exec = handoff_channel.replace(
+        "      - name: FIPS policy, key-admission, and handshake tests\n",
+        "      - name: FIPS policy, key-admission, and handshake tests\n        if: ${{ false }}\n",
+        1,
+    )
+    disabled_test_exec_failures: list[str] = []
+    check_fips(disabled_test_exec, disabled_test_exec_failures)
+    require(
+        any("must be unconditional" in item for item in disabled_test_exec_failures),
+        "self-test: conditional fips-test execution step (if: false) must fail",
+        failures,
+    )
+
+    coe_test_exec = handoff_channel.replace(
+        "      - name: FIPS policy, key-admission, and handshake tests\n",
+        "      - name: FIPS policy, key-admission, and handshake tests\n        continue-on-error: true\n",
+        1,
+    )
+    coe_test_exec_failures: list[str] = []
+    check_fips(coe_test_exec, coe_test_exec_failures)
+    require(
+        any("continue-on-error" in item for item in coe_test_exec_failures),
+        "self-test: continue-on-error on fips-test execution step must fail",
+        failures,
+    )
+
+    early_exit_test_exec = handoff_channel.replace(
+        '          unit_test_binary="$UNIT_TEST_BINARY"\n',
+        '          exit 0\n          unit_test_binary="$UNIT_TEST_BINARY"\n',
+        1,
+    )
+    early_exit_failures: list[str] = []
+    check_fips(early_exit_test_exec, early_exit_failures)
+    require(
+        any("early `exit 0`" in item for item in early_exit_failures),
+        "self-test: early exit 0 in fips-test execution step must fail",
+        failures,
+    )
+
     missing_test_count = handoff_channel.replace(
         "test result: ok\\. 1 passed; 0 failed; 0 ignored;",
         "test result: ok",
@@ -7544,7 +7761,7 @@ def self_test() -> int:
     missing_test_count_failures: list[str] = []
     check_fips(missing_test_count, missing_test_count_failures)
     require(
-        any("must assert non-zero passing FIPS policy/key-admission unit tests" in item for item in missing_test_count_failures),
+        any("must bind each test invocation" in item for item in missing_test_count_failures),
         "self-test: dropping fips-test exact 1-passed assertion must fail",
         failures,
     )
