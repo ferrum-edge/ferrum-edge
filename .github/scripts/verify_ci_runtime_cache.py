@@ -6289,83 +6289,265 @@ def _scan_shell_command_tokens(tokens: list[str]) -> bool:
     return False
 
 
+def _split_shell_pipelines(run_text: str) -> list[str]:
+    """Split a shell script into pipelines/statements while preserving pipes (`|`, `|&`), quotes, and heredoc bodies."""
+
+    pipelines: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    pending_heredocs: list[tuple[str, bool]] = []
+    expecting_heredoc_delim: tuple[bool, bool] | None = None
+    delim_buf: list[str] = []
+    delim_has_token = False
+    arith_paren_stack: list[int] = []
+    idx = 0
+    n = len(run_text)
+
+    def _finish_delim() -> None:
+        nonlocal expecting_heredoc_delim, delim_buf, delim_has_token
+        if expecting_heredoc_delim is not None and delim_has_token:
+            pending_heredocs.append(("".join(delim_buf), expecting_heredoc_delim[1]))
+            expecting_heredoc_delim = None
+            delim_buf = []
+            delim_has_token = False
+
+    def _flush_pipeline() -> None:
+        nonlocal buf, expecting_heredoc_delim, delim_buf, delim_has_token
+        _finish_delim()
+        expecting_heredoc_delim = None
+        delim_buf = []
+        delim_has_token = False
+        text = "".join(buf).strip()
+        if text:
+            pipelines.append(text)
+        buf = []
+
+    def _ends_with_pipe(parts: list[str]) -> bool:
+        tail = "".join(parts).rstrip(" \t\r\n")
+        if tail.endswith("|&"):
+            return True
+        if tail.endswith("|") and not tail.endswith("||") and not tail.endswith(">|"):
+            return True
+        return False
+
+    while idx < n:
+        ch = run_text[idx]
+        if quote is None:
+            if ch == "#" and (not buf or buf[-1] in (" ", "\t", "\r", "\n", ";", "|", "&")):
+                while idx < n and run_text[idx] != "\n":
+                    idx += 1
+                continue
+            if ch == "\\" and idx + 1 < n:
+                if run_text[idx + 1] == "\n":
+                    buf.append(" ")
+                    idx += 2
+                    continue
+                if run_text[idx + 1] == "\r" and idx + 2 < n and run_text[idx + 2] == "\n":
+                    buf.append(" ")
+                    idx += 3
+                    continue
+                buf.append(run_text[idx : idx + 2])
+                if expecting_heredoc_delim is not None:
+                    delim_buf.append(run_text[idx + 1])
+                    delim_has_token = True
+                idx += 2
+                continue
+            if run_text[idx : idx + 3] == "$((":
+                arith_paren_stack.append(0)
+                buf.append("$((")
+                idx += 3
+                continue
+            if not arith_paren_stack and run_text[idx : idx + 2] == "((" and (
+                not buf or buf[-1] in (" ", "\t", "\r", "\n", ";", "|", "&")
+            ):
+                arith_paren_stack.append(0)
+                buf.append("((")
+                idx += 2
+                continue
+            if arith_paren_stack:
+                if ch == "(":
+                    arith_paren_stack[-1] += 1
+                    buf.append(ch)
+                    idx += 1
+                    continue
+                if ch == ")":
+                    if arith_paren_stack[-1] > 0:
+                        arith_paren_stack[-1] -= 1
+                        buf.append(ch)
+                        idx += 1
+                        continue
+                    if run_text[idx : idx + 2] == "))":
+                        arith_paren_stack.pop()
+                        buf.append("))")
+                        idx += 2
+                        continue
+            if ch == "$" and idx + 1 < n and run_text[idx + 1] == "'":
+                quote = "$'"
+                buf.append("$'")
+                if expecting_heredoc_delim is not None:
+                    delim_has_token = True
+                idx += 2
+                continue
+            if ch in ("'", '"'):
+                quote = ch
+                buf.append(ch)
+                if expecting_heredoc_delim is not None:
+                    delim_has_token = True
+                idx += 1
+                continue
+            if ch in (" ", "\t", "\r"):
+                _finish_delim()
+                buf.append(ch)
+                idx += 1
+                continue
+            if (
+                not arith_paren_stack
+                and ch == "<"
+                and run_text[idx : idx + 2] == "<<"
+                and run_text[idx : idx + 3] != "<<<"
+            ):
+                _finish_delim()
+                op = "<<-" if run_text[idx : idx + 3] == "<<-" else "<<"
+                buf.append(op)
+                expecting_heredoc_delim = (True, op == "<<-")
+                idx += len(op)
+                continue
+            if not arith_paren_stack and ch == ";":
+                _flush_pipeline()
+                idx += 1
+                continue
+            if not arith_paren_stack and ch == "|" and idx + 1 < n and run_text[idx + 1] == "|":
+                _flush_pipeline()
+                idx += 2
+                continue
+            if not arith_paren_stack and ch == "&" and idx + 1 < n and run_text[idx + 1] == "&":
+                _flush_pipeline()
+                idx += 2
+                continue
+            if not arith_paren_stack and ch == "&" and not (
+                (idx > 0 and run_text[idx - 1] in (">", "<", "|"))
+                or (idx + 1 < n and run_text[idx + 1] == ">")
+            ):
+                _flush_pipeline()
+                idx += 1
+                continue
+            if ch == "\n":
+                _finish_delim()
+                idx += 1
+                if pending_heredocs:
+                    buf.append("\n")
+                    while pending_heredocs and idx < n:
+                        delim, strip_tabs = pending_heredocs.pop(0)
+                        while idx < n:
+                            nl = run_text.find("\n", idx)
+                            if nl < 0:
+                                hd_line = run_text[idx:]
+                                idx = n
+                            else:
+                                hd_line = run_text[idx:nl]
+                                idx = nl + 1
+                            buf.append(hd_line + "\n")
+                            cand = hd_line.rstrip("\r")
+                            if strip_tabs:
+                                cand = cand.lstrip("\t")
+                            if cand == delim:
+                                break
+                if not _ends_with_pipe(buf):
+                    _flush_pipeline()
+                else:
+                    buf.append("\n")
+                continue
+            buf.append(ch)
+            if expecting_heredoc_delim is not None:
+                if ch in (">", "<"):
+                    _finish_delim()
+                else:
+                    delim_buf.append(ch)
+                    delim_has_token = True
+            idx += 1
+        elif quote == "'":
+            buf.append(ch)
+            if ch == "'":
+                quote = None
+            elif expecting_heredoc_delim is not None:
+                delim_buf.append(ch)
+            idx += 1
+        elif quote == "$'":
+            if ch == "\\" and idx + 1 < n:
+                buf.append(run_text[idx : idx + 2])
+                if expecting_heredoc_delim is not None:
+                    delim_buf.append(run_text[idx + 1])
+                idx += 2
+                continue
+            buf.append(ch)
+            if ch == "'":
+                quote = None
+            elif expecting_heredoc_delim is not None:
+                delim_buf.append(ch)
+            idx += 1
+        else:  # double quote
+            if ch == "\\" and idx + 1 < n:
+                buf.append(run_text[idx : idx + 2])
+                if expecting_heredoc_delim is not None:
+                    delim_buf.append(run_text[idx + 1])
+                idx += 2
+                continue
+            buf.append(ch)
+            if ch == '"':
+                quote = None
+            elif expecting_heredoc_delim is not None:
+                delim_buf.append(ch)
+            idx += 1
+    _flush_pipeline()
+    return pipelines
+
+
 def _github_env_write_has_ci_debug_var(run_text: str) -> bool:
     """Return True if a step writes a Cargo/Rust/C/RUST_BACKTRACE variable into GITHUB_ENV."""
 
-    raw_lines = run_text.splitlines()
-    # Join backslash-continued physical lines while preserving original line order
-    # and dropping comment-only lines.
-    logical_lines: list[str] = []
-    buf = ""
-    for raw in raw_lines:
-        stripped = raw.strip()
-        if not buf and (not stripped or stripped.startswith("#")):
-            continue
-        if raw.endswith("\\") and not raw.endswith("\\\\"):
-            buf += raw[:-1] + " "
-        else:
-            logical_lines.append((buf + raw).strip())
-            buf = ""
-    if buf.strip():
-        logical_lines.append(buf.strip())
-
-    if not any("GITHUB_ENV" in ln for ln in logical_lines):
+    pipelines = _split_shell_pipelines(run_text)
+    if not any("GITHUB_ENV" in pl for pl in pipelines):
         return False
 
     simple_write_re = re.compile(
         r"""(?:>>?\s*|\btee\b[^\n]*)(?:["']?)\$\{?GITHUB_ENV\}?(?:["']?)"""
     )
-    heredoc_delim_re = re.compile(r"""<<-?\s*(?:\$?'([^']+)'|"([^"]+)"|([^\s;&|<>]+))""")
 
-    for idx, ln in enumerate(logical_lines):
-        if "GITHUB_ENV" not in ln:
+    for idx, pl in enumerate(pipelines):
+        if "GITHUB_ENV" not in pl:
             continue
-        # 1. Heredoc redirected into GITHUB_ENV: scan the command line + heredoc body.
-        if "<<" in ln and simple_write_re.search(ln):
-            if _CI_DEBUG_GITHUB_ENV_VAR_RE.search(ln):
-                return True
-            hd_m = heredoc_delim_re.search(ln)
-            if hd_m:
-                delim = hd_m.group(1) or hd_m.group(2) or hd_m.group(3)
-                body_lines: list[str] = []
-                for j in range(idx + 1, len(logical_lines)):
-                    if logical_lines[j].lstrip("\t") == delim:
-                        break
-                    body_lines.append(logical_lines[j])
-                if _CI_DEBUG_GITHUB_ENV_VAR_RE.search("\n".join(body_lines)):
-                    return True
-                continue
-        # 2. Grouped `{ ... } >> "$GITHUB_ENV"` or subshell `( ... ) >> "$GITHUB_ENV"`:
-        #    scan the matching block backwards.
-        if re.match(r"^[}\)]", ln) and simple_write_re.search(ln):
-            opener, closer = ("{", "}") if ln.startswith("}") else ("(", ")")
+        # 1. Grouped `{ ... } >> "$GITHUB_ENV"` or subshell `( ... ) >> "$GITHUB_ENV"`:
+        #    scan the matching block backwards across pipelines.
+        if re.match(r"^[}\)]", pl) and simple_write_re.search(pl):
+            opener, closer = ("{", "}") if pl.startswith("}") else ("(", ")")
             depth = 1
-            block_lines = [ln]
+            block_parts = [pl]
             for j in range(idx - 1, -1, -1):
-                prev = logical_lines[j]
-                block_lines.append(prev)
+                prev = pipelines[j]
+                block_parts.append(prev)
                 if prev.endswith(closer) or prev.startswith(closer):
                     depth += 1
                 if prev.startswith(opener) or prev.endswith(opener):
                     depth -= 1
                     if depth <= 0:
                         break
-            if _CI_DEBUG_GITHUB_ENV_VAR_RE.search("\n".join(reversed(block_lines))):
+            if _CI_DEBUG_GITHUB_ENV_VAR_RE.search("\n".join(reversed(block_parts))):
                 return True
             continue
-        # 3. Direct single-line write (`echo ... >> "$GITHUB_ENV"`, `... | tee -a "$GITHUB_ENV"`),
+        # 2. Direct pipeline write (`echo ... >> "$GITHUB_ENV"`, wrapped `printf ... |\n tee -a "$GITHUB_ENV"`,
+        #    or `cat <<'EOF' >> "$GITHUB_ENV"\n...\nEOF` whose heredoc body is attached to `pl`),
         #    excluding compound-command closers (`fi`/`done`/`esac`), `exec`, or variable aliasing.
         if (
-            simple_write_re.search(ln)
-            and not re.match(r"^(?:(?:builtin\s+)?exec|fi|done|esac)\b", ln)
-            and not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=.*GITHUB_ENV", ln)
+            simple_write_re.search(pl)
+            and not re.match(r"^(?:(?:builtin\s+)?exec|fi|done|esac)\b", pl)
+            and not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=.*GITHUB_ENV", pl)
         ):
-            if _CI_DEBUG_GITHUB_ENV_VAR_RE.search(ln):
+            if _CI_DEBUG_GITHUB_ENV_VAR_RE.search(pl):
                 return True
             continue
-        # 4. Fallback for complex/indirect GITHUB_ENV usage (exec redirect, aliasing,
-        #    python/awk script writing to os.environ["GITHUB_ENV"]): check whole step.
-        if _CI_DEBUG_GITHUB_ENV_VAR_RE.search("\n".join(logical_lines)):
+        # 3. Fallback for complex/indirect GITHUB_ENV usage (`fi >> "$GITHUB_ENV"`, `exec`,
+        #    variable aliasing, python/awk scripts): check all pipelines in the step.
+        if _CI_DEBUG_GITHUB_ENV_VAR_RE.search("\n".join(pipelines)):
             return True
     return False
 
@@ -6890,6 +7072,18 @@ def _check_shared_key_value(
         discovered.add((filename, job_id))
 
 
+def _is_plain_yaml_scalar_start(val: str) -> bool:
+    """Return True if `val` begins a YAML 1.2 plain scalar (`-`/`?` are indicators only before space/EOL)."""
+
+    if not val:
+        return False
+    if val.startswith(("{", "[", "'", '"', "|", ">", "&", "*", "!")):
+        return False
+    if val in ("-", "?") or val.startswith(("- ", "-\t", "? ", "?\t")):
+        return False
+    return True
+
+
 def _has_unsupported_fallback_yaml_syntax(workflow_text: str) -> str | None:
     """Reject explicit `?` YAML mapping keys and key-level anchors/aliases/tags in fallback mode."""
 
@@ -6971,7 +7165,7 @@ def _has_unsupported_fallback_yaml_syntax(workflow_text: str) -> str | None:
                 val_stripped = _yaml_strip_trailing_comment(raw_val).strip()
                 if not val_stripped:
                     pending_key_indent = key_indent
-                elif not val_stripped.startswith(("{", "[", "'", '"', "|", ">", "&", "*", "!")):
+                elif _is_plain_yaml_scalar_start(val_stripped):
                     plain_scalar_indent = key_indent
                     pending_key_indent = None
                 else:
@@ -6983,9 +7177,7 @@ def _has_unsupported_fallback_yaml_syntax(workflow_text: str) -> str | None:
                     val_stripped = _yaml_strip_trailing_comment(dash_m.group("rest")).strip()
                     if not val_stripped:
                         pending_key_indent = seq_indent
-                    elif not val_stripped.startswith(
-                        ("{", "[", "'", '"', "|", ">", "&", "*", "!", "?", "-")
-                    ):
+                    elif _is_plain_yaml_scalar_start(val_stripped):
                         plain_scalar_indent = seq_indent
                         pending_key_indent = None
                     else:
@@ -6993,8 +7185,7 @@ def _has_unsupported_fallback_yaml_syntax(workflow_text: str) -> str | None:
             elif (
                 pending_key_indent is not None
                 and indent > pending_key_indent
-                and not stripped.startswith(("- ", "-\t", "{", "[", "'", '"', "|", ">", "&", "*", "!", "?"))
-                and stripped != "-"
+                and _is_plain_yaml_scalar_start(stripped)
             ):
                 plain_scalar_indent = pending_key_indent
                 pending_key_indent = None
@@ -12038,6 +12229,12 @@ def self_test() -> int:
                 '          } >> "$GITHUB_ENV"\n',
             ),
             (
+                "wrapped tee pipeline write to GITHUB_ENV",
+                "        run: |\n"
+                "          printf '%s\\n' 'CARGO_PROFILE_TEST_DEBUG=2' |\n"
+                '            tee -a "$GITHUB_ENV"\n',
+            ),
+            (
                 "heredoc write to GITHUB_ENV",
                 "        run: |\n"
                 "          cat <<'EOF' >> \"$GITHUB_ENV\"\n"
@@ -12169,6 +12366,10 @@ def self_test() -> int:
                 '          echo "FERRUM_TEST_MODE=1" >> "$GITHUB_ENV"\n',
             ),
             (
+                "semicolon-separated CARGO_TARGET_DIR log and unrelated GITHUB_ENV write",
+                '        run: echo "CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-target}"; echo "FERRUM_TEST_MODE=1" >> "$GITHUB_ENV"\n',
+            ),
+            (
                 "folded scalar paragraph break separating cargo and kind --config",
                 "        run: >\n"
                 "          cargo --version\n"
@@ -12199,6 +12400,8 @@ def self_test() -> int:
             "        type: choice\n"
             "        options:\n"
             "          - CI matrix -\n"
+            "            {build, ? debug}\n"
+            "          - --debug mode\n"
             "            {build, ? debug}\n"
             "jobs:\n"
             "  scratch-job:\n"
