@@ -12,8 +12,8 @@ RUN mkdir -m 0755 /data
 # built to the declared GLIBC_2.34 runtime floor (x86_64 from a digest-pinned
 # AlmaLinux 8.10 sysroot; ARM64 from the isolated Xenial Cross image) and
 # remain forward-compatible with this newer distroless libc.
-# Digest resolved 2026-11-15; the tag is kept for readability, the digest is authoritative.
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:cb87acc574abe719b6e5c547384defa2f7b1f24af9605d3f618cf852495d8be2
+# Digest resolved 2026-11-23; the tag is kept for readability, the digest is authoritative.
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:532c7a94f9e96ba9db75eb9388f4227751131c7cb0a411d1a8521af4096135de
 
 ARG TARGETARCH
 

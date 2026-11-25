@@ -18,8 +18,8 @@
 # Build the eBPF targets with `FEATURES=cloud-secrets,ebpf`; hosted CI exercises
 # all three contracts.
 ARG FEATURES=cloud-secrets
-# Digest resolved 2026-11-15; the tag is kept for readability, the digest is authoritative.
-ARG RUNTIME_BASE=gcr.io/distroless/cc-debian13:nonroot@sha256:cb87acc574abe719b6e5c547384defa2f7b1f24af9605d3f618cf852495d8be2
+# Digest resolved 2026-11-23; the tag is kept for readability, the digest is authoritative.
+ARG RUNTIME_BASE=gcr.io/distroless/cc-debian13:nonroot@sha256:532c7a94f9e96ba9db75eb9388f4227751131c7cb0a411d1a8521af4096135de
 ARG IPROUTE2_BASE=debian:13-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 ARG IPROUTE2_VERSION=6.15.0-1
 ARG BPF_LINKER_VERSION=0.11.0
@@ -42,7 +42,7 @@ ARG EBPF_NIGHTLY_TOOLCHAIN=nightly-2026-09-30
 # `cargo +<toolchain>`, which takes precedence over the toolchain file.
 # `--locked` builds exactly ebpf/Cargo.lock and fails instead of re-resolving.
 # core-only build-std matches the crate's `#![no_std]` + `panic = "abort"`.
-# Digest resolved 2026-11-15; the tag is kept for readability, the digest is authoritative.
+# Digest resolved 2026-11-23; the tag is kept for readability, the digest is authoritative.
 FROM rust:latest@sha256:223cc32ddca8f3ee90c436dbc94b6b5f052ea7f9653c5201e9612f08ad7d21b8 AS ebpf-builder
 ARG TARGETARCH
 ARG BPF_LINKER_VERSION
@@ -94,7 +94,7 @@ RUN --mount=from=runtime-base,source=/,target=/distroless-root,ro \
         /iproute2-root /distroless-root "${IPROUTE2_VERSION}"
 
 # Stage 1: Builder — rust:latest uses trixie (Debian 13), matching distroless/cc-debian13 glibc
-# Digest resolved 2026-11-15; the tag is kept for readability, the digest is authoritative.
+# Digest resolved 2026-11-23; the tag is kept for readability, the digest is authoritative.
 FROM rust:latest@sha256:223cc32ddca8f3ee90c436dbc94b6b5f052ea7f9653c5201e9612f08ad7d21b8 AS builder
 
 # Install build dependencies
