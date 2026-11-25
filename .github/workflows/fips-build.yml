@@ -9,10 +9,14 @@ name: FIPS Build Policy
 #    feature could still be in control of a nominal FIPS build. The required
 #    `FIPS Build & Test` aggregate needs it and fails unless it succeeded, on
 #    every event and whether or not the expensive jobs were planned.
-# 2. `fips-plan` decides whether the expensive compile/claimed-check/clippy/
-#    test-binary/test jobs run.
+# 2. `fips-plan` decides `relevant` and `scope` (`none`, `compile`, or `full`)
+#    for the expensive compile/claimed-check/clippy/test-binary/test jobs.
 #    The planner is read from the trusted base; a missing or unknown planner
-#    fails closed toward running the live compile gate.
+#    fails closed toward running the full gate. On `pull_request`, ordinary
+#    non-FIPS Rust changes select `scope=compile` (running `fips-compile` and
+#    `fips-clippy` while skipping claimed checks, test-binary compile, and
+#    tests); `merge_group`, `push` to `main`, and `workflow_dispatch` always
+#    force `relevant=true` and `scope=full`.
 # 3. `fips-compile` is a build-only exact producer: it builds the locked FIPS
 #    binary, then publishes one cache layer and one immutable artifact before
 #    claimed checks, clippy, and test-binary compile start:
@@ -69,8 +73,10 @@ name: FIPS Build Policy
 #    from the successful, skipped `fips-test-build` prerequisite. This
 #    transport is available on forced-cold and fork runs without publishing
 #    shared cache.
-# 6. `fips-build` keeps the `FIPS Build & Test` check name and fails closed,
-#    including on the test-binary producer result.
+# 6. `fips-build` keeps the `FIPS Build & Test` check name and fails closed on
+#    unusable planner output, non-PR events outside `scope=full`, and every
+#    required job for the active scope (accepting skipped claimed-check,
+#    test-binary, and test jobs only on `pull_request` with `scope=compile`).
 #
 # Ferrum Edge is not a validated cryptographic module and is not independently
 # FIPS-certified. A green run here means the FIPS profile builds, links the
@@ -282,6 +288,10 @@ jobs:
               fi
             fi
             trusted_sha="$MERGE_BASE_SHA"
+            # Merge-queue runs always execute the full FIPS gate (including
+            # claimed optional-feature combinations and FIPS tests) so a
+            # cross-feature break never lands on `main`.
+            filter_args+=(--force-run)
           else
             trusted_sha="$(git rev-parse --verify --quiet 'HEAD^{commit}' || true)"
             filter_args+=(--force-run)
@@ -352,6 +362,7 @@ jobs:
           python3 -I .github/scripts/ci_runtime_plan.py --self-test
           plan="$(python3 -I .github/scripts/ci_runtime_plan.py "${filter_args[@]}")"
           relevant="$(printf '%s\n' "$plan" | sed -n 's/^relevant=//p')"
+          scope_count="$(printf '%s\n' "$plan" | grep -c '^scope=' || true)"
           scope="$(printf '%s\n' "$plan" | sed -n 's/^scope=//p')"
           case "$relevant" in
             true|false) ;;
@@ -360,14 +371,15 @@ jobs:
               exit 1
               ;;
           esac
-          # Fail closed if an older base planner omits `scope=`: run the full gate
-          # when relevant, or `none` when irrelevant.
-          if [ -z "$scope" ]; then
-            if [ "$relevant" = "false" ]; then
-              scope="none"
-            else
-              scope="full"
-            fi
+          # Fail closed if an older pre-#5832 base planner omits `scope=`: run
+          # the full gate rather than trusting an unscoped `relevant=false`
+          # skip. Reject duplicate or present-but-empty `scope=` lines.
+          if [ "$scope_count" -eq 0 ]; then
+            relevant="true"
+            scope="full"
+          elif [ "$scope_count" -ne 1 ]; then
+            echo "::error::trusted relevance filter emitted duplicate scope lines (${scope_count})" >&2
+            exit 1
           fi
           case "$scope" in
             full|compile|none) ;;
@@ -379,6 +391,10 @@ jobs:
           if { [ "$relevant" = "false" ] && [ "$scope" != "none" ]; } \
             || { [ "$relevant" = "true" ] && [ "$scope" = "none" ]; }; then
             echo "::error::trusted relevance filter emitted inconsistent relevant=${relevant} and scope=${scope}" >&2
+            exit 1
+          fi
+          if [ "$EVENT_NAME" != "pull_request" ] && { [ "$relevant" != "true" ] || [ "$scope" != "full" ]; }; then
+            echo "::error::non-PR event ${EVENT_NAME} requires relevant=true and scope=full (got relevant=${relevant}, scope=${scope})" >&2
             exit 1
           fi
           echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
@@ -872,7 +888,7 @@ jobs:
     needs:
       - fips-plan
       - fips-compile
-    if: needs.fips-plan.outputs.relevant == 'true' && needs.fips-plan.outputs.scope != 'compile'
+    if: needs.fips-plan.outputs.relevant == 'true' && (needs.fips-plan.outputs.scope != 'compile' || github.event_name != 'pull_request')
     runs-on: ubuntu-26.04
     timeout-minutes: 60
     strategy:
@@ -1992,7 +2008,7 @@ jobs:
     needs:
       - fips-plan
       - fips-compile
-    if: needs.fips-plan.outputs.relevant == 'true' && needs.fips-plan.outputs.scope != 'compile'
+    if: needs.fips-plan.outputs.relevant == 'true' && (needs.fips-plan.outputs.scope != 'compile' || github.event_name != 'pull_request')
     runs-on: ubuntu-26.04
     timeout-minutes: 90
     # Issue #4018: the precompile step below is killed with
@@ -2017,9 +2033,10 @@ jobs:
     # `debug = 0` with `split-debuginfo = off` eliminates DWARF generation peak
     # memory and shrink-wraps the compile/test artifacts, while matching
     # `fips-compile`, `fips-claimed-checks`, and `fips-clippy` identically so
-    # `Swatinem/rust-cache` keys and the exact `target/` producer handoff stay
-    # fingerprint-compatible without rebuilding `aws-lc-fips-sys` or workspace
-    # crates.
+    # `Swatinem/rust-cache` keys stay aligned (`CARGO_BUILD_JOBS` feeds the
+    # cache key) and matching Cargo dependency units (`aws-lc-fips-sys` and
+    # shared non-dev crates) stay fingerprint-compatible across the producer
+    # handoff (`ferrum-edge` still rebuilds with dev-dependency `test-support`).
     env:
       # No compiler-cache wrapper: Cargo hashes the resolved rustc-wrapper
       # executable into every artifact, so a runner- or user-level wrapper
@@ -2668,7 +2685,7 @@ jobs:
     needs:
       - fips-plan
       - fips-test-build
-    if: needs.fips-plan.outputs.relevant == 'true' && needs.fips-plan.outputs.scope != 'compile'
+    if: needs.fips-plan.outputs.relevant == 'true' && (needs.fips-plan.outputs.scope != 'compile' || github.event_name != 'pull_request')
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
@@ -2895,29 +2912,53 @@ jobs:
           set -euo pipefail
           unit_test_binary="$UNIT_TEST_BINARY"
           integration_test_binary="$INTEGRATION_TEST_BINARY"
+          unit_log="$RUNNER_TEMP/fips-unit-tests.log"
+          handshake_log="$RUNNER_TEMP/fips-handshake-tests.log"
+          permit_log="$RUNNER_TEMP/fips-handshake-permit-tests.log"
+
           python3 .github/scripts/ci_runtime_telemetry.py start --phase fips-unit-tests
           set +e
-          "$unit_test_binary" tls::fips_
-          status=$?
+          "$unit_test_binary" tls::fips_ 2>&1 | tee "$unit_log"
+          status=${PIPESTATUS[0]}
           set -e
+          if [ "$status" -eq 0 ]; then
+            if ! grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed;' "$unit_log" \
+              || ! grep -Eq '^test .*tls::fips_policy_tests::.* \.\.\. ok$' "$unit_log" \
+              || ! grep -Eq '^test .*tls::fips_key_admission_tests::.* \.\.\. ok$' "$unit_log"; then
+              echo "::error::FIPS unit tests did not execute passing cases from both tls::fips_policy_tests and tls::fips_key_admission_tests" >&2
+              status=1
+            fi
+          fi
           python3 .github/scripts/ci_runtime_telemetry.py end --phase fips-unit-tests --status "$status"
           [ "$status" -eq 0 ] || exit "$status"
 
           python3 .github/scripts/ci_runtime_telemetry.py start --phase fips-handshake-tests
           set +e
           "$integration_test_binary" \
-            integration::cp_grpc_handshake_admission_tests::frontend_and_backend_builders_complete_a_real_tls_handshake
-          status=$?
+            --exact \
+            integration::cp_grpc_handshake_admission_tests::frontend_and_backend_builders_complete_a_real_tls_handshake \
+            2>&1 | tee "$handshake_log"
+          status=${PIPESTATUS[0]}
           set -e
+          if [ "$status" -eq 0 ] && ! grep -Eq 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "$handshake_log"; then
+            echo "::error::FIPS handshake integration test did not execute exactly 1 passing test" >&2
+            status=1
+          fi
           python3 .github/scripts/ci_runtime_telemetry.py end --phase fips-handshake-tests --status "$status"
           [ "$status" -eq 0 ] || exit "$status"
 
           python3 .github/scripts/ci_runtime_telemetry.py start --phase fips-handshake-permit-tests
           set +e
           "$integration_test_binary" \
-            integration::cp_grpc_handshake_admission_tests::legitimate_data_plane_connects_once_a_permit_is_released
-          status=$?
+            --exact \
+            integration::cp_grpc_handshake_admission_tests::legitimate_data_plane_connects_once_a_permit_is_released \
+            2>&1 | tee "$permit_log"
+          status=${PIPESTATUS[0]}
           set -e
+          if [ "$status" -eq 0 ] && ! grep -Eq 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "$permit_log"; then
+            echo "::error::FIPS handshake-permit integration test did not execute exactly 1 passing test" >&2
+            status=1
+          fi
           python3 .github/scripts/ci_runtime_telemetry.py end --phase fips-handshake-permit-tests --status "$status"
           exit "$status"
 
@@ -2955,6 +2996,10 @@ jobs:
         if: needs.fips-plan.result == 'success' && ((needs.fips-plan.outputs.scope != 'full' && needs.fips-plan.outputs.scope != 'compile' && needs.fips-plan.outputs.scope != 'none') || (needs.fips-plan.outputs.relevant == 'false' && needs.fips-plan.outputs.scope != 'none') || (needs.fips-plan.outputs.relevant == 'true' && needs.fips-plan.outputs.scope == 'none'))
         run: exit 1
 
+      - name: Fail when non-PR event did not plan full FIPS scope
+        if: needs.fips-plan.result == 'success' && github.event_name != 'pull_request' && (needs.fips-plan.outputs.relevant != 'true' || needs.fips-plan.outputs.scope != 'full')
+        run: exit 1
+
       - name: Skip expensive FIPS compile for unrelated changes
         if: needs.fips-plan.outputs.relevant == 'false'
         run: |
@@ -2970,7 +3015,7 @@ jobs:
         run: exit 1
 
       - name: Fail when FIPS claimed-profile checks did not succeed
-        if: needs.fips-plan.outputs.relevant == 'true' && ((needs.fips-plan.outputs.scope != 'compile' && needs.fips-claimed-checks.result != 'success') || (needs.fips-plan.outputs.scope == 'compile' && needs.fips-claimed-checks.result != 'skipped' && needs.fips-claimed-checks.result != 'success'))
+        if: needs.fips-plan.outputs.relevant == 'true' && (((needs.fips-plan.outputs.scope != 'compile' || github.event_name != 'pull_request') && needs.fips-claimed-checks.result != 'success') || (github.event_name == 'pull_request' && needs.fips-plan.outputs.scope == 'compile' && needs.fips-claimed-checks.result != 'skipped' && needs.fips-claimed-checks.result != 'success'))
         run: exit 1
 
       - name: Fail when FIPS clippy did not succeed
@@ -2978,17 +3023,18 @@ jobs:
         run: exit 1
 
       - name: Fail when FIPS test-binary compile did not succeed
-        if: needs.fips-plan.outputs.relevant == 'true' && ((needs.fips-plan.outputs.scope != 'compile' && needs.fips-test-build.result != 'success') || (needs.fips-plan.outputs.scope == 'compile' && needs.fips-test-build.result != 'skipped' && needs.fips-test-build.result != 'success'))
+        if: needs.fips-plan.outputs.relevant == 'true' && (((needs.fips-plan.outputs.scope != 'compile' || github.event_name != 'pull_request') && needs.fips-test-build.result != 'success') || (github.event_name == 'pull_request' && needs.fips-plan.outputs.scope == 'compile' && needs.fips-test-build.result != 'skipped' && needs.fips-test-build.result != 'success'))
         run: exit 1
 
       - name: Fail when FIPS tests did not succeed
-        if: needs.fips-plan.outputs.relevant == 'true' && ((needs.fips-plan.outputs.scope != 'compile' && needs.fips-test.result != 'success') || (needs.fips-plan.outputs.scope == 'compile' && needs.fips-test.result != 'skipped' && needs.fips-test.result != 'success'))
+        if: needs.fips-plan.outputs.relevant == 'true' && (((needs.fips-plan.outputs.scope != 'compile' || github.event_name != 'pull_request') && needs.fips-test.result != 'success') || (github.event_name == 'pull_request' && needs.fips-plan.outputs.scope == 'compile' && needs.fips-test.result != 'skipped' && needs.fips-test.result != 'success'))
         run: exit 1
 
       - name: Report FIPS compile gate
         if: needs.fips-plan.outputs.relevant == 'true'
         env:
           FIPS_SCOPE: ${{ needs.fips-plan.outputs.scope }}
+          FORCE_COLD_CACHE: ${{ github.event.inputs.force_cold_cache }}
         run: |
           {
             echo "## FIPS Build & Test"
@@ -2998,7 +3044,8 @@ jobs:
               echo ""
               echo "Feature policy, locked FIPS compile, and FIPS clippy \`-D warnings\` "
               echo "passed. Claimed optional-feature combinations and FIPS handshake/policy "
-              echo "tests run on FIPS-sensitive PRs (\`scope=full\`) and every push to \`main\`."
+              echo "tests run on FIPS-sensitive PRs (\`scope=full\`), \`merge_group\`, "
+              echo "every push to \`main\`, and \`workflow_dispatch\`."
             else
               echo "Scope: **${FIPS_SCOPE}**"
               echo ""
@@ -3007,15 +3054,25 @@ jobs:
               echo "tests passed."
             fi
             echo ""
-            echo "Compile published its exact producer tree as the immutable "
-            echo "one-day handoff artifact (sha + run_id + run_attempt) after "
-            echo "the locked fips profile build. Consumers promoted that same-run "
-            echo "artifact in parallel, preferring the newest attempt so failed-job "
-            echo "reruns reuse a prior attempt's producer. The same artifact serves an "
-            echo "explicitly chained same-SHA workflow dispatch as its inter-run "
-            echo "warm source. Tests executed digest-bound binaries from the "
-            echo "immutable same-run artifact published by fips-test-build. "
-            echo "Stable rust-cache remains the inter-commit fallback."
+            if [ "$FORCE_COLD_CACHE" = "true" ]; then
+              echo "Cold-cache dispatch (\`force_cold_cache=true\`): rust-cache and "
+              echo "producer handoff publication were bypassed for this run."
+            elif [ "$FIPS_SCOPE" = "compile" ]; then
+              echo "Compile published its exact producer tree as the immutable "
+              echo "one-day handoff artifact (sha + run_id + run_attempt) after "
+              echo "the locked fips profile build, and clippy promoted that same-run "
+              echo "artifact. Stable rust-cache remains the inter-commit fallback."
+            else
+              echo "Compile published its exact producer tree as the immutable "
+              echo "one-day handoff artifact (sha + run_id + run_attempt) after "
+              echo "the locked fips profile build. Consumers promoted that same-run "
+              echo "artifact in parallel, preferring the newest attempt so failed-job "
+              echo "reruns reuse a prior attempt's producer. The same artifact serves an "
+              echo "explicitly chained same-SHA workflow dispatch as its inter-run "
+              echo "warm source. Tests executed digest-bound binaries from the "
+              echo "immutable same-run artifact published by fips-test-build. "
+              echo "Stable rust-cache remains the inter-commit fallback."
+            fi
             echo ""
             echo "Warm PR target: <=30 minutes, p95 <=45 minutes, measured on hosted runs."
           } >> "$GITHUB_STEP_SUMMARY"

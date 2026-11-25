@@ -316,41 +316,51 @@ DEDICATED_REQUIRED_CHECKS = {
             "fips-test",
         },
         "contract": {
-            "if: needs.feature-policy.result != 'success'",
-            "if: needs.fips-plan.result != 'success'",
-            "needs.fips-plan.result == 'success' && "
+            "        if: needs.feature-policy.result != 'success'\n",
+            "        if: needs.fips-plan.result != 'success'\n",
+            "        if: needs.fips-plan.result == 'success' && "
             "needs.fips-plan.outputs.relevant != 'true' && "
-            "needs.fips-plan.outputs.relevant != 'false'",
-            "needs.fips-plan.result == 'success' && "
+            "needs.fips-plan.outputs.relevant != 'false'\n",
+            "        if: needs.fips-plan.result == 'success' && "
             "((needs.fips-plan.outputs.scope != 'full' && "
             "needs.fips-plan.outputs.scope != 'compile' && "
             "needs.fips-plan.outputs.scope != 'none') || "
             "(needs.fips-plan.outputs.relevant == 'false' && "
             "needs.fips-plan.outputs.scope != 'none') || "
             "(needs.fips-plan.outputs.relevant == 'true' && "
-            "needs.fips-plan.outputs.scope == 'none'))",
-            "needs.fips-plan.outputs.relevant == 'true' && "
-            "needs.fips-compile.result != 'success'",
-            "needs.fips-plan.outputs.relevant == 'true' && "
-            "((needs.fips-plan.outputs.scope != 'compile' && "
+            "needs.fips-plan.outputs.scope == 'none'))\n",
+            "        if: needs.fips-plan.result == 'success' && "
+            "github.event_name != 'pull_request' && "
+            "(needs.fips-plan.outputs.relevant != 'true' || "
+            "needs.fips-plan.outputs.scope != 'full')\n",
+            "        if: needs.fips-plan.outputs.relevant == 'true' && "
+            "needs.fips-compile.result != 'success'\n",
+            "        if: needs.fips-plan.outputs.relevant == 'true' && "
+            "(((needs.fips-plan.outputs.scope != 'compile' || "
+            "github.event_name != 'pull_request') && "
             "needs.fips-claimed-checks.result != 'success') || "
-            "(needs.fips-plan.outputs.scope == 'compile' && "
+            "(github.event_name == 'pull_request' && "
+            "needs.fips-plan.outputs.scope == 'compile' && "
             "needs.fips-claimed-checks.result != 'skipped' && "
-            "needs.fips-claimed-checks.result != 'success'))",
-            "needs.fips-plan.outputs.relevant == 'true' && "
-            "needs.fips-clippy.result != 'success'",
-            "needs.fips-plan.outputs.relevant == 'true' && "
-            "((needs.fips-plan.outputs.scope != 'compile' && "
+            "needs.fips-claimed-checks.result != 'success'))\n",
+            "        if: needs.fips-plan.outputs.relevant == 'true' && "
+            "needs.fips-clippy.result != 'success'\n",
+            "        if: needs.fips-plan.outputs.relevant == 'true' && "
+            "(((needs.fips-plan.outputs.scope != 'compile' || "
+            "github.event_name != 'pull_request') && "
             "needs.fips-test-build.result != 'success') || "
-            "(needs.fips-plan.outputs.scope == 'compile' && "
+            "(github.event_name == 'pull_request' && "
+            "needs.fips-plan.outputs.scope == 'compile' && "
             "needs.fips-test-build.result != 'skipped' && "
-            "needs.fips-test-build.result != 'success'))",
-            "needs.fips-plan.outputs.relevant == 'true' && "
-            "((needs.fips-plan.outputs.scope != 'compile' && "
+            "needs.fips-test-build.result != 'success'))\n",
+            "        if: needs.fips-plan.outputs.relevant == 'true' && "
+            "(((needs.fips-plan.outputs.scope != 'compile' || "
+            "github.event_name != 'pull_request') && "
             "needs.fips-test.result != 'success') || "
-            "(needs.fips-plan.outputs.scope == 'compile' && "
+            "(github.event_name == 'pull_request' && "
+            "needs.fips-plan.outputs.scope == 'compile' && "
             "needs.fips-test.result != 'skipped' && "
-            "needs.fips-test.result != 'success'))",
+            "needs.fips-test.result != 'success'))\n",
         },
     },
 }
@@ -2272,6 +2282,16 @@ def main() -> int:
                 planner_errors.append(
                     f"{workflow_path} jobs.{job} is missing fail-closed contract `{contract}`"
                 )
+        if workflow_path == ".github/workflows/fips-build.yml":
+            if "continue-on-error" in body:
+                planner_errors.append(
+                    f"{workflow_path} jobs.{job} must not use continue-on-error"
+                )
+            for contract in sorted(required_check["contract"]):
+                if contract.startswith("        if: ") and f"{contract}        run: exit 1\n" not in body:
+                    planner_errors.append(
+                        f"{workflow_path} jobs.{job} guard `{contract.strip()}` must execute `run: exit 1`"
+                    )
 
     for workflow_path, required_name in sorted(REQUIRED_MERGE_GROUP_WORKFLOWS.items()):
         workflow_yml = Path(workflow_path).read_text(encoding="utf-8")

@@ -396,22 +396,26 @@ one of three scopes:
 
 - `none`: non-Rust/non-FIPS changes skip the expensive compile/clippy/test
   jobs while `FIPS Feature Policy` and the aggregate still run.
-- `compile`: ordinary Rust/test changes outside FIPS/TLS/build-graph surfaces
-  run `fips-compile` and `fips-clippy` (`--lib --tests -D warnings`) to catch
-  FIPS feature-gate compile errors, while offloading the three
-  `fips-claimed-checks` shards, `fips-test-build`, and `fips-test` to
-  FIPS-sensitive PRs and every `push` to `main`.
-- `full`: FIPS/TLS/DTLS/build-graph/workflow changes, `push` to `main`,
-  `workflow_dispatch`, and any unknown or unclassifiable diff run the full
-  matrix (compile, claimed-profile checks, clippy, test-binary precompile, and
-  policy/key-admission/handshake tests).
+- `compile`: ordinary `pull_request` Rust/test changes outside
+  FIPS/TLS/build-graph surfaces run `fips-compile` and `fips-clippy`
+  (`--lib --tests -D warnings`) to catch FIPS feature-gate compile errors,
+  while offloading the three `fips-claimed-checks` shards, `fips-test-build`,
+  and `fips-test` to FIPS-sensitive PRs, `merge_group`, every `push` to
+  `main`, and `workflow_dispatch`.
+- `full`: FIPS/TLS/DTLS/build-graph/workflow changes, `merge_group`, `push` to
+  `main`, `workflow_dispatch`, and any unknown or unclassifiable diff run the
+  full matrix (compile, claimed-profile checks, clippy, test-binary precompile,
+  and policy/key-admission/handshake tests).
 
 All four Cargo jobs (`fips-compile`, `fips-claimed-checks`, `fips-clippy`, and
 `fips-test-build`) pin identical build settings (`CARGO_BUILD_JOBS=3`,
 `CARGO_PROFILE_{DEV,TEST}_DEBUG=0`, `CARGO_PROFILE_{DEV,TEST}_SPLIT_DEBUGINFO=off`,
-`CARGO_PROFILE_{DEV,TEST}_CODEGEN_UNITS=256`) so `Swatinem/rust-cache` keys and
-the exact `target/` producer handoff stay fingerprint-compatible without
-recompiling `aws-lc-fips-sys` or workspace crates. Compile, claimed-profile
+`CARGO_PROFILE_{DEV,TEST}_CODEGEN_UNITS=256`) so `Swatinem/rust-cache` keys
+stay aligned (`CARGO_BUILD_JOBS` feeds the cache key) and matching Cargo
+dependency units (`aws-lc-fips-sys` and shared non-dev crates) stay
+fingerprint-compatible across the exact `target/` producer handoff (test and
+claimed-profile jobs still compile their own feature/dev-dependency units).
+Compile, claimed-profile
 `cargo check`, clippy `-D warnings`, and the policy/key-admission/handshake
 tests share one cache layer plus an immutable artifact handoff:
 
@@ -547,7 +551,8 @@ hit). Measured restored bytes are the restored `target/` directory for rust-cach
 directory for the promoted producer handoff. The
 required `FIPS Build & Test`
 aggregate depends on `fips-test-build` and fails closed if that test-binary
-producer does not succeed.
+producer does not succeed (accepting a skip only on `pull_request` when the
+trusted planner selected `scope=compile`).
 
 **Trust boundary.** Untrusted `run:` steps never receive GitHub Actions cache
 write credentials. `setup-sccache` installs a checksum-pinned
@@ -823,11 +828,10 @@ every other compiled Rust input (`src/`, `tests/` outside `tests/k8s/` and
 `relevant=true`. Issue #5828: PR #5825 added inline test code under
 `src/http3/` that used quinn constructors missing under
 `--no-default-features --features fips`, skipped every FIPS lane, and broke
-`FIPS clippy` on `main`. A `compile` scope needs at least the FIPS compile
-producer and FIPS clippy over the lib and test targets. The workflow reads only
-`relevant` today, so it runs the full gate for both scopes; narrowing a
-`compile` diff to compile + clippy is a `fips-build.yml` change. That file is
-digest-frozen, so this is a direct-to-`main` change.
+`FIPS clippy` on `main`. A `compile` scope runs the FIPS compile producer and
+FIPS clippy over the lib and test targets, while `fips-claimed-checks`,
+`fips-test-build`, and `fips-test` run on `scope=full` PRs, `merge_group`,
+every `push` to `main`, and `workflow_dispatch`.
 
 `coverage.yml` skips every instrumented shard on a pull
 request unless the coverage controllers themselves change; the Kind live
@@ -2611,7 +2615,7 @@ require a Cross generation transition; this subsection admits no
 |---|---|---|
 | `CARGO_BUILD_JOBS` | Job-level env `3`; caps rustc codegen threads inside the large crates | Job-level env **`2`**. `#4099` kept `3`; `#4368` lowered it after PR #4336 run `33219849557` job `99020110238` reproduced the compile-phase exit-143 stall at `Compiling testcontainers v0.27.3` with jobs=3, line-tables, and additive swap already on |
 | `timeout-minutes` | Job-specific (FIPS compile/test budget) | **`timeout-minutes: 120`**. The `#4099` comment claimed the combined lib+`unit_tests` invocation fit 75 minutes; PR #4347 run `33223661366` attempt 1 job `99027333486` was still passing tests when that deadline canceled it. GitHub cannot set per-matrix-row timeouts, so the shared `coverage-shard` job carries the lib-unit budget; integration shards still finish far earlier |
-| `line-tables-only` on `dev` **and** `test` | `CARGO_PROFILE_{DEV,TEST}_DEBUG` | Added in `#4099`. Drops variable-level DWARF only. Line/region attribution comes from `-C instrument-coverage` mapping, not DWARF locals, so `cargo llvm-cov` reports stay equivalent |
+| Debuginfo on `dev` **and** `test` | `CARGO_PROFILE_{DEV,TEST}_DEBUG=0` (with `SPLIT_DEBUGINFO=off`, `CODEGEN_UNITS=256` across all 4 FIPS Cargo jobs; `#4018` previously used `line-tables-only`) | `line-tables-only` added in `#4099`. Drops variable-level DWARF only. Line/region attribution comes from `-C instrument-coverage` mapping, not DWARF locals, so `cargo llvm-cov` reports stay equivalent |
 | Additive swapfile | Best-effort 8 GiB `/mnt/ferrum-fips-swapfile` (workflow is digest-frozen, so the step must not fail-close) | **Not added.** `coverage-shard` already enlarges swap with a fail-closed 12 GiB `/mnt/ferrum-swapfile` (same pattern as `ci.yml` `test-unit`). A second Ferrum swapfile would be redundant; converting the existing step to best-effort would not lower compile memory |
 
 Instrumentation, shard matrix, test filters, and `cargo llvm-cov` /

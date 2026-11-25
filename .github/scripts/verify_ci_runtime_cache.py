@@ -3318,13 +3318,18 @@ def check_fips_producer_channel(
         "FIPS aggregate must depend on the test-binary producer",
         failures,
     )
-    require(
-        "needs.fips-plan.outputs.scope != 'compile' && needs.fips-test-build.result != 'success'"
-        in aggregate
-        and "needs.fips-plan.outputs.scope == 'compile' && needs.fips-test-build.result != 'skipped' && needs.fips-test-build.result != 'success'"
-        in aggregate,
+    expected_test_build_guard_if = (
+        "needs.fips-plan.outputs.relevant == 'true' && "
+        "(((needs.fips-plan.outputs.scope != 'compile' || github.event_name != 'pull_request') "
+        "&& needs.fips-test-build.result != 'success') || "
+        "(github.event_name == 'pull_request' && needs.fips-plan.outputs.scope == 'compile' "
+        "&& needs.fips-test-build.result != 'skipped' && needs.fips-test-build.result != 'success'))"
+    )
+    require_fips_aggregate_fail_step(
+        aggregate,
+        expected_test_build_guard_if,
         "FIPS aggregate must fail closed when the test-binary producer fails "
-        "or is unexpectedly skipped outside scope=compile",
+        "or is unexpectedly skipped outside PR scope=compile",
         failures,
     )
 
@@ -4143,8 +4148,12 @@ def check_fips(workflow: str, failures: list[str]) -> None:
     require(
         "scope: ${{ steps.filter.outputs.scope }}" in plan_job
         and 'echo "scope=full" >> "$GITHUB_OUTPUT"' in plan_job
-        and 'echo "scope=$scope" >> "$GITHUB_OUTPUT"' in plan_job,
-        "FIPS planner must export its fail-closed scope output",
+        and 'echo "scope=$scope" >> "$GITHUB_OUTPUT"' in plan_job
+        and "grep -c '^scope='" in plan_job
+        and '[ "$scope_count" -eq 0 ]' in plan_job
+        and '[ "$EVENT_NAME" != "pull_request" ] && { [ "$relevant" != "true" ] || [ "$scope" != "full" ]; }' in plan_job,
+        "FIPS planner must export its fail-closed scope output, reject duplicate/empty scope lines, "
+        "fail closed to relevant=true/scope=full on pre-scope planners, and enforce scope=full on non-PR events",
         failures,
     )
     require(
@@ -4154,7 +4163,7 @@ def check_fips(workflow: str, failures: list[str]) -> None:
     )
     expected_full_scope_if = (
         "needs.fips-plan.outputs.relevant == 'true' && "
-        "needs.fips-plan.outputs.scope != 'compile'"
+        "(needs.fips-plan.outputs.scope != 'compile' || github.event_name != 'pull_request')"
     )
     for scoped_job, scoped_name in (
         (claimed_job, "fips-claimed-checks"),
@@ -4168,19 +4177,22 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         )
         require(
             job_if(scoped_job) == expected_full_scope_if,
-            f"{scoped_name} must skip only on exact scope == 'compile' "
+            f"{scoped_name} must skip only on PR scope == 'compile' "
             f"(expected `{expected_full_scope_if}`, got `{job_if(scoped_job)}`)",
             failures,
         )
-    expected_fips_cargo_env = (
-        ('CARGO_BUILD_JOBS: "3"', "CARGO_BUILD_JOBS"),
-        ('CARGO_PROFILE_DEV_DEBUG: "0"', "CARGO_PROFILE_DEV_DEBUG"),
-        ('CARGO_PROFILE_TEST_DEBUG: "0"', "CARGO_PROFILE_TEST_DEBUG"),
-        ('CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: "off"', "CARGO_PROFILE_DEV_SPLIT_DEBUGINFO"),
-        ('CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: "off"', "CARGO_PROFILE_TEST_SPLIT_DEBUGINFO"),
-        ('CARGO_PROFILE_DEV_CODEGEN_UNITS: "256"', "CARGO_PROFILE_DEV_CODEGEN_UNITS"),
-        ('CARGO_PROFILE_TEST_CODEGEN_UNITS: "256"', "CARGO_PROFILE_TEST_CODEGEN_UNITS"),
-    )
+    expected_fips_cargo_env = {
+        "RUSTC_WRAPPER": '""',
+        "CARGO_BUILD_RUSTC_WRAPPER": '""',
+        "CARGO_BUILD_JOBS": '"3"',
+        "CARGO_PROFILE_DEV_DEBUG": '"0"',
+        "CARGO_PROFILE_TEST_DEBUG": '"0"',
+        "CARGO_PROFILE_DEV_SPLIT_DEBUGINFO": '"off"',
+        "CARGO_PROFILE_TEST_SPLIT_DEBUGINFO": '"off"',
+        "CARGO_PROFILE_DEV_CODEGEN_UNITS": '"256"',
+        "CARGO_PROFILE_TEST_CODEGEN_UNITS": '"256"',
+    }
+    observed_cargo_envs: dict[str, dict[str, str]] = {}
     for cargo_job, cargo_name in (
         (compile_job, "fips-compile"),
         (claimed_job, "fips-claimed-checks"),
@@ -4189,13 +4201,40 @@ def check_fips(workflow: str, failures: list[str]) -> None:
     ):
         env_match = _JOB_ENV_BLOCK_RE.search(cargo_job)
         env_body = env_match.group("body") if env_match else ""
-        for expected_entry, env_key in expected_fips_cargo_env:
+        job_cargo_env: dict[str, str] = {}
+        for line in env_body.splitlines():
+            kv = re.match(r"^      ((?:CARGO|RUST)[A-Z0-9_]*):\s*(.+?)\s*$", line)
+            if kv:
+                job_cargo_env[kv.group(1)] = kv.group(2)
+        observed_cargo_envs[cargo_name] = job_cargo_env
+        for env_key, expected_val in expected_fips_cargo_env.items():
             require(
-                f"      {expected_entry}\n" in env_body,
+                job_cargo_env.get(env_key) == expected_val,
                 f"{cargo_name} must pin uniform {env_key} across FIPS compile/consumer "
                 "jobs so rust-cache and the exact producer handoff stay compatible",
                 failures,
             )
+        steps_section = cargo_job.split("\n    steps:\n", 1)[1] if "\n    steps:\n" in cargo_job else ""
+        require(
+            not re.search(
+                r"(?m)(?:^\s+CARGO_(?:PROFILE|BUILD)_[A-Z0-9_]*:|export\s+CARGO_(?:PROFILE|BUILD)_|CARGO_(?:PROFILE|BUILD)_[A-Z0-9_]*=.*GITHUB_ENV)",
+                steps_section,
+            ),
+            f"{cargo_name} must not override CARGO_PROFILE_* or CARGO_BUILD_* at step level",
+            failures,
+        )
+        for step in extract_job_steps(cargo_job):
+            if RUST_CACHE in step:
+                require(
+                    not re.search(r"(?m)^\s+(?:prefix-key|key|add-job-id-key):", step),
+                    f"{cargo_name} rust-cache step must not set prefix-key, key, or add-job-id-key",
+                    failures,
+                )
+    if len(set(tuple(sorted(v.items())) for v in observed_cargo_envs.values())) != 1:
+        failures.append(
+            "all four FIPS Cargo jobs must declare the exact same set of CARGO_* and RUST* job env vars: "
+            f"{observed_cargo_envs!r}"
+        )
     require(
         "fips-compile" in job_needs_list(claimed_job),
         "fips-claimed-checks must wait for the compile producer handoff to be published",
@@ -4289,6 +4328,16 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         failures,
     )
     require(
+        "test result: ok\\. [1-9][0-9]* passed; 0 failed;" in test_job
+        and "^test .*tls::fips_policy_tests::.* \\.\\.\\. ok$" in test_job
+        and "^test .*tls::fips_key_admission_tests::.* \\.\\.\\. ok$" in test_job
+        and test_job.count("test result: ok\\. 1 passed; 0 failed; 0 ignored;") >= 2
+        and test_job.count("--exact") >= 2,
+        "fips-test must assert non-zero passing FIPS policy/key-admission unit tests "
+        "and exact 1-passed counts for both handshake integration tests",
+        failures,
+    )
+    require(
         {"fips-plan", "fips-compile", "fips-claimed-checks", "fips-clippy",
          "fips-test-build", "fips-test"} <= job_needs_list(aggregate),
         "FIPS Build & Test aggregate must depend on every expensive FIPS job "
@@ -4296,6 +4345,12 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         failures,
     )
     require(
+        "continue-on-error" not in aggregate,
+        "FIPS Build & Test aggregate must not use continue-on-error",
+        failures,
+    )
+    require_fips_aggregate_fail_step(
+        aggregate,
         "needs.fips-plan.result == 'success' && "
         "((needs.fips-plan.outputs.scope != 'full' && "
         "needs.fips-plan.outputs.scope != 'compile' && "
@@ -4303,48 +4358,98 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         "(needs.fips-plan.outputs.relevant == 'false' && "
         "needs.fips-plan.outputs.scope != 'none') || "
         "(needs.fips-plan.outputs.relevant == 'true' && "
-        "needs.fips-plan.outputs.scope == 'none'))"
-        in aggregate,
+        "needs.fips-plan.outputs.scope == 'none'))",
         "FIPS aggregate must fail closed when planner scope is unusable or inconsistent",
         failures,
     )
-    require(
-        "needs.fips-compile.result != 'success'" in aggregate,
+    require_fips_aggregate_fail_step(
+        aggregate,
+        "needs.fips-plan.result == 'success' && github.event_name != 'pull_request' && "
+        "(needs.fips-plan.outputs.relevant != 'true' || needs.fips-plan.outputs.scope != 'full')",
+        "FIPS aggregate must fail closed when a non-PR event did not plan relevant=true and scope=full",
+        failures,
+    )
+    require_fips_aggregate_fail_step(
+        aggregate,
+        "needs.fips-plan.outputs.relevant == 'true' && needs.fips-compile.result != 'success'",
         "FIPS aggregate must fail closed when compile fails",
         failures,
     )
-    require(
-        "needs.fips-plan.outputs.scope != 'compile' && needs.fips-claimed-checks.result != 'success'"
-        in aggregate
-        and "needs.fips-plan.outputs.scope == 'compile' && needs.fips-claimed-checks.result != 'skipped' && needs.fips-claimed-checks.result != 'success'"
-        in aggregate,
+    require_fips_aggregate_fail_step(
+        aggregate,
+        "needs.fips-plan.outputs.relevant == 'true' && "
+        "(((needs.fips-plan.outputs.scope != 'compile' || github.event_name != 'pull_request') "
+        "&& needs.fips-claimed-checks.result != 'success') || "
+        "(github.event_name == 'pull_request' && needs.fips-plan.outputs.scope == 'compile' "
+        "&& needs.fips-claimed-checks.result != 'skipped' && needs.fips-claimed-checks.result != 'success'))",
         "FIPS aggregate must fail closed when claimed-profile checks fail "
-        "or skip outside scope=compile",
+        "or skip outside PR scope=compile",
         failures,
     )
-    require(
-        "needs.fips-clippy.result != 'success'" in aggregate,
+    require_fips_aggregate_fail_step(
+        aggregate,
+        "needs.fips-plan.outputs.relevant == 'true' && needs.fips-clippy.result != 'success'",
         "FIPS aggregate must fail closed when clippy fails",
         failures,
     )
-    require(
-        "needs.fips-plan.outputs.scope != 'compile' && needs.fips-test-build.result != 'success'"
-        in aggregate
-        and "needs.fips-plan.outputs.scope == 'compile' && needs.fips-test-build.result != 'skipped' && needs.fips-test-build.result != 'success'"
-        in aggregate,
+    expected_test_build_guard_if = (
+        "needs.fips-plan.outputs.relevant == 'true' && "
+        "(((needs.fips-plan.outputs.scope != 'compile' || github.event_name != 'pull_request') "
+        "&& needs.fips-test-build.result != 'success') || "
+        "(github.event_name == 'pull_request' && needs.fips-plan.outputs.scope == 'compile' "
+        "&& needs.fips-test-build.result != 'skipped' && needs.fips-test-build.result != 'success'))"
+    )
+    require_fips_aggregate_fail_step(
+        aggregate,
+        expected_test_build_guard_if,
         "FIPS aggregate must fail closed when the test-binary producer fails "
-        "or is unexpectedly skipped outside scope=compile",
+        "or is unexpectedly skipped outside PR scope=compile",
         failures,
     )
-    require(
-        "needs.fips-plan.outputs.scope != 'compile' && needs.fips-test.result != 'success'"
-        in aggregate
-        and "needs.fips-plan.outputs.scope == 'compile' && needs.fips-test.result != 'skipped' && needs.fips-test.result != 'success'"
-        in aggregate,
-        "FIPS aggregate must fail closed when tests fail or skip outside scope=compile",
+    require_fips_aggregate_fail_step(
+        aggregate,
+        "needs.fips-plan.outputs.relevant == 'true' && "
+        "(((needs.fips-plan.outputs.scope != 'compile' || github.event_name != 'pull_request') "
+        "&& needs.fips-test.result != 'success') || "
+        "(github.event_name == 'pull_request' && needs.fips-plan.outputs.scope == 'compile' "
+        "&& needs.fips-test.result != 'skipped' && needs.fips-test.result != 'success'))",
+        "FIPS aggregate must fail closed when tests fail or skip outside PR scope=compile",
         failures,
     )
     check_fips_feature_policy_gate(aggregate, failures)
+
+
+def extract_job_steps(job_body: str) -> list[str]:
+    """Return raw per-step YAML chunks from a job body's `steps:` block."""
+
+    marker = "\n    steps:\n"
+    if marker not in job_body:
+        return []
+    steps_text = job_body.split(marker, 1)[1]
+    starts = [m.start() for m in re.finditer(r"(?m)^      - ", steps_text)]
+    return [
+        steps_text[starts[i] : (starts[i + 1] if i + 1 < len(starts) else len(steps_text))]
+        for i in range(len(starts))
+    ]
+
+
+def require_fips_aggregate_fail_step(
+    aggregate: str,
+    expected_if: str,
+    message: str,
+    failures: list[str],
+) -> None:
+    """Require an executable fail-closed `exit 1` step with exact `if:` line."""
+
+    exact_if_line = f"        if: {expected_if}"
+    matching = [
+        step
+        for step in extract_job_steps(aggregate)
+        if exact_if_line in step.splitlines()
+        and "continue-on-error" not in step
+        and step_run_ends_with_exit(step, 1)
+    ]
+    require(len(matching) == 1, message, failures)
 
 
 # `FIPS Feature Policy` is not itself a required check: branch protection and
@@ -6953,7 +7058,7 @@ def self_test() -> int:
         "      - fips-test-build\n"
         "    steps:\n"
         "      - name: Fail when FIPS test-binary compile did not succeed\n"
-        "        if: needs.fips-plan.outputs.relevant == 'true' && ((needs.fips-plan.outputs.scope != 'compile' && needs.fips-test-build.result != 'success') || (needs.fips-plan.outputs.scope == 'compile' && needs.fips-test-build.result != 'skipped' && needs.fips-test-build.result != 'success'))\n"
+        "        if: needs.fips-plan.outputs.relevant == 'true' && (((needs.fips-plan.outputs.scope != 'compile' || github.event_name != 'pull_request') && needs.fips-test-build.result != 'success') || (github.event_name == 'pull_request' && needs.fips-plan.outputs.scope == 'compile' && needs.fips-test-build.result != 'skipped' && needs.fips-test-build.result != 'success'))\n"
         "        run: exit 1\n"
     )
     serial_failures: list[str] = []
@@ -7037,7 +7142,7 @@ def self_test() -> int:
     )
 
     missing_result = build_only_producer.replace(
-        "        if: needs.fips-plan.outputs.relevant == 'true' && ((needs.fips-plan.outputs.scope != 'compile' && needs.fips-test-build.result != 'success') || (needs.fips-plan.outputs.scope == 'compile' && needs.fips-test-build.result != 'skipped' && needs.fips-test-build.result != 'success'))\n",
+        "        if: needs.fips-plan.outputs.relevant == 'true' && (((needs.fips-plan.outputs.scope != 'compile' || github.event_name != 'pull_request') && needs.fips-test-build.result != 'success') || (github.event_name == 'pull_request' && needs.fips-plan.outputs.scope == 'compile' && needs.fips-test-build.result != 'skipped' && needs.fips-test-build.result != 'success'))\n",
         "        if: needs.fips-plan.outputs.relevant == 'true' && needs.fips-compile.result != 'success'\n",
         1,
     )
@@ -7330,16 +7435,16 @@ def self_test() -> int:
         failures,
     )
 
-    # Scope-gating and uniform Cargo-profile self-tests.
+    # Scope-gating, uniform Cargo-profile, aggregate-bypass, and test-count self-tests.
     bad_scope_if = handoff_channel.replace(
-        "    if: needs.fips-plan.outputs.relevant == 'true' && needs.fips-plan.outputs.scope != 'compile'\n",
+        "    if: needs.fips-plan.outputs.relevant == 'true' && (needs.fips-plan.outputs.scope != 'compile' || github.event_name != 'pull_request')\n",
         "    if: needs.fips-plan.outputs.relevant == 'true' && needs.fips-plan.outputs.scope == 'full'\n",
         1,
     )
     bad_scope_if_failures: list[str] = []
     check_fips(bad_scope_if, bad_scope_if_failures)
     require(
-        any("must skip only on exact scope == 'compile'" in item for item in bad_scope_if_failures),
+        any("must skip only on PR scope == 'compile'" in item for item in bad_scope_if_failures),
         "self-test: non-fail-closed scope == 'full' gating must fail",
         failures,
     )
@@ -7354,6 +7459,93 @@ def self_test() -> int:
     require(
         any("must pin uniform CARGO_PROFILE_DEV_DEBUG" in item for item in drifted_profile_env_failures),
         "self-test: drifted CARGO_PROFILE_DEV_DEBUG across FIPS compile jobs must fail",
+        failures,
+    )
+
+    step_env_override = handoff_channel.replace(
+        "      - name: Cache FIPS Rust and AWS-LC outputs\n",
+        '      - name: Override debug\n        env:\n          CARGO_PROFILE_DEV_DEBUG: "1"\n        run: "true"\n      - name: Cache FIPS Rust and AWS-LC outputs\n',
+        1,
+    )
+    step_env_override_failures: list[str] = []
+    check_fips(step_env_override, step_env_override_failures)
+    require(
+        any("must not override CARGO_PROFILE_* or CARGO_BUILD_* at step level" in item for item in step_env_override_failures),
+        "self-test: step-level CARGO_PROFILE_* override in FIPS job must fail",
+        failures,
+    )
+
+    prefix_key_drift = handoff_channel.replace(
+        '          cache-on-failure: "true"\n',
+        '          prefix-key: drifted-prefix\n          cache-on-failure: "true"\n',
+        1,
+    )
+    prefix_key_failures: list[str] = []
+    check_fips(prefix_key_drift, prefix_key_failures)
+    require(
+        any("must not set prefix-key" in item for item in prefix_key_failures),
+        "self-test: rust-cache prefix-key override in FIPS job must fail",
+        failures,
+    )
+
+    exit_zero_guard = handoff_channel.replace(
+        "      - name: Fail when FIPS planner scope is unusable\n"
+        "        if: needs.fips-plan.result == 'success' && ((needs.fips-plan.outputs.scope != 'full' && needs.fips-plan.outputs.scope != 'compile' && needs.fips-plan.outputs.scope != 'none') || (needs.fips-plan.outputs.relevant == 'false' && needs.fips-plan.outputs.scope != 'none') || (needs.fips-plan.outputs.relevant == 'true' && needs.fips-plan.outputs.scope == 'none'))\n"
+        "        run: exit 1\n",
+        "      - name: Fail when FIPS planner scope is unusable\n"
+        "        if: needs.fips-plan.result == 'success' && ((needs.fips-plan.outputs.scope != 'full' && needs.fips-plan.outputs.scope != 'compile' && needs.fips-plan.outputs.scope != 'none') || (needs.fips-plan.outputs.relevant == 'false' && needs.fips-plan.outputs.scope != 'none') || (needs.fips-plan.outputs.relevant == 'true' && needs.fips-plan.outputs.scope == 'none'))\n"
+        "        run: exit 0\n",
+        1,
+    )
+    exit_zero_failures: list[str] = []
+    check_fips(exit_zero_guard, exit_zero_failures)
+    require(
+        any("planner scope is unusable" in item for item in exit_zero_failures),
+        "self-test: FIPS aggregate scope guard with exit 0 must fail",
+        failures,
+    )
+
+    continue_on_error_guard = handoff_channel.replace(
+        "      - name: Fail when FIPS compile did not succeed\n"
+        "        if: needs.fips-plan.outputs.relevant == 'true' && needs.fips-compile.result != 'success'\n"
+        "        run: exit 1\n",
+        "      - name: Fail when FIPS compile did not succeed\n"
+        "        if: needs.fips-plan.outputs.relevant == 'true' && needs.fips-compile.result != 'success'\n"
+        "        continue-on-error: true\n"
+        "        run: exit 1\n",
+        1,
+    )
+    coe_failures: list[str] = []
+    check_fips(continue_on_error_guard, coe_failures)
+    require(
+        any("must not use continue-on-error" in item for item in coe_failures),
+        "self-test: FIPS aggregate guard with continue-on-error: true must fail",
+        failures,
+    )
+
+    disabled_scope_guard = handoff_channel.replace(
+        "        if: needs.fips-plan.result == 'success' && ((needs.fips-plan.outputs.scope != 'full'",
+        "        if: false && needs.fips-plan.result == 'success' && ((needs.fips-plan.outputs.scope != 'full'",
+        1,
+    )
+    disabled_scope_failures: list[str] = []
+    check_fips(disabled_scope_guard, disabled_scope_failures)
+    require(
+        any("planner scope is unusable" in item for item in disabled_scope_failures),
+        "self-test: disabled FIPS aggregate scope guard (if: false && ...) must fail",
+        failures,
+    )
+
+    missing_test_count = handoff_channel.replace(
+        "test result: ok\\. 1 passed; 0 failed; 0 ignored;",
+        "test result: ok",
+        1,
+    )
+    missing_test_count_failures: list[str] = []
+    check_fips(missing_test_count, missing_test_count_failures)
+    require(
+        any("must assert non-zero passing FIPS policy/key-admission unit tests" in item for item in missing_test_count_failures),
+        "self-test: dropping fips-test exact 1-passed assertion must fail",
         failures,
     )
 
