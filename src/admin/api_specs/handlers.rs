@@ -21,7 +21,10 @@ use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use crate::admin::api_specs::bounded_yaml::{parse_yaml_to_json_chunks, parse_yaml_to_json_reader};
-use crate::admin::api_specs::extractor::MAX_SOURCE_DOCUMENT_NODES;
+use crate::admin::api_specs::extractor::{
+    MAX_SOURCE_DOCUMENT_NODES, check_json_duplicate_member_limit_parity_for_test,
+    parse_json_reader_bounded, parse_json_slice_bounded,
+};
 use crate::admin::api_specs::{
     ExtractError, ExtractedBundle, SpecFormat, extract_with_external_refs,
 };
@@ -1452,154 +1455,6 @@ fn flatten_chunks(chunks: Vec<Vec<u8>>, total_len: usize) -> Vec<u8> {
     out
 }
 
-/// Node-bounded `serde::de::DeserializeSeed` for `serde_json::Value` that
-/// enforces `MAX_SOURCE_DOCUMENT_NODES` **during** deserialization (before
-/// materializing wide arrays/objects in memory), shared by both the normal
-/// JSON->YAML conversion path and the source-budget-exhaustion fallback.
-struct BoundedJsonValueSeed<'a> {
-    remaining_nodes: &'a mut usize,
-}
-
-impl BoundedJsonValueSeed<'_> {
-    fn charge_node<E: serde::de::Error>(&mut self) -> Result<(), E> {
-        if *self.remaining_nodes == 0 {
-            return Err(E::custom(
-                "JSON document exceeds expanded node limit; reduce nesting",
-            ));
-        }
-        *self.remaining_nodes -= 1;
-        Ok(())
-    }
-}
-
-impl<'de> serde::de::DeserializeSeed<'de> for BoundedJsonValueSeed<'_> {
-    type Value = Value;
-
-    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        deserializer.deserialize_any(self)
-    }
-}
-
-impl<'de> serde::de::Visitor<'de> for BoundedJsonValueSeed<'_> {
-    type Value = Value;
-
-    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("any valid JSON value")
-    }
-
-    fn visit_bool<E: serde::de::Error>(mut self, v: bool) -> Result<Self::Value, E> {
-        self.charge_node()?;
-        Ok(Value::Bool(v))
-    }
-
-    fn visit_i64<E: serde::de::Error>(mut self, v: i64) -> Result<Self::Value, E> {
-        self.charge_node()?;
-        Ok(Value::Number(v.into()))
-    }
-
-    fn visit_u64<E: serde::de::Error>(mut self, v: u64) -> Result<Self::Value, E> {
-        self.charge_node()?;
-        Ok(Value::Number(v.into()))
-    }
-
-    fn visit_f64<E: serde::de::Error>(mut self, v: f64) -> Result<Self::Value, E> {
-        self.charge_node()?;
-        Ok(serde_json::Number::from_f64(v).map_or(Value::Null, Value::Number))
-    }
-
-    fn visit_str<E: serde::de::Error>(mut self, v: &str) -> Result<Self::Value, E> {
-        self.charge_node()?;
-        Ok(Value::String(v.to_owned()))
-    }
-
-    fn visit_string<E: serde::de::Error>(mut self, v: String) -> Result<Self::Value, E> {
-        self.charge_node()?;
-        Ok(Value::String(v))
-    }
-
-    fn visit_none<E: serde::de::Error>(mut self) -> Result<Self::Value, E> {
-        self.charge_node()?;
-        Ok(Value::Null)
-    }
-
-    fn visit_unit<E: serde::de::Error>(mut self) -> Result<Self::Value, E> {
-        self.charge_node()?;
-        Ok(Value::Null)
-    }
-
-    fn visit_some<D: serde::Deserializer<'de>>(
-        self,
-        deserializer: D,
-    ) -> Result<Self::Value, D::Error> {
-        serde::de::DeserializeSeed::deserialize(self, deserializer)
-    }
-
-    fn visit_seq<A: serde::de::SeqAccess<'de>>(
-        mut self,
-        mut seq: A,
-    ) -> Result<Self::Value, A::Error> {
-        self.charge_node()?;
-        let mut vec = Vec::new();
-        while let Some(elem) = seq.next_element_seed(BoundedJsonValueSeed {
-            remaining_nodes: &mut *self.remaining_nodes,
-        })? {
-            vec.push(elem);
-        }
-        Ok(Value::Array(vec))
-    }
-
-    fn visit_map<A: serde::de::MapAccess<'de>>(
-        mut self,
-        mut map: A,
-    ) -> Result<Self::Value, A::Error> {
-        self.charge_node()?;
-        let mut obj = serde_json::Map::new();
-        while let Some(key) = map.next_key::<String>()? {
-            let val = map.next_value_seed(BoundedJsonValueSeed {
-                remaining_nodes: &mut *self.remaining_nodes,
-            })?;
-            obj.insert(key, val);
-        }
-        Ok(Value::Object(obj))
-    }
-}
-
-fn parse_json_slice_bounded(body: &[u8], max_nodes: usize) -> Result<Value, String> {
-    let mut remaining_nodes = max_nodes;
-    let mut de = serde_json::Deserializer::from_slice(body);
-    let value = serde::de::DeserializeSeed::deserialize(
-        BoundedJsonValueSeed {
-            remaining_nodes: &mut remaining_nodes,
-        },
-        &mut de,
-    )
-    .map_err(|e| format!("JSON parse error during conversion: {e}"))?;
-    de.end()
-        .map_err(|e| format!("JSON parse error during conversion: {e}"))?;
-    Ok(value)
-}
-
-fn parse_json_reader_bounded<R: std::io::Read>(
-    reader: R,
-    max_nodes: usize,
-) -> Result<Value, String> {
-    let mut remaining_nodes = max_nodes;
-    let mut de = serde_json::Deserializer::from_reader(reader);
-    let value = serde::de::DeserializeSeed::deserialize(
-        BoundedJsonValueSeed {
-            remaining_nodes: &mut remaining_nodes,
-        },
-        &mut de,
-    )
-    .map_err(|e| format!("JSON parse error during conversion: {e}"))?;
-    de.end()
-        .map_err(|e| format!("JSON parse error during conversion: {e}"))?;
-    Ok(value)
-}
-
 enum ConvertFormatError {
     BudgetExceeded,
     Format(String),
@@ -1671,7 +1526,12 @@ fn convert_format_capped_with_budget(
                     MAX_SOURCE_DOCUMENT_NODES,
                 )
             }
-            .map_err(ConvertFormatError::Format)?;
+            .map_err(|e| {
+                ConvertFormatError::Format(format!(
+                    "JSON parse error during conversion: {}",
+                    e.message()
+                ))
+            })?;
             // Release decompressed source chunks before allocating output.
             drop(chunks);
             let mut writer = LimitedWriter::new(max_bytes, reservation);
@@ -1720,7 +1580,8 @@ fn validate_cross_format_after_source_budget_exhaustion(
             let jv = parse_json_reader_bounded(
                 std::io::BufReader::new(reader),
                 MAX_SOURCE_DOCUMENT_NODES,
-            )?;
+            )
+            .map_err(|e| format!("JSON parse error during conversion: {}", e.message()))?;
             let mut sink = LimitedWriter::counting_only(max_bytes);
             serde_yaml::to_writer(&mut sink, &jv)
                 .map_err(|e| format!("YAML serialization error: {e}"))
@@ -3952,6 +3813,7 @@ pub(crate) async fn exercise_spec_content_response_limits_for_test() -> Result<(
         {
             return Err("bounded JSON parser failed to reject trailing tokens");
         }
+        check_json_duplicate_member_limit_parity_for_test()?;
     }
 
     // Scenario F: multi-chunk (> 64 KiB) YAML->JSON conversion streams through

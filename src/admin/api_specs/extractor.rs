@@ -6462,60 +6462,68 @@ fn parse_root_document(
     body: &[u8],
     declared_format: Option<SpecFormat>,
 ) -> Result<(serde_json::Value, SpecFormat), ExtractError> {
+    parse_root_document_with_limit(body, declared_format, MAX_SOURCE_DOCUMENT_NODES)
+}
+
+fn parse_root_document_with_limit(
+    body: &[u8],
+    declared_format: Option<SpecFormat>,
+    max_nodes: usize,
+) -> Result<(serde_json::Value, SpecFormat), ExtractError> {
     let fmt = declared_format.unwrap_or_else(|| autodetect_format(body));
 
-    // JSON prefers serde_json so error messages mention "JSON". YAML always
-    // goes through the bounded event composer (`bounded_yaml`) so anchors and
-    // aliases expand under node/depth/alias-reference/byte/work budgets with
-    // cycle detection — never through serde_yaml's unbounded materialization.
+    // JSON uses `parse_json_slice_bounded` so `max_nodes` is enforced mid-parse
+    // (counting every object member value before duplicate-key collapse, in exact
+    // parity with GET cross-format conversion). YAML always goes through the
+    // bounded event composer (`bounded_yaml`) so anchors and aliases expand
+    // under node/depth/alias-reference/byte/work budgets with cycle detection —
+    // never through serde_yaml's unbounded materialization.
     //
     // Fallback: YAML flow-style documents start with `{` and look like JSON to
     // autodetect_format, but they use unquoted keys which serde_json rejects.
-    // When JSON parsing fails on autodetected (not declared) input, retry as
-    // YAML before surfacing the error. The YAML path applies the same budgets
-    // as an explicitly declared YAML body (no autodetection differential).
+    // When JSON syntax parsing fails on autodetected (not declared) input,
+    // retry as YAML before surfacing the error. Node-limit rejections fail
+    // immediately as `InvalidJson` without retrying as YAML.
     let (root, parsed_via_yaml, actual_format): (serde_json::Value, bool, SpecFormat) = match fmt {
-        SpecFormat::Json => match serde_json::from_slice(body) {
+        SpecFormat::Json => match parse_json_slice_bounded(body, max_nodes) {
             Ok(v) => (v, false, SpecFormat::Json),
-            Err(e) if declared_format.is_none() => {
+            Err(BoundedJsonError::NodeLimitExceeded) => {
+                return Err(ExtractError::InvalidJson(
+                    BoundedJsonError::NodeLimitExceeded.message(),
+                ));
+            }
+            Err(BoundedJsonError::Parse(e)) if declared_format.is_none() => {
                 // Autodetected as JSON but failed — try YAML (covers flow-style).
                 // Preserve every semantic fail-closed YAML diagnostic. Only a
                 // YAML syntax failure keeps the original JSON error, so adding
                 // a new bounded-composer error cannot silently weaken this
                 // classification through a brittle message allowlist.
-                let val = crate::admin::api_specs::bounded_yaml::parse_yaml_to_json(
-                    body,
-                    MAX_SOURCE_DOCUMENT_NODES,
-                )
-                .map_err(|yaml_err| {
-                    if matches!(
-                        &yaml_err,
-                        crate::admin::api_specs::bounded_yaml::BoundedYamlError::Parse(_)
-                            | crate::admin::api_specs::bounded_yaml::BoundedYamlError::EmptyDocument
-                    ) {
-                        ExtractError::InvalidJson(e.to_string())
-                    } else {
-                        ExtractError::InvalidYaml(yaml_err.message())
-                    }
-                })?;
+                let val =
+                    crate::admin::api_specs::bounded_yaml::parse_yaml_to_json(body, max_nodes)
+                        .map_err(|yaml_err| {
+                            if matches!(
+                                &yaml_err,
+                                crate::admin::api_specs::bounded_yaml::BoundedYamlError::Parse(_)
+                                    | crate::admin::api_specs::bounded_yaml::BoundedYamlError::EmptyDocument
+                            ) {
+                                ExtractError::InvalidJson(e.clone())
+                            } else {
+                                ExtractError::InvalidYaml(yaml_err.message())
+                            }
+                        })?;
                 (val, true, SpecFormat::Yaml)
             }
-            Err(e) => return Err(ExtractError::InvalidJson(e.to_string())),
+            Err(BoundedJsonError::Parse(e)) => return Err(ExtractError::InvalidJson(e)),
         },
         SpecFormat::Yaml => {
-            let val = parse_yaml_document(body)?;
+            let val = crate::admin::api_specs::bounded_yaml::parse_yaml_to_json(body, max_nodes)
+                .map_err(|e| ExtractError::InvalidYaml(e.message()))?;
             (val, true, SpecFormat::Yaml)
         }
     };
 
-    // Source-tree node cap, applied to **both** formats.
-    //
-    // For YAML this is defence-in-depth on top of budgeted expansion inside
-    // `bounded_yaml`. For JSON it is the only structural bound besides the
-    // request-body byte ceiling; without it, a JSON document could present far
-    // more reference sites than an equivalently sized YAML one and face a
-    // strictly weaker admission check (GHSA-8jc7-c52g-85xr).
-    let mut budget = MAX_SOURCE_DOCUMENT_NODES;
+    // Source-tree node cap defense-in-depth across both formats.
+    let mut budget = max_nodes;
     if !count_value_nodes(&root, &mut budget) {
         return Err(if parsed_via_yaml {
             ExtractError::InvalidYaml(
@@ -6531,9 +6539,228 @@ fn parse_root_document(
     Ok((root, actual_format))
 }
 
-fn parse_yaml_document(body: &[u8]) -> Result<serde_json::Value, ExtractError> {
-    crate::admin::api_specs::bounded_yaml::parse_yaml_to_json(body, MAX_SOURCE_DOCUMENT_NODES)
-        .map_err(|e| ExtractError::InvalidYaml(e.message()))
+/// Errors returned by [`parse_json_slice_bounded`] and
+/// [`parse_json_reader_bounded`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BoundedJsonError {
+    NodeLimitExceeded,
+    Parse(String),
+}
+
+impl BoundedJsonError {
+    pub(crate) fn message(&self) -> String {
+        match self {
+            Self::NodeLimitExceeded => {
+                "JSON document exceeds expanded node limit; reduce nesting".to_string()
+            }
+            Self::Parse(msg) => msg.clone(),
+        }
+    }
+}
+
+/// Node-bounded `serde::de::DeserializeSeed` for `serde_json::Value` that
+/// enforces `max_nodes` **during** deserialization (counting every scalar,
+/// array element, and object member value before duplicate-key collapse),
+/// shared across upload/restore admission and GET cross-format conversion.
+struct BoundedJsonValueSeed<'a> {
+    remaining_nodes: &'a mut usize,
+    node_limit_exceeded: &'a mut bool,
+}
+
+impl BoundedJsonValueSeed<'_> {
+    fn charge_node<E: serde::de::Error>(&mut self) -> Result<(), E> {
+        if *self.remaining_nodes == 0 {
+            *self.node_limit_exceeded = true;
+            return Err(E::custom(
+                "JSON document exceeds expanded node limit; reduce nesting",
+            ));
+        }
+        *self.remaining_nodes -= 1;
+        Ok(())
+    }
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for BoundedJsonValueSeed<'_> {
+    type Value = serde_json::Value;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for BoundedJsonValueSeed<'_> {
+    type Value = serde_json::Value;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("any valid JSON value")
+    }
+
+    fn visit_bool<E: serde::de::Error>(mut self, v: bool) -> Result<Self::Value, E> {
+        self.charge_node::<E>()?;
+        Ok(serde_json::Value::Bool(v))
+    }
+
+    fn visit_i64<E: serde::de::Error>(mut self, v: i64) -> Result<Self::Value, E> {
+        self.charge_node::<E>()?;
+        Ok(serde_json::Value::Number(v.into()))
+    }
+
+    fn visit_u64<E: serde::de::Error>(mut self, v: u64) -> Result<Self::Value, E> {
+        self.charge_node::<E>()?;
+        Ok(serde_json::Value::Number(v.into()))
+    }
+
+    fn visit_f64<E: serde::de::Error>(mut self, v: f64) -> Result<Self::Value, E> {
+        self.charge_node::<E>()?;
+        Ok(serde_json::Number::from_f64(v)
+            .map_or(serde_json::Value::Null, serde_json::Value::Number))
+    }
+
+    fn visit_str<E: serde::de::Error>(mut self, v: &str) -> Result<Self::Value, E> {
+        self.charge_node::<E>()?;
+        Ok(serde_json::Value::String(v.to_owned()))
+    }
+
+    fn visit_string<E: serde::de::Error>(mut self, v: String) -> Result<Self::Value, E> {
+        self.charge_node::<E>()?;
+        Ok(serde_json::Value::String(v))
+    }
+
+    fn visit_none<E: serde::de::Error>(mut self) -> Result<Self::Value, E> {
+        self.charge_node::<E>()?;
+        Ok(serde_json::Value::Null)
+    }
+
+    fn visit_unit<E: serde::de::Error>(mut self) -> Result<Self::Value, E> {
+        self.charge_node::<E>()?;
+        Ok(serde_json::Value::Null)
+    }
+
+    fn visit_some<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        serde::de::DeserializeSeed::deserialize(self, deserializer)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(
+        mut self,
+        mut seq: A,
+    ) -> Result<Self::Value, A::Error> {
+        self.charge_node::<A::Error>()?;
+        let mut vec = Vec::new();
+        while let Some(elem) = seq.next_element_seed(BoundedJsonValueSeed {
+            remaining_nodes: &mut *self.remaining_nodes,
+            node_limit_exceeded: &mut *self.node_limit_exceeded,
+        })? {
+            vec.push(elem);
+        }
+        Ok(serde_json::Value::Array(vec))
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(
+        mut self,
+        mut map: A,
+    ) -> Result<Self::Value, A::Error> {
+        self.charge_node::<A::Error>()?;
+        let mut obj = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            let val = map.next_value_seed(BoundedJsonValueSeed {
+                remaining_nodes: &mut *self.remaining_nodes,
+                node_limit_exceeded: &mut *self.node_limit_exceeded,
+            })?;
+            obj.insert(key, val);
+        }
+        Ok(serde_json::Value::Object(obj))
+    }
+}
+
+pub(crate) fn parse_json_slice_bounded(
+    body: &[u8],
+    max_nodes: usize,
+) -> Result<serde_json::Value, BoundedJsonError> {
+    let mut remaining_nodes = max_nodes;
+    let mut node_limit_exceeded = false;
+    let mut de = serde_json::Deserializer::from_slice(body);
+    let value = match serde::de::DeserializeSeed::deserialize(
+        BoundedJsonValueSeed {
+            remaining_nodes: &mut remaining_nodes,
+            node_limit_exceeded: &mut node_limit_exceeded,
+        },
+        &mut de,
+    ) {
+        Ok(value) => value,
+        Err(_) if node_limit_exceeded => return Err(BoundedJsonError::NodeLimitExceeded),
+        Err(e) => return Err(BoundedJsonError::Parse(e.to_string())),
+    };
+    de.end()
+        .map_err(|e| BoundedJsonError::Parse(e.to_string()))?;
+    Ok(value)
+}
+
+pub(crate) fn parse_json_reader_bounded<R: std::io::Read>(
+    reader: R,
+    max_nodes: usize,
+) -> Result<serde_json::Value, BoundedJsonError> {
+    let mut remaining_nodes = max_nodes;
+    let mut node_limit_exceeded = false;
+    let mut de = serde_json::Deserializer::from_reader(reader);
+    let value = match serde::de::DeserializeSeed::deserialize(
+        BoundedJsonValueSeed {
+            remaining_nodes: &mut remaining_nodes,
+            node_limit_exceeded: &mut node_limit_exceeded,
+        },
+        &mut de,
+    ) {
+        Ok(value) => value,
+        Err(_) if node_limit_exceeded => return Err(BoundedJsonError::NodeLimitExceeded),
+        Err(e) => return Err(BoundedJsonError::Parse(e.to_string())),
+    };
+    de.end()
+        .map_err(|e| BoundedJsonError::Parse(e.to_string()))?;
+    Ok(value)
+}
+
+/// Test helper verifying that admission (`parse_root_document_with_limit`) and
+/// retrieval conversion (`parse_json_slice_bounded` / `parse_json_reader_bounded`)
+/// enforce the exact same pre-collapse node count on duplicate object members
+/// and map admission limit failures to `ExtractError::InvalidJson` (400).
+pub(crate) fn check_json_duplicate_member_limit_parity_for_test() -> Result<(), &'static str> {
+    // 1 object + 5 member values (all duplicate key "a") = 6 nodes pre-collapse,
+    // only 2 nodes after duplicate-key collapse.
+    let dup_json = br#"{"a":0,"a":1,"a":2,"a":3,"a":4}"#;
+    if !matches!(
+        parse_root_document_with_limit(dup_json, Some(SpecFormat::Json), 5),
+        Err(ExtractError::InvalidJson(_))
+    ) {
+        return Err("declared JSON admission failed to reject duplicate members above node cap");
+    }
+    if !matches!(
+        parse_root_document_with_limit(dup_json, None, 5),
+        Err(ExtractError::InvalidJson(_))
+    ) {
+        return Err(
+            "autodetected JSON admission failed to reject duplicate members as InvalidJson",
+        );
+    }
+    if parse_root_document_with_limit(dup_json, Some(SpecFormat::Json), 6).is_err() {
+        return Err("JSON admission rejected duplicate members at exact node cap");
+    }
+    if parse_json_slice_bounded(dup_json, 5) != Err(BoundedJsonError::NodeLimitExceeded)
+        || parse_json_reader_bounded(std::io::Cursor::new(dup_json), 5)
+            != Err(BoundedJsonError::NodeLimitExceeded)
+    {
+        return Err("bounded JSON conversion parser failed to reject duplicate members above cap");
+    }
+    if parse_json_slice_bounded(dup_json, 6).is_err()
+        || parse_json_reader_bounded(std::io::Cursor::new(dup_json), 6).is_err()
+    {
+        return Err("bounded JSON conversion parser rejected duplicate members at exact cap");
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

@@ -8883,10 +8883,15 @@ paths:
         plus the selected response format (`"<hash>-json"` or `"<hash>-yaml"`
         when served verbatim in its stored format, or
         `"<hash>-<target>-from-<stored>-v1"` when converted across formats).
-        Clients that send the matching `If-None-Match` value receive
-        `304 Not Modified`, saving bandwidth on polling integrations. Responses
-        include `Vary: Accept` because content negotiation affects the selected
-        representation and ETag.
+        Clients that send the matching exact `ETag` (or `*` for a verbatim
+        format within the decompression cap) receive `304 Not Modified` directly
+        from lightweight metadata without consuming read codec slots or
+        connection response budget. On cross-format reads, `If-None-Match: *`
+        defers `304` until bounded conversion validation succeeds, so it can
+        still return `500` if conversion fails or exceeds the decompression cap,
+        or `503` (`Retry-After: 1`) under per-connection response-budget
+        backpressure. Responses include `Vary: Accept` because content
+        negotiation affects the selected representation and ETag.
 
         The spec content is served as-is — the gateway does not rewrite any
         Ferrum extension fields in the response.
@@ -8901,7 +8906,12 @@ paths:
           required: false
           schema:
             type: string
-          description: ETag from a previous response. Returns 304 if the spec is unchanged.
+          description: >-
+            ETag from a previous response (or `*`). Exact matches (and `*` for a
+            verbatim format within the decompression cap) short-circuit to `304`;
+            on cross-format reads, `*` validates the bounded conversion first and
+            may still return `500` on conversion failure/oversize or `503` under
+            per-connection response-budget backpressure.
       responses:
         "403":
           $ref: "#/components/responses/Forbidden"
@@ -9282,7 +9292,12 @@ paths:
           required: false
           schema:
             type: string
-          description: ETag from a previous response. Returns 304 if the spec is unchanged.
+          description: >-
+            ETag from a previous response (or `*`). Exact matches (and `*` for a
+            verbatim format within the decompression cap) short-circuit to `304`;
+            on cross-format reads, `*` validates the bounded conversion first and
+            may still return `500` on conversion failure/oversize or `503` under
+            per-connection response-budget backpressure.
       responses:
         "403":
           $ref: "#/components/responses/Forbidden"

@@ -1914,6 +1914,9 @@ pub(crate) async fn exercise_response_budget_wrapper_for_test(
     // Stream reset while h2 still holds a `copy_to_bytes`-split prefix for a
     // pending socket write: dropping both the remaining frame and body must
     // keep the budget reserved until the split `Bytes` prefix itself drops.
+    if body_bytes < 1024 {
+        return Err("split-prefix check requires body_bytes >= 1024");
+    }
     let Some(split_permit) = budget.try_acquire_bytes(body_bytes) else {
         return Err("budget was not reusable before split-prefix check");
     };
