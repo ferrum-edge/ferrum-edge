@@ -18152,7 +18152,9 @@ mod inner {
                 .await?;
             let mut specs = Vec::new();
             while cursor.advance().await? {
-                let doc = cursor.deserialize_current()?;
+                let doc = cursor
+                    .deserialize_current()
+                    .map_err(|error| map_snapshot_document_error(true, "api_spec", None, error))?;
                 let spec_id = doc
                     .get_str("id")
                     .ok()

@@ -3630,7 +3630,17 @@ impl DatabaseStore {
             sqlx::query(self.q("SELECT * FROM api_specs WHERE namespace = ? ORDER BY id ASC"))
                 .bind(namespace)
                 .fetch_all(&self.pool())
-                .await?;
+                .await
+                .map_err(|error| match &error {
+                    sqlx::Error::Decode(_)
+                    | sqlx::Error::ColumnDecode { .. }
+                    | sqlx::Error::ColumnIndexOutOfBounds { .. }
+                    | sqlx::Error::ColumnNotFound(_)
+                    | sqlx::Error::TypeNotFound { .. } => anyhow::Error::new(
+                        SnapshotDataIntegrityError::new("api_spec", None, error.into()),
+                    ),
+                    _ => error.into(),
+                })?;
         let mut specs = Vec::with_capacity(rows.len());
         for row in &rows {
             // Every production caller (consistent backup export and restore
