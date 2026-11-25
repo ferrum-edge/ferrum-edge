@@ -3161,6 +3161,9 @@ CI_AGGREGATE_JOB_NAME = "test"
 # Lint on `run_rust`, while granular PR CI planning gates Lint on `run_lint`.
 # Accepting either exact anchor lets the granular gate transition land without
 # weakening the positional anchor requirement for `fuzz-smoke`.
+# Retirement note: once PR #7495 (`run_lint`) lands on `main`, drop index 0
+# (`run_rust`) from this tuple and re-point the self-test fixture/mutation
+# references to `run_lint` so no legacy transition shim remains.
 CI_FUZZ_SMOKE_LINT_GATE_ANCHORS = (
     '          require_planned_gate "Lint" "${{ needs.lint.result }}" "${{ needs.ci-plan.outputs.run_rust }}"\n',
     '          require_planned_gate "Lint" "${{ needs.lint.result }}" "${{ needs.ci-plan.outputs.run_lint }}"\n',
@@ -11999,29 +12002,36 @@ def ci_fuzz_smoke_aggregate_wiring(contents: str, source: str) -> FuzzAggregateW
         return FuzzAggregateWiring("absent", contents, [])
 
     errors: list[str] = []
-    withheld = block
+    lines = block.splitlines(keepends=True)
     for label, anchors, added in CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS:
-        occurrences = withheld.count(added)
-        if occurrences != 1:
+        raw_occurrences = "".join(lines).count(added)
+        added_indices = [idx for idx, line in enumerate(lines) if line == added]
+        if raw_occurrences != 1 or len(added_indices) != 1:
             errors.append(
                 f"{source} job {CI_AGGREGATE_JOB_NAME!r} must carry the admitted "
                 f"{CI_FUZZ_SMOKE_JOB_NAME!r} {label} exactly once "
-                f"({added.strip()!r} appears {occurrences} times)"
+                f"({added.strip()!r} appears {raw_occurrences} times)"
             )
             continue
-        matched_anchors = [
-            anchor for anchor in anchors if withheld.count(anchor + added) == 1
-        ]
-        total_matches = sum(withheld.count(anchor + added) for anchor in anchors)
-        if len(matched_anchors) != 1 or total_matches != 1:
-            anchor_desc = " or ".join(repr(anchor.strip()) for anchor in anchors)
+        added_idx = added_indices[0]
+        anchor_desc = " or ".join(repr(anchor.strip()) for anchor in anchors)
+        if added_idx == 0 or lines[added_idx - 1] not in anchors:
             errors.append(
                 f"{source} job {CI_AGGREGATE_JOB_NAME!r} must place the admitted "
                 f"{CI_FUZZ_SMOKE_JOB_NAME!r} {label} immediately after "
                 f"{anchor_desc}"
             )
             continue
-        withheld = withheld.replace(matched_anchors[0] + added, matched_anchors[0], 1)
+        anchor_indices = [idx for idx, line in enumerate(lines) if line in anchors]
+        if len(anchor_indices) != 1:
+            errors.append(
+                f"{source} job {CI_AGGREGATE_JOB_NAME!r} must carry exactly one "
+                f"admitted {CI_FUZZ_SMOKE_JOB_NAME!r} {label} anchor "
+                f"({anchor_desc}; found {len(anchor_indices)})"
+            )
+            continue
+        del lines[added_idx]
+    withheld = "".join(lines)
     if not has_admitted_job:
         errors.append(
             f"{source} job {CI_AGGREGATE_JOB_NAME!r} requires the "
@@ -28963,11 +28973,42 @@ pre_build = []
         '          require_planned_gate "Lint" "${{ needs.lint.result }}" "${{ needs.ci-plan.outputs.run_other }}"\n',
         1,
     )
-    if not ci_fuzz_smoke_aggregate_wiring(
+    unadmitted_wiring = ci_fuzz_smoke_aggregate_wiring(
         unadmitted_anchor, "self-test CI workflow (unadmitted anchor)"
-    ).errors:
+    )
+    if unadmitted_wiring.state != "invalid" or not any(
+        "immediately after" in err for err in unadmitted_wiring.errors
+    ):
         failures.append(
             "an unadmitted Lint gate anchor before fuzz-smoke was not rejected"
+        )
+    stacked_lint_anchors = aggregate_adopted.replace(
+        CI_FUZZ_SMOKE_LINT_GATE_ANCHORS[0],
+        CI_FUZZ_SMOKE_LINT_GATE_ANCHORS[0] + CI_FUZZ_SMOKE_LINT_GATE_ANCHORS[1],
+        1,
+    )
+    stacked_wiring = ci_fuzz_smoke_aggregate_wiring(
+        stacked_lint_anchors, "self-test CI workflow (stacked anchors)"
+    )
+    if stacked_wiring.state != "invalid" or not any(
+        "exactly one admitted" in err for err in stacked_wiring.errors
+    ):
+        failures.append(
+            "stacking both run_rust and run_lint Lint gate anchors before fuzz-smoke was not rejected"
+        )
+    commented_lint_anchor = aggregate_adopted_run_lint.replace(
+        CI_FUZZ_SMOKE_LINT_GATE_ANCHORS[1],
+        "          # " + CI_FUZZ_SMOKE_LINT_GATE_ANCHORS[1],
+        1,
+    )
+    commented_wiring = ci_fuzz_smoke_aggregate_wiring(
+        commented_lint_anchor, "self-test CI workflow (commented anchor)"
+    )
+    if commented_wiring.state != "invalid" or not any(
+        "immediately after" in err for err in commented_wiring.errors
+    ):
+        failures.append(
+            "a comment-prefixed run_lint anchor before fuzz-smoke was not rejected"
         )
     # A generation transition, end to end: one revision moves the whole job
     # from the retired generation to the adopted one with the aggregate wiring
