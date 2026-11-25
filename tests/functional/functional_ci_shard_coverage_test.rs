@@ -54,15 +54,24 @@ fn read_shard_filters() -> Vec<(String, Vec<String>)> {
             .and_then(|s| s.as_str())
             .expect("each functional shard entry must declare a string `shard` name")
             .to_string();
-        if let Some(filters) = entry.get("filters").and_then(|f| f.as_str()) {
-            let tokens: Vec<String> = filters
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty() && !line.starts_with('#'))
-                .map(ToString::to_string)
-                .collect();
-            shards.push((shard, tokens));
-        }
+        let filters = entry
+            .get("filters")
+            .and_then(|f| f.as_str())
+            .expect("each functional shard entry must declare a string `filters` block");
+        // Mirror `ci.yml`'s `while IFS= read -r filter; do [ -z "$filter" ] && continue; ...`
+        // without trimming whitespace or skipping `#` lines, so extra leading/trailing
+        // spaces that would cause nextest to silently skip a module fail immediately.
+        let tokens: Vec<String> = filters
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(ToString::to_string)
+            .collect();
+        assert!(
+            !tokens.is_empty(),
+            "functional shard `{}` must declare at least one filter",
+            shard
+        );
+        shards.push((shard, tokens));
     }
     assert!(
         shards.iter().any(|(_, tokens)| !tokens.is_empty()),
