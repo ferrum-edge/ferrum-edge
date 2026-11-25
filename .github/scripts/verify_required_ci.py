@@ -99,8 +99,6 @@ from verify_ci_runtime_cache import (
     CANONICAL_MERGE_GROUP_BODY,
     CANONICAL_PULL_REQUEST_BODY,
     CANONICAL_PUSH_MAIN_BODY,
-    _decode_yaml_scalar,
-    _yaml_strip_trailing_comment,
     extract_job,
     job_if,
     job_steps,
@@ -712,171 +710,50 @@ def _expr_admits_main_push(expr: str) -> bool:
     return False
 
 
-def _strip_yaml_comment_and_unquote(raw: str) -> str:
-    """Strip an unquoted trailing YAML comment and decode YAML 1.2 single/double quotes."""
+def _parse_step_mapping(step: str) -> tuple[dict[object, object] | None, str | None]:
+    """Parse a single GitHub Actions step using PyYAML (failing closed if unavailable)."""
 
-    cleaned = _yaml_strip_trailing_comment(raw).strip()
-    if not cleaned:
-        return ""
-    decoded = _decode_yaml_scalar(cleaned)
-    return cleaned if decoded is None else decoded
+    try:
+        import yaml  # type: ignore[import-untyped]
+    except ImportError:
+        return None, "PyYAML is required to validate build-test-artifacts consumer wiring"
+    try:
+        parsed = yaml.safe_load(step)
+    except Exception as exc:
+        return None, f"unparseable step YAML: {exc}"
+    if not isinstance(parsed, list) or len(parsed) != 1 or not isinstance(parsed[0], dict):
+        return None, "step YAML did not parse as a single step mapping"
+    return parsed[0], None
 
 
-def _extract_step_with_map(
-    step: str, *, force_fallback: bool = False
-) -> tuple[dict[str, str], str | None]:
-    """Parse a GitHub Actions step's `with:` mapping into normalized string pairs."""
+def _extract_step_with_map(step: str) -> tuple[dict[str, str], str | None]:
+    """Parse a GitHub Actions step's `with:` mapping via PyYAML."""
 
-    yaml = None
-    if not force_fallback:
-        try:
-            import yaml as _yaml  # type: ignore[import-untyped]
-            yaml = _yaml
-        except ImportError:
-            yaml = None
-
-    if yaml is not None:
-        try:
-            parsed = yaml.safe_load(step)
-        except Exception as exc:  # pragma: no cover - defensive
-            return {}, f"unparseable step YAML: {exc}"
-        if not isinstance(parsed, list) or len(parsed) != 1 or not isinstance(parsed[0], dict):
-            return {}, "step YAML did not parse as a single step mapping"
-        raw_with = parsed[0].get("with")
-        if raw_with is None:
-            return {}, None
-        if not isinstance(raw_with, dict):
-            return {}, "`with:` must be a mapping"
-        return {
-            str(k): ("" if v is None else str(v))
-            for k, v in raw_with.items()
-        }, None
-
-    # Fallback parser when PyYAML is unavailable (or forced by self-tests).
-    lines = step.splitlines()
-    with_idx = None
-    with_indent = 0
-    with_inline = ""
-    for idx, line in enumerate(lines):
-        m = re.match(
-            r"^(?P<lead>[ \t]*)(?:-[ \t]+)?(?P<key>'(?:[^']|'')*'|\"(?:[^\"\\]|\\.)*\"|[A-Za-z0-9_.-]+)[ \t]*:[ \t]*(?P<val>.*)$",
-            line,
-        )
-        if not m:
-            continue
-        key = _strip_yaml_comment_and_unquote(m.group("key"))
-        if key == "with":
-            with_idx = idx
-            with_indent = len(m.group("lead")) + (2 if re.match(r"^[ \t]*-[ \t]+", line) else 0)
-            with_inline = _strip_yaml_comment_and_unquote(m.group("val"))
-            break
-    if with_idx is None:
+    step_obj, err = _parse_step_mapping(step)
+    if err is not None or step_obj is None:
+        return {}, err or "step YAML did not parse as a mapping"
+    raw_with = step_obj.get("with")
+    if raw_with is None:
         return {}, None
-    if with_inline.startswith("{"):
-        if not with_inline.endswith("}"):
-            return {}, "unterminated flow `with:` mapping"
-        inner = with_inline[1:-1].strip()
-        result: dict[str, str] = {}
-        if not inner:
-            return result, None
-        # Split top-level flow entries respecting quotes.
-        entries: list[str] = []
-        buf: list[str] = []
-        in_s = in_d = esc = False
-        for ch in inner:
-            if in_d:
-                buf.append(ch)
-                if esc:
-                    esc = False
-                elif ch == "\\":
-                    esc = True
-                elif ch == '"':
-                    in_d = False
-            elif in_s:
-                buf.append(ch)
-                if ch == "'":
-                    in_s = False
-            else:
-                if ch == "'":
-                    in_s = True
-                    buf.append(ch)
-                elif ch == '"':
-                    in_d = True
-                    buf.append(ch)
-                elif ch == ",":
-                    entries.append("".join(buf).strip())
-                    buf = []
-                else:
-                    buf.append(ch)
-        if buf:
-            entries.append("".join(buf).strip())
-        for entry in entries:
-            if not entry:
-                continue
-            em = re.match(
-                r"^(?P<key>'(?:[^']|'')*'|\"(?:[^\"\\]|\\.)*\"|[A-Za-z0-9_.-]+)[ \t]*:[ \t]*(?P<val>.*)$",
-                entry,
-            )
-            if not em:
-                return {}, f"unparseable flow `with:` entry: {entry!r}"
-            result[_strip_yaml_comment_and_unquote(em.group("key"))] = (
-                _strip_yaml_comment_and_unquote(em.group("val"))
-            )
-        return result, None
-
-    result = {}
-    for line in lines[with_idx + 1 :]:
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        indent = len(line) - len(line.lstrip(" \t"))
-        if indent <= with_indent:
-            break
-        em = re.match(
-            r"^[ \t]+(?P<key>'(?:[^']|'')*'|\"(?:[^\"\\]|\\.)*\"|[A-Za-z0-9_.-]+)[ \t]*:[ \t]*(?P<val>.*)$",
-            line,
-        )
-        if not em:
-            return {}, f"unparseable `with:` line: {line!r}"
-        result[_strip_yaml_comment_and_unquote(em.group("key"))] = (
-            _strip_yaml_comment_and_unquote(em.group("val"))
-        )
-    return result, None
+    if not isinstance(raw_with, dict):
+        return {}, "`with:` must be a mapping"
+    return {
+        str(k): ("" if v is None else str(v))
+        for k, v in raw_with.items()
+    }, None
 
 
-def _step_uses_download_artifact(step: str, *, force_fallback: bool = False) -> bool:
-    """Return True if a step invokes actions/download-artifact@."""
+def _step_uses_download_artifact(step: str) -> tuple[bool, str | None]:
+    """Return `(is_download_artifact, parse_error)` for a step via PyYAML."""
 
-    yaml = None
-    if not force_fallback:
-        try:
-            import yaml as _yaml  # type: ignore[import-untyped]
-            yaml = _yaml
-        except ImportError:
-            yaml = None
-
-    if yaml is not None:
-        try:
-            parsed = yaml.safe_load(step)
-            if isinstance(parsed, list) and len(parsed) == 1 and isinstance(parsed[0], dict):
-                uses = parsed[0].get("uses")
-                return isinstance(uses, str) and uses.startswith("actions/download-artifact@")
-        except Exception:
-            pass
-    for line in step.splitlines():
-        m = re.match(
-            r"^(?:      - |        )(?P<key>'(?:[^']|'')*'|\"(?:[^\"\\]|\\.)*\"|[A-Za-z0-9_.-]+)[ \t]*:[ \t]*(?P<val>.*)$",
-            line,
-        )
-        if m and _strip_yaml_comment_and_unquote(m.group("key")) == "uses":
-            val = _strip_yaml_comment_and_unquote(m.group("val"))
-            if val.startswith("actions/download-artifact@"):
-                return True
-    return False
+    step_obj, err = _parse_step_mapping(step)
+    if err is not None or step_obj is None:
+        return False, err
+    uses = step_obj.get("uses")
+    return isinstance(uses, str) and uses.startswith("actions/download-artifact@"), None
 
 
-def test_artifact_consumer_wiring_errors(
-    ci_yml: str, *, force_fallback: bool = False
-) -> list[str]:
+def test_artifact_consumer_wiring_errors(ci_yml: str) -> list[str]:
     """Verify every consumer download of a build-test-artifacts output is produced."""
 
     errors: list[str] = []
@@ -1024,9 +901,13 @@ def test_artifact_consumer_wiring_errors(
         gate = PATH_GATED_JOBS.get(job)
         job_artifacts: set[str] = set()
         for step in _split_job_steps(job_body):
-            if not _step_uses_download_artifact(step, force_fallback=force_fallback):
+            uses_dl, step_err = _step_uses_download_artifact(step)
+            if step_err is not None:
+                errors.append(f"jobs.{job} has unparseable step YAML ({step_err})")
                 continue
-            with_map, with_err = _extract_step_with_map(step, force_fallback=force_fallback)
+            if not uses_dl:
+                continue
+            with_map, with_err = _extract_step_with_map(step)
             if with_err is not None:
                 errors.append(
                     f"jobs.{job} invokes actions/download-artifact with invalid `with:` ({with_err})"
@@ -1263,23 +1144,28 @@ def test_artifact_consumer_wiring_self_test(ci_yml: str) -> list[str]:
             + "        name: Fetch all\n"
             + with_lines
         )
-        for fallback_flag in (False, True):
-            if not test_artifact_consumer_wiring_errors(probe_job, force_fallback=fallback_flag):
-                mode = "fallback" if fallback_flag else "default"
-                failures.append(f"artifact wiring verifier ({mode}) must reject {label}")
+        if not test_artifact_consumer_wiring_errors(probe_job):
+            failures.append(f"artifact wiring verifier must reject {label}")
 
-    # 11. Equivalent reversed `||` operands must still pass (in both parser modes).
+    # 11. Equivalent reversed `||` operands and YAML-continued `uses:` must still pass.
     reversed_if = ci_yml.replace(
         "if: needs.ci-plan.outputs.run_integration == 'true' || needs.ci-plan.outputs.run_vendor_patches == 'true'",
         "if: needs.ci-plan.outputs.run_vendor_patches == 'true' || needs.ci-plan.outputs.run_integration == 'true'",
         1,
     )
-    if (
-        reversed_if == ci_yml
-        or test_artifact_consumer_wiring_errors(reversed_if, force_fallback=False)
-        or test_artifact_consumer_wiring_errors(reversed_if, force_fallback=True)
-    ):
+    if reversed_if == ci_yml or test_artifact_consumer_wiring_errors(reversed_if):
         failures.append("artifact wiring verifier must accept equivalent reversed || operands")
+
+    continued_uses = ci_yml.replace(
+        "      - name: Download prebuilt ferrum-cni binary\n"
+        "        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8\n",
+        '      - name: Download prebuilt ferrum-cni binary\n'
+        '        uses: "actions/\\\n'
+        '          download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333" # v8\n',
+        1,
+    )
+    if continued_uses == ci_yml or test_artifact_consumer_wiring_errors(continued_uses):
+        failures.append("artifact wiring verifier must accept valid YAML backslash-newline continued uses:")
 
     return failures
 
@@ -1391,6 +1277,30 @@ def check_mode_and_granular_opt_in(plan_body: str) -> list[str]:
         errors.append(
             "jobs.ci-plan must pass FERRUM_CI_PLAN_GRANULAR_GATES=1 on the executable python3 -I planner invocation"
         )
+    # Require that the `id: plan` step writes to GITHUB_OUTPUT solely via the
+    # two pinned emission lines (prevents pre-planner or post-summary overwrites).
+    plan_steps = [
+        step
+        for step in _split_job_steps(plan_body)
+        if "      - id: plan\n" in step or "        id: plan\n" in step
+    ]
+    if len(plan_steps) != 1:
+        errors.append("jobs.ci-plan must contain a single `id: plan` step")
+    else:
+        select_exec = [
+            line.strip()
+            for line in plan_steps[0].splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        github_output_lines = [line for line in select_exec if "GITHUB_OUTPUT" in line]
+        if github_output_lines != [
+            'echo "mode=$mode" >> "$GITHUB_OUTPUT"',
+            'printf \'%s=%s\\n\' "$gate" "$value" >> "$GITHUB_OUTPUT"',
+        ]:
+            errors.append(
+                "jobs.ci-plan `id: plan` step must only write to GITHUB_OUTPUT "
+                "via the two pinned emission lines"
+            )
     # Pin the exact non-blank, non-comment emission section from the planner call
     # through the gate-emission loop (stopping before the summary block `{`),
     # preventing any outer conditional wrapper on `$changed_files`, `$EVENT_NAME`,
