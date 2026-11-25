@@ -7785,9 +7785,10 @@ mod inner {
             if !self.replica_set_configured() {
                 return Err(anyhow::Error::new(Self::atomic_batch_standalone_refusal()));
             }
-            // Validate and build `api_specs` BSON documents BEFORE acquiring the
-            // connection-generation pin or mTLS admission leases so codec-slot
-            // waits never delay reconnect publication or hold admission leases.
+            // Validate, build, and size-check `api_specs` BSON documents before
+            // taking local generation pins, mTLS admission leases, or opening
+            // the replacement transaction (outer HTTP write-topology and
+            // admission pins remain held by design for the full restore).
             let mut spec_docs = Vec::with_capacity(restore.api_specs.len());
             for spec in restore.api_specs {
                 if api_spec_raw_blobs_exceed_mongo_limit(spec) {
@@ -10134,7 +10135,8 @@ mod inner {
     /// Pre-checks the raw binary/string payload lower bound before calling
     /// `mongodb::bson::to_vec`, and treats BSON's internal 16 MiB binary-field
     /// cap as `Ok(false)` rather than an unclassified serialization error so
-    /// handlers consistently return `413` (unconditional) or `409` (conditional).
+    /// handlers consistently return `413` (unconditional POST/PUT and
+    /// conditional restore) or `409` (conditional deployment PUT).
     fn spec_doc_fits_mongo_bson_limit(doc: &Document) -> Result<bool, anyhow::Error> {
         if approx_bson_doc_bytes(doc) > MONGO_API_SPEC_BSON_LIMIT_BYTES {
             return Ok(false);

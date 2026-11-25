@@ -5910,9 +5910,11 @@ paths:
         Configurable via the `FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB`
         environment variable. Returns `413 Payload Too Large` when exceeded.
 
-        Database inserts are chunked into 1,000-record transactions to keep
-        WAL/redo size bounded. A 90K-plugin restore runs as 90 commits, not
-        one massive transaction.
+        For unconditional restores (without `If-Match`), database inserts are
+        chunked into 1,000-record transactions to keep WAL/redo size bounded
+        (a 90K-plugin restore runs as 90 commits, not one massive transaction).
+        Conditional restores (with `If-Match`) commit the complete namespace
+        replacement in one atomic transaction without chunked fallback.
 
         For configurations exceeding the body limit, restore resource types
         separately using `POST /batch` with partial backup files

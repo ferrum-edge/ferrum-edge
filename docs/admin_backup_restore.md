@@ -164,6 +164,8 @@ Use `GET /backup?conditional=true` to plan conditional writes. This explicit
 opt-in requires a full, unfiltered export and a primary store that supports
 snapshot transactions: PostgreSQL, MySQL, SQLite, or replica-set MongoDB.
 Standalone MongoDB returns `501`; missing/unavailable stores return `503`.
+On MongoDB backends, conditional restores where a serialized `api_specs`
+document exceeds the ~15 MiB BSON preflight limit return `413`.
 This path never substitutes a cached snapshot or an unconditional write.
 
 The response includes an `ETag` header and a `conditional` metadata object:
