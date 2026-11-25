@@ -321,7 +321,10 @@ pub(super) async fn restore(
     mode: &BatchConfigWriteMode,
     admission: &mut crud::NamespaceConfigAdmissionGuard,
 ) -> Response<Full<Bytes>> {
-    let snapshot = match db.load_conditional_namespace_snapshot(namespace).await {
+    let snapshot = match db
+        .load_conditional_namespace_snapshot_for_write(namespace)
+        .await
+    {
         Ok(snapshot) => snapshot,
         Err(error) => return store_error(&error),
     };

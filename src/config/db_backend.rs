@@ -2628,6 +2628,16 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         ))
     }
 
+    /// Write-side conditional snapshot preflight validated under
+    /// `SPEC_WRITE_CODEC_SLOTS` so viewer `GET` bursts cannot delay conditional
+    /// restores holding namespace admission.
+    async fn load_conditional_namespace_snapshot_for_write(
+        &self,
+        namespace: &str,
+    ) -> Result<ConditionalNamespaceSnapshot, anyhow::Error> {
+        self.load_conditional_namespace_snapshot(namespace).await
+    }
+
     /// Compare and replace the complete namespace in ONE transaction. Empty
     /// graphs still check the precondition and can delete existing resources.
     async fn restore_namespace_conditionally(

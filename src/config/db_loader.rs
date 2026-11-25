@@ -3389,6 +3389,18 @@ impl DatabaseStore {
         &self,
         namespace: &str,
     ) -> Result<ConditionalNamespaceSnapshot, anyhow::Error> {
+        self.load_conditional_namespace_snapshot_with_slots(
+            namespace,
+            &crate::admin::api_specs::SPEC_READ_CODEC_SLOTS,
+        )
+        .await
+    }
+
+    async fn load_conditional_namespace_snapshot_with_slots(
+        &self,
+        namespace: &str,
+        codec_slots: &std::sync::Arc<tokio::sync::Semaphore>,
+    ) -> Result<ConditionalNamespaceSnapshot, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
         self.configure_full_load_snapshot(&mut tx).await?;
         let snapshot = self
@@ -3400,7 +3412,7 @@ impl DatabaseStore {
         // against `GET /api-specs/{id}` handlers holding `SPEC_READ_CODEC_SLOTS`.
         crate::admin::api_specs::external_refs::validate_api_spec_snapshots_async(
             &snapshot.api_specs,
-            &crate::admin::api_specs::SPEC_READ_CODEC_SLOTS,
+            codec_slots,
         )
         .await?;
         Ok(snapshot)
@@ -3621,8 +3633,13 @@ impl DatabaseStore {
                 .await?;
         let mut specs = Vec::with_capacity(rows.len());
         for row in &rows {
+            // Every production caller (consistent backup export and restore
+            // rollback snapshots) holds namespace admission; validate under
+            // write codec slots so viewer GET bursts cannot stall namespace
+            // admission.
             specs.push(
-                row_to_api_spec_async(row, &crate::admin::api_specs::SPEC_READ_CODEC_SLOTS).await?,
+                row_to_api_spec_async(row, &crate::admin::api_specs::SPEC_WRITE_CODEC_SLOTS)
+                    .await?,
             );
         }
         self.check_slow_query("list_api_specs_with_content", start);
@@ -12045,6 +12062,11 @@ impl DatabaseStore {
     }
 
     /// Fetch the ApiSpec that owns a given proxy_id.
+    ///
+    /// Content GETs use [`Self::get_api_spec_content_by_proxy`]; production
+    /// callers of this full-row lookup run under namespace admission (direct
+    /// proxy delete recovery/ownership checks), so snapshot validation uses
+    /// `SPEC_WRITE_CODEC_SLOTS`.
     pub async fn get_api_spec_by_proxy(
         &self,
         namespace: &str,
@@ -12058,7 +12080,7 @@ impl DatabaseStore {
                 .await?;
         match row {
             Some(r) => Ok(Some(
-                row_to_api_spec_async(&r, &crate::admin::api_specs::SPEC_READ_CODEC_SLOTS).await?,
+                row_to_api_spec_async(&r, &crate::admin::api_specs::SPEC_WRITE_CODEC_SLOTS).await?,
             )),
             None => Ok(None),
         }
@@ -13194,6 +13216,17 @@ impl DatabaseBackend for DatabaseStore {
         namespace: &str,
     ) -> Result<ConditionalNamespaceSnapshot, anyhow::Error> {
         DatabaseStore::load_conditional_namespace_snapshot(self, namespace).await
+    }
+
+    async fn load_conditional_namespace_snapshot_for_write(
+        &self,
+        namespace: &str,
+    ) -> Result<ConditionalNamespaceSnapshot, anyhow::Error> {
+        self.load_conditional_namespace_snapshot_with_slots(
+            namespace,
+            &crate::admin::api_specs::SPEC_WRITE_CODEC_SLOTS,
+        )
+        .await
     }
 
     async fn restore_namespace_conditionally(
