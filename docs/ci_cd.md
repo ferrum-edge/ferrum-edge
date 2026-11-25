@@ -1342,7 +1342,7 @@ cargo test --no-run --test integration_tests --test functional_tests
 cargo nextest archive --test integration_tests ...
 cargo nextest archive --test functional_tests ...
 
-# test-functional-{application,protocols,data-plane,data-plane-runtime}
+# test-functional-{application,protocols-a,protocols-b,data-plane,data-plane-runtime}
 cargo nextest run --archive-file functional-tests-*.tar.zst \
   --workspace-remap . \
   --run-ignored=all \
@@ -1507,8 +1507,9 @@ stripped of newlines and backticks before they are written.
 - The `CI Plan` job diffs `ls tests/integration/*.rs` against the union of
   declared shard filters in `ci.yml`. Adding a new `mod foo_tests` without
   wiring it into a shard fails this silent-skip guard.
-- Functional tests split across four shards (`application`, `protocols`,
-  `data-plane`, `data-plane-runtime`). `build-test-artifacts` compiles both
+- Functional tests split across five shards (`application`, `protocols-a`,
+  `protocols-b`, `data-plane`, `data-plane-runtime`). `build-test-artifacts`
+  compiles both
   test targets in one Cargo invocation, which also builds the gateway and CNI
   binaries, then packages both nextest archives in the same job/cache. Each
   functional shard downloads the existing OS/architecture-keyed artifacts with
@@ -1526,10 +1527,12 @@ stripped of newlines and backticks before they are written.
 
 #### 3. Lint Job
 
-**Runs**: `ubuntu-26.04`
+**Runs**: `ubuntu-26.04` (`timeout-minutes: 45`)
 
-Enforces code quality. Clippy omits DWARF (`profile.test.debug=0` and
-`profile.dev.debug=0`) and compiles with a single job (`CARGO_BUILD_JOBS=1`)
+Enforces code quality. Before running Clippy, the job adds a best-effort
+12 GiB `/mnt/ferrum-swapfile` for paging headroom (continuing with a warning
+on image swap if allocation fails). Clippy omits DWARF (`profile.test.debug=0`
+and `profile.dev.debug=0`) and compiles with a single job (`CARGO_BUILD_JOBS=1`)
 so large integration targets stay within hosted-runner memory: even two
 parallel jobs could overlap two large integration-target clippy processes on
 a cold cache and starve the runner, so one job removes that overlap at the

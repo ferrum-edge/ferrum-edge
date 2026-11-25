@@ -1,9 +1,9 @@
 # cargo-nextest configuration.
 #
 # ── HTTP/3 functional-test concurrency throttle ──────────────────────────────
-# Fixes the intermittent "Functional Tests (protocols)" CI flake. Each H3/QUIC
+# Fixes the intermittent "Functional Tests (protocols-*)" CI flake. Each H3/QUIC
 # functional test spawns its OWN in-process QUIC gateway + backend. When the
-# `protocols` shard runs many of them in parallel, the simultaneous QUIC gateway
+# `protocols-a` / `protocols-b` shards run many of them in parallel, the simultaneous QUIC gateway
 # startups + handshakes contend for the runner's UDP-socket + tokio-runtime
 # resources and intermittently either:
 #   * exhaust a gateway's startup retry budget

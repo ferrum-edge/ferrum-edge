@@ -2170,7 +2170,7 @@ jobs:
         include:
           - shard: application
             # Harness, admin/routing, plugins, and resilience share one runner;
-            # together their measured runtime balances the protocol-heavy shard.
+            # together their measured runtime balances the split protocol shards.
             filters: |
               common::
               scaffolding::
@@ -2246,8 +2246,11 @@ jobs:
               functional_tls_only_test
               functional_client_ip_env_test
           # Split the protocol-heavy functional suites into two balanced shards
-          # (`protocols-a` and `protocols-b`) so the functional critical path
-          # drops from ~16 min to ~8-9 min after Build Test Artifacts.
+          # (`protocols-a` and `protocols-b`), balancing both total runtime and
+          # the serial HTTP/3 nextest group (~4.4 min H3 time each) so each
+          # protocol shard finishes in ~6–8 min instead of ~16 min.
+          # (`data-plane` remains bounded on slow runs by
+          # `test_admin_mongodb_runtime_resource_crud_matrix`.)
           - shard: protocols-a
             filters: |
               functional_ai_stream_router_boundary_test
@@ -2269,6 +2272,7 @@ jobs:
               functional_header_read_timeout_test
               functional_header_size_limits_test
               functional_http1_direct_pool_test
+              functional_http3_connect_udp_test
               functional_injector_serving_test
               functional_key_auth_query_test
               functional_max_forwards_test
@@ -2295,7 +2299,6 @@ jobs:
               functional_url_query_limits_test
               functional_websocket_test
               scripted_backend_h3_tests
-              scripted_backend_streaming_latency_tests
               scripted_backend_udp_tests
           - shard: protocols-b
             filters: |
@@ -2313,7 +2316,6 @@ jobs:
               functional_h3_grpc_streaming_test
               functional_h3_local_policy_test
               functional_header_limits_test
-              functional_http3_connect_udp_test
               functional_load_testing_replay_test
               functional_mcp_aggregate_sse_test
               functional_openapi_client_contract_test
@@ -2344,6 +2346,7 @@ jobs:
               scripted_backend_h2_tests
               scripted_backend_matrix_tests
               scripted_backend_network_sim_tests
+              scripted_backend_streaming_latency_tests
               scripted_backend_tests
           # The service-backed shards run serially (`nextest_jobs: 1`) against
           # one set of Redis/MongoDB/PostgreSQL/MySQL containers per runner, so
@@ -6944,6 +6947,7 @@ jobs:
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_rust == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-26.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -6957,26 +6961,34 @@ jobs:
           cache-on-failure: "false"
           components: clippy
 
+      # Best-effort, additive swap headroom (matching fips-clippy / fips-test-build):
+      # gives `--all-targets` clippy paging headroom against future crate growth
+      # without making swap creation a hard prerequisite for Lint.
       - name: Extend runner swap for the all-targets clippy lint
         run: |
-          set -euo pipefail
-          # Same runner-loss mitigation as Unit Tests and ACME: parallel
-          # all-targets clippy on a cold cache can exceed hosted-runner RAM and
-          # kill the runner agent (exit 143) before Cargo prints a diagnostic.
-          # Swap headroom lets CARGO_BUILD_JOBS=3 safely run in parallel.
-          sudo fallocate -l 12G /mnt/ferrum-swapfile
-          sudo chmod 600 /mnt/ferrum-swapfile
-          sudo mkswap /mnt/ferrum-swapfile
-          sudo swapon /mnt/ferrum-swapfile
+          set -uo pipefail
+          ferrum_swap="/mnt/ferrum-swapfile"
+          if sudo fallocate -l 12G "$ferrum_swap" \
+            && sudo chmod 600 "$ferrum_swap" \
+            && sudo mkswap "$ferrum_swap" \
+            && sudo swapon "$ferrum_swap"; then
+            echo "Runner swap enlarged for Lint (additive 12 GiB Ferrum swapfile)."
+          else
+            echo "::warning::could not enlarge runner swap; continuing on image swap with CARGO_BUILD_JOBS=1" >&2
+            sudo swapoff "$ferrum_swap" 2>/dev/null || true
+            sudo rm -f "$ferrum_swap" || true
+          fi
           free -h
 
       - name: Run clippy
-        # Clippy does not need DWARF, so omit debuginfo to lower per-process
-        # RSS and speed up checks. With the 12 GiB swapfile above, three
-        # concurrent jobs match Unit Tests and cut serial all-targets lint wall
-        # clock roughly in half without risking exit-143 runner loss.
+        # Keep all-target lint below the hosted runner's peak-memory limit on
+        # cold caches (2026-09-17 recorded four consecutive exit-143 kills at
+        # two jobs on a cold cache). Clippy does not need DWARF, so omit
+        # debuginfo to lower per-process RSS, and keep CARGO_BUILD_JOBS=1 so
+        # large integration targets never overlap. Lint still completes ahead
+        # of the functional shards on full runs.
         env:
-          CARGO_BUILD_JOBS: 3
+          CARGO_BUILD_JOBS: 1
         run: |
           cargo clippy \
             --config profile.test.debug=0 \
