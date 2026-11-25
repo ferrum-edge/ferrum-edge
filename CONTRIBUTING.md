@@ -50,10 +50,11 @@ This project and everyone participating in it is governed by our [Code of Conduc
   Debian/Ubuntu, `libcurl-devel` on Fedora/RHEL, and Homebrew `curl` on macOS).
 - **Database** (optional): PostgreSQL, MySQL, SQLite, or MongoDB for testing database mode
 
-A full-debuginfo `codegen-units=1` `dev` build can OOM rustc on a 15 GiB host with no
-swap. If the compiler is killed for memory, retry with `CARGO_PROFILE_DEV_DEBUG=0`
-and more codegen units (for example `CARGO_PROFILE_DEV_CODEGEN_UNITS=16`). That is
-host sizing, not a missing bootstrap package; do not change `[profile.dev]` for it.
+A full-debuginfo `dev` build can OOM rustc on a 15 GiB host with no swap
+(`[profile.dev]` already sets `codegen-units = 256`). If the compiler is killed
+for memory, retry with `CARGO_PROFILE_DEV_DEBUG=0` and/or a lower
+`CARGO_BUILD_JOBS` (for example `CARGO_BUILD_JOBS=2`). That is host sizing, not
+a missing bootstrap package; do not change `[profile.dev]` for it.
 
 ### One-time local bootstrap
 

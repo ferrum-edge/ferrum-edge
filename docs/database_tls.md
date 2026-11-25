@@ -551,7 +551,7 @@ cover deferred migrations and failover recovery.
 
 The project includes functional tests that verify TLS database connectivity end-to-end.
 Hosted CI provisions PostgreSQL/MySQL TLS and MongoDB TLS/require/mTLS fixtures
-inline in the data-plane functional shard (`.github/workflows/ci.yml`) and sets
+inline in the `data_services` functional shards (`.github/workflows/ci.yml`) and sets
 `FERRUM_DB_TLS_REQUIRED=1` so a missing TLS fixture fails the job instead of
 silently skipping. Local developers keep the opt-out by leaving that flag unset
 when the containers are not running.

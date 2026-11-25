@@ -1372,12 +1372,15 @@ cargo test --no-run --test integration_tests --test functional_tests
 cargo nextest archive --test integration_tests ...
 cargo nextest archive --test functional_tests ...
 
-# test-functional-{application,protocols,data-plane,data-plane-runtime}
+# test-functional-{application,protocols-a,protocols-b,data-plane,data-plane-runtime}
+# Pass the shard's `filters:` entries as positional filter args (and `-j 1` for
+# the serialized `data_services: true` shards).
 cargo nextest run --archive-file functional-tests-*.tar.zst \
   --workspace-remap . \
   --run-ignored=all \
   --no-fail-fast \
-  -E 'not test(/test_scale_perf_30k_proxies/) and not test(/test_load_stress_10k_proxies/)'
+  -E 'not test(/test_scale_perf_30k_proxies/) and not test(/test_load_stress_10k_proxies/) and not test(/test_scale_reload_under_load/)' \
+  <shard-filters...>
 ```
 
 Every Unit Tests shard and every Integration Tests shard ends with **Check the
@@ -1537,17 +1540,19 @@ stripped of newlines and backticks before they are written.
 - The `CI Plan` job diffs `ls tests/integration/*.rs` against the union of
   declared shard filters in `ci.yml`. Adding a new `mod foo_tests` without
   wiring it into a shard fails this silent-skip guard.
-- Functional tests split across four shards (`application`, `protocols`,
-  `data-plane`, `data-plane-runtime`). `build-test-artifacts` compiles both
+- Functional tests split across five shards (`application`, `protocols-a`,
+  `protocols-b`, `data-plane`, `data-plane-runtime`). `build-test-artifacts`
+  compiles both
   test targets in one Cargo invocation, which also builds the gateway and CNI
   binaries, then packages both nextest archives in the same job/cache. Each
   functional shard downloads the existing OS/architecture-keyed artifacts with
   `FERRUM_SKIP_GATEWAY_BUILD=1`. The two data-plane shards (`data_services:
   true`) remain serialized with `nextest_jobs: 1` and are the only shards that
   start the Redis/MongoDB/PostgreSQL/MySQL containers; each runner owns its own
-  set. See
+  set. `data-plane` isolates `functional_admin_crud_resources_test` alone while
+  `data-plane-runtime` runs the remaining database-backed modules (see
   [ci_pr_validation_review_2026_09_24.md](ci_pr_validation_review_2026_09_24.md)
-  for why the data-plane modules are split in two.
+  for the original two-shard split history).
 
 **Output**:
 - Test pass/fail status
@@ -1556,10 +1561,12 @@ stripped of newlines and backticks before they are written.
 
 #### 3. Lint Job
 
-**Runs**: `ubuntu-26.04`
+**Runs**: `ubuntu-26.04` (`timeout-minutes: 45`)
 
-Enforces code quality. Clippy omits DWARF (`profile.test.debug=0` and
-`profile.dev.debug=0`) and compiles with a single job (`CARGO_BUILD_JOBS=1`)
+Enforces code quality. Before running Clippy, the job adds a best-effort
+12 GiB `/mnt/ferrum-swapfile` for paging headroom (continuing with a warning
+on image swap if allocation fails). Clippy omits DWARF (`profile.test.debug=0`
+and `profile.dev.debug=0`) and compiles with a single job (`CARGO_BUILD_JOBS=1`)
 so large integration targets stay within hosted-runner memory: even two
 parallel jobs could overlap two large integration-target clippy processes on
 a cold cache and starve the runner, so one job removes that overlap at the
