@@ -6289,19 +6289,92 @@ def _scan_shell_command_tokens(tokens: list[str]) -> bool:
     return False
 
 
+def _github_env_write_has_ci_debug_var(run_text: str) -> bool:
+    """Return True if a step writes a Cargo/Rust/C/RUST_BACKTRACE variable into GITHUB_ENV."""
+
+    raw_lines = run_text.splitlines()
+    # Join backslash-continued physical lines while preserving original line order
+    # and dropping comment-only lines.
+    logical_lines: list[str] = []
+    buf = ""
+    for raw in raw_lines:
+        stripped = raw.strip()
+        if not buf and (not stripped or stripped.startswith("#")):
+            continue
+        if raw.endswith("\\") and not raw.endswith("\\\\"):
+            buf += raw[:-1] + " "
+        else:
+            logical_lines.append((buf + raw).strip())
+            buf = ""
+    if buf.strip():
+        logical_lines.append(buf.strip())
+
+    if not any("GITHUB_ENV" in ln for ln in logical_lines):
+        return False
+
+    simple_write_re = re.compile(
+        r"""(?:>>?\s*|\btee\b[^\n]*)(?:["']?)\$\{?GITHUB_ENV\}?(?:["']?)"""
+    )
+    heredoc_delim_re = re.compile(r"""<<-?\s*(?:\$?'([^']+)'|"([^"]+)"|([^\s;&|<>]+))""")
+
+    for idx, ln in enumerate(logical_lines):
+        if "GITHUB_ENV" not in ln:
+            continue
+        # 1. Heredoc redirected into GITHUB_ENV: scan the command line + heredoc body.
+        if "<<" in ln and simple_write_re.search(ln):
+            if _CI_DEBUG_GITHUB_ENV_VAR_RE.search(ln):
+                return True
+            hd_m = heredoc_delim_re.search(ln)
+            if hd_m:
+                delim = hd_m.group(1) or hd_m.group(2) or hd_m.group(3)
+                body_lines: list[str] = []
+                for j in range(idx + 1, len(logical_lines)):
+                    if logical_lines[j].lstrip("\t") == delim:
+                        break
+                    body_lines.append(logical_lines[j])
+                if _CI_DEBUG_GITHUB_ENV_VAR_RE.search("\n".join(body_lines)):
+                    return True
+                continue
+        # 2. Grouped `{ ... } >> "$GITHUB_ENV"` or subshell `( ... ) >> "$GITHUB_ENV"`:
+        #    scan the matching block backwards.
+        if re.match(r"^[}\)]", ln) and simple_write_re.search(ln):
+            opener, closer = ("{", "}") if ln.startswith("}") else ("(", ")")
+            depth = 1
+            block_lines = [ln]
+            for j in range(idx - 1, -1, -1):
+                prev = logical_lines[j]
+                block_lines.append(prev)
+                if prev.endswith(closer) or prev.startswith(closer):
+                    depth += 1
+                if prev.startswith(opener) or prev.endswith(opener):
+                    depth -= 1
+                    if depth <= 0:
+                        break
+            if _CI_DEBUG_GITHUB_ENV_VAR_RE.search("\n".join(reversed(block_lines))):
+                return True
+            continue
+        # 3. Direct single-line write (`echo ... >> "$GITHUB_ENV"`, `... | tee -a "$GITHUB_ENV"`),
+        #    excluding compound-command closers (`fi`/`done`/`esac`), `exec`, or variable aliasing.
+        if (
+            simple_write_re.search(ln)
+            and not re.match(r"^(?:(?:builtin\s+)?exec|fi|done|esac)\b", ln)
+            and not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=.*GITHUB_ENV", ln)
+        ):
+            if _CI_DEBUG_GITHUB_ENV_VAR_RE.search(ln):
+                return True
+            continue
+        # 4. Fallback for complex/indirect GITHUB_ENV usage (exec redirect, aliasing,
+        #    python/awk script writing to os.environ["GITHUB_ENV"]): check whole step.
+        if _CI_DEBUG_GITHUB_ENV_VAR_RE.search("\n".join(logical_lines)):
+            return True
+    return False
+
+
 def _step_run_has_ci_debug_override(run_text: str) -> bool:
     """Detect shell exports, unsets, inline compiler env assignments, GITHUB_ENV writes, or cargo --config."""
 
-    non_comment_lines = [
-        ln.strip()
-        for ln in run_text.splitlines()
-        if ln.strip() and not ln.lstrip().startswith("#")
-    ]
-    if not non_comment_lines:
-        return False
-    if any("GITHUB_ENV" in ln for ln in non_comment_lines):
-        if _CI_DEBUG_GITHUB_ENV_VAR_RE.search("\n".join(non_comment_lines)):
-            return True
+    if _github_env_write_has_ci_debug_var(run_text):
+        return True
 
     commands, malformed = _tokenize_shell_script(run_text)
     if malformed:
@@ -6470,6 +6543,10 @@ def _iter_fallback_jobs(workflow_text: str) -> tuple[list[tuple[str, str]], list
                     )
                 else:
                     job_starts.append((decoded[1], idx))
+            else:
+                layout_errors.append(
+                    f"unsupported non-mapping line under `jobs:` in fallback parser: {line.strip()!r}"
+                )
     result: list[tuple[str, str]] = []
     for pos, (job_id, start_idx) in enumerate(job_starts):
         end_idx = job_starts[pos + 1][1] if pos + 1 < len(job_starts) else jobs_end
@@ -6681,14 +6758,15 @@ def _extract_job_steps_structural(job_body: str) -> tuple[list[str], list[str]]:
     step_lines = lines[steps_start:steps_end]
     non_block = _iter_non_block_scalar_lines_indexed(step_lines)
     item_indent = None
-    for _idx, (indent, line) in non_block:
-        stripped = line.lstrip(" \t")
-        if re.match(r"^-(?:[ \t]|$)", stripped):
-            item_indent = indent
-            break
+    if non_block:
+        first_indent, first_line = non_block[0][1]
+        if not re.match(r"^-(?:[ \t]|$)", first_line.lstrip(" \t")):
+            layout_errors.append(
+                f"unsupported non-sequence `steps:` content in fallback parser: {first_line.strip()!r}"
+            )
+            return [], layout_errors
+        item_indent = first_indent
     if item_indent is None:
-        if non_block:
-            layout_errors.append("unparseable `steps:` content in fallback parser")
         return [], layout_errors
     step_starts: list[int] = []
     for idx, (indent, line) in non_block:
@@ -6898,6 +6976,20 @@ def _has_unsupported_fallback_yaml_syntax(workflow_text: str) -> str | None:
                     pending_key_indent = None
                 else:
                     pending_key_indent = None
+            elif re.match(r"^[ \t]*-(?:[ \t]+|$)", line):
+                dash_m = re.match(r"^(?P<lead>[ \t]*)-(?P<rest>.*)$", line)
+                if dash_m:
+                    seq_indent = len(dash_m.group("lead"))
+                    val_stripped = _yaml_strip_trailing_comment(dash_m.group("rest")).strip()
+                    if not val_stripped:
+                        pending_key_indent = seq_indent
+                    elif not val_stripped.startswith(
+                        ("{", "[", "'", '"', "|", ">", "&", "*", "!", "?", "-")
+                    ):
+                        plain_scalar_indent = seq_indent
+                        pending_key_indent = None
+                    else:
+                        pending_key_indent = None
             elif (
                 pending_key_indent is not None
                 and indent > pending_key_indent
@@ -11939,6 +12031,20 @@ def self_test() -> int:
                 "          cargo test --no-run --config profile.test.debug=2\n",
             ),
             (
+                "grouped block write to GITHUB_ENV",
+                "        run: |\n"
+                "          {\n"
+                '            echo "CARGO_PROFILE_DEV_DEBUG=2"\n'
+                '          } >> "$GITHUB_ENV"\n',
+            ),
+            (
+                "heredoc write to GITHUB_ENV",
+                "        run: |\n"
+                "          cat <<'EOF' >> \"$GITHUB_ENV\"\n"
+                "          CARGO_PROFILE_DEV_DEBUG=2\n"
+                "          EOF\n",
+            ),
+            (
                 "plain multiline scalar blank-line break before cargo --config",
                 "        run: echo hi\n"
                 "\n"
@@ -12057,6 +12163,12 @@ def self_test() -> int:
                 "          echo \"$delay $nested\"\n",
             ),
             (
+                "logging CARGO_TARGET_DIR then writing unrelated var to GITHUB_ENV",
+                "        run: |\n"
+                '          echo "CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-target}"\n'
+                '          echo "FERRUM_TEST_MODE=1" >> "$GITHUB_ENV"\n',
+            ),
+            (
                 "folded scalar paragraph break separating cargo and kind --config",
                 "        run: >\n"
                 "          cargo --version\n"
@@ -12076,10 +12188,19 @@ def self_test() -> int:
                 f"self-test ({mode_label}): {label} must not be falsely flagged (got {ok_errs!r})",
                 failures,
             )
-        # Direct Swatinem/rust-cache with quoted '*scratch' shared-key, plain ', ? debug',
-        # and multiline wrapped plain scalar name containing `{build, ? debug}` must NOT false-positive.
+        # Direct Swatinem/rust-cache with quoted '*scratch' shared-key, wrapped plain scalar
+        # name AND wrapped plain sequence choice containing `{build, ? debug}` must NOT false-positive.
         quoted_star_wf = (
-            "name: CI matrix -\n  {build, ? debug}\non:\n  workflow_dispatch:\njobs:\n"
+            "name: CI matrix -\n  {build, ? debug}\n"
+            "on:\n"
+            "  workflow_dispatch:\n"
+            "    inputs:\n"
+            "      sample:\n"
+            "        type: choice\n"
+            "        options:\n"
+            "          - CI matrix -\n"
+            "            {build, ? debug}\n"
+            "jobs:\n"
             "  scratch-job:\n"
             "    runs-on: ubuntu-26.04\n"
             "    steps:\n"
@@ -12096,7 +12217,34 @@ def self_test() -> int:
         )
         require(
             not quoted_star_errs,
-            f"self-test ({mode_label}): quoted '*scratch' shared-key must not be rejected as alias (got {quoted_star_errs!r})",
+            f"self-test ({mode_label}): quoted '*scratch' shared-key and wrapped plain scalars must not false-positive (got {quoted_star_errs!r})",
+            failures,
+        )
+        # Next-line flow mapping under `jobs:` hiding an extra `ci-debug` consumer MUST fail
+        # in both PyYAML (inventory drift) and fallback (unsupported non-mapping line under jobs:).
+        next_line_flow_jobs_wf = (
+            "name: NextLineFlowJobs\n"
+            "on:\n  workflow_dispatch:\n"
+            "jobs:\n"
+            "  {\n"
+            "    rogue-consumer: {\n"
+            "      runs-on: ubuntu-26.04,\n"
+            "      steps: [\n"
+            "        {uses: ./.github/actions/setup-rust-ci, with: {shared-key: ci-debug}}\n"
+            "      ]\n"
+            "    }\n"
+            "  }\n"
+        )
+        next_line_flow_jobs_errs: list[str] = []
+        check_ci_debug_lane_profile_uniformity(
+            ci_live_text,
+            ambient_live_text,
+            next_line_flow_jobs_errs,
+            extra_workflows={"next-line-flow-jobs.yml": next_line_flow_jobs_wf},
+        )
+        require(
+            bool(next_line_flow_jobs_errs),
+            f"self-test ({mode_label}): next-line flow mapping under jobs: hiding ci-debug consumer must fail",
             failures,
         )
         # Direct Swatinem/rust-cache with prefix-key: v0-rust-ci-debug on an unrelated job
