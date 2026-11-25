@@ -297,6 +297,20 @@ jobs:
             mode="full"
           fi
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
+
+          # Mixed-version transition guard: if an older base planner omits any
+          # new artifact-consumer gate, the loop below fails that gate closed to
+          # `true`. Force `run_artifacts=true` whenever any consumer gate is not
+          # explicitly `false` so downstream jobs never skip behind a skipped
+          # `build-test-artifacts` producer.
+          for consumer_gate in run_integration run_functional run_plugin_hardening_redis run_helm run_vendor_patches; do
+            consumer_val="$(printf '%s\n' "$plan" | sed -n "s/^${consumer_gate}=//p")"
+            if [ "$consumer_val" != "false" ]; then
+              plan="$(printf '%s\n' "$plan" | grep -v '^run_artifacts='; echo "run_artifacts=true")"
+              break
+            fi
+          done
+
           gate_fallbacks=()
           for gate in run_helm run_ebpf_kernel_live run_netns_capture_live run_two_cluster_live run_ebpf_build run_secrets_backends run_pkcs11 run_rust run_lint run_integration run_functional run_plugin_hardening_redis run_artifacts run_acme run_conformance run_service_integration run_ebpf_userspace run_fuzz_smoke run_platform_build run_vendor_patches run_dependency_audit run_standalone_cargo; do
             value="$(printf '%s\n' "$plan" | sed -n "s/^${gate}=//p")"

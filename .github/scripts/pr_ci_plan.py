@@ -864,6 +864,7 @@ RUST_PATTERNS = [
         r"^src/",
         r"^tests/(?!k8s/|performance/)",
         r"^charts/",
+        r"^Dockerfile(?:\..*)?$",
         r"^examples/hbone_perf_fixture\.rs$",
         *(
             "^" + re.escape(path) + "$"
@@ -896,7 +897,7 @@ LINT_PATTERNS = [
         r"^src/",
         r"^tests/(?!k8s/|performance/)",
         r"^examples/.*\.rs$",
-        r"^clippy\.toml$",
+        r"^\.?clippy\.toml$",
     )
 ]
 
@@ -904,9 +905,9 @@ LINT_PATTERNS = [
 # (`conditional-live-stores`, `admin-platform`, `mesh-protocols`). Runs on Rust
 # source, `tests/integration/**`, `tests/unit/plugins/jwks_auth_support.rs`
 # (`#[path]`-included by `mesh_ext_authz_custom_tests.rs`), shared test
-# helpers/fixtures, `ferrum.conf`, `openapi.yaml`
-# (`admin_backend_egress_policy_tests.rs`), `schemas/clickhouse/`
-# (`api_chargeback_sink_tests.rs`), and the build graph.
+# helpers/fixtures, `Dockerfile*` (`example_audit_plugin_opt_in_tests.rs`),
+# `ferrum.conf`, `openapi.yaml` (`admin_backend_egress_policy_tests.rs`),
+# `schemas/clickhouse/` (`api_chargeback_sink_tests.rs`), and the build graph.
 INTEGRATION_PATTERNS = [
     re.compile(pattern)
     for pattern in (
@@ -916,6 +917,7 @@ INTEGRATION_PATTERNS = [
         r"^tests/integration/",
         r"^tests/integration_tests\.rs$",
         r"^tests/unit/plugins/jwks_auth_support\.rs$",
+        r"^Dockerfile(?:\..*)?$",
         r"^schemas/clickhouse/",
         r"^openapi\.yaml$",
         r"^ferrum\.conf$",
@@ -939,15 +941,19 @@ FUNCTIONAL_PATTERNS = [
 ]
 
 # `run_plugin_hardening_redis`: dedicated live-Redis regression job covering
-# `request_deduplication`, `hmac_auth` v2, `dpop` (with `jwks_auth`), HTTP/WS/AI
-# `rate_limiting`, and `ai_semantic_cache` Redis quarantine compare-delete
-# (plus `ai_transcript_audit`, `response_mock`, and `serverless_function`
-# configured by the deduplication tests). Runs on those plugins, shared
-# plugin/proxy/config/runtime/TLS/util surfaces, the owning test files, shared
-# test helpers/fixtures, `ferrum.conf`, and the build graph; skipped on
-# unrelated plugins (`src/plugins/cors.rs`, `src/plugins/jwt_auth.rs`, ...) and
-# non-Redis subsystems (`src/admin/`, `src/dns/`, ...) on PRs while still
-# running on every push to `main`.
+# `request_deduplication`, `hmac_auth` v2, `dpop` (`src/plugins/utils/dpop.rs`
+# with `jwks_auth` and `policy_path.rs`), HTTP `rate_limiting`
+# (`test_rate_limiting_redis`), and `ai_semantic_cache` Redis quarantine
+# compare-delete (plus `ai_transcript_audit`, `response_mock`,
+# `serverless_function`, `a2a_gateway`, `charged_decode`, `grpc_web`,
+# `ws_rate_limiting`, and `ai_rate_limiter` imported or configured by those
+# suites, plus `src/dns/` used by `RedisRateLimitClient`). Runs on those
+# plugins, shared plugin/proxy/config/modes/dns/TLS/pool/util surfaces, the
+# owning test files, shared test helpers/fixtures, `ferrum.conf`, and the build
+# graph; skipped on unrelated plugins (`src/plugins/cors.rs`,
+# `src/plugins/jwt_auth.rs`, ...) and non-Redis subsystems (`src/admin/`,
+# `src/service_discovery/`, ...) on PRs while still running on every push to
+# `main`.
 PLUGIN_HARDENING_REDIS_PATTERNS = [
     re.compile(pattern)
     for pattern in (
@@ -958,10 +964,10 @@ PLUGIN_HARDENING_REDIS_PATTERNS = [
         r"^tests/functional/mod\.rs$",
         r"^tests/functional_tests\.rs$",
         r"^ferrum\.conf$",
-        r"^src/plugins/(?:request_deduplication|hmac_auth|dpop|jwks_auth|rate_limiting|ws_rate_limiting|ai_rate_limiter|ai_semantic_cache|ai_transcript_audit|response_mock|serverless_function|mod)\.rs$",
+        r"^src/plugins/(?:request_deduplication|hmac_auth|jwks_auth|rate_limiting|ws_rate_limiting|ai_rate_limiter|ai_semantic_cache|ai_transcript_audit|response_mock|serverless_function|a2a_gateway|charged_decode|grpc_web|mod)\.rs$",
         r"^src/plugins/utils/",
-        r"^src/(?:lib|main|cli|gateway_entry|startup|plugin_cache|router_cache|consumer_index|connection_pool|retry|diagnostic_ref)\.rs$",
-        r"^src/(?:config|modes|proxy|pool|tls|fips|util)/",
+        r"^src/(?:lib|main|cli|gateway_entry|startup|plugin_cache|router_cache|consumer_index|connection_pool|retry|diagnostic_ref|policy_path)\.rs$",
+        r"^src/(?:config|modes|proxy|pool|dns|tls|fips|util)/",
     )
 ]
 
@@ -1844,6 +1850,9 @@ def self_test() -> int:
             ["Dockerfile"],
             {
                 "run_helm": True,
+                "run_rust": True,
+                "run_integration": True,
+                "run_artifacts": True,
                 "run_ebpf_kernel_live": False,
                 "run_netns_capture_live": False,
                 "run_two_cluster_live": False,
@@ -1890,12 +1899,16 @@ def self_test() -> int:
         ("pull_request", ["src/plugins/cors.rs"], src_no_redis),
         ("pull_request", ["src/plugins/request_deduplication.rs"], src_with_redis),
         ("pull_request", ["src/plugins/hmac_auth.rs"], src_with_redis),
-        ("pull_request", ["src/plugins/dpop.rs"], src_with_redis),
+        ("pull_request", ["src/plugins/utils/dpop.rs"], src_with_redis | {"run_service_integration": True, "run_standalone_cargo": True}),
         ("pull_request", ["src/plugins/jwks_auth.rs"], src_with_redis),
         ("pull_request", ["src/plugins/rate_limiting.rs"], src_with_redis),
         ("pull_request", ["src/plugins/ai_semantic_cache.rs"], src_with_redis | {"run_standalone_cargo": True}),
         ("pull_request", ["src/plugins/ai_transcript_audit.rs"], src_with_redis),
         ("pull_request", ["src/plugins/response_mock.rs"], src_with_redis),
+        ("pull_request", ["src/plugins/a2a_gateway.rs"], src_with_redis),
+        ("pull_request", ["src/dns/mod.rs"], src_with_redis),
+        ("pull_request", ["src/policy_path.rs"], src_with_redis),
+        ("pull_request", [".clippy.toml"], all_false | {"run_lint": True}),
         ("pull_request", ["src/admin/handlers.rs"], src_no_redis),
         ("pull_request", ["tests/unit/plugins/cors_tests.rs"], unit_and_lint),
         (
