@@ -10,8 +10,9 @@
 //!
 //! Suites that `docs/coverage.md` keeps outside the default baseline (subprocess
 //! functional/conformance, container-backed service integration, secrets
-//! functional, feature-gated ACME, and the live-cluster Istio status CAS proof
-//! that only its dedicated workflow runs) are listed in
+//! functional, feature-gated ACME, the live-cluster Istio status CAS proof
+//! that only its dedicated workflow runs, and the Windows-only tenant-file
+//! confinement suite that compiles out on Linux) are listed in
 //! `OUTSIDE_DEFAULT_COVERAGE_BASELINE`. Adding a new Cargo test target fails this
 //! check until it is either dispatched through both collectors or added to that
 //! exclusion with an explicit reason.
@@ -36,6 +37,10 @@ const OUTSIDE_DEFAULT_COVERAGE_BASELINE: &[&str] = &[
     // Live kind-cluster proof driven by `.github/workflows/istio-status-cas-live.yml`;
     // never part of the deterministic llvm-cov denominator.
     "k8s_istio_status_cas_live",
+    // Windows-only (`#![cfg(windows)]`) tenant-file confinement suite driven by
+    // `.github/workflows/windows-confinement.yml`; compiles out on Linux where
+    // llvm-cov runs.
+    "windows_confinement_tests",
 ];
 
 fn is_cargo_target_name(name: &str) -> bool {

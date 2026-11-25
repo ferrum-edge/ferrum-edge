@@ -35,6 +35,7 @@ tests/
 ├── service_integration/          # [[test]]: external middleware via OSS containers
 ├── acme_dns01/                   # [[test]]: ACME DNS-01 hook tests (feature `acme`)
 ├── k8s_istio_status_cas_live.rs  # Hosted kind test (istio-status-cas-live.yml)
+├── windows_confinement_tests.rs  # Windows-only (#![cfg(windows)]) tenant-file confinement suite (windows-confinement.yml)
 │
 ├── common/                       # Shared helpers (gateway harness, echo servers, ...)
 ├── scaffolding/                  # Protocol backends/clients, port registry, harness
