@@ -7111,7 +7111,7 @@ mod inner {
             namespace: &str,
             codec_slots: &std::sync::Arc<tokio::sync::Semaphore>,
         ) -> Result<DeploymentSnapshot, anyhow::Error> {
-            let _generation_pin = self.connection_generation.clone().read_owned().await;
+            let generation_pin = self.connection_generation.clone().read_owned().await;
             if !self.replica_set_configured() {
                 return Err(anyhow::Error::new(Self::atomic_batch_standalone_refusal()));
             }
@@ -7126,6 +7126,11 @@ mod inner {
                 .deployment_snapshot_in_session(&mut session, namespace, None)
                 .await?;
             session.commit_transaction().await?;
+            // Release the MongoDB session and connection-generation pin before
+            // awaiting codec capacity so reconnect publication is never delayed
+            // by in-memory snapshot validation.
+            drop(session);
+            drop(generation_pin);
             crate::admin::api_specs::external_refs::validate_api_spec_snapshots_async(
                 &snapshot.snapshot().api_specs,
                 codec_slots,
@@ -7139,7 +7144,7 @@ mod inner {
             namespace: &str,
             codec_slots: &std::sync::Arc<tokio::sync::Semaphore>,
         ) -> Result<ConditionalNamespaceSnapshot, anyhow::Error> {
-            let _generation_pin = self.connection_generation.clone().read_owned().await;
+            let generation_pin = self.connection_generation.clone().read_owned().await;
             if !self.replica_set_configured() {
                 return Err(anyhow::Error::new(Self::atomic_batch_standalone_refusal()));
             }
@@ -7159,6 +7164,8 @@ mod inner {
                 )
                 .await?;
             session.commit_transaction().await?;
+            drop(session);
+            drop(generation_pin);
             crate::admin::api_specs::external_refs::validate_api_spec_snapshots_async(
                 &snapshot.api_specs,
                 codec_slots,
@@ -7341,7 +7348,7 @@ mod inner {
                             api_spec_to_doc_unchecked(previous_spec)?,
                             desired_spec_doc,
                         );
-                        if checked_api_spec_bson_len(&document)?.is_none() {
+                        if !spec_doc_fits_mongo_bson_limit(&document)? {
                             return Err(DeploymentGraphInvalid.into());
                         }
                         let replaced = self
@@ -7586,7 +7593,7 @@ mod inner {
                         api_spec_to_doc_unchecked(previous_spec)?,
                         prepared.spec,
                     );
-                    if checked_api_spec_bson_len(&spec_doc)?.is_none() {
+                    if !spec_doc_fits_mongo_bson_limit(&spec_doc)? {
                         return Err(DeploymentGraphInvalid.into());
                     }
                     let replaced = self
@@ -7655,8 +7662,11 @@ mod inner {
             }
             let prevalidated_spec_doc = match replacement {
                 Some((_, spec)) => {
+                    if api_spec_raw_blobs_exceed_mongo_limit(spec) {
+                        return Err(DeploymentGraphInvalid.into());
+                    }
                     let doc = api_spec_to_doc_async(spec).await?;
-                    if checked_api_spec_bson_len(&doc)?.is_none() {
+                    if !spec_doc_fits_mongo_bson_limit(&doc)? {
                         return Err(DeploymentGraphInvalid.into());
                     }
                     Some(doc)
@@ -7783,12 +7793,14 @@ mod inner {
             let chunk_size = chunk_size.unwrap_or(MONGO_ATOMIC_BATCH_CHUNK_SIZE).max(1);
             let mut spec_docs = Vec::with_capacity(restore.api_specs.len());
             for spec in restore.api_specs {
-                spec_docs.push(api_spec_to_doc_async(spec).await?);
-            }
-            for doc in &spec_docs {
-                if checked_api_spec_bson_len(doc)?.is_none() {
+                if api_spec_raw_blobs_exceed_mongo_limit(spec) {
                     anyhow::bail!("MongoDB API spec document exceeds restore limit");
                 }
+                let doc = api_spec_to_doc_async(spec).await?;
+                if !spec_doc_fits_mongo_bson_limit(&doc)? {
+                    anyhow::bail!("MongoDB API spec document exceeds restore limit");
+                }
+                spec_docs.push(doc);
             }
             let replacement = MongoConditionalRestorePlan {
                 expected: restore.expected,
@@ -10083,6 +10095,13 @@ mod inner {
 
     const MONGO_API_SPEC_BSON_LIMIT_BYTES: usize = 15 * 1024 * 1024;
 
+    fn api_spec_raw_blobs_exceed_mongo_limit(spec: &ApiSpec) -> bool {
+        spec.spec_content
+            .len()
+            .saturating_add(spec.external_ref_snapshot.as_ref().map_or(0, Vec::len))
+            > MONGO_API_SPEC_BSON_LIMIT_BYTES
+    }
+
     fn approx_bson_value_bytes(value: &Bson) -> usize {
         match value {
             Bson::Binary(binary) => binary.bytes.len(),
@@ -10102,28 +10121,26 @@ mod inner {
         })
     }
 
-    /// Check whether a serialized `api_specs` BSON document fits within
-    /// [`MONGO_API_SPEC_BSON_LIMIT_BYTES`].
+    /// Return `Ok(true)` if a serialized `api_specs` BSON document fits within
+    /// [`MONGO_API_SPEC_BSON_LIMIT_BYTES`], or `Ok(false)` if oversized.
     ///
     /// Pre-checks the raw binary/string payload lower bound before calling
-    /// `mongodb::bson::to_vec`, and treats BSON's internal 16 MiB encoder limit
-    /// as an oversize result (`Ok(None)`) rather than an unclassified
-    /// serialization error so handlers consistently return `413` (unconditional)
-    /// or `409` (conditional).
-    fn checked_api_spec_bson_len(doc: &Document) -> Result<Option<usize>, anyhow::Error> {
+    /// `mongodb::bson::to_vec`, and treats BSON's internal 16 MiB binary-field
+    /// cap as `Ok(false)` rather than an unclassified serialization error so
+    /// handlers consistently return `413` (unconditional) or `409` (conditional).
+    fn spec_doc_fits_mongo_bson_limit(doc: &Document) -> Result<bool, anyhow::Error> {
         if approx_bson_doc_bytes(doc) > MONGO_API_SPEC_BSON_LIMIT_BYTES {
-            return Ok(None);
+            return Ok(false);
         }
         match mongodb::bson::to_vec(doc) {
-            Ok(bytes) if bytes.len() <= MONGO_API_SPEC_BSON_LIMIT_BYTES => Ok(Some(bytes.len())),
-            Ok(_) => Ok(None),
+            Ok(bytes) => Ok(bytes.len() <= MONGO_API_SPEC_BSON_LIMIT_BYTES),
             Err(error) => {
-                let msg = error.to_string().to_ascii_lowercase();
-                if (msg.contains("maximum") && msg.contains("size"))
-                    || msg.contains("too large")
-                    || msg.contains("exceeds")
+                if error
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("exceeded maximum size")
                 {
-                    Ok(None)
+                    Ok(false)
                 } else {
                     Err(error.into())
                 }
@@ -10135,29 +10152,80 @@ mod inner {
     /// running external-ref snapshot validation. Callers must validate through
     /// [`api_spec_to_doc_async`] (or `api_spec_to_doc` in unit tests).
     fn api_spec_to_doc_unchecked(spec: &ApiSpec) -> Result<Document, anyhow::Error> {
-        let mut doc = mongodb::bson::to_document(spec)?;
+        // Destructure `ApiSpec` exhaustively so future field additions fail to
+        // compile if missed, while keeping both binary blobs empty during
+        // `bson::to_document` so BSON 2.15 never expands `Vec<u8>` into a 24x
+        // `Bson::Array` of per-byte integers before inserting `Bson::Binary`.
+        let ApiSpec {
+            id,
+            namespace,
+            proxy_id,
+            spec_version,
+            spec_format,
+            spec_content,
+            content_encoding,
+            uncompressed_size,
+            content_hash,
+            title,
+            info_version,
+            description,
+            contact_name,
+            contact_email,
+            license_name,
+            license_identifier,
+            tags,
+            server_urls,
+            operation_count,
+            resource_hash,
+            external_ref_snapshot,
+            external_ref_digest,
+            created_at,
+            updated_at,
+        } = spec;
+        let metadata_only = ApiSpec {
+            id: id.clone(),
+            namespace: namespace.clone(),
+            proxy_id: proxy_id.clone(),
+            spec_version: spec_version.clone(),
+            spec_format: *spec_format,
+            spec_content: Vec::new(),
+            content_encoding: content_encoding.clone(),
+            uncompressed_size: *uncompressed_size,
+            content_hash: content_hash.clone(),
+            title: title.clone(),
+            info_version: info_version.clone(),
+            description: description.clone(),
+            contact_name: contact_name.clone(),
+            contact_email: contact_email.clone(),
+            license_name: license_name.clone(),
+            license_identifier: license_identifier.clone(),
+            tags: tags.clone(),
+            server_urls: server_urls.clone(),
+            operation_count: *operation_count,
+            resource_hash: resource_hash.clone(),
+            external_ref_snapshot: None,
+            external_ref_digest: external_ref_digest.clone(),
+            created_at: *created_at,
+            updated_at: *updated_at,
+        };
+        let mut doc = mongodb::bson::to_document(&metadata_only)?;
         // Composite `_id` ("{namespace}:{id}") — issue #4627.
         doc.insert("_id", namespaced_doc_id(&spec.namespace, &spec.id));
         doc.insert(
             "spec_content",
             Bson::Binary(Binary {
                 subtype: BinarySubtype::Generic,
-                bytes: spec.spec_content.clone(),
+                bytes: spec_content.clone(),
             }),
         );
-        match &spec.external_ref_snapshot {
-            Some(bytes) => {
-                doc.insert(
-                    "external_ref_snapshot",
-                    Bson::Binary(Binary {
-                        subtype: BinarySubtype::Generic,
-                        bytes: bytes.clone(),
-                    }),
-                );
-            }
-            None => {
-                doc.remove("external_ref_snapshot");
-            }
+        if let Some(bytes) = external_ref_snapshot {
+            doc.insert(
+                "external_ref_snapshot",
+                Bson::Binary(Binary {
+                    subtype: BinarySubtype::Generic,
+                    bytes: bytes.clone(),
+                }),
+            );
         }
         Ok(doc)
     }
@@ -16616,8 +16684,14 @@ mod inner {
             // Pre-flight size check: BSON document limit is 16 MiB.
             // Measure the actual serialized BSON size rather than estimating
             // with a hardcoded overhead constant.
+            if api_spec_raw_blobs_exceed_mongo_limit(spec) {
+                anyhow::bail!(
+                    "MongoDB document limit exceeded: serialized spec exceeds limit (~15 MiB); \
+                     use a SQL backend for large specs"
+                );
+            }
             let spec_doc = api_spec_to_doc_async(spec).await?;
-            if checked_api_spec_bson_len(&spec_doc)?.is_none() {
+            if !spec_doc_fits_mongo_bson_limit(&spec_doc)? {
                 anyhow::bail!(
                     "MongoDB document limit exceeded: serialized spec exceeds limit (~15 MiB); \
                      use a SQL backend for large specs"
@@ -16881,8 +16955,14 @@ mod inner {
                 );
             }
 
+            if api_spec_raw_blobs_exceed_mongo_limit(spec) {
+                anyhow::bail!(
+                    "MongoDB document limit exceeded: serialized spec exceeds limit (~15 MiB); \
+                     use a SQL backend for large specs"
+                );
+            }
             let spec_doc = api_spec_to_doc_async(spec).await?;
-            if checked_api_spec_bson_len(&spec_doc)?.is_none() {
+            if !spec_doc_fits_mongo_bson_limit(&spec_doc)? {
                 anyhow::bail!(
                     "MongoDB document limit exceeded: serialized spec exceeds limit (~15 MiB); \
                      use a SQL backend for large specs"
@@ -17109,8 +17189,14 @@ mod inner {
             // paths write the api_specs document, so both must return the
             // handler's friendly 413 classification instead of raw MongoDB
             // document-limit errors.
+            if api_spec_raw_blobs_exceed_mongo_limit(spec) {
+                anyhow::bail!(
+                    "MongoDB document limit exceeded: serialized spec exceeds limit (~15 MiB); \
+                     use a SQL backend for large specs"
+                );
+            }
             let spec_doc_check = api_spec_to_doc_async(spec).await?;
-            if checked_api_spec_bson_len(&spec_doc_check)?.is_none() {
+            if !spec_doc_fits_mongo_bson_limit(&spec_doc_check)? {
                 anyhow::bail!(
                     "MongoDB document limit exceeded: serialized spec exceeds limit (~15 MiB); \
                      use a SQL backend for large specs"
@@ -18081,8 +18167,15 @@ mod inner {
             // Pre-flight BSON size checks before any durable write.
             let mut docs = Vec::with_capacity(specs.len());
             for spec in specs {
+                if api_spec_raw_blobs_exceed_mongo_limit(spec) {
+                    anyhow::bail!(
+                        "MongoDB document limit exceeded restoring api_spec {:?}: \
+                         serialized size exceeds limit (~15 MiB)",
+                        spec.id
+                    );
+                }
                 let spec_doc = api_spec_to_doc_async(spec).await?;
-                if checked_api_spec_bson_len(&spec_doc)?.is_none() {
+                if !spec_doc_fits_mongo_bson_limit(&spec_doc)? {
                     anyhow::bail!(
                         "MongoDB document limit exceeded restoring api_spec {:?}: \
                          serialized size exceeds limit (~15 MiB)",
