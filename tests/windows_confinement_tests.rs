@@ -382,17 +382,17 @@ mod windows_confined_files {
             let mut errors = Vec::new();
             for _ in 0..128 {
                 worker_start.wait();
-                if let Err(error) = reparse_control(&attributes, 0x0009_00a4, &set) {
+                if let Err(error) = reparse_control(&attributes, 0x0009_00a4, &set)
                     // A competing checked handle can safely deny mutation.
-                    if !matches!(error.raw_os_error(), Some(5 | 32)) {
-                        errors.push(error);
-                    }
+                    && !matches!(error.raw_os_error(), Some(5 | 32))
+                {
+                    errors.push(error);
                 }
                 std::thread::yield_now();
-                if let Err(error) = reparse_control(&attributes, 0x0009_00ac, &delete) {
-                    if !matches!(error.raw_os_error(), Some(5 | 32 | 4390)) {
-                        errors.push(error);
-                    }
+                if let Err(error) = reparse_control(&attributes, 0x0009_00ac, &delete)
+                    && !matches!(error.raw_os_error(), Some(5 | 32 | 4390))
+                {
+                    errors.push(error);
                 }
                 // Do not panic before this barrier, leaving the opener parked.
                 worker_end.wait();
@@ -506,6 +506,33 @@ mod windows_confined_files {
 
     #[test]
     fn windows_repeated_success_and_refusal_do_not_grow_process_handles() {
+        const CHILD_ENV: &str = "FERRUM_WINDOWS_HANDLE_LEAK_CHILD";
+        // `GetProcessHandleCount` observes every handle in the current process.
+        // Re-execute this test alone in a dedicated child process when invoked
+        // from a parallel `cargo test` run so sibling test threads cannot skew
+        // the process-wide handle count.
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let exe = std::env::current_exe().unwrap();
+            let output = std::process::Command::new(exe)
+                .env(CHILD_ENV, "1")
+                .args([
+                    "--exact",
+                    "windows_confined_files::windows_repeated_success_and_refusal_do_not_grow_process_handles",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated handle-leak child failed ({}):\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
         #[link(name = "kernel32")]
         unsafe extern "system" {
             fn GetCurrentProcess() -> *mut std::ffi::c_void;
@@ -514,7 +541,8 @@ mod windows_confined_files {
         fn handle_count() -> u32 {
             let mut count = 0;
             // SAFETY: current-process pseudo handle is borrowed, never closed;
-            // the API fills one valid u32. Run this security target serially.
+            // the API fills one valid u32. Executed inside an isolated single-test
+            // child process above.
             assert_ne!(
                 unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) },
                 0

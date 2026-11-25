@@ -328,7 +328,7 @@ Details for every bullet live in `docs/ci_cd.md`.
 
 ## Test Structure
 
-Layout and target list: `tests/README.md`. Unit targets: `unit_tests`, `unit_plugins_a_tests`, `unit_plugins_b_tests`, `unit_gateway_core_tests`; other suite targets: `integration_tests`, `functional_tests`, `conformance_tests`; extra `[[test]]` targets: `service_integration`, `secrets_functional`, `acme_dns01_tests`.
+Layout and target list: `tests/README.md`. Unit targets: `unit_tests`, `unit_plugins_a_tests`, `unit_plugins_b_tests`, `unit_gateway_core_tests`; other suite targets: `integration_tests`, `functional_tests`, `conformance_tests`, `windows_confinement_tests` (Windows-only); extra `[[test]]` targets: `service_integration`, `secrets_functional`, `acme_dns01_tests`.
 
 Functional tests are ignored by default. Conformance reporter emits `target/conformance/coverage.{json,md}`.
 

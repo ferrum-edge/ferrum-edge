@@ -13,26 +13,36 @@ on:
     paths:
       - .github/workflows/windows-confinement.yml
       - src/tls/source/**
+      - src/tls/mod.rs
       - src/lib.rs
       - src/config/file_loader.rs
+      - src/config/env_config.rs
       - tests/windows_confinement_tests.rs
       - Cargo.toml
       - Cargo.lock
       - .cargo/**
       - build.rs
+      - build/**
+      - proto/**
+      - vendor/**
       - rust-toolchain.toml
   push:
     branches: [main]
     paths:
       - .github/workflows/windows-confinement.yml
       - src/tls/source/**
+      - src/tls/mod.rs
       - src/lib.rs
       - src/config/file_loader.rs
+      - src/config/env_config.rs
       - tests/windows_confinement_tests.rs
       - Cargo.toml
       - Cargo.lock
       - .cargo/**
       - build.rs
+      - build/**
+      - proto/**
+      - vendor/**
       - rust-toolchain.toml
   workflow_dispatch:
 
@@ -41,8 +51,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # Clear any user-level sccache wrapper; this workflow builds without a
-  # compiler cache.
+  # Clear any user-level sccache wrapper; this workflow uses no sccache
+  # (dependency artifacts are cached via Swatinem/rust-cache below).
   RUSTC_WRAPPER: ""
   CARGO_BUILD_RUSTC_WRAPPER: ""
 
@@ -58,20 +68,22 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 180
     env:
-      # Optimize the Windows test build for compile speed: omit DWARF/PDB
-      # debuginfo and keep full parallel codegen units (Cargo drops default
-      # codegen-units from 256 to 16 when incremental=0).
+      # Optimize the Windows test build for compile speed: omit Rust debuginfo
+      # (panic locations still print) and keep full parallel codegen units
+      # (rustc drops default codegen-units from 256 to 16 when incremental=0).
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
-      CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: "off"
-      CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: "off"
       CARGO_PROFILE_DEV_CODEGEN_UNITS: "256"
       CARGO_PROFILE_TEST_CODEGEN_UNITS: "256"
       RUST_BACKTRACE: "1"
       # Git Bash puts its own msys perl first on PATH, which lacks the modules
       # vendored OpenSSL's Configure needs. Use the image's Strawberry Perl.
       OPENSSL_SRC_PERL: C:\Strawberry\perl\bin\perl.exe
+      # Checksum-pinned NASM used by vendored OpenSSL on Windows; folded into
+      # the rust-cache shared-key so tool/pin bumps invalidate cached artifacts.
+      NASM_VERSION: "3.02"
+      NASM_SHA256: "161d0bfaff53c2f9e9f3e69fd0672323ebabafd1268976a5cec11be92a19aee7"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -86,7 +98,7 @@ jobs:
       # without spending the repository's 10 GB Actions cache quota on PR saves.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          shared-key: "ci-windows-confinement"
+          shared-key: "ci-windows-confinement-nasm-${{ env.NASM_VERSION }}-${{ env.NASM_SHA256 }}-strawberry"
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           cache-on-failure: "false"
 
@@ -114,13 +126,13 @@ jobs:
           }
           "PROTOC=$protocExe" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
 
-          $nasmVersion = "3.02"
+          $nasmVersion = $env:NASM_VERSION
           $nasmZip = Join-Path $env:RUNNER_TEMP "nasm-$nasmVersion-win64.zip"
           $nasmRoot = Join-Path $env:RUNNER_TEMP "nasm"
           Invoke-WebRequest `
             -Uri "https://www.nasm.us/pub/nasm/releasebuilds/$nasmVersion/win64/nasm-$nasmVersion-win64.zip" `
             -OutFile $nasmZip
-          $expectedNasmSha256 = "161d0bfaff53c2f9e9f3e69fd0672323ebabafd1268976a5cec11be92a19aee7"
+          $expectedNasmSha256 = $env:NASM_SHA256
           $actualNasmSha256 = (Get-FileHash -Algorithm SHA256 $nasmZip).Hash.ToLowerInvariant()
           if ($actualNasmSha256 -ne $expectedNasmSha256) {
             throw "NASM archive SHA-256 mismatch: expected $expectedNasmSha256, got $actualNasmSha256"

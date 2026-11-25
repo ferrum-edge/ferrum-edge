@@ -10,8 +10,9 @@
 //!
 //! Suites that `docs/coverage.md` keeps outside the default baseline (subprocess
 //! functional/conformance, container-backed service integration, secrets
-//! functional, feature-gated ACME, and the live-cluster Istio status CAS proof
-//! that only its dedicated workflow runs) are listed in
+//! functional, feature-gated ACME, the live-cluster Istio status CAS proof
+//! that only its dedicated workflow runs, and the Windows-only tenant-file
+//! confinement suite that compiles out on Linux) are listed in
 //! `OUTSIDE_DEFAULT_COVERAGE_BASELINE`. Adding a new Cargo test target fails this
 //! check until it is either dispatched through both collectors or added to that
 //! exclusion with an explicit reason.
