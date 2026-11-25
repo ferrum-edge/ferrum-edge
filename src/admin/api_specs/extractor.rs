@@ -6776,6 +6776,10 @@ impl<'de> serde::de::Visitor<'de> for BoundedJsonValueSeed<'_> {
     }
 }
 
+fn is_serde_json_recursion_limit_error(error: &serde_json::Error) -> bool {
+    error.is_syntax() && error.to_string().starts_with("recursion limit exceeded")
+}
+
 pub(crate) fn parse_json_slice_bounded(
     body: &[u8],
     max_nodes: usize,
@@ -6805,6 +6809,9 @@ pub(crate) fn parse_json_slice_bounded_with_depth(
         Ok(value) => value,
         Err(_) if node_limit_exceeded => return Err(BoundedJsonError::NodeLimitExceeded),
         Err(_) if depth_limit_exceeded => return Err(BoundedJsonError::DepthLimitExceeded),
+        Err(e) if is_serde_json_recursion_limit_error(&e) => {
+            return Err(BoundedJsonError::DepthLimitExceeded);
+        }
         Err(e) => return Err(BoundedJsonError::Parse(e.to_string())),
     };
     de.end()
@@ -6833,6 +6840,9 @@ pub(crate) fn parse_json_reader_bounded<R: std::io::Read>(
         Ok(value) => value,
         Err(_) if node_limit_exceeded => return Err(BoundedJsonError::NodeLimitExceeded),
         Err(_) if depth_limit_exceeded => return Err(BoundedJsonError::DepthLimitExceeded),
+        Err(e) if is_serde_json_recursion_limit_error(&e) => {
+            return Err(BoundedJsonError::DepthLimitExceeded);
+        }
         Err(e) => return Err(BoundedJsonError::Parse(e.to_string())),
     };
     de.end()
@@ -6898,6 +6908,26 @@ pub(crate) fn check_json_duplicate_member_limit_parity_for_test() -> Result<(), 
         || parse_json_reader_bounded(std::io::Cursor::new(dup_json), 6).is_err()
     {
         return Err("bounded JSON conversion parser rejected duplicate members at exact cap");
+    }
+
+    // 128-level nested JSON hits serde_json's built-in recursion limit; classify
+    // it as `DepthLimitExceeded` so autodetected JSON fails immediately as
+    // `InvalidJson` rather than falling back to the YAML parser.
+    let deep_json = format!("{}{}", "[".repeat(128), "]".repeat(128));
+    if parse_json_slice_bounded(deep_json.as_bytes(), 1024)
+        != Err(BoundedJsonError::DepthLimitExceeded)
+        || parse_json_reader_bounded(std::io::Cursor::new(deep_json.as_bytes()), 1024)
+            != Err(BoundedJsonError::DepthLimitExceeded)
+    {
+        return Err(
+            "bounded JSON parser did not classify serde_json recursion limit as DepthLimitExceeded",
+        );
+    }
+    if !matches!(
+        parse_root_document_with_limit(deep_json.as_bytes(), None, 1024),
+        Err(ExtractError::InvalidJson(_))
+    ) {
+        return Err("autodetected 128-level nested JSON did not fail directly with InvalidJson");
     }
 
     // Positional array entries in `x-ferrum-plugins` must be rejected as 400

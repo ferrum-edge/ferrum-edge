@@ -456,7 +456,7 @@ impl ExternalRefSnapshot {
         )
     }
 
-    fn gzip_bytes_with_limits(
+    pub(crate) fn gzip_bytes_with_limits(
         &self,
         max_decompressed: usize,
         max_compressed: usize,
@@ -528,6 +528,46 @@ pub fn validate_external_ref_snapshot_pair(
                 return Err("external_ref snapshot digest does not match stored digest".to_string());
             }
             Ok(())
+        }
+    }
+}
+
+/// Async persistence/read wrapper around [`validate_external_ref_snapshot_pair`]
+/// that offloads gzip decompression, bounded JSON parsing, and SHA-256
+/// verification onto Tokio's blocking pool under `codec_slots` so large
+/// snapshots (up to 64 MiB compressed / 128 MiB decompressed) never stall
+/// async worker threads.
+///
+/// The `(None, None)` fast path and O(1) pre-checks (missing pair, compressed
+/// size cap, and SHA-256 hex format) execute inline without acquiring a slot
+/// or cloning the snapshot blob.
+pub async fn validate_external_ref_snapshot_pair_async(
+    snapshot: Option<&[u8]>,
+    digest: Option<&str>,
+    codec_slots: &std::sync::Arc<tokio::sync::Semaphore>,
+) -> Result<(), String> {
+    match (snapshot, digest) {
+        (None, None) => Ok(()),
+        (Some(_), None) | (None, Some(_)) => {
+            Err("external_ref snapshot and digest must be present together".to_string())
+        }
+        (Some(bytes), Some(stored_digest)) => {
+            if bytes.len() > MAX_EXTERNAL_REF_SNAPSHOT_COMPRESSED_BYTES {
+                return Err("external_ref snapshot exceeds persistence size limit".to_string());
+            }
+            validate_external_ref_summary_digest(Some(stored_digest))?;
+            let permit = std::sync::Arc::clone(codec_slots)
+                .acquire_owned()
+                .await
+                .map_err(|_| "external_ref snapshot validation unavailable".to_string())?;
+            let owned_bytes = bytes.to_vec();
+            let owned_digest = stored_digest.to_string();
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                validate_external_ref_snapshot_pair(Some(&owned_bytes), Some(&owned_digest))
+            })
+            .await
+            .map_err(|_| "external_ref snapshot validation worker failed".to_string())?
         }
     }
 }
@@ -1837,29 +1877,6 @@ pub(crate) fn check_external_json_duplicate_member_limit_for_test() -> Result<()
         return Err("bounded_json_serialized_len failed to reject oversized snapshot");
     }
     Ok(())
-}
-
-/// Produce a real `ExtractError::SchemaTooLarge` from `gzip_bytes_with_limits`
-/// exceeding its compressed cap so handler-level error mapping can verify HTTP
-/// `422` + `code: "SchemaTooLarge"`.
-pub(crate) fn sample_compressed_snapshot_too_large_error_for_test()
--> Result<ExtractError, &'static str> {
-    let mut snap = ExternalRefSnapshot {
-        policy_digest: "0".repeat(64),
-        root_document_base: "https://schemas.example.com/root.json".to_string(),
-        documents: vec![ExternalRefSnapshotDocument {
-            canonical_uri: "https://schemas.example.com/common.json".to_string(),
-            content_digest: normalized_document_digest(&serde_json::json!({"ok": true})),
-            format: "json".to_string(),
-            document: serde_json::json!({"ok": true}),
-        }],
-        snapshot_digest: String::new(),
-    };
-    snap.snapshot_digest = snap.compute_digest();
-    match snap.gzip_bytes_with_limits(64 * 1024, 16) {
-        Err(err) => Ok(err),
-        Ok(_) => Err("gzip_bytes_with_limits unexpectedly succeeded under 16-byte compressed cap"),
-    }
 }
 
 fn detect_format(bytes: &[u8]) -> &'static str {

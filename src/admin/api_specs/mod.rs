@@ -39,6 +39,20 @@ pub(crate) static SPEC_WRITE_CODEC_SLOTS: std::sync::LazyLock<
     ))
 });
 
+/// Concurrent read-side API-spec decompression, snapshot integrity verification,
+/// and format-conversion jobs admitted onto the blocking pool process-wide.
+/// Isolated from write-side [`SPEC_WRITE_CODEC_SLOTS`] so bursts of viewer reads
+/// cannot starve namespace-locked `POST`/`PUT` writes.
+pub(crate) const MAX_CONCURRENT_SPEC_READ_CODEC_JOBS: usize = 4;
+
+pub(crate) static SPEC_READ_CODEC_SLOTS: std::sync::LazyLock<
+    std::sync::Arc<tokio::sync::Semaphore>,
+> = std::sync::LazyLock::new(|| {
+    std::sync::Arc::new(tokio::sync::Semaphore::new(
+        MAX_CONCURRENT_SPEC_READ_CODEC_JOBS,
+    ))
+});
+
 /// Compute the decompression cap for recovering associations from a stored spec
 /// row given a resolved `admin_spec_max_body_size_mib` (2× body cap, floored at
 /// 64 MiB) so deployments that raise the admission limit never falsely fail

@@ -6992,7 +6992,13 @@ mod inner {
                 .await?;
             let mut api_specs = Vec::new();
             while cursor.advance(&mut *session).await? {
-                api_specs.push(doc_to_api_spec(cursor.deserialize_current()?)?);
+                api_specs.push(
+                    doc_to_api_spec_async(
+                        cursor.deserialize_current()?,
+                        &crate::admin::api_specs::SPEC_READ_CODEC_SLOTS,
+                    )
+                    .await?,
+                );
             }
             let namespace_record = self
                 .get_namespace_in_session(&mut *session, namespace)
@@ -7256,8 +7262,8 @@ mod inner {
                             .ok_or(DeploymentGraphInvalid)?;
                         let document = merge_deployment_document(
                             old,
-                            api_spec_to_doc(previous_spec)?,
-                            api_spec_to_doc(spec)?,
+                            api_spec_to_doc_async(previous_spec).await?,
+                            api_spec_to_doc_async(spec).await?,
                         );
                         let replaced = self
                             .api_specs()
@@ -7312,7 +7318,7 @@ mod inner {
                         .filter(|p| p.api_spec_id.as_deref() == Some(spec.id.as_str()))
                         .map(|p| p.id.clone())
                         .collect();
-                    let prepared = prepare_api_spec_bundle_docs(bundle, spec)?;
+                    let prepared = prepare_api_spec_bundle_docs(bundle, spec).await?;
                     let previous_doc = self
                         .proxies()
                         .find_one(doc! {
@@ -7496,7 +7502,7 @@ mod inner {
                         .ok_or(DeploymentGraphInvalid)?;
                     let spec_doc = merge_deployment_document(
                         old_spec_doc,
-                        api_spec_to_doc(previous_spec)?,
+                        api_spec_to_doc_async(previous_spec).await?,
                         prepared.spec,
                     );
                     let replaced = self
@@ -7564,7 +7570,7 @@ mod inner {
                 return Err(anyhow::Error::new(Self::atomic_batch_standalone_refusal()));
             }
             if let Some((_, spec)) = replacement {
-                let encoded = mongodb::bson::to_vec(&api_spec_to_doc(spec)?)?;
+                let encoded = mongodb::bson::to_vec(&api_spec_to_doc_async(spec).await?)?;
                 if encoded.len() > 15 * 1024 * 1024 {
                     return Err(DeploymentGraphInvalid.into());
                 }
@@ -9977,20 +9983,10 @@ mod inner {
         })
     }
 
-    /// Convert an [`ApiSpec`] into a BSON `Document` for storage.
-    ///
-    /// `spec_content` (gzip bytes) serializes as BSON Binary. The document
-    /// size limit is ~16 MiB; callers must check before insert.
-    ///
-    /// Wave 5: `tags` and `server_urls` are stored as native BSON arrays.
-    fn api_spec_to_doc(spec: &ApiSpec) -> Result<Document, anyhow::Error> {
-        crate::admin::api_specs::external_refs::validate_external_ref_snapshot_pair(
-            spec.external_ref_snapshot.as_deref(),
-            spec.external_ref_digest.as_deref(),
-        )
-        .map_err(|_| {
-            anyhow::anyhow!("api_specs external-ref snapshot integrity validation failed")
-        })?;
+    /// Convert an [`ApiSpec`] into a BSON `Document` for storage without
+    /// running external-ref snapshot validation. Callers must validate through
+    /// [`api_spec_to_doc_async`] (or [`api_spec_to_doc`] in unit tests).
+    fn api_spec_to_doc_unchecked(spec: &ApiSpec) -> Result<Document, anyhow::Error> {
         let mut doc = mongodb::bson::to_document(spec)?;
         // Composite `_id` ("{namespace}:{id}") — issue #4627.
         doc.insert("_id", namespaced_doc_id(&spec.namespace, &spec.id));
@@ -10016,6 +10012,39 @@ mod inner {
             }
         }
         Ok(doc)
+    }
+
+    /// Convert an [`ApiSpec`] into a BSON `Document` for storage, offloading
+    /// external-ref snapshot gzip/SHA-256 verification onto Tokio's blocking
+    /// pool under `SPEC_WRITE_CODEC_SLOTS`.
+    ///
+    /// `spec_content` (gzip bytes) serializes as BSON Binary. The document
+    /// size limit is ~16 MiB; callers must check before insert.
+    ///
+    /// Wave 5: `tags` and `server_urls` are stored as native BSON arrays.
+    async fn api_spec_to_doc_async(spec: &ApiSpec) -> Result<Document, anyhow::Error> {
+        crate::admin::api_specs::external_refs::validate_external_ref_snapshot_pair_async(
+            spec.external_ref_snapshot.as_deref(),
+            spec.external_ref_digest.as_deref(),
+            &crate::admin::api_specs::SPEC_WRITE_CODEC_SLOTS,
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("api_specs external-ref snapshot integrity validation failed")
+        })?;
+        api_spec_to_doc_unchecked(spec)
+    }
+
+    #[cfg(test)]
+    fn api_spec_to_doc(spec: &ApiSpec) -> Result<Document, anyhow::Error> {
+        crate::admin::api_specs::external_refs::validate_external_ref_snapshot_pair(
+            spec.external_ref_snapshot.as_deref(),
+            spec.external_ref_digest.as_deref(),
+        )
+        .map_err(|_| {
+            anyhow::anyhow!("api_specs external-ref snapshot integrity validation failed")
+        })?;
+        api_spec_to_doc_unchecked(spec)
     }
 
     fn audit_event_to_doc(
@@ -10055,12 +10084,30 @@ mod inner {
         Ok(event)
     }
 
+    async fn doc_to_api_spec_async(
+        doc: Document,
+        codec_slots: &std::sync::Arc<tokio::sync::Semaphore>,
+    ) -> Result<ApiSpec, anyhow::Error> {
+        let spec = doc_to_api_spec_inner(doc, true, false)?;
+        crate::admin::api_specs::external_refs::validate_external_ref_snapshot_pair_async(
+            spec.external_ref_snapshot.as_deref(),
+            spec.external_ref_digest.as_deref(),
+            codec_slots,
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("api_specs external-ref snapshot integrity validation failed")
+        })?;
+        Ok(spec)
+    }
+
+    #[cfg(test)]
     fn doc_to_api_spec(doc: Document) -> Result<ApiSpec, anyhow::Error> {
-        doc_to_api_spec_inner(doc, true)
+        doc_to_api_spec_inner(doc, true, true)
     }
 
     fn doc_to_api_spec_content(doc: Document) -> Result<ApiSpec, anyhow::Error> {
-        doc_to_api_spec_inner(doc, false)
+        doc_to_api_spec_inner(doc, false, false)
     }
 
     fn doc_to_api_spec_conditional_meta(
@@ -10093,6 +10140,7 @@ mod inner {
     fn doc_to_api_spec_inner(
         mut doc: Document,
         snapshot_projected: bool,
+        validate_snapshot_sync: bool,
     ) -> Result<ApiSpec, anyhow::Error> {
         doc.remove("_id");
         // `api_spec_to_doc` writes both blobs as BSON Binary; build-out keeps
@@ -10125,13 +10173,15 @@ mod inner {
         spec.spec_content = spec_content;
         spec.external_ref_snapshot = external_ref_snapshot;
         if snapshot_projected {
-            crate::admin::api_specs::external_refs::validate_external_ref_snapshot_pair(
-                spec.external_ref_snapshot.as_deref(),
-                spec.external_ref_digest.as_deref(),
-            )
-            .map_err(|_| {
-                anyhow::anyhow!("api_specs external-ref snapshot integrity validation failed")
-            })?;
+            if validate_snapshot_sync {
+                crate::admin::api_specs::external_refs::validate_external_ref_snapshot_pair(
+                    spec.external_ref_snapshot.as_deref(),
+                    spec.external_ref_digest.as_deref(),
+                )
+                .map_err(|_| {
+                    anyhow::anyhow!("api_specs external-ref snapshot integrity validation failed")
+                })?;
+            }
         } else {
             crate::admin::api_specs::external_refs::validate_external_ref_summary_digest(
                 spec.external_ref_digest.as_deref(),
@@ -10149,7 +10199,7 @@ mod inner {
                 bytes: Vec::new(),
             }),
         );
-        doc_to_api_spec_inner(doc, false)
+        doc_to_api_spec_inner(doc, false, false)
     }
 
     #[derive(Clone)]
@@ -10161,7 +10211,7 @@ mod inner {
         spec: Document,
     }
 
-    fn prepare_api_spec_bundle_docs(
+    async fn prepare_api_spec_bundle_docs(
         bundle: &crate::admin::api_specs::ExtractedBundle,
         spec: &ApiSpec,
     ) -> Result<PreparedApiSpecBundleDocs, anyhow::Error> {
@@ -10184,7 +10234,7 @@ mod inner {
 
         let mut proxy_doc = proxy_to_doc(&bundle.proxy)?;
         proxy_doc.insert("api_spec_id", spec.id.as_str());
-        let spec_doc = api_spec_to_doc(spec)?;
+        let spec_doc = api_spec_to_doc_async(spec).await?;
 
         Ok(PreparedApiSpecBundleDocs {
             upstream,
@@ -10195,13 +10245,13 @@ mod inner {
         })
     }
 
-    fn prepare_api_spec_restore_docs(
+    async fn prepare_api_spec_restore_docs(
         bundle: &crate::admin::api_specs::ExtractedBundle,
         spec: &ApiSpec,
         additional_upstreams: &[Upstream],
         additional_plugins: &[PluginConfig],
     ) -> Result<PreparedApiSpecBundleDocs, anyhow::Error> {
-        let mut prepared = prepare_api_spec_bundle_docs(bundle, spec)?;
+        let mut prepared = prepare_api_spec_bundle_docs(bundle, spec).await?;
         prepared
             .additional_upstreams
             .reserve(additional_upstreams.len());
@@ -16416,7 +16466,7 @@ mod inner {
             // Pre-flight size check: BSON document limit is 16 MiB.
             // Measure the actual serialized BSON size rather than estimating
             // with a hardcoded overhead constant.
-            let spec_doc = api_spec_to_doc(spec)?;
+            let spec_doc = api_spec_to_doc_async(spec).await?;
             let bson_bytes = mongodb::bson::to_vec(&spec_doc)?;
             if bson_bytes.len() > 15 * 1024 * 1024 {
                 anyhow::bail!(
@@ -16470,7 +16520,7 @@ mod inner {
                     // With a replica set: use a multi-document transaction.
                     let connection = self.connection();
                     let mut session = connection.client.start_session().await?;
-                    let prepared_docs = prepare_api_spec_bundle_docs(bundle, spec)?;
+                    let prepared_docs = prepare_api_spec_bundle_docs(bundle, spec).await?;
                     let mut upsert_changes: Vec<(String, &'static str, String)> = Vec::new();
                     if let Some(u) = &bundle.upstream {
                         upsert_changes.push((u.namespace.clone(), "upstream", u.id.clone()));
@@ -16587,7 +16637,7 @@ mod inner {
                             inserted_proxy = Some(bundle.proxy.id.clone());
                         }
 
-                        let spec_doc = api_spec_to_doc(spec)?;
+                        let spec_doc = api_spec_to_doc_async(spec).await?;
                         self.api_specs().insert_one(spec_doc).await?;
                         inserted_spec = true;
 
@@ -16683,7 +16733,7 @@ mod inner {
                 );
             }
 
-            let spec_doc = api_spec_to_doc(spec)?;
+            let spec_doc = api_spec_to_doc_async(spec).await?;
             let bson_bytes = mongodb::bson::to_vec(&spec_doc)?;
             if bson_bytes.len() > 15 * 1024 * 1024 {
                 anyhow::bail!(
@@ -16715,7 +16765,8 @@ mod inner {
                     spec,
                     additional_upstreams,
                     additional_plugins,
-                )?;
+                )
+                .await?;
                 let guard_params = ProxyWriteGuardParams::from_proxy(&bundle.proxy);
                 let mut upsert_changes: Vec<(String, &'static str, String)> = Vec::new();
                 if let Some(upstream) = &bundle.upstream {
@@ -16911,7 +16962,7 @@ mod inner {
             // paths write the api_specs document, so both must return the
             // handler's friendly 413 classification instead of raw MongoDB
             // document-limit errors.
-            let spec_doc_check = api_spec_to_doc(spec)?;
+            let spec_doc_check = api_spec_to_doc_async(spec).await?;
             let bson_bytes = mongodb::bson::to_vec(&spec_doc_check)?;
             if bson_bytes.len() > 15 * 1024 * 1024 {
                 anyhow::bail!(
@@ -16941,10 +16992,13 @@ mod inner {
                     "namespace": &spec.namespace,
                 })
                 .await?;
-            let existing_spec: Option<ApiSpec> = existing_spec_doc
-                .as_ref()
-                .map(|doc| doc_to_api_spec(doc.clone()))
-                .transpose()?;
+            let existing_spec: Option<ApiSpec> = match existing_spec_doc {
+                Some(doc) => Some(
+                    doc_to_api_spec_async(doc, &crate::admin::api_specs::SPEC_WRITE_CODEC_SLOTS)
+                        .await?,
+                ),
+                None => None,
+            };
             let previous_declared_assoc_ids = match existing_spec.as_ref() {
                 Some(existing) => {
                     crate::admin::api_specs::declared_proxy_plugin_association_ids_from_stored_spec_async(
@@ -17149,7 +17203,7 @@ mod inner {
             let orphaned_proxy_group_plugin_deletes = if use_replica_set {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
-                let prepared_docs = prepare_api_spec_bundle_docs(effective_bundle, spec)?;
+                let prepared_docs = prepare_api_spec_bundle_docs(effective_bundle, spec).await?;
                 let guard_params = ProxyWriteGuardParams::from_proxy(&effective_bundle.proxy);
                 let mut upsert_changes: Vec<(String, &'static str, String)> = Vec::new();
                 if let Some(u) = &effective_bundle.upstream {
@@ -17313,7 +17367,7 @@ mod inner {
             } else {
                 // No replica set: best-effort delete then re-insert with
                 // compensating rollback on re-insert failure.
-                let prepared_docs = prepare_api_spec_bundle_docs(effective_bundle, spec)?;
+                let prepared_docs = prepare_api_spec_bundle_docs(effective_bundle, spec).await?;
                 self.ensure_api_spec_standalone_replace_ids_available(&prepared_docs, spec)
                     .await?;
 
@@ -17524,7 +17578,10 @@ mod inner {
                 .await?;
             self.check_slow_query("get_api_spec", start);
             match result {
-                Some(doc) => Ok(Some(doc_to_api_spec(doc)?)),
+                Some(doc) => Ok(Some(
+                    doc_to_api_spec_async(doc, &crate::admin::api_specs::SPEC_READ_CODEC_SLOTS)
+                        .await?,
+                )),
                 None => Ok(None),
             }
         }
@@ -17541,7 +17598,10 @@ mod inner {
                 .await?;
             self.check_slow_query("get_api_spec_by_proxy", start);
             match result {
-                Some(doc) => Ok(Some(doc_to_api_spec(doc)?)),
+                Some(doc) => Ok(Some(
+                    doc_to_api_spec_async(doc, &crate::admin::api_specs::SPEC_READ_CODEC_SLOTS)
+                        .await?,
+                )),
                 None => Ok(None),
             }
         }
@@ -17819,7 +17879,10 @@ mod inner {
             let mut specs = Vec::new();
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
-                specs.push(doc_to_api_spec(doc)?);
+                specs.push(
+                    doc_to_api_spec_async(doc, &crate::admin::api_specs::SPEC_READ_CODEC_SLOTS)
+                        .await?,
+                );
             }
             self.check_slow_query("list_api_specs_with_content", start);
             Ok(specs)
@@ -17837,7 +17900,7 @@ mod inner {
             // Pre-flight BSON size checks before any durable write.
             let mut docs = Vec::with_capacity(specs.len());
             for spec in specs {
-                let spec_doc = api_spec_to_doc(spec)?;
+                let spec_doc = api_spec_to_doc_async(spec).await?;
                 let bson_bytes = mongodb::bson::to_vec(&spec_doc)?;
                 if bson_bytes.len() > 15 * 1024 * 1024 {
                     anyhow::bail!(

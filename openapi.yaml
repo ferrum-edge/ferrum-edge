@@ -8827,7 +8827,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "413":
-          description: Request body exceeds `FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB` (default 25 MiB)
+          description: Request body exceeds `FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB` (default 25 MiB), or on MongoDB backends the serialized `api_specs` document (including any persisted external-ref snapshot) exceeds the ~15 MiB BSON preflight limit
           content:
             application/json:
               schema:
@@ -9139,7 +9139,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/DeploymentMutationAcknowledgement"
         "413":
-          description: Request body exceeds the configured size limit
+          description: Request body exceeds `FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB` (default 25 MiB), or on MongoDB backends the serialized `api_specs` document (including any persisted external-ref snapshot) exceeds the ~15 MiB BSON preflight limit
           content:
             application/json:
               schema:

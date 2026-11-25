@@ -2917,6 +2917,29 @@ fn build_spec_row(
     metadata: &crate::admin::api_specs::SpecMetadata,
     bundle: &crate::admin::api_specs::ExtractedBundle,
 ) -> Result<ApiSpec, ApiSpecError> {
+    build_spec_row_with_snapshot_limits(
+        id,
+        proxy_id,
+        namespace,
+        body,
+        metadata,
+        bundle,
+        crate::admin::api_specs::external_refs::MAX_EXTERNAL_REF_SNAPSHOT_DECOMPRESSED_BYTES,
+        crate::admin::api_specs::external_refs::MAX_EXTERNAL_REF_SNAPSHOT_COMPRESSED_BYTES,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_spec_row_with_snapshot_limits(
+    id: String,
+    proxy_id: String,
+    namespace: String,
+    body: &[u8],
+    metadata: &crate::admin::api_specs::SpecMetadata,
+    bundle: &crate::admin::api_specs::ExtractedBundle,
+    max_snapshot_decompressed: usize,
+    max_snapshot_compressed: usize,
+) -> Result<ApiSpec, ApiSpecError> {
     let spec_content = spec_codec::compress_gzip(body)
         .map_err(|e| ApiSpecError::Internal(format!("gzip compress failed: {e}")))?;
     let content_hash = spec_codec::sha256_hex(body);
@@ -2924,7 +2947,9 @@ fn build_spec_row(
         .map_err(|e| ApiSpecError::Internal(format!("resource hash failed: {e}")))?;
     let (external_ref_snapshot, external_ref_digest) = match &metadata.external_ref_snapshot {
         Some(snapshot) => {
-            let bytes = snapshot.gzip_bytes().map_err(map_snapshot_gzip_error)?;
+            let bytes = snapshot
+                .gzip_bytes_with_limits(max_snapshot_decompressed, max_snapshot_compressed)
+                .map_err(map_snapshot_gzip_error)?;
             (Some(bytes), Some(snapshot.snapshot_digest.clone()))
         }
         None => (None, None),
@@ -2957,15 +2982,6 @@ fn build_spec_row(
         updated_at: now,
     })
 }
-
-/// Concurrent read-side API-spec decompression / format-conversion jobs
-/// admitted onto the blocking pool process-wide. Isolated from write-side
-/// `SPEC_WRITE_CODEC_SLOTS` so bursts of viewer `GET /api-specs/{id}/content`
-/// requests cannot starve namespace-locked `POST`/`PUT` writes.
-const MAX_CONCURRENT_SPEC_READ_CODEC_JOBS: usize = 4;
-
-static SPEC_READ_CODEC_SLOTS: LazyLock<Arc<Semaphore>> =
-    LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_SPEC_READ_CODEC_JOBS)));
 
 /// Offload gzip compression, SHA-256, and canonical bundle hashing onto the
 /// blocking pool so large spec uploads (up to 25 MiB) never stall Tokio worker
@@ -3822,14 +3838,70 @@ pub(crate) async fn exercise_spec_content_response_limits_for_test() -> Result<(
         crate::admin::api_specs::external_refs::check_external_json_duplicate_member_limit_for_test(
         )?;
 
-        // Handler-level mapping: a compressed external-ref snapshot exceeding
-        // its gzip cap must surface as HTTP 422 with `code: "SchemaTooLarge"`
-        // rather than HTTP 500 Internal Server Error.
-        let oversized_err =
-            crate::admin::api_specs::external_refs::sample_compressed_snapshot_too_large_error_for_test()?;
-        let resp_422 = error_response(map_snapshot_gzip_error(oversized_err));
+        // End-to-end `build_spec_row` mapping: when an extracted spec's
+        // external-ref snapshot exceeds its compressed gzip cap during row
+        // construction, `build_spec_row_with_snapshot_limits` must preserve
+        // `ExtractError::SchemaTooLarge` so `error_response` returns HTTP 422
+        // with `code: "SchemaTooLarge"` rather than HTTP 500.
+        let ext_spec_body = br#"{
+            "openapi": "3.1.0",
+            "info": {"title": "ext-cap-test", "version": "1.0.0"},
+            "x-ferrum-proxy": {"id": "ext-cap-proxy", "backend_host": "api.example.com", "backend_port": 443},
+            "x-ferrum-external-refs": {
+                "enabled": true,
+                "document_base": "https://schemas.example.com/root.json",
+                "allowed_origins": ["https://schemas.example.com"]
+            },
+            "paths": {
+                "/items": {
+                    "post": {
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "common.json#/components/schemas/Item"}
+                                }
+                            }
+                        },
+                        "responses": {"200": {"description": "ok"}}
+                    }
+                }
+            }
+        }"#;
+        let process_policy = crate::admin::api_specs::ExternalRefProcessPolicy {
+            enabled: true,
+            allowed_origins: vec!["https://schemas.example.com".to_string()],
+            ..crate::admin::api_specs::ExternalRefProcessPolicy::default()
+        };
+        let mut loader = crate::admin::api_specs::MapExternalDocumentLoader::default();
+        loader.docs.insert(
+            "https://schemas.example.com/common.json".to_string(),
+            br#"{"components":{"schemas":{"Item":{"type":"object","properties":{"id":{"type":"string"}}}}}}"#.to_vec(),
+        );
+        let (ext_bundle, ext_metadata) = extract_with_external_refs(
+            ext_spec_body,
+            Some(SpecFormat::Json),
+            "default",
+            &process_policy,
+            &loader,
+        )
+        .map_err(|_| "failed to extract external-ref spec fixture for build_spec_row cap test")?;
+        let build_err = build_spec_row_with_snapshot_limits(
+            "ext-cap-spec".to_string(),
+            ext_bundle.proxy.id.clone(),
+            "default".to_string(),
+            ext_spec_body,
+            &ext_metadata,
+            &ext_bundle,
+            crate::admin::api_specs::external_refs::MAX_EXTERNAL_REF_SNAPSHOT_DECOMPRESSED_BYTES,
+            16,
+        )
+        .err()
+        .ok_or("build_spec_row_with_snapshot_limits unexpectedly succeeded under 16-byte compressed cap")?;
+        let resp_422 = error_response(build_err);
         if resp_422.status() != StatusCode::UNPROCESSABLE_ENTITY {
-            return Err("compressed snapshot SchemaTooLarge did not map to HTTP 422");
+            return Err(
+                "build_spec_row compressed snapshot SchemaTooLarge did not map to HTTP 422",
+            );
         }
         let body_422 = resp_422
             .into_body()
@@ -5012,7 +5084,10 @@ pub async fn handle_get_api_spec(
     // Acquire read codec capacity BEFORE loading the full compressed spec blob
     // from the database so bursts of concurrent reads cannot hold unbounded
     // multi-MiB rows in memory while queued.
-    let Ok(read_permit) = Arc::clone(&SPEC_READ_CODEC_SLOTS).acquire_owned().await else {
+    let Ok(read_permit) = Arc::clone(&crate::admin::api_specs::SPEC_READ_CODEC_SLOTS)
+        .acquire_owned()
+        .await
+    else {
         return Ok(json_resp(
             StatusCode::SERVICE_UNAVAILABLE,
             &json!({"error": "Spec codec admission unavailable"}),
@@ -5080,7 +5155,10 @@ pub async fn handle_get_api_spec_by_proxy(
         None
     };
 
-    let Ok(read_permit) = Arc::clone(&SPEC_READ_CODEC_SLOTS).acquire_owned().await else {
+    let Ok(read_permit) = Arc::clone(&crate::admin::api_specs::SPEC_READ_CODEC_SLOTS)
+        .acquire_owned()
+        .await
+    else {
         return Ok(json_resp(
             StatusCode::SERVICE_UNAVAILABLE,
             &json!({"error": "Spec codec admission unavailable"}),

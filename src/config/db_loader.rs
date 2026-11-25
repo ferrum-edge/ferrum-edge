@@ -3339,10 +3339,12 @@ impl DatabaseStore {
             .bind(namespace)
             .fetch_all(&mut **tx)
             .await?;
-        let api_specs = rows
-            .iter()
-            .map(row_to_api_spec)
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut api_specs = Vec::with_capacity(rows.len());
+        for row in &rows {
+            api_specs.push(
+                row_to_api_spec_async(row, &crate::admin::api_specs::SPEC_READ_CODEC_SLOTS).await?,
+            );
+        }
         // Release the driver copy of every stored spec document now that each
         // is decoded, rather than holding both until the snapshot returns.
         drop(rows);
@@ -3592,7 +3594,9 @@ impl DatabaseStore {
                 .await?;
         let mut specs = Vec::with_capacity(rows.len());
         for row in &rows {
-            specs.push(row_to_api_spec(row)?);
+            specs.push(
+                row_to_api_spec_async(row, &crate::admin::api_specs::SPEC_READ_CODEC_SLOTS).await?,
+            );
         }
         self.check_slow_query("list_api_specs_with_content", start);
         Ok(specs)
@@ -10937,10 +10941,12 @@ impl DatabaseStore {
     ) -> Result<(), anyhow::Error> {
         use crate::config::types::{AuthMode, ResponseBodyMode};
 
-        crate::admin::api_specs::external_refs::validate_external_ref_snapshot_pair(
+        crate::admin::api_specs::external_refs::validate_external_ref_snapshot_pair_async(
             spec.external_ref_snapshot.as_deref(),
             spec.external_ref_digest.as_deref(),
+            &crate::admin::api_specs::SPEC_WRITE_CODEC_SLOTS,
         )
+        .await
         .map_err(|_| {
             anyhow::anyhow!("api_specs external-ref snapshot integrity validation failed")
         })?;
@@ -11004,13 +11010,18 @@ impl DatabaseStore {
         } else {
             self.q("SELECT * FROM api_specs WHERE namespace = ? AND id = ? FOR UPDATE")
         };
-        let existing_spec: Option<crate::config::types::ApiSpec> = sqlx::query(&existing_spec_sql)
+        let existing_spec_row = sqlx::query(&existing_spec_sql)
             .bind(&spec.namespace)
             .bind(&spec.id)
             .fetch_optional(&mut *tx)
-            .await?
-            .map(|row| row_to_api_spec(&row))
-            .transpose()?;
+            .await?;
+        let existing_spec: Option<crate::config::types::ApiSpec> = match existing_spec_row {
+            Some(row) => Some(
+                row_to_api_spec_async(&row, &crate::admin::api_specs::SPEC_WRITE_CODEC_SLOTS)
+                    .await?,
+            ),
+            None => None,
+        };
         let previous_declared_assoc_ids = match existing_spec.as_ref() {
             Some(existing) => {
                 crate::admin::api_specs::declared_proxy_plugin_association_ids_from_stored_spec_async(
@@ -11900,10 +11911,12 @@ impl DatabaseStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         spec: &crate::config::types::ApiSpec,
     ) -> Result<(), anyhow::Error> {
-        crate::admin::api_specs::external_refs::validate_external_ref_snapshot_pair(
+        crate::admin::api_specs::external_refs::validate_external_ref_snapshot_pair_async(
             spec.external_ref_snapshot.as_deref(),
             spec.external_ref_digest.as_deref(),
+            &crate::admin::api_specs::SPEC_WRITE_CODEC_SLOTS,
         )
+        .await
         .map_err(|_| {
             anyhow::anyhow!("api_specs external-ref snapshot integrity validation failed")
         })?;
@@ -11964,7 +11977,9 @@ impl DatabaseStore {
                 .fetch_optional(&self.pool())
                 .await?;
         match row {
-            Some(r) => Ok(Some(row_to_api_spec(&r)?)),
+            Some(r) => Ok(Some(
+                row_to_api_spec_async(&r, &crate::admin::api_specs::SPEC_READ_CODEC_SLOTS).await?,
+            )),
             None => Ok(None),
         }
     }
@@ -11982,7 +11997,9 @@ impl DatabaseStore {
                 .fetch_optional(&self.pool())
                 .await?;
         match row {
-            Some(r) => Ok(Some(row_to_api_spec(&r)?)),
+            Some(r) => Ok(Some(
+                row_to_api_spec_async(&r, &crate::admin::api_specs::SPEC_READ_CODEC_SLOTS).await?,
+            )),
             None => Ok(None),
         }
     }
@@ -14829,10 +14846,21 @@ pub(crate) fn strip_api_spec_id_from_runtime_config(config: &mut GatewayConfig) 
 ///
 /// This function is used exclusively by the admin-layer api_spec methods.
 /// It must NEVER be called from runtime polling paths.
-fn row_to_api_spec(row: &AnyRow) -> Result<crate::config::types::ApiSpec, anyhow::Error> {
+async fn row_to_api_spec_async(
+    row: &AnyRow,
+    codec_slots: &std::sync::Arc<tokio::sync::Semaphore>,
+) -> Result<crate::config::types::ApiSpec, anyhow::Error> {
     // spec_content is stored as BLOB/BYTEA — sqlx returns Vec<u8>.
     let spec_content: Vec<u8> = row.try_get("spec_content")?;
-    row_to_api_spec_with_content(row, spec_content, true)
+    let spec = row_to_api_spec_with_content(row, spec_content, true)?;
+    crate::admin::api_specs::external_refs::validate_external_ref_snapshot_pair_async(
+        spec.external_ref_snapshot.as_deref(),
+        spec.external_ref_digest.as_deref(),
+        codec_slots,
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("api_specs external-ref snapshot integrity validation failed"))?;
+    Ok(spec)
 }
 
 /// Parse an api_specs content-read row whose query intentionally omitted
@@ -14867,7 +14895,7 @@ fn row_to_api_spec_conditional_meta(
 ///
 /// The list endpoint must not pull the compressed `spec_content` blob for
 /// every row. Keep `spec_content` empty here; full document retrieval goes
-/// through [`row_to_api_spec`].
+/// through [`row_to_api_spec_async`].
 fn row_to_api_spec_summary(row: &AnyRow) -> Result<crate::config::types::ApiSpec, anyhow::Error> {
     row_to_api_spec_with_content(row, Vec::new(), false)
 }
@@ -14908,15 +14936,7 @@ fn row_to_api_spec_with_content(
         None
     };
     let external_ref_digest: Option<String> = row.try_get("external_ref_digest")?;
-    if snapshot_projected {
-        crate::admin::api_specs::external_refs::validate_external_ref_snapshot_pair(
-            external_ref_snapshot.as_deref(),
-            external_ref_digest.as_deref(),
-        )
-        .map_err(|_| {
-            anyhow::anyhow!("api_specs external-ref snapshot integrity validation failed")
-        })?;
-    } else {
+    if !snapshot_projected {
         crate::admin::api_specs::external_refs::validate_external_ref_summary_digest(
             external_ref_digest.as_deref(),
         )
