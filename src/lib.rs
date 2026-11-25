@@ -116,12 +116,15 @@ pub mod _test_support {
         crate::admin::api_specs::handlers::convert_format_capped_for_test(body, from, to, max_bytes)
     }
 
+    pub use crate::admin::ResponseBudgetWrapperAudit;
+
     /// Test helper exercising budgeted `GuardedAdminBody` 64 KiB chunking,
-    /// mid-stream permit retention, drop release, and HEAD stripping.
+    /// mid-stream and queued-frame permit retention, early-drop release, and
+    /// HEAD stripping.
     pub async fn exercise_admin_response_budget_wrapper_for_test(
         capacity_kib: u32,
         body_bytes: usize,
-    ) -> Result<(usize, usize, usize, usize, bool), &'static str> {
+    ) -> Result<ResponseBudgetWrapperAudit, &'static str> {
         crate::admin::exercise_response_budget_wrapper_for_test(capacity_kib, body_bytes).await
     }
 

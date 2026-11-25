@@ -1711,36 +1711,39 @@ async fn admin_response_budget_chunks_holds_permit_and_rejects_oversized_payload
         "second payload exceeding remaining budget must be rejected"
     );
 
-    // A 200 KiB budgeted body must yield multiple <= 64 KiB frames, keep the
-    // permit reserved across intermediate frames, release on drop, and drop
-    // immediately when stripped for HEAD.
-    let (
-        frame_count,
-        available_after_acquire,
-        available_mid_stream,
-        available_after_drop,
-        head_released,
-    ) = ferrum_edge::_test_support::exercise_admin_response_budget_wrapper_for_test(
+    // A 200 KiB budgeted body must yield multiple <= 64 KiB chunks, keep the
+    // permit reserved across intermediate frames AND while queued frames remain
+    // held after `GuardedAdminBody` drops, release on frame drop or early
+    // mid-stream drop, and release immediately when stripped for HEAD.
+    let audit = ferrum_edge::_test_support::exercise_admin_response_budget_wrapper_for_test(
         256,
         200 * 1024,
     )
     .await
     .expect("budgeted response wrapper test helper");
     assert_eq!(
-        frame_count, 4,
+        audit.frame_count, 4,
         "200 KiB body must stream as four <=64 KiB chunks"
     );
-    assert_eq!(available_after_acquire, 56);
+    assert_eq!(audit.available_after_acquire, 56);
     assert_eq!(
-        available_mid_stream, 56,
+        audit.available_mid_stream, 56,
         "budget permit must remain held while subsequent chunks are still pending"
     );
     assert_eq!(
-        available_after_drop, 256,
-        "budget permit must release completely once GuardedAdminBody drops"
+        audit.available_while_frame_queued, 56,
+        "budget permit must remain held while queued GuardedAdminData frames are still in flight"
+    );
+    assert_eq!(
+        audit.available_after_frames_dropped, 256,
+        "budget permit must release completely once all queued frames drop"
     );
     assert!(
-        head_released,
+        audit.early_drop_released,
+        "early mid-stream drop must release response budget immediately"
+    );
+    assert!(
+        audit.head_released,
         "strip_head_response_body must release response budget immediately"
     );
 

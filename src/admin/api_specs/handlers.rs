@@ -1179,9 +1179,9 @@ fn content_type_for_format(fmt: SpecFormat) -> &'static str {
     }
 }
 
-/// Convert spec bytes between formats.
-///
-/// Returns `Err` if the conversion fails (malformed source document).
+/// Bounded `Write` adapter that aborts serialization once output would exceed
+/// `limit` bytes, preventing JSON/YAML format conversion from materializing an
+/// unbounded response buffer.
 struct LimitedWriter {
     buf: Vec<u8>,
     limit: usize,
@@ -1213,6 +1213,10 @@ impl std::io::Write for LimitedWriter {
     }
 }
 
+/// Convert spec bytes between formats under an explicit `max_bytes` cap.
+///
+/// Returns `Err` if the conversion fails (malformed source document or
+/// serialized output exceeding `max_bytes`).
 fn convert_format_capped(
     body: &[u8],
     from: SpecFormat,
@@ -2515,9 +2519,6 @@ async fn build_spec_row_async(
 // Helper: build spec-fetch response with ETag + content negotiation
 // ---------------------------------------------------------------------------
 
-/// `max_decompress_bytes` is the upper bound on decompressed output bytes.
-/// Guards against corrupt or adversarially inflated DB rows.  Callers should
-/// pass `2 * admin_spec_max_body_size_mib * 1024 * 1024`.
 fn spec_representation_etag(
     content_hash: &str,
     stored_format: SpecFormat,
@@ -2595,6 +2596,12 @@ fn spec_response_budget_unavailable_response() -> Response<Full<Bytes>> {
         .unwrap_or_else(|_| crate::admin::admin_builder_failure_response())
 }
 
+/// Build a spec-content response with content negotiation, ETag handling,
+/// bounded decompression/conversion, and per-connection response budgeting.
+///
+/// `max_decompress_bytes` is the upper bound on decompressed and converted
+/// output bytes, guarding against corrupt or adversarially inflated DB rows.
+/// Callers should pass `max_spec_decompress_bytes(admin_spec_max_body_size_mib)`.
 async fn spec_content_response_async(
     spec: ApiSpec,
     request_headers: &hyper::HeaderMap,
