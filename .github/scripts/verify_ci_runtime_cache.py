@@ -4968,6 +4968,8 @@ def _extract_step_submap(step: str, subkey: str) -> tuple[dict[str, str], str | 
             return {}, "; ".join(errs)
         decoded_flow: dict[str, str] = {}
         for raw_k, raw_v in pairs:
+            if raw_v.strip().startswith(("*", "&", "!")):
+                return {}, f"unsupported YAML anchor/alias/tag in flow `{subkey}.{raw_k.strip()}`"
             k_dec = _decode_yaml_value_scalar(raw_k)
             v_dec = _decode_yaml_value_scalar(raw_v)
             if k_dec is None or v_dec is None:
@@ -5705,23 +5707,88 @@ def _load_extra_workflow_texts() -> dict[str, str]:
 _CI_DEBUG_SHELL_FD_PREFIX_RE = re.compile(r"^(?:\d+|\{[A-Za-z_][A-Za-z0-9_]*\})$")
 
 
+def _strip_redirections(typed_words: list[tuple[str, str]]) -> list[str]:
+    """Drop all redirection operator tokens and their immediately following operand tokens."""
+
+    out: list[str] = []
+    i = 0
+    n = len(typed_words)
+    while i < n:
+        kind, text = typed_words[i]
+        if kind == "redir":
+            i += 2
+            continue
+        out.append(text)
+        i += 1
+    return out
+
+
 def _tokenize_shell_script(run_text: str) -> list[list[str]]:
     """POSIX-aware single-pass shell lexer splitting `run_text` into per-command unquoted word lists.
 
     Handles single/double quotes, backslash line-continuation deletion (`\\`+newline
     outside single quotes, never inside `#` comments), `#` comments ending at newline,
-    distinct unquoted redirection operator tokens (`>`, `>>`, `2>&`, `>|`, `<<<`, `&>`,
+    quoted here-document body skipping (`<<'EOF'`, `<<"EOF"`, `<<-'EOF'`), distinct
+    unquoted redirection operator stripping (`>`, `>>`, `2>&`, `>|`, `<<<`, `&>`,
     `{fd}>`, etc.), and command separators (`\\n`, `;`, `&&`, `||`, `|`).
     """
 
     commands: list[list[str]] = []
-    words: list[str] = []
+    typed_words: list[tuple[str, str]] = []
     cur: list[str] = []
     has_token = False
     cur_had_quote = False
     quote: str | None = None
+    # Pending quoted here-docs queued on the current line: list of (delimiter, strip_tabs).
+    pending_heredocs: list[tuple[str, bool]] = []
+    expecting_heredoc_delim: tuple[bool, bool] | None = None  # (active, strip_tabs)
     idx = 0
     n = len(run_text)
+
+    def _flush_word() -> None:
+        nonlocal cur, has_token, cur_had_quote, expecting_heredoc_delim
+        if not has_token:
+            return
+        word = "".join(cur)
+        typed_words.append(("word", word))
+        if expecting_heredoc_delim is not None:
+            _active, strip_tabs = expecting_heredoc_delim
+            if cur_had_quote:
+                pending_heredocs.append((word, strip_tabs))
+            expecting_heredoc_delim = None
+        cur = []
+        has_token = False
+        cur_had_quote = False
+
+    def _flush_command() -> None:
+        nonlocal typed_words, expecting_heredoc_delim
+        _flush_word()
+        expecting_heredoc_delim = None
+        if typed_words:
+            stripped = _strip_redirections(typed_words)
+            if stripped:
+                commands.append(stripped)
+            typed_words = []
+
+    def _consume_pending_heredocs(pos: int) -> int:
+        nonlocal pending_heredocs
+        while pending_heredocs and pos < n:
+            delim, strip_tabs = pending_heredocs.pop(0)
+            while pos < n:
+                nl = run_text.find("\n", pos)
+                if nl < 0:
+                    line = run_text[pos:]
+                    pos = n
+                else:
+                    line = run_text[pos:nl]
+                    pos = nl + 1
+                if line.endswith("\r"):
+                    line = line[:-1]
+                cand = line.lstrip("\t") if strip_tabs else line
+                if cand == delim:
+                    break
+        return pos
+
     while idx < n:
         ch = run_text[idx]
         if quote is None:
@@ -5743,27 +5810,23 @@ def _tokenize_shell_script(run_text: str) -> list[list[str]]:
                 idx += 2
                 continue
             if ch in (" ", "\t", "\r"):
-                if has_token:
-                    words.append("".join(cur))
-                    cur = []
-                    has_token = False
-                    cur_had_quote = False
+                _flush_word()
                 idx += 1
                 continue
-            # Emit unquoted redirection operators as distinct operator tokens so
-            # both `cargo>/dev/null`, `2>& 1`, `2>&1`, `>|`, `<<<`, `&>`, `{fd}>`
-            # stay cleanly separated from command words and operands.
+            # Emit unquoted redirection operators as typed `("redir", op)` tokens so
+            # both operators and operands (even `--` after `<<<` or redirections
+            # inside `env >/dev/null --unset`) are stripped cleanly before scanning.
             if ch in (">", "<"):
                 fd_prefix = ""
                 if has_token:
                     word_so_far = "".join(cur)
                     if not cur_had_quote and _CI_DEBUG_SHELL_FD_PREFIX_RE.match(word_so_far):
                         fd_prefix = word_so_far
+                        cur = []
+                        has_token = False
+                        cur_had_quote = False
                     else:
-                        words.append(word_so_far)
-                    cur = []
-                    has_token = False
-                    cur_had_quote = False
+                        _flush_word()
                 if ch == "<":
                     if run_text[idx : idx + 3] in ("<<<", "<<-"):
                         op = run_text[idx : idx + 3]
@@ -5776,29 +5839,27 @@ def _tokenize_shell_script(run_text: str) -> list[list[str]]:
                         op = run_text[idx : idx + 2]
                     else:
                         op = ">"
-                words.append(fd_prefix + op)
+                typed_words.append(("redir", fd_prefix + op))
+                if op in ("<<", "<<-"):
+                    expecting_heredoc_delim = (True, op == "<<-")
+                else:
+                    expecting_heredoc_delim = None
                 idx += len(op)
                 continue
             if ch == "&" and idx + 1 < n and run_text[idx + 1] == ">":
-                if has_token:
-                    words.append("".join(cur))
-                    cur = []
-                    has_token = False
-                    cur_had_quote = False
+                _flush_word()
                 op = "&>>" if run_text[idx : idx + 3] == "&>>" else "&>"
-                words.append(op)
+                typed_words.append(("redir", op))
+                expecting_heredoc_delim = None
                 idx += len(op)
                 continue
             if ch in ("\n", ";", "|", "&"):
-                if has_token:
-                    words.append("".join(cur))
-                    cur = []
-                    has_token = False
-                    cur_had_quote = False
-                if words:
-                    commands.append(words)
-                    words = []
-                if ch in ("|", "&") and idx + 1 < n and run_text[idx + 1] == ch:
+                _flush_command()
+                if ch == "\n":
+                    idx += 1
+                    if pending_heredocs:
+                        idx = _consume_pending_heredocs(idx)
+                elif ch in ("|", "&") and idx + 1 < n and run_text[idx + 1] == ch:
                     idx += 2
                 else:
                     idx += 1
@@ -5839,10 +5900,7 @@ def _tokenize_shell_script(run_text: str) -> list[list[str]]:
             else:
                 cur.append(ch)
             idx += 1
-    if has_token:
-        words.append("".join(cur))
-    if words:
-        commands.append(words)
+    _flush_command()
     return commands
 
 
@@ -5912,8 +5970,9 @@ def _scan_shell_command_tokens(tokens: list[str]) -> bool:
         if tok in _CI_DEBUG_SHELL_KEYWORDS:
             idx += 1
             continue
-        if _CI_DEBUG_SHELL_REDIR_OP_ONLY_RE.match(tok):
-            idx += 2
+        if tok.endswith(")") and not tok.startswith("-"):
+            # Skip `case` pattern arms (`a)`) and one-line function headers (`f()`).
+            idx += 1
             continue
         if "=" in tok and not tok.startswith("-"):
             var_name = tok.split("=", 1)[0].removesuffix("+")
@@ -5922,6 +5981,11 @@ def _scan_shell_command_tokens(tokens: list[str]) -> bool:
             idx += 1
             continue
         base = tok.rsplit("/", 1)[-1]
+        if base == "rustup" and idx + 2 < len(tokens) and tokens[idx + 1] == "run":
+            idx += 3
+            while idx < len(tokens) and tokens[idx].startswith("-"):
+                idx += 1
+            continue
         if base == "env":
             idx += 1
             while idx < len(tokens):
@@ -6341,6 +6405,26 @@ def _extract_step_run_text_fallback(step: str) -> tuple[str, str | None]:
                 cont_items.pop()
             if cont_items:
                 raw_first = decoded[2].strip()
+                if not raw_first:
+                    # Value starts on the next indented line (`run:\n  ...`).
+                    first_non_blank = next((c for c in cont_items if c is not None), "")
+                    if first_non_blank.startswith(("'", '"', "*", "&", "!")):
+                        return "", "unsupported next-line tagged/anchored/quoted `run:` scalar in fallback parser"
+                    parts: list[str] = []
+                    blank_run = 0
+                    for item in cont_items:
+                        if item is None:
+                            if parts:
+                                blank_run += 1
+                        else:
+                            if parts:
+                                if blank_run > 0:
+                                    parts.append("\n" * blank_run)
+                                    blank_run = 0
+                                else:
+                                    parts.append(" ")
+                            parts.append(item)
+                    return "".join(parts), None
                 if raw_first.startswith(("'", '"')):
                     return "", "unsupported multiline quoted `run:` scalar in fallback parser"
                 first_scalar = _decode_yaml_value_scalar(decoded[2])
@@ -6348,7 +6432,7 @@ def _extract_step_run_text_fallback(step: str) -> tuple[str, str | None]:
                     return "", "unparseable multiline `run:` scalar in fallback parser"
                 # YAML 1.2.2 §6.5: `k` blank lines in a plain multiline scalar emit `k` newlines;
                 # adjacent non-blank lines fold with a single space.
-                parts: list[str] = [first_scalar]
+                parts = [first_scalar]
                 blank_run = 0
                 for item in cont_items:
                     if item is None:
@@ -6526,6 +6610,33 @@ def _check_shared_key_value(
         discovered.add((filename, job_id))
 
 
+def _has_unsupported_fallback_yaml_syntax(workflow_text: str) -> str | None:
+    """Reject explicit `?` YAML mapping keys and key-level anchors/aliases/tags in fallback mode."""
+
+    lines = workflow_text.splitlines()
+    for _idx, (_indent, line) in _iter_non_block_scalar_lines_indexed(lines):
+        # Reject block-level explicit `?` keys (`? foo`, `- ? foo`) and key-level
+        # node properties (`&a run:`, `*a`, `!!str steps:`) while allowing plain
+        # sequence items like `- ?literal`.
+        if re.match(r"^[ \t]*(?:-[ \t]+)?(?:[&!*]|\?(?:[ \t]+|$))", line):
+            return f"unsupported explicit YAML key or node property in fallback parser: {line.strip()!r}"
+        # Reject inline flow explicit keys like `on: { ? workflow_dispatch : {} }` outside quotes.
+        in_quote: str | None = None
+        for pos, ch in enumerate(line):
+            if in_quote is None:
+                if ch == "#":
+                    break
+                if ch in ("'", '"'):
+                    in_quote = ch
+                elif ch in ("{", ","):
+                    rest = line[pos + 1 :].lstrip(" \t")
+                    if rest == "?" or rest.startswith(("? ", "?\t")):
+                        return f"unsupported flow explicit `?` YAML key in fallback parser: {line.strip()!r}"
+            elif ch == in_quote:
+                in_quote = None
+    return None
+
+
 def _discover_ci_debug_jobs(
     workflow_text: str,
     filename: str,
@@ -6572,8 +6683,9 @@ def _discover_ci_debug_jobs(
                     )
         return discovered, errors
 
-    if _has_explicit_yaml_key(workflow_text):
-        errors.append(f"{filename}: unsupported explicit `?` YAML mapping key in fallback parser")
+    unsupported_err = _has_unsupported_fallback_yaml_syntax(workflow_text)
+    if unsupported_err is not None:
+        errors.append(f"{filename}: {unsupported_err}")
     fallback_jobs, job_layout_errs = _iter_fallback_jobs(workflow_text)
     for jerr in job_layout_errs:
         errors.append(f"{filename}: {jerr}")
@@ -6598,9 +6710,9 @@ def _discover_ci_debug_jobs(
                 )
                 if uses_match:
                     raw_uses = _yaml_strip_trailing_comment(uses_match.group(1)).strip()
-                    if YAML_BLOCK_SCALAR.match(raw_uses) or raw_uses.startswith(("*", "&")):
+                    if YAML_BLOCK_SCALAR.match(raw_uses) or raw_uses.startswith(("*", "&", "!")):
                         errors.append(
-                            f"{filename}/{job_id} uses unsupported block-scalar or anchor/alias `uses:` in fallback parser"
+                            f"{filename}/{job_id} uses unsupported block-scalar or anchor/alias/tag `uses:` in fallback parser"
                         )
                         continue
                     cand_uses = _decode_yaml_value_scalar(uses_match.group(1)) or ""
@@ -6625,16 +6737,6 @@ def _discover_ci_debug_jobs(
             if with_err is not None:
                 errors.append(
                     f"{filename}/{job_id} rust-cache step has invalid `with:` mapping: {with_err}"
-                )
-                continue
-            alias_keys = [
-                wk
-                for wk, wv in with_map.items()
-                if isinstance(wv, str) and wv.lstrip().startswith(("*", "&"))
-            ]
-            if alias_keys:
-                errors.append(
-                    f"{filename}/{job_id} rust-cache step uses unsupported YAML anchor/alias in `with.{alias_keys[0]}`"
                 )
                 continue
             _check_shared_key_value(
@@ -6801,8 +6903,12 @@ def check_ci_debug_lane_profile_uniformity(
                 failures,
             )
             step_records = []
-            for step in raw_steps:
-                _k, scalars, _se = _extract_step_keys_and_scalars(step)
+            for step_idx, step in enumerate(raw_steps):
+                _k, scalars, se = _extract_step_keys_and_scalars(step)
+                if se is not None:
+                    failures.append(
+                        f"ci-debug lane member {filename}/{job_id} step #{step_idx} has unparseable step YAML: {se}"
+                    )
                 uses = scalars.get("uses", "")
                 st_env, st_env_err = _extract_step_submap(step, "env")
                 run_text, run_err = _extract_step_run_text_fallback(step)
@@ -11396,6 +11502,11 @@ def self_test() -> int:
             ("attached &>/dev/null mid-cargo", "cargo test --no-run&>/dev/null --config profile.test.debug=2"),
             ("spaced >& /tmp/log before cargo", ">& /tmp/log cargo test --no-run --config profile.dev.debug=2"),
             ("here-string <<< before cargo", "<<< x cargo test --no-run --config profile.dev.debug=2"),
+            ("here-string <<< -- before --config", "cargo test --no-run <<< -- --config profile.test.debug=2"),
+            ("redirection between env and --unset", "env >/dev/null --unset CARGO_PROFILE_DEV_DEBUG cargo test --no-run"),
+            ("rustup run wrapper", "rustup run stable cargo test --no-run --config profile.test.debug=2"),
+            ("case arm prefix", "a) CARGO_PROFILE_DEV_DEBUG=2 cargo test --no-run;;"),
+            ("one-line function body", "f() { cargo test --no-run --config profile.test.debug=2; }; f"),
             ("named fd {fd}> before inline env", "{fd}>/tmp/x CARGO_PROFILE_DEV_DEBUG=2 cargo test --no-run"),
             ("quoted > then & cargo", 'echo ">"& cargo test --no-run --config profile.dev.debug=2'),
             ("2>&1 before inline env", "2>&1 CARGO_PROFILE_DEV_DEBUG=2 cargo test --no-run"),
@@ -11601,6 +11712,13 @@ def self_test() -> int:
                 "        run: cargo --version && kind create cluster --config cluster.yaml\n",
             ),
             (
+                "quoted heredoc example containing cargo --config",
+                "        run: |\n"
+                "          cat <<'EOF' > /tmp/example.txt\n"
+                "          cargo test --config profile.dev.debug=2\n"
+                "          EOF\n",
+            ),
+            (
                 "folded scalar paragraph break separating cargo and kind --config",
                 "        run: >\n"
                 "          cargo --version\n"
@@ -11620,6 +11738,29 @@ def self_test() -> int:
                 f"self-test ({mode_label}): {label} must not be falsely flagged (got {ok_errs!r})",
                 failures,
             )
+        # Direct Swatinem/rust-cache with quoted '*scratch' shared-key and plain '?literal'
+        # list items must NOT trigger false-positive anchor/explicit-key errors.
+        quoted_star_wf = (
+            "name: QuotedStar\non:\n  workflow_dispatch:\njobs:\n"
+            "  scratch-job:\n"
+            "    runs-on: ubuntu-26.04\n"
+            "    steps:\n"
+            "      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0\n"
+            "        with:\n"
+            "          shared-key: '*scratch'\n"
+        )
+        quoted_star_errs: list[str] = []
+        check_ci_debug_lane_profile_uniformity(
+            ci_live_text,
+            ambient_live_text,
+            quoted_star_errs,
+            extra_workflows={"quoted-star.yml": quoted_star_wf},
+        )
+        require(
+            not quoted_star_errs,
+            f"self-test ({mode_label}): quoted '*scratch' shared-key must not be rejected as alias (got {quoted_star_errs!r})",
+            failures,
+        )
         # Direct Swatinem/rust-cache with prefix-key: v0-rust-ci-debug on an unrelated job
         # appends its job ID by default (v0-rust-ci-debug-unrelated), so it must NOT be falsely flagged.
         unrelated_prefix_wf = (
@@ -11941,6 +12082,30 @@ def self_test() -> int:
                 ci_live_text.replace(
                     "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
                     "        run: !!str cargo test --no-run --config profile.dev.debug=2\n",
+                    1,
+                ),
+            ),
+            (
+                "next-line tagged run: value",
+                ci_live_text.replace(
+                    "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
+                    "        run:\n          !!str cargo test --no-run --config profile.dev.debug=2\n",
+                    1,
+                ),
+            ),
+            (
+                "next-line quoted run: value",
+                ci_live_text.replace(
+                    "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
+                    '        run:\n          "cargo test --no-run --config profile.dev.debug=2"\n',
+                    1,
+                ),
+            ),
+            (
+                "key-level anchor &r on run:",
+                ci_live_text.replace(
+                    "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
+                    "        &r run: cargo test --no-run --config profile.dev.debug=2\n",
                     1,
                 ),
             ),
