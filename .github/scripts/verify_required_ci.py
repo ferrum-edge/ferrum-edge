@@ -99,6 +99,7 @@ from verify_ci_runtime_cache import (
     CANONICAL_MERGE_GROUP_BODY,
     CANONICAL_PULL_REQUEST_BODY,
     CANONICAL_PUSH_MAIN_BODY,
+    check_fips_aggregate_guards,
     extract_job,
     job_if,
     job_steps,
@@ -316,21 +317,51 @@ DEDICATED_REQUIRED_CHECKS = {
             "fips-test",
         },
         "contract": {
-            "if: needs.feature-policy.result != 'success'",
-            "if: needs.fips-plan.result != 'success'",
-            "needs.fips-plan.result == 'success' && "
+            "        if: needs.feature-policy.result != 'success'\n",
+            "        if: needs.fips-plan.result != 'success'\n",
+            "        if: needs.fips-plan.result == 'success' && "
             "needs.fips-plan.outputs.relevant != 'true' && "
-            "needs.fips-plan.outputs.relevant != 'false'",
-            "needs.fips-plan.outputs.relevant == 'true' && "
-            "needs.fips-compile.result != 'success'",
-            "needs.fips-plan.outputs.relevant == 'true' && "
-            "needs.fips-claimed-checks.result != 'success'",
-            "needs.fips-plan.outputs.relevant == 'true' && "
-            "needs.fips-clippy.result != 'success'",
-            "needs.fips-plan.outputs.relevant == 'true' && "
-            "needs.fips-test-build.result != 'success'",
-            "needs.fips-plan.outputs.relevant == 'true' && "
-            "needs.fips-test.result != 'success'",
+            "needs.fips-plan.outputs.relevant != 'false'\n",
+            "        if: needs.fips-plan.result == 'success' && "
+            "((needs.fips-plan.outputs.scope != 'full' && "
+            "needs.fips-plan.outputs.scope != 'compile' && "
+            "needs.fips-plan.outputs.scope != 'none') || "
+            "(needs.fips-plan.outputs.relevant == 'false' && "
+            "needs.fips-plan.outputs.scope != 'none') || "
+            "(needs.fips-plan.outputs.relevant == 'true' && "
+            "needs.fips-plan.outputs.scope == 'none'))\n",
+            "        if: needs.fips-plan.result == 'success' && "
+            "github.event_name != 'pull_request' && "
+            "(needs.fips-plan.outputs.relevant != 'true' || "
+            "needs.fips-plan.outputs.scope != 'full')\n",
+            "        if: needs.fips-plan.outputs.relevant == 'true' && "
+            "needs.fips-compile.result != 'success'\n",
+            "        if: needs.fips-plan.outputs.relevant == 'true' && "
+            "(((needs.fips-plan.outputs.scope != 'compile' || "
+            "github.event_name != 'pull_request') && "
+            "needs.fips-claimed-checks.result != 'success') || "
+            "(github.event_name == 'pull_request' && "
+            "needs.fips-plan.outputs.scope == 'compile' && "
+            "needs.fips-claimed-checks.result != 'skipped' && "
+            "needs.fips-claimed-checks.result != 'success'))\n",
+            "        if: needs.fips-plan.outputs.relevant == 'true' && "
+            "needs.fips-clippy.result != 'success'\n",
+            "        if: needs.fips-plan.outputs.relevant == 'true' && "
+            "(((needs.fips-plan.outputs.scope != 'compile' || "
+            "github.event_name != 'pull_request') && "
+            "needs.fips-test-build.result != 'success') || "
+            "(github.event_name == 'pull_request' && "
+            "needs.fips-plan.outputs.scope == 'compile' && "
+            "needs.fips-test-build.result != 'skipped' && "
+            "needs.fips-test-build.result != 'success'))\n",
+            "        if: needs.fips-plan.outputs.relevant == 'true' && "
+            "(((needs.fips-plan.outputs.scope != 'compile' || "
+            "github.event_name != 'pull_request') && "
+            "needs.fips-test.result != 'success') || "
+            "(github.event_name == 'pull_request' && "
+            "needs.fips-plan.outputs.scope == 'compile' && "
+            "needs.fips-test.result != 'skipped' && "
+            "needs.fips-test.result != 'success'))\n",
         },
     },
 }
@@ -2252,6 +2283,38 @@ def main() -> int:
                 planner_errors.append(
                     f"{workflow_path} jobs.{job} is missing fail-closed contract `{contract}`"
                 )
+        if workflow_path == ".github/workflows/fips-build.yml":
+            check_fips_aggregate_guards(workflow_yml, planner_errors)
+            # Self-test the shared structural FIPS guard verifier against
+            # quoted defaults, spaced shell override, and escaped continue-on-error.
+            for label, mutated in (
+                (
+                    "quoted workflow defaults",
+                    '"defaults":\n  run:\n    shell: bash -c true {0}\n' + workflow_yml,
+                ),
+                (
+                    "spaced shell key on guard",
+                    workflow_yml.replace(
+                        "      - name: Fail when FIPS compile did not succeed\n",
+                        "      - name: Fail when FIPS compile did not succeed\n        shell : bash -c true {0}\n",
+                        1,
+                    ),
+                ),
+                (
+                    "escaped continue-on-error on guard",
+                    workflow_yml.replace(
+                        "      - name: Fail when FIPS compile did not succeed\n",
+                        '      - name: Fail when FIPS compile did not succeed\n        "\\u0063ontinue-on-error": true\n',
+                        1,
+                    ),
+                ),
+            ):
+                probe_errors: list[str] = []
+                check_fips_aggregate_guards(mutated, probe_errors)
+                if mutated == workflow_yml or not probe_errors:
+                    planner_errors.append(
+                        f"FIPS aggregate guard self-test must reject {label}"
+                    )
 
     for workflow_path, required_name in sorted(REQUIRED_MERGE_GROUP_WORKFLOWS.items()):
         workflow_yml = Path(workflow_path).read_text(encoding="utf-8")

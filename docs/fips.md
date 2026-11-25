@@ -140,9 +140,13 @@ the module certificate's tested-platform list (see §"The module boundary").
 `.github/workflows/fips-build.yml` is the hosted FIPS gate. `FIPS Feature Policy`
 always audits the resolved feature graph, and the `FIPS Build & Test` aggregate
 fails unless that audit succeeded, including when the expensive jobs are skipped
-as irrelevant. `FIPS Build & Test` compiles the
-locked `fips` binary, every claimed feature combination, clippy `-D warnings`,
-and the policy, key-admission, and frontend/backend/CP-DP handshake tests.
+as irrelevant. On `scope=full` pull requests (FIPS/TLS/DTLS/build-graph/workflow
+diffs), `merge_group`, every push to `main`, and manual dispatch, `FIPS Build & Test`
+compiles the locked `fips` binary, every claimed feature combination, clippy
+`-D warnings`, and the policy, key-admission, and frontend/backend/CP-DP
+handshake tests; ordinary non-FIPS Rust pull requests (`scope=compile`) run the
+locked `fips` compile and clippy `-D warnings` and defer the claimed-profile
+matrix and tests to `merge_group` and `main`.
 
 `FIPS Build & Test` is **merge-blocking and publish-blocking** (issue #4445): it
 is a required check on `main` and in `.github/required-publication-checks.json`,

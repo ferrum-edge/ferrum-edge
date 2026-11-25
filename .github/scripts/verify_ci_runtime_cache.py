@@ -1181,19 +1181,18 @@ def check_rust_cache_uses_shared_key_only(
     *,
     expected_shared_key: str,
 ) -> None:
+    expected_line_re = re.compile(
+        rf"(?m)^[ \t]*['\"]?shared-key['\"]?:\s*['\"]?{re.escape(expected_shared_key)}['\"]?[ \t]*(?:#.*)?$"
+    )
     require(
-        expected_shared_key in with_block,
-        f"{source} rust-cache shared-key must be {expected_shared_key}",
+        expected_line_re.search(with_block) is not None,
+        f"{source} rust-cache shared-key must be exact `{expected_shared_key}`",
         failures,
     )
     require(
-        RUST_CACHE_BARE_KEY.search(with_block) is None,
-        f"{source} must not set rust-cache `key:` (ignored when shared-key is set)",
-        failures,
-    )
-    require(
-        RUST_CACHE_ADD_JOB_ID.search(with_block) is None,
-        f"{source} must not set rust-cache add-job-id-key (unused with shared-key)",
+        RUST_CACHE_BARE_KEY.search(with_block) is None
+        and re.search(r"(?m)^[ \t]*['\"]?(?:key|prefix-key|add-job-id-key)['\"]?:", with_block) is None,
+        f"{source} must not set rust-cache `key:`, `prefix-key:`, or `add-job-id-key:` (ignored or drifts with shared-key)",
         failures,
     )
     require(
@@ -3318,9 +3317,18 @@ def check_fips_producer_channel(
         "FIPS aggregate must depend on the test-binary producer",
         failures,
     )
-    require(
-        "needs.fips-test-build.result != 'success'" in aggregate,
-        "FIPS aggregate must fail closed when the test-binary producer fails",
+    expected_test_build_guard_if = (
+        "needs.fips-plan.outputs.relevant == 'true' && "
+        "(((needs.fips-plan.outputs.scope != 'compile' || github.event_name != 'pull_request') "
+        "&& needs.fips-test-build.result != 'success') || "
+        "(github.event_name == 'pull_request' && needs.fips-plan.outputs.scope == 'compile' "
+        "&& needs.fips-test-build.result != 'skipped' && needs.fips-test-build.result != 'success'))"
+    )
+    require_fips_aggregate_fail_step(
+        aggregate,
+        expected_test_build_guard_if,
+        "FIPS aggregate must fail closed when the test-binary producer fails "
+        "or is unexpectedly skipped outside PR scope=compile",
         failures,
     )
 
@@ -4136,11 +4144,172 @@ def check_fips(workflow: str, failures: list[str]) -> None:
     require(bool(clippy_job), "fips-clippy job is missing", failures)
     require(bool(test_build_job), "fips-test-build job is missing", failures)
     require(bool(test_job), "fips-test job is missing", failures)
+    feature_policy_job = extract_job(workflow, "feature-policy")
+    feature_audit_steps = [
+        step
+        for step in extract_job_steps(feature_policy_job)
+        if "      - name: Audit every claimed FIPS feature combination\n" in step
+    ]
+    feature_audit_exec = (
+        _extract_step_run_exec_lines(feature_audit_steps[0])
+        if len(feature_audit_steps) == 1
+        else None
+    )
+    feature_audit_keys, _feature_audit_scalars, feature_audit_err = (
+        _extract_step_keys_and_scalars(feature_audit_steps[0])
+        if len(feature_audit_steps) == 1
+        else (None, {}, "missing feature-policy audit step")
+    )
+    require(
+        bool(feature_policy_job)
+        and feature_audit_err is None
+        and feature_audit_keys == {"name", "run"}
+        and feature_audit_exec == list(EXPECTED_FIPS_FEATURE_POLICY_AUDIT_LINES)
+        and "< <(python3 .github/scripts/check_fips_feature_policy.py --list-claimed-profiles)"
+        not in feature_policy_job,
+        "feature-policy audit step must be unconditional (`{name, run}`), capture "
+        "--list-claimed-profiles before looping (not process substitution), "
+        "and fail closed with status=1 when zero profiles are audited",
+        failures,
+    )
+    check_fips_concurrency_contract(workflow, failures)
+    check_fips_aggregate_guards(workflow, failures)
+    plan_steps = [
+        step
+        for step in extract_job_steps(plan_job)
+        if "      - name: Check for FIPS compile changes\n" in step
+    ]
+    plan_exec_lines = (
+        _extract_step_run_exec_lines(plan_steps[0])
+        if len(plan_steps) == 1
+        else None
+    )
+    plan_keys, _plan_scalars, plan_keys_err = (
+        _extract_step_keys_and_scalars(plan_steps[0])
+        if len(plan_steps) == 1
+        else (None, {}, "missing fips-plan filter step")
+    )
+    require(
+        "scope: ${{ steps.filter.outputs.scope }}" in plan_job
+        and 'echo "scope=full" >> "$GITHUB_OUTPUT"' in plan_job
+        and plan_keys_err is None
+        and plan_keys == {"name", "id", "env", "run"}
+        and plan_exec_lines is not None
+        and len(plan_exec_lines) >= len(EXPECTED_FIPS_PLAN_TAIL_LINES)
+        and tuple(plan_exec_lines[-len(EXPECTED_FIPS_PLAN_TAIL_LINES) :])
+        == EXPECTED_FIPS_PLAN_TAIL_LINES,
+        "FIPS planner must export its fail-closed scope output as the exact unconditional "
+        "step suffix, reject duplicate/empty relevant or scope lines with exit 1, fail closed "
+        "to relevant=true/scope=full on pre-scope planners, and enforce scope=full on non-PR events",
+        failures,
+    )
     require(
         "needs.fips-plan.outputs.relevant == 'true'" in compile_job,
         "fips-compile must be bound to the trusted planner",
         failures,
     )
+    expected_full_scope_if = (
+        "needs.fips-plan.outputs.relevant == 'true' && "
+        "(needs.fips-plan.outputs.scope != 'compile' || github.event_name != 'pull_request')"
+    )
+    for scoped_job, scoped_name in (
+        (claimed_job, "fips-claimed-checks"),
+        (test_build_job, "fips-test-build"),
+        (test_job, "fips-test"),
+    ):
+        require(
+            "fips-plan" in job_needs_list(scoped_job),
+            f"{scoped_name} must depend on fips-plan for scope gating",
+            failures,
+        )
+        require(
+            job_if(scoped_job) == expected_full_scope_if,
+            f"{scoped_name} must skip only on PR scope == 'compile' "
+            f"(expected `{expected_full_scope_if}`, got `{job_if(scoped_job)}`)",
+            failures,
+        )
+    expected_fips_cargo_env = {
+        "RUSTC_WRAPPER": "",
+        "CARGO_BUILD_RUSTC_WRAPPER": "",
+        "CARGO_BUILD_JOBS": "3",
+        "CARGO_PROFILE_DEV_DEBUG": "0",
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+        "CARGO_PROFILE_DEV_SPLIT_DEBUGINFO": "off",
+        "CARGO_PROFILE_TEST_SPLIT_DEBUGINFO": "off",
+        "CARGO_PROFILE_DEV_CODEGEN_UNITS": "256",
+        "CARGO_PROFILE_TEST_CODEGEN_UNITS": "256",
+    }
+    observed_cargo_envs: dict[str, dict[str, str]] = {}
+    observed_cache_with: dict[str, dict[str, str]] = {}
+    for cargo_job, cargo_name in (
+        (compile_job, "fips-compile"),
+        (claimed_job, "fips-claimed-checks"),
+        (clippy_job, "fips-clippy"),
+        (test_build_job, "fips-test-build"),
+    ):
+        job_cargo_env, job_env_err = _extract_job_cargo_env(cargo_job)
+        require(
+            job_env_err is None,
+            f"{cargo_name} has invalid job env mapping: {job_env_err}",
+            failures,
+        )
+        observed_cargo_envs[cargo_name] = job_cargo_env
+        for env_key, expected_val in expected_fips_cargo_env.items():
+            require(
+                job_cargo_env.get(env_key) == expected_val,
+                f"{cargo_name} must pin uniform {env_key} across FIPS compile/consumer "
+                "jobs so rust-cache and the exact producer handoff stay compatible",
+                failures,
+            )
+        steps_section = cargo_job.split("\n    steps:\n", 1)[1] if "\n    steps:\n" in cargo_job else ""
+        # Reject block-style, single-line/multiline flow-map, spaced-colon,
+        # quoted/escaped, exported, inline, or --config CARGO_*/RUST* overrides
+        # at step level that could drift cache keys or Cargo fingerprints.
+        has_step_cargo_key = _cargo_steps_have_env_override(cargo_job, steps_section)
+        has_shell_cargo_override = (
+            re.search(
+                r"(?m)(?:"
+                r"\bexport\s+(?:CARGO|RUST)[A-Z0-9_]*="
+                r"|\b(?:CARGO_(?:PROFILE|BUILD|INCREMENTAL|TARGET|ENCODED_RUSTFLAGS)|RUSTFLAGS|RUSTDOCFLAGS)[A-Z0-9_]*="
+                r"|--config(?:=|\s+)"
+                r")",
+                steps_section,
+            )
+            is not None
+        )
+        require(
+            not has_step_cargo_key and not has_shell_cargo_override,
+            f"{cargo_name} must not override CARGO_*/RUST* build/profile settings at step level",
+            failures,
+        )
+        for step in extract_job_steps(cargo_job):
+            if RUST_CACHE in step:
+                with_map, with_err = _extract_step_with_decoded(step)
+                require(
+                    with_err is None,
+                    f"{cargo_name} rust-cache step has invalid `with:` mapping: {with_err}",
+                    failures,
+                )
+                disallowed_cache_keys = {"prefix-key", "key", "add-job-id-key"} & set(with_map)
+                require(
+                    not disallowed_cache_keys,
+                    f"{cargo_name} rust-cache step must not set prefix-key, key, or add-job-id-key "
+                    f"(found {sorted(disallowed_cache_keys)})",
+                    failures,
+                )
+                observed_cache_with[cargo_name] = {
+                    k: v for k, v in with_map.items() if k != "save-if"
+                }
+    if len(set(tuple(sorted(v.items())) for v in observed_cargo_envs.values())) != 1:
+        failures.append(
+            "all four FIPS Cargo jobs must declare the exact same set of CARGO_* and RUST* job env vars: "
+            f"{observed_cargo_envs!r}"
+        )
+    if len(set(tuple(sorted(v.items())) for v in observed_cache_with.values())) != 1:
+        failures.append(
+            "all four FIPS Cargo jobs must declare identical Swatinem/rust-cache `with:` inputs "
+            f"(excluding save-if): {observed_cache_with!r}"
+        )
     require(
         "fips-compile" in job_needs_list(claimed_job),
         "fips-claimed-checks must wait for the compile producer handoff to be published",
@@ -4233,6 +4402,42 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         "fips-test must execute the immutable artifact without invoking Cargo",
         failures,
     )
+    test_exec_steps = [
+        step
+        for step in extract_job_steps(test_job)
+        if "      - name: FIPS policy, key-admission, and handshake tests\n" in step
+    ]
+    require(
+        len(test_exec_steps) == 1,
+        "fips-test must contain the unconditional `FIPS policy, key-admission, and handshake tests` step",
+        failures,
+    )
+    if len(test_exec_steps) == 1:
+        exec_step = test_exec_steps[0]
+        exec_keys, _exec_vals, exec_err = _extract_step_keys_and_scalars(exec_step)
+        require(
+            exec_err is None and exec_keys == {"name", "env", "run"},
+            f"fips-test execution step must be unconditional with no if/shell/continue-on-error "
+            f"(keys={sorted(exec_keys) if exec_keys is not None else None}, err={exec_err})",
+            failures,
+        )
+        exec_env, exec_env_err = _extract_step_submap(exec_step, "env")
+        require(
+            exec_env_err is None
+            and exec_env == {
+                "UNIT_TEST_BINARY": "${{ steps.fips-test-binaries.outputs.unit }}",
+                "INTEGRATION_TEST_BINARY": "${{ steps.fips-test-binaries.outputs.integration }}",
+            },
+            f"fips-test execution step must bind UNIT_TEST_BINARY and INTEGRATION_TEST_BINARY exactly (env={exec_env!r}, err={exec_env_err})",
+            failures,
+        )
+        exec_lines = _extract_step_run_exec_lines(exec_step)
+        require(
+            exec_lines == list(EXPECTED_FIPS_TEST_EXEC_LINES),
+            "fips-test execution step must match the pinned executable test body "
+            "(immediate PIPESTATUS[0], non-zero/exact-1 pass-count greps, no early exit, and failure propagation)",
+            failures,
+        )
     require(
         {"fips-plan", "fips-compile", "fips-claimed-checks", "fips-clippy",
          "fips-test-build", "fips-test"} <= job_needs_list(aggregate),
@@ -4240,32 +4445,784 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         "including the test-binary producer",
         failures,
     )
-    require(
-        "needs.fips-compile.result != 'success'" in aggregate,
-        "FIPS aggregate must fail closed when compile fails",
-        failures,
-    )
-    require(
-        "needs.fips-claimed-checks.result != 'success'" in aggregate,
-        "FIPS aggregate must fail closed when claimed-profile checks fail",
-        failures,
-    )
-    require(
-        "needs.fips-clippy.result != 'success'" in aggregate,
-        "FIPS aggregate must fail closed when clippy fails",
-        failures,
-    )
-    require(
-        "needs.fips-test-build.result != 'success'" in aggregate,
-        "FIPS aggregate must fail closed when the test-binary producer fails",
-        failures,
-    )
-    require(
-        "needs.fips-test.result != 'success'" in aggregate,
-        "FIPS aggregate must fail closed when tests fail",
-        failures,
-    )
     check_fips_feature_policy_gate(aggregate, failures)
+
+
+EXPECTED_FIPS_CONCURRENCY_GROUP = (
+    "fips-build-${{ github.event_name }}-"
+    "${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.run_id }}"
+)
+EXPECTED_FIPS_CONCURRENCY_CANCEL = "${{ github.event_name != 'push' }}"
+
+EXPECTED_FIPS_FEATURE_POLICY_AUDIT_LINES = (
+    "set -euo pipefail",
+    'profiles_file="$(mktemp)"',
+    'trap \'rm -f "$profiles_file"\' EXIT',
+    "python3 .github/scripts/check_fips_feature_policy.py \\",
+    '--list-claimed-profiles > "$profiles_file"',
+    "status=0",
+    "audited=0",
+    "while IFS=$'\\t' read -r label features; do",
+    '[ -n "$features" ] || continue',
+    "audited=$((audited + 1))",
+    'echo "::group::FIPS feature graph — ${label}"',
+    'slug="$(printf \'%s\' "$features" | tr \',\' \'-\')"',
+    "cargo tree --color never -e normal,build --prefix none \\",
+    "-f '{p}|{f}' --locked \\",
+    '--no-default-features --features "$features" \\',
+    '> "/tmp/tree-${slug}.txt"',
+    "if ! python3 .github/scripts/check_fips_feature_policy.py \\",
+    '--tree "/tmp/tree-${slug}.txt" --profile fips; then',
+    'echo "::error::FIPS feature-graph audit failed for ${label} (--features ${features})"',
+    "status=1",
+    "fi",
+    'echo "::endgroup::"',
+    'done < "$profiles_file"',
+    'if [ "$audited" -eq 0 ]; then',
+    'echo "::error::FIPS feature-graph audit enumerated zero claimed profiles" >&2',
+    "status=1",
+    "fi",
+    'exit "$status"',
+)
+
+EXPECTED_FIPS_PLAN_TAIL_LINES = (
+    'relevant_count="$(printf \'%s\\n\' "$plan" | grep -c \'^relevant=\' || true)"',
+    'if [ "$relevant_count" -ne 1 ]; then',
+    'echo "::error::trusted relevance filter emitted ${relevant_count} relevant lines (expected 1)" >&2',
+    "exit 1",
+    "fi",
+    'relevant="$(printf \'%s\\n\' "$plan" | sed -n \'s/^relevant=//p\')"',
+    'scope_count="$(printf \'%s\\n\' "$plan" | grep -c \'^scope=\' || true)"',
+    'scope="$(printf \'%s\\n\' "$plan" | sed -n \'s/^scope=//p\')"',
+    'case "$relevant" in',
+    "true|false) ;;",
+    "*)",
+    'echo "::error::trusted relevance filter produced no usable verdict" >&2',
+    "exit 1",
+    ";;",
+    "esac",
+    'if [ "$scope_count" -eq 0 ]; then',
+    'relevant="true"',
+    'scope="full"',
+    'elif [ "$scope_count" -ne 1 ]; then',
+    'echo "::error::trusted relevance filter emitted duplicate scope lines (${scope_count})" >&2',
+    "exit 1",
+    "fi",
+    'case "$scope" in',
+    "full|compile|none) ;;",
+    "*)",
+    'echo "::error::trusted relevance filter produced no usable scope (${scope})" >&2',
+    "exit 1",
+    ";;",
+    "esac",
+    'if { [ "$relevant" = "false" ] && [ "$scope" != "none" ]; } \\',
+    '|| { [ "$relevant" = "true" ] && [ "$scope" = "none" ]; }; then',
+    'echo "::error::trusted relevance filter emitted inconsistent relevant=${relevant} and scope=${scope}" >&2',
+    "exit 1",
+    "fi",
+    'if [ "$EVENT_NAME" != "pull_request" ] && { [ "$relevant" != "true" ] || [ "$scope" != "full" ]; }; then',
+    'echo "::error::non-PR event ${EVENT_NAME} requires relevant=true and scope=full (got relevant=${relevant}, scope=${scope})" >&2',
+    "exit 1",
+    "fi",
+    'echo "relevant=$relevant" >> "$GITHUB_OUTPUT"',
+    'echo "scope=$scope" >> "$GITHUB_OUTPUT"',
+    'echo "Relevance decided by trusted base ${trusted_sha}." >> "$GITHUB_STEP_SUMMARY"',
+    'printf \'%s\\n\' "$plan" | sed -n \'/^## /,$p\' >> "$GITHUB_STEP_SUMMARY"',
+)
+
+EXPECTED_FIPS_TEST_EXEC_LINES = (
+    "set -euo pipefail",
+    'unit_test_binary="$UNIT_TEST_BINARY"',
+    'integration_test_binary="$INTEGRATION_TEST_BINARY"',
+    'unit_log="$RUNNER_TEMP/fips-unit-tests.log"',
+    'handshake_log="$RUNNER_TEMP/fips-handshake-tests.log"',
+    'permit_log="$RUNNER_TEMP/fips-handshake-permit-tests.log"',
+    "python3 .github/scripts/ci_runtime_telemetry.py start --phase fips-unit-tests",
+    "set +e",
+    '"$unit_test_binary" tls::fips_ 2>&1 | tee "$unit_log"',
+    "status=${PIPESTATUS[0]}",
+    "set -e",
+    'if [ "$status" -eq 0 ]; then',
+    "if ! grep -Eq 'test result: ok\\. [1-9][0-9]* passed; 0 failed;' \"$unit_log\" \\",
+    "|| ! grep -Eq '^test .*tls::fips_policy_tests::.* \\.\\.\\. ok$' \"$unit_log\" \\",
+    "|| ! grep -Eq '^test .*tls::fips_key_admission_tests::.* \\.\\.\\. ok$' \"$unit_log\"; then",
+    'echo "::error::FIPS unit tests did not execute passing cases from both tls::fips_policy_tests and tls::fips_key_admission_tests" >&2',
+    "status=1",
+    "fi",
+    "fi",
+    'python3 .github/scripts/ci_runtime_telemetry.py end --phase fips-unit-tests --status "$status"',
+    '[ "$status" -eq 0 ] || exit "$status"',
+    "python3 .github/scripts/ci_runtime_telemetry.py start --phase fips-handshake-tests",
+    "set +e",
+    '"$integration_test_binary" \\',
+    "--exact \\",
+    "integration::cp_grpc_handshake_admission_tests::frontend_and_backend_builders_complete_a_real_tls_handshake \\",
+    '2>&1 | tee "$handshake_log"',
+    "status=${PIPESTATUS[0]}",
+    "set -e",
+    'if [ "$status" -eq 0 ] && ! grep -Eq \'test result: ok\\. 1 passed; 0 failed; 0 ignored;\' "$handshake_log"; then',
+    'echo "::error::FIPS handshake integration test did not execute exactly 1 passing test" >&2',
+    "status=1",
+    "fi",
+    'python3 .github/scripts/ci_runtime_telemetry.py end --phase fips-handshake-tests --status "$status"',
+    '[ "$status" -eq 0 ] || exit "$status"',
+    "python3 .github/scripts/ci_runtime_telemetry.py start --phase fips-handshake-permit-tests",
+    "set +e",
+    '"$integration_test_binary" \\',
+    "--exact \\",
+    "integration::cp_grpc_handshake_admission_tests::legitimate_data_plane_connects_once_a_permit_is_released \\",
+    '2>&1 | tee "$permit_log"',
+    "status=${PIPESTATUS[0]}",
+    "set -e",
+    'if [ "$status" -eq 0 ] && ! grep -Eq \'test result: ok\\. 1 passed; 0 failed; 0 ignored;\' "$permit_log"; then',
+    'echo "::error::FIPS handshake-permit integration test did not execute exactly 1 passing test" >&2',
+    "status=1",
+    "fi",
+    'python3 .github/scripts/ci_runtime_telemetry.py end --phase fips-handshake-permit-tests --status "$status"',
+    'exit "$status"',
+)
+
+EXPECTED_FIPS_AGGREGATE_GUARDS = (
+    (
+        "needs.feature-policy.result != 'success'",
+        "FIPS aggregate must fail closed when feature-policy fails",
+    ),
+    (
+        "needs.fips-plan.result != 'success'",
+        "FIPS aggregate must fail closed when fips-plan fails",
+    ),
+    (
+        "needs.fips-plan.result == 'success' && "
+        "needs.fips-plan.outputs.relevant != 'true' && "
+        "needs.fips-plan.outputs.relevant != 'false'",
+        "FIPS aggregate must fail closed when planner relevant output is unusable",
+    ),
+    (
+        "needs.fips-plan.result == 'success' && "
+        "((needs.fips-plan.outputs.scope != 'full' && "
+        "needs.fips-plan.outputs.scope != 'compile' && "
+        "needs.fips-plan.outputs.scope != 'none') || "
+        "(needs.fips-plan.outputs.relevant == 'false' && "
+        "needs.fips-plan.outputs.scope != 'none') || "
+        "(needs.fips-plan.outputs.relevant == 'true' && "
+        "needs.fips-plan.outputs.scope == 'none'))",
+        "FIPS aggregate must fail closed when planner scope is unusable or inconsistent",
+    ),
+    (
+        "needs.fips-plan.result == 'success' && github.event_name != 'pull_request' && "
+        "(needs.fips-plan.outputs.relevant != 'true' || needs.fips-plan.outputs.scope != 'full')",
+        "FIPS aggregate must fail closed when a non-PR event did not plan relevant=true and scope=full",
+    ),
+    (
+        "needs.fips-plan.outputs.relevant == 'true' && needs.fips-compile.result != 'success'",
+        "FIPS aggregate must fail closed when compile fails",
+    ),
+    (
+        "needs.fips-plan.outputs.relevant == 'true' && "
+        "(((needs.fips-plan.outputs.scope != 'compile' || github.event_name != 'pull_request') "
+        "&& needs.fips-claimed-checks.result != 'success') || "
+        "(github.event_name == 'pull_request' && needs.fips-plan.outputs.scope == 'compile' "
+        "&& needs.fips-claimed-checks.result != 'skipped' && needs.fips-claimed-checks.result != 'success'))",
+        "FIPS aggregate must fail closed when claimed-profile checks fail "
+        "or skip outside PR scope=compile",
+    ),
+    (
+        "needs.fips-plan.outputs.relevant == 'true' && needs.fips-clippy.result != 'success'",
+        "FIPS aggregate must fail closed when clippy fails",
+    ),
+    (
+        "needs.fips-plan.outputs.relevant == 'true' && "
+        "(((needs.fips-plan.outputs.scope != 'compile' || github.event_name != 'pull_request') "
+        "&& needs.fips-test-build.result != 'success') || "
+        "(github.event_name == 'pull_request' && needs.fips-plan.outputs.scope == 'compile' "
+        "&& needs.fips-test-build.result != 'skipped' && needs.fips-test-build.result != 'success'))",
+        "FIPS aggregate must fail closed when the test-binary producer fails "
+        "or is unexpectedly skipped outside PR scope=compile",
+    ),
+    (
+        "needs.fips-plan.outputs.relevant == 'true' && "
+        "(((needs.fips-plan.outputs.scope != 'compile' || github.event_name != 'pull_request') "
+        "&& needs.fips-test.result != 'success') || "
+        "(github.event_name == 'pull_request' && needs.fips-plan.outputs.scope == 'compile' "
+        "&& needs.fips-test.result != 'skipped' && needs.fips-test.result != 'success'))",
+        "FIPS aggregate must fail closed when tests fail or skip outside PR scope=compile",
+    ),
+)
+
+_FLEX_YAML_MAPPING_RE = re.compile(
+    rf"^(?P<lead>[ \t]*)(?P<dash>-[ \t]+)?(?P<key>{YAML_KEY_TOKEN})[ \t]*:(?:[ \t]+(?P<val>.*))?[ \t]*$"
+)
+
+
+def _contains_contiguous_lines(haystack: list[str], needle: tuple[str, ...]) -> bool:
+    n = len(needle)
+    if n == 0:
+        return True
+    for idx in range(len(haystack) - n + 1):
+        if tuple(haystack[idx : idx + n]) == needle:
+            return True
+    return False
+
+
+def _decode_mapping_line(line: str) -> tuple[int, str, str] | None:
+    """Decode a YAML mapping line (tolerating spaces before `:`, quotes, and escapes)."""
+
+    m = _FLEX_YAML_MAPPING_RE.match(line)
+    if not m:
+        return None
+    key = _decode_yaml_scalar(m.group("key"))
+    if key is None:
+        return None
+    indent = len(m.group("lead")) + (len(m.group("dash")) if m.group("dash") else 0)
+    raw_val = m.group("val") or ""
+    return indent, key, raw_val
+
+
+def _decode_yaml_value_scalar(raw_val: str) -> str | None:
+    stripped = _yaml_strip_trailing_comment(raw_val).strip()
+    if stripped == "":
+        return ""
+    return _decode_yaml_scalar(stripped)
+
+
+def _yaml_tree_has_key(obj: object, target_keys: frozenset[str]) -> bool:
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if str(k) in target_keys:
+                return True
+            if _yaml_tree_has_key(v, target_keys):
+                return True
+    elif isinstance(obj, list):
+        for item in obj:
+            if _yaml_tree_has_key(item, target_keys):
+                return True
+    return False
+
+
+def _iter_non_block_scalar_lines(text: str) -> list[tuple[int, str]]:
+    """Yield `(indent, line)` for YAML lines outside block scalars (`|`, `>`)."""
+
+    lines = text.splitlines()
+    out: list[tuple[int, str]] = []
+    idx = 0
+    while idx < len(lines):
+        line = lines[idx]
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            idx += 1
+            continue
+        indent = len(line) - len(line.lstrip(" \t"))
+        out.append((indent, line))
+        decoded = _decode_mapping_line(line)
+        if decoded is not None:
+            key_indent, _key, raw_val = decoded
+            val_no_comment = _yaml_strip_trailing_comment(raw_val).strip()
+            if YAML_BLOCK_SCALAR.match(val_no_comment):
+                idx = _skip_block_scalar(lines, idx + 1, key_indent)
+                continue
+        idx += 1
+    return out
+
+
+def _has_explicit_yaml_key(text: str) -> bool:
+    """Return True if any non-block-scalar YAML line uses explicit `?` key syntax."""
+
+    return any(
+        YAML_EXPLICIT_KEY.match(line) is not None
+        for _indent, line in _iter_non_block_scalar_lines(text)
+    )
+
+
+def _collect_flow_keys_in_section(text: str) -> tuple[list[str], bool]:
+    """Collect decoded keys from single-line and multiline `{...}` flow maps in `text`.
+
+    Returns `(keys, unsupported_syntax)` where `unsupported_syntax` is True if an
+    unterminated/unparseable flow mapping or explicit `?` key appears outside
+    block scalars (fail-closed in the fallback parser).
+    """
+
+    keys: list[str] = []
+    non_block = [line for _indent, line in _iter_non_block_scalar_lines(text)]
+    idx = 0
+    while idx < len(non_block):
+        line = non_block[idx]
+        if YAML_EXPLICIT_KEY.match(line):
+            return keys, True
+        raw_pos = -1
+        decoded = _decode_mapping_line(line)
+        if decoded is not None:
+            val_stripped = _yaml_strip_trailing_comment(decoded[2]).lstrip()
+            if val_stripped.startswith("{") and not val_stripped.startswith("${{"):
+                # Locate the `{` starting the mapping value (after the key's `:`).
+                colon_idx = line.find(":")
+                if colon_idx != -1:
+                    raw_pos = line.find("{", colon_idx + 1)
+        elif re.match(r"^[ \t]*-[ \t]*\{", line):
+            raw_pos = line.find("{")
+        if raw_pos != -1:
+            flow_text, next_idx = _collect_multiline_flow(
+                non_block, line[raw_pos:], idx + 1
+            )
+            if flow_text is None:
+                return keys, True
+            pairs, errs = _collect_flow_mapping_pairs(flow_text)
+            if errs:
+                return keys, True
+            for raw_k, _v in pairs:
+                dec_k = _decode_yaml_scalar(raw_k)
+                if dec_k is None:
+                    return keys, True
+                keys.append(dec_k)
+            idx = next_idx
+            continue
+        idx += 1
+    return keys, False
+
+
+def _section_has_mapping_key(
+    text: str,
+    target_keys: frozenset[str],
+    *,
+    indent_filter: int | None = None,
+) -> bool:
+    """Detect decoded mapping keys (quoted, escaped, spaced-colon, or flow-map)."""
+
+    for _indent, line in _iter_non_block_scalar_lines(text):
+        decoded = _decode_mapping_line(line)
+        if decoded is not None:
+            key_indent, key, _raw_val = decoded
+            if key in target_keys and (indent_filter is None or key_indent == indent_filter):
+                return True
+    if indent_filter is None:
+        flow_keys, unsupported = _collect_flow_keys_in_section(text)
+        if unsupported or any(k in target_keys for k in flow_keys):
+            return True
+    return False
+
+
+def _section_has_mapping_key_prefix(text: str, prefixes: tuple[str, ...]) -> bool:
+    """Detect decoded mapping keys starting with any prefix (block or multiline flow-map)."""
+
+    for _indent, line in _iter_non_block_scalar_lines(text):
+        decoded = _decode_mapping_line(line)
+        if decoded is not None and any(decoded[1].startswith(p) for p in prefixes):
+            return True
+    flow_keys, unsupported = _collect_flow_keys_in_section(text)
+    if unsupported or any(any(k.startswith(p) for p in prefixes) for k in flow_keys):
+        return True
+    return False
+
+
+def _cargo_steps_have_env_override(cargo_job: str, steps_section: str) -> bool:
+    """Detect any step-level CARGO_*/RUST* env override in both PyYAML and fallback modes."""
+
+    parsed, yaml_avail, yaml_err = _try_yaml_safe_load(cargo_job)
+    if yaml_avail:
+        if yaml_err is not None or not isinstance(parsed, dict):
+            return True
+        job_obj = (
+            next(iter(parsed.values()))
+            if len(parsed) == 1
+            and "steps" not in parsed
+            and isinstance(next(iter(parsed.values())), dict)
+            else parsed
+        )
+        steps = job_obj.get("steps")
+        if not isinstance(steps, list):
+            return True
+        for step_obj in steps:
+            if not isinstance(step_obj, dict):
+                return True
+            step_env = step_obj.get("env")
+            if isinstance(step_env, dict):
+                if any(str(k).startswith(("CARGO", "RUST")) for k in step_env):
+                    return True
+            elif step_env is not None:
+                return True
+        return False
+    for _indent, line in _iter_non_block_scalar_lines(steps_section):
+        if YAML_FLOW_STEP.match(line):
+            return True
+        decoded = _decode_mapping_line(line)
+        if decoded is not None and decoded[1] == "env":
+            val_stripped = _yaml_strip_trailing_comment(decoded[2]).strip()
+            if val_stripped and not val_stripped.startswith("{"):
+                return True
+    return _section_has_mapping_key_prefix(steps_section, ("CARGO", "RUST"))
+
+
+def _try_yaml_safe_load(text: str) -> tuple[object | None, bool, str | None]:
+    """Parse YAML via PyYAML if installed. Returns `(obj, available, error)`."""
+
+    try:
+        import yaml  # type: ignore[import-untyped]
+    except ImportError:
+        return None, False, None
+    try:
+        return yaml.safe_load(text), True, None
+    except Exception as exc:
+        return None, True, str(exc)
+
+
+def _extract_step_keys_and_scalars(
+    step: str,
+) -> tuple[set[str] | None, dict[str, str], str | None]:
+    """Parse top-level keys and single-line scalar values of a job step."""
+
+    first_nonempty = next((ln for ln in step.splitlines() if ln.strip()), "")
+    if YAML_FLOW_STEP.match(first_nonempty):
+        return None, {}, "flow-style step is disallowed"
+    parsed, yaml_avail, yaml_err = _try_yaml_safe_load(step)
+    if yaml_avail:
+        if yaml_err is not None:
+            return None, {}, f"invalid step YAML: {yaml_err}"
+        if not isinstance(parsed, list) or len(parsed) != 1 or not isinstance(parsed[0], dict):
+            return None, {}, "step did not parse as a single mapping"
+        step_dict = parsed[0]
+        keys = {str(k) for k in step_dict}
+        scalars = {
+            str(k): ("" if v is None else str(v))
+            for k, v in step_dict.items()
+            if not isinstance(v, (dict, list))
+        }
+        # Also verify raw single-line vs block scalar for `run:` when checking
+        # strict single-line `run: exit 1` guards.
+        for _indent, line in _iter_non_block_scalar_lines(step):
+            decoded = _decode_mapping_line(line)
+            if decoded is not None and decoded[0] == 8 and decoded[1] == "run":
+                val_no_comment = _yaml_strip_trailing_comment(decoded[2]).strip()
+                if YAML_BLOCK_SCALAR.match(val_no_comment):
+                    scalars["__run_is_block__"] = "true"
+        return keys, scalars, None
+
+    keys = set()
+    scalars: dict[str, str] = {}
+    lines = step.splitlines()
+    idx = 0
+    while idx < len(lines):
+        line = lines[idx]
+        if not line.strip() or line.lstrip().startswith("#"):
+            idx += 1
+            continue
+        decoded = _decode_mapping_line(line)
+        if decoded is None:
+            indent = len(line) - len(line.lstrip(" \t"))
+            if indent <= 8:
+                return None, {}, f"unparseable step line: {line!r}"
+            idx += 1
+            continue
+        key_indent, key, raw_val = decoded
+        if key_indent == 8:
+            keys.add(key)
+            val_no_comment = _yaml_strip_trailing_comment(raw_val).strip()
+            if YAML_BLOCK_SCALAR.match(val_no_comment):
+                if key == "run":
+                    scalars["__run_is_block__"] = "true"
+                idx = _skip_block_scalar(lines, idx + 1, key_indent)
+                continue
+            scalar = _decode_yaml_value_scalar(raw_val)
+            if scalar is not None:
+                scalars[key] = scalar
+        idx += 1
+    return keys, scalars, None
+
+
+def _extract_step_submap(step: str, subkey: str) -> tuple[dict[str, str], str | None]:
+    """Extract a decoded string mapping from a step child key (e.g. `with` or `env`)."""
+
+    parsed, yaml_avail, yaml_err = _try_yaml_safe_load(step)
+    if yaml_avail:
+        if yaml_err is not None:
+            return {}, f"invalid step YAML: {yaml_err}"
+        if not isinstance(parsed, list) or len(parsed) != 1 or not isinstance(parsed[0], dict):
+            return {}, "step did not parse as a single mapping"
+        raw_sub = parsed[0].get(subkey)
+        if raw_sub is None:
+            return {}, None
+        if not isinstance(raw_sub, dict):
+            return {}, f"`{subkey}:` must be a mapping"
+        return {
+            str(k): ("" if v is None else (str(v).lower() if isinstance(v, bool) else str(v)))
+            for k, v in raw_sub.items()
+        }, None
+
+    lines = step.splitlines()
+    sub_idx = None
+    sub_indent = 0
+    sub_inline = ""
+    for idx, line in enumerate(lines):
+        decoded = _decode_mapping_line(line)
+        if decoded is not None and decoded[0] == 8 and decoded[1] == subkey:
+            sub_idx = idx
+            sub_indent = decoded[0]
+            sub_inline = _yaml_strip_trailing_comment(decoded[2]).strip()
+            break
+    if sub_idx is None:
+        return {}, None
+    if sub_inline.startswith("{"):
+        flow_block = _balanced_flow(sub_inline, 0)
+        if flow_block is None:
+            return {}, f"unterminated flow `{subkey}:`"
+        pairs, errs = _collect_flow_mapping_pairs(flow_block[0])
+        if errs:
+            return {}, "; ".join(errs)
+        return {k: v for k, v in pairs}, None
+    result: dict[str, str] = {}
+    idx = sub_idx + 1
+    while idx < len(lines):
+        line = lines[idx]
+        if not line.strip() or line.lstrip().startswith("#"):
+            idx += 1
+            continue
+        indent = len(line) - len(line.lstrip(" \t"))
+        if indent <= sub_indent:
+            break
+        decoded = _decode_mapping_line(line)
+        if decoded is None:
+            return {}, f"unparseable `{subkey}:` entry: {line!r}"
+        key_indent, key, raw_val = decoded
+        val_no_comment = _yaml_strip_trailing_comment(raw_val).strip()
+        if YAML_BLOCK_SCALAR.match(val_no_comment):
+            next_idx = _skip_block_scalar(lines, idx + 1, key_indent)
+            block_text = "\n".join(ln.strip() for ln in lines[idx + 1 : next_idx] if ln.strip())
+            result[key] = block_text
+            idx = next_idx
+            continue
+        scalar = _decode_yaml_value_scalar(raw_val)
+        if scalar is None:
+            return {}, f"unparseable scalar in `{subkey}.{key}`"
+        result[key] = scalar
+        idx += 1
+    return result, None
+
+
+def _extract_step_with_decoded(step: str) -> tuple[dict[str, str], str | None]:
+    return _extract_step_submap(step, "with")
+
+
+def _extract_job_cargo_env(job_body: str) -> tuple[dict[str, str], str | None]:
+    """Extract all CARGO_*/RUST* entries from a job's `env:` block (decoded)."""
+
+    parsed, yaml_avail, yaml_err = _try_yaml_safe_load(job_body)
+    if yaml_avail:
+        if yaml_err is not None:
+            return {}, f"invalid job YAML: {yaml_err}"
+        if isinstance(parsed, dict):
+            job_obj = (
+                next(iter(parsed.values()))
+                if len(parsed) == 1
+                and "env" not in parsed
+                and "steps" not in parsed
+                and isinstance(next(iter(parsed.values())), dict)
+                else parsed
+            )
+            raw_env = job_obj.get("env")
+            if raw_env is None:
+                return {}, None
+            if not isinstance(raw_env, dict):
+                return {}, "job `env:` must be a mapping"
+            return {
+                str(k): ("" if v is None else str(v))
+                for k, v in raw_env.items()
+                if str(k).startswith(("CARGO", "RUST"))
+            }, None
+
+    lines = job_body.splitlines()
+    env_idx = None
+    for idx, line in enumerate(lines):
+        decoded = _decode_mapping_line(line)
+        if decoded is not None and decoded[0] == 4 and decoded[1] == "env":
+            env_idx = idx
+            env_inline = _yaml_strip_trailing_comment(decoded[2]).strip()
+            if env_inline.startswith("{"):
+                flow_block = _balanced_flow(env_inline, 0)
+                if flow_block is None:
+                    return {}, "unterminated flow job `env:`"
+                pairs, errs = _collect_flow_mapping_pairs(flow_block[0])
+                if errs:
+                    return {}, "; ".join(errs)
+                return {k: v for k, v in pairs if k.startswith(("CARGO", "RUST"))}, None
+            break
+    if env_idx is None:
+        return {}, None
+    result: dict[str, str] = {}
+    for line in lines[env_idx + 1 :]:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip(" \t"))
+        if indent <= 4:
+            break
+        decoded = _decode_mapping_line(line)
+        if decoded is None:
+            return {}, f"unparseable job env line: {line!r}"
+        _k_indent, key, raw_val = decoded
+        scalar = _decode_yaml_value_scalar(raw_val)
+        if scalar is None:
+            return {}, f"unparseable job env value for {key}"
+        if key.startswith(("CARGO", "RUST")):
+            result[key] = scalar
+    return result, None
+
+
+def _extract_step_run_exec_lines(step: str) -> list[str] | None:
+    """Return stripped non-blank, non-comment executable lines of a step's `run:` script."""
+
+    parsed, yaml_avail, yaml_err = _try_yaml_safe_load(step)
+    if yaml_avail:
+        if yaml_err is not None or not isinstance(parsed, list) or len(parsed) != 1 or not isinstance(parsed[0], dict):
+            return None
+        run_val = parsed[0].get("run")
+        if not isinstance(run_val, str):
+            return None
+        return [
+            line.strip()
+            for line in run_val.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+
+    lines = step.splitlines()
+    for idx, line in enumerate(lines):
+        decoded = _decode_mapping_line(line)
+        if decoded is not None and decoded[0] == 8 and decoded[1] == "run":
+            val_no_comment = _yaml_strip_trailing_comment(decoded[2]).strip()
+            if re.match(r"^\|[0-9]?[-+]?$", val_no_comment):
+                end_idx = _skip_block_scalar(lines, idx + 1, 8)
+                return [
+                    ln.strip()
+                    for ln in lines[idx + 1 : end_idx]
+                    if ln.strip() and not ln.lstrip().startswith("#")
+                ]
+            if val_no_comment.startswith(">"):
+                return None
+            scalar = _decode_yaml_value_scalar(decoded[2])
+            return [scalar.strip()] if scalar else []
+    return None
+
+
+def check_fips_concurrency_contract(workflow: str, failures: list[str]) -> None:
+    """Validate the actual YAML `concurrency:` mapping (immune to comments)."""
+
+    parsed, yaml_avail, yaml_err = _try_yaml_safe_load(workflow)
+    group_val: str | None = None
+    cancel_val: str | None = None
+    if yaml_avail and yaml_err is None and isinstance(parsed, dict):
+        conc = parsed.get("concurrency")
+        if isinstance(conc, dict):
+            raw_group = conc.get("group")
+            raw_cancel = conc.get("cancel-in-progress")
+            group_val = str(raw_group) if raw_group is not None else None
+            cancel_val = str(raw_cancel) if raw_cancel is not None else None
+    else:
+        lines = workflow.splitlines()
+        conc_idx = None
+        for idx, line in enumerate(lines):
+            decoded = _decode_mapping_line(line)
+            if decoded is not None and decoded[0] == 0 and decoded[1] == "concurrency":
+                conc_idx = idx
+                break
+        if conc_idx is not None:
+            for line in lines[conc_idx + 1 :]:
+                if not line.strip() or line.lstrip().startswith("#"):
+                    continue
+                indent = len(line) - len(line.lstrip(" \t"))
+                if indent == 0:
+                    break
+                decoded = _decode_mapping_line(line)
+                if decoded is not None:
+                    _ci, k, raw_v = decoded
+                    v = _decode_yaml_value_scalar(raw_v)
+                    if k == "group":
+                        group_val = v
+                    elif k == "cancel-in-progress":
+                        cancel_val = v
+    require(
+        group_val == EXPECTED_FIPS_CONCURRENCY_GROUP,
+        "fips-build.yml concurrency.group must key non-PR/non-merge_group pushes by github.run_id "
+        f"(got {group_val!r})",
+        failures,
+    )
+    require(
+        cancel_val == EXPECTED_FIPS_CONCURRENCY_CANCEL,
+        "fips-build.yml concurrency.cancel-in-progress must be `${{ github.event_name != 'push' }}` "
+        f"(got {cancel_val!r})",
+        failures,
+    )
+
+
+def check_fips_aggregate_guards(workflow: str, failures: list[str]) -> None:
+    """Structurally verify FIPS workflow defaults/continue-on-error and all 10 aggregate guards."""
+
+    aggregate = extract_job(workflow, "fips-build")
+    require(bool(aggregate), "fips-build aggregate job is missing", failures)
+
+    parsed, yaml_avail, yaml_err = _try_yaml_safe_load(workflow)
+    yaml_has_defaults = False
+    yaml_has_coe = False
+    if yaml_avail:
+        require(yaml_err is None, f"fips-build.yml must be valid YAML: {yaml_err}", failures)
+        if isinstance(parsed, dict):
+            yaml_has_defaults = _yaml_tree_has_key(parsed, frozenset({"defaults"}))
+            yaml_has_coe = _yaml_tree_has_key(parsed, frozenset({"continue-on-error"}))
+
+    require(
+        not _has_explicit_yaml_key(workflow),
+        "fips-build.yml must not use explicit `?` YAML mapping keys",
+        failures,
+    )
+    require(
+        not yaml_has_defaults
+        and not _section_has_mapping_key(workflow, frozenset({"defaults"})),
+        "fips-build.yml must not define workflow-level or job-level `defaults:`",
+        failures,
+    )
+    require(
+        not yaml_has_coe
+        and not _section_has_mapping_key(workflow, frozenset({"continue-on-error"}))
+        and "continue-on-error" not in workflow,
+        "fips-build.yml must not use continue-on-error in any job or step",
+        failures,
+    )
+    for expected_if, message in EXPECTED_FIPS_AGGREGATE_GUARDS:
+        require_fips_aggregate_fail_step(aggregate, expected_if, message, failures)
+
+
+def extract_job_steps(job_body: str) -> list[str]:
+    """Return raw per-step YAML chunks from a job body's `steps:` block."""
+
+    marker = "\n    steps:\n"
+    if marker not in job_body:
+        return []
+    steps_text = job_body.split(marker, 1)[1]
+    starts = [m.start() for m in re.finditer(r"(?m)^      - ", steps_text)]
+    return [
+        steps_text[starts[i] : (starts[i + 1] if i + 1 < len(starts) else len(steps_text))]
+        for i in range(len(starts))
+    ]
+
+
+def require_fips_aggregate_fail_step(
+    aggregate: str,
+    expected_if: str,
+    message: str,
+    failures: list[str],
+) -> None:
+    """Require a pure {name, if, run} step with exact `if:` and single-source-line `run: exit 1`."""
+
+    matching = []
+    for step in extract_job_steps(aggregate):
+        keys, scalars, err = _extract_step_keys_and_scalars(step)
+        if err is not None or keys != {"name", "if", "run"}:
+            continue
+        if scalars.get("__run_is_block__") == "true":
+            continue
+        # Require a literal single-source-line `run: exit 1` (rejecting both
+        # block scalars and multiline quoted strings that fold to `exit 1`).
+        has_single_line_exit1 = (
+            re.search(r"(?m)^        run:[ \t]+exit 1[ \t]*(?:#.*)?$", step) is not None
+        )
+        if has_single_line_exit1 and scalars.get("if") == expected_if and scalars.get("run") == "exit 1":
+            matching.append(step)
+    require(len(matching) == 1, message, failures)
 
 
 # `FIPS Feature Policy` is not itself a required check: branch protection and
@@ -6874,7 +7831,7 @@ def self_test() -> int:
         "      - fips-test-build\n"
         "    steps:\n"
         "      - name: Fail when FIPS test-binary compile did not succeed\n"
-        "        if: needs.fips-plan.outputs.relevant == 'true' && needs.fips-test-build.result != 'success'\n"
+        "        if: needs.fips-plan.outputs.relevant == 'true' && (((needs.fips-plan.outputs.scope != 'compile' || github.event_name != 'pull_request') && needs.fips-test-build.result != 'success') || (github.event_name == 'pull_request' && needs.fips-plan.outputs.scope == 'compile' && needs.fips-test-build.result != 'skipped' && needs.fips-test-build.result != 'success'))\n"
         "        run: exit 1\n"
     )
     serial_failures: list[str] = []
@@ -6958,7 +7915,7 @@ def self_test() -> int:
     )
 
     missing_result = build_only_producer.replace(
-        "        if: needs.fips-plan.outputs.relevant == 'true' && needs.fips-test-build.result != 'success'\n",
+        "        if: needs.fips-plan.outputs.relevant == 'true' && (((needs.fips-plan.outputs.scope != 'compile' || github.event_name != 'pull_request') && needs.fips-test-build.result != 'success') || (github.event_name == 'pull_request' && needs.fips-plan.outputs.scope == 'compile' && needs.fips-test-build.result != 'skipped' && needs.fips-test-build.result != 'success'))\n",
         "        if: needs.fips-plan.outputs.relevant == 'true' && needs.fips-compile.result != 'success'\n",
         1,
     )
@@ -7250,6 +8207,500 @@ def self_test() -> int:
         "self-test: a mutable FIPS planner path must fail the literal-path gate",
         failures,
     )
+
+    # Scope-gating, uniform Cargo-profile, aggregate-bypass, and test-count self-tests.
+    bad_scope_if = handoff_channel.replace(
+        "    if: needs.fips-plan.outputs.relevant == 'true' && (needs.fips-plan.outputs.scope != 'compile' || github.event_name != 'pull_request')\n",
+        "    if: needs.fips-plan.outputs.relevant == 'true' && needs.fips-plan.outputs.scope == 'full'\n",
+        1,
+    )
+    bad_scope_if_failures: list[str] = []
+    check_fips(bad_scope_if, bad_scope_if_failures)
+    require(
+        any("must skip only on PR scope == 'compile'" in item for item in bad_scope_if_failures),
+        "self-test: non-fail-closed scope == 'full' gating must fail",
+        failures,
+    )
+
+    drifted_profile_env = handoff_channel.replace(
+        '      CARGO_PROFILE_DEV_DEBUG: "0"\n',
+        '      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"\n',
+        1,
+    )
+    drifted_profile_env_failures: list[str] = []
+    check_fips(drifted_profile_env, drifted_profile_env_failures)
+    require(
+        any("must pin uniform CARGO_PROFILE_DEV_DEBUG" in item for item in drifted_profile_env_failures),
+        "self-test: drifted CARGO_PROFILE_DEV_DEBUG across FIPS compile jobs must fail",
+        failures,
+    )
+
+    step_env_override = handoff_channel.replace(
+        "      - name: Cache FIPS Rust and AWS-LC outputs\n",
+        '      - name: Override debug\n        env:\n          CARGO_PROFILE_DEV_DEBUG: "1"\n        run: "true"\n      - name: Cache FIPS Rust and AWS-LC outputs\n',
+        1,
+    )
+    step_env_override_failures: list[str] = []
+    check_fips(step_env_override, step_env_override_failures)
+    require(
+        any("must not override CARGO_*/RUST* build/profile settings at step level" in item for item in step_env_override_failures),
+        "self-test: step-level CARGO_PROFILE_* override in FIPS job must fail",
+        failures,
+    )
+
+    flow_step_env_override = handoff_channel.replace(
+        "      - name: Cache FIPS Rust and AWS-LC outputs\n",
+        '      - name: Override flow\n        env: { CARGO_PROFILE_DEV_DEBUG: "1" }\n        run: "true"\n      - name: Cache FIPS Rust and AWS-LC outputs\n',
+        1,
+    )
+    flow_step_env_failures: list[str] = []
+    check_fips(flow_step_env_override, flow_step_env_failures)
+    require(
+        any("must not override CARGO_*/RUST* build/profile settings at step level" in item for item in flow_step_env_failures),
+        "self-test: flow-map step-level CARGO_PROFILE_* override in FIPS job must fail",
+        failures,
+    )
+
+    prefix_key_drift = handoff_channel.replace(
+        '          cache-on-failure: "true"\n',
+        '          "prefix-key": drifted-prefix\n          cache-on-failure: "true"\n',
+        1,
+    )
+    prefix_key_failures: list[str] = []
+    check_fips(prefix_key_drift, prefix_key_failures)
+    require(
+        any("prefix-key" in item for item in prefix_key_failures),
+        "self-test: quoted rust-cache prefix-key override in FIPS job must fail",
+        failures,
+    )
+
+    suffixed_shared_key = handoff_channel.replace(
+        "shared-key: ci-fips-contract-${{ hashFiles('Cargo.toml', 'Cargo.lock', '.cargo/config.toml', 'build.rs', '.github/workflows/fips-build.yml', '.github/scripts/check_fips_feature_policy.py', 'src/fips/**', 'vendor/**') }}\n",
+        "shared-key: ci-fips-contract-${{ hashFiles('Cargo.toml', 'Cargo.lock', '.cargo/config.toml', 'build.rs', '.github/workflows/fips-build.yml', '.github/scripts/check_fips_feature_policy.py', 'src/fips/**', 'vendor/**') }}-extra\n",
+        1,
+    )
+    suffixed_shared_key_failures: list[str] = []
+    check_fips(suffixed_shared_key, suffixed_shared_key_failures)
+    require(
+        any("must be exact" in item or "identical Swatinem/rust-cache" in item for item in suffixed_shared_key_failures),
+        "self-test: suffixed shared-key in one FIPS job must fail",
+        failures,
+    )
+
+    shell_override_guard = handoff_channel.replace(
+        "      - name: Fail when FIPS tests did not succeed\n",
+        "      - name: Fail when FIPS tests did not succeed\n        shell: bash -c true {0}\n",
+        1,
+    )
+    shell_override_failures: list[str] = []
+    check_fips(shell_override_guard, shell_override_failures)
+    require(
+        any("when tests fail" in item for item in shell_override_failures),
+        "self-test: FIPS aggregate guard with shell override must fail",
+        failures,
+    )
+
+    defaults_override_agg = handoff_channel.replace(
+        "  fips-build:\n    name: FIPS Build & Test\n",
+        "  fips-build:\n    name: FIPS Build & Test\n    defaults:\n      run:\n        shell: true {0}\n",
+        1,
+    )
+    defaults_override_failures: list[str] = []
+    check_fips(defaults_override_agg, defaults_override_failures)
+    require(
+        any("defaults:" in item for item in defaults_override_failures),
+        "self-test: job-level defaults: override on fips-build must fail",
+        failures,
+    )
+
+    disabled_plan_guard = handoff_channel.replace(
+        "        if: needs.fips-plan.result != 'success'\n",
+        "        if: false && needs.fips-plan.result != 'success'\n",
+        1,
+    )
+    disabled_plan_failures: list[str] = []
+    check_fips(disabled_plan_guard, disabled_plan_failures)
+    require(
+        any("when fips-plan fails" in item for item in disabled_plan_failures),
+        "self-test: disabled fips-plan failure guard must fail",
+        failures,
+    )
+
+    exit_zero_guard = handoff_channel.replace(
+        "      - name: Fail when FIPS planner scope is unusable\n"
+        "        if: needs.fips-plan.result == 'success' && ((needs.fips-plan.outputs.scope != 'full' && needs.fips-plan.outputs.scope != 'compile' && needs.fips-plan.outputs.scope != 'none') || (needs.fips-plan.outputs.relevant == 'false' && needs.fips-plan.outputs.scope != 'none') || (needs.fips-plan.outputs.relevant == 'true' && needs.fips-plan.outputs.scope == 'none'))\n"
+        "        run: exit 1\n",
+        "      - name: Fail when FIPS planner scope is unusable\n"
+        "        if: needs.fips-plan.result == 'success' && ((needs.fips-plan.outputs.scope != 'full' && needs.fips-plan.outputs.scope != 'compile' && needs.fips-plan.outputs.scope != 'none') || (needs.fips-plan.outputs.relevant == 'false' && needs.fips-plan.outputs.scope != 'none') || (needs.fips-plan.outputs.relevant == 'true' && needs.fips-plan.outputs.scope == 'none'))\n"
+        "        run: exit 0\n",
+        1,
+    )
+    exit_zero_failures: list[str] = []
+    check_fips(exit_zero_guard, exit_zero_failures)
+    require(
+        any("planner scope is unusable" in item for item in exit_zero_failures),
+        "self-test: FIPS aggregate scope guard with exit 0 must fail",
+        failures,
+    )
+
+    continue_on_error_guard = handoff_channel.replace(
+        "      - name: Fail when FIPS compile did not succeed\n"
+        "        if: needs.fips-plan.outputs.relevant == 'true' && needs.fips-compile.result != 'success'\n"
+        "        run: exit 1\n",
+        "      - name: Fail when FIPS compile did not succeed\n"
+        "        if: needs.fips-plan.outputs.relevant == 'true' && needs.fips-compile.result != 'success'\n"
+        "        continue-on-error: true\n"
+        "        run: exit 1\n",
+        1,
+    )
+    coe_failures: list[str] = []
+    check_fips(continue_on_error_guard, coe_failures)
+    require(
+        any("must not use continue-on-error" in item for item in coe_failures),
+        "self-test: FIPS aggregate guard with continue-on-error: true must fail",
+        failures,
+    )
+
+    disabled_scope_guard = handoff_channel.replace(
+        "        if: needs.fips-plan.result == 'success' && ((needs.fips-plan.outputs.scope != 'full'",
+        "        if: false && needs.fips-plan.result == 'success' && ((needs.fips-plan.outputs.scope != 'full'",
+        1,
+    )
+    disabled_scope_failures: list[str] = []
+    check_fips(disabled_scope_guard, disabled_scope_failures)
+    require(
+        any("planner scope is unusable" in item for item in disabled_scope_failures),
+        "self-test: disabled FIPS aggregate scope guard (if: false && ...) must fail",
+        failures,
+    )
+
+    disabled_test_exec = handoff_channel.replace(
+        "      - name: FIPS policy, key-admission, and handshake tests\n",
+        "      - name: FIPS policy, key-admission, and handshake tests\n        if: ${{ false }}\n",
+        1,
+    )
+    disabled_test_exec_failures: list[str] = []
+    check_fips(disabled_test_exec, disabled_test_exec_failures)
+    require(
+        any("must be unconditional" in item for item in disabled_test_exec_failures),
+        "self-test: conditional fips-test execution step (if: false) must fail",
+        failures,
+    )
+
+    coe_test_exec = handoff_channel.replace(
+        "      - name: FIPS policy, key-admission, and handshake tests\n",
+        "      - name: FIPS policy, key-admission, and handshake tests\n        continue-on-error: true\n",
+        1,
+    )
+    coe_test_exec_failures: list[str] = []
+    check_fips(coe_test_exec, coe_test_exec_failures)
+    require(
+        any("continue-on-error" in item for item in coe_test_exec_failures),
+        "self-test: continue-on-error on fips-test execution step must fail",
+        failures,
+    )
+
+    early_exit_test_exec = handoff_channel.replace(
+        '          unit_test_binary="$UNIT_TEST_BINARY"\n',
+        '          exit 0\n          unit_test_binary="$UNIT_TEST_BINARY"\n',
+        1,
+    )
+    early_exit_failures: list[str] = []
+    check_fips(early_exit_test_exec, early_exit_failures)
+    require(
+        any("pinned executable test body" in item for item in early_exit_failures),
+        "self-test: early exit 0 in fips-test execution step must fail",
+        failures,
+    )
+
+    missing_test_count = handoff_channel.replace(
+        "test result: ok\\. 1 passed; 0 failed; 0 ignored;",
+        "test result: ok",
+        1,
+    )
+    missing_test_count_failures: list[str] = []
+    check_fips(missing_test_count, missing_test_count_failures)
+    require(
+        any("pinned executable test body" in item for item in missing_test_count_failures),
+        "self-test: dropping fips-test exact 1-passed assertion must fail",
+        failures,
+    )
+
+    # Round 3/4/5 structural hardening self-tests: every case asserts its own
+    # targeted diagnostic so a passing self-test proves the intended check fired.
+    for label, expected_substr, mutated in (
+        (
+            "quoted workflow-level defaults",
+            "defaults:",
+            handoff_channel.replace(
+                "name: FIPS Build Policy\n",
+                'name: FIPS Build Policy\n"defaults":\n  run:\n    shell: bash -c true {0}\n',
+                1,
+            ),
+        ),
+        (
+            "quoted aggregate-level defaults",
+            "defaults:",
+            handoff_channel.replace(
+                "  fips-build:\n    name: FIPS Build & Test\n",
+                '  fips-build:\n    name: FIPS Build & Test\n    "defaults":\n      run:\n        shell: true {0}\n',
+                1,
+            ),
+        ),
+        (
+            "job-level defaults on fips-test",
+            "defaults:",
+            handoff_channel.replace(
+                "  fips-test:\n    name: FIPS tests\n",
+                "  fips-test:\n    name: FIPS tests\n    defaults:\n      run:\n        shell: bash -c true {0}\n",
+                1,
+            ),
+        ),
+        (
+            "explicit YAML ? defaults key",
+            "explicit `?` YAML mapping keys",
+            handoff_channel.replace(
+                "name: FIPS Build Policy\n",
+                "name: FIPS Build Policy\n? defaults\n: { run: { shell: bash -c true {0} } }\n",
+                1,
+            ),
+        ),
+        (
+            "spaced shell key on aggregate guard",
+            "when compile fails",
+            handoff_channel.replace(
+                "      - name: Fail when FIPS compile did not succeed\n",
+                "      - name: Fail when FIPS compile did not succeed\n        shell : bash -c true {0}\n",
+                1,
+            ),
+        ),
+        (
+            "escaped continue-on-error key",
+            "continue-on-error",
+            handoff_channel.replace(
+                "      - name: Fail when FIPS compile did not succeed\n",
+                '      - name: Fail when FIPS compile did not succeed\n        "\\u0063ontinue-on-error": true\n',
+                1,
+            ),
+        ),
+        (
+            "multiline trap exit-0 on aggregate guard",
+            "when compile fails",
+            handoff_channel.replace(
+                "      - name: Fail when FIPS compile did not succeed\n"
+                "        if: needs.fips-plan.outputs.relevant == 'true' && needs.fips-compile.result != 'success'\n"
+                "        run: exit 1\n",
+                "      - name: Fail when FIPS compile did not succeed\n"
+                "        if: needs.fips-plan.outputs.relevant == 'true' && needs.fips-compile.result != 'success'\n"
+                "        run: |\n"
+                "          trap 'exit 0' EXIT\n"
+                "          exit 1\n",
+                1,
+            ),
+        ),
+        (
+            "multiline quoted run on aggregate guard",
+            "when compile fails",
+            handoff_channel.replace(
+                "      - name: Fail when FIPS compile did not succeed\n"
+                "        if: needs.fips-plan.outputs.relevant == 'true' && needs.fips-compile.result != 'success'\n"
+                "        run: exit 1\n",
+                "      - name: Fail when FIPS compile did not succeed\n"
+                "        if: needs.fips-plan.outputs.relevant == 'true' && needs.fips-compile.result != 'success'\n"
+                '        run: "exit\n          1"\n',
+                1,
+            ),
+        ),
+        (
+            "spaced if key on fips-test execution step",
+            "must be unconditional",
+            handoff_channel.replace(
+                "      - name: FIPS policy, key-admission, and handshake tests\n",
+                "      - name: FIPS policy, key-admission, and handshake tests\n        if : ${{ false }}\n",
+                1,
+            ),
+        ),
+        (
+            "conditional exit 0 in fips-test execution step",
+            "pinned executable test body",
+            handoff_channel.replace(
+                '          unit_test_binary="$UNIT_TEST_BINARY"\n',
+                '          if true; then exit 0; fi\n          unit_test_binary="$UNIT_TEST_BINARY"\n',
+                1,
+            ),
+        ),
+        (
+            "bare exit in fips-test execution step",
+            "pinned executable test body",
+            handoff_channel.replace(
+                '          unit_test_binary="$UNIT_TEST_BINARY"\n',
+                '          exit\n          unit_test_binary="$UNIT_TEST_BINARY"\n',
+                1,
+            ),
+        ),
+        (
+            "intervening command before PIPESTATUS[0] in fips-test",
+            "pinned executable test body",
+            handoff_channel.replace(
+                '          "$unit_test_binary" tls::fips_ 2>&1 | tee "$unit_log"\n          status=${PIPESTATUS[0]}\n',
+                '          "$unit_test_binary" tls::fips_ 2>&1 | tee "$unit_log"\n          true\n          status=${PIPESTATUS[0]}\n',
+                1,
+            ),
+        ),
+        (
+            "fake grep keeping pattern as comment in fips-test",
+            "pinned executable test body",
+            handoff_channel.replace(
+                "          if [ \"$status\" -eq 0 ] && ! grep -Eq 'test result: ok\\. 1 passed; 0 failed; 0 ignored;' \"$handshake_log\"; then\n",
+                "          if false; then # test result: ok\\. 1 passed; 0 failed; 0 ignored;\n",
+                1,
+            ),
+        ),
+        (
+            "cargo --config=profile.dev.debug=1 override",
+            "must not override CARGO_*/RUST* build/profile settings at step level",
+            handoff_channel.replace(
+                "      - name: Build the FIPS profile\n",
+                "      - name: Override cargo config\n        run: cargo --config=profile.dev.debug=1 --version\n      - name: Build the FIPS profile\n",
+                1,
+            ),
+        ),
+        (
+            "inline CARGO_ENCODED_RUSTFLAGS override",
+            "must not override CARGO_*/RUST* build/profile settings at step level",
+            handoff_channel.replace(
+                "      - name: Build the FIPS profile\n",
+                "      - name: Override encoded rustflags\n        run: CARGO_ENCODED_RUSTFLAGS=foo true\n      - name: Build the FIPS profile\n",
+                1,
+            ),
+        ),
+        (
+            "multiline flow env with escaped CARGO_ENCODED_RUSTFLAGS on compile step",
+            "must not override CARGO_*/RUST* build/profile settings at step level",
+            handoff_channel.replace(
+                "      - name: Build the FIPS profile\n",
+                '      - name: Build the FIPS profile\n        env: {"\\u0043ARGO_ENCODED_RUSTFLAGS" : "-Cdebuginfo=1",\n          CI_REVIEW_PROBE: "1"}\n',
+                1,
+            ),
+        ),
+        (
+            "step-level Cargo env key with space before colon",
+            "must not override CARGO_*/RUST* build/profile settings at step level",
+            handoff_channel.replace(
+                "      - name: Build the FIPS profile\n",
+                '      - name: Override spaced env\n        env:\n          CARGO_PROFILE_DEV_DEBUG : "1"\n        run: "true"\n      - name: Build the FIPS profile\n',
+                1,
+            ),
+        ),
+        (
+            "rust-cache prefix-key with space before colon",
+            "prefix-key",
+            handoff_channel.replace(
+                '          cache-on-failure: "true"\n',
+                '          prefix-key : drifted-prefix\n          cache-on-failure: "true"\n',
+                1,
+            ),
+        ),
+        (
+            "comment-shadowed concurrency group reverted to github.ref",
+            "concurrency.group",
+            handoff_channel.replace(
+                "  group: fips-build-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.run_id }}\n",
+                "  # fips-build-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.run_id }}\n"
+                "  group: fips-build-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}\n",
+                1,
+            ),
+        ),
+        (
+            "feature-policy zero-profile returning status=0",
+            "feature-policy audit step",
+            handoff_channel.replace(
+                '          if [ "$audited" -eq 0 ]; then\n'
+                '            echo "::error::FIPS feature-graph audit enumerated zero claimed profiles" >&2\n'
+                "            status=1\n"
+                "          fi\n",
+                '          if [ "$audited" -eq 0 ]; then\n'
+                '            echo "::error::FIPS feature-graph audit enumerated zero claimed profiles" >&2\n'
+                "            status=0\n"
+                "          fi\n",
+                1,
+            ),
+        ),
+        (
+            "feature-policy conditional audit step",
+            "feature-policy audit step",
+            handoff_channel.replace(
+                "      - name: Audit every claimed FIPS feature combination\n",
+                "      - name: Audit every claimed FIPS feature combination\n        if: github.event_name == 'workflow_dispatch'\n",
+                1,
+            ),
+        ),
+        (
+            "feature-policy folded run: > block collapsing script into a comment",
+            "feature-policy audit step",
+            handoff_channel.replace(
+                "        run: |\n          set -euo pipefail\n          profiles_file=",
+                "        run: >\n          # comment\n          set -euo pipefail\n          profiles_file=",
+                1,
+            ),
+        ),
+        (
+            "step-level expression env on compile step",
+            "must not override CARGO_*/RUST* build/profile settings at step level",
+            handoff_channel.replace(
+                "      - name: Build the FIPS profile\n",
+                '      - name: Build the FIPS profile\n        env: ${{ fromJSON(\'{"CARGO_PROFILE_DEV_DEBUG":"1"}\') }}\n',
+                1,
+            ),
+        ),
+        (
+            "alternate-indented step-level expression env on compile step",
+            "must not override CARGO_*/RUST* build/profile settings at step level",
+            handoff_channel.replace(
+                "      - name: Build the FIPS profile\n",
+                '      -  name: Build the FIPS profile\n         env: ${{ fromJSON(\'{"CARGO_PROFILE_DEV_DEBUG":"1"}\') }}\n',
+                1,
+            ),
+        ),
+        (
+            "fips-plan removing exit 1 on invalid relevant_count",
+            "exact unconditional step suffix",
+            handoff_channel.replace(
+                '          if [ "$relevant_count" -ne 1 ]; then\n'
+                '            echo "::error::trusted relevance filter emitted ${relevant_count} relevant lines (expected 1)" >&2\n'
+                "            exit 1\n"
+                "          fi\n",
+                '          if [ "$relevant_count" -ne 1 ]; then\n'
+                '            echo "::error::trusted relevance filter emitted ${relevant_count} relevant lines (expected 1)" >&2\n'
+                "          fi\n",
+                1,
+            ),
+        ),
+        (
+            "fips-plan trailing overwrite of relevant/scope outputs",
+            "exact unconditional step suffix",
+            handoff_channel.replace(
+                '          printf \'%s\\n\' "$plan" | sed -n \'/^## /,$p\' >> "$GITHUB_STEP_SUMMARY"\n',
+                '          printf \'%s\\n\' "$plan" | sed -n \'/^## /,$p\' >> "$GITHUB_STEP_SUMMARY"\n'
+                '          echo "relevant=false" >> "$GITHUB_OUTPUT"\n'
+                '          echo "scope=none" >> "$GITHUB_OUTPUT"\n',
+                1,
+            ),
+        ),
+    ):
+        require(
+            mutated != handoff_channel,
+            f"self-test: mutation `{label}` must alter the FIPS workflow fixture",
+            failures,
+        )
+        probe_failures: list[str] = []
+        check_fips(mutated, probe_failures)
+        require(
+            any(expected_substr in item for item in probe_failures),
+            f"self-test: FIPS verifier must reject `{label}` with `{expected_substr}` "
+            f"(got {probe_failures!r})",
+            failures,
+        )
 
     decoupled_materialization = handoff_channel.replace(
         '          git cat-file blob "$entry_object" > .github/scripts/ci_runtime_plan.py\n',
