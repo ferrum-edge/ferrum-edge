@@ -59,10 +59,11 @@ fn read_shard_filters() -> Vec<(String, Vec<String>)> {
             .and_then(|f| f.as_str())
             .expect("each functional shard entry must declare a string `filters` block");
         // Mirror `ci.yml`'s `while IFS= read -r filter; do [ -z "$filter" ] && continue; ...`
-        // without trimming whitespace or skipping `#` lines, so extra leading/trailing
-        // spaces that would cause nextest to silently skip a module fail immediately.
+        // literally (splitting on `'\n'` without stripping `\r`, trimming whitespace,
+        // or skipping `#` lines), so any leading/trailing space or CRLF carriage return
+        // that would cause nextest to silently skip a module fails immediately.
         let tokens: Vec<String> = filters
-            .lines()
+            .split('\n')
             .filter(|line| !line.is_empty())
             .map(ToString::to_string)
             .collect();
