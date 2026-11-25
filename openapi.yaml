@@ -8878,6 +8878,14 @@ paths:
           the stored format is JSON → converts to YAML before responding.
         - `Accept: */*` or matching stored format → responds in stored format.
 
+        Cross-format conversions enforce both the configured decompression byte
+        ceiling and the 500,000-node source-document ceiling (for JSON sources,
+        every JSON value including containers and object member values is
+        counted during deserialization before duplicate keys collapse; YAML
+        sources also enforce bounded anchor/alias expansion). A stored document
+        that fails parsing or exceeds either ceiling returns `500 Internal
+        Server Error`.
+
         **Conditional GET** (`If-None-Match`): the response includes a
         representation-specific `ETag` based on the uncompressed spec content
         plus the selected response format (`"<hash>-json"` or `"<hash>-yaml"`

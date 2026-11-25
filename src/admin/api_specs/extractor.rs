@@ -575,10 +575,17 @@ pub fn extract_with_external_refs(
             // Explicit non-proxy scopes still fail downstream with a clear
             // error.
             let mut entry_with_default = entry.clone();
-            if let Some(map) = entry_with_default.as_object_mut() {
+            let raw_config = if let Some(map) = entry_with_default.as_object_mut() {
                 map.entry("scope".to_string())
                     .or_insert(serde_json::Value::String("proxy".to_string()));
-            }
+                // Carry the already-parsed literal `config` value directly into
+                // `PluginConfig` so `serde_json::from_value` (with `raw_value`
+                // enabled) cannot reinterpret a `$serde_json::private::RawValue`
+                // key inside `config` into an uncharged nested JSON tree.
+                map.remove("config")
+            } else {
+                None
+            };
 
             let mut pc: PluginConfig = serde_json::from_value(entry_with_default).map_err(|e| {
                 ExtractError::MalformedExtension {
@@ -586,6 +593,9 @@ pub fn extract_with_external_refs(
                     error: e.to_string(),
                 }
             })?;
+            if let Some(config) = raw_config {
+                pc.config = config;
+            }
 
             // --- ID validation for plugin (BEFORE auto-linking) -------------
             // Empty id → leave empty; handler assigns / reuses IDs.
@@ -6723,10 +6733,28 @@ pub(crate) fn parse_json_reader_bounded<R: std::io::Read>(
     Ok(value)
 }
 
+pub(crate) fn deserialize_bounded_json_value<'de, D>(
+    deserializer: D,
+) -> Result<serde_json::Value, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut remaining_nodes = MAX_SOURCE_DOCUMENT_NODES;
+    let mut node_limit_exceeded = false;
+    serde::de::DeserializeSeed::deserialize(
+        BoundedJsonValueSeed {
+            remaining_nodes: &mut remaining_nodes,
+            node_limit_exceeded: &mut node_limit_exceeded,
+        },
+        deserializer,
+    )
+}
+
 /// Test helper verifying that admission (`parse_root_document_with_limit`) and
 /// retrieval conversion (`parse_json_slice_bounded` / `parse_json_reader_bounded`)
-/// enforce the exact same pre-collapse node count on duplicate object members
-/// and map admission limit failures to `ExtractError::InvalidJson` (400).
+/// enforce the exact same pre-collapse node count on duplicate object members,
+/// map admission limit failures to `ExtractError::InvalidJson` (400), and keep
+/// `$serde_json::private::RawValue` keys literal inside extracted plugin configs.
 pub(crate) fn check_json_duplicate_member_limit_parity_for_test() -> Result<(), &'static str> {
     // 1 object + 5 member values (all duplicate key "a") = 6 nodes pre-collapse,
     // only 2 nodes after duplicate-key collapse.
@@ -6758,6 +6786,33 @@ pub(crate) fn check_json_duplicate_member_limit_parity_for_test() -> Result<(), 
         || parse_json_reader_bounded(std::io::Cursor::new(dup_json), 6).is_err()
     {
         return Err("bounded JSON conversion parser rejected duplicate members at exact cap");
+    }
+
+    // Plugin `config` must remain literal even when it contains serde_json's
+    // private `RawValue` marker key.
+    let raw_val_spec = br#"{
+        "openapi": "3.1.0",
+        "info": {"title": "raw-val", "version": "1.0.0"},
+        "paths": {},
+        "x-ferrum-proxy": {"id": "raw-val-proxy", "backend_host": "api.example.com", "backend_port": 443},
+        "x-ferrum-plugins": [{
+            "id": "raw-val-plugin",
+            "plugin_name": "cors",
+            "scope": "proxy",
+            "config": {"$serde_json::private::RawValue": "[1,2,3]"}
+        }]
+    }"#;
+    let (bundle, _) = extract(raw_val_spec, Some(SpecFormat::Json), "ferrum")
+        .map_err(|_| "spec with literal RawValue key in plugin config failed extraction")?;
+    if bundle
+        .plugins
+        .first()
+        .and_then(|p| p.config.as_object())
+        .and_then(|m| m.get("$serde_json::private::RawValue"))
+        .and_then(serde_json::Value::as_str)
+        != Some("[1,2,3]")
+    {
+        return Err("extracted PluginConfig.config reinterpreted RawValue marker");
     }
     Ok(())
 }

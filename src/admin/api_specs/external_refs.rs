@@ -400,7 +400,10 @@ pub struct ExternalRefSnapshotDocument {
     pub content_digest: String,
     /// `json` or `yaml`.
     pub format: String,
-    /// Normalized JSON value of the document.
+    /// Normalized JSON value of the document (deserialized through the shared
+    /// node-bounded literal JSON visitor so `$serde_json::private::RawValue`
+    /// keys remain literal objects and snapshot validation matches admission).
+    #[serde(deserialize_with = "super::extractor::deserialize_bounded_json_value")]
     pub document: Value,
 }
 
@@ -1477,6 +1480,42 @@ pub(crate) fn check_external_json_duplicate_member_limit_for_test() -> Result<()
     }
     if parse_loaded_document_with_limits(&uri, dup_json, 4096, 6).is_err() {
         return Err("external JSON loader rejected duplicate members at exact node cap");
+    }
+
+    // Persistence round-trip must preserve literal `$serde_json::private::RawValue`
+    // keys across `parse_loaded_document_with_limits` -> `ExternalRefSnapshot::gzip_bytes`
+    // -> `validate_external_ref_snapshot_pair` / `from_gzip_bytes`.
+    let raw_marker_json = br#"{"$serde_json::private::RawValue":"[1,2,3]"}"#;
+    let loaded = parse_loaded_document_with_limits(&uri, raw_marker_json, 4096, 16)
+        .map_err(|_| "external JSON loader rejected literal RawValue marker object")?;
+    let mut snap = ExternalRefSnapshot {
+        policy_digest: "0".repeat(64),
+        root_document_base: "https://schemas.example.com/root.json".to_string(),
+        documents: vec![ExternalRefSnapshotDocument {
+            canonical_uri: loaded.canonical_uri.to_string(),
+            content_digest: loaded.content_digest,
+            format: loaded.format.to_string(),
+            document: loaded.root,
+        }],
+        snapshot_digest: String::new(),
+    };
+    snap.snapshot_digest = snap.compute_digest();
+    let gz = snap
+        .gzip_bytes()
+        .map_err(|_| "failed to gzip external-ref snapshot")?;
+    validate_external_ref_snapshot_pair(Some(&gz), Some(&snap.snapshot_digest))
+        .map_err(|_| "external-ref snapshot validation failed for literal RawValue marker")?;
+    let decoded = ExternalRefSnapshot::from_gzip_bytes(&gz, 64 * 1024)
+        .map_err(|_| "failed to decode external-ref snapshot")?;
+    if decoded
+        .documents
+        .first()
+        .and_then(|d| d.document.as_object())
+        .and_then(|m| m.get("$serde_json::private::RawValue"))
+        .and_then(Value::as_str)
+        != Some("[1,2,3]")
+    {
+        return Err("external-ref snapshot decode reinterpreted RawValue marker");
     }
     Ok(())
 }
