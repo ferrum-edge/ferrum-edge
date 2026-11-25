@@ -507,28 +507,31 @@ mod windows_confined_files {
     #[test]
     fn windows_repeated_success_and_refusal_do_not_grow_process_handles() {
         const CHILD_ENV: &str = "FERRUM_WINDOWS_HANDLE_LEAK_CHILD";
+        const TEST_FILTER: &str = "windows_confined_files::windows_repeated_success_and_refusal_do_not_grow_process_handles";
         // `GetProcessHandleCount` observes every handle in the current process.
-        // Re-execute this test alone in a dedicated child process when invoked
-        // from a parallel `cargo test` run so sibling test threads cannot skew
-        // the process-wide handle count.
-        if std::env::var_os(CHILD_ENV).is_none() {
+        // Re-execute this test alone in a dedicated child process unless invoked
+        // via our exact single-test child command (`CHILD_ENV=1` + `--exact`) so
+        // sibling test threads or an inherited env var cannot skew the count.
+        let is_isolated_child = std::env::var(CHILD_ENV).as_deref() == Ok("1")
+            && std::env::args().any(|arg| arg == "--exact")
+            && std::env::args().any(|arg| arg == TEST_FILTER);
+        if !is_isolated_child {
             let exe = std::env::current_exe().unwrap();
             let output = std::process::Command::new(exe)
                 .env(CHILD_ENV, "1")
-                .args([
-                    "--exact",
-                    "windows_confined_files::windows_repeated_success_and_refusal_do_not_grow_process_handles",
-                    "--test-threads=1",
-                    "--nocapture",
-                ])
+                .args(["--exact", TEST_FILTER, "--test-threads=1", "--nocapture"])
                 .output()
                 .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(
                 output.status.success(),
-                "isolated handle-leak child failed ({}):\nstdout:\n{}\nstderr:\n{}",
+                "isolated handle-leak child failed ({}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
                 output.status,
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+                "isolated handle-leak child did not execute exactly 1 passing test (stale filter?):\nstdout:\n{stdout}\nstderr:\n{stderr}",
             );
             return;
         }

@@ -17,6 +17,9 @@ on:
       - src/lib.rs
       - src/config/file_loader.rs
       - src/config/env_config.rs
+      - src/config/conf_file.rs
+      - src/plugins/mod.rs
+      - custom_plugins/**
       - tests/windows_confinement_tests.rs
       - Cargo.toml
       - Cargo.lock
@@ -35,6 +38,9 @@ on:
       - src/lib.rs
       - src/config/file_loader.rs
       - src/config/env_config.rs
+      - src/config/conf_file.rs
+      - src/plugins/mod.rs
+      - custom_plugins/**
       - tests/windows_confinement_tests.rs
       - Cargo.toml
       - Cargo.lock
@@ -93,12 +99,27 @@ jobs:
         with:
           toolchain: stable
 
+      - name: Record Strawberry Perl version for cache key
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $perlVersion = & $env:OPENSSL_SRC_PERL -e 'print $^V'
+          if ([string]::IsNullOrWhiteSpace($perlVersion)) {
+            throw "could not detect Strawberry Perl version at $env:OPENSSL_SRC_PERL"
+          }
+          "OPENSSL_SRC_PERL_VERSION=$perlVersion" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+
       # Main-only-save Rust cache so PRs restore precompiled Windows dependencies
       # (including vendored OpenSSL and the `ferrum-edge` dependency graph)
       # without spending the repository's 10 GB Actions cache quota on PR saves.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          shared-key: "ci-windows-confinement-nasm-${{ env.NASM_VERSION }}-${{ env.NASM_SHA256 }}-strawberry"
+          shared-key: "ci-windows-confinement-nasm-${{ env.NASM_VERSION }}-${{ env.NASM_SHA256 }}"
+          env-vars: |
+            OPENSSL_SRC_PERL
+            OPENSSL_SRC_PERL_VERSION
+            NASM_VERSION
+            NASM_SHA256
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           cache-on-failure: "false"
 
@@ -149,8 +170,9 @@ jobs:
         run: cargo test --test windows_confinement_tests --no-run
 
       # A renamed module would otherwise match zero tests and pass. The module
-      # holds ten ordinary tests; require at least that many to pass. Run them
-      # serially: the handle-leak test counts every handle in the process.
+      # holds ten ordinary tests; require at least that many to pass. Keep
+      # `--test-threads=1` for deterministic filesystem fixtures (the
+      # handle-leak test also isolates itself in a child process).
       - name: Run Windows confinement tests
         shell: bash
         run: |
