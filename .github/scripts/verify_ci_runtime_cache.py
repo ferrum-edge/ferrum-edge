@@ -5745,6 +5745,8 @@ def _tokenize_shell_script(run_text: str) -> tuple[list[list[str]], bool]:
     pending_heredocs: list[tuple[str, bool]] = []
     expecting_heredoc_delim: tuple[bool, bool] | None = None  # (active, strip_tabs)
     expecting_redir_operand = False
+    arith_depth = 0
+    paren_depth = 0
     malformed = False
     idx = 0
     n = len(run_text)
@@ -5765,9 +5767,11 @@ def _tokenize_shell_script(run_text: str) -> tuple[list[list[str]], bool]:
         cur_had_quote = False
 
     def _flush_command() -> None:
-        nonlocal typed_words, expecting_heredoc_delim, expecting_redir_operand
+        nonlocal typed_words, expecting_heredoc_delim, expecting_redir_operand, malformed
         _flush_word()
-        expecting_heredoc_delim = None
+        if expecting_heredoc_delim is not None:
+            malformed = True
+            expecting_heredoc_delim = None
         expecting_redir_operand = False
         if typed_words:
             stripped = _strip_redirections(typed_words)
@@ -5825,6 +5829,44 @@ def _tokenize_shell_script(run_text: str) -> tuple[list[list[str]], bool]:
                 cur_had_quote = True
                 idx += 2
                 continue
+            # Track arithmetic expansions `$(( ... ))` / `(( ... ))` so bitwise
+            # shifts (`<<`, `<<=`, `>>`) inside arithmetic are not treated as heredocs.
+            if run_text[idx : idx + 3] == "$((":
+                arith_depth += 1
+                cur.append("$((")
+                has_token = True
+                idx += 3
+                continue
+            if run_text[idx : idx + 2] == "((":
+                arith_depth += 1
+                cur.append("((")
+                has_token = True
+                idx += 2
+                continue
+            if arith_depth > 0 and run_text[idx : idx + 2] == "))":
+                arith_depth -= 1
+                cur.append("))")
+                has_token = True
+                idx += 2
+                continue
+            if ch == "(" and arith_depth == 0:
+                paren_depth += 1
+                cur.append(ch)
+                has_token = True
+                idx += 1
+                continue
+            if ch == ")" and arith_depth == 0:
+                if paren_depth > 0:
+                    paren_depth -= 1
+                    cur.append(ch)
+                    has_token = True
+                else:
+                    # Unmatched `)` outside `(...)` is a Bash `case` arm terminator
+                    # (e.g. `stable)cargo ...` or `stable ) cargo ...`).
+                    _flush_word()
+                    typed_words.append(("word", ")"))
+                idx += 1
+                continue
             if ch in (" ", "\t", "\r"):
                 _flush_word()
                 idx += 1
@@ -5832,7 +5874,7 @@ def _tokenize_shell_script(run_text: str) -> tuple[list[list[str]], bool]:
             # Emit unquoted redirection operators as typed `("redir", op)` tokens.
             # When a redirection operand is already pending (e.g. `1` in `2>&1>/dev/null`),
             # flush it as the operand word instead of treating it as the next fd prefix.
-            if ch in (">", "<"):
+            if ch in (">", "<") and arith_depth == 0:
                 fd_prefix = ""
                 if has_token:
                     word_so_far = "".join(cur)
@@ -5904,6 +5946,28 @@ def _tokenize_shell_script(run_text: str) -> tuple[list[list[str]], bool]:
         elif quote == "$'":
             if ch == "\\" and idx + 1 < n:
                 nxt = run_text[idx + 1]
+                if nxt == "x":
+                    hex_m = re.match(r"[0-9A-Fa-f]{1,2}", run_text[idx + 2 : idx + 4])
+                    if hex_m:
+                        cur.append(chr(int(hex_m.group(0), 16)))
+                        idx += 2 + len(hex_m.group(0))
+                        continue
+                if nxt in ("u", "U"):
+                    max_digits = 4 if nxt == "u" else 8
+                    hex_m = re.match(
+                        rf"[0-9A-Fa-f]{{1,{max_digits}}}",
+                        run_text[idx + 2 : idx + 2 + max_digits],
+                    )
+                    if hex_m:
+                        cur.append(chr(int(hex_m.group(0), 16)))
+                        idx += 2 + len(hex_m.group(0))
+                        continue
+                if nxt in "01234567":
+                    oct_m = re.match(r"[0-7]{1,3}", run_text[idx + 1 : idx + 4])
+                    if oct_m:
+                        cur.append(chr(int(oct_m.group(0), 8) & 0xFF))
+                        idx += 1 + len(oct_m.group(0))
+                        continue
                 esc_map = {"n": "\n", "r": "\r", "t": "\t", "'": "'", '"': '"', "\\": "\\"}
                 cur.append(esc_map.get(nxt, nxt))
                 idx += 2
@@ -6017,9 +6081,13 @@ def _scan_shell_command_tokens(tokens: list[str]) -> bool:
                 return True
             idx += 1
             continue
-        if tok.endswith(")") and not tok.startswith("-"):
-            # Skip `case` pattern arms (`a)`) and one-line function headers (`f()`).
+        if tok == ")" or (tok.endswith(")") and not tok.startswith("-")):
+            # Skip `case` pattern arms (`a)`, `stable )`) and one-line function headers (`f()`).
             idx += 1
+            continue
+        if idx + 1 < len(tokens) and tokens[idx + 1] == ")":
+            # Skip `<pattern> )` case arm tokens when `)` was tokenized separately.
+            idx += 2
             continue
         base = tok.rsplit("/", 1)[-1]
         if base == "rustup" and idx + 1 < len(tokens) and tokens[idx + 1] == "run":
@@ -6434,7 +6502,9 @@ def _extract_step_run_text_fallback(step: str) -> tuple[str, str | None]:
             if val_no_comment.startswith(("*", "&", "!")):
                 return "", "unsupported YAML anchor/alias/tag in `run:` in fallback parser"
             # Single-line or multiline plain/quoted scalar.
+            raw_first_stripped = _yaml_strip_trailing_comment(decoded[2]).strip()
             cont_items: list[str | None] = []
+            seen_next_line_value = bool(raw_first_stripped)
             j = idx + 1
             while j < len(lines):
                 nxt = lines[j]
@@ -6442,9 +6512,15 @@ def _extract_step_run_text_fallback(step: str) -> tuple[str, str | None]:
                     cont_items.append(None)
                     j += 1
                     continue
+                if not seen_next_line_value and nxt.lstrip().startswith("#"):
+                    # YAML comment lines between `run:` and a next-line value are
+                    # valid at any indentation (including aligned with `run:` or col 0).
+                    j += 1
+                    continue
                 nxt_indent = len(nxt) - len(nxt.lstrip(" \t"))
                 if nxt_indent <= 8:
                     break
+                seen_next_line_value = True
                 cont_items.append(nxt.strip())
                 j += 1
             while cont_items and cont_items[-1] is None:
@@ -6681,7 +6757,8 @@ def _has_unsupported_fallback_yaml_syntax(workflow_text: str) -> str | None:
         if re.match(r"^[ \t]*(?:-[ \t]+)?(?:[&!*]|\?(?:[ \t]+|$))", line):
             return f"unsupported explicit YAML key or node property in fallback parser: {line.strip()!r}"
         # Reject inline flow explicit keys like `on: { ? workflow_dispatch : {} }`
-        # only when actually inside `{ ... }` braces outside quotes.
+        # only when `{` opens an actual YAML flow mapping at a node boundary
+        # (not inside plain scalar text such as `name: CI {build, ? debug}`).
         in_quote: str | None = None
         brace_depth = 0
         for pos, ch in enumerate(line):
@@ -6691,12 +6768,19 @@ def _has_unsupported_fallback_yaml_syntax(workflow_text: str) -> str | None:
                 if ch in ("'", '"'):
                     in_quote = ch
                 elif ch == "{":
-                    brace_depth += 1
-                    rest = line[pos + 1 :].lstrip(" \t")
-                    if rest == "?" or rest.startswith(("? ", "?\t")):
-                        return f"unsupported flow explicit `?` YAML key in fallback parser: {line.strip()!r}"
-                elif ch == "}":
-                    brace_depth = max(0, brace_depth - 1)
+                    before = line[:pos].rstrip(" \t")
+                    is_node_start = (
+                        brace_depth > 0
+                        or not before
+                        or before.endswith((":", "-", "[", ","))
+                    )
+                    if is_node_start:
+                        brace_depth += 1
+                        rest = line[pos + 1 :].lstrip(" \t")
+                        if rest == "?" or rest.startswith(("? ", "?\t")):
+                            return f"unsupported flow explicit `?` YAML key in fallback parser: {line.strip()!r}"
+                elif ch == "}" and brace_depth > 0:
+                    brace_depth -= 1
                 elif ch == "," and brace_depth > 0:
                     rest = line[pos + 1 :].lstrip(" \t")
                     if rest == "?" or rest.startswith(("? ", "?\t")):
@@ -11579,6 +11663,10 @@ def self_test() -> int:
             ("builtin export", "builtin export CARGO_PROFILE_DEV_DEBUG=2"),
             ("case arm prefix", "a) CARGO_PROFILE_DEV_DEBUG=2 cargo test --no-run;;"),
             ("single-line case statement", "case stable in stable) cargo test --no-run --config profile.test.debug=2 ;; esac"),
+            ("tight case arm stable)cargo", "case stable in stable)cargo test --no-run --config profile.test.debug=2 ;; esac"),
+            ("spaced case arm stable ) cargo", "case stable in stable ) cargo test --no-run --config profile.test.debug=2 ;; esac"),
+            ("bare heredoc missing delimiter", "cat <<"),
+            ("unclosed single quote fail closed", "echo 'unterminated"),
             ("function keyword header", "function f() { cargo test --no-run --config profile.test.debug=2; }; f"),
             ("assignment value ending in paren", "RUSTFLAGS=-L/tmp/dir(1) cargo test --no-run"),
             ("one-line function body", "f() { cargo test --no-run --config profile.test.debug=2; }; f"),
@@ -11699,6 +11787,12 @@ def self_test() -> int:
                 "            --config profile.test.debug=2\n",
             ),
             (
+                "unterminated heredoc fail closed",
+                "        run: |\n"
+                "          cat <<EOF\n"
+                "          never closed\n",
+            ),
+            (
                 "ANSI-C heredoc <<$'EOF' followed by cargo --config",
                 "        run: |\n"
                 "          cat <<$'EOF' > /tmp/msg\n"
@@ -11802,6 +11896,32 @@ def self_test() -> int:
                 "          EOF\n",
             ),
             (
+                "unquoted heredoc with apostrophe and harmless text",
+                "        run: |\n"
+                "          cat <<EOF > /tmp/example.txt\n"
+                "          It's cargo test --config profile.dev.debug=2\n"
+                "          EOF\n",
+            ),
+            (
+                "harmless ANSI-C heredoc <<$'EOF' and hex escape <<$'\\x45OF'",
+                "        run: |\n"
+                "          cat <<$'EOF' > /tmp/a.txt\n"
+                "          hello\n"
+                "          EOF\n"
+                "          cat <<$'\\x45OF' > /tmp/b.txt\n"
+                "          hello\n"
+                "          EOF\n"
+                "          echo $'don\\'t'\n",
+            ),
+            (
+                "shell arithmetic bitwise shift << and <<=",
+                "        run: |\n"
+                "          attempt=2\n"
+                "          delay=$((1 << attempt))\n"
+                "          (( delay <<= 1 ))\n"
+                "          echo \"$delay\"\n",
+            ),
+            (
                 "folded scalar paragraph break separating cargo and kind --config",
                 "        run: >\n"
                 "          cargo --version\n"
@@ -11822,9 +11942,9 @@ def self_test() -> int:
                 failures,
             )
         # Direct Swatinem/rust-cache with quoted '*scratch' shared-key, plain ', ? debug'
-        # in workflow name, and plain '- ?literal' list items must NOT false-positive.
+        # and literal braces in workflow name must NOT false-positive.
         quoted_star_wf = (
-            "name: Build widgets, ? debug\non:\n  workflow_dispatch:\njobs:\n"
+            "name: CI {build, ? debug}\non:\n  workflow_dispatch:\njobs:\n"
             "  scratch-job:\n"
             "    runs-on: ubuntu-26.04\n"
             "    steps:\n"
@@ -12181,6 +12301,22 @@ def self_test() -> int:
                 ci_live_text.replace(
                     "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
                     "        run:\n          # comment before value\n          cargo test --no-run --config profile.dev.debug=2\n",
+                    1,
+                ),
+            ),
+            (
+                "run-aligned comment before plain run: override",
+                ci_live_text.replace(
+                    "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
+                    "        run:\n        # aligned comment\n          cargo test --no-run --config profile.test.debug=2\n",
+                    1,
+                ),
+            ),
+            (
+                "run-aligned comment before next-line | block override",
+                ci_live_text.replace(
+                    "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
+                    "        run:\n        # aligned comment\n          |\n            cargo test --no-run --config profile.test.debug=2\n",
                     1,
                 ),
             ),
