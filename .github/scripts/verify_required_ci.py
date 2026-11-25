@@ -762,15 +762,39 @@ def test_artifact_consumer_wiring_errors(ci_yml: str) -> list[str]:
         else:
             build_env[env_key] = env_m.group(1)
 
-    for required_cmd in (
-        "cargo test --no-run --test integration_tests --test functional_tests",
-        "cargo test --no-run --test integration_tests",
-        "cargo test --no-run --test functional_tests",
-        "cargo test --no-run --test k8s_istio_status_cas_live",
-    ):
-        if required_cmd not in build_step:
+    required_build_branches = (
+        (
+            'if [ "$NEED_INTEGRATION" = "true" ] && [ "$NEED_FUNCTIONAL" = "true" ]; then',
+            "cargo test --no-run --test integration_tests --test functional_tests",
+        ),
+        (
+            'elif [ "$NEED_INTEGRATION" = "true" ]; then',
+            "cargo test --no-run --test integration_tests",
+        ),
+        (
+            'elif [ "$NEED_FUNCTIONAL" = "true" ]; then',
+            "cargo test --no-run --test functional_tests",
+        ),
+        (
+            'elif [ "$NEED_HELM_BIN" = "true" ]; then',
+            "cargo test --no-run --test k8s_istio_status_cas_live",
+        ),
+    )
+    build_exec_lines = [
+        line.strip()
+        for line in build_step.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    for branch_cond, required_cmd in required_build_branches:
+        matched_branch = False
+        for idx, line in enumerate(build_exec_lines[:-1]):
+            if line == branch_cond and build_exec_lines[idx + 1] == required_cmd:
+                matched_branch = True
+                break
+        if not matched_branch:
             errors.append(
-                f"jobs.build-test-artifacts build step is missing required command `{required_cmd}`"
+                f"jobs.build-test-artifacts build step must execute `{required_cmd}` "
+                f"directly under `{branch_cond}`"
             )
 
     for full_name in expected_artifacts:
@@ -785,27 +809,45 @@ def test_artifact_consumer_wiring_errors(ci_yml: str) -> list[str]:
         "ferrum-cni-debug-Linux-X64": "ferrum-cni-debug-${{ runner.os }}-${{ runner.arch }}",
     }
 
-    # Explicit inventory of all jobs in ci.yml that consume `build-test-artifacts`.
-    expected_consumers = {
-        "test-integration",
-        "test-vendor-patches",
-        "test-functional",
-        "plugin-hardening-redis-regression",
-        "helm-chart",
-        "main-linux-image",
+    # Explicit inventory of all jobs in ci.yml that consume `build-test-artifacts`
+    # and the exact canonical artifacts each job downloads.
+    expected_consumer_artifacts: dict[str, set[str]] = {
+        "test-integration": {
+            "integration-tests-archive-${{ runner.os }}-${{ runner.arch }}",
+            "ferrum-cni-debug-${{ runner.os }}-${{ runner.arch }}",
+        },
+        "test-vendor-patches": {
+            "integration-tests-archive-${{ runner.os }}-${{ runner.arch }}",
+        },
+        "test-functional": {
+            "ferrum-edge-debug-${{ runner.os }}-${{ runner.arch }}",
+            "functional-tests-archive-${{ runner.os }}-${{ runner.arch }}",
+        },
+        "plugin-hardening-redis-regression": {
+            "ferrum-edge-debug-${{ runner.os }}-${{ runner.arch }}",
+            "functional-tests-archive-${{ runner.os }}-${{ runner.arch }}",
+        },
+        "helm-chart": {
+            "ferrum-edge-debug-${{ runner.os }}-${{ runner.arch }}",
+        },
+        "main-linux-image": {
+            "ferrum-edge-debug-${{ runner.os }}-${{ runner.arch }}",
+            "ferrum-cni-debug-${{ runner.os }}-${{ runner.arch }}",
+        },
     }
+    all_ci_jobs = set(re.findall(r"(?m)^  ([a-z0-9-]+):$", ci_yml))
     discovered_consumers: set[str] = set()
 
-    for job in sorted(set(PATH_GATED_JOBS) | expected_consumers):
+    for job in sorted(all_ci_jobs | set(expected_consumer_artifacts)):
         if job == "build-test-artifacts":
             continue
         job_body = extract_job_body(ci_yml, job)
         if not job_body:
-            if job in expected_consumers:
+            if job in expected_consumer_artifacts:
                 errors.append(f"expected artifact consumer job `{job}` is missing from ci.yml")
             continue
         gate = PATH_GATED_JOBS.get(job)
-        job_downloads_producer_artifact = False
+        job_artifacts: set[str] = set()
         for step in _split_job_steps(job_body):
             if "uses: actions/download-artifact@" not in step:
                 continue
@@ -815,12 +857,12 @@ def test_artifact_consumer_wiring_errors(ci_yml: str) -> list[str]:
             raw_name = art_m.group(1)
             canonical_name = main_linux_aliases.get(raw_name, raw_name)
             if canonical_name not in expected_artifacts:
-                if job in expected_consumers:
+                if job in expected_consumer_artifacts:
                     errors.append(
                         f"jobs.{job} downloads unrecognized artifact `{raw_name}`"
                     )
                 continue
-            job_downloads_producer_artifact = True
+            job_artifacts.add(canonical_name)
             upload_if = artifact_upload_if.get(canonical_name, "")
             archive_step_name, build_vars = expected_artifacts[canonical_name]
             if gate is not None:
@@ -855,14 +897,24 @@ def test_artifact_consumer_wiring_errors(ci_yml: str) -> list[str]:
                         f"jobs.{job} downloads `{raw_name}` on push to main, but "
                         f"build env {build_vars} does not admit push to main"
                     )
-        if job_downloads_producer_artifact:
+        if job_artifacts:
             discovered_consumers.add(job)
+            if job not in expected_consumer_artifacts:
+                errors.append(
+                    f"untracked job `{job}` downloads build-test-artifacts outputs {sorted(job_artifacts)}; "
+                    "add it to expected_consumer_artifacts in verify_required_ci.py"
+                )
+            elif job_artifacts != expected_consumer_artifacts[job]:
+                errors.append(
+                    f"jobs.{job} downloaded {sorted(job_artifacts)}, expected "
+                    f"{sorted(expected_consumer_artifacts[job])}"
+                )
             if not job_needs(job_body, "build-test-artifacts"):
                 errors.append(
                     f"jobs.{job} downloads a build-test-artifacts output without needing `build-test-artifacts`"
                 )
 
-    for missing_consumer in sorted(expected_consumers - discovered_consumers):
+    for missing_consumer in sorted(set(expected_consumer_artifacts) - discovered_consumers):
         errors.append(
             f"expected artifact consumer job `{missing_consumer}` did not download any tracked artifact"
         )
@@ -914,16 +966,37 @@ def test_artifact_consumer_wiring_self_test(ci_yml: str) -> list[str]:
     if bad_download == ci_yml or not test_artifact_consumer_wiring_errors(bad_download):
         failures.append("artifact wiring verifier must reject unknown/mismatched download artifact name")
 
-    # 5. Removing Helm build command must fail.
-    drop_helm_cmd = ci_yml.replace(
-        "cargo test --no-run --test k8s_istio_status_cas_live",
-        "true",
+    # 5. Removing integration-only build command must fail (not masked by combined cmd).
+    drop_integ_cmd = ci_yml.replace(
+        '          elif [ "$NEED_INTEGRATION" = "true" ]; then\n            cargo test --no-run --test integration_tests\n',
+        '          elif [ "$NEED_INTEGRATION" = "true" ]; then\n            true\n',
         1,
     )
-    if drop_helm_cmd == ci_yml or not test_artifact_consumer_wiring_errors(drop_helm_cmd):
-        failures.append("artifact wiring verifier must reject missing Helm build command")
+    if drop_integ_cmd == ci_yml or not test_artifact_consumer_wiring_errors(drop_integ_cmd):
+        failures.append("artifact wiring verifier must reject missing integration-only build command")
 
-    # 6. Equivalent reversed `||` operands must still pass.
+    # 6. Commenting out functional-only build command must fail.
+    comment_func_cmd = ci_yml.replace(
+        '          elif [ "$NEED_FUNCTIONAL" = "true" ]; then\n            cargo test --no-run --test functional_tests\n',
+        '          elif [ "$NEED_FUNCTIONAL" = "true" ]; then\n            # cargo test --no-run --test functional_tests\n            true\n',
+        1,
+    )
+    if comment_func_cmd == ci_yml or not test_artifact_consumer_wiring_errors(comment_func_cmd):
+        failures.append("artifact wiring verifier must reject commented-out functional-only build command")
+
+    # 7. Removing CNI download from test-integration must fail.
+    drop_integ_cni_dl = ci_yml.replace(
+        "      - name: Download prebuilt ferrum-cni binary\n"
+        "        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8\n"
+        "        with:\n"
+        "          name: ferrum-cni-debug-${{ runner.os }}-${{ runner.arch }}\n",
+        "      - name: Skip CNI download\n        run: true\n",
+        1,
+    )
+    if drop_integ_cni_dl == ci_yml or not test_artifact_consumer_wiring_errors(drop_integ_cni_dl):
+        failures.append("artifact wiring verifier must reject missing ferrum-cni-debug download in test-integration")
+
+    # 8. Equivalent reversed `||` operands must still pass.
     reversed_if = ci_yml.replace(
         "if: needs.ci-plan.outputs.run_integration == 'true' || needs.ci-plan.outputs.run_vendor_patches == 'true'",
         "if: needs.ci-plan.outputs.run_vendor_patches == 'true' || needs.ci-plan.outputs.run_integration == 'true'",
@@ -939,9 +1012,17 @@ def check_mode_and_granular_opt_in(plan_body: str) -> list[str]:
     """Verify ci-plan opts into granular gates and forces mode=full on bad handshake."""
 
     errors: list[str] = []
-    if 'plan="$(FERRUM_CI_PLAN_GRANULAR_GATES=1 python3 -I ' not in plan_body:
+    exec_lines = [
+        line.strip()
+        for line in plan_body.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    if not any(
+        line.startswith('plan="$(FERRUM_CI_PLAN_GRANULAR_GATES=1 python3 -I ')
+        for line in exec_lines
+    ):
         errors.append(
-            "jobs.ci-plan must pass FERRUM_CI_PLAN_GRANULAR_GATES=1 on the python3 -I planner invocation"
+            "jobs.ci-plan must pass FERRUM_CI_PLAN_GRANULAR_GATES=1 on the executable python3 -I planner invocation"
         )
     mode_block = '          if [ "$paths_classifiable" != "true" ]; then\n            mode="full"\n          fi'
     mode_force_idx = plan_body.find(mode_block)
@@ -951,7 +1032,18 @@ def check_mode_and_granular_opt_in(plan_body: str) -> list[str]:
             "jobs.ci-plan must force mode=full when paths_classifiable != true "
             "before emitting mode to GITHUB_OUTPUT"
         )
-    if 'plan="$(printf \'%s\\n\' "$plan" | grep -v \'^run_artifacts=\'; echo "run_artifacts=true")"' not in plan_body:
+    expected_consumer_loop = (
+        "for consumer_gate in run_integration run_functional "
+        "run_plugin_hardening_redis run_helm run_vendor_patches; do"
+    )
+    if expected_consumer_loop not in exec_lines:
+        errors.append(
+            f"jobs.ci-plan must iterate over all five artifact-consumer gates (`{expected_consumer_loop}`)"
+        )
+    if (
+        'plan="$(printf \'%s\\n\' "$plan" | grep -v \'^run_artifacts=\'; echo "run_artifacts=true")"'
+        not in exec_lines
+    ):
         errors.append(
             "jobs.ci-plan must force run_artifacts=true whenever any artifact-consumer gate falls back"
         )
@@ -982,12 +1074,20 @@ def mode_and_granular_opt_in_self_test(plan_body: str) -> list[str]:
         failures.append("mode fallback verifier must reject forcing mode=full after emitting mode")
 
     comment_only_env = plan_body.replace(
-        'plan="$(FERRUM_CI_PLAN_GRANULAR_GATES=1 python3 -I ',
-        '# FERRUM_CI_PLAN_GRANULAR_GATES=1\n          plan="$(python3 -I ',
+        '          plan="$(FERRUM_CI_PLAN_GRANULAR_GATES=1 python3 -I ',
+        '          # plan="$(FERRUM_CI_PLAN_GRANULAR_GATES=1 python3 -I "\n          plan="$(python3 -I ',
         1,
     )
     if comment_only_env == plan_body or not check_mode_and_granular_opt_in(comment_only_env):
         failures.append("granular opt-in verifier must reject FERRUM_CI_PLAN_GRANULAR_GATES=1 only in a comment")
+
+    dropped_consumer = plan_body.replace(
+        " run_plugin_hardening_redis ",
+        " ",
+        1,
+    )
+    if dropped_consumer == plan_body or not check_mode_and_granular_opt_in(dropped_consumer):
+        failures.append("granular opt-in verifier must reject dropping a consumer gate from the transition guard loop")
 
     return failures
 
