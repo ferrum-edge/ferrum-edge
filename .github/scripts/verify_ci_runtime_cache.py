@@ -4841,6 +4841,8 @@ def _cargo_steps_have_env_override(cargo_job: str, steps_section: str) -> bool:
                 return True
         return False
     for _indent, line in _iter_non_block_scalar_lines(steps_section):
+        if YAML_FLOW_STEP.match(line):
+            return True
         decoded = _decode_mapping_line(line)
         if decoded is not None and decoded[1] == "env":
             val_stripped = _yaml_strip_trailing_comment(decoded[2]).strip()
