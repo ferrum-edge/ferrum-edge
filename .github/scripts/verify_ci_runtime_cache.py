@@ -5724,7 +5724,11 @@ def _strip_redirections(typed_words: list[tuple[str, str]]) -> list[str]:
     return out
 
 
-def _tokenize_shell_script(run_text: str) -> tuple[list[list[str]], bool]:
+def _tokenize_shell_script(
+    run_text: str,
+    *,
+    consume_heredocs: bool = True,
+) -> tuple[list[list[str]], bool]:
     """POSIX/Bash-aware single-pass shell lexer returning `(commands, malformed)`.
 
     Handles single/double/ANSI-C (`$'...'`) quotes, backslash line-continuation
@@ -5767,7 +5771,8 @@ def _tokenize_shell_script(run_text: str) -> tuple[list[list[str]], bool]:
         expecting_redir_operand = False
         if expecting_heredoc_delim is not None:
             _active, strip_tabs = expecting_heredoc_delim
-            pending_heredocs.append((word, strip_tabs))
+            if consume_heredocs:
+                pending_heredocs.append((word, strip_tabs))
             expecting_heredoc_delim = None
         cur_bytes.clear()
         has_token = False
@@ -6709,7 +6714,8 @@ def _compute_pipeline_compound_spans(
                     i += 2
                     continue
                 if ch == "|":
-                    at_cmd_pos = True
+                    if not (stack and stack[-1][0] == "case" and stack[-1][2] == "pattern"):
+                        at_cmd_pos = True
                     i += 2 if (i + 1 < n and code[i + 1] == "&") else 1
                     continue
                 if ch == "(":
@@ -6717,6 +6723,17 @@ def _compute_pipeline_compound_spans(
                         # Optional leading `(` in Bash case pattern `(foo|bar)`.
                         i += 1
                         continue
+                    # Function header `name() { ... }` or `name () { ... }`:
+                    # empty `()` after a command name restores command position
+                    # for the compound function body instead of acting as a subshell.
+                    if not at_cmd_pos:
+                        k = i + 1
+                        while k < n and code[k] in (" ", "\t"):
+                            k += 1
+                        if k < n and code[k] == ")":
+                            at_cmd_pos = True
+                            i = k + 1
+                            continue
                     stack.append(["(", p_idx, ""])
                     at_cmd_pos = True
                     i += 1
@@ -6760,11 +6777,42 @@ def _compute_pipeline_compound_spans(
                         j += 1
                     word = code[i:j]
                     prev_ok = i == 0 or code[i - 1] in (" ", "\t", "\r", "\n", ";", "|", "&", "(", ")")
+                    in_case_pattern = bool(
+                        stack and stack[-1][0] == "case" and stack[-1][2] == "pattern"
+                    )
                     if prev_ok and "=" not in word:
                         if word == "in" and stack and stack[-1][0] == "case" and stack[-1][2] == "header":
                             stack[-1][2] = "pattern"
                             at_cmd_pos = False
+                        elif in_case_pattern:
+                            # Inside a `case` pattern list (`start|done)`, `done)`),
+                            # no loop/conditional reserved word may match; only a
+                            # standalone `esac` at command position closes the `case`.
+                            rest_after = code[j:].lstrip(" \t")
+                            if word == "esac" and at_cmd_pos and not rest_after.startswith((")", "|")):
+                                _pop_kind("case")
+                            at_cmd_pos = False
                         elif at_cmd_pos:
+                            if word == "function":
+                                # `function name [()] <compound-cmd>`: skip the function
+                                # name (and optional `()`) and restore command position.
+                                k = j
+                                while k < n and code[k] in (" ", "\t"):
+                                    k += 1
+                                while k < n and (code[k].isalnum() or code[k] in ("_", "-", ".")):
+                                    k += 1
+                                m = k
+                                while m < n and code[m] in (" ", "\t"):
+                                    m += 1
+                                if m < n and code[m] == "(":
+                                    m2 = m + 1
+                                    while m2 < n and code[m2] in (" ", "\t"):
+                                        m2 += 1
+                                    if m2 < n and code[m2] == ")":
+                                        k = m2 + 1
+                                at_cmd_pos = True
+                                i = k
+                                continue
                             if word == "if":
                                 stack.append(["if", p_idx, ""])
                                 at_cmd_pos = True
@@ -6854,7 +6902,7 @@ _CI_DEBUG_NON_EXEC_HEREDOC_CMDS = frozenset(
 def _pipeline_has_executable_heredoc_stage(code_text: str) -> bool:
     """Return True if any stage in `code_text` invokes a command outside pure text-display/filter utilities."""
 
-    cmds, _malformed = _tokenize_shell_script(code_text)
+    cmds, _malformed = _tokenize_shell_script(code_text, consume_heredocs=False)
     if not cmds:
         return True
     for tokens in cmds:
@@ -12718,6 +12766,22 @@ def self_test() -> int:
                 "          SH\n",
             ),
             (
+                "wrapped cat heredoc continued pipe to bash writing to GITHUB_ENV",
+                "        run: |\n"
+                "          cat <<'SH' |\n"
+                '          echo "CARGO_PROFILE_TEST_DEBUG=2" >> "$GITHUB_ENV"\n'
+                "          SH\n"
+                "            bash\n",
+            ),
+            (
+                "function declaration write_settings() { ... } >> GITHUB_ENV",
+                "        run: |\n"
+                "          write_settings() {\n"
+                '            echo "CARGO_PROFILE_TEST_DEBUG=2"\n'
+                '          } >> "$GITHUB_ENV"\n'
+                "          write_settings\n",
+            ),
+            (
                 "plain multiline scalar blank-line break before cargo --config",
                 "        run: echo hi\n"
                 "\n"
@@ -12884,6 +12948,25 @@ def self_test() -> int:
                 "          cat <<'EOF' | sed 's/^/  /'\n"
                 '          echo "CARGO_PROFILE_TEST_DEBUG=2" >> "$GITHUB_ENV"\n'
                 "          EOF\n",
+            ),
+            (
+                "wrapped cat heredoc continued pipe to sed for display",
+                "        run: |\n"
+                "          cat <<'EOF' |\n"
+                '          echo "CARGO_PROFILE_TEST_DEBUG=2" >> "$GITHUB_ENV"\n'
+                "          EOF\n"
+                "            sed 's/^/  /'\n",
+            ),
+            (
+                "CARGO_TARGET_DIR log before loop with case start|done) pattern and unrelated GITHUB_ENV write",
+                "        run: |\n"
+                '          echo "CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-target}"\n'
+                "          for state in start; do\n"
+                '            case "$state" in\n'
+                "              start|done) echo ok >&2 ;;\n"
+                "            esac\n"
+                '            echo "FERRUM_TEST_MODE=1"\n'
+                '          done >> "$GITHUB_ENV"\n',
             ),
             (
                 "folded scalar paragraph break separating cargo and kind --config",
