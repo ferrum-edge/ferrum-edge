@@ -6448,8 +6448,17 @@ def _split_shell_pipelines(run_text: str) -> list[tuple[str, str]]:
                 idx += len(op)
                 continue
             if not arith_paren_stack and ch == ";":
-                _flush_pipeline()
-                idx += 1
+                if run_text[idx : idx + 3] == ";;&":
+                    _emit_code(";;&")
+                    _flush_pipeline()
+                    idx += 3
+                elif run_text[idx : idx + 2] in (";;", ";&"):
+                    _emit_code(run_text[idx : idx + 2])
+                    _flush_pipeline()
+                    idx += 2
+                else:
+                    _flush_pipeline()
+                    idx += 1
                 continue
             if not arith_paren_stack and ch == "|" and idx + 1 < n and run_text[idx + 1] == "|":
                 _flush_pipeline()
@@ -6586,6 +6595,12 @@ def _split_shell_pipelines(run_text: str) -> list[tuple[str, str]]:
         else:  # double quote
             if ch == "\\" and idx + 1 < n:
                 nxt = run_text[idx + 1]
+                if nxt == "\n":
+                    idx += 2
+                    continue
+                if nxt == "\r" and idx + 2 < n and run_text[idx + 2] == "\n":
+                    idx += 3
+                    continue
                 _emit_code(run_text[idx : idx + 2])
                 if expecting_heredoc_delim is not None:
                     if nxt in ('"', "\\", "$", "`"):
@@ -6604,88 +6619,201 @@ def _split_shell_pipelines(run_text: str) -> list[tuple[str, str]]:
     return pipelines
 
 
-def _unquoted_shell_delim_delta(code_text: str, opener: str, closer: str) -> int:
-    """Return unquoted `count(opener) - count(closer)` in shell code (ignoring quotes and escapes)."""
+def _compute_pipeline_compound_spans(
+    pipelines: list[tuple[str, str]],
+) -> dict[int, list[int]]:
+    """Map each pipeline index closing a shell compound command (`(...)`, `{...}`, `if..fi`, `for/while/until..done`, `case..esac`) to its opening pipeline index(es)."""
 
-    delta = 0
-    quote: str | None = None
-    idx = 0
-    n = len(code_text)
-    while idx < n:
-        ch = code_text[idx]
-        if quote is None:
-            if ch == "\\" and idx + 1 < n:
-                idx += 2
-                continue
-            if ch == "$" and idx + 1 < n and code_text[idx + 1] == "'":
-                quote = "$'"
-                idx += 2
-                continue
-            if ch in ("'", '"'):
-                quote = ch
-                idx += 1
-                continue
-            if ch == opener:
-                delta += 1
-            elif ch == closer:
-                delta -= 1
-            idx += 1
-        elif quote == "'":
-            if ch == "'":
-                quote = None
-            idx += 1
-        elif quote == "$'":
-            if ch == "\\" and idx + 1 < n:
-                idx += 2
-                continue
-            if ch == "'":
-                quote = None
-            idx += 1
-        else:  # double quote
-            if ch == "\\" and idx + 1 < n:
-                idx += 2
-                continue
-            if ch == '"':
-                quote = None
-            idx += 1
-    return delta
+    # Stack items: `(kind, start_idx, case_state)` where for `"case"`, `case_state` is
+    # `"header"` (waiting for `in`), `"pattern"` (inside pattern before `)`), or `"body"`.
+    stack: list[list[object]] = []
+    closed_spans: dict[int, list[int]] = {}
+
+    for p_idx, (code, _full) in enumerate(pipelines):
+        quote: str | None = None
+        arith_stack: list[int] = []
+        i = 0
+        n = len(code)
+
+        def _pop_kind(kind: str) -> None:
+            for k in range(len(stack) - 1, -1, -1):
+                if stack[k][0] == kind:
+                    start = int(stack[k][1])  # type: ignore[arg-type]
+                    del stack[k:]
+                    closed_spans.setdefault(p_idx, []).append(start)
+                    return
+
+        while i < n:
+            ch = code[i]
+            if quote is None:
+                if ch == "\\" and i + 1 < n:
+                    i += 2
+                    continue
+                if ch == "$" and i + 1 < n and code[i + 1] == "'":
+                    quote = "$'"
+                    i += 2
+                    continue
+                if ch in ("'", '"'):
+                    quote = ch
+                    i += 1
+                    continue
+                if code[i : i + 3] == "$((":
+                    arith_stack.append(0)
+                    i += 3
+                    continue
+                if not arith_stack and code[i : i + 2] == "((" and (
+                    i == 0 or code[i - 1] in (" ", "\t", "\r", "\n", ";", "|", "&")
+                ):
+                    arith_stack.append(0)
+                    i += 2
+                    continue
+                if arith_stack:
+                    if ch == "(":
+                        arith_stack[-1] += 1
+                        i += 1
+                        continue
+                    if ch == ")":
+                        if arith_stack[-1] > 0:
+                            arith_stack[-1] -= 1
+                            i += 1
+                            continue
+                        if code[i : i + 2] == "))":
+                            arith_stack.pop()
+                            i += 2
+                            continue
+                    i += 1
+                    continue
+                if code[i : i + 3] == ";;&":
+                    if stack and stack[-1][0] == "case":
+                        stack[-1][2] = "pattern"
+                    i += 3
+                    continue
+                if code[i : i + 2] in (";;", ";&"):
+                    if stack and stack[-1][0] == "case":
+                        stack[-1][2] = "pattern"
+                    i += 2
+                    continue
+                if ch == "(":
+                    if stack and stack[-1][0] == "case" and stack[-1][2] == "pattern":
+                        # Optional leading `(` in Bash case pattern `(foo|bar)`.
+                        i += 1
+                        continue
+                    stack.append(["(", p_idx, ""])
+                    i += 1
+                    continue
+                if ch == ")":
+                    if stack and stack[-1][0] == "case" and stack[-1][2] == "pattern":
+                        stack[-1][2] = "body"
+                        i += 1
+                        continue
+                    _pop_kind("(")
+                    i += 1
+                    continue
+                if ch == "{":
+                    prev_ch = code[i - 1] if i > 0 else " "
+                    nxt_ch = code[i + 1] if i + 1 < n else " "
+                    if prev_ch != "$" and prev_ch in (" ", "\t", "\r", "\n", ";", "|", "&", "(") and nxt_ch in (" ", "\t", "\r", "\n"):
+                        stack.append(["{", p_idx, ""])
+                    i += 1
+                    continue
+                if ch == "}":
+                    prev_ch = code[i - 1] if i > 0 else " "
+                    nxt_ch = code[i + 1] if i + 1 < n else " "
+                    if prev_ch in (" ", "\t", "\r", "\n", ";", "|", "&", ")") and nxt_ch in (" ", "\t", "\r", "\n", ";", "|", "&", ">", "<", ")"):
+                        _pop_kind("{")
+                    i += 1
+                    continue
+                if ch.isalpha() or ch == "_":
+                    j = i
+                    while j < n and (code[j].isalnum() or code[j] in ("_", "-", ".", "/", "=")):
+                        j += 1
+                    word = code[i:j]
+                    prev_ok = i == 0 or code[i - 1] in (" ", "\t", "\r", "\n", ";", "|", "&", "(", ")")
+                    if prev_ok and "=" not in word:
+                        if word == "if":
+                            stack.append(["if", p_idx, ""])
+                        elif word == "fi":
+                            _pop_kind("if")
+                        elif word in ("for", "while", "until", "select"):
+                            stack.append(["loop", p_idx, ""])
+                        elif word == "done":
+                            _pop_kind("loop")
+                        elif word == "case":
+                            stack.append(["case", p_idx, "header"])
+                        elif word == "in" and stack and stack[-1][0] == "case" and stack[-1][2] == "header":
+                            stack[-1][2] = "pattern"
+                        elif word == "esac":
+                            _pop_kind("case")
+                    i = j
+                    continue
+                i += 1
+            elif quote == "'":
+                if ch == "'":
+                    quote = None
+                i += 1
+            elif quote == "$'":
+                if ch == "\\" and i + 1 < n:
+                    i += 2
+                    continue
+                if ch == "'":
+                    quote = None
+                i += 1
+            else:  # double quote
+                if ch == "\\" and i + 1 < n:
+                    i += 2
+                    continue
+                if ch == '"':
+                    quote = None
+                i += 1
+    return closed_spans
+
+
+def _leading_pipeline_command(code_text: str) -> str:
+    """Return the basename of the first command token in `code_text` (best-effort)."""
+
+    cmds, _malformed = _tokenize_shell_script(code_text)
+    if not cmds:
+        return ""
+    tokens = cmds[0]
+    for tok in tokens:
+        if tok in _CI_DEBUG_SHELL_KEYWORDS:
+            continue
+        if "=" in tok and not tok.startswith("-"):
+            continue
+        return tok.rsplit("/", 1)[-1]
+    return ""
 
 
 def _github_env_write_has_ci_debug_var(run_text: str) -> bool:
     """Return True if a step writes a Cargo/Rust/C/RUST_BACKTRACE variable into GITHUB_ENV."""
 
     pipelines = _split_shell_pipelines(run_text)
-    if not any("GITHUB_ENV" in code for code, _full in pipelines):
+    if not any("GITHUB_ENV" in full for _code, full in pipelines):
         return False
 
     simple_write_re = re.compile(
         r"""(?:>>?\s*|\btee\b[^\n]*)(?:["']?)\$\{?GITHUB_ENV\}?(?:["']?)"""
     )
+    closed_spans = _compute_pipeline_compound_spans(pipelines)
 
     for idx, (code, full) in enumerate(pipelines):
+        # 0. Executable heredoc (e.g. `python3 - <<'PY'`, `bash <<'SH'`) whose body
+        #    references `GITHUB_ENV` and a Cargo/Rust/C/RUST_BACKTRACE variable, while
+        #    still ignoring literal-data `cat <<'EOF' > /tmp/file` heredocs.
         if "GITHUB_ENV" not in code:
+            if "GITHUB_ENV" in full:
+                lead_cmd = _leading_pipeline_command(code)
+                if (lead_cmd != "cat" or "|" in code) and _CI_DEBUG_GITHUB_ENV_VAR_RE.search(full):
+                    return True
             continue
-        # 1. Grouped `{ ... }` or subshell `( ... )` redirected/piped to GITHUB_ENV:
-        #    whenever `code` has net negative unquoted `)` or `}` balance (including
-        #    one-line `(cat <<'EOF'; echo done) >> "$GITHUB_ENV"` and multi-line closers),
-        #    walk backwards until the matching opener balances it and scan that whole block.
-        if simple_write_re.search(code):
-            for opener, closer in (("(", ")"), ("{", "}")):
-                balance = _unquoted_shell_delim_delta(code, opener, closer)
-                if balance < 0:
-                    block_fulls = [full]
-                    matched_opener = False
-                    for j in range(idx - 1, -1, -1):
-                        prev_code, prev_full = pipelines[j]
-                        block_fulls.append(prev_full)
-                        balance += _unquoted_shell_delim_delta(prev_code, opener, closer)
-                        if balance >= 0:
-                            matched_opener = True
-                            break
-                    if matched_opener and _CI_DEBUG_GITHUB_ENV_VAR_RE.search(
-                        "\n".join(reversed(block_fulls))
-                    ):
-                        return True
+        # 1. Compound command (`(...)`, `{...}`, `if..fi`, `for/while/until..done`, `case..esac`)
+        #    redirected/piped into GITHUB_ENV: scan ONLY the matched compound span.
+        if simple_write_re.search(code) and idx in closed_spans:
+            earliest_start = min(closed_spans[idx])
+            block_text = "\n".join(f for _c, f in pipelines[earliest_start : idx + 1])
+            if _CI_DEBUG_GITHUB_ENV_VAR_RE.search(block_text):
+                return True
+            continue
         # 2. Direct pipeline write (`echo ... >> "$GITHUB_ENV"`, wrapped `printf ... |\n tee -a "$GITHUB_ENV"`,
         #    or `cat <<'EOF' >> "$GITHUB_ENV"\n...\nEOF` whose heredoc body is attached to `full`),
         #    excluding compound-command closers (`fi`/`done`/`esac`), `exec`, or variable aliasing.
@@ -6697,8 +6825,8 @@ def _github_env_write_has_ci_debug_var(run_text: str) -> bool:
             if _CI_DEBUG_GITHUB_ENV_VAR_RE.search(full):
                 return True
             continue
-        # 3. Fallback for complex/indirect GITHUB_ENV usage (`fi >> "$GITHUB_ENV"`, `exec`,
-        #    variable aliasing, python/awk scripts): check all pipelines in the step.
+        # 3. Fallback for complex/indirect GITHUB_ENV usage (`exec >> "$GITHUB_ENV"`,
+        #    variable aliasing, inline python/awk scripts): check all pipelines in the step.
         if _CI_DEBUG_GITHUB_ENV_VAR_RE.search("\n".join(f for _c, f in pipelines)):
             return True
     return False
@@ -12440,6 +12568,33 @@ def self_test() -> int:
                 '            echo done) >> "$GITHUB_ENV"\n',
             ),
             (
+                "executable python heredoc writing to GITHUB_ENV",
+                "        run: |\n"
+                "          python3 - <<'PY'\n"
+                "          import os\n"
+                '          with open(os.environ["GITHUB_ENV"], "a") as fh:\n'
+                '              fh.write("CARGO_PROFILE_TEST_DEBUG=2\\n")\n'
+                "          PY\n",
+            ),
+            (
+                "case arm inside redirected subshell writing to GITHUB_ENV",
+                "        run: |\n"
+                "          (\n"
+                "            case ready in\n"
+                '              ready) echo "CARGO_PROFILE_TEST_DEBUG=2" ;;\n'
+                "            esac\n"
+                '          ) >> "$GITHUB_ENV"\n',
+            ),
+            (
+                "double-quoted backslash-newline heredoc delimiter before GITHUB_ENV write",
+                "        run: |\n"
+                '          cat <<"E\\\n'
+                '          OF" > /dev/null\n'
+                "          hello\n"
+                "          EOF\n"
+                '          echo "CARGO_PROFILE_TEST_DEBUG=2" >> "$GITHUB_ENV"\n',
+            ),
+            (
                 "plain multiline scalar blank-line break before cargo --config",
                 "        run: echo hi\n"
                 "\n"
@@ -12582,6 +12737,14 @@ def self_test() -> int:
                 "          EOF\n"
                 '          echo "CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-target}"\n'
                 '          echo "FERRUM_TEST_MODE=1" >> "$GITHUB_ENV"\n',
+            ),
+            (
+                "CARGO_TARGET_DIR log before unrelated if..fi >> GITHUB_ENV write",
+                "        run: |\n"
+                '          echo "CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-target}"\n'
+                "          if true; then\n"
+                '            echo "FERRUM_TEST_MODE=1"\n'
+                '          fi >> "$GITHUB_ENV"\n',
             ),
             (
                 "folded scalar paragraph break separating cargo and kind --config",
