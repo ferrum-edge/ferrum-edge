@@ -5000,6 +5000,9 @@ def _extract_step_submap(step: str, subkey: str) -> tuple[dict[str, str], str | 
         scalar = _decode_yaml_value_scalar(raw_val)
         if scalar is None:
             return {}, f"unparseable scalar in `{subkey}.{key}`"
+        raw_val_clean = _yaml_strip_trailing_comment(raw_val).strip()
+        if raw_val_clean.startswith(("*", "&", "!")):
+            return {}, f"unsupported YAML anchor/alias/tag in `{subkey}.{key}`"
         result[key] = scalar
         idx += 1
     return result, None
@@ -5699,18 +5702,23 @@ def _load_extra_workflow_texts() -> dict[str, str]:
     }
 
 
+_CI_DEBUG_SHELL_FD_PREFIX_RE = re.compile(r"^(?:\d+|\{[A-Za-z_][A-Za-z0-9_]*\})$")
+
+
 def _tokenize_shell_script(run_text: str) -> list[list[str]]:
     """POSIX-aware single-pass shell lexer splitting `run_text` into per-command unquoted word lists.
 
     Handles single/double quotes, backslash line-continuation deletion (`\\`+newline
     outside single quotes, never inside `#` comments), `#` comments ending at newline,
-    and command separators (`\\n`, `;`, `&&`, `||`, `|`).
+    distinct unquoted redirection operator tokens (`>`, `>>`, `2>&`, `>|`, `<<<`, `&>`,
+    `{fd}>`, etc.), and command separators (`\\n`, `;`, `&&`, `||`, `|`).
     """
 
     commands: list[list[str]] = []
     words: list[str] = []
     cur: list[str] = []
     has_token = False
+    cur_had_quote = False
     quote: str | None = None
     idx = 0
     n = len(run_text)
@@ -5731,6 +5739,7 @@ def _tokenize_shell_script(run_text: str) -> list[list[str]]:
                     continue
                 cur.append(run_text[idx + 1])
                 has_token = True
+                cur_had_quote = True
                 idx += 2
                 continue
             if ch in (" ", "\t", "\r"):
@@ -5738,28 +5747,54 @@ def _tokenize_shell_script(run_text: str) -> list[list[str]]:
                     words.append("".join(cur))
                     cur = []
                     has_token = False
+                    cur_had_quote = False
                 idx += 1
                 continue
-            # Keep redirection operators (`2>&1`, `>&2`, `<&0`, `>|`, `&>`, `&>>`)
-            # attached to their token instead of splitting on `&` or `|`.
-            if ch == "&" and has_token and cur and cur[-1] in (">", "<"):
-                cur.append(ch)
-                idx += 1
+            # Emit unquoted redirection operators as distinct operator tokens so
+            # both `cargo>/dev/null`, `2>& 1`, `2>&1`, `>|`, `<<<`, `&>`, `{fd}>`
+            # stay cleanly separated from command words and operands.
+            if ch in (">", "<"):
+                fd_prefix = ""
+                if has_token:
+                    word_so_far = "".join(cur)
+                    if not cur_had_quote and _CI_DEBUG_SHELL_FD_PREFIX_RE.match(word_so_far):
+                        fd_prefix = word_so_far
+                    else:
+                        words.append(word_so_far)
+                    cur = []
+                    has_token = False
+                    cur_had_quote = False
+                if ch == "<":
+                    if run_text[idx : idx + 3] in ("<<<", "<<-"):
+                        op = run_text[idx : idx + 3]
+                    elif run_text[idx : idx + 2] in ("<<", "<>", "<&"):
+                        op = run_text[idx : idx + 2]
+                    else:
+                        op = "<"
+                else:
+                    if run_text[idx : idx + 2] in (">>", ">&", ">|"):
+                        op = run_text[idx : idx + 2]
+                    else:
+                        op = ">"
+                words.append(fd_prefix + op)
+                idx += len(op)
                 continue
-            if ch == "|" and has_token and cur and cur[-1] == ">":
-                cur.append(ch)
-                idx += 1
-                continue
-            if ch == "&" and not has_token and idx + 1 < n and run_text[idx + 1] == ">":
-                cur.append(ch)
-                has_token = True
-                idx += 1
+            if ch == "&" and idx + 1 < n and run_text[idx + 1] == ">":
+                if has_token:
+                    words.append("".join(cur))
+                    cur = []
+                    has_token = False
+                    cur_had_quote = False
+                op = "&>>" if run_text[idx : idx + 3] == "&>>" else "&>"
+                words.append(op)
+                idx += len(op)
                 continue
             if ch in ("\n", ";", "|", "&"):
                 if has_token:
                     words.append("".join(cur))
                     cur = []
                     has_token = False
+                    cur_had_quote = False
                 if words:
                     commands.append(words)
                     words = []
@@ -5771,6 +5806,7 @@ def _tokenize_shell_script(run_text: str) -> list[list[str]]:
             if ch in ("'", '"'):
                 quote = ch
                 has_token = True
+                cur_had_quote = True
                 idx += 1
                 continue
             cur.append(ch)
@@ -5813,8 +5849,9 @@ def _tokenize_shell_script(run_text: str) -> list[list[str]]:
 _CI_DEBUG_SHELL_KEYWORDS = frozenset(
     {"if", "then", "elif", "else", "do", "while", "until", "!", "{"}
 )
-_CI_DEBUG_SHELL_REDIR_OP_ONLY_RE = re.compile(r"^(?:\d*(?:>>?|<<?|<>&?|>\|)|&>>?)$")
-_CI_DEBUG_SHELL_REDIR_ATTACHED_RE = re.compile(r"^(?:\d*(?:>>?|<<?|<>&?|>&\d+|>\|)|&>>?).+$")
+_CI_DEBUG_SHELL_REDIR_OP_ONLY_RE = re.compile(
+    r"^(?:(?:\d+|\{[A-Za-z_][A-Za-z0-9_]*\})?(?:>>?|<<<|<<-?|<>|<&?|>&|>\|)|&>>?)$"
+)
 # Map wrapper basename -> (options taking a separate operand, takes_leading_positional_arg)
 _CI_DEBUG_SHELL_WRAPPERS: dict[str, tuple[frozenset[str], bool]] = {
     "time": (frozenset({"-o", "--output", "-f", "--format"}), False),
@@ -5841,6 +5878,30 @@ def _split_gnu_env_s_string(split_arg: str) -> list[str]:
     return [w for sub in _tokenize_shell_script(expanded) for w in sub]
 
 
+_GNU_ENV_LONG_OPTIONS = (
+    "--ignore-environment",
+    "--unset",
+    "--chdir",
+    "--split-string",
+    "--argv0",
+    "--null",
+    "--debug",
+    "--block-signal",
+    "--default-signal",
+    "--ignore-signal",
+    "--list-signal-handling",
+)
+
+
+def _resolve_gnu_env_long_opt(opt_name: str) -> str | None:
+    """Resolve a GNU `env` long option (including unique abbreviations)."""
+
+    if opt_name in _GNU_ENV_LONG_OPTIONS:
+        return opt_name
+    matches = [cand for cand in _GNU_ENV_LONG_OPTIONS if cand.startswith(opt_name)]
+    return matches[0] if len(matches) == 1 else None
+
+
 def _scan_shell_command_tokens(tokens: list[str]) -> bool:
     """Return True if a single simple shell command overrides Cargo/Rust/C build or profile settings."""
 
@@ -5854,9 +5915,6 @@ def _scan_shell_command_tokens(tokens: list[str]) -> bool:
         if _CI_DEBUG_SHELL_REDIR_OP_ONLY_RE.match(tok):
             idx += 2
             continue
-        if _CI_DEBUG_SHELL_REDIR_ATTACHED_RE.match(tok):
-            idx += 1
-            continue
         if "=" in tok and not tok.startswith("-"):
             var_name = tok.split("=", 1)[0].removesuffix("+")
             if _CI_DEBUG_SHELL_VAR_NAME_RE.match(var_name):
@@ -5868,37 +5926,34 @@ def _scan_shell_command_tokens(tokens: list[str]) -> bool:
             idx += 1
             while idx < len(tokens):
                 arg = tokens[idx]
-                if arg in ("-i", "--ignore-environment", "-"):
+                if arg in ("-i", "-"):
                     return True
                 if arg == "--":
                     idx += 1
                     break
-                if arg in ("-u", "--unset") and idx + 1 < len(tokens):
-                    if _CI_DEBUG_SHELL_VAR_NAME_RE.match(tokens[idx + 1]):
+                if arg.startswith("--"):
+                    opt_part, has_eq, val_part = arg.partition("=")
+                    resolved = _resolve_gnu_env_long_opt(opt_part)
+                    if resolved == "--ignore-environment":
                         return True
-                    idx += 2
-                    continue
-                if arg.startswith("--unset="):
-                    if _CI_DEBUG_SHELL_VAR_NAME_RE.match(arg.split("=", 1)[1]):
-                        return True
+                    if resolved == "--unset":
+                        target_var = val_part if has_eq else (tokens[idx + 1] if idx + 1 < len(tokens) else "")
+                        if _CI_DEBUG_SHELL_VAR_NAME_RE.match(target_var):
+                            return True
+                        idx += 1 if has_eq else 2
+                        continue
+                    if resolved in ("--chdir", "--argv0"):
+                        idx += 1 if has_eq else 2
+                        continue
+                    if resolved == "--split-string":
+                        raw_s = val_part if has_eq else (tokens[idx + 1] if idx + 1 < len(tokens) else "")
+                        spliced = _split_gnu_env_s_string(raw_s)
+                        tokens = tokens[:idx] + spliced + tokens[idx + (1 if has_eq else 2) :]
+                        continue
                     idx += 1
                     continue
-                if arg in ("-C", "--chdir") and idx + 1 < len(tokens):
-                    idx += 2
-                    continue
-                if arg.startswith("--chdir="):
-                    idx += 1
-                    continue
-                if arg in ("-S", "--split-string") and idx + 1 < len(tokens):
-                    spliced = _split_gnu_env_s_string(tokens[idx + 1])
-                    tokens = tokens[:idx] + spliced + tokens[idx + 2 :]
-                    continue
-                if arg.startswith("--split-string="):
-                    spliced = _split_gnu_env_s_string(arg.split("=", 1)[1])
-                    tokens = tokens[:idx] + spliced + tokens[idx + 1 :]
-                    continue
-                # Walk short-option clusters such as `-iv`, `-uVAR`, `-vS ...`, `-vC /tmp`.
-                if arg.startswith("-") and not arg.startswith("--") and len(arg) > 1:
+                # Walk short-option clusters such as `-iv`, `-uVAR`, `-vS ...`, `-a x`, `-vC /tmp`.
+                if arg.startswith("-") and len(arg) > 1:
                     flags = arg[1:]
                     fidx = 0
                     consumed = False
@@ -5920,7 +5975,7 @@ def _scan_shell_command_tokens(tokens: list[str]) -> bool:
                                 idx += 1
                             consumed = True
                             break
-                        if ch == "C":
+                        if ch in ("C", "a"):
                             idx += 1 if rest else (2 if idx + 1 < len(tokens) else 1)
                             consumed = True
                             break
@@ -5938,9 +5993,6 @@ def _scan_shell_command_tokens(tokens: list[str]) -> bool:
                         fidx += 1
                     if not consumed:
                         idx += 1
-                    continue
-                if arg.startswith("-"):
-                    idx += 1
                     continue
                 if "=" in arg:
                     var_name = arg.split("=", 1)[0].removesuffix("+")
@@ -6269,8 +6321,8 @@ def _extract_step_run_text_fallback(step: str) -> tuple[str, str | None]:
                         prev_kind = "base"
                         blank_count = 0
                 return "".join(out_parts), None
-            if val_no_comment.startswith(("*", "&")):
-                return "", "unsupported YAML anchor/alias in `run:` in fallback parser"
+            if val_no_comment.startswith(("*", "&", "!")):
+                return "", "unsupported YAML anchor/alias/tag in `run:` in fallback parser"
             # Single-line or multiline plain/quoted scalar.
             cont_items: list[str | None] = []
             j = idx + 1
@@ -6360,6 +6412,10 @@ def _extract_job_steps_structural(job_body: str) -> tuple[list[str], list[str]]:
                 layout_errors.append(
                     "unsupported bare-dash or non-single-space step syntax in fallback parser"
                 )
+            elif re.match(r"^- [&*!{]", stripped):
+                layout_errors.append(
+                    "unsupported flow-style, anchored, tagged, or aliased step syntax in fallback parser"
+                )
             else:
                 step_starts.append(idx)
     if layout_errors:
@@ -6371,14 +6427,18 @@ def _extract_job_steps_structural(job_body: str) -> tuple[list[str], list[str]]:
         raw_chunk = step_lines[step_starts[i] : end]
         normalized: list[str] = []
         for ln in raw_chunk:
-            if not ln.strip():
+            if not ln:
                 normalized.append(ln)
             elif delta > 0:
+                # Shift whitespace-only lines too so relative indentation inside
+                # folded/literal blocks stays exact.
                 normalized.append((" " * delta) + ln)
             elif delta < 0:
                 trim = -delta
                 if ln.startswith(" " * trim):
                     normalized.append(ln[trim:])
+                elif not ln.strip():
+                    normalized.append("")
                 elif ln.lstrip().startswith("#"):
                     normalized.append(ln)
                 else:
@@ -6512,6 +6572,8 @@ def _discover_ci_debug_jobs(
                     )
         return discovered, errors
 
+    if _has_explicit_yaml_key(workflow_text):
+        errors.append(f"{filename}: unsupported explicit `?` YAML mapping key in fallback parser")
     fallback_jobs, job_layout_errs = _iter_fallback_jobs(workflow_text)
     for jerr in job_layout_errs:
         errors.append(f"{filename}: {jerr}")
@@ -6547,9 +6609,9 @@ def _discover_ci_debug_jobs(
                             f"{filename}/{job_id} has unparseable rust-cache step: {step_err}"
                         )
                 continue
-            if uses.startswith(("*", "&")):
+            if uses.startswith(("*", "&", "!")):
                 errors.append(
-                    f"{filename}/{job_id} uses unsupported YAML anchor/alias in `uses:`"
+                    f"{filename}/{job_id} uses unsupported YAML anchor/alias/tag in `uses:`"
                 )
                 continue
             if not uses and _keys is not None and "uses" in _keys:
@@ -11323,8 +11385,19 @@ def self_test() -> int:
             ("env -S GNU underscore separator", r"env -S 'cargo\_test --no-run' --config profile.test.debug=2"),
             ("env -iv combined clear", "env -iv cargo test --no-run"),
             ("env -vS combined split", "env -vS 'cargo --config profile.dev.debug=2 test'"),
+            ("env -a argv0 wrapper", "env -a x cargo test --no-run --config profile.dev.debug=2"),
+            ("env --ignore-env prefix", "env --ignore-env cargo test --no-run"),
+            ("env --uns= prefix", "env --uns=CARGO_PROFILE_DEV_DEBUG cargo test --no-run"),
+            ("env --split-str= prefix", "env --split-str='cargo test --no-run --config profile.dev.debug=2'"),
             ("leading redirection + inline env", ">/dev/null CARGO_PROFILE_DEV_DEBUG=2 cargo test --no-run"),
             ("2>&1 before cargo --config", "2>&1 cargo test --no-run --config profile.dev.debug=2"),
+            ("spaced 2>& 1 before cargo --config", "2>& 1 cargo test --no-run --config profile.test.debug=2"),
+            ("attached cargo>/dev/null", "cargo>/dev/null test --no-run --config profile.test.debug=2"),
+            ("attached &>/dev/null mid-cargo", "cargo test --no-run&>/dev/null --config profile.test.debug=2"),
+            ("spaced >& /tmp/log before cargo", ">& /tmp/log cargo test --no-run --config profile.dev.debug=2"),
+            ("here-string <<< before cargo", "<<< x cargo test --no-run --config profile.dev.debug=2"),
+            ("named fd {fd}> before inline env", "{fd}>/tmp/x CARGO_PROFILE_DEV_DEBUG=2 cargo test --no-run"),
+            ("quoted > then & cargo", 'echo ">"& cargo test --no-run --config profile.dev.debug=2'),
             ("2>&1 before inline env", "2>&1 CARGO_PROFILE_DEV_DEBUG=2 cargo test --no-run"),
             (">&2 before inline env", ">&2 RUSTFLAGS=-g cargo test --no-run"),
             ("cargo 2>&1 --config", "cargo test --no-run 2>&1 --config profile.dev.debug=2"),
@@ -11473,36 +11546,51 @@ def self_test() -> int:
                 f"self-test ({mode_label}): {label} must fail (got {ml_errs!r})",
                 failures,
             )
-        # Verify 4-space compact steps with an internal comment inside `run: |` still scan lines after `#`.
+        # Verify 4-space compact steps with an internal comment inside `run: |`,
+        # AND a compact 4-space folded `run: >` with a 9-space whitespace-only line after `\`!
         amb_head, amb_tail = ambient_live_text.split("\n  ambient-host-udp-live:\n", 1)
         amb_job_body, amb_rest = amb_tail.split("\n  ambient-host-udp-image-read:\n", 1)
         amb_job_head = amb_job_body.split("\n    steps:\n", 1)[0]
-        compact_comment_ambient = (
-            amb_head
-            + "\n  ambient-host-udp-live:\n"
-            + amb_job_head
-            + "\n    steps:\n"
-            + "    - name: Compact step with comment\n"
-            + "      run: |\n"
-            + "        echo start\n"
-            + "        # comment inside compact step\n"
-            + "        cargo test --lib --config profile.dev.debug=2\n"
-            + "    - uses: ./.github/actions/setup-rust-ci\n"
-            + "      with:\n"
-            + '        shared-key: "ci-debug"\n'
-            + "\n  ambient-host-udp-image-read:\n"
-            + amb_rest
-        )
-        compact_comment_errs: list[str] = []
-        check_ci_debug_lane_profile_uniformity(
-            ci_live_text, compact_comment_ambient, compact_comment_errs
-        )
-        require(
-            compact_comment_ambient != ambient_live_text
-            and any("GITHUB_ENV, or --config" in item for item in compact_comment_errs),
-            f"self-test ({mode_label}): 4-space compact step comment must not hide following cargo --config (got {compact_comment_errs!r})",
-            failures,
-        )
+        for label, compact_step_block in (
+            (
+                "4-space compact step comment",
+                "    - name: Compact step with comment\n"
+                "      run: |\n"
+                "        echo start\n"
+                "        # comment inside compact step\n"
+                "        cargo test --lib --config profile.dev.debug=2\n",
+            ),
+            (
+                "4-space compact folded whitespace-only line",
+                "    - name: Compact folded whitespace\n"
+                "      run: >\n"
+                "        echo pre \\\n"
+                "         \n"
+                "        cargo test --lib --config profile.test.debug=2\n",
+            ),
+        ):
+            compact_comment_ambient = (
+                amb_head
+                + "\n  ambient-host-udp-live:\n"
+                + amb_job_head
+                + "\n    steps:\n"
+                + compact_step_block
+                + "    - uses: ./.github/actions/setup-rust-ci\n"
+                + "      with:\n"
+                + '        shared-key: "ci-debug"\n'
+                + "\n  ambient-host-udp-image-read:\n"
+                + amb_rest
+            )
+            compact_comment_errs: list[str] = []
+            check_ci_debug_lane_profile_uniformity(
+                ci_live_text, compact_comment_ambient, compact_comment_errs
+            )
+            require(
+                compact_comment_ambient != ambient_live_text
+                and any("GITHUB_ENV, or --config" in item for item in compact_comment_errs),
+                f"self-test ({mode_label}): {label} must not hide following cargo --config (got {compact_comment_errs!r})",
+                failures,
+            )
         for label, ok_run_block in (
             ("non-cargo echo --config", '        run: echo "--config"\n'),
             ("echo mentioning cargo and --config", '        run: echo cargo --config foo\n'),
@@ -11736,6 +11824,39 @@ def self_test() -> int:
                 "            shared-key: ci-debug\n",
             ),
             (
+                "anchored flow step and alias step",
+                "anchored-step.yml",
+                "name: AnchoredStep\non:\n  workflow_dispatch:\njobs:\n"
+                "  anchor-debug:\n"
+                "    runs-on: ubuntu-26.04\n"
+                "    steps:\n"
+                '      - &cache {uses: ./.github/actions/setup-rust-ci, with: {shared-key: ci-debug}}\n'
+                "      - *cache\n",
+            ),
+            (
+                "explicit ? step key",
+                "explicit-step-key.yml",
+                "name: ExplicitStepKey\non:\n  workflow_dispatch:\njobs:\n"
+                "  explicit-debug:\n"
+                "    runs-on: ubuntu-26.04\n"
+                "    steps:\n"
+                "      - ? uses\n"
+                "        : ./.github/actions/setup-rust-ci\n"
+                "        with:\n"
+                "          shared-key: ci-debug\n",
+            ),
+            (
+                "tagged scalar shared-key",
+                "tagged-key.yml",
+                "name: TaggedKey\non:\n  workflow_dispatch:\njobs:\n"
+                "  tagged-debug:\n"
+                "    runs-on: ubuntu-26.04\n"
+                "    steps:\n"
+                "      - uses: ./.github/actions/setup-rust-ci\n"
+                "        with:\n"
+                "          shared-key: !!str ci-debug\n",
+            ),
+            (
                 "flow-style step item",
                 "flow-step.yml",
                 "name: FlowStep\non:\n  workflow_dispatch:\njobs:\n"
@@ -11804,27 +11925,48 @@ def self_test() -> int:
             failures,
         )
 
-        # Alias on `run:` inside a ci-debug member must fail in both modes.
-        alias_run_ci = (
-            "x-compile: &compile cargo test --no-run --config profile.dev.debug=2\n"
-            + ci_live_text.replace(
-                "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
-                "        run: *compile\n",
-                1,
-            )
-        )
-        alias_run_errs: list[str] = []
-        check_ci_debug_lane_profile_uniformity(
-            alias_run_ci, ambient_live_text, alias_run_errs
-        )
-        require(
-            any(
-                "GITHUB_ENV, or --config" in item or "unsupported YAML anchor/alias" in item
-                for item in alias_run_errs
+        # Alias/tag on `run:` or anchored flow step inside a ci-debug member must fail in both modes.
+        for label, bad_ci in (
+            (
+                "YAML alias on run:",
+                "x-compile: &compile cargo test --no-run --config profile.dev.debug=2\n"
+                + ci_live_text.replace(
+                    "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
+                    "        run: *compile\n",
+                    1,
+                ),
             ),
-            f"self-test ({mode_label}): YAML alias on run: must fail (got {alias_run_errs!r})",
-            failures,
-        )
+            (
+                "YAML tag !!str on run:",
+                ci_live_text.replace(
+                    "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
+                    "        run: !!str cargo test --no-run --config profile.dev.debug=2\n",
+                    1,
+                ),
+            ),
+            (
+                "anchored flow step inside lane job",
+                ci_live_text.replace(
+                    "      - name: Build integration tests archive\n",
+                    '      - &compile {name: Bad, run: "cargo test --no-run --config profile.test.debug=2"}\n'
+                    "      - *compile\n"
+                    "      - name: Build integration tests archive\n",
+                    1,
+                ),
+            ),
+        ):
+            alias_run_errs: list[str] = []
+            check_ci_debug_lane_profile_uniformity(
+                bad_ci, ambient_live_text, alias_run_errs
+            )
+            require(
+                any(
+                    "GITHUB_ENV, or --config" in item or "unsupported" in item
+                    for item in alias_run_errs
+                ),
+                f"self-test ({mode_label}): {label} must fail (got {alias_run_errs!r})",
+                failures,
+            )
 
     _run_ci_debug_self_tests("default")
     global _try_yaml_safe_load
