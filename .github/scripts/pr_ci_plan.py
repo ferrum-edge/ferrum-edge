@@ -833,22 +833,38 @@ PERFORMANCE_TREE_WORKSPACE_INPUTS = frozenset(
     }
 )
 
-# `run_rust`: the compile-and-test lane. Source, every test tree except the
-# Kubernetes shell suites under `tests/k8s/` (owned by the dedicated live
-# workflows) and the standalone benchmark workspaces under `tests/performance/`,
-# the operator config template and OpenAPI document (both have parity unit
-# tests), and the build graph.
+# Shared test fixtures and helpers compiled into unit, integration, and
+# functional test binaries.
+SHARED_TEST_SUPPORT_PATTERNS = (
+    r"^tests/common/",
+    r"^tests/scaffolding/",
+    r"^tests/fixtures/",
+    r"^tests/certs/",
+)
+
+# `run_rust`: the unit-test + inline-lib-test lane (`test-unit`). Covers Rust
+# source, unit test targets, shared test helpers/fixtures, functional test
+# sources (several unit contract tests embed `tests/functional/*.rs` via
+# `include_str!`), embedded contract/release-note files (`CHANGELOG.md`,
+# `docs/upgrade_guide.md`, `docs/migrations.md`, Prometheus metric contract,
+# `ferrum.conf`, `openapi.yaml`, `deny.toml`), and the build graph.
+# Pure `clippy.toml`, `tests/integration/**`, `tests/conformance/**`,
+# `tests/service_integration/**`, `tests/secrets_functional/**`,
+# `tests/acme_dns01/**`, `tests/windows_confinement_tests.rs`, and
+# `schemas/clickhouse/**` changes are validated by their own owning lanes.
 RUST_PATTERNS = [
     re.compile(pattern)
     for pattern in (
         *RUST_BUILD_GRAPH_PATTERNS,
+        *SHARED_TEST_SUPPORT_PATTERNS,
         r"^src/",
-        r"^tests/(?!k8s/|performance/)",
+        r"^tests/unit/",
+        r"^tests/unit(?:_[^/]+)?\.rs$",
+        r"^tests/functional/",
         *(
             "^" + re.escape(path) + "$"
             for path in sorted(PERFORMANCE_TREE_WORKSPACE_INPUTS)
         ),
-        r"^schemas/clickhouse/",  # DDL embedded by Rust integration tests
         # Release-note documents embedded by the changelog/upgrade-guide
         # parity unit test (DOC_PARITY_TEST_INPUTS).
         *("^" + re.escape(path) + "$" for path in sorted(DOC_PARITY_TEST_INPUTS)),
@@ -860,8 +876,76 @@ RUST_PATTERNS = [
         r"^ferrum\.conf$",
         r"^openapi\.yaml$",
         r"^deny\.toml$",
-        # `disallowed-methods` and other lint configuration read by the Lint job.
+    )
+]
+
+# `run_lint`: `cargo clippy --all-targets -- -D warnings`. Runs on Rust source,
+# root-crate test targets, build-graph inputs, and `clippy.toml`. Pure non-Rust
+# data/contract files (`CHANGELOG.md`, `openapi.yaml`, `ferrum.conf`,
+# `docs/prometheus_*`, `deny.toml`, `schemas/clickhouse/**`) do not alter
+# clippy lint diagnostics and are compiled/tested by their owning test lanes.
+LINT_PATTERNS = [
+    re.compile(pattern)
+    for pattern in (
+        *RUST_BUILD_GRAPH_PATTERNS,
+        r"^src/",
+        r"^tests/(?!k8s/|performance/)",
         r"^clippy\.toml$",
+    )
+]
+
+# `run_integration`: the in-process `integration_tests` shards
+# (`conditional-live-stores`, `admin-platform`, `mesh-protocols`). Runs on Rust
+# source, `tests/integration/**`, shared test helpers/fixtures, `openapi.yaml`
+# (`admin_backend_egress_policy_tests.rs`), `schemas/clickhouse/`
+# (`api_chargeback_sink_tests.rs`), and the build graph.
+INTEGRATION_PATTERNS = [
+    re.compile(pattern)
+    for pattern in (
+        *RUST_BUILD_GRAPH_PATTERNS,
+        *SHARED_TEST_SUPPORT_PATTERNS,
+        r"^src/",
+        r"^tests/integration/",
+        r"^tests/integration_tests\.rs$",
+        r"^schemas/clickhouse/",
+        r"^openapi\.yaml$",
+    )
+]
+
+# `run_functional`: the live-binary `functional_tests` shards. Runs on Rust
+# source, `tests/functional/**`, `tests/functional_tests.rs`, shared test
+# helpers/fixtures, and the build graph.
+FUNCTIONAL_PATTERNS = [
+    re.compile(pattern)
+    for pattern in (
+        *RUST_BUILD_GRAPH_PATTERNS,
+        *SHARED_TEST_SUPPORT_PATTERNS,
+        r"^src/",
+        r"^tests/functional/",
+        r"^tests/functional_tests\.rs$",
+    )
+]
+
+# `run_plugin_hardening_redis`: dedicated two-replica live-Redis regression job
+# covering `request_deduplication`, `hmac_auth` v2, and `dpop` shared replay
+# authority (all eight tests live in
+# `tests/functional/functional_redis_rate_limiting_test.rs`). Runs on those
+# plugins, shared plugin/proxy/config/runtime/TLS/util surfaces, that test file,
+# shared test helpers/fixtures, and the build graph; skipped on unrelated
+# plugins (`src/plugins/cors.rs`, `src/plugins/ai_*.rs`, ...) and non-Redis
+# subsystems on PRs while still running on every push to `main`.
+PLUGIN_HARDENING_REDIS_PATTERNS = [
+    re.compile(pattern)
+    for pattern in (
+        *RUST_BUILD_GRAPH_PATTERNS,
+        *SHARED_TEST_SUPPORT_PATTERNS,
+        r"^tests/functional/functional_redis_rate_limiting_test\.rs$",
+        r"^tests/functional/mod\.rs$",
+        r"^tests/functional_tests\.rs$",
+        r"^src/plugins/(?:request_deduplication|hmac_auth|dpop|mod)\.rs$",
+        r"^src/plugins/utils/",
+        r"^src/(?:lib|main|cli|gateway_entry|startup|plugin_cache|router_cache|consumer_index|connection_pool|retry|diagnostic_ref)\.rs$",
+        r"^src/(?:config|modes|proxy|pool|tls|fips|util)/",
     )
 ]
 
@@ -1059,6 +1143,10 @@ JOB_GATE_NAMES = (
     "run_secrets_backends",
     "run_pkcs11",
     "run_rust",
+    "run_lint",
+    "run_integration",
+    "run_functional",
+    "run_plugin_hardening_redis",
     "run_artifacts",
     "run_acme",
     "run_conformance",
@@ -1183,9 +1271,16 @@ def select_job_gates(event_name: str, changed_files: list[str]) -> dict[str, boo
     if any(path in GATE_CONTROLLER_PATHS for path in changed_files):
         return {name: True for name in JOB_GATE_NAMES}
 
+    run_helm = any_path_matches(HELM_PATTERNS, changed_files)
     run_rust = any_path_matches(RUST_PATTERNS, changed_files)
+    run_lint = any_path_matches(LINT_PATTERNS, changed_files)
+    run_integration = any_path_matches(INTEGRATION_PATTERNS, changed_files)
+    run_functional = any_path_matches(FUNCTIONAL_PATTERNS, changed_files)
+    run_plugin_hardening_redis = any_path_matches(
+        PLUGIN_HARDENING_REDIS_PATTERNS, changed_files
+    )
     return {
-        "run_helm": any_path_matches(HELM_PATTERNS, changed_files),
+        "run_helm": run_helm,
         "run_ebpf_kernel_live": any_path_matches(
             EBPF_KERNEL_LIVE_PATTERNS, changed_files
         ),
@@ -1201,9 +1296,19 @@ def select_job_gates(event_name: str, changed_files: list[str]) -> dict[str, boo
         ),
         "run_pkcs11": any_path_matches(PKCS11_PATTERNS, changed_files),
         "run_rust": run_rust,
-        # The debug gateway binary + nextest archives feed the Rust shards and
-        # the Helm chart's kind cluster, so either consumer schedules them.
-        "run_artifacts": run_rust or any_path_matches(HELM_PATTERNS, changed_files),
+        "run_lint": run_lint,
+        "run_integration": run_integration,
+        "run_functional": run_functional,
+        "run_plugin_hardening_redis": run_plugin_hardening_redis,
+        # The debug binaries + nextest archives feed integration, functional,
+        # plugin-hardening Redis, and Helm chart jobs; schedule only when at
+        # least one downstream consumer is active.
+        "run_artifacts": (
+            run_integration
+            or run_functional
+            or run_plugin_hardening_redis
+            or run_helm
+        ),
         "run_acme": any_path_matches(ACME_PATTERNS, changed_files),
         "run_conformance": any_path_matches(CONFORMANCE_PATTERNS, changed_files),
         "run_service_integration": any_path_matches(
@@ -1628,39 +1733,47 @@ def self_test() -> int:
         if any(path in reason for path in changed):
             failures.append("unclassifiable reason must not echo changed paths")
 
-    # Every gated job is off unless a path it owns changed. `run_rust` is the
-    # broad compile-and-test lane; the others are the narrow feature/live gates.
-    rust_only = {name: False for name in JOB_GATE_NAMES} | {
+    # Every gated job is off unless a path it owns changed.
+    all_false = {name: False for name in JOB_GATE_NAMES}
+    unit_only = all_false | {"run_rust": True}
+    unit_and_lint = unit_only | {"run_lint": True}
+    # Ordinary source files outside the Redis replay-authority surface run
+    # unit, lint, integration, functional, and artifacts without spinning up
+    # the dedicated two-replica Redis regression runner.
+    src_no_redis = all_false | {
         "run_rust": True,
+        "run_lint": True,
+        "run_integration": True,
+        "run_functional": True,
         "run_artifacts": True,
     }
-    # Source changes: the same lane (performance regression is out of band).
-    src_only = rust_only
+    src_with_redis = src_no_redis | {"run_plugin_hardening_redis": True}
     gate_cases = [
-        # Release-note documents run the changelog/upgrade-guide parity test.
-        ("pull_request", ["CHANGELOG.md"], rust_only),
-        ("pull_request", ["docs/upgrade_guide.md"], rust_only),
-        ("pull_request", ["docs/migrations.md"], rust_only),
+        # Release-note documents run only the unit parity tests (skipping
+        # lint, artifact builds, integration, functional, and Redis regression).
+        ("pull_request", ["CHANGELOG.md"], unit_only),
+        ("pull_request", ["docs/upgrade_guide.md"], unit_only),
+        ("pull_request", ["docs/migrations.md"], unit_only),
         # Nothing Rust-related: only planning/policy run.
         (
             "pull_request",
             [".github/workflows/perf-benchmark.yml"],
-            {name: False for name in JOB_GATE_NAMES},
+            all_false,
         ),
         (
             "pull_request",
             ["docs/admin_api.md", "README.md"],
-            {name: False for name in JOB_GATE_NAMES},
+            all_false,
         ),
         (
             "pull_request",
             ["tests/k8s/multicluster-federation/run.sh"],
-            {name: False for name in JOB_GATE_NAMES},
+            all_false,
         ),
         (
             "pull_request",
             ["comparison/README.md", "examples/foo.yaml"],
-            {name: False for name in JOB_GATE_NAMES},
+            all_false,
         ),
         # Helm and the shared contract inputs.
         (
@@ -1670,6 +1783,10 @@ def self_test() -> int:
                 "run_helm": True,
                 "run_artifacts": True,
                 "run_rust": False,
+                "run_lint": False,
+                "run_integration": False,
+                "run_functional": False,
+                "run_plugin_hardening_redis": False,
                 "run_platform_build": False,
             },
         ),
@@ -1686,12 +1803,26 @@ def self_test() -> int:
         (
             "pull_request",
             ["docs/prometheus_metric_contract.json"],
-            {"run_helm": True, "run_rust": True},
+            {
+                "run_helm": True,
+                "run_rust": True,
+                "run_artifacts": True,
+                "run_lint": False,
+                "run_integration": False,
+                "run_functional": False,
+            },
         ),
         (
             "pull_request",
             ["docs/prometheus_metrics.md"],
-            {"run_helm": True, "run_rust": True},
+            {
+                "run_helm": True,
+                "run_rust": True,
+                "run_artifacts": True,
+                "run_lint": False,
+                "run_integration": False,
+                "run_functional": False,
+            },
         ),
         (
             "pull_request",
@@ -1703,19 +1834,54 @@ def self_test() -> int:
             [".github/scripts/extract_rendered_prometheus_rules.py"],
             {"run_helm": True},
         ),
-        # Ordinary source and test changes: the compile-and-test lane only.
-        ("pull_request", ["src/backend_conn_limit.rs"], src_only),
-        ("pull_request", ["src/proxy/tcp_proxy.rs"], src_only),
-        ("pull_request", ["src/router_cache.rs"], src_only),
-        ("pull_request", ["src/plugins/cors.rs"], src_only),
-        ("pull_request", ["tests/unit/plugins/cors_tests.rs"], rust_only),
-        ("pull_request", ["tests/functional/functional_admin_test.rs"], rust_only),
-        ("pull_request", ["ferrum.conf"], rust_only),
-        ("pull_request", ["openapi.yaml"], rust_only),
+        # Ordinary source and test changes: only owning lanes run.
+        ("pull_request", ["src/backend_conn_limit.rs"], src_no_redis),
+        ("pull_request", ["src/proxy/tcp_proxy.rs"], src_with_redis),
+        ("pull_request", ["src/router_cache.rs"], src_with_redis),
+        ("pull_request", ["src/plugins/cors.rs"], src_no_redis),
+        ("pull_request", ["src/plugins/request_deduplication.rs"], src_with_redis),
+        ("pull_request", ["src/plugins/hmac_auth.rs"], src_with_redis),
+        ("pull_request", ["src/plugins/dpop.rs"], src_with_redis),
+        ("pull_request", ["src/admin/handlers.rs"], src_no_redis),
+        ("pull_request", ["tests/unit/plugins/cors_tests.rs"], unit_and_lint),
+        (
+            "pull_request",
+            ["tests/integration/admin_audit_rbac_tests.rs"],
+            all_false | {"run_integration": True, "run_lint": True, "run_artifacts": True},
+        ),
+        (
+            "pull_request",
+            ["tests/functional/functional_admin_test.rs"],
+            all_false
+            | {
+                "run_rust": True,
+                "run_lint": True,
+                "run_functional": True,
+                "run_artifacts": True,
+            },
+        ),
+        (
+            "pull_request",
+            ["tests/functional/functional_redis_rate_limiting_test.rs"],
+            all_false
+            | {
+                "run_rust": True,
+                "run_lint": True,
+                "run_functional": True,
+                "run_plugin_hardening_redis": True,
+                "run_artifacts": True,
+            },
+        ),
+        ("pull_request", ["ferrum.conf"], unit_only),
+        (
+            "pull_request",
+            ["openapi.yaml"],
+            unit_only | {"run_integration": True, "run_artifacts": True},
+        ),
         (
             "pull_request",
             ["src/modes/grpc_tls_reload.rs"],
-            src_only,
+            src_with_redis,
         ),
         # Build-graph inputs fan out to every compile-based job, but the
         # privileged live suites stay on main.
@@ -1724,6 +1890,11 @@ def self_test() -> int:
             ["Cargo.lock"],
             {
                 "run_rust": True,
+                "run_lint": True,
+                "run_integration": True,
+                "run_functional": True,
+                "run_plugin_hardening_redis": True,
+                "run_artifacts": True,
                 "run_acme": True,
                 "run_conformance": True,
                 "run_service_integration": True,
@@ -1746,6 +1917,10 @@ def self_test() -> int:
             ["rust-toolchain.toml"],
             {
                 "run_rust": True,
+                "run_lint": True,
+                "run_integration": True,
+                "run_functional": True,
+                "run_plugin_hardening_redis": True,
                 "run_acme": True,
                 "run_conformance": True,
                 "run_ebpf_kernel_live": False,
@@ -1758,6 +1933,11 @@ def self_test() -> int:
             [".github/workflows/ci.yml"],
             {
                 "run_rust": True,
+                "run_lint": True,
+                "run_integration": True,
+                "run_functional": True,
+                "run_plugin_hardening_redis": True,
+                "run_artifacts": True,
                 "run_helm": True,
                 "run_ebpf_kernel_live": True,
                 "run_netns_capture_live": True,
@@ -1780,12 +1960,12 @@ def self_test() -> int:
         (
             "pull_request",
             ["src/tls/acme.rs"],
-            src_only | {"run_acme": True, "run_pkcs11": False},
+            src_with_redis | {"run_acme": True, "run_pkcs11": False},
         ),
         (
             "pull_request",
             ["src/tls/mod.rs"],
-            src_only
+            src_with_redis
             | {
                 "run_acme": True,
                 "run_pkcs11": True,
@@ -1796,27 +1976,27 @@ def self_test() -> int:
         (
             "pull_request",
             ["tests/acme_dns01/mod.rs"],
-            rust_only | {"run_acme": True},
+            all_false | {"run_acme": True, "run_lint": True},
         ),
         (
             "pull_request",
             ["src/secrets/vault.rs"],
-            src_only | {"run_secrets_backends": True, "run_platform_build": True},
+            src_no_redis | {"run_secrets_backends": True, "run_platform_build": True},
         ),
         (
             "pull_request",
             ["src/tls/pkcs11.rs"],
-            src_only | {"run_pkcs11": True, "run_acme": True},
+            src_with_redis | {"run_pkcs11": True, "run_acme": True},
         ),
         (
             "pull_request",
             ["tests/conformance/istio_virtual_service.rs"],
-            rust_only | {"run_conformance": True},
+            all_false | {"run_conformance": True, "run_lint": True},
         ),
         (
             "pull_request",
             ["src/modes/mesh/policy.rs"],
-            src_only
+            src_with_redis
             | {
                 "run_helm": True,
                 "run_conformance": True,
@@ -1828,58 +2008,73 @@ def self_test() -> int:
         (
             "pull_request",
             ["src/xds/mod.rs"],
-            src_only | {"run_conformance": True, "run_standalone_cargo": True},
+            src_no_redis | {"run_conformance": True, "run_standalone_cargo": True},
         ),
         (
             "pull_request",
             ["tests/service_integration/ldap.rs"],
-            rust_only | {"run_service_integration": True},
+            all_false | {"run_service_integration": True, "run_lint": True},
         ),
         (
             "pull_request",
             ["schemas/clickhouse/charges.sql"],
-            rust_only | {"run_service_integration": True},
+            all_false
+            | {
+                "run_integration": True,
+                "run_artifacts": True,
+                "run_service_integration": True,
+            },
         ),
         # Shared host-port allocator: compiled into the secrets fixtures too, so
         # it schedules both container suites (issue #5488).
         (
             "pull_request",
             ["tests/service_integration/common/host_ports.rs"],
-            rust_only | {"run_service_integration": True, "run_secrets_backends": True},
+            all_false
+            | {
+                "run_lint": True,
+                "run_service_integration": True,
+                "run_secrets_backends": True,
+            },
         ),
         # Shared container-start retry: compiled into the secrets fixtures too
         # (follow-up to #5881), so it schedules both container suites.
         (
             "pull_request",
             ["tests/service_integration/common/container_retry.rs"],
-            rust_only | {"run_service_integration": True, "run_secrets_backends": True},
+            all_false
+            | {
+                "run_lint": True,
+                "run_service_integration": True,
+                "run_secrets_backends": True,
+            },
         ),
         # The startup smoke spawns through the shared port registry and gateway
         # harness, both compiled into the secrets target (issues #7076, #7077).
         (
             "pull_request",
             ["tests/common/gateway_harness.rs"],
-            rust_only | {"run_secrets_backends": True},
+            src_with_redis | {"run_secrets_backends": True},
         ),
         (
             "merge_group",
             ["tests/scaffolding/ports.rs"],
-            rust_only | {"run_secrets_backends": True},
+            src_with_redis | {"run_secrets_backends": True},
         ),
         (
             "pull_request",
             ["src/plugins/ldap_auth.rs"],
-            src_only | {"run_service_integration": True},
+            src_no_redis | {"run_service_integration": True},
         ),
         (
             "pull_request",
             ["src/service_discovery/consul.rs"],
-            src_only | {"run_service_integration": True},
+            src_no_redis | {"run_service_integration": True},
         ),
         (
             "pull_request",
             ["src/ebpf/loader.rs"],
-            src_only
+            src_no_redis
             | {"run_ebpf_userspace": True, "run_ebpf_kernel_live": True},
         ),
         (
@@ -1887,6 +2082,10 @@ def self_test() -> int:
             ["ebpf/ferrum-ebpf/src/main.rs"],
             {
                 "run_rust": True,
+                "run_lint": True,
+                "run_integration": True,
+                "run_functional": True,
+                "run_plugin_hardening_redis": True,
                 "run_ebpf_build": True,
                 "run_ebpf_userspace": True,
                 "run_ebpf_kernel_live": True,
@@ -1898,17 +2097,17 @@ def self_test() -> int:
         (
             "pull_request",
             ["fuzz/fuzz_targets/traceparent.rs"],
-            {"run_fuzz_smoke": True, "run_standalone_cargo": True, "run_rust": False},
+            {"run_fuzz_smoke": True, "run_standalone_cargo": True, "run_rust": False, "run_lint": False},
         ),
         (
             "pull_request",
             ["src/fuzz_support.rs"],
-            src_only | {"run_fuzz_smoke": True, "run_standalone_cargo": True},
+            src_no_redis | {"run_fuzz_smoke": True, "run_standalone_cargo": True},
         ),
         (
             "pull_request",
             ["src/proxy/proxy_protocol.rs"],
-            src_only | {"run_fuzz_smoke": True, "run_standalone_cargo": True},
+            src_with_redis | {"run_fuzz_smoke": True, "run_standalone_cargo": True},
         ),
         (
             "pull_request",
@@ -1925,6 +2124,10 @@ def self_test() -> int:
             ["vendor/h3-0.0.8-ferrum-patched/src/lib.rs"],
             {
                 "run_rust": True,
+                "run_lint": True,
+                "run_integration": True,
+                "run_functional": True,
+                "run_plugin_hardening_redis": True,
                 "run_vendor_patches": True,
                 "run_dependency_audit": True,
                 "run_fuzz_smoke": True,
@@ -1935,7 +2138,7 @@ def self_test() -> int:
         (
             "pull_request",
             ["deny.toml"],
-            {"run_dependency_audit": True, "run_rust": True},
+            all_false | {"run_dependency_audit": True, "run_rust": True},
         ),
         # Issue #7284: the modules `build.rs` `include!`s and the lint
         # configuration must not leave every gate false (a no-CI merge).
@@ -1944,6 +2147,10 @@ def self_test() -> int:
             ["build/protoc_preflight.rs"],
             {
                 "run_rust": True,
+                "run_lint": True,
+                "run_integration": True,
+                "run_functional": True,
+                "run_plugin_hardening_redis": True,
                 "run_artifacts": True,
                 "run_acme": True,
                 "run_conformance": True,
@@ -1960,23 +2167,23 @@ def self_test() -> int:
         (
             "merge_group",
             ["build/plugin_migration_exports.rs"],
-            {"run_rust": True, "run_platform_build": True},
+            {"run_rust": True, "run_lint": True, "run_platform_build": True},
         ),
         (
             "pull_request",
             ["clippy.toml"],
-            rust_only,
+            all_false | {"run_lint": True},
         ),
         # A root file merely named like the build tree stays out of the lane.
         (
             "pull_request",
             ["build.rs.md"],
-            {name: False for name in JOB_GATE_NAMES},
+            all_false,
         ),
         (
             "pull_request",
             ["docs/vendored-patch-lifecycle.json", "docs/dependency-policy.md"],
-            {"run_dependency_audit": True, "run_rust": False},
+            {"run_dependency_audit": True, "run_rust": False, "run_lint": False},
         ),
         (
             "pull_request",
@@ -1989,6 +2196,7 @@ def self_test() -> int:
                 "run_vendor_patches": False,
                 "run_artifacts": False,
                 "run_rust": False,
+                "run_lint": False,
             },
         ),
         (
@@ -1999,17 +2207,18 @@ def self_test() -> int:
                 "run_vendor_patches": False,
                 "run_artifacts": False,
                 "run_rust": False,
+                "run_lint": False,
             },
         ),
         (
             "pull_request",
             ["scripts/check_advisory_expiry.sh"],
-            {"run_dependency_audit": True, "run_rust": False},
+            {"run_dependency_audit": True, "run_rust": False, "run_lint": False},
         ),
         (
             "pull_request",
             ["scripts/verify_dependency_security_chain.py"],
-            {"run_dependency_audit": True, "run_rust": False},
+            {"run_dependency_audit": True, "run_rust": False, "run_lint": False},
         ),
         # Standalone benchmark workspaces are not root-crate inputs; their own
         # workflows (benchmark-harness-tests, performance-regression) own their
@@ -2018,7 +2227,7 @@ def self_test() -> int:
         (
             "pull_request",
             ["tests/performance/mesh/benches/rr_selection.rs"],
-            {name: False for name in JOB_GATE_NAMES} | {"run_standalone_cargo": True},
+            all_false | {"run_standalone_cargo": True},
         ),
         (
             "pull_request",
@@ -2026,42 +2235,39 @@ def self_test() -> int:
                 "tests/performance/multi_protocol/proto_bench.rs",
                 "tests/performance/multi_protocol/Cargo.lock",
             ],
-            {name: False for name in JOB_GATE_NAMES}
-            | {"run_standalone_cargo": True, "run_dependency_audit": True},
+            all_false | {"run_standalone_cargo": True, "run_dependency_audit": True},
         ),
         (
             "pull_request",
             ["tests/performance/payload_size/Cargo.lock"],
-            {name: False for name in JOB_GATE_NAMES}
-            | {"run_standalone_cargo": True, "run_dependency_audit": True},
+            all_false | {"run_standalone_cargo": True, "run_dependency_audit": True},
         ),
         (
             "pull_request",
             ["tests/performance/multi_protocol/run_protocol_test.sh"],
-            {name: False for name in JOB_GATE_NAMES},
+            all_false,
         ),
         (
             "pull_request",
             [".github/scripts/standalone_cargo_manifests.py"],
-            {name: False for name in JOB_GATE_NAMES}
-            | {"run_standalone_cargo": True, "run_dependency_audit": True},
+            all_false | {"run_standalone_cargo": True, "run_dependency_audit": True},
         ),
         # ...except the fixtures root-crate unit tests embed.
         (
             "pull_request",
             ["tests/performance/mesh-hbone-e2e/run.sh"],
-            rust_only,
+            unit_only,
         ),
         (
             "pull_request",
             ["tests/performance/mesh-hbone-e2e/README.sh"],
-            {name: False for name in JOB_GATE_NAMES},
+            all_false,
         ),
         # Live suites: only their owner paths schedule them on a PR.
         (
             "pull_request",
             ["src/proxy/netns_capture.rs"],
-            src_only
+            src_with_redis
             | {
                 "run_ebpf_kernel_live": False,
                 "run_netns_capture_live": True,
@@ -2080,12 +2286,12 @@ def self_test() -> int:
         (
             "pull_request",
             ["src/proxy/hbone_proxy.rs"],
-            src_only | {"run_two_cluster_live": True, "run_netns_capture_live": False},
+            src_with_redis | {"run_two_cluster_live": True, "run_netns_capture_live": False},
         ),
         (
             "pull_request",
             ["src/capture/mod.rs"],
-            src_only
+            src_no_redis
             | {
                 "run_ebpf_kernel_live": True,
                 "run_netns_capture_live": True,
@@ -2097,17 +2303,22 @@ def self_test() -> int:
         (
             "pull_request",
             ["src/socket_opts.rs"],
-            src_only,
+            src_no_redis,
         ),
         (
             "pull_request",
             ["src/tls/backend.rs"],
-            src_only | {"run_acme": True, "run_pkcs11": True},
+            src_with_redis | {"run_acme": True, "run_pkcs11": True},
         ),
         (
             "pull_request",
             ["tests/functional/fixtures/two_cluster_spire.sh"],
-            {"run_two_cluster_live": True, "run_rust": True},
+            {"run_two_cluster_live": True, "run_rust": True, "run_functional": True},
+        ),
+        (
+            "pull_request",
+            ["tests/windows_confinement_tests.rs"],
+            all_false | {"run_lint": True},
         ),
         # Gate controllers force every suite on.
         (

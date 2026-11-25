@@ -50,6 +50,10 @@ jobs:
       run_secrets_backends: ${{ steps.plan.outputs.run_secrets_backends }}
       run_pkcs11: ${{ steps.plan.outputs.run_pkcs11 }}
       run_rust: ${{ steps.plan.outputs.run_rust }}
+      run_lint: ${{ steps.plan.outputs.run_lint }}
+      run_integration: ${{ steps.plan.outputs.run_integration }}
+      run_functional: ${{ steps.plan.outputs.run_functional }}
+      run_plugin_hardening_redis: ${{ steps.plan.outputs.run_plugin_hardening_redis }}
       run_artifacts: ${{ steps.plan.outputs.run_artifacts }}
       run_acme: ${{ steps.plan.outputs.run_acme }}
       run_conformance: ${{ steps.plan.outputs.run_conformance }}
@@ -292,7 +296,7 @@ jobs:
           # after the new planner proves the NUL stream classifiable.
           # Missing/invalid individual outputs still fail closed to true.
           gate_fallbacks=()
-          for gate in run_helm run_ebpf_kernel_live run_netns_capture_live run_two_cluster_live run_ebpf_build run_secrets_backends run_pkcs11 run_rust run_artifacts run_acme run_conformance run_service_integration run_ebpf_userspace run_fuzz_smoke run_platform_build run_vendor_patches run_dependency_audit run_standalone_cargo; do
+          for gate in run_helm run_ebpf_kernel_live run_netns_capture_live run_two_cluster_live run_ebpf_build run_secrets_backends run_pkcs11 run_rust run_lint run_integration run_functional run_plugin_hardening_redis run_artifacts run_acme run_conformance run_service_integration run_ebpf_userspace run_fuzz_smoke run_platform_build run_vendor_patches run_dependency_audit run_standalone_cargo; do
             value="$(printf '%s\n' "$plan" | sed -n "s/^${gate}=//p")"
             if [ "$paths_classifiable" != "true" ]; then
               value=true
@@ -326,7 +330,7 @@ jobs:
             echo ""
             echo "| Gate | Scheduled |"
             echo "| --- | --- |"
-            for gate in run_helm run_ebpf_kernel_live run_netns_capture_live run_two_cluster_live run_ebpf_build run_secrets_backends run_pkcs11 run_rust run_artifacts run_acme run_conformance run_service_integration run_ebpf_userspace run_fuzz_smoke run_platform_build run_vendor_patches run_dependency_audit run_standalone_cargo; do
+            for gate in run_helm run_ebpf_kernel_live run_netns_capture_live run_two_cluster_live run_ebpf_build run_secrets_backends run_pkcs11 run_rust run_lint run_integration run_functional run_plugin_hardening_redis run_artifacts run_acme run_conformance run_service_integration run_ebpf_userspace run_fuzz_smoke run_platform_build run_vendor_patches run_dependency_audit run_standalone_cargo; do
               value="$(printf '%s\n' "$plan" | sed -n "s/^${gate}=//p")"
               if [ "$paths_classifiable" != "true" ]; then
                 value=true
@@ -1176,18 +1180,12 @@ jobs:
           tool: cargo-nextest
 
       - name: Build test targets and binaries
-        # One Cargo invocation compiles both nextest targets, so the two test
-        # crates build concurrently once the shared library is done. Cargo
-        # also builds every package bin for integration tests (for
-        # `CARGO_BIN_EXE_*`) and uplifts them to target/debug/ferrum-edge and
-        # target/debug/ferrum-cni, the paths the upload steps below publish.
-        # The archive steps then find every unit fresh and only package it.
-        #
-        # Do not add a separate `cargo build --bin` step. Without
-        # dev-dependencies Cargo resolves a different feature set (tokio
-        # `test-util`, rustls `aws-lc-rs`), which misses the test-built
-        # `ci-debug` lane and compiles the dependency graph and the library a
-        # second time. The test build then overwrote that binary anyway.
+        # Compile only the test targets and binaries needed by active downstream
+        # consumers. When both integration and functional archives are needed
+        # (ordinary `src/` PRs and every push to `main`), ONE Cargo invocation
+        # compiles both nextest targets concurrently along with `ferrum-edge`
+        # and `ferrum-cni` (for `CARGO_BIN_EXE_*`). On test-suite-only or
+        # Helm-only PRs, omitting unneeded test crates saves 4–7 minutes.
         #
         # `cni_tests` launches `env!("CARGO_BIN_EXE_ferrum-cni")`, which
         # Cargo bakes in as target/debug/ferrum-cni under the workspace path
@@ -1195,9 +1193,27 @@ jobs:
         # matching OS/arch + checkout layout, or update this artifact/path with
         # any future runner/workspace/target-dir change. These binaries are
         # used only for tests; release producers keep their shipping profile.
-        run: cargo test --no-run --test integration_tests --test functional_tests
+        env:
+          NEED_INTEGRATION: ${{ needs.ci-plan.outputs.run_integration == 'true' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch' }}
+          NEED_FUNCTIONAL: ${{ needs.ci-plan.outputs.run_functional == 'true' || needs.ci-plan.outputs.run_plugin_hardening_redis == 'true' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch' }}
+          NEED_BINS: ${{ needs.ci-plan.outputs.run_functional == 'true' || needs.ci-plan.outputs.run_plugin_hardening_redis == 'true' || needs.ci-plan.outputs.run_helm == 'true' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch' }}
+        run: |
+          set -euo pipefail
+          if [ "$NEED_INTEGRATION" = "true" ] && [ "$NEED_FUNCTIONAL" = "true" ]; then
+            cargo test --no-run --test integration_tests --test functional_tests
+          elif [ "$NEED_INTEGRATION" = "true" ]; then
+            cargo test --no-run --test integration_tests
+          elif [ "$NEED_FUNCTIONAL" = "true" ]; then
+            cargo test --no-run --test functional_tests
+          elif [ "$NEED_BINS" = "true" ]; then
+            cargo build --bin ferrum-edge --bin ferrum-cni
+          else
+            echo "::error::build-test-artifacts ran with no active artifact consumer" >&2
+            exit 1
+          fi
 
       - name: Build integration tests archive
+        if: needs.ci-plan.outputs.run_integration == 'true' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
         # Nextest archives are native binaries, so the file and artifact names
         # include runner OS/arch. Full debuginfo makes the archive hundreds of
         # MB larger and is omitted only from this transfer artifact.
@@ -1208,6 +1224,7 @@ jobs:
             --archive-file "$archive_file"
 
       - name: Build functional tests archive
+        if: needs.ci-plan.outputs.run_functional == 'true' || needs.ci-plan.outputs.run_plugin_hardening_redis == 'true' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
         # Packages the functional target compiled by the step above.
         run: |
           archive_file="functional-tests-${RUNNER_OS}-${RUNNER_ARCH}.tar.zst"
@@ -1216,6 +1233,7 @@ jobs:
             --archive-file "$archive_file"
 
       - name: Upload gateway binary
+        if: needs.ci-plan.outputs.run_functional == 'true' || needs.ci-plan.outputs.run_plugin_hardening_redis == 'true' || needs.ci-plan.outputs.run_helm == 'true' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
         # Consumers use the target/debug path and OS/arch-keyed artifact name.
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
@@ -1225,6 +1243,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload integration tests archive
+        if: needs.ci-plan.outputs.run_integration == 'true' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: integration-tests-archive-${{ runner.os }}-${{ runner.arch }}
@@ -1233,6 +1252,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload ferrum-cni binary
+        if: needs.ci-plan.outputs.run_functional == 'true' || needs.ci-plan.outputs.run_plugin_hardening_redis == 'true' || needs.ci-plan.outputs.run_helm == 'true' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ferrum-cni-debug-${{ runner.os }}-${{ runner.arch }}
@@ -1241,6 +1261,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload functional tests archive
+        if: needs.ci-plan.outputs.run_functional == 'true' || needs.ci-plan.outputs.run_plugin_hardening_redis == 'true' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: functional-tests-archive-${{ runner.os }}-${{ runner.arch }}
@@ -1258,7 +1279,7 @@ jobs:
     # wall-clock waits in `wait_for_poll` / `wait_for_route` / fixed sleeps
     # make elapsed time, not CPU utilisation, the useful balancing signal.
     name: Integration Tests (${{ matrix.shard }})
-    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_rust == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
+    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_integration == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     needs: [ci-plan, build-test-artifacts]
     runs-on: ubuntu-26.04
     strategy:
@@ -2161,7 +2182,7 @@ jobs:
 
   test-functional:
     name: Functional Tests (${{ matrix.shard }})
-    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_rust == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
+    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_functional == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     needs: [ci-plan, build-test-artifacts]
     runs-on: ubuntu-26.04
     strategy:
@@ -3003,7 +3024,7 @@ jobs:
 
   plugin-hardening-redis-regression:
     name: Plugin Hardening Redis Regression
-    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_rust == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
+    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_plugin_hardening_redis == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     needs: [ci-plan, build-test-artifacts]
     runs-on: ubuntu-26.04
     timeout-minutes: 20
@@ -6905,14 +6926,14 @@ jobs:
           require_planned_gate "Service integration" "${{ needs.test-service-integration.result }}" "${{ needs.ci-plan.outputs.run_service_integration }}"
           require_planned_gate "PKCS#11 SoftHSM integration" "${{ needs.test-pkcs11-softhsm.result }}" "${{ needs.ci-plan.outputs.run_pkcs11 }}"
           require_planned_gate "Test artifact build" "${{ needs.build-test-artifacts.result }}" "${{ needs.ci-plan.outputs.run_artifacts }}"
-          require_planned_gate "Integration" "${{ needs.test-integration.result }}" "${{ needs.ci-plan.outputs.run_rust }}"
+          require_planned_gate "Integration" "${{ needs.test-integration.result }}" "${{ needs.ci-plan.outputs.run_integration }}"
           require_planned_gate "Mesh conformance" "${{ needs.test-conformance.result }}" "${{ needs.ci-plan.outputs.run_conformance }}"
           require_planned_gate "Dependency audit" "${{ needs.dependency-audit.result }}" "${{ needs.ci-plan.outputs.run_dependency_audit }}"
           require_planned_gate "Vendored patch regressions" "${{ needs.test-vendor-patches.result }}" "${{ needs.ci-plan.outputs.run_vendor_patches }}"
-          require_planned_gate "Functional shards" "${{ needs.test-functional.result }}" "${{ needs.ci-plan.outputs.run_rust }}"
-          require_planned_gate "Plugin hardening Redis regression" "${{ needs.plugin-hardening-redis-regression.result }}" "${{ needs.ci-plan.outputs.run_rust }}"
+          require_planned_gate "Functional shards" "${{ needs.test-functional.result }}" "${{ needs.ci-plan.outputs.run_functional }}"
+          require_planned_gate "Plugin hardening Redis regression" "${{ needs.plugin-hardening-redis-regression.result }}" "${{ needs.ci-plan.outputs.run_plugin_hardening_redis }}"
           require_planned_gate "Helm chart" "${{ needs.helm-chart.result }}" "${{ needs.ci-plan.outputs.run_helm }}"
-          require_planned_gate "Lint" "${{ needs.lint.result }}" "${{ needs.ci-plan.outputs.run_rust }}"
+          require_planned_gate "Lint" "${{ needs.lint.result }}" "${{ needs.ci-plan.outputs.run_lint }}"
           require_planned_gate "Fuzz Smoke" "${{ needs.fuzz-smoke.result }}" "${{ needs.ci-plan.outputs.run_fuzz_smoke }}"
           require_planned_gate "eBPF programs" "${{ needs.build-ebpf.result }}" "${{ needs.ci-plan.outputs.run_ebpf_build }}"
           require_planned_gate "eBPF userspace loader" "${{ needs.build-ebpf-userspace.result }}" "${{ needs.ci-plan.outputs.run_ebpf_userspace }}"
@@ -6935,7 +6956,7 @@ jobs:
   lint:
     name: Lint
     needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_rust == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
+    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_lint == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
