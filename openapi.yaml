@@ -5828,8 +5828,10 @@ paths:
         the existing unconditional restore behavior. Body metadata is accepted
         and ignored; only the header establishes a precondition.
 
-        **Replacement operation** — snapshots the current namespace, deletes
-        all existing resources, and imports the provided configuration. If any
+        **Replacement operation** — requires `?confirm=true` query parameter to
+        prevent accidental invocation. For unconditional restores (without
+        `If-Match`), Ferrum snapshots the current namespace, deletes all
+        existing resources, and imports the provided configuration. If any
         import (or the delete) step fails, Ferrum clears the partial state and
         reapplies the snapshot. One persistent namespace-scoped datastore guard
         normally spans that compensating clear and every replay batch, so other
@@ -5839,16 +5841,19 @@ paths:
         current resources authoritative for matching IDs, validates the combined
         transaction-log schema graph, and inserts only missing snapshot resources.
         It never clears the intervening write; an invalid combined graph is
-        rejected before replay. Requires `?confirm=true` query parameter to
-        prevent accidental invocation.
+        rejected before replay.
 
-        The recovery snapshot uses a **non-validating raw load** from the
-        primary, so an already-invalid-but-present namespace (the case an
-        operator runs restore to *repair*) still snapshots and keeps rollback
-        available. If the snapshot cannot be taken, restore aborts before any
-        delete: connectivity failures return `503`, while corrupt/undecodable
-        stored resources return `500` with `failure_class: data_integrity` and
-        a safe resource type/id when available. API specs are included in the
+        On unconditional restores, the recovery snapshot uses a **non-validating
+        raw load** from the primary, so an already-invalid-but-present namespace
+        (the case an operator runs restore to *repair*) still snapshots and keeps
+        rollback available. If that recovery snapshot cannot be taken, restore
+        aborts before any delete: connectivity failures return `503`, while
+        corrupt/undecodable stored resources return `500` with
+        `failure_class: data_integrity` and a safe resource type/id when
+        available. On conditional restores (with `If-Match`), no compensating
+        clear/replay is used — the store rolls back the single transaction on
+        any error, and snapshot read failures (including corrupt or undecodable
+        stored resources) return `503`. API specs are included in the
         versioned backup section and are restored (and rolled back) with config
         resources. Legacy backups that omit `api_specs` while the target
         namespace holds specs require `?confirm_api_spec_deletion=true` in
@@ -21760,6 +21765,7 @@ components:
         - content_encoding
         - uncompressed_size
         - content_hash
+        - resource_hash
         - created_at
         - updated_at
       properties:
