@@ -311,7 +311,7 @@ fn namespaced_resource_documents_use_composite_durable_keys() {
         "fn proxy_to_doc(",
         "fn plugin_config_to_doc(",
         "fn upstream_to_doc(",
-        "fn api_spec_to_doc(",
+        "fn api_spec_to_doc_unchecked(",
         "fn consumer_to_doc(",
     ] {
         let start = MONGO_STORE_SOURCE
@@ -1654,7 +1654,7 @@ fn health_builds_admission_fence_snapshot_only_in_the_detailed_tier() {
         "the fence snapshot must stay inside the `if detailed` block"
     );
     let health = ADMIN_SOURCE
-        .find("if path == \"/health\" || path == \"/status\" {")
+        .find("if (path == \"/health\" || path == \"/status\") && matches!(method, Method::GET | Method::HEAD) {")
         .expect("/health handler");
     let minimal = health
         + ADMIN_SOURCE[health..]

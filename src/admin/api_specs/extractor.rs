@@ -569,15 +569,47 @@ pub fn extract_with_external_refs(
 
         let mut out = Vec::with_capacity(arr.len());
         for entry in arr {
+            // Reject positional array entries before `serde_json::from_value`
+            // so every plugin definition must be a JSON object and cannot
+            // bypass the literal `config` extraction & reserved-key guard.
+            if !entry.is_object() {
+                return Err(ExtractError::MalformedExtension {
+                    which: "x-ferrum-plugins",
+                    error: "each plugin entry must be a JSON object".to_string(),
+                });
+            }
             // Default scope to "proxy" when the spec omits it — proxy-scope
             // is the only allowed value here (enforced below), so requiring
             // explicit `scope: proxy` everywhere would just be friction.
             // Explicit non-proxy scopes still fail downstream with a clear
             // error.
             let mut entry_with_default = entry.clone();
-            if let Some(map) = entry_with_default.as_object_mut() {
+            let raw_config = if let Some(map) = entry_with_default.as_object_mut() {
                 map.entry("scope".to_string())
                     .or_insert(serde_json::Value::String("proxy".to_string()));
+                // Carry the already-parsed literal `config` value out before
+                // `serde_json::from_value` so serde_json's `raw_value` feature
+                // cannot reinterpret a `$serde_json::private::RawValue` key
+                // inside `config` into an uncharged nested JSON tree.
+                map.remove("config")
+            } else {
+                None
+            };
+            // Fail closed on serde_json's reserved internal RawValue sentinel
+            // at any depth of `config`: keeping it literal would bypass
+            // forbidden-key and plugin validation while DB/Mongo reload (which
+            // decodes plain `serde_json::Value` with `raw_value` enabled) would
+            // reinterpret or fail to decode it.
+            if raw_config
+                .as_ref()
+                .is_some_and(contains_reserved_serde_raw_value_key)
+            {
+                return Err(ExtractError::MalformedExtension {
+                    which: "x-ferrum-plugins",
+                    error: format!(
+                        "plugin config must not contain reserved key \"{SERDE_JSON_RAW_VALUE_KEY}\""
+                    ),
+                });
             }
 
             let mut pc: PluginConfig = serde_json::from_value(entry_with_default).map_err(|e| {
@@ -586,6 +618,9 @@ pub fn extract_with_external_refs(
                     error: e.to_string(),
                 }
             })?;
+            if let Some(config) = raw_config {
+                pc.config = config;
+            }
 
             // --- ID validation for plugin (BEFORE auto-linking) -------------
             // Empty id → leave empty; handler assigns / reuses IDs.
@@ -686,7 +721,9 @@ pub fn extract_with_external_refs(
     }
 
     // --- x-ferrum-mcp (optional): operations as mcp_gateway tools ----------
-    if let Some(mcp_ext) = parse_x_ferrum_mcp_extension(&root)? {
+    let mcp_ext = parse_x_ferrum_mcp_extension(&root)?;
+    let mcp_enabled = mcp_ext.is_some();
+    if let Some(mcp_ext) = mcp_ext {
         // A bridged call reaches the backend under the operation's path while
         // the client request targets the MCP endpoint, so the generated
         // validator would judge the endpoint as an unknown operation. The
@@ -737,6 +774,26 @@ pub fn extract_with_external_refs(
             operations,
             endpoint_path,
         )?;
+    }
+
+    // Final defense-in-depth across every extracted/generated/merged plugin
+    // config so `$serde_json::private::RawValue` (e.g. inside an object-valued
+    // schema `const` resolved from a local or external `$ref`) can never enter
+    // persisted plugin configs and change meaning or fail on SQL/Mongo reload.
+    for pc in &plugins {
+        if contains_reserved_serde_raw_value_key(&pc.config) {
+            let which = match pc.plugin_name.as_str() {
+                "openapi_validator" if validate_enabled => "x-ferrum-validate",
+                "mcp_gateway" if mcp_enabled => "x-ferrum-mcp",
+                _ => "x-ferrum-plugins",
+            };
+            return Err(ExtractError::MalformedExtension {
+                which,
+                error: format!(
+                    "plugin config must not contain reserved key \"{SERDE_JSON_RAW_VALUE_KEY}\""
+                ),
+            });
+        }
     }
 
     // --- Build proxy.plugins association list (Fix 2) -----------------------
@@ -808,6 +865,7 @@ pub fn extract_declared_proxy_plugin_association_ids(
         })?;
 
     let mut out = Vec::with_capacity(arr.len());
+    let mut seen = std::collections::HashSet::with_capacity(arr.len());
     for entry in arr {
         let assoc: PluginAssociation = serde_json::from_value(entry.clone()).map_err(|e| {
             ExtractError::MalformedExtension {
@@ -815,8 +873,7 @@ pub fn extract_declared_proxy_plugin_association_ids(
                 error: e.to_string(),
             }
         })?;
-        if !assoc.plugin_config_id.is_empty() && !out.iter().any(|id| id == &assoc.plugin_config_id)
-        {
+        if !assoc.plugin_config_id.is_empty() && seen.insert(assoc.plugin_config_id.clone()) {
             out.push(assoc.plugin_config_id);
         }
     }
@@ -928,13 +985,34 @@ fn schema_draft_for_openapi(version: &str) -> String {
     }
 }
 
+#[derive(Default)]
+struct ByteCountWriter {
+    bytes: usize,
+}
+
+impl std::io::Write for ByteCountWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self.bytes.saturating_add(buf.len());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_json_byte_len(value: &Value) -> Result<usize, serde_json::Error> {
+    let mut counter = ByteCountWriter::default();
+    serde_json::to_writer(&mut counter, value)?;
+    Ok(counter.bytes)
+}
+
 fn validate_openapi_validator_config_budget(config: &Value) -> Result<(), ExtractError> {
-    let size = serde_json::to_vec(config)
-        .map_err(|error| ExtractError::MalformedExtension {
+    let size =
+        serialized_json_byte_len(config).map_err(|error| ExtractError::MalformedExtension {
             which: "x-ferrum-validate",
             error: format!("generated openapi_validator config could not be serialized: {error}"),
-        })?
-        .len();
+        })?;
     if size > MAX_OPENAPI_VALIDATOR_CONFIG_SIZE {
         return Err(ExtractError::MalformedExtension {
             which: "x-ferrum-validate",
@@ -2363,12 +2441,11 @@ fn validate_generated_config_budget(
     plugin_name: &str,
     config: &Value,
 ) -> Result<(), ExtractError> {
-    let size = serde_json::to_vec(config)
-        .map_err(|error| ExtractError::MalformedExtension {
+    let size =
+        serialized_json_byte_len(config).map_err(|error| ExtractError::MalformedExtension {
             which,
             error: format!("generated {plugin_name} config could not be serialized: {error}"),
-        })?
-        .len();
+        })?;
     if size > MAX_OPENAPI_VALIDATOR_CONFIG_SIZE {
         return Err(ExtractError::MalformedExtension {
             which,
@@ -2578,14 +2655,14 @@ fn extract_operation_schemas(
                     entry.insert("parameters".to_string(), Value::Array(parameters.clone()));
                 }
                 let entry = Value::Object(entry);
-                let entry_bytes = serde_json::to_vec(&entry)
-                    .map_err(|error| ExtractError::MalformedExtension {
+                let entry_bytes = serialized_json_byte_len(&entry).map_err(|error| {
+                    ExtractError::MalformedExtension {
                         which: "x-ferrum-validate",
                         error: format!(
                             "generated openapi_validator operation could not be serialized: {error}"
                         ),
-                    })?
-                    .len();
+                    }
+                })?;
                 generated_operation_bytes = generated_operation_bytes
                     .checked_add(entry_bytes)
                     .ok_or_else(|| ExtractError::SchemaTooLarge {
@@ -6322,32 +6399,45 @@ fn extract_spec_metadata(root: &serde_json::Value, version: &str) -> ExtractedMe
 /// but returning `Result` ensures call sites handle the failure as an internal
 /// error rather than silently producing an empty hash that could trigger a false
 /// hash collision.
-pub fn hash_resource_bundle(bundle: &ExtractedBundle) -> Result<String, anyhow::Error> {
-    let mut buf = Vec::new();
+struct Sha256Writer<'a>(&'a mut crate::fips::approved::Sha256);
 
-    // Proxy — strip metadata then serialize
+impl std::io::Write for Sha256Writer<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+pub fn hash_resource_bundle(bundle: &ExtractedBundle) -> Result<String, anyhow::Error> {
+    let mut hasher = crate::fips::approved::Sha256::new();
+
+    // Proxy — strip metadata then stream canonical JSON straight into SHA-256
     let proxy_json = strip_metadata(
         serde_json::to_value(&bundle.proxy)
             .map_err(|e| anyhow::anyhow!("failed to serialize proxy for resource hash: {}", e))?,
     );
-    buf.extend_from_slice(&serde_json::to_vec(&proxy_json).map_err(|e| {
+    serde_json::to_writer(Sha256Writer(&mut hasher), &proxy_json).map_err(|e| {
         anyhow::anyhow!("failed to re-serialize proxy JSON for resource hash: {}", e)
-    })?);
-    buf.push(b'|');
+    })?;
+    hasher.update(b"|");
 
     // Upstream (optional)
     if let Some(u) = &bundle.upstream {
         let upstream_json = strip_metadata(serde_json::to_value(u).map_err(|e| {
             anyhow::anyhow!("failed to serialize upstream for resource hash: {}", e)
         })?);
-        buf.extend_from_slice(&serde_json::to_vec(&upstream_json).map_err(|e| {
+        serde_json::to_writer(Sha256Writer(&mut hasher), &upstream_json).map_err(|e| {
             anyhow::anyhow!(
                 "failed to re-serialize upstream JSON for resource hash: {}",
                 e
             )
-        })?);
+        })?;
     }
-    buf.push(b'|');
+    hasher.update(b"|");
 
     // Plugins sorted by id for determinism
     let mut plugins: Vec<_> = bundle.plugins.iter().collect();
@@ -6360,16 +6450,16 @@ pub fn hash_resource_bundle(bundle: &ExtractedBundle) -> Result<String, anyhow::
                 e
             )
         })?);
-        buf.extend_from_slice(&serde_json::to_vec(&pj).map_err(|e| {
+        serde_json::to_writer(Sha256Writer(&mut hasher), &pj).map_err(|e| {
             anyhow::anyhow!(
                 "failed to re-serialize plugin JSON for resource hash: {}",
                 e
             )
-        })?);
-        buf.push(b';');
+        })?;
+        hasher.update(b";");
     }
 
-    Ok(crate::admin::spec_codec::sha256_hex(&buf))
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// Remove metadata-only fields from a JSON value so they don't affect the hash.
@@ -6429,60 +6519,68 @@ fn parse_root_document(
     body: &[u8],
     declared_format: Option<SpecFormat>,
 ) -> Result<(serde_json::Value, SpecFormat), ExtractError> {
+    parse_root_document_with_limit(body, declared_format, MAX_SOURCE_DOCUMENT_NODES)
+}
+
+fn parse_root_document_with_limit(
+    body: &[u8],
+    declared_format: Option<SpecFormat>,
+    max_nodes: usize,
+) -> Result<(serde_json::Value, SpecFormat), ExtractError> {
     let fmt = declared_format.unwrap_or_else(|| autodetect_format(body));
 
-    // JSON prefers serde_json so error messages mention "JSON". YAML always
-    // goes through the bounded event composer (`bounded_yaml`) so anchors and
-    // aliases expand under node/depth/alias-reference/byte/work budgets with
-    // cycle detection — never through serde_yaml's unbounded materialization.
+    // JSON uses `parse_json_slice_bounded` so `max_nodes` is enforced mid-parse
+    // (counting every object member value before duplicate-key collapse, in exact
+    // parity with GET cross-format conversion). YAML always goes through the
+    // bounded event composer (`bounded_yaml`) so anchors and aliases expand
+    // under node/depth/alias-reference/byte/work budgets with cycle detection —
+    // never through serde_yaml's unbounded materialization.
     //
     // Fallback: YAML flow-style documents start with `{` and look like JSON to
     // autodetect_format, but they use unquoted keys which serde_json rejects.
-    // When JSON parsing fails on autodetected (not declared) input, retry as
-    // YAML before surfacing the error. The YAML path applies the same budgets
-    // as an explicitly declared YAML body (no autodetection differential).
+    // When JSON syntax parsing fails on autodetected (not declared) input,
+    // retry as YAML before surfacing the error. Node-limit rejections fail
+    // immediately as `InvalidJson` without retrying as YAML.
     let (root, parsed_via_yaml, actual_format): (serde_json::Value, bool, SpecFormat) = match fmt {
-        SpecFormat::Json => match serde_json::from_slice(body) {
+        SpecFormat::Json => match parse_json_slice_bounded(body, max_nodes) {
             Ok(v) => (v, false, SpecFormat::Json),
-            Err(e) if declared_format.is_none() => {
+            Err(
+                err @ (BoundedJsonError::NodeLimitExceeded | BoundedJsonError::DepthLimitExceeded),
+            ) => {
+                return Err(ExtractError::InvalidJson(err.message()));
+            }
+            Err(BoundedJsonError::Parse(e)) if declared_format.is_none() => {
                 // Autodetected as JSON but failed — try YAML (covers flow-style).
                 // Preserve every semantic fail-closed YAML diagnostic. Only a
                 // YAML syntax failure keeps the original JSON error, so adding
                 // a new bounded-composer error cannot silently weaken this
                 // classification through a brittle message allowlist.
-                let val = crate::admin::api_specs::bounded_yaml::parse_yaml_to_json(
-                    body,
-                    MAX_SOURCE_DOCUMENT_NODES,
-                )
-                .map_err(|yaml_err| {
-                    if matches!(
-                        &yaml_err,
-                        crate::admin::api_specs::bounded_yaml::BoundedYamlError::Parse(_)
-                            | crate::admin::api_specs::bounded_yaml::BoundedYamlError::EmptyDocument
-                    ) {
-                        ExtractError::InvalidJson(e.to_string())
-                    } else {
-                        ExtractError::InvalidYaml(yaml_err.message())
-                    }
-                })?;
+                let val =
+                    crate::admin::api_specs::bounded_yaml::parse_yaml_to_json(body, max_nodes)
+                        .map_err(|yaml_err| {
+                            if matches!(
+                                &yaml_err,
+                                crate::admin::api_specs::bounded_yaml::BoundedYamlError::Parse(_)
+                                    | crate::admin::api_specs::bounded_yaml::BoundedYamlError::EmptyDocument
+                            ) {
+                                ExtractError::InvalidJson(e.clone())
+                            } else {
+                                ExtractError::InvalidYaml(yaml_err.message())
+                            }
+                        })?;
                 (val, true, SpecFormat::Yaml)
             }
-            Err(e) => return Err(ExtractError::InvalidJson(e.to_string())),
+            Err(BoundedJsonError::Parse(e)) => return Err(ExtractError::InvalidJson(e)),
         },
         SpecFormat::Yaml => {
-            let val = parse_yaml_document(body)?;
+            let val = crate::admin::api_specs::bounded_yaml::parse_yaml_to_json(body, max_nodes)
+                .map_err(|e| ExtractError::InvalidYaml(e.message()))?;
             (val, true, SpecFormat::Yaml)
         }
     };
 
-    // Source-tree node cap, applied to **both** formats.
-    //
-    // For YAML this is defence-in-depth on top of budgeted expansion inside
-    // `bounded_yaml`. For JSON it is the only structural bound besides the
-    // request-body byte ceiling; without it, a JSON document could present far
-    // more reference sites than an equivalently sized YAML one and face a
-    // strictly weaker admission check (GHSA-8jc7-c52g-85xr).
-    let mut budget = MAX_SOURCE_DOCUMENT_NODES;
+    // Source-tree node cap defense-in-depth across both formats.
+    let mut budget = max_nodes;
     if !count_value_nodes(&root, &mut budget) {
         return Err(if parsed_via_yaml {
             ExtractError::InvalidYaml(
@@ -6498,9 +6596,527 @@ fn parse_root_document(
     Ok((root, actual_format))
 }
 
-fn parse_yaml_document(body: &[u8]) -> Result<serde_json::Value, ExtractError> {
-    crate::admin::api_specs::bounded_yaml::parse_yaml_to_json(body, MAX_SOURCE_DOCUMENT_NODES)
-        .map_err(|e| ExtractError::InvalidYaml(e.message()))
+const JSON_NODE_LIMIT_ERROR: &str = "JSON document exceeds expanded node limit; reduce nesting";
+const JSON_DEPTH_LIMIT_ERROR: &str = "JSON document exceeds maximum nesting depth";
+const SERDE_JSON_RAW_VALUE_KEY: &str = "$serde_json::private::RawValue";
+
+/// Maximum container nesting depth admitted for external `$ref` documents so
+/// every admitted document also fits inside `ExternalRefSnapshot`'s 3 enclosing
+/// JSON containers under `serde_json`'s 128-level recursion limit.
+pub(crate) const MAX_EXTERNAL_DOCUMENT_DEPTH: usize = 120;
+
+fn contains_reserved_serde_raw_value_key(val: &serde_json::Value) -> bool {
+    match val {
+        serde_json::Value::Object(map) => {
+            map.contains_key(SERDE_JSON_RAW_VALUE_KEY)
+                || map.values().any(contains_reserved_serde_raw_value_key)
+        }
+        serde_json::Value::Array(arr) => arr.iter().any(contains_reserved_serde_raw_value_key),
+        _ => false,
+    }
+}
+
+/// Errors returned by [`parse_json_slice_bounded`] and
+/// [`parse_json_reader_bounded`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BoundedJsonError {
+    NodeLimitExceeded,
+    DepthLimitExceeded,
+    Parse(String),
+}
+
+impl BoundedJsonError {
+    pub(crate) fn message(&self) -> String {
+        match self {
+            Self::NodeLimitExceeded => JSON_NODE_LIMIT_ERROR.to_string(),
+            Self::DepthLimitExceeded => JSON_DEPTH_LIMIT_ERROR.to_string(),
+            Self::Parse(msg) => msg.clone(),
+        }
+    }
+}
+
+/// Node- and depth-bounded `serde::de::DeserializeSeed` for `serde_json::Value`
+/// that enforces `max_nodes` (and optional `max_depth`) **during**
+/// deserialization (counting every container, scalar, array element, and object
+/// member value before duplicate-key collapse), shared across upload/restore
+/// admission, external `$ref` loading, and GET cross-format conversion.
+struct BoundedJsonValueSeed<'a> {
+    remaining_nodes: &'a mut usize,
+    node_limit_exceeded: &'a mut bool,
+    depth: usize,
+    max_depth: Option<usize>,
+    depth_limit_exceeded: &'a mut bool,
+}
+
+impl BoundedJsonValueSeed<'_> {
+    fn charge_node<E: serde::de::Error>(&mut self) -> Result<(), E> {
+        if *self.remaining_nodes == 0 {
+            *self.node_limit_exceeded = true;
+            return Err(E::custom(JSON_NODE_LIMIT_ERROR));
+        }
+        *self.remaining_nodes -= 1;
+        Ok(())
+    }
+
+    fn enter_container<E: serde::de::Error>(&mut self) -> Result<usize, E> {
+        let next_depth = self.depth.saturating_add(1);
+        if let Some(limit) = self.max_depth
+            && next_depth > limit
+        {
+            *self.depth_limit_exceeded = true;
+            return Err(E::custom(JSON_DEPTH_LIMIT_ERROR));
+        }
+        Ok(next_depth)
+    }
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for BoundedJsonValueSeed<'_> {
+    type Value = serde_json::Value;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for BoundedJsonValueSeed<'_> {
+    type Value = serde_json::Value;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("any valid JSON value")
+    }
+
+    fn visit_bool<E: serde::de::Error>(mut self, v: bool) -> Result<Self::Value, E> {
+        self.charge_node::<E>()?;
+        Ok(serde_json::Value::Bool(v))
+    }
+
+    fn visit_i64<E: serde::de::Error>(mut self, v: i64) -> Result<Self::Value, E> {
+        self.charge_node::<E>()?;
+        Ok(serde_json::Value::Number(v.into()))
+    }
+
+    fn visit_u64<E: serde::de::Error>(mut self, v: u64) -> Result<Self::Value, E> {
+        self.charge_node::<E>()?;
+        Ok(serde_json::Value::Number(v.into()))
+    }
+
+    fn visit_f64<E: serde::de::Error>(mut self, v: f64) -> Result<Self::Value, E> {
+        self.charge_node::<E>()?;
+        Ok(serde_json::Number::from_f64(v)
+            .map_or(serde_json::Value::Null, serde_json::Value::Number))
+    }
+
+    fn visit_str<E: serde::de::Error>(mut self, v: &str) -> Result<Self::Value, E> {
+        self.charge_node::<E>()?;
+        Ok(serde_json::Value::String(v.to_owned()))
+    }
+
+    fn visit_string<E: serde::de::Error>(mut self, v: String) -> Result<Self::Value, E> {
+        self.charge_node::<E>()?;
+        Ok(serde_json::Value::String(v))
+    }
+
+    fn visit_none<E: serde::de::Error>(mut self) -> Result<Self::Value, E> {
+        self.charge_node::<E>()?;
+        Ok(serde_json::Value::Null)
+    }
+
+    fn visit_unit<E: serde::de::Error>(mut self) -> Result<Self::Value, E> {
+        self.charge_node::<E>()?;
+        Ok(serde_json::Value::Null)
+    }
+
+    fn visit_some<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        serde::de::DeserializeSeed::deserialize(self, deserializer)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(
+        mut self,
+        mut seq: A,
+    ) -> Result<Self::Value, A::Error> {
+        self.charge_node::<A::Error>()?;
+        let next_depth = self.enter_container::<A::Error>()?;
+        let mut vec = Vec::new();
+        while let Some(elem) = seq.next_element_seed(BoundedJsonValueSeed {
+            remaining_nodes: &mut *self.remaining_nodes,
+            node_limit_exceeded: &mut *self.node_limit_exceeded,
+            depth: next_depth,
+            max_depth: self.max_depth,
+            depth_limit_exceeded: &mut *self.depth_limit_exceeded,
+        })? {
+            vec.push(elem);
+        }
+        Ok(serde_json::Value::Array(vec))
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(
+        mut self,
+        mut map: A,
+    ) -> Result<Self::Value, A::Error> {
+        self.charge_node::<A::Error>()?;
+        let next_depth = self.enter_container::<A::Error>()?;
+        let mut obj = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            let val = map.next_value_seed(BoundedJsonValueSeed {
+                remaining_nodes: &mut *self.remaining_nodes,
+                node_limit_exceeded: &mut *self.node_limit_exceeded,
+                depth: next_depth,
+                max_depth: self.max_depth,
+                depth_limit_exceeded: &mut *self.depth_limit_exceeded,
+            })?;
+            obj.insert(key, val);
+        }
+        Ok(serde_json::Value::Object(obj))
+    }
+}
+
+fn is_serde_json_recursion_limit_error(error: &serde_json::Error) -> bool {
+    error.is_syntax() && error.to_string().starts_with("recursion limit exceeded")
+}
+
+pub(crate) fn parse_json_slice_bounded(
+    body: &[u8],
+    max_nodes: usize,
+) -> Result<serde_json::Value, BoundedJsonError> {
+    parse_json_slice_bounded_with_depth(body, max_nodes, None)
+}
+
+pub(crate) fn parse_json_slice_bounded_with_depth(
+    body: &[u8],
+    max_nodes: usize,
+    max_depth: Option<usize>,
+) -> Result<serde_json::Value, BoundedJsonError> {
+    let mut remaining_nodes = max_nodes;
+    let mut node_limit_exceeded = false;
+    let mut depth_limit_exceeded = false;
+    let mut de = serde_json::Deserializer::from_slice(body);
+    let value = match serde::de::DeserializeSeed::deserialize(
+        BoundedJsonValueSeed {
+            remaining_nodes: &mut remaining_nodes,
+            node_limit_exceeded: &mut node_limit_exceeded,
+            depth: 0,
+            max_depth,
+            depth_limit_exceeded: &mut depth_limit_exceeded,
+        },
+        &mut de,
+    ) {
+        Ok(value) => value,
+        Err(_) if node_limit_exceeded => return Err(BoundedJsonError::NodeLimitExceeded),
+        Err(_) if depth_limit_exceeded => return Err(BoundedJsonError::DepthLimitExceeded),
+        Err(e) if is_serde_json_recursion_limit_error(&e) => {
+            return Err(BoundedJsonError::DepthLimitExceeded);
+        }
+        Err(e) => return Err(BoundedJsonError::Parse(e.to_string())),
+    };
+    de.end()
+        .map_err(|e| BoundedJsonError::Parse(e.to_string()))?;
+    Ok(value)
+}
+
+pub(crate) fn parse_json_reader_bounded<R: std::io::Read>(
+    reader: R,
+    max_nodes: usize,
+) -> Result<serde_json::Value, BoundedJsonError> {
+    let mut remaining_nodes = max_nodes;
+    let mut node_limit_exceeded = false;
+    let mut depth_limit_exceeded = false;
+    let mut de = serde_json::Deserializer::from_reader(reader);
+    let value = match serde::de::DeserializeSeed::deserialize(
+        BoundedJsonValueSeed {
+            remaining_nodes: &mut remaining_nodes,
+            node_limit_exceeded: &mut node_limit_exceeded,
+            depth: 0,
+            max_depth: None,
+            depth_limit_exceeded: &mut depth_limit_exceeded,
+        },
+        &mut de,
+    ) {
+        Ok(value) => value,
+        Err(_) if node_limit_exceeded => return Err(BoundedJsonError::NodeLimitExceeded),
+        Err(_) if depth_limit_exceeded => return Err(BoundedJsonError::DepthLimitExceeded),
+        Err(e) if is_serde_json_recursion_limit_error(&e) => {
+            return Err(BoundedJsonError::DepthLimitExceeded);
+        }
+        Err(e) => return Err(BoundedJsonError::Parse(e.to_string())),
+    };
+    de.end()
+        .map_err(|e| BoundedJsonError::Parse(e.to_string()))?;
+    Ok(value)
+}
+
+pub(crate) fn deserialize_bounded_json_value<'de, D>(
+    deserializer: D,
+) -> Result<serde_json::Value, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut remaining_nodes = MAX_SOURCE_DOCUMENT_NODES;
+    let mut node_limit_exceeded = false;
+    let mut depth_limit_exceeded = false;
+    serde::de::DeserializeSeed::deserialize(
+        BoundedJsonValueSeed {
+            remaining_nodes: &mut remaining_nodes,
+            node_limit_exceeded: &mut node_limit_exceeded,
+            depth: 0,
+            max_depth: Some(MAX_EXTERNAL_DOCUMENT_DEPTH),
+            depth_limit_exceeded: &mut depth_limit_exceeded,
+        },
+        deserializer,
+    )
+}
+
+/// Test helper verifying that admission (`parse_root_document_with_limit`) and
+/// retrieval conversion (`parse_json_slice_bounded` / `parse_json_reader_bounded`)
+/// enforce the exact same pre-collapse node count on duplicate object members,
+/// map admission limit failures to `ExtractError::InvalidJson` (400), reject
+/// positional plugin entries, and fail closed on `$serde_json::private::RawValue`
+/// keys at any depth inside extracted plugin configs.
+pub(crate) fn check_json_duplicate_member_limit_parity_for_test() -> Result<(), &'static str> {
+    // 1 object + 5 member values (all duplicate key "a") = 6 nodes pre-collapse,
+    // only 2 nodes after duplicate-key collapse.
+    let dup_json = br#"{"a":0,"a":1,"a":2,"a":3,"a":4}"#;
+    if !matches!(
+        parse_root_document_with_limit(dup_json, Some(SpecFormat::Json), 5),
+        Err(ExtractError::InvalidJson(_))
+    ) {
+        return Err("declared JSON admission failed to reject duplicate members above node cap");
+    }
+    if !matches!(
+        parse_root_document_with_limit(dup_json, None, 5),
+        Err(ExtractError::InvalidJson(_))
+    ) {
+        return Err(
+            "autodetected JSON admission failed to reject duplicate members as InvalidJson",
+        );
+    }
+    if parse_root_document_with_limit(dup_json, Some(SpecFormat::Json), 6).is_err() {
+        return Err("JSON admission rejected duplicate members at exact node cap");
+    }
+    if parse_json_slice_bounded(dup_json, 5) != Err(BoundedJsonError::NodeLimitExceeded)
+        || parse_json_reader_bounded(std::io::Cursor::new(dup_json), 5)
+            != Err(BoundedJsonError::NodeLimitExceeded)
+    {
+        return Err("bounded JSON conversion parser failed to reject duplicate members above cap");
+    }
+    if parse_json_slice_bounded(dup_json, 6).is_err()
+        || parse_json_reader_bounded(std::io::Cursor::new(dup_json), 6).is_err()
+    {
+        return Err("bounded JSON conversion parser rejected duplicate members at exact cap");
+    }
+
+    // 128-level nested JSON hits serde_json's built-in recursion limit; classify
+    // it as `DepthLimitExceeded` so autodetected JSON fails immediately as
+    // `InvalidJson` rather than falling back to the YAML parser.
+    let deep_json = format!("{}{}", "[".repeat(128), "]".repeat(128));
+    if parse_json_slice_bounded(deep_json.as_bytes(), 1024)
+        != Err(BoundedJsonError::DepthLimitExceeded)
+        || parse_json_reader_bounded(std::io::Cursor::new(deep_json.as_bytes()), 1024)
+            != Err(BoundedJsonError::DepthLimitExceeded)
+    {
+        return Err(
+            "bounded JSON parser did not classify serde_json recursion limit as DepthLimitExceeded",
+        );
+    }
+    if !matches!(
+        parse_root_document_with_limit(deep_json.as_bytes(), None, 1024),
+        Err(ExtractError::InvalidJson(_))
+    ) {
+        return Err("autodetected 128-level nested JSON did not fail directly with InvalidJson");
+    }
+
+    // Positional array entries in `x-ferrum-plugins` must be rejected as 400
+    // MalformedExtension rather than accepted via serde tuple-struct fallback.
+    let positional_plugin_spec = br#"{
+        "openapi": "3.1.0",
+        "info": {"title": "pos-plugin", "version": "1.0.0"},
+        "paths": {},
+        "x-ferrum-proxy": {"id": "pos-proxy", "backend_host": "api.example.com", "backend_port": 443},
+        "x-ferrum-plugins": [
+            [{}, "pos-id", "cors", "ferrum", {"$serde_json::private::RawValue": "[1,2,3]"}, "proxy", null, true, null, null, null, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"]
+        ]
+    }"#;
+    if !matches!(
+        extract(positional_plugin_spec, Some(SpecFormat::Json), "ferrum"),
+        Err(ExtractError::MalformedExtension {
+            which: "x-ferrum-plugins",
+            ..
+        })
+    ) {
+        return Err("positional array entry in x-ferrum-plugins was not rejected");
+    }
+
+    // Top-level, nested credential-smuggling, and invalid-JSON RawValue markers
+    // inside `x-ferrum-plugins[].config` must all fail closed with 400
+    // MalformedExtension so they can never bypass validation or corrupt reloads.
+    for config_json in [
+        r#"{"$serde_json::private::RawValue": "[1,2,3]"}"#,
+        r#"{"nested": {"$serde_json::private::RawValue": "{\"credentials\":{\"api_key\":\"secret\"}}"}}"#,
+        r#"{"$serde_json::private::RawValue": "[1,"}"#,
+    ] {
+        let raw_val_spec = format!(
+            r#"{{
+                "openapi": "3.1.0",
+                "info": {{"title": "raw-val", "version": "1.0.0"}},
+                "paths": {{}},
+                "x-ferrum-proxy": {{"id": "raw-val-proxy", "backend_host": "api.example.com", "backend_port": 443}},
+                "x-ferrum-plugins": [{{
+                    "id": "raw-val-plugin",
+                    "plugin_name": "cors",
+                    "scope": "proxy",
+                    "config": {config_json}
+                }}]
+            }}"#
+        );
+        if !matches!(
+            extract(raw_val_spec.as_bytes(), Some(SpecFormat::Json), "ferrum"),
+            Err(ExtractError::MalformedExtension {
+                which: "x-ferrum-plugins",
+                ..
+            })
+        ) {
+            return Err("plugin config containing RawValue marker was not rejected");
+        }
+    }
+
+    // Generated `x-ferrum-validate` and `x-ferrum-mcp` plugin configs resolving
+    // an external `$ref` schema whose `const` object carries the reserved
+    // RawValue marker must also fail closed with 400 MalformedExtension naming
+    // the reserved key, while companion fixtures with an ordinary `const` key
+    // extract cleanly.
+    let mut ext_docs = HashMap::new();
+    ext_docs.insert(
+        "https://schemas.example.com/shared.json".to_string(),
+        br#"{"components":{"schemas":{"EvilConst":{"type":"object","const":{"$serde_json::private::RawValue":"[1,2,3]"}},"GoodConst":{"type":"object","const":{"ordinary_key":"[1,2,3]"}}}}}"#.to_vec(),
+    );
+    let loader = MapExternalDocumentLoader { docs: ext_docs };
+    let policy = ExternalRefProcessPolicy {
+        enabled: true,
+        allowed_origins: vec!["https://schemas.example.com:443".to_string()],
+        ..ExternalRefProcessPolicy::default()
+    };
+    let make_validate_spec = |schema_name: &str| {
+        format!(
+            r#"{{
+                "openapi": "3.1.0",
+                "info": {{"title": "val-ext", "version": "1.0.0"}},
+                "x-ferrum-proxy": {{"id": "val-ext-proxy", "backend_host": "api.example.com", "backend_port": 443, "listen_path": "/api"}},
+                "x-ferrum-external-refs": true,
+                "x-ferrum-validate": true,
+                "paths": {{
+                    "/items": {{
+                        "post": {{
+                            "operationId": "createItem",
+                            "requestBody": {{
+                                "required": true,
+                                "content": {{
+                                    "application/json": {{
+                                        "schema": {{"$ref": "https://schemas.example.com/shared.json#/components/schemas/{schema_name}"}}
+                                    }}
+                                }}
+                            }},
+                            "responses": {{"200": {{"description": "ok"}}}}
+                        }}
+                    }}
+                }}
+            }}"#
+        )
+    };
+    let validate_good = make_validate_spec("GoodConst");
+    if extract_with_external_refs(
+        validate_good.as_bytes(),
+        Some(SpecFormat::Json),
+        "ferrum",
+        &policy,
+        &loader,
+    )
+    .is_err()
+    {
+        return Err("x-ferrum-validate companion fixture with ordinary const failed extraction");
+    }
+    let validate_evil = make_validate_spec("EvilConst");
+    if !matches!(
+        extract_with_external_refs(
+            validate_evil.as_bytes(),
+            Some(SpecFormat::Json),
+            "ferrum",
+            &policy,
+            &loader,
+        ),
+        Err(ExtractError::MalformedExtension {
+            which: "x-ferrum-validate",
+            error,
+        }) if error.contains(SERDE_JSON_RAW_VALUE_KEY)
+    ) {
+        return Err(
+            "x-ferrum-validate generated config with external RawValue const was not rejected by reserved-key guard",
+        );
+    }
+
+    let make_mcp_spec = |schema_name: &str| {
+        format!(
+            r#"{{
+                "openapi": "3.1.0",
+                "info": {{"title": "mcp-ext", "version": "1.0.0"}},
+                "x-ferrum-proxy": {{"id": "mcp-ext-proxy", "backend_host": "api.example.com", "backend_port": 443, "listen_path": "/api"}},
+                "x-ferrum-external-refs": true,
+                "x-ferrum-mcp": true,
+                "paths": {{
+                    "/items": {{
+                        "post": {{
+                            "operationId": "createItem",
+                            "x-ferrum-mcp": true,
+                            "requestBody": {{
+                                "required": true,
+                                "content": {{
+                                    "application/json": {{
+                                        "schema": {{"$ref": "https://schemas.example.com/shared.json#/components/schemas/{schema_name}"}}
+                                    }}
+                                }}
+                            }},
+                            "responses": {{"200": {{"description": "ok"}}}}
+                        }}
+                    }}
+                }}
+            }}"#
+        )
+    };
+    let mcp_good = make_mcp_spec("GoodConst");
+    if extract_with_external_refs(
+        mcp_good.as_bytes(),
+        Some(SpecFormat::Json),
+        "ferrum",
+        &policy,
+        &loader,
+    )
+    .is_err()
+    {
+        return Err("x-ferrum-mcp companion fixture with ordinary const failed extraction");
+    }
+    let mcp_evil = make_mcp_spec("EvilConst");
+    if !matches!(
+        extract_with_external_refs(
+            mcp_evil.as_bytes(),
+            Some(SpecFormat::Json),
+            "ferrum",
+            &policy,
+            &loader,
+        ),
+        Err(ExtractError::MalformedExtension {
+            which: "x-ferrum-mcp",
+            error,
+        }) if error.contains(SERDE_JSON_RAW_VALUE_KEY)
+    ) {
+        return Err(
+            "x-ferrum-mcp generated config with external RawValue const was not rejected by reserved-key guard",
+        );
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

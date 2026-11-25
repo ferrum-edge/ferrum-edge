@@ -16,7 +16,7 @@ use super::crud::{self, AdminResource};
 use super::preconditions::{self, IfMatch};
 use super::{AdminState, BackupExportPayload, json_response};
 use crate::config::db_backend::{
-    AtomicBatchGraph, BatchConfigWriteMode, ConditionalNamespaceRestore,
+    ApiSpecDocumentTooLarge, AtomicBatchGraph, BatchConfigWriteMode, ConditionalNamespaceRestore,
     ConditionalNamespaceSnapshot, DatabaseBackend, NamespacePreconditionFailed,
     NamespaceSnapshotTooLarge, SnapshotDigest, is_namespace_snapshot_too_large,
 };
@@ -94,6 +94,15 @@ fn store_error(error: &anyhow::Error) -> Response<Full<Bytes>> {
     if is_namespace_snapshot_too_large(error) {
         return snapshot_too_large();
     }
+    if error
+        .chain()
+        .any(|cause| cause.is::<ApiSpecDocumentTooLarge>())
+    {
+        return json_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            &json!({"error": ApiSpecDocumentTooLarge.to_string()}),
+        );
+    }
     if let Some(unsupported) = crate::config::db_backend::atomic_batch_unsupported(error) {
         return super::atomic_batch_unsupported_response(unsupported);
     }
@@ -162,7 +171,12 @@ pub(super) async fn consumer_verification(
     .await
     .is_err()
     {
-        return Ok(super::backup_audit_admit_failed_response());
+        return Ok(json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({
+                "error": "Consumer verification aborted: security audit record could not be admitted"
+            }),
+        ));
     }
     let response = json_response(StatusCode::OK, &body);
     Ok(with_tag(response, &preconditions::quoted(&tag)))
@@ -312,11 +326,15 @@ pub(super) async fn restore(
     db: &dyn DatabaseBackend,
     namespace: &str,
     payload: &RestorePayload,
+    validated_api_specs: &[crate::config::types::ApiSpec],
     if_match: &IfMatch,
     mode: &BatchConfigWriteMode,
     admission: &mut crud::NamespaceConfigAdmissionGuard,
 ) -> Response<Full<Bytes>> {
-    let snapshot = match db.load_conditional_namespace_snapshot(namespace).await {
+    let snapshot = match db
+        .load_conditional_namespace_snapshot_for_write(namespace)
+        .await
+    {
         Ok(snapshot) => snapshot,
         Err(error) => return store_error(&error),
     };
@@ -333,15 +351,6 @@ pub(super) async fn restore(
     if !if_match.matches(Some(&tag)) {
         return store_error(&anyhow::Error::new(NamespacePreconditionFailed));
     }
-    let specs = match payload
-        .api_specs
-        .as_ref()
-        .map(|section| section.to_api_specs())
-        .transpose()
-    {
-        Ok(specs) => specs.unwrap_or_default(),
-        Err(_) => return unavailable(),
-    };
     if admission.hand_off_to_restore_transaction().await.is_err() {
         return unavailable();
     }
@@ -355,7 +364,7 @@ pub(super) async fn restore(
             admission_lease: Some(admission.lease_ref()),
         },
         expected,
-        api_specs: &specs,
+        api_specs: validated_api_specs,
         gateway_trust_bundles: payload.gateway_trust_bundles.as_deref(),
     };
     if let Err(error) = db.restore_namespace_conditionally(&restore, mode).await {
@@ -366,7 +375,7 @@ pub(super) async fn restore(
         "consumers": payload.consumers.len(),
         "plugin_configs": payload.plugin_configs.len(),
         "upstreams": payload.upstreams.len(),
-        "api_specs": specs.len(),
+        "api_specs": validated_api_specs.len(),
         "gateway_trust_bundles": payload.gateway_trust_bundles.as_ref().map_or(0, Vec::len),
     }});
     let event = audit::AuditEvent::new(

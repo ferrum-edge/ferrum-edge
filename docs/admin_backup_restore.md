@@ -69,7 +69,7 @@ cat ferrum-backup.json | jq '.counts'
 ```json
 {
   "version": "1",
-  "ferrum_version": "0.9.0",
+  "ferrum_version": "0.9.21",
   "exported_at": "2025-03-26T10:30:00Z",
   "source": "database",
   "counts": {
@@ -164,6 +164,8 @@ Use `GET /backup?conditional=true` to plan conditional writes. This explicit
 opt-in requires a full, unfiltered export and a primary store that supports
 snapshot transactions: PostgreSQL, MySQL, SQLite, or replica-set MongoDB.
 Standalone MongoDB returns `501`; missing/unavailable stores return `503`.
+On MongoDB backends, conditional restores where a serialized `api_specs`
+document exceeds the ~15 MiB BSON preflight limit return `413`.
 This path never substitutes a cached snapshot or an unconditional write.
 
 The response includes an `ETag` header and a `conditional` metadata object:
@@ -423,7 +425,7 @@ For deployments exceeding the body limit, use partial backups via `?resources=` 
 
 **Restore** deserializes the request body directly into typed structs — again skipping the `Value` intermediate. Peak memory is body bytes + parsed structs.
 
-**Database inserts** are chunked into 1,000-record transactions to keep WAL/redo log size bounded and avoid prolonged lock holds. A 90,000-plugin restore runs as 90 separate transactions rather than one massive transaction.
+**Database inserts** during unconditional restores (without `If-Match`) use backend- and resource-dependent batching: SQL backends chunk independent resources into 1,000-record transactions while keeping graph-dependent plugin batches coherent, replica-set MongoDB imports plugin batches atomically in a transaction, and standalone MongoDB uses bulk writes. Conditional restores (with `If-Match`) commit the complete namespace replacement in one atomic transaction without chunked fallback.
 
 ### Example: Backup & Restore Workflow
 
@@ -478,6 +480,9 @@ The `rollback` field reports the outcome:
 - `completed` — the prior config was reapplied and retained. After a clear that committed beyond its expired lease, this can instead mean the valid union of intervening resources and missing prior resources was retained.
 - `incomplete` — reapplying the prior config failed; the response includes `rollback_errors` and instructs the operator to perform manual recovery. Ferrum retains the namespace admission guard, because the namespace may be cleared, partially imported, or partially replayed. `rollback_errors` includes `namespace admission guard retained; manual recovery required`, and the `error` message says the guard was retained. Guarded writes to the namespace fail closed until recovery: repair the namespace (for example with a fresh restore from a verified backup once the guard is cleared), stop or restart the owning admin process, and remove only the verified owner-qualified guard, as for `unknown_outcome`. If only the guard release failed after a completed replay, `rollback` is also `incomplete` and `rollback_errors` names the release failure. This also covers a late-clear additive recovery whose combined transaction-log schema graph is invalid: Ferrum preserves the intervening configuration and rejects the replay before writing any snapshot resources. The rollback is best-effort because it uses the same database backend that reported the failure.
 - `not_needed` — the **clear definitively aborted atomically** (SQL runs it in one transaction; replica-set MongoDB in a multi-document transaction). Nothing was deleted, so the prior config — including its `api_specs` — is fully intact and no compensating re-import runs. An unknown MongoDB transaction commit result is not a definitive abort, even when an immediate read still sees the prior counts. Only standalone (non-replica-set) MongoDB, whose clear deletes collections one-by-one, can leave a known partial state and take the `completed`/`incomplete` path on an ordinary delete failure.
+- `not_needed_after_intervening_write` — returned with `503` when an atomic clear definitively aborted and another writer acquired the namespace lease before recovery re-checked the lease; nothing was deleted and rollback is unnecessary.
+- `skipped_after_intervening_write` — returned with `503` when a potentially partial clear (such as a failed non-atomic standalone MongoDB clear) lost the namespace lease to another writer; rollback is skipped to preserve the intervening writer's state, and the namespace admission guard remains held so manual recovery is required.
+- `unknown_clear_outcome` — returned with `503` when the clear transaction had an ambiguous commit result and namespace admission could not be reacquired (or another writer took the lease) before recovery could inspect or restore the namespace; the namespace admission guard remains held and an `unknown_outcome` audit event is recorded.
 - `unknown_outcome` — MongoDB reported an unknown transaction commit result. Ferrum retains the namespace admission guard even when an immediate count suggests the prior config is intact, because a timed-out write may still settle later. Inspect the namespace, stop or restart the owning admin process, and remove only the verified owner-qualified guard during manual recovery.
 
 For an unknown MongoDB commit result, Ferrum verifies authoritative namespace

@@ -33,15 +33,92 @@ pub fn compress_gzip(input: &[u8]) -> std::io::Result<Vec<u8>> {
 /// `"spec content corrupt or oversized"` message — operators investigate via
 /// the DB directly.
 pub fn decompress_gzip_capped(input: &[u8], max_output: usize) -> std::io::Result<Vec<u8>> {
-    let decoder = GzDecoder::new(input);
+    let mut decoder = GzDecoder::new(input);
     let mut buf = Vec::new();
-    decoder.take(max_output as u64 + 1).read_to_end(&mut buf)?;
-    if buf.len() > max_output {
-        return Err(std::io::Error::other(
-            "decompressed size exceeds max_output cap",
-        ));
+    let max_u64 = u64::try_from(max_output).unwrap_or(u64::MAX);
+    if let Some(limit) = max_u64.checked_add(1) {
+        decoder.take(limit).read_to_end(&mut buf)?;
+        if buf.len() > max_output {
+            return Err(std::io::Error::other(
+                "decompressed size exceeds max_output cap",
+            ));
+        }
+    } else {
+        // `max_output == u64::MAX as usize`: read up to `max_u64` bytes without
+        // overflowing `max_u64 + 1`, then probe one additional byte.
+        (&mut decoder).take(max_u64).read_to_end(&mut buf)?;
+        let mut extra = [0u8; 1];
+        if decoder.read(&mut extra)? > 0 {
+            return Err(std::io::Error::other(
+                "decompressed size exceeds max_output cap",
+            ));
+        }
     }
     Ok(buf)
+}
+
+/// Stream gzip-decompressed `input` bytes into `writer` in bounded 8 KiB
+/// chunks, failing with `ErrorKind::Other` before writing past `max_output`
+/// bytes so callers can enforce live per-connection byte budgets during
+/// decompression rather than only after buffering the full output.
+///
+/// If `writer` switches to discard-and-count mode upon soft budget exhaustion,
+/// this loop keeps draining through EOF or `max_output` in the 8 KiB stack
+/// buffer so permanent gzip corruption or `> max_output` errors still win over
+/// retryable budget rejection.
+pub(crate) fn decompress_gzip_capped_to_writer<W: Write>(
+    input: &[u8],
+    max_output: usize,
+    writer: &mut W,
+) -> std::io::Result<()> {
+    let mut decoder = GzDecoder::new(input);
+    let mut chunk = [0u8; 8 * 1024];
+    let mut total: usize = 0;
+    loop {
+        let read = decoder.read(&mut chunk)?;
+        if read == 0 {
+            return Ok(());
+        }
+        total = total.saturating_add(read);
+        if total > max_output {
+            return Err(std::io::Error::other(
+                "decompressed size exceeds max_output cap",
+            ));
+        }
+        writer.write_all(&chunk[..read])?;
+    }
+}
+
+/// Streaming `Read` adapter over `GzDecoder<R>` that fails closed with
+/// `ErrorKind::Other` if decompressed output exceeds `max_output` bytes.
+pub(crate) struct CappedGzipReader<R: Read> {
+    decoder: GzDecoder<R>,
+    remaining: usize,
+}
+
+impl<R: Read> CappedGzipReader<R> {
+    pub(crate) fn new(input: R, max_output: usize) -> Self {
+        Self {
+            decoder: GzDecoder::new(input),
+            remaining: max_output,
+        }
+    }
+}
+
+impl<R: Read> Read for CappedGzipReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let read = self.decoder.read(buf)?;
+        if read > self.remaining {
+            return Err(std::io::Error::other(
+                "decompressed size exceeds max_output cap",
+            ));
+        }
+        self.remaining -= read;
+        Ok(read)
+    }
 }
 
 /// Compute the SHA-256 digest of `input` and return it as a lowercase hex

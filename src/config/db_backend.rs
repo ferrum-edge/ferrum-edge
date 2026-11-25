@@ -473,6 +473,19 @@ impl std::fmt::Display for NamespacePreconditionFailed {
 
 impl std::error::Error for NamespacePreconditionFailed {}
 
+/// A restored `api_specs` document exceeds the storage backend's per-document
+/// size limit (for example MongoDB's ~15 MiB BSON preflight cap).
+#[derive(Debug, Clone, Copy)]
+pub struct ApiSpecDocumentTooLarge;
+
+impl std::fmt::Display for ApiSpecDocumentTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MongoDB API spec document exceeds restore limit")
+    }
+}
+
+impl std::error::Error for ApiSpecDocumentTooLarge {}
+
 /// Bounded, credential-free snapshot of sticky DB failover topology.
 ///
 /// Exposed on authenticated `/health` detail and used by admin write gating so
@@ -1761,6 +1774,17 @@ pub enum SortOrder {
     Asc,
 }
 
+/// Minimal metadata required to evaluate `Accept` negotiation,
+/// `If-None-Match` (`304 Not Modified`), and per-connection buffered response
+/// budget admission without reading `spec_content` or `external_ref_snapshot`
+/// from the database.
+#[derive(Debug, Clone)]
+pub struct ApiSpecConditionalMeta {
+    pub spec_format: crate::config::types::SpecFormat,
+    pub content_hash: String,
+    pub uncompressed_size: u64,
+}
+
 /// Filter parameters for `list_api_specs`.
 #[derive(Debug, Clone)]
 pub struct ApiSpecListFilter {
@@ -2617,6 +2641,16 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         ))
     }
 
+    /// Write-side conditional snapshot preflight validated under
+    /// `SPEC_WRITE_CODEC_SLOTS` so viewer `GET` bursts cannot delay conditional
+    /// restores holding namespace admission.
+    async fn load_conditional_namespace_snapshot_for_write(
+        &self,
+        namespace: &str,
+    ) -> Result<ConditionalNamespaceSnapshot, anyhow::Error> {
+        self.load_conditional_namespace_snapshot(namespace).await
+    }
+
     /// Compare and replace the complete namespace in ONE transaction. Empty
     /// graphs still check the precondition and can delete existing resources.
     async fn restore_namespace_conditionally(
@@ -2635,6 +2669,16 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         _namespace: &str,
     ) -> Result<crate::config::deployment_mutation::DeploymentSnapshot, anyhow::Error> {
         Err(anyhow::anyhow!("Deployment authority unavailable"))
+    }
+
+    /// Write-side deployment snapshot preflight validated under
+    /// `SPEC_WRITE_CODEC_SLOTS` so viewer `GET` bursts cannot delay conditional
+    /// `PUT`/`DELETE` admission.
+    async fn load_deployment_snapshot_for_write(
+        &self,
+        namespace: &str,
+    ) -> Result<crate::config::deployment_mutation::DeploymentSnapshot, anyhow::Error> {
+        self.load_deployment_snapshot(namespace).await
     }
 
     /// Compare original evidence and remove only the selected cascade atomically.
@@ -3406,12 +3450,75 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         id: &str,
     ) -> Result<Option<ApiSpec>, anyhow::Error>;
 
+    /// Fetch a single ApiSpec by namespace + id for write-side admission (`PUT` /
+    /// `DELETE`), validating any persisted `external_ref_snapshot` under
+    /// `SPEC_WRITE_CODEC_SLOTS` so viewer `GET` bursts cannot starve writers.
+    async fn get_api_spec_for_write(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<ApiSpec>, anyhow::Error>;
+
     /// Fetch the ApiSpec that owns a given proxy (by proxy_id), if any.
     async fn get_api_spec_by_proxy(
         &self,
         namespace: &str,
         proxy_id: &str,
     ) -> Result<Option<ApiSpec>, anyhow::Error>;
+
+    /// Fetch an ApiSpec for content retrieval (`GET /api-specs/{id}`),
+    /// omitting `external_ref_snapshot` so read paths (including `304`) never
+    /// transfer, decompress, or hash the snapshot blob or re-acquire
+    /// `SPEC_READ_CODEC_SLOTS` while the handler already holds a read permit.
+    async fn get_api_spec_content(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<ApiSpec>, anyhow::Error>;
+
+    /// Fetch an ApiSpec by proxy for content retrieval
+    /// (`GET /api-specs/by-proxy/{proxy_id}`), omitting `external_ref_snapshot`.
+    async fn get_api_spec_content_by_proxy(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+    ) -> Result<Option<ApiSpec>, anyhow::Error>;
+
+    /// Fetch only `(spec_format, content_hash, uncompressed_size)` for a
+    /// conditional GET (`If-None-Match`) or partial-budget preflight so `304`
+    /// hits and doomed `503` reads bypass `SPEC_READ_CODEC_SLOTS` and never
+    /// transfer `spec_content` or `external_ref_snapshot`.
+    async fn get_api_spec_conditional_meta(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<ApiSpecConditionalMeta>, anyhow::Error> {
+        Ok(self
+            .get_api_spec_content(namespace, id)
+            .await?
+            .map(|spec| ApiSpecConditionalMeta {
+                spec_format: spec.spec_format,
+                content_hash: spec.content_hash,
+                uncompressed_size: spec.uncompressed_size,
+            }))
+    }
+
+    /// Fetch only `(spec_format, content_hash, uncompressed_size)` by proxy_id
+    /// for conditional GET (`If-None-Match`) or partial-budget preflight.
+    async fn get_api_spec_conditional_meta_by_proxy(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+    ) -> Result<Option<ApiSpecConditionalMeta>, anyhow::Error> {
+        Ok(self
+            .get_api_spec_content_by_proxy(namespace, proxy_id)
+            .await?
+            .map(|spec| ApiSpecConditionalMeta {
+                spec_format: spec.spec_format,
+                content_hash: spec.content_hash,
+                uncompressed_size: spec.uncompressed_size,
+            }))
+    }
 
     /// List ApiSpecs in a namespace, with filtering, sorting, and pagination.
     ///

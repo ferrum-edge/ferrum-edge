@@ -1903,11 +1903,12 @@ fn implemented_admin_operations() -> BTreeSet<(String, String)> {
     }
 
     // These probe handlers intentionally run before method-based dispatch.
-    // Keep their intended public GET contract explicit so adding another
+    // Keep their intended public GET/HEAD contract explicit so adding another
     // method-agnostic direct handler requires a conscious test update.
     for path in ["/live", "/health", "/status"] {
         assert!(source.contains(&format!("path == \"{path}\"")));
         operations.insert(("GET".to_string(), path.to_string()));
+        operations.insert(("HEAD".to_string(), path.to_string()));
     }
 
     operations
@@ -2232,8 +2233,11 @@ fn admin_shared_namespace_and_id_gates_document_bad_request() {
 /// name and claim checks.
 const NAMESPACE_BOUNDED_GLOBAL_ALLOWLIST: &[(&str, &str)] = &[
     ("GET", "/live"),
+    ("HEAD", "/live"),
     ("GET", "/health"),
+    ("HEAD", "/health"),
     ("GET", "/status"),
+    ("HEAD", "/status"),
     ("GET", "/overload"),
     ("GET", "/plugins"),
     ("GET", "/namespaces"),
@@ -2485,11 +2489,10 @@ fn admin_tls_store_backed_500_operation_ids() -> BTreeSet<&'static str> {
     OPS.iter().copied().collect()
 }
 
-/// TLS admin operations that never consult the managed/ACME stores and must not
-/// document a store-backed `500`.
+/// TLS admin operations that never consult the managed/ACME stores and cannot
+/// return a `500` (neither store-backed nor blocking-worker failure).
 fn admin_tls_non_store_operation_ids() -> BTreeSet<&'static str> {
     const OPS: &[&str] = &[
-        "listTlsInventory",
         "listTlsEvents",
         "forceRotateTlsSurface",
         "validateTlsMaterial",
@@ -2522,7 +2525,10 @@ fn admin_tls_store_backed_operations_document_internal_server_error() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
 
-    for operation_id in admin_tls_store_backed_500_operation_ids() {
+    for operation_id in admin_tls_store_backed_500_operation_ids()
+        .into_iter()
+        .chain(std::iter::once("listTlsInventory"))
+    {
         let (method, path, operation) = openapi_operation_by_id(&spec, operation_id);
         assert_eq!(
             operation["responses"]["500"]["$ref"], "#/components/responses/InternalServerError",
@@ -21042,7 +21048,7 @@ const UNSERVED_NAMESPACE_MARKED_MUTATIONS: &[(&str, &[&str])] = &[
     ("restoreConfig", &["200"]),
     ("createProxy", &["201"]),
     ("updateProxy", &["200"]),
-    ("deleteProxy", &["204"]),
+    ("deleteProxy", &["200", "204"]),
     ("createConsumer", &["201"]),
     ("updateConsumer", &["200"]),
     ("deleteConsumer", &["204"]),
@@ -21847,4 +21853,381 @@ fn ai_embedding_plaintext_opt_in_matches_schema_and_runtime() {
             "ai_semantic_firewall runtime admission for {config}"
         );
     }
+}
+
+#[test]
+fn openapi_structural_alignment_invariants_hold_across_paths_and_schemas() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    // 1. No GET operation may reference ReadOnly (403 on GET is Forbidden, not write read-only).
+    // 2. Every non-204/304 inline response (without $ref) must declare `content`.
+    for (path, path_item) in spec["paths"].as_object().expect("paths object") {
+        if let Some(get_responses) = path_item
+            .get("get")
+            .and_then(|op| op.get("responses"))
+            .and_then(serde_json::Value::as_object)
+        {
+            for (code, resp) in get_responses {
+                assert_ne!(
+                    resp.get("$ref").and_then(serde_json::Value::as_str),
+                    Some("#/components/responses/ReadOnly"),
+                    "GET {path} {code} must not reference ReadOnly"
+                );
+            }
+        }
+        for method in OPENAPI_HTTP_METHODS {
+            let Some(responses) = path_item
+                .get(*method)
+                .and_then(|op| op.get("responses"))
+                .and_then(serde_json::Value::as_object)
+            else {
+                continue;
+            };
+            for (code, resp) in responses {
+                if *method == "head"
+                    || matches!(code.as_str(), "204" | "304")
+                    || resp.get("$ref").is_some()
+                {
+                    continue;
+                }
+                assert!(
+                    resp.get("content").is_some(),
+                    "{method} {path} {code} inline response must declare `content`"
+                );
+            }
+        }
+    }
+
+    // 3. ClusterStatusDp.control_plane allows null (emitted when cp_connection_state is None).
+    assert_eq!(
+        spec.pointer("/components/schemas/ClusterStatusDp/properties/control_plane/type"),
+        Some(&json!(["object", "null"]))
+    );
+
+    // 4. All 6 TLS/ACME delete routes wire 409 to TlsRecordInUseConflict.
+    for op_id in [
+        "deleteAcmeCertificate",
+        "deleteManagedTlsCertificate",
+        "deleteManagedTlsCaBundle",
+        "deleteManagedTlsCrl",
+        "deleteManagedTlsOcspResponse",
+        "deleteManagedTlsJwks",
+    ] {
+        let (_, _, op) = openapi_operation_by_id(&spec, op_id);
+        assert_eq!(
+            op["responses"]["409"]["$ref"],
+            json!("#/components/responses/TlsRecordInUseConflict"),
+            "{op_id} 409 must reference TlsRecordInUseConflict"
+        );
+    }
+
+    // 5. GatewayTrustBundle and GatewayTrustBundleCreate enforce 254-byte id cap and closed shape.
+    for schema in ["GatewayTrustBundle", "GatewayTrustBundleCreate"] {
+        let obj = spec
+            .pointer(&format!("/components/schemas/{schema}"))
+            .unwrap_or_else(|| panic!("missing {schema}"));
+        assert_eq!(obj["additionalProperties"], json!(false));
+        assert_eq!(
+            obj["properties"]["id"]["maxLength"],
+            json!(ferrum_edge::config::gateway_trust::MAX_TRUST_BUNDLE_ID_BYTES)
+        );
+    }
+
+    // 6. ApiSpecSummary declares its required runtime fields.
+    let required: BTreeSet<&str> = spec
+        .pointer("/components/schemas/ApiSpecSummary/required")
+        .and_then(serde_json::Value::as_array)
+        .expect("ApiSpecSummary.required array")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    for field in [
+        "id",
+        "proxy_id",
+        "spec_version",
+        "spec_format",
+        "tags",
+        "server_urls",
+        "operation_count",
+        "uncompressed_size",
+        "content_hash",
+        "created_at",
+        "updated_at",
+    ] {
+        assert!(
+            required.contains(field),
+            "ApiSpecSummary.required missing `{field}`"
+        );
+    }
+}
+
+#[test]
+fn remaining_five_builtin_plugins_have_openapi_runtime_parity() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    // `basic_auth` reads `FERRUM_BASIC_AUTH_HMAC_SECRET` in `BasicAuth::new`, so
+    // validate through `_test_support::basic_auth_with_secret_for_test` to avoid
+    // process-global env mutation in parallel unit tests.
+    const TEST_BASIC_AUTH_SECRET: &str = "test-basic-auth-hmac-secret-at-least-32-bytes";
+    let basic_valid = json!({"hide_credentials": true});
+    let basic_invalid = json!({"hide_credentials": true, "unknown_key": 1});
+    assert_component_validity(&spec, "BasicAuthConfig", &basic_valid, true);
+    assert!(
+        ferrum_edge::_test_support::basic_auth_with_secret_for_test(
+            &basic_valid,
+            TEST_BASIC_AUTH_SECRET
+        )
+        .is_ok(),
+        "basic_auth valid config rejected by runtime: {basic_valid}"
+    );
+    assert_component_validity(&spec, "BasicAuthConfig", &basic_invalid, false);
+    assert!(
+        ferrum_edge::_test_support::basic_auth_with_secret_for_test(
+            &basic_invalid,
+            TEST_BASIC_AUTH_SECRET
+        )
+        .is_err(),
+        "basic_auth unknown-key config accepted by runtime: {basic_invalid}"
+    );
+
+    for (plugin, component, valid_cfg, invalid_unknown_key_cfg) in [
+        (
+            "otel_tracing",
+            "OtelTracingConfig",
+            json!({"root_sampling": "always_on"}),
+            json!({"root_sampling": "always_on", "unknown_key": 1}),
+        ),
+        (
+            "ai_request_guard",
+            "AiRequestGuardConfig",
+            json!({"max_tokens_limit": 2048}),
+            json!({"max_tokens_limit": 2048, "unknown_key": 1}),
+        ),
+        (
+            "a2a_gateway",
+            "A2aGatewayConfig",
+            json!({"discovery": {"public_base_url": "https://gateway.example.com"}}),
+            json!({"discovery": {"public_base_url": "https://gateway.example.com"}, "unknown_key": 1}),
+        ),
+        (
+            "mcp_gateway",
+            "McpGatewayConfig",
+            json!({
+                "mode": "transparent_proxy",
+                "endpoint": {"path": "/mcp"},
+                "servers": {
+                    "primary": {
+                        "namespace": "primary",
+                        "upstream_url": "https://mcp.example.com/mcp"
+                    }
+                }
+            }),
+            json!({
+                "mode": "transparent_proxy",
+                "endpoint": {"path": "/mcp"},
+                "servers": {
+                    "primary": {
+                        "namespace": "primary",
+                        "upstream_url": "https://mcp.example.com/mcp"
+                    }
+                },
+                "unknown_key": 1
+            }),
+        ),
+    ] {
+        assert_component_validity(&spec, component, &valid_cfg, true);
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config(plugin, &valid_cfg).is_ok(),
+            "{plugin} valid config rejected by runtime: {valid_cfg}"
+        );
+        assert_component_validity(&spec, component, &invalid_unknown_key_cfg, false);
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config(plugin, &invalid_unknown_key_cfg).is_err(),
+            "{plugin} unknown-key config accepted by runtime: {invalid_unknown_key_cfg}"
+        );
+    }
+}
+
+#[test]
+fn overload_response_one_of_distinguishes_minimal_and_detailed_tiers() {
+    use ferrum_edge::overload::{
+        ActionSnapshot, ConnPressure, FdPressure, NodeWaypointDropSnapshot, OverloadLevel,
+        OverloadSnapshot, PressureSnapshot, ReqPressure,
+    };
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let minimal = json!({"level": "normal"});
+    let mut detailed = serde_json::to_value(OverloadSnapshot {
+        level: OverloadLevel::Normal,
+        draining: false,
+        active_connections: 2,
+        active_requests: 1,
+        red_drop_probability_pct: 0.0,
+        port_exhaustion_events: 0,
+        node_waypoint_drops: NodeWaypointDropSnapshot {
+            cookie_unavailable: 0,
+            unknown_cookie: 0,
+            missing_pod_uid: 0,
+            missing_workload_hash: 0,
+            unknown_pod: 0,
+            hash_mismatch: 0,
+        },
+        pressure: PressureSnapshot {
+            file_descriptors: FdPressure {
+                current: 10,
+                max: 100,
+                ratio: 0.1,
+                enforced: true,
+            },
+            connections: ConnPressure {
+                current: 2,
+                max: 100,
+                ratio: 0.02,
+            },
+            requests: ReqPressure {
+                current: 1,
+                max: 100,
+                ratio: 0.01,
+            },
+            event_loop_latency_us: 50,
+        },
+        actions: ActionSnapshot {
+            disable_keepalive: false,
+            reject_new_connections: false,
+            reject_new_requests: false,
+        },
+    })
+    .expect("overload snapshot serializes");
+    detailed
+        .as_object_mut()
+        .expect("overload snapshot is an object")
+        .insert(
+            "stream_listeners".to_string(),
+            json!({
+                "dtls_demux_sessions_total": 0,
+                "dtls_demux_sessions": [],
+                "frontend_dtls_reload": {
+                    "generation": 0,
+                    "last_swapped_listeners": 0,
+                    "last_success_unix": null,
+                    "last_failure_unix": null,
+                    "last_outcome": "none"
+                },
+                "mesh_node_waypoint_dtls_reload": {
+                    "generation": 0,
+                    "last_swapped_listeners": 0,
+                    "last_success_unix": null,
+                    "last_failure_unix": null,
+                    "last_outcome": "none"
+                },
+                "bind_failures_total": 0,
+                "bind_failures": []
+            }),
+        );
+
+    // Confirm mutual exclusivity: OverloadLevelOnly rejects extra fields so a
+    // full OverloadSnapshot matches only OverloadSnapshot, not both branches of
+    // `/overload`'s `oneOf`.
+    assert_component_validity(&spec, "OverloadLevelOnly", &minimal, true);
+    assert_component_validity(&spec, "OverloadLevelOnly", &detailed, false);
+    assert_component_validity(&spec, "OverloadSnapshot", &detailed, true);
+    assert_component_validity(&spec, "OverloadSnapshot", &minimal, false);
+
+    let invalid_extra = json!({"level": "normal", "unexpected": true});
+    for status in ["200", "503"] {
+        let pointer =
+            format!("/paths/~1overload/get/responses/{status}/content/application~1json/schema");
+        let response_schema = spec
+            .pointer(&pointer)
+            .unwrap_or_else(|| panic!("missing /overload {status} response schema"))
+            .clone();
+        let mut combined = response_schema
+            .as_object()
+            .expect("/overload response schema is an object")
+            .clone();
+        combined.insert(
+            "$schema".to_string(),
+            json!("https://json-schema.org/draft/2020-12/schema"),
+        );
+        combined.insert("components".to_string(), spec["components"].clone());
+        let validator = jsonschema::draft202012::options()
+            .build(&serde_json::Value::Object(combined))
+            .unwrap_or_else(|e| panic!("/overload {status} oneOf schema compiles: {e}"));
+
+        assert!(
+            validator.validate(&minimal).is_ok(),
+            "/overload {status} oneOf must accept minimal OverloadLevelOnly payload"
+        );
+        assert!(
+            validator.validate(&detailed).is_ok(),
+            "/overload {status} oneOf must accept full OverloadSnapshot payload (must not match both branches)"
+        );
+        assert!(
+            validator.validate(&invalid_extra).is_err(),
+            "/overload {status} oneOf must reject minimal payload with unexpected extra property"
+        );
+    }
+}
+
+#[test]
+fn restore_503_schema_accepts_unknown_clear_outcome_bodies() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let response_schema = spec
+        .pointer("/paths/~1restore/post/responses/503/content/application~1json/schema")
+        .expect("missing /restore 503 response schema")
+        .clone();
+    let mut combined = response_schema
+        .as_object()
+        .expect("/restore 503 schema is an object")
+        .clone();
+    combined.insert(
+        "$schema".to_string(),
+        json!("https://json-schema.org/draft/2020-12/schema"),
+    );
+    combined.insert("components".to_string(), spec["components"].clone());
+    let validator = jsonschema::draft202012::options()
+        .build(&serde_json::Value::Object(combined))
+        .expect("/restore 503 schema compiles");
+
+    for body in [
+        json!({
+            "error": "Config admission was lost during an ambiguous restore clear (clear commit outcome unknown) and could not be reacquired for recovery",
+            "restore_errors": ["namespace admission lease lost"],
+            "rollback": "unknown_clear_outcome"
+        }),
+        json!({
+            "error": "Config admission was lost during an ambiguous restore clear (clear commit outcome unknown) after another writer acquired the namespace lease",
+            "restore_errors": ["namespace admission lease lost"],
+            "rollback": "unknown_clear_outcome"
+        }),
+        json!({
+            "error": "Config admission was lost during a potentially partial non-atomic restore clear after another writer acquired the namespace lease; rollback skipped",
+            "restore_errors": ["namespace admission lease lost"],
+            "rollback": "skipped_after_intervening_write"
+        }),
+        json!({
+            "error": "Config admission was lost during a failed restore clear after another writer acquired the namespace lease",
+            "restore_errors": ["namespace admission lease lost"],
+            "rollback": "not_needed_after_intervening_write"
+        }),
+    ] {
+        assert!(
+            validator.validate(&body).is_ok(),
+            "/restore 503 schema must accept body: {body}"
+        );
+    }
+
+    let invalid = json!({
+        "error": "invalid rollback value",
+        "rollback": "bogus_state"
+    });
+    assert!(
+        validator.validate(&invalid).is_err(),
+        "/restore 503 schema must reject unknown rollback enum value"
+    );
 }

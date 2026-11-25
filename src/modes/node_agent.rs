@@ -1408,6 +1408,7 @@ async fn start_node_agent_admin_listeners(
         }
     };
 
+    crate::admin::tls_management::set_process_env_config(Arc::new(env_config.clone()));
     let admin_state = AdminState {
         db: None,
         jwt_manager,

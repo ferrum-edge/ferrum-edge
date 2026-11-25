@@ -283,6 +283,11 @@ The following are rejected with HTTP 422 (the `code` field of the error body is 
 
 The credential-key check walks the plugin's `config` *value*, not the plugin metadata, so a plugin named `jwt` is fine. A JWT plugin with `config: { secret_lookup: env, validation: { validate_exp: true } }` passes; one with `config: { jwt: { secret: "abc" } }` fails.
 
+Additionally, the following structural violations in plugin extensions are rejected with HTTP 400 `MalformedExtension`:
+
+- **Non-object (positional) `x-ferrum-plugins` entries** — every element of `x-ferrum-plugins` must be a JSON/YAML object.
+- **Reserved `$serde_json::private::RawValue` key in plugin `config`** — rejected at any nesting depth in declared `x-ferrum-plugins` entries and in generated/merged `x-ferrum-validate` / `x-ferrum-mcp` configs (including object-valued schema `const` literals resolved from local or external `$ref`s).
+
 ### External `$ref` policy
 
 External and cross-document `$ref` resolution is **explicitly opt-in** and runs only at API-spec admission (POST/PUT). Runtime validation never performs network or filesystem I/O for `$ref`s: schemas and Path Items are materialized into the generated `openapi_validator` config, and an immutable external-document snapshot (plus digest) is stored on the `api_specs` row.
@@ -290,7 +295,7 @@ External and cross-document `$ref` resolution is **explicitly opt-in** and runs 
 **Gates (both required):**
 
 1. Process: `FERRUM_ADMIN_SPEC_EXTERNAL_REFS_ENABLED=true` (default `false`). See [configuration.md](configuration.md).
-2. Per-spec: `x-ferrum-external-refs: true` or an object:
+2. Per-spec: `x-ferrum-external-refs: true` (or `false` to explicitly disable) or an object:
 
 ```yaml
 x-ferrum-external-refs:
@@ -303,7 +308,7 @@ x-ferrum-external-refs:
 
 - **Files**: only under `FERRUM_ADMIN_SPEC_EXTERNAL_REFS_FILE_ROOT` (absolute). On Unix, each path component is opened relative to the already-open canonical jail descriptor with no-follow semantics, and bytes are read from the verified regular-file descriptor; symlink swaps and `..` traversal therefore fail closed without a check/reopen race. File refs are refused on platforms where this descriptor-relative containment primitive is unavailable. Client errors never echo raw host paths.
 - **Network**: HTTPS origins listed in `FERRUM_ADMIN_SPEC_EXTERNAL_REFS_ALLOWED_ORIGINS` only (plus optional explicit HTTP fixture origins). Embedded credentials and query strings are rejected. HTTPS is always public-only, independently of `FERRUM_BACKEND_ALLOW_IPS`: localhost, private, link-local, metadata, multicast/broadcast, and unspecified addresses fail closed. The only non-public HTTP exception is loopback on an explicitly configured fixture/development origin. Every redirect hop is re-allowlisted, re-resolved, screened, and pinned into that hop's HTTP client, preserving hostname/SNI validation without an unchecked second DNS lookup. Redirects cannot downgrade HTTPS, and no ambient admin credentials, cookies, bearer tokens, or proxy credentials are forwarded.
-- **Budgets and response media**: per-document and aggregate byte caps, document count, reference count, URI length, nesting depth, connect/request/total timeouts, and allowed Content-Types. A present response `Content-Type` is an admission allowlist gate: it must be valid UTF-8 and match the OpenAPI JSON/YAML/plain/octet-stream allowlist, and malformed and unsupported values fail closed with the same generic redacted diagnostic. Whether the header was present and allowed or absent entirely, the body is then parsed under bounded first-byte JSON/YAML detection (JSON when the first non-whitespace byte is `{` or `[`, YAML otherwise); an admitted header never selects the parser. `Content-Length` is preflighted without reserving from it, chunked/streamed bodies abort as soon as the cap is crossed, and the absolute total deadline covers DNS, connect/request, redirects, and every body read. Unknown, invalid, or oversized inputs fail closed with field-specific, redacted diagnostics.
+- **Budgets and response media**: per-document and aggregate byte caps, document count, reference count, URI length, ref-chain nesting depth (`max_nesting`), a 120-container document nesting depth ceiling (`400 InvalidJson` / `InvalidYaml`, ensuring every admitted document fits inside the 3 enclosing JSON containers of the persisted snapshot), aggregate normalized (128 MiB) and compressed (64 MiB) snapshot caps (`422 SchemaTooLarge`), connect/request/total timeouts, and allowed Content-Types. A present response `Content-Type` is an admission allowlist gate: it must appear at most once (repeated `Content-Type` headers fail closed), be valid UTF-8, and match the OpenAPI JSON/YAML/plain/octet-stream allowlist, and malformed, repeated, or unsupported values fail closed with the same generic redacted diagnostic. Whether the header was present and allowed or absent entirely, the body is then parsed under bounded first-byte JSON/YAML detection (JSON when the first non-whitespace byte is `{` or `[`, YAML otherwise); an admitted header never selects the parser. `Content-Length` is preflighted without reserving from it, chunked/streamed bodies abort as soon as the cap is crossed, and the absolute total deadline covers DNS, connect/request, redirects, and every body read. Unknown, invalid, or oversized inputs fail closed with field-specific, redacted diagnostics.
 
 **Snapshot / last-good:** successful admission persists a gzip-compressed normalized document set with per-document content digests and an aggregate `external_ref_digest`. The aggregate digest includes the canonical document values and effective-policy provenance: the process-policy digest, enabled state, canonical document base, and canonical sorted effective HTTPS/HTTP origin sets. Different per-spec narrowing therefore produces a different digest while ordering-equivalent allowlists remain stable. Every full SQL/Mongo/backup decode enforces the 64 MiB compressed / 128 MiB decompressed caps, revalidates each document digest, and requires the snapshot/digest fields to be present as a matching pair. Cache keys use the same effective-policy digest without rendering a file base, and serialized file-document identities are stable hashes rather than host paths. A failed PUT/extract retains the previously accepted generation (transactional replace / no write). Specs are admin-only metadata (not CP→DP published); `GET /api-specs` returns only the non-secret digest and never the snapshot bytes, and one tenant/namespace cannot read another's snapshot. Backup section version `2` carries optional snapshot bytes; version `1` backups remain restorable without them.
 
@@ -340,7 +345,7 @@ x-ferrum-external-refs:
 
 **Body size limit**: controlled by `FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB` (default 25). Returns 413 when exceeded.
 
-**YAML alias expansion**: YAML anchors and aliases are composed through a libyaml event graph and expanded deterministically under shared budgets (expanded nodes, nesting depth, alias references, a 32 MiB fail-closed upper bound on the compact JSON representation including string/key escaping, and expansion work) with cycle, undefined-alias, duplicate-anchor, and duplicate-mapping-key detection. Expansion fails closed with field-specific diagnostics and never admits exponential alias bombs. JSON and YAML submissions share the same post-parse expanded-node cap so autodetection cannot weaken admission. Keep extremely large generated specs in JSON when you need the simplest wire form; modular YAML with finite alias reuse is supported. Expansion also fails closed on a non-core or local YAML tag, a non-finite number, an integer outside the exact JSON `i64`/`u64` range, and a mapping key that has no JSON object-key spelling (null, sequence, or mapping); scalar number and boolean keys keep their stringified spelling so unquoted status codes stay valid.
+**YAML alias expansion**: YAML anchors and aliases are composed through a libyaml event graph and expanded deterministically under shared budgets (expanded nodes, nesting depth, alias references, a 32 MiB fail-closed upper bound on the compact JSON representation including string/key escaping, and expansion work) with cycle, undefined-alias, duplicate-anchor, and duplicate-mapping-key detection. Expansion fails closed with field-specific diagnostics and never admits exponential alias bombs. JSON and YAML submissions (including external `$ref` documents and GET cross-format conversions) enforce the same 500,000-node ceiling; JSON counts every JSON value (including containers and object member values) during deserialization before duplicate keys collapse so autodetection and duplicate members cannot weaken admission. Keep extremely large generated specs in JSON when you need the simplest wire form; modular YAML with finite alias reuse is supported. Expansion also fails closed on a non-core or local YAML tag, a non-finite number, an integer outside the exact JSON `i64`/`u64` range, and a mapping key that has no JSON object-key spelling (null, sequence, or mapping); scalar number and boolean keys keep their stringified spelling so unquoted status codes stay valid.
 
 **MongoDB caveat**: the BSON document limit is 16 MiB. Since spec content is gzip-compressed before storage, a spec up to approximately 14–15 MiB compressed fits within the limit. Operators with larger specs should use a SQL backend (PostgreSQL, MySQL, or SQLite).
 
@@ -819,7 +824,8 @@ curl "https://gateway/api-specs/$SPEC_ID" \
   -H "Accept: application/json"
 
 # Conditional GET (returns 304 if unchanged). The ETag is representation-
-# specific -- the quoted "<content_hash>-json" or "<content_hash>-yaml" --
+# specific -- "<content_hash>-json" or "<content_hash>-yaml" verbatim, or
+# "<content_hash>-<target>-from-<stored>-v1" when converted across formats --
 # so capture and replay the exact ETag a previous GET returned; a bare
 # content hash never matches.
 ETAG=$(curl -sS -D - -o /dev/null "https://gateway/api-specs/$SPEC_ID" \
@@ -833,7 +839,26 @@ curl "https://gateway/api-specs/$SPEC_ID" \
 # Look up spec by proxy ID
 curl "https://gateway/api-specs/by-proxy/orders-proxy" \
   -H "Authorization: Bearer $JWT"
+```
 
+> **Note (read backpressure & conditional caching):** `GET /api-specs/{id}` and
+> `GET /api-specs/by-proxy/{proxy_id}` enforce a per-connection buffered
+> response byte budget (at least 64 MiB, or the configured single-spec
+> decompression cap). If one connection stacks more unread spec bodies than its
+> budget allows (for example across multiplexed HTTP/2 streams), excess reads
+> fail fast with `503 Service Unavailable` and `Retry-After: 1` without
+> starving other connections. Conditional `If-None-Match` hits matching an exact
+> ETag (or `*` for a verbatim format within the decompression cap) read only
+> `(spec_format, content_hash, uncompressed_size)` metadata and consume neither
+> read codec slots nor connection response budget; `If-None-Match: *` on a
+> cross-format conversion defers `304` until bounded codec validation succeeds
+> (admission preflight or post-fetch reservation growth can still fail fast with
+> `503` before codec work begins if the connection budget is already saturated,
+> whereas once codec work begins, a malformed document or output exceeding the
+> decompression cap returns `500` even if the connection budget is exhausted
+> mid-decode or mid-conversion).
+
+```bash
 # Replace a spec
 curl -X PUT "https://gateway/api-specs/$SPEC_ID" \
   -H "Authorization: Bearer $JWT" \

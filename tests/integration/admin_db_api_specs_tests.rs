@@ -1765,7 +1765,12 @@ async fn replace_bundle_spec_owned_replaced_hand_added_survives() {
         upstream: None,
         plugins: vec![spec_plugin],
     };
-    let spec_v1 = make_spec(&spec_id, &proxy_id, ns, b"v1 spec");
+    let spec_v1 = make_spec(
+        &spec_id,
+        &proxy_id,
+        ns,
+        br#"{"openapi":"3.1.0","info":{"title":"v1 spec","version":"1.0"},"paths":{}}"#,
+    );
     store
         .submit_api_spec_bundle(&bundle_v1, &spec_v1)
         .await
@@ -1802,7 +1807,12 @@ async fn replace_bundle_spec_owned_replaced_hand_added_survives() {
         upstream: None,
         plugins: vec![new_spec_plugin],
     };
-    let spec_v2 = make_spec(&spec_id, &proxy_id, ns, b"v2 spec");
+    let spec_v2 = make_spec(
+        &spec_id,
+        &proxy_id,
+        ns,
+        br#"{"openapi":"3.1.0","info":{"title":"v2 spec","version":"2.0"},"paths":{}}"#,
+    );
     store
         .replace_api_spec_bundle(&bundle_v2, &spec_v2)
         .await
@@ -1870,7 +1880,12 @@ async fn replace_api_spec_bundle_does_not_delete_same_api_spec_id_in_other_names
         upstream: None,
         plugins: vec![make_plugin(&spec_plugin_id, &proxy_id, ns, None)],
     };
-    let spec_v1 = make_spec(&spec_id, &proxy_id, ns, b"v1 spec");
+    let spec_v1 = make_spec(
+        &spec_id,
+        &proxy_id,
+        ns,
+        br#"{"openapi":"3.1.0","info":{"title":"v1 spec","version":"1.0"},"paths":{}}"#,
+    );
     store
         .submit_api_spec_bundle(&bundle_v1, &spec_v1)
         .await
@@ -1920,7 +1935,12 @@ async fn replace_api_spec_bundle_does_not_delete_same_api_spec_id_in_other_names
         upstream: None,
         plugins: vec![make_plugin(&new_spec_plugin_id, &proxy_id, ns, None)],
     };
-    let spec_v2 = make_spec(&spec_id, &proxy_id, ns, b"v2 spec");
+    let spec_v2 = make_spec(
+        &spec_id,
+        &proxy_id,
+        ns,
+        br#"{"openapi":"3.1.0","info":{"title":"v2 spec","version":"2.0"},"paths":{}}"#,
+    );
     store
         .replace_api_spec_bundle(&bundle_v2, &spec_v2)
         .await
@@ -2812,7 +2832,12 @@ async fn replace_with_changed_resources_keeps_hand_added_plugins() {
         upstream: None,
         plugins: vec![spec_plugin],
     };
-    let spec_v1 = make_spec(&spec_id, &proxy_id, ns, b"v1 spec content");
+    let spec_v1 = make_spec(
+        &spec_id,
+        &proxy_id,
+        ns,
+        br#"{"openapi":"3.1.0","info":{"title":"v1 spec content","version":"1.0"},"paths":{}}"#,
+    );
     store
         .submit_api_spec_bundle(&bundle_v1, &spec_v1)
         .await
@@ -2845,7 +2870,7 @@ async fn replace_with_changed_resources_keeps_hand_added_plugins() {
         &spec_id,
         &proxy_id,
         ns,
-        b"v2 spec content with changed resources",
+        br#"{"openapi":"3.1.0","info":{"title":"v2 spec content with changed resources","version":"2.0"},"paths":{}}"#,
     );
     store
         .replace_api_spec_bundle(&bundle_v2, &spec_v2)
@@ -4011,7 +4036,12 @@ async fn replace_updates_proxy_plugins_associations() {
 
     // Initial submit with one plugin.
     let bundle_v1 = make_bundle_with_plugins(&proxy_id, ns, &[&plugin_id_v1], None);
-    let spec_v1 = make_spec(&spec_id, &proxy_id, ns, b"v1 with plugin");
+    let spec_v1 = make_spec(
+        &spec_id,
+        &proxy_id,
+        ns,
+        br#"{"openapi":"3.1.0","info":{"title":"v1 with plugin","version":"1.0"},"paths":{}}"#,
+    );
     store
         .submit_api_spec_bundle(&bundle_v1, &spec_v1)
         .await
@@ -4020,7 +4050,12 @@ async fn replace_updates_proxy_plugins_associations() {
     // Replace with a different plugin.
     let plugin_id_v2 = uid("plugin");
     let bundle_v2 = make_bundle_with_plugins(&proxy_id, ns, &[&plugin_id_v2], None);
-    let spec_v2 = make_spec(&spec_id, &proxy_id, ns, b"v2 with different plugin");
+    let spec_v2 = make_spec(
+        &spec_id,
+        &proxy_id,
+        ns,
+        br#"{"openapi":"3.1.0","info":{"title":"v2 with different plugin","version":"2.0"},"paths":{}}"#,
+    );
     store
         .replace_api_spec_bundle(&bundle_v2, &spec_v2)
         .await
@@ -4074,7 +4109,12 @@ async fn replace_with_changed_upstream_id_does_not_fail_fk() {
         upstream: Some(make_upstream(&upstream_id_v1, ns)),
         plugins: vec![],
     };
-    let spec_v1 = make_spec(&spec_id, &proxy_id, ns, b"v1 upstream");
+    let spec_v1 = make_spec(
+        &spec_id,
+        &proxy_id,
+        ns,
+        br#"{"openapi":"3.1.0","info":{"title":"v1 upstream","version":"1.0"},"paths":{}}"#,
+    );
     store
         .submit_api_spec_bundle(&bundle_v1, &spec_v1)
         .await
@@ -4106,7 +4146,12 @@ async fn replace_with_changed_upstream_id_does_not_fail_fk() {
         upstream: Some(make_upstream(&upstream_id_v2, ns)),
         plugins: vec![],
     };
-    let spec_v2 = make_spec(&spec_id, &proxy_id, ns, b"v2 different upstream");
+    let spec_v2 = make_spec(
+        &spec_id,
+        &proxy_id,
+        ns,
+        br#"{"openapi":"3.1.0","info":{"title":"v2 different upstream","version":"2.0"},"paths":{}}"#,
+    );
     store
         .replace_api_spec_bundle(&bundle_v2, &spec_v2)
         .await
@@ -4183,7 +4228,12 @@ async fn replace_with_changed_resources_keeps_manual_proxy_plugin_association() 
         upstream: None,
         plugins: vec![spec_plugin],
     };
-    let spec_v1 = make_spec(&spec_id, &proxy_id, ns, b"v1 spec content");
+    let spec_v1 = make_spec(
+        &spec_id,
+        &proxy_id,
+        ns,
+        br#"{"openapi":"3.1.0","info":{"title":"v1 spec content","version":"1.0"},"paths":{}}"#,
+    );
     store
         .submit_api_spec_bundle(&bundle_v1, &spec_v1)
         .await
@@ -4246,7 +4296,7 @@ async fn replace_with_changed_resources_keeps_manual_proxy_plugin_association() 
         &spec_id,
         &proxy_id,
         ns,
-        b"v2 spec content with changed resources",
+        br#"{"openapi":"3.1.0","info":{"title":"v2 spec content with changed resources","version":"2.0"},"paths":{}}"#,
     );
     store
         .replace_api_spec_bundle(&bundle_v2, &spec_v2)
@@ -4846,7 +4896,12 @@ async fn put_overwrites_imported_updated_at_so_polling_picks_change() {
         upstream: None,
         plugins: vec![plugin_v1],
     };
-    let spec_v1 = make_spec(&spec_id, &proxy_id, ns, b"v1 content");
+    let spec_v1 = make_spec(
+        &spec_id,
+        &proxy_id,
+        ns,
+        br#"{"openapi":"3.1.0","info":{"title":"v1 content","version":"1.0"},"paths":{}}"#,
+    );
     store
         .submit_api_spec_bundle(&bundle_v1, &spec_v1)
         .await
@@ -4874,7 +4929,12 @@ async fn put_overwrites_imported_updated_at_so_polling_picks_change() {
         upstream: None,
         plugins: vec![],
     };
-    let spec_v2 = make_spec(&spec_id, &proxy_id, ns, b"v2 content fresh ts");
+    let spec_v2 = make_spec(
+        &spec_id,
+        &proxy_id,
+        ns,
+        br#"{"openapi":"3.1.0","info":{"title":"v2 content fresh ts","version":"2.0"},"paths":{}}"#,
+    );
     store
         .replace_api_spec_bundle(&bundle_v2, &spec_v2)
         .await
@@ -4907,7 +4967,12 @@ async fn put_overwrites_imported_updated_at_so_polling_picks_change() {
         upstream: None,
         plugins: vec![],
     };
-    let spec_stale = make_spec(&spec_id, &proxy_id, ns, b"v3 content stale ts");
+    let spec_stale = make_spec(
+        &spec_id,
+        &proxy_id,
+        ns,
+        br#"{"openapi":"3.1.0","info":{"title":"v3 content stale ts","version":"3.0"},"paths":{}}"#,
+    );
     store
         .replace_api_spec_bundle(&bundle_stale, &spec_stale)
         .await

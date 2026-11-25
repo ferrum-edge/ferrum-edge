@@ -100,6 +100,132 @@ pub use router_cache::RouterCache;
 /// The leading underscore signals that this module is not part of the public API.
 #[doc(hidden)]
 pub mod _test_support {
+    /// Test helper exposing external-ref media-type allowlist validation
+    /// without widening the public API surface of `api_specs::external_refs`.
+    pub fn api_spec_external_ref_content_type_allowed_for_test(content_type: &str) -> bool {
+        crate::admin::api_specs::external_refs::content_type_allowed_for_test(content_type)
+    }
+
+    /// Test helper exposing bounded API-spec format conversion.
+    pub fn api_spec_convert_format_capped_for_test(
+        body: &[u8],
+        from: crate::config::types::SpecFormat,
+        to: crate::config::types::SpecFormat,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, String> {
+        crate::admin::api_specs::handlers::convert_format_capped_for_test(body, from, to, max_bytes)
+    }
+
+    pub use crate::admin::ResponseBudgetWrapperAudit;
+
+    /// Test helper exercising budgeted `GuardedAdminBody` 64 KiB chunking,
+    /// mid-stream and queued-frame permit retention, early-drop release, and
+    /// HEAD stripping.
+    pub async fn exercise_admin_response_budget_wrapper_for_test(
+        capacity_kib: u32,
+        body_bytes: usize,
+    ) -> Result<ResponseBudgetWrapperAudit, &'static str> {
+        crate::admin::exercise_response_budget_wrapper_for_test(capacity_kib, body_bytes).await
+    }
+
+    /// Test helper exercising a real HTTP/2 server (`max_send_buf_size = 64 KiB`)
+    /// and stalled client to verify response budget retention across `h2`
+    /// backpressure and recovery after drain.
+    pub async fn exercise_http2_stalled_response_budget_for_test() -> Result<(), &'static str> {
+        crate::admin::exercise_http2_stalled_response_budget_for_test().await
+    }
+
+    /// Test helper verifying strict per-connection response budget enforcement
+    /// without clamping oversized payloads, plus reservation shrink/grow
+    /// adjustments.
+    pub fn check_admin_response_budget_limits_for_test(
+        capacity_kib: u32,
+        oversized_bytes: usize,
+        fitting_bytes: usize,
+    ) -> (bool, bool, bool, bool) {
+        crate::admin::check_response_budget_limits_for_test(
+            capacity_kib,
+            oversized_bytes,
+            fitting_bytes,
+        )
+    }
+
+    /// Test helper verifying that streaming gzip decompression and cross-format
+    /// conversion classify mid-stream connection-budget exhaustion as `503`
+    /// while preserving `500` when output exceeds `max_bytes`.
+    pub fn check_api_spec_budgeted_decode_and_convert_for_test(
+        raw_json: &[u8],
+        max_bytes: usize,
+        budget_capacity_kib: u32,
+        already_held_bytes: usize,
+    ) -> (Option<u16>, Option<u16>) {
+        crate::admin::api_specs::handlers::check_budgeted_decode_and_convert_for_test(
+            raw_json,
+            max_bytes,
+            budget_capacity_kib,
+            already_held_bytes,
+        )
+    }
+
+    /// Test helper verifying that `LimitedWriter` never allocates capacity
+    /// beyond its reserved connection-budget permits across multiple writes.
+    pub fn check_api_spec_limited_writer_capacity_for_test() -> Result<(), &'static str> {
+        crate::admin::api_specs::handlers::check_limited_writer_capacity_for_test()
+    }
+
+    /// End-to-end test helper exercising `spec_content_response_async` with
+    /// both `max_decompress_bytes` and per-connection budget active, including
+    /// cross-format `If-None-Match: *`, multi-chunk YAML->JSON conversion, and
+    /// `406` single-format `q=0` handling.
+    pub async fn exercise_api_spec_content_response_limits_for_test() -> Result<(), &'static str> {
+        crate::admin::api_specs::handlers::exercise_spec_content_response_limits_for_test().await
+    }
+
+    /// Test helper verifying API-spec read preflight reservation and
+    /// `If-None-Match: *` conversion parity.
+    pub fn check_api_spec_read_preflight_for_test(
+        stored_format: crate::config::types::SpecFormat,
+        uncompressed_size: u64,
+        max_decompress_bytes: usize,
+        accept: &str,
+        if_none_match: Option<&str>,
+        budget_capacity_kib: u32,
+        already_held_bytes: usize,
+    ) -> (Option<u16>, usize) {
+        crate::admin::api_specs::handlers::check_spec_read_preflight_for_test(
+            stored_format,
+            uncompressed_size,
+            max_decompress_bytes,
+            accept,
+            if_none_match,
+            budget_capacity_kib,
+            already_held_bytes,
+        )
+    }
+
+    /// Construct an unregistered admin client-trust session handle for HTTP/2
+    /// trust-withdrawal transport tests.
+    pub fn new_admin_client_trust_session_for_test() -> crate::tls::ClientTrustSession {
+        crate::tls::ClientTrustSession::new_unregistered_for_test(
+            crate::tls::ClientTrustScope::AdminHttps,
+        )
+    }
+
+    /// Drive one admin connection with an explicit `ClientTrustSession`
+    /// so transport tests can verify HTTP/2 `HEAD` behavior when client trust
+    /// is withdrawn.
+    pub async fn serve_admin_io_with_client_trust_for_test<I>(
+        io: I,
+        state: crate::admin::AdminState,
+        client_ip: std::net::IpAddr,
+        client_trust: crate::tls::ClientTrustSession,
+    ) where
+        I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        crate::admin::serve_admin_io_with_client_trust_for_test(io, state, client_ip, client_trust)
+            .await;
+    }
+
     /// Signature schemes the mesh app-probe loopback HTTPS verifier
     /// advertises when its client is built from `provider` (issue #7075).
     pub fn mesh_app_probe_loopback_verifier_schemes_for_test(

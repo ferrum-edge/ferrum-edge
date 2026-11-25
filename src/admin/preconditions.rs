@@ -267,7 +267,8 @@ fn emit_canonical_json<E>(
                 if index > 0 {
                     out(",")?;
                 }
-                out(&Value::String(key.clone()).to_string())?;
+                let encoded_key = serde_json::to_string(key.as_str()).unwrap_or_default();
+                out(&encoded_key)?;
                 out(":")?;
                 emit_canonical_json(value, out)?;
             }
