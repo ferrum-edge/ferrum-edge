@@ -6130,6 +6130,106 @@ def _resolve_gnu_env_long_opt(opt_name: str) -> str | None:
     return matches[0] if len(matches) == 1 else None
 
 
+def _consume_gnu_env_prefix(
+    tokens: list[str],
+    idx: int,
+    *,
+    check_cargo_overrides: bool,
+) -> tuple[list[str], int, bool]:
+    """Consume GNU `env` options/assignments starting after `env` at `idx`.
+
+    Returns `(updated_tokens, next_idx, hit_cargo_override)`.
+    """
+
+    tokens = list(tokens)
+    while idx < len(tokens):
+        arg = tokens[idx]
+        if arg in ("-i", "-"):
+            if check_cargo_overrides:
+                return tokens, idx, True
+            idx += 1
+            continue
+        if arg == "--":
+            idx += 1
+            break
+        if arg.startswith("--"):
+            opt_part, has_eq, val_part = arg.partition("=")
+            resolved = _resolve_gnu_env_long_opt(opt_part)
+            if resolved == "--ignore-environment":
+                if check_cargo_overrides:
+                    return tokens, idx, True
+                idx += 1
+                continue
+            if resolved == "--unset":
+                target_var = val_part if has_eq else (tokens[idx + 1] if idx + 1 < len(tokens) else "")
+                if check_cargo_overrides and _CI_DEBUG_SHELL_VAR_NAME_RE.match(target_var):
+                    return tokens, idx, True
+                idx += 1 if has_eq else (2 if idx + 1 < len(tokens) else 1)
+                continue
+            if resolved in ("--chdir", "--argv0"):
+                idx += 1 if has_eq else (2 if idx + 1 < len(tokens) else 1)
+                continue
+            if resolved == "--split-string":
+                raw_s = val_part if has_eq else (tokens[idx + 1] if idx + 1 < len(tokens) else "")
+                spliced = _split_gnu_env_s_string(raw_s)
+                step = 1 if has_eq else (2 if idx + 1 < len(tokens) else 1)
+                tokens = tokens[:idx] + spliced + tokens[idx + step :]
+                continue
+            idx += 1
+            continue
+        # Walk short-option clusters such as `-iv`, `-uVAR`, `-vS ...`, `-a x`, `-vC /tmp`.
+        if arg.startswith("-") and len(arg) > 1:
+            flags = arg[1:]
+            fidx = 0
+            consumed = False
+            while fidx < len(flags):
+                ch = flags[fidx]
+                rest = flags[fidx + 1 :]
+                if ch == "i":
+                    if check_cargo_overrides:
+                        return tokens, idx, True
+                elif ch == "u":
+                    if rest:
+                        if check_cargo_overrides and _CI_DEBUG_SHELL_VAR_NAME_RE.match(rest):
+                            return tokens, idx, True
+                        idx += 1
+                    elif idx + 1 < len(tokens):
+                        if check_cargo_overrides and _CI_DEBUG_SHELL_VAR_NAME_RE.match(tokens[idx + 1]):
+                            return tokens, idx, True
+                        idx += 2
+                    else:
+                        idx += 1
+                    consumed = True
+                    break
+                elif ch in ("C", "a"):
+                    idx += 1 if rest else (2 if idx + 1 < len(tokens) else 1)
+                    consumed = True
+                    break
+                elif ch == "S":
+                    if rest:
+                        spliced = _split_gnu_env_s_string(rest)
+                        tokens = tokens[:idx] + spliced + tokens[idx + 1 :]
+                    elif idx + 1 < len(tokens):
+                        spliced = _split_gnu_env_s_string(tokens[idx + 1])
+                        tokens = tokens[:idx] + spliced + tokens[idx + 2 :]
+                    else:
+                        idx += 1
+                    consumed = True
+                    break
+                fidx += 1
+            if not consumed:
+                idx += 1
+            continue
+        if "=" in arg:
+            var_name = arg.split("=", 1)[0].removesuffix("+")
+            if check_cargo_overrides and _CI_DEBUG_SHELL_VAR_NAME_RE.match(var_name):
+                return tokens, idx, True
+            idx += 1
+            continue
+        break
+    return tokens, idx, False
+
+
 def _scan_shell_command_tokens(tokens: list[str]) -> bool:
     """Return True if a single simple shell command overrides Cargo/Rust/C build or profile settings."""
 
@@ -6169,84 +6269,11 @@ def _scan_shell_command_tokens(tokens: list[str]) -> bool:
                 idx += 1  # consume <toolchain>
             continue
         if base == "env":
-            idx += 1
-            while idx < len(tokens):
-                arg = tokens[idx]
-                if arg in ("-i", "-"):
-                    return True
-                if arg == "--":
-                    idx += 1
-                    break
-                if arg.startswith("--"):
-                    opt_part, has_eq, val_part = arg.partition("=")
-                    resolved = _resolve_gnu_env_long_opt(opt_part)
-                    if resolved == "--ignore-environment":
-                        return True
-                    if resolved == "--unset":
-                        target_var = val_part if has_eq else (tokens[idx + 1] if idx + 1 < len(tokens) else "")
-                        if _CI_DEBUG_SHELL_VAR_NAME_RE.match(target_var):
-                            return True
-                        idx += 1 if has_eq else 2
-                        continue
-                    if resolved in ("--chdir", "--argv0"):
-                        idx += 1 if has_eq else 2
-                        continue
-                    if resolved == "--split-string":
-                        raw_s = val_part if has_eq else (tokens[idx + 1] if idx + 1 < len(tokens) else "")
-                        spliced = _split_gnu_env_s_string(raw_s)
-                        tokens = tokens[:idx] + spliced + tokens[idx + (1 if has_eq else 2) :]
-                        continue
-                    idx += 1
-                    continue
-                # Walk short-option clusters such as `-iv`, `-uVAR`, `-vS ...`, `-a x`, `-vC /tmp`.
-                if arg.startswith("-") and len(arg) > 1:
-                    flags = arg[1:]
-                    fidx = 0
-                    consumed = False
-                    while fidx < len(flags):
-                        ch = flags[fidx]
-                        rest = flags[fidx + 1 :]
-                        if ch == "i":
-                            return True
-                        if ch == "u":
-                            if rest:
-                                if _CI_DEBUG_SHELL_VAR_NAME_RE.match(rest):
-                                    return True
-                                idx += 1
-                            elif idx + 1 < len(tokens):
-                                if _CI_DEBUG_SHELL_VAR_NAME_RE.match(tokens[idx + 1]):
-                                    return True
-                                idx += 2
-                            else:
-                                idx += 1
-                            consumed = True
-                            break
-                        if ch in ("C", "a"):
-                            idx += 1 if rest else (2 if idx + 1 < len(tokens) else 1)
-                            consumed = True
-                            break
-                        if ch == "S":
-                            if rest:
-                                spliced = _split_gnu_env_s_string(rest)
-                                tokens = tokens[:idx] + spliced + tokens[idx + 1 :]
-                            elif idx + 1 < len(tokens):
-                                spliced = _split_gnu_env_s_string(tokens[idx + 1])
-                                tokens = tokens[:idx] + spliced + tokens[idx + 2 :]
-                            else:
-                                idx += 1
-                            consumed = True
-                            break
-                        fidx += 1
-                    if not consumed:
-                        idx += 1
-                    continue
-                if "=" in arg:
-                    var_name = arg.split("=", 1)[0].removesuffix("+")
-                    if _CI_DEBUG_SHELL_VAR_NAME_RE.match(var_name):
-                        return True
-                    idx += 1
-                    continue
-                break
+            tokens, idx, hit = _consume_gnu_env_prefix(
+                tokens, idx + 1, check_cargo_overrides=True
+            )
+            if hit:
+                return True
             continue
         if base in _CI_DEBUG_SHELL_WRAPPERS:
             opt_with_arg, takes_pos = _CI_DEBUG_SHELL_WRAPPERS[base]
@@ -6720,7 +6747,9 @@ def _compute_pipeline_compound_spans(
                     continue
                 if ch == "(":
                     if stack and stack[-1][0] == "case" and stack[-1][2] == "pattern":
-                        # Optional leading `(` in Bash case pattern `(foo|bar)`.
+                        # Optional leading `(` starts a Bash case pattern (`(esac)`, `(foo|bar)`),
+                        # so `esac` inside it is a pattern token rather than the `case` closer.
+                        at_cmd_pos = False
                         i += 1
                         continue
                     # Function header `name() { ... }` or `name () { ... }`:
@@ -6783,23 +6812,50 @@ def _compute_pipeline_compound_spans(
                     if prev_ok and "=" not in word:
                         if word == "in" and stack and stack[-1][0] == "case" and stack[-1][2] == "header":
                             stack[-1][2] = "pattern"
-                            at_cmd_pos = False
+                            at_cmd_pos = True
                         elif in_case_pattern:
-                            # Inside a `case` pattern list (`start|done)`, `done)`),
-                            # no loop/conditional reserved word may match; only a
-                            # standalone `esac` at command position closes the `case`.
-                            rest_after = code[j:].lstrip(" \t")
-                            if word == "esac" and at_cmd_pos and not rest_after.startswith((")", "|")):
+                            # Inside a `case` pattern list (`start|done)`, `done)`, `esac*)`),
+                            # no loop/conditional reserved word may match; only a complete
+                            # `esac` token at pattern-start closes the `case` (so `esac | tee`
+                            # closes `case`, while `esac*)` and `(esac)` stay patterns).
+                            complete_token = j == n or code[j] in (
+                                " ",
+                                "\t",
+                                "\r",
+                                "\n",
+                                ";",
+                                "|",
+                                "&",
+                                ">",
+                                "<",
+                                ")",
+                            )
+                            if word == "esac" and at_cmd_pos and complete_token:
                                 _pop_kind("case")
                             at_cmd_pos = False
                         elif at_cmd_pos:
                             if word == "function":
-                                # `function name [()] <compound-cmd>`: skip the function
-                                # name (and optional `()`) and restore command position.
+                                # `function name [()] <compound-cmd>`: skip the full Bash
+                                # function-name token (including `ci::write_settings`) and
+                                # optional `()`, then restore command position.
                                 k = j
                                 while k < n and code[k] in (" ", "\t"):
                                     k += 1
-                                while k < n and (code[k].isalnum() or code[k] in ("_", "-", ".")):
+                                while k < n and code[k] not in (
+                                    " ",
+                                    "\t",
+                                    "\r",
+                                    "\n",
+                                    ";",
+                                    "|",
+                                    "&",
+                                    "(",
+                                    ")",
+                                    "<",
+                                    ">",
+                                    "{",
+                                    "}",
+                                ):
                                     k += 1
                                 m = k
                                 while m < n and code[m] in (" ", "\t"):
@@ -6905,7 +6961,8 @@ def _pipeline_has_executable_heredoc_stage(code_text: str) -> bool:
     cmds, _malformed = _tokenize_shell_script(code_text, consume_heredocs=False)
     if not cmds:
         return True
-    for tokens in cmds:
+    for raw_tokens in cmds:
+        tokens = list(raw_tokens)
         idx = 0
         while idx < len(tokens):
             tok = tokens[idx]
@@ -6917,12 +6974,9 @@ def _pipeline_has_executable_heredoc_stage(code_text: str) -> bool:
                 continue
             base = tok.rsplit("/", 1)[-1]
             if base == "env":
-                idx += 1
-                while idx < len(tokens) and (tokens[idx].startswith("-") or "=" in tokens[idx]):
-                    if tokens[idx] == "--":
-                        idx += 1
-                        break
-                    idx += 1
+                tokens, idx, _hit = _consume_gnu_env_prefix(
+                    tokens, idx + 1, check_cargo_overrides=False
+                )
                 continue
             if base in _CI_DEBUG_SHELL_WRAPPERS:
                 opt_with_arg, takes_pos = _CI_DEBUG_SHELL_WRAPPERS[base]
@@ -12782,6 +12836,21 @@ def self_test() -> int:
                 "          write_settings\n",
             ),
             (
+                "namespaced function ci::write_settings { ... } >> GITHUB_ENV",
+                "        run: |\n"
+                "          function ci::write_settings {\n"
+                '            echo "CARGO_PROFILE_TEST_DEBUG=2"\n'
+                '          } >> "$GITHUB_ENV"\n'
+                "          ci::write_settings\n",
+            ),
+            (
+                "cat heredoc piped to env --split-string='bash -s' writing to GITHUB_ENV",
+                "        run: |\n"
+                "          cat <<'SH' | env --split-string='bash -s'\n"
+                '          echo "CARGO_PROFILE_TEST_DEBUG=2" >> "$GITHUB_ENV"\n'
+                "          SH\n",
+            ),
+            (
                 "plain multiline scalar blank-line break before cargo --config",
                 "        run: echo hi\n"
                 "\n"
@@ -12967,6 +13036,22 @@ def self_test() -> int:
                 "            esac\n"
                 '            echo "FERRUM_TEST_MODE=1"\n'
                 '          done >> "$GITHUB_ENV"\n',
+            ),
+            (
+                "CARGO_TARGET_DIR log before case piped to tee GITHUB_ENV with esac*) glob",
+                "        run: |\n"
+                '          echo "CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-target}"\n'
+                '          case "${STATE:-start}" in\n'
+                "            esac*) echo FERRUM_TEST_MODE=1 ;;\n"
+                "            *) echo FERRUM_TEST_MODE=2 ;;\n"
+                '          esac | tee -a "$GITHUB_ENV"\n',
+            ),
+            (
+                "cat heredoc example piped to env --chdir /tmp sed for display",
+                "        run: |\n"
+                "          cat <<'EOF' | env --chdir /tmp sed 's/^/  /'\n"
+                '          echo "CARGO_PROFILE_TEST_DEBUG=2" >> "$GITHUB_ENV"\n'
+                "          EOF\n",
             ),
             (
                 "folded scalar paragraph break separating cargo and kind --config",
