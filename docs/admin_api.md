@@ -2913,7 +2913,7 @@ curl "https://gateway/api-specs?has_tag=public&spec_version=3.1&sort_by=title&or
 
 ### `GET /api-specs/{id}` and `GET /api-specs/by-proxy/{proxy_id}`
 
-Return the raw spec document. Supports `Accept` header content negotiation (`application/json` ↔ `application/yaml`) and conditional GET via `If-None-Match`. The `ETag` is representation-specific: the quoted `"<content_hash>-json"` for a JSON response and `"<content_hash>-yaml"` for a YAML response, where `content_hash` is the lower-case SHA-256 hex of the uncompressed stored bytes — so a cached tag never produces a false 304 across formats. Replay the exact ETag returned by a previous `GET` (or use `*`); a bare hash is not the tag. Returns **304 Not Modified** when the tag matches.
+Return the raw spec document. Supports `Accept` header content negotiation (`application/json` ↔ `application/yaml`) and conditional GET via `If-None-Match`. The `ETag` is representation-specific: verbatim responses use `"<content_hash>-json"` or `"<content_hash>-yaml"`, while format-converted responses use `"<content_hash>-<target>-from-<stored>-v1"`, where `content_hash` is the lower-case SHA-256 hex of the uncompressed stored bytes — so a cached tag never produces a false 304 across formats or conversions. Replay the exact ETag returned by a previous `GET` (or use `*`); a bare hash is not the tag. Returns **304 Not Modified** when the tag matches.
 
 ```bash
 # Retrieve as YAML (regardless of stored format)

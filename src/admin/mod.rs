@@ -1485,6 +1485,10 @@ impl AdminConnResponseBudget {
         self.semaphore.available_permits() == 0
     }
 
+    pub(crate) fn has_in_flight(&self) -> bool {
+        self.semaphore.available_permits() < self.capacity_kib as usize
+    }
+
     pub(crate) fn has_capacity_for_bytes(&self, bytes: usize) -> bool {
         self.cost_kib(bytes)
             .is_some_and(|cost| self.semaphore.available_permits() >= cost as usize)
@@ -1826,15 +1830,34 @@ pub(crate) fn check_response_budget_limits_for_test(
     (oversized_refused, first_admitted, second_refused)
 }
 
-/// Exercise a real HTTP/2 server (`max_send_buf_size = BUDGETED_BODY_CHUNK_BYTES`)
-/// and client over a small paused duplex pipe so `h2`'s send buffer saturates
-/// mid-stream on a 200 KiB budgeted response while the connection budget is
-/// 256 KiB. Verifies that a concurrent 200 KiB request receives `503` with
-/// `Retry-After: 1` while Stream 1 is stalled, and that a follow-up request
-/// succeeds with `200` once Stream 1 drains. Reached through `_test_support`.
+/// Apply the shared admin HTTP/2 transport settings used by [`serve_admin_io`]
+/// and transport tests.
+///
+/// Setting `max_send_buf_size(BUDGETED_BODY_CHUNK_BYTES)` caps `h2`'s
+/// **per-stream** send buffer at 64 KiB (down from ~400 KiB), while `h2`'s
+/// `FramedWrite` connection encoder buffer stays bounded by `COALESCE_LIMIT`.
+fn configure_admin_http2_builder(
+    builder: &mut hyper_util::server::conn::auto::Builder<hyper_util::rt::TokioExecutor>,
+    limits: AdminRequestLimits,
+) {
+    builder
+        .http2()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .max_concurrent_streams(limits.http2_max_concurrent_streams)
+        .max_header_list_size(limits.http2_max_header_list_size_bytes)
+        .max_send_buf_size(BUDGETED_BODY_CHUNK_BYTES);
+}
+
+/// Exercise a real HTTP/2 server using [`configure_admin_http2_builder`] and a
+/// client over a small paused duplex pipe so `h2` actively encodes Stream 1
+/// until the duplex pipe saturates mid-body on a 200 KiB budgeted response
+/// while the connection budget is 256 KiB. Verifies that a concurrent 200 KiB
+/// request receives `503` with `Retry-After: 1` while Stream 1 is stalled, and
+/// that a follow-up request succeeds with `200` once Stream 1 drains. Reached
+/// through `_test_support`.
 pub(crate) async fn exercise_http2_stalled_response_budget_for_test() -> Result<(), &'static str> {
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::{Context, Poll, Waker};
 
     struct PausedReadIo {
@@ -1882,17 +1905,77 @@ pub(crate) async fn exercise_http2_stalled_response_budget_for_test() -> Result<
         }
     }
 
+    struct CountingWriteIo {
+        inner: tokio::io::DuplexStream,
+        counting: Arc<AtomicBool>,
+        bytes_written: Arc<AtomicUsize>,
+        threshold: usize,
+        reached: Arc<tokio::sync::Notify>,
+    }
+
+    impl tokio::io::AsyncRead for CountingWriteIo {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for CountingWriteIo {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
+            if let Poll::Ready(Ok(n)) = poll
+                && n > 0
+                && self.counting.load(Ordering::Acquire)
+            {
+                let total = self.bytes_written.fetch_add(n, Ordering::AcqRel) + n;
+                if total >= self.threshold {
+                    self.reached.notify_waiters();
+                }
+            }
+            poll
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
     const CAPACITY_KIB: u32 = 256;
     const BODY_BYTES: usize = 200 * 1024;
-    // 16 KiB duplex pipe + 64 KiB h2 max_send_buf_size = 80 KiB < 200 KiB,
-    // guaranteeing Stream 1 stalls mid-body while client reads are paused.
-    let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+    const DUPLEX_BYTES: usize = 16 * 1024;
+    // 16 KiB duplex pipe + 64 KiB per-stream h2 send buffer + 64 KiB h2
+    // FramedWrite coalesce limit = 144 KiB < 200 KiB, guaranteeing Stream 1
+    // stalls mid-body while client reads are paused.
+    let (client_io, server_io) = tokio::io::duplex(DUPLEX_BYTES);
     let paused = Arc::new(AtomicBool::new(false));
     let read_waker = Arc::new(std::sync::Mutex::new(None));
     let gated_client = PausedReadIo {
         inner: client_io,
         paused: Arc::clone(&paused),
         read_waker: Arc::clone(&read_waker),
+    };
+    let server_bytes_written = Arc::new(AtomicUsize::new(0));
+    let pipe_saturated = Arc::new(tokio::sync::Notify::new());
+    let counted_server = CountingWriteIo {
+        inner: server_io,
+        counting: Arc::clone(&paused),
+        bytes_written: Arc::clone(&server_bytes_written),
+        threshold: DUPLEX_BYTES,
+        reached: Arc::clone(&pipe_saturated),
     };
 
     let budget = AdminConnResponseBudget::new(CAPACITY_KIB);
@@ -1941,11 +2024,10 @@ pub(crate) async fn exercise_http2_stalled_response_budget_for_test() -> Result<
         });
         let mut builder =
             hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
-        builder
-            .http2()
-            .timer(hyper_util::rt::TokioTimer::new())
-            .max_send_buf_size(BUDGETED_BODY_CHUNK_BYTES);
-        let _ = builder.serve_connection(TokioIo::new(server_io), svc).await;
+        configure_admin_http2_builder(&mut builder, AdminRequestLimits::default());
+        let _ = builder
+            .serve_connection(TokioIo::new(counted_server), svc)
+            .await;
     });
 
     let (mut sender, conn) = hyper::client::conn::http2::handshake(
@@ -1973,10 +2055,14 @@ pub(crate) async fn exercise_http2_stalled_response_budget_for_test() -> Result<
     }
     let _ = ping_resp.into_body().collect().await;
 
-    // Pause client reads so Stream 1 stalls inside the real Hyper/h2 send path.
+    // Pause client reads so Stream 1 actively pumps frames into h2 and fills
+    // the 16 KiB duplex pipe before stalling mid-body.
     let s1_wait = stream1_dispatched.notified();
     tokio::pin!(s1_wait);
     s1_wait.as_mut().enable();
+    let pipe_wait = pipe_saturated.notified();
+    tokio::pin!(pipe_wait);
+    pipe_wait.as_mut().enable();
     paused.store(true, Ordering::Release);
 
     let req1 = Request::builder()
@@ -1986,12 +2072,7 @@ pub(crate) async fn exercise_http2_stalled_response_budget_for_test() -> Result<
         .map_err(|_| "build req1")?;
     let resp1_fut = sender.send_request(req1);
     s1_wait.await;
-
-    // Yield a few times so h2 actively pumps Stream 1 into its 64 KiB send
-    // buffer + 16 KiB duplex pipe and hits backpressure.
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
+    pipe_wait.await;
     if budget.available_kib() != 56 {
         return Err("h2 released response budget before stalled Stream 1 drained");
     }
@@ -2201,12 +2282,7 @@ async fn serve_admin_io<I>(
         http1.timer(hyper_util::rt::TokioTimer::new());
         http1.header_read_timeout(Duration::from_secs(header_read_timeout_seconds));
     }
-    builder
-        .http2()
-        .timer(hyper_util::rt::TokioTimer::new())
-        .max_concurrent_streams(limits.http2_max_concurrent_streams)
-        .max_header_list_size(limits.http2_max_header_list_size_bytes)
-        .max_send_buf_size(BUDGETED_BODY_CHUNK_BYTES);
+    configure_admin_http2_builder(&mut builder, limits);
 
     let conn = builder.serve_connection(io, svc);
     tokio::pin!(conn);
@@ -12944,9 +13020,19 @@ async fn handle_restore(
         Ok(result) => result,
         Err(_error) => {
             warn_persistence_failure_redacted("restore_namespace_admission_before_import");
+            // Phase 2 already committed the namespace clear; returning drops
+            // `restore_guard` in the cleared phase, retaining the durable
+            // admission fence, so signal the retained guard explicitly.
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
-                &json!({"error": CONFIG_ADMISSION_UNAVAILABLE_MESSAGE}),
+                &json!({
+                    "error": "Config admission was lost after restore clear before import could begin; namespace admission guard retained for manual recovery",
+                    "restore_errors": restore_recovery_errors(
+                        &restore_guard,
+                        namespace,
+                        vec![NAMESPACE_ADMISSION_LOST_MESSAGE.to_string()],
+                    ),
+                }),
             ));
         }
     };

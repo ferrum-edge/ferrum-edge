@@ -2559,9 +2559,11 @@ fn if_none_match_matches(request_headers: &hyper::HeaderMap, etag: &str) -> bool
         })
 }
 
-fn try_conditional_not_modified_response(
+fn try_preflight_spec_read_response(
     meta: &crate::config::db_backend::ApiSpecConditionalMeta,
     request_headers: &hyper::HeaderMap,
+    check_if_none_match: bool,
+    response_budget: Option<&crate::admin::AdminConnResponseBudget>,
 ) -> Option<Response<Full<Bytes>>> {
     let Some(target_fmt) = negotiate_accept_or_406(request_headers, meta.spec_format) else {
         return Some(json_resp(
@@ -2571,16 +2573,30 @@ fn try_conditional_not_modified_response(
             }),
         ));
     };
-    let etag = spec_representation_etag(&meta.content_hash, meta.spec_format, target_fmt);
-    if if_none_match_matches(request_headers, &etag) {
-        return Some(
-            crate::admin::with_admin_security_headers(Response::builder())
-                .status(StatusCode::NOT_MODIFIED)
-                .header("ETag", &etag)
-                .header("Vary", "Accept")
-                .body(Full::new(Bytes::new()))
-                .unwrap_or_else(|_| crate::admin::admin_builder_failure_response()),
-        );
+    if check_if_none_match {
+        let etag = spec_representation_etag(&meta.content_hash, meta.spec_format, target_fmt);
+        if if_none_match_matches(request_headers, &etag) {
+            return Some(
+                crate::admin::with_admin_security_headers(Response::builder())
+                    .status(StatusCode::NOT_MODIFIED)
+                    .header("ETag", &etag)
+                    .header("Vary", "Accept")
+                    .body(Full::new(Bytes::new()))
+                    .unwrap_or_else(|_| crate::admin::admin_builder_failure_response()),
+            );
+        }
+    }
+    if let Some(budget) = response_budget {
+        let budget_insufficient = if target_fmt == meta.spec_format && meta.uncompressed_size > 0 {
+            usize::try_from(meta.uncompressed_size)
+                .map(|bytes| !budget.has_capacity_for_bytes(bytes))
+                .unwrap_or(true)
+        } else {
+            budget.is_exhausted()
+        };
+        if budget_insufficient {
+            return Some(spec_response_budget_unavailable_response());
+        }
     }
     None
 }
@@ -3646,33 +3662,42 @@ pub async fn handle_get_api_spec(
         Err(e) => return Ok(error_response(e)),
     };
 
-    // Fast path for conditional GET (`If-None-Match`): read only `(spec_format,
-    // content_hash)` without acquiring a global read codec slot or loading any
-    // compressed blobs so `304 Not Modified` hits never queue behind active
-    // decompression/conversion work on other connections.
-    if req.headers().contains_key(hyper::header::IF_NONE_MATCH) {
+    let has_if_none_match = req.headers().contains_key(hyper::header::IF_NONE_MATCH);
+    let response_budget = req
+        .extensions()
+        .get::<crate::admin::AdminConnResponseBudget>()
+        .cloned();
+    if !has_if_none_match
+        && response_budget
+            .as_ref()
+            .is_some_and(crate::admin::AdminConnResponseBudget::is_exhausted)
+    {
+        return Ok(spec_response_budget_unavailable_response());
+    }
+
+    // Fast path for conditional GET (`If-None-Match`) or a connection that
+    // already has buffered spec responses in flight: read only `(spec_format,
+    // content_hash, uncompressed_size)` without acquiring a global read codec
+    // slot or loading compressed blobs so `304` hits and doomed `503` reads
+    // never queue behind or occupy `SPEC_READ_CODEC_SLOTS`.
+    if has_if_none_match
+        || response_budget
+            .as_ref()
+            .is_some_and(crate::admin::AdminConnResponseBudget::has_in_flight)
+    {
         let meta = match db.get_api_spec_conditional_meta(namespace, id).await {
             Ok(Some(meta)) => meta,
             Ok(None) => return Ok(error_response(ApiSpecError::NotFound)),
             Err(e) => return Ok(error_response(classify_db_error(e))),
         };
-        if let Some(response) = try_conditional_not_modified_response(&meta, req.headers()) {
+        if let Some(response) = try_preflight_spec_read_response(
+            &meta,
+            req.headers(),
+            has_if_none_match,
+            response_budget.as_ref(),
+        ) {
             return Ok(response);
         }
-    }
-
-    // Fail fast BEFORE acquiring one of the four process-wide read codec slots
-    // or loading compressed blobs from the database when this connection's
-    // buffered response budget is already exhausted.
-    let response_budget = req
-        .extensions()
-        .get::<crate::admin::AdminConnResponseBudget>()
-        .cloned();
-    if response_budget
-        .as_ref()
-        .is_some_and(crate::admin::AdminConnResponseBudget::is_exhausted)
-    {
-        return Ok(spec_response_budget_unavailable_response());
     }
 
     // Acquire read codec capacity BEFORE loading the full compressed spec blob
@@ -3717,7 +3742,24 @@ pub async fn handle_get_api_spec_by_proxy(
         Err(e) => return Ok(error_response(e)),
     };
 
-    if req.headers().contains_key(hyper::header::IF_NONE_MATCH) {
+    let has_if_none_match = req.headers().contains_key(hyper::header::IF_NONE_MATCH);
+    let response_budget = req
+        .extensions()
+        .get::<crate::admin::AdminConnResponseBudget>()
+        .cloned();
+    if !has_if_none_match
+        && response_budget
+            .as_ref()
+            .is_some_and(crate::admin::AdminConnResponseBudget::is_exhausted)
+    {
+        return Ok(spec_response_budget_unavailable_response());
+    }
+
+    if has_if_none_match
+        || response_budget
+            .as_ref()
+            .is_some_and(crate::admin::AdminConnResponseBudget::has_in_flight)
+    {
         let meta = match db
             .get_api_spec_conditional_meta_by_proxy(namespace, proxy_id)
             .await
@@ -3726,20 +3768,14 @@ pub async fn handle_get_api_spec_by_proxy(
             Ok(None) => return Ok(error_response(ApiSpecError::NotFound)),
             Err(e) => return Ok(error_response(classify_db_error(e))),
         };
-        if let Some(response) = try_conditional_not_modified_response(&meta, req.headers()) {
+        if let Some(response) = try_preflight_spec_read_response(
+            &meta,
+            req.headers(),
+            has_if_none_match,
+            response_budget.as_ref(),
+        ) {
             return Ok(response);
         }
-    }
-
-    let response_budget = req
-        .extensions()
-        .get::<crate::admin::AdminConnResponseBudget>()
-        .cloned();
-    if response_budget
-        .as_ref()
-        .is_some_and(crate::admin::AdminConnResponseBudget::is_exhausted)
-    {
-        return Ok(spec_response_budget_unavailable_response());
     }
 
     let Ok(read_permit) = Arc::clone(&SPEC_READ_CODEC_SLOTS).acquire_owned().await else {

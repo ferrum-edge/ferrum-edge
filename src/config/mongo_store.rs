@@ -10078,9 +10078,15 @@ mod inner {
             .get_str("content_hash")
             .map_err(|_| anyhow::anyhow!("api_specs.content_hash missing or non-string"))?
             .to_string();
+        let uncompressed_size = match doc.get("uncompressed_size") {
+            Some(Bson::Int64(v)) => (*v).max(0) as u64,
+            Some(Bson::Int32(v)) => (*v).max(0) as u64,
+            _ => 0,
+        };
         Ok(crate::config::db_backend::ApiSpecConditionalMeta {
             spec_format,
             content_hash,
+            uncompressed_size,
         })
     }
 
@@ -17592,7 +17598,9 @@ mod inner {
                     "_id": namespaced_doc_id(namespace, id),
                     "namespace": namespace,
                 })
-                .projection(doc! { "_id": 0, "spec_format": 1, "content_hash": 1 })
+                .projection(
+                    doc! { "_id": 0, "spec_format": 1, "content_hash": 1, "uncompressed_size": 1 },
+                )
                 .await?;
             self.check_slow_query("get_api_spec_conditional_meta", start);
             match result {
@@ -17611,7 +17619,9 @@ mod inner {
             let result = self
                 .api_specs()
                 .find_one(doc! { "proxy_id": proxy_id, "namespace": namespace })
-                .projection(doc! { "_id": 0, "spec_format": 1, "content_hash": 1 })
+                .projection(
+                    doc! { "_id": 0, "spec_format": 1, "content_hash": 1, "uncompressed_size": 1 },
+                )
                 .await?;
             self.check_slow_query("get_api_spec_conditional_meta_by_proxy", start);
             match result {

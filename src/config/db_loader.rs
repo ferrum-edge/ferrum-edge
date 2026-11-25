@@ -12038,37 +12038,40 @@ impl DatabaseStore {
         }
     }
 
-    /// Fetch only `(spec_format, content_hash)` by namespace + id for
-    /// conditional `If-None-Match` (`304`) checks without transferring blobs.
+    /// Fetch only `(spec_format, content_hash, uncompressed_size)` by
+    /// namespace + id for conditional `If-None-Match` (`304`) or budget
+    /// preflight checks without transferring blobs.
     pub async fn get_api_spec_conditional_meta(
         &self,
         namespace: &str,
         id: &str,
     ) -> Result<Option<crate::config::db_backend::ApiSpecConditionalMeta>, anyhow::Error> {
-        let row: Option<AnyRow> =
-            sqlx::query(self.q(
-                "SELECT spec_format, content_hash FROM api_specs WHERE namespace = ? AND id = ?",
-            ))
-            .bind(namespace)
-            .bind(id)
-            .fetch_optional(&self.pool())
-            .await?;
+        let row: Option<AnyRow> = sqlx::query(
+            self.q("SELECT spec_format, content_hash, uncompressed_size \
+             FROM api_specs WHERE namespace = ? AND id = ?"),
+        )
+        .bind(namespace)
+        .bind(id)
+        .fetch_optional(&self.pool())
+        .await?;
         match row {
             Some(r) => Ok(Some(row_to_api_spec_conditional_meta(&r)?)),
             None => Ok(None),
         }
     }
 
-    /// Fetch only `(spec_format, content_hash)` by namespace + proxy_id for
-    /// conditional `If-None-Match` (`304`) checks without transferring blobs.
+    /// Fetch only `(spec_format, content_hash, uncompressed_size)` by
+    /// namespace + proxy_id for conditional `If-None-Match` (`304`) or budget
+    /// preflight checks without transferring blobs.
     pub async fn get_api_spec_conditional_meta_by_proxy(
         &self,
         namespace: &str,
         proxy_id: &str,
     ) -> Result<Option<crate::config::db_backend::ApiSpecConditionalMeta>, anyhow::Error> {
-        let row: Option<AnyRow> = sqlx::query(self.q(
-            "SELECT spec_format, content_hash FROM api_specs WHERE namespace = ? AND proxy_id = ?",
-        ))
+        let row: Option<AnyRow> = sqlx::query(
+            self.q("SELECT spec_format, content_hash, uncompressed_size \
+             FROM api_specs WHERE namespace = ? AND proxy_id = ?"),
+        )
         .bind(namespace)
         .bind(proxy_id)
         .fetch_optional(&self.pool())
@@ -14852,9 +14855,11 @@ fn row_to_api_spec_conditional_meta(
         _ => anyhow::bail!("unsupported api_specs.spec_format (expected one of: json, yaml)"),
     };
     let content_hash: String = row.try_get("content_hash")?;
+    let uncompressed_size: i64 = row.try_get("uncompressed_size")?;
     Ok(crate::config::db_backend::ApiSpecConditionalMeta {
         spec_format,
         content_hash,
+        uncompressed_size: uncompressed_size.max(0) as u64,
     })
 }
 

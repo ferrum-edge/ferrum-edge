@@ -1871,10 +1871,33 @@ pub(super) async fn handle_rotate(
                     // unrelated TLS surfaces.
                     let accepted =
                         crate::tls::source::subscription::request_all_material_set_reloads();
-                    let svid_revision = match force_reload_gateway_svid(&settlement_state).await {
-                        Ok(revision) => Some(revision),
-                        Err(response) => return *response,
-                    };
+                    let svid_revision =
+                        match force_reload_gateway_svid_result(&settlement_state).await {
+                            Ok(revision) => Some(revision),
+                            Err((status, error)) => {
+                                if settlement_state.admin_audit_enabled {
+                                    let event = crate::admin::audit::AuditEvent::new(
+                                        &settlement_actor,
+                                        "rotate",
+                                        "tls_rotation",
+                                        &requested_surface,
+                                        crate::config::types::DEFAULT_NAMESPACE,
+                                        json!({
+                                            "path": audit_path,
+                                            "accepted_surfaces": &accepted,
+                                            "svid_reload_failed": true,
+                                        }),
+                                    )
+                                    .with_outcome(crate::admin::audit::AuditOutcome::Failure);
+                                    super::record_operation_audit(&settlement_state, event).await;
+                                }
+                                let mut body = json!({"error": error});
+                                if !accepted.is_empty() {
+                                    body["accepted_surfaces"] = json!(accepted);
+                                }
+                                return super::json_response(status, &body);
+                            }
+                        };
                     if settlement_state.admin_audit_enabled {
                         let event = crate::admin::audit::AuditEvent::new(
                             &settlement_actor,
@@ -2045,36 +2068,39 @@ fn gateway_svid_is_configured(state: &AdminState) -> bool {
     })
 }
 
-async fn force_reload_gateway_svid(state: &AdminState) -> Result<u64, Box<Response<Full<Bytes>>>> {
+async fn force_reload_gateway_svid_result(state: &AdminState) -> Result<u64, (StatusCode, String)> {
     let Some(proxy_state) = state.proxy_state.as_ref() else {
-        return Err(Box::new(super::json_response(
+        return Err((
             StatusCode::NOT_FOUND,
-            &json!({"error": "proxy state is unavailable in this mode; gateway SVID cannot be reloaded"}),
-        )));
+            "proxy state is unavailable in this mode; gateway SVID cannot be reloaded".to_string(),
+        ));
     };
     if !gateway_svid_is_configured(state) {
-        return Err(Box::new(super::json_response(
+        return Err((
             StatusCode::NOT_FOUND,
-            &json!({"error": "gateway SVID sources are not configured"}),
-        )));
+            "gateway SVID sources are not configured".to_string(),
+        ));
     }
     let proxy_state = proxy_state.clone();
     // `force_reload_gateway_svid` performs blocking filesystem/remote-secret
     // I/O and X.509/SPIFFE verification; offload from Tokio async workers.
     match tokio::task::spawn_blocking(move || proxy_state.force_reload_gateway_svid()).await {
         Ok(Ok(revision)) => Ok(revision),
-        Ok(Err(error)) => Err(Box::new(super::json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": error.to_string()}),
-        ))),
+        Ok(Err(error)) => Err((StatusCode::BAD_REQUEST, error.to_string())),
         Err(error) => {
             tracing::error!("gateway SVID reload worker failed: {error}");
-            Err(Box::new(super::json_response(
+            Err((
                 StatusCode::SERVICE_UNAVAILABLE,
-                &json!({"error": "gateway SVID reload worker failed"}),
-            )))
+                "gateway SVID reload worker failed".to_string(),
+            ))
         }
     }
+}
+
+async fn force_reload_gateway_svid(state: &AdminState) -> Result<u64, Box<Response<Full<Bytes>>>> {
+    force_reload_gateway_svid_result(state)
+        .await
+        .map_err(|(status, error)| Box::new(super::json_response(status, &json!({"error": error}))))
 }
 
 fn validate_tls_material(request: &TlsValidateRequest) -> Result<Value, String> {

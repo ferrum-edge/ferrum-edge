@@ -2142,7 +2142,19 @@ paths:
                       `null` on the `all` surface when no gateway SVID source
                       is configured; absent for individual watcher surfaces.
         "400":
-          $ref: "#/components/responses/BadRequest"
+          description: Invalid rotation target or gateway SVID reload validation failure. When `surface=all` queued independent TLS watcher reloads before gateway SVID reload failed, `accepted_surfaces` lists the watchers that were already notified.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                  accepted_surfaces:
+                    type: array
+                    items:
+                      type: string
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -2165,8 +2177,39 @@ paths:
                     type: array
                     items:
                       type: string
+                  accepted_surfaces:
+                    type: array
+                    items:
+                      type: string
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          description: Audit admission failed, or gateway SVID reload settlement failed. When `surface=all` queued independent TLS watcher reloads before gateway SVID reload failed, `accepted_surfaces` lists the watchers that were already notified.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                  accepted_surfaces:
+                    type: array
+                    items:
+                      type: string
+                  audit_unavailable_reason:
+                    type: string
+                    enum:
+                      - spool_unavailable
+                      - spool_saturated
+                      - spool_io_error
+                      - invalid_record
+                      - corrupt_record
+                      - queue_saturated
+                      - worker_unavailable
+                      - delivery_exhausted
+                      - retained_capacity
+                      - no_durable_spool
+                      - destination_mismatch
+                      - prepare_failed
 
   /admin/tls/validate:
     post:
@@ -6046,12 +6089,15 @@ paths:
             namespace-admission error. Database mode with
             `FERRUM_ADMIN_READ_ONLY=true` still returns `403`.
 
-            When admission is lost during a clear whose outcome is not
+            When admission is lost after the clear committed (before import
+            starts, during import rollback reacquisition, or after an
+            intervening lease) or during a clear whose outcome is not
             definitively atomic (`rollback: "skipped_after_intervening_write"`
             or `rollback: "unknown_clear_outcome"`), existing config may be
-            partially or fully cleared, the namespace admission guard is
-            retained, and manual inspection or recovery may be required rather
-            than blindly retrying.
+            partially or fully cleared. Every fenced post-clear/ambiguous-clear
+            `503` retains the namespace admission guard, includes the
+            guard-retained diagnostic in `restore_errors`, and requires manual
+            inspection or recovery rather than blindly retrying.
 
             In database mode this status is also returned after restore has
             committed when the in-process poll-loop reload cannot make that
@@ -6091,11 +6137,12 @@ paths:
                       `not_needed` / `not_needed_after_intervening_write`: a
                       pre-delete guard or definitive atomic abort left prior
                       state untouched without needing rollback.
-                      `skipped_after_intervening_write`: a non-atomic clear may
-                      have partially removed rows, rollback was skipped because
-                      another writer acquired the namespace lease, and the
-                      namespace admission guard remains held so manual recovery
-                      is required.
+                      `skipped_after_intervening_write`: a potentially partial
+                      non-atomic clear or a committed clear with partial import
+                      could not roll back because another writer acquired the
+                      namespace lease; the namespace admission guard remains
+                      held and `restore_errors` includes the guard-retained
+                      diagnostic so manual recovery is required.
                       `unknown_clear_outcome`: the clear transaction had an
                       ambiguous commit outcome and namespace admission could not
                       be reacquired (or was taken by another writer) before
