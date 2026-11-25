@@ -6997,7 +6997,7 @@ pub(crate) fn check_json_duplicate_member_limit_parity_for_test() -> Result<(), 
     let loader = MapExternalDocumentLoader { docs: ext_docs };
     let policy = ExternalRefProcessPolicy {
         enabled: true,
-        allowed_origins: vec!["https://schemas.example.com".to_string()],
+        allowed_origins: vec!["https://schemas.example.com:443".to_string()],
         ..ExternalRefProcessPolicy::default()
     };
     let make_validate_spec = |schema_name: &str| {

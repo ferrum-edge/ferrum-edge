@@ -3869,7 +3869,7 @@ pub(crate) async fn exercise_spec_content_response_limits_for_test() -> Result<(
         }"#;
         let process_policy = crate::admin::api_specs::ExternalRefProcessPolicy {
             enabled: true,
-            allowed_origins: vec!["https://schemas.example.com".to_string()],
+            allowed_origins: vec!["https://schemas.example.com:443".to_string()],
             ..crate::admin::api_specs::ExternalRefProcessPolicy::default()
         };
         let mut loader = crate::admin::api_specs::MapExternalDocumentLoader::default();
