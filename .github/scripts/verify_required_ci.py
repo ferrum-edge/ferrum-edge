@@ -99,6 +99,8 @@ from verify_ci_runtime_cache import (
     CANONICAL_MERGE_GROUP_BODY,
     CANONICAL_PULL_REQUEST_BODY,
     CANONICAL_PUSH_MAIN_BODY,
+    _decode_yaml_scalar,
+    _yaml_strip_trailing_comment,
     extract_job,
     job_if,
     job_steps,
@@ -711,57 +713,27 @@ def _expr_admits_main_push(expr: str) -> bool:
 
 
 def _strip_yaml_comment_and_unquote(raw: str) -> str:
-    """Strip an unquoted trailing YAML comment and decode simple single/double quotes."""
+    """Strip an unquoted trailing YAML comment and decode YAML 1.2 single/double quotes."""
 
-    quote: str | None = None
-    i = 0
-    end = len(raw)
-    while i < len(raw):
-        ch = raw[i]
-        if quote == '"':
-            if ch == "\\" and i + 1 < len(raw):
-                i += 2
-                continue
-            if ch == '"':
-                quote = None
-            i += 1
-            continue
-        if quote == "'":
-            if ch == "'" and i + 1 < len(raw) and raw[i + 1] == "'":
-                i += 2
-                continue
-            if ch == "'":
-                quote = None
-            i += 1
-            continue
-        if ch in {"'", '"'}:
-            quote = ch
-            i += 1
-            continue
-        if ch == "#" and (i == 0 or raw[i - 1].isspace()):
-            end = i
-            break
-        i += 1
-    cleaned = raw[:end].strip()
-    if len(cleaned) >= 2 and cleaned[0] == "'" and cleaned[-1] == "'":
-        return cleaned[1:-1].replace("''", "'")
-    if len(cleaned) >= 2 and cleaned[0] == '"' and cleaned[-1] == '"':
-        inner = cleaned[1:-1]
-        # Decode standard double-quoted escapes including \uXXXX / \xXX.
-        try:
-            return bytes(inner, "utf-8").decode("unicode_escape")
-        except UnicodeDecodeError:
-            return inner
-    return cleaned
+    cleaned = _yaml_strip_trailing_comment(raw).strip()
+    if not cleaned:
+        return ""
+    decoded = _decode_yaml_scalar(cleaned)
+    return cleaned if decoded is None else decoded
 
 
-def _extract_step_with_map(step: str) -> tuple[dict[str, str], str | None]:
+def _extract_step_with_map(
+    step: str, *, force_fallback: bool = False
+) -> tuple[dict[str, str], str | None]:
     """Parse a GitHub Actions step's `with:` mapping into normalized string pairs."""
 
-    try:
-        import yaml  # type: ignore[import-untyped]
-    except ImportError:
-        yaml = None  # type: ignore[assignment]
+    yaml = None
+    if not force_fallback:
+        try:
+            import yaml as _yaml  # type: ignore[import-untyped]
+            yaml = _yaml
+        except ImportError:
+            yaml = None
 
     if yaml is not None:
         try:
@@ -780,7 +752,7 @@ def _extract_step_with_map(step: str) -> tuple[dict[str, str], str | None]:
             for k, v in raw_with.items()
         }, None
 
-    # Fallback parser when PyYAML is unavailable (e.g. local macOS runs).
+    # Fallback parser when PyYAML is unavailable (or forced by self-tests).
     lines = step.splitlines()
     with_idx = None
     with_indent = 0
@@ -871,13 +843,16 @@ def _extract_step_with_map(step: str) -> tuple[dict[str, str], str | None]:
     return result, None
 
 
-def _step_uses_download_artifact(step: str) -> bool:
+def _step_uses_download_artifact(step: str, *, force_fallback: bool = False) -> bool:
     """Return True if a step invokes actions/download-artifact@."""
 
-    try:
-        import yaml  # type: ignore[import-untyped]
-    except ImportError:
-        yaml = None  # type: ignore[assignment]
+    yaml = None
+    if not force_fallback:
+        try:
+            import yaml as _yaml  # type: ignore[import-untyped]
+            yaml = _yaml
+        except ImportError:
+            yaml = None
 
     if yaml is not None:
         try:
@@ -887,16 +862,21 @@ def _step_uses_download_artifact(step: str) -> bool:
                 return isinstance(uses, str) and uses.startswith("actions/download-artifact@")
         except Exception:
             pass
-    return (
-        re.search(
-            r"""(?m)^(?:      - |        )['"]?uses['"]?[ \t]*:[ \t]*['"]?actions/download-artifact@""",
-            step,
+    for line in step.splitlines():
+        m = re.match(
+            r"^(?:      - |        )(?P<key>'(?:[^']|'')*'|\"(?:[^\"\\]|\\.)*\"|[A-Za-z0-9_.-]+)[ \t]*:[ \t]*(?P<val>.*)$",
+            line,
         )
-        is not None
-    )
+        if m and _strip_yaml_comment_and_unquote(m.group("key")) == "uses":
+            val = _strip_yaml_comment_and_unquote(m.group("val"))
+            if val.startswith("actions/download-artifact@"):
+                return True
+    return False
 
 
-def test_artifact_consumer_wiring_errors(ci_yml: str) -> list[str]:
+def test_artifact_consumer_wiring_errors(
+    ci_yml: str, *, force_fallback: bool = False
+) -> list[str]:
     """Verify every consumer download of a build-test-artifacts output is produced."""
 
     errors: list[str] = []
@@ -1044,9 +1024,9 @@ def test_artifact_consumer_wiring_errors(ci_yml: str) -> list[str]:
         gate = PATH_GATED_JOBS.get(job)
         job_artifacts: set[str] = set()
         for step in _split_job_steps(job_body):
-            if not _step_uses_download_artifact(step):
+            if not _step_uses_download_artifact(step, force_fallback=force_fallback):
                 continue
-            with_map, with_err = _extract_step_with_map(step)
+            with_map, with_err = _extract_step_with_map(step, force_fallback=force_fallback)
             if with_err is not None:
                 errors.append(
                     f"jobs.{job} invokes actions/download-artifact with invalid `with:` ({with_err})"
@@ -1238,16 +1218,40 @@ def test_artifact_consumer_wiring_self_test(ci_yml: str) -> list[str]:
     if not test_artifact_consumer_wiring_errors(pattern_download_job):
         failures.append("artifact wiring verifier must reject a consumer using pattern: downloads (even with late step name)")
 
-    # 10. A consumer downloading with empty `with.name: ''` or inline-commented empty name
-    # or `pattern :` with YAML spacing or flow-style `with:` must fail.
-    for label, with_lines in (
-        ("empty single-quoted name", "        with:\n          name: ''\n"),
-        ("empty name with inline comment", "        with:\n          name: '' # Select by pattern\n"),
+    # 10. A consumer downloading with empty `with.name: ''`, YAML-escaped space `"\ "`,
+    # inline-commented empty name, `pattern :` with YAML spacing, escaped `uses:`,
+    # or flow-style `with:` must fail in BOTH default (PyYAML) and fallback parser modes.
+    for label, uses_line, with_lines in (
+        (
+            "empty single-quoted name",
+            "      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8\n",
+            "        with:\n          name: ''\n",
+        ),
+        (
+            "empty name with inline comment",
+            "      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8\n",
+            "        with:\n          name: '' # Select by pattern\n",
+        ),
+        (
+            "YAML-escaped whitespace name",
+            "      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8\n",
+            '        with:\n          name: "\\ " # YAML-escaped space\n',
+        ),
         (
             "empty name + spaced pattern key",
+            "      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8\n",
             "        with:\n          name: '' # Select by pattern\n          pattern : 'ferrum-cni-debu?-Linux-X64'\n",
         ),
-        ("flow-style with pattern", "        with: { pattern: 'ferrum-cni-debu?-Linux-X64' }\n"),
+        (
+            "flow-style with pattern",
+            "      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8\n",
+            "        with: { pattern: 'ferrum-cni-debu?-Linux-X64' }\n",
+        ),
+        (
+            "escaped uses + flow-style pattern",
+            '      - uses: "actions\\x2fdownload-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333"\n',
+            "        with: { pattern: 'ferrum-cni-debu?-Linux-X64' }\n",
+        ),
     ):
         probe_job = (
             ci_yml
@@ -1255,23 +1259,74 @@ def test_artifact_consumer_wiring_self_test(ci_yml: str) -> list[str]:
             + "    runs-on: ubuntu-26.04\n"
             + "    needs: [ci-plan, build-test-artifacts]\n"
             + "    steps:\n"
-            + "      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8\n"
+            + uses_line
             + "        name: Fetch all\n"
             + with_lines
         )
-        if not test_artifact_consumer_wiring_errors(probe_job):
-            failures.append(f"artifact wiring verifier must reject {label}")
+        for fallback_flag in (False, True):
+            if not test_artifact_consumer_wiring_errors(probe_job, force_fallback=fallback_flag):
+                mode = "fallback" if fallback_flag else "default"
+                failures.append(f"artifact wiring verifier ({mode}) must reject {label}")
 
-    # 11. Equivalent reversed `||` operands must still pass.
+    # 11. Equivalent reversed `||` operands must still pass (in both parser modes).
     reversed_if = ci_yml.replace(
         "if: needs.ci-plan.outputs.run_integration == 'true' || needs.ci-plan.outputs.run_vendor_patches == 'true'",
         "if: needs.ci-plan.outputs.run_vendor_patches == 'true' || needs.ci-plan.outputs.run_integration == 'true'",
         1,
     )
-    if reversed_if == ci_yml or test_artifact_consumer_wiring_errors(reversed_if):
+    if (
+        reversed_if == ci_yml
+        or test_artifact_consumer_wiring_errors(reversed_if, force_fallback=False)
+        or test_artifact_consumer_wiring_errors(reversed_if, force_fallback=True)
+    ):
         failures.append("artifact wiring verifier must accept equivalent reversed || operands")
 
     return failures
+
+
+_EXPECTED_CI_PLAN_EMISSION_LINES = [
+    'mode="$(printf \'%s\\n\' "$plan" | sed -n \'s/^mode=//p\')"',
+    'reason="$(printf \'%s\\n\' "$plan" | sed -n \'s/^reason=//p\')"',
+    'paths_classifiable="$(printf \'%s\\n\' "$plan" | sed -n \'s/^paths_classifiable=//p\')"',
+    'if [ "$paths_classifiable" != "true" ]; then',
+    'mode="full"',
+    "fi",
+    'echo "mode=$mode" >> "$GITHUB_OUTPUT"',
+    "for consumer_gate in run_integration run_functional run_plugin_hardening_redis run_helm run_vendor_patches; do",
+    'consumer_val="$(printf \'%s\\n\' "$plan" | sed -n "s/^${consumer_gate}=//p")"',
+    'if [ "$consumer_val" != "false" ]; then',
+    'plan="$(printf \'%s\\n\' "$plan" | grep -v \'^run_artifacts=\'; echo "run_artifacts=true")"',
+    "break",
+    "fi",
+    "done",
+    "gate_fallbacks=()",
+    f"for gate in {' '.join(JOB_GATE_NAMES)}; do",
+    'value="$(printf \'%s\\n\' "$plan" | sed -n "s/^${gate}=//p")"',
+    'if [ "$paths_classifiable" != "true" ]; then',
+    "value=true",
+    'elif [ "$value" != "true" ] && [ "$value" != "false" ]; then',
+    "value=true",
+    'gate_fallbacks+=("$gate")',
+    "fi",
+    'printf \'%s=%s\\n\' "$gate" "$value" >> "$GITHUB_OUTPUT"',
+    "done",
+]
+
+
+def _extract_ci_plan_emission_tail(plan_body: str) -> tuple[str, str | None]:
+    plan_anchor = '--changed-files "$changed_files")"'
+    anchor_idx = plan_body.find(plan_anchor)
+    if anchor_idx < 0:
+        return "", "jobs.ci-plan is missing the planner invocation anchor"
+    line_end = plan_body.find("\n", anchor_idx)
+    if line_end < 0:
+        return "", "jobs.ci-plan ended unexpectedly after planner invocation"
+    tail_lines: list[str] = []
+    for line in plan_body[line_end + 1 :].splitlines():
+        if line.strip() and (len(line) - len(line.lstrip(" "))) < 10:
+            break
+        tail_lines.append(line)
+    return textwrap.dedent("\n".join(tail_lines)), None
 
 
 def _replay_ci_plan_emission(plan_body: str, plan_text: str) -> tuple[dict[str, str], str | None]:
@@ -1280,30 +1335,26 @@ def _replay_ci_plan_emission(plan_body: str, plan_text: str) -> tuple[dict[str, 
     import subprocess
     import tempfile
 
-    plan_anchor = '--changed-files "$changed_files")"'
-    anchor_idx = plan_body.find(plan_anchor)
-    if anchor_idx < 0:
-        return {}, "jobs.ci-plan is missing the planner invocation anchor"
-    line_end = plan_body.find("\n", anchor_idx)
-    if line_end < 0:
-        return {}, "jobs.ci-plan ended unexpectedly after planner invocation"
-    tail_lines: list[str] = []
-    for line in plan_body[line_end + 1 :].splitlines():
-        if line.strip() and (len(line) - len(line.lstrip(" "))) < 10:
-            break
-        tail_lines.append(line)
-    script_tail = textwrap.dedent("\n".join(tail_lines))
-    with tempfile.NamedTemporaryFile("w+", encoding="utf-8", delete=True) as out_file:
+    script_tail, extract_err = _extract_ci_plan_emission_tail(plan_body)
+    if extract_err is not None:
+        return {}, extract_err
+    with (
+        tempfile.NamedTemporaryFile("w+", encoding="utf-8", delete=True) as out_file,
+        tempfile.NamedTemporaryFile("wb", delete=True) as changed_file,
+    ):
+        changed_file.write(b"src/main.rs\0")
+        changed_file.flush()
         env = {
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             "GITHUB_OUTPUT": out_file.name,
             "GITHUB_STEP_SUMMARY": os.devnull,
             "SYNTHETIC_PLAN": plan_text,
+            "CHANGED_FILES_PATH": changed_file.name,
         }
         prelude = (
             "set -euo pipefail\n"
             'plan="$SYNTHETIC_PLAN"\n'
-            f'changed_files="{os.devnull}"\n'
+            'changed_files="$CHANGED_FILES_PATH"\n'
         )
         proc = subprocess.run(
             ["bash", "--noprofile", "--norc"],
@@ -1340,47 +1391,30 @@ def check_mode_and_granular_opt_in(plan_body: str) -> list[str]:
         errors.append(
             "jobs.ci-plan must pass FERRUM_CI_PLAN_GRANULAR_GATES=1 on the executable python3 -I planner invocation"
         )
-    mode_block = '          if [ "$paths_classifiable" != "true" ]; then\n            mode="full"\n          fi'
-    mode_force_idx = plan_body.find(mode_block)
-    mode_emit_marker = '          echo "mode=$mode" >> "$GITHUB_OUTPUT"'
-    gate_fallbacks_marker = "          gate_fallbacks=()"
-    mode_emit_idx = plan_body.find(mode_emit_marker)
-    fallbacks_idx = plan_body.find(gate_fallbacks_marker)
-    if mode_force_idx < 0 or mode_emit_idx < 0 or mode_force_idx > mode_emit_idx:
-        errors.append(
-            "jobs.ci-plan must force mode=full when paths_classifiable != true "
-            "before emitting mode to GITHUB_OUTPUT"
-        )
-    expected_between_lines = [
-        "          for consumer_gate in run_integration run_functional run_plugin_hardening_redis run_helm run_vendor_patches; do",
-        '            consumer_val="$(printf \'%s\\n\' "$plan" | sed -n "s/^${consumer_gate}=//p")"',
-        '            if [ "$consumer_val" != "false" ]; then',
-        '              plan="$(printf \'%s\\n\' "$plan" | grep -v \'^run_artifacts=\'; echo "run_artifacts=true")"',
-        "              break",
-        "            fi",
-        "          done",
-    ]
-    if mode_emit_idx < 0 or fallbacks_idx < 0 or fallbacks_idx <= mode_emit_idx:
-        errors.append(
-            "jobs.ci-plan must place the unconditional mixed-version consumer fallback "
-            "between emitting mode and gate_fallbacks=()"
-        )
+    # Pin the exact non-blank, non-comment emission section from the planner call
+    # through the gate-emission loop (stopping before the summary block `{`),
+    # preventing any outer conditional wrapper on `$changed_files`, `$EVENT_NAME`,
+    # or `$paths_classifiable`.
+    script_tail, extract_err = _extract_ci_plan_emission_tail(plan_body)
+    if extract_err is not None:
+        errors.append(extract_err)
     else:
-        between = plan_body[mode_emit_idx + len(mode_emit_marker) : fallbacks_idx]
-        between_exec = [
-            line
-            for line in between.splitlines()
+        tail_exec = [
+            line.strip()
+            for line in script_tail.splitlines()
             if line.strip() and not line.lstrip().startswith("#")
         ]
-        if between_exec != expected_between_lines:
+        summary_open = tail_exec.index("{") if "{" in tail_exec else -1
+        emission_exec = tail_exec[:summary_open] if summary_open >= 0 else tail_exec
+        if emission_exec != _EXPECTED_CI_PLAN_EMISSION_LINES:
             errors.append(
-                "jobs.ci-plan must execute the exact unconditional mixed-version transition guard "
-                "(no enclosing conditional) between emitting mode and gate_fallbacks=()"
+                "jobs.ci-plan emission block from planner output parsing through "
+                "GITHUB_OUTPUT gate emission must match the exact unconditional "
+                "fail-closed sequence"
             )
 
-    # Behavioral Bash replay of the actual ci-plan emission tail: defeats any
-    # outer enclosing `if/else` wrapper placed before mode emission or after
-    # `gate_fallbacks=()`.
+    # Behavioral Bash replay of the actual ci-plan emission tail with a non-empty
+    # NUL-delimited `changed_files` fixture.
     bad_handshake_out, bad_err = _replay_ci_plan_emission(
         plan_body,
         "mode=light\nreason=legacy\nrun_rust=false\nrun_artifacts=false\n",
@@ -1503,17 +1537,21 @@ def mode_and_granular_opt_in_self_test(plan_body: str) -> list[str]:
         failures.append("granular opt-in verifier must reject wrapping the fallback loop in a conditional")
 
     # Outer conditional wrapping from before mode emission through after gate_fallbacks=().
-    outer_wrapped = plan_body.replace(
-        '          if [ "$paths_classifiable" != "true" ]; then\n            mode="full"\n          fi\n',
-        '          if [ "$paths_classifiable" != "true" ]; then\n          if [ "$paths_classifiable" != "true" ]; then\n            mode="full"\n          fi\n',
-        1,
-    ).replace(
-        "          gate_fallbacks=()\n",
-        '          gate_fallbacks=()\n          else\n            printf \'mode=%s\\n\' "$mode" >> "$GITHUB_OUTPUT"\n            gate_fallbacks=()\n          fi\n',
-        1,
-    )
-    if outer_wrapped == plan_body or not check_mode_and_granular_opt_in(outer_wrapped):
-        failures.append("granular opt-in verifier must reject an outer conditional spanning mode emission and gate_fallbacks=()")
+    for label, cond in (
+        ("paths_classifiable wrapper", '[ "$paths_classifiable" != "true" ]'),
+        ("changed_files wrapper", '[ ! -s "$changed_files" ]'),
+    ):
+        outer_wrapped = plan_body.replace(
+            '          if [ "$paths_classifiable" != "true" ]; then\n            mode="full"\n          fi\n',
+            f'          if {cond}; then\n          if [ "$paths_classifiable" != "true" ]; then\n            mode="full"\n          fi\n',
+            1,
+        ).replace(
+            "          gate_fallbacks=()\n",
+            '          gate_fallbacks=()\n          else\n            printf \'mode=%s\\n\' "$mode" >> "$GITHUB_OUTPUT"\n            gate_fallbacks=()\n          fi\n',
+            1,
+        )
+        if outer_wrapped == plan_body or not check_mode_and_granular_opt_in(outer_wrapped):
+            failures.append(f"granular opt-in verifier must reject an outer {label}")
 
     return failures
 
