@@ -986,8 +986,12 @@ The repository cache is a 10 GB LRU quota, so lanes are few and owned.
 lane producer (`save: "true"`) on a trusted `refs/heads/main` run; the
 sccache local store is not persisted (the restored `target/` already
 skips dependency compilation). Lanes: `ci-debug` (produced by Unit Tests;
-shared by every debug-profile job through identical `CARGO_BUILD_JOBS` /
-`CARGO_PROFILE_DEV_DEBUG` job env), `ci-lint` (produced by Lint),
+shared by all 12 debug-profile jobs across `ci.yml` and
+`ambient-host-udp-live.yml` through identical `CARGO_BUILD_JOBS=3`,
+`CARGO_PROFILE_DEV_DEBUG=0`, `CARGO_PROFILE_TEST_DEBUG=0`,
+`CARGO_PROFILE_DEV_SPLIT_DEBUGINFO=off`, and
+`CARGO_PROFILE_TEST_SPLIT_DEBUGINFO=off` env enforced by
+`check_ci_debug_lane_profile_uniformity`), `ci-lint` (produced by Lint),
 `ci-standalone-cargo` (produced by Standalone Cargo Workspaces), the main-only
 `fuzz-property-smoke` lane (Fuzz Smoke's property build, line-tables-only
 debuginfo), the registry-only `fuzz-sanitizer-smoke` lane
@@ -4181,9 +4185,11 @@ cache-hit, retention, quota, or compile-time claim. Ambient's separate GHCR
 image cache is unaffected. The frozen Ambient contract and regression
 mutations now require the `ci-debug` namespace and its explicit network,
 job-count and debuginfo settings.
-Unit, lint, feature-specific and archive-builder profiles keep separate
-keys. Reassess this map if any job changes its build profile, features,
-toolchain, environment or target layout.
+Unit (`test-unit`), `build-test-artifacts`, and the other debug-profile jobs
+share `ci-debug`, while lint, feature-specific (`fips-build.yml`,
+`windows-confinement.yml`), coverage, standalone-cargo, fuzz, and release-binary
+profiles keep separate keys. Reassess this map if any job changes its build
+profile, features, toolchain, environment or target layout.
 
 The broader quota issue still requires Unit/Lint/Artifacts retention across
 subsequent main runs; the historical sharing change alone is not evidence

@@ -1218,8 +1218,9 @@ jobs:
 
       - name: Build integration tests archive
         # Nextest archives are native binaries, so the file and artifact names
-        # include runner OS/arch. Full debuginfo makes the archive hundreds of
-        # MB larger and is omitted only from this transfer artifact.
+        # include runner OS/arch. Debuginfo is already disabled at compile time
+        # for the shared `ci-debug` lane (`CARGO_PROFILE_*_DEBUG=0` and
+        # `SPLIT_DEBUGINFO=off`), keeping this transfer archive compact.
         run: |
           archive_file="integration-tests-${RUNNER_OS}-${RUNNER_ARCH}.tar.zst"
           cargo nextest archive \
