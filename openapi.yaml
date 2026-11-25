@@ -8952,11 +8952,12 @@ paths:
           $ref: "#/components/responses/NotFound"
         "406":
           description: >-
-            Requested `Accept` header explicitly rejects offered JSON/YAML
-            representation(s) with `q=0` (including rejecting one format with
-            `q=0` without matching the other, such as
-            `Accept: application/json;q=0`; unrelated media types without any
-            `q=0` rejection default to the stored format).
+            A relevant media range in the `Accept` header matched an offered
+            JSON or YAML representation, but no supported representation has a
+            positive effective quality (for example, `Accept: application/json;q=0`
+            without any positively weighted YAML match, or both formats set to
+            `q=0`; unrelated media types that match neither JSON nor YAML fall
+            back to the stored format).
           content:
             application/json:
               schema:
@@ -9332,11 +9333,12 @@ paths:
           $ref: "#/components/responses/NotFound"
         "406":
           description: >-
-            Requested `Accept` header explicitly rejects offered JSON/YAML
-            representation(s) with `q=0` (including rejecting one format with
-            `q=0` without matching the other, such as
-            `Accept: application/json;q=0`; unrelated media types without any
-            `q=0` rejection default to the stored format).
+            A relevant media range in the `Accept` header matched an offered
+            JSON or YAML representation, but no supported representation has a
+            positive effective quality (for example, `Accept: application/json;q=0`
+            without any positively weighted YAML match, or both formats set to
+            `q=0`; unrelated media types that match neither JSON nor YAML fall
+            back to the stored format).
           content:
             application/json:
               schema:

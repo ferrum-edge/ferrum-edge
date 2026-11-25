@@ -61,6 +61,11 @@ pub fn decompress_gzip_capped(input: &[u8], max_output: usize) -> std::io::Resul
 /// chunks, failing with `ErrorKind::Other` before writing past `max_output`
 /// bytes so callers can enforce live per-connection byte budgets during
 /// decompression rather than only after buffering the full output.
+///
+/// If `writer` switches to discard-and-count mode upon soft budget exhaustion,
+/// this loop keeps draining through EOF or `max_output` in the 8 KiB stack
+/// buffer so permanent gzip corruption or `> max_output` errors still win over
+/// retryable budget rejection.
 pub(crate) fn decompress_gzip_capped_to_writer<W: Write>(
     input: &[u8],
     max_output: usize,

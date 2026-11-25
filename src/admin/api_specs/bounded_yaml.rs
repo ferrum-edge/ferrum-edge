@@ -9,7 +9,8 @@
 
 use serde_json::map::Entry;
 use serde_json::{Map, Number, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::ffi::c_void;
 use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 use std::slice;
@@ -190,7 +191,21 @@ impl Budgets {
 /// Parse `body` as a single YAML document and expand aliases into JSON under
 /// the given node budget (and the module's depth/alias/byte/work caps).
 pub(crate) fn parse_yaml_to_json(body: &[u8], max_nodes: usize) -> Result<Value, BoundedYamlError> {
-    let document = compose_document(body, max_nodes)?;
+    parse_yaml_with_parser(Parser::new(body)?, max_nodes)
+}
+
+/// Parse owned YAML `chunks` directly through libyaml's streaming read
+/// callback, dropping each consumed chunk as parsing advances so multi-chunk
+/// conversions never flatten or duplicate the raw YAML document in memory.
+pub(crate) fn parse_yaml_to_json_chunks(
+    chunks: Vec<Vec<u8>>,
+    max_nodes: usize,
+) -> Result<Value, BoundedYamlError> {
+    parse_yaml_with_parser(Parser::from_chunks(chunks)?, max_nodes)
+}
+
+fn parse_yaml_with_parser(parser: Parser, max_nodes: usize) -> Result<Value, BoundedYamlError> {
+    let document = compose_document(parser, max_nodes)?;
     let root = document.root.ok_or(BoundedYamlError::EmptyDocument)?;
     let mut budgets = Budgets {
         max_nodes,
@@ -222,8 +237,7 @@ enum Frame {
     },
 }
 
-fn compose_document(body: &[u8], max_nodes: usize) -> Result<Document, BoundedYamlError> {
-    let mut parser = Parser::new(body)?;
+fn compose_document(mut parser: Parser, max_nodes: usize) -> Result<Document, BoundedYamlError> {
     let mut document = Document {
         nodes: Vec::new(),
         anchors: HashMap::new(),
@@ -952,6 +966,79 @@ enum Event {
     MappingEnd,
 }
 
+struct ChunkedYamlSource {
+    chunks: VecDeque<Vec<u8>>,
+    offset: usize,
+}
+
+/// Heap-pinned owner for [`ChunkedYamlSource`] whose raw address stays valid
+/// and un-retagged across [`Parser`] moves until after `yaml_parser_delete`.
+struct OwnedChunkedYamlSource(NonNull<ChunkedYamlSource>);
+
+// SAFETY: `OwnedChunkedYamlSource` holds exclusive ownership of a heap-allocated
+// `ChunkedYamlSource` (`VecDeque<Vec<u8>>` + `usize`), which is `Send`.
+unsafe impl Send for OwnedChunkedYamlSource {}
+
+impl Drop for OwnedChunkedYamlSource {
+    fn drop(&mut self) {
+        // SAFETY: pointer was created via `Box::leak(Box::new(...))` in
+        // `Parser::from_chunks` and is reclaimed only after `Parser::drop`
+        // deletes `yaml_parser_t` (or before `Parser` is constructed on error).
+        unsafe {
+            drop(Box::from_raw(self.0.as_ptr()));
+        }
+    }
+}
+
+enum ParserInput {
+    /// Owned contiguous input bytes for `yaml_parser_set_input_string`.
+    Contiguous(#[allow(dead_code)] Vec<u8>),
+    /// Owned chunk queue drained incrementally by `read_from_chunks`.
+    Chunked(#[allow(dead_code)] OwnedChunkedYamlSource),
+}
+
+unsafe fn read_from_chunks(
+    data: *mut c_void,
+    buffer: *mut u8,
+    size: u64,
+    size_read: *mut u64,
+) -> i32 {
+    if data.is_null() || buffer.is_null() || size_read.is_null() {
+        return 0;
+    }
+    // SAFETY: `Parser::from_chunks` registers the non-null `OwnedChunkedYamlSource`
+    // pointer and guarantees it outlives `yaml_parser_t`.
+    let source = unsafe { &mut *data.cast::<ChunkedYamlSource>() };
+    let max_len = usize::try_from(size).unwrap_or(usize::MAX);
+    // SAFETY: libyaml supplies a writable `buffer` of `size` bytes.
+    let out = unsafe { slice::from_raw_parts_mut(buffer, max_len) };
+    let mut written = 0usize;
+    while written < out.len() {
+        let Some(front) = source.chunks.front() else {
+            break;
+        };
+        if source.offset >= front.len() {
+            source.chunks.pop_front();
+            source.offset = 0;
+            continue;
+        }
+        let remaining = &front[source.offset..];
+        let take = remaining.len().min(out.len() - written);
+        out[written..written + take].copy_from_slice(&remaining[..take]);
+        written += take;
+        source.offset += take;
+        if source.offset >= front.len() {
+            source.chunks.pop_front();
+            source.offset = 0;
+        }
+    }
+    // SAFETY: `size_read` is a valid non-null out-pointer from libyaml.
+    unsafe {
+        *size_read = written as u64;
+    }
+    1
+}
+
 struct Parser {
     /// Heap-resident foreign parser.
     ///
@@ -962,9 +1049,9 @@ struct Parser {
     /// object inside a private `Box` gives it a stable address while the owning
     /// `Parser` moves freely.
     sys: Box<sys::yaml_parser_t>,
-    /// Owned input bytes. The heap buffer must stay alive and unmoved for the
-    /// parser lifetime (`set_input_string` retains raw pointers into it).
-    _input: Vec<u8>,
+    /// Owned input storage. Must stay alive and unmoved for the parser lifetime
+    /// (`Parser::drop` deletes `sys` before this field drops).
+    _input: ParserInput,
 }
 
 impl Parser {
@@ -990,7 +1077,36 @@ impl Parser {
             // After this call the parser is self-referential via
             // `read_handler_data`; only the Box handle may move from here on.
             sys::yaml_parser_set_input_string(parser_ptr, input.as_ptr(), input.len() as u64);
-            Ok(Self { sys, _input: input })
+            Ok(Self {
+                sys,
+                _input: ParserInput::Contiguous(input),
+            })
+        }
+    }
+
+    fn from_chunks(chunks: Vec<Vec<u8>>) -> Result<Self, BoundedYamlError> {
+        let source =
+            OwnedChunkedYamlSource(NonNull::from(Box::leak(Box::new(ChunkedYamlSource {
+                chunks: chunks.into(),
+                offset: 0,
+            }))));
+        let source_ptr = source.0.as_ptr();
+        let mut sys = Box::<sys::yaml_parser_t>::new_uninit();
+        unsafe {
+            if sys::yaml_parser_initialize(sys.as_mut_ptr()).fail {
+                return Err(BoundedYamlError::Parse(
+                    "failed to initialize YAML parser".to_string(),
+                ));
+            }
+            let mut sys = sys.assume_init();
+            let parser_ptr = &mut *sys as *mut sys::yaml_parser_t;
+
+            sys::yaml_parser_set_encoding(parser_ptr, sys::YAML_UTF8_ENCODING);
+            sys::yaml_parser_set_input(parser_ptr, read_from_chunks, source_ptr.cast());
+            Ok(Self {
+                sys,
+                _input: ParserInput::Chunked(source),
+            })
         }
     }
 

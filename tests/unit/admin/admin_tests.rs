@@ -1824,6 +1824,19 @@ async fn admin_response_budget_chunks_holds_permit_and_rejects_oversized_payload
         "streaming format conversion exceeding max_bytes must still fail closed with 500"
     );
 
+    // Multi-write LimitedWriter capacity and permit accounting must never
+    // allocate beyond reserved connection-budget permits.
+    ferrum_edge::_test_support::check_api_spec_limited_writer_capacity_for_test()
+        .expect("LimitedWriter multi-write capacity/permit accounting");
+
+    // End-to-end HTTP response verification through spec_content_response_async
+    // with both max_decompress_bytes and connection budget active (including
+    // understated gzip size, cross-format If-None-Match: *, multi-chunk
+    // YAML->JSON streaming, and 406 single-format q=0 wording).
+    ferrum_edge::_test_support::exercise_api_spec_content_response_limits_for_test()
+        .await
+        .expect("spec_content_response_async dual-limit and streaming checks");
+
     // A 200 KiB budgeted body must yield multiple <= 64 KiB chunks, keep the
     // permit reserved across intermediate frames AND while queued frames remain
     // held after `GuardedAdminBody` drops, release on frame drop or early

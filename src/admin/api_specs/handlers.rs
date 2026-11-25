@@ -20,7 +20,7 @@ use std::sync::{Arc, LazyLock};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-use crate::admin::api_specs::bounded_yaml::parse_yaml_to_json;
+use crate::admin::api_specs::bounded_yaml::parse_yaml_to_json_chunks;
 use crate::admin::api_specs::extractor::MAX_SOURCE_DOCUMENT_NODES;
 use crate::admin::api_specs::{
     ExtractError, ExtractedBundle, SpecFormat, extract_with_external_refs,
@@ -1179,12 +1179,23 @@ fn content_type_for_format(fmt: SpecFormat) -> &'static str {
     }
 }
 
-/// Bounded `Write` adapter that aborts serialization once output would exceed
-/// `limit` bytes or the per-connection buffered response budget, preventing
-/// JSON/YAML format conversion from materializing an unbounded or over-budget
-/// response buffer.
+/// Fixed-block bounded `Write` adapter that enforces both an explicit byte
+/// `limit` (`500`) and an optional live per-connection
+/// [`ResponseBodyBudgetReservation`] (`503`).
+///
+/// Every chunk is allocated with exact capacity `<= BUDGETED_BODY_CHUNK_BYTES`
+/// (64 KiB) **only after** the cumulative allocated capacity across all chunks
+/// is atomically reserved, so `Vec` geometric growth can never overshoot the
+/// connection budget.
+///
+/// When the connection budget is exhausted mid-stream, the writer frees all
+/// buffered chunks immediately and continues counting emitted bytes up to
+/// `limit` in O(1) memory so a later permanent `> limit` or codec/serializer
+/// failure still fails closed with `500` rather than being masked as `503`.
 struct LimitedWriter<'a> {
-    buf: Vec<u8>,
+    chunks: Vec<Vec<u8>>,
+    total_len: usize,
+    total_cap: usize,
     limit: usize,
     reservation: Option<&'a mut crate::admin::ResponseBodyBudgetReservation>,
     budget_exceeded: bool,
@@ -1196,35 +1207,177 @@ impl<'a> LimitedWriter<'a> {
         reservation: Option<&'a mut crate::admin::ResponseBodyBudgetReservation>,
     ) -> Self {
         Self {
-            buf: Vec::new(),
+            chunks: Vec::new(),
+            total_len: 0,
+            total_cap: 0,
             limit,
             reservation,
             budget_exceeded: false,
         }
     }
+
+    fn allocated_capacity(&self) -> usize {
+        self.total_cap
+    }
+
+    fn reserved_kib(&self) -> Option<usize> {
+        self.reservation.as_ref().map(|r| r.reserved_kib())
+    }
+
+    fn release_for_budget_exhaustion(&mut self) {
+        self.budget_exceeded = true;
+        self.chunks.clear();
+        self.chunks.shrink_to_fit();
+        self.total_cap = 0;
+    }
+
+    /// Choose an exact capacity (`<= 64 KiB`) for the next independent chunk,
+    /// escalating 4 -> 8 -> 16 -> 32 -> 64 KiB while respecting `remaining_limit`
+    /// and the reservation's available-budget hint.
+    fn next_chunk_capacity(&self, min_needed: usize) -> usize {
+        let max_chunk = crate::admin::BUDGETED_BODY_CHUNK_BYTES;
+        let remaining_limit = self.limit.saturating_sub(self.total_len);
+        let escalated = if self.total_cap < 4 * 1024 {
+            4 * 1024
+        } else if self.total_cap < 16 * 1024 {
+            8 * 1024
+        } else if self.total_cap < 48 * 1024 {
+            16 * 1024
+        } else if self.total_cap < 112 * 1024 {
+            32 * 1024
+        } else {
+            max_chunk
+        };
+        let mut target = escalated
+            .max(min_needed)
+            .min(max_chunk)
+            .min(remaining_limit);
+        if let Some(res) = self.reservation.as_ref() {
+            let headroom = res
+                .max_available_bytes_hint()
+                .saturating_sub(self.total_cap);
+            if headroom < target {
+                target = headroom.max(min_needed).min(max_chunk).min(remaining_limit);
+            }
+        }
+        target.max(min_needed)
+    }
+
+    fn allocate_chunk(&mut self, min_needed: usize) -> bool {
+        let max_chunk = crate::admin::BUDGETED_BODY_CHUNK_BYTES;
+        let min_needed = min_needed.min(max_chunk);
+        let mut block_cap = self.next_chunk_capacity(min_needed);
+        if let Some(res) = self.reservation.as_mut() {
+            let Some(planned_cap) = self.total_cap.checked_add(block_cap) else {
+                self.release_for_budget_exhaustion();
+                return false;
+            };
+            if !res.try_grow_to_bytes(planned_cap) {
+                if block_cap > min_needed {
+                    block_cap = min_needed;
+                    let Some(min_planned) = self.total_cap.checked_add(block_cap) else {
+                        self.release_for_budget_exhaustion();
+                        return false;
+                    };
+                    if !res.try_grow_to_bytes(min_planned) {
+                        self.release_for_budget_exhaustion();
+                        return false;
+                    }
+                } else {
+                    self.release_for_budget_exhaustion();
+                    return false;
+                }
+            }
+        }
+        let chunk = Vec::with_capacity(block_cap);
+        let actual_cap = chunk.capacity();
+        if actual_cap > block_cap
+            && let Some(res) = self.reservation.as_mut()
+            && !self
+                .total_cap
+                .checked_add(actual_cap)
+                .is_some_and(|planned| res.try_grow_to_bytes(planned))
+        {
+            drop(chunk);
+            self.release_for_budget_exhaustion();
+            return false;
+        }
+        self.total_cap = self.total_cap.saturating_add(actual_cap);
+        self.chunks.push(chunk);
+        true
+    }
+
+    /// Consume the writer and return `(chunks, total_len, total_cap)`.
+    /// When `shrink_tail` is true and the final `<= 64 KiB` chunk has unused
+    /// capacity, shrink only that tail chunk if its brief reallocation peak
+    /// fits within the active reservation.
+    fn into_parts(mut self, shrink_tail: bool) -> (Vec<Vec<u8>>, usize, usize) {
+        if let Some(last) = self.chunks.last_mut() {
+            if last.is_empty() {
+                let cap = last.capacity();
+                self.chunks.pop();
+                self.total_cap = self.total_cap.saturating_sub(cap);
+            } else if shrink_tail && last.capacity() > last.len() {
+                let old_cap = last.capacity();
+                let tail_len = last.len();
+                let can_shrink_within_budget = match self.reservation.as_mut() {
+                    Some(res) => self
+                        .total_cap
+                        .checked_add(tail_len)
+                        .is_some_and(|peak| res.try_grow_to_bytes(peak)),
+                    None => true,
+                };
+                if can_shrink_within_budget {
+                    last.shrink_to_fit();
+                    let new_cap = last.capacity();
+                    self.total_cap = self
+                        .total_cap
+                        .saturating_sub(old_cap)
+                        .saturating_add(new_cap);
+                }
+            }
+        }
+        (self.chunks, self.total_len, self.total_cap)
+    }
 }
 
 impl std::io::Write for LimitedWriter<'_> {
-    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        let new_len = self.buf.len().saturating_add(data.len());
+    fn write(&mut self, mut data: &[u8]) -> std::io::Result<usize> {
+        let incoming = data.len();
+        let new_len = self.total_len.saturating_add(incoming);
         if new_len > self.limit {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "converted spec exceeds maximum size limit",
             ));
         }
-        if let Some(reservation) = self.reservation.as_mut()
-            && new_len > 0
-            && !reservation.try_grow_to_bytes(new_len)
-        {
-            self.budget_exceeded = true;
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "connection response budget exceeded",
-            ));
+        if incoming == 0 {
+            return Ok(0);
         }
-        self.buf.extend_from_slice(data);
-        Ok(data.len())
+        if self.budget_exceeded {
+            self.total_len = new_len;
+            return Ok(incoming);
+        }
+        while !data.is_empty() {
+            if let Some(last) = self.chunks.last_mut() {
+                let spare = last.capacity().saturating_sub(last.len());
+                if spare > 0 {
+                    let take = data.len().min(spare);
+                    last.extend_from_slice(&data[..take]);
+                    self.total_len = self.total_len.saturating_add(take);
+                    data = &data[take..];
+                    continue;
+                }
+            }
+            if !self.allocate_chunk(data.len()) {
+                // `allocate_chunk` set `budget_exceeded = true` and released
+                // all buffered chunks; keep counting remaining bytes in O(1)
+                // memory so a later `> limit` failure still wins with 500.
+                self.total_len = new_len;
+                return Ok(incoming);
+            }
+        }
+        Ok(incoming)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -1232,85 +1385,140 @@ impl std::io::Write for LimitedWriter<'_> {
     }
 }
 
+/// Zero-copy `std::io::Read` adapter over [`LimitedWriter`]'s chunked output so
+/// `serde_json::from_reader` parses directly without flattening chunks.
+struct ChunkedVecReader<'a> {
+    chunks: &'a [Vec<u8>],
+    chunk_idx: usize,
+    offset: usize,
+}
+
+impl<'a> ChunkedVecReader<'a> {
+    fn new(chunks: &'a [Vec<u8>]) -> Self {
+        Self {
+            chunks,
+            chunk_idx: 0,
+            offset: 0,
+        }
+    }
+}
+
+impl std::io::Read for ChunkedVecReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        while self.chunk_idx < self.chunks.len() {
+            let current = &self.chunks[self.chunk_idx];
+            if self.offset < current.len() {
+                let remaining = &current[self.offset..];
+                let n = remaining.len().min(buf.len());
+                buf[..n].copy_from_slice(&remaining[..n]);
+                self.offset += n;
+                if self.offset >= current.len() {
+                    self.chunk_idx += 1;
+                    self.offset = 0;
+                }
+                return Ok(n);
+            }
+            self.chunk_idx += 1;
+            self.offset = 0;
+        }
+        Ok(0)
+    }
+}
+
+fn flatten_chunks(chunks: Vec<Vec<u8>>, total_len: usize) -> Vec<u8> {
+    if chunks.len() == 1 {
+        return chunks.into_iter().next().unwrap_or_default();
+    }
+    let mut out = Vec::with_capacity(total_len);
+    for chunk in chunks {
+        out.extend_from_slice(&chunk);
+    }
+    out
+}
+
 enum ConvertFormatError {
     BudgetExceeded,
     Format(String),
 }
 
-/// Convert spec bytes between formats under an explicit `max_bytes` cap and
-/// optional live per-connection budget reservation.
+/// Convert chunked spec bytes between formats under an explicit `max_bytes`
+/// cap and optional live per-connection budget reservation.
 ///
-/// Consumes `body` by value and drops the decompressed input immediately after
-/// parsing so the decompressed source buffer and serialized output buffer
+/// Consumes `chunks` by value and releases the decompressed input chunks
+/// before allocating any serialized output chunks so source and output buffers
 /// never coexist against the connection's buffered-memory budget.
 ///
-/// Returns `Err(ConvertFormatError::BudgetExceeded)` if serialized output
-/// grows past the connection's remaining budget, or `Err(ConvertFormatError::Format)`
-/// if the source document is malformed or exceeds `max_bytes`.
+/// Returns `Err(ConvertFormatError::Format)` whenever the source document is
+/// malformed or serialized output exceeds `max_bytes` (even if the connection
+/// budget was also exhausted mid-stream), and
+/// `Err(ConvertFormatError::BudgetExceeded)` only when valid output `<= max_bytes`
+/// could not fit in the connection's remaining budget.
 fn convert_format_capped_with_budget(
-    body: Vec<u8>,
+    chunks: Vec<Vec<u8>>,
+    total_len: usize,
     from: SpecFormat,
     to: SpecFormat,
     max_bytes: usize,
     reservation: Option<&mut crate::admin::ResponseBodyBudgetReservation>,
-) -> Result<Vec<u8>, ConvertFormatError> {
+) -> Result<(Vec<Vec<u8>>, usize, usize), ConvertFormatError> {
     if from == to {
-        if body.len() > max_bytes {
+        if total_len > max_bytes {
             return Err(ConvertFormatError::Format(
                 "spec exceeds maximum size limit".to_string(),
             ));
         }
+        let total_cap: usize = chunks.iter().map(Vec::capacity).sum();
         if let Some(res) = reservation
-            && !body.is_empty()
-            && !res.try_grow_to_bytes(body.len())
+            && total_cap > 0
+            && !res.try_grow_to_bytes(total_cap)
         {
             return Err(ConvertFormatError::BudgetExceeded);
         }
-        let mut out = body;
-        out.shrink_to_fit();
-        return Ok(out);
+        return Ok((chunks, total_len, total_cap));
     }
     match (from, to) {
         (SpecFormat::Yaml, SpecFormat::Json) => {
-            let jv = parse_yaml_to_json(&body, MAX_SOURCE_DOCUMENT_NODES).map_err(|e| {
+            // Streams chunks directly into libyaml and drops each chunk as it
+            // is consumed so input is released before output allocates.
+            let jv = parse_yaml_to_json_chunks(chunks, MAX_SOURCE_DOCUMENT_NODES).map_err(|e| {
                 ConvertFormatError::Format(format!(
                     "YAML parse error during conversion: {}",
                     e.message()
                 ))
             })?;
-            // Release the decompressed source buffer before allocating output.
-            drop(body);
             let mut writer = LimitedWriter::new(max_bytes, reservation);
             if let Err(e) = serde_json::to_writer(&mut writer, &jv) {
-                if writer.budget_exceeded {
-                    return Err(ConvertFormatError::BudgetExceeded);
-                }
                 return Err(ConvertFormatError::Format(format!(
                     "JSON serialization error: {e}"
                 )));
             }
             drop(jv);
-            writer.buf.shrink_to_fit();
-            Ok(writer.buf)
+            if writer.budget_exceeded {
+                return Err(ConvertFormatError::BudgetExceeded);
+            }
+            Ok(writer.into_parts(true))
         }
         (SpecFormat::Json, SpecFormat::Yaml) => {
-            let jv: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
-                ConvertFormatError::Format(format!("JSON parse error during conversion: {e}"))
-            })?;
-            // Release the decompressed source buffer before allocating output.
-            drop(body);
+            let jv: serde_json::Value = serde_json::from_reader(ChunkedVecReader::new(&chunks))
+                .map_err(|e| {
+                    ConvertFormatError::Format(format!("JSON parse error during conversion: {e}"))
+                })?;
+            // Release decompressed source chunks before allocating output.
+            drop(chunks);
             let mut writer = LimitedWriter::new(max_bytes, reservation);
             if let Err(e) = serde_yaml::to_writer(&mut writer, &jv) {
-                if writer.budget_exceeded {
-                    return Err(ConvertFormatError::BudgetExceeded);
-                }
                 return Err(ConvertFormatError::Format(format!(
                     "YAML serialization error: {e}"
                 )));
             }
             drop(jv);
-            writer.buf.shrink_to_fit();
-            Ok(writer.buf)
+            if writer.budget_exceeded {
+                return Err(ConvertFormatError::BudgetExceeded);
+            }
+            Ok(writer.into_parts(true))
         }
         _ => Err(ConvertFormatError::Format(format!(
             "unsupported format conversion {:?} → {:?}",
@@ -1325,12 +1533,12 @@ fn convert_format_capped(
     to: SpecFormat,
     max_bytes: usize,
 ) -> Result<Vec<u8>, String> {
-    convert_format_capped_with_budget(body.to_vec(), from, to, max_bytes, None).map_err(|err| {
-        match err {
+    convert_format_capped_with_budget(vec![body.to_vec()], body.len(), from, to, max_bytes, None)
+        .map(|(chunks, total_len, _)| flatten_chunks(chunks, total_len))
+        .map_err(|err| match err {
             ConvertFormatError::BudgetExceeded => "connection response budget exceeded".to_string(),
             ConvertFormatError::Format(msg) => msg,
-        }
-    })
+        })
 }
 
 /// Test helper verifying that streaming gzip decompression and cross-format
@@ -1355,8 +1563,8 @@ pub(crate) fn check_budgeted_decode_and_convert_for_test(
             let mut writer = LimitedWriter::new(max_bytes, res.as_mut());
             match spec_codec::decompress_gzip_capped_to_writer(&compressed, max_bytes, &mut writer)
             {
+                Ok(()) if writer.budget_exceeded => Some(503),
                 Ok(()) => None,
-                Err(_) if writer.budget_exceeded => Some(503),
                 Err(_) => Some(500),
             }
         }
@@ -1366,7 +1574,8 @@ pub(crate) fn check_budgeted_decode_and_convert_for_test(
     let convert_status = {
         let mut res = budget.try_reserve_bytes(1024);
         match convert_format_capped_with_budget(
-            raw_json.to_vec(),
+            vec![raw_json.to_vec()],
+            raw_json.len(),
             SpecFormat::Json,
             SpecFormat::Yaml,
             max_bytes,
@@ -1379,6 +1588,76 @@ pub(crate) fn check_budgeted_decode_and_convert_for_test(
     };
 
     (decompress_status, convert_status)
+}
+
+/// Test helper verifying that `LimitedWriter` never allocates capacity beyond
+/// its reserved connection-budget permits across multiple successful writes,
+/// keeps every chunk `<= BUDGETED_BODY_CHUNK_BYTES`, and releases excess
+/// capacity cleanly when finished.
+pub(crate) fn check_limited_writer_capacity_for_test() -> Result<(), &'static str> {
+    use std::io::Write;
+
+    const CAPACITY_KIB: u32 = 64;
+    let budget = crate::admin::AdminConnResponseBudget::new(CAPACITY_KIB);
+    let Some(mut res) = budget.try_reserve_bytes(1024) else {
+        return Err("initial 1 KiB reservation failed");
+    };
+    let mut writer = LimitedWriter::new(CAPACITY_KIB as usize * 1024, Some(&mut res));
+    let mut expected = Vec::new();
+    for step in 0u8..16 {
+        let block = vec![b'a'.wrapping_add(step); 1536];
+        writer
+            .write_all(&block)
+            .map_err(|_| "LimitedWriter write unexpectedly failed")?;
+        expected.extend_from_slice(&block);
+
+        let actual_caps: usize = writer.chunks.iter().map(Vec::capacity).sum();
+        if actual_caps != writer.allocated_capacity() {
+            return Err("tracked total_cap diverged from actual Vec capacities");
+        }
+        if writer
+            .chunks
+            .iter()
+            .any(|c| c.capacity() > crate::admin::BUDGETED_BODY_CHUNK_BYTES)
+        {
+            return Err("chunk capacity exceeded BUDGETED_BODY_CHUNK_BYTES");
+        }
+        let Some(reserved_kib) = writer.reserved_kib() else {
+            return Err("missing active reservation");
+        };
+        if actual_caps > reserved_kib * 1024 {
+            return Err("allocated chunk capacity exceeded reserved budget permits");
+        }
+        if budget.available_kib() != (CAPACITY_KIB as usize).saturating_sub(reserved_kib) {
+            return Err("budget available_kib did not match reserved_kib");
+        }
+    }
+    if writer.budget_exceeded {
+        return Err("writer unexpectedly marked budget_exceeded");
+    }
+    let (chunks, total_len, total_cap) = writer.into_parts(true);
+    if chunks.len() < 2 {
+        return Err("expected multiple fixed-size chunks across 24 KiB write");
+    }
+    if total_len != expected.len() {
+        return Err("total_len did not match written bytes");
+    }
+    let final_caps: usize = chunks.iter().map(Vec::capacity).sum();
+    if final_caps != total_cap || final_caps > res.reserved_kib() * 1024 {
+        return Err("final chunk capacities exceeded reserved permits");
+    }
+    let assembled = flatten_chunks(chunks, total_len);
+    if assembled != expected {
+        return Err("reassembled chunk bytes differed from written input");
+    }
+    let Some(permit) = res.adjust_to_bytes(total_cap) else {
+        return Err("adjust_to_bytes failed for final capacity");
+    };
+    drop(permit);
+    if budget.available_kib() != CAPACITY_KIB as usize {
+        return Err("dropping final permit did not restore full connection budget");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2740,6 +3019,15 @@ enum SpecReadPreflight {
     Proceed(Option<crate::admin::ResponseBodyBudgetReservation>),
 }
 
+fn not_acceptable_spec_response() -> Response<Full<Bytes>> {
+    json_resp(
+        StatusCode::NOT_ACCEPTABLE,
+        &json!({
+            "error": "No supported representation has a positive effective quality for the requested Accept header"
+        }),
+    )
+}
+
 fn preflight_spec_read_from_meta(
     meta: &crate::config::db_backend::ApiSpecConditionalMeta,
     request_headers: &hyper::HeaderMap,
@@ -2748,12 +3036,7 @@ fn preflight_spec_read_from_meta(
     response_budget: Option<&crate::admin::AdminConnResponseBudget>,
 ) -> SpecReadPreflight {
     let Some(target_fmt) = negotiate_accept_or_406(request_headers, meta.spec_format) else {
-        return SpecReadPreflight::Respond(json_resp(
-            StatusCode::NOT_ACCEPTABLE,
-            &json!({
-                "error": "No representation acceptable per Accept header (all formats explicitly q=0)"
-            }),
-        ));
+        return SpecReadPreflight::Respond(not_acceptable_spec_response());
     };
     if check_if_none_match {
         let etag = spec_representation_etag(&meta.content_hash, meta.spec_format, target_fmt);
@@ -2832,14 +3115,7 @@ async fn spec_content_response_async(
     // JSON (or vice-versa).
     let target_fmt = match negotiate_accept_or_406(request_headers, spec.spec_format) {
         Some(fmt) => fmt,
-        None => {
-            return json_resp(
-                StatusCode::NOT_ACCEPTABLE,
-                &json!({
-                    "error": "No representation acceptable per Accept header (all formats explicitly q=0)"
-                }),
-            );
-        }
+        None => return not_acceptable_spec_response(),
     };
 
     let etag = spec_representation_etag(&spec.content_hash, spec.spec_format, target_fmt);
@@ -2891,6 +3167,7 @@ async fn spec_content_response_async(
     let spec_id = spec.id;
     let stored_format = spec.spec_format;
     let compressed = spec.spec_content;
+    let same_format = target_fmt == stored_format;
     let converted = tokio::task::spawn_blocking(move || {
         let _permit = read_permit;
         let decompressed = {
@@ -2900,11 +3177,8 @@ async fn spec_content_response_async(
                 max_decompress_bytes,
                 &mut writer,
             ) {
-                Ok(()) => {
-                    writer.buf.shrink_to_fit();
-                    Ok(writer.buf)
-                }
-                Err(_) if writer.budget_exceeded => Err(SpecDecodeError::BudgetExceeded),
+                Ok(()) if writer.budget_exceeded => Err(SpecDecodeError::BudgetExceeded),
+                Ok(()) => Ok(writer.into_parts(same_format)),
                 Err(e) => {
                     tracing::error!(
                         "decompress_gzip_capped_to_writer failed for spec {} (cap={} bytes): {}",
@@ -2918,18 +3192,31 @@ async fn spec_content_response_async(
                 }
             }
         };
-        let result = decompressed.and_then(|raw| {
-            if target_fmt == stored_format {
-                Ok((raw, content_type_for_format(stored_format)))
+        let result = decompressed.and_then(|(chunks, total_len, total_cap)| {
+            if same_format {
+                Ok((
+                    chunks,
+                    total_len,
+                    total_cap,
+                    content_type_for_format(stored_format),
+                ))
             } else {
                 convert_format_capped_with_budget(
-                    raw,
+                    chunks,
+                    total_len,
                     stored_format,
                     target_fmt,
                     max_decompress_bytes,
                     budget_reservation.as_mut(),
                 )
-                .map(|converted| (converted, content_type_for_format(target_fmt)))
+                .map(|(out_chunks, out_len, out_cap)| {
+                    (
+                        out_chunks,
+                        out_len,
+                        out_cap,
+                        content_type_for_format(target_fmt),
+                    )
+                })
                 .map_err(|err| match err {
                     ConvertFormatError::BudgetExceeded => SpecDecodeError::BudgetExceeded,
                     ConvertFormatError::Format(e) => {
@@ -2956,8 +3243,10 @@ async fn spec_content_response_async(
     })
     .await;
 
-    let (body_bytes, ct, budget_reservation) = match converted {
-        Ok((Ok((body_bytes, ct)), reservation)) => (body_bytes, ct, reservation),
+    let (chunks, len, total_cap, ct, budget_reservation) = match converted {
+        Ok((Ok((chunks, len, total_cap, ct)), reservation)) => {
+            (chunks, len, total_cap, ct, reservation)
+        }
         Ok((Err(SpecDecodeError::BudgetExceeded), _reservation)) => {
             return spec_response_budget_unavailable_response();
         }
@@ -2979,28 +3268,378 @@ async fn spec_content_response_async(
         return not_modified_response(&etag);
     }
 
-    let len = body_bytes.len();
-    let budget_permit = if let Some(reservation) = budget_reservation {
-        match reservation.adjust_to_bytes(len) {
-            Some(permit) => Some(permit),
-            None => return spec_response_budget_unavailable_response(),
-        }
-    } else {
-        None
-    };
+    if let Some(reservation) = budget_reservation {
+        let accounted_bytes = total_cap.max(len);
+        let Some(permit) = reservation.adjust_to_bytes(accounted_bytes) else {
+            return spec_response_budget_unavailable_response();
+        };
+        let mut response = crate::admin::with_admin_security_headers(Response::builder())
+            .status(StatusCode::OK)
+            .header("Content-Type", ct)
+            .header("Content-Length", len.to_string())
+            .header("ETag", &etag)
+            .header("Vary", "Accept")
+            .body(Full::new(Bytes::new()))
+            .unwrap_or_else(|_| crate::admin::admin_builder_failure_response());
+        response
+            .extensions_mut()
+            .insert(crate::admin::BudgetedResponseBody::from_chunks(
+                chunks, permit,
+            ));
+        return response;
+    }
 
-    let mut response = crate::admin::with_admin_security_headers(Response::builder())
+    let body_bytes = flatten_chunks(chunks, len);
+    crate::admin::with_admin_security_headers(Response::builder())
         .status(StatusCode::OK)
         .header("Content-Type", ct)
         .header("Content-Length", len.to_string())
         .header("ETag", &etag)
         .header("Vary", "Accept")
         .body(Full::new(Bytes::from(body_bytes)))
-        .unwrap_or_else(|_| crate::admin::admin_builder_failure_response());
-    if let Some(permit) = budget_permit {
-        response.extensions_mut().insert(permit);
+        .unwrap_or_else(|_| crate::admin::admin_builder_failure_response())
+}
+
+/// End-to-end test helper exercising [`spec_content_response_async`] with both
+/// `max_decompress_bytes` and per-connection budget active simultaneously,
+/// verifying:
+/// - understated-size gzip decode hitting BOTH budget and cap fails closed with `500`,
+/// - understated-size gzip decode hitting only budget returns `503` + `Retry-After: 1`,
+/// - cross-format `If-None-Match: *` hitting BOTH budget and cap returns `500`,
+/// - cross-format `If-None-Match: *` hitting only budget returns `503` + `Retry-After: 1`,
+/// - cross-format `If-None-Match: *` fitting both returns `304` and releases budget,
+/// - multi-chunk `> 64 KiB` YAML->JSON conversion streams valid `<= 64 KiB` chunks
+///   through `BudgetedResponseBody` and releases budget on drop, and
+/// - `Accept: application/json;q=0` returns `406` with aligned error wording while
+///   `Accept: application/json;q=0, application/yaml;q=0.5` succeeds with `200`.
+pub(crate) async fn exercise_spec_content_response_limits_for_test() -> Result<(), &'static str> {
+    use http_body_util::BodyExt;
+
+    let make_spec =
+        |raw: &[u8], fmt: SpecFormat, reported_size: u64| -> Result<ApiSpec, &'static str> {
+            let compressed = spec_codec::compress_gzip(raw).map_err(|_| "gzip compress failed")?;
+            let now = Utc::now();
+            Ok(ApiSpec {
+                id: "spec-limit-test".to_string(),
+                namespace: "ferrum".to_string(),
+                proxy_id: "proxy-limit-test".to_string(),
+                spec_version: "3.1.0".to_string(),
+                spec_format: fmt,
+                spec_content: compressed,
+                content_encoding: "gzip".to_string(),
+                uncompressed_size: reported_size,
+                content_hash: spec_codec::sha256_hex(raw),
+                title: Some("Limit Test".to_string()),
+                info_version: Some("1.0.0".to_string()),
+                description: None,
+                contact_name: None,
+                contact_email: None,
+                license_name: None,
+                license_identifier: None,
+                tags: Vec::new(),
+                server_urls: Vec::new(),
+                operation_count: 0,
+                resource_hash: String::new(),
+                external_ref_snapshot: None,
+                external_ref_digest: None,
+                created_at: now,
+                updated_at: now,
+            })
+        };
+
+    let make_headers = |accept: &str, inm: Option<&str>| -> hyper::HeaderMap {
+        let mut h = hyper::HeaderMap::new();
+        if let Ok(v) = hyper::header::HeaderValue::from_str(accept) {
+            h.insert(hyper::header::ACCEPT, v);
+        }
+        if let Some(inm) = inm
+            && let Ok(v) = hyper::header::HeaderValue::from_str(inm)
+        {
+            h.insert(hyper::header::IF_NONE_MATCH, v);
+        }
+        h
+    };
+
+    let local_slots = Arc::new(Semaphore::new(4));
+
+    // Scenarios A & B: ~20 KiB JSON with understated DB size metadata (1 KiB)
+    // and only 4 KiB remaining connection budget.
+    let large_json = format!(
+        r#"{{"openapi":"3.1.0","info":{{"title":"{}","version":"1.0.0"}},"paths":{{}}}}"#,
+        "a".repeat(20 * 1024)
+    );
+    {
+        let budget = crate::admin::AdminConnResponseBudget::new(64);
+        let _held = budget
+            .try_acquire_bytes(60 * 1024)
+            .ok_or("failed to hold 60 KiB")?;
+        let res = budget
+            .try_reserve_bytes(1024)
+            .ok_or("failed to reserve 1 KiB")?;
+        let permit = Arc::clone(&local_slots)
+            .try_acquire_owned()
+            .map_err(|_| "failed to acquire test codec permit")?;
+        let resp = spec_content_response_async(
+            make_spec(large_json.as_bytes(), SpecFormat::Json, 1024)?,
+            &make_headers("application/json", None),
+            12 * 1024,
+            permit,
+            Some(res),
+        )
+        .await;
+        if resp.status() != StatusCode::INTERNAL_SERVER_ERROR {
+            return Err("understated gzip decode exceeding both budget and cap must return 500");
+        }
     }
-    response
+    {
+        let budget = crate::admin::AdminConnResponseBudget::new(64);
+        let _held = budget
+            .try_acquire_bytes(60 * 1024)
+            .ok_or("failed to hold 60 KiB")?;
+        let res = budget
+            .try_reserve_bytes(1024)
+            .ok_or("failed to reserve 1 KiB")?;
+        let permit = Arc::clone(&local_slots)
+            .try_acquire_owned()
+            .map_err(|_| "failed to acquire test codec permit")?;
+        let resp = spec_content_response_async(
+            make_spec(large_json.as_bytes(), SpecFormat::Json, 1024)?,
+            &make_headers("application/json", None),
+            64 * 1024,
+            permit,
+            Some(res),
+        )
+        .await;
+        if resp.status() != StatusCode::SERVICE_UNAVAILABLE {
+            return Err("understated gzip decode within cap exceeding budget must return 503");
+        }
+        if resp
+            .headers()
+            .get("Retry-After")
+            .and_then(|v| v.to_str().ok())
+            != Some("1")
+        {
+            return Err("503 response missing Retry-After: 1");
+        }
+    }
+
+    // Scenarios C, D, E: ~8.1 KiB JSON that expands to ~16.1 KiB YAML under
+    // cross-format `If-None-Match: *`.
+    let arr = format!("[{}]", vec!["0"; 4000].join(","));
+    let expanding_json = format!(
+        r#"{{"openapi":"3.1.0","info":{{"title":"t","version":"1.0.0"}},"paths":{{}},"x-data":{arr}}}"#
+    );
+    let expanding_len = expanding_json.len() as u64;
+    {
+        let budget = crate::admin::AdminConnResponseBudget::new(64);
+        let _held = budget
+            .try_acquire_bytes(54 * 1024)
+            .ok_or("failed to hold 54 KiB")?;
+        let res = budget
+            .try_reserve_bytes(expanding_json.len())
+            .ok_or("failed to reserve expanding JSON input")?;
+        let permit = Arc::clone(&local_slots)
+            .try_acquire_owned()
+            .map_err(|_| "failed to acquire test codec permit")?;
+        let resp = spec_content_response_async(
+            make_spec(expanding_json.as_bytes(), SpecFormat::Json, expanding_len)?,
+            &make_headers("application/yaml", Some("*")),
+            12 * 1024,
+            permit,
+            Some(res),
+        )
+        .await;
+        if resp.status() != StatusCode::INTERNAL_SERVER_ERROR {
+            return Err(
+                "cross-format If-None-Match: * exceeding both budget and cap must return 500",
+            );
+        }
+    }
+    {
+        let budget = crate::admin::AdminConnResponseBudget::new(64);
+        let _held = budget
+            .try_acquire_bytes(54 * 1024)
+            .ok_or("failed to hold 54 KiB")?;
+        let res = budget
+            .try_reserve_bytes(expanding_json.len())
+            .ok_or("failed to reserve expanding JSON input")?;
+        let permit = Arc::clone(&local_slots)
+            .try_acquire_owned()
+            .map_err(|_| "failed to acquire test codec permit")?;
+        let resp = spec_content_response_async(
+            make_spec(expanding_json.as_bytes(), SpecFormat::Json, expanding_len)?,
+            &make_headers("application/yaml", Some("*")),
+            32 * 1024,
+            permit,
+            Some(res),
+        )
+        .await;
+        if resp.status() != StatusCode::SERVICE_UNAVAILABLE {
+            return Err(
+                "cross-format If-None-Match: * exceeding budget within cap must return 503",
+            );
+        }
+        if resp
+            .headers()
+            .get("Retry-After")
+            .and_then(|v| v.to_str().ok())
+            != Some("1")
+        {
+            return Err("cross-format 503 response missing Retry-After: 1");
+        }
+    }
+    {
+        let budget = crate::admin::AdminConnResponseBudget::new(64);
+        let res = budget
+            .try_reserve_bytes(expanding_json.len())
+            .ok_or("failed to reserve expanding JSON input")?;
+        let permit = Arc::clone(&local_slots)
+            .try_acquire_owned()
+            .map_err(|_| "failed to acquire test codec permit")?;
+        let resp = spec_content_response_async(
+            make_spec(expanding_json.as_bytes(), SpecFormat::Json, expanding_len)?,
+            &make_headers("application/yaml", Some("*")),
+            32 * 1024,
+            permit,
+            Some(res),
+        )
+        .await;
+        if resp.status() != StatusCode::NOT_MODIFIED {
+            return Err("cross-format If-None-Match: * fitting budget and cap must return 304");
+        }
+        if budget.available_kib() != 64 {
+            return Err("304 response must release full connection budget");
+        }
+    }
+
+    // Scenario F: multi-chunk (> 64 KiB) YAML->JSON conversion streams through
+    // `parse_yaml_to_json_chunks` and `BudgetedResponseBody`.
+    {
+        let mut big_yaml = String::from(
+            "openapi: \"3.1.0\"\ninfo:\n  title: \"chunked-yaml\"\n  version: \"1.0.0\"\npaths: {}\nx-pad: |\n",
+        );
+        let line = format!("  {}\n", "b".repeat(64));
+        for _ in 0..1200 {
+            big_yaml.push_str(&line);
+        }
+        let budget = crate::admin::AdminConnResponseBudget::new(256);
+        let res = budget
+            .try_reserve_bytes(big_yaml.len())
+            .ok_or("failed to reserve big YAML")?;
+        let permit = Arc::clone(&local_slots)
+            .try_acquire_owned()
+            .map_err(|_| "failed to acquire test codec permit")?;
+        let resp = spec_content_response_async(
+            make_spec(big_yaml.as_bytes(), SpecFormat::Yaml, big_yaml.len() as u64)?,
+            &make_headers("application/json", None),
+            256 * 1024,
+            permit,
+            Some(res),
+        )
+        .await;
+        if resp.status() != StatusCode::OK {
+            return Err("multi-chunk YAML->JSON conversion must succeed with 200");
+        }
+        let budgeted = resp
+            .extensions()
+            .get::<crate::admin::BudgetedResponseBody>()
+            .ok_or("budgeted 200 response missing BudgetedResponseBody extension")?;
+        if budgeted.chunks().len() < 2 {
+            return Err("expected >= 2 independent chunks for >64 KiB JSON response");
+        }
+        if budgeted
+            .chunks()
+            .iter()
+            .any(|c| c.len() > crate::admin::BUDGETED_BODY_CHUNK_BYTES)
+        {
+            return Err("BudgetedResponseBody chunk exceeded BUDGETED_BODY_CHUNK_BYTES");
+        }
+        let expected_cl = budgeted.total_len().to_string();
+        if resp
+            .headers()
+            .get(hyper::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            != Some(expected_cl.as_str())
+        {
+            return Err("Content-Length did not match BudgetedResponseBody total_len");
+        }
+        let mut assembled = Vec::with_capacity(budgeted.total_len());
+        for chunk in budgeted.chunks() {
+            assembled.extend_from_slice(chunk);
+        }
+        let parsed: Value = serde_json::from_slice(&assembled)
+            .map_err(|_| "multi-chunk YAML->JSON output was not valid JSON")?;
+        if parsed
+            .get("info")
+            .and_then(|i| i.get("title"))
+            .and_then(Value::as_str)
+            != Some("chunked-yaml")
+        {
+            return Err("multi-chunk YAML->JSON output had unexpected title");
+        }
+        drop(resp);
+        if budget.available_kib() != 256 {
+            return Err("dropping budgeted 200 response did not release full budget");
+        }
+    }
+
+    // Scenario G: `Accept: application/json;q=0` returns 406 with accurate
+    // wording, while adding a positively weighted YAML range succeeds.
+    {
+        let small_json =
+            br#"{"openapi":"3.1.0","info":{"title":"q0","version":"1.0.0"},"paths":{}}"#;
+        let permit = Arc::clone(&local_slots)
+            .try_acquire_owned()
+            .map_err(|_| "failed to acquire test codec permit")?;
+        let resp_406 = spec_content_response_async(
+            make_spec(small_json, SpecFormat::Json, small_json.len() as u64)?,
+            &make_headers("application/json;q=0", None),
+            64 * 1024,
+            permit,
+            None,
+        )
+        .await;
+        if resp_406.status() != StatusCode::NOT_ACCEPTABLE {
+            return Err("Accept: application/json;q=0 must return 406");
+        }
+        let body_406 = resp_406
+            .into_body()
+            .collect()
+            .await
+            .map_err(|_| "failed collecting 406 body")?
+            .to_bytes();
+        let body_str = std::str::from_utf8(&body_406).map_err(|_| "406 body not utf8")?;
+        if !body_str.contains(
+            "No supported representation has a positive effective quality for the requested Accept header",
+        ) {
+            return Err("406 error text did not match aligned specification wording");
+        }
+
+        let permit_200 = Arc::clone(&local_slots)
+            .try_acquire_owned()
+            .map_err(|_| "failed to acquire test codec permit")?;
+        let resp_200 = spec_content_response_async(
+            make_spec(small_json, SpecFormat::Json, small_json.len() as u64)?,
+            &make_headers("application/json;q=0, application/yaml;q=0.5", None),
+            64 * 1024,
+            permit_200,
+            None,
+        )
+        .await;
+        if resp_200.status() != StatusCode::OK {
+            return Err("Accept with q=0 JSON and positive YAML must succeed with 200");
+        }
+        if resp_200
+            .headers()
+            .get("Content-Type")
+            .and_then(|v| v.to_str().ok())
+            != Some("application/yaml")
+        {
+            return Err("positive YAML match did not return application/yaml");
+        }
+    }
+
+    Ok(())
 }
 
 /// Test helper verifying that `If-None-Match: *` does not short-circuit `304`

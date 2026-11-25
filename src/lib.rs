@@ -167,6 +167,20 @@ pub mod _test_support {
         )
     }
 
+    /// Test helper verifying that `LimitedWriter` never allocates capacity
+    /// beyond its reserved connection-budget permits across multiple writes.
+    pub fn check_api_spec_limited_writer_capacity_for_test() -> Result<(), &'static str> {
+        crate::admin::api_specs::handlers::check_limited_writer_capacity_for_test()
+    }
+
+    /// End-to-end test helper exercising `spec_content_response_async` with
+    /// both `max_decompress_bytes` and per-connection budget active, including
+    /// cross-format `If-None-Match: *`, multi-chunk YAML->JSON conversion, and
+    /// `406` single-format `q=0` handling.
+    pub async fn exercise_api_spec_content_response_limits_for_test() -> Result<(), &'static str> {
+        crate::admin::api_specs::handlers::exercise_spec_content_response_limits_for_test().await
+    }
+
     /// Test helper verifying API-spec read preflight reservation and
     /// `If-None-Match: *` conversion parity.
     pub fn check_api_spec_read_preflight_for_test(

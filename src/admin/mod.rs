@@ -1519,6 +1519,21 @@ pub(crate) struct ResponseBodyBudgetReservation {
 }
 
 impl ResponseBodyBudgetReservation {
+    /// Currently reserved KiB held by this reservation.
+    pub(crate) fn reserved_kib(&self) -> usize {
+        self.permit.num_permits()
+    }
+
+    /// Best-effort advisory upper bound (in bytes) on the total capacity
+    /// currently reachable by this reservation without blocking. Callers still
+    /// enforce exact limits atomically via [`Self::try_grow_to_bytes`].
+    pub(crate) fn max_available_bytes_hint(&self) -> usize {
+        self.permit
+            .num_permits()
+            .saturating_add(self.budget.available_kib())
+            .saturating_mul(1024)
+    }
+
     /// Atomically grow this reservation up to `expected_bytes` before entering
     /// the blocking decode step (for example if a concurrent `PUT` replaced a
     /// small spec with a larger one between metadata preflight and content
@@ -1561,22 +1576,62 @@ impl ResponseBodyBudgetReservation {
     }
 }
 
-/// Chunk size yielded per `poll_frame` for budgeted responses. Each chunk is
-/// copied into its own independent <= 64 KiB `Bytes` allocation carrying a
-/// clone of the shared [`ResponseBodyBudgetPermit`] so neither `h2` nor HTTP/1
-/// can retain the full source allocation after `GuardedAdminBody` drops, and
-/// the connection budget stays reserved until every queued frame finishes
-/// writing or drops.
-const BUDGETED_BODY_CHUNK_BYTES: usize = 64 * 1024;
+/// Maximum chunk size allocated by budgeted writers and yielded per
+/// `poll_frame` for budgeted responses. Each chunk is an independently
+/// allocated `<= 64 KiB` buffer already accounted under its
+/// [`ResponseBodyBudgetPermit`], so `GuardedAdminBody` moves chunks straight
+/// into `GuardedAdminData` frames without copying or pinning a full-document
+/// backing allocation.
+pub(crate) const BUDGETED_BODY_CHUNK_BYTES: usize = 64 * 1024;
 
-/// Cloneable RAII permit moved from response extensions into
-/// [`GuardedAdminBody`] and cloned onto every yielded [`GuardedAdminData`]
-/// frame so per-connection buffered response memory stays accounted until both
-/// the body and all frames queued in Hyper/`h2` have drained or dropped.
+/// Cloneable RAII permit carried inside [`BudgetedResponseBody`] and cloned
+/// onto every yielded [`GuardedAdminData`] frame so per-connection buffered
+/// response memory stays accounted until both the body and all frames queued
+/// in Hyper/`h2` have drained or dropped.
 #[derive(Clone)]
 pub(crate) struct ResponseBodyBudgetPermit(
     #[allow(dead_code)] Arc<tokio::sync::OwnedSemaphorePermit>,
 );
+
+/// Independently allocated `<= BUDGETED_BODY_CHUNK_BYTES` response chunks
+/// paired with their per-connection [`ResponseBodyBudgetPermit`].
+///
+/// Moved out of response extensions by [`GuardedAdminBody::wrap_response`] (or
+/// dropped immediately by [`strip_head_response_body`]) so outgoing HTTP/1 and
+/// HTTP/2 frames move pre-budgeted chunks with zero extra copies.
+#[derive(Clone)]
+pub(crate) struct BudgetedResponseBody {
+    chunks: std::collections::VecDeque<Bytes>,
+    remaining_bytes: usize,
+    permit: ResponseBodyBudgetPermit,
+}
+
+impl BudgetedResponseBody {
+    pub(crate) fn from_chunks(chunks: Vec<Vec<u8>>, permit: ResponseBodyBudgetPermit) -> Self {
+        let mut queue = std::collections::VecDeque::with_capacity(chunks.len());
+        let mut remaining_bytes = 0usize;
+        for chunk in chunks {
+            if chunk.is_empty() {
+                continue;
+            }
+            remaining_bytes = remaining_bytes.saturating_add(chunk.len());
+            queue.push_back(Bytes::from(chunk));
+        }
+        Self {
+            chunks: queue,
+            remaining_bytes,
+            permit,
+        }
+    }
+
+    pub(crate) fn total_len(&self) -> usize {
+        self.remaining_bytes
+    }
+
+    pub(crate) fn chunks(&self) -> &std::collections::VecDeque<Bytes> {
+        &self.chunks
+    }
+}
 
 /// `bytes::Buf` frame yielded by [`GuardedAdminBody`]. Carries an optional
 /// [`ResponseBodyBudgetPermit`] so the permit stays alive while the frame sits
@@ -1608,10 +1663,11 @@ impl bytes::Buf for GuardedAdminData {
 /// has finished writing the response and dropped the body.
 struct GuardedAdminBody {
     inner: Full<Bytes>,
-    /// Remaining slice of a budgeted response copied out in independent 64 KiB
-    /// chunks so neither `Bytes::split_to` nor `h2` can pin the original
-    /// multi-MiB allocation once the final chunk is emitted.
-    chunked_remaining: Option<Bytes>,
+    /// Pre-chunked budgeted response moved out of response extensions. Each
+    /// chunk is an independently allocated `<= 64 KiB` `Bytes` buffer already
+    /// accounted under `budgeted.permit`, so `poll_frame` moves chunks directly
+    /// into [`GuardedAdminData`] with zero extra copies.
+    budgeted: Option<BudgetedResponseBody>,
     /// `GET /charges` delivery acknowledgement, fired once hyper has taken
     /// the complete document from this body (issue #5276). A response dropped
     /// before then — a scrape cancelled while the registry was rendering, or a
@@ -1619,7 +1675,6 @@ struct GuardedAdminBody {
     /// the body is not proof the peer received it, so the registry confirms
     /// collection only after two such deliveries.
     delivery_ack: Option<plugins::api_chargeback::ChargesDeliveryAck>,
-    _budget_permit: Option<ResponseBodyBudgetPermit>,
     _guard: AdminActivityGuard,
 }
 
@@ -1627,25 +1682,24 @@ impl GuardedAdminBody {
     fn new(inner: Full<Bytes>, guard: AdminActivityGuard) -> Self {
         Self {
             inner,
-            chunked_remaining: None,
+            budgeted: None,
             delivery_ack: None,
-            _budget_permit: None,
             _guard: guard,
         }
     }
 
     /// Wrap a dispatched admin response, moving a `/charges` delivery
-    /// acknowledgement and any response-body budget permit out of the response
+    /// acknowledgement and any pre-chunked budgeted body out of response
     /// extensions into the body so they live until the body is taken/dropped.
     fn wrap_response(response: Response<Full<Bytes>>, guard: AdminActivityGuard) -> Response<Self> {
         let (mut parts, inner) = response.into_parts();
         let delivery_ack = parts
             .extensions
             .remove::<plugins::api_chargeback::ChargesDeliveryAck>();
-        let budget_permit = parts.extensions.remove::<ResponseBodyBudgetPermit>();
+        let budgeted = parts.extensions.remove::<BudgetedResponseBody>();
         let mut body = Self::new(inner, guard);
         body.delivery_ack = delivery_ack;
-        body._budget_permit = budget_permit;
+        body.budgeted = budgeted;
         Response::from_parts(parts, body)
     }
 }
@@ -1659,45 +1713,16 @@ impl http_body::Body for GuardedAdminBody {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
-        if this._budget_permit.is_some() {
-            if this.chunked_remaining.is_none() && !http_body::Body::is_end_stream(&this.inner) {
-                match http_body::Body::poll_frame(std::pin::Pin::new(&mut this.inner), cx) {
-                    std::task::Poll::Ready(Some(Ok(frame))) => {
-                        if let Ok(data) = frame.into_data() {
-                            this.chunked_remaining = Some(data);
-                        } else {
-                            return std::task::Poll::Ready(None);
-                        }
-                    }
-                    std::task::Poll::Ready(None) => return std::task::Poll::Ready(None),
-                    std::task::Poll::Ready(Some(Err(never))) => match never {},
-                    std::task::Poll::Pending => return std::task::Poll::Pending,
-                }
-            }
-            if let Some(remaining) = this.chunked_remaining.as_mut() {
-                if remaining.is_empty() {
-                    this.chunked_remaining = None;
-                    return std::task::Poll::Ready(None);
-                }
-                let take = remaining.len().min(BUDGETED_BODY_CHUNK_BYTES);
-                // Copy into an independent <= 64 KiB allocation (instead of
-                // `split_to`) so queued tail chunks cannot keep the full
-                // multi-MiB source buffer alive, and attach a clone of the
-                // shared budget permit so the budget stays held while Hyper/h2
-                // queues the frame.
-                let chunk = Bytes::copy_from_slice(&remaining[..take]);
-                bytes::Buf::advance(remaining, take);
-                if remaining.is_empty() {
-                    this.chunked_remaining = None;
-                }
-                return std::task::Poll::Ready(Some(Ok(http_body::Frame::data(
-                    GuardedAdminData {
-                        bytes: chunk,
-                        _budget_permit: this._budget_permit.clone(),
-                    },
-                ))));
-            }
-            return std::task::Poll::Ready(None);
+        if let Some(budgeted) = this.budgeted.as_mut() {
+            let Some(chunk) = budgeted.chunks.pop_front() else {
+                return std::task::Poll::Ready(None);
+            };
+            budgeted.remaining_bytes = budgeted.remaining_bytes.saturating_sub(chunk.len());
+            let permit = budgeted.permit.clone();
+            return std::task::Poll::Ready(Some(Ok(http_body::Frame::data(GuardedAdminData {
+                bytes: chunk,
+                _budget_permit: Some(permit),
+            }))));
         }
         // `Full<Bytes>` is `Unpin`, so the projection is a plain reborrow.
         let polled = http_body::Body::poll_frame(std::pin::Pin::new(&mut this.inner), cx);
@@ -1731,26 +1756,31 @@ impl http_body::Body for GuardedAdminBody {
     }
 
     fn is_end_stream(&self) -> bool {
-        if self._budget_permit.is_some() {
-            match &self.chunked_remaining {
-                Some(remaining) => remaining.is_empty(),
-                None => http_body::Body::is_end_stream(&self.inner),
-            }
+        if let Some(budgeted) = &self.budgeted {
+            budgeted.chunks.is_empty()
         } else {
             http_body::Body::is_end_stream(&self.inner)
         }
     }
 
     fn size_hint(&self) -> http_body::SizeHint {
-        if self._budget_permit.is_some() {
-            match &self.chunked_remaining {
-                Some(remaining) => http_body::SizeHint::with_exact(remaining.len() as u64),
-                None => http_body::Body::size_hint(&self.inner),
-            }
+        if let Some(budgeted) = &self.budgeted {
+            http_body::SizeHint::with_exact(budgeted.remaining_bytes as u64)
         } else {
             http_body::Body::size_hint(&self.inner)
         }
     }
+}
+
+fn budgeted_test_chunks(total_bytes: usize, fill: u8) -> Vec<Vec<u8>> {
+    let mut chunks = Vec::new();
+    let mut remaining = total_bytes;
+    while remaining > 0 {
+        let len = remaining.min(BUDGETED_BODY_CHUNK_BYTES);
+        chunks.push(vec![fill; len]);
+        remaining -= len;
+    }
+    chunks
 }
 
 /// Structured result returned by the response-budget wrapper test helper.
@@ -1772,11 +1802,17 @@ pub(crate) async fn exercise_response_budget_wrapper_for_test(
     capacity_kib: u32,
     body_bytes: usize,
 ) -> Result<ResponseBudgetWrapperAudit, &'static str> {
-    let build_body_response = |bytes: usize| {
-        Response::builder()
+    let build_budgeted_response = |bytes: usize, permit: ResponseBodyBudgetPermit| {
+        let mut resp = Response::builder()
             .status(StatusCode::OK)
-            .body(Full::new(Bytes::from(vec![b'x'; bytes])))
-            .unwrap_or_else(|_| admin_builder_failure_response())
+            .body(Full::new(Bytes::new()))
+            .unwrap_or_else(|_| admin_builder_failure_response());
+        resp.extensions_mut()
+            .insert(BudgetedResponseBody::from_chunks(
+                budgeted_test_chunks(bytes, b'x'),
+                permit,
+            ));
+        resp
     };
 
     let budget = AdminConnResponseBudget::new(capacity_kib);
@@ -1785,13 +1821,16 @@ pub(crate) async fn exercise_response_budget_wrapper_for_test(
     };
     let available_after_acquire = budget.available_kib();
 
-    let mut response = build_body_response(body_bytes);
-    response.extensions_mut().insert(permit);
+    let response = build_budgeted_response(body_bytes, permit);
 
     let activity = Arc::new(AdminConnActivity::new());
     let wrapped = GuardedAdminBody::wrap_response(response, AdminActivityGuard::new(activity));
     let mut body = wrapped.into_body();
+    if http_body::Body::size_hint(&body).exact() != Some(body_bytes as u64) {
+        return Err("initial size_hint did not match budgeted body length");
+    }
     let mut frame_count = 0usize;
+    let mut total_emitted = 0usize;
     let mut available_mid_stream = None;
     let mut queued_frames = Vec::new();
     while let Some(frame) = body.frame().await {
@@ -1802,8 +1841,13 @@ pub(crate) async fn exercise_response_budget_wrapper_for_test(
         let Ok(data) = frame.into_data() else {
             return Err("unexpected non-data frame");
         };
-        if bytes::Buf::remaining(&data) > BUDGETED_BODY_CHUNK_BYTES {
+        let chunk_len = bytes::Buf::remaining(&data);
+        if chunk_len > BUDGETED_BODY_CHUNK_BYTES {
             return Err("budgeted chunk exceeded 64 KiB");
+        }
+        total_emitted += chunk_len;
+        if http_body::Body::size_hint(&body).exact() != Some((body_bytes - total_emitted) as u64) {
+            return Err("remaining size_hint did not track popped chunk");
         }
         frame_count += 1;
         if frame_count == 1 {
@@ -1813,6 +1857,9 @@ pub(crate) async fn exercise_response_budget_wrapper_for_test(
             available_mid_stream = Some(budget.available_kib());
         }
         queued_frames.push(data);
+    }
+    if total_emitted != body_bytes {
+        return Err("emitted bytes did not equal budgeted body length");
     }
     let Some(available_mid_stream) = available_mid_stream else {
         return Err("body produced zero frames");
@@ -1830,8 +1877,7 @@ pub(crate) async fn exercise_response_budget_wrapper_for_test(
     let Some(early_permit) = budget.try_acquire_bytes(body_bytes) else {
         return Err("budget was not reusable after queued frames dropped");
     };
-    let mut early_response = build_body_response(body_bytes);
-    early_response.extensions_mut().insert(early_permit);
+    let early_response = build_budgeted_response(body_bytes, early_permit);
     let early_activity = Arc::new(AdminConnActivity::new());
     let mut early_body =
         GuardedAdminBody::wrap_response(early_response, AdminActivityGuard::new(early_activity))
@@ -1844,14 +1890,20 @@ pub(crate) async fn exercise_response_budget_wrapper_for_test(
     drop(early_body);
     let early_drop_released = budget.available_kib() == capacity_kib as usize;
 
-    // HEAD stripping drops the budget permit immediately.
+    // HEAD stripping drops the budgeted chunks + permit immediately while
+    // preserving Content-Length from the pre-chunked body length.
     let Some(head_permit) = budget.try_acquire_bytes(body_bytes) else {
         return Err("budget was not reusable after early drop");
     };
-    let mut head_response = build_body_response(body_bytes);
-    head_response.extensions_mut().insert(head_permit);
+    let mut head_response = build_budgeted_response(body_bytes, head_permit);
     strip_head_response_body(&mut head_response);
-    let head_released = budget.available_kib() == capacity_kib as usize;
+    let expected_cl = body_bytes.to_string();
+    let head_cl_ok = head_response
+        .headers()
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        == Some(expected_cl.as_str());
+    let head_released = head_cl_ok && budget.available_kib() == capacity_kib as usize;
 
     Ok(ResponseBudgetWrapperAudit {
         frame_count,
@@ -2099,9 +2151,13 @@ pub(crate) async fn exercise_http2_stalled_response_budget_for_test() -> Result<
                     let mut resp = Response::builder()
                         .status(StatusCode::OK)
                         .header("Content-Length", BODY_BYTES.to_string())
-                        .body(Full::new(Bytes::from(vec![b'a'; BODY_BYTES])))
+                        .body(Full::new(Bytes::new()))
                         .unwrap_or_else(|_| admin_builder_failure_response());
-                    resp.extensions_mut().insert(permit);
+                    resp.extensions_mut()
+                        .insert(BudgetedResponseBody::from_chunks(
+                            budgeted_test_chunks(BODY_BYTES, b'a'),
+                            permit,
+                        ));
                     resp
                 } else {
                     Response::builder()
@@ -4126,19 +4182,23 @@ pub async fn handle_admin_request(
 /// frames.
 fn strip_head_response_body(response: &mut Response<Full<Bytes>>) {
     let status = response.status();
+    let budgeted = response.extensions_mut().remove::<BudgetedResponseBody>();
     if !matches!(status, StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED)
         && !response
             .headers()
             .contains_key(hyper::header::CONTENT_LENGTH)
-        && let Some(len) = <Full<Bytes> as hyper::body::Body>::size_hint(response.body()).exact()
     {
-        response
-            .headers_mut()
-            .insert(hyper::header::CONTENT_LENGTH, HeaderValue::from(len));
+        let exact_len = budgeted
+            .as_ref()
+            .map(|b| b.total_len() as u64)
+            .or_else(|| <Full<Bytes> as hyper::body::Body>::size_hint(response.body()).exact());
+        if let Some(len) = exact_len {
+            response
+                .headers_mut()
+                .insert(hyper::header::CONTENT_LENGTH, HeaderValue::from(len));
+        }
     }
-    response
-        .extensions_mut()
-        .remove::<ResponseBodyBudgetPermit>();
+    drop(budgeted);
     *response.body_mut() = Full::new(Bytes::new());
 }
 
