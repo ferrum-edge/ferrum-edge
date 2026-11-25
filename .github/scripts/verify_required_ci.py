@@ -710,68 +710,71 @@ def _expr_admits_main_push(expr: str) -> bool:
     return False
 
 
-def _parse_step_mapping(step: str) -> tuple[dict[object, object] | None, str | None]:
-    """Parse a single GitHub Actions step using PyYAML (failing closed if unavailable)."""
+def _load_workflow_jobs(ci_yml: str) -> tuple[dict[str, dict[object, object]] | None, str | None]:
+    """Parse an entire GitHub Actions workflow via PyYAML and return its `jobs` mapping."""
 
     try:
         import yaml  # type: ignore[import-untyped]
     except ImportError:
         return None, "PyYAML is required to validate build-test-artifacts consumer wiring"
     try:
-        parsed = yaml.safe_load(step)
+        doc = yaml.safe_load(ci_yml)
     except Exception as exc:
-        return None, f"unparseable step YAML: {exc}"
-    if not isinstance(parsed, list) or len(parsed) != 1 or not isinstance(parsed[0], dict):
-        return None, "step YAML did not parse as a single step mapping"
-    return parsed[0], None
+        return None, f"unparseable workflow YAML: {exc}"
+    if not isinstance(doc, dict):
+        return None, "workflow YAML did not parse as a mapping"
+    raw_jobs = doc.get("jobs")
+    if not isinstance(raw_jobs, dict):
+        return None, "workflow YAML is missing a mapping `jobs:` section"
+    jobs: dict[str, dict[object, object]] = {}
+    for job_id, job_obj in raw_jobs.items():
+        if not isinstance(job_obj, dict):
+            return None, f"jobs.{job_id} must be a mapping"
+        jobs[str(job_id)] = job_obj
+    return jobs, None
 
 
-def _extract_step_with_map(step: str) -> tuple[dict[str, str], str | None]:
-    """Parse a GitHub Actions step's `with:` mapping via PyYAML."""
-
-    step_obj, err = _parse_step_mapping(step)
-    if err is not None or step_obj is None:
-        return {}, err or "step YAML did not parse as a mapping"
-    raw_with = step_obj.get("with")
-    if raw_with is None:
-        return {}, None
-    if not isinstance(raw_with, dict):
-        return {}, "`with:` must be a mapping"
-    return {
-        str(k): ("" if v is None else str(v))
-        for k, v in raw_with.items()
-    }, None
-
-
-def _step_uses_download_artifact(step: str) -> tuple[bool, str | None]:
-    """Return `(is_download_artifact, parse_error)` for a step via PyYAML."""
-
-    step_obj, err = _parse_step_mapping(step)
-    if err is not None or step_obj is None:
-        return False, err
-    uses = step_obj.get("uses")
-    return isinstance(uses, str) and uses.startswith("actions/download-artifact@"), None
+def _yaml_job_needs(job_obj: dict[object, object]) -> set[str]:
+    needs = job_obj.get("needs")
+    if isinstance(needs, str):
+        return {needs}
+    if isinstance(needs, list):
+        return {str(item) for item in needs}
+    return set()
 
 
 def test_artifact_consumer_wiring_errors(ci_yml: str) -> list[str]:
     """Verify every consumer download of a build-test-artifacts output is produced."""
 
+    jobs, load_err = _load_workflow_jobs(ci_yml)
+    if load_err is not None or jobs is None:
+        return [load_err or "failed to parse workflow YAML"]
+
     errors: list[str] = []
-    producer_body = extract_job_body(ci_yml, "build-test-artifacts")
-    producer_steps = _split_job_steps(producer_body)
+    producer_job = jobs.get("build-test-artifacts")
+    if producer_job is None:
+        return ["jobs.build-test-artifacts is missing from ci.yml"]
+    producer_steps = producer_job.get("steps")
+    if not isinstance(producer_steps, list):
+        return ["jobs.build-test-artifacts is missing a list `steps:` section"]
 
     # Map full artifact name -> upload step `if:` expression.
     artifact_upload_if: dict[str, str] = {}
-    step_by_name: dict[str, str] = {}
+    step_by_name: dict[str, dict[object, object]] = {}
     for step in producer_steps:
-        name_m = re.search(r"(?m)^      - name:\s*(.+?)\s*$", step)
-        if name_m:
-            step_by_name[name_m.group(1)] = step
-        if "uses: actions/upload-artifact@" in step:
-            art_m = re.search(r"(?m)^\s+name:\s*(.+?)\s*$", step)
-            if_m = re.search(r"(?m)^        if:\s*(.+?)\s*$", step)
-            if art_m:
-                artifact_upload_if[art_m.group(1)] = if_m.group(1) if if_m else "ALWAYS"
+        if not isinstance(step, dict):
+            errors.append("jobs.build-test-artifacts contains a non-mapping step")
+            continue
+        step_name = step.get("name")
+        if isinstance(step_name, str):
+            step_by_name[step_name] = step
+        uses = step.get("uses")
+        if isinstance(uses, str) and uses.startswith("actions/upload-artifact@"):
+            raw_with = step.get("with")
+            if isinstance(raw_with, dict) and raw_with.get("name") is not None:
+                art_name = str(raw_with["name"]).strip()
+                raw_if = step.get("if")
+                artifact_upload_if[art_name] = str(raw_if).strip() if raw_if is not None else "ALWAYS"
 
     expected_artifacts = {
         "ferrum-edge-debug-${{ runner.os }}-${{ runner.arch }}": (
@@ -791,19 +794,20 @@ def test_artifact_consumer_wiring_errors(ci_yml: str) -> list[str]:
             ("NEED_FUNCTIONAL",),
         ),
     }
-    build_step = step_by_name.get("Build test targets and binaries", "")
-    if not build_step:
+    build_step = step_by_name.get("Build test targets and binaries")
+    if build_step is None:
         return ["jobs.build-test-artifacts is missing step `Build test targets and binaries`"]
 
+    raw_build_env = build_step.get("env")
+    build_env_dict = raw_build_env if isinstance(raw_build_env, dict) else {}
     build_env: dict[str, str] = {}
     for env_key in ("NEED_INTEGRATION", "NEED_FUNCTIONAL", "NEED_HELM_BIN"):
-        env_m = re.search(rf"(?m)^\s+{env_key}:\s*(.+?)\s*$", build_step)
-        if not env_m:
+        if env_key not in build_env_dict or build_env_dict[env_key] is None:
             errors.append(
                 f"jobs.build-test-artifacts build step is missing env `{env_key}`"
             )
         else:
-            build_env[env_key] = env_m.group(1)
+            build_env[env_key] = str(build_env_dict[env_key]).strip()
 
     required_build_branches = (
         (
@@ -823,9 +827,11 @@ def test_artifact_consumer_wiring_errors(ci_yml: str) -> list[str]:
             "cargo test --no-run --test k8s_istio_status_cas_live",
         ),
     )
+    build_run = build_step.get("run")
+    build_run_text = build_run if isinstance(build_run, str) else ""
     build_exec_lines = [
         line.strip()
-        for line in build_step.splitlines()
+        for line in build_run_text.splitlines()
         if line.strip() and not line.strip().startswith("#")
     ]
     for branch_cond, required_cmd in required_build_branches:
@@ -878,41 +884,44 @@ def test_artifact_consumer_wiring_errors(ci_yml: str) -> list[str]:
             "ferrum-cni-debug-${{ runner.os }}-${{ runner.arch }}",
         },
     }
-    # Scan all jobs in `ci.yml` (allowing any valid GitHub Actions job ID,
-    # including underscores and uppercase letters).
-    jobs_section = ci_yml.split("\njobs:\n", 1)[1] if "\njobs:\n" in ci_yml else ci_yml
-    all_ci_jobs = set(re.findall(r"(?m)^  ([A-Za-z_][A-Za-z0-9_-]*):$", jobs_section))
     discovered_consumers: set[str] = set()
-    producer_prefixes = (
-        "ferrum-edge-debug",
-        "ferrum-cni-debug",
-        "integration-tests-archive",
-        "functional-tests-archive",
-    )
 
-    for job in sorted(all_ci_jobs | set(expected_consumer_artifacts)):
+    for job in sorted(set(jobs) | set(expected_consumer_artifacts)):
         if job == "build-test-artifacts":
             continue
-        job_body = extract_job_body(ci_yml, job)
-        if not job_body:
+        job_obj = jobs.get(job)
+        if job_obj is None:
             if job in expected_consumer_artifacts:
                 errors.append(f"expected artifact consumer job `{job}` is missing from ci.yml")
             continue
+        raw_steps = job_obj.get("steps")
+        if raw_steps is None:
+            continue
+        if not isinstance(raw_steps, list):
+            errors.append(f"jobs.{job} has a non-list `steps:` section")
+            continue
         gate = PATH_GATED_JOBS.get(job)
         job_artifacts: set[str] = set()
-        for step in _split_job_steps(job_body):
-            uses_dl, step_err = _step_uses_download_artifact(step)
-            if step_err is not None:
-                errors.append(f"jobs.{job} has unparseable step YAML ({step_err})")
+        for step in raw_steps:
+            if not isinstance(step, dict):
+                errors.append(f"jobs.{job} contains a non-mapping step")
                 continue
-            if not uses_dl:
+            uses = step.get("uses")
+            if not (isinstance(uses, str) and uses.startswith("actions/download-artifact@")):
                 continue
-            with_map, with_err = _extract_step_with_map(step)
-            if with_err is not None:
+            raw_with = step.get("with")
+            if raw_with is None:
+                with_map: dict[str, str] = {}
+            elif not isinstance(raw_with, dict):
                 errors.append(
-                    f"jobs.{job} invokes actions/download-artifact with invalid `with:` ({with_err})"
+                    f"jobs.{job} invokes actions/download-artifact with invalid `with:` (`with:` must be a mapping)"
                 )
                 continue
+            else:
+                with_map = {
+                    str(k): ("" if v is None else str(v))
+                    for k, v in raw_with.items()
+                }
             if "pattern" in with_map:
                 errors.append(
                     f"jobs.{job} downloads artifacts via `pattern: {with_map['pattern']}` instead of an explicit tracked `name:`"
@@ -946,9 +955,9 @@ def test_artifact_consumer_wiring_errors(ci_yml: str) -> list[str]:
                         f"jobs.build-test-artifacts upload condition `{upload_if}` does not admit `{gate}`"
                     )
                 if archive_step_name is not None:
-                    archive_step = step_by_name.get(archive_step_name, "")
-                    archive_if_m = re.search(r"(?m)^        if:\s*(.+?)\s*$", archive_step)
-                    archive_if = archive_if_m.group(1) if archive_if_m else ""
+                    archive_step = step_by_name.get(archive_step_name, {})
+                    raw_arch_if = archive_step.get("if")
+                    archive_if = str(raw_arch_if).strip() if raw_arch_if is not None else ""
                     if not _expr_admits_gate(archive_if, gate):
                         errors.append(
                             f"jobs.{job} ({gate}) downloads `{raw_name}`, but "
@@ -983,7 +992,7 @@ def test_artifact_consumer_wiring_errors(ci_yml: str) -> list[str]:
                     f"jobs.{job} downloaded {sorted(job_artifacts)}, expected "
                     f"{sorted(expected_consumer_artifacts[job])}"
                 )
-            if not job_needs(job_body, "build-test-artifacts"):
+            if "build-test-artifacts" not in _yaml_job_needs(job_obj):
                 errors.append(
                     f"jobs.{job} downloads a build-test-artifacts output without needing `build-test-artifacts`"
                 )
@@ -1070,19 +1079,24 @@ def test_artifact_consumer_wiring_self_test(ci_yml: str) -> list[str]:
     if drop_integ_cni_dl == ci_yml or not test_artifact_consumer_wiring_errors(drop_integ_cni_dl):
         failures.append("artifact wiring verifier must reject missing ferrum-cni-debug download in test-integration")
 
-    # 8. An underscore-named 7th consumer downloading a tracked artifact must fail.
-    extra_underscore_job = (
-        ci_yml
-        + "\n  extra_consumer:\n"
-        + "    runs-on: ubuntu-26.04\n"
-        + "    needs: [ci-plan, build-test-artifacts]\n"
-        + "    steps:\n"
-        + "      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8\n"
-        + "        with:\n"
-        + "          name: ferrum-cni-debug-${{ runner.os }}-${{ runner.arch }}\n"
-    )
-    if not test_artifact_consumer_wiring_errors(extra_underscore_job):
-        failures.append("artifact wiring verifier must reject an underscore-named untracked consumer job")
+    # 8. An underscore-named 7th consumer (including with an inline comment on `steps:`)
+    # downloading a tracked artifact must fail.
+    for label, steps_hdr in (
+        ("underscore-named untracked consumer", "    steps:\n"),
+        ("commented steps: header on untracked consumer", "    steps: # inline comment\n"),
+    ):
+        extra_consumer = (
+            ci_yml
+            + "\n  extra_consumer:\n"
+            + "    runs-on: ubuntu-26.04\n"
+            + "    needs: [ci-plan, build-test-artifacts]\n"
+            + steps_hdr
+            + "      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8\n"
+            + "        with:\n"
+            + "          name: ferrum-cni-debug-${{ runner.os }}-${{ runner.arch }}\n"
+        )
+        if not test_artifact_consumer_wiring_errors(extra_consumer):
+            failures.append(f"artifact wiring verifier must reject {label}")
 
     # 9. A consumer downloading via `pattern:` (including glob `?` and a late step `name:`) must fail.
     pattern_download_job = (
@@ -1101,7 +1115,7 @@ def test_artifact_consumer_wiring_self_test(ci_yml: str) -> list[str]:
 
     # 10. A consumer downloading with empty `with.name: ''`, YAML-escaped space `"\ "`,
     # inline-commented empty name, `pattern :` with YAML spacing, escaped `uses:`,
-    # or flow-style `with:` must fail in BOTH default (PyYAML) and fallback parser modes.
+    # or flow-style `with:` must fail.
     for label, uses_line, with_lines in (
         (
             "empty single-quoted name",
@@ -1277,30 +1291,20 @@ def check_mode_and_granular_opt_in(plan_body: str) -> list[str]:
         errors.append(
             "jobs.ci-plan must pass FERRUM_CI_PLAN_GRANULAR_GATES=1 on the executable python3 -I planner invocation"
         )
-    # Require that the `id: plan` step writes to GITHUB_OUTPUT solely via the
-    # two pinned emission lines (prevents pre-planner or post-summary overwrites).
-    plan_steps = [
-        step
-        for step in _split_job_steps(plan_body)
-        if "      - id: plan\n" in step or "        id: plan\n" in step
-    ]
-    if len(plan_steps) != 1:
-        errors.append("jobs.ci-plan must contain a single `id: plan` step")
-    else:
-        select_exec = [
-            line.strip()
-            for line in plan_steps[0].splitlines()
-            if line.strip() and not line.strip().startswith("#")
-        ]
-        github_output_lines = [line for line in select_exec if "GITHUB_OUTPUT" in line]
-        if github_output_lines != [
-            'echo "mode=$mode" >> "$GITHUB_OUTPUT"',
-            'printf \'%s=%s\\n\' "$gate" "$value" >> "$GITHUB_OUTPUT"',
-        ]:
-            errors.append(
-                "jobs.ci-plan `id: plan` step must only write to GITHUB_OUTPUT "
-                "via the two pinned emission lines"
-            )
+    # Require that the entire `ci-plan` job writes to GITHUB_OUTPUT solely via
+    # its four pinned emission lines (prevents pre-planner, post-summary, or
+    # post-binary-matrix-heredoc overwrites across all steps of `ci-plan`).
+    github_output_lines = [line for line in exec_lines if "GITHUB_OUTPUT" in line]
+    if github_output_lines != [
+        'echo "sha=$trusted_base" >> "$GITHUB_OUTPUT"',
+        'echo "mode=$mode" >> "$GITHUB_OUTPUT"',
+        'printf \'%s=%s\\n\' "$gate" "$value" >> "$GITHUB_OUTPUT"',
+        "python3 - <<'PY' >> \"$GITHUB_OUTPUT\"",
+    ]:
+        errors.append(
+            "jobs.ci-plan must only write to GITHUB_OUTPUT via its four pinned "
+            f"emission lines (found {github_output_lines!r})"
+        )
     # Pin the exact non-blank, non-comment emission section from the planner call
     # through the gate-emission loop (stopping before the summary block `{`),
     # preventing any outer conditional wrapper on `$changed_files`, `$EVENT_NAME`,
@@ -1462,6 +1466,22 @@ def mode_and_granular_opt_in_self_test(plan_body: str) -> list[str]:
         )
         if outer_wrapped == plan_body or not check_mode_and_granular_opt_in(outer_wrapped):
             failures.append(f"granular opt-in verifier must reject an outer {label}")
+
+    pre_planner_write = plan_body.replace(
+        '          plan="$(FERRUM_CI_PLAN_GRANULAR_GATES=1 python3 -I ',
+        '          echo "mode=light" >> "$GITHUB_OUTPUT"\n          plan="$(FERRUM_CI_PLAN_GRANULAR_GATES=1 python3 -I ',
+        1,
+    )
+    if pre_planner_write == plan_body or not check_mode_and_granular_opt_in(pre_planner_write):
+        failures.append("granular opt-in verifier must reject extra GITHUB_OUTPUT write before planner")
+
+    post_matrix_write = plan_body.replace(
+        '          print("matrix=" + json.dumps({"include": builds}, separators=(",", ":")))\n          PY\n',
+        '          print("matrix=" + json.dumps({"include": builds}, separators=(",", ":")))\n          PY\n          echo \'matrix={"include":[]}\' >> "$GITHUB_OUTPUT"\n',
+        1,
+    )
+    if post_matrix_write == plan_body or not check_mode_and_granular_opt_in(post_matrix_write):
+        failures.append("granular opt-in verifier must reject extra GITHUB_OUTPUT write after binary-matrix heredoc")
 
     return failures
 
