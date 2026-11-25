@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
+import subprocess
 import sys
 import tempfile
 from pathlib import Path, PurePosixPath
@@ -838,29 +840,31 @@ PERFORMANCE_TREE_WORKSPACE_INPUTS = frozenset(
 SHARED_TEST_SUPPORT_PATTERNS = (
     r"^tests/common/",
     r"^tests/scaffolding/",
+    r"^tests/support/",
     r"^tests/fixtures/",
     r"^tests/certs/",
 )
 
 # `run_rust`: the unit-test + inline-lib-test lane (`test-unit`). Covers Rust
-# source, unit test targets, shared test helpers/fixtures, functional test
-# sources (several unit contract tests embed `tests/functional/*.rs` via
-# `include_str!`), embedded contract/release-note files (`CHANGELOG.md`,
-# `docs/upgrade_guide.md`, `docs/migrations.md`, Prometheus metric contract,
-# `ferrum.conf`, `openapi.yaml`, `deny.toml`), and the build graph.
-# Pure `clippy.toml`, `tests/integration/**`, `tests/conformance/**`,
-# `tests/service_integration/**`, `tests/secrets_functional/**`,
-# `tests/acme_dns01/**`, `tests/windows_confinement_tests.rs`, and
-# `schemas/clickhouse/**` changes are validated by their own owning lanes.
+# source, every root-crate test tree except `tests/k8s/` and
+# `tests/performance/` (unit parity/contract tests embed or scan
+# `tests/functional/`, `tests/integration/`, `tests/service_integration/`,
+# `tests/secrets_functional/`, `tests/config.yaml`, and top-level `tests/*.rs`),
+# `charts/` (`chart_helpers_parity_tests.rs`), `examples/hbone_perf_fixture.rs`,
+# `PERFORMANCE_TREE_WORKSPACE_INPUTS`, embedded contract/release-note files
+# (`CHANGELOG.md`, `docs/upgrade_guide.md`, `docs/migrations.md`, Prometheus
+# metric contract, `ferrum.conf`, `openapi.yaml`, `deny.toml`), and the build
+# graph. Pure `clippy.toml` and `schemas/clickhouse/**` changes are validated
+# by their own owning lanes.
 RUST_PATTERNS = [
     re.compile(pattern)
     for pattern in (
         *RUST_BUILD_GRAPH_PATTERNS,
         *SHARED_TEST_SUPPORT_PATTERNS,
         r"^src/",
-        r"^tests/unit/",
-        r"^tests/unit(?:_[^/]+)?\.rs$",
-        r"^tests/functional/",
+        r"^tests/(?!k8s/|performance/)",
+        r"^charts/",
+        r"^examples/hbone_perf_fixture\.rs$",
         *(
             "^" + re.escape(path) + "$"
             for path in sorted(PERFORMANCE_TREE_WORKSPACE_INPUTS)
@@ -880,23 +884,27 @@ RUST_PATTERNS = [
 ]
 
 # `run_lint`: `cargo clippy --all-targets -- -D warnings`. Runs on Rust source,
-# root-crate test targets, build-graph inputs, and `clippy.toml`. Pure non-Rust
-# data/contract files (`CHANGELOG.md`, `openapi.yaml`, `ferrum.conf`,
-# `docs/prometheus_*`, `deny.toml`, `schemas/clickhouse/**`) do not alter
-# clippy lint diagnostics and are compiled/tested by their owning test lanes.
+# root-crate test and example targets, build-graph inputs, and `clippy.toml`.
+# Pure non-Rust data/contract files (`CHANGELOG.md`, `openapi.yaml`,
+# `ferrum.conf`, `docs/prometheus_*`, `deny.toml`, `schemas/clickhouse/**`) do
+# not alter clippy lint diagnostics and are compiled/tested by their owning
+# test lanes.
 LINT_PATTERNS = [
     re.compile(pattern)
     for pattern in (
         *RUST_BUILD_GRAPH_PATTERNS,
         r"^src/",
         r"^tests/(?!k8s/|performance/)",
+        r"^examples/.*\.rs$",
         r"^clippy\.toml$",
     )
 ]
 
 # `run_integration`: the in-process `integration_tests` shards
 # (`conditional-live-stores`, `admin-platform`, `mesh-protocols`). Runs on Rust
-# source, `tests/integration/**`, shared test helpers/fixtures, `openapi.yaml`
+# source, `tests/integration/**`, `tests/unit/plugins/jwks_auth_support.rs`
+# (`#[path]`-included by `mesh_ext_authz_custom_tests.rs`), shared test
+# helpers/fixtures, `ferrum.conf`, `openapi.yaml`
 # (`admin_backend_egress_policy_tests.rs`), `schemas/clickhouse/`
 # (`api_chargeback_sink_tests.rs`), and the build graph.
 INTEGRATION_PATTERNS = [
@@ -907,14 +915,17 @@ INTEGRATION_PATTERNS = [
         r"^src/",
         r"^tests/integration/",
         r"^tests/integration_tests\.rs$",
+        r"^tests/unit/plugins/jwks_auth_support\.rs$",
         r"^schemas/clickhouse/",
         r"^openapi\.yaml$",
+        r"^ferrum\.conf$",
     )
 ]
 
 # `run_functional`: the live-binary `functional_tests` shards. Runs on Rust
 # source, `tests/functional/**`, `tests/functional_tests.rs`, shared test
-# helpers/fixtures, and the build graph.
+# helpers/fixtures, `ferrum.conf` (spawned gateways in the checkout read
+# `./ferrum.conf` by default), and the build graph.
 FUNCTIONAL_PATTERNS = [
     re.compile(pattern)
     for pattern in (
@@ -923,26 +934,31 @@ FUNCTIONAL_PATTERNS = [
         r"^src/",
         r"^tests/functional/",
         r"^tests/functional_tests\.rs$",
+        r"^ferrum\.conf$",
     )
 ]
 
-# `run_plugin_hardening_redis`: dedicated two-replica live-Redis regression job
-# covering `request_deduplication`, `hmac_auth` v2, and `dpop` shared replay
-# authority (all eight tests live in
-# `tests/functional/functional_redis_rate_limiting_test.rs`). Runs on those
-# plugins, shared plugin/proxy/config/runtime/TLS/util surfaces, that test file,
-# shared test helpers/fixtures, and the build graph; skipped on unrelated
-# plugins (`src/plugins/cors.rs`, `src/plugins/ai_*.rs`, ...) and non-Redis
-# subsystems on PRs while still running on every push to `main`.
+# `run_plugin_hardening_redis`: dedicated live-Redis regression job covering
+# `request_deduplication`, `hmac_auth` v2, `dpop` (with `jwks_auth`), HTTP/WS/AI
+# `rate_limiting`, and `ai_semantic_cache` Redis quarantine compare-delete
+# (plus `ai_transcript_audit`, `response_mock`, and `serverless_function`
+# configured by the deduplication tests). Runs on those plugins, shared
+# plugin/proxy/config/runtime/TLS/util surfaces, the owning test files, shared
+# test helpers/fixtures, `ferrum.conf`, and the build graph; skipped on
+# unrelated plugins (`src/plugins/cors.rs`, `src/plugins/jwt_auth.rs`, ...) and
+# non-Redis subsystems (`src/admin/`, `src/dns/`, ...) on PRs while still
+# running on every push to `main`.
 PLUGIN_HARDENING_REDIS_PATTERNS = [
     re.compile(pattern)
     for pattern in (
         *RUST_BUILD_GRAPH_PATTERNS,
         *SHARED_TEST_SUPPORT_PATTERNS,
         r"^tests/functional/functional_redis_rate_limiting_test\.rs$",
+        r"^tests/functional/functional_ai_plugins_test\.rs$",
         r"^tests/functional/mod\.rs$",
         r"^tests/functional_tests\.rs$",
-        r"^src/plugins/(?:request_deduplication|hmac_auth|dpop|mod)\.rs$",
+        r"^ferrum\.conf$",
+        r"^src/plugins/(?:request_deduplication|hmac_auth|dpop|jwks_auth|rate_limiting|ws_rate_limiting|ai_rate_limiter|ai_semantic_cache|ai_transcript_audit|response_mock|serverless_function|mod)\.rs$",
         r"^src/plugins/utils/",
         r"^src/(?:lib|main|cli|gateway_entry|startup|plugin_cache|router_cache|consumer_index|connection_pool|retry|diagnostic_ref)\.rs$",
         r"^src/(?:config|modes|proxy|pool|tls|fips|util)/",
@@ -1256,7 +1272,12 @@ def job_gate_paths_are_classifiable(changed_files: list[str]) -> bool:
     return all(is_classifiable_repo_path(path) for path in changed_files)
 
 
-def select_job_gates(event_name: str, changed_files: list[str]) -> dict[str, bool]:
+def select_job_gates(
+    event_name: str,
+    changed_files: list[str],
+    *,
+    granular_gates: bool = True,
+) -> dict[str, bool]:
     if not is_path_gated_event(event_name) or not changed_files:
         return {name: True for name in JOB_GATE_NAMES}
 
@@ -1279,6 +1300,27 @@ def select_job_gates(event_name: str, changed_files: list[str]) -> dict[str, boo
     run_plugin_hardening_redis = any_path_matches(
         PLUGIN_HARDENING_REDIS_PATTERNS, changed_files
     )
+    run_vendor_patches = any_path_matches(VENDOR_PATCH_PATTERNS, changed_files)
+
+    # Older un-rebased PR workflows do not opt into `FERRUM_CI_PLAN_GRANULAR_GATES=1`
+    # and read `run_rust` for `lint`, `test-integration`, `test-functional`, and
+    # `plugin-hardening-redis-regression`. Preserve the legacy broad `run_rust`
+    # union for those callers so an un-rebased PR editing e.g. `clippy.toml` or
+    # `schemas/clickhouse/` can never silently skip its check.
+    if not granular_gates:
+        legacy_rust = (
+            run_rust
+            or run_lint
+            or run_integration
+            or run_functional
+            or run_plugin_hardening_redis
+        )
+        run_rust = legacy_rust
+        run_lint = legacy_rust
+        run_integration = legacy_rust
+        run_functional = legacy_rust
+        run_plugin_hardening_redis = legacy_rust
+
     return {
         "run_helm": run_helm,
         "run_ebpf_kernel_live": any_path_matches(
@@ -1301,13 +1343,14 @@ def select_job_gates(event_name: str, changed_files: list[str]) -> dict[str, boo
         "run_functional": run_functional,
         "run_plugin_hardening_redis": run_plugin_hardening_redis,
         # The debug binaries + nextest archives feed integration, functional,
-        # plugin-hardening Redis, and Helm chart jobs; schedule only when at
-        # least one downstream consumer is active.
+        # plugin-hardening Redis, Helm chart, and vendored-patch regression
+        # jobs; schedule only when at least one downstream consumer is active.
         "run_artifacts": (
             run_integration
             or run_functional
             or run_plugin_hardening_redis
             or run_helm
+            or run_vendor_patches
         ),
         "run_acme": any_path_matches(ACME_PATTERNS, changed_files),
         "run_conformance": any_path_matches(CONFORMANCE_PATTERNS, changed_files),
@@ -1321,9 +1364,7 @@ def select_job_gates(event_name: str, changed_files: list[str]) -> dict[str, boo
         "run_platform_build": any_path_matches(
             PLATFORM_BUILD_PATTERNS, changed_files
         ),
-        "run_vendor_patches": any_path_matches(
-            VENDOR_PATCH_PATTERNS, changed_files
-        ),
+        "run_vendor_patches": run_vendor_patches,
         "run_dependency_audit": any_path_matches(
             DEPENDENCY_AUDIT_PATTERNS, changed_files
         ),
@@ -1364,7 +1405,10 @@ def parse_nul_changed_files(data: bytes) -> tuple[list[str], bool]:
 
 
 def plan_from_changed_bytes(
-    event_name: str, data: bytes
+    event_name: str,
+    data: bytes,
+    *,
+    granular_gates: bool = True,
 ) -> tuple[str, str, dict[str, bool], bool]:
     """Select mode and gates from a raw NUL changed-file stream.
 
@@ -1385,7 +1429,12 @@ def plan_from_changed_bytes(
             False,
         )
     mode, reason = select_mode(event_name, changed_files)
-    return mode, reason, select_job_gates(event_name, changed_files), True
+    return (
+        mode,
+        reason,
+        select_job_gates(event_name, changed_files, granular_gates=granular_gates),
+        True,
+    )
 
 
 def read_changed_files(path: Path | None) -> tuple[list[str], bool]:
@@ -1782,7 +1831,7 @@ def self_test() -> int:
             {
                 "run_helm": True,
                 "run_artifacts": True,
-                "run_rust": False,
+                "run_rust": True,
                 "run_lint": False,
                 "run_integration": False,
                 "run_functional": False,
@@ -1842,37 +1891,66 @@ def self_test() -> int:
         ("pull_request", ["src/plugins/request_deduplication.rs"], src_with_redis),
         ("pull_request", ["src/plugins/hmac_auth.rs"], src_with_redis),
         ("pull_request", ["src/plugins/dpop.rs"], src_with_redis),
+        ("pull_request", ["src/plugins/jwks_auth.rs"], src_with_redis),
+        ("pull_request", ["src/plugins/rate_limiting.rs"], src_with_redis),
+        ("pull_request", ["src/plugins/ai_semantic_cache.rs"], src_with_redis | {"run_standalone_cargo": True}),
+        ("pull_request", ["src/plugins/ai_transcript_audit.rs"], src_with_redis),
+        ("pull_request", ["src/plugins/response_mock.rs"], src_with_redis),
         ("pull_request", ["src/admin/handlers.rs"], src_no_redis),
         ("pull_request", ["tests/unit/plugins/cors_tests.rs"], unit_and_lint),
         (
             "pull_request",
+            ["tests/unit/plugins/jwks_auth_support.rs"],
+            unit_and_lint | {"run_integration": True, "run_artifacts": True},
+        ),
+        (
+            "pull_request",
+            ["tests/support/diagnostic_interest.rs"],
+            src_with_redis,
+        ),
+        ("pull_request", ["tests/config.yaml"], unit_and_lint),
+        ("pull_request", ["examples/hbone_perf_fixture.rs"], unit_and_lint),
+        (
+            "pull_request",
             ["tests/integration/admin_audit_rbac_tests.rs"],
-            all_false | {"run_integration": True, "run_lint": True, "run_artifacts": True},
+            unit_and_lint | {"run_integration": True, "run_artifacts": True},
         ),
         (
             "pull_request",
             ["tests/functional/functional_admin_test.rs"],
-            all_false
-            | {
-                "run_rust": True,
-                "run_lint": True,
-                "run_functional": True,
-                "run_artifacts": True,
-            },
+            unit_and_lint | {"run_functional": True, "run_artifacts": True},
         ),
         (
             "pull_request",
             ["tests/functional/functional_redis_rate_limiting_test.rs"],
-            all_false
+            unit_and_lint
             | {
-                "run_rust": True,
-                "run_lint": True,
                 "run_functional": True,
                 "run_plugin_hardening_redis": True,
                 "run_artifacts": True,
             },
         ),
-        ("pull_request", ["ferrum.conf"], unit_only),
+        (
+            "pull_request",
+            ["tests/functional/functional_ai_plugins_test.rs"],
+            unit_and_lint
+            | {
+                "run_functional": True,
+                "run_plugin_hardening_redis": True,
+                "run_artifacts": True,
+            },
+        ),
+        (
+            "pull_request",
+            ["ferrum.conf"],
+            unit_only
+            | {
+                "run_integration": True,
+                "run_functional": True,
+                "run_plugin_hardening_redis": True,
+                "run_artifacts": True,
+            },
+        ),
         (
             "pull_request",
             ["openapi.yaml"],
@@ -1976,7 +2054,7 @@ def self_test() -> int:
         (
             "pull_request",
             ["tests/acme_dns01/mod.rs"],
-            all_false | {"run_acme": True, "run_lint": True},
+            unit_and_lint | {"run_acme": True},
         ),
         (
             "pull_request",
@@ -1991,7 +2069,7 @@ def self_test() -> int:
         (
             "pull_request",
             ["tests/conformance/istio_virtual_service.rs"],
-            all_false | {"run_conformance": True, "run_lint": True},
+            unit_and_lint | {"run_conformance": True},
         ),
         (
             "pull_request",
@@ -2013,7 +2091,7 @@ def self_test() -> int:
         (
             "pull_request",
             ["tests/service_integration/ldap.rs"],
-            all_false | {"run_service_integration": True, "run_lint": True},
+            unit_and_lint | {"run_service_integration": True},
         ),
         (
             "pull_request",
@@ -2030,9 +2108,8 @@ def self_test() -> int:
         (
             "pull_request",
             ["tests/service_integration/common/host_ports.rs"],
-            all_false
+            unit_and_lint
             | {
-                "run_lint": True,
                 "run_service_integration": True,
                 "run_secrets_backends": True,
             },
@@ -2042,9 +2119,8 @@ def self_test() -> int:
         (
             "pull_request",
             ["tests/service_integration/common/container_retry.rs"],
-            all_false
+            unit_and_lint
             | {
-                "run_lint": True,
                 "run_service_integration": True,
                 "run_secrets_backends": True,
             },
@@ -2318,7 +2394,7 @@ def self_test() -> int:
         (
             "pull_request",
             ["tests/windows_confinement_tests.rs"],
-            all_false | {"run_lint": True},
+            unit_and_lint,
         ),
         # Gate controllers force every suite on.
         (
@@ -2345,6 +2421,72 @@ def self_test() -> int:
                     f"{event_name} {changed!r}: expected {gate}={expected_value}, "
                     f"selected {selected[gate]}"
                 )
+
+    # Legacy-caller contract: older un-rebased workflows that invoke the
+    # planner without `FERRUM_CI_PLAN_GRANULAR_GATES=1` rely on `run_rust`
+    # covering lint, integration, functional, and Redis regression.
+    for path in (
+        "clippy.toml",
+        "schemas/clickhouse/charges.sql",
+        "tests/unit/plugins/cors_tests.rs",
+        "CHANGELOG.md",
+    ):
+        legacy = select_job_gates("pull_request", [path], granular_gates=False)
+        if not (legacy["run_rust"] and legacy["run_artifacts"]):
+            failures.append(
+                f"legacy-caller contract failed for {path}: expected run_rust=True "
+                f"and run_artifacts=True, got {legacy!r}"
+            )
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        changed_file = Path(temp_dir) / "changed.z"
+        changed_file.write_bytes(b"clippy.toml\0")
+        planner_path = Path(__file__).resolve()
+        cli_cmd = [
+            sys.executable,
+            "-I",
+            "-c",
+            (
+                'import runpy, sys; sys.path.insert(0, sys.argv.pop(1)); '
+                'sys.argv[0] = sys.argv.pop(1); runpy.run_path(sys.argv[0], run_name="__main__")'
+            ),
+            str(planner_path.parent),
+            str(planner_path),
+            "--event-name",
+            "pull_request",
+            "--changed-files",
+            str(changed_file),
+        ]
+        base_env = {k: v for k, v in os.environ.items() if k != "FERRUM_CI_PLAN_GRANULAR_GATES"}
+        legacy_cli = subprocess.run(
+            cli_cmd,
+            env=base_env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if legacy_cli.returncode != 0 or "run_rust=true" not in legacy_cli.stdout.splitlines():
+            failures.append(
+                f"CLI without FERRUM_CI_PLAN_GRANULAR_GATES must emit legacy run_rust=true: "
+                f"rc={legacy_cli.returncode}, stdout={legacy_cli.stdout!r}, stderr={legacy_cli.stderr!r}"
+            )
+        granular_cli = subprocess.run(
+            cli_cmd,
+            env=base_env | {"FERRUM_CI_PLAN_GRANULAR_GATES": "1"},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        granular_lines = set(granular_cli.stdout.splitlines())
+        if granular_cli.returncode != 0 or not (
+            "run_lint=true" in granular_lines
+            and "run_rust=false" in granular_lines
+            and "run_artifacts=false" in granular_lines
+        ):
+            failures.append(
+                f"CLI with FERRUM_CI_PLAN_GRANULAR_GATES=1 must emit granular clippy-only gates: "
+                f"rc={granular_cli.returncode}, stdout={granular_cli.stdout!r}, stderr={granular_cli.stderr!r}"
+            )
 
     if live_suite_self_test() != 0:
         failures.append("live-suite path-filter self-test failed")
@@ -2373,8 +2515,9 @@ def main() -> int:
     data = b""
     if args.changed_files is not None:
         data = args.changed_files.read_bytes()
+    granular_gates = os.environ.get("FERRUM_CI_PLAN_GRANULAR_GATES") == "1"
     mode, reason, gates, paths_classifiable = plan_from_changed_bytes(
-        args.event_name, data
+        args.event_name, data, granular_gates=granular_gates
     )
     print(f"mode={mode}")
     # Workflow ci-plan treats this flag as a trust/transport version handshake:

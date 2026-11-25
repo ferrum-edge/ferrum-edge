@@ -278,23 +278,25 @@ jobs:
             planner_dir="$trusted_dir"
           fi
 
-          plan="$(python3 -I -c 'import runpy, sys; sys.path.insert(0, sys.argv.pop(1)); sys.argv[0] = sys.argv.pop(1); runpy.run_path(sys.argv[0], run_name="__main__")' "$planner_dir" "$planner" \
+          plan="$(FERRUM_CI_PLAN_GRANULAR_GATES=1 python3 -I -c 'import runpy, sys; sys.path.insert(0, sys.argv.pop(1)); sys.argv[0] = sys.argv.pop(1); runpy.run_path(sys.argv[0], run_name="__main__")' "$planner_dir" "$planner" \
             --event-name "$EVENT_NAME" \
             --changed-files "$changed_files")"
           mode="$(printf '%s\n' "$plan" | sed -n 's/^mode=//p')"
           reason="$(printf '%s\n' "$plan" | sed -n 's/^reason=//p')"
           paths_classifiable="$(printf '%s\n' "$plan" | sed -n 's/^paths_classifiable=//p')"
-          echo "mode=$mode" >> "$GITHUB_OUTPUT"
 
-          # paths_classifiable is a trust/transport version handshake. This
-          # introducing PR and its merge group execute the trusted-base
-          # planner, which is newline-only and does not emit the flag. That
-          # older planner can treat a NUL stream as one record and still emit
-          # syntactically valid false values for pre-existing Helm/mesh/eBPF
-          # gates. Unless the flag is exactly true, force every job gate on
+          # paths_classifiable is a trust/transport version handshake. An older
+          # newline-only trusted-base planner does not emit the flag and can
+          # treat a NUL stream as one record, emitting `mode=light` or
+          # syntactically valid false values for pre-existing gates. Unless the
+          # flag is exactly true, force both `mode=full` and every job gate on
           # before GITHUB_OUTPUT emission. Honor narrow true/false values only
           # after the new planner proves the NUL stream classifiable.
           # Missing/invalid individual outputs still fail closed to true.
+          if [ "$paths_classifiable" != "true" ]; then
+            mode="full"
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
           gate_fallbacks=()
           for gate in run_helm run_ebpf_kernel_live run_netns_capture_live run_two_cluster_live run_ebpf_build run_secrets_backends run_pkcs11 run_rust run_lint run_integration run_functional run_plugin_hardening_redis run_artifacts run_acme run_conformance run_service_integration run_ebpf_userspace run_fuzz_smoke run_platform_build run_vendor_patches run_dependency_audit run_standalone_cargo; do
             value="$(printf '%s\n' "$plan" | sed -n "s/^${gate}=//p")"
@@ -1184,8 +1186,13 @@ jobs:
         # consumers. When both integration and functional archives are needed
         # (ordinary `src/` PRs and every push to `main`), ONE Cargo invocation
         # compiles both nextest targets concurrently along with `ferrum-edge`
-        # and `ferrum-cni` (for `CARGO_BIN_EXE_*`). On test-suite-only or
-        # Helm-only PRs, omitting unneeded test crates saves 4–7 minutes.
+        # and `ferrum-cni` (for `CARGO_BIN_EXE_*`). On integration-only or
+        # functional-only PRs, omitting the unused test crate saves 4–7 minutes.
+        # On Helm-only PRs, compiling the tiny default-feature test target
+        # `k8s_istio_status_cas_live` builds `target/debug/ferrum-edge` inside
+        # the exact `ci-debug` test-feature dependency graph (reusing the cached
+        # dev-dependency units instead of compiling a second feature set with
+        # `cargo build --bin`).
         #
         # `cni_tests` launches `env!("CARGO_BIN_EXE_ferrum-cni")`, which
         # Cargo bakes in as target/debug/ferrum-cni under the workspace path
@@ -1194,9 +1201,9 @@ jobs:
         # any future runner/workspace/target-dir change. These binaries are
         # used only for tests; release producers keep their shipping profile.
         env:
-          NEED_INTEGRATION: ${{ needs.ci-plan.outputs.run_integration == 'true' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch' }}
+          NEED_INTEGRATION: ${{ needs.ci-plan.outputs.run_integration == 'true' || needs.ci-plan.outputs.run_vendor_patches == 'true' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch' }}
           NEED_FUNCTIONAL: ${{ needs.ci-plan.outputs.run_functional == 'true' || needs.ci-plan.outputs.run_plugin_hardening_redis == 'true' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch' }}
-          NEED_BINS: ${{ needs.ci-plan.outputs.run_functional == 'true' || needs.ci-plan.outputs.run_plugin_hardening_redis == 'true' || needs.ci-plan.outputs.run_helm == 'true' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch' }}
+          NEED_HELM_BIN: ${{ needs.ci-plan.outputs.run_helm == 'true' }}
         run: |
           set -euo pipefail
           if [ "$NEED_INTEGRATION" = "true" ] && [ "$NEED_FUNCTIONAL" = "true" ]; then
@@ -1205,15 +1212,15 @@ jobs:
             cargo test --no-run --test integration_tests
           elif [ "$NEED_FUNCTIONAL" = "true" ]; then
             cargo test --no-run --test functional_tests
-          elif [ "$NEED_BINS" = "true" ]; then
-            cargo build --bin ferrum-edge --bin ferrum-cni
+          elif [ "$NEED_HELM_BIN" = "true" ]; then
+            cargo test --no-run --test k8s_istio_status_cas_live
           else
             echo "::error::build-test-artifacts ran with no active artifact consumer" >&2
             exit 1
           fi
 
       - name: Build integration tests archive
-        if: needs.ci-plan.outputs.run_integration == 'true' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+        if: needs.ci-plan.outputs.run_integration == 'true' || needs.ci-plan.outputs.run_vendor_patches == 'true' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
         # Nextest archives are native binaries, so the file and artifact names
         # include runner OS/arch. Full debuginfo makes the archive hundreds of
         # MB larger and is omitted only from this transfer artifact.
@@ -1243,7 +1250,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload integration tests archive
-        if: needs.ci-plan.outputs.run_integration == 'true' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+        if: needs.ci-plan.outputs.run_integration == 'true' || needs.ci-plan.outputs.run_vendor_patches == 'true' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: integration-tests-archive-${{ runner.os }}-${{ runner.arch }}
@@ -1252,7 +1259,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload ferrum-cni binary
-        if: needs.ci-plan.outputs.run_functional == 'true' || needs.ci-plan.outputs.run_plugin_hardening_redis == 'true' || needs.ci-plan.outputs.run_helm == 'true' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+        if: needs.ci-plan.outputs.run_integration == 'true' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ferrum-cni-debug-${{ runner.os }}-${{ runner.arch }}

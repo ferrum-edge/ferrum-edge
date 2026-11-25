@@ -776,12 +776,12 @@ aggregate accepts a skipped job only when its gate was `false`:
 
 | Gate | Schedules | Pull-request trigger surface |
 |---|---|---|
-| `run_rust` | Unit Tests (`test-unit`) | `src/`, `tests/unit/`, `tests/unit*.rs`, `tests/functional/` (unit contract tests embed several functional sources), shared test helpers/fixtures/certs, `PERFORMANCE_TREE_WORKSPACE_INPUTS`, `custom_plugins/`, `ebpf/`, `proto/`, `vendor/`, Cargo/toolchain/`build.rs`/`build/`, `.config/nextest.toml`, `ferrum.conf`, `openapi.yaml`, `deny.toml`, `ci.yml`, the Rust setup actions, `run_unit_ci.py`/`test_unit_ci.py`, the Prometheus metric contract and reference (`docs/prometheus_metric_contract.json`, `docs/prometheus_metrics.md`), and `DOC_PARITY_TEST_INPUTS` (`CHANGELOG.md`, `docs/upgrade_guide.md`, `docs/migrations.md`) |
-| `run_lint` | Lint (`clippy --all-targets -D warnings`) | `src/`, root-crate `tests/` (except `tests/k8s/` and `tests/performance/`), `clippy.toml`, and build-graph inputs (skipped on pure release-note/OpenAPI/`ferrum.conf`/metric-doc PRs) |
-| `run_integration` | Integration Tests (`test-integration`) | `src/`, `tests/integration/`, `tests/integration_tests.rs`, shared test helpers/fixtures/certs, `schemas/clickhouse/`, `openapi.yaml`, and build-graph inputs |
-| `run_functional` | Functional Tests (`test-functional`) | `src/`, `tests/functional/`, `tests/functional_tests.rs`, shared test helpers/fixtures/certs, and build-graph inputs |
-| `run_plugin_hardening_redis` | Plugin Hardening Redis Regression | `src/plugins/{request_deduplication,hmac_auth,dpop,mod}.rs`, `src/plugins/utils/`, core proxy/config/modes/TLS/pool/util modules, `tests/functional/functional_redis_rate_limiting_test.rs`, shared test helpers/fixtures/certs, and build-graph inputs (skipped on unrelated plugins and non-Redis subsystems on PRs; runs on every push to `main`) |
-| `run_artifacts` | Build Test Artifacts (selective targets) | `run_integration`, `run_functional`, `run_plugin_hardening_redis`, or `run_helm`; compiles and archives only the test targets and binaries required by active downstream consumers (all targets on `push` to `main` and `workflow_dispatch`) |
+| `run_rust` | Unit Tests (`test-unit`) | `src/`, root-crate `tests/` (except `tests/k8s/` and `tests/performance/`), `charts/` (`chart_helpers_parity_tests.rs`), `examples/hbone_perf_fixture.rs`, `PERFORMANCE_TREE_WORKSPACE_INPUTS`, `custom_plugins/`, `ebpf/`, `proto/`, `vendor/`, Cargo/toolchain/`build.rs`/`build/`, `.config/nextest.toml`, `ferrum.conf`, `openapi.yaml`, `deny.toml`, `ci.yml`, the Rust setup actions, `run_unit_ci.py`/`test_unit_ci.py`, the Prometheus metric contract and reference (`docs/prometheus_metric_contract.json`, `docs/prometheus_metrics.md`), and `DOC_PARITY_TEST_INPUTS` (`CHANGELOG.md`, `docs/upgrade_guide.md`, `docs/migrations.md`) |
+| `run_lint` | Lint (`clippy --all-targets -D warnings`) | `src/`, root-crate `tests/` (except `tests/k8s/` and `tests/performance/`), `examples/*.rs`, `clippy.toml`, and build-graph inputs (skipped on pure release-note/OpenAPI/`ferrum.conf`/metric-doc/ClickHouse-DDL PRs) |
+| `run_integration` | Integration Tests (`test-integration`) | `src/`, `tests/integration/`, `tests/integration_tests.rs`, `tests/unit/plugins/jwks_auth_support.rs`, shared test helpers/fixtures/certs (`tests/{common,scaffolding,support,fixtures,certs}/`), `schemas/clickhouse/`, `openapi.yaml`, `ferrum.conf`, and build-graph inputs |
+| `run_functional` | Functional Tests (`test-functional`) | `src/`, `tests/functional/`, `tests/functional_tests.rs`, shared test helpers/fixtures/certs (`tests/{common,scaffolding,support,fixtures,certs}/`), `ferrum.conf`, and build-graph inputs |
+| `run_plugin_hardening_redis` | Plugin Hardening Redis Regression | `src/plugins/{request_deduplication,hmac_auth,dpop,jwks_auth,rate_limiting,ws_rate_limiting,ai_rate_limiter,ai_semantic_cache,ai_transcript_audit,response_mock,serverless_function,mod}.rs`, `src/plugins/utils/`, core proxy/config/modes/TLS/pool/util modules, `tests/functional/functional_redis_rate_limiting_test.rs`, `tests/functional/functional_ai_plugins_test.rs`, shared test helpers/fixtures/certs, `ferrum.conf`, and build-graph inputs (skipped on unrelated plugins and non-Redis subsystems on PRs; runs on every push to `main`) |
+| `run_artifacts` | Build Test Artifacts (selective targets) | `run_integration`, `run_functional`, `run_plugin_hardening_redis`, `run_helm`, or `run_vendor_patches`; compiles and archives only the test targets and binaries required by active downstream consumers (all targets on `push` to `main` and `workflow_dispatch`) |
 | `run_acme` | ACME Feature Tests (`--features acme`, own job) | `src/tls/`, `tests/acme_dns01/`, `tests/unit/tls/`, build graph |
 | `run_conformance` | Mesh Conformance Tests | `tests/conformance/`, mesh/xDS/k8s translation modules, build graph |
 | `run_service_integration` | Service Integration (testcontainers) | `tests/service_integration/`, service discovery, the LDAP/Kafka/OIDC/introspection/chargeback plugins, DB loaders, build graph |
@@ -1339,12 +1339,16 @@ cargo nextest run --archive-file integration-tests-*.tar.zst \
   integration::admin_conditional_write_tests::mysql_conditional_restore_checks_state_and_lease_in_transaction \
   integration::admin_conditional_write_tests::mongo_replica_set_conditional_restore_checks_state_and_lease_in_transaction
 
-# build-test-artifacts (one job/cache for both archives and both binaries).
+# build-test-artifacts (one job/cache; compiles and archives only the targets
+# needed by active downstream consumers, or both on push to main / dispatch).
 # The test build also produces target/debug/ferrum-edge and ferrum-cni;
 # see "Test artifact producer: one test-feature build".
-cargo test --no-run --test integration_tests --test functional_tests
-cargo nextest archive --test integration_tests ...
-cargo nextest archive --test functional_tests ...
+cargo test --no-run --test integration_tests --test functional_tests   # both needed
+# or: cargo test --no-run --test integration_tests                     # integration/vendor only
+# or: cargo test --no-run --test functional_tests                      # functional/Redis only
+# or: cargo test --no-run --test k8s_istio_status_cas_live             # Helm-only (same ci-debug feature set)
+cargo nextest archive --test integration_tests ...                     # when integration/vendor needed
+cargo nextest archive --test functional_tests ...                      # when functional/Redis needed
 
 # test-functional-{application,protocols,data-plane,data-plane-runtime}
 cargo nextest run --archive-file functional-tests-*.tar.zst \
@@ -1512,9 +1516,12 @@ stripped of newlines and backticks before they are written.
   declared shard filters in `ci.yml`. Adding a new `mod foo_tests` without
   wiring it into a shard fails this silent-skip guard.
 - Functional tests split across four shards (`application`, `protocols`,
-  `data-plane`, `data-plane-runtime`). `build-test-artifacts` compiles both
-  test targets in one Cargo invocation, which also builds the gateway and CNI
-  binaries, then packages both nextest archives in the same job/cache. Each
+  `data-plane`, `data-plane-runtime`). `build-test-artifacts` compiles only the
+  test targets required by active downstream consumers in one Cargo invocation
+  (both `integration_tests` and `functional_tests` when both lanes are active
+  or on `push` to `main`/`workflow_dispatch`, which also builds the gateway and
+  CNI binaries), then packages only the needed nextest archives in the same
+  job/cache. Each
   functional shard downloads the existing OS/architecture-keyed artifacts with
   `FERRUM_SKIP_GATEWAY_BUILD=1`. The two data-plane shards (`data_services:
   true`) remain serialized with `nextest_jobs: 1` and are the only shards that
@@ -3977,9 +3984,16 @@ Design notes and measurements behind specific CI changes.
 ### Test artifact producer: one test-feature build
 
 `Build Test Artifacts` gates every integration shard, functional shard, the
-Redis regression, and Helm Chart. It runs one
-`cargo test --no-run --test integration_tests --test functional_tests`, then
-packages each nextest archive from the already-fresh units.
+Redis regression, Vendored Patch Regressions, and Helm Chart. It runs one
+`cargo test --no-run` command covering only the targets required by active
+downstream consumers (`--test integration_tests --test functional_tests` when
+both lanes are active or on `push` to `main`/`workflow_dispatch`;
+`--test integration_tests` for integration/vendor-only PRs;
+`--test functional_tests` for functional/Redis-only PRs; or the small
+default-feature `--test k8s_istio_status_cas_live` target on Helm-only PRs so
+the gateway binary stays inside the cached `ci-debug` test-feature graph), then
+packages and uploads only the needed nextest archives and binaries from the
+already-fresh units.
 
 Removing the separate `cargo build --bin ferrum-edge` / `--bin ferrum-cni` steps
 does not change the binaries that ship to consumers:

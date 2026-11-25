@@ -623,6 +623,109 @@ def workflow_event_body(workflow_yml: str, event: str) -> str | None:
     return "".join(lines[event_start + 1 : event_end])
 
 
+def _split_job_steps(job_body: str) -> list[str]:
+    """Split a job body's `steps:` section into raw per-step YAML chunks."""
+
+    match = re.search(r"(?m)^    steps:\s*$", job_body)
+    if not match:
+        return []
+    steps_text = job_body[match.end() :]
+    starts = [m.start() for m in re.finditer(r"(?m)^      - ", steps_text)]
+    if not starts:
+        return []
+    return [
+        steps_text[starts[i] : (starts[i + 1] if i + 1 < len(starts) else len(steps_text))]
+        for i in range(len(starts))
+    ]
+
+
+def test_artifact_consumer_wiring_errors(ci_yml: str) -> list[str]:
+    """Verify every consumer download of a build-test-artifacts output is produced."""
+
+    errors: list[str] = []
+    producer_body = extract_job_body(ci_yml, "build-test-artifacts")
+    producer_steps = _split_job_steps(producer_body)
+
+    # Map artifact name prefix -> upload step chunk, archive step chunk, and
+    # build-step env var that guarantees compilation.
+    artifact_upload_if: dict[str, str] = {}
+    step_by_name: dict[str, str] = {}
+    for step in producer_steps:
+        name_m = re.search(r"(?m)^      - name:\s*(.+?)\s*$", step)
+        if name_m:
+            step_by_name[name_m.group(1)] = step
+        if "uses: actions/upload-artifact@" in step:
+            art_m = re.search(r"(?m)^\s+name:\s*([A-Za-z0-9_.-]+?)(?:-\$\{\{|\s*$)", step)
+            if_m = re.search(r"(?m)^        if:\s*(.+?)\s*$", step)
+            if art_m:
+                artifact_upload_if[art_m.group(1)] = if_m.group(1) if if_m else "ALWAYS"
+
+    expected_artifacts = {
+        "ferrum-edge-debug": (None, ("NEED_FUNCTIONAL", "NEED_HELM_BIN")),
+        "ferrum-cni-debug": (None, ("NEED_INTEGRATION",)),
+        "integration-tests-archive": ("Build integration tests archive", ("NEED_INTEGRATION",)),
+        "functional-tests-archive": ("Build functional tests archive", ("NEED_FUNCTIONAL",)),
+    }
+    build_step = step_by_name.get("Build test targets and binaries", "")
+    if not build_step:
+        return ["jobs.build-test-artifacts is missing step `Build test targets and binaries`"]
+
+    build_env: dict[str, str] = {}
+    for env_key in ("NEED_INTEGRATION", "NEED_FUNCTIONAL", "NEED_HELM_BIN"):
+        env_m = re.search(rf"(?m)^\s+{env_key}:\s*(.+?)\s*$", build_step)
+        if not env_m:
+            errors.append(
+                f"jobs.build-test-artifacts build step is missing env `{env_key}`"
+            )
+        else:
+            build_env[env_key] = env_m.group(1)
+
+    for art_prefix in expected_artifacts:
+        if art_prefix not in artifact_upload_if:
+            errors.append(
+                f"jobs.build-test-artifacts is missing upload step for `{art_prefix}`"
+            )
+
+    # Scan every path-gated job in ci.yml for downloads of producer artifacts.
+    for job, gate in sorted(PATH_GATED_JOBS.items()):
+        if job == "build-test-artifacts":
+            continue
+        job_body = extract_job_body(ci_yml, job)
+        gate_expr = f"needs.ci-plan.outputs.{gate} == 'true'"
+        for step in _split_job_steps(job_body):
+            if "uses: actions/download-artifact@" not in step:
+                continue
+            art_m = re.search(r"(?m)^\s+name:\s*([A-Za-z0-9_.-]+?)(?:-\$\{\{|\s*$)", step)
+            if not art_m:
+                continue
+            art_prefix = art_m.group(1)
+            if art_prefix not in expected_artifacts:
+                continue
+            upload_if = artifact_upload_if.get(art_prefix, "")
+            if upload_if != "ALWAYS" and gate_expr not in upload_if:
+                errors.append(
+                    f"jobs.{job} ({gate}) downloads `{art_prefix}`, but "
+                    f"jobs.build-test-artifacts upload condition `{upload_if}` does not include `{gate_expr}`"
+                )
+            archive_step_name, build_vars = expected_artifacts[art_prefix]
+            if archive_step_name is not None:
+                archive_step = step_by_name.get(archive_step_name, "")
+                archive_if_m = re.search(r"(?m)^        if:\s*(.+?)\s*$", archive_step)
+                archive_if = archive_if_m.group(1) if archive_if_m else ""
+                if gate_expr not in archive_if:
+                    errors.append(
+                        f"jobs.{job} ({gate}) downloads `{art_prefix}`, but "
+                        f"step `{archive_step_name}` if-condition does not include `{gate_expr}`"
+                    )
+            if not any(gate_expr in build_env.get(var, "") for var in build_vars):
+                errors.append(
+                    f"jobs.{job} ({gate}) downloads `{art_prefix}`, but "
+                    f"jobs.build-test-artifacts build env {build_vars} does not include `{gate_expr}`"
+                )
+
+    return errors
+
+
 def pull_request_trigger_is_unconditional(workflow_yml: str) -> bool:
     body = workflow_event_body(workflow_yml, "pull_request")
     if body is None:
@@ -2206,6 +2309,28 @@ def main() -> int:
     for job in sorted(REMOVED_JOBS):
         if re.search(rf"(?m)^  {re.escape(job)}:$", ci_yml):
             planner_errors.append(f"consolidated jobs.{job} must not remain in ci.yml")
+
+    # Every consumer job that downloads an artifact produced by
+    # `build-test-artifacts` must have its gate covered by the matching build,
+    # archive, and upload conditions so a selective PR plan never fails on a
+    # missing download.
+    planner_errors.extend(test_artifact_consumer_wiring_errors(ci_yml))
+
+    # `ci-plan` must opt into granular gates via env var (preserving legacy
+    # `run_rust` for un-rebased PR workflows) and fail closed to `mode=full`
+    # before writing `mode` to GITHUB_OUTPUT when `paths_classifiable != true`.
+    plan_body = extract_job_body(ci_yml, "ci-plan")
+    if "FERRUM_CI_PLAN_GRANULAR_GATES=1" not in plan_body:
+        planner_errors.append(
+            "jobs.ci-plan must set FERRUM_CI_PLAN_GRANULAR_GATES=1 when invoking pr_ci_plan.py"
+        )
+    mode_force_idx = plan_body.find('if [ "$paths_classifiable" != "true" ]; then\n            mode="full"')
+    mode_emit_idx = plan_body.find('echo "mode=$mode" >> "$GITHUB_OUTPUT"')
+    if mode_force_idx < 0 or mode_emit_idx < 0 or mode_force_idx > mode_emit_idx:
+        planner_errors.append(
+            "jobs.ci-plan must force mode=full when paths_classifiable != true "
+            "before emitting mode to GITHUB_OUTPUT"
+        )
 
     for workflow_path, required_check in DEDICATED_REQUIRED_CHECKS.items():
         workflow_yml = Path(workflow_path).read_text(encoding="utf-8")
