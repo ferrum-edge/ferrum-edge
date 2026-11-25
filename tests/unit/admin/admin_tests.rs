@@ -1713,7 +1713,7 @@ async fn admin_response_budget_chunks_holds_permit_and_rejects_oversized_payload
     );
     assert!(
         shrink_and_grow_ok,
-        "provisional reservation must shrink cleanly and reject overflow growth"
+        "budget reservation must shrink/grow cleanly and reject overflow growth"
     );
 
     // Preflight must atomically reserve budget (returning 503 when remaining

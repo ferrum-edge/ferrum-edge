@@ -2697,7 +2697,7 @@ async fn spec_content_response_async(
     request_headers: &hyper::HeaderMap,
     max_decompress_bytes: usize,
     read_permit: tokio::sync::OwnedSemaphorePermit,
-    budget_reservation: Option<crate::admin::ResponseBodyBudgetReservation>,
+    mut budget_reservation: Option<crate::admin::ResponseBodyBudgetReservation>,
 ) -> Response<Full<Bytes>> {
     // Content negotiation FIRST — the ETag must be representation-specific so
     // a cached YAML ETag does not produce a false 304 when the client requests
@@ -2728,6 +2728,24 @@ async fn spec_content_response_async(
         max_decompress_bytes,
     ) {
         return not_modified_response(&etag);
+    }
+
+    // Re-check size cap and grow the connection budget reservation BEFORE
+    // decoding in case a concurrent `PUT /api-specs/{id}` replaced a small
+    // spec with a larger one between metadata preflight and content fetch.
+    if spec.uncompressed_size > max_decompress_bytes as u64 {
+        return json_resp(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({"error": "spec content corrupt or oversized"}),
+        );
+    }
+    if let Some(reservation) = budget_reservation.as_mut()
+        && spec.uncompressed_size > 0
+        && !usize::try_from(spec.uncompressed_size)
+            .ok()
+            .is_some_and(|bytes| reservation.try_grow_to_bytes(bytes))
+    {
+        return spec_response_budget_unavailable_response();
     }
 
     // Offload gzip decompression + optional YAML/JSON conversion to the
@@ -3789,18 +3807,12 @@ pub async fn handle_get_api_spec(
     // `uncompressed_size`) BEFORE acquiring one of the four process-wide read
     // codec slots or loading the compressed blob:
     // - Short-circuits `404`, `406`, `304` (exact ETag or verbatim `*` within
-    //   cap), and `500` (stored row above decompression cap).
+    //   cap), and `500` (stored row above decompression cap) even when the
+    //   connection budget is currently full.
     // - Atomically reserves only this spec's `uncompressed_size` from the
     //   connection budget so concurrent small spec reads over one HTTP/2
     //   connection proceed in parallel while reads exceeding remaining budget
     //   fail fast with `503` without occupying global codec slots.
-    if !has_if_none_match
-        && response_budget
-            .as_ref()
-            .is_some_and(crate::admin::AdminConnResponseBudget::is_exhausted)
-    {
-        return Ok(spec_response_budget_unavailable_response());
-    }
     let budget_reservation = if has_if_none_match || response_budget.is_some() {
         let meta = match db.get_api_spec_conditional_meta(namespace, id).await {
             Ok(Some(meta)) => meta,
@@ -3869,13 +3881,6 @@ pub async fn handle_get_api_spec_by_proxy(
         .cloned();
     let max_decompress = max_spec_decompress_bytes(state.admin_spec_max_body_size_mib);
 
-    if !has_if_none_match
-        && response_budget
-            .as_ref()
-            .is_some_and(crate::admin::AdminConnResponseBudget::is_exhausted)
-    {
-        return Ok(spec_response_budget_unavailable_response());
-    }
     let budget_reservation = if has_if_none_match || response_budget.is_some() {
         let meta = match db
             .get_api_spec_conditional_meta_by_proxy(namespace, proxy_id)

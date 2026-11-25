@@ -136,8 +136,8 @@ pub mod _test_support {
     }
 
     /// Test helper verifying strict per-connection response budget enforcement
-    /// without clamping oversized payloads, plus provisional reservation
-    /// shrink/grow adjustments.
+    /// without clamping oversized payloads, plus reservation shrink/grow
+    /// adjustments.
     pub fn check_admin_response_budget_limits_for_test(
         capacity_kib: u32,
         oversized_bytes: usize,

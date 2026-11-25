@@ -1481,10 +1481,6 @@ impl AdminConnResponseBudget {
         (kib <= self.capacity_kib).then_some(kib)
     }
 
-    pub(crate) fn is_exhausted(&self) -> bool {
-        self.semaphore.available_permits() == 0
-    }
-
     pub(crate) fn has_capacity_for_bytes(&self, bytes: usize) -> bool {
         self.cost_kib(bytes)
             .is_some_and(|cost| self.semaphore.available_permits() >= cost as usize)
@@ -1523,6 +1519,29 @@ pub(crate) struct ResponseBodyBudgetReservation {
 }
 
 impl ResponseBodyBudgetReservation {
+    /// Atomically grow this reservation up to `expected_bytes` before entering
+    /// the blocking decode step (for example if a concurrent `PUT` replaced a
+    /// small spec with a larger one between metadata preflight and content
+    /// fetch). Returns `false` if `expected_bytes` exceeds the connection
+    /// budget or the additional KiB are unavailable.
+    pub(crate) fn try_grow_to_bytes(&mut self, expected_bytes: usize) -> bool {
+        let Some(desired_kib) = self.budget.cost_kib(expected_bytes).map(|k| k as usize) else {
+            return false;
+        };
+        let current_kib = self.permit.num_permits();
+        if desired_kib <= current_kib {
+            return true;
+        }
+        let Ok(delta) = u32::try_from(desired_kib - current_kib) else {
+            return false;
+        };
+        let Ok(extra) = self.budget.semaphore.clone().try_acquire_many_owned(delta) else {
+            return false;
+        };
+        self.permit.merge(extra);
+        true
+    }
+
     /// Adjust this reservation to `actual_bytes`, releasing excess KiB
     /// immediately or atomically acquiring any positive delta without blocking.
     pub(crate) fn adjust_to_bytes(
@@ -1535,15 +1554,8 @@ impl ResponseBodyBudgetReservation {
             if let Some(excess) = self.permit.split(current_kib - desired_kib) {
                 drop(excess);
             }
-        } else if desired_kib > current_kib {
-            let delta = u32::try_from(desired_kib - current_kib).ok()?;
-            let extra = self
-                .budget
-                .semaphore
-                .clone()
-                .try_acquire_many_owned(delta)
-                .ok()?;
-            self.permit.merge(extra);
+        } else if desired_kib > current_kib && !self.try_grow_to_bytes(actual_bytes) {
+            return None;
         }
         Some(ResponseBodyBudgetPermit(Arc::new(self.permit)))
     }
@@ -1853,7 +1865,7 @@ pub(crate) async fn exercise_response_budget_wrapper_for_test(
 }
 
 /// Test helper verifying strict budget refusal when `bytes` exceeds capacity
-/// (no clamping bypass), provisional reservation shrink/grow adjustment, and
+/// (no clamping bypass), reservation shrink/grow adjustment, and
 /// `has_capacity_for_bytes` pre-check behavior.
 pub(crate) fn check_response_budget_limits_for_test(
     capacity_kib: u32,
