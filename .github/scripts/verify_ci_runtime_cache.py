@@ -4840,6 +4840,12 @@ def _cargo_steps_have_env_override(cargo_job: str, steps_section: str) -> bool:
             elif step_env is not None:
                 return True
         return False
+    for _indent, line in _iter_non_block_scalar_lines(steps_section):
+        decoded = _decode_mapping_line(line)
+        if decoded is not None and decoded[0] == 8 and decoded[1] == "env":
+            val_stripped = _yaml_strip_trailing_comment(decoded[2]).strip()
+            if val_stripped and not val_stripped.startswith("{"):
+                return True
     return _section_has_mapping_key_prefix(steps_section, ("CARGO", "RUST"))
 
 
@@ -5077,13 +5083,15 @@ def _extract_step_run_exec_lines(step: str) -> list[str] | None:
         decoded = _decode_mapping_line(line)
         if decoded is not None and decoded[0] == 8 and decoded[1] == "run":
             val_no_comment = _yaml_strip_trailing_comment(decoded[2]).strip()
-            if YAML_BLOCK_SCALAR.match(val_no_comment):
+            if re.match(r"^\|[0-9]?[-+]?$", val_no_comment):
                 end_idx = _skip_block_scalar(lines, idx + 1, 8)
                 return [
                     ln.strip()
                     for ln in lines[idx + 1 : end_idx]
                     if ln.strip() and not ln.lstrip().startswith("#")
                 ]
+            if val_no_comment.startswith(">"):
+                return None
             scalar = _decode_yaml_value_scalar(decoded[2])
             return [scalar.strip()] if scalar else []
     return None
@@ -8622,6 +8630,24 @@ def self_test() -> int:
             handoff_channel.replace(
                 "      - name: Audit every claimed FIPS feature combination\n",
                 "      - name: Audit every claimed FIPS feature combination\n        if: github.event_name == 'workflow_dispatch'\n",
+                1,
+            ),
+        ),
+        (
+            "feature-policy folded run: > block collapsing script into a comment",
+            "feature-policy audit step",
+            handoff_channel.replace(
+                "        run: |\n          set -euo pipefail\n          profiles_file=",
+                "        run: >\n          # comment\n          set -euo pipefail\n          profiles_file=",
+                1,
+            ),
+        ),
+        (
+            "step-level expression env on compile step",
+            "must not override CARGO_*/RUST* build/profile settings at step level",
+            handoff_channel.replace(
+                "      - name: Build the FIPS profile\n",
+                '      - name: Build the FIPS profile\n        env: ${{ fromJSON(\'{"CARGO_PROFILE_DEV_DEBUG":"1"}\') }}\n',
                 1,
             ),
         ),
