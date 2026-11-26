@@ -2369,8 +2369,10 @@ lines, each byte-exact and each anchored immediately after the trusted-base
 
 - `      - fuzz-smoke` in the aggregate `needs` list, after `      - lint`;
 - `add_row "Fuzz Smoke" "${{ needs.fuzz-smoke.result }}"`, after the `Lint` row;
-- `require_success "Fuzz Smoke" "${{ needs.fuzz-smoke.result }}"`, after the
-  `Lint` assertion.
+- `require_planned_gate "Fuzz Smoke" "${{ needs.fuzz-smoke.result }}" "${{ needs.ci-plan.outputs.run_fuzz_smoke }}"`,
+  immediately after the single exact `Lint` required-gate assertion line
+  (`CI_FUZZ_SMOKE_LINT_GATE_ANCHORS`, which accepts either the legacy `run_rust`
+  or granular `run_lint` gate expression during the granular-CI transition).
 
 Only those three lines are withheld, only when the `fuzz-smoke` job itself is
 present and byte-identical, and they are withheld from *both* sides of the

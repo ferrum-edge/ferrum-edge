@@ -3157,20 +3157,31 @@ CI_FUZZ_SMOKE_BUDGET_TEXTS = (
 # line, a tampered result expression, a relocated line, or any unrelated
 # aggregate edit leaves a digest difference or raises an error of its own.
 CI_AGGREGATE_JOB_NAME = "test"
+# Transition-safe Lint required-gate anchors: `origin/main` historically gated
+# Lint on `run_rust`, while granular PR CI planning gates Lint on `run_lint`.
+# Accepting either exact anchor lets the granular gate transition land without
+# weakening the positional anchor requirement for `fuzz-smoke`.
+# Retirement note: once PR #7495 (`run_lint`) lands on `main`, drop index 0
+# (`run_rust`) from this tuple and re-point the self-test fixture/mutation
+# references to `run_lint` so no legacy transition shim remains.
+CI_FUZZ_SMOKE_LINT_GATE_ANCHORS = (
+    '          require_planned_gate "Lint" "${{ needs.lint.result }}" "${{ needs.ci-plan.outputs.run_rust }}"\n',
+    '          require_planned_gate "Lint" "${{ needs.lint.result }}" "${{ needs.ci-plan.outputs.run_lint }}"\n',
+)
 CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS = (
     (
         "needs list",
-        "      - lint\n",
+        ("      - lint\n",),
         "      - fuzz-smoke\n",
     ),
     (
         "result summary row",
-        '          add_row "Lint" "${{ needs.lint.result }}"\n',
+        ('          add_row "Lint" "${{ needs.lint.result }}"\n',),
         '          add_row "Fuzz Smoke" "${{ needs.fuzz-smoke.result }}"\n',
     ),
     (
         "required-gate assertion",
-        '          require_planned_gate "Lint" "${{ needs.lint.result }}" "${{ needs.ci-plan.outputs.run_rust }}"\n',
+        CI_FUZZ_SMOKE_LINT_GATE_ANCHORS,
         '          require_planned_gate "Fuzz Smoke" "${{ needs.fuzz-smoke.result }}" "${{ needs.ci-plan.outputs.run_fuzz_smoke }}"\n',
     ),
 )
@@ -11991,24 +12002,36 @@ def ci_fuzz_smoke_aggregate_wiring(contents: str, source: str) -> FuzzAggregateW
         return FuzzAggregateWiring("absent", contents, [])
 
     errors: list[str] = []
-    withheld = block
-    for label, anchor, added in CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS:
-        occurrences = withheld.count(added)
-        if occurrences != 1:
+    lines = block.splitlines(keepends=True)
+    for label, anchors, added in CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS:
+        raw_occurrences = "".join(lines).count(added)
+        added_indices = [idx for idx, line in enumerate(lines) if line == added]
+        if raw_occurrences != 1 or len(added_indices) != 1:
             errors.append(
                 f"{source} job {CI_AGGREGATE_JOB_NAME!r} must carry the admitted "
                 f"{CI_FUZZ_SMOKE_JOB_NAME!r} {label} exactly once "
-                f"({added.strip()!r} appears {occurrences} times)"
+                f"({added.strip()!r} appears {raw_occurrences} times)"
             )
             continue
-        if withheld.count(anchor + added) != 1:
+        added_idx = added_indices[0]
+        anchor_desc = " or ".join(repr(anchor.strip()) for anchor in anchors)
+        if added_idx == 0 or lines[added_idx - 1] not in anchors:
             errors.append(
                 f"{source} job {CI_AGGREGATE_JOB_NAME!r} must place the admitted "
                 f"{CI_FUZZ_SMOKE_JOB_NAME!r} {label} immediately after "
-                f"{anchor.strip()!r}"
+                f"{anchor_desc}"
             )
             continue
-        withheld = withheld.replace(anchor + added, anchor, 1)
+        anchor_indices = [idx for idx, line in enumerate(lines) if line in anchors]
+        if len(anchor_indices) != 1:
+            errors.append(
+                f"{source} job {CI_AGGREGATE_JOB_NAME!r} must carry exactly one "
+                f"admitted {CI_FUZZ_SMOKE_JOB_NAME!r} {label} anchor "
+                f"({anchor_desc}; found {len(anchor_indices)})"
+            )
+            continue
+        del lines[added_idx]
+    withheld = "".join(lines)
     if not has_admitted_job:
         errors.append(
             f"{source} job {CI_AGGREGATE_JOB_NAME!r} requires the "
@@ -28825,7 +28848,8 @@ pre_build = []
         '          require_success "Native binaries" "${{ needs.build-binaries.result }}"\n'
     )
     aggregate_wired_job = aggregate_job
-    for _, aggregate_anchor, aggregate_added in CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS:
+    for _, aggregate_anchors, aggregate_added in CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS:
+        aggregate_anchor = aggregate_anchors[0]
         if aggregate_anchor not in aggregate_wired_job:
             failures.append(
                 "the aggregate self-test fixture no longer carries the anchor "
@@ -28914,6 +28938,77 @@ pre_build = []
         failures.append(
             "initial adoption of the byte-frozen fuzz job plus its required "
             "aggregate wiring was rejected"
+        )
+    # Granular Lint gate anchor (`run_lint`) must also be admitted for the
+    # `fuzz-smoke` required-gate assertion, while an unadmitted gate name is rejected.
+    aggregate_baseline_run_lint = aggregate_baseline.replace(
+        CI_FUZZ_SMOKE_LINT_GATE_ANCHORS[0],
+        CI_FUZZ_SMOKE_LINT_GATE_ANCHORS[1],
+        1,
+    )
+    aggregate_adopted_run_lint = aggregate_adopted.replace(
+        CI_FUZZ_SMOKE_LINT_GATE_ANCHORS[0],
+        CI_FUZZ_SMOKE_LINT_GATE_ANCHORS[1],
+        1,
+    )
+    run_lint_wiring = ci_fuzz_smoke_aggregate_wiring(
+        aggregate_adopted_run_lint,
+        "self-test CI workflow (run_lint)",
+    )
+    if run_lint_wiring.state != "present" or run_lint_wiring.errors:
+        failures.append(
+            "the admitted aggregate fuzz wiring with the granular run_lint anchor was rejected"
+        )
+    elif compare_pr_workflow_job(
+        aggregate_baseline_run_lint,
+        aggregate_adopted_run_lint,
+        "CI workflow",
+        "build-arm64-cross",
+    ):
+        failures.append(
+            "initial adoption of the byte-frozen fuzz job with the granular run_lint anchor was rejected"
+        )
+    unadmitted_anchor = aggregate_adopted.replace(
+        CI_FUZZ_SMOKE_LINT_GATE_ANCHORS[0],
+        '          require_planned_gate "Lint" "${{ needs.lint.result }}" "${{ needs.ci-plan.outputs.run_other }}"\n',
+        1,
+    )
+    unadmitted_wiring = ci_fuzz_smoke_aggregate_wiring(
+        unadmitted_anchor, "self-test CI workflow (unadmitted anchor)"
+    )
+    if unadmitted_wiring.state != "invalid" or not any(
+        "immediately after" in err for err in unadmitted_wiring.errors
+    ):
+        failures.append(
+            "an unadmitted Lint gate anchor before fuzz-smoke was not rejected"
+        )
+    stacked_lint_anchors = aggregate_adopted.replace(
+        CI_FUZZ_SMOKE_LINT_GATE_ANCHORS[0],
+        CI_FUZZ_SMOKE_LINT_GATE_ANCHORS[0] + CI_FUZZ_SMOKE_LINT_GATE_ANCHORS[1],
+        1,
+    )
+    stacked_wiring = ci_fuzz_smoke_aggregate_wiring(
+        stacked_lint_anchors, "self-test CI workflow (stacked anchors)"
+    )
+    if stacked_wiring.state != "invalid" or not any(
+        "exactly one admitted" in err for err in stacked_wiring.errors
+    ):
+        failures.append(
+            "stacking both run_rust and run_lint Lint gate anchors before fuzz-smoke was not rejected"
+        )
+    commented_lint_anchor = aggregate_adopted_run_lint.replace(
+        CI_FUZZ_SMOKE_LINT_GATE_ANCHORS[1],
+        "          # " + CI_FUZZ_SMOKE_LINT_GATE_ANCHORS[1],
+        1,
+    )
+    commented_wiring = ci_fuzz_smoke_aggregate_wiring(
+        commented_lint_anchor, "self-test CI workflow (commented anchor)"
+    )
+    if commented_wiring.state != "invalid" or not any(
+        "immediately after" in err for err in commented_wiring.errors
+    ):
+        failures.append(
+            "a comment-prefixed run_lint anchor before fuzz-smoke was not rejected"
         )
     # A generation transition, end to end: one revision moves the whole job
     # from the retired generation to the adopted one with the aggregate wiring
@@ -29049,7 +29144,7 @@ pre_build = []
             1,
         ),
         "dropped aggregate anchor": aggregate_adopted.replace(
-            CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS[2][1],
+            CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS[2][1][0],
             "",
             1,
         ),
