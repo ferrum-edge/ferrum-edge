@@ -1165,6 +1165,21 @@ impl ChronoParsedDateTime {
         self.unix_timestamp() * 1_000 + i64::from(self.nanosecond / 1_000_000)
     }
 
+    /// Unix nanoseconds, identical to chrono's `DateTime::timestamp_nanos_opt()`
+    /// (including its overflow behaviour and leap-second representation).
+    pub fn unix_timestamp_nanos_opt(&self) -> Option<i64> {
+        let mut timestamp = self.unix_timestamp();
+        let mut subsec_nanos = i64::from(self.nanosecond);
+        // Same negative-timestamp rearrangement as chrono (chrono#1289).
+        if timestamp < 0 {
+            subsec_nanos -= 1_000_000_000;
+            timestamp += 1;
+        }
+        timestamp
+            .checked_mul(1_000_000_000)?
+            .checked_add(subsec_nanos)
+    }
+
     /// Convert to a [`UtcTimestamp`].
     ///
     /// Fails with [`TimestampError::OutOfRange`] outside `UtcTimestamp`'s
