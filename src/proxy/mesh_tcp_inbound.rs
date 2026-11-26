@@ -656,7 +656,7 @@ async fn emit_disconnect(
     // The relay (or setup attempt) has ended. Do not retain admission capacity
     // while asynchronous disconnect observers flush logs and metrics.
     stream_ctx.release_admission_permits();
-    let disconnected_wall_at = chrono::Utc::now();
+    let disconnected_wall_at = crate::time_compat::UtcTimestamp::now();
     let summary = StreamTransactionSummary {
         namespace: proxy.namespace.clone(),
         proxy_id: proxy.id.clone(),
