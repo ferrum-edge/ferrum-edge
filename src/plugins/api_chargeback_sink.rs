@@ -8042,13 +8042,7 @@ impl SpoolManager {
             ));
         }
         self.evict_until_can_admit(incoming_len)?;
-        let today = crate::time_compat::UtcTimestamp::now().date();
-        let day = format!(
-            "{:04}{:02}{:02}",
-            today.year(),
-            u8::from(today.month()),
-            today.day()
-        );
+        let day = crate::time_compat::UtcTimestamp::now().to_compact_date();
         let dir = self.namespace_root.join(day);
         self.assert_managed_path(&dir)?;
         ensure_private_dir(&dir)?;

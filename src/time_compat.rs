@@ -225,6 +225,41 @@ impl UtcTimestamp {
         self.0.unix_timestamp() * 1_000 + i64::from(self.0.millisecond())
     }
 
+    /// Format as compact `YYYYMMDD`, matching chrono's
+    /// `format("%Y%m%d")` byte-for-byte (including chrono's explicit sign on
+    /// years outside `0..=9999`).
+    pub fn to_compact_date(&self) -> String {
+        let mut out = String::with_capacity(9);
+        let _ = self.write_compact_date(&mut out);
+        out
+    }
+
+    /// Format as compact `YYYYMMDDHHMMSS`, matching chrono's
+    /// `format("%Y%m%d%H%M%S")` byte-for-byte (including chrono's explicit
+    /// sign on years outside `0..=9999`).
+    pub fn to_compact_date_time(&self) -> String {
+        let mut out = String::with_capacity(15);
+        let _ = self.write_compact_date_time(&mut out);
+        out
+    }
+
+    fn write_compact_date_time(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        self.write_compact_date(f)?;
+        let dt = self.0;
+        write!(f, "{:02}{:02}{:02}", dt.hour(), dt.minute(), dt.second())
+    }
+
+    fn write_compact_date(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        let dt = self.0;
+        let year = dt.year();
+        if (0..=9999).contains(&year) {
+            write!(f, "{year:04}")?;
+        } else {
+            write!(f, "{year:+05}")?;
+        }
+        write!(f, "{:02}{:02}", u8::from(dt.month()), dt.day())
+    }
+
     /// Total nanoseconds since `1970-01-01T00:00:00Z`.
     #[inline]
     pub const fn unix_timestamp_nanos(&self) -> i128 {
