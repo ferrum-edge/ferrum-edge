@@ -21304,7 +21304,7 @@ async fn fire_ws_tunnel_disconnect_hooks_with_reason(
         return;
     }
     let disconnect_duration_ms = session_meta.session_start_mono.elapsed().as_millis() as f64;
-    let disconnected_at = chrono::Utc::now();
+    let disconnected_at = crate::time_compat::UtcTimestamp::now();
     let metadata = ws_disconnect_metadata(session_meta, termination_reason);
     let disconnect_ctx = crate::plugins::WsDisconnectContext {
         namespace: session_meta.namespace.clone(),
@@ -21368,7 +21368,7 @@ pub(crate) async fn fire_ws_framed_disconnect_hooks_with_reason(
         return;
     }
     let disconnect_duration_ms = session_meta.session_start_mono.elapsed().as_millis() as f64;
-    let disconnected_at = chrono::Utc::now();
+    let disconnected_at = crate::time_compat::UtcTimestamp::now();
     let metadata = ws_disconnect_metadata(&session_meta, termination_reason);
     let disconnect_ctx = crate::plugins::WsDisconnectContext {
         namespace: session_meta.namespace,
