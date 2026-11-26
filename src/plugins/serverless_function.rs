@@ -100,10 +100,10 @@
 //! }
 //! ```
 
+use crate::time_compat::UtcTimestamp;
 use async_trait::async_trait;
 use base64::Engine as _;
 use bytes::Bytes;
-use chrono::Utc;
 use http::header::{HeaderName, HeaderValue};
 use percent_encoding::percent_decode_str;
 use regex::Regex;
@@ -1294,7 +1294,7 @@ impl ServerlessFunction {
                             &refreshed
                         }
                     };
-                    let now = Utc::now();
+                    let now = UtcTimestamp::now();
                     let auth_headers =
                         sign_lambda_request(signing, &self.function_url, &payload_bytes, &now)
                             .map_err(|_| {
@@ -3957,7 +3957,7 @@ fn sign_lambda_request(
     config: &aws_sigv4::AwsSigV4Config,
     url_str: &str,
     payload: &[u8],
-    now: &chrono::DateTime<Utc>,
+    now: &UtcTimestamp,
 ) -> Result<Vec<(String, String)>, String> {
     aws_sigv4::sign_request(
         config,
@@ -3983,7 +3983,7 @@ pub mod test_helpers {
         aws_config: &Value,
         url: &str,
         payload: &[u8],
-        now: &chrono::DateTime<Utc>,
+        now: &UtcTimestamp,
     ) -> Result<Vec<(String, String)>, String> {
         let config = aws_sigv4::AwsSigV4Config {
             region: aws_config["region"]
