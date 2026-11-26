@@ -965,6 +965,9 @@ fn image_surfaces_are_scheduled_by_the_trusted_relevance_classifier() {
             [\"Dockerfile\"],
             {
                 \"run_helm\": True,
+                \"run_rust\": True,
+                \"run_integration\": True,
+                \"run_artifacts\": True,
                 \"run_ebpf_kernel_live\": False,
                 \"run_netns_capture_live\": False,
                 \"run_two_cluster_live\": False,

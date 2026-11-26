@@ -154,10 +154,10 @@ PATH_GATED_JOBS = {
     "test-pkcs11-softhsm": "run_pkcs11",
     "test-unit": "run_rust",
     "build-test-artifacts": "run_artifacts",
-    "test-integration": "run_rust",
-    "test-functional": "run_rust",
-    "plugin-hardening-redis-regression": "run_rust",
-    "lint": "run_rust",
+    "test-integration": "run_integration",
+    "test-functional": "run_functional",
+    "plugin-hardening-redis-regression": "run_plugin_hardening_redis",
+    "lint": "run_lint",
     "test-acme": "run_acme",
     "test-conformance": "run_conformance",
     "test-service-integration": "run_service_integration",
@@ -652,6 +652,800 @@ def workflow_event_body(workflow_yml: str, event: str) -> str | None:
         on_end,
     )
     return "".join(lines[event_start + 1 : event_end])
+
+
+def _split_job_steps(job_body: str) -> list[str]:
+    """Split a job body's `steps:` section into raw per-step YAML chunks."""
+
+    match = re.search(r"(?m)^    steps:\s*$", job_body)
+    if not match:
+        return []
+    steps_text = job_body[match.end() :]
+    starts = [m.start() for m in re.finditer(r"(?m)^      - ", steps_text)]
+    if not starts:
+        return []
+    return [
+        steps_text[starts[i] : (starts[i + 1] if i + 1 < len(starts) else len(steps_text))]
+        for i in range(len(starts))
+    ]
+
+
+def _split_top_level_or(expr: str) -> list[str]:
+    """Split a GitHub Actions expression on top-level `||` outside parens/quotes."""
+
+    parts: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    in_single = False
+    text = expr.strip()
+    if text.startswith("${{") and text.endswith("}}"):
+        text = text[3:-2].strip()
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "'":
+            in_single = not in_single
+            buf.append(ch)
+            i += 1
+        elif not in_single and ch == "(":
+            depth += 1
+            buf.append(ch)
+            i += 1
+        elif not in_single and ch == ")":
+            depth = max(0, depth - 1)
+            buf.append(ch)
+            i += 1
+        elif not in_single and depth == 0 and text[i : i + 2] == "||":
+            parts.append("".join(buf).strip())
+            buf = []
+            i += 2
+        else:
+            buf.append(ch)
+            i += 1
+    if buf:
+        parts.append("".join(buf).strip())
+    return parts
+
+
+def _term_is_exact_gate(term: str, gate: str) -> bool:
+    """Return True if a top-level OR term is unconditionally `needs.ci-plan.outputs.<gate> == 'true'`."""
+
+    cleaned = term.strip()
+    while cleaned.startswith("(") and cleaned.endswith(")"):
+        cleaned = cleaned[1:-1].strip()
+    expected = {
+        f"needs.ci-plan.outputs.{gate} == 'true'",
+        f"'true' == needs.ci-plan.outputs.{gate}",
+    }
+    return cleaned in expected
+
+
+def _expr_admits_gate(expr: str, gate: str) -> bool:
+    if expr == "ALWAYS":
+        return True
+    return any(_term_is_exact_gate(term, gate) for term in _split_top_level_or(expr))
+
+
+def _expr_admits_main_push(expr: str) -> bool:
+    if expr == "ALWAYS":
+        return True
+    for term in _split_top_level_or(expr):
+        cleaned = term.strip()
+        while cleaned.startswith("(") and cleaned.endswith(")"):
+            cleaned = cleaned[1:-1].strip()
+        if cleaned in {
+            "github.event_name == 'push' && github.ref == 'refs/heads/main'",
+            "github.ref == 'refs/heads/main' && github.event_name == 'push'",
+        }:
+            return True
+    return False
+
+
+def _load_workflow_jobs(ci_yml: str) -> tuple[dict[str, dict[object, object]] | None, str | None]:
+    """Parse an entire GitHub Actions workflow via PyYAML and return its `jobs` mapping."""
+
+    try:
+        import yaml  # type: ignore[import-untyped]
+    except ImportError:
+        return None, "PyYAML is required to validate build-test-artifacts consumer wiring"
+    try:
+        doc = yaml.safe_load(ci_yml)
+    except Exception as exc:
+        return None, f"unparseable workflow YAML: {exc}"
+    if not isinstance(doc, dict):
+        return None, "workflow YAML did not parse as a mapping"
+    raw_jobs = doc.get("jobs")
+    if not isinstance(raw_jobs, dict):
+        return None, "workflow YAML is missing a mapping `jobs:` section"
+    jobs: dict[str, dict[object, object]] = {}
+    for job_id, job_obj in raw_jobs.items():
+        if not isinstance(job_obj, dict):
+            return None, f"jobs.{job_id} must be a mapping"
+        jobs[str(job_id)] = job_obj
+    return jobs, None
+
+
+def _yaml_job_needs(job_obj: dict[object, object]) -> set[str]:
+    needs = job_obj.get("needs")
+    if isinstance(needs, str):
+        return {needs}
+    if isinstance(needs, list):
+        return {str(item) for item in needs}
+    return set()
+
+
+def test_artifact_consumer_wiring_errors(ci_yml: str) -> list[str]:
+    """Verify every consumer download of a build-test-artifacts output is produced."""
+
+    jobs, load_err = _load_workflow_jobs(ci_yml)
+    if load_err is not None or jobs is None:
+        return [load_err or "failed to parse workflow YAML"]
+
+    errors: list[str] = []
+    producer_job = jobs.get("build-test-artifacts")
+    if producer_job is None:
+        return ["jobs.build-test-artifacts is missing from ci.yml"]
+    producer_steps = producer_job.get("steps")
+    if not isinstance(producer_steps, list):
+        return ["jobs.build-test-artifacts is missing a list `steps:` section"]
+
+    # Map full artifact name -> upload step `if:` expression.
+    artifact_upload_if: dict[str, str] = {}
+    step_by_name: dict[str, dict[object, object]] = {}
+    for step in producer_steps:
+        if not isinstance(step, dict):
+            errors.append("jobs.build-test-artifacts contains a non-mapping step")
+            continue
+        step_name = step.get("name")
+        if isinstance(step_name, str):
+            step_by_name[step_name] = step
+        uses = step.get("uses")
+        if isinstance(uses, str) and uses.lower().startswith("actions/upload-artifact@"):
+            raw_with = step.get("with")
+            if isinstance(raw_with, dict) and raw_with.get("name") is not None:
+                art_name = str(raw_with["name"]).strip()
+                raw_if = step.get("if")
+                artifact_upload_if[art_name] = str(raw_if).strip() if raw_if is not None else "ALWAYS"
+
+    expected_artifacts = {
+        "ferrum-edge-debug-${{ runner.os }}-${{ runner.arch }}": (
+            None,
+            ("NEED_FUNCTIONAL", "NEED_HELM_BIN"),
+        ),
+        "ferrum-cni-debug-${{ runner.os }}-${{ runner.arch }}": (
+            None,
+            ("NEED_INTEGRATION",),
+        ),
+        "integration-tests-archive-${{ runner.os }}-${{ runner.arch }}": (
+            "Build integration tests archive",
+            ("NEED_INTEGRATION",),
+        ),
+        "functional-tests-archive-${{ runner.os }}-${{ runner.arch }}": (
+            "Build functional tests archive",
+            ("NEED_FUNCTIONAL",),
+        ),
+    }
+    build_step = step_by_name.get("Build test targets and binaries")
+    if build_step is None:
+        return ["jobs.build-test-artifacts is missing step `Build test targets and binaries`"]
+
+    raw_build_env = build_step.get("env")
+    build_env_dict = raw_build_env if isinstance(raw_build_env, dict) else {}
+    build_env: dict[str, str] = {}
+    for env_key in ("NEED_INTEGRATION", "NEED_FUNCTIONAL", "NEED_HELM_BIN"):
+        if env_key not in build_env_dict or build_env_dict[env_key] is None:
+            errors.append(
+                f"jobs.build-test-artifacts build step is missing env `{env_key}`"
+            )
+        else:
+            build_env[env_key] = str(build_env_dict[env_key]).strip()
+
+    required_build_branches = (
+        (
+            'if [ "$NEED_INTEGRATION" = "true" ] && [ "$NEED_FUNCTIONAL" = "true" ]; then',
+            "cargo test --no-run --test integration_tests --test functional_tests",
+        ),
+        (
+            'elif [ "$NEED_INTEGRATION" = "true" ]; then',
+            "cargo test --no-run --test integration_tests",
+        ),
+        (
+            'elif [ "$NEED_FUNCTIONAL" = "true" ]; then',
+            "cargo test --no-run --test functional_tests",
+        ),
+        (
+            'elif [ "$NEED_HELM_BIN" = "true" ]; then',
+            "cargo test --no-run --test k8s_istio_status_cas_live",
+        ),
+    )
+    build_run = build_step.get("run")
+    build_run_text = build_run if isinstance(build_run, str) else ""
+    build_exec_lines = [
+        line.strip()
+        for line in build_run_text.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    for branch_cond, required_cmd in required_build_branches:
+        matched_branch = False
+        for idx, line in enumerate(build_exec_lines[:-1]):
+            if line == branch_cond and build_exec_lines[idx + 1] == required_cmd:
+                matched_branch = True
+                break
+        if not matched_branch:
+            errors.append(
+                f"jobs.build-test-artifacts build step must execute `{required_cmd}` "
+                f"directly under `{branch_cond}`"
+            )
+
+    for full_name in expected_artifacts:
+        if full_name not in artifact_upload_if:
+            errors.append(
+                f"jobs.build-test-artifacts is missing upload step for `{full_name}`"
+            )
+
+    # Known non-OS-templated main-push consumer downloads (`main-linux-image` on Linux X64).
+    main_linux_aliases = {
+        "ferrum-edge-debug-Linux-X64": "ferrum-edge-debug-${{ runner.os }}-${{ runner.arch }}",
+        "ferrum-cni-debug-Linux-X64": "ferrum-cni-debug-${{ runner.os }}-${{ runner.arch }}",
+    }
+
+    # Explicit inventory of all jobs in ci.yml that consume `build-test-artifacts`
+    # and the exact canonical artifacts each job downloads.
+    expected_consumer_artifacts: dict[str, set[str]] = {
+        "test-integration": {
+            "integration-tests-archive-${{ runner.os }}-${{ runner.arch }}",
+            "ferrum-cni-debug-${{ runner.os }}-${{ runner.arch }}",
+        },
+        "test-vendor-patches": {
+            "integration-tests-archive-${{ runner.os }}-${{ runner.arch }}",
+        },
+        "test-functional": {
+            "ferrum-edge-debug-${{ runner.os }}-${{ runner.arch }}",
+            "functional-tests-archive-${{ runner.os }}-${{ runner.arch }}",
+        },
+        "plugin-hardening-redis-regression": {
+            "ferrum-edge-debug-${{ runner.os }}-${{ runner.arch }}",
+            "functional-tests-archive-${{ runner.os }}-${{ runner.arch }}",
+        },
+        "helm-chart": {
+            "ferrum-edge-debug-${{ runner.os }}-${{ runner.arch }}",
+        },
+        "main-linux-image": {
+            "ferrum-edge-debug-${{ runner.os }}-${{ runner.arch }}",
+            "ferrum-cni-debug-${{ runner.os }}-${{ runner.arch }}",
+        },
+    }
+    discovered_consumers: set[str] = set()
+
+    for job in sorted(set(jobs) | set(expected_consumer_artifacts)):
+        if job == "build-test-artifacts":
+            continue
+        job_obj = jobs.get(job)
+        if job_obj is None:
+            if job in expected_consumer_artifacts:
+                errors.append(f"expected artifact consumer job `{job}` is missing from ci.yml")
+            continue
+        raw_steps = job_obj.get("steps")
+        if raw_steps is None:
+            continue
+        if not isinstance(raw_steps, list):
+            errors.append(f"jobs.{job} has a non-list `steps:` section")
+            continue
+        gate = PATH_GATED_JOBS.get(job)
+        job_artifacts: set[str] = set()
+        for step in raw_steps:
+            if not isinstance(step, dict):
+                errors.append(f"jobs.{job} contains a non-mapping step")
+                continue
+            uses = step.get("uses")
+            if not (isinstance(uses, str) and uses.lower().startswith("actions/download-artifact@")):
+                continue
+            raw_with = step.get("with")
+            if raw_with is None:
+                with_map: dict[str, str] = {}
+            elif not isinstance(raw_with, dict):
+                errors.append(
+                    f"jobs.{job} invokes actions/download-artifact with invalid `with:` (`with:` must be a mapping)"
+                )
+                continue
+            else:
+                with_map = {
+                    str(k): ("" if v is None else str(v))
+                    for k, v in raw_with.items()
+                }
+            if "pattern" in with_map:
+                errors.append(
+                    f"jobs.{job} downloads artifacts via `pattern: {with_map['pattern']}` instead of an explicit tracked `name:`"
+                )
+                continue
+            if "name" not in with_map:
+                errors.append(
+                    f"jobs.{job} invokes actions/download-artifact without an explicit `with.name`"
+                )
+                continue
+            raw_name = with_map["name"].strip()
+            if not raw_name:
+                errors.append(
+                    f"jobs.{job} invokes actions/download-artifact with an empty `with.name`"
+                )
+                continue
+            canonical_name = main_linux_aliases.get(raw_name, raw_name)
+            if canonical_name not in expected_artifacts:
+                if job in expected_consumer_artifacts:
+                    errors.append(
+                        f"jobs.{job} downloads unrecognized artifact `{raw_name}`"
+                    )
+                continue
+            job_artifacts.add(canonical_name)
+            upload_if = artifact_upload_if.get(canonical_name, "")
+            archive_step_name, build_vars = expected_artifacts[canonical_name]
+            if gate is not None:
+                if not _expr_admits_gate(upload_if, gate):
+                    errors.append(
+                        f"jobs.{job} ({gate}) downloads `{raw_name}`, but "
+                        f"jobs.build-test-artifacts upload condition `{upload_if}` does not admit `{gate}`"
+                    )
+                if archive_step_name is not None:
+                    archive_step = step_by_name.get(archive_step_name, {})
+                    raw_arch_if = archive_step.get("if")
+                    archive_if = str(raw_arch_if).strip() if raw_arch_if is not None else ""
+                    if not _expr_admits_gate(archive_if, gate):
+                        errors.append(
+                            f"jobs.{job} ({gate}) downloads `{raw_name}`, but "
+                            f"step `{archive_step_name}` if-condition does not admit `{gate}`"
+                        )
+                if not any(_expr_admits_gate(build_env.get(var, ""), gate) for var in build_vars):
+                    errors.append(
+                        f"jobs.{job} ({gate}) downloads `{raw_name}`, but "
+                        f"jobs.build-test-artifacts build env {build_vars} does not admit `{gate}`"
+                    )
+            else:
+                # Main-only consumer (`main-linux-image`): verify push-to-main production.
+                if not _expr_admits_main_push(upload_if):
+                    errors.append(
+                        f"jobs.{job} downloads `{raw_name}` on push to main, but "
+                        f"upload condition `{upload_if}` does not admit push to main"
+                    )
+                if not any(_expr_admits_main_push(build_env.get(var, "")) for var in build_vars):
+                    errors.append(
+                        f"jobs.{job} downloads `{raw_name}` on push to main, but "
+                        f"build env {build_vars} does not admit push to main"
+                    )
+        if job_artifacts:
+            discovered_consumers.add(job)
+            if job not in expected_consumer_artifacts:
+                errors.append(
+                    f"untracked job `{job}` downloads build-test-artifacts outputs {sorted(job_artifacts)}; "
+                    "add it to expected_consumer_artifacts in verify_required_ci.py"
+                )
+            elif job_artifacts != expected_consumer_artifacts[job]:
+                errors.append(
+                    f"jobs.{job} downloaded {sorted(job_artifacts)}, expected "
+                    f"{sorted(expected_consumer_artifacts[job])}"
+                )
+            if "build-test-artifacts" not in _yaml_job_needs(job_obj):
+                errors.append(
+                    f"jobs.{job} downloads a build-test-artifacts output without needing `build-test-artifacts`"
+                )
+
+    for missing_consumer in sorted(set(expected_consumer_artifacts) - discovered_consumers):
+        errors.append(
+            f"expected artifact consumer job `{missing_consumer}` did not download any tracked artifact"
+        )
+
+    return errors
+
+
+def test_artifact_consumer_wiring_self_test(ci_yml: str) -> list[str]:
+    """Mutation self-tests for `test_artifact_consumer_wiring_errors`."""
+
+    failures: list[str] = []
+    base_errors = test_artifact_consumer_wiring_errors(ci_yml)
+    if base_errors:
+        return [f"artifact wiring baseline failed: {base_errors!r}"]
+
+    # 1. Dropping `run_integration` from CNI upload must fail.
+    drop_cni = ci_yml.replace(
+        "      - name: Upload ferrum-cni binary\n        if: needs.ci-plan.outputs.run_integration == 'true' || ",
+        "      - name: Upload ferrum-cni binary\n        if: ",
+        1,
+    )
+    if drop_cni == ci_yml or not test_artifact_consumer_wiring_errors(drop_cni):
+        failures.append("artifact wiring verifier must reject missing run_integration on ferrum-cni upload")
+
+    # 2. Narrowing CNI upload with `&&` must fail.
+    narrow_cni = ci_yml.replace(
+        "      - name: Upload ferrum-cni binary\n        if: needs.ci-plan.outputs.run_integration == 'true'",
+        "      - name: Upload ferrum-cni binary\n        if: needs.ci-plan.outputs.run_integration == 'true' && needs.ci-plan.outputs.run_helm == 'true'",
+        1,
+    )
+    if narrow_cni == ci_yml or not test_artifact_consumer_wiring_errors(narrow_cni):
+        failures.append("artifact wiring verifier must reject conjunctive narrowing of upload condition")
+
+    # 3. Dropping `build-test-artifacts` from consumer `needs:` must fail.
+    drop_needs = ci_yml.replace(
+        "    needs: [ci-plan, build-test-artifacts]\n",
+        "    needs: [ci-plan]\n",
+        1,
+    )
+    if drop_needs == ci_yml or not test_artifact_consumer_wiring_errors(drop_needs):
+        failures.append("artifact wiring verifier must reject a consumer missing needs: build-test-artifacts")
+
+    # 4. Misspelling a download artifact name must fail.
+    bad_download = ci_yml.replace(
+        "name: ferrum-cni-debug-Linux-X64",
+        "name: ferrum-cni-debug-Linux-ARM64",
+        1,
+    )
+    if bad_download == ci_yml or not test_artifact_consumer_wiring_errors(bad_download):
+        failures.append("artifact wiring verifier must reject unknown/mismatched download artifact name")
+
+    # 5. Removing integration-only build command must fail (not masked by combined cmd).
+    drop_integ_cmd = ci_yml.replace(
+        '          elif [ "$NEED_INTEGRATION" = "true" ]; then\n            cargo test --no-run --test integration_tests\n',
+        '          elif [ "$NEED_INTEGRATION" = "true" ]; then\n            true\n',
+        1,
+    )
+    if drop_integ_cmd == ci_yml or not test_artifact_consumer_wiring_errors(drop_integ_cmd):
+        failures.append("artifact wiring verifier must reject missing integration-only build command")
+
+    # 6. Commenting out functional-only build command must fail.
+    comment_func_cmd = ci_yml.replace(
+        '          elif [ "$NEED_FUNCTIONAL" = "true" ]; then\n            cargo test --no-run --test functional_tests\n',
+        '          elif [ "$NEED_FUNCTIONAL" = "true" ]; then\n            # cargo test --no-run --test functional_tests\n            true\n',
+        1,
+    )
+    if comment_func_cmd == ci_yml or not test_artifact_consumer_wiring_errors(comment_func_cmd):
+        failures.append("artifact wiring verifier must reject commented-out functional-only build command")
+
+    # 7. Removing CNI download from test-integration must fail.
+    drop_integ_cni_dl = ci_yml.replace(
+        "      - name: Download prebuilt ferrum-cni binary\n"
+        "        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8\n"
+        "        with:\n"
+        "          name: ferrum-cni-debug-${{ runner.os }}-${{ runner.arch }}\n",
+        "      - name: Skip CNI download\n        run: true\n",
+        1,
+    )
+    if drop_integ_cni_dl == ci_yml or not test_artifact_consumer_wiring_errors(drop_integ_cni_dl):
+        failures.append("artifact wiring verifier must reject missing ferrum-cni-debug download in test-integration")
+
+    # 8. An underscore-named 7th consumer (including with an inline comment on `steps:`
+    # or mixed-case `Actions/Download-Artifact@`) downloading a tracked artifact must fail.
+    for label, steps_hdr, uses_line in (
+        (
+            "underscore-named untracked consumer",
+            "    steps:\n",
+            "      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8\n",
+        ),
+        (
+            "commented steps: header on untracked consumer",
+            "    steps: # inline comment\n",
+            "      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8\n",
+        ),
+        (
+            "mixed-case Actions/Download-Artifact on untracked consumer",
+            "    steps:\n",
+            "      - uses: Actions/Download-Artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8\n",
+        ),
+    ):
+        extra_consumer = (
+            ci_yml
+            + "\n  extra_consumer:\n"
+            + "    runs-on: ubuntu-26.04\n"
+            + "    needs: [ci-plan, build-test-artifacts]\n"
+            + steps_hdr
+            + uses_line
+            + "        with:\n"
+            + "          name: ferrum-cni-debug-${{ runner.os }}-${{ runner.arch }}\n"
+        )
+        if not test_artifact_consumer_wiring_errors(extra_consumer):
+            failures.append(f"artifact wiring verifier must reject {label}")
+
+    # 9. A consumer downloading via `pattern:` (including glob `?` and a late step `name:`) must fail.
+    pattern_download_job = (
+        ci_yml
+        + "\n  pattern-consumer:\n"
+        + "    runs-on: ubuntu-26.04\n"
+        + "    needs: [ci-plan, build-test-artifacts]\n"
+        + "    steps:\n"
+        + "      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8\n"
+        + "        name: Fetch binaries\n"
+        + "        with:\n"
+        + "          pattern: 'ferrum-cni-debu?-Linux-X64'\n"
+    )
+    if not test_artifact_consumer_wiring_errors(pattern_download_job):
+        failures.append("artifact wiring verifier must reject a consumer using pattern: downloads (even with late step name)")
+
+    # 10. A consumer downloading with empty `with.name: ''`, YAML-escaped space `"\ "`,
+    # inline-commented empty name, `pattern :` with YAML spacing, escaped `uses:`,
+    # or flow-style `with:` must fail.
+    for label, uses_line, with_lines in (
+        (
+            "empty single-quoted name",
+            "      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8\n",
+            "        with:\n          name: ''\n",
+        ),
+        (
+            "empty name with inline comment",
+            "      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8\n",
+            "        with:\n          name: '' # Select by pattern\n",
+        ),
+        (
+            "YAML-escaped whitespace name",
+            "      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8\n",
+            '        with:\n          name: "\\ " # YAML-escaped space\n',
+        ),
+        (
+            "empty name + spaced pattern key",
+            "      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8\n",
+            "        with:\n          name: '' # Select by pattern\n          pattern : 'ferrum-cni-debu?-Linux-X64'\n",
+        ),
+        (
+            "flow-style with pattern",
+            "      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8\n",
+            "        with: { pattern: 'ferrum-cni-debu?-Linux-X64' }\n",
+        ),
+        (
+            "escaped uses + flow-style pattern",
+            '      - uses: "actions\\x2fdownload-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333"\n',
+            "        with: { pattern: 'ferrum-cni-debu?-Linux-X64' }\n",
+        ),
+    ):
+        probe_job = (
+            ci_yml
+            + "\n  empty-name-consumer:\n"
+            + "    runs-on: ubuntu-26.04\n"
+            + "    needs: [ci-plan, build-test-artifacts]\n"
+            + "    steps:\n"
+            + uses_line
+            + "        name: Fetch all\n"
+            + with_lines
+        )
+        if not test_artifact_consumer_wiring_errors(probe_job):
+            failures.append(f"artifact wiring verifier must reject {label}")
+
+    # 11. Equivalent reversed `||` operands and YAML-continued `uses:` must still pass.
+    reversed_if = ci_yml.replace(
+        "if: needs.ci-plan.outputs.run_integration == 'true' || needs.ci-plan.outputs.run_vendor_patches == 'true'",
+        "if: needs.ci-plan.outputs.run_vendor_patches == 'true' || needs.ci-plan.outputs.run_integration == 'true'",
+        1,
+    )
+    if reversed_if == ci_yml or test_artifact_consumer_wiring_errors(reversed_if):
+        failures.append("artifact wiring verifier must accept equivalent reversed || operands")
+
+    continued_uses = ci_yml.replace(
+        "      - name: Download prebuilt ferrum-cni binary\n"
+        "        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8\n",
+        '      - name: Download prebuilt ferrum-cni binary\n'
+        '        uses: "actions/\\\n'
+        '          download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333" # v8\n',
+        1,
+    )
+    if continued_uses == ci_yml or test_artifact_consumer_wiring_errors(continued_uses):
+        failures.append("artifact wiring verifier must accept valid YAML backslash-newline continued uses:")
+
+    return failures
+
+
+_EXPECTED_CI_PLAN_EMISSION_LINES = [
+    'mode="$(printf \'%s\\n\' "$plan" | sed -n \'s/^mode=//p\')"',
+    'reason="$(printf \'%s\\n\' "$plan" | sed -n \'s/^reason=//p\')"',
+    'paths_classifiable="$(printf \'%s\\n\' "$plan" | sed -n \'s/^paths_classifiable=//p\')"',
+    'if [ "$paths_classifiable" != "true" ]; then',
+    'mode="full"',
+    "fi",
+    'echo "mode=$mode" >> "$GITHUB_OUTPUT"',
+    "for consumer_gate in run_integration run_functional run_plugin_hardening_redis run_helm run_vendor_patches; do",
+    'consumer_val="$(printf \'%s\\n\' "$plan" | sed -n "s/^${consumer_gate}=//p")"',
+    'if [ "$consumer_val" != "false" ]; then',
+    'plan="$(printf \'%s\\n\' "$plan" | grep -v \'^run_artifacts=\'; echo "run_artifacts=true")"',
+    "break",
+    "fi",
+    "done",
+    "gate_fallbacks=()",
+    f"for gate in {' '.join(JOB_GATE_NAMES)}; do",
+    'value="$(printf \'%s\\n\' "$plan" | sed -n "s/^${gate}=//p")"',
+    'if [ "$paths_classifiable" != "true" ]; then',
+    "value=true",
+    'elif [ "$value" != "true" ] && [ "$value" != "false" ]; then',
+    "value=true",
+    'gate_fallbacks+=("$gate")',
+    "fi",
+    'printf \'%s=%s\\n\' "$gate" "$value" >> "$GITHUB_OUTPUT"',
+    "done",
+]
+
+
+def check_mode_and_granular_opt_in(plan_body: str) -> list[str]:
+    """Verify ci-plan opts into granular gates and forces mode=full on bad handshake."""
+
+    errors: list[str] = []
+    # Parse `ci-plan` via PyYAML to verify the `id: plan` step actually exists
+    # and owns the pinned planner/emission script (so renaming `id: plan` cannot
+    # orphan `outputs.*: ${{ steps.plan.outputs.* }}`).
+    try:
+        import yaml  # type: ignore[import-untyped]
+    except ImportError:
+        return ["PyYAML is required to validate jobs.ci-plan"]
+    try:
+        parsed_job = yaml.safe_load(plan_body)
+    except Exception as exc:
+        return [f"jobs.ci-plan YAML is unparseable: {exc}"]
+    if not isinstance(parsed_job, dict) or not isinstance(parsed_job.get("steps"), list):
+        return ["jobs.ci-plan must declare a mapping with a list `steps:` section"]
+    plan_steps = [
+        step
+        for step in parsed_job["steps"]
+        if isinstance(step, dict) and step.get("id") == "plan"
+    ]
+    if len(plan_steps) != 1:
+        errors.append("jobs.ci-plan must declare a single step with `id: plan`")
+        plan_step_run = ""
+    else:
+        raw_run = plan_steps[0].get("run")
+        plan_step_run = raw_run if isinstance(raw_run, str) else ""
+
+    plan_step_exec = [
+        line.strip()
+        for line in plan_step_run.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    if not any(
+        line.startswith('plan="$(FERRUM_CI_PLAN_GRANULAR_GATES=1 python3 -I ')
+        for line in plan_step_exec
+    ):
+        errors.append(
+            "jobs.ci-plan `id: plan` step must pass FERRUM_CI_PLAN_GRANULAR_GATES=1 "
+            "on the executable python3 -I planner invocation"
+        )
+    # Require that the entire `ci-plan` job writes to GITHUB_OUTPUT solely via
+    # its four pinned emission lines (prevents pre-planner, post-summary, or
+    # post-binary-matrix-heredoc overwrites across all steps of `ci-plan`).
+    all_step_exec: list[str] = []
+    for step in parsed_job["steps"]:
+        if isinstance(step, dict) and isinstance(step.get("run"), str):
+            all_step_exec.extend(
+                line.strip()
+                for line in step["run"].splitlines()
+                if line.strip() and not line.strip().startswith("#")
+            )
+    github_output_lines = [line for line in all_step_exec if "GITHUB_OUTPUT" in line]
+    if github_output_lines != [
+        'echo "sha=$trusted_base" >> "$GITHUB_OUTPUT"',
+        'echo "mode=$mode" >> "$GITHUB_OUTPUT"',
+        'printf \'%s=%s\\n\' "$gate" "$value" >> "$GITHUB_OUTPUT"',
+        "python3 - <<'PY' >> \"$GITHUB_OUTPUT\"",
+    ]:
+        errors.append(
+            "jobs.ci-plan must only write to GITHUB_OUTPUT via its four pinned "
+            f"emission lines (found {github_output_lines!r})"
+        )
+    # Pin the exact non-blank, non-comment emission section inside `id: plan`
+    # from planner output parsing through the gate-emission loop (stopping before
+    # `{`), preventing any outer conditional wrapper on `$changed_files`,
+    # `$EVENT_NAME`, `$GITHUB_ACTIONS`, or `$paths_classifiable`.
+    plan_anchor = '--changed-files "$changed_files")"'
+    anchor_idx = plan_step_run.find(plan_anchor)
+    if anchor_idx < 0:
+        errors.append("jobs.ci-plan `id: plan` step is missing the planner invocation anchor")
+    else:
+        line_end = plan_step_run.find("\n", anchor_idx)
+        script_tail = plan_step_run[line_end + 1 :] if line_end >= 0 else ""
+        tail_exec = [
+            line.strip()
+            for line in script_tail.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        summary_open = tail_exec.index("{") if "{" in tail_exec else -1
+        emission_exec = tail_exec[:summary_open] if summary_open >= 0 else tail_exec
+        if emission_exec != _EXPECTED_CI_PLAN_EMISSION_LINES:
+            errors.append(
+                "jobs.ci-plan emission block from planner output parsing through "
+                "GITHUB_OUTPUT gate emission must match the exact unconditional "
+                "fail-closed sequence"
+            )
+
+    return errors
+
+
+def mode_and_granular_opt_in_self_test(plan_body: str) -> list[str]:
+    """Mutation self-tests for `check_mode_and_granular_opt_in`."""
+
+    failures: list[str] = []
+    if check_mode_and_granular_opt_in(plan_body):
+        return [f"mode/granular baseline failed: {check_mode_and_granular_opt_in(plan_body)!r}"]
+
+    deleted = plan_body.replace(
+        '          if [ "$paths_classifiable" != "true" ]; then\n            mode="full"\n          fi\n',
+        "",
+        1,
+    )
+    if deleted == plan_body or not check_mode_and_granular_opt_in(deleted):
+        failures.append("mode fallback verifier must reject deleting the mode=full fallback block")
+
+    reordered = plan_body.replace(
+        '          if [ "$paths_classifiable" != "true" ]; then\n            mode="full"\n          fi\n          echo "mode=$mode" >> "$GITHUB_OUTPUT"\n',
+        '          echo "mode=$mode" >> "$GITHUB_OUTPUT"\n          if [ "$paths_classifiable" != "true" ]; then\n            mode="full"\n          fi\n',
+        1,
+    )
+    if reordered == plan_body or not check_mode_and_granular_opt_in(reordered):
+        failures.append("mode fallback verifier must reject forcing mode=full after emitting mode")
+
+    comment_only_env = plan_body.replace(
+        '          plan="$(FERRUM_CI_PLAN_GRANULAR_GATES=1 python3 -I ',
+        '          # plan="$(FERRUM_CI_PLAN_GRANULAR_GATES=1 python3 -I "\n          plan="$(python3 -I ',
+        1,
+    )
+    if comment_only_env == plan_body or not check_mode_and_granular_opt_in(comment_only_env):
+        failures.append("granular opt-in verifier must reject FERRUM_CI_PLAN_GRANULAR_GATES=1 only in a comment")
+
+    dropped_consumer = plan_body.replace(
+        " run_plugin_hardening_redis ",
+        " ",
+        1,
+    )
+    if dropped_consumer == plan_body or not check_mode_and_granular_opt_in(dropped_consumer):
+        failures.append("granular opt-in verifier must reject dropping a consumer gate from the transition guard loop")
+
+    explicit_true_only = plan_body.replace(
+        'if [ "$consumer_val" != "false" ]; then',
+        'if [ "$consumer_val" = "true" ]; then',
+        1,
+    )
+    if explicit_true_only == plan_body or not check_mode_and_granular_opt_in(explicit_true_only):
+        failures.append("granular opt-in verifier must reject changing consumer_val != false to = true")
+
+    wrapped_fallback = plan_body.replace(
+        "          for consumer_gate in run_integration run_functional run_plugin_hardening_redis run_helm run_vendor_patches; do\n",
+        '          if [ "$paths_classifiable" != "true" ]; then\n          for consumer_gate in run_integration run_functional run_plugin_hardening_redis run_helm run_vendor_patches; do\n',
+        1,
+    ).replace(
+        "          done\n\n          gate_fallbacks=()",
+        "          done\n          fi\n\n          gate_fallbacks=()",
+        1,
+    )
+    if wrapped_fallback == plan_body or not check_mode_and_granular_opt_in(wrapped_fallback):
+        failures.append("granular opt-in verifier must reject wrapping the fallback loop in a conditional")
+
+    # Outer conditional wrapping from before mode emission through after gate_fallbacks=().
+    for label, cond in (
+        ("paths_classifiable wrapper", '[ "$paths_classifiable" != "true" ]'),
+        ("changed_files wrapper", '[ ! -s "$changed_files" ]'),
+    ):
+        outer_wrapped = plan_body.replace(
+            '          if [ "$paths_classifiable" != "true" ]; then\n            mode="full"\n          fi\n',
+            f'          if {cond}; then\n          if [ "$paths_classifiable" != "true" ]; then\n            mode="full"\n          fi\n',
+            1,
+        ).replace(
+            "          gate_fallbacks=()\n",
+            '          gate_fallbacks=()\n          else\n            printf \'mode=%s\\n\' "$mode" >> "$GITHUB_OUTPUT"\n            gate_fallbacks=()\n          fi\n',
+            1,
+        )
+        if outer_wrapped == plan_body or not check_mode_and_granular_opt_in(outer_wrapped):
+            failures.append(f"granular opt-in verifier must reject an outer {label}")
+
+    pre_planner_write = plan_body.replace(
+        '          plan="$(FERRUM_CI_PLAN_GRANULAR_GATES=1 python3 -I ',
+        '          echo "mode=light" >> "$GITHUB_OUTPUT"\n          plan="$(FERRUM_CI_PLAN_GRANULAR_GATES=1 python3 -I ',
+        1,
+    )
+    if pre_planner_write == plan_body or not check_mode_and_granular_opt_in(pre_planner_write):
+        failures.append("granular opt-in verifier must reject extra GITHUB_OUTPUT write before planner")
+
+    post_matrix_write = plan_body.replace(
+        '          print("matrix=" + json.dumps({"include": builds}, separators=(",", ":")))\n          PY\n',
+        '          print("matrix=" + json.dumps({"include": builds}, separators=(",", ":")))\n          PY\n          echo \'matrix={"include":[]}\' >> "$GITHUB_OUTPUT"\n',
+        1,
+    )
+    if post_matrix_write == plan_body or not check_mode_and_granular_opt_in(post_matrix_write):
+        failures.append("granular opt-in verifier must reject extra GITHUB_OUTPUT write after binary-matrix heredoc")
+
+    renamed_plan_id = plan_body.replace("      - id: plan\n", "      - id: plan_renamed\n", 1)
+    if renamed_plan_id == plan_body or not check_mode_and_granular_opt_in(renamed_plan_id):
+        failures.append("granular opt-in verifier must reject renaming the `id: plan` step")
+
+    return failures
 
 
 def pull_request_trigger_is_unconditional(workflow_yml: str) -> bool:
@@ -1544,8 +2338,12 @@ def classifiable_handshake_self_test(ci_plan_body: str) -> list[str]:
         failures.append("parse-only mutation must still parse paths_classifiable")
 
     explicit_false = ci_plan_body.replace(
-        '[ "$paths_classifiable" != "true" ]; then',
-        '[ "$paths_classifiable" = "" ]; then',
+        CLASSIFIABLE_HANDSHAKE_GATE_BLOCK,
+        CLASSIFIABLE_HANDSHAKE_GATE_BLOCK.replace(
+            '[ "$paths_classifiable" != "true" ]; then',
+            '[ "$paths_classifiable" = "" ]; then',
+            1,
+        ),
         1,
     )
     if not check_classifiable_handshake(explicit_false):
@@ -1555,8 +2353,12 @@ def classifiable_handshake_self_test(ci_plan_body: str) -> list[str]:
         )
 
     malformed = ci_plan_body.replace(
-        '[ "$paths_classifiable" != "true" ]; then',
-        '[ "$paths_classifiable" != "true" ] && [ "$paths_classifiable" != "TRUE" ]; then',
+        CLASSIFIABLE_HANDSHAKE_GATE_BLOCK,
+        CLASSIFIABLE_HANDSHAKE_GATE_BLOCK.replace(
+            '[ "$paths_classifiable" != "true" ]; then',
+            '[ "$paths_classifiable" != "true" ] && [ "$paths_classifiable" != "TRUE" ]; then',
+            1,
+        ),
         1,
     )
     if not check_classifiable_handshake(malformed):
@@ -2237,6 +3039,20 @@ def main() -> int:
     for job in sorted(REMOVED_JOBS):
         if re.search(rf"(?m)^  {re.escape(job)}:$", ci_yml):
             planner_errors.append(f"consolidated jobs.{job} must not remain in ci.yml")
+
+    # Every consumer job that downloads an artifact produced by
+    # `build-test-artifacts` must have its gate covered by the matching build,
+    # archive, and upload conditions so a selective PR plan never fails on a
+    # missing download.
+    planner_errors.extend(test_artifact_consumer_wiring_errors(ci_yml))
+    planner_errors.extend(test_artifact_consumer_wiring_self_test(ci_yml))
+
+    # `ci-plan` must opt into granular gates via env var (preserving legacy
+    # `run_rust` for un-rebased PR workflows) and fail closed to `mode=full`
+    # before writing `mode` to GITHUB_OUTPUT when `paths_classifiable != true`.
+    plan_body = extract_job_body(ci_yml, "ci-plan")
+    planner_errors.extend(check_mode_and_granular_opt_in(plan_body))
+    planner_errors.extend(mode_and_granular_opt_in_self_test(plan_body))
 
     for workflow_path, required_check in DEDICATED_REQUIRED_CHECKS.items():
         workflow_yml = Path(workflow_path).read_text(encoding="utf-8")
