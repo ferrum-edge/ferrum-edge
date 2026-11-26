@@ -22818,9 +22818,11 @@ impl<T> Drop for AbortOnDrop<T> {
 }
 
 /// Owns a WebSocket shard task's plugin `Vec`s so that on every exit path
-/// (including `from_std` failure or abort during `from_partially_read`), any
-/// plugin whose final reference is held by this task is offloaded to drop on
-/// the `MultiThread` main runtime without spawning tasks in steady state.
+/// (including `from_std` failure or abort during `from_partially_read`),
+/// plugin drops are offloaded to the `MultiThread` main runtime. Returns early
+/// without allocating or spawning when the session has no WebSocket plugins;
+/// otherwise moves the non-empty plugin `Vec`s to the main runtime in one spawn
+/// at session end because `Arc<dyn Plugin>` cannot use atomic `Arc::into_inner`.
 #[cfg(not(feature = "bench-h1-profile"))]
 struct DropPluginsOnMainRuntime {
     framing: Vec<Arc<dyn Plugin>>,
