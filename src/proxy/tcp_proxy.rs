@@ -3021,7 +3021,7 @@ async fn run_tcp_accept_loop(
                     // retired-epoch destruction via `Arc::into_inner` onto the
                     // `MultiThread` main runtime (zero wakeups in steady state).
                     let epoch = crate::proxy::relay_shards::DropArcOnMainRuntime::new(
-                        request_epoch.load_full(),
+                        request_epoch.load(),
                     );
                     let proxy_protocol_enabled = epoch
                         .proxy_by_namespaced_id(proxy_namespace.as_ref(), proxy_id.as_ref())
