@@ -21,6 +21,10 @@ const OFFSET_FORMATS: &[&str] = &[
     "%Y-%m-%dT%H:%M:%SZ",
     "%Y-%m-%dT%H:%M:%S%.f%:z",
     "%Y-%m-%dT%H:%M:%S%:z",
+    // Remaining supported specifiers and padding flags.
+    "%Y-%m-%dT%H:%M:%S%z",
+    "%d %B %Y %H:%M:%S%.f %:z",
+    "%-d %h %Y %_H:%0M:%S %z",
 ];
 const NAIVE_FORMATS: &[&str] = &[
     // response_caching HTTP-date fallbacks.
@@ -29,6 +33,13 @@ const NAIVE_FORMATS: &[&str] = &[
     "%a %b %e %H:%M:%S %Y",
     // db_loader legacy CURRENT_TIMESTAMP rows.
     "%Y-%m-%d %H:%M:%S",
+    // A naive parse validates but ignores the offset (even an out-of-range one).
+    "%Y-%m-%dT%H:%M:%S%z",
+    // `%Y` and `%y` must agree; `%.f` without `%S` is never enough.
+    "%Y/%y %m %d %H:%M",
+    "%Y-%m-%d %H:%M%.f",
+    "%%%Y-%m-%d %H:%M:%S",
+    "%e %B %Y %H:%M:%S",
 ];
 
 const BASES: &[&str] = &[
@@ -48,6 +59,9 @@ const BASES: &[&str] = &[
     "2026-11-26T10:20:30+24:00",
     "+12345-01-01T00:00:00Z",
     "-0001-12-31T23:59:59Z",
+    "-262143-01-01T00:00:00+00:01",
+    "-262143-01-01T00:00:00-00:01",
+    "+262142-12-31T23:59:59-00:01",
     "2026-1-2T3:4:5Z",
     "2026-11-26T10:20:30 UTC",
     "2026-11-26T10:20:30+0530",
@@ -64,9 +78,11 @@ const BASES: &[&str] = &[
     "6 Nov 994 08:49:37 Z",
     "Thu,26 Nov 2026 10 : 20:30 -0000 (comment (nested) \\) x)",
     "Thu, 26 Nov 2026 23:59:60 +2359",
-    "Thu, 26 Nov 12345 10:20:30 a",
+    "Mon, 26 Nov 12345 10:20:30 a",
     "Mon, 1 Jan 0001 00:00:00 +9959",
-    "Fri, 31 Dec 262142 23:59:59 -2359",
+    // chrono's year limits: applying the offset can push UTC outside them.
+    "Mon, 31 Dec 262142 23:59:59 -2359",
+    "Mon, 31 Dec 262142 23:59:59 +2359",
     "Thu, 26 nov 2026 10:20:30 pdt",
     "Thu, 26 Nov 2026 10:20:30 J",
     // HTTP-date fallbacks and legacy SQL text.
@@ -80,6 +96,16 @@ const BASES: &[&str] = &[
     // WS-Security.
     "2026-11-26T10:20:30.5+05:30",
     "2026-11-26T10:20:30+05:30",
+    // Extra strftime specifier coverage.
+    "2026-11-26T10:20:30+9959",
+    "26 November 2026 10:20:30.5 +05:30",
+    "26 Nov 2026 10:20:30 +0530",
+    "2026/26 11 26 10:20",
+    "2026/27 11 26 10:20",
+    "-2026/26 11 26 10:20",
+    "2026-11-26 10:20.5",
+    "%2026-11-26 10:20:30",
+    "26 november 2026 10:20:30",
 ];
 
 const PALETTE: &[char] = &[
@@ -295,10 +321,10 @@ fn chrono_compatible_parsers_match_chrono_on_the_mutation_corpus() {
             .nth(i)
             .copied()
             .unwrap_or_default();
-        if fmt.ends_with('Z') {
+        if fmt.ends_with('Z') || fmt == "%Y-%m-%d %H:%M%.f" {
             assert_eq!(
                 *count, 0,
-                "{fmt} has no offset item; chrono never accepts it"
+                "{fmt} can never resolve; chrono never accepts it"
             );
         } else {
             assert!(*count > 20, "{fmt} accepted only {count} corpus inputs");
@@ -366,4 +392,85 @@ fn http_date_forms_used_by_response_caching_and_hmac_auth_follow_chrono() {
         parse_naive_from_str_chrono("1994", "%G"),
         Err(TimestampError::InvalidFormat)
     );
+}
+
+/// Branches the mutation corpus could otherwise leave untested in both
+/// directions: chrono's UTC range check after the offset, a naive parse that
+/// ignores an out-of-range offset, `%Y`/`%y` agreement, and padded
+/// non-numeric specifiers.
+#[test]
+fn boundary_and_specifier_cases_follow_chrono() {
+    let fixed_cases: &[(&str, Option<&str>)] = &[
+        ("Mon, 31 Dec 262142 23:59:59 -2359", None),
+        ("Mon, 31 Dec 262142 23:59:59 +2359", None),
+        ("-262143-01-01T00:00:00+00:01", None),
+        ("-262143-01-01T00:00:00-00:01", None),
+        ("2026-11-26T10:20:30+9959", Some("%Y-%m-%dT%H:%M:%S%z")),
+        (
+            "26 November 2026 10:20:30.5 +05:30",
+            Some("%d %B %Y %H:%M:%S%.f %:z"),
+        ),
+        (
+            "26 Nov 2026 10:20:30 +0530",
+            Some("%-d %h %Y %_H:%0M:%S %z"),
+        ),
+        ("26 Nov 2026 10:20:30 +0530", Some("%-d %-h %Y %H:%M:%S %z")),
+        ("2026-11-26 10:20:30 +0530", Some("%Y-%m-%d %H:%M:%S %-z")),
+    ];
+    for (input, fmt) in fixed_cases {
+        match fmt {
+            None => {
+                assert_fixed_parity(
+                    "rfc2822",
+                    input,
+                    parse_rfc2822_chrono(input),
+                    DateTime::parse_from_rfc2822(input),
+                );
+                assert_fixed_parity(
+                    "rfc3339-relaxed",
+                    input,
+                    parse_rfc3339_relaxed_chrono(input),
+                    input.parse::<DateTime<FixedOffset>>(),
+                );
+            }
+            Some(fmt) => {
+                assert_fixed_parity(
+                    fmt,
+                    input,
+                    parse_from_str_chrono(input, fmt),
+                    DateTime::parse_from_str(input, fmt),
+                );
+            }
+        }
+    }
+    // The UTC range check is what rejects these; the local dates are valid.
+    assert!(parse_rfc2822_chrono("Mon, 31 Dec 262142 23:59:59 -2359").is_err());
+    assert!(parse_rfc2822_chrono("Mon, 31 Dec 262142 23:59:59 +2359").is_ok());
+    assert!(parse_rfc3339_relaxed_chrono("-262143-01-01T00:00:00+00:01").is_err());
+    assert!(parse_rfc3339_relaxed_chrono("-262143-01-01T00:00:00-00:01").is_ok());
+
+    let naive_cases: &[(&str, &str)] = &[
+        ("2026-11-26T10:20:30+9959", "%Y-%m-%dT%H:%M:%S%z"),
+        ("2026/26 11 26 10:20", "%Y/%y %m %d %H:%M"),
+        ("2026/27 11 26 10:20", "%Y/%y %m %d %H:%M"),
+        ("-2026/26 11 26 10:20", "%Y/%y %m %d %H:%M"),
+        ("2026-11-26 10:20.5", "%Y-%m-%d %H:%M%.f"),
+        ("%2026-11-26 10:20:30", "%%%Y-%m-%d %H:%M:%S"),
+        ("26 november 2026 10:20:30", "%e %B %Y %H:%M:%S"),
+        ("Thu 26 Nov 2026 10:20:30", "%-a %d %b %Y %H:%M:%S"),
+        ("2026-11-26 10:20:30.5", "%Y-%m-%d %H:%M:%S%-.f"),
+        ("2026-11-26 10:20:30", "%Y-%m-%d %H:%M:%-%"),
+    ];
+    for (input, fmt) in naive_cases {
+        assert_naive_parity(
+            fmt,
+            input,
+            parse_naive_from_str_chrono(input, fmt),
+            NaiveDateTime::parse_from_str(input, fmt),
+        );
+    }
+    assert!(parse_naive_from_str_chrono("2026-11-26T10:20:30+9959", "%Y-%m-%dT%H:%M:%S%z").is_ok());
+    assert!(parse_from_str_chrono("2026-11-26T10:20:30+9959", "%Y-%m-%dT%H:%M:%S%z").is_err());
+    assert!(parse_naive_from_str_chrono("2026/26 11 26 10:20", "%Y/%y %m %d %H:%M").is_ok());
+    assert!(parse_naive_from_str_chrono("2026/27 11 26 10:20", "%Y/%y %m %d %H:%M").is_err());
 }
