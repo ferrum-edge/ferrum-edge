@@ -95,10 +95,10 @@
 
 use crate::plugins::utils::log_sampling::warn_sampled;
 
+use crate::time_compat::UtcTimestamp;
 use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
 use bytes::Bytes;
-use chrono::Utc;
 use serde_json::{Value, json};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -6381,7 +6381,7 @@ impl AiFederation {
             } => Ok(vec![(header_name.clone(), api_key.clone())]),
 
             AuthMethod::AwsSigV4 { config } => {
-                let now = Utc::now();
+                let now = UtcTimestamp::now();
                 aws_sigv4::sign_request(
                     config,
                     "bedrock",
@@ -10242,7 +10242,7 @@ pub mod test_helpers {
             "not a valid URL",
             "application/json",
             b"{}",
-            &Utc::now(),
+            &UtcTimestamp::now(),
         )
         .map_err(AuthFailure::local);
         matches!(

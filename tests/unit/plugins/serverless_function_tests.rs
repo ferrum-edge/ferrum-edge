@@ -5299,9 +5299,9 @@ fn test_aws_sigv4_includes_security_token_when_present() {
         "function_name": "my-function"
     });
     let url = "https://lambda.us-east-1.amazonaws.com/2015-03-31/functions/my-function/invocations";
-    let now = chrono::DateTime::parse_from_rfc3339("2024-01-15T12:00:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
+    let now = "2024-01-15T12:00:00Z"
+        .parse::<ferrum_edge::time_compat::UtcTimestamp>()
+        .unwrap();
 
     let headers = ferrum_edge::plugins::serverless_function::test_helpers::sign_aws_request_test(
         &aws_config,
@@ -5330,9 +5330,9 @@ fn test_aws_sigv4_includes_security_token_when_present() {
 fn test_aws_sigv4_omits_security_token_when_absent() {
     let aws_config = create_test_aws_config();
     let url = "https://lambda.us-east-1.amazonaws.com/2015-03-31/functions/my-function/invocations";
-    let now = chrono::DateTime::parse_from_rfc3339("2024-01-15T12:00:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
+    let now = "2024-01-15T12:00:00Z"
+        .parse::<ferrum_edge::time_compat::UtcTimestamp>()
+        .unwrap();
 
     let headers = ferrum_edge::plugins::serverless_function::test_helpers::sign_aws_request_test(
         &aws_config,
@@ -5355,9 +5355,9 @@ fn test_aws_sigv4_omits_security_token_when_absent() {
 #[parallel(serverless_env)]
 fn test_aws_sigv4_rejects_invalid_url() {
     let aws_config = create_test_aws_config();
-    let now = chrono::DateTime::parse_from_rfc3339("2024-01-15T12:00:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
+    let now = "2024-01-15T12:00:00Z"
+        .parse::<ferrum_edge::time_compat::UtcTimestamp>()
+        .unwrap();
 
     let result = ferrum_edge::plugins::serverless_function::test_helpers::sign_aws_request_test(
         &aws_config,
@@ -5684,9 +5684,9 @@ fn test_aws_sigv4_produces_valid_authorization_header() {
     let payload = b"{}";
     let url = "https://lambda.us-east-1.amazonaws.com/2015-03-31/functions/my-function/invocations";
 
-    let now = chrono::DateTime::parse_from_rfc3339("2024-01-15T12:00:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
+    let now = "2024-01-15T12:00:00Z"
+        .parse::<ferrum_edge::time_compat::UtcTimestamp>()
+        .unwrap();
 
     let headers = ferrum_edge::plugins::serverless_function::test_helpers::sign_aws_request_test(
         &aws_config,
@@ -5722,9 +5722,9 @@ fn test_aws_sigv4_produces_valid_authorization_header() {
 fn test_aws_sigv4_different_payloads_produce_different_signatures() {
     let aws_config = create_test_aws_config();
     let url = "https://lambda.us-east-1.amazonaws.com/2015-03-31/functions/my-function/invocations";
-    let now = chrono::DateTime::parse_from_rfc3339("2024-01-15T12:00:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
+    let now = "2024-01-15T12:00:00Z"
+        .parse::<ferrum_edge::time_compat::UtcTimestamp>()
+        .unwrap();
 
     let headers1 = ferrum_edge::plugins::serverless_function::test_helpers::sign_aws_request_test(
         &aws_config,
@@ -6241,9 +6241,9 @@ async fn test_forward_body_fails_closed_when_no_body_was_collected() {
 // ---------------------------------------------------------------------------
 
 fn sigv4_authorization_for(url: &str) -> String {
-    let now = chrono::DateTime::parse_from_rfc3339("2024-01-15T12:00:00Z")
-        .expect("fixed timestamp parses")
-        .with_timezone(&chrono::Utc);
+    let now = "2024-01-15T12:00:00Z"
+        .parse::<ferrum_edge::time_compat::UtcTimestamp>()
+        .expect("fixed timestamp parses");
     ferrum_edge::plugins::serverless_function::test_helpers::sign_aws_request_test(
         &create_test_aws_config(),
         url,

@@ -186,10 +186,17 @@ pub fn sign_request(
     url_str: &str,
     content_type: &str,
     payload: &[u8],
-    now: &chrono::DateTime<chrono::Utc>,
+    now: &crate::time_compat::UtcTimestamp,
 ) -> Result<Vec<(String, String)>, String> {
-    let date_stamp = now.format("%Y%m%d").to_string();
-    let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+    // `%Y%m%d` and `%Y%m%dT%H%M%SZ`, byte-identical to chrono's strftime.
+    let date_stamp = now.to_compact_date();
+    let clock = now.time();
+    let amz_date = format!(
+        "{date_stamp}T{:02}{:02}{:02}Z",
+        clock.hour(),
+        clock.minute(),
+        clock.second()
+    );
 
     let parsed_url =
         Url::parse(url_str).map_err(|e| format!("AWS SigV4 invalid request URL: {e}"))?;
@@ -272,7 +279,7 @@ pub fn sign_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    use crate::time_compat::UtcTimestamp;
 
     fn config() -> AwsSigV4Config {
         AwsSigV4Config {
@@ -283,10 +290,9 @@ mod tests {
         }
     }
 
-    fn now() -> chrono::DateTime<chrono::Utc> {
-        chrono::Utc
-            .with_ymd_and_hms(2024, 1, 15, 12, 0, 0)
-            .single()
+    fn now() -> UtcTimestamp {
+        "2024-01-15T12:00:00Z"
+            .parse()
             .expect("fixed timestamp should be valid")
     }
 
