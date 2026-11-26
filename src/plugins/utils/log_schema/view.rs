@@ -308,12 +308,12 @@ pub(crate) fn emit_timestamp<S: SerializeMap>(
 ) -> Result<(), S::Error> {
     match ts_format {
         TimestampFormat::Rfc3339 => map.serialize_entry(out_key, rfc3339),
-        TimestampFormat::EpochMs => match chrono::DateTime::parse_from_rfc3339(rfc3339) {
-            Ok(dt) => map.serialize_entry(out_key, &dt.timestamp_millis()),
+        TimestampFormat::EpochMs => match crate::time_compat::parse_rfc3339_chrono(rfc3339) {
+            Ok(dt) => map.serialize_entry(out_key, &dt.unix_timestamp_millis()),
             Err(_) => map.serialize_entry(out_key, rfc3339),
         },
-        TimestampFormat::EpochS => match chrono::DateTime::parse_from_rfc3339(rfc3339) {
-            Ok(dt) => map.serialize_entry(out_key, &dt.timestamp()),
+        TimestampFormat::EpochS => match crate::time_compat::parse_rfc3339_chrono(rfc3339) {
+            Ok(dt) => map.serialize_entry(out_key, &dt.unix_timestamp()),
             Err(_) => map.serialize_entry(out_key, rfc3339),
         },
     }

@@ -1698,16 +1698,16 @@ impl HmacAuth {
         }
 
         // Parse HTTP-date format (RFC 7231): "Sun, 06 Nov 1994 08:49:37 GMT"
-        if let Ok(parsed) = chrono::DateTime::parse_from_rfc2822(date_str) {
+        if let Ok(parsed) = crate::time_compat::parse_rfc2822_chrono(date_str) {
             Self::timestamps_within_clock_skew(
                 crate::time_compat::UtcTimestamp::now().unix_timestamp(),
-                parsed.timestamp(),
+                parsed.unix_timestamp(),
                 self.clock_skew_seconds,
             )
-        } else if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(date_str) {
+        } else if let Ok(parsed) = crate::time_compat::parse_rfc3339_chrono(date_str) {
             Self::timestamps_within_clock_skew(
                 crate::time_compat::UtcTimestamp::now().unix_timestamp(),
-                parsed.timestamp(),
+                parsed.unix_timestamp(),
                 self.clock_skew_seconds,
             )
         } else {

@@ -155,6 +155,11 @@ fn assert_fixed_parity(
         (Ok(o), Ok(t)) => {
             let n = t.naive_local();
             assert_eq!(
+                o.unix_timestamp_nanos_opt(),
+                t.timestamp_nanos_opt(),
+                "{what}: timestamp_nanos_opt mismatch for {input:?}"
+            );
+            assert_eq!(
                 (
                     o.unix_timestamp(),
                     o.nanosecond(),

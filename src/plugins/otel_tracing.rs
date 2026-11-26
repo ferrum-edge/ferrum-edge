@@ -3334,8 +3334,8 @@ fn timestamp_nanos(timestamp: &str) -> i64 {
     if timestamp.is_empty() {
         return 0;
     }
-    match chrono::DateTime::parse_from_rfc3339(timestamp) {
-        Ok(dt) => match dt.timestamp_nanos_opt() {
+    match crate::time_compat::parse_rfc3339_chrono(timestamp) {
+        Ok(dt) => match dt.unix_timestamp_nanos_opt() {
             Some(nanos) => nanos,
             None => {
                 debug!(

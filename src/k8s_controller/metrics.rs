@@ -272,8 +272,8 @@ pub fn route_status_publish_latency_ms(
     creation_rfc3339: Option<&str>,
     published_unix_ms: u64,
 ) -> Option<u64> {
-    let created = chrono::DateTime::parse_from_rfc3339(creation_rfc3339?).ok()?;
-    let created_ms = u64::try_from(created.timestamp_millis()).ok()?;
+    let created = crate::time_compat::parse_rfc3339_chrono(creation_rfc3339?).ok()?;
+    let created_ms = u64::try_from(created.unix_timestamp_millis()).ok()?;
     Some(published_unix_ms.saturating_sub(created_ms))
 }
 

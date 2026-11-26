@@ -435,8 +435,8 @@ fn parse_request_match(val: Option<&Value>) -> Result<Option<RequestMatch>, Stri
 
 fn parse_expires_at(val: Option<&Value>) -> Result<Option<i64>, String> {
     match val {
-        Some(Value::String(s)) => chrono::DateTime::parse_from_rfc3339(s)
-            .map(|parsed| Some(parsed.timestamp_millis()))
+        Some(Value::String(s)) => crate::time_compat::parse_rfc3339_chrono(s)
+            .map(|parsed| Some(parsed.unix_timestamp_millis()))
             .map_err(|_| "fault_injection: `expires_at` must be an RFC 3339 timestamp".to_string()),
         Some(Value::Null) | None => Ok(None),
         Some(_) => Err("fault_injection: `expires_at` must be an RFC 3339 timestamp".to_string()),
