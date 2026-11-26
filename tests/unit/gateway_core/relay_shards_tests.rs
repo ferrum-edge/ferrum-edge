@@ -205,15 +205,20 @@ async fn rehomed_tls_stream_reports_unexpected_eof_without_close_notify() {
     let (server_tcp, server_session) = server_tls.into_inner();
     let mut rehomed_server = RehomedTlsStream::new(server_tcp, server_session, Bytes::new());
 
-    // Write one TLS record, flush it, then drop the raw TCP socket WITHOUT
-    // calling `shutdown()` so no TLS `close_notify` alert is sent.
+    // Write one TLS record, flush it, then half-close ONLY the raw TCP write
+    // side without sending TLS `close_notify` (keeping `client_tcp` open so
+    // unread TLS 1.3 post-handshake session tickets do not trigger a TCP RST
+    // on Linux when the socket closes).
     client_tls
         .write_all(b"before-truncation")
         .await
         .expect("write");
     client_tls.flush().await.expect("flush");
-    let (client_tcp, _client_session) = client_tls.into_inner();
-    drop(client_tcp);
+    let (mut client_tcp, _client_session) = client_tls.into_inner();
+    client_tcp
+        .shutdown()
+        .await
+        .expect("raw tcp write half-close");
 
     // The valid record must be delivered intact before the trailing
     // UnexpectedEof surfaces (matching `tokio-rustls` deferred-error behavior).
@@ -233,6 +238,65 @@ async fn rehomed_tls_stream_reports_unexpected_eof_without_close_notify() {
         err.to_string().contains("without sending TLS close_notify"),
         "expected rustls close_notify message, got: {err}"
     );
+    drop(client_tcp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rehomed_tls_stream_preserves_deferred_error_order_and_connection_aborted_eof() {
+    let (server_cfg, client_cfg) = test_tls_configs();
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let acceptor = TlsAcceptor::from(server_cfg);
+    let connector = TlsConnector::from(client_cfg);
+    let server_name = ServerName::try_from("localhost").expect("server name");
+
+    let (_client_tls, server_tls) = tokio::join!(
+        async {
+            let tcp = TcpStream::connect(addr).await.expect("connect");
+            connector
+                .connect(server_name, tcp)
+                .await
+                .expect("client TLS handshake")
+        },
+        async {
+            let (tcp, _) = listener.accept().await.expect("accept");
+            acceptor.accept(tcp).await.expect("server TLS handshake")
+        }
+    );
+
+    let (server_tcp, server_session) = server_tls.into_inner();
+    let mut rehomed = RehomedTlsStream::with_deferred_read_error(
+        server_tcp,
+        server_session,
+        Bytes::from_static(b"pre-bytes"),
+        Some(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "simulated transport abort",
+        )),
+    );
+
+    // 1. Prefix bytes must arrive first.
+    let mut buf = [0u8; 32];
+    let n = rehomed
+        .read(&mut buf)
+        .await
+        .expect("prefix delivered first");
+    assert_eq!(&buf[..n], b"pre-bytes");
+
+    // 2. Deferred ConnectionAborted surfaces next.
+    let err = rehomed
+        .read(&mut buf)
+        .await
+        .expect_err("deferred ConnectionAborted must surface after prefix");
+    assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+
+    // 3. Subsequent reads see clean EOF (read_eof transition matching tokio-rustls).
+    let eof = rehomed
+        .read(&mut buf)
+        .await
+        .expect("reads after ConnectionAborted must return clean EOF");
+    assert_eq!(eof, 0);
 }
 
 #[tokio::test]
@@ -263,11 +327,12 @@ async fn client_write_stall_io_detaches_when_idle_and_refuses_when_armed() {
     let (small_client, _unread_peer) = tokio::io::duplex(16);
     let mut armed_stall = ClientWriteStallIo::new(small_client, 30);
     let payload = [b'x'; 64];
-    let mut fut = std::pin::pin!(armed_stall.write_all(&payload));
-    let waker = std::task::Waker::noop();
-    let mut cx = std::task::Context::from_waker(waker);
-    assert!(std::future::Future::poll(fut.as_mut(), &mut cx).is_pending());
-    drop(fut);
+    {
+        let mut fut = std::pin::pin!(armed_stall.write_all(&payload));
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        assert!(std::future::Future::poll(fut.as_mut(), &mut cx).is_pending());
+    }
 
     assert!(
         !armed_stall.can_detach(),

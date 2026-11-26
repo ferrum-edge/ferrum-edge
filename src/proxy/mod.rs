@@ -8368,6 +8368,11 @@ struct RequestConnectionMetadata {
     /// default and means no observer ran (H2/H3/tests). Only a completed
     /// observation may be [`h1_framing_guard::H1FramingResult::Clear`].
     http1_framing_result: h1_framing_guard::H1FramingResult,
+    /// Shared HTTP/1 wire-framing signals for this connection. Present on
+    /// HTTP/1.x connections wrapped by [`h1_framing_guard::H1FramingGuardIo`]
+    /// so upgraded WebSocket shard handoff can decline downcasting whenever
+    /// Hyper may hold a pending read-ahead error (ferrum-edge #5911).
+    h1_framing_signals: Option<Arc<h1_framing_guard::H1FramingSignals>>,
     /// Concrete local address of the accepted TCP connection. Unlike the
     /// listener's wildcard bind address, this identifies the pod IP the peer
     /// actually reached — it binds a Sidecar ingress CONNECT to this replica
@@ -16331,6 +16336,7 @@ async fn handle_connection(
             frontend_listen_port,
             gateway_listener_identity: gateway_listener_identity.clone(),
             http1_framing_result,
+            h1_framing_signals: response_h1_framing_signals.clone(),
             accepted_local_addr,
             frontend_sni_hostname: None,
             node_waypoint_identity: node_waypoint_identity.clone(),
@@ -17105,6 +17111,9 @@ async fn handle_websocket_request_authenticated(
     // concretization. Retries must reuse this exact authority — never
     // re-derive from backend-controlled data.
     request_host: Option<String>,
+    #[cfg_attr(feature = "bench-h1-profile", allow(unused_variables))] h1_framing_signals: Option<
+        Arc<h1_framing_guard::H1FramingSignals>,
+    >,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     info!(
         "WebSocket upgrade request authenticated for proxy: {} from: {}",
@@ -18730,6 +18739,7 @@ async fn handle_websocket_request_authenticated(
                             run_direct_ws_tunnel_maybe_on_shard(
                                 shard_handle,
                                 upgraded,
+                                h1_framing_signals.as_deref(),
                                 handshake.stream,
                                 &proxy_id,
                                 ws_conn_id,
@@ -22735,6 +22745,7 @@ enum DetachedWsClient {
         client_write_timeout: Option<Duration>,
         session: Box<rustls::ServerConnection>,
         read_buf: Bytes,
+        deferred_read_err: Option<std::io::Error>,
     },
     Plain {
         std_stream: std::net::TcpStream,
@@ -22748,10 +22759,25 @@ enum DetachedWsBackend {
     Tls {
         std_stream: std::net::TcpStream,
         session: Box<rustls::ClientConnection>,
+        deferred_read_err: Option<std::io::Error>,
     },
     Plain {
         std_stream: std::net::TcpStream,
     },
+}
+
+#[cfg(not(feature = "bench-h1-profile"))]
+fn take_tls_deferred_read_error<T: tokio::io::AsyncRead + Unpin>(
+    stream: &mut T,
+) -> Option<std::io::Error> {
+    let waker = std::task::Waker::noop();
+    let mut cx = std::task::Context::from_waker(waker);
+    let mut empty = [];
+    let mut buf = tokio::io::ReadBuf::new(&mut empty);
+    match std::pin::Pin::new(stream).poll_read(&mut cx, &mut buf) {
+        Poll::Ready(Err(err)) => Some(err),
+        Poll::Ready(Ok(())) | Poll::Pending => None,
+    }
 }
 
 #[cfg(not(feature = "bench-h1-profile"))]
@@ -22784,7 +22810,7 @@ fn try_detach_ws_client(upgraded: hyper::upgrade::Upgraded) -> std::io::Result<W
                     Box::new(relay_shards::PrefixedIo::new(maybe_guard, parts.read_buf)),
                 )));
             }
-            let tls_stream = match maybe_guard.try_into_inner() {
+            let mut tls_stream = match maybe_guard.try_into_inner() {
                 Ok(stream) => stream,
                 Err(guard) => {
                     return Ok(WsClientTakeover::Undetached(UndetachedH1WsClientIo::Tls(
@@ -22792,6 +22818,7 @@ fn try_detach_ws_client(upgraded: hyper::upgrade::Upgraded) -> std::io::Result<W
                     )));
                 }
             };
+            let deferred_read_err = take_tls_deferred_read_error(&mut tls_stream);
             let (stall_io, session) = tls_stream.into_inner();
             let (tcp, client_write_timeout) = match stall_io.try_into_parts() {
                 Ok(parts) => parts,
@@ -22807,6 +22834,7 @@ fn try_detach_ws_client(upgraded: hyper::upgrade::Upgraded) -> std::io::Result<W
                 client_write_timeout,
                 session: Box::new(session),
                 read_buf: parts.read_buf,
+                deferred_read_err,
             }));
         }
         Err(upgraded) => upgraded,
@@ -22853,6 +22881,7 @@ fn try_detach_ws_client(upgraded: hyper::upgrade::Upgraded) -> std::io::Result<W
 async fn run_direct_ws_tunnel_maybe_on_shard(
     shard_handle: tokio::runtime::Handle,
     upgraded: hyper::upgrade::Upgraded,
+    h1_framing_signals: Option<&h1_framing_guard::H1FramingSignals>,
     backend_ws_stream: BackendWsStream,
     proxy_id: &str,
     connection_id: u64,
@@ -22873,6 +22902,37 @@ async fn run_direct_ws_tunnel_maybe_on_shard(
     adaptive_buffer: &Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
     client_trust: Option<crate::tls::ClientTrustSession>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Decline downcasting `Upgraded` unless the H1 framing guard observed this
+    // connection with zero read errors, because `hyper::upgrade::Upgraded::downcast`
+    // drops any read-ahead error saved by FERRUM PATCH 003 (#5911).
+    let allow_client_downcast = h1_framing_signals.is_some_and(|signals| !signals.saw_read_error());
+    if !allow_client_downcast {
+        return run_websocket_session(
+            TokioIo::new(upgraded),
+            backend_ws_stream,
+            proxy_id,
+            connection_id,
+            ws_framing_plugins,
+            ws_frame_plugins,
+            ws_disconnect_plugins,
+            session_meta,
+            ws_connection_permit,
+            max_websocket_frame_size_bytes,
+            websocket_write_buffer_size,
+            websocket_tunnel_mode,
+            websocket_tunnel_idle_disabled_safety_cap,
+            ws_idle_tracker,
+            session_deadline,
+            shutdown_rx,
+            overload,
+            fragment_policy,
+            adaptive_buffer,
+            client_trust,
+            None,
+            None,
+        )
+        .await;
+    }
     let detached_client = match try_detach_ws_client(upgraded) {
         Ok(WsClientTakeover::Detached(detached)) => detached,
         Ok(WsClientTakeover::Upgraded(upgraded)) => {
@@ -22949,12 +23009,14 @@ async fn run_direct_ws_tunnel_maybe_on_shard(
 
     let (maybe_tls, backend_read_buffer) = backend_ws_stream.into_inner_with_read_buffer();
     let detached_backend = match maybe_tls {
-        tokio_tungstenite::MaybeTlsStream::Rustls(tls_stream) => {
+        tokio_tungstenite::MaybeTlsStream::Rustls(mut tls_stream) => {
+            let deferred_read_err = take_tls_deferred_read_error(&mut tls_stream);
             let (ws_activity, session) = tls_stream.into_inner();
             match ws_activity.into_inner().into_std() {
                 Ok(std_stream) => DetachedWsBackend::Tls {
                     std_stream,
                     session: Box::new(session),
+                    deferred_read_err,
                 },
                 Err(err) => {
                     fire_ws_tunnel_disconnect_hooks(
@@ -23024,15 +23086,21 @@ async fn run_direct_ws_tunnel_maybe_on_shard(
                 client_write_timeout,
                 session,
                 read_buf,
+                deferred_read_err,
             } => match tokio::net::TcpStream::from_std(std_stream) {
                 Ok(tcp) => {
                     let stall = client_write_stall::ClientWriteStallIo::from_parts(
                         tcp,
                         client_write_timeout,
                     );
-                    RehomedWsClientIo::Tls(Box::new(relay_shards::RehomedTlsStream::new(
-                        stall, *session, read_buf,
-                    )))
+                    RehomedWsClientIo::Tls(Box::new(
+                        relay_shards::RehomedTlsStream::with_deferred_read_error(
+                            stall,
+                            *session,
+                            read_buf,
+                            deferred_read_err,
+                        ),
+                    ))
                 }
                 Err(err) => {
                     fire_ws_tunnel_disconnect_hooks(
@@ -23082,15 +23150,40 @@ async fn run_direct_ws_tunnel_maybe_on_shard(
             },
         };
 
-        let rehomed_backend =
-            match detached_backend {
-                DetachedWsBackend::Tls {
-                    std_stream,
-                    session,
-                } => match tokio::net::TcpStream::from_std(std_stream) {
-                    Ok(tcp) => RehomedWsBackendIo::Tls(Box::new(
-                        relay_shards::RehomedTlsStream::new(tcp, *session, Bytes::new()),
-                    )),
+        let rehomed_backend = match detached_backend {
+            DetachedWsBackend::Tls {
+                std_stream,
+                session,
+                deferred_read_err,
+            } => match tokio::net::TcpStream::from_std(std_stream) {
+                Ok(tcp) => RehomedWsBackendIo::Tls(Box::new(
+                    relay_shards::RehomedTlsStream::with_deferred_read_error(
+                        tcp,
+                        *session,
+                        Bytes::new(),
+                        deferred_read_err,
+                    ),
+                )),
+                Err(err) => {
+                    fire_ws_tunnel_disconnect_hooks(
+                        &ws_disconnect_plugins,
+                        &shard_proxy_id,
+                        &session_meta,
+                        0,
+                        0,
+                        Some((
+                            crate::plugins::Direction::Unknown,
+                            retry::ErrorClass::ConnectionClosed,
+                            None,
+                        )),
+                    )
+                    .await;
+                    return Err(Box::new(err) as Box<dyn std::error::Error + Send + Sync>);
+                }
+            },
+            DetachedWsBackend::Plain { std_stream } => {
+                match tokio::net::TcpStream::from_std(std_stream) {
+                    Ok(tcp) => RehomedWsBackendIo::Plain(tcp),
                     Err(err) => {
                         fire_ws_tunnel_disconnect_hooks(
                             &ws_disconnect_plugins,
@@ -23107,29 +23200,9 @@ async fn run_direct_ws_tunnel_maybe_on_shard(
                         .await;
                         return Err(Box::new(err) as Box<dyn std::error::Error + Send + Sync>);
                     }
-                },
-                DetachedWsBackend::Plain { std_stream } => {
-                    match tokio::net::TcpStream::from_std(std_stream) {
-                        Ok(tcp) => RehomedWsBackendIo::Plain(tcp),
-                        Err(err) => {
-                            fire_ws_tunnel_disconnect_hooks(
-                                &ws_disconnect_plugins,
-                                &shard_proxy_id,
-                                &session_meta,
-                                0,
-                                0,
-                                Some((
-                                    crate::plugins::Direction::Unknown,
-                                    retry::ErrorClass::ConnectionClosed,
-                                    None,
-                                )),
-                            )
-                            .await;
-                            return Err(Box::new(err) as Box<dyn std::error::Error + Send + Sync>);
-                        }
-                    }
                 }
-            };
+            }
+        };
 
         let rehomed_backend_ws = WebSocketStream::from_partially_read(
             rehomed_backend,
@@ -27020,6 +27093,7 @@ async fn handle_tls_connection(
             frontend_listen_port: tls_connection_metadata.frontend_listen_port,
             gateway_listener_identity: tls_connection_metadata.gateway_listener_identity.clone(),
             http1_framing_result,
+            h1_framing_signals: response_h1_framing_signals.clone(),
             accepted_local_addr: tls_connection_metadata.accepted_local_addr,
             frontend_sni_hostname,
             node_waypoint_identity: tls_connection_metadata.node_waypoint_identity.clone(),
@@ -37460,6 +37534,7 @@ async fn handle_proxy_request_inner(
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     let start_time = Instant::now();
     let http1_framing_result = connection_metadata.http1_framing_result;
+    let h1_framing_signals = connection_metadata.h1_framing_signals;
     let gateway_listener_identity = connection_metadata.gateway_listener_identity;
     let accepted_local_ip = connection_metadata
         .accepted_local_addr
@@ -42198,6 +42273,7 @@ async fn handle_proxy_request_inner(
             backend_path_is_policy_bound,
             original_request_path.clone(),
             request_host.clone(),
+            h1_framing_signals,
         )
         .await;
     }

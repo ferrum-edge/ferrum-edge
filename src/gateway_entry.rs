@@ -1030,10 +1030,15 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
             | OperatingMode::DataPlane
             | OperatingMode::Mesh
     ) {
-        match proxy::relay_shards::initialize(env_config.worker_threads) {
+        match proxy::relay_shards::initialize(env_config.worker_threads, rt.handle().clone()) {
             Ok(guard) => {
+                let shard_count =
+                    proxy::relay_shards::resolve_shard_count(env_config.worker_threads);
                 info!(
-                    shards = proxy::relay_shards::resolve_shard_count(env_config.worker_threads),
+                    shards = %sanitize_startup_scalar(secrets::report_env_field(
+                        "FERRUM_WORKER_THREADS",
+                        &shard_count.to_string(),
+                    )),
                     "Initialized per-core relay shards"
                 );
                 Some(guard)

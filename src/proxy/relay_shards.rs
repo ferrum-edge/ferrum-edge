@@ -40,6 +40,7 @@ use tokio::sync::watch;
 const MIN_SHARDS: usize = 1;
 const MAX_SHARDS: usize = 64;
 const SHARD_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
+const SHARD_MAX_BLOCKING_THREADS: usize = 4;
 const SHARD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 static RELAY_SHARD_POOL: ArcSwapOption<RelayShardPool> = ArcSwapOption::const_empty();
@@ -60,6 +61,7 @@ pub fn resolve_shard_count(worker_threads: Option<usize>) -> usize {
 /// its own OS thread and OS reactor (`epoll`/`kqueue`).
 pub struct RelayShardPool {
     handles: Vec<Handle>,
+    main_runtime_handle: Option<Handle>,
     next: AtomicUsize,
 }
 
@@ -68,6 +70,13 @@ impl RelayShardPool {
     /// Tokio shard threads and waits until every shard runtime is ready to
     /// accept spawned tasks.
     pub fn new(shard_count: usize) -> io::Result<(Arc<Self>, RelayShardPoolGuard)> {
+        Self::new_inner(shard_count, None)
+    }
+
+    fn new_inner(
+        shard_count: usize,
+        main_runtime_handle: Option<Handle>,
+    ) -> io::Result<(Arc<Self>, RelayShardPoolGuard)> {
         let count = shard_count.clamp(MIN_SHARDS, MAX_SHARDS);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut handles = Vec::with_capacity(count);
@@ -82,6 +91,7 @@ impl RelayShardPool {
                 .spawn(move || {
                     let rt = match tokio::runtime::Builder::new_current_thread()
                         .enable_all()
+                        .max_blocking_threads(SHARD_MAX_BLOCKING_THREADS)
                         .build()
                     {
                         Ok(rt) => rt,
@@ -140,6 +150,7 @@ impl RelayShardPool {
 
         let pool = Arc::new(Self {
             handles,
+            main_runtime_handle,
             next: AtomicUsize::new(0),
         });
         let guard = RelayShardPoolGuard {
@@ -154,6 +165,11 @@ impl RelayShardPool {
     /// Number of active shard runtimes in this pool.
     pub fn shard_count(&self) -> usize {
         self.handles.len()
+    }
+
+    /// Clones every shard runtime handle (used for bounded event-loop probes).
+    pub fn handles(&self) -> Vec<Handle> {
+        self.handles.clone()
     }
 
     /// Selects the next shard handle in round-robin order.
@@ -183,13 +199,18 @@ impl Drop for RelayShardPoolGuard {
         if self.registered_global
             && let Some(pool) = self.pool.take()
         {
-            let current = RELAY_SHARD_POOL.load();
-            if current
-                .as_ref()
-                .is_some_and(|active| Arc::ptr_eq(active, &pool))
-            {
-                RELAY_SHARD_POOL.store(None);
-            }
+            // Identity-checked atomic CAS so an older guard cannot clear a
+            // newer pool installed concurrently.
+            RELAY_SHARD_POOL.rcu(|current| {
+                if current
+                    .as_ref()
+                    .is_some_and(|active| Arc::ptr_eq(active, &pool))
+                {
+                    None
+                } else {
+                    current.as_ref().map(Arc::clone)
+                }
+            });
         }
         let _ = self.shutdown_tx.send(true);
         for handle in self.threads.drain(..) {
@@ -200,11 +221,18 @@ impl Drop for RelayShardPoolGuard {
 
 /// Initializes and publishes the process-wide per-core relay shard pool.
 ///
+/// `main_runtime_handle` records the main multi-threaded Tokio runtime so
+/// shard-hosted connections that need blocking workers (e.g., `io_uring`
+/// splice) still submit against the operator's `FERRUM_BLOCKING_THREADS` pool.
+///
 /// Callers must hold the returned [`RelayShardPoolGuard`] for the lifetime of
 /// the gateway and drop it after the main Tokio runtime finishes draining.
-pub fn initialize(worker_threads: Option<usize>) -> io::Result<RelayShardPoolGuard> {
+pub fn initialize(
+    worker_threads: Option<usize>,
+    main_runtime_handle: Handle,
+) -> io::Result<RelayShardPoolGuard> {
     let count = resolve_shard_count(worker_threads);
-    let (pool, mut guard) = RelayShardPool::new(count)?;
+    let (pool, mut guard) = RelayShardPool::new_inner(count, Some(main_runtime_handle))?;
     guard.registered_global = true;
     RELAY_SHARD_POOL.store(Some(pool));
     Ok(guard)
@@ -218,6 +246,27 @@ pub fn next_handle() -> Option<Handle> {
         .load()
         .as_ref()
         .map(|pool| pool.next_handle())
+}
+
+/// Returns handles for all active process-wide relay shards, or an empty `Vec`
+/// when relay shards are not initialized.
+pub fn all_handles() -> Vec<Handle> {
+    RELAY_SHARD_POOL
+        .load()
+        .as_ref()
+        .map(|pool| pool.handles())
+        .unwrap_or_default()
+}
+
+/// Returns the main Tokio runtime handle registered alongside the relay shard
+/// pool, so shard-hosted tasks can route blocking work to the configured main
+/// blocking pool (`FERRUM_BLOCKING_THREADS`).
+#[inline]
+pub fn main_runtime_handle() -> Option<Handle> {
+    RELAY_SHARD_POOL
+        .load()
+        .as_ref()
+        .and_then(|pool| pool.main_runtime_handle.clone())
 }
 
 /// Transparent I/O wrapper that yields already-buffered `prefix` bytes from
@@ -307,13 +356,28 @@ pub struct RehomedTlsStream<IO, C> {
 
 impl<IO, C> RehomedTlsStream<IO, C> {
     pub fn new(io: IO, session: C, prefix: Bytes) -> Self {
+        Self::with_deferred_read_error(io, session, prefix, None)
+    }
+
+    /// Reconstructs a post-handshake TLS stream while preserving any deferred
+    /// read error observed on the previous `tokio_rustls::TlsStream` wrapper
+    /// prior to `into_inner()`.
+    pub fn with_deferred_read_error(
+        io: IO,
+        session: C,
+        prefix: Bytes,
+        deferred_read_err: Option<io::Error>,
+    ) -> Self {
+        let read_eof = deferred_read_err
+            .as_ref()
+            .is_some_and(|err| err.kind() == io::ErrorKind::ConnectionAborted);
         Self {
             io,
             session,
             prefix,
-            read_eof: false,
+            read_eof,
             write_shutdown: false,
-            deferred_read_err: None,
+            deferred_read_err,
         }
     }
 }
@@ -371,7 +435,12 @@ where
                     io_pending = true;
                     break;
                 }
-                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Ready(Err(err)) => {
+                    if err.kind() == io::ErrorKind::ConnectionAborted {
+                        self.read_eof = true;
+                    }
+                    return Poll::Ready(Err(err));
+                }
             }
         }
 
@@ -423,8 +492,21 @@ where
             this.prefix.advance(len);
             return Poll::Ready(Ok(()));
         }
-        if let Some(err) = this.deferred_read_err.take() {
-            return Poll::Ready(Err(err));
+        if this.deferred_read_err.is_some() {
+            // Drain any already-decrypted plaintext buffered in `session`
+            // before surfacing a deferred transport/TLS read error so valid
+            // bytes preceding a reset are never discarded.
+            if let Ok(data) = this.session.reader().into_first_chunk()
+                && !data.is_empty()
+            {
+                let len = data.len().min(buf.remaining());
+                buf.put_slice(&data[..len]);
+                this.session.reader().consume(len);
+                return Poll::Ready(Ok(()));
+            }
+            if let Some(err) = this.deferred_read_err.take() {
+                return Poll::Ready(Err(err));
+            }
         }
         if this.read_eof {
             return Poll::Ready(Ok(()));

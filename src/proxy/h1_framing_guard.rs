@@ -182,6 +182,11 @@ pub(super) struct H1FramingSignals {
     /// Incremented on the cold reject path only, never in `poll_read`'s fast
     /// path.
     parse_rejects: AtomicU64,
+    /// Set if the underlying transport returned a read error while Hyper was
+    /// reading ahead (ferrum-edge #5911). WebSocket shard handoff checks this
+    /// before downcasting `hyper::upgrade::Upgraded` so it never drops a
+    /// pending read-ahead error stored on `Upgraded`.
+    saw_read_error: AtomicBool,
 }
 
 impl H1FramingSignals {
@@ -195,7 +200,17 @@ impl H1FramingSignals {
             observation_disabled: AtomicBool::new(false),
             parse_reject_hint: AtomicU8::new(PARSE_HINT_NONE),
             parse_rejects: AtomicU64::new(0),
+            saw_read_error: AtomicBool::new(false),
         }
+    }
+
+    fn record_read_error(&self) {
+        self.saw_read_error.store(true, Ordering::Release);
+    }
+
+    #[cfg(not(feature = "bench-h1-profile"))]
+    pub(super) fn saw_read_error(&self) -> bool {
+        self.saw_read_error.load(Ordering::Acquire)
     }
 
     fn store_parse_reject_hint(&self, hint: u8) {
@@ -504,6 +519,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for H1FramingGuardIo<T> {
             Pin::new(&mut this.inner).poll_read(cx, buf)
         };
 
+        if matches!(result, Poll::Ready(Err(_))) {
+            this.signals.record_read_error();
+        }
         if let Poll::Ready(Ok(())) = &result {
             this.scanner.disable_if_requested(&this.signals);
             if this.scanner.observation_active() {
