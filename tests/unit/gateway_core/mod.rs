@@ -205,6 +205,7 @@ mod proxy_hop_limit_tests;
 mod proxy_protocol_tests;
 mod proxy_tests;
 mod relay_flush_progress_tests;
+mod relay_shards_tests;
 mod replay_prune_allocation_tests;
 mod request_buffer_budget_tests;
 mod request_context_tests;

@@ -391,6 +391,26 @@ impl<T> H1FramingGuardIo<T> {
             signals,
         )
     }
+
+    #[cfg(not(feature = "bench-h1-profile"))]
+    pub(super) fn can_detach(&self) -> bool {
+        self.parse_reject.is_idle()
+    }
+
+    #[cfg(not(feature = "bench-h1-profile"))]
+    pub(super) fn get_ref(&self) -> &T {
+        &self.inner
+    }
+
+    #[cfg(not(feature = "bench-h1-profile"))]
+    pub(super) fn try_into_inner(self) -> Result<T, Self> {
+        if self.can_detach() {
+            self.signals.disable_observation();
+            Ok(self.inner)
+        } else {
+            Err(self)
+        }
+    }
 }
 
 impl<T: AsyncWrite + Unpin> H1FramingGuardIo<T> {
@@ -595,6 +615,33 @@ impl<T> MaybeH1FramingGuardIo<T> {
 
     pub(super) fn passthrough(inner: T) -> Self {
         Self::Passthrough(inner)
+    }
+
+    #[cfg(not(feature = "bench-h1-profile"))]
+    pub(super) fn can_detach(&self) -> bool {
+        match self {
+            Self::Observed(guard) => guard.can_detach(),
+            Self::Passthrough(_) => true,
+        }
+    }
+
+    #[cfg(not(feature = "bench-h1-profile"))]
+    pub(super) fn get_ref(&self) -> &T {
+        match self {
+            Self::Observed(guard) => guard.get_ref(),
+            Self::Passthrough(inner) => inner,
+        }
+    }
+
+    #[cfg(not(feature = "bench-h1-profile"))]
+    pub(super) fn try_into_inner(self) -> Result<T, Self> {
+        match self {
+            Self::Observed(guard) => match guard.try_into_inner() {
+                Ok(inner) => Ok(inner),
+                Err(guard) => Err(Self::Observed(Box::new(guard))),
+            },
+            Self::Passthrough(inner) => Ok(inner),
+        }
     }
 }
 

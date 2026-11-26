@@ -978,12 +978,6 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
     // so keep explicit headroom for the production request path. This reserves
     // virtual address space per worker; pages are committed on demand.
     rt_builder.thread_stack_size(8 * 1024 * 1024);
-    // Poll the I/O and timer drivers every 8 ticks instead of Tokio's default
-    // 61. Single-poll-per-message relays (TCP-TLS, WebSocket tunnel, HTTP/1.1)
-    // otherwise drain short ready batches without reaching 61 ticks, enter
-    // work-stealing, and park workers in `futex_wait` while loopback sockets
-    // are already readable.
-    rt_builder.event_interval(8);
     // Key-tied for the same reason as the logging-clamp fields above: both are
     // parsed to `usize` and clamped with `.max(1)` before being re-rendered, so
     // a secret-backed `004` surfaces as `4` and a `0` as `1`. Those are derived
@@ -1023,6 +1017,37 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
             );
             return 1;
         }
+    };
+
+    // Per-core `current_thread` relay shards for long-lived TCP/TLS and
+    // WebSocket tunnel relays in serving modes. Dropping `relay_shards_guard`
+    // after `rt` guarantees all graceful-drain work completes before shard
+    // runtimes shut down.
+    let relay_shards_guard = if matches!(
+        env_config.mode,
+        OperatingMode::Database
+            | OperatingMode::File
+            | OperatingMode::DataPlane
+            | OperatingMode::Mesh
+    ) {
+        match proxy::relay_shards::initialize(env_config.worker_threads) {
+            Ok(guard) => {
+                info!(
+                    shards = proxy::relay_shards::resolve_shard_count(env_config.worker_threads),
+                    "Initialized per-core relay shards"
+                );
+                Some(guard)
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Failed to initialize per-core relay shards; falling back to main runtime"
+                );
+                None
+            }
+        }
+    } else {
+        None
     };
 
     observability_delivery::initialize(
@@ -1271,6 +1296,9 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
             }
         }
     });
+
+    drop(rt);
+    drop(relay_shards_guard);
 
     gateway_exit_code
 }

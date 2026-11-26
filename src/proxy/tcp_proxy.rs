@@ -2850,7 +2850,7 @@ async fn run_tcp_accept_loop(
     loop {
         tokio::select! {
             result = listener.accept() => {
-                let (mut stream, remote_addr) = match result {
+                let (stream, remote_addr) = match result {
                     Ok(conn) => conn,
                     Err(e) => {
                         // Bound the log rate independently of the backoff (an
@@ -2942,7 +2942,48 @@ async fn run_tcp_accept_loop(
                 let stream_gateway_ref = state.stream_gateway_ref.clone();
                 let trusted_proxies = state.trusted_proxies.clone();
 
-                tokio::spawn(async move {
+                // Hand off accepted TCP connections round-robin to per-core
+                // `current_thread` relay shards when initialized so each
+                // connection runs its TLS handshake, backend dial, and copy
+                // loop on one thread-local reactor without work-stealing or
+                // cross-core cache migration.
+                enum AcceptedTcpStream {
+                    Tokio(TcpStream),
+                    Std(std::net::TcpStream),
+                }
+                let (shard_handle, accepted_stream) =
+                    if let Some(handle) = crate::proxy::relay_shards::next_handle() {
+                        match stream.into_std() {
+                            Ok(std_stream) => (Some(handle), AcceptedTcpStream::Std(std_stream)),
+                            Err(e) => {
+                                warn!(
+                                    proxy_id = %state.proxy_id,
+                                    "Failed to detach accepted TCP stream for relay shard handoff: {}",
+                                    e
+                                );
+                                continue;
+                            }
+                        }
+                    } else {
+                        (None, AcceptedTcpStream::Tokio(stream))
+                    };
+
+                let conn_future = async move {
+                    let mut stream = match accepted_stream {
+                        AcceptedTcpStream::Tokio(stream) => stream,
+                        AcceptedTcpStream::Std(std_stream) => match TcpStream::from_std(std_stream)
+                        {
+                            Ok(stream) => stream,
+                            Err(e) => {
+                                warn!(
+                                    proxy_id = %proxy_id,
+                                    "Failed to re-register accepted TCP stream on relay shard: {}",
+                                    e
+                                );
+                                return;
+                            }
+                        },
+                    };
                     let _active_metric_guard = TcpActiveConnectionGuard::new(metrics.clone());
                     // Track this connection for global overload accounting and graceful drain.
                     // The guard decrements the counter on drop (all exit paths).
@@ -3396,7 +3437,12 @@ async fn run_tcp_accept_loop(
                             }
                         }
                     }
-                });
+                };
+                if let Some(handle) = shard_handle {
+                    handle.spawn(conn_future);
+                } else {
+                    tokio::spawn(conn_future);
+                }
             }
             _ = shutdown_rx.changed() => {
                 info!(
