@@ -9,7 +9,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use ferrum_edge::proxy::client_write_stall::ClientWriteStallIo;
 use ferrum_edge::proxy::relay_shards::{
-    PrefixedIo, RehomedTlsStream, RelayShardPool, resolve_shard_count,
+    DropOnMainRuntime, PrefixedIo, RehomedTlsStream, RelayShardPool, resolve_shard_count,
 };
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
@@ -339,4 +339,26 @@ async fn client_write_stall_io_detaches_when_idle_and_refuses_when_armed() {
         "armed write-stall timer must refuse cross-runtime detach"
     );
     assert!(armed_stall.try_into_parts().is_err());
+}
+
+#[tokio::test]
+async fn drop_on_main_runtime_drops_inner_inline_when_no_global_pool_is_installed() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct FlagDrop(Arc<AtomicBool>);
+    impl Drop for FlagDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let dropped = Arc::new(AtomicBool::new(false));
+    {
+        let _guard = DropOnMainRuntime::new(FlagDrop(Arc::clone(&dropped)));
+        assert!(!dropped.load(Ordering::SeqCst));
+    }
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "DropOnMainRuntime must drop its value when no global shard pool is active"
+    );
 }

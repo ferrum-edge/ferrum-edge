@@ -99,8 +99,9 @@ FERRUM_OVERLOAD_LOOP_WARN_US=10000            # log warning (10ms)
 FERRUM_OVERLOAD_LOOP_CRITICAL_US=500000       # reject connections (500ms)
 ```
 
-Each monitor tick spawns one `yield_now()` probe per runtime worker and waits
-for them for at most `FERRUM_OVERLOAD_LOOP_CRITICAL_US`, bounded by
+Each monitor tick spawns one `yield_now()` probe per main runtime worker and
+per active relay shard and waits for them for at most
+`FERRUM_OVERLOAD_LOOP_CRITICAL_US`, bounded by
 `FERRUM_OVERLOAD_CHECK_INTERVAL_MS`. A probe that has not run by then is
 reported as at least that budget, so a stall that reaches the critical
 threshold trips it, and shorter stalls report their measured latency in

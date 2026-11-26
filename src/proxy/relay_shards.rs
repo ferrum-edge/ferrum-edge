@@ -269,6 +269,38 @@ pub fn main_runtime_handle() -> Option<Handle> {
         .and_then(|pool| pool.main_runtime_handle.clone())
 }
 
+/// RAII wrapper that defers dropping `T` onto the serving `MultiThread` main
+/// runtime whenever dropped on a `current_thread` relay shard.
+///
+/// Long-lived shard tasks hold references to retired config epochs and plugin
+/// instances across live reloads. Deferring their final drop to the main
+/// runtime ensures plugin destructors that require `RuntimeFlavor::MultiThread`
+/// (e.g., ordered flush/retirement) run in the expected runtime without
+/// blocking the relay shard's event loop.
+pub struct DropOnMainRuntime<T: Send + 'static>(Option<T>);
+
+impl<T: Send + 'static> DropOnMainRuntime<T> {
+    pub fn new(value: T) -> Self {
+        Self(Some(value))
+    }
+}
+
+impl<T: Send + 'static> Drop for DropOnMainRuntime<T> {
+    fn drop(&mut self) {
+        let Some(value) = self.0.take() else {
+            return;
+        };
+        let on_current_thread = Handle::try_current()
+            .ok()
+            .is_some_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread);
+        if on_current_thread && let Some(main_handle) = main_runtime_handle() {
+            main_handle.spawn(async move {
+                drop(value);
+            });
+        }
+    }
+}
+
 /// Transparent I/O wrapper that yields already-buffered `prefix` bytes from
 /// `poll_read` before delegating reads to the underlying `io`.
 pub struct PrefixedIo<IO> {

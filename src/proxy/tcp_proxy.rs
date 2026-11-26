@@ -3016,6 +3016,13 @@ async fn run_tcp_accept_loop(
                     // `stream_proxy_protocol` must not let one connection decide header
                     // consumption from one snapshot and route with another.
                     let epoch = request_epoch.load();
+                    // Keep an epoch Arc in a main-runtime drop guard declared
+                    // before any local plugin clones so the last reference to
+                    // a retired config/plugin generation after a live reload
+                    // drops on the MultiThread main runtime rather than on a
+                    // `current_thread` relay shard.
+                    let _epoch_main_drop =
+                        crate::proxy::relay_shards::DropOnMainRuntime::new(Arc::clone(&epoch));
                     let proxy_protocol_enabled = epoch
                         .proxy_by_namespaced_id(proxy_namespace.as_ref(), proxy_id.as_ref())
                         .and_then(|p| p.stream_proxy_protocol)

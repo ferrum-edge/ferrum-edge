@@ -3696,6 +3696,30 @@ impl Drop for ApiChargebackSink {
                         finalize_snapshot_generation_and_pending(lifecycle).await;
                     });
                 });
+            } else if let Some(main_handle) = crate::proxy::relay_shards::main_runtime_handle() {
+                // Dropped on a `current_thread` relay shard while the serving
+                // main multi-thread runtime is active: do not run
+                // `finalize_without_await()` inline on the relay event loop
+                // (where the snapshot task may still run concurrently on the
+                // main runtime). Hand finalization, task abort, and sink
+                // unregistration off in order to the main runtime.
+                let lifecycle = Arc::clone(lifecycle);
+                let tasks: Vec<_> = self
+                    .background_tasks
+                    .lock()
+                    .map(|mut guard| guard.drain(..).collect())
+                    .unwrap_or_default();
+                let runtime = self.runtime.get().cloned();
+                main_handle.spawn(async move {
+                    finalize_snapshot_generation_and_pending(lifecycle).await;
+                    for task in tasks {
+                        task.abort();
+                    }
+                    if let Some(runtime) = runtime {
+                        unregister_active_sink(&runtime);
+                    }
+                });
+                return;
             } else {
                 // Current-thread tests and teardown after runtime exit cannot
                 // synchronously await a Tokio task. No task can run

@@ -78,8 +78,11 @@ Two paths still drop a pending error, with a `debug!` log, because their
 return types have no place for it: `Connection::into_parts` on the HTTP/1
 client and server (used with `without_shutdown` for manual upgrades), and a
 successful `Upgraded::downcast`. A failed downcast keeps the error on the
-`Upgraded` it returns. Ferrum uses neither path: its tunnels read the
-`Upgraded` from `hyper::upgrade::on` directly.
+`Upgraded` it returns. Ferrum never uses `Connection::into_parts`; its HTTP/1
+WebSocket relay-shard handoff calls `hyper_util::server::conn::auto::upgrade::downcast`
+only after `H1FramingSignals::saw_read_error()` confirms that no read error
+occurred during HTTP/1 read-ahead, and otherwise declines the downcast so the
+tunnel reads `Upgraded` directly with its pending error intact.
 
 ## Measured
 

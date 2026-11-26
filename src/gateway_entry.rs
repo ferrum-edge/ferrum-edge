@@ -1021,8 +1021,10 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
 
     // Per-core `current_thread` relay shards for long-lived TCP/TLS and
     // WebSocket tunnel relays in serving modes. Dropping `relay_shards_guard`
-    // after `rt` guarantees all graceful-drain work completes before shard
-    // runtimes shut down.
+    // BEFORE `rt` (after graceful drain finishes inside `rt.block_on(...)`)
+    // cancels any lingering shard-hosted connection tasks and closes their
+    // sockets first, so `rt`'s blocking-pool workers (such as `io_uring`
+    // splice threads) exit promptly instead of blocking `drop(rt)`.
     let relay_shards_guard = if matches!(
         env_config.mode,
         OperatingMode::Database
@@ -1302,8 +1304,12 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
         }
     });
 
-    drop(rt);
+    // Graceful drain has already completed inside `rt.block_on(...)`. Shut down
+    // the relay shards first so any lingering shard-hosted tasks drop their
+    // sockets and unblock main-runtime blocking workers (e.g., `io_uring`
+    // splice) before `drop(rt)` waits for the main blocking pool.
     drop(relay_shards_guard);
+    drop(rt);
 
     gateway_exit_code
 }

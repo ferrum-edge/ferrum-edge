@@ -1129,7 +1129,7 @@ active. See [response_caching](plugins.md#response_caching) for the complete rul
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `FERRUM_WORKER_THREADS` | No | CPU cores | Tokio async worker threads |
+| `FERRUM_WORKER_THREADS` | No | CPU cores | Tokio async worker threads for the main runtime; in serving modes also sizes the per-core `current_thread` relay shard pool (clamped to `1..=64`) used for TCP/TLS and WebSocket tunnel relays |
 | `FERRUM_BLOCKING_THREADS` | No | `512` | Max tokio blocking threads for file/DNS I/O |
 | `FERRUM_POOL_SHARD_AMOUNT` | No | `0` (auto) | Shard count for hot-path `DashMap`s (connection pools, pending creations, RR counters, DNS cache, circuit-breaker cache, per-IP request counts, TCP connection-throttle counters, router prefix/regex caches, `response_caching` cache/Vary-index/predictor maps, and shared local/Redis-fallback rate-limiter token-state maps used by `rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`, `udp_rate_limiting`, GraphQL type/operation limits, and `grpc_method_router`). `0` auto-derives `next_power_of_two(max(64, num_cpus * 16))` (64 on small dev hosts, 256 on a 16-core box, 1024 on a 64-core box). Positive values round up to a power of two with a minimum of two shards (`1` becomes `2`) and a ceiling of `2^30`. Tune up for hosts running 1M+ concurrent flows; tune down only under memory pressure |
 | `FERRUM_MAX_CONNECTIONS` | No | `100000` | Max concurrent proxy connections; queues when full, `0` = unlimited |

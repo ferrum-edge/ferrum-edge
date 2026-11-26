@@ -22669,6 +22669,18 @@ impl tokio::io::AsyncWrite for RehomedWsBackendIo {
 #[cfg(not(feature = "bench-h1-profile"))]
 enum UndetachedH1WsClientIo {
     Tls(Box<relay_shards::PrefixedIo<TlsH1RawClientIo>>),
+    /// TLS stream whose `ClientWriteStallIo` became armed during
+    /// `take_tls_deferred_read_error` (e.g., a last-gasp alert write on a
+    /// corrupt record into a full socket buffer): stays on the main runtime
+    /// with both `read_buf` and `deferred_read_err` preserved intact.
+    RehomedTls(
+        Box<
+            relay_shards::RehomedTlsStream<
+                client_write_stall::ClientWriteStallIo<tokio::net::TcpStream>,
+                rustls::ServerConnection,
+            >,
+        >,
+    ),
     Plain(Box<relay_shards::PrefixedIo<PlainH1RawClientIo>>),
 }
 
@@ -22681,6 +22693,7 @@ impl tokio::io::AsyncRead for UndetachedH1WsClientIo {
     ) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
             Self::Tls(inner) => std::pin::Pin::new(inner.as_mut()).poll_read(cx, buf),
+            Self::RehomedTls(inner) => std::pin::Pin::new(inner.as_mut()).poll_read(cx, buf),
             Self::Plain(inner) => std::pin::Pin::new(inner.as_mut()).poll_read(cx, buf),
         }
     }
@@ -22695,6 +22708,7 @@ impl tokio::io::AsyncWrite for UndetachedH1WsClientIo {
     ) -> Poll<std::io::Result<usize>> {
         match self.get_mut() {
             Self::Tls(inner) => std::pin::Pin::new(inner.as_mut()).poll_write(cx, buf),
+            Self::RehomedTls(inner) => std::pin::Pin::new(inner.as_mut()).poll_write(cx, buf),
             Self::Plain(inner) => std::pin::Pin::new(inner.as_mut()).poll_write(cx, buf),
         }
     }
@@ -22706,6 +22720,9 @@ impl tokio::io::AsyncWrite for UndetachedH1WsClientIo {
     ) -> Poll<std::io::Result<usize>> {
         match self.get_mut() {
             Self::Tls(inner) => std::pin::Pin::new(inner.as_mut()).poll_write_vectored(cx, bufs),
+            Self::RehomedTls(inner) => {
+                std::pin::Pin::new(inner.as_mut()).poll_write_vectored(cx, bufs)
+            }
             Self::Plain(inner) => std::pin::Pin::new(inner.as_mut()).poll_write_vectored(cx, bufs),
         }
     }
@@ -22713,6 +22730,7 @@ impl tokio::io::AsyncWrite for UndetachedH1WsClientIo {
     fn is_write_vectored(&self) -> bool {
         match self {
             Self::Tls(inner) => inner.is_write_vectored(),
+            Self::RehomedTls(inner) => inner.is_write_vectored(),
             Self::Plain(inner) => inner.is_write_vectored(),
         }
     }
@@ -22723,6 +22741,7 @@ impl tokio::io::AsyncWrite for UndetachedH1WsClientIo {
     ) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
             Self::Tls(inner) => std::pin::Pin::new(inner.as_mut()).poll_flush(cx),
+            Self::RehomedTls(inner) => std::pin::Pin::new(inner.as_mut()).poll_flush(cx),
             Self::Plain(inner) => std::pin::Pin::new(inner.as_mut()).poll_flush(cx),
         }
     }
@@ -22733,6 +22752,7 @@ impl tokio::io::AsyncWrite for UndetachedH1WsClientIo {
     ) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
             Self::Tls(inner) => std::pin::Pin::new(inner.as_mut()).poll_shutdown(cx),
+            Self::RehomedTls(inner) => std::pin::Pin::new(inner.as_mut()).poll_shutdown(cx),
             Self::Plain(inner) => std::pin::Pin::new(inner.as_mut()).poll_shutdown(cx),
         }
     }
@@ -22822,9 +22842,21 @@ fn try_detach_ws_client(upgraded: hyper::upgrade::Upgraded) -> std::io::Result<W
             let (stall_io, session) = tls_stream.into_inner();
             let (tcp, client_write_timeout) = match stall_io.try_into_parts() {
                 Ok(parts) => parts,
-                Err(_) => {
-                    return Err(std::io::Error::other(
-                        "client write-stall wrapper could not detach after readiness check",
+                Err(stall_io) => {
+                    // `take_tls_deferred_read_error` may trigger a last-gasp
+                    // alert write that arms `ClientWriteStallIo` if the client
+                    // socket buffer is full. Fall back to an undetached relay
+                    // on the main runtime with both `read_buf` and
+                    // `deferred_read_err` preserved intact.
+                    return Ok(WsClientTakeover::Undetached(
+                        UndetachedH1WsClientIo::RehomedTls(Box::new(
+                            relay_shards::RehomedTlsStream::with_deferred_read_error(
+                                stall_io,
+                                session,
+                                parts.read_buf,
+                                deferred_read_err,
+                            ),
+                        )),
                     ));
                 }
             };
@@ -23080,6 +23112,19 @@ async fn run_direct_ws_tunnel_maybe_on_shard(
     let shard_proxy_id = proxy_id.to_owned();
     let shard_adaptive_buffer = Arc::clone(adaptive_buffer);
     let mut guard = AbortOnDrop(shard_handle.spawn(async move {
+        // Declared first so it drops last: if this shard task holds the final
+        // reference to any retired plugin after a live reload, defer its Drop
+        // to the MultiThread main runtime rather than the current_thread shard.
+        let _ws_plugins_main_drop = (!ws_framing_plugins.is_empty()
+            || !ws_frame_plugins.is_empty()
+            || !ws_disconnect_plugins.is_empty())
+        .then(|| {
+            relay_shards::DropOnMainRuntime::new((
+                ws_framing_plugins.clone(),
+                ws_frame_plugins.clone(),
+                ws_disconnect_plugins.clone(),
+            ))
+        });
         let rehomed_client = match detached_client {
             DetachedWsClient::Tls {
                 std_stream,
