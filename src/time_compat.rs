@@ -1067,3 +1067,995 @@ impl<'r> Decode<'r, Any> for UtcTimestamp {
         parse_sqlite_datetime_text(raw).map_err(Into::into)
     }
 }
+
+// ── chrono-compatible parsers ──────────────────────────────────────────────
+//
+// Issue #7419 owner decision: every parse site that moves off chrono must
+// accept and reject exactly the inputs chrono 0.4.45 does, and produce the
+// same value. The functions below are line-for-line ports of chrono's
+// `parse_from_rfc3339`, `DateTime<FixedOffset>: FromStr` (the parser behind
+// chrono's serde `Deserialize`), `parse_from_rfc2822`, and the
+// `DateTime::parse_from_str` / `NaiveDateTime::parse_from_str` strftime
+// engine for the specifiers Ferrum uses. `tests/unit/config/
+// time_compat_chrono_parse_tests.rs` runs an accept/reject corpus through
+// both implementations.
+
+/// chrono's `NaiveDate` year bounds (`MIN_YEAR`/`MAX_YEAR` in chrono 0.4.45).
+const CHRONO_MIN_YEAR: i32 = (i32::MIN >> 13) + 1;
+const CHRONO_MAX_YEAR: i32 = (i32::MAX >> 13) - 1;
+
+/// A date-time accepted by one of the chrono-compatible parsers.
+///
+/// Like `chrono::DateTime<FixedOffset>`, it holds the local (offset-applied)
+/// calendar and clock fields plus the fixed UTC offset. A leap second (`:60`)
+/// is kept the way chrono keeps it: second `59` with a sub-second part of
+/// `1_000_000_000 + fraction`. Years span chrono's full `-262143..=262142`
+/// range, which is wider than [`UtcTimestamp`]'s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChronoParsedDateTime {
+    year: i32,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+    nanosecond: u32,
+    offset_seconds: i32,
+}
+
+impl ChronoParsedDateTime {
+    /// Local calendar year (chrono `naive_local().year()`).
+    pub const fn year(&self) -> i32 {
+        self.year
+    }
+
+    /// Local month, `1..=12`.
+    pub const fn month(&self) -> u8 {
+        self.month
+    }
+
+    /// Local day of month, `1..=31`.
+    pub const fn day(&self) -> u8 {
+        self.day
+    }
+
+    /// Local hour, `0..=23`.
+    pub const fn hour(&self) -> u8 {
+        self.hour
+    }
+
+    /// Local minute, `0..=59`.
+    pub const fn minute(&self) -> u8 {
+        self.minute
+    }
+
+    /// Local second, `0..=59` (a leap second reports `59`, as in chrono).
+    pub const fn second(&self) -> u8 {
+        self.second
+    }
+
+    /// Sub-second nanoseconds, `>= 1_000_000_000` for a leap second, exactly
+    /// like chrono's `nanosecond()` / `timestamp_subsec_nanos()`.
+    pub const fn nanosecond(&self) -> u32 {
+        self.nanosecond
+    }
+
+    /// Fixed offset east of UTC in seconds (chrono `offset().local_minus_utc()`).
+    pub const fn offset_seconds(&self) -> i32 {
+        self.offset_seconds
+    }
+
+    /// Whether the input named a leap second (`:60`).
+    pub const fn is_leap_second(&self) -> bool {
+        self.nanosecond >= 1_000_000_000
+    }
+
+    /// Whole Unix seconds, identical to chrono's `DateTime::timestamp()`.
+    pub fn unix_timestamp(&self) -> i64 {
+        civil_days(self.year, self.month, self.day) * 86_400
+            + i64::from(self.hour) * 3_600
+            + i64::from(self.minute) * 60
+            + i64::from(self.second)
+            - i64::from(self.offset_seconds)
+    }
+
+    /// Unix milliseconds, identical to chrono's `DateTime::timestamp_millis()`
+    /// (for a leap second this lands in the following second, as in chrono).
+    pub fn unix_timestamp_millis(&self) -> i64 {
+        self.unix_timestamp() * 1_000 + i64::from(self.nanosecond / 1_000_000)
+    }
+
+    /// Convert to a [`UtcTimestamp`].
+    ///
+    /// Fails with [`TimestampError::OutOfRange`] outside `UtcTimestamp`'s
+    /// `-9999..=9999` year range and with [`TimestampError::InvalidComponent`]
+    /// for a leap second, which `UtcTimestamp` cannot represent; a caller that
+    /// must accept leap seconds decides how to map them explicitly.
+    pub fn to_utc_timestamp(&self) -> Result<UtcTimestamp, TimestampError> {
+        if self.is_leap_second() {
+            return Err(TimestampError::InvalidComponent);
+        }
+        UtcTimestamp::from_unix_timestamp_nanos(self.unix_timestamp(), self.nanosecond)
+    }
+}
+
+/// Days from `1970-01-01` to a proleptic-Gregorian civil date.
+fn civil_days(year: i32, month: u8, day: u8) -> i64 {
+    let month = i64::from(month);
+    let year = i64::from(year) - i64::from(month <= 2);
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let month_from_march = (month + 9) % 12;
+    let day_of_year = (153 * month_from_march + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+fn chrono_is_leap_year(year: i32) -> bool {
+    year.rem_euclid(4) == 0 && (year.rem_euclid(100) != 0 || year.rem_euclid(400) == 0)
+}
+
+/// chrono `NaiveDate::from_ymd_opt` acceptance.
+fn chrono_valid_ymd(year: i32, month: u32, day: u32) -> bool {
+    if !(CHRONO_MIN_YEAR..=CHRONO_MAX_YEAR).contains(&year) || !(1..=12).contains(&month) {
+        return false;
+    }
+    let days_in_month = match month {
+        2 if chrono_is_leap_year(year) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    (1..=days_in_month).contains(&day)
+}
+
+/// Weekday of a civil date, `0` = Sunday (chrono `num_days_from_sunday`).
+fn chrono_weekday(year: i32, month: u8, day: u8) -> u8 {
+    // 1970-01-01 was a Thursday (4).
+    u8::try_from((civil_days(year, month, day) + 4).rem_euclid(7)).unwrap_or(0)
+}
+
+/// Assemble a `DateTime<FixedOffset>`-equivalent value, applying chrono's
+/// `FixedOffset::east_opt` and `from_local_datetime` range checks.
+fn chrono_assemble(
+    (year, month, day): (i32, u32, u32),
+    (hour, minute, second, nanosecond): (u32, u32, u32, u32),
+    offset_seconds: i32,
+) -> Result<ChronoParsedDateTime, TimestampError> {
+    if !(-86_399..=86_399).contains(&offset_seconds) {
+        return Err(TimestampError::OutOfRange);
+    }
+    let narrow = |v: u32| u8::try_from(v).map_err(|_| TimestampError::InvalidComponent);
+    let parsed = ChronoParsedDateTime {
+        year,
+        month: narrow(month)?,
+        day: narrow(day)?,
+        hour: narrow(hour)?,
+        minute: narrow(minute)?,
+        second: narrow(second)?,
+        nanosecond,
+        offset_seconds,
+    };
+    // The UTC date must stay inside chrono's `NaiveDateTime` range.
+    let utc_day = parsed.unix_timestamp().div_euclid(86_400);
+    let min_day = civil_days(CHRONO_MIN_YEAR, 1, 1);
+    let max_day = civil_days(CHRONO_MAX_YEAR, 12, 31);
+    if !(min_day..=max_day).contains(&utc_day) {
+        return Err(TimestampError::OutOfRange);
+    }
+    Ok(parsed)
+}
+
+/// chrono `NaiveTime::from_hms_nano_opt` acceptance (leap seconds only at `:59`).
+fn chrono_valid_hms_nano(hour: u32, minute: u32, second: u32, nano: u32) -> bool {
+    hour < 24
+        && minute < 60
+        && second < 60
+        && nano < 2_000_000_000
+        && (nano < 1_000_000_000 || second == 59)
+}
+
+/// Port of chrono `format::scan::number`.
+fn chrono_scan_number(s: &str, min: usize, max: usize) -> Result<(&str, i64), TimestampError> {
+    let bytes = s.as_bytes();
+    if bytes.len() < min {
+        return Err(TimestampError::InvalidFormat);
+    }
+    let mut n = 0i64;
+    for (i, c) in bytes.iter().take(max).copied().enumerate() {
+        if !c.is_ascii_digit() {
+            if i < min {
+                return Err(TimestampError::InvalidFormat);
+            }
+            return Ok((s.get(i..).ok_or(TimestampError::InvalidFormat)?, n));
+        }
+        n = n
+            .checked_mul(10)
+            .and_then(|n| n.checked_add(i64::from(c - b'0')))
+            .ok_or(TimestampError::OutOfRange)?;
+    }
+    let consumed = max.min(bytes.len());
+    Ok((s.get(consumed..).ok_or(TimestampError::InvalidFormat)?, n))
+}
+
+/// Port of chrono `format::scan::nanosecond`.
+fn chrono_scan_nanosecond(s: &str) -> Result<(&str, u32), TimestampError> {
+    const SCALE: [u32; 10] = [
+        0,
+        100_000_000,
+        10_000_000,
+        1_000_000,
+        100_000,
+        10_000,
+        1_000,
+        100,
+        10,
+        1,
+    ];
+    let original_len = s.len();
+    let (rest, value) = chrono_scan_number(s, 1, 9)?;
+    let value = u32::try_from(value).map_err(|_| TimestampError::OutOfRange)?;
+    let consumed = original_len - rest.len();
+    let scale = SCALE
+        .get(consumed)
+        .copied()
+        .ok_or(TimestampError::InvalidFormat)?;
+    let value = value.checked_mul(scale).ok_or(TimestampError::OutOfRange)?;
+    Ok((rest.trim_start_matches(|c: char| c.is_ascii_digit()), value))
+}
+
+/// Port of chrono `format::scan::timezone_offset`.
+fn chrono_scan_timezone_offset(
+    mut s: &str,
+    consume_colon: fn(&str) -> Result<&str, TimestampError>,
+    allow_zulu: bool,
+    allow_missing_minutes: bool,
+    allow_tz_minus_sign: bool,
+) -> Result<(&str, i32), TimestampError> {
+    if allow_zulu && matches!(s.as_bytes().first(), Some(b'Z' | b'z')) {
+        return Ok((s.get(1..).ok_or(TimestampError::InvalidFormat)?, 0));
+    }
+    let negative = match s.chars().next() {
+        Some('+') => {
+            s = &s['+'.len_utf8()..];
+            false
+        }
+        Some('-') => {
+            s = &s['-'.len_utf8()..];
+            true
+        }
+        Some('\u{2212}') if allow_tz_minus_sign => {
+            s = &s['\u{2212}'.len_utf8()..];
+            true
+        }
+        _ => return Err(TimestampError::InvalidFormat),
+    };
+    let two = |s: &str| -> Option<(u8, u8)> {
+        let b = s.as_bytes();
+        Some((*b.first()?, *b.get(1)?))
+    };
+    let hours = match two(s) {
+        Some((h1 @ b'0'..=b'9', h2 @ b'0'..=b'9')) => i32::from((h1 - b'0') * 10 + (h2 - b'0')),
+        _ => return Err(TimestampError::InvalidFormat),
+    };
+    s = s.get(2..).ok_or(TimestampError::InvalidFormat)?;
+    s = consume_colon(s)?;
+    let minutes = if let Some(pair) = two(s) {
+        match pair {
+            (m1 @ b'0'..=b'5', m2 @ b'0'..=b'9') => i32::from((m1 - b'0') * 10 + (m2 - b'0')),
+            (b'6'..=b'9', b'0'..=b'9') => return Err(TimestampError::OutOfRange),
+            _ => return Err(TimestampError::InvalidFormat),
+        }
+    } else if allow_missing_minutes {
+        0
+    } else {
+        return Err(TimestampError::InvalidFormat);
+    };
+    s = match s.len() {
+        len if len >= 2 => s.get(2..).ok_or(TimestampError::InvalidFormat)?,
+        0 => s,
+        _ => return Err(TimestampError::InvalidFormat),
+    };
+    let seconds = hours * 3_600 + minutes * 60;
+    Ok((s, if negative { -seconds } else { seconds }))
+}
+
+fn chrono_colon_required(s: &str) -> Result<&str, TimestampError> {
+    s.strip_prefix(':').ok_or(TimestampError::InvalidFormat)
+}
+
+fn chrono_colon_or_space(s: &str) -> Result<&str, TimestampError> {
+    Ok(s.trim_start_matches(|c: char| c == ':' || c.is_whitespace()))
+}
+
+fn chrono_no_colon(s: &str) -> Result<&str, TimestampError> {
+    Ok(s)
+}
+
+/// Port of chrono `scan::short_month0` (returns `0..=11`).
+fn chrono_scan_short_month0(s: &str) -> Result<(&str, u8), TimestampError> {
+    let b = s.as_bytes();
+    let (Some(&c0), Some(&c1), Some(&c2)) = (b.first(), b.get(1), b.get(2)) else {
+        return Err(TimestampError::InvalidFormat);
+    };
+    let month0 = match (c0 | 32, c1 | 32, c2 | 32) {
+        (b'j', b'a', b'n') => 0,
+        (b'f', b'e', b'b') => 1,
+        (b'm', b'a', b'r') => 2,
+        (b'a', b'p', b'r') => 3,
+        (b'm', b'a', b'y') => 4,
+        (b'j', b'u', b'n') => 5,
+        (b'j', b'u', b'l') => 6,
+        (b'a', b'u', b'g') => 7,
+        (b's', b'e', b'p') => 8,
+        (b'o', b'c', b't') => 9,
+        (b'n', b'o', b'v') => 10,
+        (b'd', b'e', b'c') => 11,
+        _ => return Err(TimestampError::InvalidFormat),
+    };
+    Ok((s.get(3..).ok_or(TimestampError::InvalidFormat)?, month0))
+}
+
+/// Port of chrono `scan::short_weekday` (returns days from Sunday).
+fn chrono_scan_short_weekday(s: &str) -> Result<(&str, u8), TimestampError> {
+    let b = s.as_bytes();
+    let (Some(&c0), Some(&c1), Some(&c2)) = (b.first(), b.get(1), b.get(2)) else {
+        return Err(TimestampError::InvalidFormat);
+    };
+    let weekday = match (c0 | 32, c1 | 32, c2 | 32) {
+        (b's', b'u', b'n') => 0,
+        (b'm', b'o', b'n') => 1,
+        (b't', b'u', b'e') => 2,
+        (b'w', b'e', b'd') => 3,
+        (b't', b'h', b'u') => 4,
+        (b'f', b'r', b'i') => 5,
+        (b's', b'a', b't') => 6,
+        _ => return Err(TimestampError::InvalidFormat),
+    };
+    Ok((s.get(3..).ok_or(TimestampError::InvalidFormat)?, weekday))
+}
+
+fn chrono_strip_suffix_ignore_case<'a>(s: &'a str, suffix: &[u8]) -> &'a str {
+    let b = s.as_bytes();
+    if b.len() >= suffix.len()
+        && b.get(..suffix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(suffix))
+    {
+        s.get(suffix.len()..).unwrap_or(s)
+    } else {
+        s
+    }
+}
+
+/// Port of chrono `scan::short_or_long_month0`.
+fn chrono_scan_short_or_long_month0(s: &str) -> Result<(&str, u8), TimestampError> {
+    const SUFFIXES: [&[u8]; 12] = [
+        b"uary", b"ruary", b"ch", b"il", b"", b"e", b"y", b"ust", b"tember", b"ober", b"ember",
+        b"ember",
+    ];
+    let (rest, month0) = chrono_scan_short_month0(s)?;
+    let suffix = SUFFIXES
+        .get(usize::from(month0))
+        .ok_or(TimestampError::InvalidFormat)?;
+    Ok((chrono_strip_suffix_ignore_case(rest, suffix), month0))
+}
+
+/// Port of chrono `scan::short_or_long_weekday`.
+fn chrono_scan_short_or_long_weekday(s: &str) -> Result<(&str, u8), TimestampError> {
+    // Indexed by days from Sunday.
+    const SUFFIXES: [&[u8]; 7] = [
+        b"day", b"day", b"sday", b"nesday", b"rsday", b"day", b"urday",
+    ];
+    let (rest, weekday) = chrono_scan_short_weekday(s)?;
+    let suffix = SUFFIXES
+        .get(usize::from(weekday))
+        .ok_or(TimestampError::InvalidFormat)?;
+    Ok((chrono_strip_suffix_ignore_case(rest, suffix), weekday))
+}
+
+/// Port of chrono `scan::space` (at least one whitespace character).
+fn chrono_scan_space(s: &str) -> Result<&str, TimestampError> {
+    let trimmed = s.trim_start();
+    if trimmed.len() < s.len() {
+        Ok(trimmed)
+    } else {
+        Err(TimestampError::InvalidFormat)
+    }
+}
+
+/// Port of chrono `scan::timezone_offset_2822`.
+fn chrono_scan_timezone_offset_2822(s: &str) -> Result<(&str, i32), TimestampError> {
+    let upto = s
+        .as_bytes()
+        .iter()
+        .position(|c| !c.is_ascii_alphabetic())
+        .unwrap_or(s.len());
+    if upto == 0 {
+        return chrono_scan_timezone_offset(s, chrono_no_colon, false, false, false);
+    }
+    let name = s
+        .as_bytes()
+        .get(..upto)
+        .ok_or(TimestampError::InvalidFormat)?;
+    let rest = s.get(upto..).ok_or(TimestampError::InvalidFormat)?;
+    let hours = |h: i32| (rest, h * 3_600);
+    if name.eq_ignore_ascii_case(b"gmt")
+        || name.eq_ignore_ascii_case(b"ut")
+        || name.eq_ignore_ascii_case(b"z")
+    {
+        Ok(hours(0))
+    } else if name.eq_ignore_ascii_case(b"edt") {
+        Ok(hours(-4))
+    } else if name.eq_ignore_ascii_case(b"est") || name.eq_ignore_ascii_case(b"cdt") {
+        Ok(hours(-5))
+    } else if name.eq_ignore_ascii_case(b"cst") || name.eq_ignore_ascii_case(b"mdt") {
+        Ok(hours(-6))
+    } else if name.eq_ignore_ascii_case(b"mst") || name.eq_ignore_ascii_case(b"pdt") {
+        Ok(hours(-7))
+    } else if name.eq_ignore_ascii_case(b"pst") {
+        Ok(hours(-8))
+    } else if let [b'a'..=b'i' | b'k'..=b'y' | b'A'..=b'I' | b'K'..=b'Y'] = name {
+        Ok((rest, 0))
+    } else {
+        Err(TimestampError::InvalidFormat)
+    }
+}
+
+/// Port of chrono `scan::comment_2822`.
+fn chrono_scan_comment_2822(s: &str) -> Result<&str, TimestampError> {
+    enum State {
+        Start,
+        Next(usize),
+        Escape(usize),
+    }
+    let s = s.trim_start();
+    let mut state = State::Start;
+    for (i, c) in s.bytes().enumerate() {
+        state = match (state, c) {
+            (State::Start, b'(') => State::Next(1),
+            (State::Next(1), b')') => {
+                return s.get(i + 1..).ok_or(TimestampError::InvalidFormat);
+            }
+            (State::Next(depth), b'\\') => State::Escape(depth),
+            (State::Next(depth), b'(') => State::Next(depth + 1),
+            (State::Next(depth), b')') => State::Next(depth - 1),
+            (State::Next(depth), _) | (State::Escape(depth), _) => State::Next(depth),
+            _ => return Err(TimestampError::InvalidFormat),
+        };
+    }
+    Err(TimestampError::InvalidFormat)
+}
+
+/// Port of the subset of chrono's `format::Parsed` that Ferrum's formats set.
+#[derive(Default)]
+struct ChronoFields {
+    year: Option<i32>,
+    year_mod_100: Option<i32>,
+    month: Option<u32>,
+    day: Option<u32>,
+    weekday: Option<u8>,
+    hour: Option<u32>,
+    minute: Option<u32>,
+    second: Option<u32>,
+    nanosecond: Option<u32>,
+    offset: Option<i32>,
+}
+
+fn chrono_set_if_consistent<T: PartialEq>(
+    slot: &mut Option<T>,
+    value: T,
+) -> Result<(), TimestampError> {
+    match slot {
+        Some(old) if *old != value => Err(TimestampError::InvalidComponent),
+        _ => {
+            *slot = Some(value);
+            Ok(())
+        }
+    }
+}
+
+fn chrono_bounded(value: i64, range: std::ops::RangeInclusive<i64>) -> Result<u32, TimestampError> {
+    if !range.contains(&value) {
+        return Err(TimestampError::OutOfRange);
+    }
+    u32::try_from(value).map_err(|_| TimestampError::OutOfRange)
+}
+
+impl ChronoFields {
+    fn set_year(&mut self, value: i64) -> Result<(), TimestampError> {
+        let year = i32::try_from(value).map_err(|_| TimestampError::OutOfRange)?;
+        chrono_set_if_consistent(&mut self.year, year)
+    }
+
+    fn set_year_mod_100(&mut self, value: i64) -> Result<(), TimestampError> {
+        let value = i32::try_from(chrono_bounded(value, 0..=99)?)
+            .map_err(|_| TimestampError::OutOfRange)?;
+        chrono_set_if_consistent(&mut self.year_mod_100, value)
+    }
+
+    fn set_month(&mut self, value: i64) -> Result<(), TimestampError> {
+        chrono_set_if_consistent(&mut self.month, chrono_bounded(value, 1..=12)?)
+    }
+
+    fn set_day(&mut self, value: i64) -> Result<(), TimestampError> {
+        chrono_set_if_consistent(&mut self.day, chrono_bounded(value, 1..=31)?)
+    }
+
+    fn set_weekday(&mut self, days_from_sunday: u8) -> Result<(), TimestampError> {
+        chrono_set_if_consistent(&mut self.weekday, days_from_sunday)
+    }
+
+    fn set_hour(&mut self, value: i64) -> Result<(), TimestampError> {
+        chrono_set_if_consistent(&mut self.hour, chrono_bounded(value, 0..=23)?)
+    }
+
+    fn set_minute(&mut self, value: i64) -> Result<(), TimestampError> {
+        chrono_set_if_consistent(&mut self.minute, chrono_bounded(value, 0..=59)?)
+    }
+
+    fn set_second(&mut self, value: i64) -> Result<(), TimestampError> {
+        chrono_set_if_consistent(&mut self.second, chrono_bounded(value, 0..=60)?)
+    }
+
+    fn set_nanosecond(&mut self, value: i64) -> Result<(), TimestampError> {
+        chrono_set_if_consistent(
+            &mut self.nanosecond,
+            chrono_bounded(value, 0..=999_999_999)?,
+        )
+    }
+
+    fn set_offset(&mut self, value: i64) -> Result<(), TimestampError> {
+        let offset = i32::try_from(value).map_err(|_| TimestampError::OutOfRange)?;
+        chrono_set_if_consistent(&mut self.offset, offset)
+    }
+
+    /// Port of `Parsed::to_naive_date` for year/month/day (+ weekday check).
+    fn to_date(&self) -> Result<(i32, u32, u32), TimestampError> {
+        let year = match (self.year, self.year_mod_100) {
+            (year, None) => year,
+            (Some(year), Some(rem)) => {
+                if year < 0 || year % 100 != rem {
+                    return Err(TimestampError::InvalidComponent);
+                }
+                Some(year)
+            }
+            (None, Some(rem)) => Some(rem + if rem < 70 { 2000 } else { 1900 }),
+        };
+        let (Some(year), Some(month), Some(day)) = (year, self.month, self.day) else {
+            return Err(TimestampError::InvalidFormat);
+        };
+        if !chrono_valid_ymd(year, month, day) {
+            return Err(TimestampError::OutOfRange);
+        }
+        if let Some(weekday) = self.weekday {
+            let month8 = u8::try_from(month).map_err(|_| TimestampError::OutOfRange)?;
+            let day8 = u8::try_from(day).map_err(|_| TimestampError::OutOfRange)?;
+            if chrono_weekday(year, month8, day8) != weekday {
+                return Err(TimestampError::InvalidComponent);
+            }
+        }
+        Ok((year, month, day))
+    }
+
+    /// Port of `Parsed::to_naive_time`.
+    fn to_time(&self) -> Result<(u32, u32, u32, u32), TimestampError> {
+        let hour = self.hour.ok_or(TimestampError::InvalidFormat)?;
+        let minute = self.minute.ok_or(TimestampError::InvalidFormat)?;
+        let (second, mut nano) = match self.second.unwrap_or(0) {
+            v @ 0..=59 => (v, 0),
+            60 => (59, 1_000_000_000),
+            _ => return Err(TimestampError::OutOfRange),
+        };
+        nano += match self.nanosecond {
+            Some(v) if self.second.is_some() => v,
+            Some(_) => return Err(TimestampError::InvalidFormat),
+            None => 0,
+        };
+        if !chrono_valid_hms_nano(hour, minute, second, nano) {
+            return Err(TimestampError::OutOfRange);
+        }
+        Ok((hour, minute, second, nano))
+    }
+
+    /// Port of `Parsed::to_datetime` (an offset is required).
+    fn to_datetime(&self) -> Result<ChronoParsedDateTime, TimestampError> {
+        let offset = self.offset.ok_or(TimestampError::InvalidFormat)?;
+        let date = self.to_date();
+        let time = self.to_time();
+        chrono_assemble(date?, time?, offset)
+    }
+
+    /// Port of `Parsed::to_naive_datetime_with_offset(0)` (offset ignored).
+    fn to_naive_datetime(&self) -> Result<ChronoParsedDateTime, TimestampError> {
+        let date = self.to_date();
+        let time = self.to_time();
+        chrono_assemble(date?, time?, 0)
+    }
+}
+
+/// The chrono `format::Item`s Ferrum's formats use.
+#[derive(Clone, Copy)]
+enum ChronoItem<'a> {
+    Literal(&'a str),
+    Space,
+    Year,
+    YearMod100,
+    Month,
+    Day,
+    Hour,
+    Minute,
+    Second,
+    ShortMonthName,
+    LongMonthName,
+    ShortWeekdayName,
+    LongWeekdayName,
+    /// `%.f`: optional `.` followed by fractional digits.
+    Nanosecond,
+    /// `%z` / `%:z`.
+    TimezoneOffset,
+}
+
+/// Port of chrono `format::parse::parse_internal` for [`ChronoItem`]s.
+fn chrono_parse_items<'s>(
+    fields: &mut ChronoFields,
+    mut s: &'s str,
+    items: &[ChronoItem<'_>],
+) -> Result<&'s str, TimestampError> {
+    for item in items {
+        match *item {
+            ChronoItem::Literal(prefix) => {
+                s = s
+                    .strip_prefix(prefix)
+                    .ok_or(TimestampError::InvalidFormat)?;
+            }
+            ChronoItem::Space => s = s.trim_start(),
+            ChronoItem::Year
+            | ChronoItem::YearMod100
+            | ChronoItem::Month
+            | ChronoItem::Day
+            | ChronoItem::Hour
+            | ChronoItem::Minute
+            | ChronoItem::Second => {
+                s = s.trim_start();
+                let (rest, value) = if matches!(item, ChronoItem::Year) {
+                    if let Some(digits) = s.strip_prefix('-') {
+                        let (rest, v) = chrono_scan_number(digits, 1, usize::MAX)?;
+                        (rest, 0i64.checked_sub(v).ok_or(TimestampError::OutOfRange)?)
+                    } else if let Some(digits) = s.strip_prefix('+') {
+                        chrono_scan_number(digits, 1, usize::MAX)?
+                    } else {
+                        chrono_scan_number(s, 1, 4)?
+                    }
+                } else {
+                    chrono_scan_number(s, 1, 2)?
+                };
+                s = rest;
+                match item {
+                    ChronoItem::Year => fields.set_year(value)?,
+                    ChronoItem::YearMod100 => fields.set_year_mod_100(value)?,
+                    ChronoItem::Month => fields.set_month(value)?,
+                    ChronoItem::Day => fields.set_day(value)?,
+                    ChronoItem::Hour => fields.set_hour(value)?,
+                    ChronoItem::Minute => fields.set_minute(value)?,
+                    _ => fields.set_second(value)?,
+                }
+            }
+            ChronoItem::ShortMonthName => {
+                let (rest, month0) = chrono_scan_short_month0(s)?;
+                s = rest;
+                fields.set_month(i64::from(month0) + 1)?;
+            }
+            ChronoItem::LongMonthName => {
+                let (rest, month0) = chrono_scan_short_or_long_month0(s)?;
+                s = rest;
+                fields.set_month(i64::from(month0) + 1)?;
+            }
+            ChronoItem::ShortWeekdayName => {
+                let (rest, weekday) = chrono_scan_short_weekday(s)?;
+                s = rest;
+                fields.set_weekday(weekday)?;
+            }
+            ChronoItem::LongWeekdayName => {
+                let (rest, weekday) = chrono_scan_short_or_long_weekday(s)?;
+                s = rest;
+                fields.set_weekday(weekday)?;
+            }
+            ChronoItem::Nanosecond => {
+                if let Some(digits) = s.strip_prefix('.') {
+                    let (rest, nano) = chrono_scan_nanosecond(digits)?;
+                    s = rest;
+                    fields.set_nanosecond(i64::from(nano))?;
+                }
+            }
+            ChronoItem::TimezoneOffset => {
+                let (rest, offset) = chrono_scan_timezone_offset(
+                    s.trim_start(),
+                    chrono_colon_or_space,
+                    false,
+                    false,
+                    true,
+                )?;
+                s = rest;
+                fields.set_offset(i64::from(offset))?;
+            }
+        }
+    }
+    Ok(s)
+}
+
+/// Port of chrono `StrftimeItems` for the specifiers Ferrum uses:
+/// `%Y %y %m %d %e %H %M %S %a %A %b %h %B %.f %z %:z %%`, optional `-`/`0`/`_`
+/// padding flags on numeric specifiers, whitespace runs, and literals.
+/// Any other specifier is refused with [`TimestampError::InvalidFormat`].
+fn chrono_strftime_items(fmt: &str) -> Result<Vec<ChronoItem<'_>>, TimestampError> {
+    let mut items = Vec::new();
+    let mut rest = fmt;
+    while let Some(c) = rest.chars().next() {
+        if c == '%' {
+            let mut spec = rest.get(1..).ok_or(TimestampError::InvalidFormat)?;
+            let mut next = || -> Result<char, TimestampError> {
+                let c = spec.chars().next().ok_or(TimestampError::InvalidFormat)?;
+                spec = spec
+                    .get(c.len_utf8()..)
+                    .ok_or(TimestampError::InvalidFormat)?;
+                Ok(c)
+            };
+            let mut code = next()?;
+            let padded = matches!(code, '-' | '0' | '_');
+            if padded {
+                code = next()?;
+            }
+            let item = match code {
+                'Y' => ChronoItem::Year,
+                'y' => ChronoItem::YearMod100,
+                'm' => ChronoItem::Month,
+                'd' | 'e' => ChronoItem::Day,
+                'H' => ChronoItem::Hour,
+                'M' => ChronoItem::Minute,
+                'S' => ChronoItem::Second,
+                'a' if !padded => ChronoItem::ShortWeekdayName,
+                'A' if !padded => ChronoItem::LongWeekdayName,
+                'b' | 'h' if !padded => ChronoItem::ShortMonthName,
+                'B' if !padded => ChronoItem::LongMonthName,
+                'z' if !padded => ChronoItem::TimezoneOffset,
+                '%' if !padded => ChronoItem::Literal("%"),
+                '.' if !padded => match next()? {
+                    'f' => ChronoItem::Nanosecond,
+                    _ => return Err(TimestampError::InvalidFormat),
+                },
+                ':' if !padded => match next()? {
+                    'z' => ChronoItem::TimezoneOffset,
+                    _ => return Err(TimestampError::InvalidFormat),
+                },
+                _ => return Err(TimestampError::InvalidFormat),
+            };
+            items.push(item);
+            rest = spec;
+        } else if c.is_whitespace() {
+            let end = rest
+                .find(|c: char| !c.is_whitespace())
+                .unwrap_or(rest.len());
+            items.push(ChronoItem::Space);
+            rest = rest.get(end..).ok_or(TimestampError::InvalidFormat)?;
+        } else {
+            let end = rest
+                .find(|c: char| c.is_whitespace() || c == '%')
+                .unwrap_or(rest.len());
+            items.push(ChronoItem::Literal(
+                rest.get(..end).ok_or(TimestampError::InvalidFormat)?,
+            ));
+            rest = rest.get(end..).ok_or(TimestampError::InvalidFormat)?;
+        }
+    }
+    Ok(items)
+}
+
+/// Parse like chrono 0.4.45 `DateTime::parse_from_rfc3339`: strict
+/// `YYYY-MM-DD(T|t| )HH:MM:SS[.f…](Z|z|±HH:MM)` with exactly four year digits,
+/// a leap second `:60` accepted at any minute, any number of fractional
+/// digits (only the first nine kept), offsets within `±23:59`, and the Unicode
+/// minus sign `−` accepted in the offset.
+pub fn parse_rfc3339_chrono(s: &str) -> Result<ChronoParsedDateTime, TimestampError> {
+    let bytes = s.as_bytes();
+    if bytes.len() < 19 {
+        return Err(TimestampError::InvalidFormat);
+    }
+    let digit = |i: usize| -> Result<u32, TimestampError> {
+        match bytes.get(i) {
+            Some(b) if b.is_ascii_digit() => Ok(u32::from(b - b'0')),
+            _ => Err(TimestampError::InvalidFormat),
+        }
+    };
+    let expect = |i: usize, allowed: &[u8]| -> Result<(), TimestampError> {
+        match bytes.get(i) {
+            Some(b) if allowed.contains(b) => Ok(()),
+            _ => Err(TimestampError::InvalidFormat),
+        }
+    };
+    let year = digit(0)? * 1000 + digit(1)? * 100 + digit(2)? * 10 + digit(3)?;
+    expect(4, b"-")?;
+    let month = digit(5)? * 10 + digit(6)?;
+    expect(7, b"-")?;
+    let day = digit(8)? * 10 + digit(9)?;
+    let year = i32::try_from(year).map_err(|_| TimestampError::OutOfRange)?;
+    if !chrono_valid_ymd(year, month, day) {
+        return Err(TimestampError::OutOfRange);
+    }
+    expect(10, b"tT ")?;
+    let hour = digit(11)? * 10 + digit(12)?;
+    expect(13, b":")?;
+    let minute = digit(14)? * 10 + digit(15)?;
+    expect(16, b":")?;
+    let second = digit(17)? * 10 + digit(18)?;
+    let (second, extra_nanos) = match second {
+        60 => (59, 1_000_000_000),
+        _ => (second, 0),
+    };
+    let (rest, nano) = if bytes.get(19) == Some(&b'.') {
+        let (rest, nano) =
+            chrono_scan_nanosecond(s.get(20..).ok_or(TimestampError::InvalidFormat)?)?;
+        (rest, extra_nanos + nano)
+    } else {
+        (
+            s.get(19..).ok_or(TimestampError::InvalidFormat)?,
+            extra_nanos,
+        )
+    };
+    if !chrono_valid_hms_nano(hour, minute, second, nano) {
+        return Err(TimestampError::OutOfRange);
+    }
+    let (rest, offset) =
+        chrono_scan_timezone_offset(rest, chrono_colon_required, true, false, true)?;
+    if !rest.is_empty() {
+        return Err(TimestampError::InvalidFormat);
+    }
+    chrono_assemble((year, month, day), (hour, minute, second, nano), offset)
+}
+
+/// Parse like chrono 0.4.45 `DateTime<FixedOffset>::from_str`, the relaxed
+/// RFC 3339 parser behind chrono's serde `Deserialize` for `DateTime`:
+/// unpadded components, whitespace between components, signed years outside
+/// `0..=9999`, a `UTC` zone name, and an offset colon that may be missing or
+/// replaced by spaces.
+pub fn parse_rfc3339_relaxed_chrono(s: &str) -> Result<ChronoParsedDateTime, TimestampError> {
+    const DATE_ITEMS: &[ChronoItem<'static>] = &[
+        ChronoItem::Year,
+        ChronoItem::Space,
+        ChronoItem::Literal("-"),
+        ChronoItem::Month,
+        ChronoItem::Space,
+        ChronoItem::Literal("-"),
+        ChronoItem::Day,
+    ];
+    const TIME_ITEMS: &[ChronoItem<'static>] = &[
+        ChronoItem::Hour,
+        ChronoItem::Space,
+        ChronoItem::Literal(":"),
+        ChronoItem::Minute,
+        ChronoItem::Space,
+        ChronoItem::Literal(":"),
+        ChronoItem::Second,
+        ChronoItem::Nanosecond,
+        ChronoItem::Space,
+    ];
+    let mut fields = ChronoFields::default();
+    let rest = chrono_parse_items(&mut fields, s, DATE_ITEMS)?;
+    let rest = match rest.as_bytes().first() {
+        Some(b't' | b'T' | b' ') => rest.get(1..).ok_or(TimestampError::InvalidFormat)?,
+        _ => return Err(TimestampError::InvalidFormat),
+    };
+    let rest = chrono_parse_items(&mut fields, rest, TIME_ITEMS)?.trim_start();
+    let (rest, offset) = if rest
+        .as_bytes()
+        .get(..3)
+        .is_some_and(|head| head.eq_ignore_ascii_case(b"UTC"))
+    {
+        (rest.get(3..).ok_or(TimestampError::InvalidFormat)?, 0)
+    } else {
+        chrono_scan_timezone_offset(rest, chrono_colon_or_space, true, false, true)?
+    };
+    fields.set_offset(i64::from(offset))?;
+    if !rest.trim_start().is_empty() {
+        return Err(TimestampError::InvalidFormat);
+    }
+    fields.to_datetime()
+}
+
+/// Parse like chrono 0.4.45 `DateTime::parse_from_rfc2822`: optional
+/// `Day,` prefix that must match the date, 1–2 digit day, 2+ digit year
+/// (two-digit years below 50 add 2000, other two- and three-digit years add
+/// 1900), optional seconds, numeric `±HHMM` or named zones (`GMT`, `UT`, `Z`,
+/// US zones, single military letters as `-0000`), trailing parenthesised
+/// comments, and Unicode whitespace between tokens.
+pub fn parse_rfc2822_chrono(s: &str) -> Result<ChronoParsedDateTime, TimestampError> {
+    let mut fields = ChronoFields::default();
+    let mut s = s.trim_start();
+
+    if let Ok((rest, weekday)) = chrono_scan_short_weekday(s) {
+        s = rest
+            .strip_prefix(',')
+            .ok_or(TimestampError::InvalidFormat)?;
+        fields.set_weekday(weekday)?;
+    }
+
+    s = s.trim_start();
+    let (rest, day) = chrono_scan_number(s, 1, 2)?;
+    fields.set_day(day)?;
+    s = chrono_scan_space(rest)?;
+    let (rest, month0) = chrono_scan_short_month0(s)?;
+    fields.set_month(1 + i64::from(month0))?;
+    s = chrono_scan_space(rest)?;
+
+    let before = s.len();
+    let (rest, mut year) = chrono_scan_number(s, 2, usize::MAX)?;
+    let year_len = before - rest.len();
+    s = rest;
+    match (year_len, year) {
+        (2, 0..=49) => year += 2000,
+        (2, 50..=99) | (3, _) => year += 1900,
+        _ => {}
+    }
+    fields.set_year(year)?;
+
+    s = chrono_scan_space(s)?;
+    let (rest, hour) = chrono_scan_number(s, 2, 2)?;
+    fields.set_hour(hour)?;
+    s = rest
+        .trim_start()
+        .strip_prefix(':')
+        .ok_or(TimestampError::InvalidFormat)?
+        .trim_start();
+    let (rest, minute) = chrono_scan_number(s, 2, 2)?;
+    fields.set_minute(minute)?;
+    s = rest;
+    if let Some(after_colon) = s.trim_start().strip_prefix(':') {
+        let (rest, second) = chrono_scan_number(after_colon, 2, 2)?;
+        fields.set_second(second)?;
+        s = rest;
+    }
+
+    s = chrono_scan_space(s)?;
+    let (rest, offset) = chrono_scan_timezone_offset_2822(s)?;
+    fields.set_offset(i64::from(offset))?;
+    s = rest;
+
+    while let Ok(rest) = chrono_scan_comment_2822(s) {
+        s = rest;
+    }
+    if !s.is_empty() {
+        return Err(TimestampError::InvalidFormat);
+    }
+    fields.to_datetime()
+}
+
+/// Parse like chrono 0.4.45 `DateTime::parse_from_str(s, fmt)`: the format
+/// must yield a date, a time and an offset. Supported specifiers:
+/// `%Y %y %m %d %e %H %M %S %a %A %b %h %B %.f %z %:z %%` (plus `-`/`0`/`_`
+/// padding flags on numeric ones); any other specifier is refused with
+/// [`TimestampError::InvalidFormat`] rather than parsed differently.
+pub fn parse_from_str_chrono(s: &str, fmt: &str) -> Result<ChronoParsedDateTime, TimestampError> {
+    let items = chrono_strftime_items(fmt)?;
+    let mut fields = ChronoFields::default();
+    let rest = chrono_parse_items(&mut fields, s, &items)?;
+    if !rest.is_empty() {
+        return Err(TimestampError::InvalidFormat);
+    }
+    fields.to_datetime()
+}
+
+/// Parse like chrono 0.4.45 `NaiveDateTime::parse_from_str(s, fmt)`: any
+/// parsed offset is validated but ignored, and the result carries offset `0`
+/// (so [`ChronoParsedDateTime::unix_timestamp`] equals chrono's
+/// `naive.and_utc().timestamp()`).
+pub fn parse_naive_from_str_chrono(
+    s: &str,
+    fmt: &str,
+) -> Result<ChronoParsedDateTime, TimestampError> {
+    let items = chrono_strftime_items(fmt)?;
+    let mut fields = ChronoFields::default();
+    let rest = chrono_parse_items(&mut fields, s, &items)?;
+    if !rest.is_empty() {
+        return Err(TimestampError::InvalidFormat);
+    }
+    fields.to_naive_datetime()
+}
