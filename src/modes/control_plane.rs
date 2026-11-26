@@ -1898,7 +1898,9 @@ pub(crate) fn publish_cp_full_reload(
         crate::config::gateway_trust::record_trust_generation_published_scoped(
             &published.gateway_trust_bundles,
             published.trust_bundles.as_deref(),
-            chrono::Utc::now().timestamp().max(0) as u64,
+            crate::time_compat::UtcTimestamp::now()
+                .unix_timestamp()
+                .max(0) as u64,
             trust_scope,
         );
         for namespace in refreshed_namespaces {
@@ -2567,7 +2569,9 @@ pub async fn run(
         crate::config::gateway_trust::record_trust_generation_published(
             &published.gateway_trust_bundles,
             published.trust_bundles.as_deref(),
-            chrono::Utc::now().timestamp().max(0) as u64,
+            crate::time_compat::UtcTimestamp::now()
+                .unix_timestamp()
+                .max(0) as u64,
         );
     }
     // Independently owned K8s overlay slot shared by the reconciler (writer)

@@ -445,7 +445,7 @@ impl MeshGrpcServer {
         })?;
         Ok(MeshConfigUpdate {
             version,
-            timestamp: chrono::Utc::now().timestamp(),
+            timestamp: crate::time_compat::UtcTimestamp::now().unix_timestamp(),
             mesh_slice_json,
             ferrum_version: FERRUM_VERSION.to_string(),
             heartbeat: false,
@@ -458,7 +458,7 @@ impl MeshGrpcServer {
     fn build_mesh_subscribe_heartbeat(version: String) -> MeshConfigUpdate {
         MeshConfigUpdate {
             version,
-            timestamp: chrono::Utc::now().timestamp(),
+            timestamp: crate::time_compat::UtcTimestamp::now().unix_timestamp(),
             mesh_slice_json: String::new(),
             ferrum_version: FERRUM_VERSION.to_string(),
             heartbeat: true,

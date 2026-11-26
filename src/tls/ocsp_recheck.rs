@@ -463,7 +463,7 @@ fn ensure_recheck_task() {
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            let outcome = run_recheck_at(chrono::Utc::now().timestamp());
+            let outcome = run_recheck_at(crate::time_compat::UtcTimestamp::now().unix_timestamp());
             debug!(
                 tracked_staples = outcome.tracked,
                 dropped_staples = outcome.dropped,

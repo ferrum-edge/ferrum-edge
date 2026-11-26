@@ -10081,7 +10081,9 @@ impl ProxyState {
         crate::config::gateway_trust::record_trust_generation_published(
             &config.gateway_trust_bundles,
             config.trust_bundles.as_deref(),
-            chrono::Utc::now().timestamp().max(0) as u64,
+            crate::time_compat::UtcTimestamp::now()
+                .unix_timestamp()
+                .max(0) as u64,
         );
         outcome
     }
@@ -10340,7 +10342,9 @@ impl ProxyState {
         crate::config::gateway_trust::record_trust_generation_published(
             &published.gateway_trust_bundles,
             published.trust_bundles.as_deref(),
-            chrono::Utc::now().timestamp().max(0) as u64,
+            crate::time_compat::UtcTimestamp::now()
+                .unix_timestamp()
+                .max(0) as u64,
         );
     }
 

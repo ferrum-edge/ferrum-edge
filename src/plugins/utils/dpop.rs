@@ -191,7 +191,7 @@ pub fn verify(input: DpopVerifyInput<'_>) -> Result<ReplayMarker, &'static str> 
     if proof_htu != input.htu {
         return Err("DPoP URL mismatch");
     }
-    let now = chrono::Utc::now().timestamp();
+    let now = crate::time_compat::UtcTimestamp::now().unix_timestamp();
     let skew = input.clock_skew.as_secs() as i64;
     if claims.iat < now.saturating_sub(skew) || claims.iat > now.saturating_add(skew) {
         return Err("DPoP iat outside clock skew");

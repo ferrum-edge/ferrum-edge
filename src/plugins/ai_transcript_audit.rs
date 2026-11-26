@@ -4545,7 +4545,7 @@ impl AiTranscriptAudit {
         AuditRecord {
             version: RECORD_VERSION,
             record_id: record_id.to_string(),
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            timestamp: crate::time_compat::UtcTimestamp::now().to_rfc3339(),
             namespace: envelope.namespace,
             proxy_id: envelope.proxy_id,
             proxy_name: envelope.proxy_name,

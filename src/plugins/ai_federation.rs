@@ -422,7 +422,7 @@ impl OAuth2Cache {
         http_client: &PluginHttpClient,
         latency_accumulator: &AtomicU64,
     ) -> Result<CachedToken, AuthFailure> {
-        let now = Utc::now().timestamp();
+        let now = crate::time_compat::UtcTimestamp::now().unix_timestamp();
         let claims = json!({
             "iss": self.client_email,
             "scope": "https://www.googleapis.com/auth/cloud-platform",
@@ -5650,7 +5650,7 @@ fn normalize_from_anthropic(resp: &Value, _model: &str) -> Result<(Value, TokenC
     let mut normalized = json!({
         "id": id,
         "object": "chat.completion",
-        "created": Utc::now().timestamp(),
+        "created": crate::time_compat::UtcTimestamp::now().unix_timestamp(),
         "model": resp_model,
         "choices": [{
             "index": 0,
@@ -5956,7 +5956,7 @@ fn normalize_from_gemini(resp: &Value, model: &str) -> Result<(Value, TokenCount
     let mut normalized = json!({
         "id": response_id,
         "object": "chat.completion",
-        "created": Utc::now().timestamp(),
+        "created": crate::time_compat::UtcTimestamp::now().unix_timestamp(),
         "model": resp_model,
         "choices": choices,
     });
@@ -6093,7 +6093,7 @@ fn normalize_from_bedrock(resp: &Value, model: &str) -> Result<(Value, TokenCoun
     let mut normalized = json!({
         "id": format!("chatcmpl-fed-{}", generate_short_id()),
         "object": "chat.completion",
-        "created": Utc::now().timestamp(),
+        "created": crate::time_compat::UtcTimestamp::now().unix_timestamp(),
         "model": model,
         "choices": [{
             "index": 0,
@@ -6200,7 +6200,7 @@ fn normalize_from_cohere(resp: &Value, model: &str) -> Result<(Value, TokenCount
     let mut normalized = json!({
         "id": id,
         "object": "chat.completion",
-        "created": Utc::now().timestamp(),
+        "created": crate::time_compat::UtcTimestamp::now().unix_timestamp(),
         "model": resp_model,
         "choices": [{
             "index": 0,

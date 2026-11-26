@@ -505,7 +505,9 @@ fn edge_is_fresh(last_seen_unix_ms: u64, generated_at_unix_ms: u64) -> bool {
 }
 
 fn now_unix_ms() -> u64 {
-    Utc::now().timestamp_millis().max(0) as u64
+    crate::time_compat::UtcTimestamp::now()
+        .unix_timestamp_millis()
+        .max(0) as u64
 }
 
 fn unix_ms_rfc3339(unix_ms: u64) -> String {

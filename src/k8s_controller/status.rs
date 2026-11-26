@@ -3530,7 +3530,8 @@ fn condition_at(
             // re-emitted, value-unchanged condition compares equal to what the
             // server persisted on the previous reconcile and the existing
             // `lastTransitionTime` can be preserved.
-            chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+            crate::time_compat::UtcTimestamp::now()
+                .to_rfc3339_opts(crate::time_compat::SecondsFormat::Secs, true)
         });
 
     let observed_generation = match object.metadata.generation {

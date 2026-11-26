@@ -336,7 +336,7 @@ impl DatabaseDeltaPollMetrics {
     /// timestamp unchanged so task death stays observable (issue #2986).
     /// Lock-free; safe from the poll task hot path.
     pub fn record_poll_completed(&self) {
-        let millis = chrono::Utc::now().timestamp_millis();
+        let millis = crate::time_compat::UtcTimestamp::now().unix_timestamp_millis();
         let millis = if millis < 0 { 0 } else { millis as u64 };
         self.last_poll_completed_at_unix_ms
             .store(millis, Ordering::Release);

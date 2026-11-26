@@ -1647,7 +1647,7 @@ impl OidcRelyingParty {
             Ok(claims) => claims,
             Err(body) => return self.callback_reject(400, body, Some(&state)),
         };
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::time_compat::UtcTimestamp::now().unix_timestamp();
         // `auth_time` is a protected claim, so it is read from the verified ID
         // token itself, never from UserInfo.
         let auth_time = claims
@@ -1972,7 +1972,7 @@ impl OidcRelyingParty {
         let Some(mut payload) = opened else {
             return self.challenge(ctx, true);
         };
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::time_compat::UtcTimestamp::now().unix_timestamp();
         if now
             > payload
                 .issued_at_unix
@@ -2660,7 +2660,7 @@ impl OidcRelyingParty {
         let code_verifier = random_b64(64)?;
         let nonce = random_b64(32)?;
         let original_url = self.pending_flow_original_url(ctx);
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::time_compat::UtcTimestamp::now().unix_timestamp();
         let expires_at_unix = now.saturating_add(self.behavior.state_ttl.as_secs() as i64);
         let mut payload = PendingFlowPayload {
             version: PENDING_FLOW_PAYLOAD_VERSION,
@@ -2782,7 +2782,7 @@ impl OidcRelyingParty {
         {
             return None;
         }
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::time_compat::UtcTimestamp::now().unix_timestamp();
         if payload.expires_at_unix <= now {
             return None;
         }
@@ -2813,7 +2813,7 @@ impl OidcRelyingParty {
         request_cookie: Option<&str>,
     ) -> Result<String, String> {
         let value = self.seal_session_value(payload)?;
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::time_compat::UtcTimestamp::now().unix_timestamp();
         let remaining = payload
             .issued_at_unix
             .saturating_add(self.session.ttl.as_secs() as i64)
@@ -3031,7 +3031,7 @@ impl OidcRelyingParty {
         refresh_token: Option<&str>,
         refresh_due: bool,
     ) -> Result<SessionPayload, String> {
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::time_compat::UtcTimestamp::now().unix_timestamp();
         let expires_at = claim_expiry(&claims).unwrap_or(now + 3600);
         let sub = required_subject(&claims, "ID token")?.to_string();
         let touch_age = if require_rolling_update {
@@ -6440,7 +6440,7 @@ mod tests {
         assert_eq!(omitted.session.cookie_name, explicit.session.cookie_name);
         assert_eq!(omitted.session.context_id, explicit.session.context_id);
 
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::time_compat::UtcTimestamp::now().unix_timestamp();
         let mut payload = session_payload(now - 10, now - 10, None, now + 1000);
         payload.context_id = omitted.session.context_id.clone();
         let cookie = omitted
@@ -6716,7 +6716,7 @@ mod tests {
         assert_ne!(first.session.cookie_name, second.session.cookie_name);
         assert_ne!(first.session.context_id, second.session.context_id);
 
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::time_compat::UtcTimestamp::now().unix_timestamp();
         let mut payload = session_payload(now - 10, now - 10, None, now + 1000);
         payload.context_id = first.session.context_id.clone();
         let first_cookie = first
@@ -6933,7 +6933,7 @@ mod tests {
     #[tokio::test]
     async fn accepted_principal_session_slides_and_emits_rolling_cookie() {
         let plugin = build_plugin("https://idp.example.com/token");
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::time_compat::UtcTimestamp::now().unix_timestamp();
         // last_touch 1000s ago (> touch_interval 900) but within idle/absolute ttl;
         // no refresh token so only the slide path runs.
         let payload = session_payload(now - 1000, now - 1000, None, now + 100_000);
@@ -6960,7 +6960,7 @@ mod tests {
     #[tokio::test]
     async fn later_accepted_session_does_not_commit_rolling_cookie() {
         let plugin = build_plugin("https://idp.example.com/token");
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::time_compat::UtcTimestamp::now().unix_timestamp();
         let payload = session_payload(now - 1000, now - 1000, None, now + 100_000);
         let mut ctx = ctx_with_session(&plugin, &payload);
         ctx.authenticated_identity = Some("first@example.com".to_string());
@@ -6992,7 +6992,7 @@ mod tests {
     #[tokio::test]
     async fn fresh_session_is_not_re_sealed() {
         let plugin = build_plugin("https://idp.example.com/token");
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::time_compat::UtcTimestamp::now().unix_timestamp();
         let payload = session_payload(now - 100, now - 100, None, now + 100_000);
         let mut ctx = ctx_with_session(&plugin, &payload);
         assert!(matches!(
@@ -7011,7 +7011,7 @@ mod tests {
     #[tokio::test]
     async fn idle_expired_session_challenges() {
         let plugin = build_plugin("https://idp.example.com/token");
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::time_compat::UtcTimestamp::now().unix_timestamp();
         // last_touch 2000s ago > idle_ttl 1800 -> re-auth. Non-browser request -> 401.
         let payload = session_payload(now - 2500, now - 2000, None, now + 100_000);
         let mut ctx = ctx_with_session(&plugin, &payload);
@@ -7038,7 +7038,7 @@ mod tests {
             .mount(&server)
             .await;
         let plugin = build_plugin(&format!("{}/token", server.uri()));
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::time_compat::UtcTimestamp::now().unix_timestamp();
         // refresh_after in the past -> due; refresh token present; session live.
         let payload = session_payload(now - 100, now - 100, Some("rt-1"), now - 10);
         let mut ctx = ctx_with_session(&plugin, &payload);
@@ -7139,7 +7139,7 @@ mod tests {
             .mount(&server)
             .await;
         let plugin = build_plugin(&format!("{}/token", server.uri()));
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::time_compat::UtcTimestamp::now().unix_timestamp();
         let payload = session_payload(now - 2500, now - 100, Some("rt-1"), now - 200);
         assert!(payload.expires_at_unix < now - 60);
         let mut ctx = ctx_with_session(&plugin, &payload);
@@ -7168,7 +7168,7 @@ mod tests {
             .mount(&server)
             .await;
         let plugin = build_plugin(&format!("{}/token", server.uri()));
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::time_compat::UtcTimestamp::now().unix_timestamp();
         let payload = session_payload(now - 100, now - 100, Some("rt-1"), now - 10);
         let mut ctx = ctx_with_session(&plugin, &payload);
         // Refresh failure is non-fatal: the existing session still authenticates.
@@ -7327,7 +7327,7 @@ mod tests {
             PluginHttpClient::default(),
         )
         .expect("OIDC config");
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::time_compat::UtcTimestamp::now().unix_timestamp();
 
         let future_nbf = sign_rs256(&json!({
             "iss": "https://idp.example.com",
@@ -7372,7 +7372,7 @@ mod tests {
     async fn refresh_re_merges_userinfo_claims() {
         // Regression: a refresh that returns a new ID token must not drop claims
         // that only come from UserInfo (e.g. an `email` used in claim_headers).
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::time_compat::UtcTimestamp::now().unix_timestamp();
         let jwks =
             rsa_jwks_from_public_pem(include_bytes!("../../tests/fixtures/test_rsa_public.pem"));
         let id_token = sign_rs256(&json!({
@@ -7463,7 +7463,7 @@ mod tests {
     #[tokio::test]
     async fn expired_token_without_refresh_token_re_challenges() {
         let plugin = build_plugin("https://idp.example.com/token");
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::time_compat::UtcTimestamp::now().unix_timestamp();
         // Within absolute/idle ttl, but expires_at_unix is well past now+leeway
         // (default id_token_clock_skew is 60s; refresh_after + 30 = now - 170), and
         // there is no refresh token so maybe_refresh_session cannot refresh.
@@ -7500,7 +7500,7 @@ mod tests {
     #[tokio::test]
     async fn unexpired_token_without_refresh_token_still_authenticates() {
         let plugin = build_plugin("https://idp.example.com/token");
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::time_compat::UtcTimestamp::now().unix_timestamp();
         // expires_at_unix = now + 100_030 (refresh_after + 30), comfortably in future.
         let payload = session_payload(now - 100, now - 100, None, now + 100_000);
         assert!(payload.expires_at_unix > now);
@@ -7516,7 +7516,7 @@ mod tests {
     #[tokio::test]
     async fn principal_less_session_discards_claim_and_rolling_cookie_state() {
         let plugin = build_claim_identity_plugin(&[]);
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::time_compat::UtcTimestamp::now().unix_timestamp();
 
         for email in [None, Some("   ")] {
             let mut payload = session_payload(now - 1000, now - 1000, None, now + 100_000);
@@ -7568,7 +7568,7 @@ mod tests {
     #[tokio::test]
     async fn accepted_session_preserves_identity_and_claim_header_exactly() {
         let plugin = build_claim_identity_plugin(&[]);
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::time_compat::UtcTimestamp::now().unix_timestamp();
         let mut payload = session_payload(now - 100, now - 100, None, now + 100_000);
         payload.claims = json!({
             "sub": "user-1",
@@ -7608,7 +7608,7 @@ mod tests {
     #[tokio::test]
     async fn rejected_session_authorization_leaves_no_claim_or_rolling_cookie_state() {
         let plugin = build_claim_identity_plugin(&["admin"]);
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::time_compat::UtcTimestamp::now().unix_timestamp();
         let mut payload = session_payload(now - 1000, now - 1000, None, now + 100_000);
         payload.claims = json!({
             "sub": "user-1",

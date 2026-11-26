@@ -58,7 +58,7 @@ fn emit_bootstrap_error(message: &str, fields: &[(&str, String)]) {
     let mut event = serde_json::Map::new();
     event.insert(
         "timestamp".to_string(),
-        serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+        serde_json::Value::String(crate::time_compat::UtcTimestamp::now().to_rfc3339()),
     );
     event.insert(
         "level".to_string(),

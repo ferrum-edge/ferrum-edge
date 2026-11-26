@@ -327,7 +327,7 @@ impl CapturedMeshEgressLifecycle {
             disconnect_direction: self.disconnect_direction,
             disconnect_cause: self.disconnect_cause,
             timestamp_connected: self.connected_wall_at.to_rfc3339(),
-            timestamp_disconnected: chrono::Utc::now().to_rfc3339(),
+            timestamp_disconnected: crate::time_compat::UtcTimestamp::now().to_rfc3339(),
             sni_hostname: stream_ctx.sni_hostname.clone(),
             metadata: stream_ctx.take_metadata(),
         })

@@ -2626,7 +2626,10 @@ fn condition(
                 None
             }
         })
-        .unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string());
+        .unwrap_or_else(|| {
+            crate::time_compat::UtcTimestamp::now()
+                .to_rfc3339_opts(crate::time_compat::SecondsFormat::Secs, true)
+        });
 
     let observed_generation = object.metadata.generation.unwrap_or(1);
 

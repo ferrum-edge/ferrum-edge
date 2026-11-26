@@ -215,7 +215,7 @@ impl ConfigChangeWatcherHealth {
     /// churn.
     pub fn record_event(&self) {
         self.events_total.fetch_add(1, Ordering::Relaxed);
-        let millis = chrono::Utc::now().timestamp_millis();
+        let millis = crate::time_compat::UtcTimestamp::now().unix_timestamp_millis();
         let millis = if millis < 0 { 0 } else { millis as u64 };
         self.last_event_unix_ms.store(millis, Ordering::Release);
     }

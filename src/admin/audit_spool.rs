@@ -219,7 +219,7 @@ impl SpooledAuditRecord {
             finalized,
             event,
             attempts: 0,
-            first_spooled_unix_ms: chrono::Utc::now().timestamp_millis(),
+            first_spooled_unix_ms: crate::time_compat::UtcTimestamp::now().unix_timestamp_millis(),
             diff_omitted: false,
         };
         let fits = serde_json::to_vec(&record)

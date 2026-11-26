@@ -952,7 +952,9 @@ fn expire_stale_bundle_after_failure(
     let Some(max_stale_age) = max_stale_age else {
         return;
     };
-    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    let now = crate::time_compat::UtcTimestamp::now()
+        .unix_timestamp()
+        .max(0) as u64;
     if store.expire_stale_bundle(cluster_name, trust_domain, now, max_stale_age) {
         warn!(
             cluster = %sanitize_startup_scalar(cluster_name),
@@ -1021,7 +1023,9 @@ async fn fetch_and_install_bundle(
     let body = read_bounded_body(response, FEDERATION_MAX_BODY_BYTES, &endpoint_for_logs).await?;
     let bundle = parse_federation_document(&body, trust_domain)?;
     validate_polled_bundle(&bundle)?;
-    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    let now = crate::time_compat::UtcTimestamp::now()
+        .unix_timestamp()
+        .max(0) as u64;
     let federated = FederatedBundle {
         bundle,
         fetched_at_unix_seconds: now,

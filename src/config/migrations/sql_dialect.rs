@@ -152,7 +152,7 @@ impl V001SqlBuilder {
             "INSERT INTO namespaces (name, created_at, updated_at) VALUES ($1, $2, $3) \
              ON CONFLICT (name) DO NOTHING"
         };
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = crate::time_compat::UtcTimestamp::now().to_rfc3339();
         sqlx::query(sql)
             .bind(crate::config::types::DEFAULT_NAMESPACE)
             .bind(&now)

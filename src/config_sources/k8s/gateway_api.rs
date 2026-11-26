@@ -1136,7 +1136,8 @@ fn condition_has_type(condition: &Value, condition_type: &str) -> bool {
 /// `lastTransitionTime` for a condition that really did change, in the
 /// `Z`-suffixed RFC 3339 form the Kubernetes API server persists.
 fn condition_transition_now() -> String {
-    Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    crate::time_compat::UtcTimestamp::now()
+        .to_rfc3339_opts(crate::time_compat::SecondsFormat::Secs, true)
 }
 
 /// Live Ferrum-owned condition for one `ancestorRef`, used to preserve

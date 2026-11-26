@@ -907,7 +907,12 @@ pub fn record_mesh_config_received(namespace: impl AsRef<str>) {
     MESH_CONFIG_LAST_RECEIVED
         .entry(Arc::from(namespace))
         .or_insert_with(|| AtomicU64::new(0))
-        .store(Utc::now().timestamp().max(0) as u64, Ordering::Relaxed);
+        .store(
+            crate::time_compat::UtcTimestamp::now()
+                .unix_timestamp()
+                .max(0) as u64,
+            Ordering::Relaxed,
+        );
 }
 
 /// Count one failed SPIFFE federation trust-bundle poll.
@@ -2109,7 +2114,9 @@ fn render_mesh_process_metric(
 }
 
 fn unix_now_seconds() -> u64 {
-    Utc::now().timestamp().max(0) as u64
+    crate::time_compat::UtcTimestamp::now()
+        .unix_timestamp()
+        .max(0) as u64
 }
 
 fn maybe_evict_stale_mesh_cert_expiry_series(now: u64) {

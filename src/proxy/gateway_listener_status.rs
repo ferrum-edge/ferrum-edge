@@ -920,7 +920,9 @@ pub fn global() -> Option<&'static Arc<GatewayListenerStatus>> {
 /// Production timestamps only; the merge itself takes the clock as an argument
 /// so tests are deterministic.
 pub fn now_unix_ms() -> u64 {
-    chrono::Utc::now().timestamp_millis().max(0) as u64
+    crate::time_compat::UtcTimestamp::now()
+        .unix_timestamp_millis()
+        .max(0) as u64
 }
 
 /// Bound and sanitize a diagnostic before it is retained.

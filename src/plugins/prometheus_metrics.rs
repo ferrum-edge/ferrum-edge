@@ -6,7 +6,6 @@
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use chrono::Utc;
 use crossbeam_utils::CachePadded;
 use dashmap::DashMap;
 use serde_json::Value;
@@ -6305,7 +6304,7 @@ impl MetricsRegistry {
         }
 
         if !self.tls_cert_gauges.is_empty() {
-            let now_ts = Utc::now().timestamp();
+            let now_ts = crate::time_compat::UtcTimestamp::now().unix_timestamp();
             output.push_str(
                 "# HELP ferrum_tls_cert_expiry_seconds Seconds until the certificate leaf not_after timestamp. Negative means expired.\n",
             );
@@ -6342,7 +6341,7 @@ impl MetricsRegistry {
         }
 
         if !self.tls_revocation_gauges.is_empty() {
-            let now_ts = Utc::now().timestamp();
+            let now_ts = crate::time_compat::UtcTimestamp::now().unix_timestamp();
             output.push_str(
                 "# HELP ferrum_tls_revocation_expiry_seconds Seconds until the revocation material nextUpdate. Negative means expired; expired material is refused at reload and at startup.\n",
             );
@@ -7621,6 +7620,7 @@ mod tests {
     use crate::tls::inventory::{
         TlsInventory, TlsInventoryEntry, TlsInventorySource, TlsInventoryState, TlsInventoryUsage,
     };
+    use chrono::Utc;
 
     fn mesh_summary() -> TransactionSummary {
         TransactionSummary {

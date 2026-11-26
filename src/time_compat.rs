@@ -213,6 +213,18 @@ impl UtcTimestamp {
         self.0.unix_timestamp()
     }
 
+    /// Whole milliseconds since `1970-01-01T00:00:00Z`, rounded toward
+    /// negative infinity (so `1969-12-31T23:59:59.9995Z` is `-1`), matching
+    /// `chrono::DateTime<Utc>::timestamp_millis()`.
+    #[inline]
+    pub fn unix_timestamp_millis(&self) -> i64 {
+        // `unix_timestamp()` already floors toward negative infinity and
+        // `millisecond()` is the non-negative millisecond within that second.
+        // The supported `-9999..=9999` year range keeps the product far
+        // inside `i64`.
+        self.0.unix_timestamp() * 1_000 + i64::from(self.0.millisecond())
+    }
+
     /// Total nanoseconds since `1970-01-01T00:00:00Z`.
     #[inline]
     pub const fn unix_timestamp_nanos(&self) -> i128 {

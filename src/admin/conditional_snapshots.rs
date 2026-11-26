@@ -3,7 +3,6 @@
 use std::collections::{BTreeMap, HashSet};
 
 use bytes::Bytes;
-use chrono::Utc;
 use http_body_util::Full;
 use hyper::{Response, StatusCode};
 use serde_json::json;
@@ -217,7 +216,7 @@ fn serialize_snapshot(
     let backup = BackupPayload {
         version: &config.version,
         ferrum_version: crate::FERRUM_VERSION,
-        exported_at: Utc::now().to_rfc3339(),
+        exported_at: crate::time_compat::UtcTimestamp::now().to_rfc3339(),
         source: "database",
         counts: BackupCounts {
             proxies: config.proxies.len(),

@@ -484,7 +484,7 @@ fn signed_fuzz_jwt_svid() -> Result<String, String> {
         .map_err(|error| error.to_string())?;
     let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
     header.kid = Some(FUZZ_JWT_SVID_KEY_ID.to_string());
-    let now = chrono::Utc::now().timestamp();
+    let now = crate::time_compat::UtcTimestamp::now().unix_timestamp();
     let claims = serde_json::json!({
         "sub": format!("spiffe://{FUZZ_JWT_SVID_TRUST_DOMAIN}/workload"),
         "aud": [FUZZ_JWT_SVID_AUDIENCE],
