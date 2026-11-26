@@ -326,6 +326,34 @@ impl UtcTimestamp {
         }
     }
 
+    /// Format as RFC 2822 (`Thu, 14 May 2026 10:00:00 +0000`), matching
+    /// `chrono::DateTime<Utc>::to_rfc2822()` byte-for-byte: English short
+    /// weekday and month names, an unpadded day of month, a four-digit year,
+    /// whole seconds and a `+0000` offset.
+    ///
+    /// Returns `None` for years outside `0..=9999`, which RFC 2822 cannot
+    /// represent and where chrono's formatter panics instead.
+    pub fn to_rfc2822(&self) -> Option<String> {
+        const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+        const MONTHS: [&str; 12] = [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ];
+        let dt = self.0;
+        let year = dt.year();
+        if !(0..=9999).contains(&year) {
+            return None;
+        }
+        let weekday = WEEKDAYS.get(usize::from(dt.weekday().number_days_from_sunday()))?;
+        let month = MONTHS.get(usize::from(u8::from(dt.month())).checked_sub(1)?)?;
+        Some(format!(
+            "{weekday}, {} {month} {year:04} {:02}:{:02}:{:02} +0000",
+            dt.day(),
+            dt.hour(),
+            dt.minute(),
+            dt.second(),
+        ))
+    }
+
     /// Parse a strict RFC 3339 timestamp string and normalize it to UTC.
     #[inline]
     pub fn parse_from_rfc3339(s: &str) -> Result<Self, TimestampError> {

@@ -29,7 +29,7 @@ fn fixed_notification() -> Notification {
         source: None,
         subject_id: None,
         namespace: None,
-        fired_at: chrono::Utc::now(),
+        fired_at: ferrum_edge::time_compat::UtcTimestamp::now(),
         fields: vec![NotificationField::new("k", "v")],
     }
 }

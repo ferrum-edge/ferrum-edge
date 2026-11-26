@@ -65,7 +65,7 @@ impl SlackChannel {
             "title": n.title,
             "text": n.body,
             "fields": fields,
-            "ts": n.fired_at.timestamp(),
+            "ts": n.fired_at.unix_timestamp(),
         });
         if let Some(source) = n.source.as_deref() {
             attachment["footer"] = json!(source);

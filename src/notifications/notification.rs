@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
+use crate::time_compat::UtcTimestamp;
 
 /// Severity level for a notification. Mapped to channel-native colors per
 /// channel (Slack hex, Teams hex, Discord int) inside each channel's
@@ -156,7 +156,7 @@ pub struct Notification {
     /// Human-friendly subject the notification is about (e.g., proxy name).
     pub subject_id: Option<Arc<str>>,
     pub namespace: Option<Arc<str>>,
-    pub fired_at: DateTime<Utc>,
+    pub fired_at: UtcTimestamp,
     pub fields: Vec<NotificationField>,
 }
 
@@ -170,7 +170,7 @@ impl Notification {
             source: None,
             subject_id: None,
             namespace: None,
-            fired_at: Utc::now(),
+            fired_at: UtcTimestamp::now(),
             fields: Vec::new(),
         }
     }
@@ -185,7 +185,7 @@ pub struct NotificationBuilder {
     source: Option<Arc<str>>,
     subject_id: Option<Arc<str>>,
     namespace: Option<Arc<str>>,
-    fired_at: DateTime<Utc>,
+    fired_at: UtcTimestamp,
     fields: Vec<NotificationField>,
 }
 
@@ -215,7 +215,7 @@ impl NotificationBuilder {
         self.namespace = Some(n.into());
         self
     }
-    pub fn fired_at(mut self, t: DateTime<Utc>) -> Self {
+    pub fn fired_at(mut self, t: UtcTimestamp) -> Self {
         self.fired_at = t;
         self
     }

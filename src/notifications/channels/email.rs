@@ -585,8 +585,11 @@ impl EmailChannel {
         let body = self.render_body(notification, extras)?;
 
         let mut headers = String::new();
+        let date = notification.fired_at.to_rfc2822().ok_or_else(|| {
+            "notification timestamp cannot be represented as an RFC 2822 Date header".to_string()
+        })?;
         headers.push_str("Date: ");
-        headers.push_str(&notification.fired_at.to_rfc2822());
+        headers.push_str(&date);
         headers.push('\n');
         headers.push_str("From: <");
         headers.push_str(&self.from);

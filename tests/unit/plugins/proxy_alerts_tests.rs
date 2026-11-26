@@ -32,6 +32,7 @@ use ferrum_edge::plugins::{
 };
 use ferrum_edge::proxy::tcp_proxy::StreamIoSide;
 use ferrum_edge::retry::ErrorClass;
+use ferrum_edge::time_compat::UtcTimestamp;
 use serde_json::json;
 
 fn http_client() -> PluginHttpClient {
@@ -456,14 +457,14 @@ fn wrapped_quiet_hours_weekday_applies_to_window_start_day() {
         weekdays: vec![0], // Sunday-starting windows only.
     };
 
-    assert!(window.matches(Utc.with_ymd_and_hms(2026, 5, 17, 23, 30, 0).unwrap()));
-    assert!(window.matches(Utc.with_ymd_and_hms(2026, 5, 18, 2, 0, 0).unwrap()));
+    assert!(window.matches("2026-05-17T23:30:00Z".parse::<UtcTimestamp>().unwrap()));
+    assert!(window.matches("2026-05-18T02:00:00Z".parse::<UtcTimestamp>().unwrap()));
     assert!(
-        !window.matches(Utc.with_ymd_and_hms(2026, 5, 17, 2, 0, 0).unwrap()),
+        !window.matches("2026-05-17T02:00:00Z".parse::<UtcTimestamp>().unwrap()),
         "early Sunday belongs to Saturday night's wrapped window"
     );
     assert!(
-        !window.matches(Utc.with_ymd_and_hms(2026, 5, 18, 23, 30, 0).unwrap()),
+        !window.matches("2026-05-18T23:30:00Z".parse::<UtcTimestamp>().unwrap()),
         "Monday night starts a Monday window, not a Sunday one"
     );
 }
@@ -3589,7 +3590,14 @@ fn incident_key_correlates_trigger_and_resolve_per_policy_rule_and_proxy() {
         proxy_name: Some("api"),
     };
     let vars = |subject: AlertSubject<'_>, policy: &str, action: EventAction| {
-        build_webhook_vars(rule, &observation, subject, policy, action, Utc::now())
+        build_webhook_vars(
+            rule,
+            &observation,
+            subject,
+            policy,
+            action,
+            UtcTimestamp::now(),
+        )
     };
     let trigger = vars(subject, "alerts-a", EventAction::Trigger);
     let resolve = vars(subject, "alerts-a", EventAction::Resolve);

@@ -701,3 +701,44 @@ async fn sqlx_any_roundtrip_matches_chrono_to_rfc3339_and_reads_legacy_rows() {
         assert_eq!(decoded.to_rfc3339_z(), expected);
     }
 }
+
+/// Phase 3 moved the notification email `Date:` header from chrono's
+/// `to_rfc2822()` to `UtcTimestamp::to_rfc2822()`. Pin it byte-for-byte,
+/// including the unpadded day of month and four-digit early years, and pin
+/// the `None` returned where chrono's formatter would panic.
+#[test]
+fn rfc2822_formatting_matches_chrono_byte_for_byte() {
+    for (secs, nanos) in representative_instants() {
+        let (ts, ch) = pair_for(secs, nanos);
+        assert_eq!(
+            ts.to_rfc2822().as_deref(),
+            Some(ch.to_rfc2822().as_str()),
+            "to_rfc2822 mismatch for ({secs}, {nanos})"
+        );
+    }
+
+    let fixed: UtcTimestamp = "2026-05-14T10:00:00Z".parse().unwrap();
+    assert_eq!(
+        fixed.to_rfc2822().as_deref(),
+        Some("Thu, 14 May 2026 10:00:00 +0000")
+    );
+
+    let year1 = UtcTimestamp::from_utc_date_time(
+        Date::from_calendar_date(1, Month::January, 1).unwrap(),
+        Time::MIDNIGHT,
+    );
+    let year1_ch = DateTime::parse_from_rfc3339("0001-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    assert_eq!(year1.to_rfc2822(), Some(year1_ch.to_rfc2822()));
+    assert_eq!(
+        year1.to_rfc2822().as_deref(),
+        Some("Mon, 1 Jan 0001 00:00:00 +0000")
+    );
+
+    let negative_year = UtcTimestamp::from_utc_date_time(
+        Date::from_calendar_date(-1, Month::December, 31).unwrap(),
+        Time::MIDNIGHT,
+    );
+    assert_eq!(negative_year.to_rfc2822(), None);
+}

@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use chrono::{DateTime, Datelike, Timelike, Utc};
+use crate::time_compat::UtcTimestamp;
 use serde_json::{Map, Value};
 
 use crate::config::BackendEgressPolicy;
@@ -173,8 +173,10 @@ pub struct QuietHourWindow {
 }
 
 impl QuietHourWindow {
-    pub fn matches(&self, dt: DateTime<Utc>) -> bool {
-        let now_minute = dt.hour() * 60 + dt.minute();
+    pub fn matches(&self, dt: UtcTimestamp) -> bool {
+        let clock = dt.time();
+        let now_minute = u32::from(clock.hour()) * 60 + u32::from(clock.minute());
+        let weekday = u32::from(dt.date().weekday().number_days_from_sunday());
         if self.from_minute == self.to_minute {
             // Zero-length window matches nothing.
             return false;
@@ -183,13 +185,13 @@ impl QuietHourWindow {
             if !(now_minute >= self.from_minute && now_minute < self.to_minute) {
                 return false;
             }
-            dt.weekday().num_days_from_sunday()
+            weekday
         } else if now_minute >= self.from_minute {
-            dt.weekday().num_days_from_sunday()
+            weekday
         } else if now_minute < self.to_minute {
             // Wrapped overnight window: after-midnight minutes still belong
             // to the previous day's scheduled window.
-            previous_weekday(dt.weekday().num_days_from_sunday())
+            previous_weekday(weekday)
         } else {
             return false;
         };
