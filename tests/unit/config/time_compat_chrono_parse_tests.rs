@@ -35,7 +35,8 @@ const NAIVE_FORMATS: &[&str] = &[
     "%Y-%m-%d %H:%M:%S",
     // A naive parse validates but ignores the offset (even an out-of-range one).
     "%Y-%m-%dT%H:%M:%S%z",
-    // `%Y` and `%y` must agree; `%.f` without `%S` is never enough.
+    // `%Y` and `%y` must agree; a fraction without `%S` is refused, but
+    // `%.f` is optional so minute-only input still resolves.
     "%Y/%y %m %d %H:%M",
     "%Y-%m-%d %H:%M%.f",
     "%%%Y-%m-%d %H:%M:%S",
@@ -104,6 +105,7 @@ const BASES: &[&str] = &[
     "2026/27 11 26 10:20",
     "-2026/26 11 26 10:20",
     "2026-11-26 10:20.5",
+    "2026-11-26 10:20",
     "%2026-11-26 10:20:30",
     "26 november 2026 10:20:30",
 ];
@@ -321,10 +323,10 @@ fn chrono_compatible_parsers_match_chrono_on_the_mutation_corpus() {
             .nth(i)
             .copied()
             .unwrap_or_default();
-        if fmt.ends_with('Z') || fmt == "%Y-%m-%d %H:%M%.f" {
+        if fmt.ends_with('Z') {
             assert_eq!(
                 *count, 0,
-                "{fmt} can never resolve; chrono never accepts it"
+                "{fmt} has no offset item; chrono never accepts it"
             );
         } else {
             assert!(*count > 20, "{fmt} accepted only {count} corpus inputs");
@@ -473,4 +475,6 @@ fn boundary_and_specifier_cases_follow_chrono() {
     assert!(parse_from_str_chrono("2026-11-26T10:20:30+9959", "%Y-%m-%dT%H:%M:%S%z").is_err());
     assert!(parse_naive_from_str_chrono("2026/26 11 26 10:20", "%Y/%y %m %d %H:%M").is_ok());
     assert!(parse_naive_from_str_chrono("2026/27 11 26 10:20", "%Y/%y %m %d %H:%M").is_err());
+    assert!(parse_naive_from_str_chrono("2026-11-26 10:20.5", "%Y-%m-%d %H:%M%.f").is_err());
+    assert!(parse_naive_from_str_chrono("2026-11-26 10:20", "%Y-%m-%d %H:%M%.f").is_ok());
 }
