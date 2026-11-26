@@ -12342,10 +12342,16 @@ def self_test() -> int:
             f"self-test ({mode_label}): step-level CARGO_PROFILE_TEST_DEBUG override must fail",
             failures,
         )
-        shell_config_ci = ci_live_text.replace(
-            "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
-            "        run: cargo test --no-run --config profile.dev.debug=2 --test integration_tests\n",
-            1,
+        def _inject_probe_step(run_block: str) -> str:
+            anchor = "      - name: Build test targets and binaries\n"
+            return ci_live_text.replace(
+                anchor,
+                "      - name: Self-test probe\n" + run_block + anchor,
+                1,
+            )
+
+        shell_config_ci = _inject_probe_step(
+            "        run: cargo test --no-run --config profile.dev.debug=2 --test integration_tests\n"
         )
         shell_config_errs: list[str] = []
         check_ci_debug_lane_profile_uniformity(
@@ -12357,10 +12363,8 @@ def self_test() -> int:
             f"self-test ({mode_label}): shell --config profile override must fail",
             failures,
         )
-        github_env_ci = ci_live_text.replace(
-            "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
-            '        run: echo CARGO_PROFILE_DEV_DEBUG=2 >> "$GITHUB_ENV"\n',
-            1,
+        github_env_ci = _inject_probe_step(
+            '        run: echo CARGO_PROFILE_DEV_DEBUG=2 >> "$GITHUB_ENV"\n'
         )
         github_env_errs: list[str] = []
         check_ci_debug_lane_profile_uniformity(
@@ -12583,11 +12587,7 @@ def self_test() -> int:
             ("quoted --config", "cargo '--config' profile.dev.debug=2 --version"),
             ("quoted --config=", 'cargo "--config=profile.dev.debug=2" test --no-run'),
         ):
-            mut_ci = ci_live_text.replace(
-                "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
-                f"        run: {bad_run}\n",
-                1,
-            )
+            mut_ci = _inject_probe_step(f"        run: {bad_run}\n")
             mut_errs: list[str] = []
             check_ci_debug_lane_profile_uniformity(mut_ci, ambient_live_text, mut_errs)
             require(
@@ -12857,11 +12857,7 @@ def self_test() -> int:
                 "          cargo test --no-run --config profile.test.debug=2\n",
             ),
         ):
-            ml_ci = ci_live_text.replace(
-                "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
-                multiline_run,
-                1,
-            )
+            ml_ci = _inject_probe_step(multiline_run)
             ml_errs: list[str] = []
             check_ci_debug_lane_profile_uniformity(ml_ci, ambient_live_text, ml_errs)
             require(
@@ -13061,11 +13057,7 @@ def self_test() -> int:
                 "          kind create cluster --config cluster.yaml\n",
             ),
         ):
-            ok_ci = ci_live_text.replace(
-                "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
-                ok_run_block,
-                1,
-            )
+            ok_ci = _inject_probe_step(ok_run_block)
             ok_errs: list[str] = []
             check_ci_debug_lane_profile_uniformity(ok_ci, ambient_live_text, ok_errs)
             require(
@@ -13444,74 +13436,54 @@ def self_test() -> int:
             (
                 "YAML alias on run:",
                 "x-compile: &compile cargo test --no-run --config profile.dev.debug=2\n"
-                + ci_live_text.replace(
-                    "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
-                    "        run: *compile\n",
-                    1,
-                ),
+                + _inject_probe_step("        run: *compile\n"),
             ),
             (
                 "YAML tag !!str on run:",
-                ci_live_text.replace(
-                    "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
-                    "        run: !!str cargo test --no-run --config profile.dev.debug=2\n",
-                    1,
+                _inject_probe_step(
+                    "        run: !!str cargo test --no-run --config profile.dev.debug=2\n"
                 ),
             ),
             (
                 "next-line tagged run: value",
-                ci_live_text.replace(
-                    "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
-                    "        run:\n          !!str cargo test --no-run --config profile.dev.debug=2\n",
-                    1,
+                _inject_probe_step(
+                    "        run:\n          !!str cargo test --no-run --config profile.dev.debug=2\n"
                 ),
             ),
             (
                 "next-line comment before plain run: override",
-                ci_live_text.replace(
-                    "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
-                    "        run:\n          # comment before value\n          cargo test --no-run --config profile.dev.debug=2\n",
-                    1,
+                _inject_probe_step(
+                    "        run:\n          # comment before value\n          cargo test --no-run --config profile.dev.debug=2\n"
                 ),
             ),
             (
                 "run-aligned comment before plain run: override",
-                ci_live_text.replace(
-                    "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
-                    "        run:\n        # aligned comment\n          cargo test --no-run --config profile.test.debug=2\n",
-                    1,
+                _inject_probe_step(
+                    "        run:\n        # aligned comment\n          cargo test --no-run --config profile.test.debug=2\n"
                 ),
             ),
             (
                 "run-aligned comment before next-line | block override",
-                ci_live_text.replace(
-                    "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
-                    "        run:\n        # aligned comment\n          |\n            cargo test --no-run --config profile.test.debug=2\n",
-                    1,
+                _inject_probe_step(
+                    "        run:\n        # aligned comment\n          |\n            cargo test --no-run --config profile.test.debug=2\n"
                 ),
             ),
             (
                 "next-line block indicator | on run:",
-                ci_live_text.replace(
-                    "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
-                    "        run:\n          |\n            cargo test --no-run --config profile.dev.debug=2\n",
-                    1,
+                _inject_probe_step(
+                    "        run:\n          |\n            cargo test --no-run --config profile.dev.debug=2\n"
                 ),
             ),
             (
                 "next-line quoted run: value",
-                ci_live_text.replace(
-                    "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
-                    '        run:\n          "cargo test --no-run --config profile.dev.debug=2"\n',
-                    1,
+                _inject_probe_step(
+                    '        run:\n          "cargo test --no-run --config profile.dev.debug=2"\n'
                 ),
             ),
             (
                 "key-level anchor &r on run:",
-                ci_live_text.replace(
-                    "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
-                    "        &r run: cargo test --no-run --config profile.dev.debug=2\n",
-                    1,
+                _inject_probe_step(
+                    "        &r run: cargo test --no-run --config profile.dev.debug=2\n"
                 ),
             ),
             (
