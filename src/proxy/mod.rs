@@ -22733,7 +22733,7 @@ enum DetachedWsClient {
     Tls {
         std_stream: std::net::TcpStream,
         client_write_timeout: Option<Duration>,
-        session: rustls::ServerConnection,
+        session: Box<rustls::ServerConnection>,
         read_buf: Bytes,
     },
     Plain {
@@ -22747,7 +22747,7 @@ enum DetachedWsClient {
 enum DetachedWsBackend {
     Tls {
         std_stream: std::net::TcpStream,
-        session: rustls::ClientConnection,
+        session: Box<rustls::ClientConnection>,
     },
     Plain {
         std_stream: std::net::TcpStream,
@@ -22805,7 +22805,7 @@ fn try_detach_ws_client(upgraded: hyper::upgrade::Upgraded) -> std::io::Result<W
             return Ok(WsClientTakeover::Detached(DetachedWsClient::Tls {
                 std_stream,
                 client_write_timeout,
-                session,
+                session: Box::new(session),
                 read_buf: parts.read_buf,
             }));
         }
@@ -22825,7 +22825,7 @@ fn try_detach_ws_client(upgraded: hyper::upgrade::Upgraded) -> std::io::Result<W
                 Ok(stream) => stream,
                 Err(guard) => {
                     return Ok(WsClientTakeover::Undetached(UndetachedH1WsClientIo::Plain(
-                        Box::new(relay_shards::PrefixedIo::new(guard, parts.read_buf)),
+                        Box::new(relay_shards::PrefixedIo::new(*guard, parts.read_buf)),
                     )));
                 }
             };
@@ -22954,7 +22954,7 @@ async fn run_direct_ws_tunnel_maybe_on_shard(
             match ws_activity.into_inner().into_std() {
                 Ok(std_stream) => DetachedWsBackend::Tls {
                     std_stream,
-                    session,
+                    session: Box::new(session),
                 },
                 Err(err) => {
                     fire_ws_tunnel_disconnect_hooks(
@@ -23031,7 +23031,7 @@ async fn run_direct_ws_tunnel_maybe_on_shard(
                         client_write_timeout,
                     );
                     RehomedWsClientIo::Tls(Box::new(relay_shards::RehomedTlsStream::new(
-                        stall, session, read_buf,
+                        stall, *session, read_buf,
                     )))
                 }
                 Err(err) => {
@@ -23089,7 +23089,7 @@ async fn run_direct_ws_tunnel_maybe_on_shard(
                     session,
                 } => match tokio::net::TcpStream::from_std(std_stream) {
                     Ok(tcp) => RehomedWsBackendIo::Tls(Box::new(
-                        relay_shards::RehomedTlsStream::new(tcp, session, Bytes::new()),
+                        relay_shards::RehomedTlsStream::new(tcp, *session, Bytes::new()),
                     )),
                     Err(err) => {
                         fire_ws_tunnel_disconnect_hooks(

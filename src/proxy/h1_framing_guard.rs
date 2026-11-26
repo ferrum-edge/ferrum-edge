@@ -403,12 +403,12 @@ impl<T> H1FramingGuardIo<T> {
     }
 
     #[cfg(not(feature = "bench-h1-profile"))]
-    pub(super) fn try_into_inner(self) -> Result<T, Self> {
+    pub(super) fn try_into_inner(self) -> Result<T, Box<Self>> {
         if self.can_detach() {
             self.signals.disable_observation();
             Ok(self.inner)
         } else {
-            Err(self)
+            Err(Box::new(self))
         }
     }
 }
@@ -638,7 +638,7 @@ impl<T> MaybeH1FramingGuardIo<T> {
         match self {
             Self::Observed(guard) => match guard.try_into_inner() {
                 Ok(inner) => Ok(inner),
-                Err(guard) => Err(Self::Observed(Box::new(guard))),
+                Err(guard) => Err(Self::Observed(guard)),
             },
             Self::Passthrough(inner) => Ok(inner),
         }

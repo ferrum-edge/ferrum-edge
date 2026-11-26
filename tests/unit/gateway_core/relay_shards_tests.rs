@@ -253,7 +253,7 @@ async fn client_write_stall_io_detaches_when_idle_and_refuses_when_armed() {
     let (client, _peer) = tokio::io::duplex(64);
     let stall = ClientWriteStallIo::new(client, 30);
     assert!(stall.can_detach());
-    let (inner, timeout) = stall.try_into_parts().expect("idle stall detaches");
+    let (inner, timeout) = stall.try_into_parts().ok().expect("idle stall detaches");
     assert_eq!(timeout, Some(Duration::from_secs(30)));
     let rebuilt = ClientWriteStallIo::from_parts(inner, timeout);
     assert!(rebuilt.can_detach());
