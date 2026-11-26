@@ -89,9 +89,9 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
+use crate::time_compat::UtcTimestamp;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde_json::Value;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -414,7 +414,8 @@ impl ProxyAlerts {
     /// monotonic `now_ms`, without waiting for its cadence.
     #[doc(hidden)]
     pub fn reevaluate_incidents_at_for_test(&self, now_ms: u64) {
-        self.core.reevaluate_idle_incidents(now_ms, Utc::now());
+        self.core
+            .reevaluate_idle_incidents(now_ms, UtcTimestamp::now());
     }
 
     /// Stop the background lifecycle task so a deterministic test that injects
@@ -466,7 +467,7 @@ impl ProxyAlerts {
             return;
         }
         self.core
-            .handle_at(sample, &owner_key, now_ms, Utc::now(), false);
+            .handle_at(sample, &owner_key, now_ms, UtcTimestamp::now(), false);
     }
 
     /// Hold the cold-path retention lock for deterministic serialization tests.
@@ -608,7 +609,7 @@ impl AlertCore {
         self.recovery_gate(channel_id)
     }
 
-    fn in_quiet_hours(&self, now: DateTime<Utc>) -> bool {
+    fn in_quiet_hours(&self, now: UtcTimestamp) -> bool {
         self.quiet_hours.iter().any(|w| w.matches(now))
     }
 
@@ -726,7 +727,7 @@ impl AlertCore {
             {
                 return;
             }
-            let now = Utc::now();
+            let now = UtcTimestamp::now();
             let now_ms = monotonic_now_ms();
             let in_quiet = self.in_quiet_hours(now);
             self.handle_at(sample, owner_key, now_ms, now, in_quiet);
@@ -741,7 +742,7 @@ impl AlertCore {
         sample: SampleInput<'_>,
         owner_key: &str,
         now_ms: u64,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
         in_quiet: bool,
     ) {
         let ownership_generation = sample
@@ -780,7 +781,7 @@ impl AlertCore {
     /// to Active and the next clear restarts the recovery interval. Event
     /// admission is limited to Resolve here: a breach never sends a Trigger or
     /// reminder from the timer (`advance_channel` with `time_driven`).
-    fn reevaluate_idle_incidents(&self, now_ms: u64, now: DateTime<Utc>) {
+    fn reevaluate_idle_incidents(&self, now_ms: u64, now: UtcTimestamp) {
         if !self.enabled {
             return;
         }
@@ -866,7 +867,7 @@ impl AlertCore {
         owner_key: &str,
         ownership_generation: u64,
         now_ms: u64,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
         in_quiet: bool,
         only_channel: Option<u32>,
     ) {
@@ -1271,7 +1272,7 @@ fn start_lifecycle_task(core: Weak<AlertCore>) -> Option<tokio::task::JoinHandle
                 return;
             };
             let now_ms = monotonic_now_ms();
-            core.reevaluate_idle_incidents(now_ms, Utc::now());
+            core.reevaluate_idle_incidents(now_ms, UtcTimestamp::now());
             tick = tick.wrapping_add(1);
             if tick.is_multiple_of(EVICTION_EVERY_TICKS) {
                 core.sweep_lifecycle(now_ms);
@@ -1783,7 +1784,7 @@ mod tests {
             owner_key,
             UNARMED_PROXY_LIFECYCLE_GENERATION,
             first_resolve_ms,
-            chrono::Utc::now(),
+            UtcTimestamp::now(),
             false,
             None,
         );
@@ -1808,7 +1809,7 @@ mod tests {
             owner_key,
             UNARMED_PROXY_LIFECYCLE_GENERATION,
             second_resolve_ms,
-            chrono::Utc::now(),
+            UtcTimestamp::now(),
             false,
             None,
         );

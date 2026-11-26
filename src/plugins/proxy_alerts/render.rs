@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
+use crate::time_compat::UtcTimestamp;
 
 use crate::notifications::{EventAction, Notification, NotificationField};
 
@@ -65,7 +65,7 @@ pub fn build_notification(
     observation: &RuleObservation,
     subject: AlertSubject<'_>,
     event_action: EventAction,
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
 ) -> Notification {
     let common = rule.common();
     let rendered = observation.render(rule);
@@ -128,7 +128,7 @@ pub fn build_webhook_vars(
     subject: AlertSubject<'_>,
     policy_id: &str,
     event_action: EventAction,
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
 ) -> HashMap<String, String> {
     let common = rule.common();
     let rendered = observation.render(rule);

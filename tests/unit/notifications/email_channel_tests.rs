@@ -15,10 +15,10 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
-use chrono::{TimeZone, Utc};
 use ferrum_edge::notifications::channels::{EmailChannel, NotificationChannel};
 use ferrum_edge::notifications::{EventAction, Notification, NotificationField, Severity};
 use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
+use ferrum_edge::time_compat::UtcTimestamp;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde_json::{Value, json};
@@ -46,7 +46,7 @@ fn notification(event_action: EventAction) -> Notification {
         source: Some("proxy_alerts:proxy_5xx".into()),
         subject_id: Some("api-gateway".into()),
         namespace: Some("ferrum".into()),
-        fired_at: Utc.with_ymd_and_hms(2026, 5, 14, 10, 0, 0).unwrap(),
+        fired_at: "2026-05-14T10:00:00Z".parse::<UtcTimestamp>().unwrap(),
         fields: vec![
             NotificationField::new("Rule", "proxy_5xx"),
             NotificationField::new("Observed", "5.00%"),
@@ -712,6 +712,12 @@ fn message_carries_the_expected_headers_and_a_decodable_body() {
             .split_once("\r\n\r\n")
             .expect("header/body separator");
 
+        // `fired_at` is 2026-05-14T10:00:00Z: the Date header must keep
+        // chrono's `to_rfc2822()` bytes (issue #7419).
+        assert!(
+            headers.contains("Date: Thu, 14 May 2026 10:00:00 +0000\r\n"),
+            "{headers}"
+        );
         assert!(headers.contains("From: <ferrum@example.com>"), "{headers}");
         assert!(
             headers.contains("To: <oncall@example.com>, <sre@example.com>"),
