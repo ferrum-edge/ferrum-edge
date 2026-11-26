@@ -978,6 +978,12 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
     // so keep explicit headroom for the production request path. This reserves
     // virtual address space per worker; pages are committed on demand.
     rt_builder.thread_stack_size(8 * 1024 * 1024);
+    // Poll the I/O and timer drivers every 8 ticks instead of Tokio's default
+    // 61. Single-poll-per-message relays (TCP-TLS, WebSocket tunnel, HTTP/1.1)
+    // otherwise drain short ready batches without reaching 61 ticks, enter
+    // work-stealing, and park workers in `futex_wait` while loopback sockets
+    // are already readable.
+    rt_builder.event_interval(8);
     // Key-tied for the same reason as the logging-clamp fields above: both are
     // parsed to `usize` and clamped with `.max(1)` before being re-rendered, so
     // a secret-backed `004` surfaces as `4` and a `0` as `1`. Those are derived

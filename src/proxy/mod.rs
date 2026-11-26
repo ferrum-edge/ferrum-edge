@@ -22187,6 +22187,10 @@ pub struct WsIdleTracker {
     timeout: Duration,
     epoch: Instant,
     last_activity_ms: AtomicU64,
+    /// Cleared when WebSocket tunnel mode takes over so `WsActivityIo` stops
+    /// issuing redundant `Instant::now()` + atomic stores on every backend TCP
+    /// read (`bidirectional_copy_for_relay` tracks idle activity directly).
+    active: std::sync::atomic::AtomicBool,
 }
 
 impl WsIdleTracker {
@@ -22195,6 +22199,7 @@ impl WsIdleTracker {
             timeout,
             epoch: Instant::now(),
             last_activity_ms: AtomicU64::new(0),
+            active: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
@@ -22204,12 +22209,23 @@ impl WsIdleTracker {
         (seconds > 0).then(|| Arc::new(Self::new(Duration::from_secs(seconds))))
     }
 
+    /// Silence byte-level activity updates once tunnel mode hands idle
+    /// tracking over to `tcp_proxy::bidirectional_copy_for_relay`.
+    #[inline]
+    pub(crate) fn deactivate(&self) {
+        self.active.store(false, Ordering::Relaxed);
+    }
+
     fn now_ms(&self) -> u64 {
         u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
     /// Record activity: bytes or a frame received from either direction.
+    #[inline]
     fn touch(&self) {
+        if !self.active.load(Ordering::Relaxed) {
+            return;
+        }
         self.last_activity_ms
             .store(self.now_ms(), Ordering::Relaxed);
     }
@@ -22636,6 +22652,12 @@ where
     // is not enforced, but data streams through a fixed-size copy buffer so there
     // is no large-allocation DoS risk.
     if websocket_tunnel_mode && ws_framing_plugins.is_empty() {
+        // `bidirectional_copy_for_relay` owns idle tracking for the raw
+        // tunnel, so silence the backend `WsActivityIo` wrapper installed
+        // during the WebSocket handshake to avoid per-read clock reads.
+        if let Some(tracker) = &ws_idle_tracker {
+            tracker.deactivate();
+        }
         debug!(
             proxy_id = %proxy_id,
             connection_id,
