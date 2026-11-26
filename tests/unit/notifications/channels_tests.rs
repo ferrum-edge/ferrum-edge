@@ -8,12 +8,12 @@ use super::parse_channels;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
-use chrono::{TimeZone, Utc};
 use ferrum_edge::notifications::channels::{
     DiscordChannel, NotificationChannel, SlackChannel, TeamsChannel, WebhookChannel,
 };
 use ferrum_edge::notifications::{EventAction, Notification, NotificationField, Severity};
 use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
+use ferrum_edge::time_compat::UtcTimestamp;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -29,7 +29,7 @@ fn fixed_notification() -> Notification {
         source: Some("proxy_alerts:proxy_5xx".into()),
         subject_id: Some("api-gateway".into()),
         namespace: Some("ferrum".into()),
-        fired_at: Utc.with_ymd_and_hms(2026, 5, 14, 10, 0, 0).unwrap(),
+        fired_at: "2026-05-14T10:00:00Z".parse::<UtcTimestamp>().unwrap(),
         fields: vec![
             NotificationField::new("Rule", "proxy_5xx"),
             NotificationField::new("Observed", "5.00%"),
@@ -352,6 +352,8 @@ fn assert_slack_payload_shape(slack: &SlackChannel) {
     assert_eq!(a["color"], Severity::High.slack_color());
     assert_eq!(a["title"], "[ALERT] proxy_5xx on api-gateway");
     assert_eq!(a["text"], "5/100 requests matched [503] over 60s");
+    // 2026-05-14T10:00:00Z as Unix seconds, as chrono's `timestamp()` emitted.
+    assert_eq!(a["ts"], 1_778_752_800_i64);
     let fields = a["fields"].as_array().expect("fields array");
     assert_eq!(fields.len(), 3);
     assert_eq!(fields[0]["title"], "Rule");
@@ -408,6 +410,8 @@ fn discord_payload_uses_embeds_with_color_int() {
     assert_eq!(e["title"], "[ALERT] proxy_5xx on api-gateway");
     assert_eq!(e["color"], Severity::High.discord_color());
     assert_eq!(e["timestamp"], fixed_notification().fired_at.to_rfc3339());
+    // Pin the bytes chrono's `to_rfc3339()` produced (issue #7419).
+    assert_eq!(e["timestamp"], "2026-05-14T10:00:00+00:00");
     let fields = e["fields"].as_array().expect("fields");
     assert_eq!(fields.len(), 3);
     assert_eq!(fields[0]["name"], "Rule");
