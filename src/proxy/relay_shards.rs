@@ -20,7 +20,7 @@
 //! or if shard initialization failed), [`next_handle`] returns `None` and
 //! callers fall back transparently to the main runtime.
 
-use std::io::{self, IoSlice, Read, Write};
+use std::io::{self, BufRead, IoSlice, Read, Write};
 use std::num::NonZeroUsize;
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
@@ -71,7 +71,7 @@ impl RelayShardPool {
         let count = shard_count.clamp(MIN_SHARDS, MAX_SHARDS);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut handles = Vec::with_capacity(count);
-        let mut threads = Vec::with_capacity(count);
+        let mut threads: Vec<thread::JoinHandle<()>> = Vec::with_capacity(count);
 
         for idx in 0..count {
             let (ready_tx, ready_rx) = mpsc::sync_channel::<io::Result<Handle>>(1);
