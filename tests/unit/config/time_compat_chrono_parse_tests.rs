@@ -1,0 +1,369 @@
+//! Accept/reject parity corpus for the chrono-compatible parsers in
+//! `ferrum_edge::time_compat` (issue #7419). Every input runs through chrono
+//! 0.4.45 and through the `time_compat` port; both must accept or both must
+//! reject, and accepted inputs must yield the same instant, sub-second part
+//! (including chrono's leap-second representation), offset and local fields.
+//!
+//! chrono stays as the oracle here until the dependency-retirement phase.
+
+use chrono::{DateTime, Datelike, FixedOffset, NaiveDateTime, Timelike};
+use ferrum_edge::time_compat::{
+    ChronoParsedDateTime, TimestampError, UtcTimestamp, parse_from_str_chrono,
+    parse_naive_from_str_chrono, parse_rfc2822_chrono, parse_rfc3339_chrono,
+    parse_rfc3339_relaxed_chrono,
+};
+
+/// The strftime formats Ferrum parses with chrono today.
+const OFFSET_FORMATS: &[&str] = &[
+    // soap_ws_security (the `...Z` forms carry no offset item, so chrono
+    // always refuses them; parity must hold for that too).
+    "%Y-%m-%dT%H:%M:%S%.fZ",
+    "%Y-%m-%dT%H:%M:%SZ",
+    "%Y-%m-%dT%H:%M:%S%.f%:z",
+    "%Y-%m-%dT%H:%M:%S%:z",
+];
+const NAIVE_FORMATS: &[&str] = &[
+    // response_caching HTTP-date fallbacks.
+    "%a, %d %b %Y %H:%M:%S GMT",
+    "%A, %d-%b-%y %H:%M:%S GMT",
+    "%a %b %e %H:%M:%S %Y",
+    // db_loader legacy CURRENT_TIMESTAMP rows.
+    "%Y-%m-%d %H:%M:%S",
+];
+
+const BASES: &[&str] = &[
+    // RFC 3339, strict and relaxed shapes.
+    "2026-11-26T10:20:30Z",
+    "2026-11-26t10:20:30.123456789z",
+    "2026-11-26 10:20:30+05:30",
+    "2026-11-26T10:20:30.1-00:00",
+    "1999-12-31T23:59:60Z",
+    "1999-12-31T23:59:60.5-01:00",
+    "2026-11-26T12:30:60+01:00",
+    "0000-01-01T00:00:00+23:59",
+    "9999-12-31T23:59:59.99999999999\u{2212}00:30",
+    "2024-02-29T12:00:00Z",
+    "2023-02-29T12:00:00Z",
+    "2026-11-26T24:00:00Z",
+    "2026-11-26T10:20:30+24:00",
+    "+12345-01-01T00:00:00Z",
+    "-0001-12-31T23:59:59Z",
+    "2026-1-2T3:4:5Z",
+    "2026-11-26T10:20:30 UTC",
+    "2026-11-26T10:20:30+0530",
+    "2026-11-26T10:20:30 +05 30",
+    " 2026 - 11 - 26 T10 : 20 : 30.5 Z ",
+    "2026-11-26T10:20:30.Z",
+    "2026-11-26T10:20:30,5Z",
+    // RFC 2822.
+    "Thu, 26 Nov 2026 10:20:30 GMT",
+    "26 Nov 2026 10:20 +0530",
+    "Wed, 26 Nov 2026 10:20:30 GMT",
+    "Thu, 26 Nov 26 10:20:30 EST",
+    "Sun, 06 Nov 94 08:49:37 GMT",
+    "6 Nov 994 08:49:37 Z",
+    "Thu,26 Nov 2026 10 : 20:30 -0000 (comment (nested) \\) x)",
+    "Thu, 26 Nov 2026 23:59:60 +2359",
+    "Thu, 26 Nov 12345 10:20:30 a",
+    "Mon, 1 Jan 0001 00:00:00 +9959",
+    "Fri, 31 Dec 262142 23:59:59 -2359",
+    "Thu, 26 nov 2026 10:20:30 pdt",
+    "Thu, 26 Nov 2026 10:20:30 J",
+    // HTTP-date fallbacks and legacy SQL text.
+    "Sun, 06 Nov 1994 08:49:37 GMT",
+    "Sunday, 06-Nov-94 08:49:37 GMT",
+    "Sun Nov  6 08:49:37 1994",
+    "Sun Nov 6 08:49:37 1994",
+    "Mon Nov  6 08:49:37 1994",
+    "2026-11-26 10:20:30",
+    "2026-1-2 3:4:5",
+    // WS-Security.
+    "2026-11-26T10:20:30.5+05:30",
+    "2026-11-26T10:20:30+05:30",
+];
+
+const PALETTE: &[char] = &[
+    '0', '1', '5', '6', '9', ' ', '\t', '\u{a0}', 'T', 't', 'Z', 'z', '+', '-', '\u{2212}', ':',
+    '.', 'x', '(', ')', '\\', ',', 'G', 'U', 'C', 'a', '\u{e9}',
+];
+
+/// Single-character deletions, substitutions and insertions of every base.
+fn corpus() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    out.push(String::new());
+    for base in BASES {
+        let chars: Vec<char> = base.chars().collect();
+        out.push((*base).to_string());
+        for i in 0..=chars.len() {
+            if i < chars.len() {
+                let mut deleted = chars.clone();
+                deleted.remove(i);
+                out.push(deleted.into_iter().collect());
+            }
+            for &p in PALETTE {
+                if i < chars.len() {
+                    let mut replaced = chars.clone();
+                    replaced[i] = p;
+                    out.push(replaced.into_iter().collect());
+                }
+                let mut inserted = chars.clone();
+                inserted.insert(i, p);
+                out.push(inserted.into_iter().collect());
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn assert_fixed_parity(
+    what: &str,
+    input: &str,
+    ours: Result<ChronoParsedDateTime, TimestampError>,
+    theirs: chrono::ParseResult<DateTime<FixedOffset>>,
+) -> bool {
+    match (ours, theirs) {
+        (Ok(o), Ok(t)) => {
+            let n = t.naive_local();
+            assert_eq!(
+                (
+                    o.unix_timestamp(),
+                    o.nanosecond(),
+                    o.offset_seconds(),
+                    o.unix_timestamp_millis()
+                ),
+                (
+                    t.timestamp(),
+                    t.timestamp_subsec_nanos(),
+                    t.offset().local_minus_utc(),
+                    t.timestamp_millis()
+                ),
+                "{what}: instant mismatch for {input:?}"
+            );
+            assert_eq!(
+                (
+                    o.year(),
+                    u32::from(o.month()),
+                    u32::from(o.day()),
+                    u32::from(o.hour()),
+                    u32::from(o.minute()),
+                    u32::from(o.second()),
+                ),
+                (
+                    n.year(),
+                    n.month(),
+                    n.day(),
+                    n.hour(),
+                    n.minute(),
+                    n.second()
+                ),
+                "{what}: local field mismatch for {input:?}"
+            );
+            assert_utc_conversion(what, input, &o);
+            true
+        }
+        (Err(_), Err(_)) => false,
+        (Ok(o), Err(e)) => panic!("{what}: time_compat accepted {input:?} as {o:?}; chrono: {e}"),
+        (Err(e), Ok(t)) => panic!("{what}: chrono accepted {input:?} as {t:?}; time_compat: {e}"),
+    }
+}
+
+fn assert_naive_parity(
+    what: &str,
+    input: &str,
+    ours: Result<ChronoParsedDateTime, TimestampError>,
+    theirs: chrono::ParseResult<NaiveDateTime>,
+) -> bool {
+    match (ours, theirs) {
+        (Ok(o), Ok(t)) => {
+            assert_eq!(o.offset_seconds(), 0, "{what}: naive offset for {input:?}");
+            assert_eq!(
+                (
+                    o.unix_timestamp(),
+                    o.nanosecond(),
+                    o.year(),
+                    u32::from(o.month()),
+                    u32::from(o.day()),
+                    u32::from(o.hour()),
+                    u32::from(o.minute()),
+                    u32::from(o.second()),
+                ),
+                (
+                    t.and_utc().timestamp(),
+                    t.nanosecond(),
+                    t.year(),
+                    t.month(),
+                    t.day(),
+                    t.hour(),
+                    t.minute(),
+                    t.second(),
+                ),
+                "{what}: naive mismatch for {input:?}"
+            );
+            assert_utc_conversion(what, input, &o);
+            true
+        }
+        (Err(_), Err(_)) => false,
+        (Ok(o), Err(e)) => panic!("{what}: time_compat accepted {input:?} as {o:?}; chrono: {e}"),
+        (Err(e), Ok(t)) => panic!("{what}: chrono accepted {input:?} as {t:?}; time_compat: {e}"),
+    }
+}
+
+/// `to_utc_timestamp` must be exact where `UtcTimestamp` can represent the
+/// value and refuse leap seconds and out-of-range years explicitly.
+fn assert_utc_conversion(what: &str, input: &str, parsed: &ChronoParsedDateTime) {
+    let converted = parsed.to_utc_timestamp();
+    if parsed.is_leap_second() {
+        assert_eq!(
+            converted,
+            Err(TimestampError::InvalidComponent),
+            "{what}: leap second conversion for {input:?}"
+        );
+        return;
+    }
+    match UtcTimestamp::from_unix_timestamp_nanos(parsed.unix_timestamp(), parsed.nanosecond()) {
+        Ok(expected) => assert_eq!(converted, Ok(expected), "{what}: conversion for {input:?}"),
+        Err(_) => assert!(
+            converted.is_err(),
+            "{what}: out-of-range conversion for {input:?}"
+        ),
+    }
+}
+
+#[test]
+fn chrono_compatible_parsers_match_chrono_on_the_mutation_corpus() {
+    let corpus = corpus();
+    assert!(
+        corpus.len() > 20_000,
+        "corpus unexpectedly small: {}",
+        corpus.len()
+    );
+
+    let mut accepted = [0usize; 3];
+    let mut accepted_formats = vec![0usize; OFFSET_FORMATS.len() + NAIVE_FORMATS.len()];
+    for input in &corpus {
+        let input = input.as_str();
+        accepted[0] += usize::from(assert_fixed_parity(
+            "rfc3339",
+            input,
+            parse_rfc3339_chrono(input),
+            DateTime::parse_from_rfc3339(input),
+        ));
+        accepted[1] += usize::from(assert_fixed_parity(
+            "rfc3339-relaxed",
+            input,
+            parse_rfc3339_relaxed_chrono(input),
+            input.parse::<DateTime<FixedOffset>>(),
+        ));
+        accepted[2] += usize::from(assert_fixed_parity(
+            "rfc2822",
+            input,
+            parse_rfc2822_chrono(input),
+            DateTime::parse_from_rfc2822(input),
+        ));
+        for (i, fmt) in OFFSET_FORMATS.iter().enumerate() {
+            accepted_formats[i] += usize::from(assert_fixed_parity(
+                fmt,
+                input,
+                parse_from_str_chrono(input, fmt),
+                DateTime::parse_from_str(input, fmt),
+            ));
+        }
+        for (i, fmt) in NAIVE_FORMATS.iter().enumerate() {
+            accepted_formats[OFFSET_FORMATS.len() + i] += usize::from(assert_naive_parity(
+                fmt,
+                input,
+                parse_naive_from_str_chrono(input, fmt),
+                NaiveDateTime::parse_from_str(input, fmt),
+            ));
+        }
+    }
+
+    // Guard against a vacuous corpus: every parser must accept a meaningful
+    // number of inputs (the two `...Z` soap formats never can).
+    for (name, count) in ["rfc3339", "rfc3339-relaxed", "rfc2822"]
+        .iter()
+        .zip(accepted)
+    {
+        assert!(count > 200, "{name} accepted only {count} corpus inputs");
+    }
+    for (i, count) in accepted_formats.iter().enumerate() {
+        let fmt = OFFSET_FORMATS
+            .iter()
+            .chain(NAIVE_FORMATS)
+            .nth(i)
+            .copied()
+            .unwrap_or_default();
+        if fmt.ends_with('Z') {
+            assert_eq!(
+                *count, 0,
+                "{fmt} has no offset item; chrono never accepts it"
+            );
+        } else {
+            assert!(*count > 20, "{fmt} accepted only {count} corpus inputs");
+        }
+    }
+}
+
+/// The three behaviours the owner called out explicitly (#7419).
+#[test]
+fn rfc3339_leap_second_unicode_minus_and_signed_years_follow_chrono() {
+    // Leap second at any minute, kept as second 59 + 1e9 nanoseconds.
+    let leap = parse_rfc3339_chrono("2026-11-26T12:30:60.25+01:00").expect("leap second");
+    assert!(leap.is_leap_second());
+    assert_eq!(leap.second(), 59);
+    assert_eq!(leap.nanosecond(), 1_250_000_000);
+    let chrono_leap = DateTime::parse_from_rfc3339("2026-11-26T12:30:60.25+01:00").unwrap();
+    assert_eq!(leap.unix_timestamp(), chrono_leap.timestamp());
+    assert_eq!(leap.unix_timestamp_millis(), chrono_leap.timestamp_millis());
+    assert_eq!(
+        leap.to_utc_timestamp(),
+        Err(TimestampError::InvalidComponent)
+    );
+
+    // Unicode minus sign in the offset.
+    let minus = parse_rfc3339_chrono("2026-11-26T10:20:30\u{2212}05:30").expect("U+2212 offset");
+    assert_eq!(minus.offset_seconds(), -(5 * 3_600 + 30 * 60));
+    assert!(DateTime::parse_from_rfc3339("2026-11-26T10:20:30\u{2212}05:30").is_ok());
+
+    // Signed or expanded years are refused by the strict parser, as chrono does.
+    for input in [
+        "+2026-11-26T10:20:30Z",
+        "-2026-11-26T10:20:30Z",
+        "12026-11-26T10:20:30Z",
+        "+012026-11-26T10:20:30Z",
+    ] {
+        assert!(parse_rfc3339_chrono(input).is_err(), "{input:?}");
+        assert!(DateTime::parse_from_rfc3339(input).is_err(), "{input:?}");
+    }
+
+    // The existing strict `parse_rfc3339` is unchanged: it still differs on
+    // exactly these inputs, which is why parse sites must use the chrono port.
+    assert!(ferrum_edge::time_compat::parse_rfc3339("2026-11-26T12:30:60Z").is_err());
+}
+
+#[test]
+fn http_date_forms_used_by_response_caching_and_hmac_auth_follow_chrono() {
+    let imf = parse_rfc2822_chrono("Sun, 06 Nov 1994 08:49:37 GMT").expect("IMF-fixdate");
+    assert_eq!(imf.unix_timestamp(), 784_111_777);
+    let rfc850 = parse_naive_from_str_chrono(
+        "Sunday, 06-Nov-94 08:49:37 GMT",
+        "%A, %d-%b-%y %H:%M:%S GMT",
+    )
+    .expect("RFC 850");
+    assert_eq!(rfc850.unix_timestamp(), 784_111_777);
+    let asctime = parse_naive_from_str_chrono("Sun Nov  6 08:49:37 1994", "%a %b %e %H:%M:%S %Y")
+        .expect("asctime");
+    assert_eq!(asctime.unix_timestamp(), 784_111_777);
+
+    // A weekday that contradicts the date is refused by both.
+    assert!(parse_rfc2822_chrono("Mon, 06 Nov 1994 08:49:37 GMT").is_err());
+    assert!(DateTime::parse_from_rfc2822("Mon, 06 Nov 1994 08:49:37 GMT").is_err());
+
+    // Unsupported specifiers are refused rather than parsed differently.
+    assert_eq!(
+        parse_naive_from_str_chrono("1994", "%G"),
+        Err(TimestampError::InvalidFormat)
+    );
+}
