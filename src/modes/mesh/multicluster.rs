@@ -1868,7 +1868,9 @@ async fn remote_discovery_loop(
                 let revision_apply_token = ctx
                     .revision_gate
                     .begin_apply(candidate.revision.as_ref(), content);
-                let now = chrono::Utc::now().timestamp().max(0) as u64;
+                let now = crate::time_compat::UtcTimestamp::now()
+                    .unix_timestamp()
+                    .max(0) as u64;
                 let workload_count = candidate.endpoints.workloads.len();
                 let entry = RemoteClusterEntry::new(
                     ctx.cluster_name.clone(),
@@ -1995,7 +1997,9 @@ fn expire_stale_endpoints_after_failure(
     if !store.cluster_generation_matches(&ctx.cluster_name, task_generation) {
         return;
     }
-    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    let now = crate::time_compat::UtcTimestamp::now()
+        .unix_timestamp()
+        .max(0) as u64;
     if store.expire_stale_endpoints_and_clear_metrics(
         &ctx.cluster_name,
         ctx.trust_domain.as_str(),
@@ -4936,7 +4940,6 @@ mod tests {
     use crate::grpc::proto::mesh_config_sync_server::{MeshConfigSync, MeshConfigSyncServer};
     use crate::grpc::proto::{MeshConfigUpdate, MeshSubscribeRequest};
     use crate::modes::mesh::slice::MeshSlice;
-    use chrono::Utc;
     use std::pin::Pin;
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
@@ -5013,7 +5016,7 @@ mod tests {
 
             let slice_update = MeshConfigUpdate {
                 version: self.slice.version.clone(),
-                timestamp: Utc::now().timestamp(),
+                timestamp: crate::time_compat::UtcTimestamp::now().unix_timestamp(),
                 mesh_slice_json: serde_json::to_string(self.slice.as_ref())
                     .map_err(|e| Status::internal(format!("serialize slice: {e}")))?,
                 ferrum_version: crate::FERRUM_VERSION.to_string(),
@@ -5033,7 +5036,7 @@ mod tests {
             };
             let heartbeat = MeshConfigUpdate {
                 version: self.slice.version.clone(),
-                timestamp: Utc::now().timestamp(),
+                timestamp: crate::time_compat::UtcTimestamp::now().unix_timestamp(),
                 mesh_slice_json: String::new(),
                 ferrum_version: crate::FERRUM_VERSION.to_string(),
                 heartbeat: true,

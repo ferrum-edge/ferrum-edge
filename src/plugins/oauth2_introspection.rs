@@ -1452,7 +1452,7 @@ fn usable_cached_credential(
     match cached_window_decision(
         credential.expires_at_unix,
         credential.not_before_unix,
-        chrono::Utc::now().timestamp(),
+        crate::time_compat::UtcTimestamp::now().unix_timestamp(),
     ) {
         Some(decision) => Err(decision),
         None => Ok(credential),
@@ -1514,7 +1514,10 @@ pub(crate) fn cached_window_status(
 fn validated_introspection_not_before(
     claims: &Value,
 ) -> Result<Option<i64>, IntrospectionDecision> {
-    validated_introspection_not_before_at(claims, chrono::Utc::now().timestamp())
+    validated_introspection_not_before_at(
+        claims,
+        crate::time_compat::UtcTimestamp::now().unix_timestamp(),
+    )
 }
 
 fn validated_introspection_not_before_at(
@@ -1546,7 +1549,10 @@ fn validated_introspection_not_before_at(
 /// members as `null` would otherwise fail every authentication with a 503.
 /// Every other present non-integer shape is still a broken dependency response.
 fn validated_introspection_expiry(claims: &Value) -> Result<Option<i64>, IntrospectionDecision> {
-    validated_introspection_expiry_at(claims, chrono::Utc::now().timestamp())
+    validated_introspection_expiry_at(
+        claims,
+        crate::time_compat::UtcTimestamp::now().unix_timestamp(),
+    )
 }
 
 fn validated_introspection_expiry_at(

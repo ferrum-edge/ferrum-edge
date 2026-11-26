@@ -6,7 +6,6 @@ pub use sql_statements::{
     split_plugin_migration_statements, statements_require_non_transactional_postgres,
 };
 
-use chrono::Utc;
 use sqlx::any::AnyRow;
 use sqlx::pool::PoolConnection;
 use sqlx::{Any, AnyConnection, AnyPool, Connection, Row};
@@ -1154,7 +1153,7 @@ impl MigrationRunner {
             migration.run_up(connection, &self.db_type).await?;
             let elapsed_ms = start.elapsed().as_millis() as i64;
 
-            let now = Utc::now().to_rfc3339();
+            let now = crate::time_compat::UtcTimestamp::now().to_rfc3339();
             let insert_sql = Self::migration_insert_sql(&self.db_type);
             sqlx::query(insert_sql)
                 .bind(migration.version() as i32)
@@ -1389,7 +1388,7 @@ impl MigrationRunner {
                                 .await,
                         )?;
                     }
-                    now = Utc::now().to_rfc3339();
+                    now = crate::time_compat::UtcTimestamp::now().to_rfc3339();
                     let elapsed_ms = start.elapsed().as_millis() as i64;
                     let insert_sql = Self::plugin_migration_insert_sql(&self.db_type);
                     sqlx::query(insert_sql)
@@ -1416,7 +1415,7 @@ impl MigrationRunner {
                                 .await,
                         )?;
                     }
-                    now = Utc::now().to_rfc3339();
+                    now = crate::time_compat::UtcTimestamp::now().to_rfc3339();
                     let elapsed_ms = start.elapsed().as_millis() as i64;
                     let insert_sql = Self::plugin_migration_insert_sql(&self.db_type);
                     sqlx::query(insert_sql)
@@ -1445,7 +1444,7 @@ impl MigrationRunner {
                                 .await,
                         )?;
                     }
-                    now = Utc::now().to_rfc3339();
+                    now = crate::time_compat::UtcTimestamp::now().to_rfc3339();
                     let elapsed_ms = start.elapsed().as_millis() as i64;
                     let insert_sql = Self::plugin_migration_insert_sql(&self.db_type);
                     sqlx::query(insert_sql)
@@ -1470,7 +1469,7 @@ impl MigrationRunner {
                                 .await,
                         )?;
                     }
-                    now = Utc::now().to_rfc3339();
+                    now = crate::time_compat::UtcTimestamp::now().to_rfc3339();
                     let elapsed_ms = start.elapsed().as_millis() as i64;
                     let insert_sql = Self::plugin_migration_insert_sql(&self.db_type);
                     sqlx::query(insert_sql)

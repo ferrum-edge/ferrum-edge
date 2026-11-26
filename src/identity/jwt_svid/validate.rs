@@ -308,7 +308,7 @@ fn check_claims(claims: &Map<String, Value>, audience: &str) -> Result<SpiffeId,
 
     let exp = numeric_claim(claims, "exp")?
         .ok_or(JwtSvidError::InvalidToken("token has no expiry claim"))?;
-    let now = chrono::Utc::now().timestamp();
+    let now = crate::time_compat::UtcTimestamp::now().unix_timestamp();
     let leeway = JWT_SVID_CLOCK_SKEW_LEEWAY_SECS as i64;
     if let Some(iat) = numeric_claim(claims, "iat")?
         && iat > now.saturating_add(leeway)

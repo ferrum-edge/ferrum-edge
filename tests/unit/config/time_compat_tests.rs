@@ -223,6 +223,79 @@ fn parse_rejects_malformed_and_overflow_inputs_without_panicking() {
     assert!(UtcTimestamp::decode_postgres_binary(&[0u8; 7]).is_err());
 }
 
+/// Phase 2 call sites replaced `Utc::now().timestamp()`,
+/// `.timestamp_millis()` and `.format("%Y-%m-%dT%H:%M:%SZ")` with
+/// `unix_timestamp()`, `unix_timestamp_millis()` and
+/// `to_rfc3339_opts(SecondsFormat::Secs, true)`. Pin all three to chrono,
+/// including pre-epoch instants where millisecond flooring matters.
+#[test]
+fn unix_epoch_accessors_and_secs_z_format_match_chrono() {
+    let mut instants = representative_instants();
+    instants.extend([
+        // Pre-epoch sub-millisecond remainders: chrono floors toward
+        // negative infinity, never toward zero.
+        (-1, 999_500_000),
+        (-1, 999_999_999),
+        (-1, 1),
+        (-1, 0),
+        (0, 999_999),
+        (0, 1_000_000),
+    ]);
+
+    for (secs, nanos) in instants {
+        let (ts, ch) = pair_for(secs, nanos);
+        assert_eq!(
+            ts.unix_timestamp(),
+            ch.timestamp(),
+            "unix_timestamp mismatch for ({secs}, {nanos})"
+        );
+        assert_eq!(
+            ts.unix_timestamp_millis(),
+            ch.timestamp_millis(),
+            "unix_timestamp_millis mismatch for ({secs}, {nanos})"
+        );
+        assert_eq!(
+            ts.to_rfc3339_opts(SecondsFormat::Secs, true),
+            ch.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            "Secs+Z vs strftime mismatch for ({secs}, {nanos})"
+        );
+        assert_eq!(
+            ts.to_compact_date(),
+            ch.format("%Y%m%d").to_string(),
+            "compact date mismatch for ({secs}, {nanos})"
+        );
+        assert_eq!(
+            ts.to_compact_date_time(),
+            ch.format("%Y%m%d%H%M%S").to_string(),
+            "compact date-time mismatch for ({secs}, {nanos})"
+        );
+    }
+
+    // Years outside 0..=9999 get chrono's explicit sign. `UtcTimestamp::now()`
+    // reads the wall clock directly, and `time/large-dates` is unified in by
+    // bson, so a far-future clock reaches these formatters.
+    for year in [-1, 10_000] {
+        let Ok(date) = Date::from_calendar_date(year, Month::December, 31) else {
+            // Without `time/large-dates` the year is unrepresentable.
+            continue;
+        };
+        let ts = UtcTimestamp::from_utc_date_time(date, Time::from_hms(10, 20, 30).unwrap());
+        let ch = DateTime::<Utc>::from_timestamp(ts.unix_timestamp(), 0)
+            .expect("chrono represents the instant");
+        assert_eq!(ts.to_compact_date(), ch.format("%Y%m%d").to_string());
+        assert_eq!(
+            ts.to_compact_date_time(),
+            ch.format("%Y%m%d%H%M%S").to_string()
+        );
+    }
+
+    let ts = UtcTimestamp::now();
+    let ch = DateTime::<Utc>::from_timestamp(ts.unix_timestamp(), ts.subsec_nanos())
+        .expect("current instant valid for chrono");
+    assert_eq!(ts.unix_timestamp_millis(), ch.timestamp_millis());
+    assert_eq!(ts.to_rfc3339(), ch.to_rfc3339());
+}
+
 #[test]
 fn system_time_and_duration_arithmetic_work_across_epoch() {
     let post = UNIX_EPOCH + StdDuration::new(1_767_323_045, 123_456_789);

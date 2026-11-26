@@ -523,7 +523,7 @@ impl FaultInjectionPlugin {
         if self.expired.load(Ordering::Relaxed) {
             return true;
         }
-        if chrono::Utc::now().timestamp_millis() >= expires_at_unix_ms {
+        if crate::time_compat::UtcTimestamp::now().unix_timestamp_millis() >= expires_at_unix_ms {
             self.expired.store(true, Ordering::Relaxed);
             return true;
         }

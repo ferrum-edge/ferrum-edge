@@ -225,7 +225,6 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use chrono::Utc;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -5490,7 +5489,7 @@ impl AnthropicSseNormalizer {
             model,
             stream_id: None,
             synthetic_id: format!("chatcmpl-stream-{}", uuid::Uuid::new_v4().simple()),
-            created: Utc::now().timestamp(),
+            created: crate::time_compat::UtcTimestamp::now().unix_timestamp(),
             message_started: false,
             role_emitted: false,
             done_emitted: false,
@@ -6364,7 +6363,7 @@ impl GeminiStreamNormalizer {
             model,
             stream_id: None,
             provider_response_id: None,
-            created: Utc::now().timestamp(),
+            created: crate::time_compat::UtcTimestamp::now().unix_timestamp(),
             done_emitted: false,
             terminal: None,
             tools_forbidden,

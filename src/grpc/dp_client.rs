@@ -939,7 +939,7 @@ pub fn generate_dp_jwt_full_with_key_id(
     audience: Option<&str>,
     key_id: Option<&str>,
 ) -> Result<String, anyhow::Error> {
-    let now = chrono::Utc::now().timestamp();
+    let now = crate::time_compat::UtcTimestamp::now().unix_timestamp();
     let mut claims = json!({
         "sub": node_id,
         "iat": now,

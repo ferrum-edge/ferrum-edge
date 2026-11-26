@@ -3580,7 +3580,7 @@ impl ChargebackRegistry {
 
         let result = serde_json::json!({
             "currency": currency,
-            "generated_at": chrono::Utc::now().to_rfc3339(),
+            "generated_at": crate::time_compat::UtcTimestamp::now().to_rfc3339(),
             "registry": self.registry_status(),
             "consumers": serde_json::Value::Object(consumer_objects),
         });

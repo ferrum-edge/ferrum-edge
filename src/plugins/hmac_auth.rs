@@ -1700,13 +1700,13 @@ impl HmacAuth {
         // Parse HTTP-date format (RFC 7231): "Sun, 06 Nov 1994 08:49:37 GMT"
         if let Ok(parsed) = chrono::DateTime::parse_from_rfc2822(date_str) {
             Self::timestamps_within_clock_skew(
-                chrono::Utc::now().timestamp(),
+                crate::time_compat::UtcTimestamp::now().unix_timestamp(),
                 parsed.timestamp(),
                 self.clock_skew_seconds,
             )
         } else if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(date_str) {
             Self::timestamps_within_clock_skew(
-                chrono::Utc::now().timestamp(),
+                crate::time_compat::UtcTimestamp::now().unix_timestamp(),
                 parsed.timestamp(),
                 self.clock_skew_seconds,
             )
@@ -1724,7 +1724,7 @@ impl HmacAuth {
         let Some(created) = created else {
             return false;
         };
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::time_compat::UtcTimestamp::now().unix_timestamp();
         Self::timestamps_within_clock_skew(now, created, self.clock_skew_seconds)
             && expires.is_none_or(|expires| now <= expires)
     }

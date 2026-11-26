@@ -202,7 +202,7 @@ impl ConfigMigrator {
         }
 
         // Create backup
-        let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
+        let timestamp = crate::time_compat::UtcTimestamp::now().to_compact_date_time();
         let backup_path = format!("{}.backup.{}", path, timestamp);
         std::fs::copy(file_path, &backup_path)?;
         info!(

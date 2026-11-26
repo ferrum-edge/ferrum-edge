@@ -1076,7 +1076,8 @@ impl KafkaDeliveryMetrics {
     }
 
     fn store_failure(&self, operation: &'static str, error_kind: &str) {
-        let occurred_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let occurred_at = crate::time_compat::UtcTimestamp::now()
+            .to_rfc3339_opts(crate::time_compat::SecondsFormat::Secs, true);
         let mut slot = match self.last_failure.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),

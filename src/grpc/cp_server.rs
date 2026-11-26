@@ -2072,7 +2072,7 @@ impl CpGrpcServer {
             update_type: 0,
             config_json: String::new(),
             version,
-            timestamp: Utc::now().timestamp(),
+            timestamp: crate::time_compat::UtcTimestamp::now().unix_timestamp(),
             ferrum_version: FERRUM_VERSION.to_string(),
             trust_bundles_json: String::new(),
             heartbeat: true,
@@ -2108,7 +2108,7 @@ impl CpGrpcServer {
                 update_type: 0, // FULL_SNAPSHOT
                 config_json,
                 version: current.loaded_at.to_rfc3339(),
-                timestamp: chrono::Utc::now().timestamp(),
+                timestamp: crate::time_compat::UtcTimestamp::now().unix_timestamp(),
                 ferrum_version: FERRUM_VERSION.to_string(),
                 trust_bundles_json,
                 heartbeat: false,
@@ -2195,7 +2195,7 @@ impl CpGrpcServer {
             update_type: 0, // FULL_SNAPSHOT
             config_json,
             version,
-            timestamp: chrono::Utc::now().timestamp(),
+            timestamp: crate::time_compat::UtcTimestamp::now().unix_timestamp(),
             ferrum_version: FERRUM_VERSION.to_string(),
             trust_bundles_json,
             heartbeat: false,
@@ -2297,7 +2297,7 @@ impl CpGrpcServer {
             update_type: 1, // DELTA
             config_json,
             version: version.to_string(),
-            timestamp: chrono::Utc::now().timestamp(),
+            timestamp: crate::time_compat::UtcTimestamp::now().unix_timestamp(),
             ferrum_version: FERRUM_VERSION.to_string(),
             trust_bundles_json,
             heartbeat: false,
@@ -2662,7 +2662,7 @@ impl ConfigSync for CpGrpcServer {
             update_type: 0, // FULL_SNAPSHOT
             config_json,
             version: config.loaded_at.to_rfc3339(),
-            timestamp: chrono::Utc::now().timestamp(),
+            timestamp: crate::time_compat::UtcTimestamp::now().unix_timestamp(),
             ferrum_version: FERRUM_VERSION.to_string(),
             trust_bundles_json,
             heartbeat: false,

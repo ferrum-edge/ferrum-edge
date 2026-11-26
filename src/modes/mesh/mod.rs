@@ -25114,7 +25114,7 @@ pub mod startup_rollback_test_seams {
         let env = probe_env_config();
         let runtime = probe_runtime_config();
         let slice = MeshSlice {
-            version: chrono::Utc::now().to_rfc3339(),
+            version: crate::time_compat::UtcTimestamp::now().to_rfc3339(),
             ..MeshSlice::default()
         };
         let config = prepare_gateway_config_from_mesh_slice(&slice, &runtime).unwrap();
@@ -27102,7 +27102,7 @@ mod tests {
             locality_lb_strict: false,
         };
         let slice = MeshSlice {
-            version: chrono::Utc::now().to_rfc3339(),
+            version: crate::time_compat::UtcTimestamp::now().to_rfc3339(),
             ..MeshSlice::default()
         };
         let config = prepare_gateway_config_from_mesh_slice(&slice, &runtime).unwrap();
@@ -34949,7 +34949,7 @@ mod tests {
             node_id: "node-a".to_string(),
             namespace: "default".to_string(),
             labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
-            version: chrono::Utc::now().to_rfc3339(),
+            version: crate::time_compat::UtcTimestamp::now().to_rfc3339(),
             telemetry_resources: vec![MeshTelemetryResource {
                 name: "api-access-log".to_string(),
                 namespace: "default".to_string(),
@@ -36305,7 +36305,7 @@ mod tests {
             node_id: "node-a".to_string(),
             namespace: "default".to_string(),
             labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
-            version: chrono::Utc::now().to_rfc3339(),
+            version: crate::time_compat::UtcTimestamp::now().to_rfc3339(),
             telemetry_resources: vec![MeshTelemetryResource {
                 name: "api-tracing".to_string(),
                 namespace: "default".to_string(),
@@ -36410,7 +36410,7 @@ mod tests {
             node_id: "node-a".to_string(),
             namespace: "default".to_string(),
             labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
-            version: chrono::Utc::now().to_rfc3339(),
+            version: crate::time_compat::UtcTimestamp::now().to_rfc3339(),
             telemetry_resources: vec![MeshTelemetryResource {
                 name: "api-tracing".to_string(),
                 namespace: "default".to_string(),
@@ -36483,7 +36483,7 @@ mod tests {
             node_id: "node-a".to_string(),
             namespace: "default".to_string(),
             labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
-            version: chrono::Utc::now().to_rfc3339(),
+            version: crate::time_compat::UtcTimestamp::now().to_rfc3339(),
             telemetry_resources: vec![MeshTelemetryResource {
                 name: "api-tracing".to_string(),
                 namespace: "default".to_string(),
@@ -38848,7 +38848,7 @@ mod tests {
                     node_id: "node-a".to_string(),
                     namespace: "default".to_string(),
                     labels: [("app".to_string(), "api".to_string())].into(),
-                    version: chrono::Utc::now().to_rfc3339(),
+                    version: crate::time_compat::UtcTimestamp::now().to_rfc3339(),
                     mesh_policies: vec![MeshPolicy {
                         name: "api-only".to_string(),
                         namespace: "default".to_string(),
@@ -40707,7 +40707,7 @@ mod tests {
             node_id: "node-a".to_string(),
             namespace: "default".to_string(),
             labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
-            version: chrono::Utc::now().to_rfc3339(),
+            version: crate::time_compat::UtcTimestamp::now().to_rfc3339(),
             request_authentications: vec![test_request_authentication(
                 "api-jwt",
                 PolicyScope::WorkloadSelector {
@@ -40787,7 +40787,7 @@ mod tests {
             namespace: "default".to_string(),
             labels: BTreeMap::from([("app".to_string(), "shared".to_string())]),
             labels_ambiguous: true,
-            version: chrono::Utc::now().to_rfc3339(),
+            version: crate::time_compat::UtcTimestamp::now().to_rfc3339(),
             request_authentications: vec![test_request_authentication(
                 "role-api-jwt",
                 PolicyScope::WorkloadSelector {
@@ -40831,7 +40831,7 @@ mod tests {
             namespace: "default".to_string(),
             labels: BTreeMap::from([("app".to_string(), "shared".to_string())]),
             labels_ambiguous: false,
-            version: chrono::Utc::now().to_rfc3339(),
+            version: crate::time_compat::UtcTimestamp::now().to_rfc3339(),
             request_authentications: vec![test_request_authentication(
                 "role-api-jwt",
                 PolicyScope::WorkloadSelector {
@@ -40867,7 +40867,7 @@ mod tests {
             namespace: "default".to_string(),
             labels: BTreeMap::from([("app".to_string(), "shared".to_string())]),
             labels_ambiguous: true,
-            version: chrono::Utc::now().to_rfc3339(),
+            version: crate::time_compat::UtcTimestamp::now().to_rfc3339(),
             request_authentications: vec![test_request_authentication(
                 "other-ns-jwt",
                 PolicyScope::WorkloadSelector {

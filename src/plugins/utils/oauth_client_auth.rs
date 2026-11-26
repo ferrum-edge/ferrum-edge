@@ -143,7 +143,7 @@ pub fn build_client_assertion(
     alg: Algorithm,
     kid: Option<&str>,
 ) -> Result<String, jsonwebtoken::errors::Error> {
-    let now = chrono::Utc::now().timestamp();
+    let now = crate::time_compat::UtcTimestamp::now().unix_timestamp();
     let mut header = Header::new(alg);
     header.kid = kid.map(ToOwned::to_owned);
     encode(

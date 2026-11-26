@@ -285,7 +285,8 @@ impl SinkState {
         let failure = SinkFailure {
             operation,
             error_kind,
-            occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            occurred_at: crate::time_compat::UtcTimestamp::now()
+                .to_rfc3339_opts(crate::time_compat::SecondsFormat::Millis, true),
         };
         let mut last = match self.last_failure.lock() {
             Ok(guard) => guard,

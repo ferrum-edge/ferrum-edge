@@ -1352,7 +1352,7 @@ impl DatabaseStore {
         listen_path: Option<&str>,
     ) -> Result<(), anyhow::Error> {
         let route_key_hash = proxy_route_key_hash(listen_path);
-        let now = Utc::now().to_rfc3339();
+        let now = crate::time_compat::UtcTimestamp::now().to_rfc3339();
         let insert_sql = self.proxy_route_lock_insert_sql();
         sqlx::query(&insert_sql)
             .bind(namespace)
@@ -1390,7 +1390,7 @@ impl DatabaseStore {
         // Distinct namespaces take distinct lock rows and do not wait on each
         // other. Multi-namespace transactions acquire these rows in sorted name
         // order before inserting change-log rows, matching mTLS DNS admission.
-        let now = Utc::now().to_rfc3339();
+        let now = crate::time_compat::UtcTimestamp::now().to_rfc3339();
         let insert_sql = self.config_change_lock_insert_sql();
         sqlx::query(&insert_sql)
             .bind(namespace)
@@ -1403,7 +1403,7 @@ impl DatabaseStore {
             // database writer lock inside the same transaction that will
             // insert the change-log row.
             sqlx::query("UPDATE config_change_locks SET updated_at = ? WHERE lock_name = ?")
-                .bind(Utc::now().to_rfc3339())
+                .bind(crate::time_compat::UtcTimestamp::now().to_rfc3339())
                 .bind(namespace)
                 .execute(&mut **tx)
                 .await?;
@@ -1456,7 +1456,7 @@ impl DatabaseStore {
         namespace: &str,
         allowed_restore_owner: Option<&str>,
     ) -> Result<(), anyhow::Error> {
-        let now = Utc::now().to_rfc3339();
+        let now = crate::time_compat::UtcTimestamp::now().to_rfc3339();
         let insert_sql = self.mtls_dns_admission_lock_insert_sql();
         sqlx::query(&insert_sql)
             .bind(namespace)
@@ -1523,7 +1523,7 @@ impl DatabaseStore {
              WHERE namespace = ? AND restore_owner IS NULL",
         ))
         .bind(&owner)
-        .bind(Utc::now().to_rfc3339())
+        .bind(crate::time_compat::UtcTimestamp::now().to_rfc3339())
         .bind(namespace)
         .execute(&mut *tx)
         .await?;
@@ -1546,7 +1546,7 @@ impl DatabaseStore {
             "UPDATE mtls_dns_admission_locks SET restore_owner = NULL, updated_at = ? \
              WHERE namespace = ? AND restore_owner = ?",
         ))
-        .bind(Utc::now().to_rfc3339())
+        .bind(crate::time_compat::UtcTimestamp::now().to_rfc3339())
         .bind(namespace)
         .bind(owner)
         .execute(&mut *tx)
@@ -1939,7 +1939,7 @@ impl DatabaseStore {
     ) -> Result<(), anyhow::Error> {
         let sql = self.q("INSERT INTO consumer_identity_index \
              (namespace, identity_value, consumer_id, created_at) VALUES (?, ?, ?, ?)");
-        let created_at = Utc::now().to_rfc3339();
+        let created_at = crate::time_compat::UtcTimestamp::now().to_rfc3339();
         for value in consumer_identity_values(consumer) {
             sqlx::query(&sql)
                 .bind(&consumer.namespace)
@@ -5139,7 +5139,7 @@ impl DatabaseStore {
         if !touched.is_empty() {
             // Advance `updated_at` so the incremental poller / CP broadcast
             // publishes the proxy whose plugin set just changed.
-            let touch_ts = Utc::now().to_rfc3339();
+            let touch_ts = crate::time_compat::UtcTimestamp::now().to_rfc3339();
             let touch_sql =
                 self.q("UPDATE proxies SET updated_at = ? WHERE id = ? AND namespace = ?");
             for proxy in &touched {
@@ -5409,7 +5409,7 @@ impl DatabaseStore {
         .await?;
 
         if !affected_proxy_ids.is_empty() {
-            let updated_at = Utc::now().to_rfc3339();
+            let updated_at = crate::time_compat::UtcTimestamp::now().to_rfc3339();
             let sql = self.q("UPDATE proxies SET updated_at = ? WHERE id = ? AND namespace = ?");
             for proxy_id in &affected_proxy_ids {
                 sqlx::query(&sql)
@@ -7547,7 +7547,7 @@ impl DatabaseStore {
         .bind(resource_type)
         .bind(resource_id)
         .bind(operation)
-        .bind(Utc::now().to_rfc3339())
+        .bind(crate::time_compat::UtcTimestamp::now().to_rfc3339())
         .execute(&mut **tx)
         .await?;
         // Track per-namespace change volume on the already-locked sequence
@@ -7711,7 +7711,7 @@ impl DatabaseStore {
         sqlx::query(&upsert_sql)
             .bind(namespace)
             .bind(retained_sequence)
-            .bind(Utc::now().to_rfc3339())
+            .bind(crate::time_compat::UtcTimestamp::now().to_rfc3339())
             .execute(&mut **tx)
             .await?;
         Ok(())
@@ -8158,7 +8158,7 @@ impl DatabaseStore {
             }
         }
         if !touched_proxies.is_empty() {
-            let touch_ts = Utc::now().to_rfc3339();
+            let touch_ts = crate::time_compat::UtcTimestamp::now().to_rfc3339();
             for (proxy_id, namespace) in touched_proxies {
                 sqlx::query(&touch_proxy_sql)
                     .bind(&touch_ts)

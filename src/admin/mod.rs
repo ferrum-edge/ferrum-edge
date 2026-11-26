@@ -4321,7 +4321,7 @@ async fn handle_admin_request_inner(
         );
         let mut health_status = json!({
             "status": "ok",
-            "timestamp": Utc::now().to_rfc3339(),
+            "timestamp": crate::time_compat::UtcTimestamp::now().to_rfc3339(),
             "mode": state.mode
         });
 
@@ -6828,7 +6828,9 @@ async fn handle_mesh_federation_get(
         ));
     }
     let snapshot = store.snapshot();
-    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    let now = crate::time_compat::UtcTimestamp::now()
+        .unix_timestamp()
+        .max(0) as u64;
     let mut bundles: Vec<serde_json::Value> = snapshot
         .bundles
         .values()
@@ -7212,7 +7214,9 @@ async fn handle_mesh_remote_clusters_get(
             inbound_spiffe_verifier_configured,
             // `timestamp()` is non-negative for any realistic wall clock; clamp the
             // theoretical pre-epoch case to 0 rather than casting a negative i64.
-            now_unix_seconds: chrono::Utc::now().timestamp().max(0) as u64,
+            now_unix_seconds: crate::time_compat::UtcTimestamp::now()
+                .unix_timestamp()
+                .max(0) as u64,
         });
 
     // `MeshRemoteClustersResponse` is fully serde-derived; treat a serialize
@@ -11772,7 +11776,7 @@ fn serialize_backup_payload(
     let backup = BackupPayload {
         version: &config.version,
         ferrum_version: crate::FERRUM_VERSION,
-        exported_at: Utc::now().to_rfc3339(),
+        exported_at: crate::time_compat::UtcTimestamp::now().to_rfc3339(),
         source,
         counts: BackupCounts {
             proxies: proxies.len(),

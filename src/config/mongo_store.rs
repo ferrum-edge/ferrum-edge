@@ -720,7 +720,10 @@ mod inner {
                 let inserted = vacant.insert(RetainedAdmissionFence {
                     namespace: namespace.to_string(),
                     owner: owner.to_string(),
-                    since_unix_ms: u64::try_from(Utc::now().timestamp_millis()).unwrap_or(0),
+                    since_unix_ms: u64::try_from(
+                        crate::time_compat::UtcTimestamp::now().unix_timestamp_millis(),
+                    )
+                    .unwrap_or(0),
                     reason,
                     connection,
                 });
@@ -2531,7 +2534,7 @@ mod inner {
                 return Ok(());
             }
             let name = crate::config::types::DEFAULT_NAMESPACE;
-            let now = Utc::now().to_rfc3339();
+            let now = crate::time_compat::UtcTimestamp::now().to_rfc3339();
             self.namespaces()
                 .update_one(
                     doc! { "_id": name },
@@ -4070,7 +4073,7 @@ mod inner {
                 "resource_type": resource_type,
                 "resource_id": resource_id,
                 "operation": operation,
-                "created_at": Utc::now().to_rfc3339(),
+                "created_at": crate::time_compat::UtcTimestamp::now().to_rfc3339(),
             }
         }
 
@@ -4140,7 +4143,7 @@ mod inner {
                     changes.len()
                 )
             })?;
-            let created_at = Utc::now().to_rfc3339();
+            let created_at = crate::time_compat::UtcTimestamp::now().to_rfc3339();
             let docs: Vec<Document> = changes
                 .iter()
                 .enumerate()
@@ -4454,7 +4457,7 @@ mod inner {
                                             "$pull": {
                                                 "plugins": { "plugin_config_id": id.as_str() }
                                             },
-                                            "$set": { "updated_at": Utc::now().to_rfc3339() },
+                                            "$set": { "updated_at": crate::time_compat::UtcTimestamp::now().to_rfc3339() },
                                         },
                                     )
                                     .session(&mut *s)
@@ -4507,7 +4510,7 @@ mod inner {
                                 },
                                 doc! {
                                     "$pull": { "plugins": { "plugin_config_id": id } },
-                                    "$set": { "updated_at": Utc::now().to_rfc3339() },
+                                    "$set": { "updated_at": crate::time_compat::UtcTimestamp::now().to_rfc3339() },
                                 },
                             )
                             .await?;
@@ -4681,7 +4684,7 @@ mod inner {
                         },
                         doc! {
                             "$pull": { "plugins": { "plugin_config_id": plugin_config_id } },
-                            "$set": { "updated_at": Utc::now().to_rfc3339() },
+                            "$set": { "updated_at": crate::time_compat::UtcTimestamp::now().to_rfc3339() },
                         },
                     )
                     .session(&mut *session)
@@ -4696,7 +4699,7 @@ mod inner {
                         },
                         doc! {
                             "$push": { "plugins": { "plugin_config_id": plugin_config_id } },
-                            "$set": { "updated_at": Utc::now().to_rfc3339() },
+                            "$set": { "updated_at": crate::time_compat::UtcTimestamp::now().to_rfc3339() },
                         },
                     )
                     .session(&mut *session)
@@ -4724,7 +4727,7 @@ mod inner {
                         },
                         doc! {
                             "$pull": { "plugins": { "plugin_config_id": plugin_config_id } },
-                            "$set": { "updated_at": Utc::now().to_rfc3339() },
+                            "$set": { "updated_at": crate::time_compat::UtcTimestamp::now().to_rfc3339() },
                         },
                     )
                     .await?;
@@ -4738,7 +4741,7 @@ mod inner {
                         },
                         doc! {
                             "$push": { "plugins": { "plugin_config_id": plugin_config_id } },
-                            "$set": { "updated_at": Utc::now().to_rfc3339() },
+                            "$set": { "updated_at": crate::time_compat::UtcTimestamp::now().to_rfc3339() },
                         },
                     )
                     .await?;
@@ -4770,7 +4773,7 @@ mod inner {
                         },
                         doc! {
                             "$pull": { "plugins": { "plugin_config_id": plugin_config_id } },
-                            "$set": { "updated_at": Utc::now().to_rfc3339() },
+                            "$set": { "updated_at": crate::time_compat::UtcTimestamp::now().to_rfc3339() },
                         },
                     )
                     .await;
@@ -4796,7 +4799,7 @@ mod inner {
                         },
                         doc! {
                             "$addToSet": { "plugins": { "plugin_config_id": plugin_config_id } },
-                            "$set": { "updated_at": Utc::now().to_rfc3339() },
+                            "$set": { "updated_at": crate::time_compat::UtcTimestamp::now().to_rfc3339() },
                         },
                     )
                     .await;
@@ -5279,7 +5282,7 @@ mod inner {
                     doc! { "_id": Self::config_change_retention_doc_id(namespace) },
                     doc! {
                         "$max": { "retained_sequence": retained_sequence },
-                        "$set": { "updated_at": Utc::now().to_rfc3339() },
+                        "$set": { "updated_at": crate::time_compat::UtcTimestamp::now().to_rfc3339() },
                     },
                 )
                 .upsert(true)
@@ -5633,7 +5636,7 @@ mod inner {
                     doc! {
                         "$set": {
                             "nonce": Uuid::new_v4().to_string(),
-                            "updated_at": Utc::now().to_rfc3339(),
+                            "updated_at": crate::time_compat::UtcTimestamp::now().to_rfc3339(),
                         }
                     },
                 )
@@ -5753,7 +5756,7 @@ mod inner {
                         doc! {
                             "$set": {
                                 "nonce": Uuid::new_v4().to_string(),
-                                "updated_at": Utc::now().to_rfc3339(),
+                                "updated_at": crate::time_compat::UtcTimestamp::now().to_rfc3339(),
                             }
                         },
                     )
@@ -5870,7 +5873,7 @@ mod inner {
                         doc! {
                             "$set": {
                                 "nonce": Uuid::new_v4().to_string(),
-                                "updated_at": Utc::now().to_rfc3339(),
+                                "updated_at": crate::time_compat::UtcTimestamp::now().to_rfc3339(),
                             }
                         },
                     )
@@ -13999,7 +14002,7 @@ mod inner {
                                         doc! {
                                             "$set": {
                                                 "nonce": Uuid::new_v4().to_string(),
-                                                "updated_at": Utc::now().to_rfc3339(),
+                                                "updated_at": crate::time_compat::UtcTimestamp::now().to_rfc3339(),
                                             }
                                         },
                                     )

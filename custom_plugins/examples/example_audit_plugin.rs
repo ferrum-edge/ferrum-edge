@@ -667,7 +667,8 @@ fn canonical_timestamp(input: &str) -> String {
                 error = %error,
                 "example_audit_plugin: transaction summary carried an invalid timestamp; using current time"
             );
-            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            crate::time_compat::UtcTimestamp::now()
+                .to_rfc3339_opts(crate::time_compat::SecondsFormat::Millis, true)
         }
     }
 }

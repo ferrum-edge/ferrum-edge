@@ -768,7 +768,8 @@ pub fn build_snapshot(
 ) -> RuntimeSnapshot {
     let metrics = global();
     RuntimeSnapshot {
-        timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        timestamp: crate::time_compat::UtcTimestamp::now()
+            .to_rfc3339_opts(crate::time_compat::SecondsFormat::Millis, true),
         uptime_seconds: metrics.started_at.elapsed().as_secs(),
         mode: mode.to_string(),
         ferrum_version: crate::FERRUM_VERSION,

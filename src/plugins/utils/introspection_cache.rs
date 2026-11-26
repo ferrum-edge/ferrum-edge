@@ -428,7 +428,7 @@ impl IntrospectionCache {
             return false;
         };
         if let Some(exp) = authorization.expires_at_unix {
-            let unix_now = chrono::Utc::now().timestamp();
+            let unix_now = crate::time_compat::UtcTimestamp::now().unix_timestamp();
             let Ok(seconds) = u64::try_from(exp.saturating_sub(unix_now)) else {
                 self.record_admission_skip(EntryClass::Active, "expiry");
                 return false;

@@ -338,7 +338,6 @@ pub fn install_test_bundle(handle: &SvidFetchHandle, bundle: SvidBundle) {
 /// loop's bundle metrics). Returns `Duration::ZERO` for already-expired
 /// bundles.
 pub(crate) fn time_until_expiry(bundle: &SvidBundle) -> Duration {
-    use chrono::Utc;
     use x509_parser::prelude::*;
     let leaf = match bundle.cert_chain_der.first() {
         Some(d) => d,
@@ -349,7 +348,7 @@ pub(crate) fn time_until_expiry(bundle: &SvidBundle) -> Duration {
         Err(_) => return Duration::ZERO,
     };
     let not_after_ts = parsed.validity().not_after.timestamp();
-    let now_ts = Utc::now().timestamp();
+    let now_ts = crate::time_compat::UtcTimestamp::now().unix_timestamp();
     if not_after_ts <= now_ts {
         Duration::ZERO
     } else {
