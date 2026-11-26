@@ -25,7 +25,7 @@ fn conditional_live_store_lane_runs_the_transactional_tests() {
         .expect("live lane filters are a string");
     for test in LIVE_TESTS {
         assert!(
-            filters.lines().any(|line| line.trim() == *test),
+            filters.split('\n').any(|line| line == *test),
             "live lane must run {test}"
         );
     }

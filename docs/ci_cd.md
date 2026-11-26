@@ -993,8 +993,13 @@ The repository cache is a 10 GB LRU quota, so lanes are few and owned.
 lane producer (`save: "true"`) on a trusted `refs/heads/main` run; the
 sccache local store is not persisted (the restored `target/` already
 skips dependency compilation). Lanes: `ci-debug` (produced by Unit Tests;
-shared by every debug-profile job through identical `CARGO_BUILD_JOBS` /
-`CARGO_PROFILE_DEV_DEBUG` job env), `ci-lint` (produced by Lint),
+shared by all 12 debug-profile jobs across `ci.yml` and
+`ambient-host-udp-live.yml` through identical `CARGO_TERM_COLOR=always`,
+`CARGO_NET_RETRY=10`, `CARGO_HTTP_MULTIPLEXING=false`, `CARGO_BUILD_JOBS=3`,
+`CARGO_PROFILE_DEV_DEBUG=0`, `CARGO_PROFILE_TEST_DEBUG=0`,
+`CARGO_PROFILE_DEV_SPLIT_DEBUGINFO=off`, and
+`CARGO_PROFILE_TEST_SPLIT_DEBUGINFO=off` env enforced by
+`check_ci_debug_lane_profile_uniformity`), `ci-lint` (produced by Lint),
 `ci-standalone-cargo` (produced by Standalone Cargo Workspaces), the main-only
 `fuzz-property-smoke` lane (Fuzz Smoke's property build, line-tables-only
 debuginfo), the registry-only `fuzz-sanitizer-smoke` lane
@@ -4148,10 +4153,13 @@ This heading is historical: no job produces or restores a
 - **Netns Source Capture** and **Two-Cluster Mesh Live** (in `ci.yml`) and the
   **Ambient host-UDP live-kernel** job (`ambient-host-udp-live.yml`) call
   `setup-rust-ci` with shared key `ci-debug` and the default `save: "false"`,
-  and compile with `CARGO_BUILD_JOBS=3` and
-  `CARGO_PROFILE_DEV_DEBUG=line-tables-only`. They restore through
+  and compile with `CARGO_BUILD_JOBS=3`, `CARGO_PROFILE_DEV_DEBUG=0`,
+  `CARGO_PROFILE_TEST_DEBUG=0`, `CARGO_PROFILE_DEV_SPLIT_DEBUGINFO=off`, and
+  `CARGO_PROFILE_TEST_SPLIT_DEBUGINFO=off`. They restore through
   `Swatinem/rust-cache` the archive Unit Tests (`core` shard) saves on main,
-  and never save.
+  and never save. All 12 `ci-debug` lane members share those exact profile
+  settings (while `coverage.yml` and `fuzz-smoke` keep `line-tables-only`
+  under their own cache keys).
 
 Matching `ubuntu-26.04` runner labels and Cargo download variables do not by
 themselves establish a shared archive: the rust-cache key also hashes every
@@ -4188,10 +4196,11 @@ Netns/Two-Cluster used `08f74bf7`. The main CI workflow exports
 `CARGO_NET_RETRY=10` and `CARGO_HTTP_MULTIPLEXING=false`; Ambient previously
 relied on the same values in `.cargo/config.toml`. The pinned Rust cache
 hashes the exported variables even though these two settings only affect
-downloading. Ambient was changed to explicitly export the same values and
-use the then-existing Netns namespace, so the complete key could match.
-Merely changing the shared-key label without matching those inputs would
-still have created two archives.
+downloading. Ambient was changed to explicitly export the same values (and now
+also exports `CARGO_TERM_COLOR=always`, which `Swatinem/rust-cache` hashes
+too) and use the shared lane namespace, so the complete key matches without
+relying on toolchain side effects. Merely changing the shared-key label without
+matching those inputs would still have created two archives.
 
 The completed Ambient/Netns archives at that time were 2,637,841,434 /
 2,637,871,806 bytes, and sharing then removed another roughly 2.64 GB
@@ -4200,9 +4209,11 @@ cache-hit, retention, quota, or compile-time claim. Ambient's separate GHCR
 image cache is unaffected. The frozen Ambient contract and regression
 mutations now require the `ci-debug` namespace and its explicit network,
 job-count and debuginfo settings.
-Unit, lint, feature-specific and archive-builder profiles keep separate
-keys. Reassess this map if any job changes its build profile, features,
-toolchain, environment or target layout.
+Unit (`test-unit`), `build-test-artifacts`, and the other debug-profile jobs
+share `ci-debug`, while lint, feature-specific (`fips-build.yml`,
+`windows-confinement.yml`), coverage, standalone-cargo, fuzz, and release-binary
+profiles keep separate keys. Reassess this map if any job changes its build
+profile, features, toolchain, environment or target layout.
 
 The broader quota issue still requires Unit/Lint/Artifacts retention across
 subsequent main runs; the historical sharing change alone is not evidence

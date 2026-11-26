@@ -4966,7 +4966,18 @@ def _extract_step_submap(step: str, subkey: str) -> tuple[dict[str, str], str | 
         pairs, errs = _collect_flow_mapping_pairs(flow_block[0])
         if errs:
             return {}, "; ".join(errs)
-        return {k: v for k, v in pairs}, None
+        decoded_flow: dict[str, str] = {}
+        for raw_k, raw_v in pairs:
+            if raw_v.strip().startswith(("*", "&", "!")):
+                return {}, f"unsupported YAML anchor/alias/tag in flow `{subkey}.{raw_k.strip()}`"
+            k_dec = _decode_yaml_value_scalar(raw_k)
+            v_dec = _decode_yaml_value_scalar(raw_v)
+            if k_dec is None or v_dec is None:
+                return {}, f"unparseable flow `{subkey}:` entry ({raw_k!r}: {raw_v!r})"
+            decoded_flow[k_dec] = v_dec
+        return decoded_flow, None
+    if sub_inline:
+        return {}, f"unsupported inline `{subkey}:` value ({sub_inline!r})"
     result: dict[str, str] = {}
     idx = sub_idx + 1
     while idx < len(lines):
@@ -4991,6 +5002,9 @@ def _extract_step_submap(step: str, subkey: str) -> tuple[dict[str, str], str | 
         scalar = _decode_yaml_value_scalar(raw_val)
         if scalar is None:
             return {}, f"unparseable scalar in `{subkey}.{key}`"
+        raw_val_clean = _yaml_strip_trailing_comment(raw_val).strip()
+        if raw_val_clean.startswith(("*", "&", "!")):
+            return {}, f"unsupported YAML anchor/alias/tag in `{subkey}.{key}`"
         result[key] = scalar
         idx += 1
     return result, None
@@ -5056,6 +5070,9 @@ def _extract_job_cargo_env(job_body: str) -> tuple[dict[str, str], str | None]:
         if decoded is None:
             return {}, f"unparseable job env line: {line!r}"
         _k_indent, key, raw_val = decoded
+        raw_val_stripped = _yaml_strip_trailing_comment(raw_val).strip()
+        if raw_val_stripped.startswith(("*", "&")):
+            return {}, f"unsupported YAML anchor/alias in env value for {key}"
         scalar = _decode_yaml_value_scalar(raw_val)
         if scalar is None:
             return {}, f"unparseable job env value for {key}"
@@ -5572,6 +5589,2418 @@ def check_shared_actions(failures: list[str]) -> None:
         failures,
         expected_count=1,
     )
+
+
+EXPECTED_CI_DEBUG_EFFECTIVE_ENV = {
+    "CARGO_TERM_COLOR": "always",
+    "CARGO_NET_RETRY": "10",
+    "CARGO_HTTP_MULTIPLEXING": "false",
+    "CARGO_BUILD_JOBS": "3",
+    "CARGO_PROFILE_DEV_DEBUG": "0",
+    "CARGO_PROFILE_TEST_DEBUG": "0",
+    "CARGO_PROFILE_DEV_SPLIT_DEBUGINFO": "off",
+    "CARGO_PROFILE_TEST_SPLIT_DEBUGINFO": "off",
+}
+_CI_DEBUG_ALLOWED_WORKFLOW_ENV_KEYS = frozenset(
+    {"CARGO_TERM_COLOR", "CARGO_NET_RETRY", "CARGO_HTTP_MULTIPLEXING"}
+)
+_CI_DEBUG_ALLOWED_STEP_ENV_KEYS = frozenset({"RUST_BACKTRACE"})
+_CI_DEBUG_ALLOWED_DIRECT_COMPUTED_KEY_PREFIXES = (
+    "build-",
+    "ci-fips-contract-",
+    "ci-windows-confinement-",
+)
+CI_DEBUG_LANE_JOBS: tuple[tuple[str, str], ...] = (
+    ("ci.yml", "test-unit"),
+    ("ci.yml", "test-acme"),
+    ("ci.yml", "test-secrets"),
+    ("ci.yml", "test-service-integration"),
+    ("ci.yml", "test-pkcs11-softhsm"),
+    ("ci.yml", "build-test-artifacts"),
+    ("ci.yml", "test-conformance"),
+    ("ci.yml", "build-ebpf-userspace"),
+    ("ci.yml", "ebpf-live"),
+    ("ci.yml", "netns-capture-live"),
+    ("ci.yml", "two-cluster-mesh-live"),
+    ("ambient-host-udp-live.yml", "ambient-host-udp-live"),
+)
+# Pinned Swatinem/rust-cache hashes every non-empty env var matching these
+# prefixes (including CARGO_TERM_COLOR) into the restore/save key.
+_CI_DEBUG_HASHED_ENV_PREFIXES = (
+    "CARGO",
+    "RUST",
+    "CC",
+    "CFLAGS",
+    "CXX",
+    "CMAKE",
+)
+# Any hashed prefix written to GITHUB_ENV persists across later steps (including
+# cache steps), so even RUST_BACKTRACE is disallowed in GITHUB_ENV writes.
+# Lowercase suffixes (e.g. CC_x86_64_unknown_linux_gnu) are honored by cc-rs
+# and hashed by Swatinem/rust-cache. Negative lookbehind avoids `$CARGO_HOME`.
+_CI_DEBUG_GITHUB_ENV_VAR_RE = re.compile(
+    r"(?<![${])\b(?:CARGO|RUST|CC|CFLAGS|CXX|CMAKE)[A-Za-z0-9_]*\b"
+)
+# Shared variable-name rule for inline assignments, `export`, `unset`, and
+# `env -u` / `--unset=`. Allows only non-hashed per-step `RUST_BACKTRACE`/`RUST_LOG`.
+_CI_DEBUG_SHELL_VAR_NAME_RE = re.compile(
+    r"^(?:CARGO|RUST(?!_BACKTRACE$|_LOG$)|CC|CFLAGS|CXX|CMAKE)[A-Za-z0-9_]*$"
+)
+
+
+def _is_setup_rust_ci_action(uses: str) -> bool:
+    return uses.strip().rstrip("/").lower() == "./.github/actions/setup-rust-ci"
+
+
+def _is_direct_rust_cache_action(uses: str) -> bool:
+    return uses.strip().lower().startswith("swatinem/rust-cache@")
+
+
+def _is_rust_cache_action(uses: str) -> bool:
+    """Return True if a step `uses:` value invokes setup-rust-ci or Swatinem/rust-cache."""
+
+    return _is_setup_rust_ci_action(uses) or _is_direct_rust_cache_action(uses)
+
+
+def _try_yaml_base_load(text: str) -> tuple[object, bool, str | None]:
+    """Load YAML with BaseLoader (YAML 1.2 string scalars: `yes`/`off` stay strings, not booleans).
+
+    Respects tests that monkeypatch `_try_yaml_safe_load` to force the fallback parser.
+    """
+
+    probe_val, yaml_avail, _probe_err = _try_yaml_safe_load("{}")
+    if not yaml_avail or not isinstance(probe_val, dict):
+        return None, False, None
+    try:
+        import yaml  # type: ignore[import-untyped]
+    except Exception:
+        return None, False, None
+    try:
+        loader = getattr(yaml, "CBaseLoader", yaml.BaseLoader)
+        return yaml.load(text, Loader=loader), True, None
+    except Exception as exc:
+        return None, True, str(exc)
+
+
+def _normalize_yaml_scalar(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return str(value).lower()
+    return str(value)
+
+
+def _load_extra_workflow_texts() -> dict[str, str]:
+    """Load every workflow under `.github/workflows/*.{yml,yaml}` except ci.yml and ambient-host-udp-live.yml."""
+
+    wf_dir = CI_WORKFLOW.parent
+    paths = sorted(
+        {*wf_dir.glob("*.yml"), *wf_dir.glob("*.yaml")},
+        key=lambda p: p.name,
+    )
+    return {
+        p.name: read_pinned(p)
+        for p in paths
+        if p.name not in {"ci.yml", "ambient-host-udp-live.yml"}
+    }
+
+
+_CI_DEBUG_SHELL_FD_PREFIX_RE = re.compile(r"^(?:\d+|\{[A-Za-z_][A-Za-z0-9_]*\})$")
+
+
+def _strip_redirections(typed_words: list[tuple[str, str]]) -> list[str]:
+    """Drop all redirection operator tokens and their immediately following operand tokens."""
+
+    out: list[str] = []
+    i = 0
+    n = len(typed_words)
+    while i < n:
+        kind, text = typed_words[i]
+        if kind == "redir":
+            i += 2
+            continue
+        out.append(text)
+        i += 1
+    return out
+
+
+def _tokenize_shell_script(
+    run_text: str,
+    *,
+    consume_heredocs: bool = True,
+) -> tuple[list[list[str]], bool]:
+    """POSIX/Bash-aware single-pass shell lexer returning `(commands, malformed)`.
+
+    Handles single/double/ANSI-C (`$'...'`) quotes, backslash line-continuation
+    deletion (`\\`+newline outside single quotes, never inside `#` comments),
+    `#` comments ending at newline, here-document body skipping (`<<EOF`, `<<'EOF'`,
+    `<<"EOF"`, `<<$'EOF'`, `<<-'EOF'`), distinct unquoted redirection operator
+    stripping (`>`, `>>`, `2>&`, `2>&1>/dev/null`, `>|`, `<<<`, `&>`, `{fd}>`),
+    and command separators (`\\n`, `;`, `&&`, `||`, `|`).
+    Returns `malformed=True` (fail closed) if the script ends inside an unclosed
+    quote or with an unmatched here-document delimiter.
+    """
+
+    commands: list[list[str]] = []
+    typed_words: list[tuple[str, str]] = []
+    cur_bytes = bytearray()
+    has_token = False
+    cur_had_quote = False
+    quote: str | None = None  # "'" | '"' | "$'"
+    pending_heredocs: list[tuple[str, bool]] = []
+    expecting_heredoc_delim: tuple[bool, bool] | None = None  # (active, strip_tabs)
+    expecting_redir_operand = False
+    arith_paren_stack: list[int] = []
+    word_paren_depth = 0
+    malformed = False
+    idx = 0
+    n = len(run_text)
+
+    def _append_text(text: str) -> None:
+        cur_bytes.extend(text.encode("utf-8", errors="surrogateescape"))
+
+    def _current_word_text() -> str:
+        return cur_bytes.decode("utf-8", errors="surrogateescape")
+
+    def _flush_word() -> None:
+        nonlocal has_token, cur_had_quote, expecting_heredoc_delim, expecting_redir_operand, word_paren_depth
+        if not has_token:
+            return
+        word = _current_word_text()
+        typed_words.append(("word", word))
+        expecting_redir_operand = False
+        if expecting_heredoc_delim is not None:
+            _active, strip_tabs = expecting_heredoc_delim
+            if consume_heredocs:
+                pending_heredocs.append((word, strip_tabs))
+            expecting_heredoc_delim = None
+        cur_bytes.clear()
+        has_token = False
+        cur_had_quote = False
+        word_paren_depth = 0
+
+    def _flush_command() -> None:
+        nonlocal typed_words, expecting_heredoc_delim, expecting_redir_operand, malformed
+        _flush_word()
+        if expecting_heredoc_delim is not None:
+            malformed = True
+            expecting_heredoc_delim = None
+        expecting_redir_operand = False
+        if typed_words:
+            stripped = _strip_redirections(typed_words)
+            if stripped:
+                commands.append(stripped)
+            typed_words = []
+
+    def _consume_pending_heredocs(pos: int) -> int:
+        nonlocal pending_heredocs, malformed
+        while pending_heredocs:
+            delim, strip_tabs = pending_heredocs.pop(0)
+            matched = False
+            while pos < n:
+                nl = run_text.find("\n", pos)
+                if nl < 0:
+                    line = run_text[pos:]
+                    pos = n
+                else:
+                    line = run_text[pos:nl]
+                    pos = nl + 1
+                if line.endswith("\r"):
+                    line = line[:-1]
+                cand = line.lstrip("\t") if strip_tabs else line
+                if cand == delim:
+                    matched = True
+                    break
+            if not matched:
+                malformed = True
+        return pos
+
+    while idx < n:
+        ch = run_text[idx]
+        if quote is None:
+            if ch == "#" and not has_token:
+                # Shell comment runs to newline; trailing `\` inside a comment does NOT continue.
+                while idx < n and run_text[idx] != "\n":
+                    idx += 1
+                continue
+            if ch == "\\" and idx + 1 < n:
+                if run_text[idx + 1] == "\n":
+                    idx += 2
+                    continue
+                if run_text[idx + 1] == "\r" and idx + 2 < n and run_text[idx + 2] == "\n":
+                    idx += 3
+                    continue
+                _append_text(run_text[idx + 1])
+                has_token = True
+                cur_had_quote = True
+                idx += 2
+                continue
+            if ch == "$" and idx + 1 < n and run_text[idx + 1] == "'":
+                # Bash ANSI-C quoting `$'...'` — bytes accumulate in `cur_bytes`
+                # across adjacent fragments (e.g. `$'\xC3'$'\xA9'`) until word flush.
+                quote = "$'"
+                has_token = True
+                cur_had_quote = True
+                idx += 2
+                continue
+            # Track arithmetic expansions `$(( ... ))` / `(( ... ))` with inner
+            # parenthesis nesting so bitwise shifts (`<<`, `<<=`, `>>`) inside
+            # arithmetic (including `$(( (1 + (2)) << attempt ))`) are not treated
+            # as heredocs.
+            if run_text[idx : idx + 3] == "$((":
+                arith_paren_stack.append(0)
+                _append_text("$((")
+                has_token = True
+                idx += 3
+                continue
+            if not arith_paren_stack and not has_token and run_text[idx : idx + 2] == "((":
+                arith_paren_stack.append(0)
+                _append_text("((")
+                has_token = True
+                idx += 2
+                continue
+            if arith_paren_stack:
+                if ch == "(":
+                    arith_paren_stack[-1] += 1
+                    _append_text(ch)
+                    has_token = True
+                    idx += 1
+                    continue
+                if ch == ")":
+                    if arith_paren_stack[-1] > 0:
+                        arith_paren_stack[-1] -= 1
+                        _append_text(ch)
+                        has_token = True
+                        idx += 1
+                        continue
+                    if run_text[idx : idx + 2] == "))":
+                        arith_paren_stack.pop()
+                        _append_text("))")
+                        has_token = True
+                        idx += 2
+                        continue
+            if ch == "(" and not arith_paren_stack:
+                word_so_far = _current_word_text() if has_token else ""
+                # Keep `(` attached only for word-embedded forms: assignments
+                # (`RUSTFLAGS=-L/tmp/dir(1)`), command/process substitutions
+                # (`$(`, `<(`, `>(`), and function headers (`f()`). Everywhere
+                # else (e.g. `(cargo ...)`, `time(cargo ...)`, `if(cargo ...)`,
+                # `(stable)cargo ...`), `(` is a Bash metacharacter separating words.
+                is_word_embedded_paren = has_token and (
+                    "=" in word_so_far
+                    or word_so_far.endswith(("$", "<", ">"))
+                    or (
+                        run_text[idx : idx + 2] == "()"
+                        and bool(re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", word_so_far))
+                    )
+                )
+                if is_word_embedded_paren:
+                    word_paren_depth += 1
+                    _append_text(ch)
+                else:
+                    _flush_word()
+                    typed_words.append(("word", "("))
+                idx += 1
+                continue
+            if ch == ")" and not arith_paren_stack:
+                if word_paren_depth > 0:
+                    word_paren_depth -= 1
+                    _append_text(ch)
+                    has_token = True
+                else:
+                    # Unmatched `)` closes a subshell or Bash `case` arm
+                    # (e.g. `stable)cargo ...`, `(stable)cargo ...`, `(cargo ...)`).
+                    _flush_word()
+                    typed_words.append(("word", ")"))
+                idx += 1
+                continue
+            if ch in (" ", "\t", "\r"):
+                _flush_word()
+                idx += 1
+                continue
+            # Emit unquoted redirection operators as typed `("redir", op)` tokens.
+            # When a redirection operand is already pending (e.g. `1` in `2>&1>/dev/null`),
+            # flush it as the operand word instead of treating it as the next fd prefix.
+            if ch in (">", "<") and not arith_paren_stack:
+                fd_prefix = ""
+                if has_token:
+                    word_so_far = _current_word_text()
+                    if (
+                        not expecting_redir_operand
+                        and not cur_had_quote
+                        and _CI_DEBUG_SHELL_FD_PREFIX_RE.match(word_so_far)
+                    ):
+                        fd_prefix = word_so_far
+                        cur_bytes.clear()
+                        has_token = False
+                        cur_had_quote = False
+                        word_paren_depth = 0
+                    else:
+                        _flush_word()
+                if expecting_heredoc_delim is not None:
+                    malformed = True
+                    expecting_heredoc_delim = None
+                if ch == "<":
+                    if run_text[idx : idx + 3] in ("<<<", "<<-"):
+                        op = run_text[idx : idx + 3]
+                    elif run_text[idx : idx + 2] in ("<<", "<>", "<&"):
+                        op = run_text[idx : idx + 2]
+                    else:
+                        op = "<"
+                else:
+                    if run_text[idx : idx + 2] in (">>", ">&", ">|"):
+                        op = run_text[idx : idx + 2]
+                    else:
+                        op = ">"
+                typed_words.append(("redir", fd_prefix + op))
+                expecting_redir_operand = True
+                if op in ("<<", "<<-"):
+                    expecting_heredoc_delim = (True, op == "<<-")
+                else:
+                    expecting_heredoc_delim = None
+                idx += len(op)
+                continue
+            if ch == "&" and not arith_paren_stack and idx + 1 < n and run_text[idx + 1] == ">":
+                _flush_word()
+                if expecting_heredoc_delim is not None:
+                    malformed = True
+                    expecting_heredoc_delim = None
+                op = "&>>" if run_text[idx : idx + 3] == "&>>" else "&>"
+                typed_words.append(("redir", op))
+                expecting_redir_operand = True
+                expecting_heredoc_delim = None
+                idx += len(op)
+                continue
+            if ch == "\n" or (not arith_paren_stack and ch in (";", "|", "&")):
+                _flush_command()
+                if ch == "\n":
+                    idx += 1
+                    if pending_heredocs:
+                        idx = _consume_pending_heredocs(idx)
+                elif ch in ("|", "&") and idx + 1 < n and run_text[idx + 1] == ch:
+                    idx += 2
+                else:
+                    idx += 1
+                continue
+            if ch in ("'", '"'):
+                quote = ch
+                has_token = True
+                cur_had_quote = True
+                idx += 1
+                continue
+            _append_text(ch)
+            has_token = True
+            idx += 1
+        elif quote == "'":
+            if ch == "'":
+                quote = None
+            else:
+                _append_text(ch)
+            idx += 1
+        elif quote == "$'":
+            if ch == "\\" and idx + 1 < n:
+                nxt = run_text[idx + 1]
+                if nxt == "x":
+                    hex_m = re.match(r"[0-9A-Fa-f]{1,2}", run_text[idx + 2 : idx + 4])
+                    if hex_m:
+                        cur_bytes.append(int(hex_m.group(0), 16))
+                        idx += 2 + len(hex_m.group(0))
+                        continue
+                if nxt in ("u", "U"):
+                    max_digits = 4 if nxt == "u" else 8
+                    hex_m = re.match(
+                        rf"[0-9A-Fa-f]{{1,{max_digits}}}",
+                        run_text[idx + 2 : idx + 2 + max_digits],
+                    )
+                    if hex_m:
+                        cp = int(hex_m.group(0), 16)
+                        if 0 <= cp <= 0x10FFFF and not (0xD800 <= cp <= 0xDFFF):
+                            _append_text(chr(cp))
+                        else:
+                            _append_text(run_text[idx : idx + 2 + len(hex_m.group(0))])
+                        idx += 2 + len(hex_m.group(0))
+                        continue
+                if nxt in "01234567":
+                    oct_m = re.match(r"[0-7]{1,3}", run_text[idx + 1 : idx + 4])
+                    if oct_m:
+                        cur_bytes.append(int(oct_m.group(0), 8) & 0xFF)
+                        idx += 1 + len(oct_m.group(0))
+                        continue
+                esc_map = {
+                    "a": "\a",
+                    "b": "\b",
+                    "e": "\x1b",
+                    "E": "\x1b",
+                    "f": "\f",
+                    "n": "\n",
+                    "r": "\r",
+                    "t": "\t",
+                    "v": "\v",
+                    "'": "'",
+                    '"': '"',
+                    "\\": "\\",
+                    "?": "?",
+                }
+                _append_text(esc_map.get(nxt, "\\" + nxt))
+                idx += 2
+                continue
+            if ch == "'":
+                quote = None
+            else:
+                _append_text(ch)
+            idx += 1
+        else:  # double quote
+            if ch == "\\" and idx + 1 < n:
+                nxt = run_text[idx + 1]
+                if nxt == "\n":
+                    idx += 2
+                    continue
+                if nxt == "\r" and idx + 2 < n and run_text[idx + 2] == "\n":
+                    idx += 3
+                    continue
+                if nxt in ('"', "\\", "$", "`"):
+                    _append_text(nxt)
+                else:
+                    _append_text("\\" + nxt)
+                idx += 2
+                continue
+            if ch == '"':
+                quote = None
+            else:
+                _append_text(ch)
+            idx += 1
+    _flush_command()
+    if quote is not None or pending_heredocs:
+        malformed = True
+    return commands, malformed
+
+
+_CI_DEBUG_SHELL_KEYWORDS = frozenset(
+    {"if", "then", "elif", "else", "do", "while", "until", "!", "{", "("}
+)
+# Map wrapper basename -> (options taking a separate operand, takes_leading_positional_arg)
+_CI_DEBUG_SHELL_WRAPPERS: dict[str, tuple[frozenset[str], bool]] = {
+    "time": (frozenset({"-o", "--output", "-f", "--format"}), False),
+    "sudo": (frozenset({"-u", "-g", "-C", "-D", "-h", "-p", "-R", "-T", "-t", "-r"}), False),
+    "timeout": (frozenset({"-k", "--kill-after", "-s", "--signal"}), True),
+    "nice": (frozenset({"-n", "--adjustment"}), False),
+    "stdbuf": (frozenset({"-i", "-o", "-e"}), False),
+    "ionice": (frozenset({"-c", "-n", "-p", "-P", "-u"}), False),
+    "taskset": (frozenset({"-c", "--cpu-list"}), False),
+    "chrt": (frozenset({"-p"}), False),
+    "setsid": (frozenset(), False),
+    "command": (frozenset(), False),
+    "builtin": (frozenset(), False),
+    "exec": (frozenset({"-a"}), False),
+    "nohup": (frozenset(), False),
+    "xargs": (frozenset({"-I", "-L", "-n", "-P", "-s", "-d", "-E", "-a"}), False),
+}
+
+
+def _split_gnu_env_s_string(split_arg: str) -> list[str]:
+    """Decode GNU `env -S` string (`\\_` acts as whitespace separator) into shell tokens."""
+
+    # In GNU coreutils `env -S`, `\_` splits arguments like a space outside single quotes.
+    expanded = split_arg.replace(r"\_", " ")
+    cmds, _malformed = _tokenize_shell_script(expanded)
+    return [w for sub in cmds for w in sub]
+
+
+_GNU_ENV_LONG_OPTIONS = (
+    "--ignore-environment",
+    "--unset",
+    "--chdir",
+    "--split-string",
+    "--argv0",
+    "--null",
+    "--debug",
+    "--block-signal",
+    "--default-signal",
+    "--ignore-signal",
+    "--list-signal-handling",
+)
+
+
+def _resolve_gnu_env_long_opt(opt_name: str) -> str | None:
+    """Resolve a GNU `env` long option (including unique abbreviations)."""
+
+    if opt_name in _GNU_ENV_LONG_OPTIONS:
+        return opt_name
+    matches = [cand for cand in _GNU_ENV_LONG_OPTIONS if cand.startswith(opt_name)]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _consume_gnu_env_prefix(
+    tokens: list[str],
+    idx: int,
+    *,
+    check_cargo_overrides: bool,
+) -> tuple[list[str], int, bool]:
+    """Consume GNU `env` options/assignments starting after `env` at `idx`.
+
+    Returns `(updated_tokens, next_idx, hit_cargo_override)`.
+    """
+
+    tokens = list(tokens)
+    while idx < len(tokens):
+        arg = tokens[idx]
+        if arg in ("-i", "-"):
+            if check_cargo_overrides:
+                return tokens, idx, True
+            idx += 1
+            continue
+        if arg == "--":
+            idx += 1
+            break
+        if arg.startswith("--"):
+            opt_part, has_eq, val_part = arg.partition("=")
+            resolved = _resolve_gnu_env_long_opt(opt_part)
+            if resolved == "--ignore-environment":
+                if check_cargo_overrides:
+                    return tokens, idx, True
+                idx += 1
+                continue
+            if resolved == "--unset":
+                target_var = val_part if has_eq else (tokens[idx + 1] if idx + 1 < len(tokens) else "")
+                if check_cargo_overrides and _CI_DEBUG_SHELL_VAR_NAME_RE.match(target_var):
+                    return tokens, idx, True
+                idx += 1 if has_eq else (2 if idx + 1 < len(tokens) else 1)
+                continue
+            if resolved in ("--chdir", "--argv0"):
+                idx += 1 if has_eq else (2 if idx + 1 < len(tokens) else 1)
+                continue
+            if resolved == "--split-string":
+                raw_s = val_part if has_eq else (tokens[idx + 1] if idx + 1 < len(tokens) else "")
+                spliced = _split_gnu_env_s_string(raw_s)
+                step = 1 if has_eq else (2 if idx + 1 < len(tokens) else 1)
+                tokens = tokens[:idx] + spliced + tokens[idx + step :]
+                continue
+            idx += 1
+            continue
+        # Walk short-option clusters such as `-iv`, `-uVAR`, `-vS ...`, `-a x`, `-vC /tmp`.
+        if arg.startswith("-") and len(arg) > 1:
+            flags = arg[1:]
+            fidx = 0
+            consumed = False
+            while fidx < len(flags):
+                ch = flags[fidx]
+                rest = flags[fidx + 1 :]
+                if ch == "i":
+                    if check_cargo_overrides:
+                        return tokens, idx, True
+                elif ch == "u":
+                    if rest:
+                        if check_cargo_overrides and _CI_DEBUG_SHELL_VAR_NAME_RE.match(rest):
+                            return tokens, idx, True
+                        idx += 1
+                    elif idx + 1 < len(tokens):
+                        if check_cargo_overrides and _CI_DEBUG_SHELL_VAR_NAME_RE.match(tokens[idx + 1]):
+                            return tokens, idx, True
+                        idx += 2
+                    else:
+                        idx += 1
+                    consumed = True
+                    break
+                elif ch in ("C", "a"):
+                    idx += 1 if rest else (2 if idx + 1 < len(tokens) else 1)
+                    consumed = True
+                    break
+                elif ch == "S":
+                    if rest:
+                        spliced = _split_gnu_env_s_string(rest)
+                        tokens = tokens[:idx] + spliced + tokens[idx + 1 :]
+                    elif idx + 1 < len(tokens):
+                        spliced = _split_gnu_env_s_string(tokens[idx + 1])
+                        tokens = tokens[:idx] + spliced + tokens[idx + 2 :]
+                    else:
+                        idx += 1
+                    consumed = True
+                    break
+                fidx += 1
+            if not consumed:
+                idx += 1
+            continue
+        if "=" in arg:
+            var_name = arg.split("=", 1)[0].removesuffix("+")
+            if check_cargo_overrides and _CI_DEBUG_SHELL_VAR_NAME_RE.match(var_name):
+                return tokens, idx, True
+            idx += 1
+            continue
+        break
+    return tokens, idx, False
+
+
+def _scan_shell_command_tokens(tokens: list[str]) -> bool:
+    """Return True if a single simple shell command overrides Cargo/Rust/C build or profile settings."""
+
+    tokens = list(tokens)
+    idx = 0
+    while idx < len(tokens):
+        tok = tokens[idx]
+        if tok in _CI_DEBUG_SHELL_KEYWORDS:
+            idx += 1
+            continue
+        if tok == "case" and idx + 2 < len(tokens) and tokens[idx + 2] == "in":
+            idx += 3
+            continue
+        if tok == "function" and idx + 1 < len(tokens):
+            idx += 2
+            continue
+        if "=" in tok and not tok.startswith("-"):
+            var_name = tok.split("=", 1)[0].removesuffix("+")
+            if _CI_DEBUG_SHELL_VAR_NAME_RE.match(var_name):
+                return True
+            idx += 1
+            continue
+        if tok == ")" or (tok.endswith(")") and not tok.startswith("-")):
+            # Skip `case` pattern arms (`a)`, `stable )`) and one-line function headers (`f()`).
+            idx += 1
+            continue
+        if idx + 1 < len(tokens) and tokens[idx + 1] == ")":
+            # Skip `<pattern> )` case arm tokens when `)` was tokenized separately.
+            idx += 2
+            continue
+        base = tok.rsplit("/", 1)[-1]
+        if base == "rustup" and idx + 1 < len(tokens) and tokens[idx + 1] == "run":
+            idx += 2
+            while idx < len(tokens) and tokens[idx].startswith("-"):
+                idx += 1
+            if idx < len(tokens):
+                idx += 1  # consume <toolchain>
+            continue
+        if base == "env":
+            tokens, idx, hit = _consume_gnu_env_prefix(
+                tokens, idx + 1, check_cargo_overrides=True
+            )
+            if hit:
+                return True
+            continue
+        if base in _CI_DEBUG_SHELL_WRAPPERS:
+            opt_with_arg, takes_pos = _CI_DEBUG_SHELL_WRAPPERS[base]
+            idx += 1
+            while idx < len(tokens) and tokens[idx].startswith("-"):
+                arg = tokens[idx]
+                if arg == "--":
+                    idx += 1
+                    break
+                if arg in opt_with_arg and idx + 1 < len(tokens):
+                    idx += 2
+                else:
+                    idx += 1
+            if takes_pos and idx < len(tokens):
+                idx += 1
+            continue
+        break
+
+    if idx >= len(tokens):
+        return False
+    cmd = tokens[idx]
+    cmd_base = cmd.rsplit("/", 1)[-1]
+    if cmd_base in ("export", "declare", "typeset", "readonly", "local"):
+        for arg in tokens[idx + 1 :]:
+            if arg.startswith("-"):
+                continue
+            var_name = arg.split("=", 1)[0].removesuffix("+")
+            if _CI_DEBUG_SHELL_VAR_NAME_RE.match(var_name):
+                return True
+        return False
+    if cmd_base == "unset":
+        for arg in tokens[idx + 1 :]:
+            if arg.startswith("-"):
+                continue
+            if _CI_DEBUG_SHELL_VAR_NAME_RE.match(arg):
+                return True
+        return False
+    if cmd_base == "cargo":
+        for arg in tokens[idx + 1 :]:
+            if arg == "--":
+                break
+            if arg == "--config" or arg.startswith("--config="):
+                return True
+        return False
+    return False
+
+
+def _split_shell_pipelines(run_text: str) -> list[tuple[str, str]]:
+    """Split a shell script into `(code_text, full_text)` pipelines preserving pipes, quotes, and heredoc bodies.
+
+    `code_text` excludes heredoc body lines so delimiter-balance and pipe-continuation checks
+    never misread text inside a heredoc; `full_text` includes each pipeline's attached heredoc bodies.
+    """
+
+    pipelines: list[tuple[str, str]] = []
+    code_buf: list[str] = []
+    full_buf: list[str] = []
+    quote: str | None = None
+    # Each pending heredoc tracks `(delimiter, strip_tabs, owner_pipeline_idx)` where
+    # `owner_pipeline_idx is None` means it belongs to the currently open pipeline.
+    pending_heredocs: list[tuple[str, bool, int | None]] = []
+    expecting_heredoc_delim: tuple[bool, bool] | None = None
+    delim_bytes = bytearray()
+    delim_has_token = False
+    arith_paren_stack: list[int] = []
+    pending_pipe = False
+    idx = 0
+    n = len(run_text)
+
+    def _emit_code(text: str) -> None:
+        code_buf.append(text)
+        full_buf.append(text)
+
+    def _delim_append(text: str) -> None:
+        delim_bytes.extend(text.encode("utf-8", errors="surrogateescape"))
+
+    def _finish_delim() -> None:
+        nonlocal expecting_heredoc_delim, delim_has_token
+        if expecting_heredoc_delim is not None and delim_has_token:
+            pending_heredocs.append(
+                (
+                    delim_bytes.decode("utf-8", errors="surrogateescape"),
+                    expecting_heredoc_delim[1],
+                    None,
+                )
+            )
+            expecting_heredoc_delim = None
+            delim_bytes.clear()
+            delim_has_token = False
+
+    def _flush_pipeline() -> None:
+        nonlocal code_buf, full_buf, expecting_heredoc_delim, delim_has_token, pending_pipe
+        _finish_delim()
+        expecting_heredoc_delim = None
+        delim_bytes.clear()
+        delim_has_token = False
+        pending_pipe = False
+        code_text = "".join(code_buf).strip()
+        full_text = "".join(full_buf).strip()
+        if code_text or full_text:
+            owner_idx = len(pipelines)
+            pipelines.append((code_text, full_text))
+            for pos_hd, (d, st, prev_owner) in enumerate(pending_heredocs):
+                if prev_owner is None:
+                    pending_heredocs[pos_hd] = (d, st, owner_idx)
+        code_buf = []
+        full_buf = []
+
+    def _ends_with_pipe(parts: list[str]) -> bool:
+        tail = "".join(parts).rstrip(" \t\r\n")
+        if tail.endswith("|&"):
+            return True
+        if tail.endswith("|") and not tail.endswith("||") and not tail.endswith(">|"):
+            return True
+        return False
+
+    while idx < n:
+        ch = run_text[idx]
+        if quote is None:
+            if ch == "#" and (not code_buf or code_buf[-1] in (" ", "\t", "\r", "\n", ";", "|", "&")):
+                while idx < n and run_text[idx] != "\n":
+                    idx += 1
+                continue
+            if ch == "\\" and idx + 1 < n:
+                if run_text[idx + 1] == "\n":
+                    _emit_code(" ")
+                    idx += 2
+                    continue
+                if run_text[idx + 1] == "\r" and idx + 2 < n and run_text[idx + 2] == "\n":
+                    _emit_code(" ")
+                    idx += 3
+                    continue
+                pending_pipe = False
+                _emit_code(run_text[idx : idx + 2])
+                if expecting_heredoc_delim is not None:
+                    _delim_append(run_text[idx + 1])
+                    delim_has_token = True
+                idx += 2
+                continue
+            if run_text[idx : idx + 3] == "$((":
+                pending_pipe = False
+                arith_paren_stack.append(0)
+                _emit_code("$((")
+                idx += 3
+                continue
+            if not arith_paren_stack and run_text[idx : idx + 2] == "((" and (
+                not code_buf or code_buf[-1] in (" ", "\t", "\r", "\n", ";", "|", "&")
+            ):
+                pending_pipe = False
+                arith_paren_stack.append(0)
+                _emit_code("((")
+                idx += 2
+                continue
+            if arith_paren_stack:
+                if ch == "(":
+                    arith_paren_stack[-1] += 1
+                    _emit_code(ch)
+                    idx += 1
+                    continue
+                if ch == ")":
+                    if arith_paren_stack[-1] > 0:
+                        arith_paren_stack[-1] -= 1
+                        _emit_code(ch)
+                        idx += 1
+                        continue
+                    if run_text[idx : idx + 2] == "))":
+                        arith_paren_stack.pop()
+                        _emit_code("))")
+                        idx += 2
+                        continue
+            if ch == "$" and idx + 1 < n and run_text[idx + 1] == "'":
+                pending_pipe = False
+                quote = "$'"
+                _emit_code("$'")
+                if expecting_heredoc_delim is not None:
+                    delim_has_token = True
+                idx += 2
+                continue
+            if ch in ("'", '"'):
+                pending_pipe = False
+                quote = ch
+                _emit_code(ch)
+                if expecting_heredoc_delim is not None:
+                    delim_has_token = True
+                idx += 1
+                continue
+            if ch in (" ", "\t", "\r"):
+                _finish_delim()
+                _emit_code(ch)
+                idx += 1
+                continue
+            if not arith_paren_stack and run_text[idx : idx + 3] == "<<<":
+                pending_pipe = False
+                _finish_delim()
+                _emit_code("<<<")
+                idx += 3
+                continue
+            if not arith_paren_stack and ch == "<" and run_text[idx : idx + 2] == "<<":
+                pending_pipe = False
+                _finish_delim()
+                op = "<<-" if run_text[idx : idx + 3] == "<<-" else "<<"
+                _emit_code(op)
+                expecting_heredoc_delim = (True, op == "<<-")
+                idx += len(op)
+                continue
+            if not arith_paren_stack and ch == ";":
+                if run_text[idx : idx + 3] == ";;&":
+                    _emit_code(";;&")
+                    _flush_pipeline()
+                    idx += 3
+                elif run_text[idx : idx + 2] in (";;", ";&"):
+                    _emit_code(run_text[idx : idx + 2])
+                    _flush_pipeline()
+                    idx += 2
+                else:
+                    _flush_pipeline()
+                    idx += 1
+                continue
+            if not arith_paren_stack and ch == "|" and idx + 1 < n and run_text[idx + 1] == "|":
+                _flush_pipeline()
+                idx += 2
+                continue
+            if not arith_paren_stack and ch == "&" and idx + 1 < n and run_text[idx + 1] == "&":
+                _flush_pipeline()
+                idx += 2
+                continue
+            if not arith_paren_stack and ch == "&" and not (
+                (idx > 0 and run_text[idx - 1] in (">", "<", "|"))
+                or (idx + 1 < n and run_text[idx + 1] == ">")
+            ):
+                _flush_pipeline()
+                idx += 1
+                continue
+            if ch == "\n":
+                _finish_delim()
+                # Track pending pipe continuation from `code_buf` independently of heredoc bodies,
+                # blank lines, and comment lines until the next pipeline command starts.
+                if _ends_with_pipe(code_buf):
+                    pending_pipe = True
+                idx += 1
+                if pending_heredocs:
+                    while pending_heredocs and idx < n:
+                        delim, strip_tabs, owner_idx = pending_heredocs.pop(0)
+                        body_chunks: list[str] = []
+                        while idx < n:
+                            nl = run_text.find("\n", idx)
+                            if nl < 0:
+                                hd_line = run_text[idx:]
+                                idx = n
+                            else:
+                                hd_line = run_text[idx:nl]
+                                idx = nl + 1
+                            body_chunks.append(hd_line + "\n")
+                            cand = hd_line.rstrip("\r")
+                            if strip_tabs:
+                                cand = cand.lstrip("\t")
+                            if cand == delim:
+                                break
+                        body_text = "\n" + "".join(body_chunks)
+                        if owner_idx is not None:
+                            prev_code, prev_full = pipelines[owner_idx]
+                            pipelines[owner_idx] = (prev_code, prev_full + body_text)
+                        else:
+                            full_buf.append(body_text)
+                if not pending_pipe:
+                    _flush_pipeline()
+                else:
+                    _emit_code("\n")
+                continue
+            if not arith_paren_stack and ch in ("|", "(", ")", ">", "<"):
+                _finish_delim()
+                _emit_code(ch)
+                if ch != "|":
+                    pending_pipe = False
+                idx += 1
+                continue
+            pending_pipe = False
+            _emit_code(ch)
+            if expecting_heredoc_delim is not None:
+                _delim_append(ch)
+                delim_has_token = True
+            idx += 1
+        elif quote == "'":
+            _emit_code(ch)
+            if ch == "'":
+                quote = None
+            elif expecting_heredoc_delim is not None:
+                _delim_append(ch)
+            idx += 1
+        elif quote == "$'":
+            if ch == "\\" and idx + 1 < n:
+                nxt = run_text[idx + 1]
+                if nxt == "x":
+                    hex_m = re.match(r"[0-9A-Fa-f]{1,2}", run_text[idx + 2 : idx + 4])
+                    if hex_m:
+                        _emit_code(run_text[idx : idx + 2 + len(hex_m.group(0))])
+                        if expecting_heredoc_delim is not None:
+                            delim_bytes.append(int(hex_m.group(0), 16))
+                        idx += 2 + len(hex_m.group(0))
+                        continue
+                if nxt in ("u", "U"):
+                    max_digits = 4 if nxt == "u" else 8
+                    hex_m = re.match(
+                        rf"[0-9A-Fa-f]{{1,{max_digits}}}",
+                        run_text[idx + 2 : idx + 2 + max_digits],
+                    )
+                    if hex_m:
+                        _emit_code(run_text[idx : idx + 2 + len(hex_m.group(0))])
+                        if expecting_heredoc_delim is not None:
+                            cp = int(hex_m.group(0), 16)
+                            if 0 <= cp <= 0x10FFFF and not (0xD800 <= cp <= 0xDFFF):
+                                _delim_append(chr(cp))
+                            else:
+                                _delim_append(run_text[idx : idx + 2 + len(hex_m.group(0))])
+                        idx += 2 + len(hex_m.group(0))
+                        continue
+                if nxt in "01234567":
+                    oct_m = re.match(r"[0-7]{1,3}", run_text[idx + 1 : idx + 4])
+                    if oct_m:
+                        _emit_code(run_text[idx : idx + 1 + len(oct_m.group(0))])
+                        if expecting_heredoc_delim is not None:
+                            delim_bytes.append(int(oct_m.group(0), 8) & 0xFF)
+                        idx += 1 + len(oct_m.group(0))
+                        continue
+                _emit_code(run_text[idx : idx + 2])
+                if expecting_heredoc_delim is not None:
+                    esc_map = {
+                        "a": "\a",
+                        "b": "\b",
+                        "e": "\x1b",
+                        "E": "\x1b",
+                        "f": "\f",
+                        "n": "\n",
+                        "r": "\r",
+                        "t": "\t",
+                        "v": "\v",
+                        "'": "'",
+                        '"': '"',
+                        "\\": "\\",
+                        "?": "?",
+                    }
+                    _delim_append(esc_map.get(nxt, "\\" + nxt))
+                idx += 2
+                continue
+            _emit_code(ch)
+            if ch == "'":
+                quote = None
+            elif expecting_heredoc_delim is not None:
+                _delim_append(ch)
+            idx += 1
+        else:  # double quote
+            if ch == "\\" and idx + 1 < n:
+                nxt = run_text[idx + 1]
+                if nxt == "\n":
+                    idx += 2
+                    continue
+                if nxt == "\r" and idx + 2 < n and run_text[idx + 2] == "\n":
+                    idx += 3
+                    continue
+                _emit_code(run_text[idx : idx + 2])
+                if expecting_heredoc_delim is not None:
+                    if nxt in ('"', "\\", "$", "`"):
+                        _delim_append(nxt)
+                    else:
+                        _delim_append("\\" + nxt)
+                idx += 2
+                continue
+            _emit_code(ch)
+            if ch == '"':
+                quote = None
+            elif expecting_heredoc_delim is not None:
+                _delim_append(ch)
+            idx += 1
+    _flush_pipeline()
+    return pipelines
+
+
+def _compute_pipeline_compound_spans(
+    pipelines: list[tuple[str, str]],
+) -> dict[int, list[int]]:
+    """Map each pipeline index closing a shell compound command (`(...)`, `{...}`, `if..fi`, `for/while/until..done`, `case..esac`) to its opening pipeline index(es)."""
+
+    # Stack items: `(kind, start_idx, case_state)` where for `"case"`, `case_state` is
+    # `"header"` (waiting for `in`), `"pattern"` (inside pattern before `)`), or `"body"`.
+    stack: list[list[object]] = []
+    closed_spans: dict[int, list[int]] = {}
+
+    for p_idx, (code, _full) in enumerate(pipelines):
+        quote: str | None = None
+        arith_stack: list[int] = []
+        at_cmd_pos = True
+        i = 0
+        n = len(code)
+
+        def _pop_kind(kind: str) -> None:
+            for k in range(len(stack) - 1, -1, -1):
+                if stack[k][0] == kind:
+                    start = int(stack[k][1])  # type: ignore[arg-type]
+                    del stack[k:]
+                    closed_spans.setdefault(p_idx, []).append(start)
+                    return
+
+        while i < n:
+            ch = code[i]
+            if quote is None:
+                if ch in (" ", "\t", "\r"):
+                    i += 1
+                    continue
+                if ch == "\n":
+                    at_cmd_pos = True
+                    i += 1
+                    continue
+                if ch == "\\" and i + 1 < n:
+                    at_cmd_pos = False
+                    i += 2
+                    continue
+                if ch == "$" and i + 1 < n and code[i + 1] == "'":
+                    quote = "$'"
+                    at_cmd_pos = False
+                    i += 2
+                    continue
+                if ch in ("'", '"'):
+                    quote = ch
+                    at_cmd_pos = False
+                    i += 1
+                    continue
+                if code[i : i + 3] == "$((":
+                    arith_stack.append(0)
+                    at_cmd_pos = False
+                    i += 3
+                    continue
+                if not arith_stack and code[i : i + 2] == "((" and (
+                    i == 0 or code[i - 1] in (" ", "\t", "\r", "\n", ";", "|", "&")
+                ):
+                    arith_stack.append(0)
+                    at_cmd_pos = False
+                    i += 2
+                    continue
+                if arith_stack:
+                    if ch == "(":
+                        arith_stack[-1] += 1
+                        i += 1
+                        continue
+                    if ch == ")":
+                        if arith_stack[-1] > 0:
+                            arith_stack[-1] -= 1
+                            i += 1
+                            continue
+                        if code[i : i + 2] == "))":
+                            arith_stack.pop()
+                            i += 2
+                            continue
+                    i += 1
+                    continue
+                if code[i : i + 3] == ";;&":
+                    if stack and stack[-1][0] == "case":
+                        stack[-1][2] = "pattern"
+                    at_cmd_pos = True
+                    i += 3
+                    continue
+                if code[i : i + 2] in (";;", ";&"):
+                    if stack and stack[-1][0] == "case":
+                        stack[-1][2] = "pattern"
+                    at_cmd_pos = True
+                    i += 2
+                    continue
+                if ch == "|":
+                    if not (stack and stack[-1][0] == "case" and stack[-1][2] == "pattern"):
+                        at_cmd_pos = True
+                    i += 2 if (i + 1 < n and code[i + 1] == "&") else 1
+                    continue
+                if ch == "(":
+                    if stack and stack[-1][0] == "case" and stack[-1][2] == "pattern":
+                        # Optional leading `(` starts a Bash case pattern (`(esac)`, `(foo|bar)`),
+                        # so `esac` inside it is a pattern token rather than the `case` closer.
+                        at_cmd_pos = False
+                        i += 1
+                        continue
+                    # Function header `name() { ... }` or `name () { ... }`:
+                    # empty `()` after a command name restores command position
+                    # for the compound function body instead of acting as a subshell.
+                    if not at_cmd_pos:
+                        k = i + 1
+                        while k < n and code[k] in (" ", "\t"):
+                            k += 1
+                        if k < n and code[k] == ")":
+                            at_cmd_pos = True
+                            i = k + 1
+                            continue
+                    stack.append(["(", p_idx, ""])
+                    at_cmd_pos = True
+                    i += 1
+                    continue
+                if ch == ")":
+                    if stack and stack[-1][0] == "case" and stack[-1][2] == "pattern":
+                        stack[-1][2] = "body"
+                        at_cmd_pos = True
+                        i += 1
+                        continue
+                    _pop_kind("(")
+                    at_cmd_pos = False
+                    i += 1
+                    continue
+                if ch == "{":
+                    prev_ch = code[i - 1] if i > 0 else " "
+                    nxt_ch = code[i + 1] if i + 1 < n else " "
+                    if at_cmd_pos and prev_ch != "$" and nxt_ch in (" ", "\t", "\r", "\n"):
+                        stack.append(["{", p_idx, ""])
+                        at_cmd_pos = True
+                    else:
+                        at_cmd_pos = False
+                    i += 1
+                    continue
+                if ch == "}":
+                    nxt_ch = code[i + 1] if i + 1 < n else " "
+                    if at_cmd_pos and nxt_ch in (" ", "\t", "\r", "\n", ";", "|", "&", ">", "<", ")"):
+                        _pop_kind("{")
+                        at_cmd_pos = False
+                    else:
+                        at_cmd_pos = False
+                    i += 1
+                    continue
+                if ch == "!" and at_cmd_pos and (i + 1 == n or code[i + 1] in (" ", "\t", "\r", "\n", "(")):
+                    # Pipeline negation `!` keeps command position for the following word.
+                    i += 1
+                    continue
+                if ch.isalpha() or ch == "_":
+                    j = i
+                    while j < n and (code[j].isalnum() or code[j] in ("_", "-", ".", "/", "=")):
+                        j += 1
+                    word = code[i:j]
+                    prev_ok = i == 0 or code[i - 1] in (" ", "\t", "\r", "\n", ";", "|", "&", "(", ")")
+                    in_case_pattern = bool(
+                        stack and stack[-1][0] == "case" and stack[-1][2] == "pattern"
+                    )
+                    if prev_ok and "=" not in word:
+                        if word == "in" and stack and stack[-1][0] == "case" and stack[-1][2] == "header":
+                            stack[-1][2] = "pattern"
+                            at_cmd_pos = True
+                        elif in_case_pattern:
+                            # Inside a `case` pattern list (`start|done)`, `done)`, `esac*)`),
+                            # no loop/conditional reserved word may match; only a complete
+                            # `esac` token at pattern-start closes the `case` (so `esac | tee`
+                            # closes `case`, while `esac*)` and `(esac)` stay patterns).
+                            complete_token = j == n or code[j] in (
+                                " ",
+                                "\t",
+                                "\r",
+                                "\n",
+                                ";",
+                                "|",
+                                "&",
+                                ">",
+                                "<",
+                                ")",
+                            )
+                            if word == "esac" and at_cmd_pos and complete_token:
+                                _pop_kind("case")
+                            at_cmd_pos = False
+                        elif at_cmd_pos:
+                            if word == "function":
+                                # `function name [()] <compound-cmd>`: skip the full Bash
+                                # function-name token (including `ci::write_settings`) and
+                                # optional `()`, then restore command position.
+                                k = j
+                                while k < n and code[k] in (" ", "\t"):
+                                    k += 1
+                                while k < n and code[k] not in (
+                                    " ",
+                                    "\t",
+                                    "\r",
+                                    "\n",
+                                    ";",
+                                    "|",
+                                    "&",
+                                    "(",
+                                    ")",
+                                    "<",
+                                    ">",
+                                    "{",
+                                    "}",
+                                ):
+                                    k += 1
+                                m = k
+                                while m < n and code[m] in (" ", "\t"):
+                                    m += 1
+                                if m < n and code[m] == "(":
+                                    m2 = m + 1
+                                    while m2 < n and code[m2] in (" ", "\t"):
+                                        m2 += 1
+                                    if m2 < n and code[m2] == ")":
+                                        k = m2 + 1
+                                at_cmd_pos = True
+                                i = k
+                                continue
+                            if word == "if":
+                                stack.append(["if", p_idx, ""])
+                                at_cmd_pos = True
+                            elif word == "fi":
+                                _pop_kind("if")
+                                at_cmd_pos = False
+                            elif word in ("while", "until"):
+                                stack.append(["loop", p_idx, ""])
+                                at_cmd_pos = True
+                            elif word in ("for", "select"):
+                                stack.append(["loop", p_idx, ""])
+                                at_cmd_pos = False
+                            elif word == "done":
+                                _pop_kind("loop")
+                                at_cmd_pos = False
+                            elif word == "case":
+                                stack.append(["case", p_idx, "header"])
+                                at_cmd_pos = False
+                            elif word == "esac":
+                                _pop_kind("case")
+                                at_cmd_pos = False
+                            elif word in ("then", "elif", "else", "do", "time"):
+                                at_cmd_pos = True
+                            else:
+                                at_cmd_pos = False
+                        else:
+                            at_cmd_pos = False
+                    else:
+                        at_cmd_pos = False
+                    i = j
+                    continue
+                if ch in (">", "<"):
+                    at_cmd_pos = False
+                    i += 1
+                    continue
+                at_cmd_pos = False
+                i += 1
+            elif quote == "'":
+                if ch == "'":
+                    quote = None
+                i += 1
+            elif quote == "$'":
+                if ch == "\\" and i + 1 < n:
+                    i += 2
+                    continue
+                if ch == "'":
+                    quote = None
+                i += 1
+            else:  # double quote
+                if ch == "\\" and i + 1 < n:
+                    i += 2
+                    continue
+                if ch == '"':
+                    quote = None
+                i += 1
+    return closed_spans
+
+
+_CI_DEBUG_NON_EXEC_HEREDOC_CMDS = frozenset(
+    {
+        "cat",
+        "sed",
+        "grep",
+        "egrep",
+        "fgrep",
+        "rg",
+        "head",
+        "tail",
+        "cut",
+        "tr",
+        "sort",
+        "uniq",
+        "wc",
+        "fmt",
+        "fold",
+        "nl",
+        "column",
+        "less",
+        "more",
+        "echo",
+        "printf",
+        "tee",
+    }
+)
+
+
+def _pipeline_has_executable_heredoc_stage(code_text: str) -> bool:
+    """Return True if any stage in `code_text` invokes a command outside pure text-display/filter utilities."""
+
+    cmds, _malformed = _tokenize_shell_script(code_text, consume_heredocs=False)
+    if not cmds:
+        return True
+    for raw_tokens in cmds:
+        tokens = list(raw_tokens)
+        idx = 0
+        while idx < len(tokens):
+            tok = tokens[idx]
+            if tok in _CI_DEBUG_SHELL_KEYWORDS:
+                idx += 1
+                continue
+            if "=" in tok and not tok.startswith("-"):
+                idx += 1
+                continue
+            base = tok.rsplit("/", 1)[-1]
+            if base == "env":
+                tokens, idx, _hit = _consume_gnu_env_prefix(
+                    tokens, idx + 1, check_cargo_overrides=False
+                )
+                continue
+            if base in _CI_DEBUG_SHELL_WRAPPERS:
+                opt_with_arg, takes_pos = _CI_DEBUG_SHELL_WRAPPERS[base]
+                idx += 1
+                while idx < len(tokens) and tokens[idx].startswith("-"):
+                    if tokens[idx] == "--":
+                        idx += 1
+                        break
+                    idx += 2 if (tokens[idx] in opt_with_arg and idx + 1 < len(tokens)) else 1
+                if takes_pos and idx < len(tokens):
+                    idx += 1
+                continue
+            if base not in _CI_DEBUG_NON_EXEC_HEREDOC_CMDS:
+                return True
+            break
+    return False
+
+
+def _github_env_write_has_ci_debug_var(run_text: str) -> bool:
+    """Return True if a step writes a Cargo/Rust/C/RUST_BACKTRACE variable into GITHUB_ENV."""
+
+    pipelines = _split_shell_pipelines(run_text)
+    if not any("GITHUB_ENV" in full for _code, full in pipelines):
+        return False
+
+    simple_write_re = re.compile(
+        r"""(?:>>?\s*|\btee\b[^\n]*)(?:["']?)\$\{?GITHUB_ENV\}?(?:["']?)"""
+    )
+    closed_spans = _compute_pipeline_compound_spans(pipelines)
+
+    for idx, (code, full) in enumerate(pipelines):
+        # 0. Executable heredoc (e.g. `python3 - <<'PY'`, `bash <<'SH'`, `cat <<'SH' | bash`)
+        #    whose body references `GITHUB_ENV` and a Cargo/Rust/C/RUST_BACKTRACE variable,
+        #    while ignoring literal-data `cat <<'EOF' > /tmp/file` and `cat <<'EOF' | sed ...`.
+        if "GITHUB_ENV" not in code:
+            if "GITHUB_ENV" in full:
+                if _pipeline_has_executable_heredoc_stage(code) and _CI_DEBUG_GITHUB_ENV_VAR_RE.search(full):
+                    return True
+            continue
+        # 1. Compound command (`(...)`, `{...}`, `if..fi`, `for/while/until..done`, `case..esac`)
+        #    redirected/piped into GITHUB_ENV: scan ONLY the matched compound span.
+        if simple_write_re.search(code) and idx in closed_spans:
+            earliest_start = min(closed_spans[idx])
+            block_text = "\n".join(f for _c, f in pipelines[earliest_start : idx + 1])
+            if _CI_DEBUG_GITHUB_ENV_VAR_RE.search(block_text):
+                return True
+            continue
+        # 2. Direct pipeline write (`echo ... >> "$GITHUB_ENV"`, wrapped `printf ... |\n tee -a "$GITHUB_ENV"`,
+        #    or `cat <<'EOF' >> "$GITHUB_ENV"\n...\nEOF` whose heredoc body is attached to `full`),
+        #    excluding compound-command closers (`fi`/`done`/`esac`), `exec`, or variable aliasing.
+        if (
+            simple_write_re.search(code)
+            and not re.match(r"^(?:(?:builtin\s+)?exec|fi|done|esac)\b", code)
+            and not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=.*GITHUB_ENV", code)
+        ):
+            if _CI_DEBUG_GITHUB_ENV_VAR_RE.search(full):
+                return True
+            continue
+        # 3. Fallback for complex/indirect GITHUB_ENV usage (`exec >> "$GITHUB_ENV"`,
+        #    variable aliasing, inline python/awk scripts): check all pipelines in the step.
+        if _CI_DEBUG_GITHUB_ENV_VAR_RE.search("\n".join(f for _c, f in pipelines)):
+            return True
+    return False
+
+
+def _step_run_has_ci_debug_override(run_text: str) -> bool:
+    """Detect shell exports, unsets, inline compiler env assignments, GITHUB_ENV writes, or cargo --config."""
+
+    if _github_env_write_has_ci_debug_var(run_text):
+        return True
+
+    commands, malformed = _tokenize_shell_script(run_text)
+    if malformed:
+        return True
+    for tokens in commands:
+        if _scan_shell_command_tokens(tokens):
+            return True
+    return False
+
+
+def _extract_env_mapping(
+    text: str,
+    *,
+    key_indent: int,
+    prefixes: tuple[str, ...],
+) -> tuple[dict[str, str], str | None]:
+    """Extract env entries matching `prefixes` from a workflow (`key_indent=0`) or job (`key_indent=4`)."""
+
+    parsed, yaml_avail, yaml_err = _try_yaml_base_load(text)
+    if yaml_avail:
+        if yaml_err is not None:
+            return {}, f"invalid YAML: {yaml_err}"
+        if not isinstance(parsed, dict):
+            return {}, "expected a YAML mapping"
+        obj = parsed
+        if (
+            key_indent == 4
+            and len(parsed) == 1
+            and "env" not in parsed
+            and "steps" not in parsed
+            and isinstance(next(iter(parsed.values())), dict)
+        ):
+            obj = next(iter(parsed.values()))
+        raw_env = obj.get("env")
+        if raw_env is None:
+            return {}, None
+        if not isinstance(raw_env, dict):
+            return {}, "`env:` must be a mapping"
+        return {
+            str(k): _normalize_yaml_scalar(v)
+            for k, v in raw_env.items()
+            if str(k).startswith(prefixes)
+        }, None
+
+    lines = text.splitlines()
+    non_block_lines = {
+        idx: ln
+        for idx, (_ind, ln) in _iter_non_block_scalar_lines_indexed(lines)
+    }
+    env_idx = None
+    for idx in sorted(non_block_lines):
+        decoded = _decode_mapping_line(non_block_lines[idx])
+        if decoded is not None and decoded[0] == key_indent and decoded[1] == "env":
+            env_idx = idx
+            env_inline = _yaml_strip_trailing_comment(decoded[2]).strip()
+            if env_inline.startswith("{"):
+                flow_block = _balanced_flow(env_inline, 0)
+                if flow_block is None:
+                    return {}, "unterminated flow `env:`"
+                pairs, errs = _collect_flow_mapping_pairs(flow_block[0])
+                if errs:
+                    return {}, "; ".join(errs)
+                decoded_flow: dict[str, str] = {}
+                for raw_k, raw_v in pairs:
+                    k_dec = _decode_yaml_value_scalar(raw_k)
+                    v_dec = _decode_yaml_value_scalar(raw_v)
+                    if k_dec is None or v_dec is None:
+                        return {}, f"unparseable flow `env:` entry ({raw_k!r}: {raw_v!r})"
+                    if k_dec.startswith(prefixes):
+                        decoded_flow[k_dec] = v_dec
+                return decoded_flow, None
+            if env_inline:
+                return {}, "`env:` must be a mapping"
+            break
+    if env_idx is None:
+        return {}, None
+    result: dict[str, str] = {}
+    for line in lines[env_idx + 1 :]:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip(" \t"))
+        if indent <= key_indent:
+            break
+        decoded = _decode_mapping_line(line)
+        if decoded is None:
+            return {}, f"unparseable env line: {line!r}"
+        _k_indent, key, raw_val = decoded
+        raw_val_stripped = _yaml_strip_trailing_comment(raw_val).strip()
+        if raw_val_stripped.startswith(("*", "&")):
+            return {}, f"unsupported YAML anchor/alias in env value for {key}"
+        scalar = _decode_yaml_value_scalar(raw_val)
+        if scalar is None:
+            return {}, f"unparseable env value for {key}"
+        if key.startswith(prefixes):
+            result[key] = scalar
+    return result, None
+
+
+def _iter_non_block_scalar_lines_indexed(lines: list[str]) -> list[tuple[int, tuple[int, str]]]:
+    """Return `(line_index, (indent, line))` excluding YAML block scalar bodies."""
+
+    out: list[tuple[int, tuple[int, str]]] = []
+    idx = 0
+    while idx < len(lines):
+        line = lines[idx]
+        if not line.strip() or line.lstrip().startswith("#"):
+            idx += 1
+            continue
+        indent = len(line) - len(line.lstrip(" \t"))
+        out.append((idx, (indent, line)))
+        decoded = _decode_mapping_line(line)
+        if decoded is not None:
+            val_no_comment = _yaml_strip_trailing_comment(decoded[2]).strip()
+            if YAML_BLOCK_SCALAR.match(val_no_comment):
+                idx = _skip_block_scalar(lines, idx + 1, decoded[0])
+                continue
+        idx += 1
+    return out
+
+
+def _iter_fallback_jobs(workflow_text: str) -> tuple[list[tuple[str, str]], list[str]]:
+    """Return `((job_id, job_body) list, layout_errors)` in fallback mode, rejecting non-2-space job indents."""
+
+    lines = workflow_text.splitlines()
+    indexed = _iter_non_block_scalar_lines_indexed(lines)
+    jobs_start = None
+    for idx, (indent, line) in indexed:
+        decoded = _decode_mapping_line(line)
+        if decoded is not None and indent == 0 and decoded[1] == "jobs":
+            inline_val = _yaml_strip_trailing_comment(decoded[2]).strip()
+            if inline_val and inline_val != "{}":
+                return [], [f"unsupported inline `jobs:` syntax in fallback parser ({inline_val!r})"]
+            jobs_start = idx + 1
+            break
+    if jobs_start is None:
+        return [], []
+    job_starts: list[tuple[str, int]] = []
+    layout_errors: list[str] = []
+    jobs_end = len(lines)
+    first_job_indent: int | None = None
+    for idx, (indent, line) in indexed:
+        if idx < jobs_start:
+            continue
+        if indent == 0:
+            jobs_end = idx
+            break
+        if first_job_indent is None:
+            first_job_indent = indent
+            if first_job_indent != 2:
+                layout_errors.append(
+                    f"unsupported non-2-space job indentation ({first_job_indent} spaces) under `jobs:` in fallback parser"
+                )
+                return [], layout_errors
+        if indent == 2:
+            if line.lstrip().startswith("?"):
+                layout_errors.append(
+                    "unsupported explicit `?` job key under `jobs:` in fallback parser"
+                )
+                continue
+            decoded = _decode_mapping_line(line)
+            if decoded is not None and decoded[0] == 2:
+                val_no_comment = _yaml_strip_trailing_comment(decoded[2]).strip()
+                if val_no_comment:
+                    layout_errors.append(
+                        f"unsupported inline/anchored job value for {decoded[1]!r} in fallback parser"
+                    )
+                else:
+                    job_starts.append((decoded[1], idx))
+            else:
+                layout_errors.append(
+                    f"unsupported non-mapping line under `jobs:` in fallback parser: {line.strip()!r}"
+                )
+    result: list[tuple[str, str]] = []
+    for pos, (job_id, start_idx) in enumerate(job_starts):
+        end_idx = job_starts[pos + 1][1] if pos + 1 < len(job_starts) else jobs_end
+        body_lines = lines[start_idx + 1 : end_idx]
+        first_field_indent = next(
+            (
+                len(bl) - len(bl.lstrip(" \t"))
+                for bl in body_lines
+                if bl.strip() and not bl.lstrip().startswith("#")
+            ),
+            None,
+        )
+        if first_field_indent is not None and first_field_indent != 4:
+            layout_errors.append(
+                f"unsupported non-4-space job field indentation ({first_field_indent} spaces) in job {job_id!r} in fallback parser"
+            )
+            continue
+        body = "\n".join(body_lines)
+        if body:
+            body += "\n"
+        result.append((job_id, body))
+    return result, layout_errors
+
+
+def _extract_step_run_text_fallback(step: str) -> tuple[str, str | None]:
+    """Extract shell text from a fallback step, preserving YAML 1.2 relative indentation and blank-line breaks."""
+
+    lines = step.splitlines()
+    for idx, line in enumerate(lines):
+        decoded = _decode_mapping_line(line)
+        if decoded is not None and decoded[0] == 8 and decoded[1] == "run":
+            val_no_comment = _yaml_strip_trailing_comment(decoded[2]).strip()
+            if YAML_BLOCK_SCALAR.match(val_no_comment):
+                end_idx = _skip_block_scalar(lines, idx + 1, 8)
+                block_lines = lines[idx + 1 : end_idx]
+                explicit_m = re.search(r"([1-9])", val_no_comment)
+                base_indent = (
+                    8 + int(explicit_m.group(1))
+                    if explicit_m
+                    else next(
+                        (
+                            len(bl) - len(bl.lstrip(" \t"))
+                            for bl in block_lines
+                            if bl.strip()
+                        ),
+                        10,
+                    )
+                )
+                if val_no_comment.startswith("|"):
+                    # Preserve relative indentation beyond base_indent (so `--no-run\\\n  --config`
+                    # retains the leading spaces on the continuation line).
+                    return (
+                        "\n".join(
+                            (bl[base_indent:] if len(bl) >= base_indent else bl.lstrip(" \t"))
+                            for bl in block_lines
+                        ),
+                        None,
+                    )
+                # YAML 1.2.2 §6.5 folded scalar (`>`):
+                # - base-indented lines fold across single line breaks with a space;
+                # - more-indented lines (including whitespace-only lines longer than base_indent)
+                #   preserve their leading relative spaces and surrounding `\n`;
+                # - `k` consecutive empty lines between base-indented lines emit `k` newlines.
+                out_parts: list[str] = []
+                prev_kind: str | None = None  # "base" | "more"
+                blank_count = 0
+                for bl in block_lines:
+                    if not bl.strip() and len(bl) <= base_indent:
+                        blank_count += 1
+                        continue
+                    bl_indent = (
+                        len(bl) - len(bl.lstrip(" \t"))
+                        if bl.strip()
+                        else len(bl)
+                    )
+                    if bl_indent > base_indent:
+                        content = bl[base_indent:]
+                        if prev_kind is not None:
+                            out_parts.append("\n" * (blank_count + 1))
+                        out_parts.append(content)
+                        prev_kind = "more"
+                        blank_count = 0
+                    else:
+                        content = bl[base_indent:] if len(bl) >= base_indent else bl.lstrip(" \t")
+                        if prev_kind == "base":
+                            if blank_count > 0:
+                                out_parts.append("\n" * blank_count)
+                            else:
+                                out_parts.append(" ")
+                        elif prev_kind == "more":
+                            out_parts.append("\n" * (blank_count + 1))
+                        out_parts.append(content)
+                        prev_kind = "base"
+                        blank_count = 0
+                return "".join(out_parts), None
+            if val_no_comment.startswith(("*", "&", "!")):
+                return "", "unsupported YAML anchor/alias/tag in `run:` in fallback parser"
+            # Single-line or multiline plain/quoted scalar.
+            raw_first_stripped = _yaml_strip_trailing_comment(decoded[2]).strip()
+            cont_items: list[str | None] = []
+            seen_next_line_value = bool(raw_first_stripped)
+            j = idx + 1
+            while j < len(lines):
+                nxt = lines[j]
+                if not nxt.strip():
+                    cont_items.append(None)
+                    j += 1
+                    continue
+                if not seen_next_line_value and nxt.lstrip().startswith("#"):
+                    # YAML comment lines between `run:` and a next-line value are
+                    # valid at any indentation (including aligned with `run:` or col 0).
+                    j += 1
+                    continue
+                nxt_indent = len(nxt) - len(nxt.lstrip(" \t"))
+                if nxt_indent <= 8:
+                    break
+                seen_next_line_value = True
+                cont_items.append(nxt.strip())
+                j += 1
+            while cont_items and cont_items[-1] is None:
+                cont_items.pop()
+            if cont_items:
+                raw_first = _yaml_strip_trailing_comment(decoded[2]).strip()
+                if not raw_first:
+                    # Value starts on a subsequent indented line (`run:\n  ...`);
+                    # skip YAML comment-only lines before inspecting the value.
+                    filtered_items: list[str | None] = []
+                    seen_value = False
+                    for item in cont_items:
+                        if item is None:
+                            if seen_value:
+                                filtered_items.append(None)
+                        elif not seen_value and item.startswith("#"):
+                            continue
+                        else:
+                            seen_value = True
+                            filtered_items.append(item)
+                    if not filtered_items:
+                        return "", None
+                    first_non_blank = next((c for c in filtered_items if c is not None), "")
+                    if first_non_blank.startswith(("'", '"', "*", "&", "!", "|", ">")):
+                        return "", "unsupported next-line block/tagged/anchored/quoted `run:` scalar in fallback parser"
+                    parts: list[str] = []
+                    blank_run = 0
+                    for item in filtered_items:
+                        if item is None:
+                            if parts:
+                                blank_run += 1
+                        else:
+                            if parts:
+                                if blank_run > 0:
+                                    parts.append("\n" * blank_run)
+                                    blank_run = 0
+                                else:
+                                    parts.append(" ")
+                            parts.append(item)
+                    return "".join(parts), None
+                if raw_first.startswith(("'", '"')):
+                    return "", "unsupported multiline quoted `run:` scalar in fallback parser"
+                first_scalar = _decode_yaml_value_scalar(decoded[2])
+                if first_scalar is None:
+                    return "", "unparseable multiline `run:` scalar in fallback parser"
+                # YAML 1.2.2 §6.5: `k` blank lines in a plain multiline scalar emit `k` newlines;
+                # adjacent non-blank lines fold with a single space.
+                parts = [first_scalar]
+                blank_run = 0
+                for item in cont_items:
+                    if item is None:
+                        blank_run += 1
+                    else:
+                        if blank_run > 0:
+                            parts.append("\n" * blank_run)
+                            blank_run = 0
+                        else:
+                            parts.append(" ")
+                        parts.append(item)
+                return "".join(parts), None
+            scalar = _decode_yaml_value_scalar(decoded[2])
+            if scalar is None:
+                return "", "unparseable `run:` scalar in fallback parser"
+            return scalar, None
+    return "", None
+
+
+def _extract_job_steps_structural(job_body: str) -> tuple[list[str], list[str]]:
+    """Extract raw step YAML chunks in fallback mode, normalizing list indent and rejecting unsupported forms."""
+
+    lines = job_body.splitlines()
+    indexed = _iter_non_block_scalar_lines_indexed(lines)
+    steps_start = None
+    steps_end = len(lines)
+    layout_errors: list[str] = []
+    for idx, (indent, line) in indexed:
+        if steps_start is None:
+            decoded = _decode_mapping_line(line)
+            if decoded is not None and indent == 4 and decoded[1] == "steps":
+                inline_val = _yaml_strip_trailing_comment(decoded[2]).strip()
+                if inline_val:
+                    layout_errors.append(
+                        f"unsupported inline `steps:` syntax in fallback parser ({inline_val!r})"
+                    )
+                    return [], layout_errors
+                steps_start = idx + 1
+        elif indent < 4 or (indent == 4 and not re.match(r"^    -(?:[ \t]|$)", line)):
+            steps_end = idx
+            break
+    if steps_start is None:
+        return [], layout_errors
+    step_lines = lines[steps_start:steps_end]
+    non_block = _iter_non_block_scalar_lines_indexed(step_lines)
+    item_indent = None
+    if non_block:
+        first_indent, first_line = non_block[0][1]
+        if not re.match(r"^-(?:[ \t]|$)", first_line.lstrip(" \t")):
+            layout_errors.append(
+                f"unsupported non-sequence `steps:` content in fallback parser: {first_line.strip()!r}"
+            )
+            return [], layout_errors
+        item_indent = first_indent
+    if item_indent is None:
+        return [], layout_errors
+    step_starts: list[int] = []
+    for idx, (indent, line) in non_block:
+        stripped = line.lstrip(" \t")
+        if indent == item_indent and re.match(r"^-(?:[ \t]|$)", stripped):
+            if stripped == "-" or not re.match(r"^- [^ \t]", stripped):
+                layout_errors.append(
+                    "unsupported bare-dash or non-single-space step syntax in fallback parser"
+                )
+            elif re.match(r"^- [&*!{]", stripped):
+                layout_errors.append(
+                    "unsupported flow-style, anchored, tagged, or aliased step syntax in fallback parser"
+                )
+            else:
+                step_starts.append(idx)
+    if layout_errors:
+        return [], layout_errors
+    delta = 6 - item_indent
+    chunks: list[str] = []
+    for i in range(len(step_starts)):
+        end = step_starts[i + 1] if i + 1 < len(step_starts) else len(step_lines)
+        raw_chunk = step_lines[step_starts[i] : end]
+        normalized: list[str] = []
+        for ln in raw_chunk:
+            if not ln:
+                normalized.append(ln)
+            elif delta > 0:
+                # Shift whitespace-only lines too so relative indentation inside
+                # folded/literal blocks stays exact.
+                normalized.append((" " * delta) + ln)
+            elif delta < 0:
+                trim = -delta
+                if ln.startswith(" " * trim):
+                    normalized.append(ln[trim:])
+                elif not ln.strip():
+                    normalized.append("")
+                elif ln.lstrip().startswith("#"):
+                    normalized.append(ln)
+                else:
+                    layout_errors.append(
+                        "inconsistent step indentation in fallback parser"
+                    )
+                    return [], layout_errors
+            else:
+                normalized.append(ln)
+        chunks.append("\n".join(normalized) + "\n")
+    return chunks, layout_errors
+
+
+def _check_shared_key_value(
+    filename: str,
+    job_id: str,
+    uses: str,
+    with_map: dict[str, object],
+    discovered: set[tuple[str, str]],
+    errors: list[str],
+) -> None:
+    """Compute effective Swatinem/rust-cache@d1527c8 namespace and discover `ci-debug` members."""
+
+    # GitHub Actions normalizes action input names case-insensitively (`INPUT_<UPPER>`).
+    norm_with = {str(k).strip().lower(): v for k, v in with_map.items()}
+    sk = _normalize_yaml_scalar(norm_with.get("shared-key")).strip()
+    if _is_setup_rust_ci_action(uses):
+        if "${{" in sk:
+            errors.append(
+                f"{filename}/{job_id} setup-rust-ci step must use a literal "
+                f"shared-key (got {sk!r})"
+            )
+        if not sk:
+            # setup-rust-ci passes shared-key directly to Swatinem/rust-cache; when
+            # omitted/empty, rust-cache falls back to `v0-rust-{job_id}`.
+            if f"v0-rust-{job_id}" == "v0-rust-ci-debug":
+                discovered.add((filename, job_id))
+            errors.append(
+                f"{filename}/{job_id} setup-rust-ci step must declare a non-empty shared-key"
+            )
+            return
+        if sk == "ci-debug":
+            discovered.add((filename, job_id))
+        return
+
+    # Direct Swatinem/rust-cache@d1527c8 (src/config.ts lines 64-81):
+    #   prefixKey = getInput("prefix-key") || "v0-rust"
+    #   sharedKey = getInput("shared-key")
+    #   if sharedKey:
+    #     namespace = f"{prefixKey}-{sharedKey}"
+    #   else:
+    #     parts = [prefixKey]
+    #     if key: parts.append(key)
+    #     addJobIdKey = getInput("add-job-id-key") (defaults to "true" when omitted)
+    #     if addJobIdKey.lower() == "true": parts.append(job_id)
+    #     namespace = "-".join(parts)
+    prefix_key = _normalize_yaml_scalar(norm_with.get("prefix-key")).strip() or "v0-rust"
+    bare_key = _normalize_yaml_scalar(norm_with.get("key")).strip()
+    has_add_job_id = "add-job-id-key" in norm_with
+    raw_add_job_id = (
+        _normalize_yaml_scalar(norm_with.get("add-job-id-key")).strip()
+        if has_add_job_id
+        else "true"
+    )
+    if "${{" in sk and not sk.startswith(_CI_DEBUG_ALLOWED_DIRECT_COMPUTED_KEY_PREFIXES):
+        errors.append(
+            f"{filename}/{job_id} Swatinem/rust-cache step uses an unadmitted "
+            f"computed shared-key that could alias ci-debug (got {sk!r})"
+        )
+    if "${{" in prefix_key or (not sk and ("${{" in bare_key or "${{" in raw_add_job_id)):
+        errors.append(
+            f"{filename}/{job_id} Swatinem/rust-cache step uses an unadmitted "
+            f"computed prefix-key/key/add-job-id-key that could alias ci-debug"
+        )
+    if sk:
+        namespace = f"{prefix_key}-{sk}"
+    else:
+        parts = [prefix_key]
+        if bare_key:
+            parts.append(bare_key)
+        if raw_add_job_id.lower() == "true":
+            parts.append(job_id)
+        namespace = "-".join(parts)
+    if namespace == "v0-rust-ci-debug":
+        discovered.add((filename, job_id))
+
+
+def _is_plain_yaml_scalar_start(val: str) -> bool:
+    """Return True if `val` begins a YAML 1.2 plain scalar (`-`/`?` are indicators only before space/EOL)."""
+
+    if not val:
+        return False
+    if val.startswith(("{", "[", "'", '"', "|", ">", "&", "*", "!")):
+        return False
+    if val in ("-", "?") or val.startswith(("- ", "-\t", "? ", "?\t")):
+        return False
+    return True
+
+
+def _has_unsupported_fallback_yaml_syntax(workflow_text: str) -> str | None:
+    """Reject explicit `?` YAML mapping keys and key-level anchors/aliases/tags in fallback mode."""
+
+    lines = workflow_text.splitlines()
+    plain_scalar_indent: int | None = None
+    pending_key_indent: int | None = None
+    for _idx, (indent, line) in _iter_non_block_scalar_lines_indexed(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if plain_scalar_indent is not None:
+            if indent > plain_scalar_indent:
+                # Continuation line of a multiline plain scalar (e.g. wrapped `name:`);
+                # `{` or `?` here is plain text, not a YAML flow opener or explicit key.
+                continue
+            plain_scalar_indent = None
+        if pending_key_indent is not None and indent <= pending_key_indent:
+            pending_key_indent = None
+        # Reject block-level explicit `?` keys (`? foo`, `- ? foo`) and key-level
+        # node properties (`&a run:`, `*a`, `!!str steps:`) while allowing plain
+        # sequence items like `- ?literal`.
+        if re.match(r"^[ \t]*(?:-[ \t]+)?(?:[&!*]|\?(?:[ \t]+|$))", line):
+            return f"unsupported explicit YAML key or node property in fallback parser: {line.strip()!r}"
+        # Reject inline flow explicit keys like `on: { ? workflow_dispatch : {} }`
+        # only when `{` opens an actual YAML flow mapping at a node boundary
+        # (not inside plain scalar text such as `name: CI matrix - {build, ? debug}`).
+        in_quote: str | None = None
+        brace_depth = 0
+        bracket_depth = 0
+        for pos, ch in enumerate(line):
+            if in_quote is None:
+                if ch == "#":
+                    break
+                if ch in ("'", '"'):
+                    in_quote = ch
+                elif ch in ("{", "["):
+                    before = line[:pos].rstrip(" \t")
+                    is_node_start = (
+                        brace_depth > 0
+                        or bracket_depth > 0
+                        or not before
+                        or bool(re.match(r"^[ \t]*-(?:[ \t]+-)*$", before))
+                        or (
+                            before.endswith(":")
+                            and ": " not in before[:-1]
+                            and ":\t" not in before[:-1]
+                        )
+                    )
+                    if is_node_start:
+                        if ch == "{":
+                            brace_depth += 1
+                            rest = line[pos + 1 :].lstrip(" \t")
+                            if rest == "?" or rest.startswith(("? ", "?\t")):
+                                return f"unsupported flow explicit `?` YAML key in fallback parser: {line.strip()!r}"
+                        else:
+                            bracket_depth += 1
+                elif ch == "}" and brace_depth > 0:
+                    brace_depth -= 1
+                elif ch == "]" and bracket_depth > 0:
+                    bracket_depth -= 1
+                elif ch == "," and brace_depth > 0:
+                    rest = line[pos + 1 :].lstrip(" \t")
+                    if rest == "?" or rest.startswith(("? ", "?\t")):
+                        return f"unsupported flow explicit `?` YAML key in fallback parser: {line.strip()!r}"
+            elif ch == in_quote:
+                if in_quote == '"':
+                    bs = 0
+                    k = pos - 1
+                    while k >= 0 and line[k] == "\\":
+                        bs += 1
+                        k -= 1
+                    if bs % 2 == 1:
+                        continue
+                in_quote = None
+        if brace_depth == 0 and bracket_depth == 0:
+            decoded_map = _decode_mapping_line(line)
+            if decoded_map is not None:
+                key_indent, _key, raw_val = decoded_map
+                val_stripped = _yaml_strip_trailing_comment(raw_val).strip()
+                if not val_stripped:
+                    pending_key_indent = key_indent
+                elif _is_plain_yaml_scalar_start(val_stripped):
+                    plain_scalar_indent = key_indent
+                    pending_key_indent = None
+                else:
+                    pending_key_indent = None
+            elif re.match(r"^[ \t]*-(?:[ \t]+|$)", line):
+                dash_m = re.match(r"^(?P<lead>[ \t]*)-(?P<rest>.*)$", line)
+                if dash_m:
+                    seq_indent = len(dash_m.group("lead"))
+                    val_stripped = _yaml_strip_trailing_comment(dash_m.group("rest")).strip()
+                    if not val_stripped:
+                        pending_key_indent = seq_indent
+                    elif _is_plain_yaml_scalar_start(val_stripped):
+                        plain_scalar_indent = seq_indent
+                        pending_key_indent = None
+                    else:
+                        pending_key_indent = None
+            elif (
+                pending_key_indent is not None
+                and indent > pending_key_indent
+                and _is_plain_yaml_scalar_start(stripped)
+            ):
+                plain_scalar_indent = pending_key_indent
+                pending_key_indent = None
+    return None
+
+
+def _discover_ci_debug_jobs(
+    workflow_text: str,
+    filename: str,
+) -> tuple[set[tuple[str, str]], list[str]]:
+    """Return `((filename, job_id) set, errors)` for cache action steps using `shared-key: ci-debug`."""
+
+    parsed, yaml_avail, yaml_err = _try_yaml_base_load(workflow_text)
+    discovered: set[tuple[str, str]] = set()
+    errors: list[str] = []
+    if yaml_avail:
+        if yaml_err is not None:
+            return discovered, [f"{filename} has invalid YAML: {yaml_err}"]
+        if not isinstance(parsed, dict):
+            return discovered, [f"{filename} did not parse as a workflow mapping"]
+        jobs = parsed.get("jobs")
+        if isinstance(jobs, dict):
+            for job_id, job_obj in jobs.items():
+                if not isinstance(job_obj, dict):
+                    continue
+                steps = job_obj.get("steps")
+                if not isinstance(steps, list):
+                    continue
+                for step in steps:
+                    if not isinstance(step, dict):
+                        continue
+                    uses = _normalize_yaml_scalar(step.get("uses"))
+                    if not _is_rust_cache_action(uses):
+                        continue
+                    with_obj = step.get("with")
+                    if with_obj is None:
+                        with_obj = {}
+                    elif not isinstance(with_obj, dict):
+                        errors.append(
+                            f"{filename}/{job_id} rust-cache step has non-mapping `with:`"
+                        )
+                        continue
+                    _check_shared_key_value(
+                        filename,
+                        str(job_id),
+                        uses,
+                        with_obj,
+                        discovered,
+                        errors,
+                    )
+        return discovered, errors
+
+    unsupported_err = _has_unsupported_fallback_yaml_syntax(workflow_text)
+    if unsupported_err is not None:
+        errors.append(f"{filename}: {unsupported_err}")
+    fallback_jobs, job_layout_errs = _iter_fallback_jobs(workflow_text)
+    for jerr in job_layout_errs:
+        errors.append(f"{filename}: {jerr}")
+    for job_id, body in fallback_jobs:
+        raw_steps, step_layout_errs = _extract_job_steps_structural(body)
+        for layout_err in step_layout_errs:
+            errors.append(f"{filename}/{job_id}: {layout_err}")
+        for step in raw_steps:
+            first_nonempty = next((ln for ln in step.splitlines() if ln.strip()), "")
+            if YAML_FLOW_STEP.match(first_nonempty):
+                errors.append(
+                    f"{filename}/{job_id} uses unsupported flow-style step syntax in fallback parser"
+                )
+                continue
+            _keys, scalars, step_err = _extract_step_keys_and_scalars(step)
+            uses = scalars.get("uses", "").strip()
+            if step_err is not None:
+                # Classify only from a step-level `uses:` line, never from unrelated `env:`/`run:` text.
+                uses_match = re.search(
+                    r"(?m)^(?:      - |        )uses:[ \t]*(.+)$",
+                    step,
+                )
+                if uses_match:
+                    raw_uses = _yaml_strip_trailing_comment(uses_match.group(1)).strip()
+                    if YAML_BLOCK_SCALAR.match(raw_uses) or raw_uses.startswith(("*", "&", "!")):
+                        errors.append(
+                            f"{filename}/{job_id} uses unsupported block-scalar or anchor/alias/tag `uses:` in fallback parser"
+                        )
+                        continue
+                    cand_uses = _decode_yaml_value_scalar(uses_match.group(1)) or ""
+                    if _is_rust_cache_action(cand_uses):
+                        errors.append(
+                            f"{filename}/{job_id} has unparseable rust-cache step: {step_err}"
+                        )
+                continue
+            if uses.startswith(("*", "&", "!")):
+                errors.append(
+                    f"{filename}/{job_id} uses unsupported YAML anchor/alias/tag in `uses:`"
+                )
+                continue
+            if not uses and _keys is not None and "uses" in _keys:
+                errors.append(
+                    f"{filename}/{job_id} uses unsupported non-scalar `uses:` in fallback parser"
+                )
+                continue
+            if not _is_rust_cache_action(uses):
+                continue
+            with_map, with_err = _extract_step_with_decoded(step)
+            if with_err is not None:
+                errors.append(
+                    f"{filename}/{job_id} rust-cache step has invalid `with:` mapping: {with_err}"
+                )
+                continue
+            _check_shared_key_value(
+                filename,
+                job_id,
+                uses,
+                with_map,
+                discovered,
+                errors,
+            )
+    return discovered, errors
+
+
+def check_ci_debug_lane_profile_uniformity(
+    ci_workflow: str,
+    ambient_workflow: str,
+    failures: list[str],
+    extra_workflows: dict[str, str] | None = None,
+) -> None:
+    """Verify every `ci-debug` rust-cache lane member compiles with uniform debug=0 profile env.
+
+    Scope: prevents accidental cache-key or Cargo-fingerprint drift across the
+    shared `ci-debug` lane (workflow/job/step `env:` plus direct shell
+    assignments, `export`/`unset`/`env`, `GITHUB_ENV` writes, and `cargo --config`).
+    Deliberately out of scope as a drift guard (not a hostile-PR sandbox):
+    subshell/command-substitution wrappers (`$(cargo ...)` / `bash -c ...`),
+    custom `shell:` overrides, or runtime edits to `~/.cargo/config.toml`.
+    """
+
+    workflows: dict[str, str] = {
+        "ci.yml": ci_workflow,
+        "ambient-host-udp-live.yml": ambient_workflow,
+    }
+    if extra_workflows:
+        for fn, text in extra_workflows.items():
+            if fn not in workflows:
+                workflows[fn] = text
+
+    discovered: set[tuple[str, str]] = set()
+    for filename, text in sorted(workflows.items()):
+        found, disc_errs = _discover_ci_debug_jobs(text, filename)
+        discovered |= found
+        failures.extend(disc_errs)
+
+    expected_set = set(CI_DEBUG_LANE_JOBS)
+    require(
+        discovered == expected_set,
+        f"ci-debug rust-cache lane job inventory drifted: discovered={sorted(discovered)!r}, "
+        f"expected={sorted(expected_set)!r}",
+        failures,
+    )
+
+    workflow_envs: dict[str, dict[str, str]] = {}
+    parsed_workflows: dict[str, dict[str, object] | None] = {}
+    fallback_jobs_by_wf: dict[str, dict[str, str]] = {}
+    lane_filenames = {filename for filename, _ in CI_DEBUG_LANE_JOBS}
+    for filename in sorted(lane_filenames):
+        wf_text = workflows[filename]
+        parsed_wf, yaml_avail, yaml_err = _try_yaml_base_load(wf_text)
+        if yaml_avail and yaml_err is None and isinstance(parsed_wf, dict):
+            parsed_workflows[filename] = parsed_wf
+        else:
+            parsed_workflows[filename] = None
+            fb_jobs, fb_job_errs = _iter_fallback_jobs(wf_text)
+            for jerr in fb_job_errs:
+                failures.append(f"{filename}: {jerr}")
+            fallback_jobs_by_wf[filename] = dict(fb_jobs)
+        wf_env, wf_err = _extract_env_mapping(
+            wf_text,
+            key_indent=0,
+            prefixes=_CI_DEBUG_HASHED_ENV_PREFIXES,
+        )
+        require(
+            wf_err is None,
+            f"{filename} has invalid top-level env: {wf_err}",
+            failures,
+        )
+        disallowed_wf_keys = sorted(
+            k for k in wf_env if k not in _CI_DEBUG_ALLOWED_WORKFLOW_ENV_KEYS
+        )
+        require(
+            not disallowed_wf_keys,
+            f"{filename} top-level env must not set hashed Cargo/Rust/C build overrides "
+            f"for ci-debug lane jobs (found {disallowed_wf_keys!r})",
+            failures,
+        )
+        workflow_envs[filename] = wf_env
+
+    for filename, job_id in CI_DEBUG_LANE_JOBS:
+        parsed_wf = parsed_workflows.get(filename)
+        if parsed_wf is not None:
+            jobs_obj = parsed_wf.get("jobs")
+            job_obj = jobs_obj.get(job_id) if isinstance(jobs_obj, dict) else None
+            require(
+                isinstance(job_obj, dict),
+                f"ci-debug lane member {filename}/{job_id} is missing",
+                failures,
+            )
+            if not isinstance(job_obj, dict):
+                continue
+            raw_job_env = job_obj.get("env")
+            if raw_job_env is None:
+                job_env: dict[str, str] = {}
+                env_err: str | None = None
+            elif not isinstance(raw_job_env, dict):
+                job_env = {}
+                env_err = "`env:` must be a mapping"
+            else:
+                job_env = {
+                    str(k): _normalize_yaml_scalar(v)
+                    for k, v in raw_job_env.items()
+                    if str(k).startswith(_CI_DEBUG_HASHED_ENV_PREFIXES)
+                }
+                env_err = None
+            parsed_steps = job_obj.get("steps")
+            require(
+                isinstance(parsed_steps, list) and len(parsed_steps) > 0,
+                f"ci-debug lane member {filename}/{job_id} must define non-empty steps",
+                failures,
+            )
+            step_records: list[tuple[str, dict[str, str], str | None, str]] = []
+            if isinstance(parsed_steps, list):
+                for st in parsed_steps:
+                    if not isinstance(st, dict):
+                        step_records.append(("", {}, "step is not a mapping", ""))
+                        continue
+                    uses = _normalize_yaml_scalar(st.get("uses"))
+                    raw_st_env = st.get("env")
+                    if raw_st_env is None:
+                        st_env: dict[str, str] = {}
+                        st_env_err: str | None = None
+                    elif not isinstance(raw_st_env, dict):
+                        st_env = {}
+                        st_env_err = "`env:` must be a mapping"
+                    else:
+                        st_env = {
+                            str(k): _normalize_yaml_scalar(v)
+                            for k, v in raw_st_env.items()
+                        }
+                        st_env_err = None
+                    raw_run = st.get("run")
+                    run_text = raw_run if isinstance(raw_run, str) else ""
+                    step_records.append((uses, st_env, st_env_err, run_text))
+        else:
+            body = fallback_jobs_by_wf.get(filename, {}).get(job_id, "")
+            require(
+                bool(body),
+                f"ci-debug lane member {filename}/{job_id} is missing",
+                failures,
+            )
+            if not body:
+                continue
+            job_env, env_err = _extract_env_mapping(
+                body,
+                key_indent=4,
+                prefixes=_CI_DEBUG_HASHED_ENV_PREFIXES,
+            )
+            raw_steps, step_layout_errs = _extract_job_steps_structural(body)
+            for layout_err in step_layout_errs:
+                failures.append(f"ci-debug lane member {filename}/{job_id}: {layout_err}")
+            require(
+                len(raw_steps) > 0,
+                f"ci-debug lane member {filename}/{job_id} must define non-empty steps",
+                failures,
+            )
+            step_records = []
+            for step_idx, step in enumerate(raw_steps):
+                _k, scalars, se = _extract_step_keys_and_scalars(step)
+                if se is not None:
+                    failures.append(
+                        f"ci-debug lane member {filename}/{job_id} step #{step_idx} has unparseable step YAML: {se}"
+                    )
+                uses = scalars.get("uses", "")
+                st_env, st_env_err = _extract_step_submap(step, "env")
+                run_text, run_err = _extract_step_run_text_fallback(step)
+                if run_err is not None:
+                    failures.append(f"ci-debug lane member {filename}/{job_id}: {run_err}")
+                step_records.append((uses, st_env, st_env_err, run_text))
+
+        require(
+            env_err is None,
+            f"ci-debug lane member {filename}/{job_id} has invalid job env: {env_err}",
+            failures,
+        )
+        effective_env = {**workflow_envs.get(filename, {}), **job_env}
+        require(
+            effective_env == EXPECTED_CI_DEBUG_EFFECTIVE_ENV,
+            f"ci-debug lane member {filename}/{job_id} must declare uniform fast-build profile env "
+            f"{EXPECTED_CI_DEBUG_EFFECTIVE_ENV!r} (got {effective_env!r})",
+            failures,
+        )
+        for step_idx, (uses, step_env, step_env_err, run_text) in enumerate(step_records):
+            require(
+                step_env_err is None,
+                f"ci-debug lane member {filename}/{job_id} step #{step_idx} has invalid step env: {step_env_err}",
+                failures,
+            )
+            allowed_keys = (
+                frozenset() if _is_rust_cache_action(uses) else _CI_DEBUG_ALLOWED_STEP_ENV_KEYS
+            )
+            disallowed_step_env = sorted(
+                k
+                for k in step_env
+                if k.startswith(_CI_DEBUG_HASHED_ENV_PREFIXES)
+                and k not in allowed_keys
+            )
+            require(
+                not disallowed_step_env,
+                f"ci-debug lane member {filename}/{job_id} must not override Cargo/Rust/C build/profile "
+                f"env at step level (found {disallowed_step_env!r})",
+                failures,
+            )
+            if run_text:
+                require(
+                    not _step_run_has_ci_debug_override(run_text),
+                    f"ci-debug lane member {filename}/{job_id} must not override Cargo/Rust/C build/profile "
+                    "settings via shell exports, inline assignments, GITHUB_ENV, or --config",
+                    failures,
+                )
 
 
 def check_docs_and_coverage(failures: list[str]) -> None:
@@ -9833,6 +12262,1291 @@ def self_test() -> int:
         failures,
     )
 
+    ci_live_text = read_pinned(CI_WORKFLOW)
+    ambient_live_text = read_pinned(AMBIENT_WORKFLOW)
+    extra_live_workflows = _load_extra_workflow_texts()
+
+    def _run_ci_debug_self_tests(mode_label: str) -> None:
+        ci_debug_ok: list[str] = []
+        check_ci_debug_lane_profile_uniformity(
+            ci_live_text,
+            ambient_live_text,
+            ci_debug_ok,
+            extra_workflows=extra_live_workflows,
+        )
+        require(
+            not ci_debug_ok,
+            f"self-test ({mode_label}): checked-in ci-debug lane uniformity must pass (got {ci_debug_ok!r})",
+            failures,
+        )
+        drifted_ci = ci_live_text.replace(
+            '      CARGO_PROFILE_DEV_DEBUG: "0"\n',
+            '      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"\n',
+            1,
+        )
+        drifted_ci_errs: list[str] = []
+        check_ci_debug_lane_profile_uniformity(
+            drifted_ci, ambient_live_text, drifted_ci_errs
+        )
+        require(
+            drifted_ci != ci_live_text
+            and any("uniform fast-build profile env" in item for item in drifted_ci_errs),
+            f"self-test ({mode_label}): drifting CARGO_PROFILE_DEV_DEBUG on a ci.yml ci-debug member must fail",
+            failures,
+        )
+        drifted_ambient = ambient_live_text.replace(
+            '      CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: "off"\n',
+            "",
+            1,
+        )
+        drifted_ambient_errs: list[str] = []
+        check_ci_debug_lane_profile_uniformity(
+            ci_live_text, drifted_ambient, drifted_ambient_errs
+        )
+        require(
+            drifted_ambient != ambient_live_text
+            and any(
+                "ambient-host-udp-live.yml/ambient-host-udp-live must declare" in item
+                for item in drifted_ambient_errs
+            ),
+            f"self-test ({mode_label}): missing CARGO_PROFILE_TEST_SPLIT_DEBUGINFO on ambient-host-udp-live must fail",
+            failures,
+        )
+        wf_override_ci = ci_live_text.replace(
+            '  CARGO_HTTP_MULTIPLEXING: "false"\n',
+            '  CARGO_HTTP_MULTIPLEXING: "false"\n  CARGO_INCREMENTAL: "1"\n',
+            1,
+        )
+        wf_override_errs: list[str] = []
+        check_ci_debug_lane_profile_uniformity(
+            wf_override_ci, ambient_live_text, wf_override_errs
+        )
+        require(
+            wf_override_ci != ci_live_text
+            and any("top-level env must not set" in item for item in wf_override_errs),
+            f"self-test ({mode_label}): workflow-level CARGO_INCREMENTAL must fail",
+            failures,
+        )
+        step_override_ci = ci_live_text.replace(
+            "      - name: Build integration tests archive\n",
+            '      - name: Build integration tests archive\n        env:\n          CARGO_PROFILE_TEST_DEBUG: "1"\n',
+            1,
+        )
+        step_override_errs: list[str] = []
+        check_ci_debug_lane_profile_uniformity(
+            step_override_ci, ambient_live_text, step_override_errs
+        )
+        require(
+            step_override_ci != ci_live_text
+            and any("at step level" in item for item in step_override_errs),
+            f"self-test ({mode_label}): step-level CARGO_PROFILE_TEST_DEBUG override must fail",
+            failures,
+        )
+        shell_config_ci = ci_live_text.replace(
+            "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
+            "        run: cargo test --no-run --config profile.dev.debug=2 --test integration_tests\n",
+            1,
+        )
+        shell_config_errs: list[str] = []
+        check_ci_debug_lane_profile_uniformity(
+            shell_config_ci, ambient_live_text, shell_config_errs
+        )
+        require(
+            shell_config_ci != ci_live_text
+            and any("--config" in item for item in shell_config_errs),
+            f"self-test ({mode_label}): shell --config profile override must fail",
+            failures,
+        )
+        github_env_ci = ci_live_text.replace(
+            "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
+            '        run: echo CARGO_PROFILE_DEV_DEBUG=2 >> "$GITHUB_ENV"\n',
+            1,
+        )
+        github_env_errs: list[str] = []
+        check_ci_debug_lane_profile_uniformity(
+            github_env_ci, ambient_live_text, github_env_errs
+        )
+        require(
+            github_env_ci != ci_live_text
+            and any("GITHUB_ENV" in item for item in github_env_errs),
+            f"self-test ({mode_label}): GITHUB_ENV profile override must fail",
+            failures,
+        )
+        extra_flow_wf = (
+            "name: Extra\non:\n  workflow_dispatch:\njobs:\n"
+            "  extra-debug:\n"
+            "    runs-on: ubuntu-26.04\n"
+            "    steps:\n"
+            "      - uses: ./.github/actions/setup-rust-ci\n"
+            "        with: {shared-key: ci-debug}\n"
+        )
+        extra_flow_errs: list[str] = []
+        check_ci_debug_lane_profile_uniformity(
+            ci_live_text,
+            ambient_live_text,
+            extra_flow_errs,
+            extra_workflows={"extra.yml": extra_flow_wf},
+        )
+        require(
+            any("inventory drifted" in item for item in extra_flow_errs),
+            f"self-test ({mode_label}): inline flow `with: {{shared-key: ci-debug}}` consumer must be discovered",
+            failures,
+        )
+        computed_key_wf = (
+            "name: Computed\non:\n  workflow_dispatch:\njobs:\n"
+            "  computed-debug:\n"
+            "    runs-on: ubuntu-26.04\n"
+            "    steps:\n"
+            "      - uses: ./.github/actions/setup-rust-ci\n"
+            "        with:\n"
+            "          shared-key: ${{ matrix.lane }}\n"
+        )
+        computed_key_errs: list[str] = []
+        check_ci_debug_lane_profile_uniformity(
+            ci_live_text,
+            ambient_live_text,
+            computed_key_errs,
+            extra_workflows={"computed.yml": computed_key_wf},
+        )
+        require(
+            any("must use a literal shared-key" in item for item in computed_key_errs),
+            f"self-test ({mode_label}): computed setup-rust-ci shared-key must fail",
+            failures,
+        )
+        heredoc_and_other_action_wf = (
+            "name: Unrelated\non:\n  workflow_dispatch:\njobs:\n"
+            "  heredoc-job:\n"
+            "    runs-on: ubuntu-26.04\n"
+            "    steps:\n"
+            "      - name: Print example\n"
+            "        run: |\n"
+            "          cat <<'EOF'\n"
+            "          shared-key: ci-debug\n"
+            "          EOF\n"
+            "      - uses: example/unrelated-action@0123456789abcdef0123456789abcdef01234567\n"
+            "        with:\n"
+            "          shared-key: ci-debug\n"
+        )
+        unrelated_errs: list[str] = []
+        check_ci_debug_lane_profile_uniformity(
+            ci_live_text,
+            ambient_live_text,
+            unrelated_errs,
+            extra_workflows={"unrelated.yml": heredoc_and_other_action_wf},
+        )
+        require(
+            not unrelated_errs,
+            f"self-test ({mode_label}): shell heredoc and unrelated action shared-key must not be counted (got {unrelated_errs!r})",
+            failures,
+        )
+        # Round 3 regressions: CARGO_TERM_COLOR drift, RUST_BACKTRACE on cache step,
+        # trailing comment on `steps:`, quoted job IDs + whitespace/case/slash variants,
+        # printf GITHUB_ENV / RUSTC= / quoted '--config', direct computed key, multiline env text.
+        missing_color_ambient = ambient_live_text.replace(
+            "      CARGO_TERM_COLOR: always\n", "", 1
+        )
+        missing_color_errs: list[str] = []
+        check_ci_debug_lane_profile_uniformity(
+            ci_live_text, missing_color_ambient, missing_color_errs
+        )
+        require(
+            missing_color_ambient != ambient_live_text
+            and any(
+                "ambient-host-udp-live.yml/ambient-host-udp-live must declare" in item
+                for item in missing_color_errs
+            ),
+            f"self-test ({mode_label}): missing CARGO_TERM_COLOR on ambient-host-udp-live must fail",
+            failures,
+        )
+        backtrace_on_cache = ambient_live_text.replace(
+            "      - uses: ./.github/actions/setup-rust-ci\n",
+            '      - uses: ./.github/actions/setup-rust-ci\n        env:\n          RUST_BACKTRACE: "1"\n',
+            1,
+        )
+        backtrace_on_cache_errs: list[str] = []
+        check_ci_debug_lane_profile_uniformity(
+            ci_live_text, backtrace_on_cache, backtrace_on_cache_errs
+        )
+        require(
+            backtrace_on_cache != ambient_live_text
+            and any("at step level" in item for item in backtrace_on_cache_errs),
+            f"self-test ({mode_label}): RUST_BACKTRACE on rust-cache step must fail",
+            failures,
+        )
+        commented_steps_ambient = ambient_live_text.replace(
+            "    steps:\n", "    steps: # trailing comment\n", 1
+        ).replace(
+            "      - name: Build live test binaries\n",
+            '      - name: Build live test binaries\n        env:\n          CARGO_PROFILE_DEV_DEBUG: "2"\n',
+            1,
+        )
+        commented_steps_errs: list[str] = []
+        check_ci_debug_lane_profile_uniformity(
+            ci_live_text, commented_steps_ambient, commented_steps_errs
+        )
+        require(
+            any("at step level" in item for item in commented_steps_errs),
+            f"self-test ({mode_label}): trailing comment on steps: must not bypass step validation",
+            failures,
+        )
+        quoted_and_trimmed_wf = (
+            "name: Quoted\non:\n  workflow_dispatch:\njobs:\n"
+            '  "extra-quoted": # comment\n'
+            "    runs-on: ubuntu-26.04\n"
+            "    steps: # comment\n"
+            "      - uses: ./.github/actions/setup-rust-ci/\n"
+            '        with: {shared-key: " ci-debug "}\n'
+            "  extra-lower:\n"
+            "    runs-on: ubuntu-26.04\n"
+            "    steps:\n"
+            "      - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0\n"
+            '        with:\n          shared-key: "ci-debug"\n'
+        )
+        quoted_errs: list[str] = []
+        check_ci_debug_lane_profile_uniformity(
+            ci_live_text,
+            ambient_live_text,
+            quoted_errs,
+            extra_workflows={"quoted.yaml": quoted_and_trimmed_wf},
+        )
+        require(
+            any(
+                "('quoted.yaml', 'extra-quoted')" in item
+                and "('quoted.yaml', 'extra-lower')" in item
+                for item in quoted_errs
+            ),
+            f"self-test ({mode_label}): quoted job IDs, trailing slash, case-insensitive rust-cache, and trimmed shared-key must be discovered (got {quoted_errs!r})",
+            failures,
+        )
+        for label, bad_run in (
+            ("printf GITHUB_ENV", 'printf "%s=%s\\n" CARGO_PROFILE_DEV_DEBUG 2 >> "$GITHUB_ENV"'),
+            ("multiline GITHUB_ENV", 'echo "RUSTFLAGS<<EOF" >> "$GITHUB_ENV"'),
+            ("RUST_BACKTRACE GITHUB_ENV", 'echo "RUST_BACKTRACE=1" >> "$GITHUB_ENV"'),
+            ("target CC GITHUB_ENV", 'echo "CC_x86_64_unknown_linux_gnu=clang" >> "$GITHUB_ENV"'),
+            ("inline RUSTC", "RUSTC=rustc cargo test --no-run"),
+            ("inline CXXFLAGS", "CXXFLAGS=-g cargo test --no-run"),
+            ("inline target CC", "CC_x86_64_unknown_linux_gnu=clang cargo test --no-run"),
+            ("unset profile", "unset CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG"),
+            ("env -u profile", "env -u CARGO_PROFILE_TEST_DEBUG cargo test --no-run"),
+            ("env -uVAR compact", "env -uCARGO_PROFILE_DEV_DEBUG cargo test --no-run"),
+            ("path-qualified /usr/bin/env", "/usr/bin/env -uCARGO_PROFILE_DEV_DEBUG cargo test --no-run"),
+            ("env -C override", "env -C /tmp CARGO_PROFILE_DEV_DEBUG=2 cargo test --no-run"),
+            ("env -S split + trailing --config", 'env -S "cargo test --no-run" --config profile.dev.debug=2'),
+            ("env -S attached arg", "env -S'RUSTFLAGS=-Cdebuginfo=2 cargo test --no-run'"),
+            ("env -S GNU underscore separator", r"env -S 'cargo\_test --no-run' --config profile.test.debug=2"),
+            ("env -iv combined clear", "env -iv cargo test --no-run"),
+            ("env -vS combined split", "env -vS 'cargo --config profile.dev.debug=2 test'"),
+            ("env -a argv0 wrapper", "env -a x cargo test --no-run --config profile.dev.debug=2"),
+            ("env --ignore-env prefix", "env --ignore-env cargo test --no-run"),
+            ("env --uns= prefix", "env --uns=CARGO_PROFILE_DEV_DEBUG cargo test --no-run"),
+            ("env --split-str= prefix", "env --split-str='cargo test --no-run --config profile.dev.debug=2'"),
+            ("leading redirection + inline env", ">/dev/null CARGO_PROFILE_DEV_DEBUG=2 cargo test --no-run"),
+            ("2>&1 before cargo --config", "2>&1 cargo test --no-run --config profile.dev.debug=2"),
+            ("spaced 2>& 1 before cargo --config", "2>& 1 cargo test --no-run --config profile.test.debug=2"),
+            ("attached cargo>/dev/null", "cargo>/dev/null test --no-run --config profile.test.debug=2"),
+            ("attached &>/dev/null mid-cargo", "cargo test --no-run&>/dev/null --config profile.test.debug=2"),
+            ("spaced >& /tmp/log before cargo", ">& /tmp/log cargo test --no-run --config profile.dev.debug=2"),
+            ("here-string <<< before cargo", "<<< x cargo test --no-run --config profile.dev.debug=2"),
+            ("here-string <<< -- before --config", "cargo test --no-run <<< -- --config profile.test.debug=2"),
+            ("redirection between env and --unset", "env >/dev/null --unset CARGO_PROFILE_DEV_DEBUG cargo test --no-run"),
+            ("adjacent 2>&1>/dev/null before env --unset", "env 2>&1>/dev/null --unset CARGO_PROFILE_DEV_DEBUG cargo test --no-run"),
+            ("rustup run wrapper", "rustup run stable cargo test --no-run --config profile.test.debug=2"),
+            ("rustup run --install wrapper", "rustup run --install stable cargo test --no-run --config profile.test.debug=2"),
+            ("builtin export", "builtin export CARGO_PROFILE_DEV_DEBUG=2"),
+            ("case arm prefix", "a) CARGO_PROFILE_DEV_DEBUG=2 cargo test --no-run;;"),
+            ("single-line case statement", "case stable in stable) cargo test --no-run --config profile.test.debug=2 ;; esac"),
+            ("tight case arm stable)cargo", "case stable in stable)cargo test --no-run --config profile.test.debug=2 ;; esac"),
+            ("spaced case arm stable ) cargo", "case stable in stable ) cargo test --no-run --config profile.test.debug=2 ;; esac"),
+            ("parenthesized tight case arm (stable)cargo", "case stable in (stable)cargo test --no-run --config profile.test.debug=2 ;; esac"),
+            ("subshell (cargo --config)", "(cargo test --no-run --config profile.test.debug=2)"),
+            ("tight time(cargo --config)", "time(cargo test --no-run --config profile.test.debug=2)"),
+            ("tight if(cargo --config)", "if(cargo test --no-run --config profile.test.debug=2); then :; fi"),
+            ("bare heredoc missing delimiter", "cat <<"),
+            ("missing heredoc delimiter before redirect", "cat << >/dev/null"),
+            ("unclosed single quote fail closed", "echo 'unterminated"),
+            ("function keyword header", "function f() { cargo test --no-run --config profile.test.debug=2; }; f"),
+            ("assignment value ending in paren", "RUSTFLAGS=-L/tmp/dir(1) cargo test --no-run"),
+            ("one-line function body", "f() { cargo test --no-run --config profile.test.debug=2; }; f"),
+            ("named fd {fd}> before inline env", "{fd}>/tmp/x CARGO_PROFILE_DEV_DEBUG=2 cargo test --no-run"),
+            ("quoted > then & cargo", 'echo ">"& cargo test --no-run --config profile.dev.debug=2'),
+            ("2>&1 before inline env", "2>&1 CARGO_PROFILE_DEV_DEBUG=2 cargo test --no-run"),
+            (">&2 before inline env", ">&2 RUSTFLAGS=-g cargo test --no-run"),
+            ("cargo 2>&1 --config", "cargo test --no-run 2>&1 --config profile.dev.debug=2"),
+            (">| clobber redirect before cargo", ">| /tmp/out cargo test --no-run --config profile.dev.debug=2"),
+            ("env -i clear", "env -i cargo test --no-run"),
+            ("sudo -u wrapper", "sudo -u runner cargo test --no-run --config profile.dev.debug=2"),
+            ("timeout wrapper", "timeout 600 cargo test --no-run --config profile.dev.debug=2"),
+            ("if/then keyword cargo", "if ! cargo test --no-run --config profile.dev.debug=2; then exit 1; fi"),
+            ("readonly override", "readonly CARGO_PROFILE_DEV_DEBUG=2"),
+            ("export += append", 'export RUSTFLAGS+=" -Cdebuginfo=2"'),
+            ("inline += append", 'RUSTFLAGS+=" -Cdebuginfo=2" cargo test --no-run'),
+            ("quoted --config", "cargo '--config' profile.dev.debug=2 --version"),
+            ("quoted --config=", 'cargo "--config=profile.dev.debug=2" test --no-run'),
+        ):
+            mut_ci = ci_live_text.replace(
+                "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
+                f"        run: {bad_run}\n",
+                1,
+            )
+            mut_errs: list[str] = []
+            check_ci_debug_lane_profile_uniformity(mut_ci, ambient_live_text, mut_errs)
+            require(
+                mut_ci != ci_live_text
+                and any("GITHUB_ENV, or --config" in item for item in mut_errs),
+                f"self-test ({mode_label}): {label} shell override must fail",
+                failures,
+            )
+        # Verify the real `/usr/bin/time ... cargo test --lib` producer line is guarded.
+        real_time_anchor = 'default-lib.time" cargo test --lib 2>&1'
+        for label, time_replacement in (
+            (
+                "real /usr/bin/time cargo --config",
+                'default-lib.time" cargo test --lib --config profile.dev.debug=2 2>&1',
+            ),
+            (
+                "real /usr/bin/time env CARGO_PROFILE override",
+                'default-lib.time" env CARGO_PROFILE_DEV_DEBUG=2 cargo test --lib 2>&1',
+            ),
+        ):
+            time_ci = ci_live_text.replace(real_time_anchor, time_replacement, 1)
+            time_errs: list[str] = []
+            check_ci_debug_lane_profile_uniformity(time_ci, ambient_live_text, time_errs)
+            require(
+                time_ci != ci_live_text
+                and any("GITHUB_ENV, or --config" in item for item in time_errs),
+                f"self-test ({mode_label}): {label} must fail (got {time_errs!r})",
+                failures,
+            )
+        for label, multiline_run in (
+            (
+                "backslash-continued cargo --config",
+                "        run: |\n"
+                "          cargo nextest archive \\\n"
+                "            --config profile.test.debug=2 \\\n"
+                "            --test integration_tests\n",
+            ),
+            (
+                "split-token backslash cargo --config",
+                "        run: |\n"
+                "          cargo test --no-run --confi\\\n"
+                "          g profile.test.debug=2\n",
+            ),
+            (
+                "comment ending in backslash before cargo --config",
+                "        run: |\n"
+                "          # Cargo configuration \\\n"
+                "          cargo test --no-run --config profile.test.debug=2\n",
+            ),
+            (
+                "trailing comment ending in backslash before cargo --config",
+                "        run: |\n"
+                "          cargo fetch # warm \\\n"
+                "          cargo test --no-run --config profile.test.debug=2\n",
+            ),
+            (
+                "folded YAML cargo --config",
+                "        run: >\n"
+                "          cargo test --no-run\n"
+                "          --config profile.test.debug=2\n",
+            ),
+            (
+                "folded YAML more-indented cargo --config after echo",
+                "        run: >\n"
+                "          echo hi\n"
+                "            cargo test --no-run --config profile.test.debug=2\n",
+            ),
+            (
+                "folded YAML >-2 cargo --config",
+                "        run: >-2\n"
+                "          cargo test --no-run\n"
+                "          --config profile.test.debug=2\n",
+            ),
+            (
+                "literal YAML |-2 cargo --config",
+                "        run: |-2\n"
+                "          cargo test --no-run --config profile.test.debug=2\n",
+            ),
+            (
+                "plain multiline scalar cargo --config",
+                "        run: cargo test --no-run\n"
+                "          --config profile.test.debug=2\n",
+            ),
+            (
+                "literal block preserving relative indent after backslash",
+                "        run: |\n"
+                "          cargo test --no-run\\\n"
+                "            --config profile.test.debug=2\n",
+            ),
+            (
+                "folded block preserving relative indent after backslash",
+                "        run: >\n"
+                "          cargo test --no-run\\\n"
+                "            --config profile.test.debug=2\n",
+            ),
+            (
+                "unterminated heredoc fail closed",
+                "        run: |\n"
+                "          cat <<EOF\n"
+                "          never closed\n",
+            ),
+            (
+                "ANSI-C heredoc <<$'EOF' followed by cargo --config",
+                "        run: |\n"
+                "          cat <<$'EOF' > /tmp/msg\n"
+                "          hello\n"
+                "          EOF\n"
+                "          cargo test --no-run --config profile.test.debug=2\n",
+            ),
+            (
+                "folded block more-indented whitespace line after backslash",
+                "        run: >\n"
+                "          echo pre \\\n"
+                "            \n"
+                "          cargo test --no-run --config profile.test.debug=2\n",
+            ),
+            (
+                "plain multiline preserving consecutive blank lines after backslash",
+                "        run: echo pre \\\n"
+                "\n"
+                "\n"
+                "          cargo test --no-run --config profile.test.debug=2\n",
+            ),
+            (
+                "grouped block write to GITHUB_ENV",
+                "        run: |\n"
+                "          {\n"
+                '            echo "CARGO_PROFILE_DEV_DEBUG=2"\n'
+                '          } >> "$GITHUB_ENV"\n',
+            ),
+            (
+                "wrapped tee pipeline write to GITHUB_ENV",
+                "        run: |\n"
+                "          printf '%s\\n' 'CARGO_PROFILE_TEST_DEBUG=2' |\n"
+                '            tee -a "$GITHUB_ENV"\n',
+            ),
+            (
+                "heredoc write to GITHUB_ENV",
+                "        run: |\n"
+                "          cat <<'EOF' >> \"$GITHUB_ENV\"\n"
+                "          CARGO_PROFILE_DEV_DEBUG=2\n"
+                "          EOF\n",
+            ),
+            (
+                "heredoc write to GITHUB_ENV followed by semicolon command",
+                "        run: |\n"
+                "          cat <<'EOF' >> \"$GITHUB_ENV\"; echo done\n"
+                "          CARGO_PROFILE_TEST_DEBUG=2\n"
+                "          EOF\n",
+            ),
+            (
+                "heredoc feeding wrapped tee pipeline to GITHUB_ENV",
+                "        run: |\n"
+                "          cat <<'EOF' |\n"
+                "          CARGO_PROFILE_TEST_DEBUG=2\n"
+                "          EOF\n"
+                '            tee -a "$GITHUB_ENV"\n',
+            ),
+            (
+                "heredoc feeding wrapped tee pipeline with blank line and comment",
+                "        run: |\n"
+                "          cat <<'EOF' |\n"
+                "          CARGO_PROFILE_TEST_DEBUG=2\n"
+                "          EOF\n"
+                "\n"
+                "          # keep pipeline open across blank line and comment\n"
+                '            tee -a "$GITHUB_ENV"\n',
+            ),
+            (
+                "one-line subshell heredoc write to GITHUB_ENV",
+                "        run: |\n"
+                '          (cat <<\'EOF\'; echo done) >> "$GITHUB_ENV"\n'
+                "          CARGO_PROFILE_TEST_DEBUG=2\n"
+                "          EOF\n",
+            ),
+            (
+                "one-line subshell heredoc piped to tee GITHUB_ENV",
+                "        run: |\n"
+                '          (cat <<\'EOF\'; true) | tee -a "$GITHUB_ENV"\n'
+                "          CARGO_PROFILE_TEST_DEBUG=2\n"
+                "          EOF\n",
+            ),
+            (
+                "multiline subshell mid-line closer write to GITHUB_ENV",
+                "        run: |\n"
+                "          (\n"
+                '            echo "CARGO_PROFILE_TEST_DEBUG=2"\n'
+                '            echo done) >> "$GITHUB_ENV"\n',
+            ),
+            (
+                "executable python heredoc writing to GITHUB_ENV",
+                "        run: |\n"
+                "          python3 - <<'PY'\n"
+                "          import os\n"
+                '          with open(os.environ["GITHUB_ENV"], "a") as fh:\n'
+                '              fh.write("CARGO_PROFILE_TEST_DEBUG=2\\n")\n'
+                "          PY\n",
+            ),
+            (
+                "case arm inside redirected subshell writing to GITHUB_ENV",
+                "        run: |\n"
+                "          (\n"
+                "            case ready in\n"
+                '              ready) echo "CARGO_PROFILE_TEST_DEBUG=2" ;;\n'
+                "            esac\n"
+                '          ) >> "$GITHUB_ENV"\n',
+            ),
+            (
+                "double-quoted backslash-newline heredoc delimiter before GITHUB_ENV write",
+                "        run: |\n"
+                '          cat <<"E\\\n'
+                '          OF" > /dev/null\n'
+                "          hello\n"
+                "          EOF\n"
+                '          echo "CARGO_PROFILE_TEST_DEBUG=2" >> "$GITHUB_ENV"\n',
+            ),
+            (
+                "argument literal if inside redirected if..fi block writing to GITHUB_ENV",
+                "        run: |\n"
+                "          if true; then\n"
+                '            echo "CARGO_PROFILE_TEST_DEBUG=2"\n'
+                "            printf 'keyword: %s\\n' if >&2\n"
+                '          fi >> "$GITHUB_ENV"\n',
+            ),
+            (
+                "cat heredoc piped to bash writing to GITHUB_ENV",
+                "        run: |\n"
+                "          cat <<'SH' | bash\n"
+                '          echo "CARGO_PROFILE_TEST_DEBUG=2" >> "$GITHUB_ENV"\n'
+                "          SH\n",
+            ),
+            (
+                "wrapped cat heredoc continued pipe to bash writing to GITHUB_ENV",
+                "        run: |\n"
+                "          cat <<'SH' |\n"
+                '          echo "CARGO_PROFILE_TEST_DEBUG=2" >> "$GITHUB_ENV"\n'
+                "          SH\n"
+                "            bash\n",
+            ),
+            (
+                "function declaration write_settings() { ... } >> GITHUB_ENV",
+                "        run: |\n"
+                "          write_settings() {\n"
+                '            echo "CARGO_PROFILE_TEST_DEBUG=2"\n'
+                '          } >> "$GITHUB_ENV"\n'
+                "          write_settings\n",
+            ),
+            (
+                "namespaced function ci::write_settings { ... } >> GITHUB_ENV",
+                "        run: |\n"
+                "          function ci::write_settings {\n"
+                '            echo "CARGO_PROFILE_TEST_DEBUG=2"\n'
+                '          } >> "$GITHUB_ENV"\n'
+                "          ci::write_settings\n",
+            ),
+            (
+                "cat heredoc piped to env --split-string='bash -s' writing to GITHUB_ENV",
+                "        run: |\n"
+                "          cat <<'SH' | env --split-string='bash -s'\n"
+                '          echo "CARGO_PROFILE_TEST_DEBUG=2" >> "$GITHUB_ENV"\n'
+                "          SH\n",
+            ),
+            (
+                "plain multiline scalar blank-line break before cargo --config",
+                "        run: echo hi\n"
+                "\n"
+                "          cargo test --no-run --config profile.test.debug=2\n",
+            ),
+        ):
+            ml_ci = ci_live_text.replace(
+                "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
+                multiline_run,
+                1,
+            )
+            ml_errs: list[str] = []
+            check_ci_debug_lane_profile_uniformity(ml_ci, ambient_live_text, ml_errs)
+            require(
+                ml_ci != ci_live_text
+                and any("GITHUB_ENV, or --config" in item for item in ml_errs),
+                f"self-test ({mode_label}): {label} must fail (got {ml_errs!r})",
+                failures,
+            )
+        # Verify 4-space compact steps with an internal comment inside `run: |`,
+        # AND a compact 4-space folded `run: >` with a 9-space whitespace-only line after `\`!
+        amb_head, amb_tail = ambient_live_text.split("\n  ambient-host-udp-live:\n", 1)
+        amb_job_body, amb_rest = amb_tail.split("\n  ambient-host-udp-image-read:\n", 1)
+        amb_job_head = amb_job_body.split("\n    steps:\n", 1)[0]
+        for label, compact_step_block in (
+            (
+                "4-space compact step comment",
+                "    - name: Compact step with comment\n"
+                "      run: |\n"
+                "        echo start\n"
+                "        # comment inside compact step\n"
+                "        cargo test --lib --config profile.dev.debug=2\n",
+            ),
+            (
+                "4-space compact folded whitespace-only line",
+                "    - name: Compact folded whitespace\n"
+                "      run: >\n"
+                "        echo pre \\\n"
+                "         \n"
+                "        cargo test --lib --config profile.test.debug=2\n",
+            ),
+        ):
+            compact_comment_ambient = (
+                amb_head
+                + "\n  ambient-host-udp-live:\n"
+                + amb_job_head
+                + "\n    steps:\n"
+                + compact_step_block
+                + "    - uses: ./.github/actions/setup-rust-ci\n"
+                + "      with:\n"
+                + '        shared-key: "ci-debug"\n'
+                + "\n  ambient-host-udp-image-read:\n"
+                + amb_rest
+            )
+            compact_comment_errs: list[str] = []
+            check_ci_debug_lane_profile_uniformity(
+                ci_live_text, compact_comment_ambient, compact_comment_errs
+            )
+            require(
+                compact_comment_ambient != ambient_live_text
+                and any("GITHUB_ENV, or --config" in item for item in compact_comment_errs),
+                f"self-test ({mode_label}): {label} must not hide following cargo --config (got {compact_comment_errs!r})",
+                failures,
+            )
+        for label, ok_run_block in (
+            ("non-cargo echo --config", '        run: echo "--config"\n'),
+            ("echo mentioning cargo and --config", '        run: echo cargo --config foo\n'),
+            ("grep searching for cargo and --config", "        run: grep -F -e cargo -e --config compile.log\n"),
+            ("cargo run -- --config binary arg", "        run: cargo run -- --config example.toml\n"),
+            (
+                "chained cargo then kind --config",
+                "        run: cargo --version && kind create cluster --config cluster.yaml\n",
+            ),
+            (
+                "quoted heredoc example containing cargo --config",
+                "        run: |\n"
+                "          cat <<'EOF' > /tmp/example.txt\n"
+                "          cargo test --config profile.dev.debug=2\n"
+                "          EOF\n",
+            ),
+            (
+                "unquoted heredoc with apostrophe and harmless text",
+                "        run: |\n"
+                "          cat <<EOF > /tmp/example.txt\n"
+                "          It's cargo test --config profile.dev.debug=2\n"
+                "          EOF\n",
+            ),
+            (
+                "harmless ANSI-C heredoc <<$'EOF', hex/octal UTF-8, and out-of-range \\U escape",
+                "        run: |\n"
+                "          cat <<$'EOF' > /tmp/a.txt\n"
+                "          hello\n"
+                "          EOF\n"
+                "          cat <<$'\\x45OF' > /tmp/b.txt\n"
+                "          hello\n"
+                "          EOF\n"
+                "          cat <<$'\\xC3\\xA9' > /tmp/c.txt\n"
+                "          hello\n"
+                "          é\n"
+                "          cat <<$'\\303\\251' > /tmp/d.txt\n"
+                "          hello\n"
+                "          é\n"
+                "          cat <<$'\\xC3'$'\\xA9' > /tmp/e.txt\n"
+                "          hello\n"
+                "          é\n"
+                "          printf '%s' $'\\U00110000'\n"
+                "          echo $'don\\'t'\n",
+            ),
+            (
+                "shell arithmetic bitwise shift <<, <<=, and nested parens",
+                "        run: |\n"
+                "          attempt=2\n"
+                "          delay=$((1 << attempt))\n"
+                "          nested=$(( (1 + (2)) << attempt ))\n"
+                "          (( delay <<= 1 ))\n"
+                "          echo \"$delay $nested\"\n",
+            ),
+            (
+                "logging CARGO_TARGET_DIR then writing unrelated var to GITHUB_ENV",
+                "        run: |\n"
+                '          echo "CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-target}"\n'
+                '          echo "FERRUM_TEST_MODE=1" >> "$GITHUB_ENV"\n',
+            ),
+            (
+                "semicolon-separated CARGO_TARGET_DIR log and unrelated GITHUB_ENV write",
+                '        run: echo "CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-target}"; echo "FERRUM_TEST_MODE=1" >> "$GITHUB_ENV"\n',
+            ),
+            (
+                "here-string <<< followed by CARGO_TARGET_DIR log and unrelated GITHUB_ENV write",
+                "        run: |\n"
+                "          cat <<< 'ready'\n"
+                '          echo "CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-target}"\n'
+                '          echo "FERRUM_TEST_MODE=1" >> "$GITHUB_ENV"\n',
+            ),
+            (
+                "tight heredoc pipe cat <<'EOF'| sed before CARGO_TARGET_DIR log and unrelated GITHUB_ENV write",
+                "        run: |\n"
+                "          cat <<'EOF'| sed -n '1p'\n"
+                "          hello\n"
+                "          EOF\n"
+                '          echo "CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-target}"\n'
+                '          echo "FERRUM_TEST_MODE=1" >> "$GITHUB_ENV"\n',
+            ),
+            (
+                "CARGO_TARGET_DIR log before unrelated if..fi >> GITHUB_ENV write",
+                "        run: |\n"
+                '          echo "CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-target}"\n'
+                "          if true; then\n"
+                '            echo "FERRUM_TEST_MODE=1"\n'
+                '          fi >> "$GITHUB_ENV"\n',
+            ),
+            (
+                "CARGO_TARGET_DIR log before loop containing echo done >&2 and unrelated GITHUB_ENV write",
+                "        run: |\n"
+                '          echo "CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-target}"\n'
+                "          for item in one; do\n"
+                "            echo done >&2\n"
+                '            echo "FERRUM_TEST_MODE=1"\n'
+                '          done >> "$GITHUB_ENV"\n',
+            ),
+            (
+                "cat heredoc example piped to sed for display",
+                "        run: |\n"
+                "          cat <<'EOF' | sed 's/^/  /'\n"
+                '          echo "CARGO_PROFILE_TEST_DEBUG=2" >> "$GITHUB_ENV"\n'
+                "          EOF\n",
+            ),
+            (
+                "wrapped cat heredoc continued pipe to sed for display",
+                "        run: |\n"
+                "          cat <<'EOF' |\n"
+                '          echo "CARGO_PROFILE_TEST_DEBUG=2" >> "$GITHUB_ENV"\n'
+                "          EOF\n"
+                "            sed 's/^/  /'\n",
+            ),
+            (
+                "CARGO_TARGET_DIR log before loop with case start|done) pattern and unrelated GITHUB_ENV write",
+                "        run: |\n"
+                '          echo "CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-target}"\n'
+                "          for state in start; do\n"
+                '            case "$state" in\n'
+                "              start|done) echo ok >&2 ;;\n"
+                "            esac\n"
+                '            echo "FERRUM_TEST_MODE=1"\n'
+                '          done >> "$GITHUB_ENV"\n',
+            ),
+            (
+                "CARGO_TARGET_DIR log before case piped to tee GITHUB_ENV with esac*) glob",
+                "        run: |\n"
+                '          echo "CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-target}"\n'
+                '          case "${STATE:-start}" in\n'
+                "            esac*) echo FERRUM_TEST_MODE=1 ;;\n"
+                "            *) echo FERRUM_TEST_MODE=2 ;;\n"
+                '          esac | tee -a "$GITHUB_ENV"\n',
+            ),
+            (
+                "cat heredoc example piped to env --chdir /tmp sed for display",
+                "        run: |\n"
+                "          cat <<'EOF' | env --chdir /tmp sed 's/^/  /'\n"
+                '          echo "CARGO_PROFILE_TEST_DEBUG=2" >> "$GITHUB_ENV"\n'
+                "          EOF\n",
+            ),
+            (
+                "folded scalar paragraph break separating cargo and kind --config",
+                "        run: >\n"
+                "          cargo --version\n"
+                "\n"
+                "          kind create cluster --config cluster.yaml\n",
+            ),
+        ):
+            ok_ci = ci_live_text.replace(
+                "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
+                ok_run_block,
+                1,
+            )
+            ok_errs: list[str] = []
+            check_ci_debug_lane_profile_uniformity(ok_ci, ambient_live_text, ok_errs)
+            require(
+                ok_ci != ci_live_text and not ok_errs,
+                f"self-test ({mode_label}): {label} must not be falsely flagged (got {ok_errs!r})",
+                failures,
+            )
+        # Direct Swatinem/rust-cache with quoted '*scratch' shared-key, wrapped plain scalar
+        # name AND wrapped plain sequence choice containing `{build, ? debug}` must NOT false-positive.
+        quoted_star_wf = (
+            "name: CI matrix -\n  {build, ? debug}\n"
+            "on:\n"
+            "  workflow_dispatch:\n"
+            "    inputs:\n"
+            "      sample:\n"
+            "        type: choice\n"
+            "        options:\n"
+            "          - CI matrix -\n"
+            "            {build, ? debug}\n"
+            "          - --debug mode\n"
+            "            {build, ? debug}\n"
+            "jobs:\n"
+            "  scratch-job:\n"
+            "    runs-on: ubuntu-26.04\n"
+            "    steps:\n"
+            "      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0\n"
+            "        with:\n"
+            "          shared-key: '*scratch'\n"
+        )
+        quoted_star_errs: list[str] = []
+        check_ci_debug_lane_profile_uniformity(
+            ci_live_text,
+            ambient_live_text,
+            quoted_star_errs,
+            extra_workflows={"quoted-star.yml": quoted_star_wf},
+        )
+        require(
+            not quoted_star_errs,
+            f"self-test ({mode_label}): quoted '*scratch' shared-key and wrapped plain scalars must not false-positive (got {quoted_star_errs!r})",
+            failures,
+        )
+        # Next-line flow mapping under `jobs:` hiding an extra `ci-debug` consumer MUST fail
+        # in both PyYAML (inventory drift) and fallback (unsupported non-mapping line under jobs:).
+        next_line_flow_jobs_wf = (
+            "name: NextLineFlowJobs\n"
+            "on:\n  workflow_dispatch:\n"
+            "jobs:\n"
+            "  {\n"
+            "    rogue-consumer: {\n"
+            "      runs-on: ubuntu-26.04,\n"
+            "      steps: [\n"
+            "        {uses: ./.github/actions/setup-rust-ci, with: {shared-key: ci-debug}}\n"
+            "      ]\n"
+            "    }\n"
+            "  }\n"
+        )
+        next_line_flow_jobs_errs: list[str] = []
+        check_ci_debug_lane_profile_uniformity(
+            ci_live_text,
+            ambient_live_text,
+            next_line_flow_jobs_errs,
+            extra_workflows={"next-line-flow-jobs.yml": next_line_flow_jobs_wf},
+        )
+        require(
+            bool(next_line_flow_jobs_errs),
+            f"self-test ({mode_label}): next-line flow mapping under jobs: hiding ci-debug consumer must fail",
+            failures,
+        )
+        # Direct Swatinem/rust-cache with prefix-key: v0-rust-ci-debug on an unrelated job
+        # appends its job ID by default (v0-rust-ci-debug-unrelated), so it must NOT be falsely flagged.
+        unrelated_prefix_wf = (
+            "name: UnrelatedPrefix\non:\n  workflow_dispatch:\njobs:\n"
+            "  unrelated-job:\n"
+            "    runs-on: ubuntu-26.04\n"
+            "    steps:\n"
+            "      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0\n"
+            "        with:\n"
+            '          prefix-key: "v0-rust-ci-debug"\n'
+        )
+        unrelated_prefix_errs: list[str] = []
+        check_ci_debug_lane_profile_uniformity(
+            ci_live_text,
+            ambient_live_text,
+            unrelated_prefix_errs,
+            extra_workflows={"unrelated-prefix.yml": unrelated_prefix_wf},
+        )
+        require(
+            not unrelated_prefix_errs,
+            f"self-test ({mode_label}): direct rust-cache with default add-job-id-key appends job ID and must not be flagged (got {unrelated_prefix_errs!r})",
+            failures,
+        )
+        for label, wf_name, wf_body, expected_substr in (
+            (
+                "4-space compact steps",
+                "compact.yml",
+                "name: Compact\non:\n  workflow_dispatch:\njobs:\n"
+                "  compact-debug:\n"
+                "    runs-on: ubuntu-26.04\n"
+                "    steps:\n"
+                "    - uses: ./.github/actions/setup-rust-ci\n"
+                "      with:\n"
+                "        shared-key: ci-debug\n",
+                "('compact.yml', 'compact-debug')",
+            ),
+            (
+                "8-space indented steps with col-0 comment",
+                "indent8.yml",
+                "name: Indent8\non:\n  workflow_dispatch:\njobs:\n"
+                "  indent8-debug:\n"
+                "    runs-on: ubuntu-26.04\n"
+                "    steps:\n"
+                "# col-0 comment inside 8-space steps\n"
+                "        - uses: ./.github/actions/setup-rust-ci\n"
+                "          with:\n"
+                "            shared-key: ci-debug\n",
+                "('indent8.yml', 'indent8-debug')",
+            ),
+            (
+                "direct rust-cache key + add-job-id-key false alias",
+                "direct-alias.yml",
+                "name: DirectAlias\non:\n  workflow_dispatch:\njobs:\n"
+                "  alias-key:\n"
+                "    runs-on: ubuntu-26.04\n"
+                "    steps:\n"
+                "      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0\n"
+                "        with:\n"
+                '          key: "ci-debug"\n'
+                '          add-job-id-key: "false"\n',
+                "('direct-alias.yml', 'alias-key')",
+            ),
+            (
+                "direct rust-cache key + add-job-id-key no alias",
+                "direct-alias-no.yml",
+                "name: DirectAliasNo\non:\n  workflow_dispatch:\njobs:\n"
+                "  alias-key-no:\n"
+                "    runs-on: ubuntu-26.04\n"
+                "    steps:\n"
+                "      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0\n"
+                "        with:\n"
+                '          key: "ci-debug"\n'
+                '          add-job-id-key: "no"\n',
+                "('direct-alias-no.yml', 'alias-key-no')",
+            ),
+            (
+                "direct rust-cache key + unquoted add-job-id-key yes (YAML 1.2 string)",
+                "direct-alias-yes.yml",
+                "name: DirectAliasYes\non:\n  workflow_dispatch:\njobs:\n"
+                "  alias-key-yes:\n"
+                "    runs-on: ubuntu-26.04\n"
+                "    steps:\n"
+                "      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0\n"
+                "        with:\n"
+                '          key: "ci-debug"\n'
+                "          add-job-id-key: yes\n",
+                "('direct-alias-yes.yml', 'alias-key-yes')",
+            ),
+            (
+                "direct rust-cache uppercase SHARED-KEY",
+                "direct-upper-key.yml",
+                "name: DirectUpperKey\non:\n  workflow_dispatch:\njobs:\n"
+                "  upper-key:\n"
+                "    runs-on: ubuntu-26.04\n"
+                "    steps:\n"
+                "      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0\n"
+                "        with:\n"
+                '          SHARED-KEY: "ci-debug"\n',
+                "('direct-upper-key.yml', 'upper-key')",
+            ),
+            (
+                "direct rust-cache omitted with on job named ci-debug",
+                "default-job-id.yml",
+                "name: DefaultJobId\non:\n  workflow_dispatch:\njobs:\n"
+                "  ci-debug:\n"
+                "    runs-on: ubuntu-26.04\n"
+                "    steps:\n"
+                "      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0\n",
+                "('default-job-id.yml', 'ci-debug')",
+            ),
+            (
+                "setup-rust-ci omitted with on job named ci-debug",
+                "setup-default-job-id.yml",
+                "name: SetupDefaultJobId\non:\n  workflow_dispatch:\njobs:\n"
+                "  ci-debug:\n"
+                "    runs-on: ubuntu-26.04\n"
+                "    steps:\n"
+                "      - uses: ./.github/actions/setup-rust-ci\n",
+                "('setup-default-job-id.yml', 'ci-debug')",
+            ),
+        ):
+            norm_errs: list[str] = []
+            check_ci_debug_lane_profile_uniformity(
+                ci_live_text,
+                ambient_live_text,
+                norm_errs,
+                extra_workflows={wf_name: wf_body},
+            )
+            require(
+                any("inventory drifted" in item and expected_substr in item for item in norm_errs),
+                f"self-test ({mode_label}): {label} must be discovered in inventory (got {norm_errs!r})",
+                failures,
+            )
+        for label, wf_name, wf_body in (
+            (
+                "4-space indented jobs under jobs:",
+                "indent4-jobs.yml",
+                "name: Indent4Jobs\non:\n  workflow_dispatch:\njobs:\n"
+                "    extra-debug:\n"
+                "      runs-on: ubuntu-26.04\n"
+                "      steps:\n"
+                "        - uses: ./.github/actions/setup-rust-ci\n"
+                "          with:\n"
+                "            shared-key: ci-debug\n",
+            ),
+            (
+                "flow-style job mapping",
+                "flow-job.yml",
+                "name: FlowJob\non:\n  workflow_dispatch:\njobs:\n"
+                "  ci-debug: {runs-on: ubuntu-26.04, steps: [{uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0}]}\n",
+            ),
+            (
+                "5-space indented job fields",
+                "indent5-fields.yml",
+                "name: Indent5Fields\non:\n  workflow_dispatch:\njobs:\n"
+                "  ci-debug:\n"
+                "     runs-on: ubuntu-26.04\n"
+                "     steps:\n"
+                "       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0\n",
+            ),
+            (
+                "alias on direct rust-cache key input",
+                "alias-key.yml",
+                "name: AliasKey\non:\n  workflow_dispatch:\nx-lane: &lane ci-debug\njobs:\n"
+                "  alias-job:\n"
+                "    runs-on: ubuntu-26.04\n"
+                "    steps:\n"
+                "      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0\n"
+                "        with:\n"
+                "          key: *lane\n"
+                '          add-job-id-key: "false"\n',
+            ),
+            (
+                "inline flow steps sequence",
+                "inline-steps.yml",
+                "name: InlineSteps\non:\n  workflow_dispatch:\njobs:\n"
+                "  inline-debug:\n"
+                "    runs-on: ubuntu-26.04\n"
+                "    steps: [{uses: ./.github/actions/setup-rust-ci, with: {shared-key: ci-debug}}]\n",
+            ),
+            (
+                "bare-dash step mapping",
+                "bare-dash.yml",
+                "name: BareDash\non:\n  workflow_dispatch:\njobs:\n"
+                "  bare-debug:\n"
+                "    runs-on: ubuntu-26.04\n"
+                "    steps:\n"
+                "      -\n"
+                "        uses: ./.github/actions/setup-rust-ci\n"
+                "        with:\n"
+                "          shared-key: ci-debug\n",
+            ),
+            (
+                "multi-space dash step spacing",
+                "multi-space-dash.yml",
+                "name: MultiSpaceDash\non:\n  workflow_dispatch:\njobs:\n"
+                "  spaced-debug:\n"
+                "    runs-on: ubuntu-26.04\n"
+                "    steps:\n"
+                "      -   uses: ./.github/actions/setup-rust-ci\n"
+                "          with:\n"
+                "            shared-key: ci-debug\n",
+            ),
+            (
+                "anchored flow step and alias step",
+                "anchored-step.yml",
+                "name: AnchoredStep\non:\n  workflow_dispatch:\njobs:\n"
+                "  anchor-debug:\n"
+                "    runs-on: ubuntu-26.04\n"
+                "    steps:\n"
+                '      - &cache {uses: ./.github/actions/setup-rust-ci, with: {shared-key: ci-debug}}\n'
+                "      - *cache\n",
+            ),
+            (
+                "explicit ? step key",
+                "explicit-step-key.yml",
+                "name: ExplicitStepKey\non:\n  workflow_dispatch:\njobs:\n"
+                "  explicit-debug:\n"
+                "    runs-on: ubuntu-26.04\n"
+                "    steps:\n"
+                "      - ? uses\n"
+                "        : ./.github/actions/setup-rust-ci\n"
+                "        with:\n"
+                "          shared-key: ci-debug\n",
+            ),
+            (
+                "tagged scalar shared-key",
+                "tagged-key.yml",
+                "name: TaggedKey\non:\n  workflow_dispatch:\njobs:\n"
+                "  tagged-debug:\n"
+                "    runs-on: ubuntu-26.04\n"
+                "    steps:\n"
+                "      - uses: ./.github/actions/setup-rust-ci\n"
+                "        with:\n"
+                "          shared-key: !!str ci-debug\n",
+            ),
+            (
+                "flow-style step item",
+                "flow-step.yml",
+                "name: FlowStep\non:\n  workflow_dispatch:\njobs:\n"
+                "  flow-debug:\n"
+                "    runs-on: ubuntu-26.04\n"
+                "    steps:\n"
+                "      - {uses: ./.github/actions/setup-rust-ci, with: {shared-key: ci-debug}}\n",
+            ),
+        ):
+            layout_errs: list[str] = []
+            check_ci_debug_lane_profile_uniformity(
+                ci_live_text,
+                ambient_live_text,
+                layout_errs,
+                extra_workflows={wf_name: wf_body},
+            )
+            require(
+                any(
+                    "inventory drifted" in item or "unsupported" in item
+                    for item in layout_errs
+                ),
+                f"self-test ({mode_label}): {label} ci-debug consumer must fail cleanly (got {layout_errs!r})",
+                failures,
+            )
+        direct_computed_wf = (
+            "name: DirectComputed\non:\n  workflow_dispatch:\njobs:\n"
+            "  alias-job:\n"
+            "    runs-on: ubuntu-26.04\n"
+            "    steps:\n"
+            "      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0\n"
+            "        with:\n"
+            "          shared-key: ${{ 'ci-debug' }}\n"
+        )
+        direct_computed_errs: list[str] = []
+        check_ci_debug_lane_profile_uniformity(
+            ci_live_text,
+            ambient_live_text,
+            direct_computed_errs,
+            extra_workflows={"direct-computed.yml": direct_computed_wf},
+        )
+        require(
+            any("unadmitted computed shared-key" in item for item in direct_computed_errs),
+            f"self-test ({mode_label}): direct Swatinem/rust-cache computed key aliasing ci-debug must fail",
+            failures,
+        )
+        multiline_env_unrelated_wf = (
+            "name: MultilineEnv\non:\n  workflow_dispatch:\njobs:\n"
+            "  other-job:\n"
+            "    runs-on: ubuntu-26.04\n"
+            "    steps:\n"
+            "      - uses: example/other@0123456789abcdef0123456789abcdef01234567\n"
+            "        env:\n"
+            "          NOTE: |\n"
+            "            ./.github/actions/setup-rust-ci\n"
+        )
+        multiline_env_errs: list[str] = []
+        check_ci_debug_lane_profile_uniformity(
+            ci_live_text,
+            ambient_live_text,
+            multiline_env_errs,
+            extra_workflows={"multiline-env.yml": multiline_env_unrelated_wf},
+        )
+        require(
+            not multiline_env_errs,
+            f"self-test ({mode_label}): multiline env mentioning setup-rust-ci on unrelated action must not fail (got {multiline_env_errs!r})",
+            failures,
+        )
+
+        # Alias/tag on `run:` or anchored flow step inside a ci-debug member must fail in both modes.
+        for label, bad_ci in (
+            (
+                "YAML alias on run:",
+                "x-compile: &compile cargo test --no-run --config profile.dev.debug=2\n"
+                + ci_live_text.replace(
+                    "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
+                    "        run: *compile\n",
+                    1,
+                ),
+            ),
+            (
+                "YAML tag !!str on run:",
+                ci_live_text.replace(
+                    "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
+                    "        run: !!str cargo test --no-run --config profile.dev.debug=2\n",
+                    1,
+                ),
+            ),
+            (
+                "next-line tagged run: value",
+                ci_live_text.replace(
+                    "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
+                    "        run:\n          !!str cargo test --no-run --config profile.dev.debug=2\n",
+                    1,
+                ),
+            ),
+            (
+                "next-line comment before plain run: override",
+                ci_live_text.replace(
+                    "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
+                    "        run:\n          # comment before value\n          cargo test --no-run --config profile.dev.debug=2\n",
+                    1,
+                ),
+            ),
+            (
+                "run-aligned comment before plain run: override",
+                ci_live_text.replace(
+                    "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
+                    "        run:\n        # aligned comment\n          cargo test --no-run --config profile.test.debug=2\n",
+                    1,
+                ),
+            ),
+            (
+                "run-aligned comment before next-line | block override",
+                ci_live_text.replace(
+                    "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
+                    "        run:\n        # aligned comment\n          |\n            cargo test --no-run --config profile.test.debug=2\n",
+                    1,
+                ),
+            ),
+            (
+                "next-line block indicator | on run:",
+                ci_live_text.replace(
+                    "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
+                    "        run:\n          |\n            cargo test --no-run --config profile.dev.debug=2\n",
+                    1,
+                ),
+            ),
+            (
+                "next-line quoted run: value",
+                ci_live_text.replace(
+                    "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
+                    '        run:\n          "cargo test --no-run --config profile.dev.debug=2"\n',
+                    1,
+                ),
+            ),
+            (
+                "key-level anchor &r on run:",
+                ci_live_text.replace(
+                    "        run: cargo test --no-run --test integration_tests --test functional_tests\n",
+                    "        &r run: cargo test --no-run --config profile.dev.debug=2\n",
+                    1,
+                ),
+            ),
+            (
+                "anchored flow step inside lane job",
+                ci_live_text.replace(
+                    "      - name: Build integration tests archive\n",
+                    '      - &compile {name: Bad, run: "cargo test --no-run --config profile.test.debug=2"}\n'
+                    "      - *compile\n"
+                    "      - name: Build integration tests archive\n",
+                    1,
+                ),
+            ),
+        ):
+            alias_run_errs: list[str] = []
+            check_ci_debug_lane_profile_uniformity(
+                bad_ci, ambient_live_text, alias_run_errs
+            )
+            require(
+                any(
+                    "GITHUB_ENV, or --config" in item or "unsupported" in item
+                    for item in alias_run_errs
+                ),
+                f"self-test ({mode_label}): {label} must fail (got {alias_run_errs!r})",
+                failures,
+            )
+
+    _run_ci_debug_self_tests("default")
+    global _try_yaml_safe_load
+    orig_yaml_loader = _try_yaml_safe_load
+    try:
+        _try_yaml_safe_load = lambda _text: (None, False, None)
+        _run_ci_debug_self_tests("fallback")
+    finally:
+        _try_yaml_safe_load = orig_yaml_loader
+
     for failure in failures:
         print(f"::error::{failure}", file=sys.stderr)
     return 1 if failures else 0
@@ -9867,6 +13581,12 @@ def main(argv: list[str] | None = None) -> int:
     check_fips(fips, failures)
     check_production_smoke(node, failures)
     check_ambient_workflow_cache_budget(ambient, failures)
+    check_ci_debug_lane_profile_uniformity(
+        read_pinned(CI_WORKFLOW),
+        ambient,
+        failures,
+        extra_workflows=_load_extra_workflow_texts(),
+    )
     check_shared_actions(failures)
     for filename, job_name in COMPLETED_CACHE_PRODUCER_JOBS:
         workflow = read_pinned(CI_WORKFLOW.parent / filename)
