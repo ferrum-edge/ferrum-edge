@@ -22817,6 +22817,47 @@ impl<T> Drop for AbortOnDrop<T> {
     }
 }
 
+/// Owns a WebSocket shard task's plugin `Vec`s so that on every exit path
+/// (including `from_std` failure or abort during `from_partially_read`), any
+/// plugin whose final reference is held by this task is offloaded to drop on
+/// the `MultiThread` main runtime without spawning tasks in steady state.
+#[cfg(not(feature = "bench-h1-profile"))]
+struct DropPluginsOnMainRuntime {
+    framing: Vec<Arc<dyn Plugin>>,
+    frame: Vec<Arc<dyn Plugin>>,
+    disconnect: Vec<Arc<dyn Plugin>>,
+}
+
+#[cfg(not(feature = "bench-h1-profile"))]
+impl Drop for DropPluginsOnMainRuntime {
+    fn drop(&mut self) {
+        if self.framing.is_empty() && self.frame.is_empty() && self.disconnect.is_empty() {
+            return;
+        }
+        let on_current_thread = tokio::runtime::Handle::try_current()
+            .ok()
+            .is_some_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread);
+        if !on_current_thread {
+            return;
+        }
+        let Some(main_handle) = relay_shards::main_runtime_handle() else {
+            return;
+        };
+        // Move the non-empty plugin Vecs unconditionally onto the main runtime
+        // rather than checking `Arc::get_mut` here: `Arc<dyn Plugin>` cannot
+        // use atomic `Arc::into_inner`, so a check-then-drop on the shard would
+        // race with a concurrent live reload decrementing the final strong ref.
+        // Tunnel sessions without WebSocket plugins return early above with
+        // zero allocations and zero wakeups.
+        let framing = std::mem::take(&mut self.framing);
+        let frame = std::mem::take(&mut self.frame);
+        let disconnect = std::mem::take(&mut self.disconnect);
+        main_handle.spawn(async move {
+            drop((framing, frame, disconnect));
+        });
+    }
+}
+
 #[cfg(not(feature = "bench-h1-profile"))]
 fn try_detach_ws_client(upgraded: hyper::upgrade::Upgraded) -> std::io::Result<WsClientTakeover> {
     let upgraded = match hyper_util::server::conn::auto::upgrade::downcast::<
@@ -23112,19 +23153,13 @@ async fn run_direct_ws_tunnel_maybe_on_shard(
     let shard_proxy_id = proxy_id.to_owned();
     let shard_adaptive_buffer = Arc::clone(adaptive_buffer);
     let mut guard = AbortOnDrop(shard_handle.spawn(async move {
-        // Declared first so it drops last: if this shard task holds the final
-        // reference to any retired plugin after a live reload, defer its Drop
-        // to the MultiThread main runtime rather than the current_thread shard.
-        let _ws_plugins_main_drop = (!ws_framing_plugins.is_empty()
-            || !ws_frame_plugins.is_empty()
-            || !ws_disconnect_plugins.is_empty())
-        .then(|| {
-            relay_shards::DropOnMainRuntime::new((
-                ws_framing_plugins.clone(),
-                ws_frame_plugins.clone(),
-                ws_disconnect_plugins.clone(),
-            ))
-        });
+        // Move all plugin vectors into a guard declared first so it drops last
+        // on every exit path (normal return, `from_std` failure, or cancel).
+        let ws_plugins_guard = DropPluginsOnMainRuntime {
+            framing: ws_framing_plugins,
+            frame: ws_frame_plugins,
+            disconnect: ws_disconnect_plugins,
+        };
         let rehomed_client = match detached_client {
             DetachedWsClient::Tls {
                 std_stream,
@@ -23149,7 +23184,7 @@ async fn run_direct_ws_tunnel_maybe_on_shard(
                 }
                 Err(err) => {
                     fire_ws_tunnel_disconnect_hooks(
-                        &ws_disconnect_plugins,
+                        &ws_plugins_guard.disconnect,
                         &shard_proxy_id,
                         &session_meta,
                         0,
@@ -23178,7 +23213,7 @@ async fn run_direct_ws_tunnel_maybe_on_shard(
                 }
                 Err(err) => {
                     fire_ws_tunnel_disconnect_hooks(
-                        &ws_disconnect_plugins,
+                        &ws_plugins_guard.disconnect,
                         &shard_proxy_id,
                         &session_meta,
                         0,
@@ -23211,7 +23246,7 @@ async fn run_direct_ws_tunnel_maybe_on_shard(
                 )),
                 Err(err) => {
                     fire_ws_tunnel_disconnect_hooks(
-                        &ws_disconnect_plugins,
+                        &ws_plugins_guard.disconnect,
                         &shard_proxy_id,
                         &session_meta,
                         0,
@@ -23231,7 +23266,7 @@ async fn run_direct_ws_tunnel_maybe_on_shard(
                     Ok(tcp) => RehomedWsBackendIo::Plain(tcp),
                     Err(err) => {
                         fire_ws_tunnel_disconnect_hooks(
-                            &ws_disconnect_plugins,
+                            &ws_plugins_guard.disconnect,
                             &shard_proxy_id,
                             &session_meta,
                             0,
@@ -23262,9 +23297,9 @@ async fn run_direct_ws_tunnel_maybe_on_shard(
             rehomed_backend_ws,
             &shard_proxy_id,
             connection_id,
-            ws_framing_plugins,
-            ws_frame_plugins,
-            ws_disconnect_plugins,
+            ws_plugins_guard.framing.clone(),
+            ws_plugins_guard.frame.clone(),
+            ws_plugins_guard.disconnect.clone(),
             session_meta,
             ws_connection_permit,
             max_websocket_frame_size_bytes,

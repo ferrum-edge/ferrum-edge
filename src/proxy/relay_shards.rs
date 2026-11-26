@@ -269,33 +269,50 @@ pub fn main_runtime_handle() -> Option<Handle> {
         .and_then(|pool| pool.main_runtime_handle.clone())
 }
 
-/// RAII wrapper that defers dropping `T` onto the serving `MultiThread` main
-/// runtime whenever dropped on a `current_thread` relay shard.
+/// RAII owner of an `Arc<T>` that atomically offloads destruction of the inner
+/// `T` onto the serving `MultiThread` main runtime only when this guard drops
+/// the final strong reference on a `current_thread` relay shard.
 ///
-/// Long-lived shard tasks hold references to retired config epochs and plugin
-/// instances across live reloads. Deferring their final drop to the main
-/// runtime ensures plugin destructors that require `RuntimeFlavor::MultiThread`
-/// (e.g., ordered flush/retirement) run in the expected runtime without
-/// blocking the relay shard's event loop.
-pub struct DropOnMainRuntime<T: Send + 'static>(Option<T>);
+/// Long-lived shard tasks hold references to retired config epochs across live
+/// reloads. Using `Arc::into_inner` keeps steady-state teardown allocation-free
+/// and wakeup-free whenever the epoch is still referenced elsewhere, while
+/// guaranteeing that the last connection holding a retired epoch destroys its
+/// plugins on the `MultiThread` main runtime without blocking the shard.
+pub struct DropArcOnMainRuntime<T: Send + Sync + 'static>(Option<Arc<T>>);
 
-impl<T: Send + 'static> DropOnMainRuntime<T> {
-    pub fn new(value: T) -> Self {
-        Self(Some(value))
+impl<T: Send + Sync + 'static> DropArcOnMainRuntime<T> {
+    pub fn new(arc: Arc<T>) -> Self {
+        Self(Some(arc))
     }
 }
 
-impl<T: Send + 'static> Drop for DropOnMainRuntime<T> {
+impl<T: Send + Sync + 'static> Deref for DropArcOnMainRuntime<T> {
+    type Target = Arc<T>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        // Invariant: `self.0` is initialized to `Some` in `new` and is only
+        // taken inside `Drop::drop`.
+        self.0
+            .as_ref()
+            .expect("DropArcOnMainRuntime inner is always Some until Drop")
+    }
+}
+
+impl<T: Send + Sync + 'static> Drop for DropArcOnMainRuntime<T> {
     fn drop(&mut self) {
-        let Some(value) = self.0.take() else {
+        let Some(arc) = self.0.take() else {
             return;
         };
         let on_current_thread = Handle::try_current()
             .ok()
             .is_some_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread);
-        if on_current_thread && let Some(main_handle) = main_runtime_handle() {
+        if on_current_thread
+            && let Some(main_handle) = main_runtime_handle()
+            && let Some(inner) = Arc::into_inner(arc)
+        {
             main_handle.spawn(async move {
-                drop(value);
+                drop(inner);
             });
         }
     }
