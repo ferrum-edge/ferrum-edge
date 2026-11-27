@@ -832,3 +832,102 @@ fn deleting_the_route_withdraws_the_mesh_route_set() {
     );
     assert!(withdrawn.gamma_route_parents.is_empty());
 }
+
+#[test]
+fn http_and_grpc_routes_on_disjoint_ports_of_one_service_both_serve() {
+    let http = http_route(
+        "default",
+        "multi-http",
+        json!({
+            "parentRefs": [{"group": "", "kind": "Service", "name": "multi", "port": 8080}],
+            "rules": [{"backendRefs": [{"name": "reviews", "port": 8080}]}]
+        }),
+    );
+    let grpc = object(
+        "GRPCRoute",
+        HTTP_ROUTE_API,
+        "default",
+        "multi-grpc",
+        json!({
+            "parentRefs": [{"group": "", "kind": "Service", "name": "multi", "port": 9090}],
+            "rules": [{
+                "matches": [{"method": {"service": "multi.v1.Multi", "method": "Get"}}],
+                "backendRefs": [{"name": "ratings", "port": 8080}]
+            }]
+        }),
+    );
+    for order in [[http.clone(), grpc.clone()], [grpc.clone(), http.clone()]] {
+        let mut objects = base_services();
+        objects.push(service(
+            "default",
+            "multi",
+            &[("http", 8080), ("grpc", 9090)],
+        ));
+        objects.extend(order);
+        let translation = translate(&objects);
+        let config = &translation.config;
+
+        // GEP-1294 only refuses a route type on a Service+port pair another
+        // type also claims; disjoint ports keep both.
+        assert_eq!(
+            outcome(&translation, &http, "core/Service/default/multi/*/8080"),
+            Some(GammaParentOutcome::Programmed { producer: true })
+        );
+        assert_eq!(
+            outcome(&translation, &grpc, "core/Service/default/multi/*/9090"),
+            Some(GammaParentOutcome::Programmed { producer: true })
+        );
+
+        let proxies = route_proxies(config);
+        assert!(!proxies.is_empty());
+        let mut rules: Vec<Value> = Vec::new();
+        for proxy in &proxies {
+            let dispatch = dispatch_plugin(config, proxy);
+            assert_eq!(dispatch.config["reject_unmatched"], json!(true));
+            // Every carried instance must construct, merged slot included.
+            ferrum_edge::plugins::mesh_route_dispatch::MeshRouteDispatch::new(&dispatch.config)
+                .expect("merged dispatch instance constructs");
+            rules.extend(
+                dispatch.config["rules"]
+                    .as_array()
+                    .expect("rules")
+                    .iter()
+                    .cloned(),
+            );
+        }
+        let to_backend =
+            |rule: &Value, host: &str| rule["destination"]["backend_host"] == json!(host);
+        assert!(
+            rules.iter().all(|rule| rule["match"]["port"].is_u64()),
+            "every rule is port-guarded, so the two route tables never mix: {rules:?}"
+        );
+        assert!(
+            rules.iter().any(|rule| rule["match"]["port"] == json!(8080)
+                && to_backend(rule, "reviews.default.svc.cluster.local")),
+            "the HTTPRoute serves port 8080: {rules:?}"
+        );
+        assert!(
+            rules.iter().any(|rule| rule["match"]["port"] == json!(9090)
+                && to_backend(rule, "ratings.default.svc.cluster.local")),
+            "the GRPCRoute serves port 9090: {rules:?}"
+        );
+        assert!(
+            !rules.iter().any(|rule| rule["match"]["port"] == json!(8080)
+                && to_backend(rule, "ratings.default.svc.cluster.local")),
+            "the GRPCRoute never answers on the HTTPRoute's port"
+        );
+        assert!(
+            !rules.iter().any(|rule| rule["match"]["port"] == json!(9090)
+                && to_backend(rule, "reviews.default.svc.cluster.local")),
+            "the HTTPRoute never answers on the GRPCRoute's port"
+        );
+        let mut slots: Vec<(&str, Option<&str>)> = gamma_proxies(config)
+            .iter()
+            .map(|proxy| (proxy.namespace.as_str(), proxy.listen_path.as_deref()))
+            .collect();
+        let total = slots.len();
+        slots.sort();
+        slots.dedup();
+        assert_eq!(slots.len(), total, "no duplicate route slot");
+    }
+}
