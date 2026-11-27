@@ -55,8 +55,9 @@ gateways, control planes, mesh data planes, charts or contract consumers.
   2-19 have moved every timestamp in `src/` and `custom_plugins/` to
   `time_compat`: the standalone uses, the config snapshot stamps, the resource,
   namespace, trust-bundle and audit timestamps, and the mesh, CP/DP status, K8s
-  and diagnostic timestamps. Remaining work: dropping the direct `chrono`
-  dependency and sqlx's `chrono` feature. The
+  and diagnostic timestamps. Remaining work: moving the test code and the mesh
+  benchmark off `chrono`, then dropping the direct `chrono` dependency and
+  sqlx's `chrono` feature. The
   exception can be retired only once no dependency still resolves `chrono`.
 - **Three other advisory exceptions were re-reviewed on 2026-11-27 and
   re-affirmed until 2027-03-31** (#7520): RUSTSEC-2024-0436 (`paste`),
@@ -248,8 +249,11 @@ gateways, control planes, mesh data planes, charts or contract consumers.
   selects such a MongoDB row fails with `503`), and the API-spec `updated_since`
   and audit `start`/`end` filters reject such a value with their `400`. A
   Kubernetes `metadata.creationTimestamp` outside that range is treated like a
-  missing one when ordering Gateway API routes, ListenerSets, BackendTLSPolicies
-  and UDP amplification policies (#7530).
+  missing one wherever resources are ordered by creation time (Gateway API route
+  conflicts, ListenerSets, Gateway frontend TLS certificate precedence,
+  BackendTLSPolicy, `BackendLBPolicy` / `XBackendTrafficPolicy` session
+  persistence and UDP amplification policies), and a leap-second
+  `creationTimestamp` sorts as the following second (#7530).
   Rendered timestamps of in-range, non-leap-second values, and the wire and
   storage text of these stamps, are byte-identical. For in-range values no
   Admin API status or envelope changes; message changes are limited to the TLS
