@@ -85,6 +85,7 @@ mod time_compat_chrono_parse_tests;
 mod time_compat_tests;
 mod tls_offload_threads_tests;
 mod udp_amplification_default_tests;
+mod v001_baseline_golden_tests;
 mod websocket_permessage_deflate_tests;
 mod workload_entry_cross_namespace_tests;
 mod workload_entry_local_inbound_slice_tests;

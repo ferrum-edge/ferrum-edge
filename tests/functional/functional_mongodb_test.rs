@@ -3729,6 +3729,148 @@ async fn test_mongodb_buildout_baseline_initialization() {
     db.drop().await.unwrap();
 }
 
+/// The MongoDB index plan is versioned and forward-only: `up` records the
+/// plan version, a later plan version adds indexes and drops exactly the
+/// indexes it retires (once), and an older binary refuses a database that a
+/// newer plan version already upgraded.
+#[tokio::test]
+#[ignore = "requires a live MongoDB server"]
+async fn test_mongodb_index_plan_version_is_recorded_and_forward_only() {
+    use ferrum_edge::_test_support::apply_mongo_index_plan_for_test;
+    use ferrum_edge::config::db_backend::DatabaseBackend;
+    use ferrum_edge::config::mongo_index_plan::{
+        MONGO_INDEX_PLAN_VERSION, MONGO_INDEX_PLAN_VERSION_COLLECTION, MongoIndexPlan,
+        RequiredMongoIndex, RetiredMongoIndex,
+    };
+    use ferrum_edge::config::mongo_store::MongoStore;
+    use mongodb::IndexModel;
+    use mongodb::options::IndexOptions;
+
+    const LEGACY_INDEX: &str = "ferrum_test_legacy_plan_index";
+    const ADDED_INDEX: &str = "ferrum_test_added_field_1";
+
+    let url =
+        std::env::var("FERRUM_TEST_MONGO_URL").unwrap_or_else(|_| DEFAULT_MONGO_URL.to_string());
+    if !continue_if_backend_available("mongodb", mongodb_is_available(&url).await, "unreachable") {
+        return;
+    }
+    let database_name = format!("ferrum_plan_version_{}", Uuid::new_v4().simple());
+    let client = MongoClient::with_uri_str(&url).await.unwrap();
+    let db = client.database(&database_name);
+    let store = MongoStore::connect(
+        &url,
+        &database_name,
+        None,
+        None,
+        None,
+        Some(10),
+        Some(10),
+        false,
+        None,
+        None,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+    let versions = db.collection::<Document>(MONGO_INDEX_PLAN_VERSION_COLLECTION);
+    let proxies = db.collection::<Document>("proxies");
+    async fn recorded_plan_version(versions: &mongodb::Collection<Document>) -> i64 {
+        versions
+            .find_one(doc! {
+                "_id": ferrum_edge::config::mongo_index_plan::MONGO_INDEX_PLAN_VERSION_DOCUMENT_ID,
+            })
+            .await
+            .unwrap()
+            .expect("plan version record")
+            .get_i64("version")
+            .unwrap()
+    }
+    let legacy_index = || {
+        IndexModel::builder()
+            .keys(doc! { "ferrum_test_legacy_field": 1 })
+            .options(
+                IndexOptions::builder()
+                    .name(LEGACY_INDEX.to_string())
+                    .build(),
+            )
+            .build()
+    };
+
+    // A fresh database records the shipped plan version; status reports it.
+    store.run_migrations().await.unwrap();
+    assert_eq!(
+        recorded_plan_version(&versions).await,
+        MONGO_INDEX_PLAN_VERSION
+    );
+    let status = store.migration_status().await.unwrap();
+    assert_eq!(status.recorded_plan_version, Some(MONGO_INDEX_PLAN_VERSION));
+    assert_eq!(status.plan_version, MONGO_INDEX_PLAN_VERSION);
+    store.run_migrations().await.unwrap();
+    assert_eq!(
+        recorded_plan_version(&versions).await,
+        MONGO_INDEX_PLAN_VERSION
+    );
+
+    // A test-only next plan version: add one index, retire a legacy one.
+    proxies.create_index(legacy_index()).await.unwrap();
+    let mut next = MongoIndexPlan::current();
+    next.version = MONGO_INDEX_PLAN_VERSION + 1;
+    next.indexes.push(RequiredMongoIndex {
+        collection: "proxies",
+        model: IndexModel::builder()
+            .keys(doc! { "ferrum_test_added_field": 1 })
+            .build(),
+    });
+    next.retired.push(RetiredMongoIndex {
+        retired_in: next.version,
+        collection: "proxies",
+        name: LEGACY_INDEX,
+    });
+    apply_mongo_index_plan_for_test(&store, &next)
+        .await
+        .unwrap();
+    let names = proxies.list_index_names().await.unwrap();
+    assert!(
+        !names.iter().any(|name| name == LEGACY_INDEX),
+        "the retired index must be dropped: {names:?}"
+    );
+    assert!(
+        names.iter().any(|name| name == ADDED_INDEX),
+        "the added index must exist: {names:?}"
+    );
+    assert_eq!(recorded_plan_version(&versions).await, next.version);
+
+    // A retirement runs once: at the recorded version it is no longer pending,
+    // so an index with that name created later is left alone.
+    proxies.create_index(legacy_index()).await.unwrap();
+    apply_mongo_index_plan_for_test(&store, &next)
+        .await
+        .unwrap();
+    let names = proxies.list_index_names().await.unwrap();
+    assert!(names.iter().any(|name| name == LEGACY_INDEX));
+
+    // The shipped binary is now older than the database: up and status refuse
+    // before any write, and the newer record and indexes are untouched.
+    let error = store
+        .run_migrations()
+        .await
+        .expect_err("an older plan must refuse a newer database");
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.contains("recorded in this database is newer than version"),
+        "unexpected refusal: {rendered}"
+    );
+    store
+        .migration_status()
+        .await
+        .expect_err("status must refuse a newer database too");
+    assert_eq!(recorded_plan_version(&versions).await, next.version);
+    let names = proxies.list_index_names().await.unwrap();
+    assert!(names.iter().any(|name| name == ADDED_INDEX));
+    db.drop().await.unwrap();
+}
+
 /// The periodic audit age-retention sweep must reach MongoDB namespaces that
 /// receive no new audit events (insert-path pruning never revisits them), and
 /// must prune by age only.

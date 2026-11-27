@@ -336,6 +336,11 @@ async fn test_v001_checksum_is_content_derived_sha256() {
     assert!(checksum.starts_with("sha256:"));
     assert_eq!(checksum.len(), "sha256:".len() + 64);
     assert_ne!(checksum, "v001_initial_schema");
+    // The recorded identity is the committed golden baseline value.
+    assert_eq!(
+        checksum,
+        ferrum_edge::config::migrations::v001_initial_schema::V001_BASELINE_CHECKSUM
+    );
 }
 
 fn declared_history(

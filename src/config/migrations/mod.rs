@@ -797,24 +797,189 @@ pub fn validate_migration_history_integrity(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Canonical migration identity
+// ---------------------------------------------------------------------------
+
+/// One SQL statement in canonical form: runs of ASCII whitespace collapse to a
+/// single space and the ends are trimmed. Migration identities hash this form,
+/// so re-indenting a raw string never changes a checksum. Baseline and forward
+/// migration DDL contains no quoted literal or SQL comment whose meaning
+/// depends on internal whitespace.
+pub(crate) fn canonical_statement(sql: &str) -> String {
+    sql.split_ascii_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// `sha256:<hex>` over a canonical migration rendering.
+pub(crate) fn canonical_checksum(canonical_text: &str) -> String {
+    use crate::fips::approved::Sha256;
+    let mut hasher = Sha256::new();
+    hasher.update(canonical_text.as_bytes());
+    format!("sha256:{}", hex::encode(hasher.finalize()))
+}
+
+/// A declarative core SQL forward migration (`V002` and later).
+///
+/// From 1.0.0 onward the `V001` baseline is frozen: every change to a built-in
+/// table, column, or index ships as a new forward migration with the next
+/// version number, appended to `MigrationRunner::shipped_migrations()`. This
+/// type is the shape such a migration takes when plain DDL is enough. Its
+/// checksum is computed from the canonical rendering of its statements (the
+/// same scheme as `V001`), so editing a shipped migration's SQL is refused as
+/// checksum drift on every database that already applied it: never edit one,
+/// add another.
+///
+/// Execution rules match `V001`: statements run in order on the migration-lock
+/// connection, and the tracking row is written only after every statement
+/// succeeded. MySQL implicitly commits DDL and PostgreSQL runs these
+/// statements outside an explicit transaction, so each statement must be safe
+/// to re-run after a partial failure (`IF NOT EXISTS` forms; on MySQL a
+/// `CREATE [UNIQUE] INDEX` that hits duplicate-key-name error 1061 and a
+/// two-token `DROP INDEX name ON table` that hits missing-key error 1091 are
+/// tolerated, exactly as for `V001` and custom-plugin migrations).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SqlMigration {
+    /// Core migration version; the next unused integer after the last shipped one.
+    pub version: i64,
+    /// Human-readable name recorded in `_ferrum_migrations.name`.
+    pub name: &'static str,
+    /// Statements for PostgreSQL, in order.
+    pub postgres: &'static [&'static str],
+    /// Statements for MySQL, in order.
+    pub mysql: &'static [&'static str],
+    /// Statements for SQLite, in order.
+    pub sqlite: &'static [&'static str],
+}
+
+impl SqlMigration {
+    /// The statements this migration runs on `db_type`.
+    pub fn statements_for(&self, db_type: &str) -> &'static [&'static str] {
+        match db_type {
+            "mysql" => self.mysql,
+            "sqlite" => self.sqlite,
+            _ => self.postgres,
+        }
+    }
+
+    /// Canonical text whose SHA-256 is this migration's recorded checksum.
+    pub fn canonical_text(&self) -> String {
+        let mut text = format!(
+            "ferrum-edge core migration V{:03}; canonical DDL format 1\n",
+            self.version
+        );
+        for (dialect, statements) in [
+            ("postgres", self.postgres),
+            ("mysql", self.mysql),
+            ("sqlite", self.sqlite),
+        ] {
+            text.push_str("dialect ");
+            text.push_str(dialect);
+            text.push('\n');
+            for statement in statements {
+                text.push_str("statement ");
+                text.push_str(&canonical_statement(statement));
+                text.push('\n');
+            }
+        }
+        text
+    }
+
+    /// `sha256:<hex>` over [`Self::canonical_text`].
+    pub fn checksum(&self) -> String {
+        canonical_checksum(&self.canonical_text())
+    }
+}
+
+fn is_mysql_create_index_statement(statement: &str) -> bool {
+    let words: Vec<&str> = statement.split_whitespace().take(3).collect();
+    let keyword = |position: usize, expected: &str| {
+        words
+            .get(position)
+            .is_some_and(|word| word.eq_ignore_ascii_case(expected))
+    };
+    keyword(0, "CREATE") && (keyword(1, "INDEX") || (keyword(1, "UNIQUE") && keyword(2, "INDEX")))
+}
+
+/// Apply the MySQL re-run tolerances documented on [`SqlMigration`].
+fn map_core_statement_result<T>(
+    db_type: &str,
+    statement: &str,
+    result: Result<T, sqlx::Error>,
+) -> Result<(), sqlx::Error> {
+    match result {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            if db_type == "mysql" {
+                let number = mysql_error_number(&error);
+                if mysql_drop_index_missing_is_benign(statement, number)
+                    || (is_mysql_create_index_statement(statement)
+                        && mysql_create_index_exists_is_benign(number))
+                {
+                    return Ok(());
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
 /// Runs versioned database migrations with tracking.
 pub struct MigrationRunner {
     pool: AnyPool,
     db_type: String,
+    /// Forward migrations appended after the shipped list. Always empty in
+    /// shipped builds; only the `test-support`-gated `_test_support` seam sets
+    /// it, so tests drive a real `V002` through this runner without shipping a
+    /// fake migration.
+    test_only_migrations: Vec<SqlMigration>,
 }
 
 impl MigrationRunner {
     pub fn new(pool: AnyPool, db_type: String) -> Self {
-        Self { pool, db_type }
+        Self {
+            pool,
+            db_type,
+            test_only_migrations: Vec::new(),
+        }
+    }
+
+    /// Test seam: append forward migrations after the shipped declarations.
+    /// Compiled only with the never-shipped `test-support` feature.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn with_test_only_migrations(mut self, migrations: Vec<SqlMigration>) -> Self {
+        self.test_only_migrations = migrations;
+        self
+    }
+
+    /// The core migrations this binary ships, in version order.
+    ///
+    /// `V001` is the frozen baseline. From 1.0.0 onward every schema change is
+    /// a new forward migration appended here with the next version; shipped
+    /// entries are never edited, reordered, or removed.
+    fn shipped_migrations() -> Vec<Box<dyn MigrationEntry>> {
+        vec![Box::new(MigrationEntryV001(
+            v001_initial_schema::V001InitialSchema,
+        ))]
+    }
+
+    /// Versions of the core migrations this binary ships, in order.
+    pub fn shipped_core_migration_versions() -> Vec<i64> {
+        Self::shipped_migrations()
+            .iter()
+            .map(|migration| migration.version())
+            .collect()
     }
 
     /// Build the ordered list of all known migrations.
     fn all_migrations(&self) -> Vec<Box<dyn MigrationEntry>> {
-        // During build-out, schema additions are folded into V001 rather than
-        // carried as upgrade migrations.
-        vec![Box::new(MigrationEntryV001(
-            v001_initial_schema::V001InitialSchema,
-        ))]
+        let mut migrations = Self::shipped_migrations();
+        migrations.extend(self.test_only_migrations.iter().map(|migration| {
+            Box::new(SqlMigrationEntry {
+                migration: *migration,
+                checksum: migration.checksum(),
+            }) as Box<dyn MigrationEntry>
+        }));
+        migrations
     }
 
     /// Ensure the `_ferrum_migrations` tracking table exists.
@@ -1598,5 +1763,37 @@ impl MigrationEntry for MigrationEntryV001 {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), anyhow::Error>> + Send + 'a>>
     {
         Box::pin(self.0.up(connection, db_type))
+    }
+}
+
+/// Wrapper for a declarative [`SqlMigration`].
+struct SqlMigrationEntry {
+    migration: SqlMigration,
+    checksum: String,
+}
+
+impl MigrationEntry for SqlMigrationEntry {
+    fn version(&self) -> i64 {
+        self.migration.version
+    }
+    fn name(&self) -> &str {
+        self.migration.name
+    }
+    fn checksum(&self) -> &str {
+        &self.checksum
+    }
+    fn run_up<'a>(
+        &'a self,
+        connection: &'a mut AnyConnection,
+        db_type: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), anyhow::Error>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            for statement in self.migration.statements_for(db_type) {
+                let result = sqlx::query(*statement).execute(&mut *connection).await;
+                map_core_statement_result(db_type, statement, result)?;
+            }
+            Ok(())
+        })
     }
 }

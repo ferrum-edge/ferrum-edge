@@ -27,6 +27,7 @@ their *failure* path, leaving the real client logic uncovered:
 | **OIDC** (`src/plugins/oidc_relying_party.rs`) | discovery, authorization-code + PKCE, JWKS/UserInfo/end-session, encrypted sessions, claim headers, idle/absolute expiry, refresh, logout | unit tests with wiremock IdP | live Ory Hydra: full browser challenge → callback session, state/correlation/nonce/issuer/audience/signature negatives (subject proven positively; `azp` multi-aud remains unit-covered), reserved-header protection, idle/absolute expiry with margin sleeps, refresh proven via token-facade `refresh_token` grant counter, RP logout (#3333) |
 | **OAuth2 introspection** (`src/plugins/oauth2_introspection.rs`) | RFC 7662 outbound introspect, discovery, cache, scope/role/audience, client auth, failure policy | unit tests with wiremock | live Hydra opaque tokens: active/inactive, scope/role/issuer/audience, `client_secret_basic` + `client_secret_post` request shaping observed on a non-secret facade, discovery facade (same-origin rewrite of admin introspect), cache hit/expiry proven by upstream-call counters without token-key leaks, timeout/malformed/oversized/wiremock-auth/unavailable → 503 (Hydra admin introspect does not enforce client auth) (#3333) |
 | **ClickHouse** (`src/plugins/api_chargeback_sink.rs`) | JSONEachRow INSERT of `ChargeEvent` against `schemas/clickhouse/charges.sql` | static DDL/serializer contract in `tests/integration/api_chargeback_sink_tests.rs`; ignored env-URL round trip | live `clickhouse/clickhouse-server:24.8`: apply baseline DDL, plugin HTTP/gRPC/stream/Unicode inserts, max-integer serializer insert, compatible DDL re-apply + durable artifact replay, identity-projection insert (issue #4441) |
+| **Schema forward migrations** (`src/config/migrations/mod.rs`, `src/modes/migrate.rs`) | `V002`+ forward migrations after the frozen `V001` baseline, through the production runner and `migrate status` / `up` reports | none: no forward migration ships yet | SQLite, live PostgreSQL 17 and MySQL 8.4 with a test-only `V002` registered through the `test-support` seam: golden `V001` identity recorded, `V002` pending/applied/no-op, idempotent re-run after a lost tracking row, fatal checksum drift on `V002` and `V001`, refusal of an unknown future version (binary downgrade) |
 
 ## Running locally
 
@@ -43,6 +44,7 @@ cargo test --test service_integration oidc
 cargo test --test service_integration oauth2_introspection
 cargo test --test service_integration clickhouse
 cargo test --test service_integration db_tls
+cargo test --test service_integration schema_forward_migrations
 ```
 
 The MySQL custom-plugin recovery test requires the pedagogical example at

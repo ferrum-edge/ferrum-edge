@@ -18,13 +18,15 @@ use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use super::common::containers::{BoxError, fail_in_ci_else_skip, start_within_deadline};
 use super::common::host_ports::{allocate_host_port, retry_on_host_port_collision};
 
-struct MySqlFixture {
+pub(super) struct MySqlFixture {
     _container: ContainerAsync<GenericImage>,
-    url: String,
-    pool: sqlx::AnyPool,
+    pub(super) url: String,
+    pub(super) pool: sqlx::AnyPool,
 }
 
-async fn start_mysql() -> Result<MySqlFixture, BoxError> {
+/// Fresh MySQL 8.4 container with an empty `ferrum` database (also used by
+/// `schema_forward_migrations`).
+pub(super) async fn start_mysql() -> Result<MySqlFixture, BoxError> {
     const PASSWORD: &str = "ferrum-mysql-test-password";
     let (container, port) = retry_on_host_port_collision(|| async {
         let host_port = allocate_host_port()?;

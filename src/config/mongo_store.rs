@@ -35,14 +35,17 @@
 //! deployments force full reloads for every change because resource writes and
 //! change records are not transactionally coupled.
 //!
-//! **Index creation**: The `run_migrations()` method creates indexes from the
-//! canonical plan in [`crate::config::mongo_index_plan`] instead of running SQL
-//! migrations. `createIndex` is idempotent **only when the full index spec
-//! (keys + options) matches**; if the keys match but options differ (e.g. a
-//! new `partialFilterExpression`), MongoDB raises `IndexOptionsConflict`
-//! (server error 85). Initialization fails on conflicting options: changed
-//! build-out schemas require a fresh database. Migrate dry-run and status
-//! consume the same plan so operator output cannot drift from `up`.
+//! **Index creation**: The `run_migrations()` method applies the versioned,
+//! forward-only index plan in [`crate::config::mongo_index_plan`] instead of
+//! running SQL migrations: it refuses a database that records a newer plan
+//! version, drops only indexes a later plan version retires by name, creates
+//! the plan, and records the version. `createIndex` is idempotent **only when
+//! the full index spec (keys + options) matches**; if the keys match but
+//! options differ (e.g. a new `partialFilterExpression`), MongoDB raises
+//! `IndexOptionsConflict` (server error 85), and initialization fails. A
+//! changed definition ships as a retirement plus a new plan entry. Migrate
+//! dry-run and status consume the same plan so operator output cannot drift
+//! from `up`.
 
 #[allow(dead_code)] // MongoStore is wired up in mode dispatch (database.rs, control_plane.rs)
 mod inner {
@@ -116,9 +119,11 @@ mod inner {
     use zeroize::Zeroizing;
     // regex::escape is used for safe MongoDB $regex pattern construction in list filters.
     use crate::config::mongo_index_plan::{
-        HMAC_SECRET_HASHES_FIELD, MongoMigrationStatus, REQUIRED_GUARD_COLLECTIONS,
-        RequiredMongoIndex, classify_guard_collections, classify_plan_against_live,
-        required_mongo_indexes,
+        HMAC_SECRET_HASHES_FIELD, MONGO_INDEX_PLAN_VERSION, MONGO_INDEX_PLAN_VERSION_COLLECTION,
+        MONGO_INDEX_PLAN_VERSION_DOCUMENT_ID, MongoIndexPlan, MongoMigrationStatus,
+        REQUIRED_GUARD_COLLECTIONS, RequiredMongoIndex, RetiredMongoIndex,
+        classify_guard_collections, classify_plan_against_live,
+        recorded_plan_version_from_document, required_mongo_indexes,
     };
     use crate::config::namespace_registry::{
         NAMESPACE_OCCUPANCY_TABLES, NamespaceRecord, NamespaceRegistryAtomicityUnsupported,
@@ -135,6 +140,7 @@ mod inner {
     // src/mongo/db/operation_exit_code.idl (server) and
     // https://www.mongodb.com/docs/manual/reference/error-codes/.
     const MONGO_ERR_NAMESPACE_NOT_FOUND: i32 = 26;
+    const MONGO_ERR_INDEX_NOT_FOUND: i32 = 27;
     const MONGO_ERR_NAMESPACE_EXISTS: i32 = 48;
     const MONGO_ERR_DUPLICATE_KEY: i32 = 11_000;
     /// `maxAwaitTimeMS` for the config-change stream's `getMore`. Bounds how
@@ -2482,9 +2488,16 @@ mod inner {
                 .into_iter()
                 .collect();
 
+            // Same refusal as `up`: an older binary must not report a database
+            // that a newer release upgraded as merely "missing" indexes.
+            let recorded_plan_version = self.recorded_index_plan_version().await?;
+            MongoIndexPlan::current().upgrade_from(recorded_plan_version)?;
+
             Ok(MongoMigrationStatus {
                 indexes: classify_plan_against_live(&live_by_collection),
                 guard_collections: classify_guard_collections(&live_collection_names),
+                recorded_plan_version,
+                plan_version: MONGO_INDEX_PLAN_VERSION,
             })
         }
 
@@ -2514,13 +2527,153 @@ mod inner {
             Ok(indexes)
         }
 
+        /// Apply one versioned index plan under the migration lease.
+        ///
+        /// Order: refuse a database whose recorded plan version is newer than
+        /// `plan` (binary downgrade) before any write; create guard
+        /// collections; drop exactly the indexes `plan` retires after the
+        /// recorded version; ensure every planned index; seed the namespace
+        /// registry; then record `plan.version`. A failure before the record
+        /// leaves the old version recorded, so the next run repeats the same
+        /// idempotent forward step.
+        pub(crate) async fn apply_index_plan(
+            &self,
+            plan: &MongoIndexPlan,
+        ) -> Result<(), anyhow::Error> {
+            let mut migration_lease = self.acquire_migration_lease().await?;
+            // Run every initialization step inside a scoped future so a failure
+            // part-way through still falls through to the lease release below.
+            // Without this, an early `?` would exit `apply_index_plan` with the
+            // lease still held, forcing other replicas to wait out the full
+            // 120s lease window before they can migrate — the `Drop` path only
+            // spawns a best-effort async cleanup that may never run when the
+            // runtime is torn down in startup/migrate mode.
+            let migration_result: Result<(), anyhow::Error> = async {
+                // Ensure indexes from the versioned plan in `mongo_index_plan`.
+                // createIndex is idempotent when keys+options match;
+                // conflicting options fail. Old indexes are dropped only when
+                // a later plan version retires them by name.
+                let recorded = self.recorded_index_plan_version().await?;
+                let retirements = plan.upgrade_from(recorded)?;
+
+                // Intentionally no automatic orphan reconcile of
+                // `consumer_identity_index` against `consumers`. Point-read
+                // consumer absence is not a uniqueness proof across serving
+                // nodes (migration lease ≠ CRUD lock); reclaiming a live
+                // reserve-first create would drop the durable uniqueness
+                // guard. Crash orphans stay locked until same-owner E11000
+                // adoption heals a retry of the same consumer id, or an
+                // operator removes the reservation manually.
+
+                // Guard collections are keyed purely by `_id` and need no
+                // secondary indexes. Some are written from inside transactions,
+                // where a cross-shard write transaction cannot implicitly
+                // create a collection and concurrent first writes can
+                // conflict, so create every guard collection explicitly.
+                // NamespaceExists (code 48) is tolerated for idempotent
+                // multi-instance startup.
+                for lock_collection in REQUIRED_GUARD_COLLECTIONS {
+                    match self.db().create_collection(*lock_collection).await {
+                        Ok(()) => {}
+                        Err(e) if is_namespace_exists(&e) => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+
+                for retired in &retirements {
+                    self.retire_planned_index(retired).await?;
+                }
+
+                for entry in &plan.indexes {
+                    self.ensure_planned_index(entry).await?;
+                }
+
+                self.initialize_namespace_registry().await?;
+
+                if recorded != Some(plan.version) {
+                    self.record_index_plan_version(plan.version).await?;
+                }
+
+                info!(
+                    "MongoDB indexes ensured (index plan version {})",
+                    plan.version
+                );
+                Ok(())
+            }
+            .await;
+
+            // Always release the lease — on success and on error — then surface
+            // the combined outcome so a migration failure is not masked by a
+            // release failure (and vice versa). Mirrors the SQL side's
+            // run-body / capture-result / release / combine pattern.
+            let release_result = migration_lease.release().await;
+            match (migration_result, release_result) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(migration_err), Ok(())) => Err(migration_err),
+                (Ok(()), Err(release_err)) => Err(release_err),
+                (Err(migration_err), Err(release_err)) => Err(migration_err.context(format!(
+                    "MongoDB migration lease release also failed: {release_err:#}"
+                ))),
+            }
+        }
+
+        /// The index-plan version recorded by the last successful `up`.
+        async fn recorded_index_plan_version(&self) -> Result<Option<i64>, anyhow::Error> {
+            let document = self
+                .collection(MONGO_INDEX_PLAN_VERSION_COLLECTION)
+                .find_one(doc! { "_id": MONGO_INDEX_PLAN_VERSION_DOCUMENT_ID })
+                .await?;
+            Ok(recorded_plan_version_from_document(document.as_ref())?)
+        }
+
+        /// Record `version` after a plan applied completely. `$max` keeps the
+        /// record monotonic even if a newer release raced past this one.
+        async fn record_index_plan_version(&self, version: i64) -> Result<(), anyhow::Error> {
+            let now = crate::time_compat::UtcTimestamp::now().to_rfc3339();
+            self.collection(MONGO_INDEX_PLAN_VERSION_COLLECTION)
+                .update_one(
+                    doc! { "_id": MONGO_INDEX_PLAN_VERSION_DOCUMENT_ID },
+                    doc! {
+                        "$max": { "version": version },
+                        "$set": { "applied_at": &now },
+                    },
+                )
+                .upsert(true)
+                .await?;
+            Ok(())
+        }
+
+        /// Drop one index a later plan version retired, by its exact name. An
+        /// index or collection that is already absent (a fresh database, or a
+        /// retry after a partial run) is the desired end state.
+        async fn retire_planned_index(
+            &self,
+            retired: &RetiredMongoIndex,
+        ) -> Result<(), anyhow::Error> {
+            match self
+                .collection(retired.collection)
+                .drop_index(retired.name)
+                .await
+            {
+                Ok(()) => Ok(()),
+                Err(e)
+                    if is_mongo_command_error_with_code(&e, MONGO_ERR_INDEX_NOT_FOUND)
+                        || is_namespace_not_found(&e) =>
+                {
+                    Ok(())
+                }
+                Err(e) => Err(e.into()),
+            }
+        }
+
         async fn ensure_planned_index(
             &self,
             entry: &RequiredMongoIndex,
         ) -> Result<(), anyhow::Error> {
             let collection = self.collection(entry.collection);
-            // A changed build-out index requires a fresh database. Never drop
-            // an existing constraint as an implicit startup upgrade.
+            // Never drop an existing constraint as an implicit startup
+            // upgrade: a changed definition ships as a retirement plus a new
+            // plan entry in a later plan version.
             collection.create_index(entry.model.clone()).await?;
             Ok(())
         }
@@ -16323,67 +16476,9 @@ mod inner {
         }
 
         async fn run_migrations(&self) -> Result<(), anyhow::Error> {
-            let mut migration_lease = self.acquire_migration_lease().await?;
-            // Run every initialization step inside a scoped future so a failure
-            // part-way through still falls through to the lease release below.
-            // Without this, an early `?` would exit `run_migrations` with the
-            // lease still held, forcing other replicas to wait out the full
-            // 120s lease window before they can migrate — the `Drop` path only
-            // spawns a best-effort async cleanup that may never run when the
-            // runtime is torn down in startup/migrate mode.
-            let migration_result: Result<(), anyhow::Error> = async {
-                // MongoDB doesn't use SQL migrations. Instead, ensure indexes
-                // from the canonical plan in `mongo_index_plan`. createIndex is
-                // idempotent when keys+options match; conflicting options fail.
-
-                // Intentionally no automatic orphan reconcile of
-                // `consumer_identity_index` against `consumers`. Point-read
-                // consumer absence is not a uniqueness proof across serving
-                // nodes (migration lease ≠ CRUD lock); reclaiming a live
-                // reserve-first create would drop the durable uniqueness
-                // guard. Crash orphans stay locked until same-owner E11000
-                // adoption heals a retry of the same consumer id, or an
-                // operator removes the reservation manually.
-
-                // Guard collections are keyed purely by `_id` and need no
-                // secondary indexes. Some are written from inside transactions,
-                // where a cross-shard write transaction cannot implicitly
-                // create a collection and concurrent first writes can
-                // conflict, so create every guard collection explicitly.
-                // NamespaceExists (code 48) is tolerated for idempotent
-                // multi-instance startup.
-                for lock_collection in REQUIRED_GUARD_COLLECTIONS {
-                    match self.db().create_collection(*lock_collection).await {
-                        Ok(()) => {}
-                        Err(e) if is_namespace_exists(&e) => {}
-                        Err(e) => return Err(e.into()),
-                    }
-                }
-
-                for entry in required_mongo_indexes() {
-                    self.ensure_planned_index(&entry).await?;
-                }
-
-                self.initialize_namespace_registry().await?;
-
-                info!("MongoDB indexes ensured");
-                Ok(())
-            }
-            .await;
-
-            // Always release the lease — on success and on error — then surface
-            // the combined outcome so a migration failure is not masked by a
-            // release failure (and vice versa). Mirrors the SQL side's
-            // run-body / capture-result / release / combine pattern.
-            let release_result = migration_lease.release().await;
-            match (migration_result, release_result) {
-                (Ok(()), Ok(())) => Ok(()),
-                (Err(migration_err), Ok(())) => Err(migration_err),
-                (Ok(()), Err(release_err)) => Err(release_err),
-                (Err(migration_err), Err(release_err)) => Err(migration_err.context(format!(
-                    "MongoDB migration lease release also failed: {release_err:#}"
-                ))),
-            }
+            // MongoDB doesn't use SQL migrations. It applies the shipped,
+            // versioned index plan; see `apply_index_plan`.
+            self.apply_index_plan(&MongoIndexPlan::current()).await
         }
 
         async fn list_namespaces(&self) -> Result<Vec<String>, anyhow::Error> {
