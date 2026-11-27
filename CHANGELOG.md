@@ -17,9 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (whose message is unchanged), a value chrono accepted whose UTC instant falls
   outside years -9999..=9999 is now rejected the same way, and a leap second
   (`:60`) is treated as the following second.
-- **`chrono` is no longer compiled into Ferrum Edge** (issue #7419). All
-  timestamps use `time` through `time_compat`; `chrono` and sqlx's `chrono`
-  feature remain only as test dependencies for the parity tests, so the
+- **`chrono` is no longer compiled into the shipped Ferrum Edge binary**
+  (issue #7419). All timestamps use `time` through `time_compat`; `chrono` and
+  sqlx's `chrono` feature remain only as dev-dependencies (test code and the
+  `time_compat` parity tests; Cargo also enables dev-dependencies when building
+  examples), so the
   RUSTSEC-2026-0543 exception stays in `deny.toml` (cargo-deny also audits
   dev-dependencies). Serialized timestamps are unchanged.
 
