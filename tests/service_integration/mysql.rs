@@ -10,6 +10,7 @@ use ferrum_edge::_test_support::DbPoolConfig;
 use ferrum_edge::config::db_loader::DatabaseStore;
 use ferrum_edge::config::migrations::MigrationRunner;
 use ferrum_edge::config::types::{Consumer, LoadBalancerAlgorithm, Upstream, UpstreamTarget};
+use ferrum_edge::time_compat::UtcTimestamp;
 use sqlx::Row;
 use testcontainers::core::IntoContainerPort;
 use testcontainers::runners::AsyncRunner;
@@ -154,8 +155,8 @@ fn make_namespace_upstream(namespace: &str, id: &str) -> Upstream {
         backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         api_spec_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         k8s_service_uid: None,
         admission_upstream_id: None,
         pending_limit_scope: None,
@@ -171,8 +172,8 @@ fn make_consumer(namespace: &str, id: &str, username: &str) -> Consumer {
         custom_id: None,
         credentials: Default::default(),
         acl_groups: Vec::new(),
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -664,8 +665,6 @@ async fn mysql_byte_exact_identity_accepts_unicode_and_space_variants() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mysql_utc_timestamp_roundtrips_byte_identically_with_chrono_and_legacy_rows() {
-    use ferrum_edge::time_compat::UtcTimestamp;
-
     let fixture = match start_mysql().await {
         Ok(fixture) => fixture,
         Err(error) => {

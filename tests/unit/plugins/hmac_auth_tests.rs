@@ -18,6 +18,7 @@ use super::plugin_utils::{
     assert_continue, assert_reject, assert_reject_body, context_with_materialized_raw_header,
     context_with_materialized_raw_header_bytes, create_test_proxy,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 
 type HmacSha256 = Hmac<Sha256>;
 type HmacSha512 = Hmac<Sha512>;
@@ -65,8 +66,8 @@ fn create_hmac_consumer_named(id: &str, username: &str, secret: &str) -> Consume
         custom_id: None,
         credentials,
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -88,8 +89,8 @@ fn create_consumer_without_hmac_creds() -> Consumer {
         custom_id: None,
         credentials,
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -1619,8 +1620,8 @@ fn create_hmac_consumer_with_secrets(secrets: &[&str]) -> Consumer {
         custom_id: None,
         credentials,
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 

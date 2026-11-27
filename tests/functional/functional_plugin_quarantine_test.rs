@@ -22,6 +22,7 @@
 //!   cargo test --test functional_tests -- --ignored --nocapture functional_plugin_quarantine
 
 use crate::common::{TestGateway, spawn_http_counting_mutations};
+use ferrum_edge::time_compat::UtcTimestamp;
 use serde_json::json;
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{Pool, Sqlite};
@@ -76,7 +77,7 @@ async fn sqlite_pool(db_url: &str) -> Pool<Sqlite> {
 
 /// Overwrite one plugin row's `config` column, bypassing admin validation.
 async fn store_plugin_config(pool: &Pool<Sqlite>, plugin_config_id: &str, config: &str) {
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = UtcTimestamp::now().to_rfc3339();
     let affected = sqlx::query(
         "UPDATE plugin_configs SET config = ?, updated_at = ? \
          WHERE id = ? AND namespace = 'ferrum'",
@@ -105,7 +106,7 @@ async fn seed_full_reload_change(pool: &Pool<Sqlite>) {
          VALUES ('ferrum', 'consumer', ?, 'upsert', ?)",
     )
     .bind(FULL_RELOAD_CONSUMER_ID)
-    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(UtcTimestamp::now().to_rfc3339())
     .execute(pool)
     .await
     .expect("config_changes seed must succeed");

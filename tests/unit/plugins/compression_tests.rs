@@ -5140,8 +5140,8 @@ async fn test_multi_instance_plugin_cache_reload_preserves_ownership() {
                     priority_override: Some(*priority),
                     trigger: None,
                     api_spec_id: None,
-                    created_at: chrono::Utc::now(),
-                    updated_at: chrono::Utc::now(),
+                    created_at: UtcTimestamp::now(),
+                    updated_at: UtcTimestamp::now(),
                 })
                 .collect(),
             upstreams: vec![],

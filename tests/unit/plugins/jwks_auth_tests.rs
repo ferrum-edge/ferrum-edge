@@ -22,6 +22,7 @@ use super::plugin_utils::{
     assert_continue, assert_reject, assert_reject_body, context_with_materialized_raw_header_lines,
     create_test_consumer,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 
 static JWKS_TEST_PATH_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -75,7 +76,6 @@ async fn jwks_marks_forwarded_custom_query_locations_for_opa_redaction() {
 }
 
 fn create_consumer(username: &str) -> ferrum_edge::config::types::Consumer {
-    use chrono::Utc;
     ferrum_edge::config::types::Consumer {
         labels: Default::default(),
         id: format!("{}-id", username),
@@ -84,8 +84,8 @@ fn create_consumer(username: &str) -> ferrum_edge::config::types::Consumer {
         custom_id: None,
         credentials: HashMap::new(),
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -93,7 +93,6 @@ fn create_consumer_with_custom_id(
     username: &str,
     custom_id: &str,
 ) -> ferrum_edge::config::types::Consumer {
-    use chrono::Utc;
     ferrum_edge::config::types::Consumer {
         labels: Default::default(),
         id: format!("{}-id", username),
@@ -102,8 +101,8 @@ fn create_consumer_with_custom_id(
         custom_id: Some(custom_id.to_string()),
         credentials: HashMap::new(),
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 

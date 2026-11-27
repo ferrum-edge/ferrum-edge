@@ -11,7 +11,6 @@ use std::io::Write;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use chrono::{Duration as ChronoDuration, Utc};
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
@@ -22,6 +21,7 @@ use ferrum_edge::config::file_loader::load_config_from_file;
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::config::{BackendEgressPolicy, EnvConfig, OperatingMode};
 use ferrum_edge::modes::file::{self, ServeOptions, apply_file_config_candidate};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const ADMIN_JWT_SECRET: &str = "file-mode-reload-observability-secret-32b";
 const ADMIN_JWT_ISSUER: &str = "ferrum-edge-test";
@@ -74,13 +74,13 @@ fn file_env(proxy_port: u16, admin_port: u16) -> EnvConfig {
 }
 
 fn mint_admin_token() -> String {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "iss": ADMIN_JWT_ISSUER,
         "sub": "reload-observability-operator",
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + ChronoDuration::seconds(1800)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(1800)).unwrap()).unix_timestamp(),
         "jti": uuid::Uuid::new_v4().to_string(),
         "role": "admin",
     });
@@ -421,8 +421,8 @@ async fn file_mode_rename_conflict_rejection_log_is_sanitized() {
         custom_id: None,
         credentials: std::collections::HashMap::new(),
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     let deny = PluginConfig {
         labels: Default::default(),
@@ -436,8 +436,8 @@ async fn file_mode_rename_conflict_rejection_log_is_sanitized() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     let mut initial = parse_gateway_yaml(&good_config_yaml("proxy-good"));
     initial.consumers.push(consumer.clone());

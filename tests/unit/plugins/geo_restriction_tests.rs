@@ -1,5 +1,4 @@
 use base64::Engine;
-use chrono::Utc;
 use ferrum_edge::PluginCache;
 use ferrum_edge::config::db_backend::NamespacedResourceId;
 use ferrum_edge::config::file_loader::load_config_from_file;
@@ -12,6 +11,7 @@ use ferrum_edge::plugins::{
     ALL_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, StreamConnectionContext,
     priority, validate_plugin_config,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use http::{HeaderMap, HeaderValue};
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
@@ -160,8 +160,8 @@ fn make_geo_plugin(id: &str, enabled: bool, config: serde_json::Value) -> Plugin
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -1982,8 +1982,8 @@ async fn principal_assertion_refresh_keeps_the_owned_outbound_copy() {
         custom_id: None,
         credentials: Default::default(),
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }));
 
     let mut owned = None;

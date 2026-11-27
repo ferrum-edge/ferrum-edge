@@ -24,7 +24,6 @@
 
 use crate::scaffolding::port_registry::TestSocket;
 
-use chrono::Utc;
 use ferrum_edge::admin::{
     AdminState,
     jwt_auth::{JwtConfig, JwtManager},
@@ -36,6 +35,7 @@ use ferrum_edge::config::types::{
     AuthMode, BackendScheme, DispatchKind, GatewayConfig, LoadBalancerAlgorithm, PluginAssociation,
     PluginConfig, PluginScope, Proxy, Upstream, UpstreamTarget,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -73,14 +73,14 @@ fn make_jwt_manager(config: &TestConfig) -> JwtManager {
 }
 
 fn make_token(config: &TestConfig) -> String {
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "iss": config.jwt_issuer,
         "sub": "test-user",
         "role": "admin",
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(config.max_ttl as i64)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(config.max_ttl as i64)).unwrap()).unix_timestamp(),
         "jti": uuid::Uuid::new_v4().to_string(),
     });
     encode(
@@ -922,7 +922,7 @@ async fn upstream_exists(store: &DatabaseStore, namespace: &str, id: &str) -> bo
 #[tokio::test]
 async fn mesh_route_dispatch_store_cross_namespace_ref_does_not_block_upstream_delete() {
     let (store, _tmp) = sqlite_store_for_store_level_tests().await;
-    let ts = chrono::Utc::now().to_rfc3339();
+    let ts = UtcTimestamp::now().to_rfc3339();
     let shared_upstream_id = "up-shared-store";
 
     seed_store_upstream(&store, NAMESPACE_A, shared_upstream_id, &ts).await;
@@ -951,7 +951,7 @@ async fn mesh_route_dispatch_store_cross_namespace_ref_does_not_block_upstream_d
 #[tokio::test]
 async fn mesh_route_dispatch_store_same_namespace_ref_blocks_upstream_delete() {
     let (store, _tmp) = sqlite_store_for_store_level_tests().await;
-    let ts = chrono::Utc::now().to_rfc3339();
+    let ts = UtcTimestamp::now().to_rfc3339();
     let upstream_id = "up-a-store-route";
 
     seed_store_upstream(&store, NAMESPACE_A, upstream_id, &ts).await;
@@ -1055,8 +1055,8 @@ fn ns_upstream(namespace: &str, id: &str) -> Upstream {
         backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         k8s_service_uid: None,
         admission_upstream_id: None,
         pending_limit_scope: None,
@@ -1076,8 +1076,8 @@ fn ns_plugin_config(namespace: &str, id: &str, scope: PluginScope) -> PluginConf
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -1145,8 +1145,8 @@ fn ns_proxy(namespace: &str, id: &str, listen_path: &str) -> Proxy {
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }

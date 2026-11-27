@@ -6,10 +6,10 @@
 
 use crate::scaffolding::port_registry::TestSocket;
 
-use chrono::Utc;
 use ferrum_edge::config::db_backend::{DatabaseBackend, plugin_association_precondition_failed};
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
 use ferrum_edge::config::types::PluginScope;
+use ferrum_edge::time_compat::UtcTimestamp;
 use std::collections::BTreeSet;
 use tempfile::TempDir;
 
@@ -25,7 +25,7 @@ async fn sqlite_store() -> (DatabaseStore, TempDir) {
 
 async fn seed_proxy_with_plugin(store: &DatabaseStore) {
     let pool = store.pool();
-    let ts = Utc::now().to_rfc3339();
+    let ts = UtcTimestamp::now().to_rfc3339();
 
     sqlx::query(
         "INSERT INTO proxies \
@@ -83,7 +83,7 @@ async fn seed_proxy_with_plugin(store: &DatabaseStore) {
 /// both rows now, so enforcement is disabled for the injection. The loader's
 /// own fail-closed validation is what these tests exercise.
 async fn inject_cross_namespace_plugin_association(store: &DatabaseStore) {
-    let ts = Utc::now().to_rfc3339();
+    let ts = UtcTimestamp::now().to_rfc3339();
     let mut conn = store.pool().acquire().await.unwrap();
     sqlx::query("PRAGMA foreign_keys = OFF")
         .execute(&mut *conn)
@@ -122,7 +122,7 @@ async fn composite_foreign_keys_refuse_cross_namespace_plugin_attachment() {
     let (store, _temp_dir) = sqlite_store().await;
     seed_proxy_with_plugin(&store).await;
 
-    let ts = Utc::now().to_rfc3339();
+    let ts = UtcTimestamp::now().to_rfc3339();
     let pool = store.pool();
     let plugin_error = sqlx::query(
         "INSERT INTO plugin_configs \
@@ -415,7 +415,7 @@ async fn admin_proxy_reads_reject_global_plugin_associations() {
     let (store, _temp_dir) = sqlite_store().await;
     seed_proxy_with_plugin(&store).await;
 
-    let ts = Utc::now().to_rfc3339();
+    let ts = UtcTimestamp::now().to_rfc3339();
     let pool = store.pool();
     sqlx::query(
         "INSERT INTO plugin_configs \
@@ -455,7 +455,7 @@ async fn admin_proxy_reads_reject_proxy_group_plugin_with_proxy_id() {
     let (store, _temp_dir) = sqlite_store().await;
     seed_proxy_with_plugin(&store).await;
 
-    let ts = Utc::now().to_rfc3339();
+    let ts = UtcTimestamp::now().to_rfc3339();
     let pool = store.pool();
     sqlx::query(
         "INSERT INTO plugin_configs \
@@ -495,7 +495,7 @@ async fn proxy_write_precheck_can_repair_invalid_associations() {
     let (store, _temp_dir) = sqlite_store().await;
     seed_proxy_with_plugin(&store).await;
 
-    let ts = Utc::now().to_rfc3339();
+    let ts = UtcTimestamp::now().to_rfc3339();
     let pool = store.pool();
     sqlx::query(
         "INSERT INTO plugin_configs \
@@ -643,14 +643,14 @@ async fn attach_admin(store: Arc<DatabaseStore>) -> (String, tokio::sync::watch:
 }
 
 fn attach_token() -> String {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "iss": "test-ferrum-edge",
         "sub": "test-user",
         "role": "admin",
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(3600)).unwrap()).unix_timestamp(),
         "jti": uuid::Uuid::new_v4().to_string(),
     });
     encode(

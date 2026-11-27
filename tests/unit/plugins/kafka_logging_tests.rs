@@ -28,6 +28,7 @@ use super::plugin_utils::{
     create_test_stream_transaction_summary, create_test_transaction_summary,
     create_test_ws_disconnect_context,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 
 fn default_http_client() -> PluginHttpClient {
     PluginHttpClient::default()
@@ -2229,7 +2230,7 @@ fn ordinary_tuning_keys_do_not_need_the_opt_in() {
 #[test]
 fn snapshot_validator_refuses_disabled_native_rows_under_the_local_opt_in() {
     let env = crate::unit::env_lock::EnvGuard::new(&[]);
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let row =
         |id: &str, producer_config: serde_json::Value| ferrum_edge::config::types::PluginConfig {
             labels: Default::default(),

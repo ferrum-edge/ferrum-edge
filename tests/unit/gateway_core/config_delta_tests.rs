@@ -1,13 +1,12 @@
 //! Tests for config delta module
 
-use chrono::{DateTime, Utc};
 use ferrum_edge::config::db_backend::NamespacedResourceId;
 use ferrum_edge::config::types::*;
 use ferrum_edge::config_delta::ConfigDelta;
 use ferrum_edge::time_compat::UtcTimestamp;
 use std::collections::HashMap;
 
-fn make_proxy(id: &str, listen_path: &str, updated_at: DateTime<Utc>) -> Proxy {
+fn make_proxy(id: &str, listen_path: &str, updated_at: UtcTimestamp) -> Proxy {
     Proxy {
         labels: Default::default(),
         id: id.to_string(),
@@ -78,7 +77,7 @@ fn make_proxy(id: &str, listen_path: &str, updated_at: DateTime<Utc>) -> Proxy {
     }
 }
 
-fn make_upstream(id: &str, targets: Vec<UpstreamTarget>, updated_at: DateTime<Utc>) -> Upstream {
+fn make_upstream(id: &str, targets: Vec<UpstreamTarget>, updated_at: UtcTimestamp) -> Upstream {
     Upstream {
         labels: Default::default(),
         id: id.to_string(),
@@ -131,7 +130,7 @@ fn make_plugin_config(
     name: &str,
     scope: PluginScope,
     proxy_id: Option<&str>,
-    updated_at: DateTime<Utc>,
+    updated_at: UtcTimestamp,
 ) -> PluginConfig {
     PluginConfig {
         labels: Default::default(),
@@ -150,7 +149,7 @@ fn make_plugin_config(
     }
 }
 
-fn make_consumer(id: &str, username: &str, updated_at: DateTime<Utc>) -> Consumer {
+fn make_consumer(id: &str, username: &str, updated_at: UtcTimestamp) -> Consumer {
     Consumer {
         labels: Default::default(),
         id: id.to_string(),
@@ -168,7 +167,7 @@ fn make_consumer(id: &str, username: &str, updated_at: DateTime<Utc>) -> Consume
 fn test_empty_delta_when_configs_identical() {
     let config = GatewayConfig {
         version: "1".to_string(),
-        proxies: vec![make_proxy("p1", "/api", Utc::now())],
+        proxies: vec![make_proxy("p1", "/api", UtcTimestamp::now())],
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
@@ -182,7 +181,7 @@ fn test_empty_delta_when_configs_identical() {
 
 #[test]
 fn test_detects_added_proxy() {
-    let t = Utc::now();
+    let t = UtcTimestamp::now();
     let old = GatewayConfig::default();
     let new = GatewayConfig {
         proxies: vec![make_proxy("p1", "/api", t)],
@@ -197,7 +196,7 @@ fn test_detects_added_proxy() {
 
 #[test]
 fn test_detects_removed_proxy() {
-    let t = Utc::now();
+    let t = UtcTimestamp::now();
     let old = GatewayConfig {
         proxies: vec![make_proxy("p1", "/api", t)],
         ..Default::default()
@@ -214,8 +213,8 @@ fn test_detects_removed_proxy() {
 
 #[test]
 fn test_detects_modified_proxy() {
-    let t1 = Utc::now();
-    let t2 = t1 + chrono::Duration::seconds(10);
+    let t1 = UtcTimestamp::now();
+    let t2 = t1.checked_add(::time::SignedDuration::seconds(10)).unwrap();
     let old = GatewayConfig {
         proxies: vec![make_proxy("p1", "/api", t1)],
         ..Default::default()
@@ -236,7 +235,7 @@ fn test_detects_modified_proxy() {
 
 #[test]
 fn test_unchanged_proxy_not_in_delta() {
-    let t = Utc::now();
+    let t = UtcTimestamp::now();
     let config = GatewayConfig {
         proxies: vec![make_proxy("p1", "/api", t)],
         ..Default::default()
@@ -248,8 +247,8 @@ fn test_unchanged_proxy_not_in_delta() {
 
 #[test]
 fn test_detects_consumer_changes() {
-    let t1 = Utc::now();
-    let t2 = t1 + chrono::Duration::seconds(5);
+    let t1 = UtcTimestamp::now();
+    let t2 = t1.checked_add(::time::SignedDuration::seconds(5)).unwrap();
     let old = GatewayConfig {
         consumers: vec![
             make_consumer("c1", "alice", t1),
@@ -280,7 +279,7 @@ fn test_detects_consumer_changes() {
 
 #[test]
 fn test_detects_added_upstream() {
-    let t = Utc::now();
+    let t = UtcTimestamp::now();
     let old = GatewayConfig::default();
     let new = GatewayConfig {
         upstreams: vec![make_upstream("u1", vec![make_target("backend1", 8080)], t)],
@@ -295,7 +294,7 @@ fn test_detects_added_upstream() {
 
 #[test]
 fn test_detects_removed_upstream() {
-    let t = Utc::now();
+    let t = UtcTimestamp::now();
     let old = GatewayConfig {
         upstreams: vec![make_upstream("u1", vec![make_target("backend1", 8080)], t)],
         ..Default::default()
@@ -312,8 +311,8 @@ fn test_detects_removed_upstream() {
 
 #[test]
 fn test_detects_modified_upstream() {
-    let t1 = Utc::now();
-    let t2 = t1 + chrono::Duration::seconds(10);
+    let t1 = UtcTimestamp::now();
+    let t2 = t1.checked_add(::time::SignedDuration::seconds(10)).unwrap();
     let old = GatewayConfig {
         upstreams: vec![make_upstream("u1", vec![make_target("backend1", 8080)], t1)],
         ..Default::default()
@@ -331,7 +330,7 @@ fn test_detects_modified_upstream() {
 
 #[test]
 fn test_unchanged_upstream_not_in_delta() {
-    let t = Utc::now();
+    let t = UtcTimestamp::now();
     let config = GatewayConfig {
         upstreams: vec![make_upstream("u1", vec![make_target("backend1", 8080)], t)],
         ..Default::default()
@@ -344,8 +343,8 @@ fn test_unchanged_upstream_not_in_delta() {
 
 #[test]
 fn test_upstream_mixed_add_remove_modify() {
-    let t1 = Utc::now();
-    let t2 = t1 + chrono::Duration::seconds(5);
+    let t1 = UtcTimestamp::now();
+    let t2 = t1.checked_add(::time::SignedDuration::seconds(5)).unwrap();
     let old = GatewayConfig {
         upstreams: vec![
             make_upstream("u1", vec![make_target("a", 80)], t1),
@@ -376,7 +375,7 @@ fn test_upstream_mixed_add_remove_modify() {
 
 #[test]
 fn test_detects_added_plugin_config() {
-    let t = Utc::now();
+    let t = UtcTimestamp::now();
     let old = GatewayConfig::default();
     let new = GatewayConfig {
         plugin_configs: vec![make_plugin_config(
@@ -398,7 +397,7 @@ fn test_detects_added_plugin_config() {
 
 #[test]
 fn test_detects_removed_plugin_config() {
-    let t = Utc::now();
+    let t = UtcTimestamp::now();
     let old = GatewayConfig {
         plugin_configs: vec![make_plugin_config(
             "pc1",
@@ -422,8 +421,8 @@ fn test_detects_removed_plugin_config() {
 
 #[test]
 fn test_detects_modified_plugin_config() {
-    let t1 = Utc::now();
-    let t2 = t1 + chrono::Duration::seconds(5);
+    let t1 = UtcTimestamp::now();
+    let t2 = t1.checked_add(::time::SignedDuration::seconds(5)).unwrap();
     let old = GatewayConfig {
         plugin_configs: vec![make_plugin_config(
             "pc1",
@@ -456,8 +455,8 @@ fn test_detects_modified_plugin_config() {
 
 #[test]
 fn test_proxy_ids_needing_plugin_rebuild_from_proxy_change() {
-    let t1 = Utc::now();
-    let t2 = t1 + chrono::Duration::seconds(5);
+    let t1 = UtcTimestamp::now();
+    let t2 = t1.checked_add(::time::SignedDuration::seconds(5)).unwrap();
     let old = GatewayConfig {
         proxies: vec![make_proxy("p1", "/api", t1)],
         ..Default::default()
@@ -473,8 +472,8 @@ fn test_proxy_ids_needing_plugin_rebuild_from_proxy_change() {
 
 #[test]
 fn test_proxy_ids_needing_plugin_rebuild_from_global_plugin_change() {
-    let t1 = Utc::now();
-    let t2 = t1 + chrono::Duration::seconds(5);
+    let t1 = UtcTimestamp::now();
+    let t2 = t1.checked_add(::time::SignedDuration::seconds(5)).unwrap();
     let proxy = make_proxy("p1", "/api", t1);
     let old = GatewayConfig {
         proxies: vec![proxy.clone()],
@@ -506,8 +505,8 @@ fn test_proxy_ids_needing_plugin_rebuild_from_global_plugin_change() {
 
 #[test]
 fn test_proxy_ids_needing_plugin_rebuild_when_global_plugin_changes_scope() {
-    let t1 = Utc::now();
-    let t2 = t1 + chrono::Duration::seconds(5);
+    let t1 = UtcTimestamp::now();
+    let t2 = t1.checked_add(::time::SignedDuration::seconds(5)).unwrap();
     let proxy1 = make_proxy("p1", "/api", t1);
     let proxy2 = make_proxy("p2", "/other", t1);
     let old = GatewayConfig {
@@ -546,7 +545,7 @@ fn test_proxy_ids_needing_plugin_rebuild_when_global_plugin_changes_scope() {
 
 #[test]
 fn test_proxy_ids_needing_plugin_rebuild_from_removed_proxy_plugin_config() {
-    let t = Utc::now();
+    let t = UtcTimestamp::now();
     let proxy1 = make_proxy("p1", "/api", t);
     let proxy2 = make_proxy("p2", "/other", t);
     let old = GatewayConfig {
@@ -581,8 +580,8 @@ fn test_proxy_ids_needing_plugin_rebuild_from_removed_proxy_plugin_config() {
 
 #[test]
 fn test_full_mixed_delta_all_entity_types() {
-    let t1 = Utc::now();
-    let t2 = t1 + chrono::Duration::seconds(5);
+    let t1 = UtcTimestamp::now();
+    let t2 = t1.checked_add(::time::SignedDuration::seconds(5)).unwrap();
     let old = GatewayConfig {
         proxies: vec![make_proxy("p1", "/api", t1)],
         consumers: vec![make_consumer("c1", "alice", t1)],
@@ -628,8 +627,8 @@ fn test_full_mixed_delta_all_entity_types() {
 
 #[test]
 fn test_plugin_rebuild_proxy_scoped_plugin_change() {
-    let t1 = Utc::now();
-    let t2 = t1 + chrono::Duration::seconds(5);
+    let t1 = UtcTimestamp::now();
+    let t2 = t1.checked_add(::time::SignedDuration::seconds(5)).unwrap();
 
     let proxy = make_proxy("p1", "/api", t1);
     let old = GatewayConfig {
@@ -661,8 +660,8 @@ fn test_plugin_rebuild_proxy_scoped_plugin_change() {
 
 #[test]
 fn test_plugin_rebuild_unrelated_proxy_not_affected() {
-    let t1 = Utc::now();
-    let t2 = t1 + chrono::Duration::seconds(5);
+    let t1 = UtcTimestamp::now();
+    let t2 = t1.checked_add(::time::SignedDuration::seconds(5)).unwrap();
 
     let proxy1 = make_proxy("p1", "/api", t1);
     let proxy2 = make_proxy("p2", "/other", t1);
@@ -699,7 +698,7 @@ fn test_plugin_rebuild_unrelated_proxy_not_affected() {
 
 #[test]
 fn test_same_timestamp_is_not_modification() {
-    let t = Utc::now();
+    let t = UtcTimestamp::now();
     let old = GatewayConfig {
         proxies: vec![make_proxy("p1", "/api", t)],
         ..Default::default()
@@ -718,7 +717,7 @@ fn test_same_timestamp_is_not_modification() {
 
 #[test]
 fn test_same_timestamp_consumer_credential_rotation_is_modification() {
-    let t = Utc::now();
+    let t = UtcTimestamp::now();
     let mut consumer = make_consumer("c1", "alice", t);
     consumer.credentials.insert(
         "keyauth".to_string(),
@@ -746,7 +745,7 @@ fn test_same_timestamp_consumer_credential_rotation_is_modification() {
 
 #[test]
 fn test_same_timestamp_plugin_body_or_enabled_change_is_modification() {
-    let t = Utc::now();
+    let t = UtcTimestamp::now();
     let mut plugin = make_plugin_config("pc1", "key_auth", PluginScope::Global, None, t);
     plugin.enabled = false;
     let old = GatewayConfig {
@@ -779,7 +778,7 @@ fn test_same_timestamp_stream_backend_change_is_modification() {
         BackendScheme::Udp,
         BackendScheme::Dtls,
     ] {
-        let mut proxy = make_proxy("p1", "/unused", Utc::now());
+        let mut proxy = make_proxy("p1", "/unused", UtcTimestamp::now());
         proxy.listen_path = None;
         proxy.listen_port = Some(9000);
         proxy.backend_scheme = Some(scheme);
@@ -805,7 +804,7 @@ fn test_same_timestamp_stream_backend_change_is_modification() {
 #[test]
 fn test_same_timestamp_route_indexed_backend_change_is_not_a_modification() {
     let old = GatewayConfig {
-        proxies: vec![make_proxy("p1", "/api", Utc::now())],
+        proxies: vec![make_proxy("p1", "/api", UtcTimestamp::now())],
         ..Default::default()
     };
     let mut new = old.clone();
@@ -823,7 +822,7 @@ fn test_same_timestamp_route_indexed_backend_change_is_not_a_modification() {
 /// otherwise content-compared.
 #[test]
 fn test_same_timestamp_stream_plugin_association_change_is_not_a_proxy_modification() {
-    let mut proxy = make_proxy("p1", "/unused", Utc::now());
+    let mut proxy = make_proxy("p1", "/unused", UtcTimestamp::now());
     proxy.listen_path = None;
     proxy.listen_port = Some(9000);
     proxy.backend_scheme = Some(BackendScheme::Tcp);
@@ -849,7 +848,7 @@ fn test_same_timestamp_stream_plugin_association_change_is_not_a_proxy_modificat
 
 #[test]
 fn test_identical_content_and_updated_at_remain_unchanged_for_all_resources() {
-    let t = Utc::now();
+    let t = UtcTimestamp::now();
     let old = GatewayConfig {
         proxies: vec![make_proxy("p1", "/api", t)],
         consumers: vec![make_consumer("c1", "alice", t)],
@@ -867,7 +866,7 @@ fn test_identical_content_and_updated_at_remain_unchanged_for_all_resources() {
     assert!(ConfigDelta::compute(&old, &new).is_empty());
 
     // Creation metadata alone does not invalidate runtime caches.
-    let created_at = t - chrono::Duration::seconds(10);
+    let created_at = t.checked_sub(::time::SignedDuration::seconds(10)).unwrap();
     new.proxies[0].created_at = created_at;
     new.consumers[0].created_at = created_at;
     new.plugin_configs[0].created_at = created_at;
@@ -886,7 +885,7 @@ fn test_identical_content_and_updated_at_remain_unchanged_for_all_resources() {
 /// proxy or upstream from the authored snapshot.
 #[test]
 fn test_projected_and_association_changes_are_not_resource_modifications() {
-    let t = Utc::now();
+    let t = UtcTimestamp::now();
     let mut proxy = make_proxy("p1", "/api", t);
     proxy.plugins = vec![PluginAssociation {
         plugin_config_id: "pc1".to_string(),
@@ -937,7 +936,7 @@ async fn test_same_timestamp_policy_reload_rebuilds_caches_with_or_without_route
     use ferrum_edge::proxy::{ConfigApplyOutcome, ProxyState};
 
     for change_route in [false, true] {
-        let t = Utc::now();
+        let t = UtcTimestamp::now();
         let mut consumer = make_consumer("c1", "alice", t);
         // `ConsumerIndex` reads keyauth credentials as an array of entries.
         consumer.credentials.insert(

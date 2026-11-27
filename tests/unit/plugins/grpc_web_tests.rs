@@ -13,6 +13,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 use super::plugin_utils::create_test_context;
+use ferrum_edge::time_compat::UtcTimestamp;
 
 fn create_grpc_web_context(content_type: &str) -> ferrum_edge::plugins::RequestContext {
     let mut ctx = create_test_context();
@@ -213,7 +214,7 @@ fn test_shared_admin_file_and_snapshot_admission_reject_invalid_shapes() {
         "got: {shared}"
     );
 
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let plugin_config = ferrum_edge::config::types::PluginConfig {
         labels: Default::default(),
         id: "grpc-web-admin".to_string(),

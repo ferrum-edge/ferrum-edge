@@ -26,6 +26,7 @@ use ferrum_edge::config::types::{
     AuthMode, BackendScheme, Consumer, LoadBalancerAlgorithm, PluginAssociation, PluginConfig,
     PluginScope, Proxy, Upstream, UpstreamTarget,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use serde_json::json;
 use sqlx::error::{DatabaseError, ErrorKind};
 use std::borrow::Cow;
@@ -192,8 +193,8 @@ fn make_upstream(id: &str) -> Upstream {
         backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         api_spec_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         k8s_service_uid: None,
         admission_upstream_id: None,
         pending_limit_scope: None,
@@ -209,8 +210,8 @@ fn make_consumer(id: &str, username: &str) -> Consumer {
         custom_id: None,
         credentials: Default::default(),
         acl_groups: Vec::new(),
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -239,7 +240,7 @@ fn make_tcp_proxy(id: &str, listen_port: u16) -> Proxy {
 }
 
 fn make_global_tcp_throttle(id: &str) -> PluginConfig {
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     PluginConfig {
         labels: Default::default(),
         id: id.to_string(),
@@ -1101,7 +1102,7 @@ async fn consumer_credential_index_preserves_exact_mtls_identity_semantics() {
     assert_eq!(loaded.consumers.len(), 2);
     assert_eq!(loaded.consumers[0].username, "alice");
 
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let error = store
         .create_plugin_config(&PluginConfig {
             labels: Default::default(),
@@ -1161,7 +1162,7 @@ async fn independent_sqlite_stores_serialize_mtls_dns_consumer_admission() {
             .await
             .unwrap();
 
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     store_a
         .create_plugin_config(&PluginConfig {
             labels: Default::default(),
@@ -1385,7 +1386,7 @@ async fn independent_sqlite_stores_atomically_serialize_policy_association_and_i
     }))
     .unwrap();
     store_a.create_proxy(&proxy).await.unwrap();
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     store_a
         .create_plugin_config(&PluginConfig {
             labels: Default::default(),
@@ -1682,7 +1683,7 @@ async fn mtls_dns_admission_loads_consumers_only_for_effective_dns_policy() {
         .await
         .expect("ordinary admission must not decode all Consumers without a DNS policy");
 
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let error = store
         .create_plugin_config(&PluginConfig {
             labels: Default::default(),
@@ -1742,7 +1743,7 @@ async fn mtls_dns_repair_deletes_may_only_reduce_existing_ambiguity() {
         .await
         .unwrap();
 
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     store
         .create_plugin_config(&PluginConfig {
             labels: Default::default(),
@@ -1796,7 +1797,7 @@ async fn load_full_config_rejects_hmac_request_body_transform_composition() {
     let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
         .await
         .unwrap();
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     for (id, plugin_name, config) in [
         (
             "cp-global-hmac",
@@ -2217,7 +2218,7 @@ async fn plugin_trigger_round_trips_create_update_full_load_and_clear() {
         ]}
     }))
     .unwrap();
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let mut plugin = PluginConfig {
         labels: Default::default(),
         id: "triggered-transformer".to_string(),
@@ -2265,7 +2266,7 @@ async fn plugin_trigger_round_trips_create_update_full_load_and_clear() {
     );
 
     plugin.trigger = Some(updated.clone());
-    plugin.updated_at = chrono::Utc::now();
+    plugin.updated_at = UtcTimestamp::now();
     assert!(store.update_plugin_config(&plugin).await.unwrap());
     let full = store.load_full_config("ferrum").await.unwrap();
     let reloaded = full
@@ -2276,7 +2277,7 @@ async fn plugin_trigger_round_trips_create_update_full_load_and_clear() {
     assert_eq!(reloaded.trigger.as_ref(), Some(&updated));
 
     plugin.trigger = None;
-    plugin.updated_at = chrono::Utc::now();
+    plugin.updated_at = UtcTimestamp::now();
     assert!(store.update_plugin_config(&plugin).await.unwrap());
     let cleared = store
         .get_plugin_config("ferrum", &plugin.id)
@@ -4289,7 +4290,7 @@ async fn batch_attach_proxy_plugins_preserves_same_ids_across_namespaces() {
     store.create_proxy(&p_a).await.unwrap();
     store.create_proxy(&p_b).await.unwrap();
 
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let pc_a = PluginConfig {
         labels: Default::default(),
         id: "shared-plugin".to_string(),

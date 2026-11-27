@@ -14,7 +14,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use chrono::Utc;
 use ferrum_edge::config::types::{
     GatewayConfig, LoadBalancerAlgorithm, MeshSdTopology, Upstream, UpstreamLocalityLbSetting,
     UpstreamTarget,
@@ -38,6 +37,7 @@ use ferrum_edge::plugin_cache::PluginCache;
 use ferrum_edge::request_epoch::RequestEpochStore;
 use ferrum_edge::service_discovery::ServiceDiscoverer;
 use ferrum_edge::service_discovery::mesh::MeshServiceDiscoverer;
+use ferrum_edge::time_compat::UtcTimestamp;
 
 fn td(raw: &str) -> TrustDomain {
     TrustDomain::new(raw).expect("trust domain")
@@ -309,7 +309,7 @@ async fn mesh_multicluster_discoverer_resolves_local_and_remote_targets() {
 #[tokio::test]
 async fn mesh_multicluster_load_balancer_fails_over_local_to_remote() {
     let upstream_id = "reviews-mc";
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
 
     // Two targets: local (us-east-1) and remote (remote-west). Source locality
     // is us-east-1, so the local target is the preferred (same-region) tier and
@@ -598,7 +598,7 @@ mod audience_binding {
     /// Mint a token whose `aud` claim is an arbitrary JSON value, so malformed
     /// and multi-valued shapes can be exercised.
     fn token_with_raw_audience(audience: serde_json::Value) -> String {
-        let now = chrono::Utc::now().timestamp();
+        let now = ferrum_edge::time_compat::UtcTimestamp::now().unix_timestamp();
         let claims = serde_json::json!({
             "sub": NODE_ID,
             "iat": now,

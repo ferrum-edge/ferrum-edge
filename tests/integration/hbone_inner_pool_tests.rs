@@ -26,7 +26,6 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use chrono::Utc;
 use ferrum_edge::_test_support::hbone_inner_h1_request_body_for_test;
 use ferrum_edge::config::PoolConfig;
 use ferrum_edge::config::types::{
@@ -61,6 +60,7 @@ use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 
 use crate::scaffolding::port_registry::TestSocket;
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const TRUST_DOMAIN: &str = "cluster.local";
 const GATEWAY_SPIFFE: &str = "ns/edge/sa/gateway";
@@ -620,7 +620,7 @@ async fn relay_tunnel(
 // ---------------------------------------------------------------------------
 
 fn source_proxy() -> Proxy {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     Proxy {
         labels: Default::default(),
         id: PROXY_ID.to_string(),

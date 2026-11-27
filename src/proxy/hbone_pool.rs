@@ -4238,8 +4238,8 @@ mod tests {
     use crate::dns::DnsConfig;
     use crate::identity::spiffe::{SpiffeId, TrustDomain};
     use crate::identity::{TrustBundle, TrustBundleSet};
+    use crate::time_compat::UtcTimestamp;
     use arc_swap::ArcSwap;
-    use chrono::Utc;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -4259,7 +4259,7 @@ mod tests {
     }
 
     fn test_proxy(connect_timeout_ms: u64) -> Proxy {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         Proxy {
             labels: Default::default(),
             id: "hbone-test".to_string(),

@@ -1,4 +1,3 @@
-use chrono::Utc;
 use ferrum_edge::config::types::{
     ALLOWED_WS_ORIGINS_STAR_GUIDANCE, ActiveHealthCheck, AuthMode, BackendScheme, BackoffStrategy,
     CircuitBreakerConfig, ConsulConfig, Consumer, DispatchKind, GatewayConfig, HealthCheckConfig,
@@ -14,6 +13,7 @@ use ferrum_edge::config::types::{
     validate_basic_auth_hmac_secret, validate_pem_ca_file, validate_pem_cert_file,
 };
 use ferrum_edge::modes::mesh::config::MeshTrafficPolicyTls;
+use ferrum_edge::time_compat::UtcTimestamp;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -82,8 +82,8 @@ fn make_proxy(id: &str, listen_path: &str) -> Proxy {
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }
@@ -97,8 +97,8 @@ fn make_consumer(id: &str, username: &str) -> Consumer {
         custom_id: None,
         credentials: HashMap::new(),
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -138,8 +138,8 @@ fn make_upstream(id: &str) -> Upstream {
         backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         k8s_service_uid: None,
         admission_upstream_id: None,
         pending_limit_scope: None,
@@ -159,8 +159,8 @@ fn make_plugin_config(id: &str) -> PluginConfig {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -3704,8 +3704,8 @@ fn test_validate_backend_ip_policy_upstream_target_denied() {
         backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         k8s_service_uid: None,
         admission_upstream_id: None,
         pending_limit_scope: None,
@@ -3748,8 +3748,8 @@ fn test_validate_backend_ip_policy_mesh_route_dispatch_trims_direct_ip() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     let config = GatewayConfig {
         plugin_configs: vec![plugin],

@@ -5447,7 +5447,7 @@ mod tests {
         use crate::config::types::{
             AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, ResponseBodyMode,
         };
-        let now = chrono::Utc::now();
+        let now = crate::time_compat::UtcTimestamp::now();
         Proxy {
             labels: Default::default(),
             id: id.to_string(),

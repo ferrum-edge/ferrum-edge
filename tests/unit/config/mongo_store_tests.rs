@@ -26,6 +26,7 @@ use ferrum_edge::_test_support::{
 };
 use ferrum_edge::config::db_backend::{DatabaseBackend, MtlsDnsAdmissionUnavailable};
 use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope};
+use ferrum_edge::time_compat::UtcTimestamp;
 use mongodb::bson::{Bson, Document, doc};
 use serde_json::json;
 use std::sync::Arc;
@@ -405,7 +406,7 @@ fn mongo_plugin_graph_validation_runs_under_the_durable_namespace_fence() {
 
 #[test]
 fn mtls_dns_policy_gate_skips_consumers_until_san_dns_is_effective() {
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let mut config = GatewayConfig {
         plugin_configs: vec![PluginConfig {
             labels: Default::default(),

@@ -71,9 +71,9 @@ use crate::admin::audit_spool::{
 };
 use crate::admin::jwt_auth::{AdminKeyTier, AdminRole, VerifiedAdminToken, ViewerNamespaceCeiling};
 use crate::config::db_backend::DatabaseBackend;
+use crate::time_compat::UtcTimestamp;
 use anyhow::anyhow;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -514,7 +514,7 @@ impl AuditRetentionPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEvent {
     pub id: String,
-    pub ts: DateTime<Utc>,
+    pub ts: UtcTimestamp,
     pub actor: String,
     pub action: String,
     pub resource_type: String,
@@ -575,7 +575,7 @@ impl AuditEvent {
         let namespace = namespace.into();
         Self {
             id: Uuid::new_v4().to_string(),
-            ts: Utc::now(),
+            ts: UtcTimestamp::now(),
             actor: actor.audit_subject(),
             action: action.into(),
             resource_type: resource_type.into(),
@@ -739,8 +739,8 @@ pub struct AuditListFilter {
     pub action: Option<String>,
     pub resource_type: Option<String>,
     pub resource_id: Option<String>,
-    pub start: Option<DateTime<Utc>>,
-    pub end: Option<DateTime<Utc>>,
+    pub start: Option<UtcTimestamp>,
+    pub end: Option<UtcTimestamp>,
     pub limit: u32,
     pub offset: u32,
 }
@@ -2359,7 +2359,7 @@ fn build_intent_event(inner: &mut AuditRequestSlotInner) -> Option<Option<AuditE
     let action = format!("{} {}", inner.method, inner.path);
     Some(Some(AuditEvent {
         id: Uuid::new_v4().to_string(),
-        ts: Utc::now(),
+        ts: UtcTimestamp::now(),
         actor,
         action,
         resource_type: AUDIT_INTENT_RESOURCE_TYPE.to_string(),
@@ -2463,7 +2463,7 @@ async fn finalize_unconsumed_intent_with_pipeline(
     }
     let event = AuditEvent {
         id: prepared.id,
-        ts: Utc::now(),
+        ts: UtcTimestamp::now(),
         actor,
         action: prepared.action,
         resource_type: AUDIT_INTENT_RESOURCE_TYPE.to_string(),

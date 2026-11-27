@@ -5,7 +5,6 @@
 //! unnecessary fragmentation (including a field that doesn't affect identity).
 //! These tests verify the key format, delimiter safety, and field inclusion.
 
-use chrono::Utc;
 use ferrum_edge::config::PoolConfig;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig, LoadBalancerAlgorithm,
@@ -19,6 +18,7 @@ use ferrum_edge::proxy::backend_capabilities::{
 };
 use ferrum_edge::proxy::grpc_proxy::GrpcConnectionPool;
 use ferrum_edge::proxy::http2_pool::Http2ConnectionPool;
+use ferrum_edge::time_compat::UtcTimestamp;
 use ferrum_edge::tls::backend::{
     BackendTlsConfigCache, SvidGenerationMatcher, pool_key_host_port_prefix,
 };
@@ -30,7 +30,7 @@ use std::time::Duration;
 
 /// Build a minimal `Proxy` with sensible defaults for pool key testing.
 fn minimal_proxy() -> Proxy {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     Proxy {
         labels: Default::default(),
         id: "test-proxy".to_string(),
@@ -2383,7 +2383,7 @@ fn test_client_config() -> rustls::ClientConfig {
 }
 
 fn make_upstream(id: &str, targets: Vec<UpstreamTarget>) -> Upstream {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     Upstream {
         labels: Default::default(),
         id: id.to_string(),

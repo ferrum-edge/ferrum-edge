@@ -1,12 +1,12 @@
 //! Tests for admin audit primitives.
 
-use chrono::{Duration, Utc};
 use ferrum_edge::admin::advancing_u32_offset;
 use ferrum_edge::admin::audit::{
     AuditActor, AuditEvent, AuditListFilter, create_diff, credential_update_diff, delete_diff,
     update_diff,
 };
 use ferrum_edge::admin::jwt_auth::{AdminClaims, AdminKeyTier, AdminRole, VerifiedAdminToken};
+use ferrum_edge::time_compat::UtcTimestamp;
 use serde_json::json;
 use uuid::Uuid;
 
@@ -20,13 +20,13 @@ fn verified(claims: AdminClaims, key_tier: AdminKeyTier) -> VerifiedAdminToken {
 }
 
 fn claims_with_role(role: serde_json::Value) -> AdminClaims {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     AdminClaims {
         iss: "test-issuer".to_string(),
         sub: "audit-user".to_string(),
-        iat: now.timestamp(),
-        nbf: now.timestamp(),
-        exp: (now + Duration::minutes(5)).timestamp(),
+        iat: now.unix_timestamp(),
+        nbf: now.unix_timestamp(),
+        exp: (now.checked_add(::time::SignedDuration::minutes(5)).unwrap()).unix_timestamp(),
         jti: Uuid::new_v4().to_string(),
         additional: json!({ "role": role }),
     }
@@ -86,13 +86,13 @@ fn test_primary_subjects_cannot_impersonate_a_viewer_key_actor() {
 
 #[test]
 fn test_audit_actor_from_claims_rejects_missing_role() {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = AdminClaims {
         iss: "test-issuer".to_string(),
         sub: "audit-user".to_string(),
-        iat: now.timestamp(),
-        nbf: now.timestamp(),
-        exp: (now + Duration::minutes(5)).timestamp(),
+        iat: now.unix_timestamp(),
+        nbf: now.unix_timestamp(),
+        exp: (now.checked_add(::time::SignedDuration::minutes(5)).unwrap()).unix_timestamp(),
         jti: Uuid::new_v4().to_string(),
         additional: json!({}),
     };
@@ -121,7 +121,7 @@ fn test_audit_event_new_populates_metadata_and_preserves_diff() {
         namespace_ceiling: None,
     };
     let diff = update_diff(json!({ "enabled": false }), json!({ "enabled": true }));
-    let before = Utc::now();
+    let before = UtcTimestamp::now();
 
     let event = AuditEvent::new(
         &actor,
@@ -131,7 +131,7 @@ fn test_audit_event_new_populates_metadata_and_preserves_diff() {
         "tenant-a",
         diff.clone(),
     );
-    let after = Utc::now();
+    let after = UtcTimestamp::now();
 
     assert!(Uuid::parse_str(&event.id).is_ok());
     assert!(event.ts >= before);
@@ -245,14 +245,14 @@ fn mesh_reset_jwt_manager(config: &MeshResetTestConfig) -> JwtManager {
 }
 
 fn mesh_reset_operator_token(config: &MeshResetTestConfig) -> String {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "iss": config.jwt_issuer,
         "sub": "mesh-reset-operator",
         "role": "operator",
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + Duration::minutes(5)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::minutes(5)).unwrap()).unix_timestamp(),
         "jti": Uuid::new_v4().to_string(),
     });
     let header = Header::new(jsonwebtoken::Algorithm::HS256);

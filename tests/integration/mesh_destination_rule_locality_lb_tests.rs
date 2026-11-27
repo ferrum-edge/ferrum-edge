@@ -6,7 +6,6 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use chrono::Utc;
 use ferrum_edge::capture::CaptureMode;
 use ferrum_edge::config::types::{
     GatewayConfig, LoadBalancerAlgorithm, MAX_TARGET_WEIGHT, Upstream, UpstreamTarget,
@@ -20,6 +19,7 @@ use ferrum_edge::modes::mesh::{
     MeshConfigProtocol, MeshRuntimeConfig, MeshTopology,
     prepare_gateway_config_via_mesh_slice_with_fixtures,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 
 fn istio_object(kind: &str, name: &str, spec: serde_json::Value) -> K8sObject {
     K8sObject {
@@ -106,7 +106,7 @@ fn runtime() -> MeshRuntimeConfig {
 }
 
 fn matching_upstream(id: &str, host_fqdn: &str) -> Upstream {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     Upstream {
         labels: Default::default(),
         id: id.to_string(),
@@ -892,7 +892,7 @@ fn distribute_projects_through_mesh_apply_onto_upstream_locality_lb_setting() {
 }
 
 fn multi_port_upstream(id: &str, host_fqdn: &str) -> Upstream {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     Upstream {
         labels: Default::default(),
         id: id.to_string(),
@@ -1045,7 +1045,7 @@ fn port_level_locality_lb_drives_distribute_at_dispatch() {
     use ferrum_edge::load_balancer::LoadBalancerCache;
     use std::collections::BTreeMap;
 
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let mut upstream = Upstream {
         labels: Default::default(),
         id: "reviews-u".to_string(),

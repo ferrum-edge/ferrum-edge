@@ -341,7 +341,7 @@ pub fn mesh_slice_with(
 /// `host` is matched as a single-element `hosts` entry — this mirrors the way
 /// mesh outbound capture proxies route by Host header / SNI.
 pub fn http_proxy(id: &str, host: &str, backend_port: u16) -> Proxy {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     Proxy {
         labels: Default::default(),
         id: id.to_string(),
@@ -413,7 +413,7 @@ pub fn http_proxy(id: &str, host: &str, backend_port: u16) -> Proxy {
 
 /// Build a mesh-mode [`Upstream`] with a single HTTP target.
 pub fn http_upstream(id: &str, host: &str, port: u16) -> Upstream {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     Upstream {
         labels: Default::default(),
         id: id.to_string(),

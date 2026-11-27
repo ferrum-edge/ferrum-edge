@@ -28,8 +28,9 @@ pub use tls_management::{
     set_tls_store_delete_hook_for_tests,
 };
 
+use crate::time_compat::UtcTimestamp;
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::header::{HeaderName, HeaderValue, RETRY_AFTER};
@@ -7520,7 +7521,7 @@ fn prepare_batch_items<R: crud::AdminResource>(
     items: &mut [R],
     kind: &str,
     namespace: &str,
-    now: chrono::DateTime<Utc>,
+    now: UtcTimestamp,
     validation_ctx: &crud::ValidationCtx<'_>,
     validation_errors: &mut Vec<String>,
 ) -> Result<(), String> {
@@ -7701,7 +7702,7 @@ async fn persist_consumer_update(
     {
         return *response;
     }
-    consumer.updated_at = Utc::now();
+    consumer.updated_at = UtcTimestamp::now();
     if let Err(_error) = namespace_admission.ensure_held() {
         warn_persistence_failure_redacted("credential_namespace_admission_before_persist");
         return mtls_dns_admission_unavailable_response();
@@ -8318,7 +8319,7 @@ fn apply_payload_namespace(payload: &mut RestorePayload, namespace: &str) {
     }
 }
 
-fn normalize_restore_payload_timestamps(payload: &mut RestorePayload, restored_at: DateTime<Utc>) {
+fn normalize_restore_payload_timestamps(payload: &mut RestorePayload, restored_at: UtcTimestamp) {
     for proxy in &mut payload.proxies {
         proxy.updated_at = restored_at;
     }
@@ -8674,7 +8675,7 @@ async fn reconcile_restored_gateway_trust_bundles(
             // the store rather than adopted from a file an operator could edit.
             desired.id = existing.id.clone();
             desired.created_at = existing.created_at;
-            desired.updated_at = Utc::now();
+            desired.updated_at = UtcTimestamp::now();
             // A payload revision is never an expectation and never a stored
             // value; the store assigns the next one from the change sequence.
             desired.revision = 0;
@@ -8706,7 +8707,7 @@ async fn reconcile_restored_gateway_trust_bundles(
             // at 1) would let a client that read the previous incarnation
             // compare-and-set against the restored one.
             desired.revision = 0;
-            desired.created_at = Utc::now();
+            desired.created_at = UtcTimestamp::now();
             desired.updated_at = desired.created_at;
             db.create_gateway_trust_bundle(&desired)
                 .await
@@ -10796,7 +10797,7 @@ async fn handle_batch_create(
         false,
     );
 
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let validation_ctx = crud::ValidationCtx::from_state(state);
     let mut validation_errors: Vec<String> = Vec::new();
 
@@ -10925,7 +10926,7 @@ async fn handle_batch_create(
         consumers: batch.consumers.clone(),
         plugin_configs: batch.plugin_configs.clone(),
         upstreams: batch.upstreams.clone(),
-        loaded_at: crate::time_compat::UtcTimestamp::now(),
+        loaded_at: now,
         known_namespaces: Vec::new(),
         mesh: state
             .cached_gateway_config()
@@ -12799,7 +12800,7 @@ async fn handle_restore(
 
     // Complete all fallible payload preparation before changing durable state.
     let mut preparation_errors = Vec::new();
-    normalize_restore_payload_timestamps(&mut payload, Utc::now());
+    normalize_restore_payload_timestamps(&mut payload, UtcTimestamp::now());
     // Namespace was already stamped on the validated candidate; re-apply
     // idempotently so preparation stays fail-closed if a resource somehow
     // lost its boundary.
@@ -13467,27 +13468,35 @@ fn parse_audit_filter(
                 "resource_type" => filter.resource_type = Some(value.into_owned()),
                 "resource_id" => filter.resource_id = Some(value.into_owned()),
                 "start" => {
+                    // chrono-compatible parse (issue #7419): the same inputs
+                    // are accepted; a leap second normalizes and an instant
+                    // outside UtcTimestamp's range is rejected like any
+                    // invalid value.
                     filter.start = Some(
-                        chrono::DateTime::parse_from_rfc3339(&value)
+                        crate::time_compat::parse_rfc3339_chrono(&value)
+                            .and_then(|parsed| parsed.to_utc_timestamp())
                             .map_err(|e| {
                                 Box::new(json_response(
                                     StatusCode::BAD_REQUEST,
                                     &json!({"error": format!("Invalid audit start timestamp: {}", e)}),
                                 ))
-                            })?
-                            .with_timezone(&Utc),
+                            })?,
                     );
                 }
                 "end" => {
+                    // chrono-compatible parse (issue #7419): the same inputs
+                    // are accepted; a leap second normalizes and an instant
+                    // outside UtcTimestamp's range is rejected like any
+                    // invalid value.
                     filter.end = Some(
-                        chrono::DateTime::parse_from_rfc3339(&value)
+                        crate::time_compat::parse_rfc3339_chrono(&value)
+                            .and_then(|parsed| parsed.to_utc_timestamp())
                             .map_err(|e| {
                                 Box::new(json_response(
                                     StatusCode::BAD_REQUEST,
                                     &json!({"error": format!("Invalid audit end timestamp: {}", e)}),
                                 ))
-                            })?
-                            .with_timezone(&Utc),
+                            })?,
                     );
                 }
                 // `limit`/`offset` are owned by `parse_pagination`, which has
@@ -13593,7 +13602,11 @@ fn maybe_enforce_namespace_claim(
 /// never have to special-case a missing field; this repair deliberately does
 /// not fabricate durable history for a row that does not exist.
 fn synthesized_namespace_record(name: &str) -> crate::config::namespace_registry::NamespaceRecord {
-    crate::config::namespace_registry::NamespaceRecord::new(name.to_string(), None, Utc::now())
+    crate::config::namespace_registry::NamespaceRecord::new(
+        name.to_string(),
+        None,
+        UtcTimestamp::now(),
+    )
 }
 
 fn namespace_registry_atomicity_unsupported_response(
@@ -14007,7 +14020,7 @@ async fn handle_create_namespace(
     let record = crate::config::namespace_registry::NamespaceRecord::new(
         request.name.clone(),
         description,
-        Utc::now(),
+        UtcTimestamp::now(),
     );
     let holds = admission.holds();
     if let Err(resp) =
@@ -15561,8 +15574,10 @@ mod tests {
         // `Default`, so build the test payload through serde — the domain
         // structs already carry `#[serde(default)]` on every field we don't
         // care about for this test.
-        let old = Utc::now() - chrono::Duration::days(90);
-        let restored_at = Utc::now();
+        let old = UtcTimestamp::now()
+            .checked_sub(::time::SignedDuration::days(90))
+            .unwrap();
+        let restored_at = UtcTimestamp::now();
         let old_ts = old.to_rfc3339();
         let payload_json = serde_json::json!({
             "proxies": [{

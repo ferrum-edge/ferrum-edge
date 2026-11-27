@@ -13,7 +13,6 @@
 use crate::config::plugin_trigger::PluginTrigger;
 use crate::startup::sanitize_startup_cause;
 use crate::time_compat::UtcTimestamp;
-use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -2384,10 +2383,10 @@ pub struct Upstream {
     /// materialization; never an operator input field.
     #[serde(skip)]
     pub admission_upstream_id: Option<String>,
-    #[serde(default = "Utc::now")]
-    pub created_at: DateTime<Utc>,
-    #[serde(default = "Utc::now")]
-    pub updated_at: DateTime<Utc>,
+    #[serde(default = "UtcTimestamp::now")]
+    pub created_at: UtcTimestamp,
+    #[serde(default = "UtcTimestamp::now")]
+    pub updated_at: UtcTimestamp,
 }
 
 /// Service discovery provider type.
@@ -3516,10 +3515,10 @@ pub struct Proxy {
     /// WebSocket Hijacking (CSWSH) per RFC 6455 §10.2.
     #[serde(default)]
     pub allowed_ws_origins: Vec<String>,
-    #[serde(default = "Utc::now")]
-    pub created_at: DateTime<Utc>,
-    #[serde(default = "Utc::now")]
-    pub updated_at: DateTime<Utc>,
+    #[serde(default = "UtcTimestamp::now")]
+    pub created_at: UtcTimestamp,
+    #[serde(default = "UtcTimestamp::now")]
+    pub updated_at: UtcTimestamp,
 }
 
 /// Links a proxy to a plugin configuration.
@@ -3555,10 +3554,10 @@ pub struct Consumer {
     /// addition to) individual consumer usernames.
     #[serde(default)]
     pub acl_groups: Vec<String>,
-    #[serde(default = "Utc::now")]
-    pub created_at: DateTime<Utc>,
-    #[serde(default = "Utc::now")]
-    pub updated_at: DateTime<Utc>,
+    #[serde(default = "UtcTimestamp::now")]
+    pub created_at: UtcTimestamp,
+    #[serde(default = "UtcTimestamp::now")]
+    pub updated_at: UtcTimestamp,
 }
 
 /// A plugin configuration resource.
@@ -3611,10 +3610,10 @@ pub struct PluginConfig {
     /// spec is removed. NOT loaded by the gateway runtime — admin-only metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_spec_id: Option<String>,
-    #[serde(default = "Utc::now")]
-    pub created_at: DateTime<Utc>,
-    #[serde(default = "Utc::now")]
-    pub updated_at: DateTime<Utc>,
+    #[serde(default = "UtcTimestamp::now")]
+    pub created_at: UtcTimestamp,
+    #[serde(default = "UtcTimestamp::now")]
+    pub updated_at: UtcTimestamp,
 }
 
 /// Wire format of the stored OpenAPI / Swagger spec document.
@@ -3706,10 +3705,10 @@ pub struct ApiSpec {
     /// Aggregate digest of the external-`$ref` admission snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_ref_digest: Option<String>,
-    #[serde(default = "Utc::now")]
-    pub created_at: DateTime<Utc>,
-    #[serde(default = "Utc::now")]
-    pub updated_at: DateTime<Utc>,
+    #[serde(default = "UtcTimestamp::now")]
+    pub created_at: UtcTimestamp,
+    #[serde(default = "UtcTimestamp::now")]
+    pub updated_at: UtcTimestamp,
 }
 
 /// Full gateway configuration snapshot.

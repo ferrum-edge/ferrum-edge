@@ -1037,7 +1037,7 @@ async fn a_row_with_an_out_of_range_revision_is_refused_rather_than_defaulted() 
 }
 
 /// An unparseable timestamp is corrupt security metadata too: inventing
-/// `Utc::now()` would make a corrupted row look like a fresh rotation on every
+/// `UtcTimestamp::now()` would make a corrupted row look like a fresh rotation on every
 /// single load.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_row_with_an_unparseable_timestamp_is_refused_rather_than_defaulted() {

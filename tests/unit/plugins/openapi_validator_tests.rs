@@ -5896,7 +5896,6 @@ fn multipart_encoding_header_content_admission_rejects_malformed_and_exclusive_s
 #[tokio::test]
 async fn multipart_encoding_header_content_plugin_cache_rebuild_replaces_and_deletes_live_contract()
 {
-    use chrono::Utc;
     use ferrum_edge::PluginCache;
     use ferrum_edge::config::types::{GatewayConfig, PluginAssociation, PluginConfig, PluginScope};
     use ferrum_edge::plugins::ProxyProtocol;
@@ -5952,8 +5951,8 @@ async fn multipart_encoding_header_content_plugin_cache_rebuild_replaces_and_del
                 priority_override: None,
                 trigger: None,
                 api_spec_id: Some("spec-1".to_string()),
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
+                created_at: UtcTimestamp::now(),
+                updated_at: UtcTimestamp::now(),
             }],
             upstreams: vec![],
             loaded_at: UtcTimestamp::now(),

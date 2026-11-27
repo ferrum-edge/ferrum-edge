@@ -1,6 +1,5 @@
 //! Tests for health check module
 
-use chrono::Utc;
 use ferrum_edge::config::types::{
     ActiveHealthCheck, BackendTlsConfig, DEFAULT_NAMESPACE, GatewayConfig, HealthCheckConfig,
     HealthProbeType, LoadBalancerAlgorithm, PassiveHealthCheck, Upstream, UpstreamTarget,
@@ -1273,8 +1272,8 @@ fn make_upstream_with_active_probe(
         backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         k8s_service_uid: None,
         admission_upstream_id: None,
         pending_limit_scope: None,
@@ -1851,8 +1850,8 @@ fn make_upstream_passive_only(
         backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         k8s_service_uid: None,
         admission_upstream_id: None,
         pending_limit_scope: None,

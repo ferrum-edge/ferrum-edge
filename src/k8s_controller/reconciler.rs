@@ -2217,7 +2217,7 @@ mod tests {
     use crate::modes::mesh::config::{
         MeshConfig, MeshPolicy, MeshService, PolicyScope, Workload, WorkloadRef, WorkloadSelector,
     };
-    use chrono::{Duration as ChronoDuration, Utc};
+    use crate::time_compat::UtcTimestamp;
     use kube::api::ApiResource;
     use kube::runtime::reflector;
     use serde_json::json;
@@ -2236,8 +2236,8 @@ mod tests {
             priority_override: None,
             trigger: None,
             api_spec_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         }
     }
 
@@ -2670,8 +2670,10 @@ mod tests {
             .loaded_at
             .checked_add(::time::SignedDuration::seconds(5))
             .unwrap();
-        new_config.plugin_configs[0].updated_at =
-            old_config.plugin_configs[0].updated_at + ChronoDuration::seconds(5);
+        new_config.plugin_configs[0].updated_at = old_config.plugin_configs[0]
+            .updated_at
+            .checked_add(::time::SignedDuration::seconds(5))
+            .unwrap();
 
         assert!(!gateway_config_content_changed(&new_config, &old_config));
     }

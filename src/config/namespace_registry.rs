@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-use chrono::{DateTime, Utc};
+use crate::time_compat::UtcTimestamp;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::config::batch_atomicity::{BatchAdmissionLeaseLost, NamespaceAdmissionLeaseHold};
@@ -114,12 +114,12 @@ pub struct NamespaceRecord {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: UtcTimestamp,
+    pub updated_at: UtcTimestamp,
 }
 
 impl NamespaceRecord {
-    pub fn new(name: String, description: Option<String>, now: DateTime<Utc>) -> Self {
+    pub fn new(name: String, description: Option<String>, now: UtcTimestamp) -> Self {
         Self {
             name,
             description,
@@ -744,9 +744,11 @@ pub fn mtls_dns_admission_namespaces<'a>(current_name: &'a str, new_name: &'a st
 pub fn parse_namespace_rfc3339(
     raw: &str,
     field: &'static str,
-) -> Result<DateTime<Utc>, NamespaceRegistryCorrupt> {
-    DateTime::parse_from_rfc3339(raw)
-        .map(|dt| dt.with_timezone(&Utc))
+) -> Result<UtcTimestamp, NamespaceRegistryCorrupt> {
+    // chrono-compatible strict RFC 3339 (issue #7419); an out-of-range
+    // instant is corrupt like any other unreadable value.
+    crate::time_compat::parse_rfc3339_chrono(raw)
+        .and_then(|parsed| parsed.to_utc_timestamp())
         .map_err(|_| NamespaceRegistryCorrupt::field(field))
 }
 

@@ -1899,7 +1899,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Once};
 
-    use chrono::Utc;
+    use crate::time_compat::UtcTimestamp;
     use rcgen::{
         BasicConstraints, CertificateParams, CertificateRevocationListParams, IsCa, Issuer,
         KeyPair, KeyUsagePurpose, RevocationReason, RevokedCertParams, SerialNumber,
@@ -2078,8 +2078,8 @@ mod tests {
             allow_path_parameters: false,
             allowed_methods: None,
             allowed_ws_origins: Vec::new(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
             pending_limit_scope: None,
         }
     }

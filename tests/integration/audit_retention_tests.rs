@@ -4,10 +4,10 @@
 //! backends behind dialect-specific DELETE rendering. Mongo parity for the
 //! shared contract is locked in `tests/unit/config/audit_retention_tests.rs`.
 
-use chrono::{Duration, Utc};
 use ferrum_edge::admin::audit::{AuditEvent, AuditListFilter, AuditRetentionPolicy};
 use ferrum_edge::config::db_backend::DatabaseBackend;
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
+use ferrum_edge::time_compat::UtcTimestamp;
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -33,7 +33,9 @@ async fn sqlite_store_with_retention(policy: AuditRetentionPolicy) -> (DatabaseS
 fn event_at(namespace: &str, id: &str, days_ago: i64, id_suffix: &str) -> AuditEvent {
     AuditEvent {
         id: format!("{id}-{id_suffix}"),
-        ts: Utc::now() - Duration::days(days_ago),
+        ts: UtcTimestamp::now()
+            .checked_sub(::time::SignedDuration::days(days_ago))
+            .unwrap(),
         actor: "tester".to_string(),
         action: "update".to_string(),
         resource_type: "proxy".to_string(),
@@ -50,7 +52,9 @@ fn event_at(namespace: &str, id: &str, days_ago: i64, id_suffix: &str) -> AuditE
 fn event_ordered(namespace: &str, id: &str, minutes_ago: i64) -> AuditEvent {
     AuditEvent {
         id: id.to_string(),
-        ts: Utc::now() - Duration::minutes(minutes_ago),
+        ts: UtcTimestamp::now()
+            .checked_sub(::time::SignedDuration::minutes(minutes_ago))
+            .unwrap(),
         actor: "tester".to_string(),
         action: "update".to_string(),
         resource_type: "proxy".to_string(),

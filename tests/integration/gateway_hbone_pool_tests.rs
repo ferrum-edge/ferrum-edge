@@ -2,7 +2,6 @@ use crate::scaffolding::port_registry::TestSocket;
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use chrono::Utc;
 use ferrum_edge::config::PoolConfig;
 use ferrum_edge::config::env_config::{EnvConfig, OperatingMode};
 use ferrum_edge::config::types::{
@@ -22,6 +21,7 @@ use ferrum_edge::proxy::mesh_trust_registry::{
 };
 use ferrum_edge::proxy::{GatewayTrustCommit, ProxyState};
 use ferrum_edge::retry::ErrorClass;
+use ferrum_edge::time_compat::UtcTimestamp;
 use ferrum_edge::tls::spiffe::build_spiffe_inbound_config;
 use http::{Response, StatusCode};
 use rcgen::{
@@ -142,7 +142,7 @@ fn svid_slot(bundle: SvidBundle) -> SharedSvidBundle {
 }
 
 fn proxy_for_test() -> Proxy {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     Proxy {
         labels: Default::default(),
         id: "gateway-hbone".to_string(),

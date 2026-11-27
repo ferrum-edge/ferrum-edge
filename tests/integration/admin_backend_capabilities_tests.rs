@@ -14,7 +14,6 @@ use crate::scaffolding::port_registry::TestSocket;
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use chrono::Utc;
 use ferrum_edge::admin::{
     AdminState,
     jwt_auth::{JwtConfig, JwtManager},
@@ -70,14 +69,14 @@ fn create_test_jwt_manager(config: &TestConfig) -> JwtManager {
 }
 
 fn generate_test_token(config: &TestConfig) -> String {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "iss": config.jwt_issuer,
         "sub": "test-user",
         "role": "admin",
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(config.max_ttl as i64)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(config.max_ttl as i64)).unwrap()).unix_timestamp(),
         "jti": uuid::Uuid::new_v4().to_string(),
     });
     let header = Header::new(jsonwebtoken::Algorithm::HS256);
@@ -262,7 +261,7 @@ fn make_minimal_proxy(id: &str) -> ferrum_edge::config::types::Proxy {
     use ferrum_edge::config::types::{
         AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, Proxy, ResponseBodyMode,
     };
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     Proxy {
         labels: Default::default(),
         id: id.to_string(),
@@ -544,14 +543,14 @@ async fn get_backend_capabilities_rejects_invalid_token() {
     let (base_url, _shutdown) = start_test_admin(state).await;
 
     // Invalid token: signed with a different secret.
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "iss": tc.jwt_issuer,
         "sub": "attacker",
         "role": "admin",
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(3600)).unwrap()).unix_timestamp(),
         "jti": uuid::Uuid::new_v4().to_string(),
     });
     let header = Header::new(jsonwebtoken::Algorithm::HS256);

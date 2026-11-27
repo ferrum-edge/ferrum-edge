@@ -12,7 +12,6 @@
 //! Every assertion here is deterministic — fixed `Instant` values and 60-second
 //! windows, no sleeps.
 
-use chrono::Utc;
 use ferrum_edge::_test_support::{
     ai_rate_limiter_shares_local_state_for_test, graphql_shares_local_state_for_test,
     grpc_method_router_shares_local_state_for_test, plugin_cache_full_reload_for_test,
@@ -61,8 +60,8 @@ fn global_plugin_config(id: &str, plugin_name: &str, config: Value) -> PluginCon
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 

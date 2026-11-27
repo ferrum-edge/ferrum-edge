@@ -8,7 +8,6 @@
 use std::collections::{BTreeMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use chrono::Utc;
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy};
 use ferrum_edge::modes::mesh::config::MeshConfig;
 use ferrum_edge::proxy::gateway_listener::{
@@ -17,6 +16,7 @@ use ferrum_edge::proxy::gateway_listener::{
     validate_process_global_frontend_conflicts,
 };
 use ferrum_edge::proxy::gateway_listener_status::GatewayListenerFailureCategory;
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const PORT: u16 = 9000;
 const DEFAULT_BIND: IpAddr = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
@@ -99,8 +99,8 @@ fn stream_proxy(id: &str, scheme: BackendScheme, port: u16) -> Proxy {
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }

@@ -3,12 +3,12 @@
 //! Phase A's rotation logic is mostly time-driven; these tests exercise the
 //! decision helpers directly so we don't need to wait wall-clock time.
 
-use chrono::Utc;
 use ferrum_edge::identity::{
     SharedSvidBundle, SvidBundle, TrustBundle, TrustBundleSet,
     rotation::{decide_next_tick, is_due_for_rotation},
     spiffe::{SpiffeId, TrustDomain, spiffe_id_to_san},
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -95,5 +95,5 @@ fn loaded_at_can_be_compared_to_now() {
         ferrum_edge::identity::spiffe::extract_spiffe_id_from_cert(&bundle.cert_chain_der[0])
             .unwrap();
     assert_eq!(parsed.trust_domain().as_str(), "td.test");
-    let _ = Utc::now();
+    let _ = UtcTimestamp::now();
 }

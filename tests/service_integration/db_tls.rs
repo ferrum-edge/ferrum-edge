@@ -16,6 +16,7 @@ use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
 use super::common::containers::{BoxError, fail_in_ci_else_skip, start_within_deadline};
 use super::common::host_ports::{allocate_host_port, retry_on_host_port_collision};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 struct SqlTlsFixture {
     _container: ContainerAsync<GenericImage>,
@@ -198,8 +199,8 @@ async fn write_consumer(store: &DatabaseStore, id: &str) {
         custom_id: None,
         credentials: Default::default(),
         acl_groups: Vec::new(),
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     store.create_consumer(&consumer).await.unwrap();
     assert!(store.get_consumer("ferrum", id).await.unwrap().is_some());

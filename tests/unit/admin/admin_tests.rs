@@ -2,7 +2,6 @@
 //!
 //! Tests for the Ferrum Edge Admin API including JWT authentication
 
-use chrono::Utc;
 use ferrum_edge::_test_support::{
     AdminMtlsDnsAdmissionHoldProbe, admin_batch_persistence_message_for_test,
     admin_consumer_persistence_response_for_test, admin_database_error_body_for_test,
@@ -15,6 +14,7 @@ use ferrum_edge::admin::{
     AdminState,
     jwt_auth::{AdminClaims, AdminRole, JwtConfig, JwtManager},
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use http_body_util::BodyExt;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
@@ -642,14 +642,14 @@ fn generate_test_token(config: &TestConfig, subject: &str) -> String {
 
 /// Generate a valid JWT token for testing with a specific role.
 fn generate_test_token_with_role(config: &TestConfig, subject: &str, role: &str) -> String {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "iss": config.jwt_issuer,
         "sub": subject,
         "role": role,
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(config.max_ttl as i64)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(config.max_ttl as i64)).unwrap()).unix_timestamp(),
         "jti": Uuid::new_v4().to_string()
     });
 
@@ -707,14 +707,14 @@ fn raw_http_status(response: &str) -> u16 {
 
 /// Generate an invalid JWT token (wrong secret)
 fn generate_invalid_token(config: &TestConfig, subject: &str) -> String {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "iss": config.jwt_issuer,
         "sub": subject,
         "role": "admin",
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(config.max_ttl as i64)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(config.max_ttl as i64)).unwrap()).unix_timestamp(),
         "jti": Uuid::new_v4().to_string()
     });
 
@@ -725,13 +725,16 @@ fn generate_invalid_token(config: &TestConfig, subject: &str) -> String {
 }
 
 fn admin_claims_with_role(role: serde_json::Value) -> AdminClaims {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     AdminClaims {
         iss: "test-ferrum-edge".to_string(),
         sub: "test-user".to_string(),
-        iat: now.timestamp(),
-        nbf: now.timestamp(),
-        exp: (now + chrono::Duration::seconds(3600)).timestamp(),
+        iat: now.unix_timestamp(),
+        nbf: now.unix_timestamp(),
+        exp: (now
+            .checked_add(::time::SignedDuration::seconds(3600))
+            .unwrap())
+        .unix_timestamp(),
         jti: Uuid::new_v4().to_string(),
         additional: role,
     }

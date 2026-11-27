@@ -52,10 +52,10 @@ gateways, control planes, mesh data planes, charts or contract consumers.
 - **The `chrono` advisory exception (RUSTSEC-2026-0543, unmaintained, no
   known vulnerability) is extended from 2026-12-31 to 2027-03-31** in
   `deny.toml` and the dependency-policy register (#7526). Issue #7419 Phases
-  2-17 have moved the standalone uses and the config snapshot stamps
-  (`GatewayConfig.loaded_at`, the ConfigSync delta `poll_timestamp`) to
-  `time_compat`. Remaining work: the resource, namespace, trust and audit
-  timestamps; the mesh, CP/DP status, K8s and diagnostic timestamps; then
+  2-18 have moved the standalone uses, the config snapshot stamps
+  (`GatewayConfig.loaded_at`, the ConfigSync delta `poll_timestamp`) and the
+  resource, namespace, trust-bundle and audit timestamps to `time_compat`.
+  Remaining work: the mesh, CP/DP status, K8s and diagnostic timestamps; then
   dropping the direct `chrono` dependency and sqlx's `chrono` feature. The
   exception can be retired only once no dependency still resolves `chrono`.
 - **Three other advisory exceptions were re-reviewed on 2026-11-27 and
@@ -216,6 +216,16 @@ gateways, control planes, mesh data planes, charts or contract consumers.
   now rejected with that `400` (for example `9999-12-31T23:59:59-00:01`, which
   is in year 10000 in UTC), and a leap second (`:60`) is treated as the
   following second.
+- **Audit log `start`/`end` filters: new 400 message text and a range limit**
+  (issue #7419, `chrono` replacement). An invalid timestamp still gets `400`
+  with the same error envelope, but the detail after
+  `Invalid audit start timestamp: ` / `Invalid audit end timestamp: ` now comes
+  from Ferrum's timestamp parser. The filters parse the same syntax chrono did,
+  with two differences: a value whose UTC instant falls outside years
+  -9999..=9999 is now rejected with that `400` (for example
+  `9999-12-31T23:59:59-00:01`), and a leap second (`:60`) is treated as the
+  following second. The API-spec `updated_since` filter applies the same two
+  rules; its `400` message is unchanged (#7529).
 - **Timestamp parsing outside the TLS events filter follows the same two
   rules** (issue #7419). Parse sites accept the same syntax chrono did, with
   two differences: a leap second (`:60`) is stored as the following second, and
@@ -229,9 +239,21 @@ gateways, control planes, mesh data planes, charts or contract consumers.
   is outside that range fails to decode instead of loading; a ConfigSync
   envelope version outside it is refused as unparseable (fail closed); and a
   mesh slice version outside it is treated like any unparseable slice version
-  (the data plane stamps the slice with its wall clock). Rendered timestamps
-  of in-range values, and the wire and storage text of these stamps, are
-  byte-identical, and no Admin API status, envelope or message changes.
+  (the data plane stamps the slice with its wall clock). The resource, namespace,
+  trust-bundle and audit timestamps follow suit (#7529): a stored `created_at`,
+  `updated_at` or audit `ts` outside that range takes the loader's existing
+  undecodable-value path (SQL resource and audit rows log a warning and use the
+  current time; MongoDB resource and audit documents, namespace and trust-bundle
+  rows, and config or backup documents fail to decode, so an audit list that
+  selects such a MongoDB row fails with `503`), and the API-spec `updated_since`
+  and audit `start`/`end` filters reject such a value with their `400`.
+  Rendered timestamps of in-range, non-leap-second values, and the wire and
+  storage text of these stamps, are byte-identical. For in-range values no
+  Admin API status or envelope changes; message changes are limited to the TLS
+  events and audit filter details noted above and to the deserializer detail
+  for an invalid timestamp field (for example in `POST /batch` and
+  `POST /restore` `400` bodies and config-load errors), which now comes from
+  Ferrum's timestamp parser instead of chrono's.
 - Docs: the support, versioning and deprecation policy
   (`docs/support_policy.md`) is adopted for Ferrum Edge 1.0.0 onward (#7521).
   It also states the compatibility rules for CP/DP versions (identical build

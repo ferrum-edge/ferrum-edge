@@ -6,8 +6,8 @@
 //! #3221). Coverage uses SQLite type drift (`X'FF'` blobs) against the shared
 //! `AnyRow`/`try_get::<String>` path used by PostgreSQL, MySQL, and SQLite.
 
-use chrono::Utc;
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
+use ferrum_edge::time_compat::UtcTimestamp;
 use sqlx::Row;
 use tempfile::TempDir;
 
@@ -174,7 +174,7 @@ fn assert_safe_decode_error(message: &str, operation: &str, column: &str) {
 #[tokio::test(flavor = "multi_thread")]
 async fn delete_plugin_config_rolls_back_when_association_proxy_id_fails_to_decode() {
     let (store, _temp_dir) = sqlite_store().await;
-    let ts = Utc::now().to_rfc3339();
+    let ts = UtcTimestamp::now().to_rfc3339();
 
     insert_proxy(&store, "proxy-1", &ts).await;
     insert_plugin(
@@ -265,7 +265,7 @@ async fn delete_plugin_config_rolls_back_when_association_proxy_id_fails_to_deco
 #[tokio::test(flavor = "multi_thread")]
 async fn delete_proxy_rolls_back_when_orphaned_proxy_group_metadata_fails_to_decode() {
     let (store, _temp_dir) = sqlite_store().await;
-    let ts = Utc::now().to_rfc3339();
+    let ts = UtcTimestamp::now().to_rfc3339();
 
     insert_proxy(&store, "proxy-1", &ts).await;
     seed_change(&store, "proxy", "proxy-1", "upsert", &ts).await;
@@ -361,7 +361,7 @@ async fn insert_named_plugin(
 #[tokio::test(flavor = "multi_thread")]
 async fn serving_load_quarantines_unconstructible_plugin_row_while_cp_load_rejects_it() {
     let (store, _temp_dir) = sqlite_store().await;
-    let ts = Utc::now().to_rfc3339();
+    let ts = UtcTimestamp::now().to_rfc3339();
 
     // Admin write-time validation rejects new rows like this; this direct
     // insert stands in for a row written before the constructor was tightened.
@@ -452,7 +452,7 @@ async fn serving_load_quarantines_unconstructible_plugin_row_while_cp_load_rejec
 #[tokio::test(flavor = "multi_thread")]
 async fn serving_load_does_not_quarantine_retired_fail_closed_auth_plugin() {
     let (store, _temp_dir) = sqlite_store().await;
-    let ts = Utc::now().to_rfc3339();
+    let ts = UtcTimestamp::now().to_rfc3339();
 
     insert_named_plugin(&store, "retired-auth", "oauth2_auth", r#"{}"#, &ts).await;
 
@@ -482,7 +482,7 @@ async fn serving_load_does_not_quarantine_retired_fail_closed_auth_plugin() {
 #[tokio::test(flavor = "multi_thread")]
 async fn full_reload_candidate_with_unconstructible_fail_closed_plugin_keeps_prior_generation() {
     let (store, _temp_dir) = sqlite_store().await;
-    let ts = Utc::now().to_rfc3339();
+    let ts = UtcTimestamp::now().to_rfc3339();
 
     insert_proxy(&store, "proxy-1", &ts).await;
     insert_plugin(
@@ -520,7 +520,9 @@ async fn full_reload_candidate_with_unconstructible_fail_closed_plugin_keeps_pri
     // A real authoritative full load carries a newer `updated_at` on the row
     // that changed; without it the apply short-circuits as `Unchanged` before
     // the plugin cache is ever rebuilt, which is not the path under test.
-    let later = Utc::now() + chrono::Duration::seconds(5);
+    let later = UtcTimestamp::now()
+        .checked_add(::time::SignedDuration::seconds(5))
+        .unwrap();
     let mut fail_closed_candidate = good.clone();
     for plugin_config in &mut fail_closed_candidate.plugin_configs {
         if plugin_config.id == "plugin-1" {

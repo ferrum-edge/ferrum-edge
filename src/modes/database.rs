@@ -4654,12 +4654,7 @@ pub(super) mod tests {
         config: serde_json::Value,
         poll_timestamp: UtcTimestamp,
     ) -> db_backend::IncrementalResult {
-        // PluginConfig still stamps with chrono until its own #7419 phase.
-        let timestamp = chrono::DateTime::from_timestamp(
-            poll_timestamp.unix_timestamp(),
-            poll_timestamp.subsec_nanos(),
-        )
-        .unwrap();
+        let timestamp = poll_timestamp;
         db_backend::IncrementalResult {
             added_or_modified_proxies: vec![],
             removed_proxy_ids: vec![],

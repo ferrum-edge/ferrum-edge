@@ -12,7 +12,7 @@
 use crate::scaffolding::port_registry::TestSocket;
 
 use arc_swap::ArcSwap;
-use chrono::Utc;
+use ferrum_edge::time_compat::UtcTimestamp;
 use ferrum_edge::{
     admin::{
         AdminState,
@@ -59,14 +59,14 @@ fn make_jwt_manager() -> JwtManager {
 }
 
 fn make_token() -> String {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "iss": JWT_ISSUER,
         "sub": "test-user",
         "role": "admin",
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(3600i64)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(3600i64)).unwrap()).unix_timestamp(),
         "jti": uuid::Uuid::new_v4().to_string(),
     });
     let key = EncodingKey::from_secret(JWT_SECRET.as_bytes()).unwrap();
@@ -446,8 +446,8 @@ fn manual_proxy_plugin(
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -1661,7 +1661,7 @@ async fn delete_rejects_removing_last_global_tcp_throttle_target_with_422() {
         .await
         .expect("create unsupported global target");
     let throttle_id = uid("global-tcp-throttle");
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     store
         .create_plugin_config(&PluginConfig {
             labels: Default::default(),
@@ -2030,8 +2030,8 @@ async fn api_spec_post_and_exact_put_validate_against_prospective_schema_graph()
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     store
         .create_plugin_config(&schema_plugin)
@@ -2100,8 +2100,8 @@ async fn api_spec_writes_ignore_an_unchanged_invalid_persisted_schema_graph() {
             priority_override: None,
             trigger: None,
             api_spec_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         })
         .await
         .expect("persist pre-existing invalid graph participant");
@@ -2157,8 +2157,8 @@ async fn api_spec_put_and_delete_validate_removed_spec_owned_schema_definitions(
             priority_override: None,
             trigger: None,
             api_spec_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         })
         .await
         .expect("persist spec-owned schema definition");
@@ -2190,8 +2190,8 @@ async fn api_spec_put_and_delete_validate_removed_spec_owned_schema_definitions(
             priority_override: None,
             trigger: None,
             api_spec_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         })
         .await
         .expect("persist manual schema referrer");
@@ -2264,8 +2264,8 @@ async fn api_spec_delete_models_proxy_and_orphaned_group_plugin_cascades() {
             priority_override: None,
             trigger: None,
             api_spec_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         })
         .await
         .expect("persist schema definition");
@@ -2299,8 +2299,8 @@ async fn api_spec_delete_models_proxy_and_orphaned_group_plugin_cascades() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     attach_manual_proxy_plugin(&store, &proxy_id, &group_logger).await;
 
@@ -3221,8 +3221,8 @@ async fn post_mtls_dns_policy_conflict_returns_409() {
         custom_id: None,
         credentials: Default::default(),
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     upper.credentials.insert(
         "mtls_auth".to_string(),
@@ -3570,7 +3570,7 @@ async fn put_preserves_created_at_advances_updated_at() {
     let created_at_str = item["created_at"]
         .as_str()
         .expect("created_at must be a string");
-    let created_at: chrono::DateTime<chrono::Utc> = created_at_str
+    let created_at: UtcTimestamp = created_at_str
         .parse()
         .expect("created_at must parse as RFC3339");
 
@@ -3608,13 +3608,13 @@ async fn put_preserves_created_at_advances_updated_at() {
     let updated_at_str = item2["updated_at"]
         .as_str()
         .expect("updated_at must be a string after PUT");
-    let updated_at: chrono::DateTime<chrono::Utc> = updated_at_str
+    let updated_at: UtcTimestamp = updated_at_str
         .parse()
         .expect("updated_at must parse as RFC3339");
 
     // created_at must be identical (as a string, before any timezone
     // normalization differences, compare the parsed timestamps).
-    let created_at_after: chrono::DateTime<chrono::Utc> = created_at_after_str
+    let created_at_after: UtcTimestamp = created_at_after_str
         .parse()
         .expect("created_at after PUT must parse as RFC3339");
     assert_eq!(
@@ -4300,8 +4300,8 @@ async fn put_with_unchanged_resources_does_not_bump_proxy_updated_at() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        proxy_after.updated_at.timestamp(),
-        before_ts.timestamp(),
+        proxy_after.updated_at.unix_timestamp(),
+        before_ts.unix_timestamp(),
         "proxy.updated_at must not advance when bundle is unchanged (idempotent PUT)"
     );
 }
@@ -4875,8 +4875,8 @@ async fn put_with_empty_plugin_ids_reuses_by_name() {
         .expect("get_proxy failed")
         .expect("proxy must still exist after PUT");
     assert_eq!(
-        proxy_after.updated_at.timestamp(),
-        updated_before.timestamp(),
+        proxy_after.updated_at.unix_timestamp(),
+        updated_before.unix_timestamp(),
         "proxy.updated_at must be unchanged when resource hash matches (short-circuit)"
     );
 }
@@ -6676,9 +6676,7 @@ async fn put_overwrites_imported_updated_at_so_polling_picks_change() {
         .await
         .expect("list_spec_owned_plugin_configs");
     if let Some(plugin) = plugins.first() {
-        let epoch = chrono::DateTime::parse_from_rfc3339("1970-01-01T00:00:00Z")
-            .unwrap()
-            .to_utc();
+        let epoch = "1970-01-01T00:00:00Z".parse::<UtcTimestamp>().unwrap();
         assert!(
             plugin.updated_at > epoch,
             "plugin.updated_at must be overwritten by server-side stamp; got {}",

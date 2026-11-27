@@ -1356,8 +1356,8 @@ mod tests {
     use crate::config::types::{Consumer, default_namespace};
     use crate::consumer_index::ConsumerIndex;
     use crate::plugins::{PluginResult, RequestContext};
+    use crate::time_compat::UtcTimestamp;
     use async_trait::async_trait;
-    use chrono::Utc;
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
@@ -1749,8 +1749,8 @@ mod tests {
             custom_id: Some("phase3-custom".to_string()),
             credentials: HashMap::new(),
             acl_groups: Vec::new(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         }
     }
 

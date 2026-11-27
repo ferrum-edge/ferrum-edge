@@ -18,9 +18,9 @@ use crate::config::types::{
     ApiSpec, Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream,
 };
 use crate::plugins::PluginHttpClient;
+use crate::time_compat::UtcTimestamp;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
@@ -247,8 +247,8 @@ pub struct ApiSpecSnapshotView<'a> {
     pub resource_hash: &'a str,
     pub external_ref_snapshot: Option<serde_json::Value>,
     pub external_ref_digest: Option<&'a str>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: UtcTimestamp,
+    pub updated_at: UtcTimestamp,
 }
 
 impl<'a> From<&'a ApiSpec> for ApiSpecSnapshotView<'a> {
@@ -1795,7 +1795,7 @@ pub struct ApiSpecListFilter {
     /// Case-insensitive substring match on `title`.
     pub title_contains: Option<String>,
     /// `updated_at >= ?`
-    pub updated_since: Option<DateTime<Utc>>,
+    pub updated_since: Option<UtcTimestamp>,
     /// Exact tag membership (tag name must appear in the stored JSON array).
     pub has_tag: Option<String>,
     /// Column to sort by (default: `UpdatedAt`).
@@ -1945,7 +1945,7 @@ pub struct IncrementalResult {
     /// Highest durable config change sequence included in this poll.
     pub sequence_cursor: u64,
     /// Timestamp to use as the in-memory/gRPC config version for this delta.
-    pub poll_timestamp: crate::time_compat::UtcTimestamp,
+    pub poll_timestamp: UtcTimestamp,
 }
 
 impl IncrementalResult {

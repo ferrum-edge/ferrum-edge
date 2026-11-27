@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::plugin_utils::assert_continue;
+use ferrum_edge::time_compat::UtcTimestamp;
 
 /// Self-signed client certificate with an explicit validity interval, in
 /// seconds relative to now. rcgen takes `time::OffsetDateTime`.
@@ -81,8 +82,8 @@ fn mtls_consumer(username: &str, identity: &str) -> Consumer {
         custom_id: None,
         credentials,
         acl_groups: Vec::new(),
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 

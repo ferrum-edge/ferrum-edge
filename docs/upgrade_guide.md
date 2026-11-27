@@ -355,18 +355,38 @@ VirtualServices for entries that start with `http[].route[].destination`.
 clients should be regenerated from the 1.0.0 `openapi.yaml`, which also marks
 every closed schema `additionalProperties: false`.
 
-### Custom plugins: request and notification timestamps use `UtcTimestamp` (issue #7419)
+### Custom plugins: timestamps use `UtcTimestamp` instead of chrono (issue #7419)
 
 `RequestContext::timestamp_received` and `Notification::fired_at` (and its
 builder setter) are now `ferrum_edge::time_compat::UtcTimestamp` instead of
-`chrono::DateTime<Utc>`. `UtcTimestamp` renders the same bytes as chrono
-through `to_rfc3339()` and exposes `unix_timestamp()` and
+`chrono::DateTime<Utc>`. So are the config-model and record timestamps
+(#7527, #7529): `GatewayConfig.loaded_at`; `created_at`/`updated_at` on
+`Proxy`, `Consumer`, `PluginConfig`, `Upstream`, `ApiSpec`, `NamespaceRecord`
+and `GatewayTrustBundleRecord` (and `updated_at` on `GatewayTrustBundleSummary`);
+`AuditEvent.ts`; `ApiSpecSnapshotView`'s `created_at`/`updated_at`; and the
+`ApiSpecListFilter.updated_since` and
+`AuditListFilter.start`/`end` list filters. For non-leap-second values
+`UtcTimestamp` renders the same bytes as chrono through `to_rfc3339()`; it
+exposes `unix_timestamp()` and
 `unix_timestamp_millis()`. Plugins also gain an optional
 `ON_RESPONSE_STREAM_TERMINATED` lifecycle hook bit (#7471); custom plugins keep
 the conservative dispatch path whether or not they declare it.
 
+Converting: `UtcTimestamp::now()` replaces `Utc::now()`; `to_rfc3339()`,
+`to_rfc3339_opts(..)` and serde produce the same text as chrono for in-range,
+non-leap-second values; `unix_timestamp()` / `unix_timestamp_millis()` replace `timestamp()` /
+`timestamp_millis()`; `checked_add` / `checked_sub` take a
+`time::SignedDuration`; and `"...".parse::<UtcTimestamp>()` or
+`UtcTimestamp::from_unix_timestamp(secs)` builds one from text or epoch
+seconds. If you still hold a `chrono::DateTime<Utc>`, convert it with
+`dt.to_rfc3339().parse::<UtcTimestamp>()`, which also applies the leap-second
+rule below.
+Two edge cases differ from chrono: an instant outside years -9999..=9999 is
+rejected (`TimestampError::OutOfRange`) rather than represented, and a leap
+second (`:60`) is stored as the following second.
+
 **Operator action:** rebuild custom plugins against 1.0.0 and replace chrono
-calls on these two fields with the `UtcTimestamp` equivalents. The
+calls on these fields with the `UtcTimestamp` equivalents. The
 custom-plugin Rust API stays unstable after 1.0.0
 ([support policy](support_policy.md#custom-plugin-rust-api)).
 

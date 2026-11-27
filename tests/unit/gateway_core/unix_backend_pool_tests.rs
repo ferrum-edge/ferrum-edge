@@ -22,13 +22,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use chrono::Utc;
 use ferrum_edge::backend_conn_limit::BackendConnectionLimitExceeded;
 use ferrum_edge::config::PoolConfig;
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, Proxy};
 use ferrum_edge::proxy::unix_backend::{MAX_UNIX_CONNECT_TIMEOUT_MS, UnixBackendError};
 use ferrum_edge::proxy::unix_backend_pool::{UnixBackendConnectionPool, UnixWireProtocol};
 use ferrum_edge::retry::ErrorClass;
+use ferrum_edge::time_compat::UtcTimestamp;
 use ferrum_edge::util::unix_socket::{AdmittedUnixSocket, admit_socket_for_connect};
 
 /// Accepts every connection and holds it open, counting acceptances so a test
@@ -158,8 +158,8 @@ fn test_proxy(id: &str) -> Proxy {
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 

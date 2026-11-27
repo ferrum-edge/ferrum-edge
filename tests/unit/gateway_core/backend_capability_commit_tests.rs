@@ -20,7 +20,6 @@
 //! `tests/integration/backend_capability_staged_commit_tests.rs` drives it
 //! through the real probes with the HTTP/3 probe held open.
 
-use chrono::Utc;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, Proxy, ResponseBodyMode,
 };
@@ -29,6 +28,7 @@ use ferrum_edge::proxy::backend_capabilities::{
     CapabilityCommitOutcome, GrpcTransportCapabilities, PlainHttpCapabilities, ProtocolSupport,
     capability_key, merge_protocol_probe_classification,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use std::collections::HashSet;
 
 const SUPPORTED: ProtocolSupport = ProtocolSupport::Supported;
@@ -36,7 +36,7 @@ const UNSUPPORTED: ProtocolSupport = ProtocolSupport::Unsupported;
 const UNKNOWN: ProtocolSupport = ProtocolSupport::Unknown;
 
 fn minimal_proxy() -> Proxy {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     Proxy {
         labels: Default::default(),
         id: "capability-commit".to_string(),

@@ -362,8 +362,8 @@ fn full_load_consumer_config(namespace: &str, generation: &str, timestamp: i64) 
             custom_id: None,
             credentials: HashMap::new(),
             acl_groups: Vec::new(),
-            created_at: Utc.timestamp_opt(timestamp, 0).single().expect("timestamp"),
-            updated_at: Utc.timestamp_opt(timestamp, 0).single().expect("timestamp"),
+            created_at: UtcTimestamp::from_unix_timestamp(timestamp).expect("timestamp"),
+            updated_at: UtcTimestamp::from_unix_timestamp(timestamp).expect("timestamp"),
         }],
         loaded_at: UtcTimestamp::from_unix_timestamp(timestamp).expect("timestamp"),
         ..GatewayConfig::default()

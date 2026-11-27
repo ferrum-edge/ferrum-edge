@@ -9,6 +9,7 @@ use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, REQUEST_ID_METADATA_KEY,
     StreamConnectionContext, StreamTransactionSummary, TCP_ONLY_PROTOCOLS, create_plugin,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -31,8 +32,8 @@ fn test_consumer(username: &str) -> ferrum_edge::config::types::Consumer {
         custom_id: None,
         credentials: HashMap::new(),
         acl_groups: Vec::new(),
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 

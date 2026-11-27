@@ -4748,7 +4748,6 @@ mod tests {
     use crate::config::db_backend::{IncrementalResult, NamespacedResourceId};
     use crate::config::types::*;
     use crate::time_compat::UtcTimestamp;
-    use chrono::Utc;
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -4904,8 +4903,8 @@ mod tests {
             backend_proxy_protocol: None,
             stream_match: None,
             compiled_stream_match: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
             pending_limit_scope: None,
         }
     }
@@ -4919,8 +4918,8 @@ mod tests {
             custom_id: None,
             credentials: std::collections::HashMap::new(),
             acl_groups: Vec::new(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         }
     }
 

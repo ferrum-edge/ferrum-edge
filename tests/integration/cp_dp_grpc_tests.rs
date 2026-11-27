@@ -185,8 +185,8 @@ fn create_test_proxy(id: &str, listen_path: &str) -> Proxy {
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }
@@ -2555,8 +2555,8 @@ async fn test_dp_keeps_last_good_snapshot_after_case_ambiguous_mtls_dns_update()
         custom_id: None,
         credentials: HashMap::new(),
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     upper.credentials.insert(
         "mtls_auth".to_string(),
@@ -2583,8 +2583,8 @@ async fn test_dp_keeps_last_good_snapshot_after_case_ambiguous_mtls_dns_update()
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }];
     CpGrpcServer::broadcast_update(&update_tx, &invalid_config);
 
@@ -3423,7 +3423,7 @@ async fn test_dp_applies_delta_modifying_proxy() {
     // Send delta that modifies proxy-0 (change backend_port)
     let mut modified_proxy = create_test_proxy("proxy-0", "/api-0");
     modified_proxy.backend_port = 9999;
-    modified_proxy.updated_at = Utc::now(); // newer timestamp
+    modified_proxy.updated_at = UtcTimestamp::now(); // newer timestamp
 
     let delta = IncrementalResult {
         added_or_modified_proxies: vec![modified_proxy],
@@ -3511,7 +3511,7 @@ async fn test_dp_applies_delta_with_mixed_operations() {
     // - Adds proxy-new
     let mut modified = create_test_proxy("proxy-0", "/api-0");
     modified.backend_port = 5555;
-    modified.updated_at = Utc::now();
+    modified.updated_at = UtcTimestamp::now();
 
     let delta = IncrementalResult {
         added_or_modified_proxies: vec![modified, create_test_proxy("proxy-new", "/api-new")],
@@ -3787,8 +3787,8 @@ fn create_test_upstream(id: &str, hosts: &[(&str, u16)]) -> Upstream {
         backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         k8s_service_uid: None,
         admission_upstream_id: None,
         pending_limit_scope: None,
@@ -3804,8 +3804,8 @@ fn create_test_consumer(id: &str, username: &str) -> Consumer {
         custom_id: None,
         credentials: HashMap::new(),
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -3972,7 +3972,9 @@ async fn test_dp_applies_delta_modifying_upstream_targets() {
 
     let mut modified_upstream =
         create_test_upstream("u1", &[("new-host-a", 9090), ("new-host-b", 9091)]);
-    modified_upstream.updated_at = Utc::now() + chrono::Duration::seconds(10);
+    modified_upstream.updated_at = UtcTimestamp::now()
+        .checked_add(::time::SignedDuration::seconds(10))
+        .unwrap();
 
     let delta = IncrementalResult {
         added_or_modified_proxies: vec![],
@@ -4266,7 +4268,9 @@ async fn test_dp_applies_delta_with_all_entity_types() {
 
     // Send a mixed delta: add proxy, remove consumer, modify upstream
     let mut modified_upstream = create_test_upstream("u1", &[("new-host", 9090)]);
-    modified_upstream.updated_at = Utc::now() + chrono::Duration::seconds(10);
+    modified_upstream.updated_at = UtcTimestamp::now()
+        .checked_add(::time::SignedDuration::seconds(10))
+        .unwrap();
 
     let delta = IncrementalResult {
         added_or_modified_proxies: vec![create_test_proxy("p2", "/new")],
@@ -6090,8 +6094,8 @@ async fn canonicalize_snapshot_for_comparison_matches_regardless_of_consumer_arr
         credentials: Default::default(),
         acl_groups: vec![],
         labels: Default::default(),
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     let consumer_b = Consumer {
         id: "consumer-b".to_string(),
@@ -6101,8 +6105,8 @@ async fn canonicalize_snapshot_for_comparison_matches_regardless_of_consumer_arr
         credentials: Default::default(),
         acl_groups: vec![],
         labels: Default::default(),
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
 
     let base_config = create_test_config(1);
@@ -7804,8 +7808,8 @@ async fn test_cp_refuses_unconstructible_plugin_config_and_dp_reports_rejection(
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }];
 
     // 1) CP admission: the shared rejecting contract now runs the same
@@ -8747,8 +8751,8 @@ mod managed_jwks_distribution {
             priority_override: None,
             trigger: None,
             api_spec_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         }];
         let (addr, _update_tx, server_handle) = start_test_cp_server(cp_config).await;
 
