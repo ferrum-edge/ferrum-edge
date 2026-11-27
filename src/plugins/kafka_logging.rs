@@ -2353,6 +2353,13 @@ impl Drop for KafkaLogging {
                 retire_generation(&handle, generation);
                 return;
             }
+            // Relay shards run `current_thread` runtimes alongside the serving
+            // `MultiThread` main runtime; route retirement there so reload
+            // teardown preserves queued records (including disconnect logs).
+            if let Some(main_handle) = crate::proxy::relay_shards::main_runtime_handle() {
+                retire_generation(&main_handle, generation);
+                return;
+            }
             // Serving modes use a multi-thread runtime and finalize explicitly.
             // A current-thread runtime cannot be synchronously blocked from
             // Drop, so close/abort admission and report any abandoned work

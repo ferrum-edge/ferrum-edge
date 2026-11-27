@@ -182,6 +182,11 @@ pub(super) struct H1FramingSignals {
     /// Incremented on the cold reject path only, never in `poll_read`'s fast
     /// path.
     parse_rejects: AtomicU64,
+    /// Set if the underlying transport returned a read error while Hyper was
+    /// reading ahead (ferrum-edge #5911). WebSocket shard handoff checks this
+    /// before downcasting `hyper::upgrade::Upgraded` so it never drops a
+    /// pending read-ahead error stored on `Upgraded`.
+    saw_read_error: AtomicBool,
 }
 
 impl H1FramingSignals {
@@ -195,7 +200,17 @@ impl H1FramingSignals {
             observation_disabled: AtomicBool::new(false),
             parse_reject_hint: AtomicU8::new(PARSE_HINT_NONE),
             parse_rejects: AtomicU64::new(0),
+            saw_read_error: AtomicBool::new(false),
         }
+    }
+
+    fn record_read_error(&self) {
+        self.saw_read_error.store(true, Ordering::Release);
+    }
+
+    #[cfg(not(feature = "bench-h1-profile"))]
+    pub(super) fn saw_read_error(&self) -> bool {
+        self.saw_read_error.load(Ordering::Acquire)
     }
 
     fn store_parse_reject_hint(&self, hint: u8) {
@@ -391,6 +406,26 @@ impl<T> H1FramingGuardIo<T> {
             signals,
         )
     }
+
+    #[cfg(not(feature = "bench-h1-profile"))]
+    pub(super) fn can_detach(&self) -> bool {
+        self.parse_reject.is_idle()
+    }
+
+    #[cfg(not(feature = "bench-h1-profile"))]
+    pub(super) fn get_ref(&self) -> &T {
+        &self.inner
+    }
+
+    #[cfg(not(feature = "bench-h1-profile"))]
+    pub(super) fn try_into_inner(self) -> Result<T, Box<Self>> {
+        if self.can_detach() {
+            self.signals.disable_observation();
+            Ok(self.inner)
+        } else {
+            Err(Box::new(self))
+        }
+    }
 }
 
 impl<T: AsyncWrite + Unpin> H1FramingGuardIo<T> {
@@ -484,6 +519,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for H1FramingGuardIo<T> {
             Pin::new(&mut this.inner).poll_read(cx, buf)
         };
 
+        if matches!(result, Poll::Ready(Err(_))) {
+            this.signals.record_read_error();
+        }
         if let Poll::Ready(Ok(())) = &result {
             this.scanner.disable_if_requested(&this.signals);
             if this.scanner.observation_active() {
@@ -595,6 +633,33 @@ impl<T> MaybeH1FramingGuardIo<T> {
 
     pub(super) fn passthrough(inner: T) -> Self {
         Self::Passthrough(inner)
+    }
+
+    #[cfg(not(feature = "bench-h1-profile"))]
+    pub(super) fn can_detach(&self) -> bool {
+        match self {
+            Self::Observed(guard) => guard.can_detach(),
+            Self::Passthrough(_) => true,
+        }
+    }
+
+    #[cfg(not(feature = "bench-h1-profile"))]
+    pub(super) fn get_ref(&self) -> &T {
+        match self {
+            Self::Observed(guard) => guard.get_ref(),
+            Self::Passthrough(inner) => inner,
+        }
+    }
+
+    #[cfg(not(feature = "bench-h1-profile"))]
+    pub(super) fn try_into_inner(self) -> Result<T, Self> {
+        match self {
+            Self::Observed(guard) => match guard.try_into_inner() {
+                Ok(inner) => Ok(inner),
+                Err(guard) => Err(Self::Observed(guard)),
+            },
+            Self::Passthrough(inner) => Ok(inner),
+        }
     }
 }
 

@@ -1111,21 +1111,35 @@ pub fn raise_fd_limit() -> RaiseFdLimitResult {
 /// [`event_loop_probe_budget`] and [`drain_event_loop_probes`]).
 async fn measure_event_loop_latency(budget: Duration) -> Duration {
     let num_workers = tokio::runtime::Handle::current().metrics().num_workers();
+    let shard_handles = crate::proxy::relay_shards::all_handles();
 
-    // Single-threaded fallback: just measure our own reschedule.
-    if num_workers <= 1 {
+    // Single-threaded fallback: just measure our own reschedule when no relay
+    // shards are active.
+    if num_workers <= 1 && shard_handles.is_empty() {
         let start = std::time::Instant::now();
         tokio::task::yield_now().await;
         return start.elapsed();
     }
 
     let mut probes = tokio::task::JoinSet::new();
-    for _ in 0..num_workers {
+    for _ in 0..num_workers.max(1) {
         let start = std::time::Instant::now();
         probes.spawn(async move {
             tokio::task::yield_now().await;
             start.elapsed()
         });
+    }
+    // Also probe each active per-core relay shard so a stalled shard trips
+    // event-loop overload shedding even while the main runtime stays idle.
+    for shard_handle in shard_handles {
+        let start = std::time::Instant::now();
+        probes.spawn_on(
+            async move {
+                tokio::task::yield_now().await;
+                start.elapsed()
+            },
+            &shard_handle,
+        );
     }
     drain_event_loop_probes(probes, budget).await
 }

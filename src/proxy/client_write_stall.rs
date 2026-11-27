@@ -154,12 +154,37 @@ pub struct ClientWriteStallIo<T> {
 impl<T> ClientWriteStallIo<T> {
     /// Wrap `inner`. `timeout_seconds == 0` disables the bound.
     pub fn new(inner: T, timeout_seconds: u64) -> Self {
+        Self::from_parts(
+            inner,
+            (timeout_seconds > 0).then(|| Duration::from_secs(timeout_seconds)),
+        )
+    }
+
+    /// Reconstruct a [`ClientWriteStallIo`] with an already-resolved timeout
+    /// (used when re-registering an idle upgraded socket on a relay shard).
+    pub fn from_parts(inner: T, timeout: Option<Duration>) -> Self {
         Self {
             inner,
-            timeout: (timeout_seconds > 0).then(|| Duration::from_secs(timeout_seconds)),
+            timeout,
             timer: None,
             armed: false,
             expired: false,
+        }
+    }
+
+    /// `true` when no stall episode is currently armed and the bound has not
+    /// expired, so the inner transport can move cleanly across Tokio runtimes.
+    pub fn can_detach(&self) -> bool {
+        !self.expired && !self.armed
+    }
+
+    /// Unwrap `(inner, timeout)` when [`Self::can_detach`] holds, or return
+    /// `Err(self)` if a stall episode is active or expired.
+    pub fn try_into_parts(self) -> Result<(T, Option<Duration>), Self> {
+        if self.can_detach() {
+            Ok((self.inner, self.timeout))
+        } else {
+            Err(self)
         }
     }
 

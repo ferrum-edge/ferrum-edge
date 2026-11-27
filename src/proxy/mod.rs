@@ -140,6 +140,7 @@ pub mod node_waypoint_udp_reply_source;
 pub mod node_waypoint_udp_steering;
 pub mod owned_shell;
 pub mod proxy_protocol;
+pub mod relay_shards;
 pub(crate) mod response_buffer_budget;
 pub mod response_watchdog;
 pub mod sni;
@@ -8367,6 +8368,11 @@ struct RequestConnectionMetadata {
     /// default and means no observer ran (H2/H3/tests). Only a completed
     /// observation may be [`h1_framing_guard::H1FramingResult::Clear`].
     http1_framing_result: h1_framing_guard::H1FramingResult,
+    /// Shared HTTP/1 wire-framing signals for this connection. Present on
+    /// HTTP/1.x connections wrapped by [`h1_framing_guard::H1FramingGuardIo`]
+    /// so upgraded WebSocket shard handoff can decline downcasting whenever
+    /// Hyper may hold a pending read-ahead error (ferrum-edge #5911).
+    h1_framing_signals: Option<Arc<h1_framing_guard::H1FramingSignals>>,
     /// Concrete local address of the accepted TCP connection. Unlike the
     /// listener's wildcard bind address, this identifies the pod IP the peer
     /// actually reached — it binds a Sidecar ingress CONNECT to this replica
@@ -16334,6 +16340,7 @@ async fn handle_connection(
             frontend_listen_port,
             gateway_listener_identity: gateway_listener_identity.clone(),
             http1_framing_result,
+            h1_framing_signals: response_h1_framing_signals.clone(),
             accepted_local_addr,
             frontend_sni_hostname: None,
             node_waypoint_identity: node_waypoint_identity.clone(),
@@ -17108,6 +17115,9 @@ async fn handle_websocket_request_authenticated(
     // concretization. Retries must reuse this exact authority — never
     // re-derive from backend-controlled data.
     request_host: Option<String>,
+    #[cfg_attr(feature = "bench-h1-profile", allow(unused_variables))] h1_framing_signals: Option<
+        Arc<h1_framing_guard::H1FramingSignals>,
+    >,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     info!(
         "WebSocket upgrade request authenticated for proxy: {} from: {}",
@@ -18721,39 +18731,101 @@ async fn handle_websocket_request_authenticated(
                 // TCP/TLS backend stream, or a mesh egress
                 // `WebSocketStream<H2ConnectTunnel>` over an Extended CONNECT
                 // tunnel. Both share the same frame relay and plugin pipeline.
-                let client_io = TokioIo::new(upgraded);
                 let relay_result = match backend_handshake {
                     WsBackendHandshake::Direct(handshake) => {
                         let handshake = *handshake;
-                        run_websocket_session(
-                            client_io,
-                            handshake.stream,
-                            &proxy_id,
-                            ws_conn_id,
-                            ws_framing_plugins,
-                            ws_frame_plugins,
-                            ws_disconnect_plugins,
-                            session_meta,
-                            ws_connection_permit,
-                            max_ws_frame,
-                            ws_write_buf,
-                            ws_tunnel,
-                            ws_tunnel_idle_disabled_safety_cap,
-                            ws_idle_tracker,
-                            ws_session_deadline,
-                            ws_shutdown_rx,
-                            Arc::clone(&state.overload),
-                            ws_fragment_policy,
-                            &adaptive_buf,
-                            ws_client_trust_session,
-                            ws_deflate_session,
-                            // H1/H2 write straight to the client transport.
-                            None,
-                        )
-                        .await
+                        #[cfg(not(feature = "bench-h1-profile"))]
+                        if ws_tunnel
+                            && ws_framing_plugins.is_empty()
+                            && ws_deflate_session.is_none()
+                            && let Some(shard_handle) = crate::proxy::relay_shards::next_handle()
+                        {
+                            run_direct_ws_tunnel_maybe_on_shard(
+                                shard_handle,
+                                upgraded,
+                                h1_framing_signals.as_deref(),
+                                handshake.stream,
+                                &proxy_id,
+                                ws_conn_id,
+                                ws_framing_plugins,
+                                ws_frame_plugins,
+                                ws_disconnect_plugins,
+                                session_meta,
+                                ws_connection_permit,
+                                max_ws_frame,
+                                ws_write_buf,
+                                ws_tunnel,
+                                ws_tunnel_idle_disabled_safety_cap,
+                                ws_idle_tracker,
+                                ws_session_deadline,
+                                ws_shutdown_rx,
+                                Arc::clone(&state.overload),
+                                ws_fragment_policy,
+                                &adaptive_buf,
+                                ws_client_trust_session,
+                            )
+                            .await
+                        } else {
+                            run_websocket_session(
+                                TokioIo::new(upgraded),
+                                handshake.stream,
+                                &proxy_id,
+                                ws_conn_id,
+                                ws_framing_plugins,
+                                ws_frame_plugins,
+                                ws_disconnect_plugins,
+                                session_meta,
+                                ws_connection_permit,
+                                max_ws_frame,
+                                ws_write_buf,
+                                ws_tunnel,
+                                ws_tunnel_idle_disabled_safety_cap,
+                                ws_idle_tracker,
+                                ws_session_deadline,
+                                ws_shutdown_rx,
+                                Arc::clone(&state.overload),
+                                ws_fragment_policy,
+                                &adaptive_buf,
+                                ws_client_trust_session,
+                                ws_deflate_session,
+                                // H1/H2 write straight to the client transport.
+                                None,
+                            )
+                            .await
+                        }
+                        #[cfg(feature = "bench-h1-profile")]
+                        {
+                            run_websocket_session(
+                                TokioIo::new(upgraded),
+                                handshake.stream,
+                                &proxy_id,
+                                ws_conn_id,
+                                ws_framing_plugins,
+                                ws_frame_plugins,
+                                ws_disconnect_plugins,
+                                session_meta,
+                                ws_connection_permit,
+                                max_ws_frame,
+                                ws_write_buf,
+                                ws_tunnel,
+                                ws_tunnel_idle_disabled_safety_cap,
+                                ws_idle_tracker,
+                                ws_session_deadline,
+                                ws_shutdown_rx,
+                                Arc::clone(&state.overload),
+                                ws_fragment_policy,
+                                &adaptive_buf,
+                                ws_client_trust_session,
+                                ws_deflate_session,
+                                // H1/H2 write straight to the client transport.
+                                None,
+                            )
+                            .await
+                        }
                     }
                     WsBackendHandshake::Mesh(handshake) => {
                         let handshake = *handshake;
+                        let client_io = TokioIo::new(upgraded);
                         run_websocket_session(
                             client_io,
                             handshake.stream,
@@ -18795,6 +18867,7 @@ async fn handle_websocket_request_authenticated(
                     #[cfg(unix)]
                     WsBackendHandshake::Unix(handshake) => {
                         let handshake = *handshake;
+                        let client_io = TokioIo::new(upgraded);
                         let relay_result = Box::pin(run_websocket_session(
                             client_io,
                             handshake.stream,
@@ -22191,6 +22264,10 @@ pub struct WsIdleTracker {
     timeout: Duration,
     epoch: Instant,
     last_activity_ms: AtomicU64,
+    /// Cleared when WebSocket tunnel mode takes over so `WsActivityIo` stops
+    /// issuing redundant `Instant::now()` + atomic stores on every backend TCP
+    /// read (`bidirectional_copy_for_relay` tracks idle activity directly).
+    active: std::sync::atomic::AtomicBool,
 }
 
 impl WsIdleTracker {
@@ -22199,6 +22276,7 @@ impl WsIdleTracker {
             timeout,
             epoch: Instant::now(),
             last_activity_ms: AtomicU64::new(0),
+            active: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
@@ -22208,12 +22286,23 @@ impl WsIdleTracker {
         (seconds > 0).then(|| Arc::new(Self::new(Duration::from_secs(seconds))))
     }
 
+    /// Silence byte-level activity updates once tunnel mode hands idle
+    /// tracking over to `tcp_proxy::bidirectional_copy_for_relay`.
+    #[inline]
+    pub(crate) fn deactivate(&self) {
+        self.active.store(false, Ordering::Relaxed);
+    }
+
     fn now_ms(&self) -> u64 {
         u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
     /// Record activity: bytes or a frame received from either direction.
+    #[inline]
     fn touch(&self) {
+        if !self.active.load(Ordering::Relaxed) {
+            return;
+        }
         self.last_activity_ms
             .store(self.now_ms(), Ordering::Relaxed);
     }
@@ -22259,6 +22348,13 @@ impl<S> WsActivityIo<S> {
     /// Access the wrapped transport (socket-option tweaks, tests).
     pub fn get_ref(&self) -> &S {
         &self.inner
+    }
+
+    /// Unwrap the underlying transport when switching to a raw tunnel relay
+    /// that owns its own idle timeout tracking.
+    #[cfg(not(feature = "bench-h1-profile"))]
+    pub(crate) fn into_inner(self) -> S {
+        self.inner
     }
 }
 
@@ -22412,6 +22508,828 @@ pub type WsRelayFailure = (
 /// `None`.
 pub type WsClientTransportSettle<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Option<WsRelayFailure>> + Send + 'a>>;
+
+#[cfg(not(feature = "bench-h1-profile"))]
+type TlsH1RawClientIo = h1_framing_guard::MaybeH1FramingGuardIo<
+    tokio_rustls::server::TlsStream<client_write_stall::ClientWriteStallIo<tokio::net::TcpStream>>,
+>;
+
+#[cfg(not(feature = "bench-h1-profile"))]
+type PlainH1RawClientIo = h1_framing_guard::H1FramingGuardIo<
+    client_write_stall::ClientWriteStallIo<tokio::net::TcpStream>,
+>;
+
+#[cfg(not(feature = "bench-h1-profile"))]
+enum RehomedWsClientIo {
+    Tls(
+        Box<
+            relay_shards::RehomedTlsStream<
+                client_write_stall::ClientWriteStallIo<tokio::net::TcpStream>,
+                rustls::ServerConnection,
+            >,
+        >,
+    ),
+    Plain(relay_shards::PrefixedIo<client_write_stall::ClientWriteStallIo<tokio::net::TcpStream>>),
+}
+
+#[cfg(not(feature = "bench-h1-profile"))]
+impl tokio::io::AsyncRead for RehomedWsClientIo {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tls(inner) => std::pin::Pin::new(inner.as_mut()).poll_read(cx, buf),
+            Self::Plain(inner) => std::pin::Pin::new(inner).poll_read(cx, buf),
+        }
+    }
+}
+
+#[cfg(not(feature = "bench-h1-profile"))]
+impl tokio::io::AsyncWrite for RehomedWsClientIo {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Tls(inner) => std::pin::Pin::new(inner.as_mut()).poll_write(cx, buf),
+            Self::Plain(inner) => std::pin::Pin::new(inner).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_write_vectored(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Tls(inner) => std::pin::Pin::new(inner.as_mut()).poll_write_vectored(cx, bufs),
+            Self::Plain(inner) => std::pin::Pin::new(inner).poll_write_vectored(cx, bufs),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::Tls(inner) => inner.is_write_vectored(),
+            Self::Plain(inner) => inner.is_write_vectored(),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tls(inner) => std::pin::Pin::new(inner.as_mut()).poll_flush(cx),
+            Self::Plain(inner) => std::pin::Pin::new(inner).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tls(inner) => std::pin::Pin::new(inner.as_mut()).poll_shutdown(cx),
+            Self::Plain(inner) => std::pin::Pin::new(inner).poll_shutdown(cx),
+        }
+    }
+}
+
+#[cfg(not(feature = "bench-h1-profile"))]
+enum RehomedWsBackendIo {
+    Tls(Box<relay_shards::RehomedTlsStream<tokio::net::TcpStream, rustls::ClientConnection>>),
+    Plain(tokio::net::TcpStream),
+}
+
+#[cfg(not(feature = "bench-h1-profile"))]
+impl tokio::io::AsyncRead for RehomedWsBackendIo {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tls(inner) => std::pin::Pin::new(inner.as_mut()).poll_read(cx, buf),
+            Self::Plain(inner) => std::pin::Pin::new(inner).poll_read(cx, buf),
+        }
+    }
+}
+
+#[cfg(not(feature = "bench-h1-profile"))]
+impl tokio::io::AsyncWrite for RehomedWsBackendIo {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Tls(inner) => std::pin::Pin::new(inner.as_mut()).poll_write(cx, buf),
+            Self::Plain(inner) => std::pin::Pin::new(inner).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_write_vectored(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Tls(inner) => std::pin::Pin::new(inner.as_mut()).poll_write_vectored(cx, bufs),
+            Self::Plain(inner) => std::pin::Pin::new(inner).poll_write_vectored(cx, bufs),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::Tls(inner) => inner.is_write_vectored(),
+            Self::Plain(inner) => inner.is_write_vectored(),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tls(inner) => std::pin::Pin::new(inner.as_mut()).poll_flush(cx),
+            Self::Plain(inner) => std::pin::Pin::new(inner).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tls(inner) => std::pin::Pin::new(inner.as_mut()).poll_shutdown(cx),
+            Self::Plain(inner) => std::pin::Pin::new(inner).poll_shutdown(cx),
+        }
+    }
+}
+
+#[cfg(not(feature = "bench-h1-profile"))]
+enum UndetachedH1WsClientIo {
+    Tls(Box<relay_shards::PrefixedIo<TlsH1RawClientIo>>),
+    /// TLS stream whose `ClientWriteStallIo` became armed during
+    /// `take_tls_deferred_read_error` (e.g., a last-gasp alert write on a
+    /// corrupt record into a full socket buffer): stays on the main runtime
+    /// with both `read_buf` and `deferred_read_err` preserved intact.
+    RehomedTls(
+        Box<
+            relay_shards::RehomedTlsStream<
+                client_write_stall::ClientWriteStallIo<tokio::net::TcpStream>,
+                rustls::ServerConnection,
+            >,
+        >,
+    ),
+    Plain(Box<relay_shards::PrefixedIo<PlainH1RawClientIo>>),
+}
+
+#[cfg(not(feature = "bench-h1-profile"))]
+impl tokio::io::AsyncRead for UndetachedH1WsClientIo {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tls(inner) => std::pin::Pin::new(inner.as_mut()).poll_read(cx, buf),
+            Self::RehomedTls(inner) => std::pin::Pin::new(inner.as_mut()).poll_read(cx, buf),
+            Self::Plain(inner) => std::pin::Pin::new(inner.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+#[cfg(not(feature = "bench-h1-profile"))]
+impl tokio::io::AsyncWrite for UndetachedH1WsClientIo {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Tls(inner) => std::pin::Pin::new(inner.as_mut()).poll_write(cx, buf),
+            Self::RehomedTls(inner) => std::pin::Pin::new(inner.as_mut()).poll_write(cx, buf),
+            Self::Plain(inner) => std::pin::Pin::new(inner.as_mut()).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_write_vectored(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Tls(inner) => std::pin::Pin::new(inner.as_mut()).poll_write_vectored(cx, bufs),
+            Self::RehomedTls(inner) => {
+                std::pin::Pin::new(inner.as_mut()).poll_write_vectored(cx, bufs)
+            }
+            Self::Plain(inner) => std::pin::Pin::new(inner.as_mut()).poll_write_vectored(cx, bufs),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::Tls(inner) => inner.is_write_vectored(),
+            Self::RehomedTls(inner) => inner.is_write_vectored(),
+            Self::Plain(inner) => inner.is_write_vectored(),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tls(inner) => std::pin::Pin::new(inner.as_mut()).poll_flush(cx),
+            Self::RehomedTls(inner) => std::pin::Pin::new(inner.as_mut()).poll_flush(cx),
+            Self::Plain(inner) => std::pin::Pin::new(inner.as_mut()).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tls(inner) => std::pin::Pin::new(inner.as_mut()).poll_shutdown(cx),
+            Self::RehomedTls(inner) => std::pin::Pin::new(inner.as_mut()).poll_shutdown(cx),
+            Self::Plain(inner) => std::pin::Pin::new(inner.as_mut()).poll_shutdown(cx),
+        }
+    }
+}
+
+#[cfg(not(feature = "bench-h1-profile"))]
+enum DetachedWsClient {
+    Tls {
+        std_stream: std::net::TcpStream,
+        client_write_timeout: Option<Duration>,
+        session: Box<rustls::ServerConnection>,
+        read_buf: Bytes,
+        deferred_read_err: Option<std::io::Error>,
+    },
+    Plain {
+        std_stream: std::net::TcpStream,
+        client_write_timeout: Option<Duration>,
+        read_buf: Bytes,
+    },
+}
+
+#[cfg(not(feature = "bench-h1-profile"))]
+enum DetachedWsBackend {
+    Tls {
+        std_stream: std::net::TcpStream,
+        session: Box<rustls::ClientConnection>,
+        deferred_read_err: Option<std::io::Error>,
+    },
+    Plain {
+        std_stream: std::net::TcpStream,
+    },
+}
+
+#[cfg(not(feature = "bench-h1-profile"))]
+fn take_tls_deferred_read_error<T: tokio::io::AsyncRead + Unpin>(
+    stream: &mut T,
+) -> Option<std::io::Error> {
+    let waker = std::task::Waker::noop();
+    let mut cx = std::task::Context::from_waker(waker);
+    let mut empty = [];
+    let mut buf = tokio::io::ReadBuf::new(&mut empty);
+    match std::pin::Pin::new(stream).poll_read(&mut cx, &mut buf) {
+        Poll::Ready(Err(err)) => Some(err),
+        Poll::Ready(Ok(())) | Poll::Pending => None,
+    }
+}
+
+#[cfg(not(feature = "bench-h1-profile"))]
+enum WsClientTakeover {
+    Detached(DetachedWsClient),
+    Undetached(UndetachedH1WsClientIo),
+    Upgraded(hyper::upgrade::Upgraded),
+}
+
+#[cfg(not(feature = "bench-h1-profile"))]
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+#[cfg(not(feature = "bench-h1-profile"))]
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Owns a WebSocket shard task's plugin `Vec`s so that on every exit path
+/// (including `from_std` failure or abort during `from_partially_read`),
+/// plugin drops are offloaded to the `MultiThread` main runtime. Returns early
+/// without allocating or spawning when the session has no WebSocket plugins;
+/// otherwise moves the non-empty plugin `Vec`s to the main runtime in one spawn
+/// at session end because `Arc<dyn Plugin>` cannot use atomic `Arc::into_inner`.
+#[cfg(not(feature = "bench-h1-profile"))]
+struct DropPluginsOnMainRuntime {
+    framing: Vec<Arc<dyn Plugin>>,
+    frame: Vec<Arc<dyn Plugin>>,
+    disconnect: Vec<Arc<dyn Plugin>>,
+}
+
+#[cfg(not(feature = "bench-h1-profile"))]
+impl Drop for DropPluginsOnMainRuntime {
+    fn drop(&mut self) {
+        if self.framing.is_empty() && self.frame.is_empty() && self.disconnect.is_empty() {
+            return;
+        }
+        let on_current_thread = tokio::runtime::Handle::try_current()
+            .ok()
+            .is_some_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread);
+        if !on_current_thread {
+            return;
+        }
+        let Some(main_handle) = relay_shards::main_runtime_handle() else {
+            return;
+        };
+        // Move the non-empty plugin Vecs unconditionally onto the main runtime
+        // rather than checking `Arc::get_mut` here: `Arc<dyn Plugin>` cannot
+        // use atomic `Arc::into_inner`, so a check-then-drop on the shard would
+        // race with a concurrent live reload decrementing the final strong ref.
+        // Tunnel sessions without WebSocket plugins return early above with
+        // zero allocations and zero wakeups.
+        let framing = std::mem::take(&mut self.framing);
+        let frame = std::mem::take(&mut self.frame);
+        let disconnect = std::mem::take(&mut self.disconnect);
+        main_handle.spawn(async move {
+            drop((framing, frame, disconnect));
+        });
+    }
+}
+
+#[cfg(not(feature = "bench-h1-profile"))]
+fn try_detach_ws_client(upgraded: hyper::upgrade::Upgraded) -> std::io::Result<WsClientTakeover> {
+    let upgraded = match hyper_util::server::conn::auto::upgrade::downcast::<
+        TokioIo<TlsH1RawClientIo>,
+    >(upgraded)
+    {
+        Ok(parts) => {
+            let maybe_guard = parts.io.into_inner();
+            if !maybe_guard.can_detach() || !maybe_guard.get_ref().get_ref().0.can_detach() {
+                return Ok(WsClientTakeover::Undetached(UndetachedH1WsClientIo::Tls(
+                    Box::new(relay_shards::PrefixedIo::new(maybe_guard, parts.read_buf)),
+                )));
+            }
+            let mut tls_stream = match maybe_guard.try_into_inner() {
+                Ok(stream) => stream,
+                Err(guard) => {
+                    return Ok(WsClientTakeover::Undetached(UndetachedH1WsClientIo::Tls(
+                        Box::new(relay_shards::PrefixedIo::new(guard, parts.read_buf)),
+                    )));
+                }
+            };
+            let deferred_read_err = take_tls_deferred_read_error(&mut tls_stream);
+            let (stall_io, session) = tls_stream.into_inner();
+            let (tcp, client_write_timeout) = match stall_io.try_into_parts() {
+                Ok(parts) => parts,
+                Err(stall_io) => {
+                    // `take_tls_deferred_read_error` may trigger a last-gasp
+                    // alert write that arms `ClientWriteStallIo` if the client
+                    // socket buffer is full. Fall back to an undetached relay
+                    // on the main runtime with both `read_buf` and
+                    // `deferred_read_err` preserved intact.
+                    return Ok(WsClientTakeover::Undetached(
+                        UndetachedH1WsClientIo::RehomedTls(Box::new(
+                            relay_shards::RehomedTlsStream::with_deferred_read_error(
+                                stall_io,
+                                session,
+                                parts.read_buf,
+                                deferred_read_err,
+                            ),
+                        )),
+                    ));
+                }
+            };
+            let std_stream = tcp.into_std()?;
+            return Ok(WsClientTakeover::Detached(DetachedWsClient::Tls {
+                std_stream,
+                client_write_timeout,
+                session: Box::new(session),
+                read_buf: parts.read_buf,
+                deferred_read_err,
+            }));
+        }
+        Err(upgraded) => upgraded,
+    };
+
+    match hyper_util::server::conn::auto::upgrade::downcast::<TokioIo<PlainH1RawClientIo>>(upgraded)
+    {
+        Ok(parts) => {
+            let guard = parts.io.into_inner();
+            if !guard.can_detach() || !guard.get_ref().can_detach() {
+                return Ok(WsClientTakeover::Undetached(UndetachedH1WsClientIo::Plain(
+                    Box::new(relay_shards::PrefixedIo::new(guard, parts.read_buf)),
+                )));
+            }
+            let stall_io = match guard.try_into_inner() {
+                Ok(stream) => stream,
+                Err(guard) => {
+                    return Ok(WsClientTakeover::Undetached(UndetachedH1WsClientIo::Plain(
+                        Box::new(relay_shards::PrefixedIo::new(*guard, parts.read_buf)),
+                    )));
+                }
+            };
+            let (tcp, client_write_timeout) = match stall_io.try_into_parts() {
+                Ok(parts) => parts,
+                Err(_) => {
+                    return Err(std::io::Error::other(
+                        "client write-stall wrapper could not detach after readiness check",
+                    ));
+                }
+            };
+            let std_stream = tcp.into_std()?;
+            Ok(WsClientTakeover::Detached(DetachedWsClient::Plain {
+                std_stream,
+                client_write_timeout,
+                read_buf: parts.read_buf,
+            }))
+        }
+        Err(upgraded) => Ok(WsClientTakeover::Upgraded(upgraded)),
+    }
+}
+
+#[cfg(not(feature = "bench-h1-profile"))]
+#[allow(clippy::too_many_arguments)]
+async fn run_direct_ws_tunnel_maybe_on_shard(
+    shard_handle: tokio::runtime::Handle,
+    upgraded: hyper::upgrade::Upgraded,
+    h1_framing_signals: Option<&h1_framing_guard::H1FramingSignals>,
+    backend_ws_stream: BackendWsStream,
+    proxy_id: &str,
+    connection_id: u64,
+    ws_framing_plugins: Vec<Arc<dyn Plugin>>,
+    ws_frame_plugins: Vec<Arc<dyn Plugin>>,
+    ws_disconnect_plugins: Vec<Arc<dyn Plugin>>,
+    session_meta: WsSessionMeta,
+    ws_connection_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    max_websocket_frame_size_bytes: usize,
+    websocket_write_buffer_size: usize,
+    websocket_tunnel_mode: bool,
+    websocket_tunnel_idle_disabled_safety_cap: Duration,
+    ws_idle_tracker: Option<Arc<WsIdleTracker>>,
+    session_deadline: WsSessionDeadline,
+    shutdown_rx: Option<watch::Receiver<bool>>,
+    overload: Arc<crate::overload::OverloadState>,
+    fragment_policy: WsFragmentPolicy,
+    adaptive_buffer: &Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
+    client_trust: Option<crate::tls::ClientTrustSession>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Decline downcasting `Upgraded` unless the H1 framing guard observed this
+    // connection with zero read errors, because `hyper::upgrade::Upgraded::downcast`
+    // drops any read-ahead error saved by FERRUM PATCH 003 (#5911).
+    let allow_client_downcast = h1_framing_signals.is_some_and(|signals| !signals.saw_read_error());
+    if !allow_client_downcast {
+        return run_websocket_session(
+            TokioIo::new(upgraded),
+            backend_ws_stream,
+            proxy_id,
+            connection_id,
+            ws_framing_plugins,
+            ws_frame_plugins,
+            ws_disconnect_plugins,
+            session_meta,
+            ws_connection_permit,
+            max_websocket_frame_size_bytes,
+            websocket_write_buffer_size,
+            websocket_tunnel_mode,
+            websocket_tunnel_idle_disabled_safety_cap,
+            ws_idle_tracker,
+            session_deadline,
+            shutdown_rx,
+            overload,
+            fragment_policy,
+            adaptive_buffer,
+            client_trust,
+            None,
+            None,
+        )
+        .await;
+    }
+    let detached_client = match try_detach_ws_client(upgraded) {
+        Ok(WsClientTakeover::Detached(detached)) => detached,
+        Ok(WsClientTakeover::Upgraded(upgraded)) => {
+            return run_websocket_session(
+                TokioIo::new(upgraded),
+                backend_ws_stream,
+                proxy_id,
+                connection_id,
+                ws_framing_plugins,
+                ws_frame_plugins,
+                ws_disconnect_plugins,
+                session_meta,
+                ws_connection_permit,
+                max_websocket_frame_size_bytes,
+                websocket_write_buffer_size,
+                websocket_tunnel_mode,
+                websocket_tunnel_idle_disabled_safety_cap,
+                ws_idle_tracker,
+                session_deadline,
+                shutdown_rx,
+                overload,
+                fragment_policy,
+                adaptive_buffer,
+                client_trust,
+                None,
+                None,
+            )
+            .await;
+        }
+        Ok(WsClientTakeover::Undetached(client_io)) => {
+            return Box::pin(run_websocket_session(
+                client_io,
+                backend_ws_stream,
+                proxy_id,
+                connection_id,
+                ws_framing_plugins,
+                ws_frame_plugins,
+                ws_disconnect_plugins,
+                session_meta,
+                ws_connection_permit,
+                max_websocket_frame_size_bytes,
+                websocket_write_buffer_size,
+                websocket_tunnel_mode,
+                websocket_tunnel_idle_disabled_safety_cap,
+                ws_idle_tracker,
+                session_deadline,
+                shutdown_rx,
+                overload,
+                fragment_policy,
+                adaptive_buffer,
+                client_trust,
+                None,
+                None,
+            ))
+            .await;
+        }
+        Err(err) => {
+            fire_ws_tunnel_disconnect_hooks(
+                &ws_disconnect_plugins,
+                proxy_id,
+                &session_meta,
+                0,
+                0,
+                Some((
+                    crate::plugins::Direction::Unknown,
+                    retry::ErrorClass::ConnectionClosed,
+                    None,
+                )),
+            )
+            .await;
+            return Err(Box::new(err));
+        }
+    };
+
+    let (maybe_tls, backend_read_buffer) = backend_ws_stream.into_inner_with_read_buffer();
+    let detached_backend = match maybe_tls {
+        tokio_tungstenite::MaybeTlsStream::Rustls(mut tls_stream) => {
+            let deferred_read_err = take_tls_deferred_read_error(&mut tls_stream);
+            let (ws_activity, session) = tls_stream.into_inner();
+            match ws_activity.into_inner().into_std() {
+                Ok(std_stream) => DetachedWsBackend::Tls {
+                    std_stream,
+                    session: Box::new(session),
+                    deferred_read_err,
+                },
+                Err(err) => {
+                    fire_ws_tunnel_disconnect_hooks(
+                        &ws_disconnect_plugins,
+                        proxy_id,
+                        &session_meta,
+                        0,
+                        0,
+                        Some((
+                            crate::plugins::Direction::Unknown,
+                            retry::ErrorClass::ConnectionClosed,
+                            None,
+                        )),
+                    )
+                    .await;
+                    return Err(Box::new(err));
+                }
+            }
+        }
+        tokio_tungstenite::MaybeTlsStream::Plain(ws_activity) => {
+            match ws_activity.into_inner().into_std() {
+                Ok(std_stream) => DetachedWsBackend::Plain { std_stream },
+                Err(err) => {
+                    fire_ws_tunnel_disconnect_hooks(
+                        &ws_disconnect_plugins,
+                        proxy_id,
+                        &session_meta,
+                        0,
+                        0,
+                        Some((
+                            crate::plugins::Direction::Unknown,
+                            retry::ErrorClass::ConnectionClosed,
+                            None,
+                        )),
+                    )
+                    .await;
+                    return Err(Box::new(err));
+                }
+            }
+        }
+        _ => {
+            fire_ws_tunnel_disconnect_hooks(
+                &ws_disconnect_plugins,
+                proxy_id,
+                &session_meta,
+                0,
+                0,
+                Some((
+                    crate::plugins::Direction::Unknown,
+                    retry::ErrorClass::ConnectionClosed,
+                    None,
+                )),
+            )
+            .await;
+            return Err(Box::new(std::io::Error::other(
+                "unsupported backend TLS stream variant for WebSocket relay shard handoff",
+            )));
+        }
+    };
+
+    let shard_proxy_id = proxy_id.to_owned();
+    let shard_adaptive_buffer = Arc::clone(adaptive_buffer);
+    let mut guard = AbortOnDrop(shard_handle.spawn(async move {
+        // Move all plugin vectors into a guard declared first so it drops last
+        // on every exit path (normal return, `from_std` failure, or cancel).
+        let ws_plugins_guard = DropPluginsOnMainRuntime {
+            framing: ws_framing_plugins,
+            frame: ws_frame_plugins,
+            disconnect: ws_disconnect_plugins,
+        };
+        let rehomed_client = match detached_client {
+            DetachedWsClient::Tls {
+                std_stream,
+                client_write_timeout,
+                session,
+                read_buf,
+                deferred_read_err,
+            } => match tokio::net::TcpStream::from_std(std_stream) {
+                Ok(tcp) => {
+                    let stall = client_write_stall::ClientWriteStallIo::from_parts(
+                        tcp,
+                        client_write_timeout,
+                    );
+                    RehomedWsClientIo::Tls(Box::new(
+                        relay_shards::RehomedTlsStream::with_deferred_read_error(
+                            stall,
+                            *session,
+                            read_buf,
+                            deferred_read_err,
+                        ),
+                    ))
+                }
+                Err(err) => {
+                    fire_ws_tunnel_disconnect_hooks(
+                        &ws_plugins_guard.disconnect,
+                        &shard_proxy_id,
+                        &session_meta,
+                        0,
+                        0,
+                        Some((
+                            crate::plugins::Direction::Unknown,
+                            retry::ErrorClass::ConnectionClosed,
+                            None,
+                        )),
+                    )
+                    .await;
+                    return Err(Box::new(err) as Box<dyn std::error::Error + Send + Sync>);
+                }
+            },
+            DetachedWsClient::Plain {
+                std_stream,
+                client_write_timeout,
+                read_buf,
+            } => match tokio::net::TcpStream::from_std(std_stream) {
+                Ok(tcp) => {
+                    let stall = client_write_stall::ClientWriteStallIo::from_parts(
+                        tcp,
+                        client_write_timeout,
+                    );
+                    RehomedWsClientIo::Plain(relay_shards::PrefixedIo::new(stall, read_buf))
+                }
+                Err(err) => {
+                    fire_ws_tunnel_disconnect_hooks(
+                        &ws_plugins_guard.disconnect,
+                        &shard_proxy_id,
+                        &session_meta,
+                        0,
+                        0,
+                        Some((
+                            crate::plugins::Direction::Unknown,
+                            retry::ErrorClass::ConnectionClosed,
+                            None,
+                        )),
+                    )
+                    .await;
+                    return Err(Box::new(err) as Box<dyn std::error::Error + Send + Sync>);
+                }
+            },
+        };
+
+        let rehomed_backend = match detached_backend {
+            DetachedWsBackend::Tls {
+                std_stream,
+                session,
+                deferred_read_err,
+            } => match tokio::net::TcpStream::from_std(std_stream) {
+                Ok(tcp) => RehomedWsBackendIo::Tls(Box::new(
+                    relay_shards::RehomedTlsStream::with_deferred_read_error(
+                        tcp,
+                        *session,
+                        Bytes::new(),
+                        deferred_read_err,
+                    ),
+                )),
+                Err(err) => {
+                    fire_ws_tunnel_disconnect_hooks(
+                        &ws_plugins_guard.disconnect,
+                        &shard_proxy_id,
+                        &session_meta,
+                        0,
+                        0,
+                        Some((
+                            crate::plugins::Direction::Unknown,
+                            retry::ErrorClass::ConnectionClosed,
+                            None,
+                        )),
+                    )
+                    .await;
+                    return Err(Box::new(err) as Box<dyn std::error::Error + Send + Sync>);
+                }
+            },
+            DetachedWsBackend::Plain { std_stream } => {
+                match tokio::net::TcpStream::from_std(std_stream) {
+                    Ok(tcp) => RehomedWsBackendIo::Plain(tcp),
+                    Err(err) => {
+                        fire_ws_tunnel_disconnect_hooks(
+                            &ws_plugins_guard.disconnect,
+                            &shard_proxy_id,
+                            &session_meta,
+                            0,
+                            0,
+                            Some((
+                                crate::plugins::Direction::Unknown,
+                                retry::ErrorClass::ConnectionClosed,
+                                None,
+                            )),
+                        )
+                        .await;
+                        return Err(Box::new(err) as Box<dyn std::error::Error + Send + Sync>);
+                    }
+                }
+            }
+        };
+
+        let rehomed_backend_ws = WebSocketStream::from_partially_read(
+            rehomed_backend,
+            backend_read_buffer.to_vec(),
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+
+        Box::pin(run_websocket_session(
+            rehomed_client,
+            rehomed_backend_ws,
+            &shard_proxy_id,
+            connection_id,
+            ws_plugins_guard.framing.clone(),
+            ws_plugins_guard.frame.clone(),
+            ws_plugins_guard.disconnect.clone(),
+            session_meta,
+            ws_connection_permit,
+            max_websocket_frame_size_bytes,
+            websocket_write_buffer_size,
+            websocket_tunnel_mode,
+            websocket_tunnel_idle_disabled_safety_cap,
+            ws_idle_tracker,
+            session_deadline,
+            shutdown_rx,
+            overload,
+            fragment_policy,
+            &shard_adaptive_buffer,
+            client_trust,
+            None,
+            None,
+        ))
+        .await
+    }));
+
+    match (&mut guard.0).await {
+        Ok(result) => result,
+        Err(join_err) => Err(Box::new(join_err)),
+    }
+}
 
 /// Entry point for every frontend's WebSocket relay (H1 Upgrade, H2 and H3
 /// Extended CONNECT).
@@ -22640,6 +23558,12 @@ where
     // is not enforced, but data streams through a fixed-size copy buffer so there
     // is no large-allocation DoS risk.
     if websocket_tunnel_mode && ws_framing_plugins.is_empty() {
+        // `bidirectional_copy_for_relay` owns idle tracking for the raw
+        // tunnel, so silence the backend `WsActivityIo` wrapper installed
+        // during the WebSocket handshake to avoid per-read clock reads.
+        if let Some(tracker) = &ws_idle_tracker {
+            tracker.deactivate();
+        }
         debug!(
             proxy_id = %proxy_id,
             connection_id,
@@ -26255,6 +27179,7 @@ async fn handle_tls_connection(
             frontend_listen_port: tls_connection_metadata.frontend_listen_port,
             gateway_listener_identity: tls_connection_metadata.gateway_listener_identity.clone(),
             http1_framing_result,
+            h1_framing_signals: response_h1_framing_signals.clone(),
             accepted_local_addr: tls_connection_metadata.accepted_local_addr,
             frontend_sni_hostname,
             node_waypoint_identity: tls_connection_metadata.node_waypoint_identity.clone(),
@@ -36695,6 +37620,7 @@ async fn handle_proxy_request_inner(
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     let start_time = Instant::now();
     let http1_framing_result = connection_metadata.http1_framing_result;
+    let h1_framing_signals = connection_metadata.h1_framing_signals;
     let gateway_listener_identity = connection_metadata.gateway_listener_identity;
     let accepted_local_ip = connection_metadata
         .accepted_local_addr
@@ -41433,6 +42359,7 @@ async fn handle_proxy_request_inner(
             backend_path_is_policy_bound,
             original_request_path.clone(),
             request_host.clone(),
+            h1_framing_signals,
         )
         .await;
     }

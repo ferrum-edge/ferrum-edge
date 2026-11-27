@@ -1019,6 +1019,44 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
         }
     };
 
+    // Per-core `current_thread` relay shards for long-lived TCP/TLS and
+    // WebSocket tunnel relays in serving modes. Dropping `relay_shards_guard`
+    // BEFORE `rt` (after graceful drain finishes inside `rt.block_on(...)`)
+    // cancels any lingering shard-hosted connection tasks and closes their
+    // sockets first, so `rt`'s blocking-pool workers (such as `io_uring`
+    // splice threads) exit promptly instead of blocking `drop(rt)`.
+    let relay_shards_guard = if matches!(
+        env_config.mode,
+        OperatingMode::Database
+            | OperatingMode::File
+            | OperatingMode::DataPlane
+            | OperatingMode::Mesh
+    ) {
+        match proxy::relay_shards::initialize(env_config.worker_threads, rt.handle().clone()) {
+            Ok(guard) => {
+                let shard_count =
+                    proxy::relay_shards::resolve_shard_count(env_config.worker_threads);
+                info!(
+                    shards = %sanitize_startup_scalar(secrets::report_env_field(
+                        "FERRUM_WORKER_THREADS",
+                        &shard_count.to_string(),
+                    )),
+                    "Initialized per-core relay shards"
+                );
+                Some(guard)
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Failed to initialize per-core relay shards; falling back to main runtime"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     observability_delivery::initialize(
         env_config.pool_shard_amount,
         env_config.log_delivery_max_tasks,
@@ -1265,6 +1303,13 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
             }
         }
     });
+
+    // Graceful drain has already completed inside `rt.block_on(...)`. Shut down
+    // the relay shards first so any lingering shard-hosted tasks drop their
+    // sockets and unblock main-runtime blocking workers (e.g., `io_uring`
+    // splice) before `drop(rt)` waits for the main blocking pool.
+    drop(relay_shards_guard);
+    drop(rt);
 
     gateway_exit_code
 }

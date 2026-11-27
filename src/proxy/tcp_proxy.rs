@@ -2850,7 +2850,7 @@ async fn run_tcp_accept_loop(
     loop {
         tokio::select! {
             result = listener.accept() => {
-                let (mut stream, remote_addr) = match result {
+                let (stream, remote_addr) = match result {
                     Ok(conn) => conn,
                     Err(e) => {
                         // Bound the log rate independently of the backoff (an
@@ -2942,11 +2942,58 @@ async fn run_tcp_accept_loop(
                 let stream_gateway_ref = state.stream_gateway_ref.clone();
                 let trusted_proxies = state.trusted_proxies.clone();
 
-                tokio::spawn(async move {
-                    let _active_metric_guard = TcpActiveConnectionGuard::new(metrics.clone());
-                    // Track this connection for global overload accounting and graceful drain.
-                    // The guard decrements the counter on drop (all exit paths).
-                    let _conn_guard = crate::overload::ConnectionGuard::new(&overload_for_conn);
+                // Acquire active-connection and graceful-drain guards BEFORE
+                // dispatching to a relay shard so a queued socket is never
+                // invisible to graceful drain's zero-connection check. Every
+                // early exit (detach failure, re-registration failure, task
+                // cancel, or normal close) releases both guards via RAII.
+                let active_metric_guard = TcpActiveConnectionGuard::new(metrics.clone());
+                let conn_guard = crate::overload::ConnectionGuard::new(&overload_for_conn);
+
+                // Hand off accepted TCP connections round-robin to per-core
+                // `current_thread` relay shards when initialized so each
+                // connection runs its TLS handshake, backend dial, and copy
+                // loop on one thread-local reactor without work-stealing or
+                // cross-core cache migration.
+                enum AcceptedTcpStream {
+                    Tokio(TcpStream),
+                    Std(std::net::TcpStream),
+                }
+                let (shard_handle, accepted_stream) =
+                    if let Some(handle) = crate::proxy::relay_shards::next_handle() {
+                        match stream.into_std() {
+                            Ok(std_stream) => (Some(handle), AcceptedTcpStream::Std(std_stream)),
+                            Err(e) => {
+                                warn!(
+                                    proxy_id = %state.proxy_id,
+                                    "Failed to detach accepted TCP stream for relay shard handoff: {}",
+                                    e
+                                );
+                                continue;
+                            }
+                        }
+                    } else {
+                        (None, AcceptedTcpStream::Tokio(stream))
+                    };
+
+                let conn_future = async move {
+                    let _active_metric_guard = active_metric_guard;
+                    let _conn_guard = conn_guard;
+                    let mut stream = match accepted_stream {
+                        AcceptedTcpStream::Tokio(stream) => stream,
+                        AcceptedTcpStream::Std(std_stream) => match TcpStream::from_std(std_stream)
+                        {
+                            Ok(stream) => stream,
+                            Err(e) => {
+                                warn!(
+                                    proxy_id = %proxy_id,
+                                    "Failed to re-register accepted TCP stream on relay shard: {}",
+                                    e
+                                );
+                                return;
+                            }
+                        },
+                    };
 
                     let connected_at = Instant::now();
                     let connected_wall_at = chrono::Utc::now();
@@ -2968,7 +3015,14 @@ async fn run_tcp_accept_loop(
                     // PROXY parsing, SNI/routing, and stream setup. A live reload that toggles
                     // `stream_proxy_protocol` must not let one connection decide header
                     // consumption from one snapshot and route with another.
-                    let epoch = request_epoch.load();
+                    // Own the connection's `Arc<RequestEpoch>` directly in a
+                    // `DropArcOnMainRuntime` guard declared before any local
+                    // plugin clones so it drops last and atomically offloads
+                    // retired-epoch destruction via `Arc::into_inner` onto the
+                    // `MultiThread` main runtime (zero wakeups in steady state).
+                    let epoch = crate::proxy::relay_shards::DropArcOnMainRuntime::new(
+                        request_epoch.load(),
+                    );
                     let proxy_protocol_enabled = epoch
                         .proxy_by_namespaced_id(proxy_namespace.as_ref(), proxy_id.as_ref())
                         .and_then(|p| p.stream_proxy_protocol)
@@ -3396,7 +3450,12 @@ async fn run_tcp_accept_loop(
                             }
                         }
                     }
-                });
+                };
+                if let Some(handle) = shard_handle {
+                    handle.spawn(conn_future);
+                } else {
+                    tokio::spawn(conn_future);
+                }
             }
             _ = shutdown_rx.changed() => {
                 info!(
@@ -9133,6 +9192,13 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    // Local to this single `poll_copy_direction` call: set when the top-up read
+    // loop already observed `Poll::Pending` (and thus registered `cx.waker()`
+    // on `reader`). If `CopyPhase::Writing` finishes synchronously in this same
+    // poll, we flush and park immediately instead of looping back for a
+    // redundant `poll_read` traversal. Automatically resets if `poll_write`
+    // returns `Poll::Pending`.
+    let mut reader_parked = false;
     loop {
         match state.phase {
             CopyPhase::Done => return Poll::Ready(Ok(())),
@@ -9184,7 +9250,10 @@ where
                                         state.carried = Some(CarriedRead::Err(e));
                                         break;
                                     }
-                                    Poll::Pending => break,
+                                    Poll::Pending => {
+                                        reader_parked = true;
+                                        break;
+                                    }
                                 }
                                 rounds += 1;
                             }
@@ -9254,18 +9323,21 @@ where
                     continue;
                 }
 
-                // Single clock read for both watermark + idle refresh.
-                let now = coarse_now_ms();
-                if let Some(wm) = read_watermark {
-                    wm.store(now, Ordering::Relaxed);
-                }
-                if let Some(la) = last_activity {
-                    la.store(now, Ordering::Relaxed);
-                }
-                if let Some(wm) = write_watermark {
-                    // Prime the watermark before entering the write loop —
-                    // captures "we have `n` bytes ready to write as of `now`".
-                    wm.store(now, Ordering::Relaxed);
+                // Single clock read shared across all watermarks updated by this read event.
+                if read_watermark.is_some() || last_activity.is_some() || write_watermark.is_some()
+                {
+                    let now = coarse_now_ms();
+                    if let Some(wm) = read_watermark {
+                        wm.store(now, Ordering::Relaxed);
+                    }
+                    if let Some(la) = last_activity {
+                        la.store(now, Ordering::Relaxed);
+                    }
+                    if let Some(wm) = write_watermark {
+                        // Prime the watermark before entering the write loop —
+                        // captures "we have `n` bytes ready to write as of `now`".
+                        wm.store(now, Ordering::Relaxed);
+                    }
                 }
                 state.pos = 0;
                 state.cap = n;
@@ -9299,7 +9371,11 @@ where
                             // cut by the authorization deadline — the same
                             // shape as the unbounded fast path, which this
                             // direction-tracking path exists to avoid.
-                            bytes.fetch_add(nw as u64, Ordering::Relaxed);
+                            // Stack-local single-task counter (never shared across
+                            // threads): relaxed load+add+store avoids an x86-64
+                            // `LOCK XADD` per write.
+                            let updated = bytes.load(Ordering::Relaxed).wrapping_add(nw as u64);
+                            bytes.store(updated, Ordering::Relaxed);
                             if let Some(wm) = write_watermark {
                                 wm.store(coarse_now_ms(), Ordering::Relaxed);
                             }
@@ -9314,15 +9390,33 @@ where
                 // Nothing remains queued in this relay's own buffer, but the
                 // writer may still be holding what it just accepted. Client
                 // silence must not retain the previous write-stall deadline —
-                // and it does not: the reader-pending branch above flushes and
-                // disarms the watermark on the very next loop iteration, so the
-                // deadline is released exactly when the bytes are actually gone
-                // rather than when they were merely handed over.
+                // and it does not: the reader-pending branch above (or the
+                // `reader_parked` fast path below) flushes and disarms the
+                // watermark immediately, so the deadline is released exactly
+                // when the bytes are actually gone rather than when they were
+                // merely handed over.
                 state.pos = 0;
                 state.cap = 0;
                 state.phase = CopyPhase::Reading;
                 if let Some(la) = last_activity {
                     la.store(coarse_now_ms(), Ordering::Relaxed);
+                }
+                if reader_parked {
+                    if state.needs_flush {
+                        match writer.as_mut().poll_flush(cx) {
+                            Poll::Ready(Ok(())) => {
+                                state.needs_flush = false;
+                                if let Some(wm) = write_watermark {
+                                    wm.store(u64::MAX, Ordering::Relaxed);
+                                }
+                            }
+                            Poll::Ready(Err(e)) => {
+                                return Poll::Ready(Err((StreamIoSide::Write, e)));
+                            }
+                            Poll::Pending => return Poll::Pending,
+                        }
+                    }
+                    return Poll::Pending;
                 }
             }
         }
@@ -10967,7 +11061,12 @@ async fn bidirectional_splice_io_uring(
     // recv/backend error. The emission sites in `io_uring_splice_loop` /
     // `libc_splice_loop` reference the same constants so a rename is a
     // compile-time coupling, not a silent drift.
-    let c2b_handle = tokio::task::spawn_blocking(move || {
+    // Submit splice blocking workers to the main runtime's configured blocking
+    // pool (`FERRUM_BLOCKING_THREADS`) when running on a relay shard so splice
+    // concurrency never spills onto per-shard blocking pools.
+    let blocking_handle = crate::proxy::relay_shards::main_runtime_handle()
+        .unwrap_or_else(tokio::runtime::Handle::current);
+    let c2b_handle = blocking_handle.spawn_blocking(move || {
         let res = io_uring_splice_direction(
             client_fd,
             c2b_pipe_w,
@@ -10987,7 +11086,7 @@ async fn bidirectional_splice_io_uring(
         }
         res
     });
-    let b2c_handle = tokio::task::spawn_blocking(move || {
+    let b2c_handle = blocking_handle.spawn_blocking(move || {
         let res = io_uring_splice_direction(
             backend_fd,
             b2c_pipe_w,
