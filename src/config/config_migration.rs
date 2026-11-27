@@ -33,8 +33,9 @@ pub struct ConfigMigrateResult {
 }
 
 impl ConfigMigrator {
-    /// No config transforms are shipped during build-out. Update the current
-    /// config shape directly instead of adding legacy compatibility steps.
+    /// No config transforms ship yet: format version `1` is the only one. A
+    /// later format version adds its transform here (see the backup and
+    /// file-config format rules in `docs/support_policy.md`).
     fn migration_chain() -> Vec<(&'static str, &'static str, ConfigMigrationFn)> {
         vec![]
     }

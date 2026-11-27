@@ -1,24 +1,22 @@
 # Safe Upgrade Guide
 
-> **BUILD-OUT — in-place database migration and binary-only rollback are
-> unsupported.** Ferrum Edge is still in active build-out: core schema changes
-> are folded into the editable `V001` baseline instead of shipping forward
-> migrations (`V002`, `V003`, …). A database that already applied an earlier
-> `V001` checksum is **refused** at startup when the binary's baseline digest
-> differs ([migration history integrity](migrations.md#migration-history-integrity)).
-> There is no supported path to "upgrade in place" by pointing a new binary at
-> the production database, and rolling back by restarting the **old** binary
-> against a database that received a changed baseline is equally unsafe. During
-> build-out, treat every core schema change as requiring a **fresh database**
-> populated from a namespace-complete logical export. Keep the **old database
-> intact** as rollback: cut traffic back to the old binary on the old
-> database, not to an older binary on the new baseline. See
+> **Upgrading from a 0.x release rebuilds the database.** Releases before 1.0.0
+> folded core schema changes into the editable `V001` baseline, and 1.0.0
+> records a new, frozen `V001` identity, so a 1.0.0 binary refuses every
+> PostgreSQL, MySQL or SQLite database created by a 0.x release
+> ([migration history integrity](migrations.md#migration-history-integrity)).
+> A 0.x MongoDB database is rebuilt the same way. There is no in-place path
+> from 0.x: populate a **fresh database** from a namespace-complete logical
+> export, and keep the **old database intact** as rollback (roll back to the
+> old binary on the old database, never to an older binary on the new
+> database). See
 > [Build-Out database upgrade](#build-out-database-upgrade-postgresql-mysql-sqlite-mongodb)
 > and [migrations.md → Build-Out Schema Policy](migrations.md#build-out-schema-policy).
-> The core schema freezes at 1.0.0: from 1.0.0 onward, schema changes ship as
-> forward-only migrations ([support policy](support_policy.md#database-schema)).
-> Upgrades between `0.x` releases, and the upgrade from `0.x` to 1.0.0, follow
-> the rebuild procedure below.
+> From 1.0.0 onward the core schema is frozen and later schema changes ship as
+> forward-only migrations ([support policy](support_policy.md#database-schema),
+> [migrations.md](migrations.md#schema-compatibility-policy)). An older binary
+> refuses a database that a newer release migrated, so take a backup before
+> every upgrade: rolling back across a migration means restoring that backup.
 
 This guide describes how to upgrade Ferrum Edge with zero configuration loss and
 a clear rollback path. The approach varies by operating mode, but the core
@@ -105,11 +103,11 @@ and [admin_backup_restore.md](admin_backup_restore.md):
 **MongoDB** takes the same path. 1.0.0 applies a versioned, forward-only index
 plan and records the plan version it applied in `_ferrum_migrations`
 (`_id: "core_index_plan"`); `migrate status` reports the recorded and binary
-plan versions. A 1.0.0 binary does not detect a 0.9.x MongoDB database on its
-own (a database with no record is read as plan version 0), so for MongoDB the
-rebuild is the documented upgrade path rather than an enforced refusal. It
-guarantees that every stored document passes the stricter 1.0.0 decoders and
-that the database's index-plan history starts at 1.0.0.
+plan versions. 1.0.0 does **not** refuse a 0.9.x MongoDB database: a database
+with no plan record is read as plan version 0. Rebuild-and-restore is still the
+only supported upgrade path for MongoDB, because 1.0.0 rejects stored documents
+that carry removed or unknown keys (see the sections below) and no in-place
+conversion exists. Do not rely on an un-rebuilt 0.9.x MongoDB database.
 
 From 1.0.0 onward, later releases ship schema changes as forward migrations
 (`V002`+) and MongoDB index changes as new index-plan versions, and each
@@ -210,11 +208,19 @@ files and connects to nothing):
   `FERRUM_DB_CONFIG_BACKUP_PATH=/path/to/backup.json FERRUM_NAMESPACE=<ns> ferrum-edge validate -m database`,
   with the deployment's usual database environment. This loader strips the
   backup envelope and checks the namespace's proxies, consumers, plugin configs
-  and upstreams without connecting to the database. It does not check the
-  `api_specs` section. Correct each resource it names through the 0.9.21 Admin
-  API, then export again.
+  and upstreams without connecting to the database. Correct each resource it
+  names through the 0.9.21 Admin API, then export again.
 - API specs: fix the same keys in `x-ferrum-proxy` / `x-ferrum-upstream`
   extensions in your source spec documents and re-submit the owning specs.
+
+**Limitations of these checks:**
+- The backup validator does not check the backup's `api_specs` section. Stored
+  API-spec documents are not validated by it at all.
+- `POST /restore` copies stored API-spec documents without re-extracting them.
+  A spec document whose `x-ferrum-proxy` or `x-ferrum-upstream` still carries an
+  unknown or removed key restores successfully, and is refused only the next
+  time it is submitted with `POST` / `PUT /api-specs`. Neither check finds such
+  a key; review the source spec documents themselves.
 
 ### ConfigSync revision 8 and the CP-first upgrade (#7520, #7524)
 
@@ -5398,9 +5404,9 @@ The public `LoadBalancer::active_connections`, `LoadBalancer::latency_ewma` and 
 
 ## Build-Out Database Upgrade (PostgreSQL, MySQL, SQLite, MongoDB)
 
-Use this procedure whenever the target binary's `V001` baseline may differ from
-the database you are running today — which is the normal case on `main` and
-build-out branches. It moves **logical configuration** (not raw SQL rows) through
+Use this procedure for every database created by a 0.x release, including the
+upgrade to 1.0.0: the 1.0.0 `V001` identity differs from every identity a 0.x
+release recorded. It moves **logical configuration** (not raw SQL rows) through
 the Admin API backup format documented in
 [admin_backup_restore.md](admin_backup_restore.md).
 
@@ -5415,7 +5421,7 @@ A namespace-complete export includes, per authenticated namespace:
 | API specs (compressed documents + ownership metadata) | `api_specs` | yes |
 | Gateway trust bundles | `gateway_trust_bundles` (full export only) | yes |
 
-Partial `?resources=` exports are **not** sufficient for a build-out rebuild;
+Partial `?resources=` exports are **not** sufficient for a rebuild;
 use an unfiltered `GET /backup` per namespace. Multi-tenant deployments repeat
 the export/import pair for every namespace (set `X-Ferrum-Namespace` on both
 calls). Backup files contain live secrets — store them like database dumps.
@@ -5550,16 +5556,16 @@ If issues arise after cutover:
 The old binary + old database is a consistent pair. The backup JSON from step 1
 is a secondary recovery copy if the old database were damaged independently.
 
-> **Unsupported during build-out:** running `FERRUM_MODE=migrate` against the
+> **Unsupported for a 0.x database:** running `FERRUM_MODE=migrate` against the
 > production database to apply "pending" core schema changes, relying on startup
-> auto-migration against an existing `V001` row, or swapping only the binary
-> while keeping the same database after a baseline change.
+> to convert an existing 0.x `V001` row, or swapping only the binary while
+> keeping the same database.
 
 ---
 
 ## Database Mode (`FERRUM_MODE=database`)
 
-Database-mode upgrades during build-out follow
+Database-mode upgrades from a 0.x release, including the upgrade to 1.0.0, follow
 [Build-Out Database Upgrade](#build-out-database-upgrade-postgresql-mysql-sqlite-mongodb)
 above. The subsections below are **staging validation checks** to run on the
 fresh database after import and before production cutover.
@@ -5913,8 +5919,8 @@ minimal. Update any collector that scrapes `/metrics` (or that relies on full
 
 ## Control Plane / Data Plane Mode (`FERRUM_MODE=cp` / `dp`)
 
-CP/DP upgrades use the same
-[build-out database rebuild](#build-out-database-upgrade-postgresql-mysql-sqlite-mongodb)
+CP/DP upgrades from a 0.x release use the same
+[database rebuild](#build-out-database-upgrade-postgresql-mysql-sqlite-mongodb)
 for the CP datastore, with the added consideration of rolling out DP nodes. The
 key property that makes this safe: **DPs cache their config in memory and
 continue serving traffic while the CP is temporarily unavailable** — up to
@@ -6015,8 +6021,8 @@ You can verify versions via the authenticated `GET /admin/metrics` endpoint on a
 ### Upgrade Order
 
 Always upgrade in this order: **CP first, then DPs.** The CP owns the
-configuration database; during build-out that database is rebuilt with
-`GET /backup` / `POST /restore`, not in-place core schema migration. DPs are
+configuration database; a database created by a 0.x release is rebuilt with
+`GET /backup` / `POST /restore`, not migrated in place. DPs are
 stateless proxies that receive config via gRPC. Upgrade CP and DP together;
 mixed builds are rejected at subscribe. Until a DP is upgraded, the new CP
 refuses its `Subscribe` and the DP keeps serving its last-known-good config
@@ -6077,7 +6083,7 @@ Verify the test DP receives the full config snapshot and proxies traffic correct
 
 Stop the old CP, repoint `FERRUM_DB_URL` at the validated fresh database (or
 swap DNS/connection strings), and start the new CP. Do **not** run in-place
-`FERRUM_MODE=migrate` against the production CP database during build-out.
+`FERRUM_MODE=migrate` against a 0.x production CP database.
 
 During the CP restart window, existing DPs keep serving their last applied
 config, but only while its age is below `FERRUM_DP_CONFIG_MAX_STALE_SECONDS`.
@@ -6168,8 +6174,8 @@ Finish the rollback inside that window.
 > starts empty, stays not-ready until it applies its first snapshot, and takes
 > that snapshot from the rolled-back CP once both run the same build. Rolling
 > back the CP database to the pre-upgrade instance therefore re-establishes the
-> prior config shape on the DP fleet. That is the supported rollback path during
-> build-out, not binary-only rollback against a changed baseline.
+> prior config shape on the DP fleet. That is the supported rollback path, not
+> binary-only rollback against a changed or migrated database.
 
 ---
 
@@ -6189,8 +6195,9 @@ cp config.yaml config.yaml.backup-v1
 
 The current config format is `version: "1"`; no config migration transforms are
 shipped. Apply the documented breaking field changes to your config and keep
-the backup until validation succeeds. `FERRUM_MIGRATE_ACTION=config` does not
-convert legacy field shapes during build-out.
+the backup until validation succeeds. No config transforms ship for format
+version `1`, so `FERRUM_MIGRATE_ACTION=config` does not convert older field
+shapes.
 
 #### 3. Validate the New Version
 
@@ -6237,8 +6244,8 @@ FERRUM_MODE=file \
 
 ### Pre-Upgrade Checklist
 
-- [ ] Read the section for your target release above (for example [Upgrading to 0.9.8](#upgrading-to-098)), [Breaking changes in 0.9.0](#breaking-changes-in-090), and the release notes for breaking changes, deprecated fields, and new required fields
-- [ ] For database/CP modes during build-out: plan a
+- [ ] Read the section for your target release above (for example [Upgrading to 1.0.0](#upgrading-to-100)), [Breaking changes in 0.9.0](#breaking-changes-in-090), and the release notes for breaking changes, deprecated fields, and new required fields
+- [ ] For database/CP modes upgrading from a 0.x release: plan a
       [fresh-database rebuild](#build-out-database-upgrade-postgresql-mysql-sqlite-mongodb)
       (`GET /backup` → fresh `V001` baseline → `POST /restore`); keep the old
       database for rollback

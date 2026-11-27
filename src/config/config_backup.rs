@@ -48,8 +48,7 @@ use tracing::{error, info, warn};
 ///
 /// Returns `Ok(None)` if the file does not exist. Returns `Err` with an
 /// actionable message when the file exists but cannot be parsed, is at an
-/// unsupported config version (with no migration path under the build-out
-/// policy), carries an empty serving namespace, or fails the rejecting runtime
+/// unsupported config version (no config transform ships for it), carries an empty serving namespace, or fails the rejecting runtime
 /// validation contract. Returns `Ok(Some(config))` only for a snapshot that is
 /// safe to serve. A backup holding no resources in the active namespace yields
 /// an empty-but-valid candidate, never a foreign one.

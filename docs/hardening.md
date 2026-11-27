@@ -16,7 +16,9 @@ Companion documents:
 > **Release status.** Ferrum Edge publishes semantic-versioned releases; the
 > [Releases page](https://github.com/ferrum-edge/ferrum-edge/releases) shows the
 > current one. As of 2026-11-22 the newest published release was **v0.9.21**
-> (see the [changelog](../CHANGELOG.md#0921---2026-11-21)). Releases before
+> (see the [changelog](../CHANGELOG.md#0921---2026-11-21)). **v1.0.0** is the
+> current release candidate (see the
+> [changelog](../CHANGELOG.md#100---2026-11-27)). Releases before
 > 1.0.0 carry no compatibility commitment; from 1.0.0 onward,
 > [support_policy.md](support_policy.md) defines what each setting here promises
 > across releases and which release receives security fixes.

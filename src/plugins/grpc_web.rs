@@ -1001,7 +1001,7 @@ pub struct GrpcWebPlugin {
 
 impl GrpcWebPlugin {
     pub fn new(config: &Value) -> Result<Self, String> {
-        // Build-out policy: require an explicit object. `null` is not an alias
+        // Require an explicit object. `null` is not an alias
         // for `{}` — omit the plugin or pass `{}` / a full object instead.
         let object = config
             .as_object()

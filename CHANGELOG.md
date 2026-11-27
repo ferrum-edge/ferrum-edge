@@ -106,7 +106,10 @@ gateways, control planes, mesh data planes, charts or contract consumers.
   (including an unfinished upgrade), and drop an old index only when a later
   plan version retires it by name. `migrate status` reports the recorded and
   binary plan versions. A database with no record, including one created by a
-  0.9.x release, is read as plan version 0.
+  0.9.x release, is read as plan version 0 and is not refused;
+  rebuild-and-restore is still the only supported upgrade path for a 0.9.x
+  MongoDB database, because 1.0.0 rejects stored documents that carry removed or
+  unknown keys and no in-place conversion exists.
 - **BREAKING:** unknown keys are rejected at every level of the configuration
   schema (#7520, #7524). This covers nested proxy and upstream objects
   (`health_checks` and its `active` / `passive` blocks, `targets[]`,
