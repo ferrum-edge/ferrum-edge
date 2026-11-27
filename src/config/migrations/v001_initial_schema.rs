@@ -59,7 +59,7 @@ impl V001InitialSchema {
 /// Canonical text whose SHA-256 is the V001 identity.
 ///
 /// One section per dialect in the fixed order PostgreSQL, MySQL, SQLite, each
-/// listing every executed statement in order (whitespace-collapsed, MySQL
+/// listing every executed statement in order (`canonical_statement` form, MySQL
 /// index statements as actually sent). Exposed so the golden test can print
 /// it when the baseline drifts.
 pub fn canonical_v001_baseline() -> String {

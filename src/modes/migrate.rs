@@ -248,6 +248,12 @@ async fn show_db_status(env_config: &EnvConfig) -> Result<(), anyhow::Error> {
                 status.plan_version
             ),
         }
+        if let Some(in_progress) = status.in_progress_plan_version {
+            println!(
+                "An upgrade to index plan version {in_progress} started and has not finished; \
+                 run 'FERRUM_MIGRATE_ACTION=up' to complete it."
+            );
+        }
         println!(
             "Compared live indexes and guard collections to the canonical plan \
              (listIndexes/listCollections only; no mutations).\n"
@@ -296,7 +302,8 @@ async fn show_db_status(env_config: &EnvConfig) -> Result<(), anyhow::Error> {
             status.indexes.len(),
             status.guard_collections.len()
         );
-        let plan_version_pending = status.recorded_plan_version != Some(status.plan_version);
+        let plan_version_pending = status.recorded_plan_version != Some(status.plan_version)
+            || status.in_progress_plan_version.is_some();
         if missing > 0 || mismatched > 0 || guard_collections_missing > 0 || plan_version_pending {
             println!("Run 'FERRUM_MIGRATE_ACTION=up' to ensure the full plan exists.");
         } else {

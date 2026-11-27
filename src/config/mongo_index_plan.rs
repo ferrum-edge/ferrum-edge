@@ -68,6 +68,9 @@ pub struct MongoMigrationStatus {
     /// Plan version recorded by the last successful `up`, or `None` when the
     /// database has never been initialized by a version-recording release.
     pub recorded_plan_version: Option<i64>,
+    /// Target version of an upgrade that started changing indexes and has not
+    /// recorded completion, if any.
+    pub in_progress_plan_version: Option<i64>,
     /// Plan version this binary applies ([`MONGO_INDEX_PLAN_VERSION`]).
     pub plan_version: i64,
 }
@@ -78,19 +81,23 @@ pub struct MongoMigrationStatus {
 
 /// Version of the canonical MongoDB index plan this binary applies.
 ///
-/// `up` (and `database` / `cp` startup) records it in
-/// [`MONGO_INDEX_PLAN_VERSION_COLLECTION`] after the plan is fully ensured,
-/// and refuses to run against a database that records a higher version (an
-/// older binary started against a database a newer release upgraded).
+/// `up` (and `database` / `cp` startup) marks the target version in progress
+/// in [`MONGO_INDEX_PLAN_VERSION_COLLECTION`] before its first schema change,
+/// and records it as applied (clearing the marker in the same update) only
+/// after the plan is fully ensured. Startup, `up`, `status`, and every
+/// reconnect refuse a database whose applied or in-progress version is higher
+/// than this one (an older binary against a database a newer release started
+/// or finished upgrading).
 ///
 /// Forward changes from 1.0.0 onward, each in one release, bump this by one:
 /// - add an index: add it to [`required_mongo_indexes`];
 /// - drop an index: remove it from the plan and add a [`RetiredMongoIndex`]
 ///   naming its exact index name with `retired_in` = the new version;
 /// - replace an index (new keys or options): retire the old name and add the
-///   new definition. Retirements are dropped before the plan is ensured, so
-///   the replacement may reuse the old name; for a unique index, note that
-///   the constraint is absent between that drop and the create.
+///   new definition under a **new** name. A planned index may never reuse a
+///   retired name (an explicit `name` option is required when the new
+///   definition keeps the old keys), so retrying a retirement can never drop
+///   the replacement.
 ///
 /// Never edit or remove a shipped entry of [`RETIRED_MONGO_INDEXES`], and
 /// never change an existing plan entry's keys or options in place: MongoDB
@@ -102,7 +109,9 @@ pub const MONGO_INDEX_PLAN_VERSION: i64 = 1;
 pub const MONGO_INDEX_PLAN_VERSION_COLLECTION: &str = "_ferrum_migrations";
 
 /// `_id` of the single document in [`MONGO_INDEX_PLAN_VERSION_COLLECTION`]
-/// that records the core index-plan version.
+/// that records the core index-plan version (`version`) and, while an `up` is
+/// between its first change and its version record, the target version it is
+/// applying (`in_progress_version`).
 pub const MONGO_INDEX_PLAN_VERSION_DOCUMENT_ID: &str = "core_index_plan";
 
 /// An index an earlier plan created that a later plan version drops.
@@ -118,6 +127,27 @@ pub struct RetiredMongoIndex {
 
 /// Indexes dropped by later plan versions, oldest first. Empty at version 1.
 pub const RETIRED_MONGO_INDEXES: &[RetiredMongoIndex] = &[];
+
+/// The index-plan state a database records.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RecordedIndexPlanState {
+    /// Last plan version applied completely; `None` for a fresh database or
+    /// one initialized before plan versions were recorded.
+    pub version: Option<i64>,
+    /// Target version of an `up` that made schema changes but has not yet
+    /// recorded completion (an interrupted or running upgrade).
+    pub in_progress: Option<i64>,
+}
+
+/// The name an index is created under: its explicit `name` option, or the
+/// driver default derived from its keys.
+pub fn planned_index_name(model: &IndexModel) -> String {
+    model
+        .options
+        .as_ref()
+        .and_then(|options| options.name.clone())
+        .unwrap_or_else(|| default_index_name(&model.keys))
+}
 
 /// One complete versioned index plan: what `up` ensures and what it drops.
 #[derive(Clone, Debug)]
@@ -137,16 +167,8 @@ impl MongoIndexPlan {
         }
     }
 
-    /// Decide the forward step from a database's recorded plan version.
-    ///
-    /// `None` (a fresh database, or one initialized before versions were
-    /// recorded) is treated as version 0. Returns the retirements to drop,
-    /// in declaration order: every entry with `recorded < retired_in`. A
-    /// recorded version above [`Self::version`] is refused, never "repaired".
-    pub fn upgrade_from(
-        &self,
-        recorded: Option<i64>,
-    ) -> Result<Vec<RetiredMongoIndex>, MongoIndexPlanError> {
+    /// Reject a malformed plan declaration.
+    pub fn validate(&self) -> Result<(), MongoIndexPlanError> {
         if self.version < 1 {
             return Err(MongoIndexPlanError::InvalidPlanVersion {
                 version: self.version,
@@ -159,7 +181,30 @@ impl MongoIndexPlan {
                     version: self.version,
                 });
             }
+            if self.indexes.iter().any(|entry| {
+                entry.collection == retired.collection
+                    && planned_index_name(&entry.model) == retired.name
+            }) {
+                return Err(MongoIndexPlanError::RetiredNameReused {
+                    collection: retired.collection,
+                    name: retired.name,
+                });
+            }
         }
+        Ok(())
+    }
+
+    /// Decide the forward step from a database's last applied plan version.
+    ///
+    /// `None` (a fresh database, or one initialized before versions were
+    /// recorded) is treated as version 0. Returns the retirements to drop,
+    /// in declaration order: every entry with `recorded < retired_in`. A
+    /// recorded version above [`Self::version`] is refused, never "repaired".
+    pub fn upgrade_from(
+        &self,
+        recorded: Option<i64>,
+    ) -> Result<Vec<RetiredMongoIndex>, MongoIndexPlanError> {
+        self.validate()?;
         let recorded = match recorded {
             None => 0,
             Some(version) if version < 1 => {
@@ -180,6 +225,26 @@ impl MongoIndexPlan {
             .copied()
             .collect())
     }
+
+    /// [`Self::upgrade_from`] for a full recorded state: an in-progress
+    /// upgrade to a version above [`Self::version`] is refused too, so an
+    /// older binary never runs against (or "repairs") a half-applied newer
+    /// plan. An in-progress version at or below this plan is resumed.
+    pub fn upgrade_from_state(
+        &self,
+        recorded: &RecordedIndexPlanState,
+    ) -> Result<Vec<RetiredMongoIndex>, MongoIndexPlanError> {
+        let retirements = self.upgrade_from(recorded.version)?;
+        if let Some(in_progress) = recorded.in_progress
+            && in_progress > self.version
+        {
+            return Err(MongoIndexPlanError::InProgressVersionNewer {
+                in_progress,
+                supported: self.version,
+            });
+        }
+        Ok(retirements)
+    }
 }
 
 /// A MongoDB index-plan version the binary cannot safely act on.
@@ -187,12 +252,19 @@ impl MongoIndexPlan {
 pub enum MongoIndexPlanError {
     /// The database records a newer plan than this binary applies.
     RecordedVersionNewer { recorded: i64, supported: i64 },
+    /// A newer release started upgrading this database and has not finished.
+    InProgressVersionNewer { in_progress: i64, supported: i64 },
     /// The recorded version document is not a positive integer version.
     InvalidRecordedVersion,
     /// A plan declares a version below 1.
     InvalidPlanVersion { version: i64 },
     /// A retirement is declared outside `2..=version`.
     InvalidRetirement { retired_in: i64, version: i64 },
+    /// A planned index reuses the name of a retired index.
+    RetiredNameReused {
+        collection: &'static str,
+        name: &'static str,
+    },
 }
 
 impl std::fmt::Display for MongoIndexPlanError {
@@ -207,6 +279,17 @@ impl std::fmt::Display for MongoIndexPlanError {
                  than version \"{supported}\" applied by this binary; refusing to run an older \
                  binary against a database a newer release upgraded. Run that newer release, \
                  or restore the backup taken before the upgrade (docs/admin_backup_restore.md)"
+            ),
+            Self::InProgressVersionNewer {
+                in_progress,
+                supported,
+            } => write!(
+                f,
+                "an upgrade to MongoDB index plan version \"{in_progress}\" started on this \
+                 database and has not finished, and this binary applies version \
+                 \"{supported}\"; refusing to run an older binary against a partly upgraded \
+                 database. Rerun the newer release to finish the upgrade, or restore the \
+                 backup taken before it (docs/admin_backup_restore.md)"
             ),
             Self::InvalidRecordedVersion => f.write_str(
                 "MongoDB index plan version record is not a positive integer; refusing to \
@@ -226,29 +309,59 @@ impl std::fmt::Display for MongoIndexPlanError {
                 "MongoDB index plan version \"{version}\" declares a retirement in version \
                  \"{retired_in}\" outside 2..={version}"
             ),
+            Self::RetiredNameReused { collection, name } => write!(
+                f,
+                "MongoDB index plan reuses retired index name `{name}` on `{collection}`; a \
+                 replacement index needs a new name"
+            ),
         }
     }
 }
 
 impl std::error::Error for MongoIndexPlanError {}
 
-/// Parse the recorded plan version from its document. A missing document is
-/// `Ok(None)`; anything other than a positive Int32/Int64 `version` is refused.
-pub fn recorded_plan_version_from_document(
-    document: Option<&Document>,
+fn recorded_version_field(
+    document: &Document,
+    field: &str,
 ) -> Result<Option<i64>, MongoIndexPlanError> {
-    let Some(document) = document else {
-        return Ok(None);
-    };
-    let version = match document.get("version") {
+    let version = match document.get(field) {
+        None => return Ok(None),
         Some(mongodb::bson::Bson::Int64(version)) => *version,
         Some(mongodb::bson::Bson::Int32(version)) => i64::from(*version),
-        _ => return Err(MongoIndexPlanError::InvalidRecordedVersion),
+        Some(_) => return Err(MongoIndexPlanError::InvalidRecordedVersion),
     };
     if version < 1 {
         return Err(MongoIndexPlanError::InvalidRecordedVersion);
     }
     Ok(Some(version))
+}
+
+/// Parse the recorded plan state from its document. A missing document is the
+/// default (nothing recorded). A present document needs a positive
+/// Int32/Int64 `version` unless only an `in_progress_version` is recorded (a
+/// first upgrade that was interrupted); any other shape is refused.
+pub fn recorded_plan_state_from_document(
+    document: Option<&Document>,
+) -> Result<RecordedIndexPlanState, MongoIndexPlanError> {
+    let Some(document) = document else {
+        return Ok(RecordedIndexPlanState::default());
+    };
+    let state = RecordedIndexPlanState {
+        version: recorded_version_field(document, "version")?,
+        in_progress: recorded_version_field(document, "in_progress_version")?,
+    };
+    if state.version.is_none() && state.in_progress.is_none() {
+        return Err(MongoIndexPlanError::InvalidRecordedVersion);
+    }
+    Ok(state)
+}
+
+/// Parse only the applied plan version (see
+/// [`recorded_plan_state_from_document`]).
+pub fn recorded_plan_version_from_document(
+    document: Option<&Document>,
+) -> Result<Option<i64>, MongoIndexPlanError> {
+    Ok(recorded_plan_state_from_document(document)?.version)
 }
 
 /// Build the baseline index plan. This is the single source of truth for
@@ -481,6 +594,30 @@ pub fn dry_run_lines() -> Vec<String> {
     lines.push("  collections ensured (empty shell):".to_string());
     for name in REQUIRED_GUARD_COLLECTIONS {
         lines.push(format!("    - {name}"));
+    }
+
+    // Destructive steps are listed too. Dry-run stays offline, so it cannot
+    // know the database's recorded version: each retirement runs only when
+    // the recorded plan version is below the version that retired it.
+    let plan = MongoIndexPlan::current();
+    lines.push(format!(
+        "  index plan version applied and recorded: {}",
+        plan.version
+    ));
+    if plan.retired.is_empty() {
+        lines.push("  indexes dropped (retired by a later plan version): none".to_string());
+    } else {
+        lines.push(
+            "  indexes dropped (by exact name, only when the recorded plan version is below \
+             the retiring version):"
+                .to_string(),
+        );
+        for retired in &plan.retired {
+            lines.push(format!(
+                "    - {}.{} (retired in plan version {})",
+                retired.collection, retired.name, retired.retired_in
+            ));
+        }
     }
     lines
 }

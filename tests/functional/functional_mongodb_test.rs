@@ -3868,6 +3868,59 @@ async fn test_mongodb_index_plan_version_is_recorded_and_forward_only() {
     assert_eq!(recorded_plan_version(&versions).await, next.version);
     let names = proxies.list_index_names().await.unwrap();
     assert!(names.iter().any(|name| name == ADDED_INDEX));
+
+    // The refusal is read-only: not even the migration-lease collection is
+    // recreated.
+    db.collection::<Document>("_ferrum_migration_locks")
+        .drop()
+        .await
+        .unwrap();
+    store
+        .run_migrations()
+        .await
+        .expect_err("an older plan must refuse a newer database");
+    assert!(
+        !db.list_collection_names()
+            .await
+            .unwrap()
+            .iter()
+            .any(|name| name == "_ferrum_migration_locks"),
+        "a refused run must not take the migration lease"
+    );
+
+    // An interrupted upgrade (marker written, completion not recorded) is
+    // refused by the older plan and resumed by its own plan, which then
+    // records completion and clears the marker in one update.
+    let plan_document = doc! {
+        "_id": ferrum_edge::config::mongo_index_plan::MONGO_INDEX_PLAN_VERSION_DOCUMENT_ID,
+    };
+    versions
+        .update_one(
+            plan_document.clone(),
+            doc! { "$set": {
+                "version": MONGO_INDEX_PLAN_VERSION,
+                "in_progress_version": next.version,
+            } },
+        )
+        .await
+        .unwrap();
+    let error = store
+        .run_migrations()
+        .await
+        .expect_err("an older plan must refuse an unfinished newer upgrade");
+    assert!(
+        format!("{error:#}").contains("has not finished"),
+        "unexpected refusal: {error:#}"
+    );
+    apply_mongo_index_plan_for_test(&store, &next)
+        .await
+        .expect("the interrupted plan resumes");
+    let record = versions.find_one(plan_document).await.unwrap().unwrap();
+    assert_eq!(record.get_i64("version").unwrap(), next.version);
+    assert!(
+        !record.contains_key("in_progress_version"),
+        "completion clears the in-progress marker: {record:?}"
+    );
     db.drop().await.unwrap();
 }
 

@@ -801,13 +801,63 @@ pub fn validate_migration_history_integrity(
 // Canonical migration identity
 // ---------------------------------------------------------------------------
 
-/// One SQL statement in canonical form: runs of ASCII whitespace collapse to a
-/// single space and the ends are trimmed. Migration identities hash this form,
-/// so re-indenting a raw string never changes a checksum. Baseline and forward
-/// migration DDL contains no quoted literal or SQL comment whose meaning
-/// depends on internal whitespace.
-pub(crate) fn canonical_statement(sql: &str) -> String {
-    sql.split_ascii_whitespace().collect::<Vec<_>>().join(" ")
+/// One SQL statement in canonical form, the text migration identities hash.
+///
+/// Outside quoted text and comments, every run of ASCII whitespace collapses
+/// to one space and the ends are trimmed, so re-indenting a raw string never
+/// changes a checksum. Quoted spans (`'...'`, `"..."`, `` `...` ``, where a
+/// doubled quote simply closes and reopens the span), `/* ... */` comments,
+/// and `--` line comments including their terminating newline are copied
+/// byte for byte, so a change to a literal, a quoted identifier, or what a
+/// line comment covers always changes the checksum.
+pub fn canonical_statement(sql: &str) -> String {
+    let mut canonical = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    let mut pending_space = false;
+    while let Some(character) = chars.next() {
+        if character.is_ascii_whitespace() {
+            pending_space = true;
+            continue;
+        }
+        if pending_space && !canonical.is_empty() {
+            canonical.push(' ');
+        }
+        pending_space = false;
+        canonical.push(character);
+        match character {
+            '\'' | '"' | '`' => {
+                for next in chars.by_ref() {
+                    canonical.push(next);
+                    if next == character {
+                        break;
+                    }
+                }
+            }
+            '-' if chars.peek() == Some(&'-') => {
+                for next in chars.by_ref() {
+                    canonical.push(next);
+                    if next == '\n' {
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                let mut previous = '\0';
+                if let Some(star) = chars.next() {
+                    canonical.push(star);
+                }
+                for next in chars.by_ref() {
+                    canonical.push(next);
+                    if previous == '*' && next == '/' {
+                        break;
+                    }
+                    previous = next;
+                }
+            }
+            _ => {}
+        }
+    }
+    canonical
 }
 
 /// `sha256:<hex>` over a canonical migration rendering.
@@ -829,14 +879,42 @@ pub(crate) fn canonical_checksum(canonical_text: &str) -> String {
 /// checksum drift on every database that already applied it: never edit one,
 /// add another.
 ///
-/// Execution rules match `V001`: statements run in order on the migration-lock
+/// Execution rules: statements run in order on the migration-lock
 /// connection, and the tracking row is written only after every statement
 /// succeeded. MySQL implicitly commits DDL and PostgreSQL runs these
 /// statements outside an explicit transaction, so each statement must be safe
-/// to re-run after a partial failure (`IF NOT EXISTS` forms; on MySQL a
-/// `CREATE [UNIQUE] INDEX` that hits duplicate-key-name error 1061 and a
-/// two-token `DROP INDEX name ON table` that hits missing-key error 1091 are
-/// tolerated, exactly as for `V001` and custom-plugin migrations).
+/// to re-run after a partial failure: use `IF NOT EXISTS` forms where the
+/// dialect has them. MySQL has no `CREATE INDEX IF NOT EXISTS`, and a
+/// duplicate-key-name error (1061) proves only that the name is taken, not
+/// that the existing index has the intended definition, so it is never
+/// tolerated. Write a MySQL index as the pair `DROP INDEX name ON table`
+/// (whose missing-key error 1091 is tolerated, as for custom-plugin
+/// migrations) followed by the exact `CREATE INDEX`: a retry then always
+/// rebuilds the intended definition.
+///
+/// Register a shipped migration with [`MigrationRunner`]'s private
+/// `shipped_migrations()` list through `sql_migration_entry`, for example:
+///
+/// ```ignore
+/// const V002_ADD_EXAMPLE: SqlMigration = SqlMigration {
+///     version: 2,
+///     name: "add_example",
+///     postgres: &["CREATE TABLE IF NOT EXISTS example (id TEXT PRIMARY KEY)"],
+///     mysql: &[
+///         "CREATE TABLE IF NOT EXISTS example (id VARCHAR(64) NOT NULL PRIMARY KEY, note VARCHAR(255) NOT NULL)",
+///         "DROP INDEX idx_example_note ON example",
+///         "CREATE INDEX idx_example_note ON example (note)",
+///     ],
+///     sqlite: &["CREATE TABLE IF NOT EXISTS example (id TEXT PRIMARY KEY)"],
+/// };
+///
+/// fn shipped_migrations() -> Vec<Box<dyn MigrationEntry>> {
+///     vec![
+///         Box::new(MigrationEntryV001(v001_initial_schema::V001InitialSchema)),
+///         sql_migration_entry(V002_ADD_EXAMPLE),
+///     ]
+/// }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SqlMigration {
     /// Core migration version; the next unused integer after the last shipped one.
@@ -890,17 +968,8 @@ impl SqlMigration {
     }
 }
 
-fn is_mysql_create_index_statement(statement: &str) -> bool {
-    let words: Vec<&str> = statement.split_whitespace().take(3).collect();
-    let keyword = |position: usize, expected: &str| {
-        words
-            .get(position)
-            .is_some_and(|word| word.eq_ignore_ascii_case(expected))
-    };
-    keyword(0, "CREATE") && (keyword(1, "INDEX") || (keyword(1, "UNIQUE") && keyword(2, "INDEX")))
-}
-
-/// Apply the MySQL re-run tolerances documented on [`SqlMigration`].
+/// Apply the only MySQL re-run tolerance documented on [`SqlMigration`]: a
+/// two-token `DROP INDEX name ON table` whose index is already absent.
 fn map_core_statement_result<T>(
     db_type: &str,
     statement: &str,
@@ -909,18 +978,23 @@ fn map_core_statement_result<T>(
     match result {
         Ok(_) => Ok(()),
         Err(error) => {
-            if db_type == "mysql" {
-                let number = mysql_error_number(&error);
-                if mysql_drop_index_missing_is_benign(statement, number)
-                    || (is_mysql_create_index_statement(statement)
-                        && mysql_create_index_exists_is_benign(number))
-                {
-                    return Ok(());
-                }
+            if db_type == "mysql"
+                && mysql_drop_index_missing_is_benign(statement, mysql_error_number(&error))
+            {
+                return Ok(());
             }
             Err(error)
         }
     }
+}
+
+/// The runner entry for a declarative forward migration. Shipped migrations
+/// and the test seam both register through this one constructor.
+fn sql_migration_entry(migration: SqlMigration) -> Box<dyn MigrationEntry> {
+    Box::new(SqlMigrationEntry {
+        migration,
+        checksum: migration.checksum(),
+    })
 }
 
 /// Runs versioned database migrations with tracking.
@@ -954,8 +1028,9 @@ impl MigrationRunner {
     /// The core migrations this binary ships, in version order.
     ///
     /// `V001` is the frozen baseline. From 1.0.0 onward every schema change is
-    /// a new forward migration appended here with the next version; shipped
-    /// entries are never edited, reordered, or removed.
+    /// a new forward migration appended here with the next version, as
+    /// `sql_migration_entry(V00N_NAME)` for a declarative [`SqlMigration`];
+    /// shipped entries are never edited, reordered, or removed.
     fn shipped_migrations() -> Vec<Box<dyn MigrationEntry>> {
         vec![Box::new(MigrationEntryV001(
             v001_initial_schema::V001InitialSchema,
@@ -973,12 +1048,11 @@ impl MigrationRunner {
     /// Build the ordered list of all known migrations.
     fn all_migrations(&self) -> Vec<Box<dyn MigrationEntry>> {
         let mut migrations = Self::shipped_migrations();
-        migrations.extend(self.test_only_migrations.iter().map(|migration| {
-            Box::new(SqlMigrationEntry {
-                migration: *migration,
-                checksum: migration.checksum(),
-            }) as Box<dyn MigrationEntry>
-        }));
+        migrations.extend(
+            self.test_only_migrations
+                .iter()
+                .map(|migration| sql_migration_entry(*migration)),
+        );
         migrations
     }
 

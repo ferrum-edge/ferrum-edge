@@ -121,9 +121,9 @@ mod inner {
     use crate::config::mongo_index_plan::{
         HMAC_SECRET_HASHES_FIELD, MONGO_INDEX_PLAN_VERSION, MONGO_INDEX_PLAN_VERSION_COLLECTION,
         MONGO_INDEX_PLAN_VERSION_DOCUMENT_ID, MongoIndexPlan, MongoMigrationStatus,
-        REQUIRED_GUARD_COLLECTIONS, RequiredMongoIndex, RetiredMongoIndex,
-        classify_guard_collections, classify_plan_against_live,
-        recorded_plan_version_from_document, required_mongo_indexes,
+        REQUIRED_GUARD_COLLECTIONS, RecordedIndexPlanState, RequiredMongoIndex, RetiredMongoIndex,
+        classify_guard_collections, classify_plan_against_live, recorded_plan_state_from_document,
+        required_mongo_indexes,
     };
     use crate::config::namespace_registry::{
         NAMESPACE_OCCUPANCY_TABLES, NamespaceRecord, NamespaceRegistryAtomicityUnsupported,
@@ -331,6 +331,27 @@ mod inner {
             err.kind.as_ref(),
             mongodb::error::ErrorKind::Command(cmd) if cmd.code == code
         )
+    }
+
+    /// Read the recorded index-plan state through `db` (the live store or a
+    /// reconnect candidate that is not yet published).
+    async fn read_recorded_index_plan_state(
+        db: &Database,
+    ) -> Result<RecordedIndexPlanState, anyhow::Error> {
+        let document = db
+            .collection::<Document>(MONGO_INDEX_PLAN_VERSION_COLLECTION)
+            .find_one(doc! { "_id": MONGO_INDEX_PLAN_VERSION_DOCUMENT_ID })
+            .await?;
+        Ok(recorded_plan_state_from_document(document.as_ref())?)
+    }
+
+    /// Refuse to publish a reconnect candidate whose database a newer release
+    /// started or finished upgrading: this binary's plan assumptions would no
+    /// longer hold for it.
+    async fn ensure_candidate_index_plan_compatible(db: &Database) -> Result<(), anyhow::Error> {
+        let recorded = read_recorded_index_plan_state(db).await?;
+        MongoIndexPlan::current().upgrade_from_state(&recorded)?;
+        Ok(())
     }
 
     fn is_namespace_exists(err: &mongodb::error::Error) -> bool {
@@ -2225,6 +2246,7 @@ mod inner {
                 self.conn_settings.tls_insecure,
             )
             .await?;
+            ensure_candidate_index_plan_compatible(&new_connection.db).await?;
             // Gate-before-publish: see `publish_reconnected_bundle` contract.
             self.publish_reconnected_bundle(
                 new_connection,
@@ -2490,13 +2512,14 @@ mod inner {
 
             // Same refusal as `up`: an older binary must not report a database
             // that a newer release upgraded as merely "missing" indexes.
-            let recorded_plan_version = self.recorded_index_plan_version().await?;
-            MongoIndexPlan::current().upgrade_from(recorded_plan_version)?;
+            let recorded = self.recorded_index_plan_state().await?;
+            MongoIndexPlan::current().upgrade_from_state(&recorded)?;
 
             Ok(MongoMigrationStatus {
                 indexes: classify_plan_against_live(&live_by_collection),
                 guard_collections: classify_guard_collections(&live_collection_names),
-                recorded_plan_version,
+                recorded_plan_version: recorded.version,
+                in_progress_plan_version: recorded.in_progress,
                 plan_version: MONGO_INDEX_PLAN_VERSION,
             })
         }
@@ -2529,17 +2552,30 @@ mod inner {
 
         /// Apply one versioned index plan under the migration lease.
         ///
-        /// Order: refuse a database whose recorded plan version is newer than
-        /// `plan` (binary downgrade) before any write; create guard
-        /// collections; drop exactly the indexes `plan` retires after the
-        /// recorded version; ensure every planned index; seed the namespace
-        /// registry; then record `plan.version`. A failure before the record
-        /// leaves the old version recorded, so the next run repeats the same
-        /// idempotent forward step.
+        /// Order:
+        /// 1. Read the recorded plan state and refuse a newer applied or
+        ///    in-progress version (binary downgrade) before any write,
+        ///    including the lease upsert.
+        /// 2. Take the migration lease and re-check under it.
+        /// 3. If this version is not yet recorded as applied, mark it in
+        ///    progress before the first schema change, so an older binary
+        ///    refuses the partly upgraded database and this binary resumes.
+        /// 4. Create guard collections, drop exactly the indexes `plan`
+        ///    retires after the recorded version (by name; a planned index
+        ///    never reuses a retired name, so a retry cannot drop a
+        ///    replacement), ensure every planned index, seed the registry.
+        /// 5. Record `plan.version` and clear the marker in one update.
+        ///
+        /// Every destructive step and the final record first prove that this
+        /// runner still owns the lease, so a runner that lost it stops.
         pub(crate) async fn apply_index_plan(
             &self,
             plan: &MongoIndexPlan,
         ) -> Result<(), anyhow::Error> {
+            // Read-only refusal: an incompatible database is rejected before
+            // the lease (an upsert into `_ferrum_migration_locks`) is taken.
+            plan.upgrade_from_state(&self.recorded_index_plan_state().await?)?;
+
             let mut migration_lease = self.acquire_migration_lease().await?;
             // Run every initialization step inside a scoped future so a failure
             // part-way through still falls through to the lease release below.
@@ -2553,8 +2589,13 @@ mod inner {
                 // createIndex is idempotent when keys+options match;
                 // conflicting options fail. Old indexes are dropped only when
                 // a later plan version retires them by name.
-                let recorded = self.recorded_index_plan_version().await?;
-                let retirements = plan.upgrade_from(recorded)?;
+                let recorded = self.recorded_index_plan_state().await?;
+                let retirements = plan.upgrade_from_state(&recorded)?;
+                let upgrading = recorded.version != Some(plan.version);
+                if upgrading {
+                    self.ensure_migration_lease_held(&migration_lease).await?;
+                    self.mark_index_plan_in_progress(plan.version).await?;
+                }
 
                 // Intentionally no automatic orphan reconcile of
                 // `consumer_identity_index` against `consumers`. Point-read
@@ -2581,6 +2622,7 @@ mod inner {
                 }
 
                 for retired in &retirements {
+                    self.ensure_migration_lease_held(&migration_lease).await?;
                     self.retire_planned_index(retired).await?;
                 }
 
@@ -2590,7 +2632,8 @@ mod inner {
 
                 self.initialize_namespace_registry().await?;
 
-                if recorded != Some(plan.version) {
+                if upgrading || recorded.in_progress.is_some() {
+                    self.ensure_migration_lease_held(&migration_lease).await?;
                     self.record_index_plan_version(plan.version).await?;
                 }
 
@@ -2614,17 +2657,47 @@ mod inner {
             }
         }
 
-        /// The index-plan version recorded by the last successful `up`.
-        async fn recorded_index_plan_version(&self) -> Result<Option<i64>, anyhow::Error> {
-            let document = self
-                .collection(MONGO_INDEX_PLAN_VERSION_COLLECTION)
-                .find_one(doc! { "_id": MONGO_INDEX_PLAN_VERSION_DOCUMENT_ID })
-                .await?;
-            Ok(recorded_plan_version_from_document(document.as_ref())?)
+        /// Fail unless `lease` is still valid and its owner-qualified lock
+        /// document still exists, i.e. no other runner has taken it over.
+        async fn ensure_migration_lease_held(
+            &self,
+            lease: &MongoLockGuard,
+        ) -> Result<(), anyhow::Error> {
+            let still_owned = lease.valid.load(Ordering::Acquire)
+                && lease
+                    .collection
+                    .find_one(doc! { "_id": &lease.lock_id, "owner": &lease.owner })
+                    .await?
+                    .is_some();
+            if !still_owned {
+                anyhow::bail!(
+                    "MongoDB migration lease was lost before a schema change; stopping so \
+                     another runner's index plan is not modified"
+                );
+            }
+            Ok(())
         }
 
-        /// Record `version` after a plan applied completely. `$max` keeps the
-        /// record monotonic even if a newer release raced past this one.
+        /// The index-plan state recorded in this store's database.
+        async fn recorded_index_plan_state(&self) -> Result<RecordedIndexPlanState, anyhow::Error> {
+            read_recorded_index_plan_state(&self.db()).await
+        }
+
+        /// Mark `version` in progress before the first schema change.
+        async fn mark_index_plan_in_progress(&self, version: i64) -> Result<(), anyhow::Error> {
+            self.collection(MONGO_INDEX_PLAN_VERSION_COLLECTION)
+                .update_one(
+                    doc! { "_id": MONGO_INDEX_PLAN_VERSION_DOCUMENT_ID },
+                    doc! { "$max": { "in_progress_version": version } },
+                )
+                .upsert(true)
+                .await?;
+            Ok(())
+        }
+
+        /// Record `version` after a plan applied completely and clear the
+        /// in-progress marker in the same single-document update. `$max` keeps
+        /// the record monotonic.
         async fn record_index_plan_version(&self, version: i64) -> Result<(), anyhow::Error> {
             let now = crate::time_compat::UtcTimestamp::now().to_rfc3339();
             self.collection(MONGO_INDEX_PLAN_VERSION_COLLECTION)
@@ -2633,6 +2706,7 @@ mod inner {
                     doc! {
                         "$max": { "version": version },
                         "$set": { "applied_at": &now },
+                        "$unset": { "in_progress_version": "" },
                     },
                 )
                 .upsert(true)
@@ -16394,6 +16468,10 @@ mod inner {
                 self.conn_settings.tls_insecure,
             )
             .await?;
+            // The candidate must still be a database this binary's index plan
+            // applies to (a primary that came back upgraded by a newer
+            // release is refused, keeping the current connection).
+            ensure_candidate_index_plan_compatible(&new_connection.db).await?;
 
             // Connection and topology published in one store under the
             // publication guards. Readers that already loaded the old `Client` or

@@ -188,8 +188,9 @@ impl V001SqlBuilder {
     /// Canonical rendering of every V001 step for this dialect, in order.
     ///
     /// Each line is the statement exactly as it is sent to the database
-    /// (after the MySQL `IF NOT EXISTS` strip), with runs of ASCII whitespace
-    /// collapsed to one space. Rust comments, helper names, and source layout
+    /// (after the MySQL `IF NOT EXISTS` strip) in `canonical_statement` form:
+    /// whitespace outside quoted text and SQL comments collapsed, quoted text
+    /// and comments kept exactly. Rust comments, helper names, and source layout
     /// are not part of it, so refactoring this file never changes V001's
     /// identity; changing any executed statement always does.
     pub(super) fn canonical_steps(&self) -> Vec<String> {
@@ -903,8 +904,8 @@ impl V001SqlBuilder {
     /// one is enabled. `restore_owner` is a logical fence that persists across
     /// every transaction in a compensating restore replay.
     ///
-    /// Build-out policy intentionally keeps this table in the current baseline
-    /// only; existing development databases must be recreated.
+    /// Part of the frozen V001 baseline; any later change to it ships as a
+    /// forward migration.
     fn create_mtls_dns_admission_locks_sql(&self) -> &'static str {
         if self.is_mysql() {
             r#"

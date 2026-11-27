@@ -10,8 +10,9 @@
 //! - a database at `V001` records the committed golden `V001` identity;
 //! - `status` reports `V002` pending, `up` applies it, `status` then reports it
 //!   applied, and a second `up` is a no-op;
-//! - a `V002` whose tracking row is lost re-runs idempotently (MySQL tolerates
-//!   only the structured duplicate-index error);
+//! - a `V002` whose tracking row is lost re-runs idempotently, and on MySQL
+//!   its drop-then-create rebuilds a same-name index with a wrong definition;
+//! - a plain `CREATE INDEX` whose name is taken fails and is not recorded;
 //! - an edited `V002` (checksum drift on an applied migration) is fatal;
 //! - a binary that does not know `V002` (a downgrade) refuses the database;
 //! - drift on the frozen `V001` row remains fatal.
@@ -48,6 +49,9 @@ const TEST_V002: SqlMigration = SqlMigration {
     ],
     mysql: &[
         "CREATE TABLE IF NOT EXISTS ferrum_test_forward_v002 (id VARCHAR(64) NOT NULL PRIMARY KEY, note VARCHAR(255) NOT NULL)",
+        // MySQL has no `CREATE INDEX IF NOT EXISTS`: drop-then-create so a
+        // retry always rebuilds the intended definition.
+        "DROP INDEX idx_ferrum_test_forward_v002_note ON ferrum_test_forward_v002",
         "CREATE INDEX idx_ferrum_test_forward_v002_note ON ferrum_test_forward_v002 (note)",
     ],
     sqlite: &[
@@ -70,6 +74,39 @@ const TEST_V002_EDITED: SqlMigration = SqlMigration {
     ],
     ..TEST_V002
 };
+
+/// A later migration whose plain `CREATE INDEX` collides with V002's index
+/// name. It must fail on every dialect and never be recorded: a taken name
+/// does not prove the existing index has the intended definition.
+const TEST_V003_COLLIDING: SqlMigration = SqlMigration {
+    version: 3,
+    name: "test_colliding_v003",
+    postgres: &["CREATE INDEX idx_ferrum_test_forward_v002_note ON ferrum_test_forward_v002 (id)"],
+    mysql: &["CREATE INDEX idx_ferrum_test_forward_v002_note ON ferrum_test_forward_v002 (id)"],
+    sqlite: &["CREATE INDEX idx_ferrum_test_forward_v002_note ON ferrum_test_forward_v002 (id)"],
+};
+
+/// MySQL definition of V002's index: `(column, non_unique)` in key order.
+async fn mysql_v002_index_definition(pool: &sqlx::AnyPool) -> Vec<(String, i64)> {
+    sqlx::query(
+        "SELECT COLUMN_NAME, CAST(NON_UNIQUE AS SIGNED) \
+         FROM information_schema.statistics \
+         WHERE table_schema = DATABASE() AND table_name = 'ferrum_test_forward_v002' \
+           AND index_name = 'idx_ferrum_test_forward_v002_note' \
+         ORDER BY SEQ_IN_INDEX",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("inspect V002 index definition")
+    .into_iter()
+    .map(|row| {
+        (
+            row.try_get(0).expect("index column name"),
+            row.try_get(1).expect("index uniqueness"),
+        )
+    })
+    .collect()
+}
 
 fn integrity_reason(error: &anyhow::Error) -> MigrationHistoryIntegrityReason {
     error
@@ -178,6 +215,56 @@ async fn exercise_forward_path(pool: &sqlx::AnyPool, db_type: &str) {
         forward_table_ids(pool).await,
         vec!["row-1".to_string()],
         "{db_type}: the re-run must not touch existing data"
+    );
+
+    if db_type == "mysql" {
+        // A same-name index with a different definition (left by anything
+        // other than V002) is rebuilt by the re-run, never accepted as-is.
+        let intended = vec![("note".to_string(), 1_i64)];
+        assert_eq!(mysql_v002_index_definition(pool).await, intended);
+        sqlx::query("DROP INDEX idx_ferrum_test_forward_v002_note ON ferrum_test_forward_v002")
+            .execute(pool)
+            .await
+            .expect("drop V002 index");
+        sqlx::query(
+            "CREATE UNIQUE INDEX idx_ferrum_test_forward_v002_note ON ferrum_test_forward_v002 (id)",
+        )
+        .execute(pool)
+        .await
+        .expect("plant a wrong same-name index");
+        sqlx::query("DELETE FROM _ferrum_migrations WHERE version = 2")
+            .execute(pool)
+            .await
+            .expect("drop V002 tracking row again");
+        forward
+            .run_pending()
+            .await
+            .expect("V002 re-runs over a wrong same-name index");
+        assert_eq!(
+            mysql_v002_index_definition(pool).await,
+            intended,
+            "mysql: the re-run must rebuild the intended index definition"
+        );
+    }
+
+    // A plain CREATE INDEX whose name is taken fails and is not recorded.
+    let colliding = migration_runner_with_test_migrations_for_test(
+        pool.clone(),
+        db_type,
+        vec![TEST_V002, TEST_V003_COLLIDING],
+    );
+    colliding
+        .run_pending()
+        .await
+        .expect_err("a colliding CREATE INDEX must fail");
+    let v3_rows: Vec<sqlx::any::AnyRow> =
+        sqlx::query("SELECT version FROM _ferrum_migrations WHERE version = 3")
+            .fetch_all(pool)
+            .await
+            .expect("read V3 tracking row");
+    assert!(
+        v3_rows.is_empty(),
+        "{db_type}: a failed V003 is never recorded"
     );
 
     // Editing an applied migration is checksum drift: fatal for status and up.

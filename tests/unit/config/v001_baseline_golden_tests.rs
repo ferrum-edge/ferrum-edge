@@ -7,10 +7,10 @@
 //! as new forward migrations (`V002`, `V003`, ...).
 
 use ferrum_edge::config::migrations::Migration;
-use ferrum_edge::config::migrations::SqlMigration;
 use ferrum_edge::config::migrations::v001_initial_schema::{
     V001_BASELINE_CHECKSUM, V001InitialSchema, canonical_v001_baseline,
 };
+use ferrum_edge::config::migrations::{SqlMigration, canonical_statement};
 
 #[test]
 fn v001_baseline_ddl_matches_the_committed_golden_checksum() {
@@ -104,4 +104,63 @@ fn forward_migration_checksum_is_canonical_and_layout_independent() {
     };
     assert_ne!(COMPACT.checksum(), changed_version.checksum());
     assert_ne!(COMPACT.checksum(), V001InitialSchema.checksum());
+}
+
+#[test]
+fn canonical_form_keeps_quoted_text_and_comments_exact() {
+    // Whitespace outside quotes and comments is layout only.
+    assert_eq!(
+        canonical_statement("  CREATE TABLE t (\n    a TEXT\n)  "),
+        "CREATE TABLE t ( a TEXT )"
+    );
+    // Whitespace inside a literal, a quoted identifier, or a backtick
+    // identifier is schema content and is kept byte for byte.
+    assert_eq!(
+        canonical_statement("ALTER TABLE t ADD c TEXT DEFAULT 'a  b'"),
+        "ALTER TABLE t ADD c TEXT DEFAULT 'a  b'"
+    );
+    assert_eq!(
+        canonical_statement("CREATE TABLE \"my  table\" (`a  b` TEXT)"),
+        "CREATE TABLE \"my  table\" (`a  b` TEXT)"
+    );
+    // A doubled quote closes and reopens the span without losing content.
+    assert_eq!(
+        canonical_statement("SELECT 'it''s  here'   AS x"),
+        "SELECT 'it''s  here' AS x"
+    );
+    // A line comment keeps its terminating newline, so what it covers can
+    // never be confused with code after it.
+    assert_eq!(
+        canonical_statement("CREATE TABLE t (a TEXT -- note\n  , b TEXT)"),
+        "CREATE TABLE t (a TEXT -- note\n , b TEXT)"
+    );
+    assert_ne!(
+        canonical_statement("SELECT 1 -- x\nFROM t"),
+        canonical_statement("SELECT 1 -- x FROM t")
+    );
+    assert_eq!(
+        canonical_statement("SELECT /* keep  this */   1"),
+        "SELECT /* keep  this */ 1"
+    );
+}
+
+#[test]
+fn a_literal_change_always_changes_a_forward_migration_checksum() {
+    const DEFAULT_TWO_SPACES: SqlMigration = SqlMigration {
+        version: 2,
+        name: "add_default",
+        postgres: &["ALTER TABLE example ADD COLUMN IF NOT EXISTS c TEXT DEFAULT 'a  b'"],
+        mysql: &["ALTER TABLE example ADD COLUMN c VARCHAR(16) DEFAULT 'a  b'"],
+        sqlite: &["ALTER TABLE example ADD COLUMN c TEXT DEFAULT 'a  b'"],
+    };
+    let one_space = SqlMigration {
+        postgres: &["ALTER TABLE example ADD COLUMN IF NOT EXISTS c TEXT DEFAULT 'a b'"],
+        ..DEFAULT_TWO_SPACES
+    };
+    assert_ne!(DEFAULT_TWO_SPACES.checksum(), one_space.checksum());
+    let reindented = SqlMigration {
+        postgres: &["ALTER TABLE example\n    ADD COLUMN IF NOT EXISTS c TEXT\n    DEFAULT 'a  b'"],
+        ..DEFAULT_TWO_SPACES
+    };
+    assert_eq!(DEFAULT_TWO_SPACES.checksum(), reindented.checksum());
 }

@@ -212,9 +212,10 @@ Each migration is a Rust function that can dispatch different SQL based on the d
 Each migration has a checksum. Core migrations use a `sha256:<hex>` digest of
 their canonical DDL: every statement the migration executes on PostgreSQL,
 MySQL, and SQLite, in order, exactly as sent (MySQL index statements without
-`IF NOT EXISTS`), with runs of whitespace collapsed. Comments, formatting, and
-helper refactors in the Rust source do not change it; any change to an executed
-statement does. `V001`'s value is committed as `V001_BASELINE_CHECKSUM` and
+`IF NOT EXISTS`), with runs of whitespace outside quoted text and SQL comments
+collapsed. Quoted literals and identifiers and SQL comments are hashed byte for
+byte. Rust comments, formatting, and helper refactors do not change it; any
+change to an executed statement's content does. `V001`'s value is committed as `V001_BASELINE_CHECKSUM` and
 pinned by a golden test. Before any write, Ferrum
 first requires unique namespaces, unique version IDs in the inclusive
 `1..=2147483647` tracking-column range, and increasing
@@ -550,20 +551,47 @@ same error a real run returns. It never creates a backup or rewrites the file.
 From 1.0.0 onward, a core SQL schema change never edits `sql_dialect.rs`'s
 `V001` statements. Instead:
 
-1. Declare the next migration as a `SqlMigration` (`src/config/migrations/mod.rs`)
-   with the next unused `version`, a `name`, and the statements for each of
-   PostgreSQL, MySQL, and SQLite. Keep the dialects aligned the way the `V001`
-   baseline does. Use a dedicated `MigrationEntry` only when plain DDL is not
-   enough (for example a data backfill).
-2. Append it to `MigrationRunner::shipped_migrations()`. Never reorder, edit, or
-   remove a shipped entry; the next change is another migration.
+1. Declare the next migration as a `SqlMigration` constant
+   (`src/config/migrations/mod.rs`) with the next unused `version`, a `name`,
+   and the statements for each of PostgreSQL, MySQL, and SQLite. Keep the
+   dialects aligned the way the `V001` baseline does. Use a dedicated
+   `MigrationEntry` only when plain DDL is not enough (for example a data
+   backfill).
+2. Register it at the end of `MigrationRunner::shipped_migrations()` through
+   the same constructor the tests use. Never reorder, edit, or remove a
+   shipped entry; the next change is another migration.
+
+   ```rust
+   const V002_ADD_EXAMPLE: SqlMigration = SqlMigration {
+       version: 2,
+       name: "add_example",
+       postgres: &["CREATE TABLE IF NOT EXISTS example (id TEXT PRIMARY KEY)"],
+       mysql: &[
+           "CREATE TABLE IF NOT EXISTS example (id VARCHAR(64) NOT NULL PRIMARY KEY, note VARCHAR(255) NOT NULL)",
+           "DROP INDEX idx_example_note ON example",
+           "CREATE INDEX idx_example_note ON example (note)",
+       ],
+       sqlite: &["CREATE TABLE IF NOT EXISTS example (id TEXT PRIMARY KEY)"],
+   };
+
+   fn shipped_migrations() -> Vec<Box<dyn MigrationEntry>> {
+       vec![
+           Box::new(MigrationEntryV001(v001_initial_schema::V001InitialSchema)),
+           sql_migration_entry(V002_ADD_EXAMPLE),
+       ]
+   }
+   ```
+
 3. Make every statement safe to re-run after a partial failure: MySQL commits
    DDL implicitly and PostgreSQL runs these statements outside an explicit
    transaction, and the tracking row is written only after every statement
-   succeeds. Use `IF NOT EXISTS` forms where the dialect has them. On MySQL a
-   `CREATE [UNIQUE] INDEX` that hits duplicate-key-name error 1061 and a
-   two-token `DROP INDEX name ON table` that hits missing-key error 1091 are
-   tolerated, exactly as for `V001` and custom-plugin migrations.
+   succeeds. Use `IF NOT EXISTS` forms where the dialect has them. MySQL has
+   no `CREATE INDEX IF NOT EXISTS`, and a duplicate-key-name error (1061)
+   proves only that the name is taken, not that the index has the intended
+   definition, so forward migrations never tolerate it: write each MySQL
+   index as `DROP INDEX name ON table` (its missing-key error 1091 is
+   tolerated) followed by the exact `CREATE INDEX`, as above. A retry then
+   always rebuilds the intended definition.
 4. Update persistence, config types, validation, documentation, and OpenAPI
    where the changed field is exposed, and document the change in the release
    notes and upgrade guide.
@@ -663,31 +691,47 @@ For config files, restore from the `.backup.*` file that was created before the 
 ## MongoDB Migrations
 
 MongoDB does not use SQL migrations. Instead, `MongoStore::run_migrations()`
-applies the versioned index plan in `src/config/mongo_index_plan.rs` under the
-migration lease:
+(run by `database` / `cp` startup and `migrate up`) applies the versioned index
+plan in `src/config/mongo_index_plan.rs`:
 
-1. Read the recorded plan version from the `_ferrum_migrations` collection
-   (document `_id: "core_index_plan"`, field `version`). If it is newer than
-   the binary's `MONGO_INDEX_PLAN_VERSION`, refuse before any write: an older
-   binary must not run against a database a newer release upgraded. A record
-   that is not a positive integer is also refused.
-2. Create the guard collections.
-3. Drop, by exact name, each index in `RETIRED_MONGO_INDEXES` whose
-   `retired_in` version is above the recorded version (an index that is already
-   absent is fine). Nothing else is ever dropped.
-4. Ensure every planned index with idempotent `createIndex` operations.
-5. Seed the namespace registry, then record the plan version.
+1. Read the recorded plan state from the `_ferrum_migrations` collection
+   (document `_id: "core_index_plan"`: `version`, the last plan applied
+   completely, and `in_progress_version`, the target of an upgrade that has
+   started changing indexes but not finished). If either is newer than the
+   binary's `MONGO_INDEX_PLAN_VERSION`, refuse before any write, including the
+   migration-lease document: an older binary must not run against a database
+   a newer release upgraded or started upgrading. A record that is not a
+   positive integer is also refused.
+2. Take the migration lease and repeat that check under it.
+3. If this plan version is not yet recorded as applied, set
+   `in_progress_version` to it before the first schema change.
+4. Create the guard collections; drop, by exact name, each index in
+   `RETIRED_MONGO_INDEXES` whose `retired_in` version is above the recorded
+   version (an index that is already absent is fine; nothing else is ever
+   dropped); ensure every planned index with idempotent `createIndex`; seed
+   the namespace registry.
+5. Record the plan version and clear `in_progress_version` in one
+   single-document update.
 
-A failure before step 5 leaves the old version recorded, so the next run
-repeats the same idempotent forward step. A database with no record (fresh, or
-initialized by a release before 1.0.0) is treated as version 0. Conflicting
-existing index options still fail initialization: `createIndex` is a no-op only
-when the full index spec (keys + options) matches. Migrate dry-run prints the
-plan without connecting; migrate status connects, runs `listIndexes`, reports
-the recorded and binary plan versions and each required index as present,
-missing, or mismatched, plus whether the required guard-collection shells
-exist. Status also refuses a newer recorded plan version, and connectivity or
-authentication failures return nonzero.
+Before each drop and before the final record, the runner proves it still owns
+the migration lease (valid renewal and an owner-qualified lock document), so a
+runner that lost its lease stops instead of changing another runner's indexes.
+A failure before step 5 leaves the marker in place: an older binary keeps
+refusing the database, and a rerun of the same release resumes and finishes
+the same idempotent forward step. A database with no record (fresh, or
+initialized by a release before 1.0.0) is treated as version 0. Reconnecting
+to the primary or a failover URL reads the candidate database's plan state and
+keeps the current connection if the candidate was upgraded by a newer release.
+
+Conflicting existing index options still fail initialization: `createIndex` is
+a no-op only when the full index spec (keys + options) matches. Migrate
+dry-run prints the plan without connecting, including the plan version and
+every retirement it would drop (each only when the recorded version is below
+its `retired_in`). Migrate status connects, runs `listIndexes`, reports the
+recorded, in-progress, and binary plan versions and each required index as
+present, missing, or mismatched, plus whether the required guard-collection
+shells exist. Status refuses a newer applied or in-progress plan version, and
+connectivity or authentication failures return nonzero.
 
 ### Changing the MongoDB index plan
 
@@ -697,9 +741,10 @@ Each change bumps `MONGO_INDEX_PLAN_VERSION` by one in the release that makes it
 - **Drop an index:** remove it from the plan and add a `RetiredMongoIndex`
   with its exact index name and `retired_in` set to the new version.
 - **Replace an index** (new keys or options): retire the old name and add the
-  new definition. Retirements are dropped before the plan is ensured, so the
-  replacement may reuse the old name; a unique constraint is absent between
-  that drop and the create.
+  new definition under a new name. A planned index may never reuse a retired
+  name (the plan is rejected), so a definition that keeps the old keys needs
+  an explicit `name` option. This keeps a retried retirement from ever
+  dropping the replacement.
 
 Never edit an existing plan entry's keys or options in place (MongoDB refuses
 a same-key index with different options) and never edit or remove a shipped
