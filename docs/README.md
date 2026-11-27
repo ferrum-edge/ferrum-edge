@@ -17,7 +17,8 @@ Repository-root companions: [README.md](../README.md),
 |---|---|
 | [hardening.md](hardening.md) | **Production hardening checklist** — every surface, the setting that secures it, and the "never in production" list |
 | [threat_model.md](threat_model.md) | **Threat model** — trust boundaries, attacker capabilities, controls, and documented residuals |
-| [support_policy.md](support_policy.md) | **Support, versioning, and deprecation policy** — what a version number promises today and after 1.0 |
+| [support_policy.md](support_policy.md) | **Support, versioning, and deprecation policy** — SemVer surface, supported releases, deprecation periods, and the compatibility of each interface from 1.0.0 onward |
+| [known_limitations.md](known_limitations.md) | **Known limitations** — unsupported shapes, what happens instead, and the workaround, in one place |
 | [deliberate_decisions.md](deliberate_decisions.md) | **Deliberate decisions** — trade-offs made on purpose (bounded UDP amplification, strict admin `aud`, expired-CRL refusal, `panic = "abort"`, ...) and the tests that pin them |
 | [configuration.md](configuration.md) | The complete `FERRUM_*` environment variable reference and file-mode config format |
 
