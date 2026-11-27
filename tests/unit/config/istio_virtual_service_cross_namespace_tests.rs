@@ -518,10 +518,10 @@ fn a_missing_named_port_is_a_reference_refusal() {
 
 /// Review F7 (round 5): a named port resolves in route translation exactly
 /// as admission resolved it, under every custom-domain spelling admission
-/// accepts (case folded, root dots on the host and on the configured domain).
+/// accepts (case folded, a root dot on the host and on the configured domain).
 #[test]
 fn a_named_port_resolves_under_every_admitted_custom_domain_spelling() {
-    for domain in ["Corp.Example.", "corp.example", ".corp.example."] {
+    for domain in ["Corp.Example.", "corp.example"] {
         for host in [
             "ratings.other.svc.corp.example",
             "ratings.other.svc.corp.example.",

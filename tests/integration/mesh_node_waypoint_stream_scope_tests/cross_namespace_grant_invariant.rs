@@ -48,8 +48,8 @@ use super::super::mesh_test_support::{
     DEFAULT_NAMESPACE, policy_allow_principal, policy_deny_principal, workload_for,
 };
 use super::cross_namespace_routes::{
-    OTHER, RATINGS_OTHER, SOURCE_PREFIX, destination_rule, ninety_ten_spec, node_waypoint_runtime,
-    sidecar_runtime, slice_for, translated_with_grant, virtual_service,
+    OTHER, RATINGS_OTHER, SOURCE_PREFIX, destination_rule, node_waypoint_runtime, sidecar_runtime,
+    slice_for, translated_with_grant, virtual_service,
 };
 
 /// The VirtualService whose routes name the granted target.
@@ -99,8 +99,27 @@ fn fixture(with_grant: bool, with_entry: bool) -> GatewayConfig {
     let mut config = translated_with_grant(
         vec![
             // Names the granted target: a DestinationRule-governed 90/10
-            // split with a leg to `other/ratings`.
-            virtual_service("granted", ninety_ten_spec()),
+            // split with a leg to `other/ratings`, on its own path so it
+            // shadows no route the fixture serves without the grant.
+            virtual_service(
+                "granted",
+                json!({
+                    "hosts": ["reviews.default.svc.cluster.local"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/granted"}}],
+                        "route": [
+                            {"destination": {
+                                "host": "reviews.default.svc.cluster.local",
+                                "port": {"number": 8080}
+                            }, "weight": 90},
+                            {"destination": {
+                                "host": RATINGS_OTHER,
+                                "port": {"number": 8080}
+                            }, "weight": 10}
+                        ]
+                    }]
+                }),
+            ),
             // Names only `default/reviews`.
             virtual_service(
                 "local",
