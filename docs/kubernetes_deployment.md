@@ -874,7 +874,7 @@ spec:
       terminationGracePeriodSeconds: 110
       containers:
         - name: ferrum-edge
-          image: docker.io/ferrumedge/ferrum-edge:0.9.21
+          image: docker.io/ferrumedge/ferrum-edge:1.0.0
           imagePullPolicy: IfNotPresent
           args: ["run"]
           env:

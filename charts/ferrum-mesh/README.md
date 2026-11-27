@@ -57,7 +57,8 @@ the data planes cannot reach it.
 
 ## Container image tag
 
-The current `appVersion` is **0.9.21**, the published v0.9.21 release. The
+The current `appVersion` is **1.0.0**, the v1.0.0 release; until it is
+published, pin the published v0.9.21 tag. The
 shared tag feeds mesh/control-plane, injector sidecar/capture-init and
 CNI/node-agent images; explicit node-agent or injector overrides must match the same release.
 Existing `-ebpf` and `-ebpf-tools` selection still applies to capture paths.

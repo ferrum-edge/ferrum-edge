@@ -7,28 +7,203 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Security
+## [1.0.0] - 2026-11-27
 
+1.0.0 is the first stable release of Ferrum Edge. It follows published 0.9.21
+directly. From this release onward the
+[support policy](docs/support_policy.md) applies:
+
+- **Semantic versioning** over the declared public surface: `FERRUM_*`
+  environment variables and `ferrum.conf` keys, the file-mode and backup
+  document formats, the Admin API in `openapi.yaml`, the built-in plugin
+  configuration schemas, the transaction log schema, the Prometheus metric
+  contract, the CLI, the Helm chart values and the vocabularies published as
+  `contracts-edge-<version>`. Features labelled Beta or Experimental are
+  outside the GA promises, as the policy's maturity levels describe.
+- **Only the newest release is supported.** Every fix, security fixes of every
+  severity included, ships in the next patch or minor release cut from `main`;
+  there are no backports. 0.x releases are unsupported once 1.0.0 is published.
+- **Deprecation before removal.** A removed setting, field or endpoint is
+  deprecated for at least one minor release and 90 days and removed only in a
+  major release.
+- **Frozen schema, forward-only migrations.** The core SQL baseline `V001` is
+  frozen, and its identity is now derived from the DDL it executes. Later
+  schema changes ship as forward migrations (`V002`+), and MongoDB records a
+  versioned, forward-only index plan.
+
+Configuration was closed before the freeze. Unknown keys are refused in the
+nested objects of proxies, upstreams, native mesh resources and the remaining
+open Admin API request bodies instead of being silently dropped, and settings that were
+accepted but never applied are removed: `FERRUM_TLS_OFFLOAD_THREADS`,
+`FERRUM_UDP_GRO_ENABLED`, and the passive-health `gateway_error_codes` and
+`split_external_local_origin_errors` fields. The release also fixes database
+outage detection and SQL and MongoDB store defects, aligns the Admin API with
+`openapi.yaml`, and speeds up `key_auth`, the built-in plugins and TCP and
+WebSocket tunnel relays.
+
+Upgrading from 0.9.21 is a one-time step. Every PostgreSQL, MySQL, SQLite and
+MongoDB database created by a 0.9.x release is rebuilt from a validated logical
+backup, and the ConfigSync protocol revision is now 8, so the control plane and
+its data planes are upgraded together, control plane first. Read
+[Upgrading to 1.0.0](docs/upgrade_guide.md#upgrading-to-100) before updating
+gateways, control planes, mesh data planes, charts or contract consumers.
+
+### Security
 - **The `chrono` advisory exception (RUSTSEC-2026-0543, unmaintained, no
   known vulnerability) is extended from 2026-12-31 to 2027-03-31** in
-  `deny.toml` and the dependency-policy register. Issue #7419 Phases 2-16 have
-  moved most standalone uses to `time_compat`; the config model, persistence
-  layer and CP/DP, mesh, K8s and xDS consumers remain.
+  `deny.toml` and the dependency-policy register (#7526). Issue #7419 Phases
+  2-16 have moved most standalone uses to `time_compat`; the config model,
+  persistence layer and CP/DP, mesh, K8s and xDS consumers remain.
+- **Three other advisory exceptions were re-reviewed on 2026-11-27 and
+  re-affirmed until 2027-03-31** (#7520): RUSTSEC-2024-0436 (`paste`),
+  RUSTSEC-2024-0449 (`unsafe-libyaml`) and RUSTSEC-2026-0440
+  (`astral-tokio-tar`, a test-only dependency). All three are informational
+  "unmaintained" advisories with no patched release and no released parent
+  without them. The `unsafe-libyaml` exception now also describes opt-in
+  external `$ref` fetching for API specs as an input path.
+- **`kube` is updated to 5.2.0** (`kube-client`, `kube-core`, `kube-derive`,
+  `kube-runtime`; from 5.1.0, and from 5.0.0 in `fuzz/`) in the root, `fuzz/`
+  and `tests/performance/mesh/` lockfiles for RUSTSEC-2026-0600 (#7498). The
+  advisory affects kube's `openssl-tls` connector, which trusted OpenSSL's
+  default CA store in addition to the configured cluster CA. Ferrum builds kube
+  with `rustls-tls` only, so the affected connector was never compiled in; the
+  update keeps the dependency audit clean.
 - **`url` is updated from 2.5.8 to 2.5.9** (with `form_urlencoded` 1.2.2 ->
   1.2.3) in the root, `fuzz/`, and `tests/performance/mesh/` lockfiles to fix
-  RUSTSEC-2026-0592 (`Url::origin()` stack overflow on nested `blob:` URLs).
+  RUSTSEC-2026-0592 (`Url::origin()` stack overflow on nested `blob:` URLs)
+  (#7479).
+
+### Removed
+- **BREAKING:** `FERRUM_TLS_OFFLOAD_THREADS` and the unwired TLS handshake
+  offload runtime are removed (#7520). The variable was reserved and any
+  nonzero value already failed startup. A `ferrum.conf` that still sets the key
+  now fails with `Unknown ferrum.conf key`; set in the process environment, it
+  is ignored like any other unknown variable.
+- **BREAKING:** `FERRUM_UDP_GRO_ENABLED` is removed (#7524). It was documented
+  as reserved and was a no-op for every value: frontend UDP sockets never
+  enabled `UDP_GRO`. A `ferrum.conf` that still sets it now fails with
+  `Unknown ferrum.conf key`.
+- **BREAKING:** the passive-health fields
+  `health_checks.passive.gateway_error_codes` and
+  `split_external_local_origin_errors` are removed from the native config
+  schema and `openapi.yaml` (#7520). They were accepted and persisted but never
+  applied. Passive health keeps one failure bucket for HTTP status failures and
+  connection errors, exactly as before.
 
 ### Changed
-
+- **BREAKING (database):** the core SQL baseline `V001` is frozen for 1.0.0,
+  and schema changes from 1.0.0 onward ship as forward migrations (`V002`+)
+  (#7523). `V001`'s recorded checksum is now derived from the canonical DDL it
+  executes instead of Rust source text, so code refactors no longer change it;
+  the committed `V001_BASELINE_CHECKSUM` and a golden test pin it. A database
+  created by a 0.9.x release records a different `V001` identity and is
+  refused with a `checksum_mismatch` integrity error. Upgrade it once by
+  backup, fresh 1.0.0 database, and restore. An older binary refuses a
+  database that a newer release migrated (`kind=unknown_applied_version`).
+- **MongoDB applies a versioned, forward-only index plan** (#7523). `migrate
+  up` and startup record the plan version in `_ferrum_migrations`
+  (`_id: "core_index_plan"`), refuse a database recorded by a newer plan
+  (including an unfinished upgrade), and drop an old index only when a later
+  plan version retires it by name. `migrate status` reports the recorded and
+  binary plan versions. A database with no record, including one created by a
+  0.9.x release, is read as plan version 0 and is not refused;
+  rebuild-and-restore is still the only supported upgrade path for a 0.9.x
+  MongoDB database, because 1.0.0 rejects stored documents that carry removed or
+  unknown keys and no in-place conversion exists.
+- **BREAKING:** unknown keys are rejected in every nested object of the
+  configuration schema (#7520, #7524). This covers nested proxy and upstream
+  objects (`health_checks` and its `active` / `passive` blocks, `targets[]`,
+  `service_discovery` and its provider objects, `subsets[]` and their
+  `traffic_policy`, `port_overrides`, `locality_lb_setting`,
+  `hash_on_cookie_config`, `circuit_breaker`, `retry` and its `backoff` variant
+  body, `plugins[]`), every native mesh resource object (including the
+  `Workload` and `MeshService` inventory, which used to tolerate unknown
+  members, and the gateway trust-bundle objects that reuse them), and the
+  managed TLS, ACME, namespace and mesh egress-scope test Admin API request
+  bodies. Those request bodies must also be JSON objects: a positional array is
+  refused. Previously nested objects silently dropped unknown keys, so a typo
+  such as `health_checks.pasive` built a resource with that policy missing.
+  The Admin API, `/batch`, `POST /restore`, API-spec `x-ferrum-proxy` /
+  `x-ferrum-upstream`, file mode, `ferrum-edge validate`, mesh documents and
+  the MeshConfig ConfigMap, database and MongoDB loads and CP-to-DP sync
+  refuse such a key and name it. One exception: a MongoDB read of a stored
+  proxy projects each embedded `plugins[]` association onto its declared
+  members (`plugin_config_id`) before the strict decode, because deployment
+  mutations keep opaque association metadata in the store; such stored
+  metadata does not block a load, while the same member is still refused on
+  every write path. `openapi.yaml` marks every such schema
+  `additionalProperties: false`, including `Proxy`, `Upstream` and
+  `PluginConfigBase`, which were already strict at runtime. Free-form maps
+  (`labels`, plugin `config`, consumer `credentials`) stay open; built-in
+  plugin configs already rejected unknown keys.
+- **BREAKING:** ConfigSync protocol revision 8 (`<version>+configsync.r8`)
+  (#7520, #7524). Revision 7 removed the two passive-health fields and closed
+  the passive object; revision 8 closes the other nested proxy, upstream and
+  mesh objects. A 0.9.21
+  peer (`0.9.21+configsync.r6`) is refused at `Subscribe`, so the control
+  plane and its data planes must be upgraded together.
+- **BREAKING:** JSON documents with a repeated object member name are refused
+  by file-mode JSON config loading, the offline config backup loader
+  (`FERRUM_DB_CONFIG_BACKUP_PATH`) and config migration
+  (`FERRUM_MIGRATE_ACTION=config`) (#7487). They match YAML's existing
+  duplicate-key refusal instead of keeping the last value.
+- **Mesh / Istio:** Sidecar and NodeWaypoint data planes now refuse a
+  VirtualService weighted-split leg that names a Service in another namespace
+  even when no DestinationRule governs the split (#7528, issue #7499).
+  Previously such a leg could receive traffic when the slice modeled that
+  Service. This matches the existing refusal of cross-namespace direct,
+  dispatch-rule and DestinationRule-governed destinations. Routes naming the
+  split are removed, and the host keeps its plain Service route only where one
+  exists; a route the translator terminates unconditionally with a `404` keeps
+  that `404` with the refused split detached. A mesh-bound VirtualService
+  naming such destinations stays `FerrumAccepted`. Its condition message now
+  counts them, and `status.ferrum.translation.deferred_fields` lists each one
+  (budgeted, with zero-weight legs marked as omitted during translation),
+  judged against the controller's cluster domain, so keep
+  `FERRUM_K8S_CLUSTER_DOMAIN` equal to the data planes'
+  `FERRUM_MESH_CLUSTER_DOMAIN`.
+- **Istio DestinationRule `outlierDetection.splitExternalLocalOriginErrors:
+  true` is reported as a deferred field** (#7520): a translate-time warning
+  plus a tier-scoped `status.ferrum.translation.deferred_fields` entry. Ferrum
+  keeps one shared 5xx and local-origin bucket, which matches Istio's `false`
+  default, so `false` is not reported.
+- **`FERRUM_WORKER_THREADS` also sizes the relay shard pool** (#7506). In
+  serving modes, accepted TCP/TLS stream connections and upgraded HTTP/1.1
+  WebSocket tunnels are handed to a pool of per-core single-threaded runtimes
+  (`ferrum-relay-0..N-1`), sized from `FERRUM_WORKER_THREADS` or the host's
+  parallelism and clamped to `1..=64`, so a serving process runs that many
+  additional threads. The overload manager's event-loop probe measures the
+  relay shards as well as the main runtime workers.
+- **Admin API behaviour aligned with `openapi.yaml`** (#7491):
+  - `/live`, `/health` and `/status` answer only `GET` and `HEAD`.
+  - Role checks run before the `If-Match` / `?conditional=true` refusals on
+    `DELETE` and bodyless `POST` routes, so a caller without the write role
+    gets `403`, not `400`.
+  - `confirm` and `confirm_api_spec_deletion` query flags fail closed when any
+    repeated occurrence is not `true`, and query flags are parsed with full
+    form-URL decoding.
+  - `GET /metrics`, `GET /metrics/runtime` and backup serialization return
+    `500` on a serialization failure instead of `200` with `{}`.
+  - `POST /batch`'s pre-transaction `409` carries `"rollback": "not_needed"`,
+    matching `BatchAtomicFailureResponse`.
+  - `/api-specs` returns `503` for a transient database outage instead of
+    `500` (#7484).
+  - ACME order creation and renewal map an upstream CA or DNS failure to
+    `502`.
+  - Gateway trust-bundle IDs follow the shared resource-ID rules (at most 254
+    bytes).
+  - `openapi.yaml` status codes, schemas, headers and examples now match the
+    handlers; see #7491 for the list. Contract consumers pick these up from
+    the matching `contracts-edge` tag.
 - **Raw `^` in request paths is now forwarded to backends as `%5E`.** `url`
   2.5.9 added `^` to the WHATWG path percent-encode set, and Ferrum's direct
   HTTP/1.1 origin-form request-target builder now matches `url` 2.5.9 so
   backends receive `%5E` for a literal `^` in the path on both the direct
   HTTP/1.1 pool and the `reqwest` dispatch path (a `^` in the query string
-  remains literal).
-- **TLS events `since` filter: new 400 message text for an invalid timestamp**
-  (issue #7419, `chrono` replacement). The status code, error envelope and the
-  set of rejected inputs are unchanged; only the human-readable detail after
+  remains literal) (#7479).
+- **TLS events `since` filter: new 400 message text and a range limit**
+  (issue #7419, `chrono` replacement). An invalid timestamp still gets `400`
+  with the same error envelope, but the human-readable detail after
   `invalid since timestamp: ` now comes from Ferrum's timestamp parser instead
   of chrono's. A value chrono accepted whose UTC instant falls outside years
   -9999..=9999 is now rejected the same way, and a leap second (`:60`) is
@@ -41,16 +216,153 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (whose message is unchanged), a value chrono accepted whose UTC instant falls
   outside years -9999..=9999 is now rejected the same way, and a leap second
   (`:60`) is treated as the following second.
+  of chrono's. The filter parses the same syntax chrono did, with two
+  differences: a value whose UTC instant falls outside years -9999..=9999 is
+  now rejected with that `400` (for example `9999-12-31T23:59:59-00:01`, which
+  is in year 10000 in UTC), and a leap second (`:60`) is treated as the
+  following second.
+- **Timestamp parsing outside the TLS events filter follows the same two
+  rules** (issue #7419). Parse sites accept the same syntax chrono did, with
+  two differences: a leap second (`:60`) is stored as the following second, and
+  an instant chrono accepted outside years -9999..=9999 takes the site's normal
+  invalid-timestamp path: `response_caching` treats such an HTTP date header
+  as unparseable, `transaction_debugger` refuses such a `capture_expires_at`,
+  and `soap_ws_security` refuses a
+  `9999-12-31T23:59:60Z` leap second as out of range. Rendered timestamps of
+  in-range values are byte-identical.
+- Docs: the support, versioning and deprecation policy
+  (`docs/support_policy.md`) is adopted for Ferrum Edge 1.0.0 onward (#7521).
+  It also states the compatibility rules for CP/DP versions (identical build
+  required), the custom-plugin Rust API (unstable), the gRPC surfaces, the
+  ClickHouse charge schema, backup and config documents and the database
+  schema, and defines the GA, Beta and Experimental maturity levels.
+  `SECURITY.md` lists the supported 1.x releases.
+- Docs: the new `docs/known_limitations.md` lists unsupported shapes with
+  workarounds (#7521). The mesh product deferral index lists open issues
+  #7499, #7500, #7501 and #7503. ServiceWaypoint is described as an HBONE L4
+  relay with destination-scoped authorization that does not apply
+  VirtualService `http[]` routes or GAMMA HTTPRoute Service parents.
 
 ### Fixed
-
+- **Database outage detection and failover recovery** (#7484).
+  - A control plane whose every namespace failed to load reported a
+    successful full reload and marked the database available, so it skipped
+    failover reconnect and the config-source-unavailable signal. It now
+    treats that as an outage, while a partial failure still keeps each failed
+    namespace's last known good config.
+  - `database` and `cp` modes route every full-reload connectivity failure
+    through failover reconnect, including the offline-backup bootstrap,
+    forced full reloads and rejected-delta escalation.
+  - `GET /config/apply-status` no longer reports `unverifiable` when an admin
+    write commits on a newer topology epoch before the poll loop observes it,
+    and a stale sequence from a replaced topology no longer triggers spurious
+    poll nudges after failover.
+- **SQL store** (#7485).
+  - PostgreSQL `proxies.udp_max_response_amplification_factor` (`REAL`) was
+    decoded as absent; it is now read, and a value that cannot be decoded
+    fails closed.
+  - Incremental config loads read the change log and every changed resource
+    in one `REPEATABLE READ` snapshot, so a concurrent delete or update can no
+    longer produce a proxy with stripped plugin associations.
+  - HTTP route uniqueness in database mode is scoped by `listen_port`, as in
+    file mode and runtime validation, so the same `listen_path` on two
+    different listen ports is no longer refused with `409`. On MySQL,
+    `proxies.listen_path` and `_ferrum_plugin_migrations.plugin_name` use the
+    binary `utf8mb4_0900_bin` collation, so paths that differ only in case or
+    trailing spaces are distinct.
+  - Deleting a gateway trust bundle takes the config-change lock first, like
+    create, update, restore and rename, which removes an AB-BA deadlock.
+  - MySQL lease renewals in the same millisecond verify ownership instead of
+    reading `rows_affected() == 0` as a lost lease.
+  - Plugin associations are de-duplicated per namespace, config-change
+    compaction keeps its retention per namespace, a deterministic row-decode
+    error no longer tears down a healthy read-replica pool, and the consumer
+    credential index covers `(namespace, consumer_id)`.
+- **MongoDB store** (#7486, #7490).
+  - Full consumer loads sort on the `{namespace, _id}` index instead of an
+    unindexed field, which avoided MongoDB's 100 MiB in-memory sort limit. Key
+    and mTLS-identity uniqueness checks and the latest-sequence lookup now use
+    their indexes, and new indexes cover `consumer_identity_index` by consumer
+    and `api_specs` by ID.
+  - Transient transaction errors keep their retry labels through internal
+    error conversion, and a retried API-spec restore no longer appends
+    duplicate change-log rows.
+  - API-spec submit/replace, `batch_create_proxies` and atomic batch writes
+    take the route-bucket locks and apply route uniqueness and upstream
+    reference guards in their transaction. Orphan-upstream cleanup is scoped
+    by namespace and skips API-spec-owned upstreams. A lost compare-and-swap
+    on a trust-bundle update aborts instead of committing a change-log row.
+    Large consumer-identity and namespace deletes are chunked under the BSON
+    document limit.
+  - Change-log compaction is computed per namespace, and a compaction failure
+    no longer rolls back the committed write. Replica-set incremental loads
+    read in one snapshot transaction.
+- **Declarative config and reload** (#7487).
+  - A file that is deleted and recreated non-atomically while it is read is
+    retried as unstable instead of failing as not found.
+  - The offline backup loader strips the `conditional` envelope field that
+    `GET /backup?conditional=true` emits, and config migration accepts an
+    integer `version` (`version: 1`) like the file loader. Migrated files are
+    written atomically and keep their permissions.
+  - A reload that changes an HTTP proxy or upstream without changing its
+    `updated_at` now reconciles target health, DNS warmup, backend
+    capabilities, stream listeners, service discovery and active health
+    checks.
+  - Combined deltas no longer leave a dangling plugin association on a
+    modified proxy, and HMAC credential ownership on reload follows the same
+    `(namespace, id)` order as full database loads.
+  - `ferrum.conf` parsing strips a leading UTF-8 byte order mark and reads
+    `KEY = # comment` as an empty value. The Unix `SIGHUP` reload loop exits
+    cleanly instead of spinning when its signal stream closes.
+- **Admin API** (#7491).
+  - `PUT` on proxies, upstreams, plugin configs, consumers and gateway trust
+    bundles keeps the resource's original `created_at`.
+  - Failed restores and failed atomic deletes are audited as `failure` (or
+    `unknown_outcome`) instead of `success`.
+  - `PUT /api-specs/{id}` accepts generated `openapi_validator` /
+    `mcp_gateway` specs nested 33 to 64 levels deep instead of failing with
+    `500`, and an integer overflow in the capped gzip decoder is fixed.
+  - Typed managed-TLS and ACME `PUT` / `DELETE` are atomic against concurrent
+    changes. Control-plane and node-agent TLS delete guards and
+    `/admin/tls/inventory` see environment-configured TLS sources. Gateway SVID
+    rotation returns `404` when no gateway SVID is configured.
+  - `GET /admin/tls/acme/accounts` and the TLS inventory no longer block async
+    workers.
+- Docs: `contracts-edge-0.9.21` is recorded as published (2026-11-22); the
+  docs said it had not been cut (#7521).
 - The release workflow's SQLite volume smoke (`scripts/smoke_sqlite_volume.sh`) now
   resolves the container's configured `Config.User` (including distroless `nonroot`'s
   bare numeric `65532`) against `/etc/passwd` and `/etc/group` inside the image rather
   than assuming a bare UID or username's primary group, verifies that `/data` (with
   no setgid bit) and the created `/data/ferrum.db` are owned by `65532:65532` across
   migration and restart, and is exercised on pull requests against the published
-  image via `.github/workflows/sqlite-volume-smoke.yml`.
+  image via `.github/workflows/sqlite-volume-smoke.yml` (#7475, #7478).
+
+### Performance
+- **`key_auth` and the direct HTTP/1.1 streaming path** (#7471). An
+  authenticated request no longer spawns three extra tasks (upload pump,
+  response watchdog, deferred transaction logger), authenticated responses
+  keep their exact `Content-Length` so headers and body coalesce into one
+  write, header-only `key_auth` skips the request-header map copy, and
+  response headers are sanitized in place. On the comparison benchmark
+  `key_auth` throughput rose by about half, to within a few percent of plain
+  HTTP.
+- **Built-in plugin hot paths** (#7474). Among built-in plugins only the six
+  authorizing ones run the authorize phase, the per-proxy plugin lookup does
+  one map lookup instead of five, eleven more audited built-ins take the
+  request-header passthrough, and plugins with hooks that do nothing are skipped. Many plugins drop
+  per-request allocations, syscalls and lock contention, including
+  `compression` (small payloads compress inline), `rate_limiting`,
+  `response_caching`, `cors`, `waf`, `prometheus_metrics` and the AI request
+  guards. Custom plugins keep the conservative path.
+- **TCP/TLS and WebSocket tunnel relays run on per-core relay shards**
+  (#7506), so persistent byte relays no longer contend on the main runtime's
+  scheduler. On 4-vCPU benchmark runners this lifted 10 KB `tcp-tls` and `wss`
+  throughput past Envoy; 70 KB and 500 KB `tcp-tls` transfers trade a few
+  percent against the previous build.
+- **Admin API hot paths** (#7491). JWT verification keys and validation are
+  cached, `/metrics` verifies the token once, drift hashing streams into
+  SHA-256, and API-spec format conversion and gzip run off the async workers.
 
 ## [0.9.21] - 2026-11-21
 
@@ -15158,7 +15470,8 @@ published release notes.
   remediate these rows before upgrade; see the
   [Safe Upgrade Guide](docs/upgrade_guide.md#tcp-connection-throttle-validation-hardening).
 
-[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.21...HEAD
+[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.21...v1.0.0
 [0.9.21]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.20...v0.9.21
 [0.9.20]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.19...v0.9.20
 [0.9.19]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.17...v0.9.19
