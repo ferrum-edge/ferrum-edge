@@ -152,6 +152,7 @@ SUITE_PATTERNS: dict[str, list[str]] = {
         r"^\.github/scripts/live_suite_path_filter\.py$",
         r"^\.github/actions/package-ferrum-runtime-image/",
         r"^\.github/actions/setup-kubernetes-tools/",
+        r"^\.github/actions/(setup-rust-ci|setup-sccache|setup-fast-linker)/",
         r"^tests/k8s/mesh_e2e_service_waypoint/",
         *exact_path_patterns(MESH_E2E_SERVICE_WAYPOINT_CRD_FIXTURE_PATHS),
         r"^tests/k8s/lib/(live_assertions|spire)\.sh$",
@@ -249,6 +250,16 @@ SUITE_LOCAL_ACTION_DEPENDENCIES: dict[str, tuple[str, ...]] = {
         "setup-sccache",
     ),
     "cni-lifecycle": (
+        "package-ferrum-runtime-image",
+        "setup-fast-linker",
+        "setup-kubernetes-tools",
+        "setup-rust-ci",
+        "setup-sccache",
+    ),
+    # mesh-e2e-service-waypoint-live.yml runs setup-rust-ci (which runs
+    # setup-sccache and setup-fast-linker), package-ferrum-runtime-image and
+    # setup-kubernetes-tools.
+    "mesh-e2e-service-waypoint": (
         "package-ferrum-runtime-image",
         "setup-fast-linker",
         "setup-kubernetes-tools",
@@ -1402,6 +1413,10 @@ def self_test() -> int:
         ("mesh-e2e-service-waypoint", ["src/config_sources/k8s/gateway_api.rs"], True),
         ("mesh-e2e-service-waypoint", ["src/plugins/mesh_route_dispatch.rs"], True),
         ("mesh-e2e-service-waypoint", ["tests/k8s/mesh_e2e_sidecar/run.sh"], False),
+        ("mesh-e2e-service-waypoint", [".github/actions/setup-rust-ci/action.yml"], True),
+        ("mesh-e2e-service-waypoint", [".github/actions/setup-sccache/action.yml"], True),
+        ("mesh-e2e-service-waypoint", [".github/actions/setup-fast-linker/action.yml"], True),
+        ("mesh-e2e-service-waypoint", [".github/actions/setup-bpf-linker/action.yml"], False),
         ("mesh-e2e-service-waypoint", ["src/proxy/mod.rs"], False),
         ("mesh-e2e-service-waypoint", ["docs/mesh.md"], False),
         ("mesh-e2e-service-waypoint", ["Cargo.lock"], False),

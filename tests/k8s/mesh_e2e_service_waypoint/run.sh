@@ -236,9 +236,18 @@ record() {
 
 # ── secrets and CP/DP transport PKI ─────────────────────────────────────────
 
+# Every run deploys a FRESH fixture. The Deployments read per-run credentials
+# (admin JWT secret, CP/DP tokens, transport PKI) from Secrets at start, so
+# re-applying unchanged templates on a reused cluster would leave pods running
+# with the previous run's credentials. Delete any namespace a previous run
+# left behind before minting anything; on CI's fresh cluster this is a no-op.
 ensure_namespaces() {
   local ns
   for ns in "$NS" "$BETA_NS"; do
+    if kubectl --context "$CONTEXT" get namespace "$ns" >/dev/null 2>&1; then
+      log "deleting namespace $ns left by a previous run (fresh fixture per run)"
+      kubectl --context "$CONTEXT" delete namespace "$ns" --wait=true --timeout=300s
+    fi
     kubectl --context "$CONTEXT" create namespace "$ns" \
       --dry-run=client -o yaml | kubectl --context "$CONTEXT" apply -f -
   done
@@ -573,27 +582,40 @@ for pod in data.get("items", []):
 
 # ── admin and metrics helpers (waypoint admin binds loopback) ───────────────
 
+# Authenticated GET on a waypoint's loopback admin API. Prints the body and
+# succeeds only for a completed 2xx response (curl -f): an exec, transport or
+# HTTP failure returns non-zero so callers can never mistake it for data.
 waypoint_admin_get() {
   local path="$1" deploy="${2:-$WAYPOINT}" token
   token="$(mint_admin_jwt)"
   # shellcheck disable=SC2016
-  timeout 30 kubectl --context "$CONTEXT" -n "$NS" exec "deploy/$deploy" -c curl -- \
-    sh -c 'curl -s -m 10 -H "Authorization: Bearer $1" "http://127.0.0.1:15020$2"' \
-    sh "$token" "$path" 2>/dev/null || true
+  timeout "$(cap 30)" kubectl --context "$CONTEXT" -n "$NS" exec "deploy/$deploy" -c curl -- \
+    sh -c 'curl -fsS -m 10 -H "Authorization: Bearer $1" "http://127.0.0.1:15020$2"' \
+    sh "$token" "$path" 2>/dev/null
 }
 
 # Sum every sample of a Prometheus family, optionally filtered by one
-# `reason` label value. Prints 0 when the family is absent.
+# `reason` label value. A family absent from a VALIDATED scrape counts 0; a
+# failed scrape (exec/HTTP failure, or a body with no Prometheus TYPE line)
+# prints `scrape-failed`, which `delta` turns into `unknown` and every
+# assertion treats as a failure.
 metric_sum() {
-  local family="$1" reason="${2:-}"
-  waypoint_admin_get /metrics | python3 -c '
+  local family="$1" reason="${2:-}" body
+  if ! body="$(waypoint_admin_get /metrics)"; then
+    printf 'scrape-failed'
+    return 0
+  fi
+  printf '%s\n' "$body" | python3 -c '
 import re
 import sys
 
 family, reason = sys.argv[1], sys.argv[2]
 total = 0.0
+validated = False
 pattern = re.compile(r"^" + re.escape(family) + r"(\{(?P<labels>[^}]*)\})?\s+(?P<value>\S+)")
 for line in sys.stdin:
+    if line.startswith("# TYPE "):
+        validated = True
     match = pattern.match(line)
     if not match:
         continue
@@ -603,8 +625,9 @@ for line in sys.stdin:
     try:
         total += float(match.group("value"))
     except ValueError:
-        pass
-print(int(total))
+        print("scrape-failed")
+        sys.exit(0)
+print(int(total) if validated else "scrape-failed")
 ' "$family" "$reason"
 }
 
@@ -624,6 +647,20 @@ remaining() {
   printf '%s' "$left"
 }
 
+# min(n, remaining budget), at least 1: the cap for one bounded operation.
+# Before the L7 budget starts (deploy and binding phases) it is just n.
+cap() {
+  local want="$1" left
+  if (( PROBE_DEADLINE == 0 )); then
+    printf '%s' "$want"
+    return 0
+  fi
+  left="$(remaining)"
+  (( left < want )) && want="$left"
+  (( want < 1 )) && want=1
+  printf '%s' "$want"
+}
+
 # ── HBONE client ────────────────────────────────────────────────────────────
 #
 # One inner request through a fresh authenticated HTTP/2 CONNECT tunnel to the
@@ -638,7 +675,7 @@ hbone_request() {
   local url="$1" header="${2:-}" host_override="${3:-}" max_time="${4:-10}"
   local proxy_ip="${5:-$SWP_POD_IP}"
   # shellcheck disable=SC2016
-  timeout "$(( max_time + 20 ))" kubectl --context "$CONTEXT" -n "$NS" exec deploy/hbone-client -c curl -- \
+  timeout "$(cap $(( max_time + 20 )))" kubectl --context "$CONTEXT" -n "$NS" exec deploy/hbone-client -c curl -- \
     sh -c '
       url="$1"; header="$2"; host="$3"; proxy="$4"; max="$5"
       : >/tmp/hb 2>/dev/null || true
@@ -678,6 +715,13 @@ settle() {
     sleep 2
   done
   printf '%s' "$out"
+}
+
+settled_ok() {
+  local out="$1" rc code
+  rc="$(field "$out" 1)"
+  code="$(field "$out" 2)"
+  [[ "$rc" == "0" && "$code" == "200" ]]
 }
 
 # Up to N sequential inner requests, each over its own HBONE tunnel, classified
@@ -755,7 +799,7 @@ summary_of() {
 # (No backticks in these heredocs: they interpolate.)
 
 apply_split_virtual_service() {
-  kubectl --context "$CONTEXT" --request-timeout=60s apply -f - <<YAML
+  kubectl --context "$CONTEXT" --request-timeout="$(cap 60)s" apply -f - <<YAML
 apiVersion: networking.istio.io/v1
 kind: VirtualService
 metadata:
@@ -800,7 +844,7 @@ YAML
 # swsvc-v2's own policy: DENY requests carrying x-deny: true. swsvc-v1 has no
 # policy, so the same header on the v1 branch must still be served.
 apply_v2_authorization_policy() {
-  kubectl --context "$CONTEXT" --request-timeout=60s apply -f - <<YAML
+  kubectl --context "$CONTEXT" --request-timeout="$(cap 60)s" apply -f - <<YAML
 apiVersion: security.istio.io/v1
 kind: AuthorizationPolicy
 metadata:
@@ -820,7 +864,7 @@ YAML
 }
 
 apply_cross_namespace_virtual_service() {
-  kubectl --context "$CONTEXT" --request-timeout=60s apply -f - <<YAML
+  kubectl --context "$CONTEXT" --request-timeout="$(cap 60)s" apply -f - <<YAML
 apiVersion: networking.istio.io/v1
 kind: VirtualService
 metadata:
@@ -839,7 +883,7 @@ YAML
 }
 
 apply_reference_grant() {
-  kubectl --context "$CONTEXT" --request-timeout=60s apply -f - <<YAML
+  kubectl --context "$CONTEXT" --request-timeout="$(cap 60)s" apply -f - <<YAML
 apiVersion: gateway.networking.k8s.io/v1beta1
 kind: ReferenceGrant
 metadata:
@@ -864,7 +908,7 @@ vs_status_until() {
   verdict="missing - -"
   for _ in $(seq 1 60); do
     (( $(remaining) > 0 )) || break
-    json="$(timeout 20 kubectl --context "$CONTEXT" -n "$NS" get \
+    json="$(timeout "$(cap 20)" kubectl --context "$CONTEXT" -n "$NS" get \
       "virtualservices.networking.istio.io/$name" -o json 2>/dev/null || true)"
     printf '%s\n' "$json" > "$RESULTS_DIR/vs-$name-status.txt"
     verdict="$(printf '%s' "$json" | python3 -c '
@@ -900,7 +944,7 @@ binding_verdict() {
   local deploy="$1" json verdict _
   verdict="no-response"
   for _ in $(seq 1 60); do
-    json="$(waypoint_admin_get /service-waypoint/services "$deploy")"
+    json="$(waypoint_admin_get /service-waypoint/services "$deploy" || true)"
     printf '%s\n' "$json" > "$RESULTS_DIR/service-waypoint-services-$deploy.txt"
     verdict="$(printf '%s' "$json" | python3 -c '
 import json
@@ -912,14 +956,16 @@ try:
 except Exception:
     print("unparseable")
     sys.exit(0)
-names = sorted(
-    s.get("name") for s in doc.get("services") or [] if s.get("namespace") == ns
+# The FULL (namespace, name) set: an unexpected bound Service in any
+# namespace (for example beta/xsvc, which carries no waypoint label) fails.
+pairs = sorted(
+    "%s/%s" % (s.get("namespace"), s.get("name")) for s in doc.get("services") or []
 )
-want = sorted(["swsvc", "swsvc-v1", "swsvc-v2", "swx"])
-if doc.get("waypoint_name") == waypoint and names == want:
-    print("bound " + ",".join(names))
+want = sorted("%s/%s" % (ns, name) for name in ("swsvc", "swsvc-v1", "swsvc-v2", "swx"))
+if doc.get("waypoint_name") == waypoint and pairs == want:
+    print("bound " + ",".join(pairs))
 else:
-    print("unexpected waypoint=%s services=%s" % (doc.get("waypoint_name"), ",".join(names)))
+    print("unexpected waypoint=%s services=%s" % (doc.get("waypoint_name"), ",".join(pairs)))
 ' "$NS" "$WAYPOINT")"
     [[ "$verdict" == bound* ]] && break
     sleep 2
@@ -982,6 +1028,11 @@ probe_weighted_split() {
   local url="http://$FRONTEND_HOST:8080/" settled clean_before clean_after out
   settled="$(settle "$url" "" "$V1_MARKER|$V2_MARKER")"
   printf 'settle: %s\n' "$settled" > "$RESULTS_DIR/swp-split.txt"
+  if ! settled_ok "$settled"; then
+    record service_waypoint.virtual_service.weighted_split_90_10 fail hbone-client \
+      "swsvc-v1+swsvc-v2" "route never settled: ${settled//$'\t'/ }" swp-split.txt
+    return 0
+  fi
   clean_before="$(metric_sum ferrum_mesh_service_waypoint_l7_tunnel_terminations_total clean_close)"
   out="$(sample "$url" "$SPLIT_REQUESTS" "" "$SPLIT_V1_MIN" "$SPLIT_V1_MAX")"
   clean_after="$(metric_sum ferrum_mesh_service_waypoint_l7_tunnel_terminations_total clean_close)"
@@ -1001,7 +1052,12 @@ probe_weighted_split() {
 # Count non-reevaluation waypoint policy denies attributed to swsvc-v2's
 # policy (the `rule` names the AuthorizationPolicy).
 v2_policy_deny_count() {
-  waypoint_admin_get "/mesh/policy-denies/recent?limit=200" | python3 -c '
+  local body
+  if ! body="$(waypoint_admin_get "/mesh/policy-denies/recent?limit=200")"; then
+    printf 'scrape-failed'
+    return 0
+  fi
+  printf '%s\n' "$body" | python3 -c '
 import json
 import sys
 
@@ -1009,10 +1065,13 @@ policy = sys.argv[1]
 try:
     doc = json.load(sys.stdin)
 except Exception:
-    print(0)
+    print("scrape-failed")
+    sys.exit(0)
+if not isinstance(doc.get("grouped"), list):
+    print("scrape-failed")
     sys.exit(0)
 total = 0
-for group in doc.get("grouped") or []:
+for group in doc["grouped"]:
     if group.get("reevaluation"):
         continue
     if policy in (group.get("rule") or ""):
@@ -1032,7 +1091,7 @@ probe_header_and_branch_authz() {
   deny_before="$(v2_policy_deny_count)"
   # A second header rides as the inner request's own header line.
   # shellcheck disable=SC2016
-  denied="$(timeout 40 kubectl --context "$CONTEXT" -n "$NS" exec deploy/hbone-client -c curl -- \
+  denied="$(timeout "$(cap 40)" kubectl --context "$CONTEXT" -n "$NS" exec deploy/hbone-client -c curl -- \
     sh -c '
       : >/tmp/hd
       rc=0
@@ -1044,7 +1103,7 @@ probe_header_and_branch_authz() {
     ' sh "$url" "https://$SWP_POD_IP:15008" 2>/dev/null || printf 'EXECFAIL\t000\t\n')"
   deny_after="$(v2_policy_deny_count)"
   # shellcheck disable=SC2016
-  stable="$(timeout 40 kubectl --context "$CONTEXT" -n "$NS" exec deploy/hbone-client -c curl -- \
+  stable="$(timeout "$(cap 40)" kubectl --context "$CONTEXT" -n "$NS" exec deploy/hbone-client -c curl -- \
     sh -c '
       : >/tmp/hv
       rc=0
@@ -1105,47 +1164,96 @@ probe_host_spoof() {
 }
 
 # Cross-namespace destination: refused without a ReferenceGrant, admitted with
-# one, withdrawn after it is deleted. "Reached" means a completed 200 with the
-# beta backend's marker through the swx frontend.
-xns_reached() {
-  local out rc code body
-  out="$(hbone_request "http://$XNS_FRONTEND_HOST:8080/" "" "" 10)"
+# one, withdrawn after it is deleted. One request through the swx frontend is
+# classified as exactly one of:
+#   reached          a completed 200 with the beta backend's marker
+#   refused          a completed response (curl exit 0) with a gateway status
+#                    (403/404/502/503) and no beta marker: an OBSERVED refusal
+#   error:<rc>/<code> anything else (exec or transport failure, timeout, other
+#                    status), which is never evidence of either
+xns_classify() {
+  local proxy_ip="${1:-$SWP_POD_IP}" out rc code body
+  if (( $(remaining) <= 0 )); then
+    printf 'error:deadline'
+    return 0
+  fi
+  out="$(hbone_request "http://$XNS_FRONTEND_HOST:8080/" "" "" 10 "$proxy_ip")"
   rc="$(field "$out" 1)"
   code="$(field "$out" 2)"
   body="$(field "$out" 3)"
-  [[ "$rc" == "0" && "$code" == "200" && "$body" == "$XSVC_MARKER" ]]
+  if [[ "$rc" == "0" && "$code" == "200" && "$body" == "$XSVC_MARKER" ]]; then
+    printf 'reached'
+    return 0
+  fi
+  if [[ "$rc" == "0" && "$body" != "$XSVC_MARKER" ]]; then
+    case "$code" in
+      403|404|502|503)
+        printf 'refused'
+        return 0
+        ;;
+    esac
+  fi
+  printf 'error:%s/%s' "$rc" "$code"
 }
 
-# Retry until the reachability equals `want` (reached|unreached).
-xns_until() {
-  local want="$1" now
+# N consecutive requests must ALL be observed refusals (no retries): used
+# where the destination was never admitted, so any reach or error fails.
+xns_all_refused() {
+  local n="$1" proxy_ip="${2:-$SWP_POD_IP}" i verdict seen=""
+  for (( i = 0; i < n; i++ )); do
+    verdict="$(xns_classify "$proxy_ip")"
+    seen="$seen $verdict"
+    [[ "$verdict" == "refused" ]] || { printf 'not-refused:%s' "$seen"; return 0; }
+  done
+  printf 'refused:%s' "$seen"
+}
+
+# Retry until the first observed reach, within the budget.
+xns_until_reached() {
+  local verdict="error:deadline"
   while (( $(remaining) > 0 )); do
-    now=unreached
-    xns_reached && now=reached
-    [[ "$now" == "$want" ]] && { printf '%s' "$now"; return 0; }
+    verdict="$(xns_classify)"
+    [[ "$verdict" == "reached" ]] && break
     sleep 2
   done
-  printf '%s' "${now:-unreached}"
+  printf '%s' "$verdict"
+}
+
+# After a withdrawal the data plane converges asynchronously: retry until N
+# CONSECUTIVE observed refusals (a reach or an error resets the run), and
+# fail with the last observation if the budget expires first.
+xns_until_refused() {
+  local n="$1" run=0 verdict="error:deadline" seen=""
+  while (( $(remaining) > 0 )); do
+    verdict="$(xns_classify)"
+    seen="$seen $verdict"
+    if [[ "$verdict" == "refused" ]]; then
+      run=$(( run + 1 ))
+      (( run >= n )) && { printf 'refused:%s' "${seen: -200}"; return 0; }
+    else
+      run=0
+      sleep 2
+    fi
+  done
+  printf 'not-converged:%s' "${seen: -200}"
 }
 
 probe_cross_namespace() {
   log "probing the cross-namespace destination and its ReferenceGrant"
   local diagnostics="$RESULTS_DIR/swp-cross-namespace.txt" ok=true s1 s2 s3 r1 r2 r3
-  kubectl --context "$CONTEXT" -n "$BETA_NS" delete referencegrant "$REFERENCE_GRANT" \
-    --ignore-not-found >/dev/null 2>&1 || true
+  timeout "$(cap 60)" kubectl --context "$CONTEXT" -n "$BETA_NS" delete referencegrant \
+    "$REFERENCE_GRANT" --ignore-not-found >/dev/null 2>&1 || true
   apply_cross_namespace_virtual_service > "$diagnostics" 2>&1 || ok=false
 
   s1="$(vs_status_until "$XNS_VS" rejected)"
-  # Rejected + never reached: sample a few times after the status settled.
-  r1=unreached
-  local _
-  for _ in 1 2 3 4 5; do xns_reached && r1=reached; done
+  # Never admitted: five requests, each an observed refusal.
+  r1="$(xns_all_refused 5)"
   printf 'phase1 (no grant): status=%s reach=%s\n' "$s1" "$r1" >> "$diagnostics"
-  [[ "${s1%% *}" == "False" && "$s1" == *" RefNotPermitted "* && "$r1" == "unreached" ]] || ok=false
+  [[ "${s1%% *}" == "False" && "$s1" == *" RefNotPermitted "* && "$r1" == refused:* ]] || ok=false
 
   apply_reference_grant >> "$diagnostics" 2>&1 || ok=false
   s2="$(vs_status_until "$XNS_VS" accepted)"
-  r2="$(xns_until reached)"
+  r2="$(xns_until_reached)"
   printf 'phase2 (grant applied): status=%s reach=%s\n' "$s2" "$r2" >> "$diagnostics"
   [[ "${s2%% *}" == "True" && "$r2" == "reached" ]] || ok=false
 
@@ -1153,29 +1261,20 @@ probe_cross_namespace() {
   # only ferrum: the beta leg must stay refused there. A refusal is a
   # completed response (curl exit 0) with a gateway status and no beta
   # marker, never a timeout or a transport error.
-  local narrow_ok=true narrow_out narrow_rc narrow_code narrow_body narrow_seen=""
-  for _ in 1 2 3 4 5; do
-    narrow_out="$(hbone_request "http://$XNS_FRONTEND_HOST:8080/" "" "" 10 "$SWP_NARROW_POD_IP")"
-    narrow_rc="$(field "$narrow_out" 1)"
-    narrow_code="$(field "$narrow_out" 2)"
-    narrow_body="$(field "$narrow_out" 3)"
-    narrow_seen="$narrow_seen rc=$narrow_rc/$narrow_code"
-    case "$narrow_code" in
-      403|404|502|503) ;;
-      *) narrow_ok=false ;;
-    esac
-    [[ "$narrow_rc" == "0" && "$narrow_body" != "$XSVC_MARKER" ]] || narrow_ok=false
-  done
-  printf 'phase2 narrow replica (token ns=%s only):%s refused=%s\n' "$NS" "$narrow_seen" \
-    "$narrow_ok" >> "$diagnostics"
+  local narrow_ok=false narrow_seen
+  narrow_seen="$(xns_all_refused 5 "$SWP_NARROW_POD_IP")"
+  [[ "$narrow_seen" == refused:* ]] && narrow_ok=true
+  printf 'phase2 narrow replica (token ns=%s only): %s\n' "$NS" "$narrow_seen" >> "$diagnostics"
   [[ "$narrow_ok" == "true" ]] || ok=false
 
-  kubectl --context "$CONTEXT" -n "$BETA_NS" delete referencegrant "$REFERENCE_GRANT" \
-    >> "$diagnostics" 2>&1 || ok=false
+  timeout "$(cap 60)" kubectl --context "$CONTEXT" -n "$BETA_NS" delete referencegrant \
+    "$REFERENCE_GRANT" >> "$diagnostics" 2>&1 || ok=false
   s3="$(vs_status_until "$XNS_VS" rejected)"
-  r3="$(xns_until unreached)"
+  # The withdrawal converges asynchronously: three consecutive observed
+  # refusals within the budget.
+  r3="$(xns_until_refused 3)"
   printf 'phase3 (grant deleted): status=%s reach=%s\n' "$s3" "$r3" >> "$diagnostics"
-  [[ "${s3%% *}" == "False" && "$r3" == "unreached" ]] || ok=false
+  [[ "${s3%% *}" == "False" && "$s3" == *" RefNotPermitted "* && "$r3" == refused:* ]] || ok=false
 
   log "cross-namespace: no-grant=[$s1/$r1] grant=[$s2/$r2] narrow-token=[$narrow_ok:$narrow_seen] deleted=[$s3/$r3]"
   if [[ "$ok" == "true" ]]; then
@@ -1200,7 +1299,7 @@ probe_fence_revocation() {
   fence_before="$(metric_sum ferrum_mesh_service_waypoint_l7_tunnel_terminations_total fence_revoked)"
 
   # shellcheck disable=SC2016
-  timeout 150 kubectl --context "$CONTEXT" -n "$NS" exec deploy/hbone-client -c curl -- \
+  timeout "$(cap 150)" kubectl --context "$CONTEXT" -n "$NS" exec deploy/hbone-client -c curl -- \
     sh -c '
       rc=0
       curl -sS -v -m 120 -o /tmp/held.body --proxy "$2" --proxy-http2 --proxytunnel \
@@ -1213,6 +1312,7 @@ probe_fence_revocation() {
   local held_pid=$!
 
   for _ in $(seq 1 30); do
+    (( $(remaining) > 0 )) || break
     sample_active="$(metric_sum ferrum_mesh_service_waypoint_l7_tunnels_active)"
     if [[ "$sample_active" =~ ^[0-9]+$ ]] && (( sample_active > active )); then
       active="$sample_active"
@@ -1223,8 +1323,8 @@ probe_fence_revocation() {
   METRIC_ACTIVE_MAX="$active"
   printf 'l7_tunnels_active observed while held: %s\n' "$active" > "$diagnostics"
 
-  kubectl --context "$CONTEXT" -n "$NS" label service swsvc-v1 istio.io/use-waypoint- \
-    >> "$diagnostics" 2>&1 || true
+  timeout "$(cap 60)" kubectl --context "$CONTEXT" -n "$NS" label service swsvc-v1 \
+    istio.io/use-waypoint- >> "$diagnostics" 2>&1 || true
   local started ended
   started="$(date +%s)"
   wait "$held_pid" || true
@@ -1305,13 +1405,31 @@ run_l7_probes() {
       return 0
       ;;
   esac
-  probe_weighted_split
-  probe_header_and_branch_authz
-  probe_host_spoof
-  probe_cross_namespace
-  # Last: it withdraws swsvc-v1's binding.
-  probe_fence_revocation
+  run_phase 60 service_waypoint.virtual_service.weighted_split_90_10 probe_weighted_split
+  run_phase 60 service_waypoint.virtual_service.header_match_and_per_branch_authz \
+    probe_header_and_branch_authz
+  run_phase 30 service_waypoint.virtual_service.host_spoof_rejected probe_host_spoof
+  run_phase 120 service_waypoint.virtual_service.cross_namespace_reference_grant \
+    probe_cross_namespace
+  # Last: it withdraws swsvc-v1's binding. It needs room for the held request
+  # (curl -m 120) plus the revocation window.
+  run_phase 170 service_waypoint.hbone.fence_revocation_on_binding_withdrawal \
+    probe_fence_revocation
   record_metrics_row
+}
+
+# Run one probe only if at least `min_secs` of the L7 budget remain;
+# otherwise record its row as failed instead of running it past the deadline.
+run_phase() {
+  local min_secs="$1" assertion_id="$2" probe="$3" left
+  left="$(remaining)"
+  if (( left < min_secs )); then
+    log "not running $probe: ${left}s of the L7 budget left (needs ${min_secs}s)"
+    record "$assertion_id" fail "$WAYPOINT" "" \
+      "deadline: ${left}s of the ${PROBE_BUDGET_SECS}s L7 budget left, phase needs ${min_secs}s"
+    return 0
+  fi
+  "$probe"
 }
 
 # ── diagnostics + gate ──────────────────────────────────────────────────────

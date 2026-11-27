@@ -59,18 +59,25 @@ Each run writes `target/mesh-e2e-service-waypoint/live-assertions.json`
 
 | Assertion | Proof |
 |---|---|
-| `service_waypoint.binding.bound_services_projected` | `GET /service-waypoint/services` on both waypoint replicas names `swp` and exactly the four bound Services (required in every run, including the adoption window below) |
+| `service_waypoint.binding.bound_services_projected` | `GET /service-waypoint/services` on both waypoint replicas names `swp` and exactly the four bound `(namespace, name)` pairs; any other Service in any namespace fails (required in every run, including the adoption window below) |
 | `service_waypoint.status.mesh_http_routes_reported` | the split VirtualService reports `FerrumAccepted=True` with `status.ferrum.translation.mesh_http_routes: sidecar_node_and_service_waypoint` |
 | `service_waypoint.virtual_service.weighted_split_90_10` | **1000** inner requests, each over its own HBONE tunnel to the `swsvc` host, all complete (curl exit 0) with 200 from a leg, with the `swsvc-v1` count in **[850, 950]** (the design's 85-95%). With `X ~ Binomial(1000, 0.9)` (sd 9.49) that is +-5.3 sd: `P(X<850)=2.8e-7`, `P(X>950)=2.8e-9`; 100/0, 50/50 and a 96/4 drift fail. The sample stops as soon as it can no longer pass |
 | `service_waypoint.virtual_service.header_match_and_per_branch_authz` | all **100** `x-canary: true` requests reach `swsvc-v2`; `x-canary: true` + `x-deny: true` is refused **403** by swsvc-v2's own AuthorizationPolicy (`targetRefs` Service `swsvc-v2`, DENY on `request.headers[x-deny]`) and the waypoint's `GET /mesh/policy-denies/recent` records the deny for that policy; `x-stable: true` + `x-deny: true` is still served by `swsvc-v1` (no policy) |
 | `service_waypoint.virtual_service.host_spoof_rejected` | CONNECT to `swsvc` with inner `Host: swsvc-v2...:8080` returns **403** and no backend marker |
-| `service_waypoint.virtual_service.cross_namespace_reference_grant` | the `swx` VirtualService to `xsvc.beta` reports `FerrumAccepted=False` reason `RefNotPermitted` and never reaches `xsvc` without a ReferenceGrant; with a ReferenceGrant in `beta` it reports `True` and reaches `xsvc` through `swp` (token `ns` covers `beta`), while `swp-narrow` (token `ns` = `ferrum`) keeps refusing it — five completed responses (curl exit 0) with `403`/`404`/`502`/`503` and no `xsvc` marker, never a timeout; after deleting the grant it is refused and unreachable again |
+| `service_waypoint.virtual_service.cross_namespace_reference_grant` | the `swx` VirtualService to `xsvc.beta` reports `FerrumAccepted=False` reason `RefNotPermitted` and never reaches `xsvc` without a ReferenceGrant; with a ReferenceGrant in `beta` it reports `True` and reaches `xsvc` through `swp` (token `ns` covers `beta`), while `swp-narrow` (token `ns` = `ferrum`) keeps refusing it; after deleting the grant the status is `RefNotPermitted` again and three consecutive requests are refused. Each request is classified as reached (200 + marker), an observed refusal (curl exit 0, `403`/`404`/`502`/`503`, no marker) or an error; an error or timeout is never counted as a refusal, the never-admitted phases need five refusals in a row, and the withdrawal must converge inside the budget |
 | `service_waypoint.hbone.fence_revocation_on_binding_withdrawal` | an inner `GET /slow` on `swsvc-v1` (the backend answers after 90 s) is held over an L7 tunnel; removing `istio.io/use-waypoint` from `swsvc-v1` cuts it with `RST_STREAM(CONNECT_ERROR)` in under 80 s and moves `ferrum_mesh_hbone_tunnel_revocations_total` |
 | `service_waypoint.metrics.l7_families_moved` | `ferrum_mesh_service_waypoint_l7_tunnels_active` is at least 1 while the tunnel is held; `ferrum_mesh_service_waypoint_l7_tunnel_terminations_total` moves for `reason="clean_close"` over the split sample and `reason="fence_revoked"` over the withdrawal; `ferrum_mesh_service_waypoint_route_refusals_total{reason="host_mismatch"}` moves over the spoof probe; the HBONE revocation counter moves over the withdrawal |
 
 The fence-revocation probe runs last because it withdraws `swsvc-v1`'s
-binding. All L7 probes share a 1500 s budget; every request is bounded by
-`curl -m`.
+binding. All L7 probes share a 1500 s budget: a phase that cannot start with
+enough budget left records its row as failed, every Kubernetes mutation and
+in-pod request is capped by the remaining budget, and every request is also
+bounded by `curl -m`. Metric deltas need a successful, authenticated scrape
+(containing Prometheus `# TYPE` lines) on both sides; a failed scrape fails
+the row rather than counting as zero.
+
+Every run deploys a fresh fixture: namespaces a previous run left on a reused
+cluster are deleted before the per-run credentials are minted.
 
 ## Adoption window (until #7500 / #7501 ship)
 
