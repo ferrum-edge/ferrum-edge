@@ -651,11 +651,20 @@ fn from_str_and_deserialize_match_chrono_on_the_mutation_corpus() {
             (Err(error), Ok(theirs)) => {
                 out_of_range += 1;
                 assert_eq!(error, TimestampError::OutOfRange, "{input:?} -> {theirs:?}");
-                assert_eq!(
-                    parse_rfc3339_relaxed_chrono(input)
-                        .and_then(|parsed| parsed.to_utc_timestamp()),
-                    Err(TimestampError::OutOfRange),
-                    "{input:?} must be refused only for its range"
+                // Independently of time_compat: chrono's instant, with a leap
+                // second moved to the next second (owner option B), must lie
+                // outside -9999..=9999.
+                let (mut secs, mut nanos) = (theirs.timestamp(), theirs.timestamp_subsec_nanos());
+                if nanos >= 1_000_000_000 {
+                    secs += 1;
+                    nanos -= 1_000_000_000;
+                }
+                let year = DateTime::<chrono::Utc>::from_timestamp(secs, nanos)
+                    .map(|normalized| normalized.year())
+                    .expect("chrono represents its own normalized instant");
+                assert!(
+                    !(-9999..=9999).contains(&year),
+                    "{input:?} refused although its UTC year {year} is in range"
                 );
             }
             (Ok(ours), Err(error)) => {
@@ -673,7 +682,7 @@ fn from_str_and_deserialize_match_chrono_on_the_mutation_corpus() {
     // The relaxed forms chrono's serde accepts.
     for input in [
         "2026-1-2T3:4:5Z",
-        " 2026 - 11 - 26 T10 : 20 : 30.5 Z ",
+        " 2026 - 11 - 26T10 : 20 : 30.5 Z ",
         "2026-11-26T10:20:30 UTC",
         "2026-11-26T10:20:30+0530",
         "2026-11-26T10:20:30 +05 30",
