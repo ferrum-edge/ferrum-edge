@@ -20800,7 +20800,10 @@ extensionProviders:
         // port name but different port numbers; lookup must resolve against
         // the namespace embedded in the destination host, not the first match.
         let svc_default = service_with_named_ports("reviews", "default", &[("http", 8080)]);
-        let svc_prod = service_with_named_ports("reviews", "prod", &[("http", 9090)]);
+        let mut svc_prod = service_with_named_ports("reviews", "prod", &[("http", 9090)]);
+        // Selector-backed, so the EndpointSlice attribution a cross-namespace
+        // destination needs (issue #7499) admits it with pod discovery off.
+        svc_prod.spec["selector"] = serde_json::json!({"app": "reviews"});
         let vs_default = virtual_service_with_destination(
             "reviews-default",
             serde_json::json!({
@@ -20815,11 +20818,26 @@ extensionProviders:
                 "port": {"name": "http"}
             }),
         );
-        // Cross-namespace destination is allowed: VS in `default` pointing at
-        // a Service in `prod` — must resolve to the prod port number.
+        // Cross-namespace destination admitted by a ReferenceGrant in `prod`
+        // (issue #7499): VS in `default` pointing at a Service in `prod` —
+        // must resolve to the prod port number.
         vs_prod.metadata.namespace = "default".to_string();
+        let grant = object_with_metadata(
+            "ReferenceGrant",
+            "gateway.networking.k8s.io/v1beta1",
+            "allow-default-virtual-services",
+            "prod",
+            serde_json::json!({
+                "from": [{
+                    "group": "networking.istio.io",
+                    "kind": "VirtualService",
+                    "namespace": "default"
+                }],
+                "to": [{"group": "", "kind": "Service", "name": "reviews"}]
+            }),
+        );
         let result = translate_k8s_objects(
-            &[svc_default, svc_prod, vs_default, vs_prod],
+            &[svc_default, svc_prod, grant, vs_default, vs_prod],
             options().with_source_namespaces(vec!["default".to_string(), "prod".to_string()]),
         )
         .expect("translation succeeds");
