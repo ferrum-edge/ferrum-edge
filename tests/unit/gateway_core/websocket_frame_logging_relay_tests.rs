@@ -275,7 +275,7 @@ fn session_meta(connection_id: u64) -> ferrum_edge::proxy::WsSessionMeta {
         8000,
         None,
         ferrum_edge::plugins::MetadataMap::default(),
-        chrono::Utc::now(),
+        ferrum_edge::time_compat::UtcTimestamp::now(),
     );
     meta.connection_id = connection_id;
     meta
