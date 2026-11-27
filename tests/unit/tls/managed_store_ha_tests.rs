@@ -443,3 +443,102 @@ fn a_refused_precondition_changes_nothing_on_any_write_path() {
         .expect("removed");
     assert_eq!(removed.ca_bundle_pem.as_deref(), Some("rotated"));
 }
+
+/// Review F1/F3: the existing-record rules and a lapsed delete fence answer
+/// before the caller's precondition, so a stale tag never hides them.
+#[test]
+fn existing_record_rules_and_a_lapsed_fence_take_precedence_over_the_precondition() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = ManagedTlsStore::open(dir.path()).expect("open");
+    store
+        .upsert(ca_record("shared-id", "ca"), false)
+        .expect("seed CA bundle");
+
+    // A cross-kind overwrite is the documented 409, whatever the tag says.
+    let crl = ManagedTlsRecord::new_crl(
+        "shared-id".to_string(),
+        "shared-id".to_string(),
+        None,
+        "crl".to_string(),
+    );
+    assert!(matches!(
+        store.upsert_if(crl, true, |_| false),
+        Err(ManagedTlsError::KindConflict { .. })
+    ));
+    // So is an existing id without `allow_overwrite`.
+    assert!(matches!(
+        store.upsert_if(ca_record("shared-id", "other"), false, |_| false),
+        Err(ManagedTlsError::AlreadyExists(_))
+    ));
+    // And a typed update of another kind.
+    let crl = ManagedTlsRecord::new_crl(
+        "shared-id".to_string(),
+        "shared-id".to_string(),
+        None,
+        "crl".to_string(),
+    );
+    assert!(matches!(
+        store.update_existing_if(crl, |_| false),
+        Err(ManagedTlsError::KindConflict { .. })
+    ));
+
+    // A delete whose authorization fence lapsed reports that (`Ok(None)`,
+    // answered as 503), never a stale-tag refusal.
+    assert!(matches!(
+        store.delete_kind_if_authorized_and(
+            "shared-id",
+            ManagedTlsMaterialKind::CaBundle,
+            |_| false,
+            || false,
+        ),
+        Ok(None)
+    ));
+    assert!(store.get("shared-id").is_ok(), "nothing was removed");
+}
+
+/// Review F4: every successful write stamps a revision the record never had,
+/// so a same-material replacement whose clock repeats `updated_at` — and a
+/// delete-then-recreate — still change the stored representation the Admin
+/// API `ETag` is computed over.
+#[test]
+fn every_write_stamps_a_new_revision_independent_of_the_clock() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = ManagedTlsStore::open(dir.path()).expect("open");
+    let created = store
+        .upsert(ca_record("same-material", "pem"), false)
+        .expect("create");
+    assert!(created.revision > 0, "a create is stamped");
+    let seen = store.get("same-material").expect("read");
+    assert_eq!(seen.revision, created.revision, "the stamp is persisted");
+
+    let replaced = store
+        .update_existing_if(ca_record("same-material", "pem"), |_| true)
+        .expect("same-material replacement");
+    assert!(replaced.revision > seen.revision);
+
+    // Pin the clock-derived fields to the earlier read: the representation
+    // still differs, so an earlier tag can never match after a write.
+    let mut pinned = store.get("same-material").expect("read back");
+    pinned.updated_at = seen.updated_at;
+    pinned.created_at = seen.created_at;
+    assert_ne!(
+        serde_json::to_value(&pinned).expect("serialize"),
+        serde_json::to_value(&seen).expect("serialize"),
+        "a same-material replacement must change the tagged representation \
+         even when the clock repeats"
+    );
+
+    let overwritten = store
+        .upsert(ca_record("same-material", "pem"), true)
+        .expect("same-material overwrite");
+    assert!(overwritten.revision > replaced.revision);
+
+    store.delete("same-material").expect("delete");
+    let recreated = store
+        .upsert(ca_record("same-material", "pem"), false)
+        .expect("recreate");
+    assert!(
+        recreated.revision > overwritten.revision,
+        "a recreate never reuses a revision the deleted record had"
+    );
+}

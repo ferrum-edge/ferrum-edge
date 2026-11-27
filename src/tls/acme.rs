@@ -171,6 +171,13 @@ pub struct AcmeCertificateRecord {
     pub not_after: Option<UtcTimestamp>,
     pub created_at: UtcTimestamp,
     pub updated_at: UtcTimestamp,
+    /// Store version of the commit that last wrote this record (`0` for a
+    /// record not yet written through a store that stamps it). Every
+    /// successful create or replacement, renewal included, stamps a value the
+    /// record never had before, so the Admin API `ETag` (which covers it)
+    /// changes on every write even when material and clock repeat.
+    #[serde(default)]
+    pub revision: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -898,8 +905,8 @@ impl AcmeCertificateStore {
     ///
     /// `precondition` receives the authoritative stored record (or `None` when
     /// the id is free) under the same exclusive cross-process lock that
-    /// commits the write, before the overwrite rule is applied. Returning
-    /// `false` refuses the write with
+    /// commits the write, after the overwrite rule (so its `409` keeps
+    /// precedence). Returning `false` refuses the write with
     /// [`AcmeError::CertificatePreconditionFailed`] and changes nothing.
     pub fn upsert_certificate_if(
         &self,
@@ -914,26 +921,41 @@ impl AcmeCertificateStore {
         let outcome = self.file.mutate(move |document| {
             let mut record = record;
             let now = UtcTimestamp::now();
-            if !precondition(document.certificates.get(&record.id)) {
-                return Err(AcmeError::CertificatePreconditionFailed(record.id));
-            }
-            if let Some(existing) = document.certificates.get(&record.id) {
-                if !allow_overwrite {
-                    return Err(AcmeError::AlreadyExists(record.id));
+            // The overwrite rule answers first; the caller's precondition is
+            // evaluated only against a record this write could replace (or a
+            // free id, which a conditional precondition never accepts).
+            let preserved_created_at = match document.certificates.get(&record.id) {
+                Some(existing) => {
+                    if !allow_overwrite {
+                        return Err(AcmeError::AlreadyExists(record.id));
+                    }
+                    if !precondition(Some(existing)) {
+                        return Err(AcmeError::CertificatePreconditionFailed(record.id));
+                    }
+                    Some(existing.created_at)
                 }
-                record.created_at = existing.created_at;
-                record.updated_at = now;
-            } else {
-                if document.certificates.len() >= max_certificates {
-                    record_store_admission_rejected(
-                        TlsPersistentStoreKind::AcmeCertificates,
-                        TlsStoreAdmissionReason::RecordLimit,
-                    );
-                    return Err(AcmeError::RecordLimitReached);
+                None => {
+                    if !precondition(None) {
+                        return Err(AcmeError::CertificatePreconditionFailed(record.id));
+                    }
+                    None
                 }
-                record.created_at = now;
-                record.updated_at = now;
+            };
+            match preserved_created_at {
+                Some(created_at) => record.created_at = created_at,
+                None => {
+                    if document.certificates.len() >= max_certificates {
+                        record_store_admission_rejected(
+                            TlsPersistentStoreKind::AcmeCertificates,
+                            TlsStoreAdmissionReason::RecordLimit,
+                        );
+                        return Err(AcmeError::RecordLimitReached);
+                    }
+                    record.created_at = now;
+                }
             }
+            record.updated_at = now;
+            record.revision = document.store_version.saturating_add(1);
             document
                 .certificates
                 .insert(record.id.clone(), record.clone());
@@ -975,6 +997,9 @@ impl AcmeCertificateStore {
             }
             record.created_at = existing.created_at;
             record.updated_at = now;
+            // The version this commit publishes (`mutate` writes exactly
+            // `store_version + 1`), so every replacement is distinguishable.
+            record.revision = document.store_version.saturating_add(1);
             document
                 .certificates
                 .insert(record.id.clone(), record.clone());
@@ -1013,8 +1038,8 @@ impl AcmeCertificateStore {
 
     /// [`Self::delete_certificate_if_authorized`] guarded by a caller
     /// precondition, evaluated against the authoritative record (after the
-    /// existence check, before the authorization check) under the exclusive
-    /// lock that commits the removal. `false` refuses with
+    /// existence and authorization checks, immediately before removal) under
+    /// the exclusive lock that commits the removal. `false` refuses with
     /// [`AcmeError::CertificatePreconditionFailed`] and removes nothing.
     pub fn delete_certificate_if_authorized_and(
         &self,
@@ -1029,11 +1054,13 @@ impl AcmeCertificateStore {
                 let Some(existing) = document.certificates.get(&id) else {
                     return Err(AcmeError::NotFound(id.clone()));
                 };
-                if !precondition(existing) {
-                    return Err(AcmeError::CertificatePreconditionFailed(id.clone()));
-                }
+                // A lapsed authorization fence answers before the caller's
+                // precondition, so a stale tag never hides a lost fence.
                 if !still_authorized() {
                     return Ok((false, None));
+                }
+                if !precondition(existing) {
+                    return Err(AcmeError::CertificatePreconditionFailed(id.clone()));
                 }
                 match document.certificates.remove(&id) {
                     Some(record) => Ok((true, Some(record))),
@@ -1603,6 +1630,7 @@ impl AcmeCertificateRecord {
             not_after,
             created_at: now,
             updated_at: now,
+            revision: 0,
         })
     }
 

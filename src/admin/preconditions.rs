@@ -121,6 +121,13 @@ fn parse_if_match_field(
                 continue;
             }
             b'*' => {
+                // `*` is a single alternative to an entity-tag list (RFC 9110
+                // §13.1.1), never a list member: a repeated wildcard, on one
+                // field line or across several, is malformed rather than a
+                // looser "exists" precondition.
+                if *any {
+                    return Err("If-Match '*' must appear exactly once".to_string());
+                }
                 *any = true;
                 i += 1;
             }

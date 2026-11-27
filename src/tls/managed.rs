@@ -100,6 +100,17 @@ pub struct ManagedTlsRecord {
     pub jwks_json: Option<String>,
     pub created_at: UtcTimestamp,
     pub updated_at: UtcTimestamp,
+    /// Store version of the commit that last wrote this record (`0` for a
+    /// record not yet written through a store that stamps it).
+    ///
+    /// Stamped under the exclusive lock from the document's monotonic
+    /// `store_version`, so every successful create or replacement — including
+    /// a same-material rotation, a write whose clock repeats `updated_at`, and
+    /// a delete-then-recreate — gives the record a value it never had before.
+    /// The Admin API `ETag` covers it, so every write invalidates every tag
+    /// issued earlier.
+    #[serde(default)]
+    pub revision: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -257,6 +268,14 @@ impl VersionedStoreFile for ManagedTlsStoreFile {
     }
 }
 
+/// The store version the commit in progress will publish, used as the
+/// written record's [`ManagedTlsRecord::revision`]. `SharedStoreFile::mutate`
+/// publishes exactly `store_version + 1` of the document it handed to the
+/// mutation, and that version only ever grows.
+fn next_record_revision(document: &ManagedTlsStoreFile) -> u64 {
+    document.store_version.saturating_add(1)
+}
+
 #[derive(Debug)]
 pub struct ManagedTlsStore {
     file: SharedStoreFile<ManagedTlsStoreFile>,
@@ -384,8 +403,8 @@ impl ManagedTlsStore {
     ///
     /// `precondition` receives the authoritative stored record (or `None` when
     /// the id is free) under the same exclusive cross-process lock that
-    /// commits the write, before existence, overwrite, and kind rules are
-    /// applied. Returning `false` refuses the write with
+    /// commits the write, after the overwrite and kind rules (so their `409`s
+    /// keep precedence). Returning `false` refuses the write with
     /// [`ManagedTlsError::PreconditionFailed`] and changes nothing, so a
     /// conditional overwrite can never commit over a record another writer
     /// (on this or another instance sharing the store) replaced in between.
@@ -406,33 +425,49 @@ impl ManagedTlsStore {
         let outcome = self.file.mutate(move |document| {
             let mut record = record;
             let now = UtcTimestamp::now();
-            if !precondition(document.records.get(&record.id)) {
-                return Err(ManagedTlsError::PreconditionFailed(record.id));
+            // The overwrite and cross-kind rules answer first; the caller's
+            // precondition is evaluated only against a record this write
+            // could legitimately replace (or against a free id, which a
+            // conditional precondition never accepts).
+            let preserved_created_at = match document.records.get(&record.id) {
+                Some(existing) => {
+                    if !allow_overwrite {
+                        return Err(ManagedTlsError::AlreadyExists(record.id));
+                    }
+                    if existing.kind != record.kind {
+                        return Err(ManagedTlsError::KindConflict {
+                            id: record.id,
+                            existing_kind: existing.kind.as_str(),
+                            requested_kind: record.kind.as_str(),
+                        });
+                    }
+                    if !precondition(Some(existing)) {
+                        return Err(ManagedTlsError::PreconditionFailed(record.id));
+                    }
+                    Some(existing.created_at)
+                }
+                None => {
+                    if !precondition(None) {
+                        return Err(ManagedTlsError::PreconditionFailed(record.id));
+                    }
+                    None
+                }
+            };
+            match preserved_created_at {
+                Some(created_at) => record.created_at = created_at,
+                None => {
+                    if document.records.len() >= max_records {
+                        record_store_admission_rejected(
+                            TlsPersistentStoreKind::Managed,
+                            TlsStoreAdmissionReason::RecordLimit,
+                        );
+                        return Err(ManagedTlsError::RecordLimitReached);
+                    }
+                    record.created_at = now;
+                }
             }
-            if let Some(existing) = document.records.get(&record.id) {
-                if !allow_overwrite {
-                    return Err(ManagedTlsError::AlreadyExists(record.id));
-                }
-                if existing.kind != record.kind {
-                    return Err(ManagedTlsError::KindConflict {
-                        id: record.id,
-                        existing_kind: existing.kind.as_str(),
-                        requested_kind: record.kind.as_str(),
-                    });
-                }
-                record.created_at = existing.created_at;
-                record.updated_at = now;
-            } else {
-                if document.records.len() >= max_records {
-                    record_store_admission_rejected(
-                        TlsPersistentStoreKind::Managed,
-                        TlsStoreAdmissionReason::RecordLimit,
-                    );
-                    return Err(ManagedTlsError::RecordLimitReached);
-                }
-                record.created_at = now;
-                record.updated_at = now;
-            }
+            record.updated_at = now;
+            record.revision = next_record_revision(document);
             document.records.insert(record.id.clone(), record.clone());
             Ok(record)
         })?;
@@ -480,6 +515,7 @@ impl ManagedTlsStore {
             }
             record.created_at = existing.created_at;
             record.updated_at = now;
+            record.revision = next_record_revision(document);
             document.records.insert(record.id.clone(), record.clone());
             Ok(record)
         })?;
@@ -528,9 +564,9 @@ impl ManagedTlsStore {
     }
 
     /// [`Self::delete_kind_if_authorized`] guarded by a caller precondition,
-    /// evaluated against the authoritative record (after the existence and
-    /// kind checks, before the authorization check) under the exclusive lock
-    /// that commits the removal. `false` refuses with
+    /// evaluated against the authoritative record (after the existence, kind,
+    /// and authorization checks, immediately before removal) under the
+    /// exclusive lock that commits the removal. `false` refuses with
     /// [`ManagedTlsError::PreconditionFailed`] and removes nothing.
     pub fn delete_kind_if_authorized_and(
         &self,
@@ -565,11 +601,14 @@ impl ManagedTlsStore {
                         actual: existing.kind.as_str(),
                     });
                 }
-                if !precondition(existing) {
-                    return Err(ManagedTlsError::PreconditionFailed(id.clone()));
-                }
+                // A lapsed authorization fence answers before the caller's
+                // precondition, so a delete that lost its fence always reports
+                // that (and never a stale tag that would hide it).
                 if !still_authorized() {
                     return Ok((false, None));
+                }
+                if !precondition(existing) {
+                    return Err(ManagedTlsError::PreconditionFailed(id.clone()));
                 }
                 match document.records.remove(&id) {
                     Some(record) => Ok((true, Some(record))),
@@ -638,6 +677,7 @@ impl ManagedTlsRecord {
             jwks_json: None,
             created_at: now,
             updated_at: now,
+            revision: 0,
         }
     }
 
@@ -662,6 +702,7 @@ impl ManagedTlsRecord {
             jwks_json: None,
             created_at: now,
             updated_at: now,
+            revision: 0,
         }
     }
 
@@ -681,6 +722,7 @@ impl ManagedTlsRecord {
             jwks_json: None,
             created_at: now,
             updated_at: now,
+            revision: 0,
         }
     }
 
@@ -705,6 +747,7 @@ impl ManagedTlsRecord {
             jwks_json: None,
             created_at: now,
             updated_at: now,
+            revision: 0,
         }
     }
 
@@ -729,6 +772,7 @@ impl ManagedTlsRecord {
             jwks_json: Some(jwks_json),
             created_at: now,
             updated_at: now,
+            revision: 0,
         }
     }
 

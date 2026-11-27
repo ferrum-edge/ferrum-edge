@@ -841,8 +841,11 @@ rotating the same record cannot silently overwrite each other:
   token verified by `FERRUM_ADMIN_JWT_VIEWER_SECRET`). The tag is the same
   keyed MAC used for configuration resources, computed over the complete
   stored record, including the private key and other material the response
-  never shows, and bound to the record id. It changes on every write of the
-  record, including a same-material rotation (`updated_at` changes).
+  never shows, and bound to the record id. Every successful write stamps the
+  record with a new store revision (the monotonic version of the commit that
+  wrote it), so the tag changes on every write, including a same-material
+  rotation, a write whose clock repeats `updated_at`, and a
+  delete-then-recreate: no write ever leaves an earlier tag valid.
 - `PUT .../{id}` and `DELETE .../{id}` with `If-Match` are refused with
   `412 Precondition Failed` and `{"error": "managed TLS record '<id>' has changed since the supplied If-Match entity-tag was issued; re-read it and reapply your changes"}`
   (`ACME certificate '<id>' ...` for ACME records) unless the stored record
@@ -851,12 +854,21 @@ rotating the same record cannot silently overwrite each other:
 - A collection `POST` with `allow_overwrite: true` evaluates `If-Match` for
   the replacement case: the precondition never holds when the id is free
   (`412`, RFC 9110 §13.1.1), so a conditional overwrite can never turn into a
-  create. It is evaluated before the overwrite and cross-kind rules, so a
-  matching tag on a `POST` without `allow_overwrite` is still `409`.
+  create. The existing-record rules answer first: an existing id without
+  `allow_overwrite` (`409`) and a cross-kind collision (`409`) are reported
+  as such whatever the tag, and the precondition is evaluated only against a
+  same-kind record the write could replace.
 - Strict parsing, `*` (the record must exist), strong comparison, tag lists,
   and `400` for a malformed or empty header are identical to the
-  configuration resources. `404` (missing id) and the typed-route `409`/`400`
-  kind mismatches are answered before the precondition, as there.
+  configuration resources; a repeated wildcard (`*, *`) is malformed (`400`)
+  there as here.
+- **Status precedence**, the same on `PUT`, `DELETE`, and overwrite `POST`
+  and in every interleaving, because each later check is re-made under the
+  store lock: `400` malformed `If-Match`; `404` missing id; the kind mismatch
+  (`409` on `PUT` and `POST`, `400` on `DELETE`); `409` existing id without
+  `allow_overwrite` (`POST`); on `DELETE`, `409` while the record is still
+  referenced and `503` when the reference fence lapsed before the removal;
+  then `412` for a stale tag.
 - **Atomic across instances.** The comparison is made by the TLS store against
   the authoritative record inside the exclusive cross-process lock that also
   commits the write (the same read-modify-write that already makes
@@ -868,8 +880,10 @@ rotating the same record cannot silently overwrite each other:
   whichever database backend (PostgreSQL, MySQL, SQLite, MongoDB) or mode
   (`database`, `cp`) serves the Admin API. Tags agree across replicas that
   share `FERRUM_ADMIN_JWT_SECRET`.
-- A `DELETE` evaluates the precondition after the reference check, so a stale
-  delete of a record that is now referenced answers `409` with `used_by`.
+- A `DELETE` evaluates the precondition after the reference check and the
+  fence re-check, so a stale delete of a record that is now referenced
+  answers `409` with `used_by`, and one whose fence lapsed answers `503`;
+  `412` means the record itself changed.
 - Write responses carry no tag; re-read for the tag of the accepted state.
   Omitting `If-Match` keeps the unconditional behaviour.
 
@@ -1765,7 +1779,8 @@ curl -X PUT -H "Authorization: Bearer $TOKEN" -H "If-Match: $ETAG" \
   `FERRUM_ADMIN_JWT_SECRET` so it cannot be used to test guesses of a redacted
   value; replicas sharing that secret issue identical tags, and rotating it
   invalidates outstanding tags (writes then return `412` until re-read).
-- **Strict parsing for row writes.** `*` requires only that the resource exists.
+- **Strict parsing for row writes.** `*` requires only that the resource exists;
+  it must be the whole header, so a repeated wildcard (`*, *`) is `400`.
   Comparison is strong, so a weak `W/"…"` tag never matches. A comma-separated list
   matches if any member does. A malformed or empty `If-Match` is `400`, never
   treated as absent. Row preconditions apply only to `PUT`/`DELETE` on the

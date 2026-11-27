@@ -532,3 +532,34 @@ fn conditional_certificate_replacement_from_two_instances_commits_exactly_once()
         Err(AcmeError::NotFound(_))
     ));
 }
+
+/// Review F3/F4 for ACME certificates: a lapsed delete fence answers before
+/// the precondition, an existing id without `allow_overwrite` keeps its 409,
+/// and every write stamps a new revision even for identical material.
+#[test]
+fn certificate_writes_stamp_revisions_and_keep_rule_precedence() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = AcmeCertificateStore::open(dir.path()).expect("open");
+    let created = store
+        .upsert_certificate(certificate("rev-cert", "pem"), false)
+        .expect("create");
+    assert!(created.revision > 0);
+    let replaced = store
+        .update_existing_certificate_if(certificate("rev-cert", "pem"), |_| true)
+        .expect("same-material replacement");
+    assert!(replaced.revision > created.revision);
+    let renewed = store
+        .upsert_certificate(certificate("rev-cert", "pem"), true)
+        .expect("renewal-style overwrite");
+    assert!(renewed.revision > replaced.revision);
+
+    assert!(matches!(
+        store.upsert_certificate_if(certificate("rev-cert", "pem"), false, |_| false),
+        Err(AcmeError::AlreadyExists(_))
+    ));
+    assert!(matches!(
+        store.delete_certificate_if_authorized_and("rev-cert", |_| false, || false),
+        Ok(None)
+    ));
+    assert!(store.get_certificate("rev-cert").is_ok(), "nothing removed");
+}

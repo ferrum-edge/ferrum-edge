@@ -9615,9 +9615,10 @@ components:
         the `ETag` from `GET` on the same resource; the write is refused with
         `412` unless the stored resource still has that representation, so a
         draft opened before someone else's accepted change can never revert
-        it. `*` requires only that the resource exists. Comparison is strong:
-        a weak (`W/`) tag never matches. A comma-separated list matches when
-        any member does.
+        it. `*` requires only that the resource exists and must be the whole
+        header (a repeated `*` is `400`). Comparison is strong: a weak (`W/`)
+        tag never matches. A comma-separated list matches when any member
+        does.
 
         The comparison and the write are atomic with respect to every admin
         writer of this namespace — including another control-plane replica
@@ -9667,15 +9668,19 @@ components:
         replica, or ACME renewal — can commit between the comparison and the
         write.
 
-        On `PUT` and `DELETE` a request that would otherwise be `404` (or a
-        cross-kind `409`) is answered that way regardless of the precondition.
+        Status precedence, identical on `PUT`, `DELETE`, and overwrite `POST`
+        in every interleaving (each check is re-made under the store lock):
+        `400` malformed header; `404` missing id; the kind mismatch (`409` on
+        `PUT`/`POST`, `400` on `DELETE`); `409` existing id without
+        `allow_overwrite` (`POST`); on `DELETE`, `409` while still referenced
+        and `503` when the reference fence lapsed; then `412` for a stale tag.
         On a collection `POST` the precondition applies to the
-        `allow_overwrite: true` replacement case: it is refused with `412` when
-        the id is free (a precondition cannot hold without a current record)
-        or the stored record has changed, before the overwrite rule is applied.
+        `allow_overwrite: true` replacement case and never holds when the id
+        is free (`412`), so a conditional overwrite never creates a record.
 
         Omitting the header keeps the write unconditional. A malformed or
-        empty header is `400`, never treated as absent.
+        empty header (including a repeated `*`) is `400`, never treated as
+        absent.
     ExpectedProxyIds:
       name: expected_proxy_ids
       in: query
@@ -9872,8 +9877,11 @@ components:
         keyed from `FERRUM_ADMIN_JWT_SECRET` over the complete stored record
         (including private key and other material never returned in the body,
         which is why it is keyed rather than a plain digest), bound to the
-        record id. It changes whenever any stored field changes, including
-        `updated_at`. Present only when the caller's token was verified by
+        record id. Every successful write stamps the record with a new,
+        monotonically increasing store revision that the tag covers, so the
+        tag changes on every write (a same-material rotation and a
+        delete-then-recreate included) and no write leaves an earlier tag
+        valid. Present only when the caller's token was verified by
         `FERRUM_ADMIN_JWT_SECRET` (GHSA-crqx-mp2f-v8c8). Replicas configured
         with the same secret issue identical tags. Write responses do not
         carry a tag: re-read the record to obtain the tag for the accepted

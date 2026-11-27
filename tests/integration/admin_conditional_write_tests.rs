@@ -474,7 +474,16 @@ async fn weak_malformed_and_list_tags_are_evaluated_strictly() {
     .await;
     assert_eq!(reply.status, 412, "weak tag: {}", reply.body);
 
-    for malformed in ["", "unquoted", "\"unterminated", "\"a\" \"b\"", "*, \"a\""] {
+    for malformed in [
+        "",
+        "unquoted",
+        "\"unterminated",
+        "\"a\" \"b\"",
+        "*, \"a\"",
+        // A repeated wildcard is malformed, never an existence-only write.
+        "*, *",
+        "* *",
+    ] {
         let reply = send(
             Method::PUT,
             &base,
@@ -6440,6 +6449,49 @@ async fn assert_tls_record_conditional_writes(db: Arc<dyn DatabaseBackend>) {
     .await;
     assert_eq!(unconditional.status, 200, "{}", unconditional.body);
 
+    // A repeated wildcard is malformed, never an existence-only write.
+    let repeated_wildcard = send(
+        Method::PUT,
+        &base,
+        &path,
+        &token,
+        Some("*, *"),
+        Some(&json!({"ca_bundle_pem": tls_ca_pem()})),
+    )
+    .await;
+    assert_eq!(repeated_wildcard.status, 400, "{}", repeated_wildcard.body);
+
+    // Every successful write invalidates earlier tags, even when it stores
+    // exactly the same material.
+    let same_material = json!({"ca_bundle_pem": tls_ca_pem()});
+    let before_same = get(&base, &path).await.etag.expect("tag");
+    let same_once = send(
+        Method::PUT,
+        &base,
+        &path,
+        &token,
+        Some(&before_same),
+        Some(&same_material),
+    )
+    .await;
+    assert_eq!(same_once.status, 200, "{}", same_once.body);
+    let after_same = get(&base, &path).await.etag.expect("tag");
+    assert_ne!(after_same, before_same);
+    let reused = send(
+        Method::PUT,
+        &base,
+        &path,
+        &token,
+        Some(&before_same),
+        Some(&same_material),
+    )
+    .await;
+    assert_eq!(
+        reused.status, 412,
+        "a tag issued before a same-material write must not match: {}",
+        reused.body
+    );
+
     // A conditional DELETE with the current tag removes the record; a missing
     // record is 404 whatever the precondition says.
     let delete_tag = get(&base, &path).await.etag.expect("tag");
@@ -6463,6 +6515,78 @@ async fn assert_tls_record_conditional_writes(db: Arc<dyn DatabaseBackend>) {
     )
     .await;
     assert_eq!(missing.status, 404, "{}", missing.body);
+
+    // Delete-and-recreate under another kind: a stale CA-bundle tag must not
+    // mask the kind mismatch the typed routes document.
+    let (cert_pem, key_pem) = tls_leaf_pem();
+    let recreated = send(
+        Method::POST,
+        &base,
+        "/admin/tls/certificates",
+        &token,
+        None,
+        Some(&json!({"id": id, "name": id, "cert_pem": cert_pem, "key_pem": key_pem})),
+    )
+    .await;
+    assert_eq!(recreated.status, 201, "{}", recreated.body);
+    let cross_kind_overwrite = send(
+        Method::POST,
+        &base,
+        "/admin/tls/ca-bundles",
+        &token,
+        Some(&delete_tag),
+        Some(
+            &json!({"id": id, "name": id, "ca_bundle_pem": tls_ca_pem(), "allow_overwrite": true}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        cross_kind_overwrite.status, 409,
+        "cross-kind overwrite keeps its 409 under a stale tag: {}",
+        cross_kind_overwrite.body
+    );
+    let cross_kind_put = send(
+        Method::PUT,
+        &base,
+        &path,
+        &token,
+        Some(&delete_tag),
+        Some(&json!({"ca_bundle_pem": tls_ca_pem()})),
+    )
+    .await;
+    assert_eq!(cross_kind_put.status, 409, "{}", cross_kind_put.body);
+    let cross_kind_delete = send(
+        Method::DELETE,
+        &base,
+        &path,
+        &token,
+        Some(&delete_tag),
+        None,
+    )
+    .await;
+    assert_eq!(cross_kind_delete.status, 400, "{}", cross_kind_delete.body);
+    // An existing id without `allow_overwrite` keeps its 409 too.
+    let (other_cert_pem, other_key_pem) = tls_leaf_pem();
+    let no_overwrite = send(
+        Method::POST,
+        &base,
+        "/admin/tls/certificates",
+        &token,
+        Some(&delete_tag),
+        Some(&json!({"id": id, "name": id, "cert_pem": other_cert_pem, "key_pem": other_key_pem})),
+    )
+    .await;
+    assert_eq!(no_overwrite.status, 409, "{}", no_overwrite.body);
+    let cert_cleanup = send(
+        Method::DELETE,
+        &base,
+        &format!("/admin/tls/certificates/{id}"),
+        &token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(cert_cleanup.status, 200, "{}", cert_cleanup.body);
 
     // ---- ACME certificate ---------------------------------------------------
     let acme_id = format!("cond-acme-{suffix}");
