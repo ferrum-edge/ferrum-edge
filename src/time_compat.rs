@@ -559,11 +559,14 @@ impl fmt::Display for UtcTimestamp {
     }
 }
 
+/// Parses exactly what chrono's `DateTime<Utc>: FromStr` (the relaxed RFC 3339
+/// parser) accepts, normalizing a leap second and refusing an instant outside
+/// the supported year range (issue #7419 owner decisions).
 impl FromStr for UtcTimestamp {
     type Err = TimestampError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        parse_rfc3339(s)
+        parse_rfc3339_relaxed_chrono(s).and_then(|parsed| parsed.to_utc_timestamp())
     }
 }
 
@@ -624,7 +627,9 @@ impl<'de> Deserialize<'de> for UtcTimestamp {
             where
                 E: de::Error,
             {
-                parse_rfc3339(value).map_err(E::custom)
+                // Same acceptance as chrono's `DateTime<Utc>` serde impl,
+                // which parses with the relaxed RFC 3339 parser (issue #7419).
+                value.parse::<UtcTimestamp>().map_err(E::custom)
             }
         }
 
