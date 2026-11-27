@@ -459,6 +459,36 @@ async fn create_get_list_and_reject_duplicates_and_invalid_names() {
     .await;
     assert_eq!(status, 400, "wrong-typed description on create: {body:?}");
 
+    // The create body is a closed JSON object: neither a positional array
+    // (which serde would map onto `name`/`description` in order) nor an
+    // unknown member is admitted, and nothing is persisted.
+    for (rejected, name) in [
+        (json!(["positional", null]), "positional"),
+        (json!({"name": "extra", "descripton": "typo"}), "extra"),
+    ] {
+        let (status, body) = send(
+            reqwest::Method::POST,
+            &base,
+            "/namespaces",
+            &token,
+            Some(rejected.clone()),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "non-object or open create {rejected}: {body:?}"
+        );
+        let (status, _body) = send(
+            reqwest::Method::GET,
+            &base,
+            &format!("/namespaces/{name}"),
+            &token,
+            None,
+        )
+        .await;
+        assert_eq!(status, 404, "a rejected create must not persist {name}");
+    }
+
     let (status, body) = send(
         reqwest::Method::POST,
         &base,

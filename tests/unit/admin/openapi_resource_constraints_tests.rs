@@ -319,6 +319,122 @@ fn passive_health_unknown_keys_are_rejected_by_schema_and_runtime() {
     }
 }
 
+/// The 1.0 config surface is closed: every nested object under a proxy,
+/// upstream or plugin config rejects an unknown (or misspelled) key in both
+/// the schema (`additionalProperties: false`) and runtime admission
+/// (`deny_unknown_fields`), so a typo never silently drops a policy.
+#[test]
+fn nested_unknown_keys_are_rejected_by_schema_and_runtime() {
+    let spec = spec();
+    for component in ["Upstream", "UpstreamCreate"] {
+        let schema = validator(&spec, component);
+        for pointer in [
+            "/unknown_top_level_key",
+            "/health_checks/pasive",
+            "/health_checks/active/intervl_seconds",
+            "/health_checks/passive/unhealthy_treshold",
+            "/targets/0/wieght",
+            "/hash_on_cookie_config/pth",
+        ] {
+            let mut body = upstream();
+            set_field(&mut body, pointer, json!(1));
+            assert_parity(&schema, component, &body, false);
+        }
+        for provider in ["dns_sd", "kubernetes", "consul", "mesh"] {
+            let mut body = upstream();
+            body["service_discovery"] = json!({
+                "provider": provider,
+                (provider): {"service_name": "backend"}
+            });
+            if provider == "consul" {
+                body["service_discovery"][provider]["address"] = json!("http://consul:8500");
+            }
+            assert_parity(&schema, component, &body, true);
+            let mut misspelled = body.clone();
+            set_field(
+                &mut misspelled,
+                &format!("/service_discovery/{provider}/poll_intervl_seconds"),
+                json!(30),
+            );
+            assert_parity(&schema, component, &misspelled, false);
+            let mut outer = body;
+            set_field(&mut outer, "/service_discovery/stale_polcy", json!("serve"));
+            assert_parity(&schema, component, &outer, false);
+        }
+    }
+    for component in ["Proxy", "ProxyCreate"] {
+        let schema = validator(&spec, component);
+        for pointer in [
+            "/unknown_top_level_key",
+            "/circuit_breaker/failure_treshold",
+            "/retry/max_retires",
+        ] {
+            let mut body = proxy();
+            set_field(&mut body, pointer, json!(1));
+            assert_parity(&schema, component, &body, false);
+        }
+        let mut body = proxy();
+        body["plugins"] = json!([{"plugin_config_id": "p1"}]);
+        assert_parity(&schema, component, &body, true);
+        body["plugins"][0]["plugin_confg_id"] = json!("p2");
+        assert_parity(&schema, component, &body, false);
+
+        // Externally tagged enum variant bodies are closed too: a container
+        // attribute on `RetryConfig` does not reach into `BackoffStrategy`.
+        for (backoff, expected) in [
+            (json!({"fixed": {"delay_ms": 100}}), true),
+            (json!({"exponential": {"base_ms": 10, "max_ms": 100}}), true),
+            (json!({"fixed": {"delay_ms": 100, "jiter_ms": 50}}), false),
+            (
+                json!({"exponential": {"base_ms": 10, "max_ms": 100, "factor": 2}}),
+                false,
+            ),
+            (json!({"fixed": {"delay_ms": 100}, "jitter": true}), false),
+        ] {
+            let mut body = proxy();
+            body["retry"] = json!({"backoff": backoff});
+            assert_parity(&schema, component, &body, expected);
+        }
+    }
+}
+
+/// Gateway trust-bundle CRUD and restore reuse the closed mesh trust-bundle
+/// types, so the published schema must refuse the same unknown members.
+#[test]
+fn gateway_trust_bundle_unknown_keys_are_rejected_by_schema_and_runtime() {
+    use ferrum_edge::config::gateway_trust::GatewayTrustBundleRecord;
+
+    let spec = spec();
+    let schema = validator(&spec, "GatewayTrustBundleCreate");
+    let baseline = json!({
+        "trust_domain": "example.org",
+        "bundle": {
+            "local": {
+                "trust_domain": "example.org",
+                "jwt_authorities": [{"key_id": "k1", "public_key_pem": "pem"}]
+            }
+        }
+    });
+    assert!(schema.is_valid(&baseline), "baseline schema");
+    serde_json::from_value::<GatewayTrustBundleRecord>(baseline.clone())
+        .expect("baseline runtime decode");
+    for pointer in [
+        "/bundle",
+        "/bundle/local",
+        "/bundle/local/jwt_authorities/0",
+    ] {
+        let mut body = baseline.clone();
+        set_field(&mut body, &format!("{pointer}/misspelled_member"), json!(1));
+        assert!(!schema.is_valid(&body), "schema accepted {pointer}: {body}");
+        let error = serde_json::from_value::<GatewayTrustBundleRecord>(body)
+            .expect_err("runtime must reject the unknown member");
+        assert!(
+            error.to_string().contains("misspelled_member"),
+            "{pointer}: {error}"
+        );
+    }
+}
+
 #[test]
 fn proxy_routing_and_stream_controls_match_runtime() {
     let spec = spec();

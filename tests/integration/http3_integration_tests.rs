@@ -348,7 +348,6 @@ async fn test_http3_proxy_state_creation() {
             false, // io_uring_splice_enabled
             false, // record_mesh_mtls_metric
             0,     // so_busy_poll_us
-            false, // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
             false, // udp_gso_enabled
             false, // udp_pktinfo_enabled
             Arc::new(ferrum_edge::proxy::client_ip::TrustedProxies::none()),
@@ -703,7 +702,6 @@ async fn test_http3_full_integration() {
             false, // io_uring_splice_enabled
             false, // record_mesh_mtls_metric
             0,     // so_busy_poll_us
-            false, // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
             false, // udp_gso_enabled
             false, // udp_pktinfo_enabled
             Arc::new(ferrum_edge::proxy::client_ip::TrustedProxies::none()),
