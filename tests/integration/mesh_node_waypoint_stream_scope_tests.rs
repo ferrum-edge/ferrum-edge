@@ -2126,6 +2126,10 @@ mod http_routes;
 /// ReferenceGrant (issue #7499).
 mod cross_namespace_routes;
 
+/// The same destinations on a NodeWaypoint, authorized against the
+/// destination namespace's policy (issue #7499).
+mod cross_namespace_node_waypoint;
+
 /// Per-destination authorization for `mesh_route_dispatch` branches of a
 /// carried VirtualService route (issue #7383).
 mod route_branch_authz;

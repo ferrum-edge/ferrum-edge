@@ -1655,7 +1655,7 @@ fn vs_cross_namespace_destination_requires_reference_grant() {
         category = CATEGORY,
         feature = "http[].route[].destination cross-namespace Service (mesh)",
         status = Status::Supported,
-        notes = "A mesh-bound VirtualService destination in another namespace is admitted only with a ReferenceGrant in the destination namespace (from networking.istio.io/VirtualService, to core Service), an existing non-ExternalName Service declaring the port, and EndpointSlice attribution; otherwise the VirtualService is refused (FerrumAccepted=False, RefNotPermitted). Sidecar data planes route an admitted destination through a route-namespace clone of the destination Service upstream; NodeWaypoint and Ambient/ServiceWaypoint data planes do not route it (issue #7499).",
+        notes = "A mesh-bound VirtualService destination in another namespace is admitted only with a ReferenceGrant in the destination namespace (from networking.istio.io/VirtualService, to core Service), an existing non-ExternalName Service declaring the port, and EndpointSlice attribution; otherwise the VirtualService is refused (FerrumAccepted=False, RefNotPermitted). Sidecar and NodeWaypoint data planes route an admitted destination through a route-namespace clone of a destination source upstream built from the Service's workloads (a NodeWaypoint authorizes it against the destination namespace's AuthorizationPolicy and RequestAuthentication); Ambient/ServiceWaypoint data planes apply no http[] routes (issue #7499).",
     );
     let service = namespaced_object(
         "v1",

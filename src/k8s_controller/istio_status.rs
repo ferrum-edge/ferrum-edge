@@ -1461,11 +1461,11 @@ pub const VIRTUAL_SERVICE_MESH_HTTP_ROUTES_NOTE: &str = "mesh http[] routes are 
 /// view, so the note says what happens when it cannot.
 pub const VIRTUAL_SERVICE_CROSS_NAMESPACE_DESTINATIONS_NOTE: &str = "cross-namespace destinations \
      admitted by ReferenceGrant (status.ferrum.translation.cross_namespace_destinations) are \
-     routed only by Sidecar data planes whose control-plane namespace scope covers the \
-     destination namespace and whose Sidecar egress scope imports the destination Service; \
-     NodeWaypoint data planes do not route cross-namespace destinations (tracked in issue \
-     #7499), and a data plane that cannot route one does not receive the route and keeps \
-     routing that host to its plain Service";
+     routed by Sidecar and NodeWaypoint data planes whose control-plane namespace scope covers \
+     the destination namespace and that see the destination Service (namespace visibility or a \
+     Sidecar egress import); a NodeWaypoint authorizes them against the destination \
+     namespace's AuthorizationPolicy and RequestAuthentication, and a data plane that cannot \
+     route one does not receive the route and keeps routing that host to its plain Service";
 
 /// Status for `VirtualService`. The translator consumes `spec.http` routes
 /// (incl. `mirror` / `rewrite` / `redirect` / `corsPolicy`) and `spec.tcp` /

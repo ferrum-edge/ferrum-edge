@@ -4307,7 +4307,10 @@ fn pending_limit_logical_id(upstream: &Upstream) -> &str {
         .starts_with(crate::modes::mesh::MESH_OUTBOUND_UPSTREAM_ID_PREFIX)
         || upstream
             .id
-            .starts_with(crate::modes::mesh::MESH_OUTBOUND_HTTP_BYWL_UPSTREAM_ID_PREFIX);
+            .starts_with(crate::modes::mesh::MESH_OUTBOUND_HTTP_BYWL_UPSTREAM_ID_PREFIX)
+        // A cross-namespace destination source (issue #7499) is the same
+        // Service port's upstream: its clones share the Service's lane.
+        || crate::modes::mesh::is_cross_namespace_destination_source_id(&upstream.id);
     if is_mesh_http_egress {
         upstream
             .name

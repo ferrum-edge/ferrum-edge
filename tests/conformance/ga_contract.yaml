@@ -150,7 +150,7 @@ capabilities:
     exclusions:
       - Ambient and ServiceWaypoint data planes apply no mesh http[] routes and are excluded.
       - NodeWaypoint route carriage is Experimental with its topology and is not covered by this live row.
-      - Cross-namespace carried destinations are refused on every topology until issue #7499.
+      - Cross-namespace carried destinations (served only when a ReferenceGrant in the destination namespace admits them, issue #7499) are covered by translation and integration tests only, not by this live row.
       - The live split rides one Sidecar client in one namespace; DestinationRule-governed leg-by-leg dispatch is covered by integration tests only.
 
   - id: mesh.peer_authentication.strict_mtls

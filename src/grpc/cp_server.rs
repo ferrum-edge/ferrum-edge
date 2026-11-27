@@ -1227,6 +1227,21 @@ impl CpGrpcServer {
             }
             retained
         });
+        // Issue #7499: the namespaces of the authorized cross-namespace
+        // destinations that survived the ceilings above. A NodeWaypoint judges
+        // those destinations' AuthorizationPolicy itself, so their namespaces'
+        // policies survive the `mesh_policies` retain below (the slice builder
+        // keeps only those selecting a destination workload).
+        let cross_namespace_destination_namespaces: BTreeSet<String> =
+            if request.node_waypoint_capture_scoping {
+                mesh.virtual_service_http_routes
+                    .iter()
+                    .flat_map(|routes| routes.authorized_cross_namespace_targets.iter())
+                    .map(|target| target.namespace.clone())
+                    .collect()
+            } else {
+                BTreeSet::new()
+            };
         // A ServiceWaypoint terminates traffic for destination-visible services,
         // but trusted Ambient UDP evidence can name a source pod from any
         // namespace this CP is allowed to serve. An explicit bearer claim
@@ -1454,6 +1469,16 @@ impl CpGrpcServer {
                                 &istio_root_namespace,
                             )
                         }))
+                || cross_namespace_destination_namespaces
+                    .iter()
+                    .any(|destination_namespace| {
+                        Self::policy_scope_can_apply_to_namespace(
+                            &policy.namespace,
+                            &policy.scope,
+                            destination_namespace,
+                            &istio_root_namespace,
+                        )
+                    })
         });
         mesh.peer_authentications.retain(|policy| {
             Self::peer_auth_can_apply_to_namespace(policy, namespace, &istio_root_namespace)
@@ -1498,6 +1523,9 @@ impl CpGrpcServer {
                         .iter()
                         .any(|destination_namespace| can_apply_to(destination_namespace))
                         || capture_destination_namespaces
+                            .iter()
+                            .any(|destination_namespace| can_apply_to(destination_namespace))
+                        || cross_namespace_destination_namespaces
                             .iter()
                             .any(|destination_namespace| can_apply_to(destination_namespace))))
         });

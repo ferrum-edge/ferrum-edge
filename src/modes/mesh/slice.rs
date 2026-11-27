@@ -736,16 +736,19 @@ pub const MAX_HTTP_ROUTE_CROSS_NAMESPACE_TARGETS: usize = 4096;
 /// (`<svc>.<ns>`, `<svc>.<ns>.svc`, `<svc>.<ns>.svc.<cluster domain>`, an
 /// optional trailing dot, any case) is recognized, so the control-plane
 /// authorization check sees exactly the destinations the data plane would
-/// rebind. A short name is always the route's own namespace. Over-matching is
-/// the safe direction: a host taken for a cross-namespace Service needs an
-/// explicit authorization to be carried.
+/// rebind. A short name is always the route's own namespace. An absolute
+/// two-label name (`httpbin.org.`) is external: no cluster DNS search suffix
+/// completes it. Over-matching is the safe direction: a host taken for a
+/// cross-namespace Service needs an explicit authorization to be carried.
 pub fn carried_route_cross_namespace_service(
     host: &str,
     route_namespace: &str,
     cluster_domain: &str,
 ) -> Option<(String, String)> {
-    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
-    if host.is_empty() || host.contains('*') {
+    let trimmed = host.trim();
+    let absolute = trimmed.ends_with('.');
+    let host = trimmed.trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() || host.contains('*') || (absolute && host.matches('.').count() == 1) {
         return None;
     }
     let cluster_domain = cluster_domain.trim().trim_matches('.').to_ascii_lowercase();
@@ -1941,7 +1944,6 @@ impl MeshSlice {
         // with every destination admitted by an applicable Sidecar egress
         // scope exactly like the L4 routes above. Ambient (the L4 data plane),
         // ServiceWaypoint and the gateway topologies request none.
-        let sidecar_http_routes = request.sidecar_http_routes;
         let http_routes = if request.node_waypoint_capture_scoping || request.sidecar_http_routes {
             node_waypoint_http_route_set(
                 config,
@@ -1975,41 +1977,39 @@ impl MeshSlice {
                     .then_some(cluster_domain.as_str()),
                 &cluster_domain,
                 // Issue #7499: an authorized cross-namespace destination rides
-                // only to a Sidecar (the one topology that routes it; a
-                // NodeWaypoint slice does not carry the destination
-                // namespace's policies, issue #7499), and only when this
-                // subscriber sees its
-                // Service port, by the same rule that builds `services` below
-                // (namespace visibility, or the applicable Sidecar egress
-                // scope).
+                // to a Sidecar or a NodeWaypoint only when this subscriber sees
+                // its Service port, by the same rule that builds `services`
+                // below (namespace visibility, or the applicable Sidecar egress
+                // scope). A NodeWaypoint slice then also carries the
+                // destination namespace's AuthorizationPolicy and
+                // RequestAuthentication resources selecting the destination's
+                // workloads (`with_cross_namespace_destination_policies`).
                 &|target_namespace: &str, target_name: &str, port: u16| {
-                    sidecar_http_routes
-                        && mesh.services.iter().any(|service| {
-                            if service.namespace != target_namespace || service.name != target_name
-                            {
-                                return false;
+                    mesh.services.iter().any(|service| {
+                        if service.namespace != target_namespace || service.name != target_name {
+                            return false;
+                        }
+                        match applicable_sidecar {
+                            None => {
+                                resource_namespace_visible(
+                                    &service_waypoint_namespaces,
+                                    &service.namespace,
+                                    &namespace,
+                                ) && service
+                                    .ports
+                                    .iter()
+                                    .any(|service_port| service_port.port == port)
                             }
-                            match applicable_sidecar {
-                                None => {
-                                    resource_namespace_visible(
-                                        &service_waypoint_namespaces,
-                                        &service.namespace,
-                                        &namespace,
-                                    ) && service
+                            Some(sidecar) => sidecar
+                                .narrow_service(service, &cluster_domain)
+                                .is_some_and(|narrowed| {
+                                    narrowed
                                         .ports
                                         .iter()
                                         .any(|service_port| service_port.port == port)
-                                }
-                                Some(sidecar) => sidecar
-                                    .narrow_service(service, &cluster_domain)
-                                    .is_some_and(|narrowed| {
-                                        narrowed
-                                            .ports
-                                            .iter()
-                                            .any(|service_port| service_port.port == port)
-                                    }),
-                            }
-                        })
+                                }),
+                        }
+                    })
                 },
             )
         } else {
@@ -2432,6 +2432,22 @@ impl MeshSlice {
         // namespace-local workload view above never holds.
         let workloads =
             with_cross_namespace_destination_workloads(workloads, &http_routes, &services, mesh);
+        // A NodeWaypoint judges the destination's AuthorizationPolicy and
+        // RequestAuthentication itself (a Sidecar source judges none, #4158),
+        // so its slice also carries the destination namespace's resources
+        // that select those destination workloads.
+        let (mesh_policies, request_authentications) = if request.node_waypoint_capture_scoping {
+            with_cross_namespace_destination_policies(
+                mesh_policies,
+                request_authentications,
+                mesh,
+                &workloads,
+                &http_routes,
+                &namespace,
+            )
+        } else {
+            (mesh_policies, request_authentications)
+        };
 
         // Bind `request.namespace` so we can both move it into `self` and
         // borrow it inside the `multi_cluster` `.retain` closure below without
@@ -2866,14 +2882,16 @@ fn narrow_cross_namespace_target_service_refs(
 /// reach in another namespace (issue #7499).
 ///
 /// The slice's workload view is namespace-local, so a Service imported from
-/// another namespace has no dialable endpoint on its own. A Sidecar dials an
-/// authorized cross-namespace route destination through that Service's
-/// workloads, so exactly those are added: only for Services the control plane
-/// already authorized for a carried route
-/// (`MeshHttpRouteSet::authorized_cross_namespace_targets`, Sidecar slices
-/// only) AND kept in this subscriber's narrowed `services`, and only
+/// another namespace has no dialable endpoint on its own. A Sidecar or
+/// NodeWaypoint dials an authorized cross-namespace route destination through
+/// that Service's workloads, so exactly those are added: only for Services the
+/// control plane already authorized for a carried route
+/// (`MeshHttpRouteSet::authorized_cross_namespace_targets`) AND kept in this
+/// subscriber's narrowed `services`, and only
 /// workloads the Service itself lists, attached to it by namespace and name.
-/// Nothing else in another namespace becomes visible.
+/// Nothing else in another namespace becomes visible, and the data plane keeps
+/// these workloads out of every ordinary route (they back the authorized
+/// routes only).
 fn with_cross_namespace_destination_workloads(
     mut workloads: Vec<Workload>,
     http_routes: &MeshHttpRouteSet,
@@ -2940,6 +2958,66 @@ fn with_cross_namespace_destination_workloads(
         }
     }
     workloads
+}
+
+/// Add the AuthorizationPolicy and RequestAuthentication resources that
+/// select the workloads [`with_cross_namespace_destination_workloads`] added
+/// for authorized cross-namespace route destinations (issue #7499), for a
+/// NodeWaypoint slice.
+///
+/// A NodeWaypoint judges a carried route's destination policy itself
+/// (`thread_node_waypoint_route_branches_to_authz`, RequestAuthentication
+/// destination scoping), so a destination in another namespace needs that
+/// namespace's resources in the slice; without them the route would be
+/// judged against an incomplete set. Exactly the resources whose scope
+/// applies to one of those destination workloads are added (a policy of the
+/// destination namespace, or a root-namespace one already present), so
+/// nothing of a namespace without an authorized destination rides, and each
+/// policy still applies only to the scopes it selects at evaluation time.
+fn with_cross_namespace_destination_policies(
+    mut mesh_policies: Vec<MeshPolicy>,
+    mut request_authentications: Vec<MeshRequestAuthentication>,
+    mesh: &MeshConfig,
+    workloads: &[Workload],
+    http_routes: &MeshHttpRouteSet,
+    subscriber_namespace: &str,
+) -> (Vec<MeshPolicy>, Vec<MeshRequestAuthentication>) {
+    let targets = cross_namespace_target_services(http_routes);
+    if targets.is_empty() {
+        return (mesh_policies, request_authentications);
+    }
+    let destinations: Vec<&Workload> = workloads
+        .iter()
+        .filter(|workload| {
+            workload.namespace != subscriber_namespace
+                && workload.attached_service_namespace() == workload.namespace
+                && targets.contains(&(workload.namespace.as_str(), workload.service_name.as_str()))
+        })
+        .collect();
+    if destinations.is_empty() {
+        return (mesh_policies, request_authentications);
+    }
+    for policy in &mesh.mesh_policies {
+        if destinations.iter().any(|workload| {
+            policy_scope_applies_to_workload(policy, &workload.namespace, &workload.selector.labels)
+        }) && !mesh_policies.contains(policy)
+        {
+            mesh_policies.push(policy.clone());
+        }
+    }
+    for resource in &mesh.request_authentications {
+        if destinations.iter().any(|workload| {
+            crate::modes::mesh::config::scope_applies_to_workload(
+                &resource.scope,
+                &workload.namespace,
+                &workload.selector.labels,
+            )
+        }) && !request_authentications.contains(resource)
+        {
+            request_authentications.push(resource.clone());
+        }
+    }
+    (mesh_policies, request_authentications)
 }
 
 fn resource_namespace_visible(

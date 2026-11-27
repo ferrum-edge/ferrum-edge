@@ -6246,11 +6246,18 @@ fn route_backends(
             ));
         };
         let port = resolve_destination_port(object, destination, host, acc)?.unwrap_or(80);
+        // An absolute two-label name (`httpbin.org.`) is external, whatever
+        // Service its relative spelling would name (issue #7499).
+        let absolute_two_label = {
+            let trimmed = host.trim();
+            trimmed.ends_with('.') && trimmed.trim_end_matches('.').matches('.').count() == 1
+        };
         let service_identity = service_host_components(
             host,
             &object.metadata.namespace,
             &acc.options.cluster_domain,
         )
+        .filter(|_| !absolute_two_label)
         .and_then(|(svc, ns)| {
             acc.service_port_exists(ns, svc, port)
                 .then(|| (ns.to_string(), svc.to_string(), port))

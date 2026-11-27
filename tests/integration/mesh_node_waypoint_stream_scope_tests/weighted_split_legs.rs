@@ -902,8 +902,9 @@ fn a_destination_rule_split_with_an_unmodeled_leg_is_refused() {
 }
 
 /// Refusals that remain: a leg in another namespace needs a ReferenceGrant
-/// (issue #7499), so translation refuses the VirtualService; with one, a
-/// NodeWaypoint still refuses the route (see `cross_namespace_routes.rs`).
+/// (issue #7499), so translation refuses the VirtualService (a granted leg is
+/// served: see `cross_namespace_routes.rs` and
+/// `cross_namespace_node_waypoint.rs`).
 #[test]
 fn a_destination_rule_split_with_a_leg_in_another_namespace_is_refused() {
     let objects = vec![

@@ -128,8 +128,10 @@ enrolled rows and required live assertion IDs; fixture detail is in the
   `networking.istio.io/VirtualService` to core `Service`), an existing
   non-`ExternalName` Service declaring the port, and EndpointSlice attribution,
   or the VirtualService is refused (`FerrumAccepted=False`, `RefNotPermitted`);
-  an admitted destination is routed by a Sidecar whose egress scope imports the
-  Service, and refused by a NodeWaypoint (issue #7499; see [mesh.md →
+  an admitted destination is routed by a Sidecar or NodeWaypoint that sees the
+  Service (a NodeWaypoint authorizes it against the destination namespace's
+  AuthorizationPolicy and RequestAuthentication), and the grant never makes the
+  Service reachable through ordinary capture (issue #7499; see [mesh.md →
   Cross-namespace destinations](mesh.md#cross-namespace-destinations)).
 
   | Topology | Mesh-bound VirtualService `http[]` routes |
@@ -346,7 +348,6 @@ ledger unless they change the support contract.
 
 | Deferral | Issue | Doc anchor |
 |---|---|---|
-| Cross-namespace VirtualService `http[]` destinations: **partly delivered**. Sidecar routes a ReferenceGrant-authorized destination (refusals report `FerrumAccepted=False`/`RefNotPermitted`); NodeWaypoint still refuses every cross-namespace destination and keeps the host on its Service route until the destination namespace's AuthorizationPolicy / RequestAuthentication ride NodeWaypoint slices (part 2) | [#7499](https://github.com/ferrum-edge/ferrum-edge/issues/7499) | [mesh.md → Cross-namespace destinations](mesh.md#cross-namespace-destinations) |
 | ServiceWaypoint `http_routes` control-plane projection, wire contract, and data-plane materialization (today a ServiceWaypoint receives no HTTP routes) | [#7500](https://github.com/ferrum-edge/ferrum-edge/issues/7500) | [mesh.md → Service Waypoint](mesh.md#service-waypoint) |
 | ServiceWaypoint L7 HTTP/1.1 and HTTP/2 termination and bound-Service dispatch on HBONE `:15008` (today an L4 relay only) | [#7501](https://github.com/ferrum-edge/ferrum-edge/issues/7501) | [mesh.md → Service Waypoint](mesh.md#service-waypoint) |
 | Live ServiceWaypoint end-to-end suite in kind (today ServiceWaypoint has no live data-path suite) | [#7503](https://github.com/ferrum-edge/ferrum-edge/issues/7503) | [mesh.md → Topology maturity](mesh.md#topology-maturity) |
