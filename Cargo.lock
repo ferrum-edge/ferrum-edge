@@ -1295,10 +1295,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
- "js-sys",
  "num-traits",
  "serde",
- "wasm-bindgen",
  "windows-link",
 ]
 
@@ -2228,7 +2226,6 @@ dependencies = [
  "base64 0.23.1",
  "brotli",
  "bytes",
- "chrono",
  "clap",
  "crc32fast",
  "crossbeam-queue",
@@ -6092,7 +6089,6 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "cfg-if",
- "chrono",
  "crc",
  "crossbeam-queue",
  "either",
@@ -6169,7 +6165,6 @@ dependencies = [
  "bitflags",
  "byteorder",
  "bytes",
- "chrono",
  "crc",
  "digest 0.11.3",
  "dotenvy",
@@ -6200,7 +6195,6 @@ dependencies = [
  "base64 0.22.1",
  "bitflags",
  "byteorder",
- "chrono",
  "crc",
  "dotenvy",
  "etcetera",
@@ -6234,7 +6228,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "88b6b78a34ddcb1db4046d462db8f79cee811019d7297b99fca8fac5de26672e"
 dependencies = [
  "atoi",
- "chrono",
  "flume",
  "form_urlencoded",
  "futures-channel",

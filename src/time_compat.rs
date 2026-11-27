@@ -1182,8 +1182,9 @@ impl<'r> Decode<'r, Any> for UtcTimestamp {
 // chrono's serde `Deserialize`), `parse_from_rfc2822`, and the
 // `DateTime::parse_from_str` / `NaiveDateTime::parse_from_str` strftime
 // engine for the specifiers Ferrum uses. `tests/unit/config/
-// time_compat_chrono_parse_tests.rs` runs an accept/reject corpus through
-// both implementations.
+// time_compat_chrono_parse_tests.rs` checks an accept/reject corpus against
+// chrono 0.4.45's results, recorded in `tests/fixtures/time_compat/` (chrono
+// itself is not a dependency).
 
 /// chrono's `NaiveDate` year bounds (`MIN_YEAR`/`MAX_YEAR` in chrono 0.4.45).
 const CHRONO_MIN_YEAR: i32 = (i32::MIN >> 13) + 1;

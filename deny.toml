@@ -70,8 +70,19 @@ unused-ignored-advisory = "deny"
 # RUSTSEC-2024-0449 (unsafe-libyaml) and RUSTSEC-2026-0440 (astral-tokio-tar)
 # were checked against the RustSec advisory-db and crates.io. None has a
 # patched release or a released parent that drops it, so each is re-affirmed
-# to 2027-03-31 with the evidence in its entry. RUSTSEC-2026-0543 (chrono) is
-# re-evaluated separately under issue #7419.
+# to 2027-03-31 with the evidence in its entry.
+#
+# Retired 2026-11-27 by issue #7419 (Phases 2-21): RUSTSEC-2026-0543 (chrono
+# 0.4.45, unmaintained). ferrum-edge no longer depends on chrono, not even as
+# a dev-dependency, and sqlx's `chrono` feature is off, so chrono is never
+# compiled. The root Cargo.lock still records a chrono entry under serde_with
+# 3.21.0 because serde_with's `std`/`alloc` features carry weak
+# `chrono_0_4?/...` references, which Cargo's resolver always locks
+# (rust-lang/cargo#10801). Those features are enabled by testcontainers 0.28.0
+# (dev-dependency, default features) and by the google-cloud-* crates behind
+# the optional `secrets-gcp` feature. serde_with's `chrono_0_4` feature stays
+# off, and cargo-deny's feature-resolved graph does not include chrono. See
+# docs/dependency-policy.md.
 ignore = [
     # ── paste 1.0.15 — RUSTSEC-2024-0436, unmaintained (repository archived).
     # A proc-macro only: it runs at compile time and has no runtime or network
@@ -140,40 +151,6 @@ ignore = [
     # 0.7.0, and testcontainers-rs#1006 (replace it with `tar`) is still open
     # and unmerged. No lockfile-only change removes the crate.
     { id = "RUSTSEC-2026-0440", reason = "astral-tokio-tar 0.6.2 unmaintained (Astral ended maintenance 2026-11-03, patched = [], informational, no known vulnerability). Only parent is testcontainers 0.28.0 (still the latest release, re-checked 2026-11-27; testcontainers-rs#1006 replacing it with tar still open), a dev-dependency of the secrets_functional and service_integration test targets; not in the shipped binary or images. Retire when a testcontainers release replaces it. [expires:2027-03-31]" },
-
-    # ── chrono 0.4.45 — RUSTSEC-2026-0543, unmaintained (announced in
-    # chronotope/chrono#1768, opened 2026-01-22; RustSec advisory issued
-    # 2026-11-17; all versions affected, no patched release). An
-    # informational advisory, not a known vulnerability. Re-evaluated
-    # 2026-11-22 (issue #7419 Phase 1) against cargo-deny's own inclusion graph
-    # (all features):
-    #   - ferrum-edge itself: a direct dependency when added (config-model
-    #     timestamps, the database layer, Admin API output; ~535 Rust files).
-    #     tests/performance/mesh/ also declared it directly. Both are gone as
-    #     of Phase 20; see the 2026-11-27 note below.
-    #   - sqlx 0.9.1 through our `chrono` feature: sqlx-core (vendored),
-    #     sqlx-postgres, sqlx-mysql and sqlx-sqlite.
-    #   Issue #7419 Phases 17-20 move src/ and custom_plugins/ fully to
-    #   time_compat and leave chrono (and sqlx's chrono feature) as a
-    #   dev-dependency used only by the time_compat parity tests.
-    # Resolved in Phase 1: google-cloud-auth was bumped from 1.13.0 to 1.17.0
-    # (with matching google-cloud-gax 1.15.0 / google-cloud-gax-internal 0.7.19 /
-    # google-cloud-secretmanager-v1 1.14.0), which uses jiff and no longer pulls
-    # chrono. `src/time_compat.rs` adds the `time`-backed compatibility layer
-    # preserving byte-identical serde and SQL (SQLite/MySQL/Postgres/Any) formats.
-    # Not a parent: serde_with 3.21.0 lists chrono in Cargo.lock only
-    # because Cargo records optional dependencies named by weak `dep?/feature`
-    # entries (rust-lang/cargo#10801). Nothing enables serde_with's chrono
-    # feature, so it is not compiled and cargo-deny does not report it; the
-    # mongodb, testcontainers and google-cloud-* paths to serde_with do not
-    # bring chrono in.
-    # Extended 2026-11-27 from 2026-12-31 to 2027-03-31. Issue #7419 Phases
-    # 2-20 moved every production and test-helper timestamp to `time_compat`;
-    # chrono and sqlx's `chrono` feature are now dev-dependencies used only by
-    # the time_compat parity tests (Cargo also enables dev-dependencies for
-    # examples and benches). Retire by replacing that parity oracle with
-    # recorded values and removing chrono entirely.
-    { id = "RUSTSEC-2026-0543", reason = "chrono 0.4.45 unmaintained (chronotope/chrono#1768, all versions, patched = [], informational, no known vulnerability). Issue #7419 Phases 2-20 moved src/ and custom_plugins/ off chrono, so the shipped binary, fuzz/ and tests/performance/mesh no longer compile it. Remaining parent (cargo-deny graph, which includes dev-dependencies): ferrum-edge's own dev-dependency on chrono plus sqlx 0.9.1's chrono feature, enabled only through dev-dependencies and used only by the three time_compat parity tests (time_compat_tests, time_compat_chrono_parse_tests and the MySQL service-integration parity test). serde_with 3.21.0 lists chrono in Cargo.lock only through weak features (cargo#10801) and does not compile it. Extended from 2026-12-31. Retire in the issue #7419 follow-up that replaces the parity oracle with recorded values and removes chrono from dev-dependencies and every lockfile. [expires:2027-03-31]" },
 ]
 
 [bans]

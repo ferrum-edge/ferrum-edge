@@ -399,7 +399,10 @@ rejected (`TimestampError::OutOfRange`) rather than represented, and a leap
 second (`:60`) is stored as the following second.
 
 **Operator action:** rebuild custom plugins against 1.0.0 and replace chrono
-calls on these fields with the `UtcTimestamp` equivalents. The
+calls on these fields with the `UtcTimestamp` equivalents. Ferrum Edge no
+longer depends on `chrono` (#7419), so a custom plugin that still calls
+`chrono` directly must add it to `[dependencies]` in `Cargo.toml` itself
+([Adding Dependencies](../CUSTOM_PLUGINS.md#adding-dependencies)). The
 custom-plugin Rust API stays unstable after 1.0.0
 ([support policy](support_policy.md#custom-plugin-rust-api)).
 

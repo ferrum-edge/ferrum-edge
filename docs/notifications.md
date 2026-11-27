@@ -241,12 +241,12 @@ Operator expectations for webhook and email consumers:
 
 ```rust
 use std::sync::Arc;
-use chrono::Utc;
 use tokio::sync::Semaphore;
 use ferrum_edge::notifications::{
     dispatch, EventAction, Notification, NotificationField, Severity,
     channels::parse_channels,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 
 let channels = parse_channels(http_client.backend_allow_ips(), &serde_json::json!({
     "ops": {
@@ -261,7 +261,7 @@ let n = Notification::builder("Gateway entered draining state")
     .severity(Severity::High)
     .event_action(EventAction::Trigger)
     .source("overload_manager")
-    .fired_at(Utc::now())
+    .fired_at(UtcTimestamp::now())
     .field("FD %", "96")
     .build();
 

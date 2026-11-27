@@ -50,15 +50,16 @@ gateways, control planes, mesh data planes, charts or contract consumers.
 
 ### Security
 - **The `chrono` advisory exception (RUSTSEC-2026-0543, unmaintained, no
-  known vulnerability) is extended from 2026-12-31 to 2027-03-31** in
-  `deny.toml` and the dependency-policy register (#7526). Issue #7419 Phases
-  2-20 have moved every timestamp in `src/`, `custom_plugins/` and the test
-  helpers to `time_compat`, and `chrono` (with sqlx's `chrono` feature) is now
-  only a dev-dependency used by the `time_compat` parity tests; the shipped
-  binary, `fuzz/` and the mesh benchmark no longer compile it. Remaining work:
-  replacing the parity tests' chrono oracle with recorded values and removing
-  `chrono` entirely. The
-  exception can be retired only once no dependency still resolves `chrono`.
+  known vulnerability) is removed: `chrono` is no longer a dependency of
+  Ferrum Edge** (issue #7419, Phases 2-21 complete). Every timestamp in
+  `src/`, `custom_plugins/` and the tests uses `time_compat`. The parity tests
+  now compare against chrono 0.4.45 outputs recorded in
+  `tests/fixtures/time_compat/`, and `chrono` and sqlx's `chrono` feature are
+  gone from `[dev-dependencies]`, so nothing compiles `chrono`. The root
+  `Cargo.lock` still lists a `chrono` entry that is never compiled. It is
+  there because `serde_with` (reached through the test-only `testcontainers`
+  and the `secrets-gcp` Google Cloud crates) names `chrono` as an optional
+  dependency (rust-lang/cargo#10801). See the dependency-policy register.
 - **Three other advisory exceptions were re-reviewed on 2026-11-27 and
   re-affirmed until 2027-03-31** (#7520): RUSTSEC-2024-0436 (`paste`),
   RUSTSEC-2024-0449 (`unsafe-libyaml`) and RUSTSEC-2026-0440
