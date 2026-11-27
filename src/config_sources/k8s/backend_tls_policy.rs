@@ -21,7 +21,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use chrono::{DateTime, Utc};
+use crate::time_compat::UtcTimestamp;
 use serde_json::Value;
 
 use crate::config::types::{
@@ -276,7 +276,7 @@ struct IndexedBackendTlsPolicy {
     section_name: Option<String>,
     /// Ports this policy governs, resolved against the target Service.
     port_scope: PolicyPortScope,
-    creation_timestamp: Option<DateTime<Utc>>,
+    creation_timestamp: Option<UtcTimestamp>,
     record: BackendTlsPolicyRecord,
 }
 
@@ -627,8 +627,11 @@ pub(super) fn collect(
         .metadata
         .creation_timestamp
         .as_deref()
-        .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
-        .map(|ts| ts.with_timezone(&Utc));
+        .and_then(|ts| {
+            crate::time_compat::parse_rfc3339_chrono(ts)
+                .and_then(|parsed| parsed.to_utc_timestamp())
+                .ok()
+        });
 
     let mut target_services: Vec<(String, String)> = Vec::new();
     let mut any_target_resolved = false;

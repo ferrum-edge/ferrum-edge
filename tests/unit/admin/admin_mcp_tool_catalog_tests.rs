@@ -8,7 +8,6 @@
 //! tools through the running plugin instance.
 
 use arc_swap::ArcSwap;
-use chrono::Utc;
 use ferrum_edge::admin::{
     AdminState,
     jwt_auth::{JwtConfig, JwtManager, ViewerNamespaceCeiling},
@@ -20,6 +19,7 @@ use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext};
 use ferrum_edge::proxy::ProxyState;
+use ferrum_edge::time_compat::UtcTimestamp;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -51,14 +51,14 @@ fn jwt_manager() -> JwtManager {
 }
 
 fn token(secret: &str, role: &str, ns: Option<Value>) -> String {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let mut claims = json!({
         "iss": ISSUER,
         "sub": "foundry",
         "role": role,
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(600)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(600)).unwrap()).unix_timestamp(),
         "jti": uuid::Uuid::new_v4().to_string(),
     });
     if let Some(ns) = ns {

@@ -6,7 +6,6 @@
 
 use std::collections::HashMap;
 
-use chrono::Utc;
 use serde_json::{Value, json};
 
 use ferrum_edge::ConsumerIndex;
@@ -21,6 +20,7 @@ use ferrum_edge::plugins::{Plugin, RequestContext, jwks_auth::JwksAuth};
 
 use super::jwks_auth_support::{build_rsa_jwks_from_pem, create_rs256_token, default_client};
 use super::plugin_utils::assert_continue;
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const PREFIX: &str = "test_auth.claim_header.";
 
@@ -41,8 +41,8 @@ fn consumer(id: &str, username: &str) -> Consumer {
         custom_id: None,
         credentials: HashMap::new(),
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 

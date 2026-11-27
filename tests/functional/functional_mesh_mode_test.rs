@@ -23,7 +23,6 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use chrono::Utc;
 use futures_util::{Stream, StreamExt, stream};
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::Frame;
@@ -78,6 +77,7 @@ use crate::common::{
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::{GetOptions, Http3Client, Http3GrpcStream, WebSocketOptions};
 use crate::scaffolding::ports::reserve_port;
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const GRPC_SECRET: &str = "ferrum-edge-functional-mesh-grpc-secret00";
 pub(crate) const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
@@ -157,7 +157,7 @@ impl MeshConfigSync for StaticMeshControlPlane {
 
         let update = MeshConfigUpdate {
             version: slice.version.clone(),
-            timestamp: Utc::now().timestamp(),
+            timestamp: UtcTimestamp::now().unix_timestamp(),
             mesh_slice_json: serde_json::to_string(&slice)
                 .map_err(|e| Status::internal(format!("serialize mesh slice: {e}")))?,
             ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
@@ -178,7 +178,7 @@ impl MeshConfigSync for StaticMeshControlPlane {
         };
         let heartbeat = MeshConfigUpdate {
             version: self.slice.version.clone(),
-            timestamp: Utc::now().timestamp(),
+            timestamp: UtcTimestamp::now().unix_timestamp(),
             mesh_slice_json: String::new(),
             ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
             heartbeat: true,
@@ -328,7 +328,7 @@ fn initial_mesh_slice(node_id: &str) -> MeshSlice {
     MeshSlice {
         node_id: node_id.to_string(),
         namespace: "ferrum".to_string(),
-        version: Utc::now().to_rfc3339(),
+        version: UtcTimestamp::now().to_rfc3339(),
         ..MeshSlice::default()
     }
 }
@@ -339,7 +339,7 @@ fn east_west_service_slice(node_id: &str) -> MeshSlice {
     MeshSlice {
         node_id: node_id.to_string(),
         namespace: "ferrum".to_string(),
-        version: Utc::now().to_rfc3339(),
+        version: UtcTimestamp::now().to_rfc3339(),
         workloads: vec![Workload {
             spiffe_id: spiffe_id.clone(),
             selector: WorkloadSelector::default(),
@@ -1903,7 +1903,7 @@ fn dr_live_slice(
     MeshSlice {
         node_id: node_id.to_string(),
         namespace: DR_LIVE_CLIENT_NAMESPACE.to_string(),
-        version: Utc::now().to_rfc3339(),
+        version: UtcTimestamp::now().to_rfc3339(),
         istio_root_namespace: DR_LIVE_ROOT_NAMESPACE.to_string(),
         service_entries: vec![ServiceEntry {
             name: "dr-live-external".to_string(),
@@ -2321,7 +2321,7 @@ fn disable_peer_auth_slice(node_id: &str) -> MeshSlice {
     MeshSlice {
         node_id: node_id.to_string(),
         namespace: "ferrum".to_string(),
-        version: Utc::now().to_rfc3339(),
+        version: UtcTimestamp::now().to_rfc3339(),
         peer_authentications: vec![PeerAuthentication {
             name: "mesh-disable".to_string(),
             namespace: "ferrum".to_string(),
@@ -2660,7 +2660,7 @@ fn strict_peer_auth_slice(node_id: &str) -> MeshSlice {
     MeshSlice {
         node_id: node_id.to_string(),
         namespace: "ferrum".to_string(),
-        version: Utc::now().to_rfc3339(),
+        version: UtcTimestamp::now().to_rfc3339(),
         peer_authentications: vec![PeerAuthentication {
             name: "mesh-strict".to_string(),
             namespace: "ferrum".to_string(),
@@ -3634,7 +3634,7 @@ fn inbound_authz_slice(
     MeshSlice {
         node_id: node_id.to_string(),
         namespace: "ferrum".to_string(),
-        version: Utc::now().to_rfc3339(),
+        version: UtcTimestamp::now().to_rfc3339(),
         workloads: vec![server_workload],
         services: vec![echo_service],
         peer_authentications: vec![PeerAuthentication {
@@ -3903,7 +3903,7 @@ fn cross_namespace_workload_entry_inbound_slice(
     MeshSlice {
         node_id: node_id.to_string(),
         namespace: "vms".to_string(),
-        version: Utc::now().to_rfc3339(),
+        version: UtcTimestamp::now().to_rfc3339(),
         workloads: vec![workload],
         services: vec![attached_service, decoy_identity_namespace_service],
         peer_authentications: vec![PeerAuthentication {
@@ -4685,7 +4685,7 @@ fn egress_service_slice(
     MeshSlice {
         node_id: node_id.to_string(),
         namespace: "ferrum".to_string(),
-        version: Utc::now().to_rfc3339(),
+        version: UtcTimestamp::now().to_rfc3339(),
         workloads: vec![Workload {
             spiffe_id: b_id.clone(),
             selector: WorkloadSelector {
@@ -6888,7 +6888,7 @@ fn cross_cluster_dest_slice(
     MeshSlice {
         node_id: node_id.to_string(),
         namespace: "ferrum".to_string(),
-        version: Utc::now().to_rfc3339(),
+        version: UtcTimestamp::now().to_rfc3339(),
         workloads: vec![Workload {
             spiffe_id: c_id.clone(),
             selector: WorkloadSelector {
@@ -6985,7 +6985,7 @@ fn cross_cluster_east_west_slice(
     MeshSlice {
         node_id: node_id.to_string(),
         namespace: "ferrum".to_string(),
-        version: Utc::now().to_rfc3339(),
+        version: UtcTimestamp::now().to_rfc3339(),
         // The east-west passthrough forwards SNI → the service workload addr:port;
         // here that "workload" is C's INBOUND mTLS listener (modeling the
         // destination's inbound iptables redirect — see the fn doc).
@@ -7047,7 +7047,7 @@ fn cross_cluster_client_slice(
     MeshSlice {
         node_id: node_id.to_string(),
         namespace: "ferrum".to_string(),
-        version: Utc::now().to_rfc3339(),
+        version: UtcTimestamp::now().to_rfc3339(),
         // The REMOTE workload of svc-c (trust domain B, network net-b). Its
         // address is a remote pod IP that must NEVER be dialed directly — the
         // cross-cluster target dials the east-west gateway instead.
@@ -8073,7 +8073,7 @@ fn cross_cluster_ambient_dest_slice(
     MeshSlice {
         node_id: node_id.to_string(),
         namespace: "ferrum".to_string(),
-        version: Utc::now().to_rfc3339(),
+        version: UtcTimestamp::now().to_rfc3339(),
         workloads: vec![Workload {
             spiffe_id: c_id.clone(),
             selector: WorkloadSelector {
@@ -8161,7 +8161,7 @@ fn cross_cluster_ambient_east_west_slice(
     MeshSlice {
         node_id: node_id.to_string(),
         namespace: "ferrum".to_string(),
-        version: Utc::now().to_rfc3339(),
+        version: UtcTimestamp::now().to_rfc3339(),
         workloads: vec![Workload {
             spiffe_id: c_id.clone(),
             selector: WorkloadSelector::default(),
@@ -8225,7 +8225,7 @@ fn cross_cluster_ambient_client_slice(
     MeshSlice {
         node_id: node_id.to_string(),
         namespace: "ferrum".to_string(),
-        version: Utc::now().to_rfc3339(),
+        version: UtcTimestamp::now().to_rfc3339(),
         workloads: vec![Workload {
             spiffe_id: c_id.clone(),
             selector: WorkloadSelector::default(),
@@ -10270,7 +10270,7 @@ fn udp_dest_slice(
     MeshSlice {
         node_id: node_id.to_string(),
         namespace: "ferrum".to_string(),
-        version: Utc::now().to_rfc3339(),
+        version: UtcTimestamp::now().to_rfc3339(),
         workloads: vec![Workload {
             spiffe_id: b_id.clone(),
             selector: WorkloadSelector {
@@ -10971,7 +10971,7 @@ fn third_workload_refusal_slice(
     MeshSlice {
         node_id: node_id.to_string(),
         namespace: "ferrum".to_string(),
-        version: Utc::now().to_rfc3339(),
+        version: UtcTimestamp::now().to_rfc3339(),
         workloads: vec![
             Workload {
                 spiffe_id: b_id.clone(),
@@ -11733,7 +11733,7 @@ fn sidecar_ingress_stream_slice(
     MeshSlice {
         node_id: node_id.to_string(),
         namespace: "ferrum".to_string(),
-        version: Utc::now().to_rfc3339(),
+        version: UtcTimestamp::now().to_rfc3339(),
         workloads: vec![workload.clone()],
         services: vec![service.clone()],
         local_inbound_workloads: Some(vec![workload]),
@@ -12495,7 +12495,7 @@ fn target_refs_waypoint_slice(
     MeshSlice {
         node_id: node_id.to_string(),
         namespace: WAYPOINT_TARGET_REFS_NAMESPACE.to_string(),
-        version: Utc::now().to_rfc3339(),
+        version: UtcTimestamp::now().to_rfc3339(),
         // The DENY policy below is owned by this namespace, and one caller
         // attaches a `GatewayClass` arm. GatewayClass is cluster-scoped, so
         // only the Istio root namespace may own such a policy — declare this
@@ -13607,7 +13607,7 @@ fn live_source_capture_slice(
     MeshSlice {
         node_id: node_id.to_string(),
         namespace: "ferrum".to_string(),
-        version: Utc::now().to_rfc3339(),
+        version: UtcTimestamp::now().to_rfc3339(),
         workloads: vec![Workload {
             spiffe_id: b_id.clone(),
             selector: WorkloadSelector {
@@ -15944,7 +15944,7 @@ fn live_xc_dest_slice(
     MeshSlice {
         node_id: node_id.to_string(),
         namespace: "ferrum".to_string(),
-        version: Utc::now().to_rfc3339(),
+        version: UtcTimestamp::now().to_rfc3339(),
         workloads: vec![live_xc_workload(dest_ip.to_string(), false)],
         services: live_xc_services(&workload_id),
         peer_authentications: vec![PeerAuthentication {
@@ -15972,7 +15972,7 @@ fn live_xc_east_west_slice(node_id: &str, dest_ip: std::net::Ipv4Addr) -> MeshSl
     MeshSlice {
         node_id: node_id.to_string(),
         namespace: "ferrum".to_string(),
-        version: Utc::now().to_rfc3339(),
+        version: UtcTimestamp::now().to_rfc3339(),
         workloads: vec![live_xc_workload(dest_ip.to_string(), false)],
         services: live_xc_services(&workload_id),
         ..MeshSlice::default()
@@ -16014,7 +16014,7 @@ fn live_xc_source_slice(
     MeshSlice {
         node_id: node_id.to_string(),
         namespace: "ferrum".to_string(),
-        version: Utc::now().to_rfc3339(),
+        version: UtcTimestamp::now().to_rfc3339(),
         workloads: vec![live_xc_workload(dest_ip.to_string(), true)],
         ambient_udp_source_workloads: vec![source_workload],
         services,

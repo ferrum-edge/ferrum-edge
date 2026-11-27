@@ -10,6 +10,7 @@ use ferrum_edge::config::PoolConfig;
 use ferrum_edge::config::types::{AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, Proxy};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::proxy::http2_pool::{Http2ConnectionPool, Http2PoolError};
+use ferrum_edge::time_compat::UtcTimestamp;
 use ferrum_edge::tls::backend::BackendTlsConfigBuilder;
 use http_body_util::Full;
 use hyper::body::Incoming;
@@ -144,8 +145,8 @@ fn create_test_proxy(port: u16, ca_path: &str, san_allow_list: Vec<String>) -> P
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }

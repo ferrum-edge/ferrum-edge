@@ -16,6 +16,7 @@ use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 
 use crate::scaffolding::ports::reserve_port;
+use ferrum_edge::time_compat::UtcTimestamp;
 
 fn ensure_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -351,8 +352,8 @@ async fn mesh_peer_auth_live_reload_tcp_tls_swap_takes_effect_on_next_accept() {
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     };
     proxy.dispatch_kind = DispatchKind::TcpTls;
@@ -363,7 +364,7 @@ async fn mesh_peer_auth_live_reload_tcp_tls_swap_takes_effect_on_next_accept() {
         consumers: vec![],
         upstreams: vec![],
         plugin_configs: vec![],
-        loaded_at: chrono::Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };
@@ -427,7 +428,6 @@ async fn mesh_peer_auth_live_reload_tcp_tls_swap_takes_effect_on_next_accept() {
         false,
         false,
         0,
-        false,
         false,
         false,
         Arc::new(TrustedProxies::none()),

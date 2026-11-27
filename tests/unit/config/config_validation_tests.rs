@@ -1,9 +1,9 @@
-use chrono::Utc;
 use ferrum_edge::config::db_backend::FullConfigLoadPurpose;
 use ferrum_edge::config::types::{
     Consumer, GatewayConfig, PluginConfig, PluginScope, anchor_regex_pattern, hosts_overlap,
     redact_consumer_credentials, validate_host_entry,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -20,8 +20,8 @@ fn make_consumer(id: &str, username: &str) -> Consumer {
         custom_id: None,
         credentials: HashMap::new(),
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -774,8 +774,8 @@ fn runtime_plugin_composition_validation_treats_globals_as_gateway_wide() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     let config = GatewayConfig {
         plugin_configs: vec![
@@ -822,8 +822,8 @@ fn plugin_config_for_gate(id: &str, plugin_name: &str, config: serde_json::Value
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 

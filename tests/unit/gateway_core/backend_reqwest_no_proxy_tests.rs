@@ -1,12 +1,12 @@
 //! Ambient-proxy isolation for policy-governed backend reqwest clients.
 
-use chrono::Utc;
 use ferrum_edge::config::PoolConfig;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, Proxy, ResponseBodyMode,
 };
 use ferrum_edge::connection_pool::ConnectionPool;
 use ferrum_edge::dns::{DnsCache, DnsConfig};
+use ferrum_edge::time_compat::UtcTimestamp;
 use std::sync::Arc;
 use std::time::Duration;
 use wiremock::MockServer;
@@ -58,7 +58,7 @@ impl Drop for ProxyEnvGuard {
 }
 
 fn minimal_proxy() -> Proxy {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     Proxy {
         labels: Default::default(),
         id: "test-proxy".to_string(),

@@ -18,7 +18,7 @@ use crate::common::{
 };
 
 use base64::Engine;
-use chrono::Utc;
+use ferrum_edge::time_compat::UtcTimestamp;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -235,7 +235,7 @@ async fn send_raw_h1_hmac_request(
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let authority = format!("127.0.0.1:{proxy_port}");
-    let date = Utc::now().to_rfc2822();
+    let date = UtcTimestamp::now().to_rfc2822().unwrap();
     let authorization =
         hmac_authorization_for_digest(method, "/hmacauth", &date, &authority, digest);
     let request = format!(
@@ -329,7 +329,7 @@ async fn send_h2_hmac_request(
     body_after_headers: Option<&[u8]>,
 ) -> u16 {
     let authority = format!("127.0.0.1:{proxy_port}");
-    let date = Utc::now().to_rfc2822();
+    let date = UtcTimestamp::now().to_rfc2822().unwrap();
     let authorization =
         hmac_authorization_for_digest(method, "/hmacauth", &date, &authority, digest);
     let stream = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
@@ -751,11 +751,11 @@ async fn update_proxy(
 
 /// Generate a consumer JWT token signed with the consumer's secret
 fn generate_consumer_jwt(consumer_username: &str, secret: &str, exp_offset_secs: i64) -> String {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "sub": consumer_username,
-        "iat": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(exp_offset_secs)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(exp_offset_secs)).unwrap()).unix_timestamp(),
     });
     let header = Header::new(jsonwebtoken::Algorithm::HS256);
     let key = EncodingKey::from_secret(secret.as_bytes()).unwrap();
@@ -914,13 +914,13 @@ async fn test_access_control_allows_jwks_authenticated_identity_when_enabled() {
 
     tokio::time::sleep(Duration::from_secs(4)).await;
 
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let token = create_rs256_token(
         &json!({
             "sub": "oidc-user-123",
             "scope": "gateway:access",
-            "iat": now.timestamp(),
-            "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
+            "iat": now.unix_timestamp(),
+            "exp": (now.checked_add(::time::SignedDuration::seconds(3600)).unwrap()).unix_timestamp(),
         }),
         private_key_pem,
     );
@@ -1641,7 +1641,7 @@ async fn test_auth_acl_comprehensive() {
 
     // Test 17: HMAC Auth — valid signature
     println!("\n--- Test 17: HMAC Auth — Valid Signature ---");
-    let date = Utc::now().to_rfc2822();
+    let date = UtcTimestamp::now().to_rfc2822().unwrap();
     let hmac_header = hmac_v2_authorization(
         "GET",
         "/hmacauth",
@@ -1674,7 +1674,7 @@ async fn test_auth_acl_comprehensive() {
 
     // Test 18: HMAC Auth — wrong secret (bad signature)
     println!("\n--- Test 18: HMAC Auth — Wrong Secret ---");
-    let date = Utc::now().to_rfc2822();
+    let date = UtcTimestamp::now().to_rfc2822().unwrap();
     let hmac_header = hmac_v2_authorization(
         "GET",
         "/hmacauth",
@@ -1726,7 +1726,7 @@ async fn test_auth_acl_comprehensive() {
 
     // Test 20: HMAC Auth — unknown consumer
     println!("\n--- Test 20: HMAC Auth — Unknown Consumer ---");
-    let date = Utc::now().to_rfc2822();
+    let date = UtcTimestamp::now().to_rfc2822().unwrap();
     let hmac_header = hmac_v2_authorization(
         "GET",
         "/hmacauth",
@@ -1755,7 +1755,7 @@ async fn test_auth_acl_comprehensive() {
     // body reaches the HMAC plug-in's 10 MiB collection limit. Exact response
     // parity prevents the former 413-vs-401 username-enumeration oracle.
     println!("\n--- HMAC Auth — Oversized Invalid Credential Parity ---");
-    let oversized_date = Utc::now().to_rfc2822();
+    let oversized_date = UtcTimestamp::now().to_rfc2822().unwrap();
     let (known_wrong_status, known_wrong_body) = send_declared_oversized_invalid_h1_hmac_request(
         harness._gw.proxy_port,
         &oversized_date,
@@ -1780,7 +1780,7 @@ async fn test_auth_acl_comprehensive() {
     println!("\n--- Test 21: HMAC Auth — Missing Auth Header ---");
     let resp = client
         .get(format!("{}/hmacauth", proxy_url))
-        .header("Date", Utc::now().to_rfc2822())
+        .header("Date", UtcTimestamp::now().to_rfc2822().unwrap())
         .header("Digest", empty_digest_header())
         .send()
         .await
@@ -2792,7 +2792,7 @@ async fn test_hmac_auth_plus_acl() {
         authority: &str,
         secret: &str,
     ) -> (String, String) {
-        let date = Utc::now().to_rfc2822();
+        let date = UtcTimestamp::now().to_rfc2822().unwrap();
         let header = hmac_v2_authorization(
             "GET",
             path,
@@ -3075,7 +3075,7 @@ async fn test_hmac_v2_backend_sees_exactly_one_mutation_for_a_replayed_request()
     wait_until_hmac_v2_route_and_plugin_active(&client, &url).await;
 
     let authority = hmac_authority_from_url(&url);
-    let date = Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+    let date = httpdate::fmt_http_date(std::time::SystemTime::now());
     let digest = empty_digest_header();
     let nonce = crate::common::hmac_v2_nonce(0x5eed_0001);
     let request = crate::common::HmacV2Request {
@@ -3288,7 +3288,7 @@ async fn test_hmac_v2_content_digest_forwards_original_body() {
     wait_until_hmac_v2_route_and_plugin_active(&client, &url).await;
 
     let authority = hmac_authority_from_url(&url);
-    let date = Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+    let date = httpdate::fmt_http_date(std::time::SystemTime::now());
     let nonempty = br#"{"ping":1}"#;
     let nonempty_digest = content_digest_sha256_header(nonempty);
     let nonce = crate::common::hmac_v2_nonce(0x3932_0001);

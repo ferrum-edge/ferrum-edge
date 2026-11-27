@@ -1,6 +1,5 @@
 //! Tests for TCP/UDP stream proxy configuration types and validation.
 
-use chrono::Utc;
 use ferrum_edge::config::types::{
     ActiveHealthCheck, AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig,
     HealthProbeType, MAX_TCP_IDLE_TIMEOUT, Proxy,
@@ -8,6 +7,7 @@ use ferrum_edge::config::types::{
 use ferrum_edge::proxy::stream_match::{
     MAX_STREAM_MATCH_ARMS, StreamMatchArm, StreamMatchCriteria,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use std::collections::BTreeMap;
 
 fn make_stream_proxy(id: &str, scheme: BackendScheme, port: u16) -> Proxy {
@@ -75,8 +75,8 @@ fn make_stream_proxy(id: &str, scheme: BackendScheme, port: u16) -> Proxy {
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }
@@ -146,8 +146,8 @@ fn make_http_proxy(id: &str, listen_path: &str) -> Proxy {
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }
@@ -159,7 +159,7 @@ fn test_config(proxies: Vec<Proxy>) -> GatewayConfig {
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     }

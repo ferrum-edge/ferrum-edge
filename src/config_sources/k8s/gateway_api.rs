@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use chrono::{DateTime, Utc};
+use crate::time_compat::UtcTimestamp;
 use serde_json::{Value, json};
 
 use crate::config::types::{
@@ -79,7 +79,7 @@ const KEY_WAYPOINT_FOR: &str = "istio.io/waypoint-for";
 #[derive(Debug, Clone)]
 struct GatewayApiRouteConflictCandidate {
     resource: K8sResourceKey,
-    creation_timestamp: Option<DateTime<Utc>>,
+    creation_timestamp: Option<UtcTimestamp>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -147,7 +147,7 @@ struct FrontendTlsHostnameClaim {
     /// Listener `hostname`, ASCII-lowercased. `None` (a catch-all listener)
     /// never collides: it claims no specific SNI name.
     hostname: Option<String>,
-    creation_timestamp: Option<DateTime<Utc>>,
+    creation_timestamp: Option<UtcTimestamp>,
     certificate_identity: Vec<String>,
 }
 
@@ -257,7 +257,7 @@ fn frontend_tls_listener_admission(
 pub(crate) struct PendingFrontendTlsListener {
     pub key: GatewayApiListenerKey,
     pub hostname: Option<String>,
-    pub creation_timestamp: Option<DateTime<Utc>>,
+    pub creation_timestamp: Option<UtcTimestamp>,
     /// `(cert_source, key_source)` per `certificateRefs` entry, in spec order.
     pub certificates: Vec<(String, String)>,
 }
@@ -299,7 +299,7 @@ struct GatewayApiDispatchRulePrecedence {
     method_match: bool,
     header_count: usize,
     query_param_count: usize,
-    creation_timestamp: Option<DateTime<Utc>>,
+    creation_timestamp: Option<UtcTimestamp>,
     namespace: String,
     name: String,
     rule_index: usize,
@@ -405,7 +405,7 @@ const DEFAULT_SESSION_NAME: &str = "ferrum-session";
 #[derive(Debug, Clone)]
 pub(crate) struct GatewayBackendSessionPolicy {
     pub resource: K8sResourceKey,
-    pub creation_timestamp: Option<DateTime<Utc>>,
+    pub creation_timestamp: Option<UtcTimestamp>,
     /// `None` = policy accepted but carries no `sessionPersistence`.
     pub session: Option<GatewaySessionPersistence>,
 }
@@ -4769,15 +4769,17 @@ fn l4_route_listener_bindings_for_namespace(
         .collect()
 }
 
-pub(crate) fn parse_k8s_timestamp(value: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(value)
+/// chrono-compatible strict RFC 3339 (issue #7419); an instant outside
+/// `UtcTimestamp`'s range is treated like any unparseable timestamp.
+pub(crate) fn parse_k8s_timestamp(value: &str) -> Option<UtcTimestamp> {
+    crate::time_compat::parse_rfc3339_chrono(value)
+        .and_then(|parsed| parsed.to_utc_timestamp())
         .ok()
-        .map(|timestamp| timestamp.with_timezone(&Utc))
 }
 
 pub(super) fn compare_creation_timestamps(
-    left: &Option<DateTime<Utc>>,
-    right: &Option<DateTime<Utc>>,
+    left: &Option<UtcTimestamp>,
+    right: &Option<UtcTimestamp>,
 ) -> Ordering {
     match (left, right) {
         (Some(left_ts), Some(right_ts)) => left_ts.cmp(right_ts),

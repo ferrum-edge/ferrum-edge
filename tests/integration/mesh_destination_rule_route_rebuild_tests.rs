@@ -11,7 +11,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use chrono::{Duration, Utc};
 use ferrum_edge::config::types::{
     Consumer, DnsSdConfig, GatewayConfig, LoadBalancerAlgorithm, MAX_TARGET_WEIGHT, MeshSdConfig,
     Proxy, SdProvider, ServiceDiscoveryConfig, Upstream, UpstreamLocalityLbSetting,
@@ -31,6 +30,7 @@ use ferrum_edge::modes::mesh::{
 use ferrum_edge::proxy::{ConfigApplyOutcome, ProxyState};
 
 use super::mesh_test_support::{service_for, workload_for};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 fn runtime() -> MeshRuntimeConfig {
     MeshRuntimeConfig {
@@ -125,7 +125,7 @@ fn unrelated_http_proxy() -> Proxy {
 }
 
 fn unrelated_consumer(id: &str, username: &str) -> Consumer {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     Consumer {
         labels: Default::default(),
         id: id.to_string(),
@@ -157,7 +157,7 @@ fn lb_hash_on_for_port(state: &ProxyState, port: u16) -> HashOnStrategy {
 }
 
 fn sd_upstream() -> Upstream {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     Upstream {
         labels: Default::default(),
         id: "reviews-u".to_string(),
@@ -264,10 +264,7 @@ fn remove_trusted_mesh_plugins_for_public_update_fixture(config: &mut GatewayCon
     }
 }
 
-fn prepared_with_dr_at(
-    dr: Option<MeshDestinationRule>,
-    stamp: chrono::DateTime<Utc>,
-) -> GatewayConfig {
+fn prepared_with_dr_at(dr: Option<MeshDestinationRule>, stamp: UtcTimestamp) -> GatewayConfig {
     let mut proxy = http_proxy();
     proxy.created_at = stamp;
     proxy.updated_at = stamp;
@@ -299,10 +296,15 @@ fn prepared_with_dr_at(
 }
 
 fn prepared_with_dr(dr: Option<MeshDestinationRule>) -> GatewayConfig {
-    prepared_with_dr_at(dr, Utc::now() - Duration::seconds(30))
+    prepared_with_dr_at(
+        dr,
+        UtcTimestamp::now()
+            .checked_sub(::time::SignedDuration::seconds(30))
+            .unwrap(),
+    )
 }
 
-fn prepared_mesh_sd_with_dr(stamp: chrono::DateTime<Utc>, idle_ms: u64) -> GatewayConfig {
+fn prepared_mesh_sd_with_dr(stamp: UtcTimestamp, idle_ms: u64) -> GatewayConfig {
     let workload = workload_for("reviews", "default", [("app", "reviews")], ["10.0.0.9"]);
     let service = service_for("reviews", "default", &[&workload]);
     let mut proxy = http_proxy();
@@ -431,7 +433,7 @@ fn projected_only_configs_with_extra_proxies(
     mutate_new: impl FnOnce(&mut Upstream),
     extra_proxies: Vec<Proxy>,
 ) -> (GatewayConfig, GatewayConfig) {
-    let stamp = Utc::now();
+    let stamp = UtcTimestamp::now();
     let mut old_upstream = sd_upstream();
     old_upstream.created_at = stamp;
     old_upstream.updated_at = stamp;
@@ -598,7 +600,9 @@ async fn update_config_removes_dr_fallback_and_restores_route_defaults() {
 
 #[tokio::test]
 async fn update_config_dr_noop_and_repeated_reload_are_stable() {
-    let stamp = Utc::now() - Duration::seconds(30);
+    let stamp = UtcTimestamp::now()
+        .checked_sub(::time::SignedDuration::seconds(30))
+        .unwrap();
     let prepared = prepared_with_dr_at(Some(destination_rule(Some(7_000), None)), stamp);
     let (state, _handles) = new_proxy_state(prepared.clone());
     assert_eq!(route_fallback_idle_ms(&state), Some(7_000));
@@ -641,7 +645,9 @@ async fn update_config_applies_mesh_dr_prepare_without_proxy_resource_edit() {
     // Proxy `updated_at` bump — the invalidation signal must fire from the
     // projected fields alone (or the mesh-block / upstream timestamp delta
     // the mesh apply already produces).
-    let stamp = Utc::now() - Duration::seconds(30);
+    let stamp = UtcTimestamp::now()
+        .checked_sub(::time::SignedDuration::seconds(30))
+        .unwrap();
     let initial = prepared_with_dr_at(
         Some(destination_rule(
             Some(1_500),
@@ -693,7 +699,9 @@ async fn update_config_unrelated_mesh_policy_does_not_require_proxy_edit_for_dr(
     // Pin the "no unrelated event" acceptance criterion: a DestinationRule
     // projection change is sufficient by itself. The prior generation already
     // carries a non-DR mesh block; swapping only the DR still republishes.
-    let stamp = Utc::now() - Duration::seconds(30);
+    let stamp = UtcTimestamp::now()
+        .checked_sub(::time::SignedDuration::seconds(30))
+        .unwrap();
     let mut base = prepared_with_dr_at(Some(destination_rule(Some(2_200), None)), stamp);
     if let Some(mesh) = base.mesh.as_mut() {
         // Keep a stable non-DR mesh field so the candidate is not "mesh absent".
@@ -1135,7 +1143,10 @@ async fn ordinary_proxy_edit_preserves_unaffected_load_balancer_snapshot() {
         .find(|proxy| proxy.id == "reviews-p")
         .expect("reviews proxy");
     proxy.backend_read_timeout_ms = 7_500;
-    proxy.updated_at += Duration::seconds(1);
+    proxy.updated_at = proxy
+        .updated_at
+        .checked_add(::time::SignedDuration::seconds(1))
+        .unwrap();
     new_config.normalize_fields();
 
     let (state, _handles) = new_proxy_state(old_config);
@@ -1198,7 +1209,9 @@ async fn empty_delta_same_timestamp_upstream_target_change_republishes_load_bala
 
 #[tokio::test]
 async fn empty_delta_dr_rebuild_preserves_live_service_discovery_targets() {
-    let stamp = Utc::now() - Duration::seconds(30);
+    let stamp = UtcTimestamp::now()
+        .checked_sub(::time::SignedDuration::seconds(30))
+        .unwrap();
     let old_config = prepared_mesh_sd_with_dr(stamp, 1_000);
     let new_config = prepared_mesh_sd_with_dr(stamp, 9_000);
     let delta = ferrum_edge::config_delta::ConfigDelta::compute(&old_config, &new_config);

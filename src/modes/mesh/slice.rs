@@ -772,6 +772,7 @@ pub fn carried_route_cross_namespace_service(
 /// `type_url` and deserializing `value` into its own representation; the xDS
 /// layer treats everything inside `value` as uninterpreted bytes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshExtensionConfig {
     pub name: String,
     /// Namespace this extension config is allowed to reach via per-node mesh
@@ -8737,7 +8738,7 @@ mod tests {
             })),
             ..GatewayConfig::default()
         };
-        config.loaded_at = chrono::Utc::now();
+        config.loaded_at = crate::time_compat::UtcTimestamp::now();
 
         let slice = MeshSlice::from_gateway_config(
             &config,

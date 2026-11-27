@@ -32,7 +32,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::Utc;
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, watch};
 
@@ -60,6 +59,7 @@ use ferrum_edge::proxy::udp_proxy::{UdpListenerConfig, UdpProxyMetrics, start_ud
 use ferrum_edge::request_epoch::RequestEpochStore;
 
 use crate::scaffolding::ports::reserve_udp_port;
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const PROXY_ID: &str = "udp-datagram-client-address";
 const SECRET: &str = "0123456789abcdef0123456789abcdef";
@@ -181,8 +181,8 @@ fn udp_proxy(listen_port: u16, backend_port: u16) -> Proxy {
         allowed_methods: None,
         allowed_ws_origins: vec![],
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }
@@ -248,7 +248,7 @@ async fn try_spawn_gateway(
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };
@@ -328,7 +328,6 @@ async fn try_spawn_gateway(
         recvmmsg_batch_size: 64,
         overload: Arc::new(OverloadState::new()),
         so_busy_poll_us: 0,
-        udp_gro_enabled: false,
         udp_gso_enabled: false,
         udp_pktinfo_enabled: false,
         mesh_outbound_enforcement: empty_slot(),

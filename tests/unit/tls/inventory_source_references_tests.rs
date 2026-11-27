@@ -7,6 +7,7 @@
 //! guards match on, and must not load any material.
 
 use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope, Proxy};
+use ferrum_edge::time_compat::UtcTimestamp;
 use ferrum_edge::tls::inventory::{TlsSourceReference, gateway_source_references};
 use serde_json::json;
 
@@ -39,8 +40,8 @@ fn jwks_auth(id: &str, source: &str, enabled: bool) -> PluginConfig {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 

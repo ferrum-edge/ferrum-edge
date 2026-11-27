@@ -35,14 +35,17 @@
 //! deployments force full reloads for every change because resource writes and
 //! change records are not transactionally coupled.
 //!
-//! **Index creation**: The `run_migrations()` method creates indexes from the
-//! canonical plan in [`crate::config::mongo_index_plan`] instead of running SQL
-//! migrations. `createIndex` is idempotent **only when the full index spec
-//! (keys + options) matches**; if the keys match but options differ (e.g. a
-//! new `partialFilterExpression`), MongoDB raises `IndexOptionsConflict`
-//! (server error 85). Initialization fails on conflicting options: changed
-//! build-out schemas require a fresh database. Migrate dry-run and status
-//! consume the same plan so operator output cannot drift from `up`.
+//! **Index creation**: The `run_migrations()` method applies the versioned,
+//! forward-only index plan in [`crate::config::mongo_index_plan`] instead of
+//! running SQL migrations: it refuses a database that records a newer plan
+//! version, drops only indexes a later plan version retires by name, creates
+//! the plan, and records the version. `createIndex` is idempotent **only when
+//! the full index spec (keys + options) matches**; if the keys match but
+//! options differ (e.g. a new `partialFilterExpression`), MongoDB raises
+//! `IndexOptionsConflict` (server error 85), and initialization fails. A
+//! changed definition ships as a retirement plus a new plan entry. Migrate
+//! dry-run and status consume the same plan so operator output cannot drift
+//! from `up`.
 
 #[allow(dead_code)] // MongoStore is wired up in mode dispatch (database.rs, control_plane.rs)
 mod inner {
@@ -88,10 +91,10 @@ mod inner {
         ConfigValidationRejection, ValidationAction, ValidationPipeline,
         collect_rejecting_runtime_config_errors, validate_plugin_file_dependencies_off_thread,
     };
+    use crate::time_compat::UtcTimestamp;
     use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
     use anyhow::Context;
     use async_trait::async_trait;
-    use chrono::{DateTime, Utc};
     use dashmap::DashMap;
     use mongodb::bson::{
         Binary, Bson, DateTime as BsonDateTime, Document, doc, spec::BinarySubtype,
@@ -116,8 +119,10 @@ mod inner {
     use zeroize::Zeroizing;
     // regex::escape is used for safe MongoDB $regex pattern construction in list filters.
     use crate::config::mongo_index_plan::{
-        HMAC_SECRET_HASHES_FIELD, MongoMigrationStatus, REQUIRED_GUARD_COLLECTIONS,
-        RequiredMongoIndex, classify_guard_collections, classify_plan_against_live,
+        HMAC_SECRET_HASHES_FIELD, MONGO_INDEX_PLAN_VERSION, MONGO_INDEX_PLAN_VERSION_COLLECTION,
+        MONGO_INDEX_PLAN_VERSION_DOCUMENT_ID, MongoIndexPlan, MongoMigrationStatus,
+        REQUIRED_GUARD_COLLECTIONS, RecordedIndexPlanState, RequiredMongoIndex, RetiredMongoIndex,
+        classify_guard_collections, classify_plan_against_live, recorded_plan_state_from_document,
         required_mongo_indexes,
     };
     use crate::config::namespace_registry::{
@@ -135,6 +140,7 @@ mod inner {
     // src/mongo/db/operation_exit_code.idl (server) and
     // https://www.mongodb.com/docs/manual/reference/error-codes/.
     const MONGO_ERR_NAMESPACE_NOT_FOUND: i32 = 26;
+    const MONGO_ERR_INDEX_NOT_FOUND: i32 = 27;
     const MONGO_ERR_NAMESPACE_EXISTS: i32 = 48;
     const MONGO_ERR_DUPLICATE_KEY: i32 = 11_000;
     /// `maxAwaitTimeMS` for the config-change stream's `getMore`. Bounds how
@@ -316,8 +322,11 @@ mod inner {
     /// its second — over-inclusive by at most one second, the same safe
     /// direction as the incremental poll's explicit 1s margin (never drop
     /// newer rows).
-    fn mongo_updated_at_lower_bound(ts: DateTime<Utc>) -> String {
-        ts.format("%Y-%m-%dT%H:%M:%S").to_string()
+    fn mongo_updated_at_lower_bound(ts: UtcTimestamp) -> String {
+        // chrono's `%Y-%m-%dT%H:%M:%S`: RFC 3339 whole seconds without the `Z`.
+        let mut bound = ts.to_rfc3339_opts(crate::time_compat::SecondsFormat::Secs, true);
+        bound.pop();
+        bound
     }
 
     fn is_mongo_command_error_with_code(err: &mongodb::error::Error, code: i32) -> bool {
@@ -325,6 +334,27 @@ mod inner {
             err.kind.as_ref(),
             mongodb::error::ErrorKind::Command(cmd) if cmd.code == code
         )
+    }
+
+    /// Read the recorded index-plan state through `db` (the live store or a
+    /// reconnect candidate that is not yet published).
+    async fn read_recorded_index_plan_state(
+        db: &Database,
+    ) -> Result<RecordedIndexPlanState, anyhow::Error> {
+        let document = db
+            .collection::<Document>(MONGO_INDEX_PLAN_VERSION_COLLECTION)
+            .find_one(doc! { "_id": MONGO_INDEX_PLAN_VERSION_DOCUMENT_ID })
+            .await?;
+        Ok(recorded_plan_state_from_document(document.as_ref())?)
+    }
+
+    /// Refuse to publish a reconnect candidate whose database a newer release
+    /// started or finished upgrading: this binary's plan assumptions would no
+    /// longer hold for it.
+    async fn ensure_candidate_index_plan_compatible(db: &Database) -> Result<(), anyhow::Error> {
+        let recorded = read_recorded_index_plan_state(db).await?;
+        MongoIndexPlan::current().upgrade_from_state(&recorded)?;
+        Ok(())
     }
 
     fn is_namespace_exists(err: &mongodb::error::Error) -> bool {
@@ -2219,6 +2249,7 @@ mod inner {
                 self.conn_settings.tls_insecure,
             )
             .await?;
+            ensure_candidate_index_plan_compatible(&new_connection.db).await?;
             // Gate-before-publish: see `publish_reconnected_bundle` contract.
             self.publish_reconnected_bundle(
                 new_connection,
@@ -2482,9 +2513,17 @@ mod inner {
                 .into_iter()
                 .collect();
 
+            // Same refusal as `up`: an older binary must not report a database
+            // that a newer release upgraded as merely "missing" indexes.
+            let recorded = self.recorded_index_plan_state().await?;
+            MongoIndexPlan::current().upgrade_from_state(&recorded)?;
+
             Ok(MongoMigrationStatus {
                 indexes: classify_plan_against_live(&live_by_collection),
                 guard_collections: classify_guard_collections(&live_collection_names),
+                recorded_plan_version: recorded.version,
+                in_progress_plan_version: recorded.in_progress,
+                plan_version: MONGO_INDEX_PLAN_VERSION,
             })
         }
 
@@ -2514,13 +2553,201 @@ mod inner {
             Ok(indexes)
         }
 
+        /// Apply one versioned index plan under the migration lease.
+        ///
+        /// Order:
+        /// 1. Read the recorded plan state and refuse a newer applied or
+        ///    in-progress version (binary downgrade) before any write,
+        ///    including the lease upsert.
+        /// 2. Take the migration lease and re-check under it.
+        /// 3. If this version is not yet recorded as applied, mark it in
+        ///    progress before the first schema change, so an older binary
+        ///    refuses the partly upgraded database and this binary resumes.
+        /// 4. Create guard collections, drop exactly the indexes `plan`
+        ///    retires after the recorded version (by name; a planned index
+        ///    never reuses a retired name, so a retry cannot drop a
+        ///    replacement), ensure every planned index, seed the registry.
+        /// 5. Record `plan.version` and clear the marker in one update.
+        ///
+        /// Every destructive step and the final record first prove that this
+        /// runner still owns the lease, so a runner that lost it stops.
+        pub(crate) async fn apply_index_plan(
+            &self,
+            plan: &MongoIndexPlan,
+        ) -> Result<(), anyhow::Error> {
+            // Read-only refusal: an incompatible database is rejected before
+            // the lease (an upsert into `_ferrum_migration_locks`) is taken.
+            plan.upgrade_from_state(&self.recorded_index_plan_state().await?)?;
+
+            let mut migration_lease = self.acquire_migration_lease().await?;
+            // Run every initialization step inside a scoped future so a failure
+            // part-way through still falls through to the lease release below.
+            // Without this, an early `?` would exit `apply_index_plan` with the
+            // lease still held, forcing other replicas to wait out the full
+            // 120s lease window before they can migrate — the `Drop` path only
+            // spawns a best-effort async cleanup that may never run when the
+            // runtime is torn down in startup/migrate mode.
+            let migration_result: Result<(), anyhow::Error> = async {
+                // Ensure indexes from the versioned plan in `mongo_index_plan`.
+                // createIndex is idempotent when keys+options match;
+                // conflicting options fail. Old indexes are dropped only when
+                // a later plan version retires them by name.
+                let recorded = self.recorded_index_plan_state().await?;
+                let retirements = plan.upgrade_from_state(&recorded)?;
+                let upgrading = recorded.version != Some(plan.version);
+                if upgrading {
+                    self.ensure_migration_lease_held(&migration_lease).await?;
+                    self.mark_index_plan_in_progress(plan.version).await?;
+                }
+
+                // Intentionally no automatic orphan reconcile of
+                // `consumer_identity_index` against `consumers`. Point-read
+                // consumer absence is not a uniqueness proof across serving
+                // nodes (migration lease ≠ CRUD lock); reclaiming a live
+                // reserve-first create would drop the durable uniqueness
+                // guard. Crash orphans stay locked until same-owner E11000
+                // adoption heals a retry of the same consumer id, or an
+                // operator removes the reservation manually.
+
+                // Guard collections are keyed purely by `_id` and need no
+                // secondary indexes. Some are written from inside transactions,
+                // where a cross-shard write transaction cannot implicitly
+                // create a collection and concurrent first writes can
+                // conflict, so create every guard collection explicitly.
+                // NamespaceExists (code 48) is tolerated for idempotent
+                // multi-instance startup.
+                for lock_collection in REQUIRED_GUARD_COLLECTIONS {
+                    match self.db().create_collection(*lock_collection).await {
+                        Ok(()) => {}
+                        Err(e) if is_namespace_exists(&e) => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+
+                for retired in &retirements {
+                    self.ensure_migration_lease_held(&migration_lease).await?;
+                    self.retire_planned_index(retired).await?;
+                }
+
+                for entry in &plan.indexes {
+                    self.ensure_planned_index(entry).await?;
+                }
+
+                self.initialize_namespace_registry().await?;
+
+                if upgrading || recorded.in_progress.is_some() {
+                    self.ensure_migration_lease_held(&migration_lease).await?;
+                    self.record_index_plan_version(plan.version).await?;
+                }
+
+                info!("MongoDB indexes ensured from the versioned index plan");
+                Ok(())
+            }
+            .await;
+
+            // Always release the lease — on success and on error — then surface
+            // the combined outcome so a migration failure is not masked by a
+            // release failure (and vice versa). Mirrors the SQL side's
+            // run-body / capture-result / release / combine pattern.
+            let release_result = migration_lease.release().await;
+            match (migration_result, release_result) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(migration_err), Ok(())) => Err(migration_err),
+                (Ok(()), Err(release_err)) => Err(release_err),
+                (Err(migration_err), Err(release_err)) => Err(migration_err.context(format!(
+                    "MongoDB migration lease release also failed: {release_err:#}"
+                ))),
+            }
+        }
+
+        /// Fail unless `lease` is still valid and its owner-qualified lock
+        /// document still exists, i.e. no other runner has taken it over.
+        async fn ensure_migration_lease_held(
+            &self,
+            lease: &MongoLockGuard,
+        ) -> Result<(), anyhow::Error> {
+            let still_owned = lease.valid.load(Ordering::Acquire)
+                && lease
+                    .collection
+                    .find_one(doc! { "_id": &lease.lock_id, "owner": &lease.owner })
+                    .await?
+                    .is_some();
+            if !still_owned {
+                anyhow::bail!(
+                    "MongoDB migration lease was lost before a schema change; stopping so \
+                     another runner's index plan is not modified"
+                );
+            }
+            Ok(())
+        }
+
+        /// The index-plan state recorded in this store's database.
+        async fn recorded_index_plan_state(&self) -> Result<RecordedIndexPlanState, anyhow::Error> {
+            read_recorded_index_plan_state(&self.db()).await
+        }
+
+        /// Mark `version` in progress before the first schema change.
+        async fn mark_index_plan_in_progress(&self, version: i64) -> Result<(), anyhow::Error> {
+            self.collection(MONGO_INDEX_PLAN_VERSION_COLLECTION)
+                .update_one(
+                    doc! { "_id": MONGO_INDEX_PLAN_VERSION_DOCUMENT_ID },
+                    doc! { "$max": { "in_progress_version": version } },
+                )
+                .upsert(true)
+                .await?;
+            Ok(())
+        }
+
+        /// Record `version` after a plan applied completely and clear the
+        /// in-progress marker in the same single-document update. `$max` keeps
+        /// the record monotonic.
+        async fn record_index_plan_version(&self, version: i64) -> Result<(), anyhow::Error> {
+            let now = crate::time_compat::UtcTimestamp::now().to_rfc3339();
+            self.collection(MONGO_INDEX_PLAN_VERSION_COLLECTION)
+                .update_one(
+                    doc! { "_id": MONGO_INDEX_PLAN_VERSION_DOCUMENT_ID },
+                    doc! {
+                        "$max": { "version": version },
+                        "$set": { "applied_at": &now },
+                        "$unset": { "in_progress_version": "" },
+                    },
+                )
+                .upsert(true)
+                .await?;
+            Ok(())
+        }
+
+        /// Drop one index a later plan version retired, by its exact name. An
+        /// index or collection that is already absent (a fresh database, or a
+        /// retry after a partial run) is the desired end state.
+        async fn retire_planned_index(
+            &self,
+            retired: &RetiredMongoIndex,
+        ) -> Result<(), anyhow::Error> {
+            match self
+                .collection(retired.collection)
+                .drop_index(retired.name)
+                .await
+            {
+                Ok(()) => Ok(()),
+                Err(e)
+                    if is_mongo_command_error_with_code(&e, MONGO_ERR_INDEX_NOT_FOUND)
+                        || is_namespace_not_found(&e) =>
+                {
+                    Ok(())
+                }
+                Err(e) => Err(e.into()),
+            }
+        }
+
         async fn ensure_planned_index(
             &self,
             entry: &RequiredMongoIndex,
         ) -> Result<(), anyhow::Error> {
             let collection = self.collection(entry.collection);
-            // A changed build-out index requires a fresh database. Never drop
-            // an existing constraint as an implicit startup upgrade.
+            // Never drop an existing constraint as an implicit startup
+            // upgrade: a changed definition ships as a retirement plus a new
+            // plan entry in a later plan version.
             collection.create_index(entry.model.clone()).await?;
             Ok(())
         }
@@ -2912,7 +3139,7 @@ mod inner {
             &self,
             namespace: &str,
         ) -> Result<GatewayConfig, anyhow::Error> {
-            let loaded_at = Utc::now();
+            let loaded_at = crate::time_compat::UtcTimestamp::now();
             let (proxies, plugin_configs) = if self.replica_set_configured() {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
@@ -2980,7 +3207,7 @@ mod inner {
             namespace: &str,
             scope: &crate::config::policy_graph_scope::PolicyGraphScope,
         ) -> Result<GatewayConfig, anyhow::Error> {
-            let loaded_at = Utc::now();
+            let loaded_at = crate::time_compat::UtcTimestamp::now();
             let scoped_proxy_ids: Vec<String> = scope.proxy_ids.iter().cloned().collect();
             let changed_ids: Vec<&str> = scope
                 .changed_plugin_config_ids
@@ -5372,12 +5599,17 @@ mod inner {
         async fn count_updated_before_in_boundary_second(
             &self,
             base_filter: &Document,
-            since: DateTime<Utc>,
+            since: UtcTimestamp,
         ) -> Result<i64, anyhow::Error> {
             // Restrict to `[floor(since), floor(since)+1s)` — the only window
             // the whole-second floor can over-include.
             let floor = mongo_updated_at_lower_bound(since);
-            let next = mongo_updated_at_lower_bound(since + chrono::Duration::seconds(1));
+            // chrono's year-10000 upper bound (`+10000-...`) sorted below every
+            // stored year-9999 value, so that window was always empty.
+            let Some(next_second) = since.checked_add(::time::SignedDuration::seconds(1)) else {
+                return Ok(0);
+            };
+            let next = mongo_updated_at_lower_bound(next_second);
             let mut filter = base_filter.clone();
             filter.insert("updated_at", doc! { "$gte": &floor, "$lt": &next });
 
@@ -5392,8 +5624,9 @@ mod inner {
                 // Parse the stored RFC 3339 string exactly (faithful across
                 // every AutoSi fractional width) and apply `< since`.
                 if let Ok(raw) = doc.get_str("updated_at")
-                    && let Ok(parsed) = DateTime::parse_from_rfc3339(raw)
-                    && parsed.with_timezone(&Utc) < since
+                    && let Ok(parsed) = crate::time_compat::parse_rfc3339_chrono(raw)
+                        .and_then(|parsed| parsed.to_utc_timestamp())
+                    && parsed < since
                 {
                     overage += 1;
                 }
@@ -8472,7 +8705,7 @@ mod inner {
                 }
             }
 
-            let now = Utc::now();
+            let now = UtcTimestamp::now();
             let mut record = existing
                 .unwrap_or_else(|| NamespaceRecord::new(current_name.to_string(), None, now));
             if let Some(description) = &plan.description {
@@ -9701,8 +9934,37 @@ mod inner {
     /// `doc_to_*` helper strips MongoDB's `_id` before deserialization.
     fn doc_to_proxy(mut doc: Document) -> Result<Proxy, anyhow::Error> {
         doc.remove("_id");
+        project_stored_plugin_associations(&mut doc);
         let proxy: Proxy = deserialize_config_document(doc)?;
         Ok(proxy)
+    }
+
+    /// Typed view of the embedded `plugins[]` association documents.
+    ///
+    /// Stored association objects deliberately retain opaque metadata
+    /// members: deployment mutations keep the raw objects as store evidence
+    /// and write them back whenever the association identity survives (see
+    /// `crate::config::deployment_mutation`). `PluginAssociation` itself is
+    /// closed, so admission refuses such members; the typed decode of a
+    /// stored row keeps only the members the type declares, so a stored row
+    /// never becomes unreadable (or uncorrectable) because of association
+    /// metadata. Every other proxy member is still decoded strictly, and a
+    /// non-document entry still fails decoding.
+    fn project_stored_plugin_associations(doc: &mut Document) {
+        let Some(Bson::Array(associations)) = doc.get_mut("plugins") else {
+            return;
+        };
+        for entry in associations.iter_mut() {
+            if let Bson::Document(association) = entry {
+                let mut typed = Document::new();
+                for field in crate::config::types::PLUGIN_ASSOCIATION_FIELDS {
+                    if let Some(value) = association.get(*field) {
+                        typed.insert(*field, value.clone());
+                    }
+                }
+                *association = typed;
+            }
+        }
     }
 
     /// Keep BSON field paths separate from the bare serde error just like the
@@ -10284,7 +10546,7 @@ mod inner {
         doc.insert("diff", serde_json::to_string(&event.diff)?);
         doc.insert(
             "ts",
-            Bson::DateTime(BsonDateTime::from_millis(event.ts.timestamp_millis())),
+            Bson::DateTime(BsonDateTime::from_millis(event.ts.unix_timestamp_millis())),
         );
         Ok(doc)
     }
@@ -10294,13 +10556,13 @@ mod inner {
     ) -> Result<crate::admin::audit::AuditEvent, anyhow::Error> {
         doc.remove("_id");
         // `audit_event_to_doc` is the only writer: `ts` is always a BSON
-        // DateTime and `diff` always JSON text. Build-out keeps no decoders
-        // for other shapes (issue #7218).
+        // DateTime and `diff` always JSON text. No decoders are kept for
+        // shapes retired before 1.0.0 (issue #7218).
         let Some(Bson::DateTime(ts)) = doc.remove("ts") else {
             anyhow::bail!("audit event ts must be a BSON DateTime");
         };
-        let ts = DateTime::<Utc>::from_timestamp_millis(ts.timestamp_millis())
-            .ok_or_else(|| anyhow::anyhow!("audit event ts is outside chrono range"))?;
+        let ts = UtcTimestamp::from_unix_timestamp_millis(ts.timestamp_millis())
+            .map_err(|_| anyhow::anyhow!("audit event ts is outside the supported range"))?;
         doc.insert("ts", ts.to_rfc3339());
         let Some(Bson::String(diff_json)) = doc.remove("diff") else {
             anyhow::bail!("audit event diff must be JSON text");
@@ -10372,8 +10634,8 @@ mod inner {
         validate_snapshot_sync: bool,
     ) -> Result<ApiSpec, anyhow::Error> {
         doc.remove("_id");
-        // `api_spec_to_doc` writes both blobs as BSON Binary; build-out keeps
-        // no decoder for the retired integer-array shape (issue #7218).
+        // `api_spec_to_doc` writes both blobs as BSON Binary; no decoder is
+        // kept for the integer-array shape retired before 1.0.0 (issue #7218).
         let spec_content = match doc.remove("spec_content") {
             Some(Bson::Binary(binary)) => binary.bytes,
             Some(_) => anyhow::bail!("api_specs.spec_content has an unexpected BSON type"),
@@ -10530,7 +10792,7 @@ mod inner {
             proxies,
             plugin_configs,
             upstreams,
-            loaded_at: Utc::now(),
+            loaded_at: crate::time_compat::UtcTimestamp::now(),
             ..Default::default()
         };
         candidate.normalize_fields();
@@ -10971,7 +11233,7 @@ mod inner {
             purpose: FullConfigLoadPurpose,
         ) -> Result<GatewayConfig, anyhow::Error> {
             let start = std::time::Instant::now();
-            let loaded_at = Utc::now();
+            let loaded_at = crate::time_compat::UtcTimestamp::now();
             let (proxies, consumers, plugin_configs, upstreams, gateway_trust_bundles) =
                 if self.replica_set_configured.load(Ordering::Acquire) {
                     let connection = self.connection();
@@ -11339,7 +11601,7 @@ mod inner {
             // the snapshot inside a majority/snapshot transaction; standalone
             // reads directly from the primary.
             let start = std::time::Instant::now();
-            let loaded_at = Utc::now();
+            let loaded_at = crate::time_compat::UtcTimestamp::now();
             let (proxies, consumers, plugin_configs, upstreams, gateway_trust_bundles) =
                 if self.replica_set_configured.load(Ordering::Acquire) {
                     let connection = self.connection();
@@ -11461,7 +11723,7 @@ mod inner {
             &self,
             namespace: &str,
         ) -> Result<GatewayConfig, anyhow::Error> {
-            let loaded_at = Utc::now();
+            let loaded_at = crate::time_compat::UtcTimestamp::now();
             let proxies = self
                 .load_full_proxies_opt_session(namespace, None, true)
                 .await?;
@@ -11608,7 +11870,7 @@ mod inner {
                 );
             }
             let start = std::time::Instant::now();
-            let poll_timestamp = Utc::now();
+            let poll_timestamp = crate::time_compat::UtcTimestamp::now();
             // Run the cursor retention checks, change-log scan, and changed-doc
             // point-loads inside one `ReadConcern::snapshot()` transaction so
             // concurrent writes cannot cause torn views between `config_changes`
@@ -16244,6 +16506,10 @@ mod inner {
                 self.conn_settings.tls_insecure,
             )
             .await?;
+            // The candidate must still be a database this binary's index plan
+            // applies to (a primary that came back upgraded by a newer
+            // release is refused, keeping the current connection).
+            ensure_candidate_index_plan_compatible(&new_connection.db).await?;
 
             // Connection and topology published in one store under the
             // publication guards. Readers that already loaded the old `Client` or
@@ -16323,67 +16589,9 @@ mod inner {
         }
 
         async fn run_migrations(&self) -> Result<(), anyhow::Error> {
-            let mut migration_lease = self.acquire_migration_lease().await?;
-            // Run every initialization step inside a scoped future so a failure
-            // part-way through still falls through to the lease release below.
-            // Without this, an early `?` would exit `run_migrations` with the
-            // lease still held, forcing other replicas to wait out the full
-            // 120s lease window before they can migrate — the `Drop` path only
-            // spawns a best-effort async cleanup that may never run when the
-            // runtime is torn down in startup/migrate mode.
-            let migration_result: Result<(), anyhow::Error> = async {
-                // MongoDB doesn't use SQL migrations. Instead, ensure indexes
-                // from the canonical plan in `mongo_index_plan`. createIndex is
-                // idempotent when keys+options match; conflicting options fail.
-
-                // Intentionally no automatic orphan reconcile of
-                // `consumer_identity_index` against `consumers`. Point-read
-                // consumer absence is not a uniqueness proof across serving
-                // nodes (migration lease ≠ CRUD lock); reclaiming a live
-                // reserve-first create would drop the durable uniqueness
-                // guard. Crash orphans stay locked until same-owner E11000
-                // adoption heals a retry of the same consumer id, or an
-                // operator removes the reservation manually.
-
-                // Guard collections are keyed purely by `_id` and need no
-                // secondary indexes. Some are written from inside transactions,
-                // where a cross-shard write transaction cannot implicitly
-                // create a collection and concurrent first writes can
-                // conflict, so create every guard collection explicitly.
-                // NamespaceExists (code 48) is tolerated for idempotent
-                // multi-instance startup.
-                for lock_collection in REQUIRED_GUARD_COLLECTIONS {
-                    match self.db().create_collection(*lock_collection).await {
-                        Ok(()) => {}
-                        Err(e) if is_namespace_exists(&e) => {}
-                        Err(e) => return Err(e.into()),
-                    }
-                }
-
-                for entry in required_mongo_indexes() {
-                    self.ensure_planned_index(&entry).await?;
-                }
-
-                self.initialize_namespace_registry().await?;
-
-                info!("MongoDB indexes ensured");
-                Ok(())
-            }
-            .await;
-
-            // Always release the lease — on success and on error — then surface
-            // the combined outcome so a migration failure is not masked by a
-            // release failure (and vice versa). Mirrors the SQL side's
-            // run-body / capture-result / release / combine pattern.
-            let release_result = migration_lease.release().await;
-            match (migration_result, release_result) {
-                (Ok(()), Ok(())) => Ok(()),
-                (Err(migration_err), Ok(())) => Err(migration_err),
-                (Ok(()), Err(release_err)) => Err(release_err),
-                (Err(migration_err), Err(release_err)) => Err(migration_err.context(format!(
-                    "MongoDB migration lease release also failed: {release_err:#}"
-                ))),
-            }
+            // MongoDB doesn't use SQL migrations. It applies the shipped,
+            // versioned index plan; see `apply_index_plan`.
+            self.apply_index_plan(&MongoIndexPlan::current()).await
         }
 
         async fn list_namespaces(&self) -> Result<Vec<String>, anyhow::Error> {
@@ -18030,7 +18238,7 @@ mod inner {
             // is at most one second of resource writes (typically empty), so
             // this is a small, index-bounded scan that fetches only timestamps.
             let boundary_overage = match filter.updated_since {
-                Some(since) if since.timestamp_subsec_nanos() != 0 => {
+                Some(since) if since.subsec_nanos() != 0 => {
                     self.count_updated_before_in_boundary_second(&filter_doc, since)
                         .await?
                 }
@@ -18069,7 +18277,7 @@ mod inner {
             // matches the SQL backend, which applies the exact `updated_at >= ?`
             // predicate before `LIMIT/OFFSET`.
             let exact_postfilter_since = match filter.updated_since {
-                Some(since) if since.timestamp_subsec_nanos() != 0 => Some(since),
+                Some(since) if since.subsec_nanos() != 0 => Some(since),
                 _ => None,
             };
 
@@ -18983,8 +19191,8 @@ mod inner {
         }
     }
 
-    fn audit_ts_bound(value: &DateTime<Utc>) -> Bson {
-        Bson::DateTime(BsonDateTime::from_millis(value.timestamp_millis()))
+    fn audit_ts_bound(value: &UtcTimestamp) -> Bson {
+        Bson::DateTime(BsonDateTime::from_millis(value.unix_timestamp_millis()))
     }
 
     impl MongoStore {
@@ -19079,7 +19287,11 @@ mod inner {
             retention_days: u64,
         ) -> Result<u64, anyhow::Error> {
             let days_i64 = i64::try_from(retention_days).unwrap_or(i64::MAX);
-            let cutoff = Utc::now() - chrono::Duration::days(days_i64);
+            let cutoff = days_i64
+                .checked_mul(86_400)
+                .and_then(crate::time_compat::chrono_try_seconds)
+                .and_then(|age| UtcTimestamp::now().checked_sub(age))
+                .ok_or_else(|| anyhow::anyhow!("audit retention cutoff is out of range"))?;
             let cutoff_bson = audit_ts_bound(&cutoff);
             let mut total = 0u64;
             for _ in 0..crate::admin::audit::AUDIT_RETENTION_PRUNE_MAX_BATCHES {
@@ -19764,12 +19976,12 @@ mod inner {
 
         #[test]
         fn audit_ts_range_filter_uses_bson_datetimes() {
-            let start = DateTime::parse_from_rfc3339("2026-05-18T01:00:00Z")
-                .expect("start timestamp")
-                .with_timezone(&Utc);
-            let end = DateTime::parse_from_rfc3339("2026-05-18T02:00:00Z")
-                .expect("end timestamp")
-                .with_timezone(&Utc);
+            let start = "2026-05-18T01:00:00Z"
+                .parse::<UtcTimestamp>()
+                .expect("start timestamp");
+            let end = "2026-05-18T02:00:00Z"
+                .parse::<UtcTimestamp>()
+                .expect("end timestamp");
             let filter = crate::admin::audit::AuditListFilter {
                 start: Some(start),
                 end: Some(end),
@@ -19781,22 +19993,22 @@ mod inner {
             assert_eq!(
                 range.get("$gte"),
                 Some(&Bson::DateTime(BsonDateTime::from_millis(
-                    start.timestamp_millis()
+                    start.unix_timestamp_millis()
                 )))
             );
             assert_eq!(
                 range.get("$lte"),
                 Some(&Bson::DateTime(BsonDateTime::from_millis(
-                    end.timestamp_millis()
+                    end.unix_timestamp_millis()
                 )))
             );
         }
 
-        /// How a `DateTime<Utc>` is actually persisted into `updated_at`:
+        /// How a `UtcTimestamp` is actually persisted into `updated_at`:
         /// chrono's serde impl (`SecondsFormat::AutoSi`). Mirrors what
         /// `bson::to_document` writes for resource/api-spec docs, so the bound
         /// tests below compare against the real stored bytes.
-        fn stored_updated_at(ts: DateTime<Utc>) -> String {
+        fn stored_updated_at(ts: UtcTimestamp) -> String {
             serde_json::to_string(&ts)
                 .expect("serialize timestamp")
                 .trim_matches('"')
@@ -19805,12 +20017,12 @@ mod inner {
 
         #[test]
         fn mongo_updated_at_lower_bound_floors_to_whole_second() {
-            let whole = DateTime::parse_from_rfc3339("2026-05-18T01:00:00Z")
-                .expect("timestamp")
-                .with_timezone(&Utc);
-            let fractional = DateTime::parse_from_rfc3339("2026-05-18T01:00:00.123Z")
-                .expect("timestamp")
-                .with_timezone(&Utc);
+            let whole = "2026-05-18T01:00:00Z"
+                .parse::<UtcTimestamp>()
+                .expect("timestamp");
+            let fractional = "2026-05-18T01:00:00.123Z"
+                .parse::<UtcTimestamp>()
+                .expect("timestamp");
 
             assert_eq!(mongo_updated_at_lower_bound(whole), "2026-05-18T01:00:00");
             assert_eq!(
@@ -19828,9 +20040,9 @@ mod inner {
             // Regression: `GET /api-specs?updated_since=...T01:00:00Z` must not
             // omit a row stored at `...T01:00:00.123Z`. A naive `Z`-suffixed
             // bound excludes it because `.` (0x2E) sorts before `Z` (0x5A).
-            let bound_instant = DateTime::parse_from_rfc3339("2026-05-18T01:00:00Z")
-                .expect("timestamp")
-                .with_timezone(&Utc);
+            let bound_instant = "2026-05-18T01:00:00Z"
+                .parse::<UtcTimestamp>()
+                .expect("timestamp");
             let bound = mongo_updated_at_lower_bound(bound_instant);
 
             // Stored values at or after the bound, across every AutoSi width.
@@ -19843,9 +20055,9 @@ mod inner {
                 "2026-05-18T01:01:00.5Z",         // later minute, fractional
             ] {
                 let stored = stored_updated_at(
-                    DateTime::parse_from_rfc3339(stored_instant)
-                        .expect("stored timestamp")
-                        .with_timezone(&Utc),
+                    stored_instant
+                        .parse::<UtcTimestamp>()
+                        .expect("stored timestamp"),
                 );
                 assert!(
                     stored.as_str() >= bound.as_str(),
@@ -19860,9 +20072,9 @@ mod inner {
                 "2026-05-17T23:59:59.5Z",
             ] {
                 let stored = stored_updated_at(
-                    DateTime::parse_from_rfc3339(stored_instant)
-                        .expect("stored timestamp")
-                        .with_timezone(&Utc),
+                    stored_instant
+                        .parse::<UtcTimestamp>()
+                        .expect("stored timestamp"),
                 );
                 assert!(
                     stored.as_str() < bound.as_str(),
@@ -19877,15 +20089,17 @@ mod inner {
         // matches every chronologically-`>= since` row but over-includes rows
         // in `[floor(since), since)`; these helpers reproduce the decision the
         // store makes on parsed timestamps (faithful across AutoSi widths).
-        fn parse_stored(stored: &str) -> DateTime<Utc> {
-            DateTime::parse_from_rfc3339(stored)
-                .expect("stored timestamp")
-                .with_timezone(&Utc)
+        fn parse_stored(stored: &str) -> UtcTimestamp {
+            stored.parse::<UtcTimestamp>().expect("stored timestamp")
         }
-        fn in_boundary_window(stored: &str, since: DateTime<Utc>) -> bool {
+        fn in_boundary_window(stored: &str, since: UtcTimestamp) -> bool {
             // `[floor(since), floor(since)+1s)` — the only over-included window.
             let lo = mongo_updated_at_lower_bound(since);
-            let hi = mongo_updated_at_lower_bound(since + chrono::Duration::seconds(1));
+            let hi = mongo_updated_at_lower_bound(
+                since
+                    .checked_add(::time::SignedDuration::seconds(1))
+                    .unwrap(),
+            );
             let s = stored_updated_at(parse_stored(stored));
             s.as_str() >= lo.as_str() && s.as_str() < hi.as_str()
         }
@@ -19920,7 +20134,7 @@ mod inner {
             // Whole-second `since`: the floor is already exact, so the boundary
             // window holds nothing `< since` and no overage is subtracted.
             let whole = parse_stored("2026-05-18T01:00:00Z");
-            assert_eq!(whole.timestamp_subsec_nanos(), 0);
+            assert_eq!(whole.subsec_nanos(), 0);
             assert!(in_boundary_window("2026-05-18T01:00:00.000000001Z", whole));
             assert!(
                 parse_stored("2026-05-18T01:00:00.000000001Z") >= whole,
@@ -20010,9 +20224,9 @@ mod inner {
 
         #[test]
         fn audit_event_to_doc_stores_ts_as_bson_datetime() {
-            let ts = DateTime::parse_from_rfc3339("2026-05-18T01:00:00.123Z")
-                .expect("timestamp")
-                .with_timezone(&Utc);
+            let ts = "2026-05-18T01:00:00.123Z"
+                .parse::<UtcTimestamp>()
+                .expect("timestamp");
             let event = crate::admin::audit::AuditEvent {
                 id: "audit-1".to_string(),
                 ts,
@@ -20041,7 +20255,7 @@ mod inner {
             assert_eq!(
                 doc.get("ts"),
                 Some(&Bson::DateTime(BsonDateTime::from_millis(
-                    ts.timestamp_millis()
+                    ts.unix_timestamp_millis()
                 )))
             );
             assert!(
@@ -20050,13 +20264,16 @@ mod inner {
             );
 
             let round_trip = doc_to_audit_event(doc).expect("audit event round-trips");
-            assert_eq!(round_trip.ts.timestamp_millis(), ts.timestamp_millis());
+            assert_eq!(
+                round_trip.ts.unix_timestamp_millis(),
+                ts.unix_timestamp_millis()
+            );
             assert_eq!(round_trip.diff, event.diff);
         }
 
         #[test]
         fn decoders_refuse_shapes_no_writer_produces() {
-            // Issue #7218: build-out keeps no decoders for retired shapes.
+            // Issue #7218: no decoders are kept for shapes retired before 1.0.0.
             let mut audit = doc! {
                 "_id": "event-1",
                 "ts": "2026-05-18T01:00:00Z",
@@ -20082,7 +20299,7 @@ mod inner {
 
         #[test]
         fn api_spec_doc_stores_spec_content_as_bson_binary() {
-            let now = chrono::Utc::now();
+            let now = UtcTimestamp::now();
             let spec = ApiSpec {
                 id: "spec-1".to_string(),
                 namespace: "ferrum".to_string(),
@@ -20146,7 +20363,7 @@ mod inner {
 
         #[test]
         fn api_spec_summary_doc_allows_projected_out_spec_content() {
-            let now = chrono::Utc::now();
+            let now = UtcTimestamp::now();
             let spec = ApiSpec {
                 id: "spec-summary".to_string(),
                 namespace: "ferrum".to_string(),
@@ -20193,7 +20410,7 @@ mod inner {
 
         #[test]
         fn proxy_bson_round_trip() {
-            let now = chrono::Utc::now();
+            let now = UtcTimestamp::now();
             let proxy = Proxy {
                 labels: Default::default(),
                 id: "test-proxy".to_string(),
@@ -20285,7 +20502,7 @@ mod inner {
 
         #[test]
         fn consumer_bson_round_trip() {
-            let now = chrono::Utc::now();
+            let now = UtcTimestamp::now();
             let consumer = Consumer {
                 labels: Default::default(),
                 id: "consumer-1".to_string(),
@@ -20315,7 +20532,7 @@ mod inner {
 
         #[test]
         fn plugin_config_bson_round_trip() {
-            let now = chrono::Utc::now();
+            let now = UtcTimestamp::now();
             let pc = PluginConfig {
                 labels: Default::default(),
                 id: "plugin-1".to_string(),
@@ -20351,7 +20568,7 @@ mod inner {
 
         #[test]
         fn upstream_bson_round_trip() {
-            let now = chrono::Utc::now();
+            let now = UtcTimestamp::now();
             let upstream = Upstream {
                 labels: Default::default(),
                 id: "upstream-1".to_string(),
@@ -20426,7 +20643,7 @@ mod inner {
 
         #[test]
         fn proxy_to_doc_sets_id_field() {
-            let now = chrono::Utc::now();
+            let now = UtcTimestamp::now();
             let proxy = Proxy {
                 labels: Default::default(),
                 id: "unique-id-123".to_string(),
@@ -20518,7 +20735,7 @@ mod inner {
         /// likewise omit meaningless null keys. `proxy_to_doc` strips both.
         #[test]
         fn proxy_to_doc_strips_null_index_fields() {
-            let now = chrono::Utc::now();
+            let now = UtcTimestamp::now();
             let proxy = Proxy {
                 labels: Default::default(),
                 id: "http-proxy".to_string(),
@@ -20608,7 +20825,7 @@ mod inner {
 
         #[test]
         fn consumer_to_doc_strips_null_custom_id() {
-            let now = chrono::Utc::now();
+            let now = UtcTimestamp::now();
             let consumer = Consumer {
                 labels: Default::default(),
                 id: "c-1".to_string(),
@@ -20643,8 +20860,8 @@ mod inner {
                 custom_id: None,
                 credentials,
                 acl_groups: vec![],
-                created_at: chrono::Utc::now(),
-                updated_at: chrono::Utc::now(),
+                created_at: UtcTimestamp::now(),
+                updated_at: UtcTimestamp::now(),
             };
 
             let doc = consumer_to_doc(&consumer).unwrap();
@@ -20662,7 +20879,7 @@ mod inner {
 
         #[test]
         fn upstream_to_doc_strips_null_name() {
-            let now = chrono::Utc::now();
+            let now = UtcTimestamp::now();
             let upstream = Upstream {
                 labels: Default::default(),
                 id: "u-1".to_string(),
@@ -20705,7 +20922,7 @@ mod inner {
 
         #[test]
         fn consumer_with_credentials_round_trip() {
-            let now = chrono::Utc::now();
+            let now = UtcTimestamp::now();
             let mut credentials = std::collections::HashMap::new();
             credentials.insert(
                 "key_auth".to_string(),
@@ -20737,7 +20954,7 @@ mod inner {
 
         #[test]
         fn proxy_with_plugin_associations_round_trip() {
-            let now = chrono::Utc::now();
+            let now = UtcTimestamp::now();
             let proxy = Proxy {
                 labels: Default::default(),
                 id: "proxy-with-plugins".to_string(),

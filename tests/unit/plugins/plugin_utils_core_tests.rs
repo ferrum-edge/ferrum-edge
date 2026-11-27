@@ -32,6 +32,7 @@ use ferrum_edge::plugins::utils::token_extract::{
     mark_provider_query_credential_locations, query_locations_have_semicolon_alias,
 };
 use ferrum_edge::startup::render_startup_error;
+use ferrum_edge::time_compat::UtcTimestamp;
 use ferrum_edge::util::unknown_keys::reject_unknown_keys;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
@@ -1034,7 +1035,7 @@ async fn compiled_validation_matches_per_call_validation() {
     };
     let compiled = CompiledJwtValidation::new(&params);
     let store = two_key_store();
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
 
     let cases = [
         (
@@ -1111,7 +1112,7 @@ async fn compiled_validation_matches_per_call_validation() {
 /// The compiled policy carries the configured `exp`/`nbf` leeway.
 #[test]
 fn compiled_validation_applies_configured_leeway() {
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let store = two_key_store();
     let recently_expired = super::jwks_auth_support::create_rs256_token_with_kid(
         &json!({"sub": "u", "exp": now - 20}),

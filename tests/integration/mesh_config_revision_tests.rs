@@ -55,7 +55,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::{TimeZone, Utc};
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, watch};
 use tokio_stream::StreamExt as _;
@@ -98,6 +97,7 @@ use ferrum_edge::modes::mesh::runtime::{
 };
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::plugins::mesh::prometheus_helpers::render_mesh_observability_metrics;
+use ferrum_edge::time_compat::UtcTimestamp;
 use kube::runtime::watcher::Event;
 
 const NODE_ID: &str = "dp-node-a";
@@ -361,10 +361,10 @@ fn full_load_consumer_config(namespace: &str, generation: &str, timestamp: i64) 
             custom_id: None,
             credentials: HashMap::new(),
             acl_groups: Vec::new(),
-            created_at: Utc.timestamp_opt(timestamp, 0).single().expect("timestamp"),
-            updated_at: Utc.timestamp_opt(timestamp, 0).single().expect("timestamp"),
+            created_at: UtcTimestamp::from_unix_timestamp(timestamp).expect("timestamp"),
+            updated_at: UtcTimestamp::from_unix_timestamp(timestamp).expect("timestamp"),
         }],
-        loaded_at: Utc.timestamp_opt(timestamp, 0).single().expect("timestamp"),
+        loaded_at: UtcTimestamp::from_unix_timestamp(timestamp).expect("timestamp"),
         ..GatewayConfig::default()
     }
 }
@@ -854,7 +854,7 @@ fn malformed_authorities_are_treated_as_absent() {
 #[test]
 fn admit_refuses_present_malformed_revision_even_on_bootstrap() {
     let gate = MeshRevisionGate::new();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
 
     assert_eq!(
         gate.admit(None, cid(1), now),
@@ -887,7 +887,7 @@ fn admit_refuses_present_malformed_revision_even_on_bootstrap() {
 #[test]
 fn maximum_sequence_orders_without_wrapping() {
     let gate = MeshRevisionGate::new();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
 
     gate.admit(Some(&revision("db", u64::MAX - 1)), cid(1), now)
         .expect("the penultimate sequence establishes the baseline");
@@ -913,10 +913,7 @@ fn maximum_sequence_orders_without_wrapping() {
 #[test]
 fn gate_quarantines_stale_and_keeps_accepting_forward_progress() {
     let gate = MeshRevisionGate::new();
-    let now = Utc
-        .with_ymd_and_hms(2026, 7, 26, 12, 0, 0)
-        .single()
-        .expect("fixture time");
+    let now = "2026-07-26T12:00:00Z".parse::<UtcTimestamp>().unwrap();
 
     gate.admit(Some(&revision("db", 100)), cid(1), now)
         .expect("bootstrap installs");
@@ -968,10 +965,7 @@ fn gate_adopts_a_persistent_foreign_authority_after_the_grace_period() {
     gate.set_policy(MeshRevisionPolicy {
         foreign_authority_adopt_secs: 300,
     });
-    let t0 = Utc
-        .with_ymd_and_hms(2026, 7, 26, 12, 0, 0)
-        .single()
-        .expect("fixture time");
+    let t0 = "2026-07-26T12:00:00Z".parse::<UtcTimestamp>().unwrap();
 
     gate.admit(Some(&revision("db", 100)), cid(1), t0)
         .expect("bootstrap installs");
@@ -988,7 +982,7 @@ fn gate_adopts_a_persistent_foreign_authority_after_the_grace_period() {
     gate.admit_at(
         Some(&revision("db-restored", 2)),
         cid(2),
-        t0 + chrono::Duration::days(30),
+        t0.checked_add(::time::SignedDuration::days(30)).unwrap(),
         monotonic_t0 + std::time::Duration::from_secs(299),
     )
     .expect_err("a forward wall-clock jump cannot expire the monotonic grace window");
@@ -999,14 +993,16 @@ fn gate_adopts_a_persistent_foreign_authority_after_the_grace_period() {
     gate.admit_at(
         Some(&revision("db-other", 7)),
         cid(3),
-        t0 + chrono::Duration::seconds(300),
+        t0.checked_add(::time::SignedDuration::seconds(300))
+            .unwrap(),
         monotonic_t0 + std::time::Duration::from_secs(300),
     )
     .expect_err("a different foreign authority restarts the window");
     gate.admit_at(
         Some(&revision("db-restored", 3)),
         cid(2),
-        t0 + chrono::Duration::seconds(301),
+        t0.checked_add(::time::SignedDuration::seconds(301))
+            .unwrap(),
         monotonic_t0 + std::time::Duration::from_secs(301),
     )
     .expect_err("the original foreign authority also restarts its window");
@@ -1015,7 +1011,8 @@ fn gate_adopts_a_persistent_foreign_authority_after_the_grace_period() {
         .admit_at(
             Some(&revision("db-restored", 4)),
             cid(2),
-            t0 + chrono::Duration::seconds(601),
+            t0.checked_add(::time::SignedDuration::seconds(601))
+                .unwrap(),
             monotonic_t0 + std::time::Duration::from_secs(601),
         )
         .expect("a continuously observed foreign authority is adopted");
@@ -1034,17 +1031,14 @@ fn adoption_can_be_disabled_and_reset_is_the_operator_escape_hatch() {
     gate.set_policy(MeshRevisionPolicy {
         foreign_authority_adopt_secs: 0,
     });
-    let t0 = Utc
-        .with_ymd_and_hms(2026, 7, 26, 12, 0, 0)
-        .single()
-        .expect("fixture time");
+    let t0 = "2026-07-26T12:00:00Z".parse::<UtcTimestamp>().unwrap();
 
     gate.admit(Some(&revision("db", 100)), cid(1), t0)
         .expect("bootstrap installs");
     gate.admit(
         Some(&revision("db-restored", 1)),
         cid(2),
-        t0 + chrono::Duration::days(30),
+        t0.checked_add(::time::SignedDuration::days(30)).unwrap(),
     )
     .expect_err("adoption disabled: a foreign authority stays quarantined forever");
 
@@ -1057,7 +1051,7 @@ fn adoption_can_be_disabled_and_reset_is_the_operator_escape_hatch() {
     gate.admit(
         Some(&revision("db", 5)),
         cid(3),
-        t0 + chrono::Duration::days(60),
+        t0.checked_add(::time::SignedDuration::days(60)).unwrap(),
     )
     .expect_err("a same-authority rewind is never auto-adopted");
 
@@ -1069,7 +1063,7 @@ fn adoption_can_be_disabled_and_reset_is_the_operator_escape_hatch() {
     gate.admit(
         Some(&revision("db", 5)),
         cid(3),
-        t0 + chrono::Duration::days(61),
+        t0.checked_add(::time::SignedDuration::days(61)).unwrap(),
     )
     .expect("after a reset the rewound revision installs");
     assert_eq!(gate.accepted(), Some(revision("db", 5)));

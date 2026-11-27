@@ -86,7 +86,7 @@ pub(crate) use istio::service_entry_endpoint_is_network_gateway_only;
 
 use std::collections::{HashMap, HashSet};
 
-use chrono::Utc;
+use crate::time_compat::UtcTimestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -3001,7 +3001,7 @@ pub(crate) struct RouteProxySpec {
 }
 
 pub(crate) fn proxy_for_route(spec: RouteProxySpec) -> Proxy {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     // A route whose literal path match itself contains `;` declares a path
     // parameter explicitly, so it opts in rather than being unreachable and
     // refused at admission (GHSA-fcqw-793q-wg5x). Every other translated
@@ -3104,7 +3104,7 @@ pub(crate) fn route_request_transformer_plugin_for_proxy(
     proxy_id: &str,
     namespace: &str,
 ) -> PluginConfig {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     PluginConfig {
         labels: Default::default(),
         id: format!("istio-vs-req-xform-{proxy_id}"),
@@ -3131,7 +3131,7 @@ pub(crate) fn route_response_transformer_plugin_for_proxy(
     proxy_id: &str,
     namespace: &str,
 ) -> PluginConfig {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     PluginConfig {
         labels: Default::default(),
         id: format!("istio-vs-resp-xform-{proxy_id}"),
@@ -3165,7 +3165,7 @@ pub(crate) fn request_termination_plugin_for_proxy(
     namespace: &str,
     message: &str,
 ) -> PluginConfig {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     PluginConfig {
         labels: Default::default(),
         id: format!("istio-vs-rt-{proxy_id}"),
@@ -3972,7 +3972,7 @@ pub(crate) fn mesh_route_dispatch_plugin_from_rules(
     if rules.is_empty() {
         return None;
     }
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     Some(PluginConfig {
         labels: Default::default(),
         id: format!("istio-vs-mrd-{proxy_id}"),
@@ -4444,7 +4444,7 @@ pub(crate) fn upstream_for_route_with_session(
     backends: Vec<RouteBackend>,
     session: Option<&GatewaySessionPersistence>,
 ) -> Upstream {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let first_weight = backends.first().map(|backend| backend.weight).unwrap_or(1);
     let has_weighted_target = backends
         .iter()

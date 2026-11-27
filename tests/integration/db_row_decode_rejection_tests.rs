@@ -8,7 +8,6 @@
 use crate::scaffolding::port_registry::TestSocket;
 
 use arc_swap::ArcSwap;
-use chrono::Utc;
 use ferrum_edge::_test_support::{
     is_poll_validation_rejection, is_row_decode_rejection, record_config_validation_rejection,
 };
@@ -21,6 +20,7 @@ use ferrum_edge::config::db_loader::{DatabaseBackend, DatabaseStore, DbPoolConfi
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, Consumer, DispatchKind, Proxy, Upstream, default_namespace,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -102,8 +102,8 @@ fn test_proxy(id: &str, listen_path: &str) -> Proxy {
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }
@@ -117,8 +117,8 @@ fn test_consumer(id: &str) -> Consumer {
         custom_id: None,
         credentials: HashMap::new(),
         acl_groups: vec![],
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -133,14 +133,14 @@ fn jwt_manager() -> JwtManager {
 }
 
 fn admin_token() -> String {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "iss": "test-ferrum-edge",
         "sub": "test-user",
         "role": "admin",
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(3600)).unwrap()).unix_timestamp(),
         "jti": uuid::Uuid::new_v4().to_string()
     });
     encode(

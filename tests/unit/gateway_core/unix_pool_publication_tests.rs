@@ -22,18 +22,18 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Duration, Utc};
 use ferrum_edge::config::db_loader::{IncrementalResult, NamespacedResourceId};
 use ferrum_edge::config::types::*;
 use ferrum_edge::proxy::{ConfigApplyOutcome, ProxyState};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const UNIX_SOCKET_TAG: &str = "mesh.unix_socket";
 const UNIX_SOCKET_H2C_TAG: &str = "mesh.unix_socket_h2c";
 const PROXY_ID: &str = "sidecar-ingress-unix";
 const UPSTREAM_ID: &str = "sidecar-ingress-unix-upstream";
 
-fn ts(secs: i64) -> DateTime<Utc> {
-    DateTime::from_timestamp(secs, 0).expect("valid test timestamp")
+fn ts(secs: i64) -> UtcTimestamp {
+    UtcTimestamp::from_unix_timestamp(secs).expect("valid test timestamp")
 }
 
 /// Accepts and holds every connection, so a pooled carrier stays live.
@@ -88,7 +88,7 @@ fn unix_target(socket_path: &str, h2c: bool) -> UpstreamTarget {
     }
 }
 
-fn unix_upstream(socket_path: &str, h2c: bool, stamp: DateTime<Utc>) -> Upstream {
+fn unix_upstream(socket_path: &str, h2c: bool, stamp: UtcTimestamp) -> Upstream {
     Upstream {
         labels: Default::default(),
         id: UPSTREAM_ID.to_string(),
@@ -124,7 +124,7 @@ fn unix_upstream(socket_path: &str, h2c: bool, stamp: DateTime<Utc>) -> Upstream
     }
 }
 
-fn unix_proxy(id: &str, listen_path: &str, stamp: DateTime<Utc>) -> Proxy {
+fn unix_proxy(id: &str, listen_path: &str, stamp: UtcTimestamp) -> Proxy {
     Proxy {
         labels: Default::default(),
         id: id.to_string(),
@@ -194,7 +194,7 @@ fn unix_proxy(id: &str, listen_path: &str, stamp: DateTime<Utc>) -> Proxy {
     }
 }
 
-fn config_with(socket_path: &str, h2c: bool, stamp: DateTime<Utc>) -> GatewayConfig {
+fn config_with(socket_path: &str, h2c: bool, stamp: UtcTimestamp) -> GatewayConfig {
     let mut config = GatewayConfig {
         version: "1".to_string(),
         proxies: vec![unix_proxy(PROXY_ID, "/", stamp)],
@@ -271,7 +271,7 @@ fn removal(id: &str) -> NamespacedResourceId {
     }
 }
 
-fn delta_removing_the_proxy(stamp: DateTime<Utc>) -> IncrementalResult {
+fn delta_removing_the_proxy(stamp: UtcTimestamp) -> IncrementalResult {
     IncrementalResult {
         added_or_modified_proxies: vec![],
         removed_proxy_ids: vec![removal(PROXY_ID)],
@@ -286,7 +286,7 @@ fn delta_removing_the_proxy(stamp: DateTime<Utc>) -> IncrementalResult {
     }
 }
 
-fn delta_repointing_the_socket(socket_path: &str, stamp: DateTime<Utc>) -> IncrementalResult {
+fn delta_repointing_the_socket(socket_path: &str, stamp: UtcTimestamp) -> IncrementalResult {
     IncrementalResult {
         added_or_modified_proxies: vec![],
         removed_proxy_ids: vec![],
@@ -317,7 +317,11 @@ async fn an_incremental_withdrawal_retires_the_pooled_unix_carrier() {
     let before = state.unix_backend_pool.publication_generation();
 
     let outcome = state
-        .apply_incremental(delta_removing_the_proxy(stamp + Duration::seconds(1)))
+        .apply_incremental(delta_removing_the_proxy(
+            stamp
+                .checked_add(::time::SignedDuration::seconds(1))
+                .unwrap(),
+        ))
         .await;
     assert_eq!(outcome, ConfigApplyOutcome::Applied);
 
@@ -351,7 +355,9 @@ async fn an_incremental_socket_path_change_retires_the_old_carrier() {
     let outcome = state
         .apply_incremental(delta_repointing_the_socket(
             moved.to_str().expect("utf-8"),
-            stamp + Duration::seconds(1),
+            stamp
+                .checked_add(::time::SignedDuration::seconds(1))
+                .unwrap(),
         ))
         .await;
     assert_eq!(outcome, ConfigApplyOutcome::Applied);
@@ -409,7 +415,9 @@ async fn a_full_snapshot_proxy_deletion_retires_the_pooled_carrier() {
     let state = state_from(config_with(socket.to_str().expect("utf-8"), false, stamp)).await;
     pool_one_carrier(&state, &socket, &root).await;
 
-    let later = stamp + Duration::seconds(1);
+    let later = stamp
+        .checked_add(::time::SignedDuration::seconds(1))
+        .unwrap();
     let mut without_proxy = config_with(socket.to_str().expect("utf-8"), false, later);
     without_proxy.proxies.clear();
     assert_eq!(
@@ -440,7 +448,9 @@ async fn a_rejected_candidate_neither_advances_the_generation_nor_retires() {
     let before = state.unix_backend_pool.publication_generation();
 
     // Two host-less proxies on one listen path is a validation conflict.
-    let later = stamp + Duration::seconds(1);
+    let later = stamp
+        .checked_add(::time::SignedDuration::seconds(1))
+        .unwrap();
     let mut invalid = config_with(socket.to_str().expect("utf-8"), false, later);
     invalid
         .proxies
@@ -499,7 +509,7 @@ async fn an_unchanged_candidate_does_not_advance_the_generation() {
 fn config_with_keep_alive(
     socket_path: &str,
     h2c: bool,
-    stamp: DateTime<Utc>,
+    stamp: UtcTimestamp,
     pool_enable_http_keep_alive: Option<bool>,
 ) -> GatewayConfig {
     let mut config = config_with(socket_path, h2c, stamp);
@@ -510,7 +520,7 @@ fn config_with_keep_alive(
 fn config_with_h1_and_h2c(
     h1_path: &str,
     h2c_path: &str,
-    stamp: DateTime<Utc>,
+    stamp: UtcTimestamp,
     pool_enable_http_keep_alive: Option<bool>,
 ) -> GatewayConfig {
     let mut config = config_with(h1_path, false, stamp);
@@ -597,7 +607,9 @@ async fn update_config_keep_alive_false_retires_pooled_h1_carriers() {
     let state = state_from(config_with(path, false, stamp)).await;
     pool_one_carrier(&state, &socket, &root).await;
 
-    let later = stamp + Duration::seconds(1);
+    let later = stamp
+        .checked_add(::time::SignedDuration::seconds(1))
+        .unwrap();
     assert_eq!(
         state.update_config(config_with_keep_alive(path, false, later, Some(false))),
         ConfigApplyOutcome::Applied

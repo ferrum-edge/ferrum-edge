@@ -30,7 +30,6 @@
 
 use std::collections::HashMap;
 
-use chrono::Utc;
 use serde_json::{Value, json};
 
 use ferrum_edge::_test_support::materialize_transformer_runtime_overlay_for_test;
@@ -42,6 +41,7 @@ use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::modes::mesh::config::{MeshRuntimeOverlay, RuntimeValue};
 use ferrum_edge::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext};
 use ferrum_edge::proxy::ProxyState;
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const SCOPE: &str = "gen-barrier";
 const REQUEST_GATE_KEY: &str = "ferrum.request_transformer.gen-barrier.enabled";
@@ -124,8 +124,8 @@ fn test_proxy(id: &str, plugin_ids: &[&str]) -> Proxy {
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }
@@ -140,8 +140,8 @@ fn plugin_config(id: &str, plugin_name: &str, config: Value) -> PluginConfig {
         enabled: true,
         scope: PluginScope::Proxy,
         proxy_id: Some("gated".to_string()),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         priority_override: None,
         trigger: None,
         api_spec_id: None,
@@ -191,7 +191,7 @@ fn generation(
         consumers: vec![],
         plugin_configs: vec![plugin_config("gate", plugin_name, static_config)],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         frontend_tls_cert_path: None,
         frontend_tls_key_path: None,

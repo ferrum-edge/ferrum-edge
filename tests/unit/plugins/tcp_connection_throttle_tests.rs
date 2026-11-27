@@ -3,6 +3,7 @@ use ferrum_edge::plugins::{
     Plugin, PluginResult, ProxyProtocol, StreamConnectionContext, create_plugin,
 };
 use ferrum_edge::proxy::proxy_protocol::{ProxyProtocolResult, apply_proxy_result};
+use ferrum_edge::time_compat::UtcTimestamp;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,8 +22,8 @@ fn make_consumer(username: &str) -> Consumer {
         custom_id: None,
         credentials: HashMap::new(),
         acl_groups: Vec::new(),
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 

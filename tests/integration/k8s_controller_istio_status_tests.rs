@@ -1912,3 +1912,155 @@ fn mesh_bound_virtual_service_status_reports_where_http_routes_apply() {
     assert_eq!(scope, Value::Null, "no http[] routes, nothing to qualify");
     assert!(!message.contains(VIRTUAL_SERVICE_MESH_HTTP_ROUTES_NOTE));
 }
+
+/// `(FerrumAccepted status, reason, message, translation detail)` of a
+/// VirtualService named `name` with `spec`, planned under `options` with no
+/// ReferenceGrant in the snapshot.
+fn cross_namespace_report(
+    name: &str,
+    spec: Value,
+    options: K8sTranslationOptions,
+) -> (String, String, String, Value) {
+    let obj = object("networking.istio.io/v1", "VirtualService", name, spec);
+    let updates = plan_istio_status_updates(&[obj], options);
+    let update = update_for(&updates, "VirtualService", name);
+    let condition = find_condition(
+        update.status["conditions"].as_array().unwrap(),
+        "FerrumAccepted",
+    );
+    (
+        condition["status"].as_str().unwrap_or_default().to_string(),
+        condition["reason"].as_str().unwrap_or_default().to_string(),
+        condition["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        update.ferrum_detail.as_ref().unwrap()["translation"].clone(),
+    )
+}
+
+fn cross_namespace_leg(host: &str, weight: u32) -> Value {
+    json!({"destination": {"host": host, "port": {"number": 8080}}, "weight": weight})
+}
+
+fn cross_namespace_direct(host: &str) -> Value {
+    json!({
+        "hosts": ["reviews.default.svc.cluster.local"],
+        "http": [{"route": [cross_namespace_leg(host, 100)]}]
+    })
+}
+
+/// Asserts a mesh-bound VirtualService naming an ungranted Service in another
+/// namespace is refused as a reference resolution failure (issue #7499): the
+/// destination is never reported as deferred, because no data plane is left
+/// to refuse it.
+fn assert_cross_namespace_refused(name: &str, spec: Value, options: K8sTranslationOptions) {
+    let (status, reason, message, translation) = cross_namespace_report(name, spec, options);
+    assert_eq!(status, "False", "{name}: {message}");
+    assert_eq!(reason, "RefNotPermitted", "{name}: {message}");
+    assert!(
+        message.contains("cross-namespace VirtualService destination is not permitted"),
+        "{name}: {message}"
+    );
+    assert!(
+        translation.get("deferred_fields").is_none()
+            && translation.get("cross_namespace_destinations").is_none(),
+        "{name}: a refused VirtualService reports no deferred or admitted destination: \
+         {translation}"
+    );
+}
+
+/// Issue #7499: a mesh-bound VirtualService whose `http[]` destination (direct,
+/// weighted-split leg, or zero-weight leg) names a Service in another namespace
+/// without a ReferenceGrant in that namespace is `FerrumAccepted=False` /
+/// `RefNotPermitted`. Same-namespace Services, external hosts and gateway-only
+/// VirtualServices are accepted and report no cross-namespace destination.
+#[test]
+fn mesh_bound_virtual_service_status_refuses_ungranted_cross_namespace_destinations() {
+    for host in [
+        "ratings.other.svc.cluster.local",
+        "ratings.other.svc.cluster.local.",
+        "ratings.other.svc",
+        "ratings.other",
+    ] {
+        assert_cross_namespace_refused("cross", cross_namespace_direct(host), options());
+    }
+
+    assert_cross_namespace_refused(
+        "split",
+        json!({
+            "hosts": ["reviews.default.svc.cluster.local"],
+            "http": [{"route": [
+                cross_namespace_leg("reviews.default.svc.cluster.local", 90),
+                cross_namespace_leg("ratings.other.svc.cluster.local", 10)
+            ]}]
+        }),
+        options(),
+    );
+    // A zero-weight leg is dropped by translation, but it still names the
+    // Service, so it needs the same grant.
+    assert_cross_namespace_refused(
+        "zero-weight",
+        json!({
+            "hosts": ["reviews.default.svc.cluster.local"],
+            "http": [{"route": [
+                cross_namespace_leg("reviews.default.svc.cluster.local", 100),
+                cross_namespace_leg("details.third.svc.cluster.local", 0)
+            ]}]
+        }),
+        options(),
+    );
+
+    for (name, spec) in [
+        (
+            "same-namespace",
+            cross_namespace_direct("reviews.default.svc.cluster.local"),
+        ),
+        ("short-name", cross_namespace_direct("reviews")),
+        ("external", cross_namespace_direct("api.example.com")),
+        (
+            "gateway-only",
+            json!({
+                "hosts": ["reviews.default.svc.cluster.local"],
+                "gateways": ["ingress-gw"],
+                "http": [{"route": [cross_namespace_leg("ratings.other.svc.cluster.local", 100)]}]
+            }),
+        ),
+    ] {
+        let (status, _, message, translation) = cross_namespace_report(name, spec, options());
+        assert_eq!(status, "True", "{name}: {message}");
+        assert!(!message.contains("another namespace"), "{name}: {message}");
+        assert!(
+            translation.get("cross_namespace_destinations").is_none(),
+            "{name}: {translation}"
+        );
+    }
+}
+
+/// Issue #7499: the configured cluster domain is normalized (surrounding
+/// dots, case) exactly as the mesh data plane's host index normalizes it, so
+/// a custom domain written with a trailing dot classifies a fully qualified
+/// host the same way on both sides.
+#[test]
+fn cross_namespace_admission_normalizes_a_custom_cluster_domain() {
+    let custom = || options().with_cluster_domain("Corp.Example.".to_string());
+    for host in [
+        "ratings.other.svc.corp.example",
+        "ratings.other.svc.corp.example.",
+        "ratings.other",
+        "ratings.other.svc",
+    ] {
+        assert_cross_namespace_refused("custom", cross_namespace_direct(host), custom());
+    }
+    // Under the controller's `corp.example` domain a `cluster.local` FQDN is
+    // an external host, not a Service reference (the controller's cluster
+    // domain must match the data planes' FERRUM_MESH_CLUSTER_DOMAIN; a data
+    // plane that reads it as a Service in another namespace refuses the
+    // route, since the binding never authorized it).
+    let (status, _, message, _) = cross_namespace_report(
+        "custom-external",
+        cross_namespace_direct("ratings.other.svc.cluster.local"),
+        custom(),
+    );
+    assert_eq!(status, "True", "{message}");
+}

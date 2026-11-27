@@ -28,7 +28,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use chrono::Utc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::watch;
@@ -49,6 +48,7 @@ use ferrum_edge::request_epoch::RequestEpochStore;
 use serde_json::json;
 
 use crate::scaffolding::ports::reserve_port;
+use ferrum_edge::time_compat::UtcTimestamp;
 
 // Each test that asserts on the Prometheus stream-decision counter MUST
 // scope its enforcement to a unique namespace label. The Prometheus
@@ -133,8 +133,8 @@ fn tcp_proxy(listen_port: u16, backend_port: u16) -> Proxy {
         allowed_methods: None,
         allowed_ws_origins: vec![],
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }
@@ -240,7 +240,7 @@ async fn try_spawn_tcp_listener(
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };
@@ -575,7 +575,7 @@ async fn try_spawn_udp_listener(
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };
@@ -635,7 +635,6 @@ async fn try_spawn_udp_listener(
         recvmmsg_batch_size: 64,
         overload,
         so_busy_poll_us: 0,
-        udp_gro_enabled: false,
         udp_gso_enabled: false,
         udp_pktinfo_enabled: false,
         mesh_outbound_enforcement: enforcement,

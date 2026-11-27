@@ -23,6 +23,7 @@ use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::proxy::grpc_proxy::{GrpcBody, GrpcConnectionPool};
 use ferrum_edge::proxy::http2_pool::{Http2ConnectionPool, Http2PoolError};
 use ferrum_edge::proxy::{ProxyState, handle_proxy_request};
+use ferrum_edge::time_compat::UtcTimestamp;
 use hickory_resolver::proto::{
     op::Message,
     rr::{RData, Record, RecordType},
@@ -111,8 +112,8 @@ fn create_test_proxy() -> Proxy {
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }
@@ -3300,8 +3301,8 @@ async fn assert_unclassified_https_uploads(
         enabled: true,
         scope: ferrum_edge::config::types::PluginScope::Proxy,
         proxy_id: Some(proxy.id.clone()),
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         priority_override: None,
         trigger: None,
         api_spec_id: None,
@@ -3310,7 +3311,7 @@ async fn assert_unclassified_https_uploads(
         version: "1".to_string(),
         proxies: vec![proxy.clone()],
         plugin_configs: vec![policy],
-        loaded_at: chrono::Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..Default::default()
     };
     let env_config = ferrum_edge::config::EnvConfig {
@@ -3504,7 +3505,7 @@ async fn assert_direct_h2_host_and_authority(h2_frontend: bool) {
     let config = GatewayConfig {
         version: "1".to_string(),
         proxies: vec![proxy],
-        loaded_at: chrono::Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..Default::default()
     };
     let (state, _health_handles) =
@@ -5386,8 +5387,8 @@ async fn start_adaptive_direct_h2_gateway(
         enabled: true,
         scope: ferrum_edge::config::types::PluginScope::Proxy,
         proxy_id: Some(proxy.id.clone()),
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         priority_override: None,
         trigger: None,
         api_spec_id: None,
@@ -5401,7 +5402,7 @@ async fn start_adaptive_direct_h2_gateway(
         version: "1".to_string(),
         proxies: vec![proxy],
         plugin_configs: vec![policy],
-        loaded_at: chrono::Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..Default::default()
     };
     let (state, _health_handles) =

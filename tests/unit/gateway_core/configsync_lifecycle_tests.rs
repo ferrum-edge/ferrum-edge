@@ -9,7 +9,6 @@
 //! namespace-qualified removal filtering surfaces exposed for deterministic
 //! verification without standing up a live CP.
 
-use chrono::{TimeZone, Utc};
 use ferrum_edge::FERRUM_VERSION;
 use ferrum_edge::config::db_loader::{IncrementalResult, NamespacedResourceId};
 use ferrum_edge::config::types::GatewayConfig;
@@ -39,6 +38,7 @@ use ferrum_edge::grpc::dp_client::{
     filter_incremental_to_namespace, subscribe_admission_refusal, subscribe_build_mismatch,
 };
 use ferrum_edge::identity::{TrustBundle, TrustBundleSet as RuntimeTrustBundleSet, TrustDomain};
+use ferrum_edge::time_compat::UtcTimestamp;
 use ferrum_edge::util::backoff::{BACKOFF_INITIAL_SECS, BACKOFF_MAX_SECS};
 use tonic::transport::Channel;
 
@@ -174,7 +174,7 @@ fn connection_error_after_accepted_config_resets_backoff() {
 
 #[test]
 fn reconcile_snapshot_version_requires_envelope_loaded_at_parity() {
-    let loaded_at = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
+    let loaded_at = "2026-07-01T12:00:00Z".parse::<UtcTimestamp>().unwrap();
     assert_eq!(
         reconcile_snapshot_version(&loaded_at.to_rfc3339(), loaded_at).unwrap(),
         loaded_at
@@ -183,7 +183,7 @@ fn reconcile_snapshot_version_requires_envelope_loaded_at_parity() {
         reconcile_snapshot_version("garbage", loaded_at),
         Err(VersionReconcileError::UnparseableEnvelope)
     ));
-    let other = Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap();
+    let other = "2026-06-01T12:00:00Z".parse::<UtcTimestamp>().unwrap();
     assert!(matches!(
         reconcile_snapshot_version(&other.to_rfc3339(), loaded_at),
         Err(VersionReconcileError::Inconsistent { .. })
@@ -196,13 +196,13 @@ fn reconcile_snapshot_version_requires_envelope_loaded_at_parity() {
 
 #[test]
 fn full_snapshot_fencing_rejects_older_cross_source() {
-    let applied = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
+    let applied = "2026-07-01T12:00:00Z".parse::<UtcTimestamp>().unwrap();
     let authority = AppliedSnapshotAuthority {
         version: Some(applied),
         source_cp_url: "http://cp-primary:50051".to_string(),
         gateway_trust: GatewayTrustEquivalenceState::Absent,
     };
-    let older = Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap();
+    let older = "2026-06-01T12:00:00Z".parse::<UtcTimestamp>().unwrap();
 
     let rejected = evaluate_full_snapshot_authority(
         Some(&authority),
@@ -222,7 +222,7 @@ fn full_snapshot_fencing_rejects_older_cross_source() {
             .expect("same-source recovery snapshots remain accepted");
     assert_eq!(same_source, applied);
 
-    let newer = Utc.with_ymd_and_hms(2026, 8, 1, 12, 0, 0).unwrap();
+    let newer = "2026-08-01T12:00:00Z".parse::<UtcTimestamp>().unwrap();
     let accepted = evaluate_full_snapshot_authority(
         Some(&authority),
         newer,
@@ -235,14 +235,14 @@ fn full_snapshot_fencing_rejects_older_cross_source() {
 
 #[test]
 fn same_source_recovery_watermark_is_monotonic() {
-    let applied = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
+    let applied = "2026-07-01T12:00:00Z".parse::<UtcTimestamp>().unwrap();
     let authority = AppliedSnapshotAuthority {
         version: Some(applied),
         source_cp_url: "http://cp-a:50051".to_string(),
         gateway_trust: GatewayTrustEquivalenceState::Absent,
     };
-    let older = Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap();
-    let newer = Utc.with_ymd_and_hms(2026, 8, 1, 12, 0, 0).unwrap();
+    let older = "2026-06-01T12:00:00Z".parse::<UtcTimestamp>().unwrap();
+    let newer = "2026-08-01T12:00:00Z".parse::<UtcTimestamp>().unwrap();
 
     assert_eq!(
         evaluate_full_snapshot_authority(Some(&authority), older, "http://cp-a:50051", false,)
@@ -265,7 +265,7 @@ fn fenced_full_snapshot_disposition_terminates_stream() {
     // reading from the stale fallback CP and apply its next delta against newer
     // config. This asserts the terminate contract at the pure decision seam the
     // stream loop actually calls.
-    let applied = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
+    let applied = "2026-07-01T12:00:00Z".parse::<UtcTimestamp>().unwrap();
     let authority = AppliedSnapshotAuthority {
         version: Some(applied),
         source_cp_url: "http://cp-primary:50051".to_string(),
@@ -274,7 +274,7 @@ fn fenced_full_snapshot_disposition_terminates_stream() {
 
     match full_snapshot_stream_disposition(
         Some(&authority),
-        Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap(),
+        "2026-06-01T12:00:00Z".parse::<UtcTimestamp>().unwrap(),
         "http://cp-fallback:50051",
         false,
     ) {
@@ -287,7 +287,7 @@ fn fenced_full_snapshot_disposition_terminates_stream() {
             assert_eq!(fenced_applied, applied);
             assert_eq!(
                 incoming,
-                Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap()
+                "2026-06-01T12:00:00Z".parse::<UtcTimestamp>().unwrap()
             );
         }
         other => panic!("older cross-source snapshot must terminate the stream, got {other:?}"),
@@ -296,7 +296,7 @@ fn fenced_full_snapshot_disposition_terminates_stream() {
 
 #[test]
 fn accepted_full_snapshot_disposition_applies_and_adopts_version() {
-    let applied = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
+    let applied = "2026-07-01T12:00:00Z".parse::<UtcTimestamp>().unwrap();
     let authority = AppliedSnapshotAuthority {
         version: Some(applied),
         source_cp_url: "http://cp-primary:50051".to_string(),
@@ -307,12 +307,12 @@ fn accepted_full_snapshot_disposition_applies_and_adopts_version() {
     assert_eq!(
         full_snapshot_stream_disposition(
             Some(&authority),
-            Utc.with_ymd_and_hms(2026, 8, 1, 12, 0, 0).unwrap(),
+            "2026-08-01T12:00:00Z".parse::<UtcTimestamp>().unwrap(),
             "http://cp-fallback:50051",
             false,
         ),
         FullSnapshotStreamDisposition::Apply {
-            version: Utc.with_ymd_and_hms(2026, 8, 1, 12, 0, 0).unwrap(),
+            version: "2026-08-01T12:00:00Z".parse::<UtcTimestamp>().unwrap(),
         }
     );
 
@@ -321,7 +321,7 @@ fn accepted_full_snapshot_disposition_applies_and_adopts_version() {
     assert_eq!(
         full_snapshot_stream_disposition(
             Some(&authority),
-            Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap(),
+            "2026-06-01T12:00:00Z".parse::<UtcTimestamp>().unwrap(),
             "http://cp-primary:50051",
             false,
         ),
@@ -330,7 +330,7 @@ fn accepted_full_snapshot_disposition_applies_and_adopts_version() {
 
     // The first snapshot (no applied authority yet) applies and adopts its
     // committed stamp.
-    let first = Utc.with_ymd_and_hms(2026, 7, 20, 0, 0, 0).unwrap();
+    let first = "2026-07-20T00:00:00Z".parse::<UtcTimestamp>().unwrap();
     assert_eq!(
         full_snapshot_stream_disposition(None, first, "http://cp-a:50051", false),
         FullSnapshotStreamDisposition::Apply { version: first }
@@ -339,8 +339,8 @@ fn accepted_full_snapshot_disposition_applies_and_adopts_version() {
 
 #[test]
 fn equivalent_older_cross_source_snapshot_establishes_safe_base() {
-    let applied = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
-    let older = Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap();
+    let applied = "2026-07-01T12:00:00Z".parse::<UtcTimestamp>().unwrap();
+    let older = "2026-06-01T12:00:00Z".parse::<UtcTimestamp>().unwrap();
     let authority = AppliedSnapshotAuthority {
         version: Some(applied),
         source_cp_url: "http://cp-primary:50051".to_string(),
@@ -394,9 +394,13 @@ fn equivalent_older_cross_source_snapshot_establishes_safe_base() {
 
 #[test]
 fn equivalent_older_snapshot_does_not_authorize_aba_delta_rollback() {
-    let applied = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
-    let snapshot = applied - chrono::Duration::hours(2);
-    let stale_delta = applied - chrono::Duration::hours(1);
+    let applied = "2026-07-01T12:00:00Z".parse::<UtcTimestamp>().unwrap();
+    let snapshot = applied
+        .checked_sub(::time::SignedDuration::hours(2))
+        .unwrap();
+    let stale_delta = applied
+        .checked_sub(::time::SignedDuration::hours(1))
+        .unwrap();
     let authority = AppliedSnapshotAuthority {
         version: Some(applied),
         source_cp_url: "http://cp-primary:50051".to_string(),
@@ -433,7 +437,7 @@ fn delta_authority_fence_admits_equal_newer_and_unestablished_watermarks() {
     // was never established (no authority, or an authority with no comparable
     // version) has nothing to fence against, so the delta proceeds to the
     // subscription-base gate and the ordinary parse/validate/apply path.
-    let applied = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
+    let applied = "2026-07-01T12:00:00Z".parse::<UtcTimestamp>().unwrap();
     let authority = AppliedSnapshotAuthority {
         version: Some(applied),
         source_cp_url: "http://cp-primary:50051".to_string(),
@@ -444,26 +448,52 @@ fn delta_authority_fence_admits_equal_newer_and_unestablished_watermarks() {
     assert!(evaluate_delta_authority(Some(&authority), applied).is_ok());
     // Newer: ordinary forward progress.
     assert!(
-        evaluate_delta_authority(Some(&authority), applied + chrono::Duration::seconds(1)).is_ok()
+        evaluate_delta_authority(
+            Some(&authority),
+            applied
+                .checked_add(::time::SignedDuration::seconds(1))
+                .unwrap()
+        )
+        .is_ok()
     );
     // One second older is still a rollback.
     assert_eq!(
-        evaluate_delta_authority(Some(&authority), applied - chrono::Duration::seconds(1)),
+        evaluate_delta_authority(
+            Some(&authority),
+            applied
+                .checked_sub(::time::SignedDuration::seconds(1))
+                .unwrap()
+        ),
         Err(StaleSnapshotReject::OlderThanApplied {
             applied,
-            incoming: applied - chrono::Duration::seconds(1),
+            incoming: applied
+                .checked_sub(::time::SignedDuration::seconds(1))
+                .unwrap(),
         })
     );
 
-    assert!(evaluate_delta_authority(None, applied - chrono::Duration::hours(9)).is_ok());
+    assert!(
+        evaluate_delta_authority(
+            None,
+            applied
+                .checked_sub(::time::SignedDuration::hours(9))
+                .unwrap()
+        )
+        .is_ok()
+    );
     let unestablished = AppliedSnapshotAuthority {
         version: None,
         source_cp_url: "http://cp-primary:50051".to_string(),
         gateway_trust: GatewayTrustEquivalenceState::Unknown,
     };
     assert!(
-        evaluate_delta_authority(Some(&unestablished), applied - chrono::Duration::hours(9))
-            .is_ok()
+        evaluate_delta_authority(
+            Some(&unestablished),
+            applied
+                .checked_sub(::time::SignedDuration::hours(9))
+                .unwrap()
+        )
+        .is_ok()
     );
 }
 
@@ -473,7 +503,7 @@ fn delta_authority_fence_applies_to_the_same_source_that_holds_authority() {
     // authority's `source_cp_url` becomes that CP, so a source-exempt fence
     // would be inert exactly in the ABA case it exists to stop. A lagging CP
     // replaying its own history is fenced until it catches back up.
-    let applied = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
+    let applied = "2026-07-01T12:00:00Z".parse::<UtcTimestamp>().unwrap();
     let authority = AppliedSnapshotAuthority {
         version: Some(applied),
         source_cp_url: "http://cp-fallback:50051".to_string(),
@@ -481,7 +511,12 @@ fn delta_authority_fence_applies_to_the_same_source_that_holds_authority() {
     };
 
     assert!(matches!(
-        evaluate_delta_authority(Some(&authority), applied - chrono::Duration::minutes(1)),
+        evaluate_delta_authority(
+            Some(&authority),
+            applied
+                .checked_sub(::time::SignedDuration::minutes(1))
+                .unwrap()
+        ),
         Err(StaleSnapshotReject::OlderThanApplied { .. })
     ));
     assert!(evaluate_delta_authority(Some(&authority), applied).is_ok());
@@ -504,8 +539,8 @@ fn older_cross_source_same_config_different_trust_is_fenced() {
     // Security: GatewayConfig-only equality must NOT bypass fencing when the
     // CP trust side channel differs (or clear-vs-present). Otherwise an older
     // fallback snapshot would apply stale trust anchors.
-    let applied = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
-    let older = Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap();
+    let applied = "2026-07-01T12:00:00Z".parse::<UtcTimestamp>().unwrap();
+    let older = "2026-06-01T12:00:00Z".parse::<UtcTimestamp>().unwrap();
     let current_trust = gateway_trust_equivalence_state(Some(&test_runtime_trust(
         "cluster.local",
         &[&[1, 2, 3, 4]],
@@ -577,8 +612,8 @@ fn older_cross_source_same_config_different_trust_is_fenced() {
 
 #[test]
 fn older_cross_source_same_config_equivalent_trust_establishes_safe_base() {
-    let applied = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
-    let older = Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap();
+    let applied = "2026-07-01T12:00:00Z".parse::<UtcTimestamp>().unwrap();
+    let older = "2026-06-01T12:00:00Z".parse::<UtcTimestamp>().unwrap();
     let trust_a = test_runtime_trust("cluster.local", &[&[1, 2, 3, 4], &[5, 6, 7, 8]]);
     // Same material with reordered x509 authorities must still fingerprint equal.
     let trust_b = test_runtime_trust("cluster.local", &[&[5, 6, 7, 8], &[1, 2, 3, 4]]);
@@ -620,8 +655,8 @@ fn older_cross_source_same_config_equivalent_trust_establishes_safe_base() {
 
 #[test]
 fn trust_only_update_keeps_authority_trust_equivalence_in_sync() {
-    let t0 = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
-    let older = Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap();
+    let t0 = "2026-07-01T12:00:00Z".parse::<UtcTimestamp>().unwrap();
+    let older = "2026-06-01T12:00:00Z".parse::<UtcTimestamp>().unwrap();
     let initial_trust = gateway_trust_equivalence_state(Some(&test_runtime_trust(
         "cluster.local",
         &[&[1, 2, 3, 4]],
@@ -693,8 +728,8 @@ fn trust_only_update_keeps_authority_trust_equivalence_in_sync() {
 
 #[test]
 fn accepted_resource_delta_advances_authority_trust_only_and_reject_do_not() {
-    let t0 = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
-    let t1 = Utc.with_ymd_and_hms(2026, 7, 1, 13, 0, 0).unwrap();
+    let t0 = "2026-07-01T12:00:00Z".parse::<UtcTimestamp>().unwrap();
+    let t1 = "2026-07-01T13:00:00Z".parse::<UtcTimestamp>().unwrap();
     let mut authority = Some(AppliedSnapshotAuthority {
         version: Some(t0),
         source_cp_url: "http://cp-a:50051".to_string(),
@@ -735,8 +770,8 @@ fn accepted_resource_delta_advances_authority_trust_only_and_reject_do_not() {
 fn unchanged_full_snapshot_authority_trust_stays_unknown_not_absent() {
     // Root follow-up: an empty/Unchanged trust side channel must not record
     // Absent. Absent is established only by an accepted explicit Clear.
-    let applied = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
-    let older = Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap();
+    let applied = "2026-07-01T12:00:00Z".parse::<UtcTimestamp>().unwrap();
+    let older = "2026-06-01T12:00:00Z".parse::<UtcTimestamp>().unwrap();
 
     let gateway_trust = resolve_authority_trust_after_snapshot(None, None);
     assert_eq!(gateway_trust, GatewayTrustEquivalenceState::Unknown);
@@ -807,8 +842,8 @@ fn unchanged_full_snapshot_authority_trust_stays_unknown_not_absent() {
 
 #[test]
 fn trust_only_clear_or_replace_establishes_comparability_from_unknown() {
-    let t0 = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
-    let older = Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap();
+    let t0 = "2026-07-01T12:00:00Z".parse::<UtcTimestamp>().unwrap();
+    let older = "2026-06-01T12:00:00Z".parse::<UtcTimestamp>().unwrap();
     let mut authority = Some(AppliedSnapshotAuthority {
         version: Some(t0),
         source_cp_url: "http://cp-primary:50051".to_string(),
@@ -877,9 +912,9 @@ fn delta_after_resource_advances_fences_older_cross_source_snapshot() {
     // Blocker 1: accepted resource deltas move the active config ahead; the
     // watermark must follow so a later cross-source snapshot between those
     // versions is refused rather than rolling config back.
-    let snapshot = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
-    let after_delta = Utc.with_ymd_and_hms(2026, 7, 1, 14, 0, 0).unwrap();
-    let stale_failover = Utc.with_ymd_and_hms(2026, 7, 1, 13, 0, 0).unwrap();
+    let snapshot = "2026-07-01T12:00:00Z".parse::<UtcTimestamp>().unwrap();
+    let after_delta = "2026-07-01T14:00:00Z".parse::<UtcTimestamp>().unwrap();
+    let stale_failover = "2026-07-01T13:00:00Z".parse::<UtcTimestamp>().unwrap();
 
     let mut authority = None;
     advance_authority_from_committed(&mut authority, "http://cp-primary:50051", snapshot);
@@ -1278,7 +1313,7 @@ fn unknown_prior_authority_still_accepts_cross_source() {
         source_cp_url: "http://cp-a:50051".to_string(),
         gateway_trust: GatewayTrustEquivalenceState::Absent,
     };
-    let newer = Utc.with_ymd_and_hms(2026, 7, 20, 0, 0, 0).unwrap();
+    let newer = "2026-07-20T00:00:00Z".parse::<UtcTimestamp>().unwrap();
     let accepted =
         evaluate_full_snapshot_authority(Some(&authority), newer, "http://cp-b:50051", false)
             .expect("a real failover snapshot must not be fenced by an unknown authority");
@@ -1291,9 +1326,9 @@ fn reconnect_preserves_last_config_received_at_and_divergence() {
     // instead of mirroring the field-carry logic in the test. A reconnect
     // (including CP failover) preserves applied-config age and sticky divergence
     // while marking the new stream connected to the new target.
-    let stamp = Utc.with_ymd_and_hms(2026, 7, 24, 1, 2, 3).unwrap();
-    let diverged_since = Utc.with_ymd_and_hms(2026, 7, 24, 1, 0, 0).unwrap();
-    let connected_since = Utc.with_ymd_and_hms(2026, 7, 24, 2, 0, 0).unwrap();
+    let stamp = "2026-07-24T01:02:03Z".parse::<UtcTimestamp>().unwrap();
+    let diverged_since = "2026-07-24T01:00:00Z".parse::<UtcTimestamp>().unwrap();
+    let connected_since = "2026-07-24T02:00:00Z".parse::<UtcTimestamp>().unwrap();
     let prev = DpCpConnectionState {
         connected: false,
         cp_url: "http://cp-old:50051".to_string(),
@@ -1338,7 +1373,7 @@ fn namespace_qualified_removals_are_fail_closed_on_mismatch() {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![NamespacedResourceId::new("production", "u1")],
         sequence_cursor: 0,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     };
 
     let filtered = filter_incremental_to_namespace(&mut delta, "production");
@@ -1366,8 +1401,14 @@ fn future_skew_tolerance_is_bounded_and_positive() {
     // which trips `clippy::assertions_on_constants` under `-D warnings`. A stamp
     // one second ahead of `now` is admitted only when the tolerance is strictly
     // positive, so this pins the same contract through the guard itself.
-    let now = Utc.with_ymd_and_hms(2026, 7, 24, 12, 0, 0).unwrap();
-    assert!(evaluate_snapshot_clock_skew(now + chrono::Duration::seconds(1), now).is_ok());
+    let now = "2026-07-24T12:00:00Z".parse::<UtcTimestamp>().unwrap();
+    assert!(
+        evaluate_snapshot_clock_skew(
+            now.checked_add(::time::SignedDuration::seconds(1)).unwrap(),
+            now
+        )
+        .is_ok()
+    );
 }
 
 #[test]
@@ -1375,19 +1416,29 @@ fn clock_skew_guard_refuses_implausibly_future_committed_stamp() {
     // Issue M1: a CP-clock-stamped committed timestamp far in the DP's future
     // would poison the monotonic freshness watermark. Admit stamps at/behind now
     // and within tolerance; fail closed (never clamp) beyond tolerance.
-    let now = Utc.with_ymd_and_hms(2026, 7, 24, 12, 0, 0).unwrap();
+    let now = "2026-07-24T12:00:00Z".parse::<UtcTimestamp>().unwrap();
 
     assert!(evaluate_snapshot_clock_skew(now, now).is_ok());
-    let past = now - chrono::Duration::seconds(10_000);
+    let past = now
+        .checked_sub(::time::SignedDuration::seconds(10_000))
+        .unwrap();
     assert!(evaluate_snapshot_clock_skew(past, now).is_ok());
 
     // Exactly at the tolerance boundary is still admitted (realistic NTP drift).
-    let within = now + chrono::Duration::seconds(CONFIGSYNC_MAX_FUTURE_SKEW_SECS);
+    let within = now
+        .checked_add(::time::SignedDuration::seconds(
+            CONFIGSYNC_MAX_FUTURE_SKEW_SECS,
+        ))
+        .unwrap();
     assert!(evaluate_snapshot_clock_skew(within, now).is_ok());
 
     // One second beyond tolerance is refused, and the reject carries the exact
     // untrusted stamp / reference time / tolerance — never a clamped value.
-    let beyond = now + chrono::Duration::seconds(CONFIGSYNC_MAX_FUTURE_SKEW_SECS + 1);
+    let beyond = now
+        .checked_add(::time::SignedDuration::seconds(
+            CONFIGSYNC_MAX_FUTURE_SKEW_SECS + 1,
+        ))
+        .unwrap();
     match evaluate_snapshot_clock_skew(beyond, now) {
         Err(StaleSnapshotReject::ImplausiblyFutureStamp {
             committed,
@@ -1425,14 +1476,18 @@ fn older_payload_exception_is_required_only_for_cross_source_strictly_older() {
     // disposition in exactly one case — a cross-source candidate strictly older
     // than a parseable applied watermark. The predicate gates the two canonical
     // JSON conversions to that case; every other case is decided without them.
-    let applied = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
+    let applied = "2026-07-01T12:00:00Z".parse::<UtcTimestamp>().unwrap();
     let authority = AppliedSnapshotAuthority {
         version: Some(applied),
         source_cp_url: "http://cp-a:50051".to_string(),
         gateway_trust: GatewayTrustEquivalenceState::Absent,
     };
-    let older = applied - chrono::Duration::seconds(3600);
-    let newer = applied + chrono::Duration::seconds(3600);
+    let older = applied
+        .checked_sub(::time::SignedDuration::seconds(3600))
+        .unwrap();
+    let newer = applied
+        .checked_add(::time::SignedDuration::seconds(3600))
+        .unwrap();
 
     // Required: cross-source, strictly older, parseable applied version.
     assert!(snapshot_requires_older_payload_exception(
@@ -1584,7 +1639,7 @@ fn qualified_removal_delta(namespace: &str) -> IncrementalResult {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![NamespacedResourceId::new(namespace, "u1")],
         sequence_cursor: 7,
-        poll_timestamp: Utc.with_ymd_and_hms(2026, 7, 24, 12, 0, 0).unwrap(),
+        poll_timestamp: "2026-07-24T12:00:00Z".parse::<UtcTimestamp>().unwrap(),
     }
 }
 

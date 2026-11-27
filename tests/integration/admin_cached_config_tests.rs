@@ -6,7 +6,6 @@
 use crate::scaffolding::port_registry::TestSocket;
 
 use arc_swap::ArcSwap;
-use chrono::Utc;
 use ferrum_edge::admin::{
     AdminState,
     jwt_auth::{JwtConfig, JwtManager},
@@ -24,6 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::scaffolding::ports;
+use ferrum_edge::time_compat::UtcTimestamp;
 
 /// Test configuration
 #[derive(Clone)]
@@ -55,14 +55,14 @@ fn create_test_jwt_manager(config: &TestConfig) -> JwtManager {
 }
 
 fn generate_test_token(config: &TestConfig) -> String {
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "iss": config.jwt_issuer,
         "sub": "test-user",
         "role": "admin",
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(config.max_ttl as i64)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(config.max_ttl as i64)).unwrap()).unix_timestamp(),
         "jti": uuid::Uuid::new_v4().to_string()
     });
     let header = Header::new(jsonwebtoken::Algorithm::HS256);
@@ -71,14 +71,14 @@ fn generate_test_token(config: &TestConfig) -> String {
 }
 
 fn generate_expired_test_token(config: &TestConfig) -> String {
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "iss": config.jwt_issuer,
         "sub": "test-user",
         "role": "admin",
-        "iat": (now - chrono::Duration::seconds(900)).timestamp(),
-        "nbf": (now - chrono::Duration::seconds(900)).timestamp(),
-        "exp": (now - chrono::Duration::seconds(300)).timestamp(),
+        "iat": (now.checked_sub(::time::SignedDuration::seconds(900)).unwrap()).unix_timestamp(),
+        "nbf": (now.checked_sub(::time::SignedDuration::seconds(900)).unwrap()).unix_timestamp(),
+        "exp": (now.checked_sub(::time::SignedDuration::seconds(300)).unwrap()).unix_timestamp(),
         "jti": uuid::Uuid::new_v4().to_string()
     });
     let header = Header::new(jsonwebtoken::Algorithm::HS256);
@@ -151,8 +151,8 @@ fn create_test_proxy(id: &str, listen_path: &str, host: &str, port: u16) -> Prox
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }
@@ -173,8 +173,8 @@ fn create_test_gateway_config() -> GatewayConfig {
             custom_id: Some("alice-custom".to_string()),
             credentials: HashMap::new(),
             acl_groups: Vec::new(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         }],
         plugin_configs: vec![PluginConfig {
             labels: Default::default(),
@@ -188,11 +188,11 @@ fn create_test_gateway_config() -> GatewayConfig {
             priority_override: None,
             trigger: None,
             api_spec_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         }],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     }
@@ -234,8 +234,8 @@ fn create_test_upstream(id: &str, name: &str) -> Upstream {
         backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         k8s_service_uid: None,
         admission_upstream_id: None,
         pending_limit_scope: None,
@@ -1512,8 +1512,8 @@ fn create_pagination_test_config() -> GatewayConfig {
             custom_id: None,
             credentials: HashMap::new(),
             acl_groups: Vec::new(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         });
         plugin_configs.push(PluginConfig {
             labels: Default::default(),
@@ -1527,8 +1527,8 @@ fn create_pagination_test_config() -> GatewayConfig {
             priority_override: None,
             trigger: None,
             api_spec_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         });
     }
     GatewayConfig {
@@ -1537,7 +1537,7 @@ fn create_pagination_test_config() -> GatewayConfig {
         consumers,
         plugin_configs,
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     }
@@ -2011,8 +2011,8 @@ fn proxy_filter_plugin_config(
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -2034,7 +2034,7 @@ async fn test_list_plugin_configs_filtered_by_proxy_id() {
             proxy_filter_plugin_config("other-ns-1", other_ns, PluginScope::Proxy, Some("proxy-a")),
         ],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };
@@ -5298,7 +5298,7 @@ async fn mtls_dns_restore_abandoned_lost_lease_recovery_keeps_guarded_writes_ref
             "UPDATE mtls_dns_admission_locks SET restore_owner = NULL, updated_at = ? \
              WHERE namespace = ?",
         )
-        .bind(Utc::now().to_rfc3339())
+        .bind(UtcTimestamp::now().to_rfc3339())
         .bind("ferrum")
         .execute(&pool)
         .await
@@ -5765,8 +5765,8 @@ async fn test_backup_restore_roundtrip_preserves_api_specs_json_and_yaml() {
             .expect("bundle resource hash"),
             external_ref_snapshot: None,
             external_ref_digest: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         };
         db.submit_api_spec_bundle(&bundle, &spec)
             .await
@@ -5815,8 +5815,8 @@ async fn test_backup_restore_roundtrip_preserves_api_specs_json_and_yaml() {
             .expect("bundle resource hash"),
             external_ref_snapshot: None,
             external_ref_digest: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         };
         db.submit_api_spec_bundle(&bundle, &spec)
             .await
@@ -5926,8 +5926,8 @@ async fn test_restore_rollback_restores_api_specs() {
         resource_hash: String::new(),
         external_ref_snapshot: None,
         external_ref_digest: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     db.submit_api_spec_bundle(&bundle, &spec)
         .await
@@ -6039,8 +6039,8 @@ async fn test_restore_legacy_backup_requires_api_spec_deletion_confirmation() {
         resource_hash: String::new(),
         external_ref_snapshot: None,
         external_ref_digest: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     db.submit_api_spec_bundle(&bundle, &spec)
         .await
@@ -6149,8 +6149,8 @@ async fn test_restore_rejects_hostile_api_spec_metadata_before_delete() {
         resource_hash: String::new(),
         external_ref_snapshot: None,
         external_ref_digest: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     db.submit_api_spec_bundle(&bundle, &kept_spec)
         .await
@@ -6195,8 +6195,8 @@ async fn test_restore_rejects_hostile_api_spec_metadata_before_delete() {
                 "server_urls": [],
                 "operation_count": 0,
                 "resource_hash": "a".repeat(64),
-                "created_at": chrono::Utc::now().to_rfc3339(),
-                "updated_at": chrono::Utc::now().to_rfc3339()
+                "created_at": UtcTimestamp::now().to_rfc3339(),
+                "updated_at": UtcTimestamp::now().to_rfc3339()
             }]
         }
     });
@@ -6271,8 +6271,8 @@ async fn test_restore_rejects_hostile_api_spec_metadata_before_delete() {
                 "server_urls": [],
                 "operation_count": 0,
                 "resource_hash": "a".repeat(64),
-                "created_at": chrono::Utc::now().to_rfc3339(),
-                "updated_at": chrono::Utc::now().to_rfc3339()
+                "created_at": UtcTimestamp::now().to_rfc3339(),
+                "updated_at": UtcTimestamp::now().to_rfc3339()
             }]
         }
     });
@@ -9173,7 +9173,7 @@ async fn test_proxy_invalid_association_does_not_fall_back_and_put_repairs() {
     let db = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
         .await
         .expect("Failed to connect to test database");
-    let ts = Utc::now().to_rfc3339();
+    let ts = UtcTimestamp::now().to_rfc3339();
     let pool = db.pool();
 
     sqlx::query(
@@ -9260,7 +9260,7 @@ async fn test_proxy_get_namespace_miss_does_not_validate_other_namespace_associa
     let db = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
         .await
         .expect("Failed to connect to test database");
-    let ts = Utc::now().to_rfc3339();
+    let ts = UtcTimestamp::now().to_rfc3339();
     let pool = db.pool();
 
     sqlx::query(
@@ -10475,8 +10475,8 @@ async fn test_cluster_endpoint_cp_mode_with_connected_dps() {
             node_id: "dp-node-1".to_string(),
             version: "0.9.0".to_string(),
             namespace: "ferrum".to_string(),
-            connected_at: Utc::now(),
-            last_update_at: Utc::now(),
+            connected_at: UtcTimestamp::now(),
+            last_update_at: UtcTimestamp::now(),
             backend_egress_policy: None,
         },
     );
@@ -10486,8 +10486,8 @@ async fn test_cluster_endpoint_cp_mode_with_connected_dps() {
             node_id: "dp-node-2".to_string(),
             version: "0.9.0".to_string(),
             namespace: "staging".to_string(),
-            connected_at: Utc::now(),
-            last_update_at: Utc::now(),
+            connected_at: UtcTimestamp::now(),
+            last_update_at: UtcTimestamp::now(),
             backend_egress_policy: None,
         },
     );
@@ -10557,9 +10557,13 @@ async fn test_cluster_endpoint_cp_mode_with_connected_dps() {
 async fn test_cluster_endpoint_cp_mode_with_connected_mesh_nodes() {
     let tc = TestConfig::default();
     let registry = std::sync::Arc::new(ferrum_edge::grpc::mesh_registry::MeshNodeRegistry::new());
-    let connected_at = Utc::now();
-    let last_heartbeat_at = connected_at + chrono::Duration::seconds(30);
-    let last_update_at = connected_at + chrono::Duration::seconds(60);
+    let connected_at = UtcTimestamp::now();
+    let last_heartbeat_at = connected_at
+        .checked_add(::time::SignedDuration::seconds(30))
+        .unwrap();
+    let last_update_at = connected_at
+        .checked_add(::time::SignedDuration::seconds(60))
+        .unwrap();
 
     registry.insert(ferrum_edge::grpc::mesh_registry::MeshNodeInfo {
         node_id: "mesh-node-1".to_string(),
@@ -10633,7 +10637,7 @@ async fn test_cluster_endpoint_cp_mode_with_connected_mesh_nodes() {
 #[tokio::test]
 async fn test_cluster_endpoint_dp_mode_connected() {
     let tc = TestConfig::default();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let conn_state = std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(
         ferrum_edge::grpc::dp_client::DpCpConnectionState {
             connected: true,
@@ -10830,14 +10834,14 @@ async fn test_cluster_endpoint_database_mode() {
 // ---- Pagination is validated before the shared request-body read ----
 
 fn generate_test_token_with_role(config: &TestConfig, role: &str) -> String {
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "iss": config.jwt_issuer,
         "sub": "test-user",
         "role": role,
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(config.max_ttl as i64)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(config.max_ttl as i64)).unwrap()).unix_timestamp(),
         "jti": uuid::Uuid::new_v4().to_string()
     });
     let header = Header::new(jsonwebtoken::Algorithm::HS256);

@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
 
-use chrono::Utc;
 use prost::Message;
 
 use ferrum_edge::config::types::GatewayConfig;
@@ -11,6 +10,7 @@ use ferrum_edge::modes::mesh::config::{
     TrustBundle, TrustBundleSet, Workload, WorkloadPort, WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::slice::MeshExtensionConfig;
+use ferrum_edge::time_compat::UtcTimestamp;
 use ferrum_edge::xds::proto;
 use ferrum_edge::xds::{
     AckOutcome, CDS_TYPE_URL, ECDS_TYPE_URL, EDS_TYPE_URL, FERRUM_ECDS_DESTINATION_RULE_TYPE_URL,
@@ -121,7 +121,7 @@ fn mesh_config() -> MeshConfig {
 fn gateway_config() -> GatewayConfig {
     GatewayConfig {
         mesh: Some(Box::new(mesh_config())),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     }
 }
@@ -222,7 +222,7 @@ fn translators_deduplicate_colliding_cluster_resources() {
     });
     let config = GatewayConfig {
         mesh: Some(Box::new(mesh)),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     let request = MeshSliceRequest::from_xds_node("node-a".to_string(), "default".to_string());
@@ -262,7 +262,7 @@ fn service_entry_workload_selector_does_not_hide_visible_entry() {
     });
     let config = GatewayConfig {
         mesh: Some(Box::new(mesh)),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     let request = MeshSliceRequest {
@@ -292,7 +292,7 @@ fn translators_deduplicate_colliding_listener_and_route_resources() {
     mesh.services.push(mesh.services[0].clone());
     let config = GatewayConfig {
         mesh: Some(Box::new(mesh)),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     let request = MeshSliceRequest::from_xds_node("node-a".to_string(), "default".to_string());
@@ -343,7 +343,7 @@ fn translator_deduplicates_colliding_sds_resources() {
     });
     let config = GatewayConfig {
         mesh: Some(Box::new(mesh)),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     let request = MeshSliceRequest::from_xds_node("node-a".to_string(), "default".to_string());
@@ -580,7 +580,7 @@ fn slice_with_extension_configs(configs: Vec<MeshExtensionConfig>) -> MeshSlice 
     };
     let config = GatewayConfig {
         mesh: Some(Box::new(MeshConfig::default())),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     let mut slice = MeshSlice::from_gateway_config(&config, request);

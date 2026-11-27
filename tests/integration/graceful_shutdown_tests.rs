@@ -25,7 +25,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use chrono::Utc;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -36,6 +35,7 @@ use tokio::net::TcpListener;
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::proxy::{ProxyState, start_proxy_listener_with_bound_listener};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 // ── Test fixtures (mirrors grpc_proxy_tests + connection_pool_tests) ───────
 
@@ -103,8 +103,8 @@ fn create_test_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }
@@ -136,7 +136,7 @@ fn create_test_proxy_state(proxies: Vec<Proxy>) -> ProxyState {
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         frontend_tls_cert_path: None,
         frontend_tls_key_path: None,
@@ -737,7 +737,7 @@ fn create_test_proxy_state_with_env(
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         frontend_tls_cert_path: None,
         frontend_tls_key_path: None,

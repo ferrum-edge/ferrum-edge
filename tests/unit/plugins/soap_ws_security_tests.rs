@@ -13,6 +13,7 @@ use ferrum_edge::plugins::soap_ws_security::SoapWsSecurity;
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext, priority,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -192,9 +193,10 @@ fn wrap_soap(security_content: &str) -> String {
 }
 
 fn fresh_timestamp() -> String {
-    let now = chrono::Utc::now();
-    let created = now.format("%Y-%m-%dT%H:%M:%S%.3fZ");
-    let expires = (now + chrono::Duration::minutes(5)).format("%Y-%m-%dT%H:%M:%S%.3fZ");
+    let now = UtcTimestamp::now();
+    let created = now.to_rfc3339_opts(ferrum_edge::time_compat::SecondsFormat::Millis, true);
+    let expires = (now.checked_add(::time::SignedDuration::minutes(5)).unwrap())
+        .to_rfc3339_opts(ferrum_edge::time_compat::SecondsFormat::Millis, true);
     format!(
         r#"<wsu:Timestamp wsu:Id="TS-1">
         <wsu:Created>{}</wsu:Created>
@@ -350,8 +352,8 @@ fn assert_username_token_structural(
 }
 
 fn password_digest_token(username: &str, password: &str, nonce_bytes: &[u8]) -> String {
-    let created = chrono::Utc::now()
-        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+    let created = UtcTimestamp::now()
+        .to_rfc3339_opts(ferrum_edge::time_compat::SecondsFormat::Millis, true)
         .to_string();
     password_digest_token_with_created(username, password, nonce_bytes, &created)
 }
@@ -410,8 +412,8 @@ fn password_digest_security_block(
 }
 
 fn fresh_created() -> String {
-    chrono::Utc::now()
-        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+    UtcTimestamp::now()
+        .to_rfc3339_opts(ferrum_edge::time_compat::SecondsFormat::Millis, true)
         .to_string()
 }
 
@@ -1064,9 +1066,11 @@ async fn test_future_timestamp_rejects() {
     }))
     .unwrap();
 
-    let future = (chrono::Utc::now() + chrono::Duration::hours(1))
-        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-        .to_string();
+    let future = (UtcTimestamp::now()
+        .checked_add(::time::SignedDuration::hours(1))
+        .unwrap())
+    .to_rfc3339_opts(ferrum_edge::time_compat::SecondsFormat::Millis, true)
+    .to_string();
     let ts = format!(
         r#"<wsu:Timestamp wsu:Id="TS-1">
             <wsu:Created>{}</wsu:Created>
@@ -1092,9 +1096,13 @@ async fn test_timestamp_expires_past_rejects() {
     }))
     .unwrap();
 
-    let now = chrono::Utc::now();
-    let created = (now - chrono::Duration::minutes(1)).format("%Y-%m-%dT%H:%M:%S%.3fZ");
-    let expires = (now - chrono::Duration::minutes(30)).format("%Y-%m-%dT%H:%M:%S%.3fZ");
+    let now = UtcTimestamp::now();
+    let created = (now.checked_sub(::time::SignedDuration::minutes(1)).unwrap())
+        .to_rfc3339_opts(ferrum_edge::time_compat::SecondsFormat::Millis, true);
+    let expires = (now
+        .checked_sub(::time::SignedDuration::minutes(30))
+        .unwrap())
+    .to_rfc3339_opts(ferrum_edge::time_compat::SecondsFormat::Millis, true);
     let ts = format!(
         r#"<wsu:Timestamp wsu:Id="TS-1">
             <wsu:Created>{}</wsu:Created>
@@ -1116,23 +1124,39 @@ async fn test_timestamp_expires_past_rejects() {
 #[tokio::test]
 async fn test_timestamp_without_zone_designator_rejected() {
     let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
-    let now = chrono::Utc::now();
-    let expires_at = now + chrono::Duration::minutes(5);
+    let now = UtcTimestamp::now();
+    let expires_at = now.checked_add(::time::SignedDuration::minutes(5)).unwrap();
 
-    let cases = [
-        ("%Y-%m-%dT%H:%M:%S%.3f", false),
-        ("%Y-%m-%dT%H:%M:%S", false),
-        ("%Y-%m-%dT%H:%M:%S%.3fZ", true),
-        ("%Y-%m-%dT%H:%M:%S%:z", true),
+    // Each case renders `now`/`expires_at` the way its labelled strftime
+    // pattern would.
+    use ferrum_edge::time_compat::SecondsFormat;
+    let millis_zoneless = |t: UtcTimestamp| {
+        t.to_rfc3339_opts(SecondsFormat::Millis, true)
+            .trim_end_matches('Z')
+            .to_string()
+    };
+    let secs_zoneless = |t: UtcTimestamp| {
+        t.to_rfc3339_opts(SecondsFormat::Secs, true)
+            .trim_end_matches('Z')
+            .to_string()
+    };
+    let millis_z = |t: UtcTimestamp| t.to_rfc3339_opts(SecondsFormat::Millis, true);
+    let secs_offset = |t: UtcTimestamp| t.to_rfc3339_opts(SecondsFormat::Secs, false);
+    type Case<'a> = (&'a str, &'a dyn Fn(UtcTimestamp) -> String, bool);
+    let cases: [Case<'_>; 4] = [
+        ("%Y-%m-%dT%H:%M:%S%.3f", &millis_zoneless, false),
+        ("%Y-%m-%dT%H:%M:%S", &secs_zoneless, false),
+        ("%Y-%m-%dT%H:%M:%S%.3fZ", &millis_z, true),
+        ("%Y-%m-%dT%H:%M:%S%:z", &secs_offset, true),
     ];
-    for (format, accepted) in cases {
+    for (format, render, accepted) in cases {
         let ts = format!(
             r#"<wsu:Timestamp wsu:Id="TS-1">
             <wsu:Created>{}</wsu:Created>
             <wsu:Expires>{}</wsu:Expires>
         </wsu:Timestamp>"#,
-            now.format(format),
-            expires_at.format(format)
+            render(now),
+            render(expires_at)
         );
         let body = wrap_soap(&ts);
         let mut ctx = make_ctx_with_soap_body(&body);
@@ -1159,8 +1183,8 @@ async fn test_timestamp_without_zone_designator_rejected() {
             <wsu:Created>{}</wsu:Created>
             <wsu:Expires>{}</wsu:Expires>
         </wsu:Timestamp>"#,
-        now.format("%Y-%m-%dT%H:%M:%S%.3fZ"),
-        expires_at.format("%Y-%m-%dT%H:%M:%S%.3f")
+        millis_z(now),
+        millis_zoneless(expires_at)
     );
     let body = wrap_soap(&ts);
     let mut ctx = make_ctx_with_soap_body(&body);
@@ -1180,9 +1204,15 @@ async fn test_timestamp_without_zone_designator_rejected() {
 #[tokio::test]
 async fn test_password_digest_created_without_zone_designator_rejected() {
     let plugin = SoapWsSecurity::new(&username_token_digest_config()).unwrap();
-    let now = chrono::Utc::now();
-    let zoned = now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-    let zoneless = now.format("%Y-%m-%dT%H:%M:%S%.3f").to_string();
+    let now = UtcTimestamp::now();
+    let zoned = now
+        .to_rfc3339_opts(ferrum_edge::time_compat::SecondsFormat::Millis, true)
+        .to_string();
+    let zoneless = now
+        .to_rfc3339_opts(ferrum_edge::time_compat::SecondsFormat::Millis, true)
+        .trim_end_matches('Z')
+        .to_string()
+        .to_string();
 
     let security = password_digest_security_block(
         "alice",
@@ -1214,7 +1244,8 @@ async fn test_timestamp_require_expires_missing_rejects() {
     });
     let plugin = SoapWsSecurity::new(&config).unwrap();
 
-    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ");
+    let now =
+        UtcTimestamp::now().to_rfc3339_opts(ferrum_edge::time_compat::SecondsFormat::Millis, true);
     let ts = format!(
         r#"<wsu:Timestamp wsu:Id="TS-1">
             <wsu:Created>{}</wsu:Created>
@@ -1594,8 +1625,8 @@ async fn failed_digest_attempts_do_not_poison_a_valid_principals_nonce() {
         ("alice", "wrongpassword", b"wrong-password-race".as_slice()),
     ] {
         let plugin = SoapWsSecurity::new(&username_token_digest_config()).unwrap();
-        let created = chrono::Utc::now()
-            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        let created = UtcTimestamp::now()
+            .to_rfc3339_opts(ferrum_edge::time_compat::SecondsFormat::Millis, true)
             .to_string();
 
         let failed_token = password_digest_token_with_created(
@@ -1724,6 +1755,7 @@ fn test_saml_unreadable_signing_cert_is_error() {
 mod saml_fixtures {
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as B64;
+    use ferrum_edge::time_compat::UtcTimestamp;
     use ring::rand::SystemRandom;
     use ring::signature::{RSA_PKCS1_SHA256, RsaKeyPair};
     use std::path::PathBuf;
@@ -1894,15 +1926,19 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
 
     /// A `Conditions` window that is inside policy for a fixture built now.
     pub fn default_not_before() -> String {
-        (chrono::Utc::now() - chrono::Duration::seconds(60))
-            .format("%Y-%m-%dT%H:%M:%SZ")
-            .to_string()
+        (UtcTimestamp::now()
+            .checked_sub(::time::SignedDuration::seconds(60))
+            .unwrap())
+        .to_rfc3339_opts(ferrum_edge::time_compat::SecondsFormat::Secs, true)
+        .to_string()
     }
 
     pub fn default_not_on_or_after() -> String {
-        (chrono::Utc::now() + chrono::Duration::seconds(120))
-            .format("%Y-%m-%dT%H:%M:%SZ")
-            .to_string()
+        (UtcTimestamp::now()
+            .checked_add(::time::SignedDuration::seconds(120))
+            .unwrap())
+        .to_rfc3339_opts(ferrum_edge::time_compat::SecondsFormat::Secs, true)
+        .to_string()
     }
 
     pub struct AssertionBuilder<'a> {
@@ -2224,9 +2260,11 @@ fn wrap_saml_assertion(assertion_xml: &str) -> String {
 }
 
 fn far_future() -> String {
-    (chrono::Utc::now() + chrono::Duration::days(7))
-        .format("%Y-%m-%dT%H:%M:%SZ")
-        .to_string()
+    (UtcTimestamp::now()
+        .checked_add(::time::SignedDuration::days(7))
+        .unwrap())
+    .to_rfc3339_opts(ferrum_edge::time_compat::SecondsFormat::Secs, true)
+    .to_string()
 }
 
 #[tokio::test]
@@ -2321,9 +2359,13 @@ async fn test_saml_pinned_signing_cert_outside_validity_window_rejected() {
 /// refused, one field at a time.
 #[tokio::test]
 async fn test_saml_conditions_without_zone_designator_rejected() {
-    let zoneless = |offset: chrono::Duration| {
-        (chrono::Utc::now() + offset)
-            .format("%Y-%m-%dT%H:%M:%S")
+    let zoneless = |offset: ::time::SignedDuration| {
+        UtcTimestamp::now()
+            .checked_add(offset)
+            .unwrap()
+            .to_rfc3339_opts(ferrum_edge::time_compat::SecondsFormat::Secs, true)
+            .trim_end_matches('Z')
+            .to_string()
             .to_string()
     };
     for (field, needle) in [
@@ -2338,9 +2380,9 @@ async fn test_saml_conditions_without_zone_designator_rejected() {
             "alice@example.com",
         );
         if field == "NotBefore" {
-            builder.not_before = Some(zoneless(-chrono::Duration::seconds(60)));
+            builder.not_before = Some(zoneless(-::time::SignedDuration::seconds(60)));
         } else {
-            builder.not_on_or_after = Some(zoneless(chrono::Duration::seconds(120)));
+            builder.not_on_or_after = Some(zoneless(::time::SignedDuration::seconds(120)));
         }
         let body = wrap_saml_assertion(&builder.build());
         let mut ctx = make_ctx_with_soap_body(&body);
@@ -2572,11 +2614,17 @@ async fn test_saml_expired_assertion_rejects() {
     // default) or the lifetime cap — which is checked first, because it is what
     // makes the fixed replay horizon sufficient — answers instead of the expiry
     // arm this test is about. One hour in the past clears the 300s clock skew.
-    let expired_at = chrono::Utc::now() - chrono::Duration::seconds(3_600);
-    let nb = (expired_at - chrono::Duration::seconds(60))
-        .format("%Y-%m-%dT%H:%M:%SZ")
+    let expired_at = UtcTimestamp::now()
+        .checked_sub(::time::SignedDuration::seconds(3_600))
+        .unwrap();
+    let nb = (expired_at
+        .checked_sub(::time::SignedDuration::seconds(60))
+        .unwrap())
+    .to_rfc3339_opts(ferrum_edge::time_compat::SecondsFormat::Secs, true)
+    .to_string();
+    let noa = expired_at
+        .to_rfc3339_opts(ferrum_edge::time_compat::SecondsFormat::Secs, true)
         .to_string();
-    let noa = expired_at.format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let mut builder = saml_fixtures::AssertionBuilder::new(
         "_assertion-expired",
         "https://idp.example.com/metadata",
@@ -2610,9 +2658,11 @@ async fn test_saml_not_yet_valid_rejects() {
     let plugin = SoapWsSecurity::new(&cfg).unwrap();
 
     let nb = far_future();
-    let noa = (chrono::Utc::now() + chrono::Duration::days(7) + chrono::Duration::seconds(120))
-        .format("%Y-%m-%dT%H:%M:%SZ")
-        .to_string();
+    let noa = (UtcTimestamp::now()
+        .checked_add(::time::SignedDuration::days(7) + ::time::SignedDuration::seconds(120))
+        .unwrap())
+    .to_rfc3339_opts(ferrum_edge::time_compat::SecondsFormat::Secs, true)
+    .to_string();
     let mut builder = saml_fixtures::AssertionBuilder::new(
         "_assertion-future",
         "https://idp.example.com/metadata",
@@ -3469,9 +3519,10 @@ fn test_plugin_priority() {
 async fn test_handles_different_namespace_prefixes() {
     let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
 
-    let now = chrono::Utc::now();
-    let created = now.format("%Y-%m-%dT%H:%M:%S%.3fZ");
-    let expires = (now + chrono::Duration::minutes(5)).format("%Y-%m-%dT%H:%M:%S%.3fZ");
+    let now = UtcTimestamp::now();
+    let created = now.to_rfc3339_opts(ferrum_edge::time_compat::SecondsFormat::Millis, true);
+    let expires = (now.checked_add(::time::SignedDuration::minutes(5)).unwrap())
+        .to_rfc3339_opts(ferrum_edge::time_compat::SecondsFormat::Millis, true);
 
     // Use non-standard prefixes (s: instead of soap:, sec: instead of wsse:)
     let body = format!(
@@ -4139,10 +4190,12 @@ mod x509_roundtrip {
         signed_body_xml: &str,
         rewrite_signed_info: impl FnOnce(String) -> String,
     ) -> String {
-        let now = chrono::Utc::now();
-        let created = now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-        let expires = (now + chrono::Duration::minutes(5))
-            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        let now = UtcTimestamp::now();
+        let created = now
+            .to_rfc3339_opts(ferrum_edge::time_compat::SecondsFormat::Millis, true)
+            .to_string();
+        let expires = (now.checked_add(::time::SignedDuration::minutes(5)).unwrap())
+            .to_rfc3339_opts(ferrum_edge::time_compat::SecondsFormat::Millis, true)
             .to_string();
 
         let timestamp_xml = format!(
@@ -5361,7 +5414,9 @@ async fn test_out_of_range_expires_is_rejected_not_panicking() {
     // Year 9999 is the *upper admitted* year and is intentionally accepted when
     // the rest of the Timestamp policy holds; do not treat it as out-of-range.
     let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
-    let created = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let created = UtcTimestamp::now()
+        .to_rfc3339_opts(ferrum_edge::time_compat::SecondsFormat::Secs, true)
+        .to_string();
     let security = format!(
         r#"<wsu:Timestamp>
         <wsu:Created>{created}</wsu:Created>
@@ -6502,9 +6557,11 @@ fn digest_unbound_config(created_max_age_seconds: u64) -> Value {
     })
 }
 
-fn offset_created(offset: chrono::Duration) -> String {
-    (chrono::Utc::now() + offset)
-        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+fn offset_created(offset: ::time::SignedDuration) -> String {
+    UtcTimestamp::now()
+        .checked_add(offset)
+        .unwrap()
+        .to_rfc3339_opts(ferrum_edge::time_compat::SecondsFormat::Millis, true)
         .to_string()
 }
 
@@ -6519,7 +6576,7 @@ async fn digest_created_that_is_too_old_is_rejected() {
     // The digest still verifies — the token is genuine, just stale. Before this
     // fix nothing looked at the instant, so "genuine but stale" was accepted.
     let plugin = SoapWsSecurity::new(&digest_unbound_config(300)).unwrap();
-    let stale = offset_created(-chrono::Duration::hours(1));
+    let stale = offset_created(-::time::SignedDuration::hours(1));
     let block =
         password_digest_security_block("alice", "secret123", b"stale-created-01", &stale, None);
     let result = digest_outcome(&plugin, &block).await;
@@ -6529,7 +6586,7 @@ async fn digest_created_that_is_too_old_is_rejected() {
 #[tokio::test]
 async fn digest_created_in_the_future_is_rejected() {
     let plugin = SoapWsSecurity::new(&digest_unbound_config(300)).unwrap();
-    let future = offset_created(chrono::Duration::hours(1));
+    let future = offset_created(::time::SignedDuration::hours(1));
     let block =
         password_digest_security_block("alice", "secret123", b"future-created-1", &future, None);
     let result = digest_outcome(&plugin, &block).await;
@@ -6566,7 +6623,7 @@ async fn digest_created_that_is_malformed_is_rejected_without_echoing_it() {
 #[tokio::test]
 async fn digest_within_the_freshness_window_still_succeeds() {
     let plugin = SoapWsSecurity::new(&digest_unbound_config(300)).unwrap();
-    let recent = offset_created(-chrono::Duration::seconds(30));
+    let recent = offset_created(-::time::SignedDuration::seconds(30));
     let block =
         password_digest_security_block("alice", "secret123", b"fresh-created-01", &recent, None);
     let result = digest_outcome(&plugin, &block).await;
@@ -6597,8 +6654,8 @@ async fn captured_token_paired_with_a_fresh_timestamp_is_rejected() {
     }))
     .unwrap();
 
-    let captured = offset_created(-chrono::Duration::minutes(30));
-    let fresh_timestamp = offset_created(chrono::Duration::zero());
+    let captured = offset_created(-::time::SignedDuration::minutes(30));
+    let fresh_timestamp = offset_created(::time::SignedDuration::ZERO);
     let block = password_digest_security_block(
         "alice",
         "secret123",
@@ -6640,9 +6697,9 @@ async fn digest_created_past_the_timestamp_expires_is_rejected() {
     // against a 5-minute outer skew, so it has not "expired" on its own terms),
     // while the UsernameToken Created sits one minute ago — after that Expires
     // with a zero UsernameToken skew.
-    let ts_created = offset_created(-chrono::Duration::minutes(10));
-    let ts_expires = offset_created(-chrono::Duration::minutes(4));
-    let ut_created = offset_created(-chrono::Duration::minutes(1));
+    let ts_created = offset_created(-::time::SignedDuration::minutes(10));
+    let ts_expires = offset_created(-::time::SignedDuration::minutes(4));
+    let ut_created = offset_created(-::time::SignedDuration::minutes(1));
 
     let nonce = b"past-expires-01!";
     let nonce_b64 =
@@ -6674,7 +6731,7 @@ async fn a_present_timestamp_is_validated_even_when_not_required() {
     // validated. `timestamp.require: false` means "a Timestamp may be absent",
     // never "an out-of-policy Timestamp is ignored".
     let plugin = SoapWsSecurity::new(&username_token_digest_config()).unwrap();
-    let stale_timestamp = offset_created(-chrono::Duration::hours(6));
+    let stale_timestamp = offset_created(-::time::SignedDuration::hours(6));
     let block = password_digest_security_block(
         "alice",
         "secret123",
@@ -8200,8 +8257,8 @@ mod advisory_regressions {
             custom_id: Some("alice".to_string()),
             credentials: HashMap::new(),
             acl_groups: vec!["finance".to_string()],
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         };
         let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -9593,7 +9650,9 @@ async fn test_username_token_comment_outside_value_elements_still_accepted() {
 #[tokio::test]
 async fn test_username_token_created_comment_truncation_rejected() {
     let plugin = SoapWsSecurity::new(&username_token_digest_config()).unwrap();
-    let created = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let created = UtcTimestamp::now()
+        .to_rfc3339_opts(ferrum_edge::time_compat::SecondsFormat::Secs, true)
+        .to_string();
     let ut = format!(
         r#"<wsse:UsernameToken>
         <wsse:Username>alice</wsse:Username>
@@ -9621,7 +9680,9 @@ async fn test_username_token_created_comment_truncation_rejected() {
 #[tokio::test]
 async fn test_username_token_nonce_comment_truncation_rejected() {
     let plugin = SoapWsSecurity::new(&username_token_digest_config()).unwrap();
-    let created = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let created = UtcTimestamp::now()
+        .to_rfc3339_opts(ferrum_edge::time_compat::SecondsFormat::Secs, true)
+        .to_string();
     let ut = format!(
         r#"<wsse:UsernameToken>
         <wsse:Username>alice</wsse:Username>
@@ -9649,10 +9710,12 @@ async fn test_username_token_nonce_comment_truncation_rejected() {
 #[tokio::test]
 async fn test_timestamp_created_comment_truncation_rejected() {
     let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
-    let now = chrono::Utc::now();
-    let created = now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-    let expires = (now + chrono::Duration::minutes(5))
-        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+    let now = UtcTimestamp::now();
+    let created = now
+        .to_rfc3339_opts(ferrum_edge::time_compat::SecondsFormat::Millis, true)
+        .to_string();
+    let expires = (now.checked_add(::time::SignedDuration::minutes(5)).unwrap())
+        .to_rfc3339_opts(ferrum_edge::time_compat::SecondsFormat::Millis, true)
         .to_string();
     let ts = format!(
         r#"<wsu:Timestamp wsu:Id="TS-1">
@@ -9923,9 +9986,10 @@ async fn test_username_is_matched_including_its_surrounding_spaces() {
 #[tokio::test]
 async fn test_timestamp_instants_still_collapse_surrounding_whitespace() {
     let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
-    let now = chrono::Utc::now();
-    let created = now.format("%Y-%m-%dT%H:%M:%S%.3fZ");
-    let expires = (now + chrono::Duration::minutes(5)).format("%Y-%m-%dT%H:%M:%S%.3fZ");
+    let now = UtcTimestamp::now();
+    let created = now.to_rfc3339_opts(ferrum_edge::time_compat::SecondsFormat::Millis, true);
+    let expires = (now.checked_add(::time::SignedDuration::minutes(5)).unwrap())
+        .to_rfc3339_opts(ferrum_edge::time_compat::SecondsFormat::Millis, true);
     let timestamp = format!(
         r#"<wsu:Timestamp wsu:Id="TS-1">
         <wsu:Created>
@@ -11272,9 +11336,11 @@ async fn saml_confirmations_outcome(
 #[tokio::test]
 async fn saml_a_later_qualifying_subject_confirmation_is_accepted() {
     let valid_until = saml_fixtures::default_not_on_or_after();
-    let expired = (chrono::Utc::now() - chrono::Duration::hours(2))
-        .format("%Y-%m-%dT%H:%M:%SZ")
-        .to_string();
+    let expired = (UtcTimestamp::now()
+        .checked_sub(::time::SignedDuration::hours(2))
+        .unwrap())
+    .to_rfc3339_opts(ferrum_edge::time_compat::SecondsFormat::Secs, true)
+    .to_string();
     for (label, first) in [
         (
             "other recipient",

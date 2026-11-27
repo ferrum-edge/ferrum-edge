@@ -15,7 +15,6 @@
 use crate::scaffolding::port_registry::TestSocket;
 
 use arc_swap::ArcSwap;
-use chrono::Utc;
 use ferrum_edge::_test_support::lock_namespace_registry_admission_for_test;
 use ferrum_edge::_test_support::{NamespaceRegistryPhase, set_namespace_registry_fault_for_test};
 use ferrum_edge::admin::{
@@ -31,6 +30,7 @@ use ferrum_edge::config::db_backend::DatabaseBackend;
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
 use ferrum_edge::config::namespace_registry::MAX_NAMESPACE_DESCRIPTION_CHARS;
 use ferrum_edge::config::types::GatewayConfig;
+use ferrum_edge::time_compat::UtcTimestamp;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
@@ -51,14 +51,14 @@ fn jwt_manager() -> JwtManager {
 }
 
 fn token_with_role(role: &str) -> String {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "iss": JWT_ISSUER,
         "sub": "namespace-admin",
         "role": role,
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(3600)).unwrap()).unix_timestamp(),
         "jti": uuid::Uuid::new_v4().to_string(),
     });
     encode(
@@ -76,15 +76,15 @@ fn admin_token() -> String {
 /// Mint an admin JWT carrying an `ns` claim verbatim, so the namespace-claim
 /// gate can be exercised with both the single-string and the array shapes.
 fn admin_token_with_ns(ns: Value) -> String {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "iss": JWT_ISSUER,
         "sub": "namespace-admin",
         "role": "admin",
         "ns": ns,
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(3600)).unwrap()).unix_timestamp(),
         "jti": uuid::Uuid::new_v4().to_string(),
     });
     encode(
@@ -458,6 +458,36 @@ async fn create_get_list_and_reject_duplicates_and_invalid_names() {
     )
     .await;
     assert_eq!(status, 400, "wrong-typed description on create: {body:?}");
+
+    // The create body is a closed JSON object: neither a positional array
+    // (which serde would map onto `name`/`description` in order) nor an
+    // unknown member is admitted, and nothing is persisted.
+    for (rejected, name) in [
+        (json!(["positional", null]), "positional"),
+        (json!({"name": "extra", "descripton": "typo"}), "extra"),
+    ] {
+        let (status, body) = send(
+            reqwest::Method::POST,
+            &base,
+            "/namespaces",
+            &token,
+            Some(rejected.clone()),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "non-object or open create {rejected}: {body:?}"
+        );
+        let (status, _body) = send(
+            reqwest::Method::GET,
+            &base,
+            &format!("/namespaces/{name}"),
+            &token,
+            None,
+        )
+        .await;
+        assert_eq!(status, 404, "a rejected create must not persist {name}");
+    }
 
     let (status, body) = send(
         reqwest::Method::POST,
@@ -997,7 +1027,7 @@ async fn confirmed_cascade_removes_every_occupancy_and_ancillary_surface() {
 
     // Surfaces with no admin write endpoint: seeded directly so the cascade is
     // proved against the real row shapes.
-    let now = Utc::now().to_rfc3339();
+    let now = UtcTimestamp::now().to_rfc3339();
     sqlx::query(
         "INSERT INTO gateway_trust_bundles \
          (namespace, id, trust_domain, bundle, revision, updated_by, created_at, updated_at) \
@@ -1499,7 +1529,7 @@ async fn store_create_rename_delete_round_trip() {
     let dir = TempDir::new().unwrap();
     let store = Arc::new(make_store(&dir).await);
     let db: Arc<dyn DatabaseBackend> = store.clone();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let record = ferrum_edge::config::namespace_registry::NamespaceRecord::new(
         "direct".to_string(),
         Some("via store".to_string()),
@@ -1563,7 +1593,7 @@ async fn namespace_rename_moves_historical_audit_namespace() {
     let dir = TempDir::new().unwrap();
     let store = Arc::new(make_store(&dir).await);
     let db: Arc<dyn DatabaseBackend> = store.clone();
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let record = ferrum_edge::config::namespace_registry::NamespaceRecord::new(
         "hist-a".to_string(),
         None,
@@ -1765,7 +1795,7 @@ async fn namespace_rename_fails_closed_on_a_target_mtls_dns_restore_fence() {
          VALUES (?, ?, ?)",
     )
     .bind("alpha")
-    .bind(Utc::now().to_rfc3339())
+    .bind(UtcTimestamp::now().to_rfc3339())
     .bind("restore-owner-uuid")
     .execute(&store.pool())
     .await
@@ -1810,7 +1840,7 @@ async fn namespace_rename_fails_closed_on_a_source_mtls_dns_restore_fence() {
          VALUES (?, ?, ?)",
     )
     .bind("alpha")
-    .bind(Utc::now().to_rfc3339())
+    .bind(UtcTimestamp::now().to_rfc3339())
     .bind("restore-owner-uuid")
     .execute(&store.pool())
     .await
@@ -2126,7 +2156,7 @@ async fn sql_backend_refuses_protected_namespaces_without_the_handler_precheck()
         let record = ferrum_edge::config::namespace_registry::NamespaceRecord::new(
             name.to_string(),
             None,
-            Utc::now(),
+            UtcTimestamp::now(),
         );
         let admission = lock_namespace_registry_admission_for_test(store.clone(), &[name])
             .await

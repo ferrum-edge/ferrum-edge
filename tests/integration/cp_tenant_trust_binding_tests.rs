@@ -23,7 +23,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use chrono::Utc;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, Validation, decode, encode};
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -48,6 +47,7 @@ use ferrum_edge::grpc::mesh_registry::MeshNodeRegistry;
 use ferrum_edge::grpc::mesh_server::MeshGrpcServer;
 use ferrum_edge::identity::TrustDomain;
 use ferrum_edge::modes::mesh::config::{MeshConfig, MeshService, TrustBundle, TrustBundleSet};
+use ferrum_edge::time_compat::UtcTimestamp;
 use ferrum_edge::xds::proto::aggregated_discovery_service_client::AggregatedDiscoveryServiceClient;
 use ferrum_edge::xds::proto::{DeltaDiscoveryRequest, DiscoveryRequest, Node};
 use ferrum_edge::xds::{LDS_TYPE_URL, XdsAdsServer};
@@ -129,7 +129,7 @@ fn mint(
     ns: Option<serde_json::Value>,
     audience: Option<&str>,
 ) -> String {
-    let now = Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     mint_with_exp(secret, kid, node_id, ns, audience, now + 600)
 }
 
@@ -141,7 +141,7 @@ fn mint_with_exp(
     audience: Option<&str>,
     exp: i64,
 ) -> String {
-    let now = Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let mut claims = json!({
         "sub": node_id,
         "iat": now,
@@ -172,7 +172,7 @@ fn mint_with_nbf(
     ns: Option<serde_json::Value>,
     nbf: Option<i64>,
 ) -> String {
-    let now = Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let mut claims = json!({
         "sub": node_id,
         "iat": now,
@@ -201,7 +201,7 @@ fn mint_with_nbf(
 fn tenant_marked_config() -> GatewayConfig {
     GatewayConfig {
         version: "1".to_string(),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: vec![TENANT_A.to_string(), TENANT_B.to_string()],
         mesh: Some(Box::new(MeshConfig {
             services: vec![
@@ -533,7 +533,7 @@ fn captured_old_verifier_snapshot_cannot_bind_after_remove_then_readd() {
 fn grpc_jwt_rejects_future_nbf_before_namespace_resolution() {
     let verifier = CpDpVerifierStore::from_arc(two_tenant_bundle());
     let snapshot = verifier.load();
-    let now = Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
 
     let future_nbf_valid_ns = mint_with_nbf(
         TENANT_A_SECRET,
@@ -942,7 +942,7 @@ async fn deadlines_preempt_buffered_configuration_output() {
         "token-deadline-buffered-node",
         Some(json!(TENANT_A)),
         None,
-        Utc::now().timestamp() - 59,
+        UtcTimestamp::now().unix_timestamp() - 59,
     );
     let request = authorize(tonic::Request::new(()), &token);
     let identity = snapshot
@@ -1115,7 +1115,7 @@ async fn accepted_token_expiry_closes_stream_without_heartbeat_extension() {
         "expiring-config-node",
         Some(json!(TENANT_A)),
         None,
-        Utc::now().timestamp() - 58,
+        UtcTimestamp::now().unix_timestamp() - 58,
     );
     let mut config_client = configsync_client!(addr, config_token);
     let mut config_stream = config_client
@@ -1149,7 +1149,7 @@ async fn accepted_token_expiry_closes_stream_without_heartbeat_extension() {
             node_id,
             Some(json!(TENANT_A)),
             Some(&audience),
-            Utc::now().timestamp() - 58,
+            UtcTimestamp::now().unix_timestamp() - 58,
         );
         let mut mesh_client = mesh_client!(addr, mesh_token);
         let mut mesh_stream = mesh_client
@@ -1171,7 +1171,7 @@ async fn accepted_token_expiry_closes_stream_without_heartbeat_extension() {
         "expiring-xds-sotw-node",
         Some(json!(TENANT_A)),
         None,
-        Utc::now().timestamp() - 58,
+        UtcTimestamp::now().unix_timestamp() - 58,
     );
     let mut sotw_client = AggregatedDiscoveryServiceClient::new(xds_channel(addr).await);
     let (sotw_tx, sotw_rx) = mpsc::channel(2);
@@ -1207,7 +1207,7 @@ async fn accepted_token_expiry_closes_stream_without_heartbeat_extension() {
         "expiring-xds-delta-node",
         Some(json!(TENANT_A)),
         None,
-        Utc::now().timestamp() - 58,
+        UtcTimestamp::now().unix_timestamp() - 58,
     );
     let mut delta_client = AggregatedDiscoveryServiceClient::new(xds_channel(addr).await);
     let (delta_tx, delta_rx) = mpsc::channel(2);
@@ -2229,7 +2229,7 @@ async fn unauthenticated_failures_do_not_disclose_key_inventory() {
         None,
     );
     let wrong_alg = {
-        let now = Utc::now().timestamp();
+        let now = UtcTimestamp::now().unix_timestamp();
         let claims = json!({
             "sub": "dp-a",
             "iat": now,

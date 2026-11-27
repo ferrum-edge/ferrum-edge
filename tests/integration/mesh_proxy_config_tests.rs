@@ -5,7 +5,6 @@
 //! `sampling_percentage: N` in the injected `__mesh_workload_metrics` plugin
 //! config when `prepare_gateway_config_via_mesh_slice` runs.
 
-use chrono::Utc;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
@@ -19,6 +18,7 @@ use ferrum_edge::modes::mesh::{
     MESH_WORKLOAD_METRICS_PLUGIN_ID, MeshConfigProtocol, MeshRuntimeConfig, MeshTopology,
     prepare_gateway_config_via_mesh_slice,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 
 fn test_addr(s: &str) -> SocketAddr {
     s.parse().expect("valid socket address")
@@ -107,7 +107,7 @@ fn proxy_config_tracing_sampling_flows_into_workload_metrics_plugin() {
     };
     let config = GatewayConfig {
         mesh: Some(Box::new(mesh)),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     let runtime = test_runtime();
@@ -153,7 +153,7 @@ fn proxy_config_does_not_set_sampling_when_unset() {
     };
     let config = GatewayConfig {
         mesh: Some(Box::new(mesh)),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     let runtime = test_runtime();
@@ -218,7 +218,7 @@ fn telemetry_tracing_sampling_overrides_proxy_config_tracing_sampling() {
     };
     let config = GatewayConfig {
         mesh: Some(Box::new(mesh)),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     let runtime = test_runtime();
@@ -288,7 +288,7 @@ fn proxy_config_tracing_sampling_survives_telemetry_without_sampling_field() {
     };
     let config = GatewayConfig {
         mesh: Some(Box::new(mesh)),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     let runtime = test_runtime();
@@ -338,7 +338,7 @@ fn proxy_config_zero_sampling_is_applied_not_skipped() {
     };
     let config = GatewayConfig {
         mesh: Some(Box::new(mesh)),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     let runtime = test_runtime();
@@ -389,7 +389,7 @@ fn proxy_config_non_matching_selector_does_not_apply() {
     };
     let config = GatewayConfig {
         mesh: Some(Box::new(mesh)),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     let runtime = test_runtime();
@@ -429,7 +429,7 @@ fn mesh_wide_proxy_config_applies_to_workload_in_other_namespace() {
     };
     let config = GatewayConfig {
         mesh: Some(Box::new(mesh)),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     let runtime = test_runtime();

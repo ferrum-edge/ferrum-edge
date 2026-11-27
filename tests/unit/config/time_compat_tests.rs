@@ -1,20 +1,165 @@
 //! Byte-for-byte compatibility tests for `ferrum_edge::time_compat` against
-//! `chrono::DateTime<chrono::Utc>` across serde, SQLite, MySQL, PostgreSQL,
-//! and `sqlx::Any` (issue #7419, Phase 1).
+//! chrono 0.4.45's `DateTime<Utc>` across serde, SQLite, MySQL, PostgreSQL,
+//! and `sqlx::Any` (issue #7419, Phase 1). chrono is no longer a dependency:
+//! its outputs for every case below were recorded once from chrono itself in
+//! `tests/fixtures/time_compat/chrono_0_4_45_value_oracle.jsonl` and are
+//! compared here as fixed expected values.
 
+use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::{Duration as StdDuration, UNIX_EPOCH};
 
-use chrono::{DateTime, NaiveDateTime, SecondsFormat as ChronoSecondsFormat, Utc};
 use ferrum_edge::time_compat::{
     SecondsFormat, TimestampError, UtcTimestamp, decode_sqlite_julian_day,
     parse_mysql_datetime_text, parse_postgres_datetime_text, parse_rfc3339,
     parse_sqlite_datetime_text,
 };
+use serde_json::Value;
 use sqlx::any::AnyPoolOptions;
 use sqlx::encode::IsNull;
 use sqlx::postgres::{PgArgumentBuffer, PgHasArrayType};
 use sqlx::{Encode, MySql, Postgres, Row, Sqlite, SqlitePool, Type};
-use time::{Date, Month, SignedDuration, Time, UtcOffset};
+use time::{Date, Month, OffsetDateTime, SignedDuration, Time, UtcOffset};
+
+const ORACLE_JSONL: &str =
+    include_str!("../../fixtures/time_compat/chrono_0_4_45_value_oracle.jsonl");
+
+/// chrono's outputs for one `DateTime::<Utc>::from_timestamp(secs, nanos)`.
+#[derive(Debug, serde::Deserialize)]
+struct InstantRecord {
+    secs: i64,
+    nanos: u32,
+    /// `to_rfc3339()`.
+    rfc3339: String,
+    /// `to_rfc3339_opts(mode, use_z)` for Secs, Millis, Micros, Nanos, AutoSi,
+    /// each with `use_z` false then true.
+    opts: Vec<String>,
+    /// `Display`.
+    display: String,
+    debug: String,
+    json: String,
+    yaml: String,
+    /// `timestamp()`, `timestamp_subsec_nanos()`, `timestamp_millis()`.
+    ts: i64,
+    subsec: u32,
+    millis: i64,
+    /// `format("%Y-%m-%dT%H:%M:%SZ")`, `format("%Y%m%d")`,
+    /// `format("%Y%m%d%H%M%S")`.
+    secs_z: String,
+    ymd: String,
+    ymdhms: String,
+    rfc2822: String,
+    /// `format("%d/%b/%Y:%H:%M:%S %z")`.
+    clf: String,
+    /// MySQL binary `Encode` bytes (hex) and `size_hint`.
+    mysql: String,
+    mysql_hint: usize,
+    /// PostgreSQL binary `Encode` bytes (hex) and `size_hint`.
+    pg: String,
+    pg_hint: usize,
+    /// Bytes SQLite stored for a bound value in a DATETIME and a TEXT column
+    /// (hex of `CAST(.. AS BLOB)`).
+    sqlite_dt: String,
+    sqlite_txt: String,
+}
+
+impl InstantRecord {
+    fn opts(&self, mode: SecondsFormat, use_z: bool) -> &str {
+        let index = match mode {
+            SecondsFormat::Secs => 0,
+            SecondsFormat::Millis => 1,
+            SecondsFormat::Micros => 2,
+            SecondsFormat::Nanos => 3,
+            SecondsFormat::AutoSi => 4,
+        };
+        &self.opts[index * 2 + usize::from(use_z)]
+    }
+}
+
+fn unhex(hex_text: &str) -> Vec<u8> {
+    hex::decode(hex_text).unwrap_or_else(|error| panic!("bad oracle hex {hex_text:?}: {error}"))
+}
+
+struct Oracle {
+    instants: HashMap<(i64, u32), InstantRecord>,
+    lines: Vec<Value>,
+}
+
+impl Oracle {
+    fn instant(&self, secs: i64, nanos: u32) -> &InstantRecord {
+        self.instants
+            .get(&(secs, nanos))
+            .unwrap_or_else(|| panic!("no chrono oracle record for ({secs}, {nanos})"))
+    }
+
+    fn all(&self, kind: &str) -> impl Iterator<Item = &Value> {
+        let kind = kind.to_string();
+        self.lines
+            .iter()
+            .filter(move |line| line["k"] == kind.as_str())
+    }
+
+    /// The single line of `kind` whose `field` equals `key`.
+    fn find(&self, kind: &str, field: &str, key: impl Into<Value>) -> &Value {
+        let key = key.into();
+        let mut found = self.all(kind).filter(|line| line[field] == key);
+        let line = found
+            .next()
+            .unwrap_or_else(|| panic!("no chrono oracle {kind} line with {field} = {key}"));
+        assert!(found.next().is_none(), "duplicate oracle {kind} line {key}");
+        line
+    }
+
+    fn misc(&self) -> &Value {
+        self.all("misc").next().expect("oracle misc line")
+    }
+}
+
+fn oracle() -> &'static Oracle {
+    static ORACLE: OnceLock<Oracle> = OnceLock::new();
+    ORACLE.get_or_init(|| {
+        let mut instants = HashMap::new();
+        let mut lines = Vec::new();
+        for line in ORACLE_JSONL.lines().filter(|line| !line.trim().is_empty()) {
+            let value: Value = serde_json::from_str(line)
+                .unwrap_or_else(|error| panic!("bad oracle line {line:?}: {error}"));
+            if value["k"] == "inst" {
+                let record: InstantRecord = serde_json::from_value(value)
+                    .unwrap_or_else(|error| panic!("bad oracle instant {line:?}: {error}"));
+                assert_eq!(record.opts.len(), 10, "{line:?}");
+                assert!(
+                    instants
+                        .insert((record.secs, record.nanos), record)
+                        .is_none(),
+                    "duplicate oracle instant {line:?}"
+                );
+            } else {
+                lines.push(value);
+            }
+        }
+        Oracle { instants, lines }
+    })
+}
+
+fn int(value: &Value) -> i64 {
+    value
+        .as_i64()
+        .unwrap_or_else(|| panic!("oracle value {value} is not an integer"))
+}
+
+fn text(value: &Value) -> &str {
+    value
+        .as_str()
+        .unwrap_or_else(|| panic!("oracle value {value} is not a string"))
+}
+
+/// chrono's `(timestamp(), timestamp_subsec_nanos())` on an oracle line.
+fn instant_of(line: &Value) -> (i64, u32) {
+    (
+        int(&line["ts"]),
+        u32::try_from(int(&line["subsec"])).expect("subsec nanos"),
+    )
+}
 
 /// Representative instants covering whole seconds, ms/us/ns AutoSi buckets,
 /// trailing-zero subseconds, sub-microsecond nanos, midnight, leap day,
@@ -55,60 +200,87 @@ fn representative_instants() -> Vec<(i64, u32)> {
     ]
 }
 
-fn pair_for(secs: i64, nanos: u32) -> (UtcTimestamp, DateTime<Utc>) {
+fn pair_for(secs: i64, nanos: u32) -> (UtcTimestamp, &'static InstantRecord) {
     let ts = UtcTimestamp::from_unix_timestamp_nanos(secs, nanos)
         .expect("representative instant valid for UtcTimestamp");
-    let ch = DateTime::<Utc>::from_timestamp(secs, nanos)
-        .expect("representative instant valid for chrono");
-    assert_eq!(ts.unix_timestamp(), ch.timestamp());
-    assert_eq!(ts.subsec_nanos(), ch.timestamp_subsec_nanos());
+    let ch = oracle().instant(secs, nanos);
+    assert_eq!(ts.unix_timestamp(), ch.ts);
+    assert_eq!(ts.subsec_nanos(), ch.subsec);
     (ts, ch)
 }
 
 #[test]
 fn rfc3339_formatting_matches_chrono_byte_for_byte() {
     let modes = [
-        (SecondsFormat::Secs, ChronoSecondsFormat::Secs),
-        (SecondsFormat::Millis, ChronoSecondsFormat::Millis),
-        (SecondsFormat::Micros, ChronoSecondsFormat::Micros),
-        (SecondsFormat::Nanos, ChronoSecondsFormat::Nanos),
-        (SecondsFormat::AutoSi, ChronoSecondsFormat::AutoSi),
+        SecondsFormat::Secs,
+        SecondsFormat::Millis,
+        SecondsFormat::Micros,
+        SecondsFormat::Nanos,
+        SecondsFormat::AutoSi,
     ];
 
     for (secs, nanos) in representative_instants() {
         let (ts, ch) = pair_for(secs, nanos);
 
         assert_eq!(
-            ts.to_rfc3339().as_bytes(),
-            ch.to_rfc3339().as_bytes(),
+            ts.to_rfc3339(),
+            ch.rfc3339,
             "to_rfc3339 mismatch for ({secs}, {nanos})"
         );
         assert_eq!(
-            ts.to_rfc3339_z().as_bytes(),
-            ch.to_rfc3339_opts(ChronoSecondsFormat::AutoSi, true)
-                .as_bytes(),
+            ts.to_rfc3339_z(),
+            ch.opts(SecondsFormat::AutoSi, true),
             "to_rfc3339_z mismatch for ({secs}, {nanos})"
         );
 
-        for (ours, theirs) in modes {
+        for mode in modes {
             for use_z in [false, true] {
                 assert_eq!(
-                    ts.to_rfc3339_opts(ours, use_z).as_bytes(),
-                    ch.to_rfc3339_opts(theirs, use_z).as_bytes(),
-                    "to_rfc3339_opts({ours:?}, {use_z}) mismatch for ({secs}, {nanos})"
+                    ts.to_rfc3339_opts(mode, use_z),
+                    ch.opts(mode, use_z),
+                    "to_rfc3339_opts({mode:?}, {use_z}) mismatch for ({secs}, {nanos})"
                 );
             }
         }
     }
 
     // Year 0001 boundary (valid for RFC 3339 / SQLite / Postgres, outside MySQL 1000..=9999).
+    let misc = oracle().misc();
     let year1_date = Date::from_calendar_date(1, Month::January, 1).unwrap();
     let year1_ts = UtcTimestamp::from_utc_date_time(year1_date, Time::MIDNIGHT);
-    let year1_ch = DateTime::parse_from_rfc3339("0001-01-01T00:00:00Z")
-        .unwrap()
-        .with_timezone(&Utc);
-    assert_eq!(year1_ts.to_rfc3339(), year1_ch.to_rfc3339());
+    assert_eq!(year1_ts.unix_timestamp(), int(&misc["year1_ts"]));
+    assert_eq!(year1_ts.to_rfc3339(), text(&misc["year1_rfc3339"]));
     assert_eq!(year1_ts.to_rfc3339_z(), "0001-01-01T00:00:00Z");
+}
+
+#[test]
+fn chrono_display_and_default_match_chrono_byte_for_byte() {
+    for (secs, nanos) in representative_instants() {
+        let (ts, ch) = pair_for(secs, nanos);
+        assert_eq!(
+            ts.to_chrono_display(),
+            ch.display,
+            "to_chrono_display mismatch for ({secs}, {nanos})"
+        );
+        assert_eq!(
+            format!("{ts:?}"),
+            ch.debug,
+            "Debug mismatch for ({secs}, {nanos})"
+        );
+    }
+    for year in [-9999, -1, 0, 1, 9999] {
+        let date = Date::from_calendar_date(year, Month::December, 31).unwrap();
+        let ts = UtcTimestamp::from_utc_date_time(date, Time::MIDNIGHT);
+        let ch = oracle().find("year_display", "year", year);
+        assert_eq!(ts.unix_timestamp(), int(&ch["ts"]), "year {year}");
+        assert_eq!(ts.to_chrono_display(), text(&ch["display"]), "year {year}");
+    }
+
+    assert_eq!(UtcTimestamp::default(), UtcTimestamp::UNIX_EPOCH);
+    assert_eq!(
+        UtcTimestamp::default().to_rfc3339(),
+        text(&oracle().misc()["default_rfc3339"])
+    );
 }
 
 #[test]
@@ -116,32 +288,25 @@ fn serde_json_and_yaml_match_chrono_byte_for_byte() {
     for (secs, nanos) in representative_instants() {
         let (ts, ch) = pair_for(secs, nanos);
 
+        // Byte-identical output also means chrono reads what UtcTimestamp writes.
         let ts_json = serde_json::to_string(&ts).expect("serialize UtcTimestamp to JSON");
-        let ch_json = serde_json::to_string(&ch).expect("serialize chrono DateTime to JSON");
         assert_eq!(
-            ts_json.as_bytes(),
-            ch_json.as_bytes(),
+            ts_json, ch.json,
             "JSON serialization mismatch for ({secs}, {nanos})"
         );
 
-        // Cross-deserialize JSON written by chrono into UtcTimestamp and vice versa.
+        // Deserialize JSON written by chrono into UtcTimestamp.
         let decoded_ts: UtcTimestamp =
-            serde_json::from_str(&ch_json).expect("deserialize chrono JSON into UtcTimestamp");
+            serde_json::from_str(&ch.json).expect("deserialize chrono JSON into UtcTimestamp");
         assert_eq!(decoded_ts, ts);
 
-        let decoded_ch: DateTime<Utc> =
-            serde_json::from_str(&ts_json).expect("deserialize UtcTimestamp JSON into chrono");
-        assert_eq!(decoded_ch, ch);
-
         let ts_yaml = serde_yaml::to_string(&ts).expect("serialize UtcTimestamp to YAML");
-        let ch_yaml = serde_yaml::to_string(&ch).expect("serialize chrono DateTime to YAML");
         assert_eq!(
-            ts_yaml.as_bytes(),
-            ch_yaml.as_bytes(),
+            ts_yaml, ch.yaml,
             "YAML serialization mismatch for ({secs}, {nanos})"
         );
         let decoded_yaml: UtcTimestamp =
-            serde_yaml::from_str(&ch_yaml).expect("deserialize chrono YAML into UtcTimestamp");
+            serde_yaml::from_str(&ch.yaml).expect("deserialize chrono YAML into UtcTimestamp");
         assert_eq!(decoded_yaml, ts);
     }
 
@@ -154,11 +319,10 @@ fn serde_json_and_yaml_match_chrono_byte_for_byte() {
         "\"2026-01-02T03:04:05.12345678999Z\"",
     ] {
         let ts: UtcTimestamp = serde_json::from_str(input).expect("UtcTimestamp parses input");
-        let ch: DateTime<Utc> = serde_json::from_str(input).expect("chrono parses input");
-        assert_eq!(ts.unix_timestamp(), ch.timestamp(), "input={input}");
+        let ch = instant_of(oracle().find("serde_in", "i", input));
         assert_eq!(
-            ts.subsec_nanos(),
-            ch.timestamp_subsec_nanos(),
+            (ts.unix_timestamp(), ts.subsec_nanos()),
+            ch,
             "input={input}"
         );
     }
@@ -246,27 +410,27 @@ fn unix_epoch_accessors_and_secs_z_format_match_chrono() {
         let (ts, ch) = pair_for(secs, nanos);
         assert_eq!(
             ts.unix_timestamp(),
-            ch.timestamp(),
+            ch.ts,
             "unix_timestamp mismatch for ({secs}, {nanos})"
         );
         assert_eq!(
             ts.unix_timestamp_millis(),
-            ch.timestamp_millis(),
+            ch.millis,
             "unix_timestamp_millis mismatch for ({secs}, {nanos})"
         );
         assert_eq!(
             ts.to_rfc3339_opts(SecondsFormat::Secs, true),
-            ch.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            ch.secs_z,
             "Secs+Z vs strftime mismatch for ({secs}, {nanos})"
         );
         assert_eq!(
             ts.to_compact_date(),
-            ch.format("%Y%m%d").to_string(),
+            ch.ymd,
             "compact date mismatch for ({secs}, {nanos})"
         );
         assert_eq!(
             ts.to_compact_date_time(),
-            ch.format("%Y%m%d%H%M%S").to_string(),
+            ch.ymdhms,
             "compact date-time mismatch for ({secs}, {nanos})"
         );
     }
@@ -275,25 +439,50 @@ fn unix_epoch_accessors_and_secs_z_format_match_chrono() {
     // reads the wall clock directly, and `time/large-dates` is unified in by
     // bson, so a far-future clock reaches these formatters.
     for year in [-1, 10_000] {
+        let ch = oracle().find("compact_year", "year", year);
         let Ok(date) = Date::from_calendar_date(year, Month::December, 31) else {
-            // Without `time/large-dates` the year is unrepresentable.
+            // Without `time/large-dates` the year is unrepresentable (it was
+            // when the oracle was recorded, if the record says so).
+            assert_eq!(ch["skipped"].as_bool(), Some(true), "year {year}");
             continue;
         };
         let ts = UtcTimestamp::from_utc_date_time(date, Time::from_hms(10, 20, 30).unwrap());
-        let ch = DateTime::<Utc>::from_timestamp(ts.unix_timestamp(), 0)
-            .expect("chrono represents the instant");
-        assert_eq!(ts.to_compact_date(), ch.format("%Y%m%d").to_string());
+        assert_eq!(ts.unix_timestamp(), int(&ch["ts"]), "year {year}");
+        assert_eq!(ts.to_compact_date(), text(&ch["ymd"]), "year {year}");
         assert_eq!(
             ts.to_compact_date_time(),
-            ch.format("%Y%m%d%H%M%S").to_string()
+            text(&ch["ymdhms"]),
+            "year {year}"
         );
     }
 
+    // The wall clock. Millis floor the nanosecond instant, and `to_rfc3339()`
+    // follows chrono's rule pinned per instant above: `AutoSi` fractional
+    // seconds (none when zero, else 3, 6 or 9 digits) and a `+00:00` suffix.
     let ts = UtcTimestamp::now();
-    let ch = DateTime::<Utc>::from_timestamp(ts.unix_timestamp(), ts.subsec_nanos())
-        .expect("current instant valid for chrono");
-    assert_eq!(ts.unix_timestamp_millis(), ch.timestamp_millis());
-    assert_eq!(ts.to_rfc3339(), ch.to_rfc3339());
+    assert_eq!(
+        i128::from(ts.unix_timestamp_millis()),
+        ts.unix_timestamp_nanos().div_euclid(1_000_000)
+    );
+    let nanos = ts.subsec_nanos();
+    let fraction = if nanos == 0 {
+        String::new()
+    } else if nanos.is_multiple_of(1_000_000) {
+        format!(".{:03}", nanos / 1_000_000)
+    } else if nanos.is_multiple_of(1_000) {
+        format!(".{:06}", nanos / 1_000)
+    } else {
+        format!(".{nanos:09}")
+    };
+    let whole_seconds = ts.to_rfc3339_opts(SecondsFormat::Secs, false);
+    let expected = format!(
+        "{}{fraction}+00:00",
+        whole_seconds
+            .strip_suffix("+00:00")
+            .expect("Secs rendering ends in +00:00")
+    );
+    assert_eq!(ts.to_rfc3339(), expected);
+    assert_eq!(parse_rfc3339(&ts.to_rfc3339()), Ok(ts));
 }
 
 #[test]
@@ -326,6 +515,27 @@ fn system_time_and_duration_arithmetic_work_across_epoch() {
     assert_eq!(normalized, ts_post);
 }
 
+/// Asserts the recorded chrono `type_info()` equals `time::OffsetDateTime`'s
+/// for `field` (so `OffsetDateTime` stands in for chrono below) and returns
+/// chrono's recorded `Debug` text.
+fn chrono_type_info_debug(field: &str) -> &'static str {
+    let info = oracle()
+        .all("type_info")
+        .next()
+        .expect("oracle type_info line");
+    assert_eq!(
+        info[format!("{field}_eq").as_str()].as_bool(),
+        Some(true),
+        "chrono and OffsetDateTime {field} type_info differed when recorded"
+    );
+    assert_eq!(
+        info[format!("{field}_chrono").as_str()],
+        info[format!("{field}_time").as_str()],
+        "{field}"
+    );
+    text(&info[format!("{field}_chrono").as_str()])
+}
+
 #[tokio::test]
 async fn sqlite_roundtrip_is_byte_identical_to_chrono_and_reads_legacy_rows() {
     let pool = SqlitePool::connect("sqlite::memory:")
@@ -346,12 +556,20 @@ async fn sqlite_roundtrip_is_byte_identical_to_chrono_and_reads_legacy_rows() {
     .expect("create ts_parity table");
 
     assert_eq!(
+        format!("{:?}", <UtcTimestamp as Type<Sqlite>>::type_info()),
+        chrono_type_info_debug("sqlite")
+    );
+    assert_eq!(
         <UtcTimestamp as Type<Sqlite>>::type_info(),
-        <DateTime<Utc> as Type<Sqlite>>::type_info()
+        <OffsetDateTime as Type<Sqlite>>::type_info()
     );
 
     for (idx, (secs, nanos)) in representative_instants().into_iter().enumerate() {
         let (ts, ch) = pair_for(secs, nanos);
+        // sqlx-sqlite binds chrono's DateTime<Utc> as TEXT, so the recorded
+        // stored bytes are exactly what chrono wrote.
+        let chrono_dt = String::from_utf8(unhex(&ch.sqlite_dt)).expect("chrono DATETIME text");
+        let chrono_txt = String::from_utf8(unhex(&ch.sqlite_txt)).expect("chrono TEXT text");
 
         sqlx::query(
             "INSERT INTO ts_parity (id, dt_compat, dt_chrono, txt_compat, txt_chrono)
@@ -359,9 +577,9 @@ async fn sqlite_roundtrip_is_byte_identical_to_chrono_and_reads_legacy_rows() {
         )
         .bind(idx as i64)
         .bind(ts)
-        .bind(ch)
+        .bind(chrono_dt.as_str())
         .bind(ts)
-        .bind(ch)
+        .bind(chrono_txt.as_str())
         .execute(&pool)
         .await
         .expect("insert parity row");
@@ -375,7 +593,6 @@ async fn sqlite_roundtrip_is_byte_identical_to_chrono_and_reads_legacy_rows() {
                 CAST(txt_chrono AS BLOB),
                 dt_compat,
                 dt_chrono,
-                dt_compat,
                 txt_chrono
              FROM ts_parity WHERE id = ?1",
         )
@@ -389,6 +606,8 @@ async fn sqlite_roundtrip_is_byte_identical_to_chrono_and_reads_legacy_rows() {
         let txt_compat_bytes: Vec<u8> = row.try_get(2).expect("txt_compat blob");
         let txt_chrono_bytes: Vec<u8> = row.try_get(3).expect("txt_chrono blob");
 
+        assert_eq!(dt_chrono_bytes, unhex(&ch.sqlite_dt));
+        assert_eq!(txt_chrono_bytes, unhex(&ch.sqlite_txt));
         assert_eq!(
             dt_compat_bytes, dt_chrono_bytes,
             "SQLite DATETIME bytes diverged from chrono for ({secs}, {nanos})"
@@ -398,17 +617,15 @@ async fn sqlite_roundtrip_is_byte_identical_to_chrono_and_reads_legacy_rows() {
             "SQLite TEXT bytes diverged from chrono for ({secs}, {nanos})"
         );
 
-        // Round-trip both directions: UtcTimestamp reads chrono-written columns
-        // and chrono reads UtcTimestamp-written columns.
+        // UtcTimestamp reads its own and chrono-written columns. Since the
+        // bytes are identical, chrono reads UtcTimestamp-written columns too.
         let compat_from_compat: UtcTimestamp = row.try_get(4).expect("decode compat from compat");
         let compat_from_chrono: UtcTimestamp = row.try_get(5).expect("decode compat from chrono");
-        let chrono_from_compat: DateTime<Utc> = row.try_get(6).expect("decode chrono from compat");
-        let compat_from_txt: UtcTimestamp = row.try_get(7).expect("decode compat from chrono text");
+        let compat_from_txt: UtcTimestamp = row.try_get(6).expect("decode compat from chrono text");
 
         assert_eq!(compat_from_compat, ts);
         assert_eq!(compat_from_chrono, ts);
         assert_eq!(compat_from_txt, ts);
-        assert_eq!(chrono_from_compat, ch);
     }
 
     // Legacy SQLite row formats: TEXT (CURRENT_TIMESTAMP, space separator,
@@ -438,7 +655,7 @@ async fn sqlite_roundtrip_is_byte_identical_to_chrono_and_reads_legacy_rows() {
     ];
 
     for (raw, expected_rfc3339_z) in legacy_text_cases {
-        let row = sqlx::query("SELECT ?1, ?1")
+        let row = sqlx::query("SELECT ?1")
             .bind(raw)
             .fetch_one(&pool)
             .await
@@ -446,18 +663,16 @@ async fn sqlite_roundtrip_is_byte_identical_to_chrono_and_reads_legacy_rows() {
         let compat_val: UtcTimestamp = row
             .try_get(0)
             .unwrap_or_else(|e| panic!("UtcTimestamp failed on legacy SQLite text {raw:?}: {e}"));
-        let chrono_val: DateTime<Utc> = row
-            .try_get(1)
-            .unwrap_or_else(|e| panic!("chrono failed on legacy SQLite text {raw:?}: {e}"));
+        let chrono_val = oracle().find("sqlite_text", "i", raw);
+        assert_eq!(
+            chrono_val["ok"].as_bool(),
+            Some(true),
+            "chrono decoded {raw:?}"
+        );
         assert_eq!(compat_val.to_rfc3339_z(), expected_rfc3339_z, "raw={raw:?}");
         assert_eq!(
-            compat_val.unix_timestamp(),
-            chrono_val.timestamp(),
-            "raw={raw:?}"
-        );
-        assert_eq!(
-            compat_val.subsec_nanos(),
-            chrono_val.timestamp_subsec_nanos(),
+            (compat_val.unix_timestamp(), compat_val.subsec_nanos()),
+            instant_of(chrono_val),
             "raw={raw:?}"
         );
         assert_eq!(parse_sqlite_datetime_text(raw).unwrap(), compat_val);
@@ -465,40 +680,53 @@ async fn sqlite_roundtrip_is_byte_identical_to_chrono_and_reads_legacy_rows() {
 
     // Legacy INTEGER Unix seconds (positive, epoch, negative pre-epoch).
     for unix_secs in [1_767_323_045_i64, 0, -86_400] {
-        let row = sqlx::query("SELECT ?1, ?1")
+        let row = sqlx::query("SELECT ?1")
             .bind(unix_secs)
             .fetch_one(&pool)
             .await
             .expect("select legacy integer");
         let compat_val: UtcTimestamp = row.try_get(0).expect("decode integer timestamp");
-        let chrono_val: DateTime<Utc> = row.try_get(1).expect("chrono decode integer timestamp");
-        assert_eq!(compat_val.unix_timestamp(), chrono_val.timestamp());
+        let chrono_val = instant_of(oracle().find("sqlite_int", "i", unix_secs));
+        assert_eq!(compat_val.unix_timestamp(), chrono_val.0);
         assert_eq!(compat_val.subsec_nanos(), 0);
+        assert_eq!(chrono_val.1, 0);
     }
 
     // Legacy REAL Julian day numbers (pre-epoch and post-epoch).
     for (unix_secs, subsec_nanos) in [(-1_i64, 500_000_000_u32), (1, 500_000_000)] {
         let julian = 2_440_587.5 + (unix_secs as f64 + f64::from(subsec_nanos) / 1e9) / 86_400.0;
-        let row = sqlx::query("SELECT ?1, ?1")
+        let chrono_val = oracle().find("sqlite_julian", "secs", unix_secs);
+        assert_eq!(
+            text(&chrono_val["julian_bits"]),
+            format!("{:016x}", julian.to_bits()),
+            "the recorded Julian day input"
+        );
+        let (chrono_secs, chrono_nanos) = instant_of(chrono_val);
+        let row = sqlx::query("SELECT ?1")
             .bind(julian)
             .fetch_one(&pool)
             .await
             .expect("select legacy julian real");
         let compat_val: UtcTimestamp = row.try_get(0).expect("decode julian day");
-        let chrono_val: DateTime<Utc> = row.try_get(1).expect("chrono decode julian day");
         let expected = UtcTimestamp::from_unix_timestamp_nanos(unix_secs, subsec_nanos).unwrap();
         let diff_us = (compat_val - expected).whole_microseconds().abs();
         assert!(diff_us < 1_000, "julian diff too large: {diff_us} us");
-        assert_eq!(compat_val.unix_timestamp(), chrono_val.timestamp());
+        assert_eq!(compat_val.unix_timestamp(), chrono_secs);
         assert!(
-            (i64::from(compat_val.subsec_nanos()) - i64::from(chrono_val.timestamp_subsec_nanos()))
-                .abs()
-                <= 1,
+            (i64::from(compat_val.subsec_nanos()) - i64::from(chrono_nanos)).abs() <= 1,
             "julian subsec diverged from chrono"
         );
     }
 
-    // Invalid SQLite text fails closed.
+    // Invalid SQLite text fails closed, as it did for chrono.
+    assert_eq!(
+        oracle().find("sqlite_text", "i", "not-a-date")["ok"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        oracle().all("sqlite_bad_literal").next().unwrap()["ok"].as_bool(),
+        Some(false)
+    );
     let bad_row = sqlx::query("SELECT 'not-a-date'")
         .fetch_one(&pool)
         .await
@@ -509,11 +737,15 @@ async fn sqlite_roundtrip_is_byte_identical_to_chrono_and_reads_legacy_rows() {
 #[test]
 fn mysql_binary_wire_encoding_matches_chrono_byte_for_byte_and_decodes_legacy_formats() {
     assert_eq!(
+        format!("{:?}", <UtcTimestamp as Type<MySql>>::type_info()),
+        chrono_type_info_debug("mysql")
+    );
+    assert_eq!(
         <UtcTimestamp as Type<MySql>>::type_info(),
-        <DateTime<Utc> as Type<MySql>>::type_info()
+        <OffsetDateTime as Type<MySql>>::type_info()
     );
     assert!(<UtcTimestamp as Type<MySql>>::compatible(
-        &<DateTime<Utc> as Type<MySql>>::type_info()
+        &<OffsetDateTime as Type<MySql>>::type_info()
     ));
     assert!(<UtcTimestamp as Type<MySql>>::compatible(
         &<String as Type<MySql>>::type_info()
@@ -521,21 +753,14 @@ fn mysql_binary_wire_encoding_matches_chrono_byte_for_byte_and_decodes_legacy_fo
 
     for (secs, nanos) in representative_instants() {
         let (ts, ch) = pair_for(secs, nanos);
+        let chrono_buf = unhex(&ch.mysql);
 
         let mut compat_buf = Vec::new();
-        let mut chrono_buf = Vec::new();
-
         let compat_null = <UtcTimestamp as Encode<'_, MySql>>::encode_by_ref(&ts, &mut compat_buf)
             .expect("encode UtcTimestamp for MySQL");
-        let chrono_null = <DateTime<Utc> as Encode<'_, MySql>>::encode_by_ref(&ch, &mut chrono_buf)
-            .expect("encode chrono DateTime for MySQL");
         assert!(
             matches!(compat_null, IsNull::No),
             "UtcTimestamp MySQL encode returned IsNull::Yes for ({secs}, {nanos})"
-        );
-        assert!(
-            matches!(chrono_null, IsNull::No),
-            "chrono MySQL encode returned IsNull::Yes for ({secs}, {nanos})"
         );
 
         assert_eq!(
@@ -544,7 +769,7 @@ fn mysql_binary_wire_encoding_matches_chrono_byte_for_byte_and_decodes_legacy_fo
         );
         assert_eq!(
             <UtcTimestamp as Encode<'_, MySql>>::size_hint(&ts),
-            <DateTime<Utc> as Encode<'_, MySql>>::size_hint(&ch),
+            ch.mysql_hint,
             "MySQL size_hint mismatch for ({secs}, {nanos})"
         );
 
@@ -594,13 +819,15 @@ fn mysql_binary_wire_encoding_matches_chrono_byte_for_byte_and_decodes_legacy_fo
             .unwrap_or_else(|e| panic!("parse_mysql_datetime_text failed on {raw:?}: {e}"));
         assert_eq!(parsed.to_rfc3339_z(), expected, "raw={raw:?}");
 
-        // Cross-check space-separated rows directly against chrono's MySQL text parser.
+        // Cross-check space-separated rows against chrono's MySQL text parser
+        // (`NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f")`).
         if !raw.contains('T') {
-            let ch = NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f")
-                .expect("chrono parses MySQL text")
-                .and_utc();
-            assert_eq!(parsed.unix_timestamp(), ch.timestamp());
-            assert_eq!(parsed.subsec_nanos(), ch.timestamp_subsec_nanos());
+            let ch = instant_of(oracle().find("mysql_text", "i", raw));
+            assert_eq!(
+                (parsed.unix_timestamp(), parsed.subsec_nanos()),
+                ch,
+                "raw={raw:?}"
+            );
         }
     }
 }
@@ -608,15 +835,23 @@ fn mysql_binary_wire_encoding_matches_chrono_byte_for_byte_and_decodes_legacy_fo
 #[test]
 fn postgres_binary_and_text_wire_formats_match_chrono_byte_for_byte() {
     assert_eq!(
+        format!("{:?}", <UtcTimestamp as Type<Postgres>>::type_info()),
+        chrono_type_info_debug("pg")
+    );
+    assert_eq!(
+        format!("{:?}", <UtcTimestamp as PgHasArrayType>::array_type_info()),
+        chrono_type_info_debug("pg_arr")
+    );
+    assert_eq!(
         <UtcTimestamp as Type<Postgres>>::type_info(),
-        <DateTime<Utc> as Type<Postgres>>::type_info()
+        <OffsetDateTime as Type<Postgres>>::type_info()
     );
     assert_eq!(
         <UtcTimestamp as PgHasArrayType>::array_type_info(),
-        <DateTime<Utc> as PgHasArrayType>::array_type_info()
+        <OffsetDateTime as PgHasArrayType>::array_type_info()
     );
     assert!(<UtcTimestamp as Type<Postgres>>::compatible(
-        &<DateTime<Utc> as Type<Postgres>>::type_info()
+        &<OffsetDateTime as Type<Postgres>>::type_info()
     ));
     assert!(<UtcTimestamp as Type<Postgres>>::compatible(
         &<String as Type<Postgres>>::type_info()
@@ -624,23 +859,15 @@ fn postgres_binary_and_text_wire_formats_match_chrono_byte_for_byte() {
 
     for (secs, nanos) in representative_instants() {
         let (ts, ch) = pair_for(secs, nanos);
+        let chrono_buf = unhex(&ch.pg);
 
         let mut compat_buf = PgArgumentBuffer::default();
-        let mut chrono_buf = PgArgumentBuffer::default();
-
         let compat_null =
             <UtcTimestamp as Encode<'_, Postgres>>::encode_by_ref(&ts, &mut compat_buf)
                 .expect("encode UtcTimestamp for Postgres");
-        let chrono_null =
-            <DateTime<Utc> as Encode<'_, Postgres>>::encode_by_ref(&ch, &mut chrono_buf)
-                .expect("encode chrono DateTime for Postgres");
         assert!(
             matches!(compat_null, IsNull::No),
             "UtcTimestamp Postgres encode returned IsNull::Yes for ({secs}, {nanos})"
-        );
-        assert!(
-            matches!(chrono_null, IsNull::No),
-            "chrono Postgres encode returned IsNull::Yes for ({secs}, {nanos})"
         );
 
         assert_eq!(
@@ -650,11 +877,11 @@ fn postgres_binary_and_text_wire_formats_match_chrono_byte_for_byte() {
         );
         assert_eq!(
             <UtcTimestamp as Encode<'_, Postgres>>::size_hint(&ts),
-            <DateTime<Utc> as Encode<'_, Postgres>>::size_hint(&ch),
+            ch.pg_hint,
             "Postgres size_hint mismatch for ({secs}, {nanos})"
         );
 
-        let decoded = UtcTimestamp::decode_postgres_binary(chrono_buf.as_slice())
+        let decoded = UtcTimestamp::decode_postgres_binary(&chrono_buf)
             .expect("decode chrono Postgres binary bytes");
         // Verify binary round-trip matches chrono's exact microsecond truncation
         // (including negative durations toward zero around 2000-01-01).
@@ -682,21 +909,12 @@ fn postgres_binary_and_text_wire_formats_match_chrono_byte_for_byte() {
         let parsed = parse_postgres_datetime_text(raw)
             .unwrap_or_else(|e| panic!("parse_postgres_datetime_text failed on {raw:?}: {e}"));
 
-        // Compare against chrono's Postgres text parser.
-        let ch_utc = if raw.len() > 19 && (raw[19..].contains('+') || raw[19..].contains('-')) {
-            DateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f%#z")
-                .unwrap_or_else(|e| panic!("chrono failed on Postgres text {raw:?}: {e}"))
-                .with_timezone(&Utc)
-        } else {
-            NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f")
-                .unwrap_or_else(|e| panic!("chrono failed on Postgres naive text {raw:?}: {e}"))
-                .and_utc()
-        };
-
-        assert_eq!(parsed.unix_timestamp(), ch_utc.timestamp(), "raw={raw:?}");
+        // Compare against chrono's Postgres text parser (`%Y-%m-%d
+        // %H:%M:%S%.f%#z` with an offset, `NaiveDateTime` without one).
+        let ch_utc = instant_of(oracle().find("pg_text", "i", raw));
         assert_eq!(
-            parsed.subsec_nanos(),
-            ch_utc.timestamp_subsec_nanos(),
+            (parsed.unix_timestamp(), parsed.subsec_nanos()),
+            ch_utc,
             "raw={raw:?}"
         );
     }
@@ -735,7 +953,7 @@ async fn sqlx_any_roundtrip_matches_chrono_to_rfc3339_and_reads_legacy_rows() {
         sqlx::query("INSERT INTO any_ts_parity (id, compat_ts, chrono_ts) VALUES (?, ?, ?)")
             .bind(idx as i64)
             .bind(ts)
-            .bind(ch.to_rfc3339())
+            .bind(ch.rfc3339.as_str())
             .execute(&pool)
             .await
             .expect("insert any_ts_parity row");
@@ -785,7 +1003,7 @@ fn rfc2822_formatting_matches_chrono_byte_for_byte() {
         let (ts, ch) = pair_for(secs, nanos);
         assert_eq!(
             ts.to_rfc2822().as_deref(),
-            Some(ch.to_rfc2822().as_str()),
+            Some(ch.rfc2822.as_str()),
             "to_rfc2822 mismatch for ({secs}, {nanos})"
         );
     }
@@ -800,10 +1018,10 @@ fn rfc2822_formatting_matches_chrono_byte_for_byte() {
         Date::from_calendar_date(1, Month::January, 1).unwrap(),
         Time::MIDNIGHT,
     );
-    let year1_ch = DateTime::parse_from_rfc3339("0001-01-01T00:00:00Z")
-        .unwrap()
-        .with_timezone(&Utc);
-    assert_eq!(year1.to_rfc2822(), Some(year1_ch.to_rfc2822()));
+    assert_eq!(
+        year1.to_rfc2822().as_deref(),
+        Some(text(&oracle().misc()["year1_rfc2822"]))
+    );
     assert_eq!(
         year1.to_rfc2822().as_deref(),
         Some("Mon, 1 Jan 0001 00:00:00 +0000")
@@ -834,15 +1052,13 @@ fn chrono_try_seconds_accepts_exactly_what_chrono_does() {
         i64::MIN,
     ] {
         let ours = ferrum_edge::time_compat::chrono_try_seconds(secs);
-        let theirs = chrono::TimeDelta::try_seconds(secs);
-        assert_eq!(ours.is_some(), theirs.is_some(), "acceptance for {secs}");
-        if let (Some(ours), Some(theirs)) = (ours, theirs) {
-            assert_eq!(
-                ours.whole_seconds(),
-                theirs.num_seconds(),
-                "value for {secs}"
-            );
-        }
+        let theirs = &oracle().find("try_seconds", "i", secs)["secs"];
+        assert_eq!(
+            ours.map(|duration| duration.whole_seconds()),
+            theirs.as_i64(),
+            "acceptance and value for {secs}"
+        );
+        assert_eq!(theirs.is_null(), ours.is_none(), "acceptance for {secs}");
     }
 }
 
@@ -852,11 +1068,7 @@ fn chrono_try_seconds_accepts_exactly_what_chrono_does() {
 fn common_log_format_matches_chrono_strftime() {
     for (secs, nanos) in representative_instants() {
         let (ts, ch) = pair_for(secs, nanos);
-        assert_eq!(
-            ts.to_common_log_format(),
-            ch.format("%d/%b/%Y:%H:%M:%S %z").to_string(),
-            "({secs}, {nanos})"
-        );
+        assert_eq!(ts.to_common_log_format(), ch.clf, "({secs}, {nanos})");
     }
     let fixed: UtcTimestamp = "2026-11-07T08:09:10Z".parse().unwrap();
     assert_eq!(fixed.to_common_log_format(), "07/Nov/2026:08:09:10 +0000");
@@ -871,7 +1083,7 @@ fn common_log_format_matches_chrono_strftime() {
 fn from_unix_timestamp_millis_matches_chrono_in_range() {
     assert_eq!(
         UtcTimestamp::UNIX_EPOCH.to_rfc3339(),
-        DateTime::<Utc>::UNIX_EPOCH.to_rfc3339()
+        text(&oracle().misc()["epoch_rfc3339"])
     );
     for millis in [
         0_i64,
@@ -886,16 +1098,17 @@ fn from_unix_timestamp_millis_matches_chrono_in_range() {
         253_402_300_799_999,
     ] {
         let ours = UtcTimestamp::from_unix_timestamp_millis(millis).expect("in range");
-        let theirs = DateTime::<Utc>::from_timestamp_millis(millis).expect("chrono in range");
-        assert_eq!(ours.to_rfc3339(), theirs.to_rfc3339(), "millis {millis}");
+        let theirs = text(&oracle().find("from_millis", "i", millis)["rfc3339"]);
+        assert_eq!(ours.to_rfc3339(), theirs, "millis {millis}");
         assert_eq!(ours.unix_timestamp_millis(), millis, "round trip {millis}");
     }
     // Year 10000 is representable in chrono but not in UtcTimestamp.
-    assert!(DateTime::<Utc>::from_timestamp_millis(253_402_300_800_000).is_some());
+    assert!(oracle().find("from_millis", "i", 253_402_300_800_000_i64)["rfc3339"].is_string());
     assert_eq!(
         UtcTimestamp::from_unix_timestamp_millis(253_402_300_800_000),
         Err(TimestampError::OutOfRange)
     );
+    assert!(oracle().find("from_millis", "i", i64::MIN)["rfc3339"].is_null());
     assert_eq!(
         UtcTimestamp::from_unix_timestamp_millis(i64::MIN),
         Err(TimestampError::OutOfRange)

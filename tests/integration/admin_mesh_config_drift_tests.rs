@@ -11,7 +11,6 @@
 use crate::scaffolding::port_registry::TestSocket;
 
 use arc_swap::ArcSwap;
-use chrono::Utc;
 use ferrum_edge::admin::{
     AdminState,
     jwt_auth::{JwtConfig, JwtManager},
@@ -26,6 +25,7 @@ use ferrum_edge::modes::mesh::config::{
 use ferrum_edge::modes::mesh::runtime::MeshRuntimeState;
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::proxy::ProxyState;
+use ferrum_edge::time_compat::UtcTimestamp;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -60,14 +60,14 @@ fn create_test_jwt_manager(config: &TestConfig) -> JwtManager {
 }
 
 fn generate_test_token(config: &TestConfig) -> String {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "iss": config.jwt_issuer,
         "sub": "test-user",
         "role": "admin",
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(config.max_ttl as i64)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(config.max_ttl as i64)).unwrap()).unix_timestamp(),
         "jti": uuid::Uuid::new_v4().to_string(),
     });
     let header = Header::new(jsonwebtoken::Algorithm::HS256);
@@ -79,7 +79,7 @@ fn build_admin_state(jwt: JwtManager, mesh_runtime_state: Option<MeshRuntimeStat
     let mesh = MeshConfig::default();
     let cfg = GatewayConfig {
         version: "1".to_string(),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         mesh: Some(Box::new(mesh)),
         ..GatewayConfig::default()
     };
@@ -289,7 +289,7 @@ async fn config_drift_endpoint_reflects_accepted_slice() {
     install_accepted_slice(&runtime, populated_slice("alpha", "v-drift-1"));
     // Sleep so `age_seconds > 0` is observable on fast hardware — the
     // assertion is `> 0` rather than equality because the response builder
-    // reads `chrono::Utc::now()` inside the handler.
+    // reads `UtcTimestamp::now()` inside the handler.
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
 
     let state = build_admin_state(create_test_jwt_manager(&tc), Some(runtime));

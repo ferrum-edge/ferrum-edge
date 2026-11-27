@@ -24,7 +24,6 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use chrono::Utc;
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -43,6 +42,7 @@ use ferrum_edge::proxy::client_abort_scope::{
 };
 use ferrum_edge::proxy::{ProxyState, start_proxy_listener_with_bound_listener};
 use ferrum_edge::retry::ErrorClass;
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const WAIT: Duration = Duration::from_secs(10);
 /// How long a terminal count must stay unchanged to count as settled.
@@ -88,7 +88,7 @@ impl Gateway {
         let config = GatewayConfig {
             version: "1".to_string(),
             proxies: vec![proxy],
-            loaded_at: Utc::now(),
+            loaded_at: UtcTimestamp::now(),
             ..GatewayConfig::default()
         };
         let state = ProxyState::new(config, DnsCache::new(DnsConfig::default()), env, None, None)

@@ -1,9 +1,9 @@
 //! Tests for ConsumerIndex — credential-indexed consumer lookup
 
-use chrono::Utc;
 use ferrum_edge::ConsumerIndex;
 use ferrum_edge::config::db_backend::NamespacedResourceId;
 use ferrum_edge::config::types::Consumer;
+use ferrum_edge::time_compat::UtcTimestamp;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 
@@ -42,8 +42,8 @@ fn make_consumer(
         custom_id: custom_id.map(|s| s.to_string()),
         credentials,
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -246,8 +246,8 @@ fn test_consumer_with_no_keyauth_credentials() {
         custom_id: None,
         credentials,
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     let index = ConsumerIndex::new(&[consumer]);
 
@@ -375,8 +375,8 @@ fn make_consumer_with_array_keys(id: &str, username: &str, keys: &[&str]) -> Con
         custom_id: None,
         credentials,
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -453,8 +453,8 @@ fn make_consumer_with_array_mtls(id: &str, username: &str, identities: &[&str]) 
         custom_id: None,
         credentials,
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -505,8 +505,8 @@ fn make_consumer_with_jwt(id: &str, username: &str) -> Consumer {
         custom_id: None,
         credentials,
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -530,8 +530,8 @@ fn make_consumer_with_hmac(id: &str, username: &str) -> Consumer {
         custom_id: None,
         credentials,
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -646,8 +646,8 @@ fn test_auth_type_counts_multiple_jwt_array_credentials() {
         custom_id: None,
         credentials,
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     let index = ConsumerIndex::new(&[c]);
     let (_keyauth, _basic, _mtls, jwt, _hmac, _identity, _total) = index.auth_type_counts();
@@ -701,8 +701,8 @@ fn test_build_index_single_consumer_basicauth_only() {
         custom_id: None,
         credentials,
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     let index = ConsumerIndex::new(&[c]);
 
@@ -820,8 +820,8 @@ fn test_build_index_consumer_with_all_credential_types() {
         custom_id: Some("custom-all".to_string()),
         credentials,
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     let index = ConsumerIndex::new(&[c]);
 
@@ -1060,8 +1060,8 @@ fn test_multi_jwt_array_credential_count() {
         custom_id: None,
         credentials,
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     let index = ConsumerIndex::new(&[c]);
 
@@ -1269,8 +1269,8 @@ fn test_apply_delta_modify_hmac_consumer_updates_count() {
         custom_id: None,
         credentials,
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     index.apply_delta(&[], &[], &[c1_modified]);
 
@@ -1322,8 +1322,8 @@ fn test_consumer_with_empty_credentials() {
         custom_id: None,
         credentials: HashMap::new(),
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     let index = ConsumerIndex::new(&[c]);
 
@@ -1401,8 +1401,8 @@ fn test_non_object_array_elements_filtered_out() {
         custom_id: None,
         credentials,
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     let index = ConsumerIndex::new(&[c]);
 
@@ -1463,8 +1463,8 @@ fn test_keyauth_entry_missing_key_field_not_indexed() {
         custom_id: None,
         credentials,
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     let index = ConsumerIndex::new(&[c]);
 
@@ -1497,8 +1497,8 @@ fn test_mtls_entry_missing_identity_field_not_indexed() {
         custom_id: None,
         credentials,
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     let index = ConsumerIndex::new(&[c]);
 

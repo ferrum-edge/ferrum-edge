@@ -11,7 +11,6 @@ use crate::scaffolding::port_registry::TestSocket;
 
 use arc_swap::ArcSwap;
 use base64::Engine;
-use chrono::Utc;
 use ferrum_edge::admin::{
     AdminState,
     jwt_auth::{JwtConfig, JwtManager},
@@ -28,6 +27,7 @@ use ferrum_edge::modes::mesh::federation::{
 use ferrum_edge::modes::mesh::runtime::MeshRuntimeState;
 use ferrum_edge::plugins::PluginHttpClient;
 use ferrum_edge::proxy::ProxyState;
+use ferrum_edge::time_compat::UtcTimestamp;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -404,14 +404,14 @@ fn jwt_manager(config: &AdminTestConfig) -> JwtManager {
 }
 
 fn admin_token(config: &AdminTestConfig) -> String {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "iss": config.jwt_issuer,
         "sub": "test-user",
         "role": "admin",
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(config.max_ttl as i64)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(config.max_ttl as i64)).unwrap()).unix_timestamp(),
         "jti": uuid::Uuid::new_v4().to_string(),
     });
     let header = Header::new(jsonwebtoken::Algorithm::HS256);
@@ -422,7 +422,7 @@ fn admin_token(config: &AdminTestConfig) -> String {
 fn build_admin_state(jwt: JwtManager, mesh_runtime_state: Option<MeshRuntimeState>) -> AdminState {
     let cfg = GatewayConfig {
         version: "1".to_string(),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     let env_config = EnvConfig {

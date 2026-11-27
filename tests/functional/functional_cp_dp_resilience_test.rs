@@ -34,7 +34,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use chrono::Utc;
 use ferrum_edge::admin::{
     AdminState,
     jwt_auth::{JwtConfig, JwtManager},
@@ -46,6 +45,7 @@ use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::grpc::cp_server::{CpGrpcServer, DpNodeRegistry};
 use ferrum_edge::grpc::dp_client::{self, DpCpConnectionState};
 use ferrum_edge::proxy::ProxyState;
+use ferrum_edge::time_compat::UtcTimestamp;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
 use tokio::time::{sleep, timeout};
@@ -133,8 +133,8 @@ fn create_test_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }
@@ -313,14 +313,14 @@ async fn spawn_admin(state: AdminState) -> (String, tokio::sync::watch::Sender<b
 }
 
 fn generate_admin_token() -> String {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "iss": "ferrum-edge",
         "sub": "resilience-test",
         "role": "admin",
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(3600)).unwrap()).unix_timestamp(),
         "jti": uuid::Uuid::new_v4().to_string(),
     });
     encode(
@@ -413,7 +413,7 @@ async fn test_broadcast_overflow_triggers_full_snapshot_recovery() {
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };
@@ -481,7 +481,7 @@ async fn test_broadcast_overflow_triggers_full_snapshot_recovery() {
             consumers: vec![],
             plugin_configs: vec![],
             upstreams: vec![],
-            loaded_at: Utc::now(),
+            loaded_at: UtcTimestamp::now(),
             known_namespaces: Vec::new(),
             ..Default::default()
         };
@@ -550,7 +550,7 @@ async fn test_multi_cp_failover_connects_to_fallback() {
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };
@@ -663,7 +663,7 @@ async fn test_primary_retry_reconnects_to_primary() {
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };
@@ -724,7 +724,7 @@ async fn test_primary_retry_reconnects_to_primary() {
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };
@@ -828,7 +828,7 @@ async fn test_cluster_endpoint_shape_cp_and_dp() {
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };

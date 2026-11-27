@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use chrono::Utc;
 use ferrum_edge::config::types::{
     GatewayConfig, HealthCheckConfig, LoadBalancerAlgorithm, PassiveHealthCheck, Proxy,
     ResolvedSubsetTrafficPolicy, SubsetDefinition, SubsetTrafficPolicy, Upstream,
@@ -11,6 +10,7 @@ use ferrum_edge::health_check::HealthChecker;
 use ferrum_edge::load_balancer::{
     HashOnStrategy, HealthContext, LoadBalancerCache, target_host_port_key, target_key,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 
 fn target(host: &str, port: u16) -> UpstreamTarget {
     weighted_target(host, port, 1)
@@ -83,7 +83,7 @@ fn upstream_with_overrides(
     targets: Vec<UpstreamTarget>,
     port_overrides: HashMap<u16, UpstreamPortOverride>,
 ) -> Upstream {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     Upstream {
         labels: Default::default(),
         id: "u1".to_string(),

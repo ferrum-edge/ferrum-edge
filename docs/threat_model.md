@@ -4,7 +4,7 @@ What Ferrum Edge defends, what each trust boundary assumes about the peer on the
 other side, which attacker capabilities are in scope, and — explicitly — which
 residual risks the shipped controls do **not** cover.
 
-This document describes the gateway as it exists today (`0.9.x`, pre-1.0). It
+This document describes the gateway as it exists in the current release. It
 is a statement of current posture, not a roadmap. Where a control is partial, the
 gap is written down rather than softened. The operational counterpart is
 [hardening.md](hardening.md); every control named here is configured there.

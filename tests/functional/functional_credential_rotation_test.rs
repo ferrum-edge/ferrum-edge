@@ -16,7 +16,7 @@ use crate::scaffolding::port_registry::TestSocket;
 use crate::common::{
     TestGateway, empty_digest_header, hmac_authority_from_url, hmac_v2_authorization,
 };
-use chrono::Utc;
+use ferrum_edge::time_compat::UtcTimestamp;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
 use std::time::Duration;
@@ -287,11 +287,11 @@ async fn attach_plugins(
 }
 
 fn generate_consumer_jwt(consumer_username: &str, secret: &str, exp_offset_secs: i64) -> String {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "sub": consumer_username,
-        "iat": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(exp_offset_secs)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(exp_offset_secs)).unwrap()).unix_timestamp(),
     });
     let header = Header::new(jsonwebtoken::Algorithm::HS256);
     let key = EncodingKey::from_secret(secret.as_bytes()).unwrap();
@@ -755,7 +755,7 @@ async fn test_credential_rotation_hmac() {
         username: &str,
         secret: &str,
     ) -> reqwest::Response {
-        let date = Utc::now().to_rfc2822();
+        let date = UtcTimestamp::now().to_rfc2822().unwrap();
         let authority = hmac_authority_from_url(url);
         let header = hmac_v2_authorization(
             "GET",

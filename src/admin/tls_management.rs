@@ -1651,6 +1651,7 @@ fn validate_filter_value(key: &str, value: &str) -> Result<(), String> {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TlsValidateRequest {
     #[serde(default)]
     cert_pem: Option<String>,
@@ -1667,6 +1668,7 @@ struct TlsValidateRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManagedCertificateRequest {
     #[serde(default)]
     id: Option<String>,
@@ -1687,6 +1689,7 @@ struct ManagedCertificateRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManagedCaBundleRequest {
     #[serde(default)]
     id: Option<String>,
@@ -1704,6 +1707,7 @@ struct ManagedCaBundleRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManagedCrlRequest {
     #[serde(default)]
     id: Option<String>,
@@ -1717,6 +1721,7 @@ struct ManagedCrlRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManagedOcspResponseRequest {
     #[serde(default)]
     id: Option<String>,
@@ -1730,6 +1735,7 @@ struct ManagedOcspResponseRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManagedJwksRequest {
     #[serde(default)]
     id: Option<String>,
@@ -1743,6 +1749,7 @@ struct ManagedJwksRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AcmeCertificateRequest {
     #[serde(default)]
     id: Option<String>,
@@ -1776,6 +1783,7 @@ enum AcmeChallengeType {
 
 #[cfg(feature = "acme")]
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AcmeOrderRequest {
     #[serde(default)]
     id: Option<String>,
@@ -1797,6 +1805,7 @@ struct AcmeOrderRequest {
 
 #[cfg(feature = "acme")]
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct AcmeOrderFinalizeRequest {
     #[serde(default)]
     certificate_id: Option<String>,
@@ -1812,6 +1821,7 @@ struct AcmeOrderFinalizeRequest {
 
 #[cfg(feature = "acme")]
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct AcmeRenewRequest {
     #[serde(default)]
     id: Option<String>,
@@ -1830,15 +1840,16 @@ struct AcmeRenewRequest {
 pub(super) async fn handle_validate(
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let request: TlsValidateRequest = match serde_json::from_slice(body_bytes) {
-        Ok(request) => request,
-        Err(error) => {
-            return Ok(super::json_response(
-                StatusCode::BAD_REQUEST,
-                &json!({"valid": false, "error": format!("Invalid JSON body: {error}")}),
-            ));
-        }
-    };
+    let request: TlsValidateRequest =
+        match crate::util::json_object::from_json_object_slice(body_bytes) {
+            Ok(request) => request,
+            Err(error) => {
+                return Ok(super::json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({"valid": false, "error": format!("Invalid JSON body: {error}")}),
+                ));
+            }
+        };
 
     match validate_tls_material(&request) {
         Ok(response) => Ok(super::json_response(StatusCode::OK, &response)),
@@ -2839,11 +2850,14 @@ fn request_managed_source_reloads() {
     let _ = crate::tls::source::subscription::request_all_material_set_reloads();
 }
 
+/// Admin request bodies are JSON objects: the shared object guard refuses a
+/// positional array (which serde would otherwise map onto struct fields in
+/// declaration order) as well as unknown members of the closed request types.
 fn parse_json<T>(body_bytes: &[u8]) -> Result<T, Box<Response<Full<Bytes>>>>
 where
     T: for<'de> Deserialize<'de>,
 {
-    serde_json::from_slice(body_bytes).map_err(|error| {
+    crate::util::json_object::from_json_object_slice(body_bytes).map_err(|error| {
         Box::new(super::json_response(
             StatusCode::BAD_REQUEST,
             &json!({"error": format!("Invalid JSON body: {error}")}),

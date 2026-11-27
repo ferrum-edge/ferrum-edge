@@ -5,7 +5,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
 use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope};
 use ferrum_edge::plugin_cache::PluginCache;
 use ferrum_edge::plugins::udp_logging::{UDP_LOGGING_CONFIG_KEYS, UdpLogging};
@@ -21,6 +20,7 @@ use super::plugin_utils::{
     assert_ws_session_end_record, create_test_stream_transaction_summary,
     create_test_transaction_summary, create_test_ws_disconnect_context,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 
 fn test_client() -> PluginHttpClient {
     PluginHttpClient::default()
@@ -773,8 +773,8 @@ fn test_udp_logging_disabled_skips_construction_validation() {
             priority_override: None,
             trigger: None,
             api_spec_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         }],
         ..GatewayConfig::default()
     };
@@ -809,8 +809,8 @@ async fn test_udp_logging_unknown_key_instance_keeps_last_known_good() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     let mut bad_gateway = GatewayConfig {
         proxies: vec![proxy.clone()],
@@ -1107,8 +1107,8 @@ fn test_udp_logging_file_dependency_phase_reports_bad_dtls_material() {
             priority_override: None,
             trigger: None,
             api_spec_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         }],
         ..GatewayConfig::default()
     };
@@ -1192,8 +1192,8 @@ fn test_udp_logging_file_dependency_duplicate_sources_materialize_once() {
                 priority_override: None,
                 trigger: None,
                 api_spec_id: None,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
+                created_at: UtcTimestamp::now(),
+                updated_at: UtcTimestamp::now(),
             },
             PluginConfig {
                 labels: Default::default(),
@@ -1207,8 +1207,8 @@ fn test_udp_logging_file_dependency_duplicate_sources_materialize_once() {
                 priority_override: None,
                 trigger: None,
                 api_spec_id: None,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
+                created_at: UtcTimestamp::now(),
+                updated_at: UtcTimestamp::now(),
             },
         ],
         ..GatewayConfig::default()

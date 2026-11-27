@@ -12,11 +12,11 @@
 //! configured deadline, a request that finishes inside the deadline is served
 //! normally, and requests no handler will read never have their body collected.
 
-use chrono::Utc;
 use ferrum_edge::admin::{
     AdminConnLimiter, AdminRequestLimits, AdminState,
     jwt_auth::{JwtConfig, JwtManager},
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -57,14 +57,14 @@ fn jwt_manager() -> JwtManager {
 }
 
 fn token_with_role(role: &str) -> String {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "iss": JWT_ISSUER,
         "sub": "slowloris-test-user",
         "role": role,
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(3600)).unwrap()).unix_timestamp(),
         "jti": Uuid::new_v4().to_string(),
     });
     let header = Header::new(jsonwebtoken::Algorithm::HS256);

@@ -17,7 +17,6 @@ use crate::scaffolding::port_registry::TestSocket;
 
 use arc_swap::ArcSwap;
 use base64::Engine;
-use chrono::Utc;
 use ferrum_edge::admin::{
     AdminState,
     jwt_auth::{JwtConfig, JwtManager},
@@ -28,6 +27,7 @@ use ferrum_edge::config::gateway_trust::{
     GatewayTrustBundleRecord, MAX_AUDIT_ACTOR_CHARS, MAX_X509_AUTHORITIES_PER_BUNDLE,
     record_trust_generation_published, reset_observability_for_tests,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
@@ -48,14 +48,14 @@ fn jwt_manager() -> JwtManager {
 }
 
 fn admin_token(subject: &str) -> String {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "iss": JWT_ISSUER,
         "sub": subject,
         "role": "admin",
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(3600)).unwrap()).unix_timestamp(),
         "jti": uuid::Uuid::new_v4().to_string(),
     });
     encode(
@@ -652,7 +652,7 @@ async fn a_backup_round_trips_the_trust_resource_with_server_assigned_revisions(
     record_trust_generation_published(
         std::slice::from_ref(&published),
         None,
-        Utc::now().timestamp().max(0) as u64,
+        UtcTimestamp::now().unix_timestamp().max(0) as u64,
     );
     let (status, view) = get_json(&base, "/gateway-trust/status", "ferrum").await;
     assert_eq!(status, 200);

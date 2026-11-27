@@ -13,7 +13,8 @@
 //!   secret namespace [`PLUGIN_SECRET_EXAMPLE_ENV`])
 //!
 //! Every inventory member owns its own docs table row and template
-//! assignment; build-out policy keeps no compatibility aliases.
+//! assignment. There are no compatibility aliases; a rename or removal follows
+//! the deprecation rules in `docs/support_policy.md`.
 //!
 //! External unit tests under `tests/unit/config/env_docs_parity_tests.rs`
 //! fail closed when a public inventory setting lacks a
@@ -632,7 +633,6 @@ pub const PUBLIC_FERRUM_ENV_SETTINGS: &[&str] = &[
     TRANSCRIPT_SINK_SECRET_EXAMPLE_ENV,
     "FERRUM_TRUSTED_PROXIES",
     "FERRUM_UDP_CLEANUP_INTERVAL_SECONDS",
-    "FERRUM_UDP_GRO_ENABLED",
     "FERRUM_UDP_GSO_ENABLED",
     "FERRUM_UDP_MAX_SESSIONS",
     "FERRUM_UDP_MAX_SESSIONS_PER_IP",

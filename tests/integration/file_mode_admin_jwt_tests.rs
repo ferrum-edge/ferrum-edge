@@ -11,7 +11,6 @@ use crate::scaffolding::port_registry::TestSocket;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use chrono::{Duration as ChronoDuration, Utc};
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
 use tokio::time::sleep;
@@ -19,6 +18,7 @@ use tokio::time::sleep;
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::config::{EnvConfig, OperatingMode};
 use ferrum_edge::modes::file::{self, ServeOptions};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 /// Serialize the few tests that mutate `FERRUM_ADMIN_JWT_*` inside this
 /// integration binary. Other integration modules do not touch these keys.
@@ -105,13 +105,13 @@ fn file_env(proxy_port: u16, admin_port: u16) -> EnvConfig {
 }
 
 fn mint_external_admin_token(secret: &str, issuer: &str) -> String {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "iss": issuer,
         "sub": "external-operator",
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + ChronoDuration::seconds(1800)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(1800)).unwrap()).unix_timestamp(),
         "jti": uuid::Uuid::new_v4().to_string(),
         "role": "admin",
     });

@@ -13,7 +13,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
-use chrono::Utc;
 use ferrum_edge::_test_support::{
     run_after_proxy_hooks_reject_for_test, run_before_proxy_hooks_for_test,
     set_grpc_deadline_budget_for_test,
@@ -27,6 +26,7 @@ use ferrum_edge::plugins::{
 use serde_json::json;
 
 use super::{make_plugin_config_with_json, make_proxy, minimal_plugin_config};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 /// Trait methods covered by [`PluginHooks`], with the flag each one needs.
 /// `log_with_mesh_key`'s default calls `log`, so either override needs `LOG`.
@@ -568,7 +568,7 @@ fn published_request_transformer(
         version: "1".to_string(),
         proxies: vec![make_proxy("api", "/api", vec!["stamp"])],
         plugin_configs: vec![plugin_config],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..Default::default()
     };
     let cache = PluginCache::new(&config).expect("plugin cache builds");

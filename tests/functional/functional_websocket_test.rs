@@ -36,6 +36,7 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
 use crate::scaffolding::ports::reserve_refused_tcp_port;
 use crate::scaffolding::{H3WebSocketFrame, Http3Client, WebSocketOptions};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 // ============================================================================
 // Helpers
@@ -4141,8 +4142,8 @@ async fn test_websocket_active_jwt_session_closes_at_credential_expiry() {
     // Mint only after the readiness barrier has proven ownership of the
     // gateway listener, so the short-lived credential is valid at upgrade.
     let token_minted_at = tokio::time::Instant::now();
-    let expires_at = chrono::Utc::now()
-        .timestamp()
+    let expires_at = UtcTimestamp::now()
+        .unix_timestamp()
         .saturating_add(CREDENTIAL_TTL_SECONDS);
     let token = jsonwebtoken::encode(
         &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),

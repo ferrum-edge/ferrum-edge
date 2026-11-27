@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 
 use super::jwks_auth_support::{build_rsa_jwks_from_pem, default_client, make_ctx};
 use super::plugin_utils::{assert_continue, assert_reject};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const ISSUER: &str = "https://algorithms.example.com";
 const RSA_PRIVATE_PEM: &[u8] = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
@@ -38,7 +39,7 @@ fn sign(alg: Algorithm, kid: &str, key: &EncodingKey, sub: &str) -> String {
         &json!({
             "iss": ISSUER,
             "sub": sub,
-            "exp": chrono::Utc::now().timestamp() + 3600
+            "exp": UtcTimestamp::now().unix_timestamp() + 3600
         }),
         key,
     )

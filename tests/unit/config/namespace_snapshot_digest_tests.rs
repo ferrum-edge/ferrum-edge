@@ -2,7 +2,6 @@
 //! and deployment authority: stored spec documents are fenced by digest, never
 //! materialized as JSON number arrays.
 
-use chrono::{DateTime, Utc};
 use ferrum_edge::config::db_backend::{
     ConditionalNamespaceSnapshot, MAX_NAMESPACE_SNAPSHOT_REPRESENTATION_BYTES, SnapshotDigest,
     is_namespace_snapshot_too_large,
@@ -13,6 +12,7 @@ use ferrum_edge::config::deployment_mutation::{
     is_deployment_commit_outcome_unknown, is_deployment_mutation_not_started,
 };
 use ferrum_edge::config::types::{ApiSpec, GatewayConfig, SpecFormat};
+use ferrum_edge::time_compat::UtcTimestamp;
 use serde_json::json;
 
 const LARGE_SPEC_BYTES: usize = 6 * 1024 * 1024;
@@ -20,7 +20,7 @@ const LARGE_SPEC_BYTES: usize = 6 * 1024 * 1024;
 fn spec(id: &str, content: Vec<u8>) -> ApiSpec {
     // A fixed instant: snapshots built by separate calls must be identical,
     // and chrono renders sub-second precision with a value-dependent width.
-    let now: DateTime<Utc> = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let now: UtcTimestamp = UtcTimestamp::from_unix_timestamp(1_700_000_000).unwrap();
     ApiSpec {
         id: id.to_string(),
         namespace: "ferrum".to_string(),

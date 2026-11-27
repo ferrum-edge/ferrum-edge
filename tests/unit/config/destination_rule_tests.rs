@@ -9,6 +9,7 @@ use ferrum_edge::config::types::{
     GatewayConfig, H2UpgradePolicy, LoadBalancerAlgorithm, PassiveHealthCheck, Proxy,
     SubsetDefinition, SubsetTrafficPolicy, Upstream, UpstreamTarget,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use std::collections::HashMap;
 
 // ── SubsetDefinition / SubsetTrafficPolicy serde ─────────────────────────────
@@ -229,6 +230,65 @@ fn passive_health_check_rejects_removed_and_unknown_fields() {
     }
 }
 
+/// Every nested upstream object rejects unknown keys, naming the key, rather
+/// than silently dropping a misspelled policy (1.0 config freeze).
+#[test]
+fn upstream_nested_objects_reject_unknown_keys() {
+    let base = serde_json::json!({
+        "id": "u1",
+        "targets": [{"host": "backend.example", "port": 8080}],
+    });
+    for (pointer, key, value) in [
+        (
+            "",
+            "health_checks",
+            serde_json::json!({"pasive": {"unhealthy_threshold": 1}}),
+        ),
+        (
+            "",
+            "health_checks",
+            serde_json::json!({"active": {"intervl_seconds": 5}}),
+        ),
+        ("", "hash_on_cookie_config", serde_json::json!({"pth": "/"})),
+        (
+            "",
+            "locality_lb_setting",
+            serde_json::json!({"enabeld": true}),
+        ),
+        (
+            "",
+            "subsets",
+            serde_json::json!([{"name": "v1", "labels": {"v": "1"}, "lables": {}}]),
+        ),
+        (
+            "",
+            "port_overrides",
+            serde_json::json!({"8080": {"conect_timeout_ms": 5}}),
+        ),
+        (
+            "",
+            "service_discovery",
+            serde_json::json!({
+                "provider": "dns_sd",
+                "dns_sd": {"service_name": "backend", "poll_intervl_seconds": 5}
+            }),
+        ),
+        ("/targets/0", "wieght", serde_json::json!(1)),
+    ] {
+        let mut body = base.clone();
+        body.pointer_mut(pointer)
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("object")
+            .insert(key.to_string(), value);
+        let error = serde_json::from_value::<Upstream>(body)
+            .expect_err("an unknown nested upstream key must be rejected");
+        assert!(
+            error.to_string().contains("unknown field"),
+            "{pointer}/{key}: {error}"
+        );
+    }
+}
+
 #[test]
 fn upstream_with_removed_passive_field_is_rejected() {
     let body = serde_json::json!({
@@ -284,8 +344,8 @@ fn make_upstream(subsets: Option<Vec<SubsetDefinition>>) -> Upstream {
         backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         api_spec_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         k8s_service_uid: None,
         admission_upstream_id: None,
         pending_limit_scope: None,

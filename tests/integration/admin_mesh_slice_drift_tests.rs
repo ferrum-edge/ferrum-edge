@@ -8,7 +8,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use chrono::Utc;
 use ferrum_edge::admin::{
     AdminState,
     jwt_auth::{JwtConfig, JwtManager},
@@ -26,6 +25,7 @@ use ferrum_edge::grpc::proto::mesh_config_sync_server::MeshConfigSyncServer;
 use ferrum_edge::grpc::proto::{
     MeshSliceRejectReason, MeshSliceStatusPhase, MeshSliceStatusReport, MeshSubscribeRequest,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -37,14 +37,14 @@ const ADMIN_JWT_ISSUER: &str = "test-ferrum-edge";
 const GRPC_JWT_SECRET: &str = "test-cp-dp-grpc-jwt-secret-at-least-32";
 
 fn admin_token() -> String {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "iss": ADMIN_JWT_ISSUER,
         "sub": "test-user",
         "role": "admin",
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(3600)).unwrap()).unix_timestamp(),
         "jti": uuid::Uuid::new_v4().to_string(),
     });
     encode(
@@ -420,15 +420,15 @@ async fn status_report_skips_session_mismatches_across_permitted_namespaces() {
             .await;
     });
 
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let token = encode(
         &Header::new(jsonwebtoken::Algorithm::HS256),
         &json!({
             "iss": DEFAULT_CP_DP_JWT_ISSUER,
             "sub": "mesh-dp-beta",
-            "iat": now.timestamp(),
-            "nbf": now.timestamp(),
-            "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
+            "iat": now.unix_timestamp(),
+            "nbf": now.unix_timestamp(),
+            "exp": (now.checked_add(::time::SignedDuration::seconds(3600)).unwrap()).unix_timestamp(),
             "ns": ["alpha", "beta"],
             "aud": MESH_LOCAL_SUBSCRIBE_AUDIENCE,
         }),
@@ -503,7 +503,12 @@ async fn drift_registry_refusal_still_delivers_mesh_config_untracked() {
     let drift = Arc::new(MeshSliceDriftRegistry::with_max_entries(1));
     // Occupy the only slot with a connected row so it cannot be evicted.
     let occupant = drift
-        .open_session("mesh-dp-occupant", "ferrum", Utc::now(), Some("v1"))
+        .open_session(
+            "mesh-dp-occupant",
+            "ferrum",
+            UtcTimestamp::now(),
+            Some("v1"),
+        )
         .expect("occupant admitted");
     assert!(!occupant.is_empty());
 

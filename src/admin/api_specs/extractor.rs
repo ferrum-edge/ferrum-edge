@@ -24,8 +24,8 @@ use crate::config::types::{
 use crate::config::types::{PluginAssociation, PluginConfig, PluginScope, Proxy, Upstream};
 use crate::plugins::mcp_openapi_bridge as mcp_bridge;
 use crate::plugins::utils::sse::is_text_event_stream_media_type;
+use crate::time_compat::UtcTimestamp;
 use crate::util::media_type::is_concrete_http_media_type;
-use chrono::Utc;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -846,6 +846,14 @@ pub fn extract_with_external_refs(
 /// This deliberately ignores associations auto-added from `x-ferrum-plugins`.
 /// Replacement code uses it to distinguish associations owned by the previous
 /// spec document from associations an operator added later through direct CRUD.
+///
+/// It reads the *stored* document of an already admitted spec, which may
+/// predate the closed `PluginAssociation` schema. It therefore projects each
+/// entry onto its `plugin_config_id` (the array, each entry being an object,
+/// and the ID being a string are still required) instead of re-running the
+/// strict decode, so a historical extra member can never block the `PUT`
+/// that replaces the document. Submitted documents are still decoded
+/// strictly by the extractor.
 pub fn extract_declared_proxy_plugin_association_ids(
     body: &[u8],
     declared_format: Option<SpecFormat>,
@@ -867,14 +875,21 @@ pub fn extract_declared_proxy_plugin_association_ids(
     let mut out = Vec::with_capacity(arr.len());
     let mut seen = std::collections::HashSet::with_capacity(arr.len());
     for entry in arr {
-        let assoc: PluginAssociation = serde_json::from_value(entry.clone()).map_err(|e| {
-            ExtractError::MalformedExtension {
+        let object = entry
+            .as_object()
+            .ok_or_else(|| ExtractError::MalformedExtension {
                 which: "x-ferrum-proxy.plugins",
-                error: e.to_string(),
-            }
-        })?;
-        if !assoc.plugin_config_id.is_empty() && seen.insert(assoc.plugin_config_id.clone()) {
-            out.push(assoc.plugin_config_id);
+                error: "expected each association to be an object".to_string(),
+            })?;
+        let plugin_config_id = object
+            .get("plugin_config_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ExtractError::MalformedExtension {
+                which: "x-ferrum-proxy.plugins",
+                error: "each association requires a string `plugin_config_id`".to_string(),
+            })?;
+        if !plugin_config_id.is_empty() && seen.insert(plugin_config_id.to_string()) {
+            out.push(plugin_config_id.to_string());
         }
     }
     Ok(out)
@@ -958,7 +973,7 @@ fn auto_inject_openapi_validator(
     }
 
     validate_openapi_validator_config_budget(&auto_config)?;
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     plugins.push(PluginConfig {
         labels: Default::default(),
         id: String::new(),
@@ -2337,7 +2352,7 @@ fn auto_inject_mcp_gateway(
     }
 
     validate_generated_config_budget("x-ferrum-mcp", "mcp_gateway", &auto_config)?;
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     plugins.push(PluginConfig {
         labels: Default::default(),
         id: String::new(),
@@ -9559,18 +9574,16 @@ x-ferrum-proxy:
 
     #[test]
     fn test_hash_ignores_created_at_and_updated_at() {
-        use chrono::{TimeZone, Utc};
-
         let mut bundle1 = build_test_bundle("hash-proxy", None);
         let mut bundle2 = build_test_bundle("hash-proxy", None);
 
         // Stamp different timestamps — hash_resource_bundle strips
         // created_at / updated_at via strip_metadata, so these must not
         // affect the hash.
-        bundle1.proxy.created_at = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
-        bundle1.proxy.updated_at = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
-        bundle2.proxy.created_at = Utc.with_ymd_and_hms(2025, 6, 15, 12, 0, 0).unwrap();
-        bundle2.proxy.updated_at = Utc.with_ymd_and_hms(2025, 6, 15, 12, 0, 0).unwrap();
+        bundle1.proxy.created_at = "2024-01-01T00:00:00Z".parse::<UtcTimestamp>().unwrap();
+        bundle1.proxy.updated_at = "2024-01-01T00:00:00Z".parse::<UtcTimestamp>().unwrap();
+        bundle2.proxy.created_at = "2025-06-15T12:00:00Z".parse::<UtcTimestamp>().unwrap();
+        bundle2.proxy.updated_at = "2025-06-15T12:00:00Z".parse::<UtcTimestamp>().unwrap();
 
         let hash1 = hash_resource_bundle(&bundle1).unwrap();
         let hash2 = hash_resource_bundle(&bundle2).unwrap();

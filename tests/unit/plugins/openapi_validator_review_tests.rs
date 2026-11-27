@@ -4,7 +4,6 @@
 //! specificity, scope-list and plugin-scope admission, and declared
 //! event-stream responses.
 
-use chrono::Utc;
 use ferrum_edge::_test_support::{
     RESPONSE_BUFFER_RESERVATION_UNIT_BYTES as UNIT, RESPONSE_DECODE_BROTLI_SCRATCH_BYTES,
     ResponseBufferBudgetProbe, openapi_validator_decode_body_in,
@@ -19,6 +18,7 @@ use std::collections::HashMap;
 use std::io::Write as _;
 
 use super::plugin_utils::{assert_continue, assert_reject};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 fn content_type_headers(content_type: &str) -> HashMap<String, String> {
     HashMap::from([("content-type".to_string(), content_type.to_string())])
@@ -877,8 +877,8 @@ fn validator_plugin_config(scope: PluginScope, proxy_id: Option<&str>) -> Plugin
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -898,7 +898,7 @@ fn non_proxy_scoped_validators_are_refused_by_shared_config_validation() {
         let config = GatewayConfig {
             version: "1".to_string(),
             plugin_configs: vec![plugin],
-            loaded_at: Utc::now(),
+            loaded_at: UtcTimestamp::now(),
             ..Default::default()
         };
         let load_errors = config

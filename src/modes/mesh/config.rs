@@ -70,6 +70,7 @@ pub enum AppProtocol {
 /// (K8s labels, VM tags, or static), the `service_name` is the logical
 /// service it participates in.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Workload {
     pub spiffe_id: SpiffeId,
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object")]
@@ -188,6 +189,7 @@ pub struct NodeWaypointAssertor {
 
 /// Destination NodeWaypoint transport endpoint for a workload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeWaypointEndpoint {
     /// IP or DNS name of the destination NodeWaypoint instance that owns the
     /// selected workload's node. This is the outer TCP/TLS dial target.
@@ -225,6 +227,7 @@ fn is_default_node_waypoint_hbone_port(port: &u16) -> bool {
 
 /// A port advertised by a workload.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkloadPort {
     pub port: u16,
     #[serde(default)]
@@ -262,6 +265,7 @@ impl WorkloadSelector {
 
 /// A logical service. Workloads are referenced by SPIFFE ID.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshService {
     pub name: String,
     pub namespace: String,
@@ -317,6 +321,7 @@ pub struct MeshService {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServicePort {
     pub port: u16,
     #[serde(default)]
@@ -397,6 +402,7 @@ impl ServicePort {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkloadRef {
     pub spiffe_id: SpiffeId,
 }
@@ -2495,9 +2501,9 @@ pub fn workload_selector_matches<L: WorkloadLabels + ?Sized>(
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 /// Closed with its JWT rule types (issue #6616), like the authorization
 /// grammar: a misspelled `refused` or `jwt_rules` member would otherwise drop
-/// a refusal or a token requirement. Inventory types (`Workload`,
-/// `MeshService`) deliberately stay open for forward compatibility
-/// (`unknown_mesh_fields_are_tolerated`).
+/// a refusal or a token requirement. Since the 1.0 config freeze every native
+/// mesh resource type is closed, inventory types (`Workload`, `MeshService`)
+/// included (`unknown_mesh_fields_are_rejected`).
 #[serde(deny_unknown_fields)]
 pub struct MeshRequestAuthentication {
     pub name: String,
@@ -2980,6 +2986,7 @@ pub struct AccessLogFilter {
 /// Most-specific match wins per workload (WorkloadSelector > Namespace >
 /// MeshWide); same-specificity ties are broken by ASCII-ordered name.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshProxyConfig {
     pub name: String,
     pub namespace: String,
@@ -3287,6 +3294,7 @@ impl MtlsMode {
 // ── ServiceEntry ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServiceEntry {
     pub name: String,
     pub namespace: String,
@@ -3357,6 +3365,7 @@ pub enum ServiceEntryLocation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshEndpoint {
     pub address: String,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -3373,6 +3382,7 @@ pub struct MeshEndpoint {
 /// [`crate::identity::TrustBundleSet`] in shape, but uses serialisable
 /// representations so the config can be persisted to file/DB.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TrustBundleSet {
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object")]
     pub local: TrustBundle,
@@ -3386,6 +3396,7 @@ pub struct TrustBundleSet {
 /// serialisation-friendly (no `Vec<u8>` raw bytes) so YAML/JSON output
 /// stays human-readable.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TrustBundle {
     pub trust_domain: TrustDomain,
     /// Base64-encoded DER certificates.
@@ -3399,6 +3410,7 @@ pub struct TrustBundle {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct JwtAuthority {
     pub key_id: String,
     pub public_key_pem: String,
@@ -3469,6 +3481,7 @@ impl TrustBundleSet {
 /// When the flag is unset, sidecars are accepted and persisted in
 /// `MeshConfig` but slice narrowing is not applied (existing behavior).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshSidecar {
     pub name: String,
     pub namespace: String,
@@ -3547,6 +3560,7 @@ pub struct MeshSidecar {
 /// disambiguation the default inbound materializer uses, but keyed by the
 /// declared listener port instead of the resolved container port.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshSidecarIngress {
     /// The listener port the workload declares. Inbound traffic addressed to
     /// this port (captured original destination, or a peer's request
@@ -4153,6 +4167,7 @@ fn parse_ingress_default_endpoint(
 /// A single egress listener entry under a [`MeshSidecar`]. Carries the
 /// Istio scope-host syntax (`namespace/host`) plus an optional port narrowing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshSidecarEgress {
     /// Egress hosts in Istio scope-host syntax:
     ///   - `*/*`           — allow everything (effectively no narrowing)
@@ -4308,6 +4323,7 @@ pub struct EastWestGateway {
 /// The mesh runtime applies these onto matching `Upstream` entries during
 /// mesh config preparation (`apply_destination_rules`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshDestinationRule {
     pub name: String,
     pub namespace: String,
@@ -4360,6 +4376,7 @@ pub struct MeshDestinationRule {
 
 /// Traffic policy controlling connection pool, outlier detection, and LB.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshTrafficPolicy {
     /// Backend connect timeout in milliseconds
     /// (from `connectionPool.tcp.connectTimeout`).
@@ -4454,6 +4471,7 @@ pub struct MeshTrafficPolicy {
 /// [`crate::config::types::UpstreamPortOverride`] for the corresponding
 /// resolved slots and dispatch wiring.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshConnectionPoolHttp {
     /// Mapped from `idleTimeout` (parsed as an Istio duration, persisted
     /// as milliseconds). Translator rejects sub-second durations because
@@ -4539,6 +4557,7 @@ pub struct MeshConnectionPoolHttp {
 /// a `MeshTrafficPolicyTls` with a server-side mode is treated as a
 /// programming error by the cold-path apply).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshTrafficPolicyTls {
     /// DR client-side TLS mode: `Disable` / `Simple` / `Mutual` / `IstioMutual`.
     ///
@@ -4615,6 +4634,7 @@ impl Default for MeshTrafficPolicyTls {
 
 /// Outlier detection settings from Istio DestinationRule.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshOutlierDetection {
     /// Number of consecutive errors before ejecting a target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4655,6 +4675,7 @@ pub enum MeshSimpleLb {
 
 /// Consistent hash key source.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshConsistentHash {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_header_name: Option<String>,
@@ -4680,6 +4701,7 @@ pub struct MeshConsistentHash {
 /// failover, it replaces the default region/zone/subzone tiers with ordered
 /// workload-label priority tiers. Without that signal it is inert.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshLocalityLbSetting {
     /// When `false`, disables all locality preference (priority tier,
     /// distribute weighting, failover override, and failover-priority
@@ -4728,6 +4750,7 @@ impl Default for MeshLocalityLbSetting {
 /// integers verbatim and use them as ratios so non-summing operator
 /// configurations still produce a deterministic ratio split.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshLocalityDistribute {
     pub from: String,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -4737,6 +4760,7 @@ pub struct MeshLocalityDistribute {
 /// One `localityLbSetting.failover[]` entry. `from` and `to` are Istio
 /// region names (the first `region/zone/subzone` segment).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshLocalityFailover {
     pub from: String,
     pub to: String,
@@ -4744,6 +4768,7 @@ pub struct MeshLocalityFailover {
 
 /// Named subset of targets with label selectors and optional policy override.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshSubset {
     pub name: String,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -4770,6 +4795,7 @@ pub struct MeshSubset {
 /// host-routed `/`; the K8s translator carries the first corsPolicy-bearing
 /// `http[]` entry per host).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshVirtualServiceCorsPolicy {
     /// Source resource name (diagnostics only).
     pub name: String,
@@ -4895,6 +4921,7 @@ pub fn virtual_service_http_routes_exported_to_namespace(
 
 /// The Istio `corsPolicy` fields Ferrum projects onto the `cors` plugin.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshCorsPolicy {
     /// Origin matchers (Istio `allowOrigins[]` StringMatch). At least one is
     /// required — a CORS policy that can never match an origin is a config
@@ -5096,6 +5123,7 @@ impl NodeWaypointCaptureInventoryState {
 /// Stored as `Option<Box<MeshConfig>>` on `GatewayConfig` — `None` when
 /// the operator has no mesh resources, zero cost in that case.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshConfig {
     /// Istio root namespace used for mesh-wide policy resources and
     /// cluster-wide Sidecar defaults. Native mesh YAML can override it;
@@ -6733,6 +6761,7 @@ impl MeshConfig {
 /// list as the authoritative routing-view narrowing key when
 /// `MeshSliceRequest.waypoint_name == Some(name)`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshWaypointBinding {
     /// Waypoint name. Matches the `metadata.name` of the Gateway resource
     /// in the K8s flow, and the `istio.io/use-waypoint` annotation value
@@ -6807,6 +6836,7 @@ fn default_waypoint_for() -> String {
 /// xDS ECDS without needing a separate per-service lookup table at apply
 /// time.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshWaypointServiceRef {
     pub namespace: String,
     pub name: String,

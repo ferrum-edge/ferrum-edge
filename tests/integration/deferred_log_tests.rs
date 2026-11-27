@@ -2190,7 +2190,7 @@ async fn deferred_terminal_formats_rfc3339_timestamp_at_fire_time() {
         "the fire-time fill formats the context's own receipt instant"
     );
     assert!(
-        chrono::DateTime::parse_from_rfc3339(&captures[0].timestamp_received).is_ok(),
+        ferrum_edge::time_compat::parse_rfc3339_chrono(&captures[0].timestamp_received).is_ok(),
         "the delivered timestamp must be parseable rfc3339, not an empty string"
     );
 }

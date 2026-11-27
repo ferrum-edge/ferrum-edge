@@ -68,7 +68,7 @@ fn loads_yaml_mesh_document_and_builds_slice() {
         !slice.version.is_empty(),
         "slice version must carry the load timestamp"
     );
-    chrono::DateTime::parse_from_rfc3339(&slice.version)
+    ferrum_edge::time_compat::parse_rfc3339_chrono(&slice.version)
         .expect("file-built slice version is the RFC3339 load timestamp");
 }
 
@@ -346,7 +346,7 @@ fn reload_then_load_produces_advancing_versions() {
     let path = write_temp("yaml", VALID_MESH_YAML);
     let first = load_mesh_slice_from_file(&path, request_for_namespace("ferrum"))
         .expect("first load succeeds");
-    // Two `Utc::now()` stamps in the same instant would compare equal and
+    // Two `UtcTimestamp::now()` stamps in the same instant would compare equal and
     // mask the assertion; force distinct timestamps.
     std::thread::sleep(std::time::Duration::from_millis(2));
     let second = load_mesh_slice_from_file(&path, request_for_namespace("ferrum"))

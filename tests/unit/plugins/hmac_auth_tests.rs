@@ -1,7 +1,6 @@
 //! Tests for hmac_auth plugin
 
 use base64::Engine;
-use chrono::Utc;
 use ferrum_edge::ConsumerIndex;
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::plugins::utils::auth_flow::AuthMechanism;
@@ -18,6 +17,7 @@ use super::plugin_utils::{
     assert_continue, assert_reject, assert_reject_body, context_with_materialized_raw_header,
     context_with_materialized_raw_header_bytes, create_test_proxy,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 
 type HmacSha256 = Hmac<Sha256>;
 type HmacSha512 = Hmac<Sha512>;
@@ -65,8 +65,8 @@ fn create_hmac_consumer_named(id: &str, username: &str, secret: &str) -> Consume
         custom_id: None,
         credentials,
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -88,8 +88,8 @@ fn create_consumer_without_hmac_creds() -> Consumer {
         custom_id: None,
         credentials,
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -125,7 +125,7 @@ fn set_ctx_namespace(ctx: &mut RequestContext, namespace: &str) {
 
 /// Generate a current RFC 2822 date string.
 fn current_date() -> String {
-    Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string()
+    httpdate::fmt_http_date(std::time::SystemTime::now())
 }
 
 /// Nonces the signing helpers bound into each signature, keyed by signature,
@@ -1490,7 +1490,7 @@ async fn test_rfc3339_date_format() {
     let method = "GET";
     let path = "/test";
     // Use RFC 3339 date format
-    let date = Utc::now().to_rfc3339();
+    let date = UtcTimestamp::now().to_rfc3339();
     let signature = sign_sha256(TEST_SECRET, method, path, &date);
 
     let mut ctx = make_ctx(method, path);
@@ -1619,8 +1619,8 @@ fn create_hmac_consumer_with_secrets(secrets: &[&str]) -> Consumer {
         custom_id: None,
         credentials,
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -2147,9 +2147,12 @@ async fn v2_binds_every_signed_field() {
     let mut ctx = request.context();
     ctx.headers.insert(
         "date".to_string(),
-        (Utc::now() - chrono::Duration::seconds(30))
-            .format("%a, %d %b %Y %H:%M:%S GMT")
-            .to_string(),
+        httpdate::fmt_http_date(std::time::SystemTime::from(
+            UtcTimestamp::now()
+                .checked_sub(::time::SignedDuration::seconds(30))
+                .unwrap()
+                .into_offset_date_time(),
+        )),
     );
     assert_reject(
         plugin.authenticate(&mut ctx, &consumer_index).await,
@@ -3904,7 +3907,7 @@ fn test_component_value(ctx: &RequestContext, name: &str) -> String {
 fn rfc9421_params(nonce: &str) -> String {
     format!(
         r#";created={};keyid="{TEST_USERNAME}";nonce="{nonce}""#,
-        Utc::now().timestamp()
+        UtcTimestamp::now().unix_timestamp()
     )
 }
 
@@ -4104,7 +4107,7 @@ async fn rfc9421_binds_every_covered_component() {
 #[tokio::test]
 async fn rfc9421_enforces_created_and_expires() {
     let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
-    let now = Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let cases = [
         (
             "stale-created",
@@ -4180,7 +4183,7 @@ async fn rfc9421_enforces_created_and_expires() {
 async fn rfc9421_refuses_unknown_algorithms_components_and_parameters() {
     let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
     let nonce = test_nonce(0x7300);
-    let now = Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let base_params = format!(r#";created={now};keyid="{TEST_USERNAME}";nonce="{nonce}""#);
     let cases: Vec<(&str, String, &str)> = vec![
         (
@@ -4424,7 +4427,7 @@ async fn rfc9421_wrong_key_or_unknown_keyid_is_invalid_credentials() {
         RFC9421_BASELINE,
         &format!(
             r#";created={};keyid="nobody";nonce="{}""#,
-            Utc::now().timestamp(),
+            UtcTimestamp::now().unix_timestamp(),
             test_nonce(0x7601)
         ),
     );

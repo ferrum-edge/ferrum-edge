@@ -1,5 +1,5 @@
+use crate::time_compat::UtcTimestamp;
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
 use http_body_util::Full;
 use hyper::{Response, StatusCode};
 use serde::{Serialize, de::DeserializeOwned};
@@ -2692,10 +2692,10 @@ pub(crate) trait AdminResource:
     fn set_id(&mut self, id: String);
     fn namespace(&self) -> &str;
     fn set_namespace(&mut self, ns: String);
-    fn created_at(&self) -> DateTime<Utc>;
-    fn set_created_at(&mut self, now: DateTime<Utc>);
-    fn set_updated_at(&mut self, now: DateTime<Utc>);
-    fn updated_at(&self) -> DateTime<Utc>;
+    fn created_at(&self) -> UtcTimestamp;
+    fn set_created_at(&mut self, now: UtcTimestamp);
+    fn set_updated_at(&mut self, now: UtcTimestamp);
+    fn updated_at(&self) -> UtcTimestamp;
     fn normalize(&mut self);
     fn validate(&self, ctx: &ValidationCtx<'_>) -> Result<(), ValidationError>;
     fn cached_items(config: &GatewayConfig) -> &[Self];
@@ -3658,7 +3658,7 @@ pub(crate) async fn handle_delete<R: AdminResource>(
 pub(crate) fn prepare_batch_resource<R: AdminResource>(
     resource: &mut R,
     namespace: &str,
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
     validation_ctx: &ValidationCtx<'_>,
 ) -> Result<(), BatchPreparationError> {
     if resource.id().is_empty() {
@@ -4216,19 +4216,19 @@ impl AdminResource for Upstream {
         self.namespace = ns;
     }
 
-    fn created_at(&self) -> DateTime<Utc> {
+    fn created_at(&self) -> UtcTimestamp {
         self.created_at
     }
 
-    fn set_created_at(&mut self, now: DateTime<Utc>) {
+    fn set_created_at(&mut self, now: UtcTimestamp) {
         self.created_at = now;
     }
 
-    fn set_updated_at(&mut self, now: DateTime<Utc>) {
+    fn set_updated_at(&mut self, now: UtcTimestamp) {
         self.updated_at = now;
     }
 
-    fn updated_at(&self) -> DateTime<Utc> {
+    fn updated_at(&self) -> UtcTimestamp {
         self.updated_at
     }
 
@@ -4476,19 +4476,19 @@ impl AdminResource for GatewayTrustBundleRecord {
         self.namespace = ns;
     }
 
-    fn created_at(&self) -> DateTime<Utc> {
+    fn created_at(&self) -> UtcTimestamp {
         self.created_at
     }
 
-    fn set_created_at(&mut self, now: DateTime<Utc>) {
+    fn set_created_at(&mut self, now: UtcTimestamp) {
         self.created_at = now;
     }
 
-    fn set_updated_at(&mut self, now: DateTime<Utc>) {
+    fn set_updated_at(&mut self, now: UtcTimestamp) {
         self.updated_at = now;
     }
 
-    fn updated_at(&self) -> DateTime<Utc> {
+    fn updated_at(&self) -> UtcTimestamp {
         self.updated_at
     }
 
@@ -4705,19 +4705,19 @@ impl AdminResource for PluginConfig {
         self.namespace = ns;
     }
 
-    fn created_at(&self) -> DateTime<Utc> {
+    fn created_at(&self) -> UtcTimestamp {
         self.created_at
     }
 
-    fn set_created_at(&mut self, now: DateTime<Utc>) {
+    fn set_created_at(&mut self, now: UtcTimestamp) {
         self.created_at = now;
     }
 
-    fn set_updated_at(&mut self, now: DateTime<Utc>) {
+    fn set_updated_at(&mut self, now: UtcTimestamp) {
         self.updated_at = now;
     }
 
-    fn updated_at(&self) -> DateTime<Utc> {
+    fn updated_at(&self) -> UtcTimestamp {
         self.updated_at
     }
 
@@ -4968,7 +4968,7 @@ impl AdminResource for PluginConfig {
                 }
             }
             if changed {
-                current_proxy.updated_at = Utc::now();
+                current_proxy.updated_at = UtcTimestamp::now();
                 if !db.update_proxy(&current_proxy).await? {
                     anyhow::bail!(
                         "late plugin delete compensation could not restore proxy '{}' associations",
@@ -5376,19 +5376,19 @@ impl AdminResource for Proxy {
         self.namespace = ns;
     }
 
-    fn created_at(&self) -> DateTime<Utc> {
+    fn created_at(&self) -> UtcTimestamp {
         self.created_at
     }
 
-    fn set_created_at(&mut self, now: DateTime<Utc>) {
+    fn set_created_at(&mut self, now: UtcTimestamp) {
         self.created_at = now;
     }
 
-    fn set_updated_at(&mut self, now: DateTime<Utc>) {
+    fn set_updated_at(&mut self, now: UtcTimestamp) {
         self.updated_at = now;
     }
 
-    fn updated_at(&self) -> DateTime<Utc> {
+    fn updated_at(&self) -> UtcTimestamp {
         self.updated_at
     }
 
@@ -6080,19 +6080,19 @@ impl AdminResource for Consumer {
         self.namespace = ns;
     }
 
-    fn created_at(&self) -> DateTime<Utc> {
+    fn created_at(&self) -> UtcTimestamp {
         self.created_at
     }
 
-    fn set_created_at(&mut self, now: DateTime<Utc>) {
+    fn set_created_at(&mut self, now: UtcTimestamp) {
         self.created_at = now;
     }
 
-    fn set_updated_at(&mut self, now: DateTime<Utc>) {
+    fn set_updated_at(&mut self, now: UtcTimestamp) {
         self.updated_at = now;
     }
 
-    fn updated_at(&self) -> DateTime<Utc> {
+    fn updated_at(&self) -> UtcTimestamp {
         self.updated_at
     }
 
@@ -6678,7 +6678,7 @@ async fn handle_write<R: AdminResource>(
         ));
     }
 
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     match action {
         WriteAction::Create => {
             resource.set_created_at(now);

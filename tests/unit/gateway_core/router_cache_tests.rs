@@ -1,4 +1,3 @@
-use chrono::Utc;
 use ferrum_edge::RouterCache;
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy};
 use ferrum_edge::modes::mesh::MeshTrafficDirection;
@@ -10,6 +9,7 @@ use ferrum_edge::router_cache::{
     path_parameter_direct_workload_route_admitted, path_parameter_route_admitted,
     path_parameter_scoped_route_admitted,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 
 // This suite intentionally exercises the public RouterCache facade.
 // Request hot paths use epoch-loaded route snapshots and are covered by
@@ -81,8 +81,8 @@ fn test_proxy(id: &str, listen_path: &str) -> Proxy {
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }
@@ -94,7 +94,7 @@ fn test_config(proxies: Vec<Proxy>) -> GatewayConfig {
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     }

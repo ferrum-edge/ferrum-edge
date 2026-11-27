@@ -42,6 +42,7 @@ use ferrum_edge::plugins::compression::CompressionPlugin;
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext, priority,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -166,8 +167,8 @@ fn make_consumer(username: &str) -> Arc<Consumer> {
         custom_id: None,
         credentials: HashMap::new(),
         acl_groups: Vec::new(),
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     })
 }
 

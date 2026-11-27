@@ -10,7 +10,7 @@
 //! missing or unusable policy falls through to the next precedence level and
 //! finally the controller default — never to unlimited.
 
-use chrono::{DateTime, Utc};
+use crate::time_compat::UtcTimestamp;
 use serde_json::Value;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -123,7 +123,7 @@ struct ValidPolicyBody {
 #[derive(Debug, Clone)]
 struct IndexedPolicy {
     resource: K8sResourceKey,
-    creation_timestamp: Option<DateTime<Utc>>,
+    creation_timestamp: Option<UtcTimestamp>,
     body: ValidPolicyBody,
 }
 

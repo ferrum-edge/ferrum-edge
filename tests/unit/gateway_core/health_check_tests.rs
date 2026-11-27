@@ -1,12 +1,12 @@
 //! Tests for health check module
 
-use chrono::Utc;
 use ferrum_edge::config::types::{
     ActiveHealthCheck, BackendTlsConfig, DEFAULT_NAMESPACE, GatewayConfig, HealthCheckConfig,
     HealthProbeType, LoadBalancerAlgorithm, PassiveHealthCheck, Upstream, UpstreamTarget,
     default_namespace,
 };
 use ferrum_edge::health_check::HealthChecker;
+use ferrum_edge::time_compat::UtcTimestamp;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -1272,8 +1272,8 @@ fn make_upstream_with_active_probe(
         backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         k8s_service_uid: None,
         admission_upstream_id: None,
         pending_limit_scope: None,
@@ -1289,7 +1289,7 @@ fn config_with_upstreams(upstreams: Vec<Upstream>) -> GatewayConfig {
         consumers: Vec::new(),
         plugin_configs: Vec::new(),
         upstreams,
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         frontend_tls_cert_path: None,
         frontend_tls_key_path: None,
@@ -1850,8 +1850,8 @@ fn make_upstream_passive_only(
         backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         k8s_service_uid: None,
         admission_upstream_id: None,
         pending_limit_scope: None,

@@ -1,6 +1,5 @@
 //! Tests for prometheus_metrics plugin
 
-use chrono::Utc;
 use ferrum_edge::PluginCache;
 use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope};
 use ferrum_edge::config_delta::ConfigDelta;
@@ -24,6 +23,7 @@ use ferrum_edge::retry::{
     OBS_CONFIG_STALE, OBS_OVERLOAD, intern_http_metrics_error_class,
     intern_http_observability_error_class,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use serde_json::json;
 use serial_test::serial;
 use std::collections::HashMap;
@@ -3336,7 +3336,7 @@ fn prometheus_gateway_config(plugin_configs: Vec<PluginConfig>) -> GatewayConfig
         consumers: vec![],
         plugin_configs,
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     }
@@ -3421,7 +3421,7 @@ fn test_rejected_plugin_cache_rebuild_leaves_registry_policy_untouched() {
         prometheus_plugin_config(60, 60_000, 2500),
         invalid_key_auth_plugin_config(),
     ];
-    rejected.plugin_configs[0].updated_at = Utc::now();
+    rejected.plugin_configs[0].updated_at = UtcTimestamp::now();
     let err = cache
         .rebuild(&rejected)
         .err()
@@ -3461,7 +3461,7 @@ fn test_rejected_plugin_cache_delta_leaves_registry_policy_untouched() {
         prometheus_plugin_config(60, 60_000, 2500),
         invalid_key_auth_plugin_config(),
     ];
-    rejected.plugin_configs[0].updated_at = Utc::now();
+    rejected.plugin_configs[0].updated_at = UtcTimestamp::now();
     let delta = ConfigDelta::compute(&valid, &rejected);
     let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&valid, &rejected);
     let err = cache

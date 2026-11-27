@@ -21,7 +21,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
 use ferrum_edge::capture::CaptureMode;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, DispatchKind, GatewayConfig, LoadBalancerAlgorithm, MAX_TARGET_WEIGHT,
@@ -44,6 +43,7 @@ use ferrum_edge::proxy::{
     ProxyState, start_proxy_listener_with_bound_listener,
     start_proxy_listener_with_bound_listener_and_mesh_direction,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
@@ -328,7 +328,7 @@ pub fn mesh_slice_with(
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect::<BTreeMap<_, _>>(),
-        version: Utc::now().to_rfc3339(),
+        version: UtcTimestamp::now().to_rfc3339(),
         workloads,
         services,
         mesh_policies,
@@ -340,7 +340,7 @@ pub fn mesh_slice_with(
 /// `host` is matched as a single-element `hosts` entry — this mirrors the way
 /// mesh outbound capture proxies route by Host header / SNI.
 pub fn http_proxy(id: &str, host: &str, backend_port: u16) -> Proxy {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     Proxy {
         labels: Default::default(),
         id: id.to_string(),
@@ -412,7 +412,7 @@ pub fn http_proxy(id: &str, host: &str, backend_port: u16) -> Proxy {
 
 /// Build a mesh-mode [`Upstream`] with a single HTTP target.
 pub fn http_upstream(id: &str, host: &str, port: u16) -> Upstream {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     Upstream {
         labels: Default::default(),
         id: id.to_string(),
@@ -473,7 +473,7 @@ pub fn gateway_config_with_mesh(
         upstreams,
         consumers: Vec::new(),
         plugin_configs: Vec::new(),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         frontend_tls_cert_path: None,
         frontend_tls_key_path: None,

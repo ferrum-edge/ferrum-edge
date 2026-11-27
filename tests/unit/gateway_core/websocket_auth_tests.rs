@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use chrono::Utc;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, Consumer, DispatchKind, GatewayConfig, HttpFlavor, PluginAssociation,
     PluginConfig, PluginScope, Proxy,
@@ -8,6 +7,7 @@ use ferrum_edge::config::types::{
 use ferrum_edge::plugins::{ProxyProtocol, RequestContext};
 use ferrum_edge::proxy::backend_dispatch::detect_http_flavor;
 use ferrum_edge::proxy::run_authentication_phase;
+use ferrum_edge::time_compat::UtcTimestamp;
 use ferrum_edge::{ConsumerIndex, PluginCache};
 use http::Request;
 use serde_json::{Map, Value, json};
@@ -82,8 +82,8 @@ fn keyauth_proxy() -> Proxy {
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }
@@ -101,8 +101,8 @@ fn keyauth_plugin_config() -> PluginConfig {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -124,8 +124,8 @@ fn keyauth_consumer() -> Consumer {
         custom_id: Some("ws-custom-id".to_string()),
         credentials,
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -136,7 +136,7 @@ fn gateway_config() -> GatewayConfig {
         consumers: vec![keyauth_consumer()],
         plugin_configs: vec![keyauth_plugin_config()],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     }

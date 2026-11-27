@@ -33,6 +33,7 @@ use ferrum_edge::k8s_controller::status::{
     FERRUM_GATEWAY_CONTROLLER_NAME, GatewayApiStatusUpdate, plan_gateway_api_status_updates,
 };
 use ferrum_edge::load_balancer::{HashOnStrategy, LoadBalancerCache};
+use ferrum_edge::time_compat::UtcTimestamp;
 use serde_json::{Value, json};
 
 fn options() -> K8sTranslationOptions {
@@ -334,8 +335,8 @@ fn sticky_session_cookie_omits_max_age_on_set_cookie() {
         backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         api_spec_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         k8s_service_uid: None,
         admission_upstream_id: None,
         pending_limit_scope: None,

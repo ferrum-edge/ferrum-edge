@@ -8,13 +8,13 @@
 //! test file (`*_logging_tests.rs`); this file is the parity table that fails
 //! when a new log sink joins without the contract.
 
-use chrono::Utc;
 use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope, Proxy};
 use ferrum_edge::plugin_cache::PluginCache;
 use ferrum_edge::plugins::builtin_parity::builtin_plugin_parity_meta;
 use ferrum_edge::plugins::{
     BUILTIN_PLUGIN_REGISTRATIONS, PluginFailurePolicy, plugin_failure_policy,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use serde_json::{Value, json};
 
 /// Every built-in log sink. A registered plugin named `*_logging` that is
@@ -83,8 +83,8 @@ fn gateway_with(name: &str, config: Value) -> GatewayConfig {
             priority_override: None,
             trigger: None,
             api_spec_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         }],
         ..GatewayConfig::default()
     }

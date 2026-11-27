@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::fips::approved::Sha256;
-use chrono::{DateTime, Utc};
+use crate::time_compat::UtcTimestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -108,7 +108,7 @@ pub struct MeshSliceDriftView {
     /// Wall-clock timestamp of the most recent slice accepted by the proxy
     /// runtime. `None` when no slice has been accepted yet.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_received_at: Option<DateTime<Utc>>,
+    pub last_received_at: Option<UtcTimestamp>,
     /// `now - last_received_at` in seconds. `None` when `last_received_at`
     /// is `None`. Operators alert on this exceeding a threshold (typically
     /// 2-3× `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS`).
@@ -217,10 +217,10 @@ pub struct MeshConfigDriftInputs<'a> {
     pub slice: Option<&'a MeshSlice>,
     /// Most recent slice-install timestamp from
     /// [`crate::modes::mesh::runtime::MeshRuntimeState::last_applied_at`].
-    pub last_install_at: Option<DateTime<Utc>>,
+    pub last_install_at: Option<UtcTimestamp>,
     /// Wall-clock "now" used to compute `age_seconds`. Injected so unit
     /// tests are deterministic.
-    pub now: DateTime<Utc>,
+    pub now: UtcTimestamp,
     /// Operator-configured mesh source protocol from
     /// `FERRUM_MESH_CONFIG_PROTOCOL`.
     pub source_protocol: &'a str,
@@ -246,11 +246,11 @@ pub fn try_build_response(
     inputs: MeshConfigDriftInputs<'_>,
 ) -> Result<MeshConfigDriftResponse, serde_json::Error> {
     let (last_received_at, age_seconds) = inputs.last_install_at.map_or((None, None), |ts| {
-        // `signed_duration_since` returns a `chrono::Duration`. Clamp the
+        // Subtracting two `UtcTimestamp`s yields a signed duration. Clamp the
         // signed seconds to a non-negative `u64`: a slice accepted in the
         // future (clock skew on the gRPC sender) maps to `0` rather than a
         // huge underflow.
-        let seconds = inputs.now.signed_duration_since(ts).num_seconds().max(0) as u64;
+        let seconds = (inputs.now - ts).whole_seconds().max(0) as u64;
         (Some(ts), Some(seconds))
     });
 
@@ -436,7 +436,6 @@ mod tests {
         RuntimeValue,
     };
     use crate::modes::mesh::slice::MeshSlice;
-    use chrono::TimeZone;
     use std::collections::HashMap;
 
     fn test_revision_diagnostics() -> MeshRevisionDiagnostics {
@@ -451,12 +450,14 @@ mod tests {
         }
     }
 
-    fn install_time() -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 5, 18, 19, 32, 11).unwrap()
+    fn install_time() -> UtcTimestamp {
+        "2026-05-18T19:32:11Z".parse::<UtcTimestamp>().unwrap()
     }
 
-    fn now_after_install(seconds: i64) -> DateTime<Utc> {
-        install_time() + chrono::Duration::seconds(seconds)
+    fn now_after_install(seconds: i64) -> UtcTimestamp {
+        install_time()
+            .checked_add(::time::SignedDuration::seconds(seconds))
+            .unwrap()
     }
 
     fn slice_with(namespace: &str, version: &str) -> MeshSlice {
@@ -693,7 +694,9 @@ mod tests {
         let resp = build_response(MeshConfigDriftInputs {
             slice: Some(&slice),
             last_install_at: Some(install_time()),
-            now: install_time() - chrono::Duration::seconds(10),
+            now: install_time()
+                .checked_sub(::time::SignedDuration::seconds(10))
+                .unwrap(),
             source_protocol: "native",
             source_cp_url: "",
             include_overlay: true,

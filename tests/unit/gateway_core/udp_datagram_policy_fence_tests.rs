@@ -7,7 +7,6 @@
 
 use std::sync::Arc;
 
-use chrono::Utc;
 use ferrum_edge::_test_support::udp_datagram_policy_fence_for_test;
 use ferrum_edge::PluginCache;
 use ferrum_edge::config::types::{
@@ -21,6 +20,7 @@ use ferrum_edge::request_epoch::RequestEpochStore;
 use serde_json::json;
 
 use crate::unit::plugins::plugin_utils::{make_plugin_config_with_json, make_proxy};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 fn udp_proxy(id: &str, port: u16, plugin_ids: Vec<&str>) -> Proxy {
     let mut proxy = make_proxy(id, "/", plugin_ids);
@@ -46,7 +46,7 @@ fn gateway_config(proxies: Vec<Proxy>, plugin_configs: Vec<PluginConfig>) -> Gat
         version: "1".to_string(),
         proxies,
         plugin_configs,
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..Default::default()
     }
 }
@@ -132,7 +132,10 @@ fn tightening_a_datagram_hook_ends_the_established_session() {
 
     let mut tightened = runtime.config.clone();
     tightened.plugin_configs[0].config = json!({"datagrams_per_second": 10});
-    tightened.plugin_configs[0].updated_at += chrono::Duration::seconds(1);
+    tightened.plugin_configs[0].updated_at = tightened.plugin_configs[0]
+        .updated_at
+        .checked_add(::time::SignedDuration::seconds(1))
+        .unwrap();
     runtime.reload(tightened);
 
     assert!(
@@ -158,7 +161,10 @@ fn adding_a_datagram_hook_ends_a_hookless_session() {
     added.proxies[0].plugins = vec![PluginAssociation {
         plugin_config_id: "udp-rl".to_string(),
     }];
-    added.proxies[0].updated_at += chrono::Duration::seconds(1);
+    added.proxies[0].updated_at = added.proxies[0]
+        .updated_at
+        .checked_add(::time::SignedDuration::seconds(1))
+        .unwrap();
     added.plugin_configs.push(limiter(10));
     runtime.reload(added);
 
@@ -179,7 +185,10 @@ fn removing_a_datagram_hook_ends_the_established_session() {
 
     let mut removed = runtime.config.clone();
     removed.proxies[0].plugins.clear();
-    removed.proxies[0].updated_at += chrono::Duration::seconds(1);
+    removed.proxies[0].updated_at = removed.proxies[0]
+        .updated_at
+        .checked_add(::time::SignedDuration::seconds(1))
+        .unwrap();
     removed.plugin_configs.clear();
     runtime.reload(removed);
 

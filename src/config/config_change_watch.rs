@@ -247,8 +247,9 @@ impl ConfigChangeWatcherHealth {
         let last_event_at = if last_event_unix_ms == 0 {
             None
         } else {
-            chrono::DateTime::from_timestamp_millis(last_event_unix_ms as i64)
-                .map(|ts| ts.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+            crate::time_compat::UtcTimestamp::from_unix_timestamp_millis(last_event_unix_ms as i64)
+                .ok()
+                .map(|ts| ts.to_rfc3339_opts(crate::time_compat::SecondsFormat::Millis, true))
         };
         Some(ConfigChangeWatcherStatus {
             enabled: true,

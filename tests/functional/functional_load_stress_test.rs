@@ -31,7 +31,6 @@
 
 use crate::scaffolding::port_registry::TestSocket;
 
-use chrono::Utc;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper::service::service_fn;
@@ -54,6 +53,7 @@ use crate::common::scheduled_scaling::{
     scheduled_scaling_admin_jwt_max_ttl_value, wait_for_batch_apply_cursor,
     wait_for_config_convergence,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 
 // --- Configuration constants ---
 
@@ -551,15 +551,15 @@ impl LoadTestHarness {
     }
 
     fn generate_admin_token(&self) -> Result<String, Box<dyn std::error::Error>> {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let claims = json!({
             "iss": self.jwt_issuer,
             "sub": "test-admin",
             "role": "admin",
-            "iat": now.timestamp(),
-            "nbf": now.timestamp(),
-            "exp": (now + chrono::Duration::seconds(SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS))
-                .timestamp(),
+            "iat": now.unix_timestamp(),
+            "nbf": now.unix_timestamp(),
+            "exp": (now.checked_add(::time::SignedDuration::seconds(SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS)).unwrap())
+                .unix_timestamp(),
             "jti": Uuid::new_v4().to_string()
         });
         let header = Header::new(jsonwebtoken::Algorithm::HS256);
@@ -623,11 +623,11 @@ enum SampleAuth {
 // --- Consumer JWT generation ---
 
 fn generate_consumer_jwt(username: &str, secret: &str) -> String {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "sub": username,
-        "iat": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(3600)).unwrap()).unix_timestamp(),
     });
     let header = Header::new(jsonwebtoken::Algorithm::HS256);
     let key = EncodingKey::from_secret(secret.as_bytes()).unwrap();

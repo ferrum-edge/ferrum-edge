@@ -28,6 +28,7 @@ use ferrum_edge::service_discovery::{
     DiscoverySnapshot, ServiceDiscoverer, ServiceDiscoveryManager,
     spawn_supervised_discovery_task_for_test,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 
 /// The health registry and the Prometheus registry are process-global.
 static REGISTRY_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -109,8 +110,8 @@ fn upstream_with_sd(
         backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         api_spec_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         k8s_service_uid: None,
         admission_upstream_id: None,
         pending_limit_scope: None,
@@ -2693,8 +2694,11 @@ async fn apply_passive_reload(state: &ferrum_edge::proxy::ProxyState, incrementa
         .iter_mut()
         .find(|proxy| proxy.id == "filler")
         .unwrap();
-    filler.updated_at += chrono::Duration::seconds(1);
-    filler.backend_path = Some(format!("/revision-{}", filler.updated_at.timestamp()));
+    filler.updated_at = filler
+        .updated_at
+        .checked_add(::time::SignedDuration::seconds(1))
+        .unwrap();
+    filler.backend_path = Some(format!("/revision-{}", filler.updated_at.unix_timestamp()));
     let outcome = if incremental {
         state
             .apply_incremental(IncrementalResult {
@@ -2707,7 +2711,7 @@ async fn apply_passive_reload(state: &ferrum_edge::proxy::ProxyState, incrementa
                 added_or_modified_upstreams: vec![],
                 removed_upstream_ids: vec![],
                 sequence_cursor: 0,
-                poll_timestamp: chrono::Utc::now(),
+                poll_timestamp: UtcTimestamp::now(),
             })
             .await
     } else {

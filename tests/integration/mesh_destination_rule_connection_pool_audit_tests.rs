@@ -13,7 +13,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use chrono::Utc;
 use ferrum_edge::backend_conn_limit::{
     BackendConnectionLimiter, ReqwestConnectionAdmission, is_backend_connection_limit_error,
 };
@@ -23,6 +22,7 @@ use ferrum_edge::config::types::{
 use ferrum_edge::config::{EnvConfig, PoolConfig};
 use ferrum_edge::connection_pool::ConnectionPool;
 use ferrum_edge::dns::{DnsCache, DnsConfig};
+use ferrum_edge::time_compat::UtcTimestamp;
 use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
@@ -95,8 +95,8 @@ fn proxy_for_backend(port: u16) -> Proxy {
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }

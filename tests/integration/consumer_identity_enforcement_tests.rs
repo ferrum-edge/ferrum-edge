@@ -11,10 +11,10 @@
 //! Exercises the SQLite path; the same `DatabaseStore` implementation backs
 //! PostgreSQL/MySQL behind dialect-specific SQL rendering.
 
-use chrono::Utc;
 use ferrum_edge::config::db_backend::{BatchConfigWriteMode, DatabaseBackend};
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
 use ferrum_edge::config::types::Consumer;
+use ferrum_edge::time_compat::UtcTimestamp;
 use std::collections::HashMap;
 use tempfile::TempDir;
 
@@ -41,8 +41,8 @@ fn consumer_in(namespace: &str, id: &str, username: &str, custom_id: Option<&str
         custom_id: custom_id.map(str::to_string),
         credentials: HashMap::new(),
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 

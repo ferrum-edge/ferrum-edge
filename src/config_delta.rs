@@ -20,7 +20,7 @@
 //! junction-table changes can arrive without advancing the owning proxy's
 //! timestamp.
 
-use chrono::{DateTime, Utc};
+use crate::time_compat::UtcTimestamp;
 use std::collections::{HashMap, HashSet};
 
 use crate::config::db_backend::NamespacedResourceId;
@@ -247,7 +247,7 @@ type ResourceKey<'a> = (&'a str, &'a str);
 trait HasNamespacedIdAndTimestamp {
     fn namespace(&self) -> &str;
     fn id(&self) -> &str;
-    fn updated_at(&self) -> DateTime<Utc>;
+    fn updated_at(&self) -> UtcTimestamp;
 
     /// Whether this resource's own persisted content differs from `other`,
     /// consulted only when both carry the same `updated_at`.
@@ -315,7 +315,7 @@ impl HasNamespacedIdAndTimestamp for Proxy {
     fn id(&self) -> &str {
         &self.id
     }
-    fn updated_at(&self) -> DateTime<Utc> {
+    fn updated_at(&self) -> UtcTimestamp {
         self.updated_at
     }
     /// Stream-family proxies compare their own persisted row; route-indexed
@@ -344,8 +344,8 @@ impl HasNamespacedIdAndTimestamp for Proxy {
             return false;
         }
         timestamp_neutral_content_changed(other, self, |proxy| {
-            proxy.created_at = DateTime::<Utc>::UNIX_EPOCH;
-            proxy.updated_at = DateTime::<Utc>::UNIX_EPOCH;
+            proxy.created_at = UtcTimestamp::UNIX_EPOCH;
+            proxy.updated_at = UtcTimestamp::UNIX_EPOCH;
             proxy.plugins.clear();
         })
     }
@@ -358,15 +358,15 @@ impl HasNamespacedIdAndTimestamp for Consumer {
     fn id(&self) -> &str {
         &self.id
     }
-    fn updated_at(&self) -> DateTime<Utc> {
+    fn updated_at(&self) -> UtcTimestamp {
         self.updated_at
     }
     /// Every `Consumer` field is operator-owned persisted state, so a reused
     /// `updated_at` must not hide a rotated or revoked credential.
     fn persisted_content_changed(&self, other: &Self) -> bool {
         timestamp_neutral_content_changed(other, self, |consumer| {
-            consumer.created_at = DateTime::<Utc>::UNIX_EPOCH;
-            consumer.updated_at = DateTime::<Utc>::UNIX_EPOCH;
+            consumer.created_at = UtcTimestamp::UNIX_EPOCH;
+            consumer.updated_at = UtcTimestamp::UNIX_EPOCH;
         })
     }
 }
@@ -378,7 +378,7 @@ impl HasNamespacedIdAndTimestamp for PluginConfig {
     fn id(&self) -> &str {
         &self.id
     }
-    fn updated_at(&self) -> DateTime<Utc> {
+    fn updated_at(&self) -> UtcTimestamp {
         self.updated_at
     }
     /// Every `PluginConfig` field is operator-owned persisted state, so a
@@ -386,8 +386,8 @@ impl HasNamespacedIdAndTimestamp for PluginConfig {
     /// `enabled` flip.
     fn persisted_content_changed(&self, other: &Self) -> bool {
         timestamp_neutral_content_changed(other, self, |plugin_config| {
-            plugin_config.created_at = DateTime::<Utc>::UNIX_EPOCH;
-            plugin_config.updated_at = DateTime::<Utc>::UNIX_EPOCH;
+            plugin_config.created_at = UtcTimestamp::UNIX_EPOCH;
+            plugin_config.updated_at = UtcTimestamp::UNIX_EPOCH;
         })
     }
 }
@@ -399,7 +399,7 @@ impl HasNamespacedIdAndTimestamp for Upstream {
     fn id(&self) -> &str {
         &self.id
     }
-    fn updated_at(&self) -> DateTime<Utc> {
+    fn updated_at(&self) -> UtcTimestamp {
         self.updated_at
     }
     // No persisted-content fingerprint: `targets` is resolved by service
@@ -499,14 +499,13 @@ mod tests {
     use crate::config::types::{
         BackendScheme, DispatchKind, PluginAssociation, PluginScope, default_namespace,
     };
-    use chrono::TimeZone;
     use serde_json::json;
 
     #[derive(Clone)]
     struct TestResource {
         namespace: String,
         id: String,
-        updated_at: DateTime<Utc>,
+        updated_at: UtcTimestamp,
     }
 
     impl HasNamespacedIdAndTimestamp for TestResource {
@@ -518,15 +517,13 @@ mod tests {
             &self.id
         }
 
-        fn updated_at(&self) -> DateTime<Utc> {
+        fn updated_at(&self) -> UtcTimestamp {
             self.updated_at
         }
     }
 
-    fn ts(seconds: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(seconds, 0)
-            .single()
-            .expect("fixed timestamp should be valid")
+    fn ts(seconds: i64) -> UtcTimestamp {
+        UtcTimestamp::from_unix_timestamp(seconds).expect("fixed timestamp should be valid")
     }
 
     fn config(proxies: Vec<Proxy>, plugin_configs: Vec<PluginConfig>) -> GatewayConfig {
@@ -538,7 +535,7 @@ mod tests {
             consumers: vec![],
             plugin_configs,
             upstreams: vec![],
-            loaded_at: ts(0),
+            loaded_at: UtcTimestamp::UNIX_EPOCH,
             known_namespaces: vec![],
             frontend_tls_cert_path: None,
             frontend_tls_key_path: None,
@@ -561,7 +558,7 @@ mod tests {
         listen_path: Option<&str>,
         hosts: &[&str],
         plugin_ids: &[&str],
-        updated_at: DateTime<Utc>,
+        updated_at: UtcTimestamp,
     ) -> Proxy {
         proxy_in_namespace(
             default_namespace().as_str(),
@@ -579,7 +576,7 @@ mod tests {
         listen_path: Option<&str>,
         hosts: &[&str],
         plugin_ids: &[&str],
-        updated_at: DateTime<Utc>,
+        updated_at: UtcTimestamp,
     ) -> Proxy {
         let mut proxy: Proxy = serde_json::from_value(json!({
             "id": id,
@@ -607,7 +604,7 @@ mod tests {
         id: &str,
         scope: PluginScope,
         proxy_id: Option<&str>,
-        updated_at: DateTime<Utc>,
+        updated_at: UtcTimestamp,
     ) -> PluginConfig {
         PluginConfig {
             labels: Default::default(),
@@ -626,7 +623,7 @@ mod tests {
         }
     }
 
-    fn consumer(namespace: &str, id: &str, updated_at: DateTime<Utc>) -> Consumer {
+    fn consumer(namespace: &str, id: &str, updated_at: UtcTimestamp) -> Consumer {
         Consumer {
             labels: Default::default(),
             id: id.to_string(),

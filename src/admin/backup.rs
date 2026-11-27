@@ -357,8 +357,8 @@ pub(crate) struct ApiSpecBackupItem {
     /// Aggregate digest of the external-`$ref` admission snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) external_ref_digest: Option<String>,
-    pub(crate) created_at: chrono::DateTime<chrono::Utc>,
-    pub(crate) updated_at: chrono::DateTime<chrono::Utc>,
+    pub(crate) created_at: crate::time_compat::UtcTimestamp,
+    pub(crate) updated_at: crate::time_compat::UtcTimestamp,
 }
 
 fn default_namespace() -> String {
@@ -758,7 +758,7 @@ pub(crate) fn validate_restore_api_specs_section_with_total_limit(
             continue;
         }
         // Every spec writer records the generated bundle's hash, so a backup
-        // item always carries one; build-out keeps no legacy empty form.
+        // item always carries one; the pre-1.0 empty form is not accepted.
         if item.resource_hash.len() != 64
             || !item
                 .resource_hash
@@ -1441,8 +1441,8 @@ mod tests {
             resource_hash: "abc".to_string(),
             external_ref_snapshot: None,
             external_ref_digest: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: crate::time_compat::UtcTimestamp::now(),
+            updated_at: crate::time_compat::UtcTimestamp::now(),
         };
         let item = ApiSpecBackupItem::from_api_spec(&spec);
         let restored = item.to_api_spec().expect("decode");
@@ -1509,8 +1509,8 @@ mod tests {
             resource_hash: "a".repeat(64),
             external_ref_snapshot_base64: None,
             external_ref_digest: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: crate::time_compat::UtcTimestamp::now(),
+            updated_at: crate::time_compat::UtcTimestamp::now(),
         }
     }
 
@@ -1665,7 +1665,7 @@ mod tests {
 
     #[test]
     fn validate_api_specs_section_rejects_retired_shapes() {
-        // Issue #7218: build-out keeps no legacy restore shapes — section
+        // Issue #7218: restore keeps no pre-1.0 legacy shapes — section
         // version "1" and an empty `resource_hash` are refused.
         let raw = br#"{"openapi":"3.1.0","info":{"title":"t","version":"1"},"paths":{}}"#;
         let proxies = vec![sample_owned_proxy("spec-1", "proxy-1")];

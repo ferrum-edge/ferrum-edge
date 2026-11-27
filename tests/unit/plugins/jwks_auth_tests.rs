@@ -22,6 +22,7 @@ use super::plugin_utils::{
     assert_continue, assert_reject, assert_reject_body, context_with_materialized_raw_header_lines,
     create_test_consumer,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 
 static JWKS_TEST_PATH_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -75,7 +76,6 @@ async fn jwks_marks_forwarded_custom_query_locations_for_opa_redaction() {
 }
 
 fn create_consumer(username: &str) -> ferrum_edge::config::types::Consumer {
-    use chrono::Utc;
     ferrum_edge::config::types::Consumer {
         labels: Default::default(),
         id: format!("{}-id", username),
@@ -84,8 +84,8 @@ fn create_consumer(username: &str) -> ferrum_edge::config::types::Consumer {
         custom_id: None,
         credentials: HashMap::new(),
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -93,7 +93,6 @@ fn create_consumer_with_custom_id(
     username: &str,
     custom_id: &str,
 ) -> ferrum_edge::config::types::Consumer {
-    use chrono::Utc;
     ferrum_edge::config::types::Consumer {
         labels: Default::default(),
         id: format!("{}-id", username),
@@ -102,8 +101,8 @@ fn create_consumer_with_custom_id(
         custom_id: Some(custom_id.to_string()),
         credentials: HashMap::new(),
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -111,7 +110,7 @@ fn claims_with_default_exp(claims: &Value) -> Value {
     let mut claims = claims.clone();
     if let Some(obj) = claims.as_object_mut() {
         obj.entry("exp")
-            .or_insert_with(|| json!(chrono::Utc::now().timestamp() + 3600));
+            .or_insert_with(|| json!(UtcTimestamp::now().unix_timestamp() + 3600));
     }
     claims
 }
@@ -1665,7 +1664,7 @@ async fn test_jwks_auth_rejects_future_nbf() {
     )
     .unwrap();
 
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let token = create_rs256_token_exact(
         &json!({
             "sub": "nbf-user",
@@ -1698,7 +1697,7 @@ async fn test_jwks_auth_accepts_past_nbf_with_zero_leeway() {
     )
     .unwrap();
 
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let token = create_rs256_token_exact(
         &json!({
             "sub": "nbf-user",
@@ -2098,7 +2097,7 @@ async fn dpop_valid_proof_with_matching_jkt_succeeds() {
         &json!({"sub": "idp-user", "iss": "https://idp.example.com", "cnf": {"jkt": jkt}}),
         private_key_pem,
     );
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     // RFC 9449 §4.3: the proof must bind to the presented access token via the
     // `ath` claim (SHA-256 of the token, base64url no-pad).
     let ath = {
@@ -3558,7 +3557,7 @@ async fn mesh_shaped_jwks_auth_rejects_aud_less_and_future_nbf_before_identity_s
     )
     .unwrap();
 
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let aud_less = create_rs256_token_exact(
         &json!({
             "iss": "https://issuer.example.com",
@@ -3883,7 +3882,7 @@ struct DpopFixture {
 }
 
 fn build_dpop_fixture(jti: &str) -> (DpopFixture, serde_json::Value) {
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     build_dpop_fixture_with_times(jti, now, Some(now + 60))
 }
 
@@ -3904,7 +3903,7 @@ fn build_dpop_fixture_with_times(
 /// signing key and issuer, so distinct subjects are distinct replay-quota
 /// principals inside one replay lane.
 fn build_dpop_fixture_for_subject(jti: &str, sub: &str) -> (DpopFixture, serde_json::Value) {
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     build_dpop_fixture_for_subject_with_times(jti, sub, now, Some(now + 60))
 }
 
@@ -3919,7 +3918,7 @@ fn build_dpop_fixture_for_subject_with_times(
 
 /// Build a DPoP fixture whose proof is bound to an explicit `htu`.
 fn build_dpop_fixture_for_htu(jti: &str, htu: &str) -> (DpopFixture, serde_json::Value) {
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     build_dpop_fixture_with(jti, "idp-user", now, Some(now + 60), htu)
 }
 
@@ -5527,7 +5526,7 @@ async fn dpop_authorization_scheme_with_an_empty_token_rejects() {
 
 #[tokio::test]
 async fn dpop_proof_without_exp_is_accepted() {
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let (fixture, jwks) = build_dpop_fixture_with_times("dpop-no-exp", now, None);
     let plugin = dpop_plugin(&jwks, "dpop-no-exp");
     let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
@@ -5541,7 +5540,7 @@ async fn dpop_proof_without_exp_is_accepted() {
 /// can never outlive its own declared expiry.
 #[tokio::test]
 async fn dpop_proof_with_a_past_exp_is_rejected() {
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let (fixture, jwks) = build_dpop_fixture_with_times("dpop-past-exp", now, Some(now - 3_600));
     let plugin = dpop_plugin(&jwks, "dpop-past-exp");
     let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
@@ -5556,7 +5555,7 @@ async fn dpop_proof_with_a_past_exp_is_rejected() {
 /// `iat` ± `dpop_clock_skew_secs` remains the freshness bound with `exp` gone.
 #[tokio::test]
 async fn dpop_proof_with_iat_outside_the_skew_window_is_rejected() {
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let (fixture, jwks) = build_dpop_fixture_with_times("dpop-stale-iat", now - 3_600, None);
     let plugin = dpop_plugin(&jwks, "dpop-stale-iat");
     let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
@@ -5570,7 +5569,7 @@ async fn dpop_proof_with_iat_outside_the_skew_window_is_rejected() {
 
 #[tokio::test]
 async fn dpop_proof_with_a_future_iat_outside_the_skew_window_is_rejected() {
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let (fixture, jwks) = build_dpop_fixture_with_times("dpop-future-iat", now + 3_600, None);
     let plugin = dpop_plugin(&jwks, "dpop-future-iat");
     let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
@@ -6070,7 +6069,7 @@ async fn jwks_dpop_token_failures_answer_invalid_token_under_the_dpop_scheme() {
         }),
         private_key_pem,
     );
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let mut dpop_header = Header::new(jsonwebtoken::Algorithm::RS256);
     dpop_header.typ = Some("dpop+jwt".to_string());
     dpop_header.jwk = Some(jwk);
@@ -6144,7 +6143,7 @@ async fn jwks_dpop_principal_reauthenticates_under_the_dpop_scheme() {
             &json!({"sub": "idp-user", "iss": "https://idp.example.com", "cnf": {"jkt": jkt}}),
             private_key_pem,
         );
-        let now = chrono::Utc::now().timestamp();
+        let now = UtcTimestamp::now().unix_timestamp();
         let ath = {
             use base64::Engine;
             use sha2::{Digest, Sha256};
@@ -6405,7 +6404,7 @@ async fn clock_skew_seconds_widens_exp_and_nbf_validation() {
     let jwks = build_rsa_jwks_from_pem(include_bytes!(
         "../../../tests/fixtures/test_rsa_public.pem"
     ));
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let recently_expired = create_rs256_token_exact(
         &json!({"sub": "skew-user", "exp": now - 20}),
         private_key_pem,

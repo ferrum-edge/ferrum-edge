@@ -1,6 +1,5 @@
 //! Tests for body_validator plugin — XML CDATA, comments, processing instructions
 
-use chrono::Utc;
 use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope};
 use ferrum_edge::plugins::body_validator::{
     BODY_VALIDATOR_CONFIG_KEYS, BODY_VALIDATOR_PROTOBUF_METHOD_KEYS, BodyValidator,
@@ -10,6 +9,7 @@ use serde_json::json;
 use std::collections::HashMap;
 
 use super::plugin_utils::{assert_continue, assert_reject};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 fn body_validator_plugin_config(
     id: &str,
@@ -28,8 +28,8 @@ fn body_validator_plugin_config(
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 

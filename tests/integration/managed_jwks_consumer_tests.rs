@@ -12,7 +12,6 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use chrono::Utc;
 use ferrum_edge::ConsumerIndex;
 use ferrum_edge::admin::{
     AdminState,
@@ -29,13 +28,14 @@ use reqwest::StatusCode;
 use serde_json::{Value, json};
 
 use crate::scaffolding::port_registry::TestSocket;
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const ADMIN_SECRET: &str = "managed-jwks-admin-secret-0123456789abcdef";
 const ADMIN_ISSUER: &str = "managed-jwks-test";
 const TOKEN_ISSUER: &str = "https://managed-jwks.idp.example";
 
 fn admin_token() -> String {
-    let now = Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let claims = json!({
         "iss": ADMIN_ISSUER,
         "sub": "tls-admin",
@@ -227,7 +227,7 @@ fn bearer(key: &SigningKey) -> String {
     let claims = json!({
         "iss": TOKEN_ISSUER,
         "sub": "managed-user",
-        "exp": Utc::now().timestamp() + 3600,
+        "exp": UtcTimestamp::now().unix_timestamp() + 3600,
     });
     encode(&header, &claims, &key.encoding).expect("sign token")
 }
@@ -274,8 +274,8 @@ fn jwks_auth_plugin_config(id: &str, source: &str) -> PluginConfig {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 

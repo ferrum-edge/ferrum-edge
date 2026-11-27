@@ -10,7 +10,7 @@
 use super::functional_auth_acl_test::{build_rsa_jwks_from_pem, create_rs256_token};
 use crate::scaffolding::ports::reserve_port;
 use bytes::Bytes;
-use chrono::Utc;
+use ferrum_edge::time_compat::UtcTimestamp;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::server::conn::http2::Builder as Http2ServerBuilder;
@@ -661,12 +661,12 @@ async fn test_grpc_access_control_distinguishes_authorization_from_missing_ident
         start_gateway_with_retry(config_path.to_str().unwrap()).await;
     let gateway_addr = format!("127.0.0.1:{gateway_port}");
 
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let token = create_rs256_token(
         &json!({
             "sub": "authenticated-external-user",
-            "iat": now.timestamp(),
-            "exp": (now + chrono::Duration::seconds(3600)).timestamp()
+            "iat": now.unix_timestamp(),
+            "exp": (now.checked_add(::time::SignedDuration::seconds(3600)).unwrap()).unix_timestamp()
         }),
         private_key_pem,
     );

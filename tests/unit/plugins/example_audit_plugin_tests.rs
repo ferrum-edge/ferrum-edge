@@ -13,6 +13,7 @@ use ferrum_edge::plugins::{
     ALL_PROTOCOLS, Plugin, PluginHttpClient, ResponseBodyProduction, StreamTransactionSummary,
     TransactionSummary,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use serde_json::json;
 use std::ffi::{OsStr, OsString};
 use std::sync::Arc;
@@ -687,8 +688,8 @@ async fn test_log_and_stream_hooks_enqueue_without_panic() {
     plugin.on_stream_disconnect(&stream).await;
 }
 
-fn rfc3339_millis(dt: chrono::DateTime<chrono::Utc>) -> String {
-    dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+fn rfc3339_millis(dt: UtcTimestamp) -> String {
+    dt.to_rfc3339_opts(ferrum_edge::time_compat::SecondsFormat::Millis, true)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -757,9 +758,14 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
     // Live rows must stay inside `retention_days` as civil time moves. A
     // hardcoded 2026-07-20 timestamp becomes `timestamp < now-30d` on
     // 2026-08-19 and is deleted by the same TEXT comparison the worker uses.
-    let now = chrono::Utc::now();
-    let cutoff = rfc3339_millis(now - chrono::Duration::days(30));
-    let live_ts = |offset_ms: i64| rfc3339_millis(now + chrono::Duration::milliseconds(offset_ms));
+    let now = UtcTimestamp::now();
+    let cutoff = rfc3339_millis(now.checked_sub(::time::SignedDuration::days(30)).unwrap());
+    let live_ts = |offset_ms: i64| {
+        rfc3339_millis(
+            now.checked_add(::time::SignedDuration::milliseconds(offset_ms))
+                .unwrap(),
+        )
+    };
 
     // An allowlisted per-instance key family (`correlation_id.instance.<id>`),
     // so the values survive the fail-closed metadata gate and the
@@ -1054,7 +1060,7 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
         !tcp_timestamp.is_empty(),
         "bounded TCP write must persist a non-empty timestamp"
     );
-    chrono::DateTime::parse_from_rfc3339(&tcp_timestamp)
+    ferrum_edge::time_compat::parse_rfc3339_chrono(&tcp_timestamp)
         .expect("bounded TCP write must persist a parseable RFC3339 timestamp");
     assert!(
         tcp_timestamp.as_str() >= cutoff.as_str(),

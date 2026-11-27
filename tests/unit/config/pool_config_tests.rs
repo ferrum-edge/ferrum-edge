@@ -1,6 +1,5 @@
 //! Tests for connection pool configuration
 
-use chrono::Utc;
 use ferrum_edge::config::EnvConfig;
 use ferrum_edge::config::PoolConfig;
 use ferrum_edge::config::conf_file::ConfFile;
@@ -11,6 +10,7 @@ use ferrum_edge::config::types::{
 };
 
 use crate::unit::env_lock::with_env_vars;
+use ferrum_edge::time_compat::UtcTimestamp;
 
 fn parse_pool() -> Result<PoolConfig, String> {
     PoolConfig::from_env_with_conf(&ConfFile::default())
@@ -81,8 +81,8 @@ fn create_test_proxy() -> Proxy {
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }

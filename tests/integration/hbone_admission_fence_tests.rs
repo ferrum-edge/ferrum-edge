@@ -73,7 +73,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use chrono::Utc;
 use hyper::{Method, Request, StatusCode};
 use rustls::pki_types::CertificateRevocationListDer;
 use serde_json::json;
@@ -121,6 +120,7 @@ use super::mesh_test_support::{
     DEFAULT_NAMESPACE, default_mesh_runtime, gateway_config_with_mesh, mesh_config_with,
     policy_allow_principal, policy_deny_principal,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const CLIENT_SPIFFE: &str = "spiffe://cluster.local/ns/default/sa/client";
 const OTHER_SPIFFE: &str = "spiffe://cluster.local/ns/default/sa/other";
@@ -352,8 +352,8 @@ fn unclassified_plugin() -> PluginConfig {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -374,8 +374,8 @@ fn access_control_plugin() -> PluginConfig {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -408,8 +408,8 @@ fn spiffe_rate_limit_plugin(max_requests: u32) -> PluginConfig {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -1928,8 +1928,8 @@ fn http_only_admission_plugin() -> PluginConfig {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -3662,8 +3662,8 @@ fn access_control_engineering_plugin() -> PluginConfig {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -3676,8 +3676,8 @@ fn fence_acl_consumer(id: &str, username: &str, groups: &[&str]) -> Consumer {
         custom_id: None,
         credentials: Default::default(),
         acl_groups: groups.iter().map(|group| group.to_string()).collect(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -4447,7 +4447,10 @@ async fn an_outbound_terminated_connect_decided_by_the_registry_never_advertises
         .find(|row| row.id == "operator-outbound-registry")
         .expect("operator registry");
     registry.config["registry"] = json!([]);
-    registry.updated_at += chrono::Duration::seconds(1);
+    registry.updated_at = registry
+        .updated_at
+        .checked_add(::time::SignedDuration::seconds(1))
+        .unwrap();
     assert_eq!(state.update_config(config), ConfigApplyOutcome::Applied);
     wait_for_settled_sweeps(&state).await;
 
@@ -4517,7 +4520,10 @@ async fn a_registry_scope_change_refolds_the_recorded_outbound_admission_facts()
         .find(|row| row.id == "operator-outbound-registry")
         .expect("operator registry");
     registry.config["outbound_listen_ports"] = json!([gateway_addr.port()]);
-    registry.updated_at += chrono::Duration::seconds(1);
+    registry.updated_at = registry
+        .updated_at
+        .checked_add(::time::SignedDuration::seconds(1))
+        .unwrap();
     assert_eq!(state.update_config(config), ConfigApplyOutcome::Applied);
     assert_tunnel_closed(&mut tunnel.response_body).await;
     wait_for_no_live_tunnels(&state).await;

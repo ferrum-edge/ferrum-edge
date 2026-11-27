@@ -12,12 +12,12 @@
 //! entry is destroyed; with the recheck it survives.
 
 use async_trait::async_trait;
-use chrono::Utc;
 use ferrum_edge::config::PoolConfig;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, Proxy, ResponseBodyMode,
 };
 use ferrum_edge::pool::{GenericPool, PoolManager};
+use ferrum_edge::time_compat::UtcTimestamp;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -58,7 +58,7 @@ impl PoolManager for CleanupRecheckManager {
 }
 
 fn test_proxy() -> Proxy {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     Proxy {
         labels: Default::default(),
         id: "pool-cleanup-recheck-test".to_string(),

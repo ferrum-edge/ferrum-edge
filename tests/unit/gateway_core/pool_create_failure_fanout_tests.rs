@@ -6,12 +6,12 @@
 //! H2/gRPC/H3 adapters lives in `pool_create_failure_classification_tests.rs`.
 
 use async_trait::async_trait;
-use chrono::Utc;
 use ferrum_edge::config::PoolConfig;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, Proxy, ResponseBodyMode,
 };
 use ferrum_edge::pool::{GenericPool, PoolCreateCaller, PoolManager, SharedPoolCreateError};
+use ferrum_edge::time_compat::UtcTimestamp;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -62,7 +62,7 @@ impl PoolManager for FanoutTestManager {
 }
 
 fn test_proxy() -> Proxy {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     Proxy {
         labels: Default::default(),
         id: "pool-fanout-test".to_string(),

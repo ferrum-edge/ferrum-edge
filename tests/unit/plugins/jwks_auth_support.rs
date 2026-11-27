@@ -1,4 +1,5 @@
 use ferrum_edge::plugins::{PluginHttpClient, RequestContext};
+use ferrum_edge::time_compat::UtcTimestamp;
 use serde_json::{Value, json};
 use std::sync::OnceLock;
 
@@ -26,7 +27,7 @@ pub fn create_rs256_token(claims: &Value, private_key_pem: &[u8]) -> String {
     let mut claims = claims.clone();
     if let Some(obj) = claims.as_object_mut() {
         obj.entry("exp")
-            .or_insert_with(|| json!(chrono::Utc::now().timestamp() + 3600));
+            .or_insert_with(|| json!(UtcTimestamp::now().unix_timestamp() + 3600));
     }
 
     create_rs256_token_exact(&claims, private_key_pem)
@@ -50,7 +51,7 @@ fn claims_with_default_exp(claims: &Value) -> Value {
     let mut claims = claims.clone();
     if let Some(obj) = claims.as_object_mut() {
         obj.entry("exp")
-            .or_insert_with(|| json!(chrono::Utc::now().timestamp() + 3600));
+            .or_insert_with(|| json!(UtcTimestamp::now().unix_timestamp() + 3600));
     }
     claims
 }

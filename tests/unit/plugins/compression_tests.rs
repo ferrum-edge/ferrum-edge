@@ -16,6 +16,7 @@ use ferrum_edge::_test_support::{
 use ferrum_edge::plugins::compression::{COMPRESSION_CONFIG_KEYS, CompressionPlugin};
 use ferrum_edge::plugins::response_caching::ResponseCaching;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext, validate_plugin_config};
+use ferrum_edge::time_compat::UtcTimestamp;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -5139,12 +5140,12 @@ async fn test_multi_instance_plugin_cache_reload_preserves_ownership() {
                     priority_override: Some(*priority),
                     trigger: None,
                     api_spec_id: None,
-                    created_at: chrono::Utc::now(),
-                    updated_at: chrono::Utc::now(),
+                    created_at: UtcTimestamp::now(),
+                    updated_at: UtcTimestamp::now(),
                 })
                 .collect(),
             upstreams: vec![],
-            loaded_at: chrono::Utc::now(),
+            loaded_at: UtcTimestamp::now(),
             known_namespaces: Vec::new(),
             ..Default::default()
         }

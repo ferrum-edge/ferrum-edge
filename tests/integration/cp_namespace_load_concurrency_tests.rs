@@ -14,7 +14,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::{DateTime, TimeZone, Utc};
 use ferrum_edge::config::db_backend::{FullConfigLoadPurpose, IncrementalResult};
 use ferrum_edge::config::types::{GatewayConfig, Proxy};
 use ferrum_edge::grpc::cp_server::CpScope;
@@ -22,12 +21,13 @@ use ferrum_edge::modes::control_plane::{
     CpFullLoadSource, CpIncrementalLoadSource, cp_namespace_load_concurrency,
     load_full_config_multi_with_sequence_for_test, load_incremental_config_multi_for_test,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use tokio::sync::{Barrier, Notify};
 
 const GATE_TIMEOUT: Duration = Duration::from_secs(10);
 
-fn ts(seconds: i64) -> DateTime<Utc> {
-    Utc.timestamp_opt(seconds, 0).single().expect("timestamp")
+fn ts(seconds: i64) -> UtcTimestamp {
+    UtcTimestamp::from_unix_timestamp(seconds).expect("timestamp")
 }
 
 fn proxy(namespace: &str, suffix: &str) -> Proxy {

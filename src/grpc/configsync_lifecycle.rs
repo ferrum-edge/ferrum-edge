@@ -11,13 +11,13 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::fips::approved::Sha256;
-use chrono::{DateTime, Utc};
 use semver::Version;
 use serde_json::Value;
 
 use crate::FERRUM_VERSION;
 use crate::config::types::GatewayConfig;
 use crate::identity::{TrustBundle, TrustBundleSet as RuntimeTrustBundleSet};
+use crate::time_compat::UtcTimestamp;
 use crate::util::backoff::{BACKOFF_INITIAL_SECS, next_backoff_secs};
 
 /// HTTP/2 PING interval on the DP→CP ConfigSync channel.
@@ -133,7 +133,7 @@ impl GatewayTrustEquivalenceState {
 /// never convert Unknown into Absent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppliedSnapshotAuthority {
-    pub version: Option<DateTime<Utc>>,
+    pub version: Option<UtcTimestamp>,
     pub source_cp_url: String,
     pub gateway_trust: GatewayTrustEquivalenceState,
 }
@@ -145,8 +145,8 @@ pub enum VersionReconcileError {
     UnparseableEnvelope,
     /// Envelope timestamp disagrees with the parsed snapshot's `loaded_at`.
     Inconsistent {
-        envelope: DateTime<Utc>,
-        loaded_at: DateTime<Utc>,
+        envelope: UtcTimestamp,
+        loaded_at: UtcTimestamp,
     },
 }
 
@@ -157,20 +157,20 @@ pub enum StaleSnapshotReject {
     UnparseableVersion,
     /// Envelope version disagreed with the snapshot body's `loaded_at`.
     InconsistentVersion {
-        envelope: DateTime<Utc>,
-        loaded_at: DateTime<Utc>,
+        envelope: UtcTimestamp,
+        loaded_at: UtcTimestamp,
     },
     /// A failover snapshot is older than the applied authority.
     OlderThanApplied {
-        applied: DateTime<Utc>,
-        incoming: DateTime<Utc>,
+        applied: UtcTimestamp,
+        incoming: UtcTimestamp,
     },
     /// The committed stamp is implausibly far in the DP's future — a skewed or
     /// hostile CP clock. Admitting it would poison the monotonic freshness
     /// watermark, so it fails closed instead of being clamped into authority.
     ImplausiblyFutureStamp {
-        committed: DateTime<Utc>,
-        now: DateTime<Utc>,
+        committed: UtcTimestamp,
+        now: UtcTimestamp,
         tolerance_secs: i64,
     },
 }
@@ -182,16 +182,18 @@ pub enum StaleSnapshotReject {
 /// fabricated timestamp). Inconsistent or unparseable inputs fail closed.
 pub fn reconcile_snapshot_version(
     envelope_version: &str,
-    loaded_at: DateTime<Utc>,
-) -> Result<DateTime<Utc>, VersionReconcileError> {
+    loaded_at: UtcTimestamp,
+) -> Result<UtcTimestamp, VersionReconcileError> {
     // Prefer exact CP stamp parity (`loaded_at.to_rfc3339()`), then accept
     // equivalent RFC3339 encodings of the same instant.
     if envelope_version == loaded_at.to_rfc3339() {
         return Ok(loaded_at);
     }
-    let Some(envelope) = DateTime::parse_from_rfc3339(envelope_version)
+    // chrono-compatible strict RFC 3339 acceptance (issue #7419); an instant
+    // outside UtcTimestamp's range is unparseable here and fails closed.
+    let Some(envelope) = crate::time_compat::parse_rfc3339_chrono(envelope_version)
+        .and_then(|parsed| parsed.to_utc_timestamp())
         .ok()
-        .map(|dt| dt.with_timezone(&Utc))
     else {
         return Err(VersionReconcileError::UnparseableEnvelope);
     };
@@ -205,10 +207,7 @@ pub fn reconcile_snapshot_version(
 }
 
 /// Monotonic max of an optional prior watermark and a newly committed stamp.
-pub fn monotonic_watermark(
-    prior: Option<DateTime<Utc>>,
-    committed: DateTime<Utc>,
-) -> DateTime<Utc> {
+pub fn monotonic_watermark(prior: Option<UtcTimestamp>, committed: UtcTimestamp) -> UtcTimestamp {
     match prior {
         Some(prev) if prev > committed => prev,
         _ => committed,
@@ -396,7 +395,7 @@ fn canonical_json_value(value: Value) -> Value {
 pub fn advance_authority_from_committed(
     authority: &mut Option<AppliedSnapshotAuthority>,
     source_cp_url: &str,
-    committed: DateTime<Utc>,
+    committed: UtcTimestamp,
 ) {
     match authority {
         Some(existing) => {
@@ -473,12 +472,10 @@ pub fn cp_endpoints_same_source(a: &str, b: &str) -> bool {
 /// fails over while last-known-good config keeps serving. Stamps at or behind
 /// `now`, and stamps within tolerance, are admitted unchanged.
 pub fn evaluate_snapshot_clock_skew(
-    incoming_committed: DateTime<Utc>,
-    now: DateTime<Utc>,
+    incoming_committed: UtcTimestamp,
+    now: UtcTimestamp,
 ) -> Result<(), StaleSnapshotReject> {
-    if incoming_committed.signed_duration_since(now)
-        > chrono::Duration::seconds(CONFIGSYNC_MAX_FUTURE_SKEW_SECS)
-    {
+    if incoming_committed - now > ::time::SignedDuration::seconds(CONFIGSYNC_MAX_FUTURE_SKEW_SECS) {
         return Err(StaleSnapshotReject::ImplausiblyFutureStamp {
             committed: incoming_committed,
             now,
@@ -503,7 +500,7 @@ pub fn evaluate_snapshot_clock_skew(
 /// exception is not strictly required.
 pub fn snapshot_requires_older_payload_exception(
     authority: Option<&AppliedSnapshotAuthority>,
-    incoming_committed: DateTime<Utc>,
+    incoming_committed: UtcTimestamp,
     source_cp_url: &str,
 ) -> bool {
     let Some(authority) = authority else {
@@ -538,10 +535,10 @@ pub fn snapshot_requires_older_payload_exception(
 ///   accepted and its committed stamp adopted.
 pub fn evaluate_full_snapshot_authority(
     authority: Option<&AppliedSnapshotAuthority>,
-    incoming_committed: DateTime<Utc>,
+    incoming_committed: UtcTimestamp,
     source_cp_url: &str,
     incoming_matches_applied_config: bool,
-) -> Result<DateTime<Utc>, StaleSnapshotReject> {
+) -> Result<UtcTimestamp, StaleSnapshotReject> {
     let Some(authority) = authority else {
         return Ok(incoming_committed);
     };
@@ -574,7 +571,7 @@ pub fn evaluate_full_snapshot_authority(
 pub enum FullSnapshotStreamDisposition {
     /// Apply the snapshot; adopt `version` as the new applied watermark once
     /// the apply succeeds.
-    Apply { version: DateTime<Utc> },
+    Apply { version: UtcTimestamp },
     /// Refuse the snapshot and terminate the stream so no later message from
     /// the same source can apply; the outer loop fails over with backoff.
     RefuseAndTerminate(StaleSnapshotReject),
@@ -583,7 +580,7 @@ pub enum FullSnapshotStreamDisposition {
 /// Decide how the ConfigSync stream must react after version reconciliation.
 pub fn full_snapshot_stream_disposition(
     authority: Option<&AppliedSnapshotAuthority>,
-    incoming_committed: DateTime<Utc>,
+    incoming_committed: UtcTimestamp,
     source_cp_url: &str,
     incoming_matches_applied_config: bool,
 ) -> FullSnapshotStreamDisposition {
@@ -700,7 +697,7 @@ pub fn evaluate_delta_against_subscription_base(
 /// subscription-base and parse/validate/apply gates.
 pub fn evaluate_delta_authority(
     authority: Option<&AppliedSnapshotAuthority>,
-    incoming_committed: DateTime<Utc>,
+    incoming_committed: UtcTimestamp,
 ) -> Result<(), StaleSnapshotReject> {
     let Some(applied) = authority.and_then(|authority| authority.version) else {
         return Ok(());
@@ -961,7 +958,10 @@ pub fn check_peer_version_compatibility(
 /// now denies unknown fields, so a revision-6 peer's snapshot or delta that
 /// carries either key no longer decodes.
 ///
-/// Revision 8: reserved for the strict mesh config change (edge#7524).
+/// Revision 8: every nested proxy/upstream/plugin-association object and
+/// every native mesh resource object denies unknown fields (1.0 config
+/// freeze), so a snapshot or delta member that a revision-7 peer tolerated as
+/// ignorable now fails to decode.
 ///
 /// Revision 9: the mesh VirtualService HTTP route binding
 /// (`MeshVirtualServiceHttpRoutes`) gained `authorized_cross_namespace_targets`

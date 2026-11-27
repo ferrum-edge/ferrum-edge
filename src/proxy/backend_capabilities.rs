@@ -1122,10 +1122,10 @@ mod tests {
     use crate::config::types::{
         AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, Proxy, ResponseBodyMode,
     };
-    use chrono::Utc;
+    use crate::time_compat::UtcTimestamp;
 
     fn minimal_proxy() -> Proxy {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         Proxy {
             labels: Default::default(),
             id: "p1".to_string(),

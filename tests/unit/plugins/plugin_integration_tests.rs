@@ -15,6 +15,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use super::plugin_utils::{create_test_consumer, create_test_context, create_test_proxy};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 fn create_response_context(path: &str) -> RequestContext {
     let mut ctx = create_test_context();
@@ -490,8 +491,8 @@ async fn test_plugin_scope_configuration() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
 
     assert_eq!(global_config.scope, PluginScope::Global);
@@ -510,8 +511,8 @@ async fn test_plugin_scope_configuration() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
 
     assert_eq!(proxy_config.scope, PluginScope::Proxy);

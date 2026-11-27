@@ -6,7 +6,6 @@
 use crate::scaffolding::port_registry::TestSocket;
 
 use arc_swap::ArcSwap;
-use chrono::Utc;
 use ferrum_edge::admin::{
     AdminState,
     jwt_auth::{JwtConfig, JwtManager},
@@ -19,6 +18,7 @@ use ferrum_edge::plugins::TransactionSummary;
 use ferrum_edge::proxy::ProxyState;
 use ferrum_edge::retry::ErrorClass;
 use ferrum_edge::runtime_metrics::{LogLevel, PoolKind};
+use ferrum_edge::time_compat::UtcTimestamp;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -54,14 +54,14 @@ fn create_test_jwt_manager(config: &TestConfig) -> JwtManager {
 }
 
 fn generate_test_token(config: &TestConfig) -> String {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "iss": config.jwt_issuer,
         "sub": "test-user",
         "role": "admin",
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(config.max_ttl as i64)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(config.max_ttl as i64)).unwrap()).unix_timestamp(),
         "jti": uuid::Uuid::new_v4().to_string(),
     });
     let header = Header::new(jsonwebtoken::Algorithm::HS256);
@@ -72,7 +72,7 @@ fn generate_test_token(config: &TestConfig) -> String {
 fn admin_state_with_runtime_metrics(jwt: JwtManager) -> AdminState {
     let cfg = GatewayConfig {
         version: "1".to_string(),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };

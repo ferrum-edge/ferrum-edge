@@ -139,9 +139,9 @@ pub(super) fn contract(name: &str) -> Option<PluginConfigContract> {
                     },
                     // Peer and request authentications are policy grammar and
                     // closed. Inventory members (`workloads`, `services`) are
-                    // not in the examples: they stay open on purpose so a
-                    // newer schema's fields are tolerated (see
-                    // `unknown_mesh_fields_are_tolerated`).
+                    // closed too since the 1.0 config freeze (see
+                    // `unknown_mesh_fields_are_rejected`); they are not in
+                    // these plugin examples.
                     "peer_authentications": [
                         {
                             "name": "default-strict",

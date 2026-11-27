@@ -48,7 +48,6 @@ use crate::scaffolding::port_registry::TestSocket;
 
 use std::time::Duration;
 
-use chrono::Utc;
 use ferrum_edge::config::EnvConfig;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use rcgen::{
@@ -61,6 +60,7 @@ use tokio::net::{TcpListener, UdpSocket};
 
 use crate::common::{TestGateway, TrustedProjectedGateway, TrustedProjectedGatewayOptions};
 use crate::scaffolding::clients::{Http3Client, Http3ConnectUdp};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const MASQUE_PREFIX: &str = "/.well-known/masque";
 
@@ -1161,11 +1161,11 @@ const AUTH_TERMINATION_GRACE: Duration = Duration::from_secs(25);
 /// gateway's `jwt_auth` plugin validates it and publishes the authoritative
 /// credential deadline onto the request.
 fn mint_masque_token(ttl_secs: i64) -> String {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "sub": AUTH_CONSUMER,
-        "iat": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(ttl_secs)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(ttl_secs)).unwrap()).unix_timestamp(),
     });
     encode(
         &Header::new(jsonwebtoken::Algorithm::HS256),

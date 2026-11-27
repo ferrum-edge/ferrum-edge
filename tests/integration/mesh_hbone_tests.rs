@@ -1,7 +1,6 @@
 use crate::scaffolding::port_registry::TestSocket;
 
 use bytes::Bytes;
-use chrono::Utc;
 use hyper::{Method, Request, StatusCode};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
@@ -47,6 +46,7 @@ use ferrum_edge::proxy::{
     ProxyState, start_proxy_listener_with_bound_listener,
     start_proxy_listener_with_bound_listener_and_mesh_direction,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 
 pub(super) fn create_mesh_proxy(backend_port: u16) -> Proxy {
     Proxy {
@@ -112,8 +112,8 @@ pub(super) fn create_mesh_proxy(backend_port: u16) -> Proxy {
         allow_path_parameters: false,
         allowed_methods: None,
         allowed_ws_origins: vec![],
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }
@@ -169,7 +169,7 @@ fn create_mesh_proxy_state_with_upstreams(
         consumers,
         plugin_configs,
         upstreams,
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         frontend_tls_cert_path: None,
         frontend_tls_key_path: None,
@@ -212,8 +212,8 @@ fn create_hmac_consumer(secret: &str) -> Consumer {
         custom_id: None,
         credentials,
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -232,8 +232,8 @@ fn hmac_auth_plugin_config() -> PluginConfig {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -254,8 +254,8 @@ fn spiffe_identity_plugin_config(proxy_id: &str) -> PluginConfig {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -624,8 +624,8 @@ fn mesh_route_dispatch_connect_timeout_plugin(
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -802,7 +802,7 @@ async fn hbone_connect_with_body_auth_plugin_is_rejected() {
 
     let method = "CONNECT";
     let path = "/";
-    let date = Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+    let date = httpdate::fmt_http_date(std::time::SystemTime::now());
     let authorization = hmac_v2_authorization(
         method,
         path,
@@ -1329,8 +1329,8 @@ fn spiffe_identity_global_plugin_config() -> PluginConfig {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -1356,7 +1356,7 @@ fn create_inbound_relay_gateway_state(mesh: Option<MeshConfig>) -> ProxyState {
         consumers: vec![],
         plugin_configs: vec![spiffe_plugin],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         frontend_tls_cert_path: None,
         frontend_tls_key_path: None,
@@ -2156,7 +2156,7 @@ fn materialize_source_side_external_udp(
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         frontend_tls_cert_path: None,
         frontend_tls_key_path: None,
@@ -5187,8 +5187,8 @@ fn global_mesh_route_dispatch_to(host: &str, port: u16) -> PluginConfig {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -5419,7 +5419,7 @@ fn create_post_plugin_third_workload_state(
         consumers: vec![],
         plugin_configs: vec![spiffe_plugin, route_override],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         frontend_tls_cert_path: None,
         frontend_tls_key_path: None,

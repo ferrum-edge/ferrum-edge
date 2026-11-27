@@ -1665,7 +1665,7 @@ mod tests {
     use crate::config::types::{
         AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, ResponseBodyMode,
     };
-    use chrono::Utc;
+    use crate::time_compat::UtcTimestamp;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use tokio::sync::Notify;
 
@@ -1732,7 +1732,7 @@ mod tests {
     }
 
     fn test_proxy() -> Proxy {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         Proxy {
             labels: Default::default(),
             id: "pool-test".to_string(),

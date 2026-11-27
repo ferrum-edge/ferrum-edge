@@ -51,7 +51,6 @@
 use std::time::Duration;
 
 use bytes::Bytes;
-use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
 
@@ -63,6 +62,7 @@ use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::{GetOptions, Http3Client};
 use crate::scaffolding::harness::GatewayHarness;
 use crate::scaffolding::ports::{reserve_colocated_tcp_udp, reserve_port};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 /// Consumer identity and shared HMAC secret used by every test in this file.
 const CONSUMER: &str = "h3-lifetime-alice";
@@ -94,11 +94,11 @@ const CREDENTIAL_EXPIRED_SETTLE: Duration = Duration::from_millis(500);
 /// future. The gateway's `jwt_auth` plugin validates it and publishes the
 /// authoritative deadline onto the request.
 fn mint_short_lived_token() -> String {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "sub": CONSUMER,
-        "iat": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(TOKEN_TTL_SECS)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(TOKEN_TTL_SECS)).unwrap()).unix_timestamp(),
     });
     encode(
         &Header::new(jsonwebtoken::Algorithm::HS256),

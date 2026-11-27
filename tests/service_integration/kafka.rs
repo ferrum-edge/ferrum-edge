@@ -8,7 +8,6 @@
 
 use std::time::Duration;
 
-use chrono::Utc;
 use ferrum_edge::plugins::kafka_logging::{KafkaLogging, KafkaSinkSnapshot};
 use ferrum_edge::plugins::utils::PluginHttpClient;
 use ferrum_edge::plugins::{Plugin, TransactionSummary};
@@ -18,6 +17,7 @@ use serial_test::serial;
 use crate::common::containers::{
     RedpandaContainer, fail_in_ci_else_skip, start_redpanda_container, start_redpanda_tls_container,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 
 async fn redpanda(test: &str) -> Option<RedpandaContainer> {
     match start_redpanda_container().await {
@@ -35,7 +35,7 @@ fn summary(path: &str, client_ip: &str) -> TransactionSummary {
         // `log_with_mirror` from the authoritative RequestContext.
         plugin_trigger_decisions: Default::default(),
         namespace: "ferrum".to_string(),
-        timestamp_received: Utc::now().to_rfc3339(),
+        timestamp_received: UtcTimestamp::now().to_rfc3339(),
         client_ip: client_ip.to_string(),
         consumer_username: None,
         principal_origin: None,

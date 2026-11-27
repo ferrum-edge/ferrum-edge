@@ -1,7 +1,7 @@
 use crate::scaffolding::port_registry::TestSocket;
 
 use arc_swap::ArcSwap;
-use chrono::Utc;
+use ferrum_edge::time_compat::UtcTimestamp;
 use ferrum_edge::{
     admin::{
         AdminState,
@@ -34,13 +34,13 @@ fn jwt_manager() -> JwtManager {
 }
 
 fn token(subject: &str, role: Option<&str>) -> String {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let mut claims = json!({
         "iss": JWT_ISSUER,
         "sub": subject,
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(3600)).unwrap()).unix_timestamp(),
         "jti": uuid::Uuid::new_v4().to_string(),
     });
     if let Some(role) = role {
@@ -55,13 +55,13 @@ fn token(subject: &str, role: Option<&str>) -> String {
 }
 
 fn token_with_ns(subject: &str, role: Option<&str>, ns: Value) -> String {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let mut claims = json!({
         "iss": JWT_ISSUER,
         "sub": subject,
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(3600)).unwrap()).unix_timestamp(),
         "jti": uuid::Uuid::new_v4().to_string(),
         "ns": ns,
     });
@@ -858,8 +858,8 @@ async fn malformed_persisted_serverless_url_is_wholly_redacted_from_views_and_au
             priority_override: None,
             trigger: None,
             api_spec_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         })
         .await
         .expect("persist malformed legacy plugin config");
@@ -3616,8 +3616,8 @@ async fn custom_plugin_configs_fail_closed_for_non_admins() {
             priority_override: None,
             trigger: None,
             api_spec_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         })
         .await
         .expect("persist custom plugin config");

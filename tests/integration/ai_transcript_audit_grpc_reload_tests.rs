@@ -18,7 +18,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use chrono::Utc;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -30,6 +29,7 @@ use ferrum_edge::config::types::{
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::plugins::{Plugin, ProxyProtocol};
 use ferrum_edge::proxy::{ConfigApplyOutcome, ProxyState};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const PROXY_ID: &str = "grpc-audit-proxy";
 const AUDIT_PLUGIN_ID: &str = "grpc-audit";
@@ -111,8 +111,8 @@ fn test_proxy() -> Proxy {
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }
@@ -127,8 +127,8 @@ fn audit_plugin_config(config: Value) -> PluginConfig {
         enabled: true,
         scope: PluginScope::Proxy,
         proxy_id: Some(PROXY_ID.to_string()),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         priority_override: None,
         trigger: None,
         api_spec_id: None,
@@ -227,7 +227,7 @@ fn empty_delta() -> IncrementalResult {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
         sequence_cursor: 0,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     }
 }
 

@@ -1,6 +1,5 @@
 //! Apply-begin capabilities must keep the serving generation as the rollback floor.
 
-use chrono::Utc;
 use ferrum_edge::modes::mesh::revision::{
     MeshConfigRevision, MeshRevisionContentIdentity, MeshRevisionGate, MeshRevisionOrder,
     MeshRevisionRejectReason,
@@ -9,6 +8,7 @@ use ferrum_edge::modes::mesh::runtime::MeshRuntimeState;
 use ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock;
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::plugins::mesh::prometheus_helpers::render_mesh_observability_metrics;
+use ferrum_edge::time_compat::UtcTimestamp;
 
 fn slice(sequence: u64) -> MeshSlice {
     MeshSlice {
@@ -142,10 +142,12 @@ fn overlay_refresh_permission_binds_the_applied_content_and_respects_reset() {
     let pending = MeshConfigRevision::new("db", 30);
     let content = MeshRevisionContentIdentity::from_digest([1; 32]);
     let divergent = MeshRevisionContentIdentity::from_digest([2; 32]);
-    gate.admit(Some(&serving), content, Utc::now()).unwrap();
+    gate.admit(Some(&serving), content, UtcTimestamp::now())
+        .unwrap();
     let token = gate.begin_apply(Some(&serving), content).unwrap();
     assert!(gate.commit_applied(Some(&serving), content, token));
-    gate.admit(Some(&pending), divergent, Utc::now()).unwrap();
+    gate.admit(Some(&pending), divergent, UtcTimestamp::now())
+        .unwrap();
 
     assert!(gate.begin_apply(Some(&serving), divergent).is_none());
     let token = gate.begin_apply(Some(&serving), content).unwrap();

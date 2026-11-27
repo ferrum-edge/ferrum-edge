@@ -12,7 +12,6 @@
 //! asserted here.
 
 use base64::Engine;
-use chrono::Utc;
 use ferrum_edge::config::db_backend::{
     FullConfigLoadPurpose, IncrementalFullReloadReason, IncrementalResult,
     gateway_trust_bundle_revision_conflict, is_incremental_full_reload_required,
@@ -23,6 +22,7 @@ use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::grpc::cp_server::{CpGrpcServer, CpScope};
 use ferrum_edge::identity::TrustDomain;
 use ferrum_edge::modes::mesh::config::{TrustBundle, TrustBundleSet};
+use ferrum_edge::time_compat::UtcTimestamp;
 use tempfile::TempDir;
 
 async fn sqlite_store() -> (DatabaseStore, TempDir) {
@@ -438,7 +438,7 @@ async fn a_corrupted_stored_bundle_rejects_the_load_without_leaking_material() {
 fn config_with_records(records: Vec<GatewayTrustBundleRecord>) -> GatewayConfig {
     GatewayConfig {
         version: "1".to_string(),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         gateway_trust_bundles: records,
         ..Default::default()
     }
@@ -1037,7 +1037,7 @@ async fn a_row_with_an_out_of_range_revision_is_refused_rather_than_defaulted() 
 }
 
 /// An unparseable timestamp is corrupt security metadata too: inventing
-/// `Utc::now()` would make a corrupted row look like a fresh rotation on every
+/// `UtcTimestamp::now()` would make a corrupted row look like a fresh rotation on every
 /// single load.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_row_with_an_unparseable_timestamp_is_refused_rather_than_defaulted() {
@@ -1130,7 +1130,7 @@ async fn an_ordinary_resource_delta_leaves_applied_trust_untouched() {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
         sequence_cursor: 0,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     };
     let version = delta.poll_timestamp.to_rfc3339();
     assert!(CpGrpcServer::broadcast_delta_with_trust_bundles(

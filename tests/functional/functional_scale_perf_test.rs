@@ -30,7 +30,6 @@
 use crate::scaffolding::port_registry::TestSocket;
 
 use bytes::Bytes;
-use chrono::Utc;
 use http_body_util::Full;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
@@ -51,6 +50,7 @@ use crate::common::scheduled_scaling::{
     scheduled_scaling_admin_jwt_max_ttl_value, wait_for_batch_apply_cursor,
     wait_for_config_convergence,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const BATCH_SIZE: usize = 3_000;
 const TOTAL_PROXIES: usize = 30_000;
@@ -346,15 +346,15 @@ impl ScalePerfHarness {
     }
 
     fn generate_token(&self) -> Result<String, Box<dyn std::error::Error>> {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let claims = json!({
             "iss": self.jwt_issuer,
             "sub": "test-admin",
             "role": "admin",
-            "iat": now.timestamp(),
-            "nbf": now.timestamp(),
-            "exp": (now + chrono::Duration::seconds(SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS))
-                .timestamp(),
+            "iat": now.unix_timestamp(),
+            "nbf": now.unix_timestamp(),
+            "exp": (now.checked_add(::time::SignedDuration::seconds(SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS)).unwrap())
+                .unix_timestamp(),
             "jti": Uuid::new_v4().to_string()
         });
         let header = Header::new(jsonwebtoken::Algorithm::HS256);
@@ -1153,7 +1153,7 @@ fn write_results_json(path: &str, db_label: &str, results: &[PerfResult]) {
     let document = json!({
         "test": "tests/functional/functional_scale_perf_test.rs",
         "database": db_label,
-        "finished_utc": Utc::now().to_rfc3339(),
+        "finished_utc": UtcTimestamp::now().to_rfc3339(),
         "git_commit": commit,
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
@@ -2274,7 +2274,7 @@ fn write_reload_results(
         "test": "tests/functional/functional_scale_perf_test.rs::test_scale_reload_under_load",
         "database": harness.db_label,
         "complete": complete,
-        "finished_utc": Utc::now().to_rfc3339(),
+        "finished_utc": UtcTimestamp::now().to_rfc3339(),
         "git_commit": Command::new("git").args(["rev-parse", "HEAD"]).output().ok()
             .and_then(|o| String::from_utf8(o.stdout).ok()).map(|s| s.trim().to_string()),
         "os": std::env::consts::OS,

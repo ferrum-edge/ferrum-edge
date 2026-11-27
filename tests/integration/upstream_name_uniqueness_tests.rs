@@ -6,10 +6,10 @@
 //! These tests exercise that persistence invariant on SQLite (same
 //! `DatabaseStore` path as PostgreSQL/MySQL behind dialect SQL rendering).
 
-use chrono::Utc;
 use ferrum_edge::config::db_backend::DatabaseBackend;
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
 use ferrum_edge::config::types::{LoadBalancerAlgorithm, Upstream, UpstreamTarget};
+use ferrum_edge::time_compat::UtcTimestamp;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::TempDir;
@@ -73,8 +73,8 @@ fn named_upstream(namespace: &str, id: &str, name: Option<&str>) -> Upstream {
         backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         k8s_service_uid: None,
         admission_upstream_id: None,
         pending_limit_scope: None,
@@ -192,7 +192,7 @@ async fn update_keeping_own_name_succeeds() {
 
     let mut updated = named_upstream("ferrum", "u1", Some("keep-me"));
     updated.targets[0].port = 9090;
-    updated.updated_at = Utc::now();
+    updated.updated_at = UtcTimestamp::now();
     let matched = store
         .update_upstream(&updated)
         .await

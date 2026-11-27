@@ -5365,8 +5365,9 @@ fn virtual_service_cross_namespace_service(
     if normalized.contains('*') {
         return None;
     }
+    let cluster_domain = normalized_mesh_cluster_domain(&acc.options.cluster_domain);
     let (service, namespace) =
-        service_host_components(&normalized, route_namespace, &acc.options.cluster_domain)?;
+        service_host_components(&normalized, route_namespace, &cluster_domain)?;
     if namespace == route_namespace {
         return None;
     }
@@ -5389,13 +5390,23 @@ pub(super) fn virtual_service_may_name_cross_namespace_service(
     object: &K8sObject,
     cluster_domain: &str,
 ) -> bool {
-    object.kind == "VirtualService"
-        && virtual_service_binds_mesh(object)
-        && virtual_service_destination_hosts(object).any(|host| {
-            let normalized = host.trim().trim_end_matches('.').to_ascii_lowercase();
-            service_host_components(&normalized, &object.metadata.namespace, cluster_domain)
-                .is_some_and(|(_, namespace)| namespace != object.metadata.namespace)
-        })
+    if object.kind != "VirtualService" || !virtual_service_binds_mesh(object) {
+        return false;
+    }
+    let cluster_domain = normalized_mesh_cluster_domain(cluster_domain);
+    virtual_service_destination_hosts(object).any(|host| {
+        let normalized = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        service_host_components(&normalized, &object.metadata.namespace, &cluster_domain)
+            .is_some_and(|(_, namespace)| namespace != object.metadata.namespace)
+    })
+}
+
+/// The cluster domain normalized the way the mesh data plane's host index
+/// normalizes `FERRUM_MESH_CLUSTER_DOMAIN` (surrounding whitespace and dots
+/// dropped, lowercase), so the translator and the data plane classify a
+/// fully qualified host the same way when the two settings agree (issue #7499).
+fn normalized_mesh_cluster_domain(cluster_domain: &str) -> String {
+    cluster_domain.trim().trim_matches('.').to_ascii_lowercase()
 }
 
 /// Every `spec.http[].route[].destination.host` of a VirtualService.
@@ -6853,7 +6864,7 @@ fn route_mirror_plugin(
         return Ok(None);
     }
 
-    let now = chrono::Utc::now();
+    let now = crate::time_compat::UtcTimestamp::now();
     Ok(Some(PluginConfig {
         labels: Default::default(),
         id: format!("istio-vs-mirror-{proxy_id}"),
@@ -7389,7 +7400,7 @@ fn route_cors_plugin(object: &K8sObject, http: &Value, proxy_id: &str) -> Option
         serde_json::json!(unmatched),
     );
 
-    let now = chrono::Utc::now();
+    let now = crate::time_compat::UtcTimestamp::now();
     Some(PluginConfig {
         labels: Default::default(),
         id: format!("istio-vs-cors-{proxy_id}"),

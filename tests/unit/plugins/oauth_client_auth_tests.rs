@@ -11,6 +11,7 @@ use ferrum_edge::plugins::utils::oauth_client_auth::{
     PrivateKeyDecodeError, basic_authorization_header, build_client_assertion, decode_private_key,
     form_encode_component, private_key_jwt_algorithm, probe_client_assertion_signing,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use serde_json::Value;
 
@@ -191,7 +192,7 @@ fn client_assertion_carries_the_rfc7523_claims_and_verifies() {
     assert_eq!(exp - iat, CLIENT_ASSERTION_LIFETIME_SECS);
     assert_eq!(CLIENT_ASSERTION_LIFETIME_SECS, 300);
     assert!(
-        (iat - chrono::Utc::now().timestamp()).abs() <= 5,
+        (iat - UtcTimestamp::now().unix_timestamp()).abs() <= 5,
         "iat is the signing instant"
     );
     assert!(

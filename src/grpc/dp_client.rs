@@ -24,7 +24,6 @@
 //! SNI is extracted from the CP URL so TLS certificate validation works
 //! correctly even when connecting via IP address with a hostname-based cert.
 use arc_swap::ArcSwap;
-use chrono::{DateTime, Utc};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::Serialize;
 use serde_json::json;
@@ -65,6 +64,7 @@ use crate::identity::TrustBundleSet as RuntimeTrustBundleSet;
 use crate::modes::mesh::config::TrustBundleSet as ConfigTrustBundleSet;
 use crate::proxy::{ConfigApplyOutcome, GatewayTrustCommit, ProxyState};
 use crate::startup::sanitize_startup_cause;
+use crate::time_compat::UtcTimestamp;
 use crate::tls::multi_cert::{
     GatewayCertificateInput, load_gateway_multi_cert_tls_config_with_handshake_scope,
 };
@@ -84,15 +84,15 @@ pub struct DpCpConnectionState {
     pub is_primary: bool,
     /// Timestamp of the last *accepted* config update received from CP.
     /// Rejected resource deltas must not advance this stamp.
-    pub last_config_received_at: Option<DateTime<Utc>>,
+    pub last_config_received_at: Option<UtcTimestamp>,
     /// When the current connection was established (None if disconnected).
-    pub connected_since: Option<DateTime<Utc>>,
+    pub connected_since: Option<UtcTimestamp>,
     /// Sticky operator signal: a non-empty ConfigSync DELTA was rejected and
     /// the DP has not yet accepted an authoritative FULL_SNAPSHOT recovery
     /// (issue #2394). Last-known-good config continues to serve.
     pub config_diverged: bool,
     /// When sticky divergence was first raised (cleared on FULL_SNAPSHOT recovery).
-    pub config_diverged_since: Option<DateTime<Utc>>,
+    pub config_diverged_since: Option<UtcTimestamp>,
     /// Count of divergence → FULL_SNAPSHOT recovery transitions.
     pub config_divergence_recoveries_total: u64,
 }
@@ -124,7 +124,7 @@ impl DpCpConnectionState {
         &self,
         cp_url: &str,
         is_primary: bool,
-        connected_since: DateTime<Utc>,
+        connected_since: UtcTimestamp,
     ) -> Self {
         Self {
             connected: true,
@@ -1651,7 +1651,7 @@ fn update_state_config_received(connection_state: Option<&Arc<ArcSwap<DpCpConnec
             connected: true,
             cp_url: prev.cp_url.clone(),
             is_primary: prev.is_primary,
-            last_config_received_at: Some(Utc::now()),
+            last_config_received_at: Some(UtcTimestamp::now()),
             connected_since: prev.connected_since,
             config_diverged: prev.config_diverged,
             config_diverged_since: prev.config_diverged_since,
@@ -1675,7 +1675,7 @@ fn update_state_config_diverged(
         .invalidate_configsync_divergence_metrics_cache();
     if let Some(cs) = connection_state {
         let prev = cs.load();
-        let since = prev.config_diverged_since.unwrap_or_else(Utc::now);
+        let since = prev.config_diverged_since.unwrap_or_else(UtcTimestamp::now);
         cs.store(Arc::new(DpCpConnectionState {
             connected: prev.connected,
             cp_url: prev.cp_url.clone(),
@@ -2345,7 +2345,11 @@ async fn connect_and_subscribe_with_startup_ready_inner(
     // divergence across reconnects (see `DpCpConnectionState::reconnected`).
     if let Some(cs) = connection_state {
         let prev = cs.load();
-        cs.store(Arc::new(prev.reconnected(cp_url, is_primary, Utc::now())));
+        cs.store(Arc::new(prev.reconnected(
+            cp_url,
+            is_primary,
+            UtcTimestamp::now(),
+        )));
     }
     // An authoritative source is reachable again, so the stale-config bound
     // stops accruing (issue #3726). Reachability is NOT freshness: this never
@@ -2596,7 +2600,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                             cp_url = %sanitize_startup_cause(format!("{cp_url:?}"), &[]),
                             version = %sanitize_startup_cause(format!("{:?}", update.version), &[]),
                             loaded_at = %sanitize_startup_cause(
-                                format!("{:?}", config.loaded_at.to_string()),
+                                format!("{:?}", config.loaded_at.to_chrono_display()),
                                 &[]
                             ),
                             "Refusing FULL_SNAPSHOT with inconsistent or unorderable version \
@@ -2612,14 +2616,14 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                 // time catches up. Fail closed: refuse, alarm, and fail over while
                 // last-known-good config keeps serving. Never clamp the untrusted
                 // stamp into authority (issue M1).
-                if let Err(reason) = evaluate_snapshot_clock_skew(committed, Utc::now()) {
+                if let Err(reason) = evaluate_snapshot_clock_skew(committed, UtcTimestamp::now()) {
                     record_fenced_full_snapshot(divergence_metrics);
                     warn!(
                         ?reason,
                         cp_url = %sanitize_startup_cause(format!("{cp_url:?}"), &[]),
                         version = %sanitize_startup_cause(format!("{:?}", update.version), &[]),
                         loaded_at = %sanitize_startup_cause(
-                            format!("{:?}", config.loaded_at.to_string()),
+                            format!("{:?}", config.loaded_at.to_chrono_display()),
                             &[]
                         ),
                         "Refusing FULL_SNAPSHOT with an implausibly-future committed timestamp \
@@ -2913,7 +2917,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                             &[]
                                         ),
                                         poll_timestamp = %sanitize_startup_cause(
-                                            format!("{:?}", poll_timestamp.to_string()),
+                                            format!("{:?}", poll_timestamp.to_chrono_display()),
                                             &[]
                                         ),
                                         "Refusing DELTA with inconsistent or unorderable freshness"
@@ -2935,7 +2939,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                 }
                             };
                         if let Err(reason) =
-                            evaluate_snapshot_clock_skew(committed_delta, Utc::now())
+                            evaluate_snapshot_clock_skew(committed_delta, UtcTimestamp::now())
                         {
                             warn!(
                                 ?reason,
@@ -2945,7 +2949,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                     &[]
                                 ),
                                 poll_timestamp = %sanitize_startup_cause(
-                                    format!("{:?}", poll_timestamp.to_string()),
+                                    format!("{:?}", poll_timestamp.to_chrono_display()),
                                     &[]
                                 ),
                                 "Refusing DELTA with an implausibly-future committed timestamp \
@@ -2968,7 +2972,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                     &[]
                                 ),
                                 poll_timestamp = %sanitize_startup_cause(
-                                    format!("{:?}", poll_timestamp.to_string()),
+                                    format!("{:?}", poll_timestamp.to_chrono_display()),
                                     &[]
                                 ),
                                 "Refusing DELTA older than the applied authority watermark"
@@ -3385,7 +3389,6 @@ mod tests {
     use crate::config::db_loader::NamespacedResourceId;
     use crate::dns::{DnsCache, DnsConfig};
     use crate::proxy::ProxyState;
-    use chrono::Utc;
     use serde_json::json;
 
     fn minimal_proxy_state() -> ProxyState {
@@ -3988,7 +3991,7 @@ mod tests {
                 upstream_in_namespace("u-prod", "production"),
                 upstream_in_namespace("u-staging", "staging"),
             ],
-            loaded_at: Utc::now(),
+            loaded_at: UtcTimestamp::now(),
             known_namespaces: Vec::new(),
             frontend_tls_cert_path: None,
             frontend_tls_key_path: None,
@@ -4031,7 +4034,7 @@ mod tests {
             consumers: Vec::new(),
             plugin_configs: Vec::new(),
             upstreams: Vec::new(),
-            loaded_at: Utc::now(),
+            loaded_at: UtcTimestamp::now(),
             known_namespaces: Vec::new(),
             frontend_tls_cert_path: None,
             frontend_tls_key_path: None,
@@ -4076,7 +4079,7 @@ mod tests {
             consumers: vec![],
             plugin_configs: vec![],
             upstreams: vec![],
-            loaded_at: Utc::now(),
+            loaded_at: UtcTimestamp::now(),
             known_namespaces: Vec::new(),
             frontend_tls_cert_path: None,
             frontend_tls_key_path: None,
@@ -4100,7 +4103,7 @@ mod tests {
     fn filter_config_clears_foreign_gateway_frontend_tls_sources() {
         let mut cfg = GatewayConfig {
             version: "1".to_string(),
-            loaded_at: Utc::now(),
+            loaded_at: UtcTimestamp::now(),
             frontend_tls_cert_path: Some("k8s://staging/gateway-cert#tls.crt".to_string()),
             frontend_tls_key_path: Some("k8s://staging/gateway-cert#tls.key".to_string()),
             frontend_tls_source_namespace: Some("staging".to_string()),
@@ -4117,7 +4120,7 @@ mod tests {
     fn filter_config_keeps_matching_gateway_frontend_tls_sources() {
         let mut cfg = GatewayConfig {
             version: "1".to_string(),
-            loaded_at: Utc::now(),
+            loaded_at: UtcTimestamp::now(),
             frontend_tls_cert_path: Some("k8s://secrets/gateway-cert#tls.crt".to_string()),
             frontend_tls_key_path: Some("k8s://secrets/gateway-cert#tls.key".to_string()),
             frontend_tls_source_namespace: Some("production".to_string()),
@@ -4139,7 +4142,7 @@ mod tests {
     fn filter_config_projects_namespace_scoped_gateway_frontend_tls_sources() {
         let mut cfg = GatewayConfig {
             version: "1".to_string(),
-            loaded_at: Utc::now(),
+            loaded_at: UtcTimestamp::now(),
             frontend_tls_cert_path: Some("k8s://staging/gateway-cert#tls.crt".to_string()),
             frontend_tls_key_path: Some("k8s://staging/gateway-cert#tls.key".to_string()),
             frontend_tls_source_namespace: Some("staging".to_string()),
@@ -4203,7 +4206,7 @@ mod tests {
             ],
             removed_upstream_ids: vec![],
             sequence_cursor: 0,
-            poll_timestamp: Utc::now(),
+            poll_timestamp: UtcTimestamp::now(),
         };
 
         let filtered = filter_incremental_to_namespace(&mut delta, "production");
@@ -4234,7 +4237,7 @@ mod tests {
             added_or_modified_upstreams: vec![],
             removed_upstream_ids: vec![],
             sequence_cursor: 0,
-            poll_timestamp: Utc::now(),
+            poll_timestamp: UtcTimestamp::now(),
         };
         assert_eq!(filter_incremental_to_namespace(&mut delta, "production"), 0);
     }

@@ -1,6 +1,5 @@
 //! Tests for the CORS plugin
 
-use chrono::Utc;
 use ferrum_edge::PluginCache;
 use ferrum_edge::config::types::{GatewayConfig, PluginAssociation, PluginConfig, PluginScope};
 use ferrum_edge::plugins::cors::CorsPlugin;
@@ -10,6 +9,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 
 use super::plugin_utils::{capture_logs, create_test_proxy};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 fn make_ctx() -> RequestContext {
     RequestContext::new(
@@ -2711,8 +2711,8 @@ fn cors_plugin_config(
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -2735,7 +2735,7 @@ fn gateway_with_cors_proxy(cors_origins: Value, allowed_ws_origins: Vec<String>)
             Some("ws-api"),
         )],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     }

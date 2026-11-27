@@ -15,7 +15,6 @@
 use crate::scaffolding::port_registry::TestSocket;
 
 use arc_swap::ArcSwap;
-use chrono::Utc;
 use ferrum_edge::admin::{
     AdminState,
     jwt_auth::{JwtConfig, JwtManager},
@@ -25,6 +24,7 @@ use ferrum_edge::config::db_backend::{
     BatchConfigWriteMode, DatabaseBackend, NamespaceConfigAdmissionLeaseBackend,
 };
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
+use ferrum_edge::time_compat::UtcTimestamp;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use reqwest::Method;
 use serde_json::{Value, json};
@@ -46,14 +46,14 @@ fn jwt_manager_with_secret(secret: &str) -> JwtManager {
 }
 
 fn token_with_role(secret: &str, role: &str) -> String {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "iss": JWT_ISSUER,
         "sub": "conditional-writer",
         "role": role,
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(3600)).unwrap()).unix_timestamp(),
         "jti": uuid::Uuid::new_v4().to_string(),
     });
     encode(

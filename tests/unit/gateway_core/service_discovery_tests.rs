@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::unit::env_lock::EnvGuard;
+use ferrum_edge::time_compat::UtcTimestamp;
 
 /// Checked-in one-line nonsecret SA token for mock Kubernetes `discover()` tests.
 /// Keeps those tests off the host/in-cluster default path and out of `KUBE_TOKEN`.
@@ -73,8 +74,8 @@ fn make_upstream(
         backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         api_spec_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         k8s_service_uid: None,
         admission_upstream_id: None,
         pending_limit_scope: None,

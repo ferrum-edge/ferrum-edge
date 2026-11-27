@@ -1,10 +1,10 @@
-use chrono::{TimeZone, Utc};
 use ferrum_edge::grpc::mesh_registry::{MeshNodeInfo, MeshNodeRegistry};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 #[test]
 fn equal_subjects_remain_separate_between_namespaces() {
     let registry = MeshNodeRegistry::new();
-    let connected_at = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 1).unwrap();
+    let connected_at = "2026-05-05T12:00:01Z".parse::<UtcTimestamp>().unwrap();
     let first = MeshNodeInfo {
         node_id: "shared-subject".to_string(),
         version: "v1".to_string(),

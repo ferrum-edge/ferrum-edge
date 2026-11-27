@@ -96,12 +96,25 @@
 
 use super::{mysql_create_index_exists_is_benign, mysql_error_number};
 use sqlx::AnyConnection;
+use std::borrow::Cow;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SqlDialect {
     Postgres,
     MySql,
     Sqlite,
+}
+
+/// One V001 step, in execution order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum V001Step {
+    /// Executed verbatim (the SQLite pragma and every `CREATE TABLE`).
+    Statement(&'static str),
+    /// `CREATE [UNIQUE] INDEX`; MySQL strips `IF NOT EXISTS` and tolerates only
+    /// the structured duplicate-key-name error.
+    Index(&'static str),
+    /// The default-namespace registry seed, bound to `DEFAULT_NAMESPACE`.
+    SeedDefaultNamespace(&'static str),
 }
 
 /// Small dialect-aware SQL helper for V001.
@@ -128,12 +141,76 @@ impl V001SqlBuilder {
         // MySQL auto-commits DDL, so a mid-V001 failure cannot be rolled back.
         // Keep every statement idempotent and only let MigrationRunner record
         // V001 after this full apply path returns successfully.
-        self.enable_sqlite_foreign_keys(connection).await?;
-        self.create_tables(connection).await?;
-        self.create_indexes(connection).await?;
-        self.create_unique_indexes(connection).await?;
-        self.seed_default_namespace(connection).await?;
+        //
+        // `steps()` is the single list both this executor and the canonical
+        // checksum (`canonical_steps`) read, so the recorded V001 identity is
+        // always the identity of exactly what ran.
+        for step in self.steps() {
+            match step {
+                V001Step::Statement(sql) => {
+                    sqlx::query(sql).execute(&mut *connection).await?;
+                }
+                V001Step::Index(sql) => self.execute_index_sql(connection, sql).await?,
+                V001Step::SeedDefaultNamespace(sql) => {
+                    self.seed_default_namespace(connection, sql).await?;
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Every V001 step for this dialect, in execution order.
+    fn steps(&self) -> Vec<V001Step> {
+        let mut steps = Vec::with_capacity(64);
+        if self.is_sqlite() {
+            steps.push(V001Step::Statement("PRAGMA foreign_keys = ON"));
+        }
+        steps.extend(self.table_sqls().into_iter().map(V001Step::Statement));
+        steps.extend(self.index_sqls().into_iter().map(V001Step::Index));
+        steps.extend(
+            self.audit_event_index_sqls()
+                .iter()
+                .copied()
+                .map(V001Step::Index),
+        );
+        steps.extend(
+            self.namespace_unique_index_sqls()
+                .iter()
+                .copied()
+                .map(V001Step::Index),
+        );
+        steps.push(V001Step::SeedDefaultNamespace(
+            self.seed_default_namespace_sql(),
+        ));
+        steps
+    }
+
+    /// Canonical rendering of every V001 step for this dialect, in order.
+    ///
+    /// Each line is the statement exactly as it is sent to the database
+    /// (after the MySQL `IF NOT EXISTS` strip) in `canonical_statement` form:
+    /// whitespace outside quoted text and SQL comments collapsed, quoted text
+    /// and comments kept exactly. Rust comments, helper names, and source layout
+    /// are not part of it, so refactoring this file never changes V001's
+    /// identity; changing any executed statement always does.
+    pub(super) fn canonical_steps(&self) -> Vec<String> {
+        self.steps()
+            .into_iter()
+            .map(|step| match step {
+                V001Step::Statement(sql) => {
+                    format!("statement {}", super::canonical_statement(sql))
+                }
+                V001Step::Index(sql) => format!(
+                    "index {}",
+                    super::canonical_statement(&self.executed_index_sql(sql))
+                ),
+                V001Step::SeedDefaultNamespace(sql) => format!(
+                    "seed {} binds=[{:?}, <now>, <now>]",
+                    super::canonical_statement(sql),
+                    crate::config::types::DEFAULT_NAMESPACE
+                ),
+            })
+            .collect()
     }
 
     /// Seed the initial registry as part of V001, never on subsequent startup.
@@ -141,17 +218,8 @@ impl V001SqlBuilder {
     async fn seed_default_namespace(
         &self,
         connection: &mut AnyConnection,
+        sql: &'static str,
     ) -> Result<(), anyhow::Error> {
-        let sql = if self.is_mysql() {
-            "INSERT INTO namespaces (name, created_at, updated_at) VALUES (?, ?, ?) \
-             ON DUPLICATE KEY UPDATE name = namespaces.name"
-        } else if self.is_sqlite() {
-            "INSERT INTO namespaces (name, created_at, updated_at) VALUES (?, ?, ?) \
-             ON CONFLICT (name) DO NOTHING"
-        } else {
-            "INSERT INTO namespaces (name, created_at, updated_at) VALUES ($1, $2, $3) \
-             ON CONFLICT (name) DO NOTHING"
-        };
         let now = crate::time_compat::UtcTimestamp::now().to_rfc3339();
         sqlx::query(sql)
             .bind(crate::config::types::DEFAULT_NAMESPACE)
@@ -162,21 +230,21 @@ impl V001SqlBuilder {
         Ok(())
     }
 
-    async fn enable_sqlite_foreign_keys(
-        &self,
-        connection: &mut AnyConnection,
-    ) -> Result<(), anyhow::Error> {
-        if self.is_sqlite() {
-            sqlx::query("PRAGMA foreign_keys = ON")
-                .execute(&mut *connection)
-                .await?;
+    fn seed_default_namespace_sql(&self) -> &'static str {
+        if self.is_mysql() {
+            "INSERT INTO namespaces (name, created_at, updated_at) VALUES (?, ?, ?) \
+             ON DUPLICATE KEY UPDATE name = namespaces.name"
+        } else if self.is_sqlite() {
+            "INSERT INTO namespaces (name, created_at, updated_at) VALUES (?, ?, ?) \
+             ON CONFLICT (name) DO NOTHING"
+        } else {
+            "INSERT INTO namespaces (name, created_at, updated_at) VALUES ($1, $2, $3) \
+             ON CONFLICT (name) DO NOTHING"
         }
-
-        Ok(())
     }
 
-    async fn create_tables(&self, connection: &mut AnyConnection) -> Result<(), anyhow::Error> {
-        for sql in [
+    fn table_sqls(&self) -> Vec<&'static str> {
+        vec![
             self.create_upstreams_sql(),
             self.create_consumers_sql(),
             self.create_consumer_credential_index_sql(),
@@ -210,15 +278,11 @@ impl V001SqlBuilder {
             // exist before any resource row is written; GET /namespaces unions
             // this table with the derived resource-table names.
             self.create_namespaces_sql(),
-        ] {
-            sqlx::query(sql).execute(&mut *connection).await?;
-        }
-
-        Ok(())
+        ]
     }
 
-    async fn create_indexes(&self, connection: &mut AnyConnection) -> Result<(), anyhow::Error> {
-        let indexes = [
+    fn index_sqls(&self) -> Vec<&'static str> {
+        vec![
             // Relationship indexes lead with `namespace` because every
             // relationship key is `(namespace, id)` (issue #4627): they serve
             // the namespace-scoped reference scans AND satisfy MySQL's
@@ -296,36 +360,7 @@ impl V001SqlBuilder {
             "CREATE INDEX IF NOT EXISTS idx_proxies_ns_api_spec_id ON proxies (namespace, api_spec_id)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_api_spec_id ON plugin_configs (namespace, api_spec_id)",
             "CREATE INDEX IF NOT EXISTS idx_upstreams_ns_api_spec_id ON upstreams (namespace, api_spec_id)",
-        ];
-
-        for idx_sql in indexes {
-            self.execute_index_sql(connection, idx_sql).await?;
-        }
-        self.create_audit_event_indexes(connection).await?;
-
-        Ok(())
-    }
-
-    async fn create_unique_indexes(
-        &self,
-        connection: &mut AnyConnection,
-    ) -> Result<(), anyhow::Error> {
-        for idx_sql in self.namespace_unique_index_sqls() {
-            self.execute_index_sql(connection, idx_sql).await?;
-        }
-
-        Ok(())
-    }
-
-    async fn create_audit_event_indexes(
-        &self,
-        connection: &mut AnyConnection,
-    ) -> Result<(), anyhow::Error> {
-        for idx_sql in self.audit_event_index_sqls() {
-            self.execute_index_sql(connection, idx_sql).await?;
-        }
-
-        Ok(())
+        ]
     }
 
     fn audit_event_index_sqls(&self) -> &'static [&'static str] {
@@ -348,7 +383,7 @@ impl V001SqlBuilder {
             // error text instead would also accept any failure whose message
             // happens to contain "1061" and record V001 with an index missing.
             // Derived only from the static index DDL above.
-            let mysql_sql = sqlx::AssertSqlSafe(idx_sql.replace("IF NOT EXISTS ", ""));
+            let mysql_sql = sqlx::AssertSqlSafe(self.executed_index_sql(idx_sql).into_owned());
             if let Err(e) = sqlx::query(mysql_sql).execute(&mut *connection).await
                 && !mysql_create_index_exists_is_benign(mysql_error_number(&e))
             {
@@ -359,6 +394,15 @@ impl V001SqlBuilder {
         }
 
         Ok(())
+    }
+
+    /// The index statement exactly as it is sent to this dialect.
+    fn executed_index_sql(&self, idx_sql: &'static str) -> Cow<'static, str> {
+        if self.is_mysql() {
+            Cow::Owned(idx_sql.replace("IF NOT EXISTS ", ""))
+        } else {
+            Cow::Borrowed(idx_sql)
+        }
     }
 
     fn is_mysql(&self) -> bool {
@@ -860,8 +904,8 @@ impl V001SqlBuilder {
     /// one is enabled. `restore_owner` is a logical fence that persists across
     /// every transaction in a compensating restore replay.
     ///
-    /// Build-out policy intentionally keeps this table in the current baseline
-    /// only; existing development databases must be recreated.
+    /// Part of the frozen V001 baseline; any later change to it ships as a
+    /// forward migration.
     fn create_mtls_dns_admission_locks_sql(&self) -> &'static str {
         if self.is_mysql() {
             r#"

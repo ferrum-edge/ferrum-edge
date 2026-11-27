@@ -33,6 +33,7 @@ use ferrum_edge::proxy::udp_proxy::{
     UdpListenerConfig, UdpProxyMetrics, start_udp_listener_holding_port,
 };
 use ferrum_edge::request_epoch::RequestEpochStore;
+use ferrum_edge::time_compat::UtcTimestamp;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -110,8 +111,8 @@ fn create_stream_proxy(id: &str, scheme: BackendScheme, port: u16) -> Proxy {
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     };
     proxy.resolved_tls = BackendTlsConfig::from_proxy(&proxy);
@@ -499,7 +500,6 @@ fn create_manager_runtime(
         false, // io_uring_splice_enabled
         false, // record_mesh_mtls_metric
         0,     // so_busy_poll_us
-        false, // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
         false, // udp_gso_enabled
         false, // udp_pktinfo_enabled
         Arc::new(TrustedProxies::none()),
@@ -520,7 +520,7 @@ fn empty_config() -> GatewayConfig {
         consumers: vec![],
         upstreams: vec![],
         plugin_configs: vec![],
-        loaded_at: chrono::Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     }
@@ -680,7 +680,6 @@ fn create_datagram_reload_manager_runtime(
         false,
         false,
         0,
-        false,
         false,
         false,
         trusted_proxies,
@@ -1478,7 +1477,6 @@ fn direct_udp_listener_config(
         session_shard_amount: 0,
         overload: Arc::new(ferrum_edge::overload::OverloadState::new()),
         so_busy_poll_us: 0,
-        udp_gro_enabled: false,
         udp_gso_enabled: false,
         udp_pktinfo_enabled: false,
         mesh_outbound_enforcement: ferrum_edge::modes::mesh::outbound_enforcement::empty_slot(),

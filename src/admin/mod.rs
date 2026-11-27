@@ -28,8 +28,8 @@ pub use tls_management::{
     set_tls_store_delete_hook_for_tests,
 };
 
+use crate::time_compat::UtcTimestamp;
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::header::{HeaderName, HeaderValue, RETRY_AFTER};
@@ -6773,6 +6773,7 @@ fn tls_mutation_audit_descriptor(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MeshEgressScopeTestRequest {
     host: String,
     #[serde(default)]
@@ -7069,7 +7070,7 @@ async fn handle_mesh_config_drift_get(
         match mesh_config_drift::try_build_response(mesh_config_drift::MeshConfigDriftInputs {
             slice: slice_snapshot.as_ref().as_ref(),
             last_install_at,
-            now: chrono::Utc::now(),
+            now: UtcTimestamp::now(),
             source_protocol: &source_protocol,
             source_cp_url: &source_cp_url,
             include_overlay,
@@ -7272,20 +7273,24 @@ async fn handle_mesh_policy_denies_recent_get(
         }
     };
     let recorder = crate::modes::mesh::policy_deny_log::global();
-    let window_chrono = match chrono::Duration::from_std(window) {
-        Ok(d) => d,
+    // Should be unreachable — `parse_mesh_policy_denies_query` clamps to
+    // MESH_POLICY_DENIES_MAX_WINDOW, far inside the representable range — but
+    // treat overflow defensively rather than panic in production.
+    let cutoff = match ::time::SignedDuration::try_from(window)
+        .map_err(|e| e.to_string())
+        .and_then(|window| {
+            UtcTimestamp::now()
+                .checked_sub(window)
+                .ok_or_else(|| "out of range".to_string())
+        }) {
+        Ok(cutoff) => cutoff,
         Err(e) => {
-            // Should be unreachable — `parse_mesh_policy_denies_query` clamps
-            // to MESH_POLICY_DENIES_MAX_WINDOW which is well under the
-            // chrono limit — but treat overflow defensively rather than
-            // panic in production.
             return Ok(json_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &json!({"error": format!("window overflow: {e}")}),
             ));
         }
     };
-    let cutoff = Utc::now() - window_chrono;
     let aggregate = recorder.aggregate_recent(cutoff, limit);
     Ok(json_response(
         StatusCode::OK,
@@ -7394,15 +7399,16 @@ async fn handle_mesh_egress_scope_test(
             &json!({"error": "No active mesh egress scope"}),
         ));
     };
-    let candidate: MeshEgressScopeTestRequest = match serde_json::from_slice(body_bytes) {
-        Ok(candidate) => candidate,
-        Err(e) => {
-            return Ok(json_response(
-                StatusCode::BAD_REQUEST,
-                &json!({"error": format!("Invalid JSON body: {e}")}),
-            ));
-        }
-    };
+    let candidate: MeshEgressScopeTestRequest =
+        match crate::util::json_object::from_json_object_slice(body_bytes) {
+            Ok(candidate) => candidate,
+            Err(e) => {
+                return Ok(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({"error": format!("Invalid JSON body: {e}")}),
+                ));
+            }
+        };
     let host = candidate.host.trim();
     if host.is_empty() {
         return Ok(json_response(
@@ -7518,7 +7524,7 @@ fn prepare_batch_items<R: crud::AdminResource>(
     items: &mut [R],
     kind: &str,
     namespace: &str,
-    now: chrono::DateTime<Utc>,
+    now: UtcTimestamp,
     validation_ctx: &crud::ValidationCtx<'_>,
     validation_errors: &mut Vec<String>,
 ) -> Result<(), String> {
@@ -7699,7 +7705,7 @@ async fn persist_consumer_update(
     {
         return *response;
     }
-    consumer.updated_at = Utc::now();
+    consumer.updated_at = UtcTimestamp::now();
     if let Err(_error) = namespace_admission.ensure_held() {
         warn_persistence_failure_redacted("credential_namespace_admission_before_persist");
         return mtls_dns_admission_unavailable_response();
@@ -8316,7 +8322,7 @@ fn apply_payload_namespace(payload: &mut RestorePayload, namespace: &str) {
     }
 }
 
-fn normalize_restore_payload_timestamps(payload: &mut RestorePayload, restored_at: DateTime<Utc>) {
+fn normalize_restore_payload_timestamps(payload: &mut RestorePayload, restored_at: UtcTimestamp) {
     for proxy in &mut payload.proxies {
         proxy.updated_at = restored_at;
     }
@@ -8672,7 +8678,7 @@ async fn reconcile_restored_gateway_trust_bundles(
             // the store rather than adopted from a file an operator could edit.
             desired.id = existing.id.clone();
             desired.created_at = existing.created_at;
-            desired.updated_at = Utc::now();
+            desired.updated_at = UtcTimestamp::now();
             // A payload revision is never an expectation and never a stored
             // value; the store assigns the next one from the change sequence.
             desired.revision = 0;
@@ -8704,7 +8710,7 @@ async fn reconcile_restored_gateway_trust_bundles(
             // at 1) would let a client that read the previous incarnation
             // compare-and-set against the restored one.
             desired.revision = 0;
-            desired.created_at = Utc::now();
+            desired.created_at = UtcTimestamp::now();
             desired.updated_at = desired.created_at;
             db.create_gateway_trust_bundle(&desired)
                 .await
@@ -10794,7 +10800,7 @@ async fn handle_batch_create(
         false,
     );
 
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let validation_ctx = crud::ValidationCtx::from_state(state);
     let mut validation_errors: Vec<String> = Vec::new();
 
@@ -12524,7 +12530,7 @@ async fn handle_restore(
         consumers: std::mem::take(&mut payload.consumers),
         plugin_configs: std::mem::take(&mut payload.plugin_configs),
         upstreams: std::mem::take(&mut payload.upstreams),
-        loaded_at: Utc::now(),
+        loaded_at: crate::time_compat::UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         mesh: state
             .cached_gateway_config()
@@ -12797,7 +12803,7 @@ async fn handle_restore(
 
     // Complete all fallible payload preparation before changing durable state.
     let mut preparation_errors = Vec::new();
-    normalize_restore_payload_timestamps(&mut payload, Utc::now());
+    normalize_restore_payload_timestamps(&mut payload, UtcTimestamp::now());
     // Namespace was already stamped on the validated candidate; re-apply
     // idempotently so preparation stays fail-closed if a resource somehow
     // lost its boundary.
@@ -13465,27 +13471,35 @@ fn parse_audit_filter(
                 "resource_type" => filter.resource_type = Some(value.into_owned()),
                 "resource_id" => filter.resource_id = Some(value.into_owned()),
                 "start" => {
+                    // chrono-compatible parse (issue #7419): the same inputs
+                    // are accepted; a leap second normalizes and an instant
+                    // outside UtcTimestamp's range is rejected like any
+                    // invalid value.
                     filter.start = Some(
-                        chrono::DateTime::parse_from_rfc3339(&value)
+                        crate::time_compat::parse_rfc3339_chrono(&value)
+                            .and_then(|parsed| parsed.to_utc_timestamp())
                             .map_err(|e| {
                                 Box::new(json_response(
                                     StatusCode::BAD_REQUEST,
                                     &json!({"error": format!("Invalid audit start timestamp: {}", e)}),
                                 ))
-                            })?
-                            .with_timezone(&Utc),
+                            })?,
                     );
                 }
                 "end" => {
+                    // chrono-compatible parse (issue #7419): the same inputs
+                    // are accepted; a leap second normalizes and an instant
+                    // outside UtcTimestamp's range is rejected like any
+                    // invalid value.
                     filter.end = Some(
-                        chrono::DateTime::parse_from_rfc3339(&value)
+                        crate::time_compat::parse_rfc3339_chrono(&value)
+                            .and_then(|parsed| parsed.to_utc_timestamp())
                             .map_err(|e| {
                                 Box::new(json_response(
                                     StatusCode::BAD_REQUEST,
                                     &json!({"error": format!("Invalid audit end timestamp: {}", e)}),
                                 ))
-                            })?
-                            .with_timezone(&Utc),
+                            })?,
                     );
                 }
                 // `limit`/`offset` are owned by `parse_pagination`, which has
@@ -13591,7 +13605,11 @@ fn maybe_enforce_namespace_claim(
 /// never have to special-case a missing field; this repair deliberately does
 /// not fabricate durable history for a row that does not exist.
 fn synthesized_namespace_record(name: &str) -> crate::config::namespace_registry::NamespaceRecord {
-    crate::config::namespace_registry::NamespaceRecord::new(name.to_string(), None, Utc::now())
+    crate::config::namespace_registry::NamespaceRecord::new(
+        name.to_string(),
+        None,
+        UtcTimestamp::now(),
+    )
 }
 
 fn namespace_registry_atomicity_unsupported_response(
@@ -13963,7 +13981,7 @@ async fn handle_create_namespace(
         Err(response) => return Ok(response),
     };
     let request: crate::config::namespace_registry::CreateNamespaceRequest =
-        match serde_json::from_slice(body) {
+        match crate::util::json_object::from_json_object_slice(body) {
             Ok(request) => request,
             Err(e) => {
                 return Ok(json_response(
@@ -14005,7 +14023,7 @@ async fn handle_create_namespace(
     let record = crate::config::namespace_registry::NamespaceRecord::new(
         request.name.clone(),
         description,
-        Utc::now(),
+        UtcTimestamp::now(),
     );
     let holds = admission.holds();
     if let Err(resp) =
@@ -15559,8 +15577,10 @@ mod tests {
         // `Default`, so build the test payload through serde — the domain
         // structs already carry `#[serde(default)]` on every field we don't
         // care about for this test.
-        let old = Utc::now() - chrono::Duration::days(90);
-        let restored_at = Utc::now();
+        let old = UtcTimestamp::now()
+            .checked_sub(::time::SignedDuration::days(90))
+            .unwrap();
+        let restored_at = UtcTimestamp::now();
         let old_ts = old.to_rfc3339();
         let payload_json = serde_json::json!({
             "proxies": [{

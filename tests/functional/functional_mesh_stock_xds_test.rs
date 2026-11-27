@@ -98,6 +98,7 @@ use crate::functional::functional_mesh_mode_test::{
     loopback_ephemeral, plaintext_http_get, reserve_mesh_ports, spawn_mesh_gateway,
     start_static_mesh_cp, wait_for_gateway_listener,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const A_SPIFFE: &str = "spiffe://cluster.local/ns/ferrum/sa/client-app";
 const B_SPIFFE: &str = "spiffe://cluster.local/ns/ferrum/sa/svc-b";
@@ -788,7 +789,7 @@ fn destination_slice(node_id: &str, backend_port: u16) -> MeshSlice {
     MeshSlice {
         node_id: node_id.to_string(),
         namespace: "ferrum".to_string(),
-        version: chrono::Utc::now().to_rfc3339(),
+        version: UtcTimestamp::now().to_rfc3339(),
         workloads,
         services,
         peer_authentications: vec![PeerAuthentication {

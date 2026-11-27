@@ -8,7 +8,6 @@
 use crate::scaffolding::port_registry::TestSocket;
 
 use arc_swap::ArcSwap;
-use chrono::Utc;
 use ferrum_edge::PluginCache;
 use ferrum_edge::admin::{
     AdminState,
@@ -23,6 +22,7 @@ use ferrum_edge::plugins::PluginHttpClient;
 use ferrum_edge::plugins::mesh::bpf_metrics::{DEFAULT_METRIC_PREFIX, PLUGIN_NAME};
 use ferrum_edge::proxy::client_ip::TrustedProxies;
 use ferrum_edge::proxy::{ConfigApplyOutcome, ProxyState};
+use ferrum_edge::time_compat::UtcTimestamp;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
 use std::collections::HashSet;
@@ -45,14 +45,14 @@ fn jwt_manager() -> JwtManager {
 }
 
 fn admin_token() -> String {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "iss": JWT_ISSUER,
         "sub": "mesh-bpf-metrics-test",
         "role": "admin",
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(600)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(600)).unwrap()).unix_timestamp(),
         "jti": uuid::Uuid::new_v4().to_string(),
     });
     encode(
@@ -80,15 +80,15 @@ fn bpf_metrics_plugin_config(prefix: Option<&str>) -> PluginConfig {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
 fn gateway_with_bpf_metrics(prefix: Option<&str>) -> GatewayConfig {
     GatewayConfig {
         version: "1".to_string(),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         plugin_configs: vec![bpf_metrics_plugin_config(prefix)],
         ..Default::default()
     }
@@ -97,7 +97,7 @@ fn gateway_with_bpf_metrics(prefix: Option<&str>) -> GatewayConfig {
 fn empty_gateway(version: &str) -> GatewayConfig {
     GatewayConfig {
         version: version.to_string(),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..Default::default()
     }
 }

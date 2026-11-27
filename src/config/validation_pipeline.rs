@@ -902,7 +902,7 @@ mod tests {
     use crate::config::types::{
         GatewayConfig, PluginAssociation, PluginConfig, PluginScope, Proxy, default_namespace,
     };
-    use chrono::Utc;
+    use crate::time_compat::UtcTimestamp;
     use serde_json::json;
 
     fn runtime_proxy(id: &str, listen_path: Option<&str>, backend_scheme: &str) -> Proxy {
@@ -1077,8 +1077,8 @@ mod tests {
                 priority_override: None,
                 trigger: None,
                 api_spec_id: None,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
+                created_at: UtcTimestamp::now(),
+                updated_at: UtcTimestamp::now(),
             }],
             ..Default::default()
         };
@@ -1105,8 +1105,8 @@ mod tests {
                 priority_override: None,
                 trigger: None,
                 api_spec_id: None,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
+                created_at: UtcTimestamp::now(),
+                updated_at: UtcTimestamp::now(),
             }],
             ..Default::default()
         };
@@ -1137,8 +1137,8 @@ mod tests {
                 priority_override: None,
                 trigger: None,
                 api_spec_id: None,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
+                created_at: UtcTimestamp::now(),
+                updated_at: UtcTimestamp::now(),
             }],
             ..Default::default()
         };
@@ -1220,8 +1220,8 @@ mod tests {
                 priority_override: None,
                 trigger: None,
                 api_spec_id: None,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
+                created_at: UtcTimestamp::now(),
+                updated_at: UtcTimestamp::now(),
             }],
             ..Default::default()
         };

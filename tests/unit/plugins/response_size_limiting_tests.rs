@@ -4,6 +4,7 @@ use bytes::Bytes;
 use ferrum_edge::_test_support::finalize_synthetic_response_for_test;
 use ferrum_edge::plugins::response_size_limiting::ResponseSizeLimiting;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext, validate_plugin_config};
+use ferrum_edge::time_compat::UtcTimestamp;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -734,7 +735,6 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
 /// (`PluginCacheRequestView::stamp_route_body_policy`) for a proxy whose
 /// plugin chain is exactly `plugins` (`(name, config)` pairs).
 fn route_stamped_ctx(plugins: &[(&str, serde_json::Value)]) -> RequestContext {
-    use chrono::Utc;
     use ferrum_edge::config::types::{
         GatewayConfig, PluginAssociation, PluginConfig, PluginScope, default_namespace,
     };
@@ -755,8 +755,8 @@ fn route_stamped_ctx(plugins: &[(&str, serde_json::Value)]) -> RequestContext {
             priority_override: None,
             trigger: None,
             api_spec_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         })
         .collect();
     proxy.plugins = plugin_configs
@@ -770,7 +770,7 @@ fn route_stamped_ctx(plugins: &[(&str, serde_json::Value)]) -> RequestContext {
         version: "1".to_string(),
         proxies: vec![proxy],
         plugin_configs,
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..Default::default()
     };
     let cache = ferrum_edge::PluginCache::new(&config).expect("route plugin chain must admit");

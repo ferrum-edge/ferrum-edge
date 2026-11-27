@@ -4,6 +4,7 @@
 //! and page by stable IDs rather than mutable offsets.
 
 use ferrum_edge::config::db_loader::{DatabaseBackend, DatabaseStore, DbPoolConfig};
+use ferrum_edge::time_compat::UtcTimestamp;
 use tempfile::TempDir;
 
 async fn sqlite_store() -> (DatabaseStore, TempDir) {
@@ -17,7 +18,7 @@ async fn sqlite_store() -> (DatabaseStore, TempDir) {
 }
 
 async fn seed_runtime_row_set(store: &DatabaseStore, idx: usize) {
-    let ts = chrono::Utc::now().to_rfc3339();
+    let ts = UtcTimestamp::now().to_rfc3339();
     let pool = store.pool();
     let suffix = format!("{idx:02}");
 

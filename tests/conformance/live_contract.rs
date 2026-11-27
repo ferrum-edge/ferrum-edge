@@ -29,13 +29,13 @@
 //! ([`validate_live_artifact`]) so the rules are unit-tested below without any
 //! filesystem or clock dependence.
 
-use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::process::Command;
 
 use super::contract::{Contract, ContractMaturity, load_contract};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const SUPPORTED_ARTIFACT_SCHEMA_VERSION: u32 = 1;
 
@@ -78,7 +78,7 @@ pub(crate) fn validate_live_artifact(
     contract: &Contract,
     artifact_json: &str,
     expected: &ExpectedArtifact,
-    now: DateTime<Utc>,
+    now: UtcTimestamp,
 ) -> Result<Vec<String>, Vec<String>> {
     let artifact: LiveArtifact = match serde_json::from_str(artifact_json) {
         Ok(artifact) => artifact,
@@ -113,11 +113,13 @@ pub(crate) fn validate_live_artifact(
         ));
     }
 
-    match DateTime::parse_from_rfc3339(&artifact.created_at) {
+    match ferrum_edge::time_compat::parse_rfc3339_chrono(&artifact.created_at)
+        .and_then(|parsed| parsed.to_utc_timestamp())
+    {
         Ok(created_at) => {
             if let Some(max_age_hours) = expected.max_age_hours {
-                let age = now.signed_duration_since(created_at.with_timezone(&Utc));
-                let max_age = Duration::seconds((max_age_hours * 3600.0) as i64);
+                let age = now - created_at;
+                let max_age = ::time::SignedDuration::seconds((max_age_hours * 3600.0) as i64);
                 if age > max_age {
                     errors.push(format!(
                         "artifact created_at `{}` is older than the {max_age_hours}h freshness \
@@ -125,7 +127,7 @@ pub(crate) fn validate_live_artifact(
                         artifact.created_at
                     ));
                 }
-                if age < Duration::zero() - Duration::minutes(5) {
+                if age < ::time::SignedDuration::minutes(-5) {
                     errors.push(format!(
                         "artifact created_at `{}` is in the future — clock skew or a corrupt \
                          artifact",
@@ -248,7 +250,7 @@ fn live_contract_artifact_gate() {
         }),
     };
     let contract = load_contract().expect("ga_contract.yaml must be valid");
-    match validate_live_artifact(&contract, &raw, &expected, Utc::now()) {
+    match validate_live_artifact(&contract, &raw, &expected, UtcTimestamp::now()) {
         Ok(lines) => {
             for line in lines {
                 println!("live_contract: {line}");
@@ -344,10 +346,10 @@ fn artifact_json(
     .to_string()
 }
 
-fn fixed_now() -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339("2026-07-01T12:00:00Z")
+fn fixed_now() -> UtcTimestamp {
+    "2026-07-01T12:00:00Z"
+        .parse::<UtcTimestamp>()
         .expect("fixed now parses")
-        .with_timezone(&Utc)
 }
 
 fn expected_all() -> ExpectedArtifact {

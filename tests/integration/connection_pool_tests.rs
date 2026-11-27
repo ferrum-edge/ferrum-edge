@@ -1,10 +1,10 @@
 //! Tests for connection pool manager
 
-use chrono::Utc;
 use ferrum_edge::config::PoolConfig;
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, Proxy};
 use ferrum_edge::connection_pool::ConnectionPool;
 use ferrum_edge::dns::{DnsCache, DnsConfig};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 fn create_test_proxy() -> Proxy {
     Proxy {
@@ -71,8 +71,8 @@ fn create_test_proxy() -> Proxy {
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }

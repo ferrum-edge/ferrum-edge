@@ -6,13 +6,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use chrono::Utc;
 use ferrum_edge::config::types::{
     BackendTlsConfig, GatewayConfig, PluginConfig, PluginScope, Proxy, ResolvedPortOverride,
     RetryConfig, Upstream, UpstreamPortOverride,
 };
 use ferrum_edge::plugins::mesh_route_dispatch::MeshRouteDispatch;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
+use ferrum_edge::time_compat::UtcTimestamp;
 use serde_json::json;
 
 fn test_proxy() -> Arc<Proxy> {
@@ -77,8 +77,8 @@ fn mesh_route_plugin_config(config: serde_json::Value) -> PluginConfig {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -526,15 +526,17 @@ async fn mesh_route_dispatch_accepts_valid_retry_and_backend_tls_controls() {
 }
 
 #[test]
-fn mesh_route_dispatch_strict_nested_policy_does_not_change_shared_types() {
+fn shared_retry_and_backend_tls_types_are_closed_too() {
+    // Since the 1.0 config freeze the shared proxy types are closed as well,
+    // so the plugin's strict nested policy and the shared types agree.
     let retry = serde_json::from_value::<RetryConfig>(json!({"max_retry": 2}))
-        .expect("shared retry config keeps its existing compatibility boundary");
-    assert_eq!(retry, RetryConfig::default());
+        .expect_err("shared retry config rejects a misspelled key");
+    assert!(retry.to_string().contains("max_retry"), "{retry}");
 
     let tls =
         serde_json::from_value::<BackendTlsConfig>(json!({"client_certpath": "/tls/client.pem"}))
-            .expect("shared backend TLS config keeps its existing compatibility boundary");
-    assert_eq!(tls, BackendTlsConfig::default_verify());
+            .expect_err("shared backend TLS config rejects a misspelled key");
+    assert!(tls.to_string().contains("client_certpath"), "{tls}");
 }
 
 #[tokio::test]

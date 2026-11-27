@@ -398,6 +398,22 @@ impl UtcTimestamp {
         out
     }
 
+    /// Format like chrono's `DateTime<Utc>` `Display` impl
+    /// (`YYYY-MM-DD HH:MM:SS[.fff|.ffffff|.fffffffff] UTC`), byte-for-byte for
+    /// every non-leap value. `UtcTimestamp`'s own [`fmt::Display`] prints
+    /// RFC 3339 with `Z` instead.
+    pub fn to_chrono_display(&self) -> String {
+        let mut out = self.to_rfc3339_opts(SecondsFormat::AutoSi, true);
+        // The first `T` is always the date/time separator.
+        if let Some(pos) = out.find('T') {
+            out.replace_range(pos..=pos, " ");
+        }
+        // Swap the trailing `Z` for chrono's ` UTC` offset text.
+        out.pop();
+        out.push_str(" UTC");
+        out
+    }
+
     /// Write RFC 3339 output into any [`fmt::Write`] without allocating.
     pub fn write_rfc3339_opts(
         &self,
@@ -598,6 +614,14 @@ impl fmt::Debug for UtcTimestamp {
 impl fmt::Display for UtcTimestamp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.write_rfc3339_opts(f, SecondsFormat::AutoSi, true)
+    }
+}
+
+/// [`UtcTimestamp::UNIX_EPOCH`], matching `chrono::DateTime::<Utc>::default()`,
+/// so `#[derive(Default)]` config types keep the same default stamp.
+impl Default for UtcTimestamp {
+    fn default() -> Self {
+        Self::UNIX_EPOCH
     }
 }
 
@@ -1158,8 +1182,9 @@ impl<'r> Decode<'r, Any> for UtcTimestamp {
 // chrono's serde `Deserialize`), `parse_from_rfc2822`, and the
 // `DateTime::parse_from_str` / `NaiveDateTime::parse_from_str` strftime
 // engine for the specifiers Ferrum uses. `tests/unit/config/
-// time_compat_chrono_parse_tests.rs` runs an accept/reject corpus through
-// both implementations.
+// time_compat_chrono_parse_tests.rs` checks an accept/reject corpus against
+// chrono 0.4.45's results, recorded in `tests/fixtures/time_compat/` (chrono
+// itself is not a dependency).
 
 /// chrono's `NaiveDate` year bounds (`MIN_YEAR`/`MAX_YEAR` in chrono 0.4.45).
 const CHRONO_MIN_YEAR: i32 = (i32::MIN >> 13) + 1;

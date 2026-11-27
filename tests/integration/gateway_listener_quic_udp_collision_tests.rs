@@ -12,7 +12,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use chrono::Utc;
 use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -36,6 +35,7 @@ use ferrum_edge::proxy::gateway_listener::{
 use ferrum_edge::proxy::gateway_listener_status::{
     GatewayListenerFailureCategory, GatewayListenerProtocolHalf,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use ferrum_edge::tls::{NoVerifier, TlsPolicy};
 
 const HOST: &str = "app.example.com";
@@ -123,8 +123,8 @@ fn stream_proxy(id: &str, scheme: BackendScheme, port: u16) -> Proxy {
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }
@@ -133,7 +133,7 @@ fn tls_config_with(proxies: Vec<Proxy>, listen_port: u16) -> GatewayConfig {
     let mut config = GatewayConfig {
         version: "1".into(),
         proxies,
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     config.resolve_dispatch_kind();
@@ -147,7 +147,7 @@ fn plaintext_config_with(proxies: Vec<Proxy>) -> GatewayConfig {
     let mut config = GatewayConfig {
         version: "1".into(),
         proxies,
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     config.resolve_dispatch_kind();

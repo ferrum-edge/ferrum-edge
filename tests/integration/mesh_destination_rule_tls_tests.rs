@@ -26,6 +26,7 @@ use ferrum_edge::modes::mesh::{
     MeshConfigProtocol, MeshRuntimeConfig, MeshTopology,
     prepare_gateway_config_via_mesh_slice_with_fixtures,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 
 fn slice_request_for_default_ns() -> MeshSliceRequest {
     MeshSliceRequest {
@@ -127,7 +128,7 @@ fn test_runtime() -> MeshRuntimeConfig {
 /// give the upstream a single target with the same FQDN as the DR's host.
 fn build_matching_upstream(id: &str, host_fqdn: &str) -> Upstream {
     use std::collections::HashMap;
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     Upstream {
         labels: Default::default(),
         id: id.to_string(),

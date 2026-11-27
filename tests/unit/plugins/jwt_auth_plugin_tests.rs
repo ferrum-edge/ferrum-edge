@@ -7,7 +7,6 @@ use ferrum_edge::plugins::{
 use serde_json::json;
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use chrono::Utc;
 use ferrum_edge::config::types::Consumer;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -17,6 +16,7 @@ use super::plugin_utils::{
     context_with_materialized_raw_header_bytes, context_with_materialized_raw_header_lines,
     create_test_consumer,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 
 fn make_ctx() -> RequestContext {
     RequestContext::new(
@@ -448,7 +448,7 @@ async fn leeway_allows_token_within_skew_window() {
     let token = create_jwt_token_exact(
         &json!({
             "sub": "testuser",
-            "exp": Utc::now().timestamp() - 30,
+            "exp": UtcTimestamp::now().unix_timestamp() - 30,
             "nbf": 0
         }),
         "test-jwt-secret-0123456789abcdefghij",
@@ -731,8 +731,8 @@ fn make_consumer_with_jwt_secrets(secrets: &[&str]) -> Consumer {
         custom_id: Some("custom-123".to_string()),
         credentials,
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -1289,8 +1289,8 @@ fn consumer_with_jwt_secret(id: &str, username: &str, secret: &str) -> Consumer 
         custom_id: None,
         credentials,
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 

@@ -11,7 +11,6 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use base64::Engine as _;
-use chrono::Utc;
 use ferrum_edge::admin::{
     AdminState,
     jwt_auth::{JwtConfig, JwtManager},
@@ -19,6 +18,7 @@ use ferrum_edge::admin::{
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig, Proxy, ResponseBodyMode,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use ferrum_edge::tls::managed::ManagedTlsMaterialKind;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use rcgen::{
@@ -104,14 +104,14 @@ fn create_test_admin_state(
 }
 
 fn generate_admin_token(config: &TestConfig) -> String {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "iss": config.jwt_issuer,
         "sub": "admin-user",
         "role": "admin",
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(config.max_ttl as i64)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(config.max_ttl as i64)).unwrap()).unix_timestamp(),
         "jti": Uuid::new_v4().to_string()
     });
     encode(
@@ -390,7 +390,7 @@ fn assert_kind_conflict(body: &Value, id: &str, existing: Collection, requested:
 }
 
 fn https_proxy_referencing_ca(id: &str, ca_id: &str) -> Proxy {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     Proxy {
         labels: Default::default(),
         id: id.to_string(),

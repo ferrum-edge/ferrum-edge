@@ -37,7 +37,6 @@ use crate::scaffolding::port_registry::TestSocket;
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use chrono::Utc;
 use ferrum_edge::config::EnvConfig;
 use ferrum_edge::config::PoolConfig;
 use ferrum_edge::config::types::{
@@ -59,6 +58,7 @@ use ferrum_edge::proxy::mesh_mtls_pool::{
     MESH_CROSS_CLUSTER_TAG, MESH_EASTWEST_SNI_TAG, MESH_MTLS_PORT_TAG, MESH_MTLS_TARGET_TAG,
     MESH_TRUST_DOMAIN_TAG, MeshMtlsConnectionPool,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use ferrum_edge::tls::spiffe::build_spiffe_inbound_config;
 use http::{HeaderMap, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
@@ -163,7 +163,7 @@ fn svid_slot(bundle: SvidBundle) -> SharedSvidBundle {
 }
 
 fn grpc_proxy_for_test() -> Proxy {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     Proxy {
         labels: Default::default(),
         id: "mesh-mtls-grpc".to_string(),

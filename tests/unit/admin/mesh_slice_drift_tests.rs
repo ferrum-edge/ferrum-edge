@@ -3,7 +3,6 @@
 use std::sync::{Arc, Barrier};
 
 use arc_swap::ArcSwap;
-use chrono::{Duration, TimeZone, Utc};
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::grpc::admission::authenticated_principal_key;
 use ferrum_edge::grpc::cp_server::CpScope;
@@ -16,12 +15,15 @@ use ferrum_edge::grpc::mesh_slice_drift::{
 };
 use ferrum_edge::modes::mesh::config::{AppProtocol, MeshConfig, MeshService, ServicePort};
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
+use ferrum_edge::time_compat::UtcTimestamp;
 
-fn at(second: u32) -> chrono::DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 2, 12, 0, second).unwrap()
+fn at(second: u32) -> UtcTimestamp {
+    format!("2026-08-02T12:00:{second:02}Z")
+        .parse::<UtcTimestamp>()
+        .unwrap()
 }
 
-fn open(registry: &MeshSliceDriftRegistry, node_id: &str, when: chrono::DateTime<Utc>) -> String {
+fn open(registry: &MeshSliceDriftRegistry, node_id: &str, when: UtcTimestamp) -> String {
     registry
         .open_session(node_id, "ferrum", when, Some("v1"))
         .expect("open")
@@ -41,7 +43,9 @@ fn desired_sent_ack_converges_and_drift_flags_clear() {
             &token,
             "v1",
             MeshSliceReportStatus::Accepted,
-            connected_at + Duration::seconds(1),
+            connected_at
+                .checked_add(::time::SignedDuration::seconds(1))
+                .unwrap(),
         )
         .expect("install-time accept");
     // Issue #4812: the install ACK alone must NOT converge the row.
@@ -60,7 +64,9 @@ fn desired_sent_ack_converges_and_drift_flags_clear() {
             &token,
             "v1",
             MeshSliceReportStatus::Applied,
-            connected_at + Duration::seconds(2),
+            connected_at
+                .checked_add(::time::SignedDuration::seconds(2))
+                .unwrap(),
         )
         .expect("runtime applied");
 
@@ -319,9 +325,11 @@ fn maintenance_republishes_advancing_ages_without_removal() {
         )
         .unwrap();
 
-    let maintenance_at = connected_at + Duration::seconds(42);
+    let maintenance_at = connected_at
+        .checked_add(::time::SignedDuration::seconds(42))
+        .unwrap();
     assert_eq!(
-        registry.reap_expired(maintenance_at, Duration::seconds(300)),
+        registry.reap_expired(maintenance_at, ::time::SignedDuration::seconds(300)),
         0
     );
     let snapshot = registry.snapshot();
@@ -351,8 +359,10 @@ fn disconnect_retention_and_reap_are_session_safe() {
     registry.mark_disconnected("dp-a", &current_token, at(1));
 
     let removed = registry.reap_expired(
-        connected_at + Duration::seconds(302),
-        Duration::seconds(300),
+        connected_at
+            .checked_add(::time::SignedDuration::seconds(302))
+            .unwrap(),
+        ::time::SignedDuration::seconds(300),
     );
     assert_eq!(removed, 1);
     assert!(registry.is_empty());
@@ -452,7 +462,9 @@ fn production_cap_evicts_only_a_disconnected_victim() {
             node_id,
             &replacement_key,
             namespace,
-            connected_at + Duration::seconds(1),
+            connected_at
+                .checked_add(::time::SignedDuration::seconds(1))
+                .unwrap(),
             &initial_slice,
             request,
             scope,
@@ -486,7 +498,9 @@ fn service(name: &str, namespace: &str) -> MeshService {
 
 fn projected_config(second: u32, services: Vec<MeshService>) -> GatewayConfig {
     GatewayConfig {
-        loaded_at: at(second),
+        loaded_at: format!("2026-08-02T12:00:{second:02}Z")
+            .parse::<UtcTimestamp>()
+            .unwrap(),
         mesh: Some(Box::new(MeshConfig {
             services,
             ..MeshConfig::default()
