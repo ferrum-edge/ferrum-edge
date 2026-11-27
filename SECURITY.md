@@ -2,25 +2,29 @@
 
 ## Supported Versions
 
-Ferrum Edge is in pre-1.0 build-out. A source tag alone does not prove that its
-release assets or container images finished publishing. Check the
+Support windows, deprecation periods, and the backport policy are defined in
+[docs/support_policy.md](docs/support_policy.md). They apply from Ferrum Edge
+1.0.0 onward; releases before 1.0.0 (`0.x`) are build-out releases with no
+backport commitment. A source tag alone does not prove that its release assets
+or container images finished publishing. Check the
 [Releases page](https://github.com/ferrum-edge/ferrum-edge/releases) and the
 version's release workflow before choosing an artifact.
 
 | Version | Status | Security updates |
 | ------- | ------ | ---------------- |
-| `main` | active build-out; breaking changes expected | fixes land on `main`; CI validates but does not publish production artifacts; the `latest` / `main-<sha>` development images follow it |
-| Published `v0.9.x` artifacts | pre-1.0 versioned releases, where publication completed | take a subsequently published version containing the fix; no minor-line backport window is committed yet |
+| Current `1.Y` minor (from 1.0.0 onward) | supported | every fix ships as a new patch release of that minor |
+| Previous `1.Y` minor | supported for 6 months after the next minor is published | Critical and High fixes are backported as patch releases; Medium at maintainer discretion; Low is not backported |
+| Older `1.Y` minors | unsupported | upgrade to a supported minor |
+| Published `v0.9.x` and earlier `0.x` artifacts | pre-1.0 build-out releases, where publication completed | until 1.0.0 is published, fixes ship in the next published `0.9.x` release (no backports); once 1.0.0 is published, unsupported — upgrade to 1.x |
+| `main` | development branch | fixes land on `main` first; CI validates but does not publish production artifacts; the `latest` / `main-<sha>` development images follow it |
 | `latest` / `main-<sha>` container tags | `latest` moves forward to the newest built `main` commit that passed CI and was signed, and may skip intermediate commits; `main-<sha>` exists only for built commits | development channel only; do not use as a security-update channel |
 | Historical `latest` GitHub prerelease binaries | no longer refreshed | do not use |
 
-Production artifacts are published by the version-tag release workflow after
-exact-commit validation. Pin a published version or immutable image digest and
-verify that its release contains the required fix; merging a fix to `main` does
-not update an installed artifact. The proposed support windows, deprecation
-periods, and backport policy for 1.0 are documented in
-[docs/support_policy.md](docs/support_policy.md). Existing pre-1.0 tags do not
-activate those proposed 1.0 commitments or declare a stable database schema.
+Within a supported minor, only its newest patch release is supported. Production
+artifacts are published by the version-tag release workflow after exact-commit
+validation. Pin a published version or immutable image digest and verify that
+its release contains the required fix; merging a fix to `main` does not update
+an installed artifact.
 
 ## Reporting a Vulnerability
 

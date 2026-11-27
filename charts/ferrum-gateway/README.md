@@ -46,10 +46,13 @@ fail at template time with a pointer to [`ferrum-mesh`](../ferrum-mesh).
 external pre-deploy Job examples under
 [`examples/migrate-job-*.yaml`](examples/) (see
 [docs/kubernetes_deployment.md](../../docs/kubernetes_deployment.md#explicit-migrate-mode-external-job)).
-During build-out, a changed core V001 baseline requires a fresh database and
-logical import; retain the old database for rollback. Startup and explicit `up`
-initialize that baseline, without an online upgrade path. Use the explicit Job
-for `status`, dry-run and operator-controlled `up` / `config` workflows.
+Releases before 1.0.0 change the core V001 baseline without an online upgrade
+path: a changed baseline requires a fresh database and logical import, keeping
+the old database for rollback, and the upgrade from `0.x` to 1.0.0 follows the
+same procedure. From 1.0.0 onward, core schema changes ship as forward-only
+migrations (see [docs/migrations.md](../../docs/migrations.md)). Startup and
+explicit `up` initialize the schema. Use the explicit Job for `status`, dry-run
+and operator-controlled `up` / `config` workflows.
 
 ## Security defaults you should know
 
