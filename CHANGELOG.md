@@ -248,9 +248,12 @@ gateways, control planes, mesh data planes, charts or contract consumers.
   selects such a MongoDB row fails with `503`), and the API-spec `updated_since`
   and audit `start`/`end` filters reject such a value with their `400`.
   Rendered timestamps of in-range, non-leap-second values, and the wire and
-  storage text of these stamps, are byte-identical, and no Admin API status or
-  envelope changes; the only message changes are the TLS events and audit
-  filter details noted above.
+  storage text of these stamps, are byte-identical. For in-range values no
+  Admin API status or envelope changes; message changes are limited to the TLS
+  events and audit filter details noted above and to the deserializer detail
+  for an invalid timestamp field (for example in `POST /batch` and
+  `POST /restore` `400` bodies and config-load errors), which now comes from
+  Ferrum's timestamp parser instead of chrono's.
 - Docs: the support, versioning and deprecation policy
   (`docs/support_policy.md`) is adopted for Ferrum Edge 1.0.0 onward (#7521).
   It also states the compatibility rules for CP/DP versions (identical build
