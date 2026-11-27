@@ -25,7 +25,6 @@ use crate::plugins::utils::log_sampling::warn_sampled;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use chrono::{SecondsFormat, TimeZone, Utc};
 use dashmap::DashMap;
 use http::header::CONTENT_TYPE;
 use reqwest::StatusCode;
@@ -17020,9 +17019,13 @@ fn timestamp_json(timestamp: i64) -> Value {
     if timestamp <= 0 {
         Value::Null
     } else {
-        match Utc.timestamp_opt(timestamp, 0).single() {
-            Some(dt) => Value::String(dt.to_rfc3339_opts(SecondsFormat::Secs, true)),
-            None => Value::Null,
+        // An instant outside UtcTimestamp's range renders as null, the same
+        // as any other unrepresentable timestamp (issue #7419).
+        match crate::time_compat::UtcTimestamp::from_unix_timestamp(timestamp) {
+            Ok(ts) => {
+                Value::String(ts.to_rfc3339_opts(crate::time_compat::SecondsFormat::Secs, true))
+            }
+            Err(_) => Value::Null,
         }
     }
 }
