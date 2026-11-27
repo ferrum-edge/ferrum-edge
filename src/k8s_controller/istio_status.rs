@@ -1402,6 +1402,19 @@ pub const VIRTUAL_SERVICE_MESH_HTTP_ROUTES_NOTE: &str = "mesh http[] routes are 
      Sidecar and NodeWaypoint data planes; Ambient and ServiceWaypoint data planes ignore them \
      and route to the destination Service";
 
+/// The `FerrumAccepted` message note for a mesh-bound VirtualService whose
+/// `http[]` routes reach Services in other namespaces (issue #7499). Those
+/// destinations passed ReferenceGrant, Service and EndpointSlice admission;
+/// whether a given data plane routes them still depends on that data plane's
+/// view, so the note says what happens when it cannot.
+pub const VIRTUAL_SERVICE_CROSS_NAMESPACE_DESTINATIONS_NOTE: &str = "cross-namespace destinations \
+     admitted by ReferenceGrant (status.ferrum.translation.cross_namespace_destinations) are \
+     routed only by Sidecar data planes whose control-plane namespace scope covers the \
+     destination namespace and whose Sidecar egress scope imports the destination Service; \
+     NodeWaypoint data planes do not route cross-namespace destinations (tracked in issue \
+     #7499), and a data plane that cannot route one does not receive the route and keeps \
+     routing that host to its plain Service";
+
 /// Status for `VirtualService`. The translator consumes `spec.http` routes
 /// (incl. `mirror` / `rewrite` / `redirect` / `corsPolicy`) and `spec.tcp` /
 /// `spec.tls` L4 route blocks (translated to stream proxies: port / SNI
@@ -1434,9 +1447,30 @@ fn virtual_service_status(
         .unwrap_or(0);
 
     match result {
-        Ok(_translation) => {
+        Ok(translation) => {
             let deferred = virtual_service_deferred_fields(&object.spec);
             let clamped = virtual_service_clamped_fields(&object.spec);
+            // Issue #7499: the cross-namespace Services this VirtualService's
+            // mesh binding was admitted to reach, read from the translation
+            // itself so status reports exactly what the translator authorized.
+            let cross_namespace_destinations: Vec<String> = translation
+                .config
+                .mesh
+                .as_ref()
+                .and_then(|mesh| {
+                    mesh.virtual_service_http_routes.iter().find(|binding| {
+                        binding.namespace == object.metadata.namespace
+                            && binding.name == object.metadata.name
+                    })
+                })
+                .map(|binding| {
+                    binding
+                        .authorized_cross_namespace_targets
+                        .iter()
+                        .map(|target| format!("{}/{}", target.namespace, target.name))
+                        .collect()
+                })
+                .unwrap_or_default();
             // Issues #7390, #7423: a mesh-bound VirtualService's `http[]`
             // routes reach only Sidecar and NodeWaypoint data planes
             // (`MeshSlice.http_routes`); Ambient and ServiceWaypoint data planes
@@ -1454,6 +1488,9 @@ fn virtual_service_status(
             }
             if mesh_http_routes.is_some() {
                 notes.push(VIRTUAL_SERVICE_MESH_HTTP_ROUTES_NOTE.to_string());
+            }
+            if !cross_namespace_destinations.is_empty() {
+                notes.push(VIRTUAL_SERVICE_CROSS_NAMESPACE_DESTINATIONS_NOTE.to_string());
             }
             let message = if notes.is_empty() {
                 format!(
@@ -1476,10 +1513,27 @@ fn virtual_service_status(
             if let Some(scope) = mesh_http_routes {
                 detail["translation"]["mesh_http_routes"] = json!(scope);
             }
+            if !cross_namespace_destinations.is_empty() {
+                detail["translation"]["cross_namespace_destinations"] =
+                    json!(cross_namespace_destinations);
+            }
             accepted_status(object, true, "Accepted", &message, Some(detail))
         }
         Err(error) => {
             let message = format!("Ferrum rejected this VirtualService: {error}");
+            // Issue #7499: a destination in another namespace that ReferenceGrant,
+            // Service or EndpointSlice admission refused is a reference
+            // resolution failure, reported with the Gateway API vocabulary.
+            let reason = match error {
+                K8sTranslateError::InvalidResource { message, .. }
+                    if crate::config_sources::k8s::message_is_virtual_service_cross_namespace_refusal(
+                        message,
+                    ) =>
+                {
+                    "RefNotPermitted"
+                }
+                _ => "Invalid",
+            };
             let detail = json!({
                 "translation": {
                     "hosts": host_count,
@@ -1487,7 +1541,7 @@ fn virtual_service_status(
                     "error": format!("{error}"),
                 }
             });
-            accepted_status(object, false, "Invalid", &message, Some(detail))
+            accepted_status(object, false, reason, &message, Some(detail))
         }
     }
 }

@@ -978,6 +978,24 @@ pub mod _test_support {
         )
     }
 
+    /// The control plane's per-subscriber mesh filter (CP scope, bearer `ns`
+    /// claim, destination visibility) that runs before every
+    /// `MeshSlice::from_gateway_config`, so tests can prove what a scoped
+    /// control plane projects (issue #7499 cross-namespace ceilings).
+    pub fn filter_config_to_mesh_request_for_test(
+        config: &crate::config::types::GatewayConfig,
+        request: &crate::modes::mesh::slice::MeshSliceRequest,
+        scope: &crate::grpc::cp_server::CpScope,
+        bearer_namespaces: Option<&std::collections::HashSet<String>>,
+    ) -> crate::config::types::GatewayConfig {
+        crate::grpc::cp_server::CpGrpcServer::filter_config_to_mesh_request_for_scope_and_bearer(
+            config,
+            request,
+            scope,
+            bearer_namespaces,
+        )
+    }
+
     /// The production `mesh_route_dispatch` upstream-reference check the
     /// validation pipeline runs on every candidate config.
     pub fn validate_mesh_route_dispatch_upstream_references_for_test(

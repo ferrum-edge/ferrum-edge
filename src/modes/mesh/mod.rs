@@ -1744,7 +1744,8 @@ fn prepare_normalized_gateway_config_for_mesh(
     // under the service-port key or dial-port key their dispatch path uses.
     // Topology-aware: Ambient emits HBONE routes; Sidecar emits SVID-mTLS routes.
     materialize_mesh_outbound_proxies(&mut config, runtime, mesh_slice);
-    bind_carried_http_routes_to_node_waypoint_transport(&mut config, runtime, mesh_slice)?;
+    let cross_namespace_clones =
+        bind_carried_http_routes_to_node_waypoint_transport(&mut config, runtime, mesh_slice)?;
     // After rebinding, so each candidate names the destination route dispatch
     // actually selects (the Service port's upstream, not its DNS name).
     thread_node_waypoint_route_branches_to_authz(&mut config, runtime);
@@ -1767,10 +1768,18 @@ fn prepare_normalized_gateway_config_for_mesh(
     // path as every other NodeWaypoint UDP/DTLS surface.
     materialize_node_waypoint_udp_listeners(&mut config, runtime, mesh_slice);
     fail_closed_node_waypoint_udp_dtls_scoped_policies(&mut config, runtime);
+    // A cross-namespace destination clone (issue #7499) stays in place while
+    // rules apply: its targets are workload addresses and its id is not a
+    // host, so no rule matches it, and `RouteOverrideConnectTimeouts` reads
+    // its references to project the destination rule's connect timeout onto
+    // the Service upstream it copies.
     apply_destination_rules(&mut config, runtime, mesh_slice)?;
     project_mesh_source_locality(&mut config, runtime, mesh_slice);
     // After DestinationRules and locality, so the route-scoped clones carry
-    // the same projected policy as the Service upstreams they copy.
+    // the same projected policy as the Service upstreams they copy: the
+    // cross-namespace destination clones (issue #7499) and the Sidecar
+    // same-namespace ones.
+    materialize_cross_namespace_destination_clones(&mut config, runtime, &cross_namespace_clones);
     clone_sidecar_carried_destination_upstreams(&mut config, runtime, mesh_slice);
     // Project slice-filtered ServiceEntries back into the prepared mesh
     // block so introspection consumers (admin diagnostics, projected-config
@@ -4452,6 +4461,36 @@ fn decode_http_route_set(
         "upstream",
         upstreams.iter().map(|upstream| upstream.id.as_str()),
     )?;
+    // Issue #7499: each cross-namespace authorization names a carried route
+    // and a Service in ANOTHER namespace, once. Anything else is malformed and
+    // refuses the slice; a well-formed entry still authorizes nothing the
+    // route does not name, and a route naming an unlisted Service is refused
+    // by the binding (`cross_namespace_refused`) without rejecting the slice.
+    let targets = &set.authorized_cross_namespace_targets;
+    if targets.len() > slice::MAX_HTTP_ROUTE_CROSS_NAMESPACE_TARGETS {
+        return Err(anyhow::anyhow!(
+            "Mesh slice HTTP route set lists more than {} cross-namespace targets",
+            slice::MAX_HTTP_ROUTE_CROSS_NAMESPACE_TARGETS
+        ));
+    }
+    let mut seen_targets: HashSet<&slice::MeshHttpRouteCrossNamespaceTarget> = HashSet::new();
+    for (index, target) in targets.iter().enumerate() {
+        let well_formed = [target.namespace.as_str(), target.name.as_str()]
+            .iter()
+            .all(|value| {
+                !value.is_empty()
+                    && value.trim() == *value
+                    && value.len() <= config::MAX_VIRTUAL_SERVICE_CROSS_NAMESPACE_TARGET_LEN
+            })
+            && target.namespace != slice.namespace
+            && proxies.iter().any(|proxy| proxy.id == target.proxy_id)
+            && seen_targets.insert(target);
+        if !well_formed {
+            return Err(anyhow::anyhow!(
+                "Mesh slice HTTP route cross-namespace target {index} is malformed"
+            ));
+        }
+    }
 
     let carried_upstreams: BTreeSet<&str> = upstreams
         .iter()
@@ -5036,7 +5075,8 @@ fn destination_rule_originates_tls_for_host(mesh_slice: &MeshSlice, host: &str, 
 /// external hosts are left as they are.
 ///
 /// Refusal versus rejection (issue #7440). Every refusal above, and the
-/// Sidecar ones (a direct or rule destination in another namespace, a route
+/// Sidecar ones (a destination in another namespace not authorized for its
+/// route, issue #7499; a route
 /// claiming the local inbound slot, an authority rewrite its destination
 /// cannot route, a route whose `sourceNamespace` conditions all name another
 /// namespace while it serves matched requests only), concerns a well-formed
@@ -5052,9 +5092,9 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
-) -> Result<(), anyhow::Error> {
+) -> Result<Vec<CrossNamespaceDestinationClone>, anyhow::Error> {
     if !runtime.topology.serves_virtual_service_http_routes() || mesh_slice.http_routes.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let hosts = CarriedRouteHostIndex::new(mesh_slice, &runtime.cluster_domain);
     let sidecar = runtime.topology == MeshTopology::Sidecar;
@@ -5090,6 +5130,46 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
             .any(|upstream| upstream.namespace == namespace && upstream.id == id)
             .then_some(id)
     };
+    // Issue #7499: the Services in other namespaces each carried route may
+    // reach, as the control plane authorized them for this slice
+    // (`MeshHttpRouteSet::authorized_cross_namespace_targets`, shape-checked
+    // by `decode_http_route_set`). A destination in another namespace without
+    // an entry for its route refuses that route (`cross_namespace_refused`);
+    // the rest of the slice keeps serving.
+    //
+    // Only a Sidecar routes one: the destination Sidecar enforces its own
+    // AuthorizationPolicy and RequestAuthentication on the inbound request
+    // and a source Sidecar judges no destination policy (#4158). A
+    // NodeWaypoint judges destination policy itself, and its slice does not
+    // carry the destination namespace's AuthorizationPolicy and
+    // RequestAuthentication resources (tracked in issue #7499), so it keeps
+    // refusing every cross-namespace destination, authorized or not.
+    let cross_namespace_routing = sidecar;
+    let authorized_targets: HashSet<(&str, &str, &str)> = mesh_slice
+        .http_routes
+        .authorized_cross_namespace_targets
+        .iter()
+        .map(|target| {
+            (
+                target.proxy_id.as_str(),
+                target.namespace.as_str(),
+                target.name.as_str(),
+            )
+        })
+        .collect();
+    let route_authorizes = |proxy_id: &str, namespace: &str, name: &str| {
+        cross_namespace_routing && authorized_targets.contains(&(proxy_id, namespace, name))
+    };
+    // A split is reached through every carried route naming it, so a
+    // cross-namespace leg must be authorized for each of them.
+    let split_referencers = carried_split_referencers(config);
+    // Route-namespace clones of the cross-namespace Service upstreams the
+    // rebound references name, keyed `(route namespace, clone id)`.
+    let mut cross_namespace_clones: BTreeMap<(String, String), CrossNamespaceDestinationClone> =
+        BTreeMap::new();
+    // Destinations (direct, rule, or split leg) in another namespace that are
+    // not authorized for their route.
+    let mut cross_namespace_refused = 0usize;
 
     // 1. Weighted splits. Each leg is resolved to its dial targets first, then
     // ONE scale is applied to every leg (external legs included) so the
@@ -5130,7 +5210,6 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
         let mut service_targets: Vec<(u32, Vec<UpstreamTarget>)> = Vec::new();
         let mut rebound = true;
         let mut governed_by_destination_rule = false;
-        let mut cross_namespace_leg = false;
         for target in &split.targets {
             match hosts.classify(&namespace, &target.host) {
                 CarriedRouteHost::External => {
@@ -5148,6 +5227,23 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                 }
                 CarriedRouteHost::UnmodeledService => rebound = false,
                 CarriedRouteHost::Service(service_namespace, service_name) => {
+                    // Issue #7499: a leg in another namespace needs every
+                    // route naming this split to be authorized for it.
+                    let cross_namespace = service_namespace != namespace;
+                    if cross_namespace
+                        && !split_referencers
+                            .get(&(namespace.clone(), id.clone()))
+                            .is_some_and(|routes| {
+                                !routes.is_empty()
+                                    && routes.iter().all(|route| {
+                                        route_authorizes(route, &service_namespace, &service_name)
+                                    })
+                            })
+                    {
+                        cross_namespace_refused += 1;
+                        rebound = false;
+                        continue;
+                    }
                     if service_has_destination_rule(
                         mesh_slice,
                         &service_namespace,
@@ -5203,16 +5299,28 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                         rebound = false;
                         continue;
                     }
-                    // A leg is dispatched through its Service upstream by a
-                    // namespace-local route override, so a Service in another
-                    // namespace cannot be a leg.
-                    cross_namespace_leg |= service_namespace != namespace;
-                    match service_legs
-                        .iter_mut()
-                        .find(|(leg_id, _)| *leg_id == service_upstream_id)
-                    {
+                    // A leg is dispatched through a namespace-local route
+                    // override, so a leg in another namespace is dispatched
+                    // through its route-namespace clone of the Service
+                    // upstream (issue #7499), materialized after
+                    // DestinationRules apply. The clone is created only if a
+                    // surviving reference names it.
+                    let leg_id = if cross_namespace {
+                        register_cross_namespace_destination_clone(
+                            &mut cross_namespace_clones,
+                            &namespace,
+                            &service_namespace,
+                            &service_name,
+                            target.port,
+                            &service_upstream_id,
+                            true,
+                        )
+                    } else {
+                        service_upstream_id
+                    };
+                    match service_legs.iter_mut().find(|(known, _)| *known == leg_id) {
                         Some(leg) => leg.1 = leg.1.saturating_add(target.weight),
-                        None => service_legs.push((service_upstream_id, target.weight)),
+                        None => service_legs.push((leg_id, target.weight)),
                     }
                     service_targets.push((target.weight, leg_targets.clone()));
                     legs.push((target.weight, leg_targets));
@@ -5225,12 +5333,7 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
         }
         if governed_by_destination_rule {
             let first_external = external_targets.first().cloned();
-            let legs_for_dispatch = if cross_namespace_leg {
-                None
-            } else {
-                weighted_split_legs(config, split, service_legs, external_targets)
-            };
-            match legs_for_dispatch {
+            match weighted_split_legs(config, split, service_legs, external_targets) {
                 Some((split_legs, residuals)) => {
                     residual_upstreams.extend(residuals);
                     leg_dispatched.insert((namespace.clone(), id.clone()), split_legs);
@@ -5291,8 +5394,6 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
     let mut wildcard_direct_backend_refused = 0usize;
     // Sidecar routes that claim the local workload's own inbound route slot.
     let mut local_inbound_route_conflicts = 0usize;
-    // Direct or dispatch-rule destinations in another namespace.
-    let mut cross_namespace_refused = 0usize;
     // Sidecar `rewrite.authority` that does not name the selected destination.
     let mut authority_rewrite_refused = 0usize;
     for index in 0..config.proxies.len() {
@@ -5362,15 +5463,45 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                     }
                     CarriedRouteHost::UnmodeledService => keep = false,
                     // A Service upstream lives in its own namespace while the
-                    // route and its references resolve in the route's, so a
-                    // cross-namespace destination would leave a dangling
-                    // reference that refuses the whole generation: refuse the
-                    // route instead (the host keeps its Service route).
-                    CarriedRouteHost::Service(service_namespace, _)
+                    // route and its references resolve in the route's
+                    // (`validate_upstream_references` stays namespace-local).
+                    // An authorized destination in another namespace (issue
+                    // #7499) is bound to a route-namespace clone of that
+                    // Service port's upstream; any other one refuses the route
+                    // (the host keeps its Service route).
+                    CarriedRouteHost::Service(service_namespace, service_name)
                         if service_namespace != namespace =>
                     {
-                        cross_namespace_refused += 1;
-                        keep = false;
+                        match service_upstream(
+                            config,
+                            &service_namespace,
+                            &service_name,
+                            backend_port,
+                        ) {
+                            Some(service_upstream_id)
+                                if route_authorizes(
+                                    &proxy_id,
+                                    &service_namespace,
+                                    &service_name,
+                                ) =>
+                            {
+                                let clone_id = register_cross_namespace_destination_clone(
+                                    &mut cross_namespace_clones,
+                                    &namespace,
+                                    &service_namespace,
+                                    &service_name,
+                                    backend_port,
+                                    &service_upstream_id,
+                                    true,
+                                );
+                                candidates.insert(clone_id.clone());
+                                proxy_upstream = Some(clone_id);
+                            }
+                            _ => {
+                                cross_namespace_refused += 1;
+                                keep = false;
+                            }
+                        }
                     }
                     CarriedRouteHost::Service(service_namespace, service_name) => {
                         match service_upstream(
@@ -5480,8 +5611,9 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                         candidates.insert(format!("{host}|{port}"));
                     }
                     CarriedRouteHost::UnmodeledService => keep = false,
-                    CarriedRouteHost::Service(service_namespace, _)
-                        if service_namespace != namespace =>
+                    CarriedRouteHost::Service(service_namespace, service_name)
+                        if service_namespace != namespace
+                            && !route_authorizes(&proxy_id, &service_namespace, &service_name) =>
                     {
                         cross_namespace_refused += 1;
                         keep = false;
@@ -5505,6 +5637,23 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                             keep = false;
                         }
                         match service_upstream(config, &service_namespace, &service_name, port) {
+                            // An authorized destination in another namespace
+                            // (checked above) is bound to its route-namespace
+                            // clone, tag-free when a Sidecar forwards an
+                            // admitted `rewrite.authority` verbatim.
+                            Some(id) if service_namespace != namespace => {
+                                let clone_id = register_cross_namespace_destination_clone(
+                                    &mut cross_namespace_clones,
+                                    &namespace,
+                                    &service_namespace,
+                                    &service_name,
+                                    port,
+                                    &id,
+                                    rewrite_authority.is_none(),
+                                );
+                                candidates.insert(clone_id.clone());
+                                rule_rewrites.push((plugin_index, rule_index, clone_id));
+                            }
                             Some(id) => {
                                 candidates.insert(id.clone());
                                 rule_rewrites.push((plugin_index, rule_index, id));
@@ -5660,7 +5809,9 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
              wildcard DestinationRule names a direct external backend no rule can apply to, \
              or (Sidecar) a route claims the local workload's own inbound route, applies \
              only to other source namespaces, or rewrites the authority to a host its \
-             destination does not answer; their hosts use the materialized Service routes"
+             destination does not answer, or a destination in another namespace is not \
+             authorized for its route (issue #7499); their hosts use the materialized Service \
+             routes"
         );
         config
             .proxies
@@ -5698,6 +5849,14 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
             .starts_with(slice::VIRTUAL_SERVICE_HTTP_ROUTE_UPSTREAM_ID_PREFIX)
             || referenced_splits.contains(&(upstream.namespace.clone(), upstream.id.clone()))
     });
+    // Issue #7499: the cross-namespace clones a surviving route, dispatch
+    // rule or weighted-split leg names. They are materialized now (so
+    // per-route authorization and RequestAuthentication scoping resolve them
+    // to the destination Service's workloads) and again after DestinationRules
+    // apply, from the destination Service's post-DR upstream.
+    let referenced_clones =
+        surviving_cross_namespace_destination_clones(config, cross_namespace_clones);
+    materialize_cross_namespace_destination_clones(config, runtime, &referenced_clones);
     // A carried route declaring a modeled Service's host (`reviews`, or its
     // FQDN) stands for that Service under every name a client can use, like
     // the Service route it shadows, so it answers all of the Service's host
@@ -5709,7 +5868,263 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
         // get their Service routes back.
         materialize_mesh_outbound_proxies(config, runtime, mesh_slice);
     }
-    Ok(())
+    Ok(referenced_clones)
+}
+
+/// Prefix of the route-namespace clone of a cross-namespace Service upstream
+/// that a carried VirtualService route dials (issue #7499):
+/// `__mesh-out-vs-xns-upstream-<digest of route ns | Service ns | Service | port>`.
+pub(crate) const MESH_OUTBOUND_VS_CROSS_NAMESPACE_UPSTREAM_ID_PREFIX: &str =
+    "__mesh-out-vs-xns-upstream-";
+
+/// The same clone for a Sidecar dispatch rule whose admitted
+/// `rewrite.authority` is forwarded verbatim (no authority tags).
+pub(crate) const MESH_OUTBOUND_VS_CROSS_NAMESPACE_REWRITE_UPSTREAM_ID_PREFIX: &str =
+    "__mesh-out-vs-xns-rw-upstream-";
+
+/// Whether `id` names a cross-namespace destination clone (issue #7499).
+pub(crate) fn is_cross_namespace_destination_clone_id(id: &str) -> bool {
+    id.starts_with(MESH_OUTBOUND_VS_CROSS_NAMESPACE_UPSTREAM_ID_PREFIX)
+        || id.starts_with(MESH_OUTBOUND_VS_CROSS_NAMESPACE_REWRITE_UPSTREAM_ID_PREFIX)
+}
+
+/// A route-namespace clone of the upstream of Service port
+/// `service_namespace/service_name:service_port` (issue #7499).
+///
+/// `GatewayConfig::validate_upstream_references` resolves every route and
+/// dispatch reference inside the route's namespace, so a carried route never
+/// names another namespace's upstream. An authorized cross-namespace
+/// destination is dialed through this clone instead: it lives in
+/// `route_namespace` under a deterministic id, copies the destination Service
+/// upstream AFTER DestinationRules and locality applied (so the destination
+/// namespace's winning rule, chosen by the subscriber → Service namespace →
+/// root lookup, governs it), is admitted as that upstream
+/// (`Upstream::admission_upstream_id`, so `http2MaxRequests` and
+/// `http1MaxPendingRequests` stay one lane per Service port), and stamps
+/// every target with the destination Service identity: the
+/// `upstream.service.*` tags NodeWaypoint authorization and
+/// RequestAuthentication scoping resolve the destination namespace's policy
+/// from, and on a Sidecar the destination authority
+/// ([`stamp_sidecar_destination_authority`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CrossNamespaceDestinationClone {
+    pub(crate) route_namespace: String,
+    pub(crate) clone_id: String,
+    pub(crate) service_namespace: String,
+    pub(crate) service_name: String,
+    pub(crate) service_port: u16,
+    pub(crate) service_upstream_id: String,
+    /// `false` for a Sidecar rule whose admitted `rewrite.authority` is
+    /// forwarded verbatim.
+    pub(crate) stamp_host: bool,
+}
+
+/// The deterministic id of a cross-namespace destination clone (issue
+/// #7499). Hashed, so a namespace or Service name can never make one route
+/// namespace's clone id collide with an operator id or another Service's.
+pub(crate) fn cross_namespace_destination_clone_id(
+    route_namespace: &str,
+    service_namespace: &str,
+    service_name: &str,
+    service_port: u16,
+    stamp_host: bool,
+) -> String {
+    let identity = format!(
+        "{}|{route_namespace}|{}|{service_namespace}|{}|{service_name}|{service_port}",
+        route_namespace.len(),
+        service_namespace.len(),
+        service_name.len()
+    );
+    let digest = hex::encode(crate::fips::approved::Sha256::digest(identity.as_bytes()));
+    let prefix = if stamp_host {
+        MESH_OUTBOUND_VS_CROSS_NAMESPACE_UPSTREAM_ID_PREFIX
+    } else {
+        MESH_OUTBOUND_VS_CROSS_NAMESPACE_REWRITE_UPSTREAM_ID_PREFIX
+    };
+    format!("{prefix}{}", &digest[..32])
+}
+
+/// Record the clone a rebound cross-namespace reference needs and return its
+/// id (issue #7499).
+fn register_cross_namespace_destination_clone(
+    clones: &mut BTreeMap<(String, String), CrossNamespaceDestinationClone>,
+    route_namespace: &str,
+    service_namespace: &str,
+    service_name: &str,
+    service_port: u16,
+    service_upstream_id: &str,
+    stamp_host: bool,
+) -> String {
+    let clone_id = cross_namespace_destination_clone_id(
+        route_namespace,
+        service_namespace,
+        service_name,
+        service_port,
+        stamp_host,
+    );
+    clones
+        .entry((route_namespace.to_string(), clone_id.clone()))
+        .or_insert_with(|| CrossNamespaceDestinationClone {
+            route_namespace: route_namespace.to_string(),
+            clone_id: clone_id.clone(),
+            service_namespace: service_namespace.to_string(),
+            service_name: service_name.to_string(),
+            service_port,
+            service_upstream_id: service_upstream_id.to_string(),
+            stamp_host,
+        });
+    clone_id
+}
+
+/// `(namespace, split id)` → the carried routes naming that weighted split as
+/// their own destination or a dispatch rule's (issue #7499).
+fn carried_split_referencers(config: &GatewayConfig) -> HashMap<(String, String), Vec<String>> {
+    let dispatch: HashMap<(&str, &str), &serde_json::Value> = config
+        .plugin_configs
+        .iter()
+        .filter(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+        .map(|plugin| {
+            (
+                (plugin.namespace.as_str(), plugin.id.as_str()),
+                &plugin.config,
+            )
+        })
+        .collect();
+    let mut referencers: HashMap<(String, String), Vec<String>> = HashMap::new();
+    for proxy in config
+        .proxies
+        .iter()
+        .filter(|proxy| config::is_virtual_service_http_route_proxy_id(&proxy.id))
+    {
+        let mut named: Vec<&str> = proxy.upstream_id.as_deref().into_iter().collect();
+        for association in &proxy.plugins {
+            if let Some(dispatch_config) = dispatch.get(&(
+                proxy.namespace.as_str(),
+                association.plugin_config_id.as_str(),
+            )) {
+                named.extend(slice::mesh_route_dispatch_rule_upstream_ids(
+                    dispatch_config,
+                ));
+            }
+        }
+        for id in named {
+            if !id.starts_with(slice::VIRTUAL_SERVICE_HTTP_ROUTE_UPSTREAM_ID_PREFIX) {
+                continue;
+            }
+            let routes = referencers
+                .entry((proxy.namespace.clone(), id.to_string()))
+                .or_default();
+            if !routes.contains(&proxy.id) {
+                routes.push(proxy.id.clone());
+            }
+        }
+    }
+    referencers
+}
+
+/// The registered cross-namespace clones a surviving route, dispatch rule or
+/// weighted-split leg still names (issue #7499), in deterministic order. A
+/// clone only a refused route or a failed split named is never created.
+fn surviving_cross_namespace_destination_clones(
+    config: &GatewayConfig,
+    mut registered: BTreeMap<(String, String), CrossNamespaceDestinationClone>,
+) -> Vec<CrossNamespaceDestinationClone> {
+    if registered.is_empty() {
+        return Vec::new();
+    }
+    let mut referenced: BTreeSet<(String, String)> = BTreeSet::new();
+    for proxy in &config.proxies {
+        if let Some(upstream_id) = proxy.upstream_id.as_deref()
+            && is_cross_namespace_destination_clone_id(upstream_id)
+        {
+            referenced.insert((proxy.namespace.clone(), upstream_id.to_string()));
+        }
+    }
+    for plugin in &config.plugin_configs {
+        if plugin.plugin_name != "mesh_route_dispatch" {
+            continue;
+        }
+        // Rule destinations and every weighted-split leg.
+        for id in slice::mesh_route_dispatch_rule_upstream_ids(&plugin.config) {
+            if is_cross_namespace_destination_clone_id(id) {
+                referenced.insert((plugin.namespace.clone(), id.to_string()));
+            }
+        }
+    }
+    referenced
+        .into_iter()
+        .filter_map(|key| registered.remove(&key))
+        .collect()
+}
+
+/// Materialize (or refresh) each cross-namespace destination clone from its
+/// destination Service upstream (issue #7499); see
+/// [`CrossNamespaceDestinationClone`]. Runs once in the binding, so
+/// authorization and RequestAuthentication scoping see the clones, and again
+/// after DestinationRules and locality applied, so each clone carries the
+/// destination Service upstream's projected policy. A clone whose Service
+/// upstream is gone is left out, and the dangling reference refuses the
+/// generation (the last accepted one keeps serving).
+fn materialize_cross_namespace_destination_clones(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+    clones: &[CrossNamespaceDestinationClone],
+) {
+    let sidecar = runtime.topology == MeshTopology::Sidecar;
+    for spec in clones {
+        let source = config
+            .upstreams
+            .iter()
+            .find(|upstream| {
+                upstream.namespace == spec.service_namespace
+                    && upstream.id == spec.service_upstream_id
+            })
+            .cloned();
+        let Some(mut clone) = source else {
+            config.upstreams.retain(|upstream| {
+                !(upstream.namespace == spec.route_namespace && upstream.id == spec.clone_id)
+            });
+            continue;
+        };
+        clone.id = spec.clone_id.clone();
+        // A distinct name: upstream names are unique per namespace.
+        clone.name = Some(spec.clone_id.clone());
+        clone.namespace = spec.route_namespace.clone();
+        clone.admission_upstream_id = Some(crate::config::types::AdmissionUpstreamRef {
+            namespace: spec.service_namespace.clone(),
+            id: spec.service_upstream_id.clone(),
+        });
+        for target in &mut clone.targets {
+            target.service_port_policy_key = Some(spec.service_port);
+            target.tags.insert(
+                UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG.to_string(),
+                spec.service_namespace.clone(),
+            );
+            target.tags.insert(
+                UPSTREAM_TARGET_SERVICE_NAME_TAG.to_string(),
+                spec.service_name.clone(),
+            );
+            target.tags.insert(
+                UPSTREAM_TARGET_SERVICE_PORT_TAG.to_string(),
+                spec.service_port.to_string(),
+            );
+            if sidecar {
+                stamp_sidecar_destination_authority(
+                    target,
+                    &spec.service_namespace,
+                    &spec.service_name,
+                    spec.service_port,
+                    spec.stamp_host,
+                );
+            }
+        }
+        match config.upstreams.iter_mut().find(|upstream| {
+            upstream.namespace == spec.route_namespace && upstream.id == spec.clone_id
+        }) {
+            Some(existing) => *existing = clone,
+            None => config.upstreams.push(clone),
+        }
+    }
 }
 
 /// Pin the destination Service authority on a Sidecar mesh-mTLS target a
@@ -5952,7 +6367,10 @@ fn clone_sidecar_carried_destination_upstreams(
         clone.name = Some(clone_id);
         // Admitted as the Service upstream it copies, so the destination's
         // active-request and pending lanes are shared with the Service route.
-        clone.admission_upstream_id = Some(service_upstream_id.clone());
+        clone.admission_upstream_id = Some(crate::config::types::AdmissionUpstreamRef {
+            namespace: namespace.clone(),
+            id: service_upstream_id.clone(),
+        });
         for target in &mut clone.targets {
             stamp_sidecar_destination_authority(
                 target,
@@ -6444,14 +6862,24 @@ fn thread_node_waypoint_route_branches_to_authz(
         return;
     };
     // Index each residual external leg like every other route upstream, so
-    // its candidate is judged on its own host and port.
-    if !route_upstream_legs.is_empty()
+    // its candidate is judged on its own host and port. Every cross-namespace
+    // destination clone (issue #7499) is indexed too, whether or not its route
+    // has other candidates: its targets name the destination Service, so the
+    // route (or the selected leg) is authorized against the destination
+    // namespace's policy, never the route namespace's.
+    let has_cross_namespace_clones = config
+        .upstreams
+        .iter()
+        .any(|upstream| is_cross_namespace_destination_clone_id(&upstream.id));
+    if (!route_upstream_legs.is_empty() || has_cross_namespace_clones)
         && let Some(route_upstreams) = authz_config
             .get_mut("node_waypoint_route_upstreams")
             .and_then(serde_json::Value::as_array_mut)
     {
         for upstream in &config.upstreams {
-            if !route_upstream_legs.contains(&(upstream.namespace.clone(), upstream.id.clone())) {
+            if !route_upstream_legs.contains(&(upstream.namespace.clone(), upstream.id.clone()))
+                && !is_cross_namespace_destination_clone_id(&upstream.id)
+            {
                 continue;
             }
             let listed = route_upstreams.iter().any(|entry| {
@@ -10908,6 +11336,33 @@ impl RouteOverrideConnectTimeouts {
                     .or_default()
                     .insert(proxy.id.clone());
             }
+        }
+        // Issue #7499: a cross-namespace destination clone copies its
+        // Service upstream after rules apply, so when a route reaches the
+        // clone (through an override, or as its own destination) the rule's
+        // timeout must land on the Service upstream's port slots for the
+        // clone to carry it.
+        let mut clone_sources: Vec<(String, String)> = Vec::new();
+        for upstream in &config.upstreams {
+            let Some(source) = upstream.admission_upstream_id.as_ref() else {
+                continue;
+            };
+            if !is_cross_namespace_destination_clone_id(&upstream.id) {
+                continue;
+            }
+            let reached = upstreams
+                .get(upstream.namespace.as_str())
+                .is_some_and(|ids| ids.contains(&upstream.id))
+                || config.proxies.iter().any(|proxy| {
+                    proxy.namespace == upstream.namespace
+                        && proxy.upstream_id.as_deref() == Some(upstream.id.as_str())
+                });
+            if reached {
+                clone_sources.push((source.namespace.clone(), source.id.clone()));
+            }
+        }
+        for (namespace, id) in clone_sources {
+            upstreams.entry(namespace).or_default().insert(id);
         }
         for proxy in &config.proxies {
             if proxy.upstream_subset.is_some() {
@@ -16748,6 +17203,9 @@ fn sanitize_egress_host_id_part(value: &str) -> String {
 fn node_waypoint_route_upstream_for_authz(upstream_id: &str) -> bool {
     upstream_id.starts_with("istio-vs-upstream-")
         || upstream_id.starts_with("gwapi-route-upstream-")
+        // Issue #7499: a route-namespace clone of a cross-namespace Service
+        // upstream resolves to the destination Service's workloads.
+        || is_cross_namespace_destination_clone_id(upstream_id)
 }
 
 fn push_node_waypoint_authz_cluster_domain(

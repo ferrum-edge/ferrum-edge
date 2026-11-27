@@ -48,6 +48,9 @@ pub(crate) use istio::{
 // Same for the mesh binding of a VirtualService's `http[]` routes (issue #7390):
 // the status writer reports where they apply from the predicate that decides it.
 pub(crate) use istio::virtual_service_binds_mesh;
+// Issue #7499: the status writer classifies a refused cross-namespace
+// VirtualService destination with the translator's own marker.
+pub(crate) use istio::message_is_virtual_service_cross_namespace_refusal;
 // Shared with the Istio status writer the same way: Sidecar `ingress[]`
 // classification used by resolution and deferred-field reporting is one
 // predicate, so modeled HTTP and stream listeners cannot be reported deferred.
@@ -1314,6 +1317,13 @@ impl K8sAccumulator {
         }
     }
 
+    /// Whether the translator collected at least one Service in `namespace`.
+    pub(crate) fn namespace_has_services(&self, namespace: &str) -> bool {
+        self.service_port_names
+            .get(namespace)
+            .is_some_and(|services| !services.is_empty())
+    }
+
     pub(crate) fn service_exists(&self, namespace: &str, service: &str) -> bool {
         self.service_port_names
             .get(namespace)
@@ -2075,10 +2085,13 @@ pub(crate) fn gateway_api_status_conflict_context(
 /// GRPCRoute backends expand onto are verified here too (issue #6123); see
 /// [`core::verify_service_import_endpoint_slices`].
 fn build_endpoint_slice_guard(acc: &mut K8sAccumulator, objects: &[K8sObject]) {
-    if !objects
-        .iter()
-        .any(|object| is_gateway_api_route_kind(&object.kind))
-    {
+    // Issue #7499: a mesh-bound VirtualService destination in another
+    // namespace goes through the same guard as a Gateway API backendRef.
+    let cluster_domain = acc.options.cluster_domain.clone();
+    if !objects.iter().any(|object| {
+        is_gateway_api_route_kind(&object.kind)
+            || istio::virtual_service_may_name_cross_namespace_service(object, &cluster_domain)
+    }) {
         return;
     }
     let pod_discovery_enabled = acc.options.pod_discovery_enabled;

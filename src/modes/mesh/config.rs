@@ -4842,6 +4842,44 @@ pub struct MeshVirtualServiceHttpRoutes {
     /// `namespace`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proxy_ids: Vec<String>,
+    /// Services in OTHER namespaces the listed routes may reach (issue
+    /// #7499). A route destination (direct, `mesh_route_dispatch` rule, or
+    /// weighted-split leg) naming a Service outside `namespace` is served only
+    /// when that Service is listed here. The Kubernetes translator lists a
+    /// target only after a Gateway API `ReferenceGrant` in the target
+    /// namespace admitted `networking.istio.io/VirtualService` from
+    /// `namespace` to that core `Service`, the Service exists in the
+    /// translated inventory (not `ExternalName`, the port declared), and its
+    /// EndpointSlices passed attribution. File and database operators declare
+    /// the list explicitly; a bare host string never authorizes another
+    /// namespace. The control plane still bounds the list by its namespace
+    /// scope, the subscriber's bearer `ns` claim, and the subscriber's own
+    /// Service visibility before any target reaches a data plane.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authorized_cross_namespace_targets: Vec<MeshWaypointServiceRef>,
+}
+
+/// Most `authorized_cross_namespace_targets` one VirtualService HTTP route
+/// binding may list (issue #7499).
+pub const MAX_VIRTUAL_SERVICE_CROSS_NAMESPACE_TARGETS: usize = 64;
+
+/// Longest `namespace` or `name` of an authorized cross-namespace target
+/// (a DNS-1123 subdomain).
+pub const MAX_VIRTUAL_SERVICE_CROSS_NAMESPACE_TARGET_LEN: usize = 253;
+
+/// Whether `binding` authorizes its routes to reach Service
+/// `target_namespace/target_name` in another namespace (issue #7499).
+/// A same-namespace reference never needs (or gets) an authorization here.
+pub fn virtual_service_http_routes_authorize_target(
+    binding: &MeshVirtualServiceHttpRoutes,
+    target_namespace: &str,
+    target_name: &str,
+) -> bool {
+    target_namespace != binding.namespace
+        && binding
+            .authorized_cross_namespace_targets
+            .iter()
+            .any(|target| target.namespace == target_namespace && target.name == target_name)
 }
 
 /// Returns true when a VirtualService HTTP route binding is visible to a
@@ -7337,6 +7375,49 @@ fn validate_virtual_service_http_routes(
                     "{context}: `proxy_ids[{id_index}]` is not a VirtualService HTTP route proxy id"
                 ));
             }
+        }
+        validate_virtual_service_cross_namespace_targets(&context, binding, errors);
+    }
+}
+
+/// Fail-closed admission for a binding's `authorized_cross_namespace_targets`
+/// (issue #7499). Diagnostics name the entry by ordinal and never echo a
+/// supplied namespace or name.
+fn validate_virtual_service_cross_namespace_targets(
+    context: &str,
+    binding: &MeshVirtualServiceHttpRoutes,
+    errors: &mut Vec<String>,
+) {
+    let targets = &binding.authorized_cross_namespace_targets;
+    if targets.len() > MAX_VIRTUAL_SERVICE_CROSS_NAMESPACE_TARGETS {
+        errors.push(format!(
+            "{context}: `authorized_cross_namespace_targets` lists more than \
+             {MAX_VIRTUAL_SERVICE_CROSS_NAMESPACE_TARGETS} entries"
+        ));
+        return;
+    }
+    let mut seen = HashSet::new();
+    for (index, target) in targets.iter().enumerate() {
+        let entry = format!("{context}: `authorized_cross_namespace_targets[{index}]`");
+        for (field, value) in [("namespace", &target.namespace), ("name", &target.name)] {
+            if value.is_empty() || value.trim() != value.as_str() {
+                errors.push(format!(
+                    "{entry}: `{field}` must be non-empty with no surrounding whitespace"
+                ));
+            } else if value.len() > MAX_VIRTUAL_SERVICE_CROSS_NAMESPACE_TARGET_LEN {
+                errors.push(format!(
+                    "{entry}: `{field}` exceeds {MAX_VIRTUAL_SERVICE_CROSS_NAMESPACE_TARGET_LEN} bytes"
+                ));
+            }
+        }
+        if target.namespace == binding.namespace {
+            errors.push(format!(
+                "{entry}: names the binding's own namespace; only Services in another namespace \
+                 need an authorization"
+            ));
+        }
+        if !seen.insert((target.namespace.as_str(), target.name.as_str())) {
+            errors.push(format!("{entry}: duplicate target"));
         }
     }
 }

@@ -1559,3 +1559,85 @@ fn vs_single_destination_route_headers_are_applied() {
         "the route-level block must run after the per-destination block"
     );
 }
+
+fn namespaced_object(
+    api_version: &str,
+    kind: &str,
+    name: &str,
+    namespace: &str,
+    spec: Value,
+) -> K8sObject {
+    K8sObject {
+        api_version: api_version.to_string(),
+        kind: kind.to_string(),
+        metadata: K8sMetadata {
+            name: name.to_string(),
+            namespace: namespace.to_string(),
+            ..K8sMetadata::default()
+        },
+        spec,
+        status: Value::Object(serde_json::Map::new()),
+    }
+}
+
+/// VS field: `http[].route[].destination.host` naming a Service in another
+/// namespace (issue #7499). Istio itself routes such a mesh destination with
+/// no grant; Ferrum treats the namespace as a tenancy boundary and admits it
+/// only with a Gateway API `ReferenceGrant` in the destination namespace
+/// (`networking.istio.io/VirtualService` → core `Service`), refusing the
+/// VirtualService fail-closed otherwise.
+#[test]
+fn vs_cross_namespace_destination_requires_reference_grant() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "http[].route[].destination cross-namespace Service (mesh)",
+        status = Status::Supported,
+        notes = "A mesh-bound VirtualService destination in another namespace is admitted only with a ReferenceGrant in the destination namespace (from networking.istio.io/VirtualService, to core Service), an existing non-ExternalName Service declaring the port, and EndpointSlice attribution; otherwise the VirtualService is refused (FerrumAccepted=False, RefNotPermitted). Sidecar data planes route an admitted destination through a route-namespace clone of the destination Service upstream; NodeWaypoint and Ambient/ServiceWaypoint data planes do not route it (issue #7499).",
+    );
+    let service = namespaced_object(
+        "v1",
+        "Service",
+        "ratings",
+        "other",
+        json!({"selector": {"app": "ratings"}, "ports": [{"name": "http", "port": 8080}]}),
+    );
+    let route = virtual_service(json!({
+        "hosts": ["reviews.default.svc.cluster.local"],
+        "http": [{"route": [{"destination": {
+            "host": "ratings.other.svc.cluster.local",
+            "port": {"number": 8080}
+        }}]}]
+    }));
+    let all_namespaces = || options().with_source_namespaces(Vec::new());
+
+    translate_k8s_objects(&[service.clone(), route.clone()], all_namespaces())
+        .expect_err("an ungranted cross-namespace destination refuses the VirtualService");
+
+    let grant = namespaced_object(
+        "gateway.networking.k8s.io/v1beta1",
+        "ReferenceGrant",
+        "allow-vs",
+        "other",
+        json!({
+            "from": [{"group": "networking.istio.io", "kind": "VirtualService", "namespace": "default"}],
+            "to": [{"group": "", "kind": "Service", "name": "ratings"}]
+        }),
+    );
+    let translation = translate_k8s_objects(&[service, grant, route], all_namespaces())
+        .expect("a granted cross-namespace destination translates");
+    let binding = translation
+        .config
+        .mesh
+        .as_ref()
+        .and_then(|mesh| mesh.virtual_service_http_routes.first())
+        .expect("mesh binding");
+    assert_eq!(binding.authorized_cross_namespace_targets.len(), 1);
+    assert_eq!(
+        binding.authorized_cross_namespace_targets[0].namespace,
+        "other"
+    );
+    assert_eq!(
+        binding.authorized_cross_namespace_targets[0].name,
+        "ratings"
+    );
+}

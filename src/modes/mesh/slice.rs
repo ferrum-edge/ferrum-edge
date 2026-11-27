@@ -689,12 +689,77 @@ pub struct MeshHttpRouteSet {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub plugin_configs: Vec<serde_json::Value>,
+    /// The Services in other namespaces each carried route may reach (issue
+    /// #7499), one entry per `(route, Service)`. The control plane writes an
+    /// entry only for a destination its route's VirtualService binding
+    /// authorizes (`MeshVirtualServiceHttpRoutes::authorized_cross_namespace_targets`),
+    /// inside the control plane's namespace scope and the subscriber's bearer
+    /// `ns` claim, and only when the Service is in this slice's `services`.
+    /// The data plane serves a cross-namespace destination only when its route
+    /// has a matching entry, and refuses that route otherwise
+    /// (`cross_namespace_refused`). Per route rather than per slice, so one
+    /// route's authorization never widens another's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authorized_cross_namespace_targets: Vec<MeshHttpRouteCrossNamespaceTarget>,
 }
 
 impl MeshHttpRouteSet {
     pub fn is_empty(&self) -> bool {
-        self.proxies.is_empty() && self.upstreams.is_empty() && self.plugin_configs.is_empty()
+        self.proxies.is_empty()
+            && self.upstreams.is_empty()
+            && self.plugin_configs.is_empty()
+            && self.authorized_cross_namespace_targets.is_empty()
     }
+}
+
+/// One authorized cross-namespace destination of one carried VirtualService
+/// HTTP route (issue #7499): the route `proxy_id` (in the slice namespace) may
+/// reach Service `namespace/name`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeshHttpRouteCrossNamespaceTarget {
+    pub proxy_id: String,
+    pub namespace: String,
+    pub name: String,
+}
+
+/// Most `authorized_cross_namespace_targets` entries one carried route set may
+/// hold (issue #7499): a data plane refuses a larger set as malformed.
+pub const MAX_HTTP_ROUTE_CROSS_NAMESPACE_TARGETS: usize = 4096;
+
+/// The in-cluster Service a carried VirtualService destination host names in a
+/// namespace OTHER than `route_namespace`, as `(namespace, name)` (issue
+/// #7499), or `None` for a same-namespace Service or an external host.
+///
+/// Every alias form the translator and the data plane treat as a Service
+/// (`<svc>.<ns>`, `<svc>.<ns>.svc`, `<svc>.<ns>.svc.<cluster domain>`, an
+/// optional trailing dot, any case) is recognized, so the control-plane
+/// authorization check sees exactly the destinations the data plane would
+/// rebind. A short name is always the route's own namespace. Over-matching is
+/// the safe direction: a host taken for a cross-namespace Service needs an
+/// explicit authorization to be carried.
+pub fn carried_route_cross_namespace_service(
+    host: &str,
+    route_namespace: &str,
+    cluster_domain: &str,
+) -> Option<(String, String)> {
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() || host.contains('*') {
+        return None;
+    }
+    let cluster_domain = cluster_domain.trim().trim_matches('.').to_ascii_lowercase();
+    let labels: Vec<&str> = host.split('.').collect();
+    if labels.iter().any(|label| label.is_empty()) {
+        return None;
+    }
+    let (name, namespace) = match labels.as_slice() {
+        [name, namespace] | [name, namespace, "svc"] => (*name, *namespace),
+        [name, namespace, "svc", rest @ ..] if rest.join(".") == cluster_domain => {
+            (*name, *namespace)
+        }
+        _ => return None,
+    };
+    (namespace != route_namespace).then(|| (namespace.to_string(), name.to_string()))
 }
 
 /// One opaque typed extension config, transported through xDS ECDS.
@@ -1874,6 +1939,7 @@ impl MeshSlice {
         // with every destination admitted by an applicable Sidecar egress
         // scope exactly like the L4 routes above. Ambient (the L4 data plane),
         // ServiceWaypoint and the gateway topologies request none.
+        let sidecar_http_routes = request.sidecar_http_routes;
         let http_routes = if request.node_waypoint_capture_scoping || request.sidecar_http_routes {
             node_waypoint_http_route_set(
                 config,
@@ -1905,6 +1971,44 @@ impl MeshSlice {
                 request
                     .sidecar_http_routes
                     .then_some(cluster_domain.as_str()),
+                &cluster_domain,
+                // Issue #7499: an authorized cross-namespace destination rides
+                // only to a Sidecar (the one topology that routes it; a
+                // NodeWaypoint slice does not carry the destination
+                // namespace's policies, issue #7499), and only when this
+                // subscriber sees its
+                // Service port, by the same rule that builds `services` below
+                // (namespace visibility, or the applicable Sidecar egress
+                // scope).
+                &|target_namespace: &str, target_name: &str, port: u16| {
+                    sidecar_http_routes
+                        && mesh.services.iter().any(|service| {
+                            if service.namespace != target_namespace || service.name != target_name
+                            {
+                                return false;
+                            }
+                            match applicable_sidecar {
+                                None => {
+                                    resource_namespace_visible(
+                                        &service_waypoint_namespaces,
+                                        &service.namespace,
+                                        &namespace,
+                                    ) && service
+                                        .ports
+                                        .iter()
+                                        .any(|service_port| service_port.port == port)
+                                }
+                                Some(sidecar) => sidecar
+                                    .narrow_service(service, &cluster_domain)
+                                    .is_some_and(|narrowed| {
+                                        narrowed
+                                            .ports
+                                            .iter()
+                                            .any(|service_port| service_port.port == port)
+                                    }),
+                            }
+                        })
+                },
             )
         } else {
             MeshHttpRouteSet::default()
@@ -2315,6 +2419,11 @@ impl MeshSlice {
         // A cross-namespace attachment must survive narrowing together with the
         // MeshService that AUTHORIZES it, or not at all.
         let workloads = retain_authorized_cross_namespace_attachments(workloads, &services);
+        // Issue #7499: a Sidecar dials an authorized cross-namespace carried
+        // route destination through that Service's own workloads, which the
+        // namespace-local workload view above never holds.
+        let workloads =
+            with_cross_namespace_destination_workloads(workloads, &http_routes, &services, mesh);
 
         // Bind `request.namespace` so we can both move it into `self` and
         // borrow it inside the `multi_cluster` `.retain` closure below without
@@ -2692,6 +2801,51 @@ fn retain_authorized_cross_namespace_attachments(
                 ))
         })
         .collect()
+}
+
+/// Add the workloads backing each Service a carried route is authorized to
+/// reach in another namespace (issue #7499).
+///
+/// The slice's workload view is namespace-local, so a Service imported from
+/// another namespace has no dialable endpoint on its own. A Sidecar dials an
+/// authorized cross-namespace route destination through that Service's
+/// workloads, so exactly those are added: only for Services the control plane
+/// already authorized for a carried route
+/// (`MeshHttpRouteSet::authorized_cross_namespace_targets`, Sidecar slices
+/// only) AND kept in this subscriber's narrowed `services`, and only
+/// workloads the Service itself lists, attached to it by namespace and name.
+/// Nothing else in another namespace becomes visible.
+fn with_cross_namespace_destination_workloads(
+    mut workloads: Vec<Workload>,
+    http_routes: &MeshHttpRouteSet,
+    services: &[MeshService],
+    mesh: &MeshConfig,
+) -> Vec<Workload> {
+    if http_routes.authorized_cross_namespace_targets.is_empty() {
+        return workloads;
+    }
+    let targets: BTreeSet<(&str, &str)> = http_routes
+        .authorized_cross_namespace_targets
+        .iter()
+        .map(|target| (target.namespace.as_str(), target.name.as_str()))
+        .collect();
+    for service in services
+        .iter()
+        .filter(|service| targets.contains(&(service.namespace.as_str(), service.name.as_str())))
+    {
+        for workload in &mesh.workloads {
+            let backs_service = workload.attached_service_namespace() == service.namespace
+                && workload.service_name == service.name
+                && service
+                    .workloads
+                    .iter()
+                    .any(|reference| reference.spiffe_id == workload.spiffe_id);
+            if backs_service && !workloads.contains(workload) {
+                workloads.push(workload.clone());
+            }
+        }
+    }
+    workloads
 }
 
 fn resource_namespace_visible(
@@ -3620,13 +3774,20 @@ fn node_waypoint_http_route_set(
     service_waypoint_namespaces: &Option<BTreeSet<String>>,
     destination_admitted: &dyn Fn(&str, &str, u16) -> bool,
     portless_rewrite_cluster_domain: Option<&str>,
+    cluster_domain: &str,
+    cross_namespace_target_visible: &dyn Fn(&str, &str, u16) -> bool,
 ) -> MeshHttpRouteSet {
     use crate::config::types::{PluginConfig, Upstream};
     use crate::modes::mesh::config::{
-        is_virtual_service_http_route_proxy_id, virtual_service_http_routes_exported_to_namespace,
+        MeshVirtualServiceHttpRoutes, is_virtual_service_http_route_proxy_id,
+        virtual_service_http_routes_authorize_target,
+        virtual_service_http_routes_exported_to_namespace,
     };
 
-    let mut bound: HashSet<(&str, &str)> = HashSet::new();
+    // Every visible binding that lists a route. One route is listed by one
+    // binding in practice; should two list it, a cross-namespace destination
+    // must be authorized by all of them (issue #7499), never by the union.
+    let mut bound: HashMap<(&str, &str), Vec<&MeshVirtualServiceHttpRoutes>> = HashMap::new();
     for binding in &mesh.virtual_service_http_routes {
         if !resource_namespace_visible(service_waypoint_namespaces, &binding.namespace, namespace)
             || !virtual_service_http_routes_exported_to_namespace(binding, namespace)
@@ -3634,7 +3795,10 @@ fn node_waypoint_http_route_set(
             continue;
         }
         for id in &binding.proxy_ids {
-            bound.insert((binding.namespace.as_str(), id.as_str()));
+            bound
+                .entry((binding.namespace.as_str(), id.as_str()))
+                .or_default()
+                .push(binding);
         }
     }
     if bound.is_empty() {
@@ -3665,8 +3829,10 @@ fn node_waypoint_http_route_set(
     let mut carried_upstreams: HashSet<(&str, &str)> = HashSet::new();
     let mut carried_plugins: HashSet<(&str, &str)> = HashSet::new();
     for proxy in &config.proxies {
-        if !bound.contains(&(proxy.namespace.as_str(), proxy.id.as_str()))
-            || !is_virtual_service_http_route_proxy_id(&proxy.id)
+        let Some(bindings) = bound.get(&(proxy.namespace.as_str(), proxy.id.as_str())) else {
+            continue;
+        };
+        if !is_virtual_service_http_route_proxy_id(&proxy.id)
             || proxy.dispatch_kind.is_stream()
             || proxy
                 .backend_scheme
@@ -3768,6 +3934,43 @@ fn node_waypoint_http_route_set(
         {
             continue;
         }
+        // Issue #7499: a destination in another namespace rides only when
+        // every binding listing the route authorizes that Service and this
+        // subscriber sees its port. Anything else withholds the route, so its
+        // host keeps the plain Service route; the data plane refuses a route
+        // whose cross-namespace destination arrives without an entry.
+        let mut route_targets: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut cross_namespace_withheld = false;
+        for (host, port) in &destinations {
+            let Some((target_namespace, target_name)) =
+                carried_route_cross_namespace_service(host, proxy_namespace, cluster_domain)
+            else {
+                continue;
+            };
+            let authorized = bindings.iter().all(|binding| {
+                virtual_service_http_routes_authorize_target(
+                    binding,
+                    &target_namespace,
+                    &target_name,
+                )
+            });
+            if !authorized
+                || !cross_namespace_target_visible(&target_namespace, &target_name, *port)
+            {
+                cross_namespace_withheld = true;
+                break;
+            }
+            route_targets.insert((target_namespace, target_name));
+        }
+        if cross_namespace_withheld {
+            debug!(
+                proxy_id = %sanitize_startup_cause(format!("{:?}", proxy.id.to_string()), &[]),
+                "VirtualService HTTP route names a Service in another namespace that its \
+                 binding does not authorize or this subscriber does not see; not carrying it \
+                 to the mesh slice"
+            );
+            continue;
+        }
         let Ok(proxy_value) = serde_json::to_value(proxy) else {
             continue;
         };
@@ -3801,6 +4004,14 @@ fn node_waypoint_http_route_set(
             continue;
         }
         set.proxies.push(proxy_value);
+        set.authorized_cross_namespace_targets
+            .extend(route_targets.into_iter().map(|(namespace, name)| {
+                MeshHttpRouteCrossNamespaceTarget {
+                    proxy_id: proxy.id.clone(),
+                    namespace,
+                    name,
+                }
+            }));
         for (plugin, value) in plugin_values {
             carried_plugins.insert((plugin.namespace.as_str(), plugin.id.as_str()));
             set.plugin_configs.push(value);

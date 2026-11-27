@@ -118,7 +118,14 @@ enrolled rows and required live assertion IDs; fixture detail is in the
   rule-bearing upstream and authorized on its own policy; an external leg whose
   rule originates TLS is dialed over TLS, and a direct external backend whose
   rule originates TLS, or that any wildcard rule names, is refused (issues
-  #7387, #7395).
+  #7387, #7395). A route destination in **another namespace** needs a Gateway
+  API `ReferenceGrant` in the destination namespace (from
+  `networking.istio.io/VirtualService` to core `Service`), an existing
+  non-`ExternalName` Service declaring the port, and EndpointSlice attribution,
+  or the VirtualService is refused (`FerrumAccepted=False`, `RefNotPermitted`);
+  an admitted destination is routed by a Sidecar whose egress scope imports the
+  Service, and refused by a NodeWaypoint (issue #7499; see [mesh.md →
+  Cross-namespace destinations](mesh.md#cross-namespace-destinations)).
 
   | Topology | Mesh-bound VirtualService `http[]` routes |
   |---|---|
@@ -333,7 +340,8 @@ ledger unless they change the support contract.
 
 | Deferral | Issue | Doc anchor |
 |---|---|---|
-| _None open._ | — | — |
+| NodeWaypoint routing of ReferenceGrant-authorized cross-namespace VirtualService `http[]` destinations (needs the destination namespace's AuthorizationPolicy / RequestAuthentication projected into NodeWaypoint slices) | [#7499](https://github.com/ferrum-edge/ferrum-edge/issues/7499) | [mesh.md → Cross-namespace destinations](mesh.md#cross-namespace-destinations) |
+| ServiceWaypoint VirtualService `http[]` route projection and L7 termination on `:15008` | [#7500](https://github.com/ferrum-edge/ferrum-edge/issues/7500), [#7501](https://github.com/ferrum-edge/ferrum-edge/issues/7501) | Topology table above (*VirtualService on mesh data planes*) |
 
 Completed historical rows (do **not** re-list as open): EgressGateway UDP `ServiceEntry` materialization (#3263 — external UDP ports materialize a datagram-over-mesh destination allowlist consumed by the gateway's authenticated mesh CONNECT terminator, plus the source-side `Sidecar`/`Ambient` producer that originates the identity-pinned `udp` CONNECT to the configured gateway; still no UDP/DTLS listener, by design); Ambient UDP capture producer + privileged live source-capture **and enrolled-destination** e2e (#2013 / #2038 / #3621 — `functional_mesh_live_source_capture_udp_manager_hbone_round_trip` covers source-capture through HBONE to an echo bound inside the enrolled destination pod netns, and `node-waypoint-ebpf-live` independently proves the marked backend datagram is admitted through the enrolled-pod `tc_inbound` guard while unmarked traffic is dropped); Ambient native gRPC over HBONE on the standard H1/H2 frontend (#3728 — the shared nested-HTTP/2 transport now serves every frontend; native gRPC still deliberately bypasses the generic HTTP/1.1 HBONE dispatch); VirtualService `tls[]` SNI passthrough L4 routing (`sniHosts` + port); general opaque-TLS SNI L4 routing outside passthrough (#3264 — an ordinary `tcp` stream listener that terminates nothing routes by normalized `server_name`, with fail-closed admission for indeterminate ClientHellos; see [`docs/tcp_udp_proxy.md`](tcp_udp_proxy.md#opaque-tls-sni-routing)); VirtualService `tcp[]`/`tls[]` weighted multi-destination splitting (#3251); remote-discovery JWT audience binding (#2475); subset-scoped DestinationRule HTTP connection-pool policy (#3228 / #3240–#3242); the poller-driven partition and bounded last-good-retention live gate (#3331); NodeWaypoint observability contract + maturity promotion gates (#3334 — ADR evidence table + Experimental→Beta/Beta→GA gates documented; maturity remains Experimental until promotion criteria close).
 

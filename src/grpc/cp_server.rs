@@ -1201,13 +1201,31 @@ impl CpGrpcServer {
                     policy, namespace,
                 )
         });
-        mesh.virtual_service_http_routes.retain(|routes| {
-            visible_namespaces.contains(&routes.namespace)
+        mesh.virtual_service_http_routes.retain_mut(|routes| {
+            let retained = visible_namespaces.contains(&routes.namespace)
                 && Self::namespace_allowed_by_scope(&routes.namespace, scope)
                 && bearer_namespaces.is_none_or(|allowed| allowed.contains(&routes.namespace))
                 && crate::modes::mesh::config::virtual_service_http_routes_exported_to_namespace(
                     routes, namespace,
-                )
+                );
+            // Issue #7499: an authorized cross-namespace destination is a
+            // ceiling, not a grant of visibility. Keep only targets in a
+            // namespace this subscription sees, that the CP scope serves for
+            // cross-namespace routing, and that the bearer `ns` claim
+            // authorizes. The slice builder then also requires the Service in
+            // the subscriber's own view.
+            if retained {
+                routes.authorized_cross_namespace_targets.retain(|target| {
+                    visible_namespaces.contains(&target.namespace)
+                        && Self::cross_namespace_route_target_allowed_by_scope(
+                            &target.namespace,
+                            scope,
+                        )
+                        && bearer_namespaces
+                            .is_none_or(|allowed| allowed.contains(&target.namespace))
+                });
+            }
+            retained
         });
         // A ServiceWaypoint terminates traffic for destination-visible services,
         // but trusted Ambient UDP evidence can name a source pod from any
@@ -1727,6 +1745,22 @@ impl CpGrpcServer {
         match scope {
             Some(CpScope::Set(scope_namespaces)) => scope_namespaces.contains(namespace),
             _ => true,
+        }
+    }
+
+    /// Whether a VirtualService HTTP route may reach a Service in `namespace`
+    /// across namespaces under this CP scope (issue #7499). Stricter than
+    /// [`Self::namespace_allowed_by_scope`]: a `Single` CP is one tenant's
+    /// authority and never routes a carried route into another namespace,
+    /// whatever a binding lists; a `Set` CP only into namespaces it serves.
+    fn cross_namespace_route_target_allowed_by_scope(
+        namespace: &str,
+        scope: Option<&CpScope>,
+    ) -> bool {
+        match scope {
+            Some(CpScope::Single(scope_namespace)) => namespace == scope_namespace,
+            Some(CpScope::Set(scope_namespaces)) => scope_namespaces.contains(namespace),
+            Some(CpScope::All) | None => true,
         }
     }
 
