@@ -836,7 +836,7 @@ fn consumer_identity_reserve_paths_adopt_same_owner_on_duplicate_key() {
         "batch failure release must run on the adoption-conflict path"
     );
 
-    let migrations = mongo_method("run_migrations(");
+    let migrations = mongo_fn_body("pub(crate) async fn apply_index_plan(");
     assert!(
         !migrations.contains("reconcile_orphaned_consumer_identity_reservations"),
         "startup migrations must not reclaim reservations from point-read consumer absence"
