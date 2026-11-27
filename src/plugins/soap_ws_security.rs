@@ -344,7 +344,8 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
-use time::SignedDuration;
+// `x509_parser::prelude::*` also exports a `time` module; name the crate.
+use ::time::SignedDuration;
 use tracing::{debug, warn};
 use x509_parser::prelude::*;
 
@@ -1121,15 +1122,11 @@ fn admitted_duration(path: &str, key: &str, seconds: u64) -> Result<SignedDurati
     duration.ok_or_else(message)
 }
 
-/// `now + skew`, failing closed where an unchecked addition would have
+/// `window + skew`, failing closed where an unchecked addition would have
 /// panicked. Unreachable under the admitted duration bounds; kept so the
-/// request path never panics.
-fn instant_plus_skew(now: UtcTimestamp, skew: SignedDuration) -> Result<UtcTimestamp, String> {
-    now.checked_add(skew)
-        .ok_or_else(|| "WS-Security: the current time is outside the supported range".to_string())
-}
-
-/// `window + skew` with the same fail-closed guarantee.
+/// request path never panics. Instant-versus-skew checks are written as
+/// instant differences (`a - b > skew`), which are exact and cannot leave
+/// UtcTimestamp's range even for a year-9999 instant.
 fn window_plus_skew(
     window: SignedDuration,
     skew: SignedDuration,
@@ -2717,14 +2714,14 @@ impl SoapWsSecurity {
         // Durations are pre-converted at config admission and `parse_ws_datetime`
         // clamps parsed instants to `MIN_PARSED_YEAR..=MAX_PARSED_YEAR`, so
         // neither the duration construction nor the instant arithmetic below can
-        // overflow under the current admission invariants. `checked_add_signed`
-        // on Expires remains as defensive fail-closed arithmetic against future
-        // clamp drift.
+        // overflow under the current admission invariants. Skew comparisons are
+        // instant differences, and `max_age + skew` is a checked addition that
+        // fails closed.
         let skew = self.clock_skew;
         let max_age = self.timestamp_max_age;
 
         // Created must not be in the future (with clock skew tolerance)
-        if created > instant_plus_skew(now, skew)? {
+        if created - now > skew {
             return Err("WS-Security: Timestamp Created is in the future".to_string());
         }
 
@@ -2738,11 +2735,9 @@ impl SoapWsSecurity {
 
         // Expires check
         if let Some(expires) = Self::timestamp_instant(ts_node, "Expires")? {
-            let expires_with_skew = expires.checked_add(skew).ok_or_else(|| {
-                "WS-Security: Expires timestamp is outside the supported range".to_string()
-            })?;
-
-            if now > expires_with_skew {
+            // `now > expires + skew`, as a difference so an in-range year-9999
+            // Expires never has to be shifted past UtcTimestamp's range.
+            if now - expires > skew {
                 return Err("WS-Security: Timestamp has expired".to_string());
             }
         } else if self.timestamp_require_expires {
@@ -2795,7 +2790,7 @@ impl SoapWsSecurity {
         })?;
 
         let skew = self.ut_created_clock_skew;
-        if created > instant_plus_skew(now, skew)? {
+        if created - now > skew {
             return Err("WS-Security: UsernameToken Created is in the future".to_string());
         }
         if now - created > window_plus_skew(self.ut_created_max_age, skew)? {
@@ -2840,10 +2835,7 @@ impl SoapWsSecurity {
             ));
         }
         if let Some(outer_expires) = outer_expires {
-            let outer_expires_with_skew = outer_expires.checked_add(skew).ok_or_else(|| {
-                "WS-Security: Timestamp Expires is outside the supported range".to_string()
-            })?;
-            if created > outer_expires_with_skew {
+            if created - outer_expires > skew {
                 return Err(
                     "WS-Security: UsernameToken Created is past the Timestamp Expires".to_string(),
                 );
@@ -4281,13 +4273,10 @@ impl SoapWsSecurity {
                 self.saml_max_assertion_lifetime_seconds
             ));
         }
-        if instant_plus_skew(now, skew)? < not_before {
+        if not_before - now > skew {
             return Err("WS-Security: SAML Assertion is not yet valid".to_string());
         }
-        let expiry_with_skew = not_on_or_after.checked_add(skew).ok_or_else(|| {
-            "WS-Security: SAML NotOnOrAfter is outside the supported range".to_string()
-        })?;
-        if now > expiry_with_skew {
+        if now - not_on_or_after > skew {
             return Err("WS-Security: SAML Assertion has expired".to_string());
         }
 
@@ -4541,18 +4530,14 @@ impl SoapWsSecurity {
                     "WS-Security: invalid SAML SubjectConfirmationData NotOnOrAfter".to_string()
                 })
             })?;
-        let expiry_with_skew = not_on_or_after.checked_add(skew).ok_or_else(|| {
-            "WS-Security: SAML SubjectConfirmationData NotOnOrAfter is outside the supported range"
-                .to_string()
-        })?;
-        if now > expiry_with_skew {
+        if now - not_on_or_after > skew {
             return Err("WS-Security: SAML SubjectConfirmationData has expired".to_string());
         }
         if let Some(raw) = data.unqualified_attribute("NotBefore") {
             let not_before = parse_ws_datetime(raw).ok_or_else(|| {
                 "WS-Security: invalid SAML SubjectConfirmationData NotBefore".to_string()
             })?;
-            if instant_plus_skew(now, skew)? < not_before {
+            if not_before - now > skew {
                 return Err(
                     "WS-Security: SAML SubjectConfirmationData is not yet valid".to_string()
                 );
