@@ -2809,7 +2809,7 @@ async fn serve_mongo_lease_wire_connection(
                             .ok()
                             .and_then(|u| u.get_document("$set").ok())
                             .and_then(|set| set.get_datetime("expires_at").ok())
-                            .is_some_and(|expiry| expiry.unix_timestamp_millis() == 0);
+                            .is_some_and(|expiry| expiry.timestamp_millis() == 0);
                         let mode = fault.mode.load(Ordering::SeqCst);
                         if mode == 1 {
                             if releasing {
@@ -3009,7 +3009,7 @@ async fn assert_mongo_cancelled_renewals_cannot_revive(url: &str) {
             released
                 .get_datetime("expires_at")
                 .unwrap()
-                .unix_timestamp_millis(),
+                .timestamp_millis(),
             0
         );
         drop(local);
@@ -3035,7 +3035,7 @@ async fn assert_mongo_cancelled_renewals_cannot_revive(url: &str) {
             before
                 .get_datetime("expires_at")
                 .unwrap()
-                .unix_timestamp_millis(),
+                .timestamp_millis(),
             0
         );
         let expected_generation = if after_takeover {

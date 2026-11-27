@@ -912,7 +912,7 @@ async fn free_tiers_emit_counted_zero_charge_rows_with_and_without_bandwidth() {
         .respond_with(ResponseTemplate::new(200))
         .mount(&server)
         .await;
-    let emitted_after = UtcTimestamp::now().timestamp_nanos_opt().unwrap();
+    let emitted_after = i64::try_from(UtcTimestamp::now().unix_timestamp_nanos()).unwrap();
     for bandwidth in [false, true] {
         let mut config = lifecycle_sink_config(&server);
         config["batch"]["size"] = json!(1);
@@ -946,7 +946,7 @@ async fn free_tiers_emit_counted_zero_charge_rows_with_and_without_bandwidth() {
             .partial_cmp(&b["charge_total"].as_f64())
             .unwrap()
     });
-    let emitted_before = UtcTimestamp::now().timestamp_nanos_opt().unwrap();
+    let emitted_before = i64::try_from(UtcTimestamp::now().unix_timestamp_nanos()).unwrap();
     for row in &rows {
         assert_eq!(row["call_count"], 1);
         assert_eq!(row["charge_call"], 0.0);

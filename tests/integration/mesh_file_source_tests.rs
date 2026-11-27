@@ -9,7 +9,6 @@ use std::io::Write;
 
 use ferrum_edge::modes::mesh::config_consumer::file_source::load_mesh_slice_from_file;
 use ferrum_edge::modes::mesh::slice::MeshSliceRequest;
-use ferrum_edge::time_compat::UtcTimestamp;
 
 fn request_for_namespace(namespace: &str) -> MeshSliceRequest {
     MeshSliceRequest {

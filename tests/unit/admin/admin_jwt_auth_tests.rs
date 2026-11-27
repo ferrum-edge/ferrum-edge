@@ -611,8 +611,9 @@ fn test_jwt_future_iat_within_cap_rejected() {
         sub: "admin-user".to_string(),
         iat: (now.checked_add(::time::SignedDuration::days(3650)).unwrap()).unix_timestamp(), // ~10 years in the future
         nbf: now.unix_timestamp(), // immediately usable
-        exp: (now.checked_add(::time::SignedDuration::days(3650)).unwrap()
-            + ::time::SignedDuration::seconds(3600))
+        exp: (now
+            .checked_add(::time::SignedDuration::days(3650) + ::time::SignedDuration::seconds(3600))
+            .unwrap())
         .unix_timestamp(),
         jti: uuid::Uuid::new_v4().to_string(),
         additional: json!({}),

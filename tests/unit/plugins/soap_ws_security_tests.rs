@@ -1127,20 +1127,35 @@ async fn test_timestamp_without_zone_designator_rejected() {
     let now = UtcTimestamp::now();
     let expires_at = now.checked_add(::time::SignedDuration::minutes(5)).unwrap();
 
-    let cases = [
-        ("%Y-%m-%dT%H:%M:%S%.3f", false),
-        ("%Y-%m-%dT%H:%M:%S", false),
-        ("%Y-%m-%dT%H:%M:%S%.3fZ", true),
-        ("%Y-%m-%dT%H:%M:%S%:z", true),
+    // Each case renders `now`/`expires_at` the way the chrono strftime pattern
+    // in its comment did.
+    use ferrum_edge::time_compat::SecondsFormat;
+    let millis_zoneless = |t: UtcTimestamp| {
+        t.to_rfc3339_opts(SecondsFormat::Millis, true)
+            .trim_end_matches('Z')
+            .to_string()
+    };
+    let secs_zoneless = |t: UtcTimestamp| {
+        t.to_rfc3339_opts(SecondsFormat::Secs, true)
+            .trim_end_matches('Z')
+            .to_string()
+    };
+    let millis_z = |t: UtcTimestamp| t.to_rfc3339_opts(SecondsFormat::Millis, true);
+    let secs_offset = |t: UtcTimestamp| t.to_rfc3339_opts(SecondsFormat::Secs, false);
+    let cases: [(&dyn Fn(UtcTimestamp) -> String, bool); 4] = [
+        (&millis_zoneless, false), // %Y-%m-%dT%H:%M:%S%.3f
+        (&secs_zoneless, false),   // %Y-%m-%dT%H:%M:%S
+        (&millis_z, true),         // %Y-%m-%dT%H:%M:%S%.3fZ
+        (&secs_offset, true),      // %Y-%m-%dT%H:%M:%S%:z
     ];
-    for (format, accepted) in cases {
+    for (render, accepted) in cases {
         let ts = format!(
             r#"<wsu:Timestamp wsu:Id="TS-1">
             <wsu:Created>{}</wsu:Created>
             <wsu:Expires>{}</wsu:Expires>
         </wsu:Timestamp>"#,
-            now.format(format),
-            expires_at.format(format)
+            render(now),
+            render(expires_at)
         );
         let body = wrap_soap(&ts);
         let mut ctx = make_ctx_with_soap_body(&body);
@@ -2646,9 +2661,8 @@ async fn test_saml_not_yet_valid_rejects() {
 
     let nb = far_future();
     let noa = (UtcTimestamp::now()
-        .checked_add(::time::SignedDuration::days(7))
-        .unwrap()
-        + ::time::SignedDuration::seconds(120))
+        .checked_add(::time::SignedDuration::days(7) + ::time::SignedDuration::seconds(120))
+        .unwrap())
     .to_rfc3339_opts(ferrum_edge::time_compat::SecondsFormat::Secs, true)
     .to_string();
     let mut builder = saml_fixtures::AssertionBuilder::new(

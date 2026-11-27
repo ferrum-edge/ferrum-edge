@@ -615,8 +615,9 @@ tonic-prost-build = "0.14.6"
 [dev-dependencies]
 # chrono is test-only (issue #7419): it is the reference oracle for the
 # `time_compat` parity tests and nothing else.
-# sqlx's `chrono` feature is enabled here, for test builds only, so the parity
-# tests can encode and decode chrono values through the same drivers.
+# sqlx's `chrono` feature is enabled here, so only dev builds (tests, examples
+# and benches) compile it; the parity tests encode and decode chrono values
+# through the same drivers.
 chrono = { version = "0.4", features = ["serde"] }
 sqlx = { version = "0.9", default-features = false, features = ["chrono"] }
 # Independent reference implementations for cryptographic test vectors and
