@@ -10026,9 +10026,9 @@ mod inner {
                 if filter.exclude_at_sign_names && *field == list_query::NAME_FIELD {
                     let mut no_at_sign = Document::new();
                     no_at_sign.insert(field.to_string(), doc! { "$not": { "$regex": "@" } });
-                    alternatives.push(doc! { "$and": [regex_on(*field), no_at_sign] });
+                    alternatives.push(doc! { "$and": [regex_on(field), no_at_sign] });
                 } else {
-                    alternatives.push(regex_on(*field));
+                    alternatives.push(regex_on(field));
                 }
             }
             if let Some(hosts_field) = hosts_field
