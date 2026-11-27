@@ -18,10 +18,18 @@
 //! Errors reuse [`HbonePoolError`] — the two pools share every failure shape
 //! (DNS, TCP, SPIFFE TLS config, TLS/H2 handshake) except HBONE's CONNECT
 //! stream, so the dispatch error mapping stays single-sourced.
+//!
+//! The pool has two lanes. The HTTP lane pools hyper HTTP/2 senders for
+//! HTTP-family egress. The raw-TCP tunnel lane (issue #7537) pools raw-`h2`
+//! SVID-mTLS carriers that multiplex captured raw-TCP streams as bare CONNECT
+//! streams; it reuses the HBONE pool's carrier entry, least-loaded selection,
+//! pruning, keepalive eviction, idle sweeper and dialer rather than adding a
+//! third pool, and shares this pool's SVID-rotation, trust and CRL drains.
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use dashmap::DashMap;
+use futures_util::FutureExt;
 use http_body::Frame;
 use hyper::client::conn::http2;
 use hyper_util::rt::TokioIo;
@@ -49,9 +57,12 @@ use crate::tls::backend::BackendSvidGeneration;
 use crate::tls::spiffe::build_spiffe_outbound_config;
 
 use super::hbone_pool::{
-    H2ConnectTunnel, H2WsConnectTunnel, HbonePoolError, MESH_SPIFFE_ID_TAG,
-    authority_for_host_port, dial_h2_connect_sender, entry_idle_expired, matches_boolish_true,
-    open_h2_connect_stream, open_h2_ws_connect_stream_within, svid_fingerprint,
+    H2ConnectTunnel, H2WsConnectTunnel, HboneKeepalivePoolHandle, HbonePoolEntry, HbonePoolError,
+    HboneStreamLease, MESH_SPIFFE_ID_TAG, MeshH2Transport, authority_for_host_port,
+    dial_h2_connect_sender, entry_idle_expired, h2_window_sizes, matches_boolish_true,
+    open_h2_connect_stream, open_h2_connect_stream_reserved, open_h2_ws_connect_stream_within,
+    prune_pool_entries as prune_tunnel_entries, select_least_loaded,
+    spawn_idle_entry_sweeper as spawn_tunnel_sweeper, svid_fingerprint,
     target_expected_peer_spiffe, unix_secs, write_pool_config_key,
 };
 
@@ -710,7 +721,68 @@ pub struct MeshMtlsConnectionPool {
     /// Gateway-to-mesh transport ownership registry (issue #3859), installed
     /// once by `ProxyState`. Unset for focused tests and standalone callers.
     mesh_trust_registry: OnceLock<Arc<MeshTrustRegistry>>,
+    /// The raw-TCP egress tunnel lane (issue #7537): pooled raw-`h2` SVID-mTLS
+    /// connections to peer sidecars' `:15006`, each multiplexing bare CONNECT
+    /// streams up to its stream cap. Same entry type, selection, pruning,
+    /// keepalive eviction and idle sweeper as the HBONE pool; keyed by
+    /// `write_mesh_mtls_tunnel_pool_key`, whose SVID fingerprint sits at the
+    /// same index as the HTTP lane's so one rotation drain covers both lanes.
+    /// Shares `creation_locks` with the HTTP lane (the key prefixes differ).
+    tunnel_entries: Arc<DashMap<String, Vec<HbonePoolEntry>>>,
+    tunnel_counters: MeshMtlsTunnelCounters,
 }
+
+/// Lifetime counters of the raw-TCP tunnel lane (issue #7537), rendered on
+/// `/metrics` through `MeshMtlsConnectionPool::tunnel_pool_stats`. Each tunnel
+/// open bumps at most two relaxed counters; nothing here is on the byte path.
+#[derive(Default)]
+struct MeshMtlsTunnelCounters {
+    connections_opened: AtomicU64,
+    streams_reused: AtomicU64,
+    streams_new_connection: AtomicU64,
+    saturation_waits_admitted: AtomicU64,
+    saturation_waits_timed_out: AtomicU64,
+}
+
+/// Scrape-time view of the Sidecar raw-TCP tunnel lane (issue #7537).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MeshMtlsTunnelPoolStats {
+    /// Pooled carrier connections resident in the lane.
+    pub connections: usize,
+    /// CONNECT streams open on pooled carriers right now.
+    pub active_streams: usize,
+    /// Carrier connections the lane dialed (pooled or served unpooled).
+    pub connections_opened: u64,
+    /// Tunnels opened on an already-pooled carrier.
+    pub streams_reused: u64,
+    /// Tunnels opened on a carrier dialed for them.
+    pub streams_new_connection: u64,
+    /// Tunnels that waited for a stream slot (every carrier at its stream cap,
+    /// lane at `FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST`) and then got one.
+    pub saturation_waits_admitted: u64,
+    /// Tunnels that waited for a stream slot and ran out of connect budget.
+    pub saturation_waits_timed_out: u64,
+}
+
+/// Outcome of the tunnel lane's write-path checkout for one key.
+enum TunnelCheckout {
+    /// A pooled carrier with a stream slot reserved for this tunnel.
+    Reserved(MeshH2Transport, HboneStreamLease),
+    /// Every live carrier is at its stream cap and the key is at its
+    /// configured width: wait for a sibling stream to close.
+    SaturatedAtWidth,
+    /// No carrier with room and the key can widen: dial one.
+    NeedsCarrier,
+}
+
+/// Fully stalled streams a pooled tunnel carrier's connection-level receive
+/// window must absorb while still leaving a whole stream window for its live
+/// siblings (issue #7537). See `tunnel_carrier_pool_config`.
+pub const MESH_MTLS_TUNNEL_STALLED_STREAM_HEADROOM: u32 = 15;
+
+/// Longest single sleep while a tunnel waits for a stream slot on a saturated,
+/// width-capped key. The wait starts at 2 ms and doubles up to this.
+const MESH_MTLS_TUNNEL_SLOT_WAIT_MAX: Duration = Duration::from_millis(50);
 
 struct MeshMtlsSvidIdentityCache {
     source: Arc<Option<SvidBundle>>,
@@ -783,7 +855,15 @@ impl MeshMtlsConnectionPool {
     ) -> Self {
         let entries = Arc::new(DashMap::with_shard_amount(shard_amount));
         spawn_idle_entry_sweeper(&entries, &pool_config);
+        let tunnel_entries = Arc::new(DashMap::with_shard_amount(shard_amount));
+        spawn_tunnel_sweeper(
+            &tunnel_entries,
+            &pool_config,
+            crate::runtime_metrics::PoolKind::MeshMtlsTunnel,
+        );
         Self {
+            tunnel_entries,
+            tunnel_counters: MeshMtlsTunnelCounters::default(),
             entries,
             growth_backoff_until: DashMap::new(),
             creation_locks: DashMap::with_shard_amount(shard_amount),
@@ -802,8 +882,8 @@ impl MeshMtlsConnectionPool {
     }
 
     /// Install the gateway trust ownership registry (issue #3859) so every
-    /// mesh-mTLS transport this pool dials — pooled, raw-TCP 1:1, datagram 1:1,
-    /// or WebSocket 1:1 — is registered under the accepted gateway trust
+    /// mesh-mTLS transport this pool dials — pooled HTTP senders, pooled
+    /// raw-TCP tunnel carriers, datagram 1:1, or WebSocket 1:1 — is registered under the accepted gateway trust
     /// generation and can be synchronously retired when an authority is
     /// withdrawn. Idempotent; later calls are ignored.
     pub fn attach_mesh_trust_registry(&self, registry: Arc<MeshTrustRegistry>) {
@@ -847,6 +927,40 @@ impl MeshMtlsConnectionPool {
 
     pub fn pool_size(&self) -> usize {
         self.entries.iter().map(|entry| entry.value().len()).sum()
+    }
+
+    /// Pooled raw-TCP tunnel carrier connections (issue #7537). Scrape-time
+    /// only: walks every shard.
+    pub fn tunnel_pool_size(&self) -> usize {
+        self.tunnel_entries
+            .iter()
+            .map(|entry| entry.value().len())
+            .sum()
+    }
+
+    /// Scrape-time view of the raw-TCP tunnel lane (issue #7537): resident
+    /// carriers, open CONNECT streams on them, and the lane's lifetime
+    /// counters. Walks every shard, so call it from `/metrics`, not a hot path.
+    pub fn tunnel_pool_stats(&self) -> MeshMtlsTunnelPoolStats {
+        let mut connections = 0usize;
+        let mut active_streams = 0usize;
+        for entry in self.tunnel_entries.iter() {
+            connections = connections.saturating_add(entry.value().len());
+            for carrier in entry.value() {
+                active_streams =
+                    active_streams.saturating_add(carrier.transport.load.active_streams());
+            }
+        }
+        let counters = &self.tunnel_counters;
+        MeshMtlsTunnelPoolStats {
+            connections,
+            active_streams,
+            connections_opened: counters.connections_opened.load(Ordering::Relaxed),
+            streams_reused: counters.streams_reused.load(Ordering::Relaxed),
+            streams_new_connection: counters.streams_new_connection.load(Ordering::Relaxed),
+            saturation_waits_admitted: counters.saturation_waits_admitted.load(Ordering::Relaxed),
+            saturation_waits_timed_out: counters.saturation_waits_timed_out.load(Ordering::Relaxed),
+        }
     }
 
     /// Cached gateway SVID fingerprint, keyed by `Arc::ptr_eq` on the SVID
@@ -951,9 +1065,22 @@ impl MeshMtlsConnectionPool {
             }
             !drain
         });
+        // The raw-TCP tunnel lane keys the fingerprint at the same index, so
+        // one rotation drain retires both lanes (issue #7537). Tunnels already
+        // open on a drained carrier keep running on it, exactly as a 1:1
+        // tunnel kept its own connection; no NEW stream is ever opened on it.
+        let mut tunnels_evicted = 0usize;
+        self.tunnel_entries.retain(|key, entries| {
+            let drain = fingerprint_retired(key);
+            if drain {
+                tunnels_evicted = tunnels_evicted.saturating_add(entries.len());
+            }
+            !drain
+        });
         self.creation_locks
             .retain(|key, _| !fingerprint_retired(key));
         record_mesh_mtls_evictions(evicted);
+        record_mesh_mtls_tunnel_evictions(tunnels_evicted);
     }
 
     /// Drain pool entries belonging to the retired SVID `generation` — and to
@@ -1009,12 +1136,20 @@ impl MeshMtlsConnectionPool {
         self.drain_retired_fingerprints(&retired);
     }
 
+    /// Remove every pooled connection from BOTH lanes — the HTTP-family
+    /// senders and the raw-TCP tunnel carriers (issue #7537). Called for a
+    /// missing SVID, a committed gateway trust change, and every backend
+    /// TLS/CRL reload, so a carrier verified against withdrawn trust or a
+    /// since-revoked peer certificate is never handed to a new tunnel.
     pub fn force_drain_all(&self) {
         let evicted = self.pool_size();
+        let tunnels_evicted = self.tunnel_pool_size();
         self.entries.clear();
+        self.tunnel_entries.clear();
         self.creation_locks.clear();
         self.retired_svid_fingerprints.clear();
         record_mesh_mtls_evictions(evicted);
+        record_mesh_mtls_tunnel_evictions(tunnels_evicted);
     }
 
     /// Checkout (or create) a multiplexed H2 sender to `target_host:mtls_port`.
@@ -1146,22 +1281,52 @@ impl MeshMtlsConnectionPool {
     }
 
     /// Open a raw-TCP egress CONNECT tunnel to a peer sidecar's inbound mTLS
-    /// listener (`:15006`, or the `mesh.mtls_port`-tagged override) over a
-    /// FRESH SVID-mTLS H2 connection. `target_host:target_port` is the
-    /// destination workload's address and app (container) port — the CONNECT
-    /// `:authority` the peer's transport-agnostic inbound relay dials locally.
-    ///
-    /// Unlike HTTP-family Sidecar egress (which multiplexes over the pooled
-    /// [`MeshMtlsSender`] connections) and Ambient raw-TCP egress (which
-    /// multiplexes over the shared HBONE pool), each captured raw-TCP stream
-    /// gets its OWN mesh-mTLS H2 connection carrying exactly ONE CONNECT
-    /// stream (1:1, dropped when the stream closes). `dial_host` is the peer
+    /// listener (`:15006`, or the `mesh.mtls_port`-tagged override) as one
+    /// CONNECT stream multiplexed over a POOLED SVID-mTLS HTTP/2 connection
+    /// (issue #7537). `target_host:target_port` is the destination workload's
+    /// address and app (container) port — the CONNECT `:authority` the peer's
+    /// transport-agnostic inbound relay dials locally. `dial_host` is the peer
     /// pod in-cluster or the east-west gateway cross-cluster;
     /// `authority_host:target_port` is always the real destination workload.
-    /// Raw-TCP streams are
-    /// long-lived, so the handshake amortizes over the connection's lifetime,
-    /// and SVID rotation is automatic because every new stream dials with the
-    /// current SVID. Pooling these tunnels is a documented follow-up.
+    ///
+    /// **Pool key.** Carriers live in the tunnel lane, keyed by
+    /// `write_mesh_mtls_tunnel_pool_key`: the dial target (`dial_host`,
+    /// `mtls_port`, DNS override), the CONNECT authority (`authority_host`,
+    /// `target_port`) and the DestinationRule policy port, the gateway SVID
+    /// fingerprint, and the peer verification scope — the pinned
+    /// `expected_peer` in-cluster, or the `td-only` marker plus the
+    /// cross-cluster trust domain and SNI override. A carrier verified for one
+    /// identity or trust scope is therefore never reused for another, and a
+    /// carrier only ever carries streams for one exact authority.
+    ///
+    /// **Limits.** A new tunnel takes a stream slot on the least-loaded live
+    /// carrier still under its stream cap (the peer's
+    /// `SETTINGS_MAX_CONCURRENT_STREAMS`, lowered to the effective
+    /// `maxConcurrentStreams`), reserved by compare-and-swap so racing opens
+    /// cannot overshoot the cap. Only when every carrier is full does the lane
+    /// dial another, up to `FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST`, so `N`
+    /// concurrent tunnels use at most `⌈N / cap⌉` connections. Every dial
+    /// takes the destination's DestinationRule `maxConnections` slot, owned by
+    /// the connection driver. When every carrier is full and the key is at its
+    /// width, the tunnel waits for a sibling stream to close, bounded by the
+    /// destination's connect timeout. Idle carriers are pruned by the idle
+    /// timeout and the periodic sweeper.
+    ///
+    /// **Retirement.** SVID rotation (fingerprint drain), trust-bundle change,
+    /// backend TLS/CRL reload and committed gateway trust changes all remove
+    /// carriers from the lane (`force_drain_svid_generation` /
+    /// `force_drain_all`); a gateway trust withdrawal additionally retires
+    /// every registered carrier's gate, which errors every stream on it; and a
+    /// carrier is never handed out past the earlier of its peer's and this
+    /// gateway's leaf `notAfter`. One stream's reset (`RST_STREAM`) is local
+    /// to that stream; its siblings and the carrier stay up.
+    ///
+    /// **Flow control.** Each tunnel reads with its own HTTP/2 stream window
+    /// and releases credit only as the relay consumes bytes, and writes only
+    /// the capacity the peer granted that stream, so a stalled reader or
+    /// writer back-pressures its own captured socket. Carrier connections
+    /// size their connection-level receive window so stalled streams cannot
+    /// consume the credit live siblings need (`tunnel_carrier_pool_config`).
     ///
     /// The CONNECT is BARE — no `x-ferrum-mesh-protocol` marker and no W3C
     /// baggage: the peer authenticates this gateway by its mTLS client
@@ -1169,8 +1334,9 @@ impl MeshMtlsConnectionPool {
     /// destination's inbound relay (`build_inbound_hbone_relay_proxy`, gated by
     /// `is_hbone_connect` + `mesh_direction == Inbound`, which a bare H2 CONNECT
     /// satisfies) dials the authority. Fail-closed: a missing gateway SVID
-    /// errors before the dial. In-cluster dials pin `expected_peer`; cross-
-    /// cluster dials use the caller's trust-domain scope + SNI override.
+    /// errors before any checkout or dial. In-cluster dials pin
+    /// `expected_peer`; cross-cluster dials use the caller's trust-domain scope
+    /// + SNI override.
     #[allow(clippy::too_many_arguments)]
     pub async fn open_connect_tunnel(
         &self,
@@ -1184,53 +1350,61 @@ impl MeshMtlsConnectionPool {
         expected_trust_domain: Option<&TrustDomain>,
         sni_override: Option<&str>,
     ) -> Result<H2ConnectTunnel, HbonePoolError> {
-        // Fail closed when no gateway SVID is loaded — never dial a mesh peer
-        // identity-less (parity with `get_sender` and the HBONE raw-TCP path).
-        let _ = self.current_svid_fingerprint_cached()?;
+        // Fail closed when no gateway SVID is loaded — never check out or dial
+        // a mesh peer identity-less (parity with `get_sender` and the HBONE
+        // raw-TCP path). The fingerprint is also the key's identity field.
+        let fingerprint = self.current_svid_fingerprint_cached()?;
         let pool_config = self.pool_config.for_proxy(proxy);
-        // DR keepalive override resolved for the destination's APP port
-        // (`target_port`), not the transport `mtls_port`.
-        let port_override = proxy
-            .dispatch_port_overrides
-            .as_ref()
-            .and_then(|m| m.get(&target_policy_port));
-        let keepalive_override = port_override.and_then(|o| o.tcp_keepalive.as_ref());
-        let effective_connect_timeout_ms = port_override
-            .and_then(|o| o.connect_timeout_ms)
-            .unwrap_or(proxy.backend_connect_timeout_ms);
+        // DR `connectTimeout` override resolved for the destination's APP /
+        // service policy port, not the transport `mtls_port`.
+        let effective_connect_timeout_ms =
+            self.effective_connect_timeout_ms(proxy, target_policy_port);
         let connect_timeout = Duration::from_millis(effective_connect_timeout_ms);
-        // Each raw-TCP / datagram tunnel session dials its OWN connection, so it
-        // is admitted on the destination's `maxConnections` lane (keyed by the
-        // dial peer + the APP/service policy port, never `:15006`).
-        let conn_admission = self.conn_admission(proxy, dial_host, target_policy_port);
-        // Registered like every pooled transport (issue #3859): a 1:1 raw-TCP
-        // bridge never enters the pool map, so pool clearing could not reach it.
-        let transport = dial_h2_connect_sender(
-            &self.dns_cache,
-            &self.gateway_svid,
-            self.crls.load_full(),
-            proxy,
+        let key_fields = MeshMtlsTunnelKey {
             dial_host,
+            target_port,
             mtls_port,
+            dns_override: proxy.dns_override.as_deref(),
+            svid_fingerprint: fingerprint.as_ref(),
             expected_peer,
-            expected_trust_domain,
             sni_override,
-            &pool_config,
-            keepalive_override,
-            Some(connect_timeout),
-            conn_admission.as_ref(),
-            self.trust_registry(),
-            MeshTransportKind::MeshMtls,
-            None,
-            // The Sidecar mesh-mTLS CONNECT tunnel shares the raw-`h2` dial with
-            // Ambient HBONE, so it inherits the same receive-side header-block
-            // bound: hyper's 16 KiB, never `h2`'s 16 MiB default.
-            crate::proxy::hbone_pool::HBONE_DEFAULT_MAX_HEADER_LIST_SIZE,
-        )
-        .await?;
-        tokio::time::timeout(
+            expected_trust_domain,
+            authority_host,
+            policy_port: target_policy_port,
+        };
+        key_fields.delimiter_free()?;
+
+        // Shared-lock fast path: reserve a slot on a live pooled carrier.
+        let fast = with_mesh_mtls_tunnel_pool_key(&key_fields, &pool_config, |key| {
+            self.try_reserve_pooled_tunnel_carrier(key)
+        });
+        let (transport, reservation, fresh_carrier) = match fast {
+            Some((transport, reservation)) => (transport, reservation, false),
+            None => {
+                let key = with_mesh_mtls_tunnel_pool_key(&key_fields, &pool_config, |key| {
+                    key.to_string()
+                });
+                self.checkout_or_dial_tunnel_carrier(
+                    proxy,
+                    &key_fields,
+                    &key,
+                    &pool_config,
+                    connect_timeout,
+                    effective_connect_timeout_ms,
+                )
+                .await?
+            }
+        };
+        let tunnel = tokio::time::timeout(
             connect_timeout,
-            open_h2_connect_stream(transport, authority_host, target_port, None, None),
+            open_h2_connect_stream_reserved(
+                transport,
+                reservation,
+                authority_host,
+                target_port,
+                None,
+                None,
+            ),
         )
         .await
         .map_err(|_| HbonePoolError::ConnectStream {
@@ -1239,7 +1413,14 @@ impl MeshMtlsConnectionPool {
                 "timed out after {}ms waiting for sidecar mesh-mTLS CONNECT response",
                 effective_connect_timeout_ms
             ),
-        })?
+        })??;
+        let opened = if fresh_carrier {
+            &self.tunnel_counters.streams_new_connection
+        } else {
+            &self.tunnel_counters.streams_reused
+        };
+        opened.fetch_add(1, Ordering::Relaxed);
+        Ok(tunnel)
     }
 
     /// Open a datagram-over-mesh-mTLS CONNECT tunnel to a peer sidecar's inbound
@@ -1267,7 +1448,8 @@ impl MeshMtlsConnectionPool {
     /// Destination authorization still applies the existing trusted-assertor /
     /// trust-domain gates before treating either assertion as authoritative.
     ///
-    /// Like [`Self::open_connect_tunnel`] each UDP session gets its OWN
+    /// Unlike [`Self::open_connect_tunnel`] (whose raw-TCP streams share pooled
+    /// carriers, issue #7537) each UDP session gets its OWN
     /// mesh-mTLS H2 connection carrying exactly ONE CONNECT stream (1:1, dropped
     /// when the session ends), NOT multiplexed over the pooled
     /// [`MeshMtlsSender`] connections — a captured UDP flow is a distinct
@@ -1314,7 +1496,7 @@ impl MeshMtlsConnectionPool {
             .and_then(|o| o.connect_timeout_ms)
             .unwrap_or(proxy.backend_connect_timeout_ms);
         let connect_timeout = Duration::from_millis(effective_connect_timeout_ms);
-        // Each raw-TCP / datagram tunnel session dials its OWN connection, so it
+        // Each datagram tunnel session dials its OWN connection, so it
         // is admitted on the destination's `maxConnections` lane (keyed by the
         // dial peer + the APP/service policy port, never `:15006`).
         let conn_admission = self.conn_admission(proxy, dial_host, target_policy_port);
@@ -1377,7 +1559,7 @@ impl MeshMtlsConnectionPool {
     /// peer as `/ws?room=1` rather than `/` — the destination routes and builds
     /// the local backend WebSocket URL on the path the client requested.
     ///
-    /// Like [`Self::open_connect_tunnel`] (raw-TCP egress) this is **1:1**: each
+    /// Unlike [`Self::open_connect_tunnel`] (pooled raw-TCP carriers) this is **1:1**: each
     /// WebSocket session gets its OWN mesh-mTLS H2 connection carrying exactly
     /// ONE Extended CONNECT stream (dropped when the session closes), NOT
     /// multiplexed over the pooled [`MeshMtlsSender`] connections. A proxied
@@ -1894,8 +2076,14 @@ impl MeshMtlsConnectionPool {
             record_mesh_mtls_evictions(prune_pool_entries(entries));
             !entries.is_empty()
         });
+        self.tunnel_entries.retain(|_, entries| {
+            record_mesh_mtls_tunnel_evictions(prune_tunnel_entries(entries));
+            !entries.is_empty()
+        });
         self.creation_locks.retain(|key, lock| {
-            self.entries.contains_key(key.as_str()) || Arc::strong_count(lock) > 1
+            self.entries.contains_key(key.as_str())
+                || self.tunnel_entries.contains_key(key.as_str())
+                || Arc::strong_count(lock) > 1
         });
         self.growth_backoff_until.retain(|_, until| *until > now);
     }
@@ -2139,6 +2327,290 @@ impl MeshMtlsConnectionPool {
             crate::dns::CandidateConnectError::Failed { source, .. } => source,
         })
     }
+
+    /// Shared-lock fast path of the raw-TCP tunnel lane (issue #7537): reserve
+    /// a stream slot on the least-loaded live carrier still under its stream
+    /// cap. A miss (empty key, every carrier full, a closed carrier) falls
+    /// through to [`Self::checkout_or_dial_tunnel_carrier`], whose write path
+    /// prunes. No allocation; the reservation is one CAS.
+    fn try_reserve_pooled_tunnel_carrier(
+        &self,
+        key: &str,
+    ) -> Option<(MeshH2Transport, HboneStreamLease)> {
+        let entries = self.tunnel_entries.get(key)?;
+        reserve_tunnel_carrier(entries.value(), unix_secs())
+    }
+
+    /// Exclusive-lock checkout of the tunnel lane: prune dead, retired,
+    /// keepalive-failed, credential-expired and idle carriers, then reserve a
+    /// slot on the least-loaded carrier with room, or report whether the key
+    /// may widen.
+    fn cached_tunnel_carrier(&self, key: &str, max_entries: usize) -> TunnelCheckout {
+        let Some(mut entries) = self.tunnel_entries.get_mut(key) else {
+            return TunnelCheckout::NeedsCarrier;
+        };
+        record_mesh_mtls_tunnel_evictions(prune_tunnel_entries(&mut entries));
+        let now = unix_secs();
+        if let Some((transport, reservation)) = reserve_tunnel_carrier(&entries, now) {
+            return TunnelCheckout::Reserved(transport, reservation);
+        }
+        if select_least_loaded(&entries, now).live >= max_entries {
+            TunnelCheckout::SaturatedAtWidth
+        } else {
+            TunnelCheckout::NeedsCarrier
+        }
+    }
+
+    /// Slow path of the tunnel lane: reuse a pooled carrier with room, wait
+    /// for a stream slot when every carrier is full and the key is at its
+    /// width, or dial one more carrier (coalesced with every other caller that
+    /// reached the same conclusion for this key, issue #5046). Returns the
+    /// carrier, this tunnel's reserved stream slot, and whether the carrier
+    /// was dialed for it. The whole checkout is bounded by `connect_timeout`.
+    async fn checkout_or_dial_tunnel_carrier(
+        &self,
+        proxy: &Proxy,
+        fields: &MeshMtlsTunnelKey<'_>,
+        key: &str,
+        pool_config: &PoolConfig,
+        connect_timeout: Duration,
+        effective_connect_timeout_ms: u64,
+    ) -> Result<(MeshH2Transport, HboneStreamLease, bool), HbonePoolError> {
+        self.maybe_prune_idle_entries();
+        let max_entries = pool_config.http2_connections_per_host.max(1);
+        let started = Instant::now();
+        let mut slot_wait = TunnelSlotWait::new(started, connect_timeout);
+        loop {
+            match self.cached_tunnel_carrier(key, max_entries) {
+                TunnelCheckout::Reserved(transport, reservation) => {
+                    slot_wait.admitted(&self.tunnel_counters);
+                    return Ok((transport, reservation, false));
+                }
+                TunnelCheckout::SaturatedAtWidth => {
+                    slot_wait
+                        .wait(&self.tunnel_counters, fields, effective_connect_timeout_ms)
+                        .await?;
+                    continue;
+                }
+                TunnelCheckout::NeedsCarrier => {}
+            }
+
+            let Some(remaining) = crate::pool::remaining_connect_timeout(started, connect_timeout)
+            else {
+                return Err(HbonePoolError::ConnectTimeout {
+                    addr: format!("{}:{}", fields.dial_host, fields.mtls_port),
+                    timeout_ms: effective_connect_timeout_ms,
+                });
+            };
+            let creation_slot = self.creation_slot(key);
+            // Join the cohort BEFORE awaiting the lock so a failed dial in
+            // flight releases this caller with its typed outcome (issue #5046).
+            let cohort = creation_slot.join();
+            let mut creation_lease = match tokio::time::timeout(remaining, cohort.wait()).await {
+                Ok(SharedCreationRole::Creator(lease)) => lease,
+                Ok(SharedCreationRole::Failed(shared)) => {
+                    return Err(shared.clone_for_broadcast());
+                }
+                Err(_) => {
+                    return Err(HbonePoolError::ConnectTimeout {
+                        addr: format!("{}:{}", fields.dial_host, fields.mtls_port),
+                        timeout_ms: effective_connect_timeout_ms,
+                    });
+                }
+            };
+            // Re-check under the creation lock: the creator this caller queued
+            // behind may have published a carrier with room, or filled the key.
+            match self.cached_tunnel_carrier(key, max_entries) {
+                TunnelCheckout::Reserved(transport, reservation) => {
+                    slot_wait.admitted(&self.tunnel_counters);
+                    return Ok((transport, reservation, false));
+                }
+                TunnelCheckout::SaturatedAtWidth => {
+                    drop(creation_lease);
+                    slot_wait
+                        .wait(&self.tunnel_counters, fields, effective_connect_timeout_ms)
+                        .await?;
+                    continue;
+                }
+                TunnelCheckout::NeedsCarrier => {}
+            }
+            if let Some(shared) = creation_lease.take_broadcast_failure() {
+                return Err(shared.clone_for_broadcast());
+            }
+            let (transport, reservation) = self
+                .dial_and_publish_tunnel(
+                    &creation_lease,
+                    proxy,
+                    fields,
+                    key,
+                    pool_config,
+                    max_entries,
+                    started,
+                    connect_timeout,
+                    effective_connect_timeout_ms,
+                )
+                .await?;
+            return Ok((transport, reservation, true));
+        }
+    }
+
+    /// Dial one raw-TCP tunnel carrier for `key` while holding its creation
+    /// lock, reserve this tunnel's stream slot on it, and pool it if the TLS
+    /// material it was built from is still current — the same pooling fence
+    /// as the HTTP lane's `dial_and_publish`. The dial is the shared raw-`h2`
+    /// SVID-mTLS dialer (`dial_h2_connect_sender`): it takes the destination's
+    /// `maxConnections` slot (owned by the connection driver), registers the
+    /// transport with the gateway trust registry, and arms HTTP/2 keepalive
+    /// with an identity-safe eviction handle into this lane.
+    #[allow(clippy::too_many_arguments)]
+    async fn dial_and_publish_tunnel(
+        &self,
+        cohort: &crate::pool::SharedCreationLease<'_, Arc<HbonePoolError>>,
+        proxy: &Proxy,
+        fields: &MeshMtlsTunnelKey<'_>,
+        key: &str,
+        pool_config: &PoolConfig,
+        max_entries: usize,
+        creation_started: Instant,
+        connect_timeout: Duration,
+        effective_connect_timeout_ms: u64,
+    ) -> Result<(MeshH2Transport, HboneStreamLease), HbonePoolError> {
+        let remaining = crate::pool::remaining_connect_timeout(creation_started, connect_timeout)
+            .ok_or_else(|| HbonePoolError::ConnectTimeout {
+            addr: format!("{}:{}", fields.dial_host, fields.mtls_port),
+            timeout_ms: effective_connect_timeout_ms,
+        })?;
+        // Snapshot the SVID and CRL slots before dialing (see
+        // `dial_and_publish`): an unchanged slot across the dial proves the
+        // session was built from material that is still current.
+        let svid_slot_before_dial = self.gateway_svid.load_full();
+        let crls_before_dial = self.crls.load_full();
+        // DR `tcpKeepalive` per-port override for the destination's APP /
+        // service policy port, never the transport `:15006`.
+        let keepalive_override = proxy
+            .dispatch_port_overrides
+            .as_ref()
+            .and_then(|m| m.get(&fields.policy_port))
+            .and_then(|o| o.tcp_keepalive.as_ref());
+        // The carrier is a physical connection, so it is admitted on the
+        // destination's `maxConnections` lane (keyed by the dial peer + the
+        // APP/service policy port, never `:15006`); the streams it carries take
+        // no slot.
+        let conn_admission = self.conn_admission(proxy, fields.dial_host, fields.policy_port);
+        let carrier_config = tunnel_carrier_pool_config(pool_config);
+        // Boxed so the TLS + HTTP/2 handshake is not a frame slot in the
+        // captured-connection task that awaits `open_connect_tunnel`.
+        let dial = Box::pin(dial_h2_connect_sender(
+            &self.dns_cache,
+            &self.gateway_svid,
+            crls_before_dial.clone(),
+            proxy,
+            fields.dial_host,
+            fields.mtls_port,
+            fields.expected_peer,
+            fields.expected_trust_domain,
+            fields.sni_override,
+            &carrier_config,
+            keepalive_override,
+            Some(remaining),
+            conn_admission.as_ref(),
+            self.trust_registry(),
+            MeshTransportKind::MeshMtls,
+            Some(HboneKeepalivePoolHandle::new(
+                Arc::clone(&self.tunnel_entries),
+                key.to_string(),
+                crate::runtime_metrics::PoolKind::MeshMtlsTunnel,
+            )),
+            // Hyper's 16 KiB response header-block bound, never `h2`'s 16 MiB.
+            crate::proxy::hbone_pool::HBONE_DEFAULT_MAX_HEADER_LIST_SIZE,
+        ));
+        let transport = match tokio::time::timeout(remaining, dial).await {
+            Ok(Ok(transport)) => {
+                crate::runtime_metrics::global_ref()
+                    .record_pool_handshake(crate::runtime_metrics::PoolKind::MeshMtlsTunnel);
+                transport
+            }
+            Ok(Err(err)) => {
+                crate::runtime_metrics::global_ref()
+                    .record_pool_failure(crate::runtime_metrics::PoolKind::MeshMtlsTunnel);
+                // One physical dial, one outcome for the whole cohort (#5046).
+                cohort.publish_failure(Arc::new(err.clone_for_broadcast()));
+                return Err(err);
+            }
+            Err(_) => {
+                crate::runtime_metrics::global_ref()
+                    .record_pool_failure(crate::runtime_metrics::PoolKind::MeshMtlsTunnel);
+                // The creator's own budget expiring is not evidence about the
+                // peer: not broadcast, so each waiter keeps its own deadline.
+                return Err(HbonePoolError::ConnectTimeout {
+                    addr: format!("{}:{}", fields.dial_host, fields.mtls_port),
+                    timeout_ms: effective_connect_timeout_ms,
+                });
+            }
+        };
+        self.tunnel_counters
+            .connections_opened
+            .fetch_add(1, Ordering::Relaxed);
+        // A gateway trust withdrawal that landed between registration and here
+        // already retired this transport: neither pool nor serve it (#3859).
+        if transport.is_retired() {
+            return Err(HbonePoolError::TrustWithdrawn);
+        }
+        // Reserve this tunnel's slot BEFORE the carrier becomes visible, so a
+        // caller queued on the creation lock cannot take it first.
+        let reservation =
+            transport
+                .load
+                .try_reserve()
+                .ok_or_else(|| HbonePoolError::ConnectStream {
+                    authority: authority_for_host_port(fields.authority_host, fields.target_port),
+                    message: "freshly dialed sidecar mesh-mTLS connection has no stream slot"
+                        .to_string(),
+                })?;
+        let svid_slot_unchanged =
+            Arc::ptr_eq(&svid_slot_before_dial, &self.gateway_svid.load_full());
+        let crls_unchanged = Arc::ptr_eq(&crls_before_dial, &self.crls.load_full());
+        let key_fingerprint_is_current = self
+            .current_svid_fingerprint_cached()
+            .ok()
+            .is_some_and(|current| mesh_mtls_key_svid_fingerprint(key) == Some(current.as_ref()));
+        if transport.keepalive_failed()
+            || !svid_slot_unchanged
+            || !crls_unchanged
+            || !key_fingerprint_is_current
+        {
+            // A rotation / CRL drain may have fired during the dial: pooling now
+            // would resurrect a retired-material carrier after its one-shot
+            // drain. Serve this tunnel on it; the connection closes with it.
+            debug!(
+                dial_host = fields.dial_host,
+                mtls_port = fields.mtls_port,
+                expected_peer = expected_peer_display(fields.expected_peer),
+                "Sidecar SVID-mTLS tunnel connection completed under rotated TLS material; serving without pooling"
+            );
+            return Ok((transport, reservation));
+        }
+        let idle_timeout_seconds = pool_config.idle_timeout_seconds;
+        self.tunnel_entries
+            .entry(key.to_string())
+            .and_modify(|entries| {
+                record_mesh_mtls_tunnel_evictions(prune_tunnel_entries(entries));
+                entries.push(HbonePoolEntry::new(transport.clone(), idle_timeout_seconds));
+                if entries.len() > max_entries {
+                    let overflow = entries.len() - max_entries;
+                    entries.drain(0..overflow);
+                    record_mesh_mtls_tunnel_evictions(overflow);
+                }
+            })
+            .or_insert_with(|| vec![HbonePoolEntry::new(transport.clone(), idle_timeout_seconds)]);
+        debug!(
+            dial_host = fields.dial_host,
+            mtls_port = fields.mtls_port,
+            expected_peer = expected_peer_display(fields.expected_peer),
+            "Created sidecar SVID-mTLS raw-TCP tunnel connection"
+        );
+        Ok((transport, reservation))
+    }
 }
 
 /// SVID-fingerprint field of a mesh mTLS pool key:
@@ -2219,6 +2691,13 @@ fn prune_pool_entries(entries: &mut Vec<MeshMtlsPoolEntry>) -> usize {
 fn record_mesh_mtls_evictions(count: usize) {
     crate::runtime_metrics::global_ref()
         .record_pool_evictions(crate::runtime_metrics::PoolKind::MeshMtls, count as u64);
+}
+
+fn record_mesh_mtls_tunnel_evictions(count: usize) {
+    crate::runtime_metrics::global_ref().record_pool_evictions(
+        crate::runtime_metrics::PoolKind::MeshMtlsTunnel,
+        count as u64,
+    );
 }
 
 /// Seconds between idle sweeps: the global idle timeout clamped to `1..=60`,
@@ -2337,6 +2816,304 @@ fn write_mesh_mtls_pool_key(
             .unwrap_or_default()
     );
     write_pool_config_key(buf, pool_config);
+}
+
+thread_local! {
+    static MESH_MTLS_TUNNEL_POOL_KEY_BUF: RefCell<String> = RefCell::new(String::with_capacity(224));
+}
+
+/// Every field that pins a raw-TCP tunnel carrier's peer (issue #7537). Two
+/// tunnels share a carrier only when every field is equal.
+pub(crate) struct MeshMtlsTunnelKey<'a> {
+    /// Network peer the carrier is dialed to (the peer pod in-cluster, the
+    /// east-west gateway cross-cluster).
+    pub(crate) dial_host: &'a str,
+    /// CONNECT authority port (the destination workload's app port).
+    pub(crate) target_port: u16,
+    /// Peer sidecar inbound mTLS port (`:15006` or `mesh.mtls_port`).
+    pub(crate) mtls_port: u16,
+    pub(crate) dns_override: Option<&'a str>,
+    /// This gateway's SVID leaf fingerprint. Index 5 of the key, the same
+    /// index as the HTTP lane, so `mesh_mtls_key_svid_fingerprint` and the
+    /// rotation drain read both lanes.
+    pub(crate) svid_fingerprint: &'a str,
+    /// Pinned destination identity (in-cluster), or `None` for the
+    /// trust-domain-scoped cross-cluster dial (rendered `td-only`).
+    pub(crate) expected_peer: Option<&'a SpiffeId>,
+    /// Cross-cluster ClientHello SNI override.
+    pub(crate) sni_override: Option<&'a str>,
+    /// Cross-cluster remote trust domain the peer must belong to.
+    pub(crate) expected_trust_domain: Option<&'a TrustDomain>,
+    /// CONNECT authority host (the real destination workload), so a carrier
+    /// only ever carries streams for one exact authority.
+    pub(crate) authority_host: &'a str,
+    /// DestinationRule policy port: the `maxConnections` lane the carrier's
+    /// slot is charged to.
+    pub(crate) policy_port: u16,
+}
+
+impl MeshMtlsTunnelKey<'_> {
+    /// The key is `|`-delimited, so a free-text field containing `|` could
+    /// make two different field tuples render the same key (or shift the
+    /// fingerprint index the rotation drain parses). SPIFFE IDs and trust
+    /// domains cannot contain `|` by construction; the remaining free-text
+    /// fields are refused here, fail-closed, before any lookup or dial.
+    fn delimiter_free(&self) -> Result<(), HbonePoolError> {
+        let fields = [
+            Some(self.dial_host),
+            Some(self.authority_host),
+            self.sni_override,
+            self.dns_override,
+        ];
+        match fields
+            .into_iter()
+            .flatten()
+            .find(|value| value.contains('|'))
+        {
+            Some(value) => Err(HbonePoolError::InvalidDialHostTag {
+                value: value.to_string(),
+                message: "sidecar mesh-mTLS tunnel dial metadata must not contain '|'".to_string(),
+            }),
+            None => Ok(()),
+        }
+    }
+}
+
+fn with_mesh_mtls_tunnel_pool_key<R>(
+    fields: &MeshMtlsTunnelKey<'_>,
+    pool_config: &PoolConfig,
+    f: impl FnOnce(&str) -> R,
+) -> R {
+    MESH_MTLS_TUNNEL_POOL_KEY_BUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        write_mesh_mtls_tunnel_pool_key(&mut buf, fields, pool_config);
+        f(&buf)
+    })
+}
+
+/// `mesh-mtls-tcp|{dial_host}|{target_port}|{mtls_port}|{dns_override}|{svid_fingerprint}|{peer}|{sni}|{td}|{authority_host}|{policy_port}|pool=...`
+///
+/// The fingerprint is field 5, exactly as in `write_mesh_mtls_pool_key`, so
+/// `mesh_mtls_key_svid_fingerprint` and `drain_retired_fingerprints` cover the
+/// tunnel lane unchanged. The `mesh-mtls-tcp` prefix keeps the lane's keys
+/// disjoint from the HTTP lane's in the shared `creation_locks` map.
+pub(crate) fn write_mesh_mtls_tunnel_pool_key(
+    buf: &mut String,
+    fields: &MeshMtlsTunnelKey<'_>,
+    pool_config: &PoolConfig,
+) {
+    buf.clear();
+    let _ = write!(
+        buf,
+        "mesh-mtls-tcp|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        fields.dial_host,
+        fields.target_port,
+        fields.mtls_port,
+        fields.dns_override.unwrap_or_default(),
+        fields.svid_fingerprint,
+        expected_peer_display(fields.expected_peer),
+        fields.sni_override.unwrap_or_default(),
+        fields
+            .expected_trust_domain
+            .map(TrustDomain::as_str)
+            .unwrap_or_default(),
+        fields.authority_host,
+        fields.policy_port,
+    );
+    write_pool_config_key(buf, pool_config);
+}
+
+/// Reserve a stream slot on the least-loaded live carrier under its cap.
+///
+/// `select_least_loaded` (shared with the HBONE pool) skips retired,
+/// keepalive-failed, credential-expired, idle-expired and saturated carriers;
+/// the reservation is a CAS, so a racing checkout that took the last slot
+/// makes this rescan instead of overshooting the cap. Bounded: at most one
+/// rescan per entry.
+fn reserve_tunnel_carrier(
+    entries: &[HbonePoolEntry],
+    now: u64,
+) -> Option<(MeshH2Transport, HboneStreamLease)> {
+    for _ in 0..=entries.len() {
+        let (index, _) = select_least_loaded(entries, now).chosen?;
+        let entry = &entries[index];
+        let Some(reservation) = entry.transport.load.try_reserve() else {
+            continue;
+        };
+        // One liveness probe for the chosen carrier only: a closed connection
+        // reports `Err` here and the write path prunes it.
+        return match entry.transport.sender.clone().ready().now_or_never() {
+            Some(Ok(sender)) => {
+                entry.last_used_at.store(now, Ordering::Relaxed);
+                Some((
+                    MeshH2Transport {
+                        sender,
+                        gate: entry.transport.gate.clone(),
+                        load: entry.transport.load.clone(),
+                        credential_not_after: entry.transport.credential_not_after,
+                    },
+                    reservation,
+                ))
+            }
+            _ => None,
+        };
+    }
+    None
+}
+
+/// Bounded wait for a stream slot on a saturated, width-capped key: the
+/// tunnel lane's overload behaviour (issue #7537). It never dials past
+/// `FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST` and never opens a stream past a
+/// carrier's cap; a burst above `cap × width` drains as sibling tunnels close,
+/// or fails once the destination's connect timeout is spent. Polls with
+/// exponential backoff (2 ms doubling to 50 ms): this runs only at overload,
+/// and polling keeps every stream close free of any wake-up bookkeeping.
+struct TunnelSlotWait {
+    started: Instant,
+    budget: Duration,
+    next_sleep: Duration,
+    waited: bool,
+}
+
+impl TunnelSlotWait {
+    fn new(started: Instant, budget: Duration) -> Self {
+        Self {
+            started,
+            budget,
+            next_sleep: Duration::from_millis(2),
+            waited: false,
+        }
+    }
+
+    async fn wait(
+        &mut self,
+        counters: &MeshMtlsTunnelCounters,
+        fields: &MeshMtlsTunnelKey<'_>,
+        effective_connect_timeout_ms: u64,
+    ) -> Result<(), HbonePoolError> {
+        let Some(remaining) = crate::pool::remaining_connect_timeout(self.started, self.budget)
+        else {
+            counters
+                .saturation_waits_timed_out
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(HbonePoolError::ConnectStream {
+                authority: authority_for_host_port(fields.authority_host, fields.target_port),
+                message: format!(
+                    "timed out after {effective_connect_timeout_ms}ms waiting for a stream slot: \
+                     every pooled sidecar mesh-mTLS connection is at its stream cap and the \
+                     pool is at its connection limit"
+                ),
+            });
+        };
+        if !self.waited {
+            debug!(
+                dial_host = fields.dial_host,
+                mtls_port = fields.mtls_port,
+                expected_peer = expected_peer_display(fields.expected_peer),
+                "Every pooled sidecar mesh-mTLS tunnel connection is at its stream cap; waiting for a stream slot"
+            );
+        }
+        self.waited = true;
+        tokio::time::sleep(self.next_sleep.min(remaining)).await;
+        self.next_sleep = (self.next_sleep * 2).min(MESH_MTLS_TUNNEL_SLOT_WAIT_MAX);
+        Ok(())
+    }
+
+    fn admitted(&self, counters: &MeshMtlsTunnelCounters) {
+        if self.waited {
+            counters
+                .saturation_waits_admitted
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// HTTP/2 settings a raw-TCP tunnel carrier is dialed with (issue #7537).
+///
+/// Every setting except the receive windows is the effective pool config.
+/// The windows are fixed (adaptive windowing is resolved through the same
+/// `h2_window_sizes` floors the HBONE dial uses, then pinned) and sized so a
+/// stalled stream cannot starve its siblings: a tunnel releases receive
+/// credit only as its relay consumes bytes, so a stream whose captured client
+/// stops reading holds at most one stream window of connection credit. The
+/// connection window is raised to cover `min(stream cap, 1 +
+/// MESH_MTLS_TUNNEL_STALLED_STREAM_HEADROOM)` full stream windows, within the
+/// 128 MiB window ceiling; if that ceiling cannot fit two stream windows the
+/// stream window is lowered to half the connection window. With the defaults
+/// (8 MiB stream window, 1000 streams) a carrier keeps a full window for live
+/// streams while up to 15 of its streams are stalled. Buffered memory per
+/// carrier stays bounded by open streams × stream window, as it was with one
+/// connection per tunnel.
+fn tunnel_carrier_pool_config(pool_config: &PoolConfig) -> PoolConfig {
+    use crate::config::types::{MAX_HTTP2_WINDOW_SIZE, MIN_HTTP2_WINDOW_SIZE};
+
+    let (stream_window, connection_window) = h2_window_sizes(pool_config);
+    let covered_streams = pool_config
+        .http2_max_concurrent_streams
+        .unwrap_or(u32::MAX)
+        .clamp(
+            1,
+            MESH_MTLS_TUNNEL_STALLED_STREAM_HEADROOM.saturating_add(1),
+        );
+    let wanted = u64::from(stream_window).saturating_mul(u64::from(covered_streams));
+    let connection_window = u32::try_from(
+        u64::from(connection_window)
+            .max(wanted)
+            .min(u64::from(MAX_HTTP2_WINDOW_SIZE)),
+    )
+    .unwrap_or(MAX_HTTP2_WINDOW_SIZE);
+    let stream_window = if covered_streams >= 2
+        && u64::from(stream_window).saturating_mul(2) > u64::from(connection_window)
+    {
+        (connection_window / 2).max(MIN_HTTP2_WINDOW_SIZE)
+    } else {
+        stream_window
+    };
+    let mut carrier = pool_config.clone();
+    carrier.http2_adaptive_window = false;
+    carrier.http2_initial_stream_window_size = stream_window;
+    carrier.http2_initial_connection_window_size = connection_window;
+    carrier
+}
+
+/// Test view of the tunnel carrier window sizing: `(stream, connection)`.
+#[doc(hidden)]
+pub fn tunnel_carrier_window_sizes_for_tests(pool_config: &PoolConfig) -> (u32, u32) {
+    let carrier = tunnel_carrier_pool_config(pool_config);
+    (
+        carrier.http2_initial_stream_window_size,
+        carrier.http2_initial_connection_window_size,
+    )
+}
+
+/// Test view of the tunnel lane's pool key.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn mesh_mtls_tunnel_pool_key_for_tests(
+    dial_host: &str,
+    target_port: u16,
+    mtls_port: u16,
+    svid_fingerprint: &str,
+    expected_peer: Option<&SpiffeId>,
+    sni_override: Option<&str>,
+    expected_trust_domain: Option<&TrustDomain>,
+    authority_host: &str,
+    policy_port: u16,
+    pool_config: &PoolConfig,
+) -> String {
+    let fields = MeshMtlsTunnelKey {
+        dial_host,
+        target_port,
+        mtls_port,
+        dns_override: None,
+        svid_fingerprint,
+        expected_peer,
+        sni_override,
+        expected_trust_domain,
+        authority_host,
+        policy_port,
+    };
+    with_mesh_mtls_tunnel_pool_key(&fields, pool_config, str::to_string)
 }
 
 /// Build CONNECT baggage for a mesh-mTLS datagram tunnel.

@@ -523,6 +523,50 @@ fn direct_h1_pool_families_render_idle_dials_reuse_and_each_eviction_reason() {
     );
 }
 
+/// Issue #7537: the Sidecar raw-TCP tunnel lane renders its open-stream gauge,
+/// carrier dials, tunnels by carrier reuse, and saturation waits by outcome,
+/// one series per closed-set label value.
+#[test]
+fn mesh_mtls_tunnel_pool_families_render_streams_dials_reuse_and_waits() {
+    let stats = ferrum_edge::proxy::mesh_mtls_pool::MeshMtlsTunnelPoolStats {
+        connections: 3,
+        active_streams: 11,
+        connections_opened: 4,
+        streams_reused: 40,
+        streams_new_connection: 4,
+        saturation_waits_admitted: 2,
+        saturation_waits_timed_out: 1,
+    };
+    let mut out = String::new();
+    data_path_metrics::render_mesh_mtls_tunnel_pool(&mut out, &stats, NS_LABEL);
+
+    for line in [
+        "# TYPE ferrum_mesh_mtls_tunnel_pool_active_streams gauge",
+        "ferrum_mesh_mtls_tunnel_pool_active_streams{namespace=\"ferrum\"} 11",
+        "# TYPE ferrum_mesh_mtls_tunnel_pool_connections_opened_total counter",
+        "ferrum_mesh_mtls_tunnel_pool_connections_opened_total{namespace=\"ferrum\"} 4",
+        "# TYPE ferrum_mesh_mtls_tunnel_pool_streams_total counter",
+        "ferrum_mesh_mtls_tunnel_pool_streams_total{carrier=\"reused\",namespace=\"ferrum\"} 40",
+        "ferrum_mesh_mtls_tunnel_pool_streams_total{carrier=\"new\",namespace=\"ferrum\"} 4",
+        "# TYPE ferrum_mesh_mtls_tunnel_pool_saturation_waits_total counter",
+        "ferrum_mesh_mtls_tunnel_pool_saturation_waits_total{result=\"admitted\",namespace=\"ferrum\"} 2",
+        "ferrum_mesh_mtls_tunnel_pool_saturation_waits_total{result=\"timed_out\",namespace=\"ferrum\"} 1",
+    ] {
+        assert!(
+            out.lines().any(|candidate| candidate == line),
+            "missing `{line}`:\n{out}"
+        );
+    }
+    assert_eq!(
+        samples(&out, "ferrum_mesh_mtls_tunnel_pool_streams_total").len(),
+        2
+    );
+    assert_eq!(
+        samples(&out, "ferrum_mesh_mtls_tunnel_pool_saturation_waits_total").len(),
+        2
+    );
+}
+
 #[test]
 fn process_families_render_both_tls_reason_buckets_and_the_retry_counter() {
     data_path_metrics::record_backend_retry_attempt();

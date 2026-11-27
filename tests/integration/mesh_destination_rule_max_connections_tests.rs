@@ -700,10 +700,18 @@ fn non_websocket_mesh_tunnel_dials_still_resolve_their_own_admission_lane() {
     let mtls = mesh_mtls_pool_source();
     let hbone = hbone_pool_source();
 
-    let raw_tcp = method_body(mtls, "pub async fn open_connect_tunnel(");
+    // Sidecar raw-TCP tunnels are pooled (issue #7537): every carrier dial
+    // goes through `dial_and_publish_tunnel`, which admits the physical
+    // connection; streams multiplexed onto it take no slot.
+    let raw_tcp = method_body(mtls, "async fn dial_and_publish_tunnel(");
     assert!(
         raw_tcp.contains("self.conn_admission("),
-        "the mesh-mTLS raw-TCP tunnel owns its physical connection"
+        "the pooled mesh-mTLS raw-TCP tunnel carrier owns its physical connection"
+    );
+    let raw_tcp_checkout = method_body(mtls, "async fn checkout_or_dial_tunnel_carrier(");
+    assert!(
+        raw_tcp_checkout.contains(".dial_and_publish_tunnel("),
+        "every raw-TCP tunnel carrier dial goes through dial_and_publish_tunnel"
     );
 
     let mtls_udp = method_body(mtls, "pub async fn open_datagram_tunnel(");

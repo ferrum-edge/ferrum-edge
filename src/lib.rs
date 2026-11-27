@@ -6537,6 +6537,7 @@ pub mod _test_support {
                 sender,
                 gate: crate::proxy::mesh_trust_registry::MeshTransportGate::new(),
                 load: crate::proxy::hbone_pool::HboneConnectionLoad::default(),
+                credential_not_after: u64::MAX,
             },
             "backend.test",
             80,
