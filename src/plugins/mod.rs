@@ -3837,8 +3837,11 @@ pub struct RequestContext {
     /// (`SO_ORIGINAL_DST`) and shared by every request on the connection.
     /// `None` on non-capture listeners, non-Linux platforms, and
     /// non-redirected (direct-dial) traffic. Mesh outbound routing uses the
-    /// port to disambiguate multi-port services; the address is reserved for
-    /// the raw-TCP egress follow-up.
+    /// port to disambiguate multi-port services; the full address is the
+    /// `loadBalancer.simple=PASSTHROUGH` target hint passed to
+    /// `backend_dispatch::select_upstream_target` (including the HBONE paths
+    /// in `src/proxy/hbone_proxy.rs`), and is preferred for
+    /// [`Self::destination_ip`].
     pub orig_dst: Option<std::net::SocketAddr>,
     /// Local (destination) IP of the frontend connection this request arrived
     /// on, stamped once at accept from the listener's bound address or the
