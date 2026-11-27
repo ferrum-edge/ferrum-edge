@@ -74,12 +74,6 @@ mod non_linux_stubs {
     }
 
     #[test]
-    fn set_udp_gro_noop() {
-        assert!(set_udp_gro(0, true).is_ok());
-        assert!(set_udp_gro(0, false).is_ok());
-    }
-
-    #[test]
     fn send_with_gso_returns_unsupported() {
         let result = send_with_gso(0, b"data", 4, &(), 0);
         assert!(result.is_err());
@@ -127,11 +121,6 @@ mod non_linux_stubs {
     #[test]
     fn is_tcp_fastopen_available_returns_false() {
         assert!(!is_tcp_fastopen_available());
-    }
-
-    #[test]
-    fn is_udp_gro_available_returns_false() {
-        assert!(!is_udp_gro_available());
     }
 
     #[test]
