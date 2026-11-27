@@ -23,6 +23,7 @@ use crate::scaffolding::ports::{reserve_port, reserve_refused_tcp_port};
 use crate::scaffolding::{
     file_mode_yaml_for_backend, file_mode_yaml_for_backend_with, to_file_mode_yaml,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use serde_json::json;
@@ -2776,14 +2777,14 @@ const DIAGNOSTIC_JWT_ISSUER: &str = "ferrum-edge-diagnostic-ref-functional";
 
 /// An admin JWT for the diagnostics gateway with `extra` claims merged in.
 fn diagnostic_token(extra: serde_json::Value) -> String {
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let mut claims = json!({
         "iss": DIAGNOSTIC_JWT_ISSUER,
         "sub": "diagnostics-reader",
         "role": "viewer",
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(600)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(600)).unwrap()).unix_timestamp(),
         "jti": uuid::Uuid::new_v4().to_string(),
     });
     if let (Some(object), Some(extra)) = (claims.as_object_mut(), extra.as_object()) {

@@ -18,7 +18,7 @@ use crate::common::{
     DbType, TestGateway, continue_if_tls_fixture_available, ensure_shared_sql_containers_resumed,
     provision_isolated_sql_database,
 };
-use chrono::Utc;
+use ferrum_edge::time_compat::UtcTimestamp;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
 use std::process::{Command, Stdio};
@@ -103,14 +103,14 @@ impl DbTlsTestHarness {
     }
 
     fn generate_token(&self) -> Result<String, Box<dyn std::error::Error>> {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let claims = json!({
             "iss": self.jwt_issuer,
             "sub": "test-admin",
             "role": "admin",
-            "iat": now.timestamp(),
-            "nbf": now.timestamp(),
-            "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
+            "iat": now.unix_timestamp(),
+            "nbf": now.unix_timestamp(),
+            "exp": (now.checked_add(::time::SignedDuration::seconds(3600)).unwrap()).unix_timestamp(),
             "jti": Uuid::new_v4().to_string()
         });
 

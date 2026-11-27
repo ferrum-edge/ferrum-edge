@@ -41,6 +41,7 @@ use crate::scaffolding::harness::GatewayHarness;
 use crate::scaffolding::ports::{reserve_port, reserve_refused_tcp_port};
 use crate::scaffolding::to_file_mode_yaml;
 use bytes::Bytes;
+use ferrum_edge::time_compat::UtcTimestamp;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -5608,7 +5609,7 @@ fn grpc_early_response_yaml(backend_port: u16, authenticated: bool) -> String {
 
 /// Bearer token for the consumer that [`grpc_early_response_yaml`] configures.
 fn grpc_early_response_authorization() -> String {
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let token = jsonwebtoken::encode(
         &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
         &json!({"sub": "affinity-consumer", "iat": now, "exp": now + 600}),

@@ -58,7 +58,6 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -67,6 +66,7 @@ use crate::scaffolding::backends::{ScriptedTcpBackend, TcpStep};
 use crate::scaffolding::clients::raw_h2::join_idle_h2_driver;
 use crate::scaffolding::harness::GatewayHarness;
 use crate::scaffolding::ports::reserve_port;
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const CONSUMER: &str = "h1h2-lifetime-alice";
 const JWT_SECRET: &str = "h1h2-auth-lifetime-shared-hmac-secret-2026";
@@ -112,15 +112,18 @@ fn mint_short_lived_token(exp_shape: ExpShape) -> String {
 }
 
 fn mint_token_with_ttl(exp_shape: ExpShape, ttl_secs: i64) -> String {
-    let now = Utc::now();
-    let exp_seconds = (now + chrono::Duration::seconds(ttl_secs)).timestamp();
+    let now = UtcTimestamp::now();
+    let exp_seconds = (now
+        .checked_add(::time::SignedDuration::seconds(ttl_secs))
+        .unwrap())
+    .unix_timestamp();
     let exp = match exp_shape {
         ExpShape::Integer => json!(exp_seconds),
         ExpShape::Fractional => json!(exp_seconds as f64 + 0.25),
     };
     let claims = json!({
         "sub": CONSUMER,
-        "iat": now.timestamp(),
+        "iat": now.unix_timestamp(),
         "exp": exp,
     });
     encode(

@@ -9,7 +9,6 @@
 //! and the refusal must not depend on whether that material exists.
 
 use arc_swap::ArcSwap;
-use chrono::Utc;
 use ferrum_edge::admin::{
     AdminState,
     jwt_auth::{JwtConfig, JwtManager},
@@ -17,6 +16,7 @@ use ferrum_edge::admin::{
 };
 use ferrum_edge::config::db_backend::DatabaseBackend;
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
+use ferrum_edge::time_compat::UtcTimestamp;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -44,15 +44,15 @@ fn token(role: &str, namespaces: &[&str]) -> String {
 }
 
 fn token_with_claim(role: &str, namespaces: Option<&[&str]>) -> String {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let mut claims = json!({
         "iss": JWT_ISSUER,
         "sub": format!("tenant-a-{role}"),
         "role": role,
         "ns": namespaces,
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(600)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(600)).unwrap()).unix_timestamp(),
         "jti": uuid::Uuid::new_v4().to_string(),
     });
     if namespaces.is_none() {

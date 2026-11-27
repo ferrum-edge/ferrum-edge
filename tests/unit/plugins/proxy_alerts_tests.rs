@@ -15,7 +15,6 @@
 //!   trailers-only, H2/H3, and gateway-rejection summary shapes.
 //! - Plugin construction wires everything end-to-end.
 
-use chrono::{TimeZone, Utc};
 use ferrum_edge::plugins::proxy_alerts::ProxyAlerts;
 use ferrum_edge::plugins::proxy_alerts::config::QuietHourWindow;
 use ferrum_edge::plugins::proxy_alerts::cooldown::{
@@ -2364,8 +2363,10 @@ fn stream_duration_percentile_observes_monotonic_producer_duration() {
         .collect();
     let store = WindowStore::new(specs);
 
-    let connected = Utc.with_ymd_and_hms(2026, 7, 21, 12, 0, 0).unwrap();
-    let disconnected = connected - chrono::Duration::hours(1);
+    let connected = "2026-07-21T12:00:00Z".parse::<UtcTimestamp>().unwrap();
+    let disconnected = connected
+        .checked_sub(::time::SignedDuration::hours(1))
+        .unwrap();
     let summary = StreamTransactionSummary {
         plugin_trigger_decisions: Default::default(),
         namespace: "ferrum".to_string(),

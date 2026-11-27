@@ -24,6 +24,7 @@ use super::plugin_utils::{
     assert_continue, assert_no_effective_credential_deadline, assert_reject_body,
     context_with_materialized_raw_header, create_test_consumer,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 
 struct InvalidSecondaryAuth;
 
@@ -2374,7 +2375,7 @@ async fn oauth2_discovery_failure_diagnostics_never_print_endpoint_credentials()
 #[tokio::test]
 async fn future_introspection_nbf_must_not_authenticate() {
     let server = MockServer::start().await;
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     Mock::given(method("POST"))
         .and(path("/introspect"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -2408,7 +2409,7 @@ async fn future_introspection_nbf_must_not_authenticate() {
 #[tokio::test]
 async fn an_inverted_introspection_window_never_authenticates() {
     let server = MockServer::start().await;
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     Mock::given(method("POST"))
         .and(path("/introspect"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -2452,7 +2453,7 @@ async fn an_inverted_introspection_window_never_authenticates() {
 #[tokio::test]
 async fn absent_null_past_and_current_nbf_still_authenticate() {
     let server = MockServer::start().await;
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let responses = Arc::new([
         json!({"active": true, "username": "no-nbf"}),
         json!({"active": true, "username": "null-nbf", "nbf": null}),
@@ -2503,7 +2504,7 @@ async fn absent_null_past_and_current_nbf_still_authenticate() {
 #[tokio::test]
 async fn null_expiry_members_authenticate_like_omitted_ones() {
     let server = MockServer::start().await;
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let responses = Arc::new([
         json!({"active": true, "username": "null-exp", "exp": null}),
         json!({"active": true, "username": "null-active-until", "active_until": null}),
@@ -2560,7 +2561,7 @@ async fn null_expiry_members_authenticate_like_omitted_ones() {
 #[tokio::test]
 async fn null_expiry_member_does_not_mask_an_expired_sibling() {
     let server = MockServer::start().await;
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     Mock::given(method("POST"))
         .and(path("/introspect"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -2650,7 +2651,7 @@ async fn malformed_introspection_nbf_is_a_503_and_never_cached() {
 #[tokio::test]
 async fn a_future_nbf_is_not_cached_and_authenticates_once_its_window_opens() {
     let server = MockServer::start().await;
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let responses = Arc::new([
         json!({"active": true, "username": "pending", "nbf": now + 3600}),
         json!({"active": true, "username": "pending", "nbf": now + 3600}),

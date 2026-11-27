@@ -24,6 +24,7 @@ use serde_json::{Value, json};
 
 use super::jwks_auth_support::{cache_test_lock, default_client, make_ctx};
 use super::plugin_utils::{assert_continue, assert_reject};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const ISSUER: &str = "https://managed-idp.example.com";
 
@@ -65,7 +66,7 @@ fn token(key: &SigningKey, subject: &str) -> String {
     let claims = json!({
         "iss": ISSUER,
         "sub": subject,
-        "exp": chrono::Utc::now().timestamp() + 3600,
+        "exp": UtcTimestamp::now().unix_timestamp() + 3600,
     });
     encode(&header, &claims, &key.encoding).expect("sign token")
 }

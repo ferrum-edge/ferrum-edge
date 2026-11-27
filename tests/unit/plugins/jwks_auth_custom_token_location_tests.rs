@@ -8,6 +8,7 @@ use super::jwks_auth_support::{
 use super::plugin_utils::{
     assert_continue, assert_reject, assert_reject_body, create_test_consumer,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 
 fn plugin_with_custom_locations() -> JwksAuth {
     let jwks = build_rsa_jwks_from_pem(include_bytes!(
@@ -333,7 +334,7 @@ async fn custom_location_rejects_expired_token() {
         &json!({
             "iss": "https://issuer.example.com",
             "sub": "expired-user",
-            "exp": chrono::Utc::now().timestamp() - 3600
+            "exp": UtcTimestamp::now().unix_timestamp() - 3600
         }),
         include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
     );

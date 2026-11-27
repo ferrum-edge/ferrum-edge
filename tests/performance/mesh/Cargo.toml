@@ -22,7 +22,6 @@ serde_json = "1"
 # SYNC: keep aligned with the root Cargo.toml. `unix_backend_pool` drives the
 # production Unix connection pool, which is async and binds real Unix-domain
 # sockets, so the bench needs a runtime and a temp dir.
-chrono = { version = "0.4", features = ["serde"] }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time"] }
 

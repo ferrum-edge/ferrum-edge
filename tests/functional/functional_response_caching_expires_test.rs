@@ -5,7 +5,7 @@ use crate::scaffolding::clients::{Http1Client, Http2Client, Http3Client};
 use crate::scaffolding::ports::reserve_port;
 
 use bytes::Bytes;
-use chrono::Utc;
+use ferrum_edge::time_compat::UtcTimestamp;
 use http::{Request, Response};
 use http_body_util::Full;
 use hyper::body::Incoming;
@@ -19,9 +19,12 @@ use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 
 fn http_date(offset_seconds: i64) -> String {
-    (Utc::now() + chrono::Duration::seconds(offset_seconds))
-        .format("%a, %d %b %Y %H:%M:%S GMT")
-        .to_string()
+    httpdate::fmt_http_date(std::time::SystemTime::from(
+        UtcTimestamp::now()
+            .checked_add(::time::SignedDuration::seconds(offset_seconds))
+            .unwrap()
+            .into_offset_date_time(),
+    ))
 }
 
 /// Request-driven origin: every request the gateway forwards is counted and

@@ -4538,9 +4538,7 @@ async fn test_hmac_v2_shared_redis_admits_one_backend_mutation_across_replicas()
     let port_b = replica_b.proxy_port;
 
     let client = reqwest::Client::new();
-    let date = chrono::Utc::now()
-        .format("%a, %d %b %Y %H:%M:%S GMT")
-        .to_string();
+    let date = httpdate::fmt_http_date(std::time::SystemTime::now());
     let digest = crate::common::empty_digest_header();
 
     // 1. One accepted request reaches the backend exactly once.

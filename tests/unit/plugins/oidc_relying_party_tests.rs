@@ -1,5 +1,4 @@
 use base64::Engine;
-use chrono::Utc;
 use ferrum_edge::_test_support::{
     oidc_discovery_published_within_for_test, oidc_open_session_cookie_for_test,
     oidc_resolve_discovery_for_test, oidc_resolved_discovery_endpoints_for_test,
@@ -398,7 +397,7 @@ async fn principal_less_refresh_due_session_does_not_refresh_or_slide() {
         PluginHttpClient::default(),
     )
     .expect("valid refresh config");
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let cookie = oidc_sealed_refresh_session_cookie_for_test(
         &plugin,
         json!({"sub": "subject-only", "exp": now + 3600}),
@@ -435,7 +434,7 @@ async fn earlier_single_mode_principal_prevents_later_oidc_refresh_and_slide() {
         .expect("valid refresh config"),
     );
     let key_auth = Arc::new(KeyAuth::new(&json!({})).expect("valid key auth config"));
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let cookie = oidc_sealed_refresh_session_cookie_for_test(
         &oidc,
         json!({
@@ -492,7 +491,7 @@ async fn accepted_oidc_refresh_commits_rotated_token_once() {
         PluginHttpClient::default(),
     )
     .expect("valid refresh config");
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let cookie = oidc_sealed_refresh_session_cookie_for_test(
         &plugin,
         json!({
@@ -544,7 +543,7 @@ async fn accepted_refresh_failure_commits_backoff_and_avoids_retry_storm() {
         PluginHttpClient::default(),
     )
     .expect("valid refresh config");
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let cookie = oidc_sealed_refresh_session_cookie_for_test(
         &plugin,
         json!({
@@ -618,7 +617,7 @@ async fn concurrent_refresh_due_requests_share_one_rotation_and_never_reseal_the
         PluginHttpClient::default(),
     )
     .expect("valid refresh config");
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let cookie = oidc_sealed_refresh_session_cookie_for_test(
         &plugin,
         json!({
@@ -697,7 +696,7 @@ async fn spent_refresh_token_rejection_emits_no_cookie_and_is_not_resubmitted() 
         PluginHttpClient::default(),
     )
     .expect("valid refresh config");
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let cookie = oidc_sealed_refresh_session_cookie_for_test(
         &plugin,
         json!({
@@ -745,7 +744,7 @@ async fn concurrent_requests_share_one_transient_refresh_failure_and_backoff() {
         PluginHttpClient::default(),
     )
     .expect("valid refresh config");
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let cookie = oidc_sealed_refresh_session_cookie_for_test(
         &plugin,
         json!({
@@ -823,7 +822,7 @@ async fn oidc_success_commits_claim_headers_and_rolling_cookie_together() {
     config["providers"][0]["consumer_identity_claim"] = json!("email");
     config["providers"][0]["claim_headers"] = json!({"role": "X-Trusted-Role"});
     let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let set_cookie = oidc_sealed_session_cookie_for_test(
         &plugin,
         json!({
@@ -882,7 +881,7 @@ async fn oidc_single_auth_scope_rejection_returns_rotated_refresh_cookie() {
         .mount(&server)
         .await;
     let plugin = Arc::new(refresh_rejection_plugin(&format!("{}/token", server.uri())));
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let cookie = oidc_sealed_due_refresh_session_cookie_for_test(
         &plugin,
         json!({
@@ -943,7 +942,7 @@ async fn oidc_scope_rejection_persists_refresh_failure_backoff() {
         .mount(&server)
         .await;
     let plugin = refresh_rejection_plugin(&format!("{}/token", server.uri()));
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let cookie = oidc_sealed_due_refresh_session_cookie_for_test(
         &plugin,
         json!({
@@ -1027,7 +1026,7 @@ async fn oidc_multi_auth_preserves_rotated_cookie_when_later_credential_rejects(
         Arc::new(KeyAuth::new(&json!({"key_location": "header:X-API-Key"})).unwrap());
     let consumers = [create_test_consumer()];
     let consumer_index = ConsumerIndex::new(&consumers);
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let cookie = oidc_sealed_due_refresh_session_cookie_for_test(
         &oidc,
         json!({
@@ -1148,7 +1147,7 @@ async fn oidc_multi_auth_preserves_distinct_rejected_session_cookies() {
     };
     let first = Arc::new(rejection_plugin("first_session", "/first-token"));
     let second = Arc::new(rejection_plugin("second_session", "/second-token"));
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let claims = json!({
         "sub": "oidc-subject",
         "email": "rejected@example.test",
@@ -1267,7 +1266,7 @@ async fn oidc_multi_auth_uses_later_same_name_rejected_session_cookie() {
         OidcRelyingParty::new(&config, PluginHttpClient::default())
             .expect("second OIDC config must be valid"),
     );
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let cookie = oidc_sealed_due_refresh_session_cookie_for_test(
         &first,
         json!({
@@ -1346,7 +1345,7 @@ async fn oidc_multi_auth_preserves_selected_rejection_cookie() {
     second_config["session"]["cookie_name"] = json!("second_session");
     let second =
         Arc::new(OidcRelyingParty::new(&second_config, PluginHttpClient::default()).unwrap());
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let first_cookie = oidc_sealed_due_refresh_session_cookie_for_test(
         &first,
         json!({
@@ -1454,7 +1453,7 @@ async fn oidc_multi_auth_keeps_later_clear_for_shared_session_cookie() {
     second_config["session"]["cookie_name"] = json!("ferrum");
     let second =
         Arc::new(OidcRelyingParty::new(&second_config, PluginHttpClient::default()).unwrap());
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let first_cookie = oidc_sealed_due_refresh_session_cookie_for_test(
         &first,
         json!({
@@ -1530,7 +1529,7 @@ async fn oidc_multi_auth_preserves_refresh_backoff_when_later_credential_rejects
     let auth_plugins = [oidc_plugin, key_auth];
     let consumers = [create_test_consumer()];
     let consumer_index = ConsumerIndex::new(&consumers);
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let cookie = oidc_sealed_due_refresh_session_cookie_for_test(
         &oidc,
         json!({
@@ -1620,7 +1619,7 @@ async fn oidc_multi_auth_discards_scope_rejection_refresh_cookie_on_later_succes
         Arc::new(KeyAuth::new(&json!({"key_location": "header:X-API-Key"})).unwrap());
     let consumers = [create_test_consumer()];
     let consumer_index = ConsumerIndex::new(&consumers);
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let cookie = oidc_sealed_due_refresh_session_cookie_for_test(
         &oidc,
         json!({
@@ -1688,7 +1687,7 @@ async fn oidc_multi_auth_discards_uncommitted_attempt_metadata() {
         Arc::new(KeyAuth::new(&json!({"key_location": "header:X-API-Key"})).unwrap());
     let consumers = [create_test_consumer()];
     let consumer_index = ConsumerIndex::new(&consumers);
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let attempted_cookies = [
         oidc_sealed_session_cookie_for_test(
             &oidc,
@@ -2749,7 +2748,7 @@ fn oidc_id_token_claims(challenge: &BrowserChallenge) -> serde_json::Value {
         "aud": "ferrum-gateway",
         "sub": "user-1",
         "nonce": challenge.nonce.as_str(),
-        "exp": chrono::Utc::now().timestamp() + 86_400,
+        "exp": UtcTimestamp::now().unix_timestamp() + 86_400,
     })
 }
 
@@ -3839,7 +3838,7 @@ async fn unrepresentable_provider_expires_in_does_not_panic_the_session_path() {
             PluginHttpClient::default(),
         )
         .expect("refresh plugin");
-        let now = chrono::Utc::now().timestamp();
+        let now = UtcTimestamp::now().unix_timestamp();
         let cookie = oidc_sealed_due_refresh_session_cookie_for_test(
             &plugin,
             json!({
@@ -3878,7 +3877,7 @@ async fn spent_refresh_token_suppresses_the_rolling_idle_cookie() {
         PluginHttpClient::default(),
     )
     .expect("valid refresh config");
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let cookie = oidc_sealed_refresh_session_cookie_for_test(
         &plugin,
         json!({
@@ -3944,7 +3943,7 @@ async fn client_secret_basic_form_encodes_credentials_before_basic_encoding() {
     });
     let plugin =
         OidcRelyingParty::new(&config, PluginHttpClient::default()).expect("valid refresh config");
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let cookie = oidc_sealed_due_refresh_session_cookie_for_test(
         &plugin,
         json!({
@@ -3993,7 +3992,7 @@ async fn refresh_grant_client_assertion(
     config["providers"][0]["client_auth"] = client_auth;
     let plugin =
         OidcRelyingParty::new(&config, PluginHttpClient::default()).expect("valid refresh config");
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let cookie = oidc_sealed_due_refresh_session_cookie_for_test(
         &plugin,
         json!({
@@ -5194,7 +5193,7 @@ fn zero_skew_config() -> serde_json::Value {
 #[tokio::test]
 async fn a_fractional_id_token_expiry_still_bounds_the_session() {
     let plugin = OidcRelyingParty::new(&zero_skew_config(), PluginHttpClient::default()).unwrap();
-    let now = Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let set_cookie = oidc_sealed_session_cookie_for_test(
         &plugin,
         json!({"sub": "oidc-subject", "exp": now as f64 + 5.25}),
@@ -5224,7 +5223,7 @@ async fn a_fractional_id_token_expiry_still_bounds_the_session() {
 #[tokio::test]
 async fn an_expired_fractional_id_token_re_challenges_instead_of_riding_the_session_ttl() {
     let plugin = OidcRelyingParty::new(&zero_skew_config(), PluginHttpClient::default()).unwrap();
-    let now = Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let set_cookie = oidc_sealed_session_cookie_for_test(
         &plugin,
         json!({"sub": "oidc-subject", "exp": now as f64 - 0.5}),
@@ -5357,7 +5356,7 @@ async fn refresh_grant_carries_the_proxy_hop_count() {
             PluginHttpClient::default(),
         )
         .expect("valid refresh config");
-        let now = chrono::Utc::now().timestamp();
+        let now = UtcTimestamp::now().unix_timestamp();
         let cookie = oidc_sealed_refresh_session_cookie_for_test(
             &plugin,
             json!({
@@ -5445,7 +5444,7 @@ async fn websocket_handshake_delivers_the_rotated_session_cookie() {
         PluginHttpClient::default(),
     )
     .expect("valid refresh config");
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let cookie = oidc_sealed_refresh_session_cookie_for_test(
         &plugin,
         json!({
@@ -5535,7 +5534,7 @@ async fn expired_claims_after_a_spent_refresh_leave_the_browser_cookie_alone() {
         PluginHttpClient::default(),
     )
     .expect("valid refresh config");
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     // Claims past expiry plus the default 60 s skew, but inside the idle and
     // absolute session bounds.
     let cookie = oidc_sealed_refresh_session_cookie_for_test(
@@ -5649,7 +5648,7 @@ async fn consumed_refresh_grant_with_an_unverifiable_id_token_drops_the_spent_to
     config["providers"][0]["jwks_uri"] = json!(format!("{}/jwks", server.uri()));
     let plugin =
         OidcRelyingParty::new(&config, PluginHttpClient::default()).expect("valid refresh config");
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let cookie = oidc_sealed_refresh_session_cookie_for_test(
         &plugin,
         json!({
@@ -5705,7 +5704,7 @@ async fn consumed_refresh_grant_with_an_unverifiable_id_token_drops_the_spent_to
 async fn large_sessions_are_split_into_browser_storable_chunk_cookies() {
     let plugin = OidcRelyingParty::new(&base_config(), PluginHttpClient::default())
         .expect("valid oidc config");
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let claims = json!({
         "sub": "alice",
         "exp": now + 3600,
@@ -6407,7 +6406,7 @@ fn new_rejects_trusted_redirect_entries_that_are_not_authorities() {
 async fn lowering_the_cookie_cap_keeps_existing_chunked_sessions() {
     let original = OidcRelyingParty::new(&base_config(), PluginHttpClient::default())
         .expect("valid oidc config");
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let set_cookie = oidc_sealed_session_cookie_for_test(
         &original,
         json!({"sub": "alice", "exp": now + 3600, "groups": "g".repeat(3500)}),
@@ -6458,7 +6457,7 @@ async fn cancelled_leader_after_an_accepted_refresh_never_resubmits_the_spent_to
         )
         .mount(&server)
         .await;
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let id_token = create_rs256_token_with_kid(
         &json!({
             "iss": TEST_ISSUER,
@@ -6620,7 +6619,7 @@ async fn authorization_requests_carry_static_params_and_max_age() {
 #[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn max_age_enforces_auth_time_at_callback_and_on_every_request() {
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     for (auth_time, admitted) in [(None, false), (Some(now - 3600), false), (Some(now), true)] {
         let server = MockServer::start().await;
         let plugin = callback_plugin_with(&server, |config| {
@@ -6751,7 +6750,7 @@ async fn forward_access_token_relays_the_refreshed_access_token() {
     let mut config = refresh_config(&format!("{}/token", server.uri()));
     config["providers"][0]["forward_access_token"] = json!(true);
     let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let cookie = oidc_sealed_refresh_session_cookie_for_test(
         &plugin,
         json!({"sub": "oidc-subject", "email": "relay@example.test", "exp": now + 3600}),
