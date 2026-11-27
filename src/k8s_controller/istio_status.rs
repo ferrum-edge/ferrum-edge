@@ -605,7 +605,7 @@ pub fn plan_istio_status_updates_budgeted(
                 peer_authentication_status(object, result, &options.istio_root_namespace)
             }
             "DestinationRule" => destination_rule_status(object, result),
-            "VirtualService" => virtual_service_status(object, result),
+            "VirtualService" => virtual_service_status(object, result, &options.cluster_domain),
             "ServiceEntry" => service_entry_status(object, result),
             "RequestAuthentication" => {
                 request_authentication_status(object, result, &options.istio_root_namespace)
@@ -1471,6 +1471,7 @@ pub const VIRTUAL_SERVICE_MESH_HTTP_ROUTES_NOTE: &str = "mesh http[] routes are 
 fn virtual_service_status(
     object: &K8sObject,
     result: Result<&K8sTranslation, &K8sTranslateError>,
+    cluster_domain: &str,
 ) -> (Value, Option<Value>) {
     let host_count = object
         .spec
@@ -1487,7 +1488,24 @@ fn virtual_service_status(
 
     match result {
         Ok(_translation) => {
-            let deferred = virtual_service_deferred_fields(&object.spec);
+            let mut deferred: Vec<String> = virtual_service_deferred_fields(&object.spec)
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            // Issue #7499: Sidecar and NodeWaypoint data planes refuse a
+            // carried route whose destination is a Service in another
+            // namespace and keep routing that host to its plain Service. The
+            // VirtualService stays accepted (gateway routes are unaffected),
+            // but each such destination is reported, read with the data
+            // plane's own Service host forms.
+            deferred.extend(
+                crate::config_sources::k8s::virtual_service_mesh_cross_namespace_destinations(
+                    object,
+                    cluster_domain,
+                )
+                .into_iter()
+                .map(|destination| virtual_service_cross_namespace_deferred_field(&destination)),
+            );
             let clamped = virtual_service_clamped_fields(&object.spec);
             // Issues #7390, #7423: a mesh-bound VirtualService's `http[]`
             // routes reach only Sidecar and NodeWaypoint data planes
@@ -1542,6 +1560,28 @@ fn virtual_service_status(
             accepted_status(object, false, "Invalid", &message, Some(detail))
         }
     }
+}
+
+/// Text that starts every `deferred_fields` entry for a mesh-bound
+/// VirtualService destination in another namespace (issue #7499).
+pub const VIRTUAL_SERVICE_CROSS_NAMESPACE_DEFERRED_PREFIX: &str = "http[].route[].destination";
+
+/// The `deferred_fields` entry for one mesh-bound VirtualService destination
+/// in another namespace (issue #7499). The host and Service are Debug-quoted.
+fn virtual_service_cross_namespace_deferred_field(
+    destination: &crate::config_sources::k8s::VirtualServiceCrossNamespaceDestination,
+) -> String {
+    format!(
+        "{VIRTUAL_SERVICE_CROSS_NAMESPACE_DEFERRED_PREFIX} http[{}].route[{}] host {:?} names \
+         Service {:?}/{:?} in another namespace: Sidecar and NodeWaypoint mesh data planes \
+         refuse this route destination in this release and keep routing the host to its plain \
+         Service (issue #7499); gateway routes are unaffected",
+        destination.route_index,
+        destination.destination_index,
+        destination.host,
+        destination.namespace,
+        destination.name,
+    )
 }
 
 /// VirtualService HTTP-route fields the translator parses past but never

@@ -1912,3 +1912,107 @@ fn mesh_bound_virtual_service_status_reports_where_http_routes_apply() {
     assert_eq!(scope, Value::Null, "no http[] routes, nothing to qualify");
     assert!(!message.contains(VIRTUAL_SERVICE_MESH_HTTP_ROUTES_NOTE));
 }
+
+/// Issue #7499: Sidecar and NodeWaypoint data planes refuse a carried route
+/// whose destination is a Service in another namespace (and keep routing the
+/// host to its plain Service). A mesh-bound VirtualService naming one stays
+/// `FerrumAccepted=True` (gateway routes are unaffected) and reports each such
+/// destination in `status.ferrum.translation.deferred_fields`. Same-namespace
+/// Services, external hosts and gateway-only VirtualServices report nothing.
+#[test]
+fn mesh_bound_virtual_service_status_reports_refused_cross_namespace_destinations() {
+    use ferrum_edge::k8s_controller::istio_status::VIRTUAL_SERVICE_CROSS_NAMESPACE_DEFERRED_PREFIX;
+
+    let leg = |host: &str, weight: u32| json!({"destination": {"host": host, "port": {"number": 8080}}, "weight": weight});
+    // `(VirtualService, condition message, cross-namespace deferred entries)`.
+    let report = |name: &str, spec: Value| -> (String, Vec<String>) {
+        let obj = object("networking.istio.io/v1", "VirtualService", name, spec);
+        let updates = plan_istio_status_updates(&[obj], options());
+        let update = update_for(&updates, "VirtualService", name);
+        let condition = find_condition(
+            update.status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(
+            condition["status"].as_str(),
+            Some("True"),
+            "{name}: gateway routes are still served, so the VirtualService stays accepted"
+        );
+        let refused = update.ferrum_detail.as_ref().unwrap()["translation"]["deferred_fields"]
+            .as_array()
+            .expect("deferred_fields")
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|field| field.starts_with(VIRTUAL_SERVICE_CROSS_NAMESPACE_DEFERRED_PREFIX))
+            .map(str::to_string)
+            .collect();
+        (condition["message"].as_str().unwrap().to_string(), refused)
+    };
+    let direct = |host: &str| {
+        json!({
+            "hosts": ["reviews.default.svc.cluster.local"],
+            "http": [{"route": [leg(host, 100)]}]
+        })
+    };
+
+    for host in [
+        "ratings.other.svc.cluster.local",
+        "ratings.other.svc",
+        "ratings.other",
+    ] {
+        let (message, refused) = report("cross", direct(host));
+        assert_eq!(refused.len(), 1, "{host}: {refused:?}");
+        assert!(
+            refused[0].contains("http[0].route[0]")
+                && refused[0].contains("\"other\"/\"ratings\"")
+                && refused[0].contains("Sidecar and NodeWaypoint")
+                && refused[0].contains("#7499"),
+            "{host}: {}",
+            refused[0]
+        );
+        assert!(
+            message.contains("deferred fields:") && message.contains("in another namespace"),
+            "{host}: the condition message carries the note: {message}"
+        );
+    }
+
+    // Every split leg is reported, zero-weight legs included.
+    let (_, refused) = report(
+        "split",
+        json!({
+            "hosts": ["reviews.default.svc.cluster.local"],
+            "http": [{"route": [
+                leg("reviews.default.svc.cluster.local", 90),
+                leg("ratings.other.svc.cluster.local", 10),
+                leg("details.third.svc.cluster.local", 0)
+            ]}]
+        }),
+    );
+    assert_eq!(refused.len(), 2, "{refused:?}");
+    assert!(
+        refused[0].contains("http[0].route[1]") && refused[0].contains("\"other\"/\"ratings\"")
+    );
+    assert!(
+        refused[1].contains("http[0].route[2]") && refused[1].contains("\"third\"/\"details\"")
+    );
+
+    for (name, spec) in [
+        (
+            "same-namespace",
+            direct("reviews.default.svc.cluster.local"),
+        ),
+        ("short-name", direct("reviews")),
+        ("external", direct("api.example.com")),
+        (
+            "gateway-only",
+            json!({
+                "hosts": ["reviews.default.svc.cluster.local"],
+                "gateways": ["ingress-gw"],
+                "http": [{"route": [leg("ratings.other.svc.cluster.local", 100)]}]
+            }),
+        ),
+    ] {
+        let (_, refused) = report(name, spec);
+        assert!(refused.is_empty(), "{name}: {refused:?}");
+    }
+}
