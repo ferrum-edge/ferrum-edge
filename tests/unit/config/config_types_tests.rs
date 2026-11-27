@@ -161,16 +161,18 @@ fn upstream_target_service_port_policy_key_is_derived_not_serialized() {
         "derived policy key must not be emitted into config JSON"
     );
 
-    let deserialized: UpstreamTarget = serde_json::from_value(serde_json::json!({
+    // `UpstreamTarget` is closed (1.0 config freeze), so config JSON that
+    // tries to set the derived key is refused rather than silently ignored.
+    let error = serde_json::from_value::<UpstreamTarget>(serde_json::json!({
         "host": "10.0.0.1",
         "port": 8080,
         "service_port_policy_key": 80,
         "weight": 1
     }))
-    .expect("deserialize target");
+    .expect_err("config JSON must not be able to set the derived policy key");
     assert!(
-        deserialized.service_port_policy_key.is_none(),
-        "config JSON must not be able to set the derived policy key"
+        error.to_string().contains("service_port_policy_key"),
+        "the refusal must name the derived key: {error}"
     );
 }
 

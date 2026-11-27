@@ -706,6 +706,7 @@ impl MeshHttpRouteSet {
 /// `type_url` and deserializing `value` into its own representation; the xDS
 /// layer treats everything inside `value` as uninterpreted bytes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshExtensionConfig {
     pub name: String,
     /// Namespace this extension config is allowed to reach via per-node mesh

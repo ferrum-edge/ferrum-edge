@@ -267,7 +267,7 @@ def retain_runtime(destination, container, config_path):
             "FERRUM_METRICS_ALLOWED_CIDRS", "FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE",
             "FERRUM_POOL_WARMUP_ENABLED", "FERRUM_LOG_LEVEL", "FERRUM_UDP_MAX_SESSIONS",
             "FERRUM_UDP_RECVMMSG_BATCH_SIZE", "FERRUM_UDP_GSO_ENABLED",
-            "FERRUM_UDP_GRO_ENABLED", "FERRUM_UDP_PKTINFO_ENABLED"}
+            "FERRUM_UDP_PKTINFO_ENABLED"}
     environment = dict(entry.split("=", 1) for entry in container["Config"]["Env"])
     result = dict(image_id=container["Image"], container_id=container["Id"],
                   config_sha256=hashlib.sha256(Path(config_path).read_bytes()).hexdigest(),

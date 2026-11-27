@@ -6773,6 +6773,7 @@ fn tls_mutation_audit_descriptor(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MeshEgressScopeTestRequest {
     host: String,
     #[serde(default)]
@@ -7398,15 +7399,16 @@ async fn handle_mesh_egress_scope_test(
             &json!({"error": "No active mesh egress scope"}),
         ));
     };
-    let candidate: MeshEgressScopeTestRequest = match serde_json::from_slice(body_bytes) {
-        Ok(candidate) => candidate,
-        Err(e) => {
-            return Ok(json_response(
-                StatusCode::BAD_REQUEST,
-                &json!({"error": format!("Invalid JSON body: {e}")}),
-            ));
-        }
-    };
+    let candidate: MeshEgressScopeTestRequest =
+        match crate::util::json_object::from_json_object_slice(body_bytes) {
+            Ok(candidate) => candidate,
+            Err(e) => {
+                return Ok(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({"error": format!("Invalid JSON body: {e}")}),
+                ));
+            }
+        };
     let host = candidate.host.trim();
     if host.is_empty() {
         return Ok(json_response(
@@ -13979,7 +13981,7 @@ async fn handle_create_namespace(
         Err(response) => return Ok(response),
     };
     let request: crate::config::namespace_registry::CreateNamespaceRequest =
-        match serde_json::from_slice(body) {
+        match crate::util::json_object::from_json_object_slice(body) {
             Ok(request) => request,
             Err(e) => {
                 return Ok(json_response(

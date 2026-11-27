@@ -1218,7 +1218,6 @@ See [connection_pooling.md](connection_pooling.md) for the full configuration re
 | `FERRUM_TCP_FASTOPEN_QUEUE_LEN` | No | `256` | TCP Fast Open server queue length |
 | `FERRUM_KTLS_ENABLED` | No | `auto` | Linux kTLS probe/gating; TLS 1.2 frontend-TLS TCP relays hand off to the kernel from an unbuffered rustls handshake, everything else keeps the userspace relay |
 | `FERRUM_IO_URING_SPLICE_ENABLED` | No | `auto` | Linux io_uring splice toggle |
-| `FERRUM_UDP_GRO_ENABLED` | No | `auto` | Linux UDP GRO toggle; currently reserved/no-op |
 | `FERRUM_UDP_GSO_ENABLED` | No | `auto` | Linux UDP GSO send batching toggle |
 | `FERRUM_UDP_PKTINFO_ENABLED` | No | `auto` | Linux IP_PKTINFO/IPV6_PKTINFO reply-source optimization toggle |
 | `FERRUM_SO_BUSY_POLL_US` | No | `0` | Linux SO_BUSY_POLL duration for latency-sensitive UDP sockets |

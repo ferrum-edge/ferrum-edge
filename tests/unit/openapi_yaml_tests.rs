@@ -812,6 +812,88 @@ fn typed_component_properties_match_serde_field_inventories() {
     check!(MeshEgressScopeResource, "MeshEgressScopeResource");
 }
 
+/// Every published schema whose runtime type denies unknown fields must say
+/// so (1.0 config freeze), including nested inline objects and enum variant
+/// payloads that a component-level `additionalProperties` does not reach.
+/// A runtime type that closes without this list growing is the drift this
+/// guards against.
+#[test]
+fn closed_runtime_types_have_closed_schemas() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let components = [
+        "Proxy",
+        "Upstream",
+        "PluginConfigBase",
+        "HealthCheckConfig",
+        "ActiveHealthCheck",
+        "PassiveHealthCheck",
+        "UpstreamTarget",
+        "HashOnCookieConfig",
+        "BackendTlsConfig",
+        "CircuitBreakerConfig",
+        "RetryConfig",
+        "ServiceDiscoveryConfig",
+        "SubsetDefinition",
+        "SubsetTrafficPolicy",
+        "UpstreamPortOverride",
+        "UpstreamLocalityLbSetting",
+        "LocalityDistribute",
+        "LocalityFailover",
+        "TcpKeepaliveCfg",
+        "PluginAssociation",
+        "MeshTrafficPolicyTls",
+        "GatewayTrustBundle",
+        "GatewayTrustBundleCreate",
+        "GatewayTrustBundleSet",
+        "TrustBundle",
+        "TlsValidateRequest",
+        "ManagedTlsCertificateRequest",
+        "ManagedTlsCaBundleRequest",
+        "ManagedTlsCrlRequest",
+        "ManagedTlsOcspResponseRequest",
+        "ManagedTlsJwksRequest",
+        "AcmeCertificateRequest",
+        "AcmeOrderRequest",
+        "AcmeOrderFinalizeRequest",
+        "AcmeRenewRequest",
+        "CreateNamespaceRequest",
+        "UpdateNamespaceRequest",
+    ];
+    let mut pointers: Vec<String> = components
+        .iter()
+        .map(|name| format!("/components/schemas/{name}"))
+        .collect();
+    for provider in ["dns_sd", "kubernetes", "consul", "mesh"] {
+        pointers.push(format!(
+            "/components/schemas/ServiceDiscoveryConfig/properties/{provider}"
+        ));
+    }
+    pointers.extend(
+        [
+            "/components/schemas/TrustBundle/properties/jwt_authorities/items",
+            "/components/schemas/BackoffStrategy/oneOf/0",
+            "/components/schemas/BackoffStrategy/oneOf/0/properties/fixed",
+            "/components/schemas/BackoffStrategy/oneOf/1",
+            "/components/schemas/BackoffStrategy/oneOf/1/properties/exponential",
+        ]
+        .map(String::from),
+    );
+    let open: Vec<&String> = pointers
+        .iter()
+        .filter(|pointer| {
+            let schema = spec
+                .pointer(pointer)
+                .unwrap_or_else(|| panic!("{pointer} exists"));
+            schema.get("additionalProperties") != Some(&serde_json::Value::Bool(false))
+        })
+        .collect();
+    assert!(
+        open.is_empty(),
+        "schemas for closed runtime types must set additionalProperties: false: {open:?}"
+    );
+}
+
 #[test]
 fn circuit_breaker_config_documents_cooldown_seconds_input_alias() {
     let spec: serde_json::Value =
