@@ -3088,10 +3088,11 @@ version = "<version>"
 3. Tag: `git tag v<version>` (matching the new version exactly)
 4. Release: GitHub Actions automatically builds and publishes
 
-During active build-out, any breaking change to configuration shapes,
-environment variables, schema, defaults, or other user-facing behavior must add
-an `Unreleased` changelog entry in the same pull request. Release preparation
-moves those entries under the new version heading.
+Any breaking change to configuration shapes, environment variables, schema,
+defaults, or other user-facing behavior must add an `Unreleased` changelog entry
+in the same pull request. Release preparation moves those entries under the new
+version heading. From 1.0.0 onward, such a change must also follow the SemVer
+and deprecation rules in [support_policy.md](support_policy.md).
 
 ### Version Numbering
 
