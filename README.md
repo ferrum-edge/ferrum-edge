@@ -19,7 +19,7 @@
 > the initial schema (recreate development databases when it changes; see the
 > [migrations guide](docs/migrations.md)). From 1.0.0 onward, the
 > [support policy](docs/support_policy.md) applies: semantic versioning,
-> deprecation periods, support windows, and forward-only schema migrations.
+> deprecation periods, support for the newest release, and forward-only schema migrations.
 > Current gaps are listed in [known limitations](docs/known_limitations.md).
 
 ## Overview
@@ -574,8 +574,11 @@ publishes them in
 [ferrum-edge/ferrum-contracts](https://github.com/ferrum-edge/ferrum-contracts).
 Consumers (Nexus, Foundry, Anvil, Alloy, GitForgeOps) pin the
 `contracts-edge-<edge-version>` tags from that repository rather than reading
-Edge source. The current published Edge release is **v0.9.21**, published on
-2026-11-22 from release commit `f9915358c8032214f4034a17c28cdf72d14006c3`. Its
+Edge source. For the current Edge release and its Contracts tag, see the Edge
+[Releases page](https://github.com/ferrum-edge/ferrum-edge/releases) and the
+[Contracts releases](https://github.com/ferrum-edge/ferrum-contracts/releases).
+As of 2026-11-22, the newest published Edge release was **v0.9.21**, published
+from release commit `f9915358c8032214f4034a17c28cdf72d14006c3`, and its
 matching Contracts tag is
 [`contracts-edge-0.9.21`](https://github.com/ferrum-edge/ferrum-contracts/releases/tag/contracts-edge-0.9.21)
 on commit `92d8da5be93ea1ece9f47729b1f7aa10ae8a7c3f`, published on 2026-11-22.

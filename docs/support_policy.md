@@ -26,16 +26,17 @@ From 1.0.0 onward:
 | Topic | Commitment | Section |
 |---|---|---|
 | Versioning | [SemVer 2.0.0](https://semver.org/) over the declared public surface | [Semantic versioning](#semantic-versioning) |
-| Current minor | Supported: every fix ships as a patch release of it | [Supported versions](#supported-versions-and-support-windows) |
-| Previous minor | Supported for **6 months** after the next minor is published | [Supported versions](#supported-versions-and-support-windows) |
-| Older minors, and `0.x` once 1.0.0 is published | Unsupported | [Supported versions](#supported-versions-and-support-windows) |
+| Supported release | Only the **newest release** of the newest major line. Every fix, security fixes of every severity included, ships in the next patch or minor release cut from `main` | [Supported versions](#supported-versions) |
+| Earlier releases | Unsupported: no backports to earlier minors or patches, no long-term-support line. Upgrade to the newest release to get a fix | [Supported versions](#supported-versions) |
+| `0.x` releases | Unsupported once 1.0.0 is published | [Supported versions](#supported-versions) |
+| Previous major | Its support end is announced in the release notes of the new major | [Supported versions](#supported-versions) |
 | Deprecation period | At least **one full minor release and 90 days**, whichever is longer; removal only in a major release | [Deprecation](#deprecation-notice-period) |
-| Security backports | Critical and High: always backported to the supported previous minor; Medium: at maintainer discretion; Low: not backported | [Security fixes](#security-fix-backport-policy) |
-| CP / DP versions | Control plane and every data plane run the **identical build**; no version skew is supported | [CP/DP version skew](#control-plane--data-plane-version-skew) |
+| Security fixes | Every severity is fixed in the next release from `main`; no backports | [Security fixes](#security-fixes) |
+| CP / DP versions | Control plane and every data plane run the **same build**; no version skew is supported | [CP/DP version skew](#control-plane--data-plane-version-skew) |
 | Custom-plugin Rust API | **Unstable**: not covered by SemVer; changes only in minor or major releases (not patch, except for a security fix), each with an upgrade-guide entry | [Custom plugins](#custom-plugin-rust-api) |
 | gRPC / proto | Internal between Ferrum components; not a public API | [gRPC and protobuf](#grpc-and-protobuf-surfaces) |
 | ClickHouse charge schema | Native row contract changes only in minor (additive) or major (incompatible) releases, with the DDL to apply | [ClickHouse](#clickhouse-chargeback-schema) |
-| Backup and config documents | A document written by a 1.x release loads on every later 1.x release | [Backup and config format](#backup-export-and-file-config-format) |
+| Backup and config documents | A `GET /backup` export and a file-mode config file written by a 1.x release keep loading on later 1.x releases, through the entry points listed for each | [Backup and config format](#backup-export-and-file-config-format) |
 | Database schema | Forward-only migrations from 1.0.0 | [Database schema](#database-schema) |
 | Feature maturity | GA, Beta, Experimental, Dev-only, Out-of-scope, each with its own promise | [Feature maturity](#feature-maturity-levels) |
 
@@ -56,8 +57,8 @@ path-scoped rules under `.claude/rules/`) states this directly:
   populated from a namespace-complete logical export, keeping the old database
   intact as the rollback target.
 
-No `0.x` release has a support window or backport commitment: a fix ships in the
-next published release. The upgrade procedure for `0.x` releases, including the
+No `0.x` release has a support or backport commitment: a fix ships in the next
+published release. The upgrade procedure for `0.x` releases, including the
 upgrade from the last `0.x` release to 1.0.0, is
 [upgrade_guide.md](upgrade_guide.md); a database created by a `0.x` release is
 rebuilt from a logical export rather than upgraded in place. Breaking changes
@@ -76,7 +77,7 @@ every `0.x` upgrade.
 
 | Artifact | What it is | Use in production? |
 |---|---|---|
-| Published `vX.Y.Z` release and container image | version-tag workflow output after validation | Pin the published version or digest; its support window is in [Supported versions](#supported-versions-and-support-windows) |
+| Published `vX.Y.Z` release and container image | version-tag workflow output after validation | Pin the published version or digest; which release is supported is in [Supported versions](#supported-versions) |
 | `latest` / `main-<sha>` container tags | development build of the newest built `main` commit that passed CI; `latest` may skip intermediate commits and `main-<sha>` exists only for built commits | No — a moving development channel, not a release or update channel |
 | Historical `latest` GitHub prerelease | retained old binaries; not refreshed | No |
 | Source at a commit | source identity, not proof of a published artifact | Pin the commit and validate your own build |
@@ -137,21 +138,32 @@ A security fix that **must** break a documented surface to close the issue may
 ship in a minor or patch release. When that happens it is called out in the
 release notes, the upgrade guide, and the advisory, and the reason is stated.
 
-### Supported versions and support windows
+### Supported versions
 
-| Line | Window | What it receives |
+| Release | Status | How it gets fixes |
 |---|---|---|
-| Current minor (newest `1.Y`) | supported | Bug, regression, and security fixes, as patch releases |
-| Previous minor | supported for **6 months** after the next minor is published | Critical and High security fixes, and fixes for severe regressions introduced in that minor, as patch releases |
-| Older minors | unsupported | Nothing; upgrade to a supported minor |
+| Newest release of the newest major line | supported | Bug, regression, and security fixes of every severity ship in the next patch or minor release, cut from `main` |
+| Every earlier release of that line (earlier minors and earlier patches) | unsupported | No backports; upgrade to the newest release |
+| Previous major line (for example 1.x after 2.0.0 is published) | support end announced in the release notes of the new major | See below |
 | `0.x` releases | unsupported once 1.0.0 is published | Nothing; upgrade to 1.x |
 
-- Within a supported minor, only the newest patch release is supported: a fix
-  ships as a new patch release, never as a change to an existing one.
-- Feature work lands in the current minor only.
-- The table applies across a major release: after 2.0.0 is published, the last
-  1.x minor is the previous minor for 6 months.
-- There is no long-term-support line.
+- **Upgrading to the newest release is how fixes are obtained.** Production
+  releases are cut only from `main`; there are no maintenance branches, so no
+  fix is published for an earlier minor or patch.
+- **That upgrade is designed to be safe within a major line.** Minor and patch
+  releases are backward compatible over the declared public surface
+  ([Semantic versioning](#semantic-versioning)), and a deprecated surface keeps
+  working for the full [deprecation period](#deprecation-notice-period). Read
+  the upgrade guide for the exceptions this policy allows in a minor release:
+  Beta and Experimental features, the custom-plugin Rust API, and a security fix
+  that must break a documented surface.
+- **A new major line.** When a new major (for example 2.0.0) is published, its
+  release notes state when support for the previous major ends. Fixes after that
+  release still come only from `main`, so a release of the previous major line
+  is possible only once a maintenance release path exists.
+- **Maintenance branches may be added later.** Introducing maintenance branches,
+  backports, or a long-term-support line would extend this policy and would be
+  announced here; it is not a commitment today.
 - Until 1.0.0 is published, the newest `0.9.x` release is the only maintained
   release, and fixes ship in the next published release (no backports).
 
@@ -182,14 +194,11 @@ The surface-specific rules below apply the same period.
 A Beta or Experimental surface follows the rules of its
 [maturity level](#feature-maturity-levels) instead.
 
-### Security-fix backport policy
+### Security fixes
 
-| Severity | Fixed in current minor | Backported to the supported previous minor |
-|---|---|---|
-| Critical | yes | yes |
-| High | yes | yes |
-| Medium | yes | at maintainer discretion |
-| Low | yes | no — rolls into the next minor |
+A security fix of any severity (Critical, High, Medium, or Low) ships in the next
+release cut from `main`, as a patch or minor release; there are no backports to
+earlier releases. Response targets by severity are below.
 
 Severity targets and the private disclosure process are in
 [SECURITY.md](../SECURITY.md). Fixed vulnerabilities are published as GitHub
@@ -204,16 +213,22 @@ crates. See [dependency-policy.md](dependency-policy.md#1-blocking-dependency-ga
 ### Control plane / data plane version skew
 
 **Covered:** none. The control plane (CP) and every data plane (DP) must run the
-identical Ferrum Edge build. This is the rule in every release, including `0.x`.
+same Ferrum Edge build. This is the operational rule in every release, including
+`0.x`.
 
-Each side enforces it with the ConfigSync build identity,
+**What the runtime enforces.** The gate compares the ConfigSync wire identity,
 `<crate version>+configsync.r<revision>`, where the revision is
-`CONFIG_SYNC_PROTOCOL_REVISION` in `src/grpc/configsync_lifecycle.rs`. The DP
-sends its identity on every ConfigSync request; the CP refuses any other
-identity (another crate version, patch releases included, another revision, or
-none) with `FAILED_PRECONDITION` before streaming any config. The CP stamps its
-identity on every frame, heartbeats included, and the DP drops the stream on a
-frame from another build. See
+`CONFIG_SYNC_PROTOCOL_REVISION` in `src/grpc/configsync_lifecycle.rs`. It does
+not compare executable builds: the identity carries no commit or build-feature
+information, so two binaries built from different commits with the same crate
+version and revision are accepted by each other. A successful subscription
+therefore does not prove that the deployment runs one build; deploy the same
+published artifact to the CP and every DP. The DP sends its identity on every
+ConfigSync request, and the CP refuses any other identity (another crate
+version, patch releases included, another revision, or none) with
+`FAILED_PRECONDITION` before streaming any config. The CP stamps its identity
+on every frame, heartbeats included, and the DP drops the stream on a frame
+carrying another identity. See
 [Build Identity Gate](upgrade_guide.md#build-identity-gate).
 
 **Supported upgrade procedure:** upgrade every CP first, then every DP, in one
@@ -222,15 +237,23 @@ multi-CP deployment, every CP must be upgraded before the DPs; failover never
 bridges builds. Rollback is the same operation in reverse, with every CP and
 every DP returned to the old build.
 
-**What a DP does while it cannot sync:** a DP that a CP refuses, or that cannot
-reach any CP, keeps serving the last configuration it validated and applied.
-That configuration is bounded by `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` (default
-`3600`): once its age passes the bound while no CP is authoritative, the DP
-degrades readiness and, under the default
-`FERRUM_DP_CONFIG_STALE_ACTION=fail_closed`, refuses new traffic while existing
-connections drain. A DP keeps no on-disk configuration cache, so a DP restarted
-during the window starts empty and stays not-ready until it applies a snapshot
-from a CP on the same build. Finish the upgrade inside the stale bound; see
+**What a DP does while it cannot sync.** A DP that a CP refuses, or that cannot
+reach any CP, keeps serving the last configuration it validated and applied, up
+to `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` (default `3600`). That bound is measured
+from the moment the DP last **applied** a configuration snapshot, not from the
+start of the upgrade or of the outage: heartbeats, reconnects, and refused
+subscriptions never reset it. Once no CP is authoritative for the DP (the first
+failed connect or subscribe, including the build-identity refusal from an
+upgraded CP) and that age has reached the bound, the DP degrades readiness and,
+under the default `FERRUM_DP_CONFIG_STALE_ACTION=fail_closed`, refuses new
+traffic while existing connections drain. A DP whose configuration has not
+changed for longer than the bound therefore stops admitting new traffic as soon
+as the last CP on its build goes away, with no grace period. The time each old DP
+has left during a CP-first upgrade is the bound minus the age of its last
+applied snapshot, which can be zero. Plan the DP replacement to follow the CP
+upgrade immediately, behind a load balancer that honours readiness. A DP keeps
+no on-disk configuration cache, so an upgraded or restarted DP starts empty and
+stays not-ready until it applies a snapshot from a CP on the same build. See
 [cp_dp_mode.md](cp_dp_mode.md#bounded-last-known-good-configuration-age).
 
 **Mesh data planes** subscribe with `MeshSubscribe` (or Ferrum xDS). The CP
@@ -242,8 +265,8 @@ order.
 
 **Breaking changes:** any change to the ConfigSync messages, frame semantics, or
 snapshot/delta JSON contract bumps the revision, and can happen in any release.
-The build identity gate turns every such change into a refusal at subscribe
-instead of a misread configuration, and the upgrade guide names the new
+Because the revision is part of the wire identity, the gate turns every such
+change into a refusal at subscribe instead of a misread configuration, and the upgrade guide names the new
 revision. A future release that adds a supported skew window will state it here.
 
 ### Custom-plugin Rust API
@@ -281,7 +304,7 @@ not supported.
 
 | Surface | Between | Compatibility |
 |---|---|---|
-| `ferrum.ConfigSync` (`Subscribe`, `GetFullConfig`) | Ferrum CP and Ferrum DP | Identical build only ([above](#control-plane--data-plane-version-skew)). Changes bump the ConfigSync revision and can happen in any release. |
+| `ferrum.ConfigSync` (`Subscribe`, `GetFullConfig`) | Ferrum CP and Ferrum DP | Same build only; the runtime refuses any other wire identity ([above](#control-plane--data-plane-version-skew)). Changes bump the ConfigSync revision and can happen in any release. |
 | `ferrum.MeshConfigSync` (`MeshSubscribe`, `ReportMeshSliceStatus`) and Ferrum xDS (`FERRUM_MESH_CONFIG_PROTOCOL=xds`, Envoy ADS framing with Ferrum resources and ECDS carriers) | Ferrum CP and Ferrum mesh data planes, including cross-cluster discovery | Same build required in practice ([above](#control-plane--data-plane-version-skew)); changes can happen in any release. |
 | Standard protocols Ferrum speaks: Envoy xDS v3 discovery (`stock_xds`), Envoy RTDS, the SPIFFE Workload API, and `grpc.health.v1` health checks | Ferrum and third-party components | Follow the upstream specification. Support for each is a feature with its own maturity level (for example, `stock_xds` is Beta). |
 
@@ -305,24 +328,34 @@ alters an existing ClickHouse table.
 
 ### Backup, export, and file-config format
 
-`GET /backup` documents and file-mode configuration files carry a top-level
-`version` field, currently `"1"` (`CURRENT_CONFIG_VERSION` in
-`src/config/types.rs`). File-mode loading and backup bootstrap run a
-version-migration chain in memory when a document carries an older `version`,
-and `FERRUM_MODE=migrate` with `FERRUM_MIGRATE_ACTION=config` rewrites a
-configuration file on disk. No migration step exists yet, because `"1"` is the
-only version. `POST /restore` reads the document shape directly and does not
-check `version`.
+Two documents carry a top-level `version` field, currently `"1"`
+(`CURRENT_CONFIG_VERSION` in `src/config/types.rs`), and each has its own entry
+points:
 
-- **Covered:** from 1.0.0 onward, a backup or file-mode configuration written by
-  a 1.x release is accepted by every later 1.x release, through every loader
-  (file mode, backup bootstrap, and `POST /restore`). A change that would make
-  such a document unreadable either keeps the old shape accepted (a minor change)
-  or increments `version` and ships the migration step for it.
+| Document | Entry points that read it | Version handling today |
+|---|---|---|
+| `GET /backup` export, unmodified | `POST /restore`; the database-mode fallback file `FERRUM_DB_CONFIG_BACKUP_PATH` (also checked by `ferrum-edge validate` in database mode) | The fallback loader strips the export envelope and runs the version-migration chain in memory. `POST /restore` refuses a document whose `version` names a format version other than the current one, and has no migration step. |
+| File-mode configuration file | File mode (`FERRUM_FILE_CONFIG_PATH`) and `ferrum-edge validate`; `FERRUM_MODE=migrate` with `FERRUM_MIGRATE_ACTION=config` rewrites it on disk | Runs the version-migration chain in memory. |
+
+No migration step exists yet, because `"1"` is the only version. The two
+documents are not interchangeable: file mode refuses unknown top-level fields,
+so a `GET /backup` export (which carries `ferrum_version`, `exported_at`,
+`counts` and other envelope fields) is not a valid file-mode configuration.
+
+- **Covered:** from 1.0.0 onward, an unmodified `GET /backup` export taken from a
+  1.x release is accepted by `POST /restore` and by `FERRUM_DB_CONFIG_BACKUP_PATH`
+  on every later 1.x release, and a file-mode configuration file that a 1.x
+  release accepts is accepted by file mode on every later 1.x release, apart from
+  surfaces removed after their deprecation period, which only happens in a major
+  release. A change that would make either document unreadable either keeps the
+  old shape accepted (a minor change) or increments `version`; the release that
+  increments it ships the migration step on every entry point listed above for
+  that document, `POST /restore` included, and the upgrade guide says so.
 - **Not covered:** loading a document written by a newer release on an older
-  release; documents written by `0.x` releases (take a fresh `GET /backup` from
-  the last `0.x` release before upgrading to 1.0.0); partial `?resources=`
-  exports as a complete rebuild source.
+  release; using a backup export as a file-mode configuration file; a backup
+  export edited by hand; documents written by `0.x` releases (take a fresh
+  `GET /backup` from the last `0.x` release before upgrading to 1.0.0); partial
+  `?resources=` exports as a complete rebuild source.
 
 ### Database schema
 
@@ -346,9 +379,9 @@ Each feature has one maturity level. A feature that no document labels is
 
 | Level | What it promises across releases |
 |---|---|
-| **GA** | Covered by SemVer and the deprecation notice period. A regression is a release blocker. A mesh GA feature is also enrolled in `tests/conformance/ga_contract.yaml`, so a semantic regression fails CI. GA is never downgraded except in a major release. |
-| **Beta** | Feature-complete and tested, with a documented sharp edge or an owed verification step. Receives bug and security fixes within the support windows. Its configuration is not removed or renamed without a deprecation notice, but the notice may end in a minor release rather than a major one, and documented behaviour may change in a minor release with an upgrade-guide entry. |
-| **Experimental** | Opt-in and off by default, with a safety-relevant caveat or no live data-path verification. No compatibility promise: it may change or be removed in any minor release, with a release-notes and upgrade-guide entry. Security reports about it are handled like any other. |
+| **GA** | Covered by SemVer and the deprecation notice period. A reported regression is a release blocker. GA is never downgraded except in a major release. In the mesh, GA ("Stable" in [mesh.md](mesh.md#maturity-and-support-status)) means production-suitable and exercised end-to-end against a live data path; CI fails on a semantic regression only for the features enrolled in `tests/conformance/ga_contract.yaml`, and not every GA row is enrolled yet (the generated `target/conformance/coverage.md` lists the enrolled rows). |
+| **Beta** | Feature-complete and tested, with a documented sharp edge or an owed verification step. Receives bug and security fixes in the supported release like any other feature. Its configuration is not removed or renamed without a deprecation notice, but the notice may end in a minor release rather than a major one, and documented behaviour may change in a minor release with an upgrade-guide entry. |
+| **Experimental** | Usable with a safety-relevant caveat (for example plaintext or partial enforcement) or without live data-path verification; not recommended without compensating controls. No compatibility promise: it may change or be removed in any minor release, with a release-notes and upgrade-guide entry. Most Experimental features are opt-in (a flag, a topology, or a configuration block). Some activate automatically when their input is present, and their documentation says so: for example, a Sidecar applies a mesh-bound VirtualService's `http[]` routes whenever the control plane delivers them, with no separate opt-in. Security reports about it are handled like any other. |
 | **Dev-only** | Requires a non-default build feature or development opt-in and is absent from the default published artifacts. No support promise. |
 | **Out-of-scope** | An explicit non-goal, documented so it is not mistaken for a gap (for example `EnvoyFilter`). |
 
@@ -376,7 +409,7 @@ Current gaps and unsupported shapes are listed in
 
 ## Changes to this policy
 
-A change that reduces a commitment (a shorter support window, a shorter
+A change that reduces a commitment (less support for released versions, a shorter
 deprecation period, a narrower SemVer surface, a weaker compatibility rule) is
 announced in the release notes one minor release before it takes effect. A change
 that extends a commitment takes effect when it is published.

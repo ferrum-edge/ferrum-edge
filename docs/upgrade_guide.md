@@ -5783,8 +5783,13 @@ Stop the old CP, repoint `FERRUM_DB_URL` at the validated fresh database (or
 swap DNS/connection strings), and start the new CP. Do **not** run in-place
 `FERRUM_MODE=migrate` against the production CP database during build-out.
 
-During the CP restart window, existing DPs continue serving traffic with their
-cached config. No downtime for API consumers.
+During the CP restart window, existing DPs keep serving their last applied
+config, but only while its age is below `FERRUM_DP_CONFIG_MAX_STALE_SECONDS`.
+The age is measured from the DP's last applied snapshot, not from the start of
+the restart: a DP whose config has not changed for longer than the bound
+degrades readiness and, under the default `fail_closed`, refuses new traffic as
+soon as its subscribe to the restarting CP fails (see
+[cp_dp_mode.md](cp_dp_mode.md#bounded-last-known-good-configuration-age)).
 
 ```bash
 # Stop old CP, then:
@@ -5801,7 +5806,7 @@ FERRUM_MODE=cp \
 
 #### 4. Upgrade the DPs
 
-Upgrade CP and DP together; mixed builds are rejected at subscribe. Replace every DP right after the CP: an old DP cannot receive config from the new CP, so it serves its last-known-good config (bounded by `FERRUM_DP_CONFIG_MAX_STALE_SECONDS`) and backs off until it is replaced. Each upgraded DP connects to the CP and receives a fresh config snapshot.
+Upgrade CP and DP together; mixed builds are rejected at subscribe. Replace every DP right after the CP: an old DP cannot receive config from the new CP, so it serves its last applied config and backs off until it is replaced. `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` keeps counting from that DP's last applied snapshot, so its remaining time can already be zero. Each upgraded DP connects to the CP and receives a fresh config snapshot.
 
 ```bash
 # On each DP node, stop old binary and start new:
@@ -5956,7 +5961,7 @@ Releases before 1.0.0 carry no compatibility commitment. From 1.0.0 onward, the
 | Database schema, `0.x` releases and `0.x` → 1.0.0 | No — rebuild a fresh DB + `POST /restore` | No — old binary + old DB only |
 | Database schema, from 1.0.0 onward | Yes — forward-only migrations ([support policy](support_policy.md#database-schema)) | No — restore the pre-upgrade database |
 | Config file and backup documents | `0.x`: no guarantee; update the config shape and validate. From 1.0.0: a document written by a 1.x release loads on every later 1.x release ([support policy](support_policy.md#backup-export-and-file-config-format)) | No guarantee |
-| gRPC protocol (CP↔DP) | No — CP and DP must run the same build (any other build is rejected at Subscribe), in every release ([support policy](support_policy.md#control-plane--data-plane-version-skew)) | No — same build required |
+| gRPC protocol (CP↔DP) | No — CP and DP must run the same build in every release; any other ConfigSync wire identity (`<crate version>+configsync.r<revision>`) is rejected at Subscribe ([support policy](support_policy.md#control-plane--data-plane-version-skew)) | No — same build required |
 | Admin API | `0.x`: no guarantee; changes are visible through the `openapi.yaml` parity gate. From 1.0.0: SemVer and the deprecation notice period ([support policy](support_policy.md#deprecation-notice-period)) | Check release notes |
 
 ### Downtime Expectations

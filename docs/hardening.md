@@ -9,17 +9,17 @@ Companion documents:
 
 - [Threat model](threat_model.md) — trust boundaries, attacker capabilities, and
   the residuals this checklist cannot close.
-- [Support policy](support_policy.md) — what a version number promises and how long a release is supported.
+- [Support policy](support_policy.md) — what a version number promises and which release is supported.
 - [Known limitations](known_limitations.md) — unsupported shapes and their workarounds.
 - [SECURITY.md](../SECURITY.md) — vulnerability reporting and the supply-chain gate.
 
-> **Release status.** Ferrum Edge publishes semantic-versioned releases (see the [Releases
-> page](https://github.com/ferrum-edge/ferrum-edge/releases) for the current
-> tag). The latest published release is **v0.9.21** (see the
-> [changelog](../CHANGELOG.md#0921---2026-11-21)). Releases before 1.0.0 carry
-> no compatibility commitment; from 1.0.0 onward,
+> **Release status.** Ferrum Edge publishes semantic-versioned releases; the
+> [Releases page](https://github.com/ferrum-edge/ferrum-edge/releases) shows the
+> current one. As of 2026-11-22 the newest published release was **v0.9.21**
+> (see the [changelog](../CHANGELOG.md#0921---2026-11-21)). Releases before
+> 1.0.0 carry no compatibility commitment; from 1.0.0 onward,
 > [support_policy.md](support_policy.md) defines what each setting here promises
-> across releases and how long a release receives security fixes.
+> across releases and which release receives security fixes.
 >
 > **Feature availability by release.** Resource labels (`labels` /
 > `ResourceLabels` on Proxy, Consumer, Upstream, and PluginConfig,
