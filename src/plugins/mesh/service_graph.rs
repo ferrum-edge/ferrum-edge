@@ -5,7 +5,6 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use serde::Serialize;
@@ -511,8 +510,9 @@ fn now_unix_ms() -> u64 {
 }
 
 fn unix_ms_rfc3339(unix_ms: u64) -> String {
-    DateTime::<Utc>::from_timestamp_millis(unix_ms as i64)
-        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
+    // Out-of-range values fall back to the Unix epoch, as before (issue #7419).
+    crate::time_compat::UtcTimestamp::from_unix_timestamp_millis(unix_ms as i64)
+        .unwrap_or(crate::time_compat::UtcTimestamp::UNIX_EPOCH)
         .to_rfc3339()
 }
 
