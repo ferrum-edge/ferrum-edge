@@ -6103,7 +6103,7 @@ fn resolve_destination_port(
 /// dots that aren't the root anchor, consecutive dots) are also rejected.
 /// Callers MUST treat `None` as "this host is not a Kubernetes service
 /// reference" and surface a clear error instead of attempting a service lookup.
-fn service_host_components<'a>(
+pub(super) fn service_host_components<'a>(
     host: &'a str,
     default_namespace: &'a str,
     cluster_domain: &str,

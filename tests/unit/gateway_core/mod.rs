@@ -118,6 +118,7 @@ mod k8s_client_defaults_tests;
 mod k8s_consumer_assertion_route_filter_tests;
 mod k8s_controller_metrics_tests;
 mod k8s_controller_rbac_parity_tests;
+mod k8s_gamma_route_translation_tests;
 mod k8s_gateway_status_ssa_cas_tests;
 mod k8s_headless_service_dns_fallback_tests;
 mod k8s_http_route_redirect_filters_tests;

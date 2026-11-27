@@ -16918,8 +16918,10 @@ fn mirror_mesh_authz_baggage_gate_fields(target: &mut serde_json::Value, gate: &
 /// `gateway_config_from_mesh_slice_with_federation` decodes their
 /// `istio-vs-upstream-*` weighted-split upstreams into the config, so this
 /// returns those upstreams. `gwapi-route-upstream-*` ids stay admitted for
-/// parity with `mesh_authz`, but Gateway API HTTPRoute routes bind Gateway
-/// listeners and never ride a mesh slice. Every other topology returns
+/// parity with `mesh_authz`, but Gateway-bound HTTPRoute routes never ride a
+/// mesh slice; GAMMA (Service-parent) routes ride as `istio-vs-gamma_*` with
+/// `istio-vs-upstream-gamma_*` upstreams, which this covers (issue #7538).
+/// Every other topology returns
 /// nothing, since its slice carries no HTTP route.
 fn node_waypoint_authz_route_upstreams(config: &GatewayConfig) -> Vec<serde_json::Value> {
     config

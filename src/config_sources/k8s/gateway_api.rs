@@ -38,6 +38,11 @@ use super::backend_tls_policy::MAX_POLICY_ANCESTORS;
 use crate::config::db_backend::NamespacedResourceId;
 use crate::config::types::{HashOnCookieConfig, PluginConfig, Proxy};
 
+// Gateway API GAMMA: HTTPRoute / GRPCRoute with `Service` parentRefs (issue
+// #7538). A child module so it reuses this translator's private rule, filter
+// and backend builders unchanged.
+pub(super) mod gamma;
+
 // Use an absolute DNS name (trailing dot) so resolvers must query this exact
 // label and cannot append search domains from resolv.conf.
 const ZERO_WEIGHT_BACKEND_HOST: &str = "ferrum-zero-weight.invalid.";
@@ -339,6 +344,9 @@ pub(super) fn translate(
         "HTTPRoute" | "GRPCRoute" => {
             let (proxies, plugins) = http_route_resources(object, acc)?;
             upsert_http_route_resources(acc, proxies, plugins, &object.kind);
+            // GAMMA `Service` parents are staged here and materialized by
+            // `finalize_gamma_routes` once the whole snapshot is known.
+            gamma::stage_service_parent_routes(acc, object)?;
             Ok(true)
         }
         "TCPRoute" => {
@@ -390,6 +398,12 @@ pub(super) fn translate(
         "BackendLBPolicy" | "XBackendTrafficPolicy" => Ok(true),
         _ => Ok(false),
     }
+}
+
+/// Materialize the staged GAMMA routes (issue #7538) after every object has
+/// been translated; see [`gamma::finalize`].
+pub(super) fn finalize_gamma_routes(acc: &mut K8sAccumulator) {
+    gamma::finalize(acc);
 }
 
 /// Default session token name when `sessionPersistence.sessionName` is omitted
@@ -3579,6 +3593,10 @@ fn can_merge_http_route_proxy(
     // Reject different slots before proxy_source allocates an ownership key.
     // Unique host/path snapshots otherwise allocate on every quadratic miss.
     occupies_same_route_slot(existing, proxy)
+        // A GAMMA (Service-parent) route proxy only ever merges with another
+        // GAMMA proxy, never with a parentless legacy Gateway API claim that
+        // happens to share the slot (issue #7538).
+        && gamma::is_gamma_route_proxy_id(&existing.id) == gamma::is_gamma_route_proxy_id(&proxy.id)
         && acc.proxy_source(&existing.namespace, &existing.id) == Some(SourceKind::GatewayApi)
         && route_proxy_listener(acc, existing) == route_proxy_listener(acc, proxy)
         && namespaced_resource_key(&existing.namespace, &existing.id)

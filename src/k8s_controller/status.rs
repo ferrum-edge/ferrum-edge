@@ -13,17 +13,19 @@ use crate::config_sources::k8s::backend_tls_policy::{
 };
 use crate::config_sources::k8s::udp_amplification_policy::lookup_route_posture;
 use crate::config_sources::k8s::{
+    GAMMA_ROUTE_PROGRAMMED_SCOPE_NOTE, GammaParentKey, GammaParentOutcome,
     GatewayApiAllowedRoutesNamespaces, GatewayApiBackendTlsPolicyStatus, GatewayApiListenerKey,
     GatewayApiListenerParentKind, GatewayApiMaterializedRouteParent, GatewayApiRouteAttachment,
     GatewayApiRouteConflict, GatewayApiRouteConflictKey, GatewayClassAuthority,
     INCOMPATIBLE_FILTERS_MARKER, K8sObject, K8sResourceKey, K8sTranslateError, K8sTranslation,
     K8sTranslationOptions, UNSUPPORTED_SHAPE_MARKER, backend_lb_policy_conflict_losers,
-    backend_lb_policy_status, gateway_api_route_conflict_keys_with_acc,
+    backend_lb_policy_status, gamma_parent_ref_key, gateway_api_route_conflict_keys_with_acc,
     gateway_api_section_name_is_valid, gateway_api_status_conflict_context,
-    merge_backend_lb_policy_status, namespace_selector_matches,
+    merge_backend_lb_policy_status, namespace_selector_matches, parent_ref_is_service,
     parse_gateway_listener_allowed_route_namespaces, parse_reference_grant_permissions,
-    secret_object_is_valid_tls_certificate, translate_k8s_objects_collecting_skips,
-    validate_gateway_listener_allowed_routes, validate_listenerset_listener_entry,
+    route_has_service_parent_ref, secret_object_is_valid_tls_certificate,
+    translate_k8s_objects_collecting_skips, validate_gateway_listener_allowed_routes,
+    validate_listenerset_listener_entry,
 };
 use crate::k8s_controller::convert::k8s_time_to_rfc3339;
 use crate::k8s_controller::metrics::{
@@ -42,6 +44,7 @@ use crate::udp_amplification::{
 };
 
 pub use crate::config_sources::k8s::FERRUM_GATEWAY_CONTROLLER_NAME;
+pub use crate::config_sources::k8s::FERRUM_MESH_CONTROLLER_NAME;
 
 /// Stable server-side-apply owner shared by every Ferrum controller replica.
 /// Using the Gateway API controller name keeps ownership stable across restarts
@@ -3069,6 +3072,25 @@ fn route_status(
         }));
     }
 
+    // GAMMA `Service` parents (issue #7538), under the mesh controller name.
+    if route_has_service_parent_ref(object) {
+        let verdict = GammaRouteVerdict {
+            accepted,
+            resolved_refs,
+            accepted_reason,
+            resolved_refs_reason,
+            message: &message,
+        };
+        for parent_ref in route_parent_refs_borrowed(object)
+            .iter()
+            .filter(|parent_ref| parent_ref_is_service(parent_ref))
+        {
+            parents.push(gamma_service_parent_status(
+                object, parent_ref, result, &verdict,
+            ));
+        }
+    }
+
     let mut status = object.status.clone();
     ensure_status_object(&mut status).insert("parents".to_string(), Value::Array(parents));
     status
@@ -3423,13 +3445,18 @@ fn preserve_live_parent_condition_transition_times(
         return desired_parent;
     };
     let desired_key = route_parent_ref_key_for_namespace(&update.namespace, desired_parent_ref);
+    // Gateway parents and GAMMA Service parents carry different controller
+    // names; match the live entry written under the desired one.
+    let desired_controller = desired_parent
+        .get("controllerName")
+        .and_then(Value::as_str)
+        .unwrap_or(FERRUM_GATEWAY_CONTROLLER_NAME);
     let live_conditions = live_status
         .and_then(|status| status.get("parents"))
         .and_then(Value::as_array)
         .and_then(|parents| {
             parents.iter().find(|parent| {
-                parent.get("controllerName").and_then(Value::as_str)
-                    == Some(FERRUM_GATEWAY_CONTROLLER_NAME)
+                parent.get("controllerName").and_then(Value::as_str) == Some(desired_controller)
                     && parent.get("parentRef").is_some_and(|parent_ref| {
                         route_parent_ref_key_for_namespace(&update.namespace, parent_ref)
                             == desired_key
@@ -3636,14 +3663,27 @@ fn existing_parent_status<'a>(
     object: &K8sObject,
     parent_ref: &Value,
 ) -> Option<&'a [Value]> {
+    existing_parent_status_for_controller(
+        status,
+        object,
+        parent_ref,
+        FERRUM_GATEWAY_CONTROLLER_NAME,
+    )
+}
+
+fn existing_parent_status_for_controller<'a>(
+    status: &'a Value,
+    object: &K8sObject,
+    parent_ref: &Value,
+    controller_name: &str,
+) -> Option<&'a [Value]> {
     let parent_ref_key = route_parent_ref_key(object, parent_ref);
     status
         .get("parents")
         .and_then(Value::as_array)
         .and_then(|parents| {
             parents.iter().find(|parent| {
-                parent.get("controllerName").and_then(Value::as_str)
-                    == Some(FERRUM_GATEWAY_CONTROLLER_NAME)
+                parent.get("controllerName").and_then(Value::as_str) == Some(controller_name)
                     && parent.get("parentRef").is_some_and(|existing_ref| {
                         route_parent_ref_key(object, existing_ref) == parent_ref_key
                     })
@@ -3652,6 +3692,186 @@ fn existing_parent_status<'a>(
         .and_then(|parent| parent.get("conditions"))
         .and_then(Value::as_array)
         .map(Vec::as_slice)
+}
+
+/// Route-level translation verdict a GAMMA parent inherits when the route
+/// itself was refused (or its backendRefs did not all resolve).
+struct GammaRouteVerdict<'a> {
+    accepted: bool,
+    resolved_refs: bool,
+    accepted_reason: &'a str,
+    resolved_refs_reason: &'a str,
+    message: &'a str,
+}
+
+/// Desired `status.parents[]` entry for one GAMMA `Service` parentRef (issue
+/// #7538), from the outcome translation recorded for it.
+fn gamma_service_parent_status(
+    object: &K8sObject,
+    parent_ref: &Value,
+    result: Result<&K8sTranslation, &K8sTranslateError>,
+    verdict: &GammaRouteVerdict<'_>,
+) -> Value {
+    let existing = existing_parent_status_for_controller(
+        &object.status,
+        object,
+        parent_ref,
+        FERRUM_MESH_CONTROLLER_NAME,
+    );
+    let key = GammaParentKey {
+        route: K8sResourceKey::from_object(object),
+        parent_ref: gamma_parent_ref_key(&object.metadata.namespace, parent_ref),
+    };
+    let (
+        accepted,
+        accepted_reason,
+        accepted_message,
+        programmed,
+        programmed_reason,
+        programmed_message,
+        conflict,
+    ) = match result {
+        Err(_) => (
+            verdict.accepted,
+            verdict.accepted_reason.to_string(),
+            verdict.message.to_string(),
+            false,
+            if verdict.resolved_refs {
+                "TranslationFailed".to_string()
+            } else {
+                verdict.resolved_refs_reason.to_string()
+            },
+            verdict.message.to_string(),
+            None,
+        ),
+        Ok(translation) => match translation.gamma_route_parents.get(&key) {
+            Some(GammaParentOutcome::Programmed { producer }) => {
+                let role = if *producer { "producer" } else { "consumer" };
+                (
+                    true,
+                    "Accepted".to_string(),
+                    format!("Ferrum accepted this {role} route for the mesh"),
+                    true,
+                    "Programmed".to_string(),
+                    format!(
+                        "Ferrum programmed this {role} route: {GAMMA_ROUTE_PROGRAMMED_SCOPE_NOTE}"
+                    ),
+                    None,
+                )
+            }
+            Some(GammaParentOutcome::NoRules) => (
+                true,
+                "Accepted".to_string(),
+                "Ferrum accepted this route for the mesh".to_string(),
+                false,
+                "NoRules".to_string(),
+                "Ferrum accepted this route but no materialized rule was produced for this \
+                     Service parent"
+                    .to_string(),
+                None,
+            ),
+            Some(GammaParentOutcome::Pending { message }) => (
+                true,
+                "Accepted".to_string(),
+                "Ferrum accepted this route for the mesh".to_string(),
+                false,
+                "Pending".to_string(),
+                format!("Ferrum did not program this route: {message}"),
+                None,
+            ),
+            Some(GammaParentOutcome::NoMatchingParent { message }) => (
+                false,
+                "NoMatchingParent".to_string(),
+                format!("Ferrum rejected this route attachment: {message}"),
+                false,
+                "NoMatchingParent".to_string(),
+                format!("Ferrum did not program this route: {message}"),
+                None,
+            ),
+            Some(GammaParentOutcome::UnsupportedValue { message }) => (
+                false,
+                "UnsupportedValue".to_string(),
+                format!("Ferrum does not implement this route shape for the mesh: {message}"),
+                false,
+                "UnsupportedValue".to_string(),
+                format!("Ferrum did not program this route: {message}"),
+                None,
+            ),
+            Some(GammaParentOutcome::Conflicted { message }) => (
+                false,
+                "Conflicted".to_string(),
+                format!("Ferrum did not apply this route: {message}"),
+                false,
+                "Conflicted".to_string(),
+                format!("Ferrum did not program this route: {message}"),
+                Some(message.clone()),
+            ),
+            None => (
+                false,
+                "Pending".to_string(),
+                "Ferrum has not evaluated this Service parent".to_string(),
+                false,
+                "Pending".to_string(),
+                "Ferrum has not evaluated this Service parent".to_string(),
+                None,
+            ),
+        },
+    };
+    let has_conflict = conflict.is_some();
+    let conflicted_message =
+        conflict.unwrap_or_else(|| "No GAMMA route conflicts detected by Ferrum".to_string());
+    let conditions = vec![
+        condition_at(
+            object,
+            existing,
+            "Accepted",
+            accepted,
+            &accepted_reason,
+            &accepted_message,
+        ),
+        condition_at(
+            object,
+            existing,
+            "ResolvedRefs",
+            verdict.resolved_refs,
+            if verdict.resolved_refs {
+                "ResolvedRefs"
+            } else {
+                verdict.resolved_refs_reason
+            },
+            if verdict.resolved_refs {
+                "All backendRefs accepted by Ferrum"
+            } else {
+                verdict.message
+            },
+        ),
+        condition_at(
+            object,
+            existing,
+            "Programmed",
+            programmed,
+            &programmed_reason,
+            &programmed_message,
+        ),
+        condition_at(
+            object,
+            existing,
+            "Conflicted",
+            has_conflict,
+            if has_conflict {
+                "Conflicted"
+            } else {
+                "NoConflicts"
+            },
+            &conflicted_message,
+        ),
+    ];
+    let conditions = merge_condition_entries(existing, conditions);
+    json!({
+        "parentRef": parent_ref,
+        "controllerName": FERRUM_MESH_CONTROLLER_NAME,
+        "conditions": conditions,
+    })
 }
 
 fn merge_parent_statuses(status: &Value, desired_ferrum_parents: Vec<Value>) -> Vec<Value> {
@@ -3683,8 +3903,17 @@ fn retained_existing_parent_statuses(status: &Value) -> Vec<Value> {
         .collect()
 }
 
+/// Route parents Ferrum owns: Gateway/ListenerSet parents under the gateway
+/// controller name and GAMMA `Service` parents under the mesh controller name.
+fn is_ferrum_parent_controller(controller_name: Option<&str>) -> bool {
+    matches!(
+        controller_name,
+        Some(FERRUM_GATEWAY_CONTROLLER_NAME | FERRUM_MESH_CONTROLLER_NAME)
+    )
+}
+
 fn is_ferrum_parent_status(parent: &Value) -> bool {
-    parent.get("controllerName").and_then(Value::as_str) == Some(FERRUM_GATEWAY_CONTROLLER_NAME)
+    is_ferrum_parent_controller(parent.get("controllerName").and_then(Value::as_str))
 }
 
 fn has_ferrum_parent_status(status: &Value) -> bool {
@@ -3693,10 +3922,7 @@ fn has_ferrum_parent_status(status: &Value) -> bool {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .any(|parent| {
-            parent.get("controllerName").and_then(Value::as_str)
-                == Some(FERRUM_GATEWAY_CONTROLLER_NAME)
-        })
+        .any(is_ferrum_parent_status)
 }
 
 fn route_parent_refs_borrowed(object: &K8sObject) -> &[Value] {
@@ -3719,7 +3945,9 @@ fn status_candidate_is_eligible(object: &K8sObject, indexes: &GatewayApiStatusIn
         "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute" | "UDPRoute" => {
             // Borrowed predicate only — do not deep-clone parentRefs before the
             // fair work budget selects the expensive status window (#2397).
+            // A GAMMA `Service` parent is Ferrum's mesh to report on (#7538).
             route_has_managed_parent_ref_indexed(object, indexes)
+                || route_has_service_parent_ref(object)
                 || has_ferrum_parent_status(&object.status)
         }
         // A policy is Ferrum's business when at least one target Service is
