@@ -57,11 +57,6 @@ gateways, control planes, mesh data planes, charts or contract consumers.
   namespace, trust-bundle and audit timestamps, and the mesh, CP/DP status, K8s
   and diagnostic timestamps. Remaining work: dropping the direct `chrono`
   dependency and sqlx's `chrono` feature. The
-  2-18 have moved the standalone uses, the config snapshot stamps
-  (`GatewayConfig.loaded_at`, the ConfigSync delta `poll_timestamp`) and the
-  resource, namespace, trust-bundle and audit timestamps to `time_compat`.
-  Remaining work: the mesh, CP/DP status, K8s and diagnostic timestamps; then
-  dropping the direct `chrono` dependency and sqlx's `chrono` feature. The
   exception can be retired only once no dependency still resolves `chrono`.
 - **Three other advisory exceptions were re-reviewed on 2026-11-27 and
   re-affirmed until 2027-03-31** (#7520): RUSTSEC-2024-0436 (`paste`),
@@ -247,20 +242,14 @@ gateways, control planes, mesh data planes, charts or contract consumers.
   (the data plane stamps the slice with its wall clock). The resource, namespace,
   trust-bundle and audit timestamps follow suit (#7529): a stored `created_at`,
   `updated_at` or audit `ts` outside that range takes the loader's existing
-  undecodable-value path (SQL resource rows log a warning and use the current
-  time; MongoDB resource documents, namespace and trust-bundle rows, and config
-  or backup documents fail to decode), and the API-spec `updated_since` and audit
-  `start`/`end` filters reject such a value with their existing `400`. A
-  Kubernetes `metadata.creationTimestamp` outside that range is treated like a
-  missing one when ordering Gateway API routes, ListenerSets, BackendTLSPolicies
-  and UDP amplification policies (#7530). Rendered timestamps
-  of in-range values, and the wire and storage text of these stamps, are
-  byte-identical, and no Admin API status, envelope or message changes.
   undecodable-value path (SQL resource and audit rows log a warning and use the
   current time; MongoDB resource and audit documents, namespace and trust-bundle
   rows, and config or backup documents fail to decode, so an audit list that
   selects such a MongoDB row fails with `503`), and the API-spec `updated_since`
-  and audit `start`/`end` filters reject such a value with their `400`.
+  and audit `start`/`end` filters reject such a value with their `400`. A
+  Kubernetes `metadata.creationTimestamp` outside that range is treated like a
+  missing one when ordering Gateway API routes, ListenerSets, BackendTLSPolicies
+  and UDP amplification policies (#7530).
   Rendered timestamps of in-range, non-leap-second values, and the wire and
   storage text of these stamps, are byte-identical. For in-range values no
   Admin API status or envelope changes; message changes are limited to the TLS

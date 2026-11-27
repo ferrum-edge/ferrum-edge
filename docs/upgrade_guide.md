@@ -370,9 +370,9 @@ follow (#7530): `DpNodeInfo` and `MeshNodeInfo` connection and update stamps,
 `DpCpConnectionState`'s `last_config_received_at` / `connected_since` /
 `config_diverged_since`, mesh policy-deny events and aggregates, mesh slice-drift
 entries, the mesh revision gate and runtime install/apply stamps; registry TTLs
-and retention windows are now `time::SignedDuration`. For non-leap-second
-values `UtcTimestamp` renders the same bytes as chrono through `to_rfc3339()`;
-it exposes `unix_timestamp()` and
+and retention windows are now `time::SignedDuration`. For non-leap-second values
+`UtcTimestamp` renders the same bytes as chrono through `to_rfc3339()`; it
+exposes `unix_timestamp()` and
 `unix_timestamp_millis()`. Plugins also gain an optional
 `ON_RESPONSE_STREAM_TERMINATED` lifecycle hook bit (#7471); custom plugins keep
 the conservative dispatch path whether or not they declare it.
