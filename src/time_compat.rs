@@ -191,6 +191,19 @@ impl UtcTimestamp {
         self.0
     }
 
+    /// `1970-01-01T00:00:00Z`, matching `chrono::DateTime::<Utc>::UNIX_EPOCH`.
+    pub const UNIX_EPOCH: Self = Self(OffsetDateTime::UNIX_EPOCH);
+
+    /// Construct from Unix epoch milliseconds, flooring toward negative
+    /// infinity like `chrono::DateTime::from_timestamp_millis`. Fails with
+    /// [`TimestampError::OutOfRange`] outside the supported year range.
+    pub fn from_unix_timestamp_millis(millis: i64) -> Result<Self, TimestampError> {
+        let secs = millis.div_euclid(1_000);
+        let nanos = u32::try_from(millis.rem_euclid(1_000) * 1_000_000)
+            .map_err(|_| TimestampError::OutOfRange)?;
+        Self::from_unix_timestamp_nanos(secs, nanos)
+    }
+
     /// Construct from whole Unix epoch seconds.
     #[inline]
     pub fn from_unix_timestamp(secs: i64) -> Result<Self, TimestampError> {
