@@ -178,18 +178,12 @@ fn gamma_routes_ride_the_sidecar_and_node_waypoint_slices_only() {
     let config = producer_config();
     let node_waypoint = slice_for(&config, &runtime_for_topology(MeshTopology::NodeWaypoint));
     let proxy_ids = carried_ids(&node_waypoint.http_routes.proxies);
-    assert!(
-        proxy_ids
-            .iter()
-            .any(|id| id.starts_with("istio-vs-gamma_httproute-")),
-        "the route proxy rides: {proxy_ids:?}"
+    assert_eq!(
+        proxy_ids.len(),
+        1,
+        "one route for the Service: {proxy_ids:?}"
     );
-    assert!(
-        proxy_ids
-            .iter()
-            .any(|id| id.starts_with("istio-vs-gamma_unmatched")),
-        "the unmatched catch-all rides: {proxy_ids:?}"
-    );
+    assert!(proxy_ids[0].starts_with("istio-vs-gamma_service-"));
     let upstream_ids = carried_ids(&node_waypoint.http_routes.upstreams);
     assert_eq!(upstream_ids.len(), 1, "the weighted split upstream rides");
     assert!(upstream_ids[0].starts_with("istio-vs-upstream-gamma_httproute-"));
@@ -213,6 +207,59 @@ fn gamma_routes_ride_the_sidecar_and_node_waypoint_slices_only() {
                 .http_routes
                 .is_empty(),
             "{topology:?} is not served GAMMA routes in this release"
+        );
+    }
+}
+
+/// F1: the same snapshot handed to a gateway (non-mesh) data plane, or seen on
+/// an inbound mesh listener, serves nothing for a GAMMA route.
+#[test]
+fn a_gateway_listener_never_serves_a_gamma_route() {
+    let config = producer_config();
+    for path in ["/api/items", "/other"] {
+        let routed = routed_proxy_id(&config, path, None);
+        assert!(
+            routed
+                .as_deref()
+                .is_none_or(|id| !id.starts_with("istio-vs-gamma_")),
+            "a gateway listener given the translated snapshot must not route {path} to the \
+             GAMMA proxy, got {routed:?}"
+        );
+        let inbound = routed_proxy_id(&config, path, Some(MeshTrafficDirection::Inbound));
+        assert!(
+            inbound
+                .as_deref()
+                .is_none_or(|id| !id.starts_with("istio-vs-gamma_")),
+            "an inbound mesh listener never serves a GAMMA route, got {inbound:?}"
+        );
+    }
+    assert!(
+        routed_proxy_id(&config, "/api/items", Some(MeshTrafficDirection::Outbound))
+            .is_some_and(|id| id.starts_with("istio-vs-gamma_")),
+        "the outbound mesh listener does"
+    );
+}
+
+/// A consumer route whose backend is in another namespace is never carried in
+/// this release, to any namespace.
+#[test]
+fn a_cross_namespace_consumer_route_is_carried_nowhere() {
+    let config = translated_config(&[
+        k8s_service(DEFAULT_NAMESPACE, "reviews"),
+        k8s_service(DEFAULT_NAMESPACE, "ratings"),
+        gamma_route("clients", DEFAULT_NAMESPACE, DEFAULT_NAMESPACE),
+    ]);
+    let node_waypoint = runtime_for_topology(MeshTopology::NodeWaypoint);
+    for namespace in [DEFAULT_NAMESPACE, "clients", "other"] {
+        let request = MeshSliceRequest {
+            namespace: namespace.to_string(),
+            ..node_waypoint.mesh_slice_request()
+        };
+        assert!(
+            MeshSlice::from_gateway_config(&config, request)
+                .http_routes
+                .is_empty(),
+            "{namespace}: a consumer route never affects another namespace's traffic"
         );
     }
 }
@@ -286,7 +333,7 @@ fn node_waypoint_data_plane_materializes_gamma_routes() {
     for id in carried_ids(&slice.http_routes.proxies) {
         assert!(
             prepared.proxies.iter().any(|proxy| proxy.id == id),
-            "{id} materializes"
+            "{id} materializes (the data-plane binding did not refuse it)"
         );
     }
     let dispatch_count = prepared
@@ -300,7 +347,7 @@ fn node_waypoint_data_plane_materializes_gamma_routes() {
                     .is_some_and(|id| id.starts_with("istio-vs-gamma_"))
         })
         .count();
-    assert_eq!(dispatch_count, 2, "route and catch-all dispatch instances");
+    assert_eq!(dispatch_count, 1, "the Service's one dispatch instance");
 }
 
 #[test]
@@ -310,25 +357,21 @@ fn sidecar_serves_gamma_routes_on_outbound_capture_only() {
     let slice = slice_for(&config, &runtime);
     let prepared = prepare_gateway_config_from_mesh_slice(&slice, &runtime)
         .expect("the data plane accepts the GAMMA route set");
+    let gamma_id = carried_ids(&slice.http_routes.proxies).remove(0);
+    assert!(
+        prepared.proxies.iter().any(|proxy| proxy.id == gamma_id),
+        "the Sidecar binding keeps the GAMMA route"
+    );
 
-    let api = routed_proxy_id(
-        &prepared,
-        "/api/items",
-        Some(MeshTrafficDirection::Outbound),
-    )
-    .expect("outbound routes /api");
-    assert!(
-        api.starts_with("istio-vs-gamma_httproute-"),
-        "the GAMMA route serves its path, got {api:?}"
-    );
-    let other = routed_proxy_id(&prepared, "/other", Some(MeshTrafficDirection::Outbound))
-        .expect("outbound routes /other");
-    assert!(
-        other.starts_with("istio-vs-gamma_unmatched"),
-        "a path no attached route claims is rejected, not served by the plain \
-         Service route, got {other:?}"
-    );
+    // Every path of the Service host reaches the GAMMA route on outbound
+    // capture: its dispatch instance serves the matching rule or rejects the
+    // request, so no path falls through to the plain Service route.
     for path in ["/api/items", "/other"] {
+        assert_eq!(
+            routed_proxy_id(&prepared, path, Some(MeshTrafficDirection::Outbound)),
+            Some(gamma_id.clone()),
+            "{path}"
+        );
         assert!(
             routed_proxy_id(&prepared, path, Some(MeshTrafficDirection::Inbound))
                 .is_none_or(|id| !id.starts_with("istio-vs-")),

@@ -1,17 +1,20 @@
 //! Gateway API GAMMA routes: `HTTPRoute` / `GRPCRoute` with `Service`
 //! parentRefs (issue #7538).
 //!
-//! These tests pin the control-plane half: translation into the mesh route
-//! set (`istio-vs-gamma_*` proxies, `istio-vs-upstream-gamma_*` upstreams and a
-//! `gamma_<ns>_<svc>` `mesh.virtual_service_http_routes` binding), parent
-//! resolution (`port`, `sectionName`, unknown/headless/ExternalName Services),
-//! precedence (VirtualService over GAMMA, GRPCRoute over HTTPRoute, oldest
-//! route keeps an identical match), refusals with the Gateway-bound route's
-//! `Accepted=False` reasons, and `status.parents[]` under the mesh controller
-//! name.
+//! These tests pin the control-plane half: translation of every route attached
+//! to one Service from one namespace into ONE mesh route (an
+//! `istio-vs-gamma_service-*` `/` proxy whose single `mesh_route_dispatch`
+//! instance carries every rule with an explicit path predicate, ordered by
+//! Gateway API precedence, `reject_unmatched`), its
+//! `istio-vs-upstream-gamma_*` upstreams and `gamma_<ns>_<svc>` binding; parent
+//! resolution; producer/consumer ReferenceGrant rules; precedence; refusals with
+//! the Gateway-bound `Accepted=False` reasons; and `status.parents[]` under the
+//! mesh controller name.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use ferrum_edge::_test_support::run_before_proxy_hooks_for_test;
 use ferrum_edge::config::types::{GatewayConfig, PluginConfig, Proxy};
 use ferrum_edge::config_sources::k8s::{
     GammaParentKey, GammaParentOutcome, K8sMetadata, K8sObject, K8sResourceKey, K8sTranslation,
@@ -22,11 +25,15 @@ use ferrum_edge::k8s_controller::status::{
     FERRUM_GATEWAY_CONTROLLER_NAME, FERRUM_MESH_CONTROLLER_NAME, plan_gateway_api_status_updates,
 };
 use ferrum_edge::modes::mesh::config::MeshVirtualServiceHttpRoutes;
+use ferrum_edge::plugins::mesh_route_dispatch::MeshRouteDispatch;
+use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext, create_plugin};
 use serde_json::{Value, json};
 
 const HTTP_ROUTE_API: &str = "gateway.networking.k8s.io/v1";
 const OLDER: &str = "2024-01-01T00:00:00Z";
 const NEWER: &str = "2024-06-01T00:00:00Z";
+const REVIEWS: &str = "reviews.default.svc.cluster.local";
+const RATINGS: &str = "ratings.default.svc.cluster.local";
 
 fn options() -> K8sTranslationOptions {
     K8sTranslationOptions::new(
@@ -56,6 +63,7 @@ fn object(kind: &str, api_version: &str, namespace: &str, name: &str, spec: Valu
 }
 
 /// A selector-backed ClusterIP Service with the given `(name, port)` ports.
+/// Port names follow the Istio convention (`http*` / `grpc*` are HTTP-family).
 fn service(namespace: &str, name: &str, ports: &[(&str, u16)]) -> K8sObject {
     let ports: Vec<Value> = ports
         .iter()
@@ -72,6 +80,10 @@ fn service(namespace: &str, name: &str, ports: &[(&str, u16)]) -> K8sObject {
 
 fn http_route(namespace: &str, name: &str, spec: Value) -> K8sObject {
     object("HTTPRoute", HTTP_ROUTE_API, namespace, name, spec)
+}
+
+fn grpc_route(namespace: &str, name: &str, spec: Value) -> K8sObject {
+    object("GRPCRoute", HTTP_ROUTE_API, namespace, name, spec)
 }
 
 fn created_at(mut object: K8sObject, timestamp: &str) -> K8sObject {
@@ -120,18 +132,11 @@ fn gamma_proxies(config: &GatewayConfig) -> Vec<&Proxy> {
         .collect()
 }
 
-/// GAMMA route proxies, without the per-Service unmatched catch-all.
-fn route_proxies(config: &GatewayConfig) -> Vec<&Proxy> {
-    gamma_proxies(config)
-        .into_iter()
-        .filter(|proxy| !proxy.id.starts_with("istio-vs-gamma_unmatched"))
-        .collect()
-}
-
-fn catch_all(config: &GatewayConfig) -> Option<&Proxy> {
-    gamma_proxies(config)
-        .into_iter()
-        .find(|proxy| proxy.id.starts_with("istio-vs-gamma_unmatched"))
+/// The group's one route proxy.
+fn gamma_proxy(config: &GatewayConfig) -> &Proxy {
+    let proxies = gamma_proxies(config);
+    assert_eq!(proxies.len(), 1, "one route per Service: {proxies:?}");
+    proxies[0]
 }
 
 fn gamma_binding<'a>(
@@ -157,6 +162,13 @@ fn dispatch_plugin<'a>(config: &'a GatewayConfig, proxy: &Proxy) -> &'a PluginCo
         .expect("route proxy carries mesh_route_dispatch")
 }
 
+fn dispatch_rules(config: &GatewayConfig) -> Vec<Value> {
+    dispatch_plugin(config, gamma_proxy(config)).config["rules"]
+        .as_array()
+        .expect("rules")
+        .clone()
+}
+
 fn outcome(
     translation: &K8sTranslation,
     route: &K8sObject,
@@ -171,12 +183,16 @@ fn outcome(
         .cloned()
 }
 
-fn route_parents_status(objects: &[K8sObject], kind: &str, name: &str) -> Vec<Value> {
+fn route_status(objects: &[K8sObject], kind: &str, name: &str) -> Value {
     plan_gateway_api_status_updates(objects, options(), &[])
         .into_iter()
         .find(|update| update.kind == kind && update.name == name)
         .unwrap_or_else(|| panic!("{kind} {name} gets a status update"))
-        .status["parents"]
+        .status
+}
+
+fn route_parents_status(objects: &[K8sObject], kind: &str, name: &str) -> Vec<Value> {
+    route_status(objects, kind, name)["parents"]
         .as_array()
         .expect("parents array")
         .clone()
@@ -204,22 +220,72 @@ fn assert_condition(parent: &Value, condition_type: &str, status: &str, reason: 
     assert_eq!(found["reason"], json!(reason), "{condition_type}: {found}");
 }
 
+const PARENT: &str = "core/Service/default/reviews/*/*";
+
+/// What the group's dispatch instance does with one request: the selected
+/// destination host, or the rejection status.
+#[derive(Debug, PartialEq, Eq)]
+enum Dispatched {
+    To(String),
+    Upstream(String),
+    Rejected(u16),
+    Continue,
+}
+
+async fn dispatch(
+    config: &GatewayConfig,
+    method: &str,
+    path: &str,
+    request_headers: &[(&str, &str)],
+) -> Dispatched {
+    let proxy = gamma_proxy(config);
+    let plugin_config = dispatch_plugin(config, proxy);
+    let plugin: Arc<dyn Plugin> = create_plugin("mesh_route_dispatch", &plugin_config.config)
+        .expect("dispatch plugin builds")
+        .expect("dispatch plugin exists");
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        method.to_string(),
+        path.to_string(),
+    );
+    let mut headers: HashMap<String, String> = request_headers
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
+    headers.insert("host".to_string(), REVIEWS.to_string());
+    ctx.headers = headers.clone();
+    ctx.matched_proxy = Some(Arc::new(proxy.clone()));
+    match run_before_proxy_hooks_for_test(&[plugin], &mut ctx, &mut headers).await {
+        PluginResult::Reject { status_code, .. } => Dispatched::Rejected(status_code),
+        _ => match (
+            ctx.route_override_backend_host.clone(),
+            ctx.route_override_upstream_id.clone(),
+        ) {
+            (Some(host), _) => Dispatched::To(host),
+            (None, Some(upstream)) => Dispatched::Upstream(upstream),
+            (None, None) => Dispatched::Continue,
+        },
+    }
+}
+
 #[test]
-fn producer_route_translates_into_the_mesh_route_set_and_binding() {
+fn producer_route_translates_into_one_service_route_and_binding() {
     let route = http_route("default", "reviews-route", split_route_spec());
     let mut objects = base_services();
     objects.push(route.clone());
     let translation = translate(&objects);
     let config = &translation.config;
 
-    let proxies = route_proxies(config);
-    assert_eq!(proxies.len(), 1, "one rule, one listen path");
-    let proxy = proxies[0];
-    assert_eq!(proxy.listen_path.as_deref(), Some("/api"));
-    assert!(proxy.id.starts_with("istio-vs-gamma_httproute-"));
+    let proxy = gamma_proxy(config);
+    assert!(proxy.id.starts_with("istio-vs-gamma_service-"));
     assert!(proxy.id.contains("__"), "source-bound digest suffix");
     assert_eq!(proxy.namespace, "default");
-    assert_eq!(proxy.hosts, vec!["reviews.default.svc.cluster.local"]);
+    assert_eq!(proxy.listen_path.as_deref(), Some("/"));
+    assert_eq!(
+        proxy.hosts,
+        vec![REVIEWS.to_string(), "10.96.0.10".to_string()],
+        "the Service host and its cluster IP"
+    );
     assert_eq!(proxy.listen_port, None, "a mesh route opens no listener");
     assert!(
         !config
@@ -229,15 +295,14 @@ fn producer_route_translates_into_the_mesh_route_set_and_binding() {
         "a Service parent never materializes a Gateway route"
     );
 
-    let upstream_id = proxy
-        .upstream_id
-        .as_deref()
-        .expect("weighted split upstream");
-    assert!(upstream_id.starts_with("istio-vs-upstream-gamma_httproute-"));
     let upstream = config
         .upstreams
         .iter()
-        .find(|upstream| upstream.id == upstream_id)
+        .find(|upstream| {
+            upstream
+                .id
+                .starts_with("istio-vs-upstream-gamma_httproute-")
+        })
         .expect("split upstream translated");
     let mut targets: Vec<(&str, u16)> = upstream
         .targets
@@ -247,57 +312,34 @@ fn producer_route_translates_into_the_mesh_route_set_and_binding() {
     targets.sort();
     assert_eq!(
         targets,
-        vec![
-            ("ratings.default.svc.cluster.local", 8080),
-            ("reviews.default.svc.cluster.local", 8080)
-        ],
+        vec![(RATINGS, 8080), (REVIEWS, 8080)],
         "backends are Service hosts the data plane rebinds, never endpoint IPs"
     );
 
     let dispatch = dispatch_plugin(config, proxy);
     assert_eq!(dispatch.id, format!("istio-vs-mrd-{}", proxy.id));
-    assert_eq!(
-        dispatch.config["reject_unmatched"],
-        json!(true),
-        "a request matching no rule of the attached route is rejected"
-    );
+    assert_eq!(dispatch.config["reject_unmatched"], json!(true));
     assert!(
         !dispatch.config.to_string().contains("_ferrum_"),
         "internal precedence metadata is stripped"
     );
-
-    // GAMMA rejects requests no attached route matches: the paths the route
-    // does not claim get a `/` catch-all that aborts with 404, instead of
-    // falling through to the plain Service route.
-    let unmatched = catch_all(config).expect("unmatched catch-all");
-    assert_eq!(unmatched.listen_path.as_deref(), Some("/"));
-    assert_eq!(unmatched.hosts, vec!["reviews.default.svc.cluster.local"]);
-    let unmatched_rules = dispatch_plugin(config, unmatched).config["rules"]
-        .as_array()
-        .expect("rules")
-        .clone();
-    assert_eq!(unmatched_rules.len(), 1);
-    assert_eq!(unmatched_rules[0]["match"], json!({}));
+    MeshRouteDispatch::new(&dispatch.config).expect("the carried instance constructs");
+    let rules = dispatch_rules(config);
+    assert_eq!(rules.len(), 1);
     assert_eq!(
-        unmatched_rules[0]["fault"]["abort"]["status_code"],
-        json!(404)
+        rules[0]["match"]["uri"],
+        json!({"regex": "/api(/.*)?"}),
+        "PathPrefix keeps element-wise semantics"
     );
-    assert_eq!(
-        unmatched_rules[0]["fault"]["abort"]["percentage"],
-        json!(100.0)
-    );
+    assert_eq!(rules[0]["match"]["headers"], json!({"x-version": "v2"}));
 
     let binding =
         gamma_binding(config, "default", "gamma_default_reviews").expect("GAMMA mesh binding");
     assert_eq!(binding.export_to, vec!["*".to_string()], "producer route");
-    let mut bound = binding.proxy_ids.clone();
-    bound.sort();
-    let mut expected = vec![proxy.id.clone(), unmatched.id.clone()];
-    expected.sort();
-    assert_eq!(bound, expected);
+    assert_eq!(binding.proxy_ids, vec![proxy.id.clone()]);
 
     assert_eq!(
-        outcome(&translation, &route, "core/Service/default/reviews/*/*"),
+        outcome(&translation, &route, PARENT),
         Some(GammaParentOutcome::Programmed { producer: true })
     );
 }
@@ -328,6 +370,141 @@ fn producer_route_status_reports_the_service_parent_under_the_mesh_controller() 
     );
 }
 
+/// F2: a rule on a longer path never hides a matching rule on a shorter path
+/// or a regex path; a miss on every rule is rejected, never forwarded to the
+/// plain Service.
+#[tokio::test]
+async fn every_rule_of_the_service_is_evaluated_in_gateway_api_precedence() {
+    let route = http_route(
+        "default",
+        "reviews-route",
+        json!({
+            "parentRefs": [service_parent("reviews")],
+            "rules": [
+                {
+                    "matches": [{
+                        "path": {"type": "PathPrefix", "value": "/api"},
+                        "headers": [{"name": "x-version", "value": "v2"}]
+                    }],
+                    "backendRefs": [{"name": "ratings", "port": 8080}]
+                },
+                {
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/"}}],
+                    "backendRefs": [{"name": "reviews", "port": 8080}]
+                }
+            ]
+        }),
+    );
+    let regex_route = created_at(
+        http_route(
+            "default",
+            "reviews-regex",
+            json!({
+                "parentRefs": [service_parent("reviews")],
+                "rules": [{
+                    "matches": [{"path": {"type": "RegularExpression", "value": "/v[0-9]+/.*"}}],
+                    "backendRefs": [{"name": "ratings", "port": 8080}]
+                }]
+            }),
+        ),
+        NEWER,
+    );
+    let mut objects = base_services();
+    objects.push(route);
+    objects.push(regex_route);
+    let config = translate(&objects).config;
+
+    assert_eq!(
+        dispatch(&config, "GET", "/api/items", &[("x-version", "v2")]).await,
+        Dispatched::To(RATINGS.to_string()),
+        "the guarded /api rule serves a matching request"
+    );
+    assert_eq!(
+        dispatch(&config, "GET", "/api/items", &[]).await,
+        Dispatched::To(REVIEWS.to_string()),
+        "an /api request missing the header falls to the / rule, not a 404"
+    );
+    assert_eq!(
+        dispatch(&config, "GET", "/apix", &[("x-version", "v2")]).await,
+        Dispatched::To(REVIEWS.to_string()),
+        "PathPrefix /api never matches /apix"
+    );
+    // A regex rule from another route is evaluated after every prefix rule:
+    // the / prefix rule wins for /v1/x, as the router orders prefix before
+    // regex for Gateway-bound routes.
+    assert_eq!(
+        dispatch(&config, "GET", "/v1/x", &[]).await,
+        Dispatched::To(REVIEWS.to_string())
+    );
+}
+
+#[tokio::test]
+async fn a_regex_only_route_is_reachable_and_unmatched_requests_are_rejected() {
+    let route = http_route(
+        "default",
+        "reviews-regex",
+        json!({
+            "parentRefs": [service_parent("reviews")],
+            "rules": [{
+                "matches": [{"path": {"type": "RegularExpression", "value": "/v[0-9]+/.*"}}],
+                "backendRefs": [{"name": "ratings", "port": 8080}]
+            }]
+        }),
+    );
+    let mut objects = base_services();
+    objects.push(route);
+    let config = translate(&objects).config;
+    assert_eq!(
+        dispatch(&config, "GET", "/v2/items", &[]).await,
+        Dispatched::To(RATINGS.to_string())
+    );
+    assert_eq!(
+        dispatch(&config, "GET", "/other", &[]).await,
+        Dispatched::Rejected(404),
+        "GAMMA rejects a request no attached route matches"
+    );
+}
+
+#[test]
+fn identical_matches_are_served_by_the_oldest_route_in_any_snapshot_order() {
+    let path_route = |name: &str, backend: &str| {
+        http_route(
+            "default",
+            name,
+            json!({
+                "parentRefs": [service_parent("reviews")],
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/same"}}],
+                    "backendRefs": [{"name": backend, "port": 8080}]
+                }]
+            }),
+        )
+    };
+    let older = created_at(path_route("older", "reviews"), OLDER);
+    let newer = created_at(path_route("newer", "ratings"), NEWER);
+    for order in [
+        [older.clone(), newer.clone()],
+        [newer.clone(), older.clone()],
+    ] {
+        let mut objects = base_services();
+        objects.extend(order);
+        let translation = translate(&objects);
+        let rules = dispatch_rules(&translation.config);
+        assert_eq!(rules.len(), 2, "both rules are carried, ordered: {rules:?}");
+        assert_eq!(
+            rules[0]["destination"]["backend_host"],
+            json!(REVIEWS),
+            "the older route's identical match comes first"
+        );
+        for route in [&older, &newer] {
+            assert_eq!(
+                outcome(&translation, route, PARENT),
+                Some(GammaParentOutcome::Programmed { producer: true })
+            );
+        }
+    }
+}
+
 #[test]
 fn consumer_route_with_a_local_backend_is_namespace_local() {
     let route = http_route(
@@ -347,77 +524,52 @@ fn consumer_route_with_a_local_backend_is_namespace_local() {
     let translation = translate(&objects);
     let config = &translation.config;
 
-    let proxies = gamma_proxies(config);
-    assert_eq!(proxies.len(), 1);
+    let proxy = gamma_proxy(config);
     assert_eq!(
-        proxies[0].namespace, "clients",
+        proxy.namespace, "clients",
         "routes live in the route namespace"
     );
-    assert_eq!(proxies[0].hosts, vec!["reviews.default.svc.cluster.local"]);
+    assert_eq!(proxy.hosts[0], REVIEWS);
     let binding =
         gamma_binding(config, "clients", "gamma_default_reviews").expect("consumer binding");
     assert!(
         binding.export_to.is_empty(),
         "a consumer route applies only to clients in its own namespace"
     );
-    let dispatch = dispatch_plugin(config, proxies[0]);
     assert!(
-        dispatch.config.to_string().contains("request_timeout_ms"),
+        gamma_binding(config, "default", "gamma_default_reviews").is_none(),
+        "a consumer route never writes a binding another namespace receives"
+    );
+    let rules = dispatch_rules(config);
+    assert!(
+        rules[0].get("request_timeout_ms").is_some(),
         "rule timeouts ride the dispatch rule exactly as for a Gateway route"
     );
     assert_eq!(
-        outcome(&translation, &route, "core/Service/default/reviews/*/*"),
+        outcome(&translation, &route, PARENT),
         Some(GammaParentOutcome::Programmed { producer: false })
     );
 }
 
+/// Consumer routes need no ReferenceGrant for a cross-namespace backendRef
+/// (upstream GAMMA; the MESH-HTTP `MeshConsumerRoute` test relies on it). Until
+/// cross-namespace legs are carried (#7499) the route is accepted and `Pending`.
 #[test]
-fn cross_namespace_backend_needs_a_reference_grant_and_waits_for_cross_namespace_carriage() {
-    let route_spec = json!({
-        "parentRefs": [{"group": "", "kind": "Service", "name": "reviews", "namespace": "default"}],
-        "rules": [{"backendRefs": [{"name": "reviews", "namespace": "default", "port": 8080}]}]
-    });
-    let route = http_route("clients", "reviews-consumer", route_spec);
-
-    // No ReferenceGrant: the backend is refused exactly as on a Gateway route
-    // (fail-closed 500, ResolvedRefs=False/RefNotPermitted).
+fn consumer_route_cross_namespace_backend_needs_no_reference_grant() {
+    let route = http_route(
+        "clients",
+        "reviews-consumer",
+        json!({
+            "parentRefs": [{"group": "", "kind": "Service", "name": "reviews", "namespace": "default"}],
+            "rules": [{"backendRefs": [{"name": "reviews", "namespace": "default", "port": 8080}]}]
+        }),
+    );
     let mut objects = base_services();
     objects.push(route.clone());
     let translation = translate(&objects);
-    let proxies = gamma_proxies(&translation.config);
-    assert_eq!(proxies.len(), 1);
-    let dispatch = dispatch_plugin(&translation.config, proxies[0]);
-    assert!(
-        dispatch.config.to_string().contains("ReferenceGrant"),
-        "the unresolved share fails closed with the backendRef fault"
-    );
-    let parents = route_parents_status(&objects, "HTTPRoute", "reviews-consumer");
-    assert_condition(
-        mesh_parent(&parents),
-        "ResolvedRefs",
-        "False",
-        "RefNotPermitted",
-    );
-
-    // Granted: the backend resolves, but mesh data planes refuse a carried
-    // route with a cross-namespace destination until #7499 lands, so the
-    // route is accepted and reported Pending instead of being carried inert.
-    let grant = object(
-        "ReferenceGrant",
-        "gateway.networking.k8s.io/v1beta1",
-        "default",
-        "clients-to-reviews",
-        json!({
-            "from": [{"group": "gateway.networking.k8s.io", "kind": "HTTPRoute", "namespace": "clients"}],
-            "to": [{"group": "", "kind": "Service"}]
-        }),
-    );
-    objects.push(grant);
-    let translation = translate(&objects);
     assert!(gamma_proxies(&translation.config).is_empty());
-    assert!(gamma_binding(&translation.config, "clients", "gamma_default_reviews").is_none());
     assert!(matches!(
-        outcome(&translation, &route, "core/Service/default/reviews/*/*"),
+        outcome(&translation, &route, PARENT),
         Some(GammaParentOutcome::Pending { .. })
     ));
     let parents = route_parents_status(&objects, "HTTPRoute", "reviews-consumer");
@@ -425,6 +577,97 @@ fn cross_namespace_backend_needs_a_reference_grant_and_waits_for_cross_namespace
     assert_condition(parent, "Accepted", "True", "Accepted");
     assert_condition(parent, "ResolvedRefs", "True", "ResolvedRefs");
     assert_condition(parent, "Programmed", "False", "Pending");
+}
+
+/// A producer route redirects every client's traffic, so a backendRef into a
+/// third namespace needs that namespace's ReferenceGrant.
+#[test]
+fn producer_route_backend_in_another_namespace_needs_a_reference_grant() {
+    let route = http_route(
+        "default",
+        "reviews-producer",
+        json!({
+            "parentRefs": [service_parent("reviews")],
+            "rules": [{"backendRefs": [{"name": "proxy", "namespace": "clients", "port": 8080}]}]
+        }),
+    );
+    let mut objects = base_services();
+    objects.push(service("clients", "proxy", &[("http", 8080)]));
+    objects.push(route.clone());
+
+    let translation = translate(&objects);
+    let rules = dispatch_rules(&translation.config);
+    assert!(
+        rules[0].to_string().contains("ReferenceGrant"),
+        "the ungranted share fails closed with the backendRef 500 fault"
+    );
+    let parents = route_parents_status(&objects, "HTTPRoute", "reviews-producer");
+    assert_condition(
+        mesh_parent(&parents),
+        "ResolvedRefs",
+        "False",
+        "RefNotPermitted",
+    );
+
+    objects.push(object(
+        "ReferenceGrant",
+        "gateway.networking.k8s.io/v1beta1",
+        "clients",
+        "default-to-proxy",
+        json!({
+            "from": [{"group": "gateway.networking.k8s.io", "kind": "HTTPRoute", "namespace": "default"}],
+            "to": [{"group": "", "kind": "Service"}]
+        }),
+    ));
+    let translation = translate(&objects);
+    assert!(gamma_proxies(&translation.config).is_empty());
+    assert!(matches!(
+        outcome(&translation, &route, PARENT),
+        Some(GammaParentOutcome::Pending { .. })
+    ));
+    let parents = route_parents_status(&objects, "HTTPRoute", "reviews-producer");
+    assert_condition(
+        mesh_parent(&parents),
+        "ResolvedRefs",
+        "True",
+        "ResolvedRefs",
+    );
+}
+
+/// A consumer route can never route to a Service the control plane does not
+/// expose (outside its namespaces, so outside every data plane's `ns`
+/// ceiling): the share fails closed.
+#[test]
+fn consumer_route_to_a_target_outside_the_watch_scope_is_refused() {
+    let route = http_route(
+        "clients",
+        "reviews-elsewhere",
+        json!({
+            "parentRefs": [{"group": "", "kind": "Service", "name": "reviews", "namespace": "default"}],
+            "rules": [{"backendRefs": [{"name": "hidden", "namespace": "elsewhere", "port": 8080}]}]
+        }),
+    );
+    // `elsewhere` is outside this control plane's namespaces, so its Service
+    // never enters the inventory a data plane could be handed.
+    let mut objects = base_services();
+    objects.push(route.clone());
+    let translation = translate(&objects);
+    let rules = dispatch_rules(&translation.config);
+    assert!(
+        rules[0]["fault"]["abort"]["status_code"] == json!(500),
+        "an unexposed target is unroutable: {rules:?}"
+    );
+    assert!(
+        !rules[0].to_string().contains("hidden.elsewhere"),
+        "the unexposed Service is never a destination"
+    );
+    let parents = route_parents_status(&objects, "HTTPRoute", "reviews-elsewhere");
+    assert_condition(
+        mesh_parent(&parents),
+        "ResolvedRefs",
+        "False",
+        "BackendNotFound",
+    );
 }
 
 #[test]
@@ -468,6 +711,10 @@ fn unresolvable_service_parents_are_refused_with_no_matching_parent() {
             "section-port-disagree",
             json!({"group": "", "kind": "Service", "name": "multi", "sectionName": "http", "port": 9090}),
         ),
+        (
+            "non-http-port",
+            json!({"group": "", "kind": "Service", "name": "multi", "sectionName": "db"}),
+        ),
     ];
     for (name, parent_ref) in cases {
         let route = http_route(
@@ -482,7 +729,7 @@ fn unresolvable_service_parents_are_refused_with_no_matching_parent() {
         objects.push(service(
             "default",
             "multi",
-            &[("http", 8080), ("admin", 9090)],
+            &[("http", 8080), ("http-admin", 9090), ("db", 5432)],
         ));
         objects.push(headless.clone());
         objects.push(external.clone());
@@ -492,7 +739,7 @@ fn unresolvable_service_parents_are_refused_with_no_matching_parent() {
             gamma_proxies(&translation.config).is_empty(),
             "{name}: nothing is carried"
         );
-        let key = ferrum_edge_gamma_key(&parent_ref);
+        let key = default_parent_key(&parent_ref);
         assert!(
             matches!(
                 outcome(&translation, &route, &key),
@@ -510,7 +757,7 @@ fn unresolvable_service_parents_are_refused_with_no_matching_parent() {
 
 /// The parent key translation records an outcome under, for a parentRef in
 /// the `default` namespace.
-fn ferrum_edge_gamma_key(parent_ref: &Value) -> String {
+fn default_parent_key(parent_ref: &Value) -> String {
     let name = parent_ref["name"].as_str().unwrap_or("*");
     let section = parent_ref["sectionName"].as_str().unwrap_or("*");
     let port = parent_ref["port"]
@@ -550,6 +797,106 @@ fn unsupported_filters_refuse_the_route_with_the_gateway_route_reason() {
     assert_condition(parent, "Programmed", "False", "TranslationFailed");
 }
 
+/// F8: an unsupported match predicate on any rule refuses the Service parent
+/// instead of being dropped while a supported sibling keeps it programmed.
+#[test]
+fn unsupported_match_predicates_refuse_the_service_parent() {
+    let route = http_route(
+        "default",
+        "regex-header",
+        json!({
+            "parentRefs": [service_parent("reviews")],
+            "rules": [
+                {
+                    "matches": [{"headers": [{"name": "x-a", "value": "1"}]}],
+                    "backendRefs": [{"name": "reviews", "port": 8080}]
+                },
+                {
+                    "matches": [{"headers": [{"type": "RegularExpression", "name": "x-b", "value": "v.*"}]}],
+                    "backendRefs": [{"name": "ratings", "port": 8080}]
+                }
+            ]
+        }),
+    );
+    let mut objects = base_services();
+    objects.push(route.clone());
+    let translation = translate(&objects);
+    assert!(gamma_proxies(&translation.config).is_empty());
+    assert!(matches!(
+        outcome(&translation, &route, PARENT),
+        Some(GammaParentOutcome::UnsupportedValue { .. })
+    ));
+    let parents = route_parents_status(&objects, "HTTPRoute", "regex-header");
+    assert_condition(
+        mesh_parent(&parents),
+        "Accepted",
+        "False",
+        "UnsupportedValue",
+    );
+}
+
+/// F10: an authority rewrite the Sidecar data plane would drop is refused, not
+/// advertised as programmed.
+#[test]
+fn hostname_rewrites_must_name_the_single_backend_service() {
+    let rewrite_route = |name: &str, hostname: &str| {
+        http_route(
+            "default",
+            name,
+            json!({
+                "parentRefs": [service_parent("reviews")],
+                "rules": [{
+                    "filters": [{"type": "URLRewrite", "urlRewrite": {"hostname": hostname}}],
+                    "backendRefs": [{"name": "ratings", "port": 8080}]
+                }]
+            }),
+        )
+    };
+    let foreign = rewrite_route("foreign", "api.example.com");
+    let mut objects = base_services();
+    objects.push(foreign.clone());
+    let translation = translate(&objects);
+    assert!(gamma_proxies(&translation.config).is_empty());
+    assert!(matches!(
+        outcome(&translation, &foreign, PARENT),
+        Some(GammaParentOutcome::UnsupportedValue { .. })
+    ));
+
+    let own = rewrite_route("own", "ratings.default.svc.cluster.local");
+    let mut objects = base_services();
+    objects.push(own.clone());
+    let translation = translate(&objects);
+    assert_eq!(
+        outcome(&translation, &own, PARENT),
+        Some(GammaParentOutcome::Programmed { producer: true })
+    );
+}
+
+/// F11: a matching HTTP rule with no backend and no answering filter returns a
+/// 500; it never falls through to the plain Service.
+#[test]
+fn a_rule_without_backends_answers_500() {
+    let route = http_route(
+        "default",
+        "no-backend",
+        json!({
+            "parentRefs": [service_parent("reviews")],
+            "rules": [{"matches": [{"path": {"type": "PathPrefix", "value": "/api"}}]}]
+        }),
+    );
+    let mut objects = base_services();
+    objects.push(route.clone());
+    let translation = translate(&objects);
+    let rules = dispatch_rules(&translation.config);
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0]["fault"]["abort"]["status_code"], json!(500));
+    assert_eq!(rules[0]["fault"]["abort"]["percentage"], json!(100.0));
+    assert_eq!(
+        outcome(&translation, &route, PARENT),
+        Some(GammaParentOutcome::Programmed { producer: true })
+    );
+}
+
 #[test]
 fn session_persistence_is_refused_for_the_service_parent() {
     let route = http_route(
@@ -568,33 +915,33 @@ fn session_persistence_is_refused_for_the_service_parent() {
     let translation = translate(&objects);
     assert!(gamma_proxies(&translation.config).is_empty());
     assert!(matches!(
-        outcome(&translation, &route, "core/Service/default/reviews/*/*"),
+        outcome(&translation, &route, PARENT),
         Some(GammaParentOutcome::UnsupportedValue { .. })
     ));
-    let parents = route_parents_status(&objects, "HTTPRoute", "sticky");
-    assert_condition(
-        mesh_parent(&parents),
-        "Accepted",
-        "False",
-        "UnsupportedValue",
-    );
 }
 
-#[test]
-fn a_mesh_bound_virtual_service_takes_precedence_over_gamma_routes() {
-    let virtual_service = object(
+fn reviews_virtual_service(export_to: Option<Value>) -> K8sObject {
+    let mut spec = json!({
+        "hosts": ["reviews"],
+        "http": [{"route": [{"destination": {"host": "reviews", "port": {"number": 8080}}}]}]
+    });
+    if let Some(export_to) = export_to {
+        spec["exportTo"] = export_to;
+    }
+    object(
         "VirtualService",
         "networking.istio.io/v1",
         "default",
         "reviews-vs",
-        json!({
-            "hosts": ["reviews"],
-            "http": [{"route": [{"destination": {"host": "reviews", "port": {"number": 8080}}}]}]
-        }),
-    );
+        spec,
+    )
+}
+
+#[test]
+fn a_mesh_bound_virtual_service_takes_precedence_over_gamma_routes() {
     let route = http_route("default", "reviews-route", split_route_spec());
     let mut objects = base_services();
-    objects.push(virtual_service);
+    objects.push(reviews_virtual_service(None));
     objects.push(route.clone());
     let translation = translate(&objects);
     let config = &translation.config;
@@ -607,13 +954,7 @@ fn a_mesh_bound_virtual_service_takes_precedence_over_gamma_routes() {
             .any(|binding| binding.name == "reviews-vs"),
         "the VirtualService binding is untouched"
     );
-    assert!(
-        !mesh
-            .virtual_service_http_routes
-            .iter()
-            .any(|binding| binding.name.starts_with("gamma_"))
-    );
-    let lost = outcome(&translation, &route, "core/Service/default/reviews/*/*");
+    let lost = outcome(&translation, &route, PARENT);
     let Some(GammaParentOutcome::Conflicted { message }) = lost else {
         panic!("the GAMMA route loses: {lost:?}");
     };
@@ -626,211 +967,111 @@ fn a_mesh_bound_virtual_service_takes_precedence_over_gamma_routes() {
     assert_condition(parent, "Conflicted", "True", "Conflicted");
 }
 
+/// F9: a VirtualService the route namespace's clients never receive (its
+/// `exportTo` excludes its own namespace) does not suppress the GAMMA route.
 #[test]
-fn grpc_route_wins_over_http_route_on_the_same_service() {
-    let grpc = object(
-        "GRPCRoute",
-        HTTP_ROUTE_API,
-        "default",
-        "reviews-grpc",
-        json!({
-            "parentRefs": [service_parent("reviews")],
-            "rules": [{
-                "matches": [{"method": {"service": "reviews.v1.Reviews", "method": "Get"}}],
-                "backendRefs": [{"name": "reviews", "port": 8080}]
-            }]
-        }),
-    );
-    let http = created_at(
-        http_route("default", "reviews-http", split_route_spec()),
-        OLDER,
-    );
+fn an_unexported_virtual_service_does_not_suppress_gamma() {
+    let route = http_route("default", "reviews-route", split_route_spec());
     let mut objects = base_services();
-    objects.push(created_at(grpc.clone(), NEWER));
-    objects.push(http.clone());
+    objects.push(reviews_virtual_service(Some(json!(["other"]))));
+    objects.push(route.clone());
     let translation = translate(&objects);
-
-    let proxies = route_proxies(&translation.config);
-    assert!(!proxies.is_empty());
-    assert!(
-        proxies
-            .iter()
-            .all(|proxy| proxy.id.starts_with("istio-vs-gamma_grpcroute-")),
-        "only the GRPCRoute is carried"
-    );
-    assert!(matches!(
-        outcome(&translation, &http, "core/Service/default/reviews/*/*"),
-        Some(GammaParentOutcome::Conflicted { .. })
-    ));
+    assert_eq!(gamma_proxies(&translation.config).len(), 1);
     assert_eq!(
-        outcome(
-            &translation,
-            &created_at(grpc, NEWER),
-            "core/Service/default/reviews/*/*"
-        ),
+        outcome(&translation, &route, PARENT),
         Some(GammaParentOutcome::Programmed { producer: true })
     );
 }
 
 #[test]
-fn routes_on_one_service_merge_and_the_oldest_keeps_an_identical_match() {
-    let path_route = |name: &str, path: &str, backend: &str| {
-        http_route(
+fn grpc_route_wins_over_http_route_on_the_same_port() {
+    let grpc = created_at(
+        grpc_route(
             "default",
-            name,
+            "reviews-grpc",
             json!({
                 "parentRefs": [service_parent("reviews")],
                 "rules": [{
-                    "matches": [{"path": {"type": "PathPrefix", "value": path}}],
-                    "backendRefs": [{"name": backend, "port": 8080}]
+                    "matches": [{"method": {"service": "reviews.v1.Reviews", "method": "Get"}}],
+                    "backendRefs": [{"name": "reviews", "port": 8080}]
                 }]
             }),
-        )
-    };
-
-    // Distinct paths: both routes are carried under one binding.
-    let a = created_at(path_route("route-a", "/a", "reviews"), OLDER);
-    let b = created_at(path_route("route-b", "/b", "ratings"), NEWER);
-    let mut objects = base_services();
-    objects.push(b.clone());
-    objects.push(a.clone());
-    let translation = translate(&objects);
-    let binding = gamma_binding(&translation.config, "default", "gamma_default_reviews")
-        .expect("one binding per Service");
-    assert_eq!(
-        binding.proxy_ids.len(),
-        3,
-        "both routes plus the unmatched catch-all"
+        ),
+        NEWER,
     );
-    for route in [&a, &b] {
-        assert_eq!(
-            outcome(&translation, route, "core/Service/default/reviews/*/*"),
-            Some(GammaParentOutcome::Programmed { producer: true })
-        );
-    }
-
-    // Identical match: the older route keeps it, whatever the snapshot order.
-    let older = created_at(path_route("older", "/same", "reviews"), OLDER);
-    let newer = created_at(path_route("newer", "/same", "ratings"), NEWER);
-    for order in [
-        [older.clone(), newer.clone()],
-        [newer.clone(), older.clone()],
-    ] {
-        let mut objects = base_services();
-        objects.extend(order);
-        let translation = translate(&objects);
-        let proxies: Vec<&Proxy> = route_proxies(&translation.config)
-            .into_iter()
-            .filter(|proxy| proxy.listen_path.as_deref() == Some("/same"))
-            .collect();
-        assert_eq!(proxies.len(), 1, "one slot, one proxy");
-        assert_eq!(
-            proxies[0].backend_host, "reviews.default.svc.cluster.local",
-            "the older route's backend serves the shared match"
-        );
-        assert_eq!(
-            outcome(&translation, &older, "core/Service/default/reviews/*/*"),
-            Some(GammaParentOutcome::Programmed { producer: true })
-        );
-        assert!(matches!(
-            outcome(&translation, &newer, "core/Service/default/reviews/*/*"),
-            Some(GammaParentOutcome::Conflicted { .. })
-        ));
-    }
+    let http = http_route("default", "reviews-http", split_route_spec());
+    let mut objects = base_services();
+    objects.push(grpc.clone());
+    objects.push(http.clone());
+    let translation = translate(&objects);
+    assert!(matches!(
+        outcome(&translation, &http, PARENT),
+        Some(GammaParentOutcome::Conflicted { .. })
+    ));
+    assert_eq!(
+        outcome(&translation, &grpc, PARENT),
+        Some(GammaParentOutcome::Programmed { producer: true })
+    );
+    assert!(
+        dispatch_rules(&translation.config)
+            .iter()
+            .all(|rule| rule["match"]["headers"]["content-type"].is_object()),
+        "only the GRPCRoute's rules are carried"
+    );
 }
 
+/// F5: an HTTPRoute loses only the ports a GRPCRoute claims; its other
+/// parentRef keeps serving.
 #[test]
-fn a_port_scoped_parent_guards_every_rule_and_passes_other_ports_through() {
-    for parent_ref in [
-        json!({"group": "", "kind": "Service", "name": "multi", "port": 8080}),
-        json!({"group": "", "kind": "Service", "name": "multi", "sectionName": "http"}),
-    ] {
-        let route = http_route(
-            "default",
-            "multi-route",
-            json!({
-                "parentRefs": [parent_ref],
-                "rules": [{"backendRefs": [{"name": "reviews", "port": 8080}]}]
-            }),
-        );
-        let mut objects = base_services();
-        objects.push(service(
-            "default",
-            "multi",
-            &[("http", 8080), ("admin", 9090)],
-        ));
-        objects.push(route);
-        let translation = translate(&objects);
-        let config = &translation.config;
-        let proxies = gamma_proxies(config);
-        assert_eq!(proxies.len(), 1, "the route owns `/`, so no catch-all");
-        let dispatch = dispatch_plugin(config, proxies[0]);
-        assert_eq!(dispatch.config["reject_unmatched"], json!(true));
-        let rules = dispatch.config["rules"].as_array().expect("rules");
-        let ports: Vec<u64> = rules
-            .iter()
-            .map(|rule| {
-                rule["match"]["port"]
-                    .as_u64()
-                    .expect("every rule is port-guarded")
-            })
-            .collect();
-        assert!(ports.contains(&8080), "the route's own port: {rules:?}");
-        let pass_through = rules
-            .iter()
-            .find(|rule| rule["match"]["port"] == json!(9090))
-            .expect("the unattached port passes through");
-        assert_eq!(
-            pass_through["destination"]["backend_host"],
-            json!("multi.default.svc.cluster.local")
-        );
-        assert_eq!(pass_through["destination"]["backend_port"], json!(9090));
-    }
-}
-
-#[test]
-fn a_parent_port_covering_every_service_port_is_unscoped() {
-    let route = http_route(
+fn port_overlap_with_a_grpc_route_withdraws_only_the_overlapping_parent() {
+    let multi = service("default", "multi", &[("http", 8080), ("http-admin", 9090)]);
+    let http = http_route(
         "default",
-        "reviews-route",
+        "multi-http",
         json!({
-            "parentRefs": [{"group": "", "kind": "Service", "name": "reviews", "port": 8080}],
+            "parentRefs": [
+                {"group": "", "kind": "Service", "name": "multi", "sectionName": "http"},
+                {"group": "", "kind": "Service", "name": "multi", "sectionName": "http-admin"}
+            ],
             "rules": [{"backendRefs": [{"name": "reviews", "port": 8080}]}]
         }),
     );
+    let grpc = grpc_route(
+        "default",
+        "multi-grpc",
+        json!({
+            "parentRefs": [{"group": "", "kind": "Service", "name": "multi", "sectionName": "http"}],
+            "rules": [{"backendRefs": [{"name": "ratings", "port": 8080}]}]
+        }),
+    );
     let mut objects = base_services();
-    objects.push(route);
+    objects.push(multi);
+    objects.push(http.clone());
+    objects.push(grpc.clone());
     let translation = translate(&objects);
-    let proxies = gamma_proxies(&translation.config);
-    assert_eq!(proxies.len(), 1);
-    assert!(
-        !translation
-            .config
-            .plugin_configs
-            .iter()
-            .any(
-                |plugin| plugin.proxy_id.as_deref() == Some(proxies[0].id.as_str())
-                    && plugin.config.to_string().contains("\"port\"")
-            ),
-        "a single-port Service needs no port predicate"
+    assert!(matches!(
+        outcome(&translation, &http, "core/Service/default/multi/http/*"),
+        Some(GammaParentOutcome::Conflicted { .. })
+    ));
+    assert_eq!(
+        outcome(
+            &translation,
+            &http,
+            "core/Service/default/multi/http-admin/*"
+        ),
+        Some(GammaParentOutcome::Programmed { producer: true })
     );
-}
-
-#[test]
-fn deleting_the_route_withdraws_the_mesh_route_set() {
-    let mut objects = base_services();
-    objects.push(http_route("default", "reviews-route", split_route_spec()));
-    assert!(!gamma_proxies(&translate(&objects).config).is_empty());
-    let withdrawn = translate(&base_services());
-    assert!(gamma_proxies(&withdrawn.config).is_empty());
+    let rules = dispatch_rules(&translation.config);
     assert!(
-        withdrawn
-            .config
-            .upstreams
-            .iter()
-            .all(|upstream| !upstream.id.starts_with("istio-vs-upstream-gamma_"))
+        rules.iter().any(|rule| rule["match"]["port"] == json!(9090)
+            && rule["destination"]["backend_host"] == json!(REVIEWS)),
+        "the HTTPRoute keeps serving its admin port: {rules:?}"
     );
-    assert!(withdrawn.gamma_route_parents.is_empty());
+    assert!(
+        !rules.iter().any(|rule| rule["match"]["port"] == json!(8080)
+            && rule["destination"]["backend_host"] == json!(REVIEWS)),
+        "the HTTPRoute never answers on the GRPCRoute's port"
+    );
 }
 
 #[test]
@@ -843,9 +1084,7 @@ fn http_and_grpc_routes_on_disjoint_ports_of_one_service_both_serve() {
             "rules": [{"backendRefs": [{"name": "reviews", "port": 8080}]}]
         }),
     );
-    let grpc = object(
-        "GRPCRoute",
-        HTTP_ROUTE_API,
+    let grpc = grpc_route(
         "default",
         "multi-grpc",
         json!({
@@ -866,9 +1105,6 @@ fn http_and_grpc_routes_on_disjoint_ports_of_one_service_both_serve() {
         objects.extend(order);
         let translation = translate(&objects);
         let config = &translation.config;
-
-        // GEP-1294 only refuses a route type on a Service+port pair another
-        // type also claims; disjoint ports keep both.
         assert_eq!(
             outcome(&translation, &http, "core/Service/default/multi/*/8080"),
             Some(GammaParentOutcome::Programmed { producer: true })
@@ -877,57 +1113,229 @@ fn http_and_grpc_routes_on_disjoint_ports_of_one_service_both_serve() {
             outcome(&translation, &grpc, "core/Service/default/multi/*/9090"),
             Some(GammaParentOutcome::Programmed { producer: true })
         );
-
-        let proxies = route_proxies(config);
-        assert!(!proxies.is_empty());
-        let mut rules: Vec<Value> = Vec::new();
-        for proxy in &proxies {
-            let dispatch = dispatch_plugin(config, proxy);
-            assert_eq!(dispatch.config["reject_unmatched"], json!(true));
-            // Every carried instance must construct, merged slot included.
-            ferrum_edge::plugins::mesh_route_dispatch::MeshRouteDispatch::new(&dispatch.config)
-                .expect("merged dispatch instance constructs");
-            rules.extend(
-                dispatch.config["rules"]
-                    .as_array()
-                    .expect("rules")
-                    .iter()
-                    .cloned(),
-            );
-        }
-        let to_backend =
-            |rule: &Value, host: &str| rule["destination"]["backend_host"] == json!(host);
+        let proxy = gamma_proxy(config);
+        let dispatch = dispatch_plugin(config, proxy);
+        MeshRouteDispatch::new(&dispatch.config).expect("the shared instance constructs");
+        let rules = dispatch_rules(config);
         assert!(
             rules.iter().all(|rule| rule["match"]["port"].is_u64()),
             "every rule is port-guarded, so the two route tables never mix: {rules:?}"
         );
-        assert!(
-            rules.iter().any(|rule| rule["match"]["port"] == json!(8080)
-                && to_backend(rule, "reviews.default.svc.cluster.local")),
-            "the HTTPRoute serves port 8080: {rules:?}"
-        );
-        assert!(
-            rules.iter().any(|rule| rule["match"]["port"] == json!(9090)
-                && to_backend(rule, "ratings.default.svc.cluster.local")),
-            "the GRPCRoute serves port 9090: {rules:?}"
-        );
+        assert!(rules.iter().any(|rule| rule["match"]["port"] == json!(8080)
+            && rule["destination"]["backend_host"] == json!(REVIEWS)));
+        assert!(rules.iter().any(|rule| rule["match"]["port"] == json!(9090)
+            && rule["destination"]["backend_host"] == json!(RATINGS)));
         assert!(
             !rules.iter().any(|rule| rule["match"]["port"] == json!(8080)
-                && to_backend(rule, "ratings.default.svc.cluster.local")),
-            "the GRPCRoute never answers on the HTTPRoute's port"
+                && rule["destination"]["backend_host"] == json!(RATINGS))
         );
         assert!(
             !rules.iter().any(|rule| rule["match"]["port"] == json!(9090)
-                && to_backend(rule, "reviews.default.svc.cluster.local")),
-            "the HTTPRoute never answers on the GRPCRoute's port"
+                && rule["destination"]["backend_host"] == json!(REVIEWS))
         );
-        let mut slots: Vec<(&str, Option<&str>)> = gamma_proxies(config)
-            .iter()
-            .map(|proxy| (proxy.namespace.as_str(), proxy.listen_path.as_deref()))
-            .collect();
-        let total = slots.len();
-        slots.sort();
-        slots.dedup();
-        assert_eq!(slots.len(), total, "no duplicate route slot");
     }
+}
+
+#[test]
+fn a_port_scoped_parent_guards_every_rule_and_passes_other_http_ports_through() {
+    for parent_ref in [
+        json!({"group": "", "kind": "Service", "name": "multi", "port": 8080}),
+        json!({"group": "", "kind": "Service", "name": "multi", "sectionName": "http"}),
+    ] {
+        let route = http_route(
+            "default",
+            "multi-route",
+            json!({
+                "parentRefs": [parent_ref],
+                "rules": [{"backendRefs": [{"name": "reviews", "port": 8080}]}]
+            }),
+        );
+        let mut objects = base_services();
+        objects.push(service(
+            "default",
+            "multi",
+            &[("http", 8080), ("http-admin", 9090), ("db", 5432)],
+        ));
+        objects.push(route);
+        let config = translate(&objects).config;
+        let rules = dispatch_rules(&config);
+        assert!(
+            rules.iter().all(|rule| rule["match"]["port"].is_u64()),
+            "every rule is port-guarded: {rules:?}"
+        );
+        assert_eq!(
+            rules[0]["match"]["port"],
+            json!(8080),
+            "the route's own port first"
+        );
+        let pass_through = rules
+            .iter()
+            .find(|rule| rule["match"]["port"] == json!(9090))
+            .expect("the unattached HTTP port passes through");
+        assert_eq!(
+            pass_through["destination"]["backend_host"],
+            json!("multi.default.svc.cluster.local")
+        );
+        assert_eq!(pass_through["destination"]["backend_port"], json!(9090));
+        assert!(
+            !rules
+                .iter()
+                .any(|rule| rule["match"]["port"] == json!(5432)),
+            "a non-HTTP port gets no HTTP pass-through"
+        );
+    }
+}
+
+#[test]
+fn a_parent_port_covering_every_http_port_is_unscoped() {
+    let route = http_route(
+        "default",
+        "reviews-route",
+        json!({
+            "parentRefs": [{"group": "", "kind": "Service", "name": "reviews", "port": 8080}],
+            "rules": [{"backendRefs": [{"name": "reviews", "port": 8080}]}]
+        }),
+    );
+    let mut objects = base_services();
+    objects.push(route);
+    let rules = dispatch_rules(&translate(&objects).config);
+    assert!(
+        rules.iter().all(|rule| rule["match"].get("port").is_none()),
+        "a single-port Service needs no port predicate: {rules:?}"
+    );
+}
+
+/// F6: a Gateway parent the route cannot attach to never withdraws its
+/// independent Service attachment.
+#[test]
+fn a_refused_gateway_parent_keeps_the_service_attachment() {
+    let route = http_route(
+        "default",
+        "both-parents",
+        json!({
+            "parentRefs": [
+                {"name": "missing-gateway", "sectionName": "http"},
+                service_parent("reviews")
+            ],
+            "rules": [{"backendRefs": [{"name": "reviews", "port": 8080}]}]
+        }),
+    );
+    let mut objects = base_services();
+    objects.push(route.clone());
+    let (translation, skipped) =
+        translate_k8s_objects_collecting_skips(&objects, options()).expect("translation");
+    assert!(
+        !skipped.contains_key(&K8sResourceKey::from_object(&route)),
+        "the route is not refused as a whole"
+    );
+    assert_eq!(
+        outcome(&translation, &route, PARENT),
+        Some(GammaParentOutcome::Programmed { producer: true })
+    );
+    let parents = route_parents_status(&objects, "HTTPRoute", "both-parents");
+    assert_condition(mesh_parent(&parents), "Accepted", "True", "Accepted");
+}
+
+/// F7: two Service attachments of one route can never derive one id.
+#[test]
+fn distinct_service_attachments_get_distinct_ids() {
+    let route = http_route(
+        "default",
+        "two-services",
+        json!({
+            "parentRefs": [service_parent("app"), service_parent("app-0")],
+            "rules": [
+                {
+                    "matches": [
+                        {"path": {"type": "PathPrefix", "value": "/a"}},
+                        {"path": {"type": "PathPrefix", "value": "/b"}}
+                    ],
+                    "backendRefs": [{"name": "reviews", "port": 8080}, {"name": "ratings", "port": 8080}]
+                },
+                {"backendRefs": [{"name": "reviews", "port": 8080}, {"name": "ratings", "port": 8080}]}
+            ]
+        }),
+    );
+    let mut objects = base_services();
+    objects.push(service("default", "app", &[("http", 8080)]));
+    objects.push(service("default", "app-0", &[("http", 8080)]));
+    objects.push(route);
+    let config = translate(&objects).config;
+    let mut proxy_ids: Vec<&str> = gamma_proxies(&config)
+        .iter()
+        .map(|proxy| proxy.id.as_str())
+        .collect();
+    assert_eq!(proxy_ids.len(), 2, "one route per Service");
+    proxy_ids.sort();
+    proxy_ids.dedup();
+    assert_eq!(proxy_ids.len(), 2);
+    let mut upstream_ids: Vec<&str> = config
+        .upstreams
+        .iter()
+        .filter(|upstream| upstream.id.starts_with("istio-vs-upstream-gamma_"))
+        .map(|upstream| upstream.id.as_str())
+        .collect();
+    assert_eq!(upstream_ids.len(), 4, "two rules for each of two Services");
+    upstream_ids.sort();
+    upstream_ids.dedup();
+    assert_eq!(upstream_ids.len(), 4, "no id is derived twice");
+}
+
+/// F12: Ferrum's parent entries never push `status.parents` past the schema
+/// bound of 32, and never displace another controller's entries.
+#[test]
+fn route_status_parents_stay_within_the_schema_bound() {
+    let mut parent_refs = vec![service_parent("reviews")];
+    for index in 0..4 {
+        parent_refs
+            .push(json!({"group": "", "kind": "Service", "name": format!("missing-{index}")}));
+    }
+    let mut route = http_route(
+        "default",
+        "crowded",
+        json!({
+            "parentRefs": parent_refs,
+            "rules": [{"backendRefs": [{"name": "reviews", "port": 8080}]}]
+        }),
+    );
+    let foreign: Vec<Value> = (0..30)
+        .map(|index| {
+            json!({
+                "parentRef": {"group": "", "kind": "Service", "name": format!("other-{index}")},
+                "controllerName": "example.com/other-mesh",
+                "conditions": []
+            })
+        })
+        .collect();
+    route.status = json!({"parents": foreign});
+    let mut objects = base_services();
+    objects.push(route);
+    let status = route_status(&objects, "HTTPRoute", "crowded");
+    let parents = status["parents"].as_array().expect("parents");
+    assert!(parents.len() <= 32, "{} parents", parents.len());
+    assert_eq!(
+        parents
+            .iter()
+            .filter(|parent| parent["controllerName"] == json!("example.com/other-mesh"))
+            .count(),
+        30,
+        "every other controller's entry is kept"
+    );
+}
+
+#[test]
+fn deleting_the_route_withdraws_the_mesh_route() {
+    let mut objects = base_services();
+    objects.push(http_route("default", "reviews-route", split_route_spec()));
+    assert!(!gamma_proxies(&translate(&objects).config).is_empty());
+    let withdrawn = translate(&base_services());
+    assert!(gamma_proxies(&withdrawn.config).is_empty());
+    assert!(
+        withdrawn
+            .config
+            .upstreams
+            .iter()
+            .all(|upstream| !upstream.id.starts_with("istio-vs-upstream-gamma_"))
+    );
+    assert!(withdrawn.gamma_route_parents.is_empty());
 }

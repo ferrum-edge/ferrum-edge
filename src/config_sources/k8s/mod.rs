@@ -1118,6 +1118,15 @@ pub(crate) struct K8sAccumulator {
     /// (`spec.clusterIP: None`). A headless Service has no frontend, so it is
     /// never a GAMMA route parent (issue #7538).
     headless_services: HashSet<(String, String)>,
+    /// `(namespace, name)` → the Service ports mesh data planes route HTTP on
+    /// (`modes::mesh::is_http_family_mesh_protocol` over the same port
+    /// classification the mesh Service inventory uses), for GAMMA port scoping.
+    pub(crate) service_http_family_ports:
+        HashMap<(String, String), std::collections::BTreeSet<u16>>,
+    /// `(namespace, name)` → the Service's IPv4 cluster IPs, which a GAMMA
+    /// route also answers on (a client may address the Service frontend by
+    /// its cluster IP).
+    pub(crate) service_cluster_ipv4s: HashMap<(String, String), Vec<String>>,
     /// GAMMA `(route, Service)` attachments admitted in the per-object pass,
     /// awaiting snapshot-wide precedence in `gateway_api::finalize_gamma_routes`.
     pub(crate) gamma_staged_routes: Vec<gateway_api::gamma::GammaStagedRoute>,
@@ -1275,6 +1284,8 @@ impl K8sAccumulator {
             external_name_services: HashSet::new(),
             selectorless_services: HashSet::new(),
             headless_services: HashSet::new(),
+            service_http_family_ports: HashMap::new(),
+            service_cluster_ipv4s: HashMap::new(),
             gamma_staged_routes: Vec::new(),
             gamma_route_parents: HashMap::new(),
             endpoint_slice_guard: backend_ref::EndpointSliceGuard::default(),
@@ -2745,6 +2756,41 @@ pub(crate) fn collect_service(
                 truncated: port_specs_truncated,
             },
         );
+    let service_key = (
+        object.metadata.namespace.clone(),
+        object.metadata.name.clone(),
+    );
+    let http_family_ports: std::collections::BTreeSet<u16> = ports
+        .iter()
+        .filter(|port_entry| {
+            crate::modes::mesh::is_http_family_mesh_protocol(core::service_app_protocol(
+                port_entry,
+                string_field(port_entry, "name"),
+            ))
+        })
+        .filter_map(|port_entry| port_entry.get("port").and_then(Value::as_u64))
+        .filter_map(|port| u16::try_from(port).ok())
+        .collect();
+    acc.service_http_family_ports
+        .insert(service_key.clone(), http_family_ports);
+    let mut cluster_ipv4s: Vec<String> = string_field(&object.spec, "clusterIP")
+        .into_iter()
+        .chain(
+            object
+                .spec
+                .get("clusterIPs")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str),
+        )
+        .filter_map(|address| address.parse::<std::net::Ipv4Addr>().ok())
+        .filter(|address| !address.is_unspecified())
+        .map(|address| address.to_string())
+        .collect();
+    cluster_ipv4s.sort();
+    cluster_ipv4s.dedup();
+    acc.service_cluster_ipv4s.insert(service_key, cluster_ipv4s);
     if string_field(&object.spec, "clusterIP") == Some("None") {
         acc.headless_services.insert((
             object.metadata.namespace.clone(),

@@ -7854,7 +7854,7 @@ fn sni_passthrough_destination_rule_view(dr: &MeshDestinationRule) -> MeshDestin
 /// `Udp` is a distinct L4 transport with its own datagram capture/egress lane.
 /// Neither is HTTP-family — only `Udp` is also excluded from the raw-TCP
 /// stream lane (see [`service_udp_stream_ports`]).
-fn is_http_family_mesh_protocol(protocol: AppProtocol) -> bool {
+pub(crate) fn is_http_family_mesh_protocol(protocol: AppProtocol) -> bool {
     matches!(
         protocol,
         AppProtocol::Http | AppProtocol::Http2 | AppProtocol::Grpc | AppProtocol::Unknown
@@ -8009,6 +8009,14 @@ pub(crate) fn mesh_route_admitted_for_direction(
     id: &str,
     request_direction: Option<MeshTrafficDirection>,
 ) -> bool {
+    // A Gateway API GAMMA route (`Service` parentRef, issue #7538) applies
+    // only to mesh traffic a client sends to the Service: never on a gateway
+    // (non-mesh) listener, which would otherwise serve it to anyone who names
+    // the Service host and dial its backend without the mesh binding, and
+    // never on an inbound mesh listener.
+    if config::is_gamma_http_route_proxy_id(id) {
+        return request_direction == Some(MeshTrafficDirection::Outbound);
+    }
     match mesh_route_direction(id) {
         Some(route_direction) => request_direction == Some(route_direction),
         None => {

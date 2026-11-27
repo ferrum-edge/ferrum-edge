@@ -342,11 +342,28 @@ pub(super) fn translate(
         // keyed on source kind. This also preserves listener isolation because
         // HTTP-family proxies do not retain the listener that admitted them.
         "HTTPRoute" | "GRPCRoute" => {
+            // GAMMA `Service` parents (issue #7538) are staged here and
+            // materialized by `finalize_gamma_routes` once the whole snapshot
+            // is known. They are independent of the route's Gateway parents:
+            // route content is admitted once for both, but a Gateway parent
+            // that is refused (a missing listener or section, a namespace the
+            // listener does not allow) only withdraws the Gateway attachment
+            // and never the Service one. The Gateway parents' status is still
+            // derived from the listeners, exactly as for an accepted route.
+            if gamma::route_has_service_parent_ref(object) {
+                ensure_http_route_features(object)?;
+                gamma::stage_service_parent_routes(acc, object)?;
+                if let Err(error) = ensure_route_parent_refs_allowed(object, acc) {
+                    acc.warnings.push(format!(
+                        "{} {:?}/{:?}: no Gateway parent admits the route ({error}); its Service \
+                         parents are still served",
+                        object.kind, object.metadata.namespace, object.metadata.name
+                    ));
+                    return Ok(true);
+                }
+            }
             let (proxies, plugins) = http_route_resources(object, acc)?;
             upsert_http_route_resources(acc, proxies, plugins, &object.kind);
-            // GAMMA `Service` parents are staged here and materialized by
-            // `finalize_gamma_routes` once the whole snapshot is known.
-            gamma::stage_service_parent_routes(acc, object)?;
             Ok(true)
         }
         "TCPRoute" => {
@@ -9358,12 +9375,29 @@ fn checked_backend_namespace(
     acc: &mut K8sAccumulator,
     from_kind: &str,
 ) -> Result<(super::backend_ref::BackendKind, String), K8sTranslateError> {
+    checked_backend_namespace_with_grant_policy(object, backend_ref, acc, from_kind, true)
+}
+
+/// [`checked_backend_namespace`] with an explicit ReferenceGrant policy; see
+/// `backend_ref::checked_backend_namespace_with_grant_policy`.
+fn checked_backend_namespace_with_grant_policy(
+    object: &K8sObject,
+    backend_ref: &Value,
+    acc: &mut K8sAccumulator,
+    from_kind: &str,
+    require_reference_grant: bool,
+) -> Result<(super::backend_ref::BackendKind, String), K8sTranslateError> {
     use super::backend_ref::{
         BackendKind, endpoint_slice_unverified_warning, message_is_endpoint_slice_refusal,
     };
 
-    let checked =
-        super::backend_ref::checked_backend_namespace(object, backend_ref, acc, from_kind);
+    let checked = super::backend_ref::checked_backend_namespace_with_grant_policy(
+        object,
+        backend_ref,
+        acc,
+        from_kind,
+        require_reference_grant,
+    );
     match &checked {
         Err(K8sTranslateError::InvalidResource { message, .. })
             if message_is_endpoint_slice_refusal(message) =>

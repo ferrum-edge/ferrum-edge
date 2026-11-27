@@ -194,6 +194,22 @@ pub(crate) fn checked_backend_namespace(
     acc: &K8sAccumulator,
     from_kind: &str,
 ) -> Result<(BackendKind, String), K8sTranslateError> {
+    checked_backend_namespace_with_grant_policy(object, backend_ref, acc, from_kind, true)
+}
+
+/// [`checked_backend_namespace`] with the cross-namespace ReferenceGrant
+/// requirement made explicit. `require_reference_grant: false` is ONLY for a
+/// GAMMA consumer route (issue #7538): it steers its own namespace's outbound
+/// traffic to a destination its clients could call directly, so upstream
+/// GAMMA requires no grant. Every other check (backend kind, ExternalName
+/// refusal, EndpointSlice attribution) still runs.
+pub(crate) fn checked_backend_namespace_with_grant_policy(
+    object: &K8sObject,
+    backend_ref: &Value,
+    acc: &K8sAccumulator,
+    from_kind: &str,
+    require_reference_grant: bool,
+) -> Result<(BackendKind, String), K8sTranslateError> {
     let backend_namespace =
         string_field(backend_ref, "namespace").unwrap_or(&object.metadata.namespace);
     let to_group = string_field(backend_ref, "group").unwrap_or_default();
@@ -207,7 +223,8 @@ pub(crate) fn checked_backend_namespace(
         })?;
 
     let backend_name = string_field(backend_ref, "name");
-    if backend_namespace != object.metadata.namespace
+    if require_reference_grant
+        && backend_namespace != object.metadata.namespace
         && !acc.reference_grant_allows(
             &object.metadata.namespace,
             api_group(&object.api_version),

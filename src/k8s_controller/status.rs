@@ -2832,6 +2832,7 @@ fn route_status(
         };
 
     let mut parents = retained_existing_parent_statuses(&object.status);
+    let retained_parents = parents.len();
     for parent_ref in managed_parent_refs {
         let existing_parent_status = existing_parent_status(&object.status, object, parent_ref);
         let parent_ref_key = route_parent_ref_key(object, parent_ref);
@@ -3086,14 +3087,26 @@ fn route_status(
             .filter(|parent_ref| parent_ref_is_service(parent_ref))
         {
             parents.push(gamma_service_parent_status(
-                object, parent_ref, result, &verdict,
+                object, parent_ref, result, &verdict, indexes,
             ));
         }
     }
 
+    cap_route_parent_statuses(&mut parents, retained_parents);
     let mut status = object.status.clone();
     ensure_status_object(&mut status).insert("parents".to_string(), Value::Array(parents));
     status
+}
+
+/// Upper bound of `RouteStatus.parents` (`+kubebuilder:validation:MaxItems=32`).
+const MAX_ROUTE_PARENT_STATUSES: usize = 32;
+
+/// Keep a route's `status.parents` within the schema bound, which the API
+/// server enforces on the whole patch. Entries other controllers wrote (the
+/// first `retained`) are never dropped; Ferrum's own entries (Gateway parents,
+/// then GAMMA Service parents, in spec order) fill the remaining capacity.
+fn cap_route_parent_statuses(parents: &mut Vec<Value>, retained: usize) {
+    parents.truncate(MAX_ROUTE_PARENT_STATUSES.max(retained));
 }
 
 /// This route's refused same-slot claims, in a deterministic order.
@@ -3288,8 +3301,17 @@ fn route_status_merge_patch_for_update(
         .map(|parent| preserve_live_parent_condition_transition_times(update, parent, live_status))
         .collect();
     let parents = match live_status {
-        Some(status) => merge_parent_statuses(status, desired_parents),
-        None => desired_parents,
+        Some(status) => {
+            let retained = retained_existing_parent_statuses(status).len();
+            let mut parents = merge_parent_statuses(status, desired_parents);
+            cap_route_parent_statuses(&mut parents, retained);
+            parents
+        }
+        None => {
+            let mut parents = desired_parents;
+            cap_route_parent_statuses(&mut parents, 0);
+            parents
+        }
     };
 
     json!({
@@ -3711,7 +3733,28 @@ fn gamma_service_parent_status(
     parent_ref: &Value,
     result: Result<&K8sTranslation, &K8sTranslateError>,
     verdict: &GammaRouteVerdict<'_>,
+    indexes: &GatewayApiStatusIndexes<'_>,
 ) -> Value {
+    // A consumer route (its Service parent lives in another namespace) needs
+    // no ReferenceGrant for a cross-namespace backendRef; a producer route
+    // does. Translation applies the same rule, so ResolvedRefs is judged per
+    // parent rather than from the route-wide Gateway verdict.
+    let parent_namespace = parent_ref
+        .get("namespace")
+        .and_then(Value::as_str)
+        .unwrap_or(&object.metadata.namespace);
+    let producer_parent = parent_namespace == object.metadata.namespace;
+    let (resolved_refs, resolved_refs_reason) = match result {
+        Ok(_) => match route_unresolved_backend_ref_reason_with_grant_policy(
+            object,
+            indexes,
+            producer_parent,
+        ) {
+            Some(reason) => (false, reason),
+            None => (true, "ResolvedRefs"),
+        },
+        Err(_) => (verdict.resolved_refs, verdict.resolved_refs_reason),
+    };
     let existing = existing_parent_status_for_controller(
         &object.status,
         object,
@@ -3817,6 +3860,16 @@ fn gamma_service_parent_status(
             ),
         },
     };
+    let resolved_refs_message = if resolved_refs {
+        "All backendRefs accepted by Ferrum".to_string()
+    } else if result.is_ok() {
+        format!(
+            "Ferrum accepted this route but could not resolve all backendRefs: \
+             {resolved_refs_reason}"
+        )
+    } else {
+        verdict.message.to_string()
+    };
     let has_conflict = conflict.is_some();
     let conflicted_message =
         conflict.unwrap_or_else(|| "No GAMMA route conflicts detected by Ferrum".to_string());
@@ -3833,17 +3886,9 @@ fn gamma_service_parent_status(
             object,
             existing,
             "ResolvedRefs",
-            verdict.resolved_refs,
-            if verdict.resolved_refs {
-                "ResolvedRefs"
-            } else {
-                verdict.resolved_refs_reason
-            },
-            if verdict.resolved_refs {
-                "All backendRefs accepted by Ferrum"
-            } else {
-                verdict.message
-            },
+            resolved_refs,
+            resolved_refs_reason,
+            &resolved_refs_message,
         ),
         condition_at(
             object,
@@ -4273,6 +4318,17 @@ fn route_unresolved_backend_ref_reason(
     route: &K8sObject,
     indexes: &GatewayApiStatusIndexes<'_>,
 ) -> Option<&'static str> {
+    route_unresolved_backend_ref_reason_with_grant_policy(route, indexes, true)
+}
+
+/// [`route_unresolved_backend_ref_reason`] with an explicit cross-namespace
+/// ReferenceGrant policy. `false` is only for a GAMMA consumer route's Service
+/// parent, which translation admits without a grant (issue #7538).
+fn route_unresolved_backend_ref_reason_with_grant_policy(
+    route: &K8sObject,
+    indexes: &GatewayApiStatusIndexes<'_>,
+    require_reference_grant: bool,
+) -> Option<&'static str> {
     use crate::config_sources::k8s::backend_ref::{
         BackendRefStatusInventory, unresolved_backend_ref_reason,
     };
@@ -4301,14 +4357,15 @@ fn route_unresolved_backend_ref_reason(
             backend_ref,
             &inventory,
             |to_namespace, to_group, to_kind, to_name| {
-                reference_grant_allows_backend_ref(
-                    indexes,
-                    route,
-                    to_namespace,
-                    to_group,
-                    to_kind,
-                    to_name,
-                )
+                !require_reference_grant
+                    || reference_grant_allows_backend_ref(
+                        indexes,
+                        route,
+                        to_namespace,
+                        to_group,
+                        to_kind,
+                        to_name,
+                    )
             },
         ) {
             return Some(reason);
