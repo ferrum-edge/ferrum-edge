@@ -499,10 +499,12 @@ impl Plugin for GrpcDeadline {
 
         let deadline_ms = if ctx.grpc_deadline_header_is_remaining {
             let remaining_ms = ctx.grpc_deadline_remaining_ms().unwrap_or_else(|| {
-                let elapsed = chrono::Utc::now()
-                    .signed_duration_since(ctx.timestamp_received)
-                    .num_milliseconds()
-                    .max(0) as u64;
+                let elapsed = u64::try_from(
+                    (crate::time_compat::UtcTimestamp::now() - ctx.timestamp_received)
+                        .whole_milliseconds()
+                        .max(0),
+                )
+                .unwrap_or(u64::MAX);
                 effective_ms.saturating_sub(elapsed)
             });
             if remaining_ms == 0 {

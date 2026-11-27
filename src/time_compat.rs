@@ -294,6 +294,35 @@ impl UtcTimestamp {
         write!(f, "{:02}{:02}", u8::from(dt.month()), dt.day())
     }
 
+    /// Format as `%d/%b/%Y:%H:%M:%S %z` (`27/Nov/2026:10:20:30 +0000`, the
+    /// Apache common-log / API Gateway `requestContext.time` shape), matching
+    /// chrono's strftime output byte-for-byte for a UTC value, including
+    /// chrono's explicit `%Y` sign outside `0..=9999`.
+    pub fn to_common_log_format(&self) -> String {
+        const MONTHS: [&str; 12] = [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ];
+        let dt = self.0;
+        let month = usize::from(u8::from(dt.month()))
+            .checked_sub(1)
+            .and_then(|index| MONTHS.get(index))
+            .copied()
+            .unwrap_or("Jan");
+        let year = dt.year();
+        let year = if (0..=9999).contains(&year) {
+            format!("{year:04}")
+        } else {
+            format!("{year:+05}")
+        };
+        format!(
+            "{:02}/{month}/{year}:{:02}:{:02}:{:02} +0000",
+            dt.day(),
+            dt.hour(),
+            dt.minute(),
+            dt.second()
+        )
+    }
+
     /// Total nanoseconds since `1970-01-01T00:00:00Z`.
     #[inline]
     pub const fn unix_timestamp_nanos(&self) -> i128 {
