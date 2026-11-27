@@ -2219,7 +2219,7 @@ async fn restore_registry_write_and_namespace_update_serialize() {
                 "round {round}: restore ran last and rewrote the updated row: {row}"
             );
         }
-        let (status, proxy) = admin_request(
+        let (status, proxy, _) = admin_request(
             reqwest::Method::GET,
             &base,
             "/proxies/serial-proxy",
