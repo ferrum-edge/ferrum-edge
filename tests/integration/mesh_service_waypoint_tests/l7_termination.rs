@@ -178,12 +178,18 @@ fn translate(config: &mut GatewayConfig, objects: &[K8sObject]) {
     config.upstreams.extend(translated.upstreams);
     config.plugin_configs.extend(translated.plugin_configs);
     if let Some(mesh) = translated.mesh {
-        config
-            .mesh
-            .get_or_insert_with(Box::default)
+        let target = config.mesh.get_or_insert_with(Box::default);
+        target
             .virtual_service_http_routes
             .extend(mesh.virtual_service_http_routes);
+        target.destination_rules.extend(mesh.destination_rules);
     }
+}
+
+fn destination_rule(name: &str, spec: serde_json::Value) -> K8sObject {
+    let mut object = virtual_service(name, spec);
+    object.kind = "DestinationRule".to_string();
+    object
 }
 
 fn workload_port(port: u16, protocol: AppProtocol, name: &str) -> WorkloadPort {
@@ -1407,5 +1413,234 @@ async fn a_tunnel_the_peer_closes_ends_cleanly_and_releases_its_gauge_slot() {
     .await;
     wait_until(|| l7_tunnels_active() == 0, "the gauge release").await;
     assert_eq!(waypoint.state.hbone_admission_fence.live_tunnels(), 0);
+    waypoint.teardown().await;
+}
+
+/// Acceptance: the 90/10 split is checked over 1000 selections when a
+/// DestinationRule governs a leg, so the split is dispatched leg by leg, each
+/// leg through its own rule-bearing upstream and judged on its own verdict.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_destination_rule_governed_split_is_dispatched_leg_by_leg_90_10() {
+    let mut waypoint = Waypoint::start(Scenario {
+        virtual_services: vec![
+            virtual_service("reviews-split", split_90_10()),
+            destination_rule(
+                "ratings-pool",
+                json!({
+                    "host": host("ratings"),
+                    "trafficPolicy": {"connectionPool": {"tcp": {"connectTimeout": "2s"}}}
+                }),
+            ),
+        ],
+        ..Scenario::default()
+    })
+    .await;
+    let leg_dispatched = waypoint
+        .state
+        .config
+        .load()
+        .plugin_configs
+        .iter()
+        .any(|plugin| {
+            plugin.plugin_name == "mesh_route_dispatch"
+                && plugin
+                    .config
+                    .get("weighted_splits")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|splits| !splits.is_empty())
+        });
+    assert!(
+        leg_dispatched,
+        "fixture: the split is dispatched leg by leg"
+    );
+    let tunnel = waypoint
+        .tunnel(&format!("{}:{SERVICE_PORT}", host("reviews")), &[])
+        .await;
+    let mut inner = inner_http1(tunnel).await;
+    let mut reviews = 0usize;
+    for _ in 0..1000 {
+        let response = send_h1(&mut inner, get("/", &host("reviews"))).await;
+        assert_eq!(response.status, StatusCode::OK, "{}", response.body);
+        if response.served_by() == "reviews" {
+            reviews += 1;
+        }
+    }
+    assert!(
+        (850..=950).contains(&reviews),
+        "the leg-dispatched 90/10 split holds: reviews={reviews}"
+    );
+    waypoint.teardown().await;
+}
+
+/// A scripted loopback backend: answers each request with the status, delay
+/// and body `respond` picks from the request head.
+type ScriptedResponder = Arc<dyn Fn(&str) -> (u16, Duration, String) + Send + Sync>;
+
+async fn start_scripted_backend(
+    respond: ScriptedResponder,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind scripted backend");
+    let addr = listener.local_addr().expect("scripted backend addr");
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let respond = Arc::clone(&respond);
+            tokio::spawn(async move {
+                let mut buf = [0_u8; 4096];
+                let n = match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => n,
+                };
+                let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let (status, delay, body) = respond(&request);
+                tokio::time::sleep(delay).await;
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    (addr, handle)
+}
+
+/// Acceptance: retries, timeouts and loopback mirrors of a carried route
+/// apply to inner requests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inner_requests_apply_retries_timeouts_and_loopback_mirrors() {
+    // The mirror target: a loopback listener the translator admits.
+    let (mirror_responder, mirror_log) = marker_responder("mirror");
+    let (mirror_addr, mirror_handle) = start_http_backend(mirror_responder).await;
+    // A flaky / slow path on its own backend, reached through a second
+    // route on the reviews host.
+    let flaky_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let attempts = Arc::clone(&flaky_attempts);
+    let (scripted_addr, scripted_handle) =
+        start_scripted_backend(Arc::new(move |request: &str| {
+            if request.starts_with("GET /flaky") {
+                let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if attempt == 0 {
+                    return (503, Duration::ZERO, "flaky-first".to_string());
+                }
+                return (200, Duration::ZERO, "flaky-recovered".to_string());
+            }
+            if request.starts_with("GET /slow") {
+                return (200, Duration::from_secs(3), "too-late".to_string());
+            }
+            (200, Duration::ZERO, "scripted".to_string())
+        }))
+        .await;
+    let spec = json!({
+        "hosts": [host("reviews")],
+        "http": [
+            {
+                "match": [{"uri": {"prefix": "/flaky"}}],
+                "retries": {"attempts": 2, "retryOn": "5xx"},
+                "route": [{"destination": {"host": host("ratings"), "port": {"number": SERVICE_PORT}}}]
+            },
+            {
+                "match": [{"uri": {"prefix": "/slow"}}],
+                "timeout": "0.3s",
+                "route": [{"destination": {"host": host("ratings"), "port": {"number": SERVICE_PORT}}}]
+            },
+            {
+                "mirror": {"host": "127.0.0.1", "port": {"number": mirror_addr.port()}},
+                "mirrorPercentage": {"value": 100},
+                "route": [{"destination": {"host": host("reviews"), "port": {"number": SERVICE_PORT}}}]
+            }
+        ]
+    });
+    let backends = start_backends().await;
+    // Ratings is served by the scripted backend in this scenario.
+    let mut scripted = Backends {
+        ratings: scripted_addr,
+        ..backends
+    };
+    scripted.handles.push(scripted_handle);
+    scripted.handles.push(mirror_handle);
+    let state = build_state(prepared(
+        &scripted,
+        &Scenario {
+            virtual_services: vec![virtual_service("reviews-policies", spec)],
+            ..Scenario::default()
+        },
+    ));
+    let certs = generate_hbone_mtls_certs(CLIENT_SPIFFE);
+    let listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind waypoint");
+    let addr = listener.local_addr().expect("waypoint addr");
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let serve_state = state.clone();
+    let server_config = hbone_server_config(&certs);
+    tokio::spawn(async move {
+        let _ = start_proxy_listener_with_bound_listener_and_mesh_direction(
+            listener,
+            serve_state,
+            shutdown_rx,
+            Some(server_config),
+            Some(MeshTrafficDirection::Inbound),
+        )
+        .await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (sender, conn_task) = connect_hbone_h2_mtls(addr, hbone_client_config(&certs)).await;
+    let mut waypoint = Waypoint {
+        state,
+        backends: scripted,
+        sender,
+        conn_task,
+        shutdown_tx,
+        certs,
+        addr,
+    };
+    let tunnel = waypoint
+        .tunnel(&format!("{}:{SERVICE_PORT}", host("reviews")), &[])
+        .await;
+    let mut inner = inner_http1(tunnel).await;
+
+    let flaky = send_h1(&mut inner, get("/flaky", &host("reviews"))).await;
+    assert_eq!(
+        flaky.status,
+        StatusCode::OK,
+        "the retry recovers: {}",
+        flaky.body
+    );
+    assert_eq!(flaky.body, "flaky-recovered");
+    assert_eq!(
+        flaky_attempts.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "exactly one retry"
+    );
+
+    let slow = send_h1(&mut inner, get("/slow", &host("reviews"))).await;
+    assert_eq!(
+        slow.status,
+        StatusCode::GATEWAY_TIMEOUT,
+        "the route timeout fires"
+    );
+
+    let mirrored = send_h1(&mut inner, get("/mirrored", &host("reviews"))).await;
+    assert_eq!(mirrored.status, StatusCode::OK);
+    assert_eq!(mirrored.served_by(), "reviews");
+    wait_until(
+        || {
+            mirror_log
+                .lock()
+                .map(|log| {
+                    log.iter()
+                        .any(|request| request.starts_with("GET /mirrored"))
+                })
+                .unwrap_or(false)
+        },
+        "the loopback mirror copy",
+    )
+    .await;
     waypoint.teardown().await;
 }
