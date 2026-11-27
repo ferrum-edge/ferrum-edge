@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use crate::fips::approved::Sha256;
-use chrono::{DateTime, Utc};
+use crate::time_compat::UtcTimestamp;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, CertificateRevocationListDer};
 use serde::{Deserialize, Serialize};
@@ -98,8 +98,8 @@ pub struct ManagedTlsRecord {
     pub ocsp_der_base64: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jwks_json: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: UtcTimestamp,
+    pub updated_at: UtcTimestamp,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -117,9 +117,9 @@ pub struct ManagedTlsRecordSummary {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sans: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub not_before: Option<DateTime<Utc>>,
+    pub not_before: Option<UtcTimestamp>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub not_after: Option<DateTime<Utc>>,
+    pub not_after: Option<UtcTimestamp>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fingerprint_sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -128,8 +128,8 @@ pub struct ManagedTlsRecordSummary {
     pub crl_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub byte_length: Option<usize>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: UtcTimestamp,
+    pub updated_at: UtcTimestamp,
 }
 
 #[derive(Debug, Clone)]
@@ -379,7 +379,7 @@ impl ManagedTlsStore {
         // ceiling; overwrite and delete remain available at the limit.
         let outcome = self.file.mutate(move |document| {
             let mut record = record;
-            let now = Utc::now();
+            let now = UtcTimestamp::now();
             if let Some(existing) = document.records.get(&record.id) {
                 if !allow_overwrite {
                     return Err(ManagedTlsError::AlreadyExists(record.id));
@@ -423,7 +423,7 @@ impl ManagedTlsStore {
         validate_managed_record_material_size(&record, self.max_material_bytes)?;
         let outcome = self.file.mutate(move |document| {
             let mut record = record;
-            let now = Utc::now();
+            let now = UtcTimestamp::now();
             let Some(existing) = document.records.get(&record.id) else {
                 return Err(ManagedTlsError::NotFound(record.id));
             };
@@ -560,7 +560,7 @@ impl ManagedTlsRecord {
         key_pem: String,
         chain_pem: Option<String>,
     ) -> Self {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         Self {
             id,
             name,
@@ -584,7 +584,7 @@ impl ManagedTlsRecord {
         description: Option<String>,
         ca_bundle_pem: String,
     ) -> Self {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         Self {
             id,
             name,
@@ -603,7 +603,7 @@ impl ManagedTlsRecord {
     }
 
     pub fn new_crl(id: String, name: String, description: Option<String>, crl_pem: String) -> Self {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         Self {
             id,
             name,
@@ -627,7 +627,7 @@ impl ManagedTlsRecord {
         description: Option<String>,
         ocsp_der_base64: String,
     ) -> Self {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         Self {
             id,
             name,
@@ -651,7 +651,7 @@ impl ManagedTlsRecord {
         description: Option<String>,
         jwks_json: String,
     ) -> Self {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         Self {
             id,
             name,
@@ -986,8 +986,8 @@ struct CertificateMetadata {
     subject: Option<String>,
     issuer: Option<String>,
     sans: Vec<String>,
-    not_before: Option<DateTime<Utc>>,
-    not_after: Option<DateTime<Utc>>,
+    not_before: Option<UtcTimestamp>,
+    not_after: Option<UtcTimestamp>,
     count: usize,
 }
 
@@ -1002,8 +1002,9 @@ fn certificate_metadata(bytes: &[u8]) -> Result<CertificateMetadata, String> {
         X509Certificate::from_der(first.as_ref()).map_err(|error| error.to_string())?;
     let subject = Some(parsed.subject().to_string());
     let issuer = Some(parsed.issuer().to_string());
-    let not_before = DateTime::<Utc>::from_timestamp(parsed.validity().not_before.timestamp(), 0);
-    let not_after = DateTime::<Utc>::from_timestamp(parsed.validity().not_after.timestamp(), 0);
+    let not_before =
+        UtcTimestamp::from_unix_timestamp(parsed.validity().not_before.timestamp()).ok();
+    let not_after = UtcTimestamp::from_unix_timestamp(parsed.validity().not_after.timestamp()).ok();
     let sans = crate::tls::san::certificate_san_strings(&parsed);
     Ok(CertificateMetadata {
         subject,

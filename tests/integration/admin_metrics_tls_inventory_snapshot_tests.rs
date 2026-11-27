@@ -15,7 +15,7 @@
 use crate::scaffolding::port_registry::TestSocket;
 
 use arc_swap::ArcSwap;
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{Duration as ChronoDuration, Utc};
 use ferrum_edge::admin::{
     AdminState,
     jwt_auth::{JwtConfig, JwtManager},
@@ -52,7 +52,7 @@ struct CountingInventoryCollector {
     fetches: AtomicU64,
     started: tokio::sync::watch::Sender<u64>,
     next_gate: Mutex<Option<mpsc::Receiver<()>>>,
-    not_after: DateTime<Utc>,
+    not_after: ferrum_edge::time_compat::UtcTimestamp,
 }
 
 impl CountingInventoryCollector {
@@ -62,7 +62,9 @@ impl CountingInventoryCollector {
             fetches: AtomicU64::new(0),
             started: tokio::sync::watch::channel(0).0,
             next_gate: Mutex::new(None),
-            not_after: Utc::now() + ChronoDuration::days(30),
+            not_after: ferrum_edge::time_compat::UtcTimestamp::now()
+                .checked_add(::time::SignedDuration::days(30))
+                .expect("test instant in range"),
         }
     }
 
@@ -115,7 +117,11 @@ impl TlsInventoryCollector for CountingInventoryCollector {
                 subject: Some("CN=counting-fake".to_string()),
                 issuer: Some("CN=counting-fake".to_string()),
                 sans: Vec::new(),
-                not_before: Some(Utc::now() - ChronoDuration::days(1)),
+                not_before: Some(
+                    ferrum_edge::time_compat::UtcTimestamp::now()
+                        .checked_sub(::time::SignedDuration::days(1))
+                        .expect("test instant in range"),
+                ),
                 not_after: Some(self.not_after),
                 days_until_expiry: Some(30),
                 next_update: None,

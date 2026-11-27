@@ -12,7 +12,6 @@ use std::io::Cursor;
 use std::thread;
 use std::time::Duration;
 
-use chrono::Utc;
 use ferrum_edge::config::env_config::{
     DEFAULT_TLS_ACME_TERMINAL_ORDER_HISTORY, DEFAULT_TLS_MANAGED_MAX_RECORDS,
     DEFAULT_TLS_STORE_MAX_DOCUMENT_BYTES, HARD_MAX_TLS_STORE_MAX_DOCUMENT_BYTES,
@@ -102,7 +101,7 @@ fn sample_managed(id: &str) -> ManagedTlsRecord {
 }
 
 fn sample_order(id: &str, certificate_id: &str, status: AcmeOrderStatus) -> AcmeOrderRecord {
-    let now = Utc::now();
+    let now = ferrum_edge::time_compat::UtcTimestamp::now();
     AcmeOrderRecord {
         id: id.to_string(),
         certificate_id: Some(certificate_id.to_string()),
@@ -123,7 +122,7 @@ fn sample_order(id: &str, certificate_id: &str, status: AcmeOrderStatus) -> Acme
 }
 
 fn sample_certificate(id: &str) -> AcmeCertificateRecord {
-    let now = Utc::now();
+    let now = ferrum_edge::time_compat::UtcTimestamp::now();
     AcmeCertificateRecord {
         id: id.to_string(),
         domains: vec!["example.test".to_string()],
@@ -144,7 +143,7 @@ fn sample_certificate(id: &str) -> AcmeCertificateRecord {
 fn event_with(cert_id: &str) -> TlsSourceEvent {
     TlsSourceEvent {
         id: 0,
-        at: Utc::now(),
+        at: ferrum_edge::time_compat::UtcTimestamp::now(),
         surface: "proxy_https".to_string(),
         outcome: "rotated".to_string(),
         sources: vec![TlsSourceEventMaterial {
