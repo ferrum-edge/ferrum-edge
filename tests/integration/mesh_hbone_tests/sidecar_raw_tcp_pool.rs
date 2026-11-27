@@ -11,8 +11,9 @@
 //! that tunnel.
 
 use super::{
-    create_mesh_proxy, create_mesh_proxy_state_with_config, spiffe_identity_plugin_config,
-    spiffe_root, spiffe_svid_slot, start_gateway_mtls,
+    create_mesh_proxy, create_mesh_proxy_state_with_config, create_mesh_proxy_state_with_env,
+    mesh_env_config, spiffe_identity_plugin_config, spiffe_root, spiffe_svid_slot,
+    start_gateway_mtls,
 };
 use crate::scaffolding::port_registry::TestSocket;
 
@@ -34,7 +35,8 @@ const TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Multi-connection TCP echo backend. A connection whose first bytes are
 /// `RESET` is closed with `SO_LINGER=0` (a TCP RST), the backend failure the
-/// destination relay must surface as a reset of that one CONNECT stream.
+/// destination relay must surface as a reset of that one CONNECT stream; one
+/// whose first bytes are `STALL` is never read again.
 async fn start_resettable_echo_backend() -> (
     std::net::SocketAddr,
     Arc<AtomicUsize>,
@@ -59,6 +61,13 @@ async fn start_resettable_echo_backend() -> (
                         Ok(0) | Err(_) => return,
                         Ok(n) => n,
                     };
+                    if buf[..n].starts_with(b"STALL") {
+                        // The application stops reading for good; keep the
+                        // socket open so the relay's writes back up.
+                        let _held = stream;
+                        std::future::pending::<()>().await;
+                        return;
+                    }
                     if buf[..n].starts_with(b"RESET") {
                         let Ok(std_stream) = stream.into_std() else {
                             return;
@@ -189,6 +198,147 @@ async fn sidecar_raw_tcp_tunnels_share_pooled_connections_through_a_ferrum_desti
     assert_eq!(pool.tunnel_pool_stats().connections_opened, 3);
     assert_eq!(pool.tunnel_pool_size(), 3);
 
+    shutdown_tx.send(true).expect("shutdown destination");
+    backend_handle.abort();
+}
+
+/// The send direction against the real Ferrum frontend with TIGHT windows
+/// (equal 64 KiB stream and connection windows, a valid configuration): one
+/// tunnel's destination application stops reading indefinitely, so its relay
+/// stops draining the CONNECT stream. The mesh inbound listener sizes its
+/// connection window to cover every admitted stream (issue #7537), so sibling
+/// tunnels on the same pooled connection keep flowing while the stalled
+/// tunnel's writer is held by back-pressure.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stalled_destination_application_never_starves_sibling_tunnels() {
+    use ferrum_edge::modes::mesh::MeshTrafficDirection;
+    use ferrum_edge::proxy::start_proxy_listener_with_bound_listener_and_mesh_direction;
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let (root_der, root_pem, root_key_pem) = spiffe_root();
+    let destination_id: SpiffeId = "spiffe://cluster.local/ns/default/sa/orders"
+        .parse()
+        .expect("destination id");
+    let source_id: SpiffeId = "spiffe://cluster.local/ns/default/sa/client"
+        .parse()
+        .expect("source id");
+    let destination_slot = spiffe_svid_slot(&destination_id, &root_der, &root_pem, &root_key_pem);
+    let source_slot = spiffe_svid_slot(&source_id, &root_der, &root_pem, &root_key_pem);
+
+    let (backend_addr, _backend_accepted, backend_handle) = start_resettable_echo_backend().await;
+    let mut destination_proxy = create_mesh_proxy(backend_addr.port());
+    // Keep the relay's own write deadline out of the picture: the stall must
+    // be held by flow control for the whole test, not reset by a timeout.
+    destination_proxy.backend_write_timeout_ms = 120_000;
+    destination_proxy.backend_read_timeout_ms = 120_000;
+    let spiffe_plugin = spiffe_identity_plugin_config(&destination_proxy.id);
+    destination_proxy.plugins.push(PluginAssociation {
+        plugin_config_id: spiffe_plugin.id.clone(),
+    });
+    let mut env = mesh_env_config();
+    env.frontend_h2_initial_stream_window_size = 65_535;
+    env.frontend_h2_initial_connection_window_size = 65_535;
+    let state =
+        create_mesh_proxy_state_with_env(destination_proxy, vec![], vec![spiffe_plugin], env);
+    let server_config = ferrum_edge::tls::spiffe::build_spiffe_inbound_config(
+        destination_slot,
+        true,
+        Arc::new(Vec::new()),
+    )
+    .expect("destination spiffe server config");
+    let listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind destination");
+    let gateway_addr = listener.local_addr().expect("destination addr");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        let _ = start_proxy_listener_with_bound_listener_and_mesh_direction(
+            listener,
+            state,
+            shutdown_rx,
+            Some(server_config),
+            Some(MeshTrafficDirection::Inbound),
+        )
+        .await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let pool = MeshMtlsConnectionPool::new(
+        PoolConfig::default(),
+        DnsCache::new(DnsConfig::default()),
+        source_slot,
+        4,
+    );
+    let source_proxy = create_mesh_proxy(AUTHORITY_PORT);
+    let open = || {
+        pool.open_connect_tunnel(
+            &source_proxy,
+            "127.0.0.1",
+            AUTHORITY_HOST,
+            AUTHORITY_PORT,
+            AUTHORITY_PORT,
+            gateway_addr.port(),
+            Some(&destination_id),
+            None,
+            None,
+        )
+    };
+
+    let mut stalled = tokio::time::timeout(TIMEOUT, open())
+        .await
+        .expect("timely tunnel open")
+        .expect("stalled tunnel");
+    stalled.write_all(b"STALL").await.expect("stall trigger");
+    let written = Arc::new(AtomicUsize::new(0));
+    let written_task = written.clone();
+    let writer = tokio::spawn(async move {
+        let chunk = vec![0x42u8; 16 * 1024];
+        while let Ok(n) = stalled.write(&chunk).await {
+            written_task.fetch_add(n, Ordering::SeqCst);
+        }
+    });
+    // Wait until the stalled tunnel's writer is held by flow control.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut last = usize::MAX;
+    loop {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let now = written.load(Ordering::SeqCst);
+        if now == last && now > 0 {
+            break;
+        }
+        last = now;
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the stalled tunnel never reached back-pressure"
+        );
+    }
+    assert!(
+        !writer.is_finished(),
+        "the stalled writer is held, not failed"
+    );
+
+    // Siblings on the same pooled connection still flow both ways.
+    for index in 0..3 {
+        let mut sibling = tokio::time::timeout(TIMEOUT, open())
+            .await
+            .expect("timely sibling open")
+            .expect("sibling tunnel");
+        let payload = vec![b'a' + index as u8; 256 * 1024];
+        sibling.write_all(&payload).await.expect("sibling write");
+        let mut echoed = vec![0u8; payload.len()];
+        tokio::time::timeout(Duration::from_secs(10), sibling.read_exact(&mut echoed))
+            .await
+            .expect("a sibling is not starved by the stalled tunnel")
+            .expect("sibling echo");
+        assert_eq!(echoed, payload);
+    }
+    assert_eq!(
+        pool.tunnel_pool_stats().connections_opened,
+        1,
+        "every tunnel shared the one pooled connection"
+    );
+
+    writer.abort();
     shutdown_tx.send(true).expect("shutdown destination");
     backend_handle.abort();
 }

@@ -2816,6 +2816,13 @@ impl RouterCache {
                         // builders leave unset.
                         relay_proxy.dispatch_port_overrides =
                             dispatch_port_overrides_for_upstream(upstream);
+                        // And the inherited top-level `connectionPool.http` overlay, so the
+                        // tunnel pools resolve `maxConcurrentStreams` / `idleTimeout` with the
+                        // same per-port > top-level precedence as HTTP (issue #7537).
+                        relay_proxy.dispatch_port_override_fallback =
+                            crate::config::types::dispatch_port_override_fallback_from_upstream(
+                                upstream,
+                            );
                         let relay_proxy = Arc::new(relay_proxy);
                         let service_fqdn = upstream
                             .name
@@ -2876,6 +2883,10 @@ impl RouterCache {
                     // Same per-port DR override projection as the VIP table.
                     relay_proxy.dispatch_port_overrides =
                         dispatch_port_overrides_for_upstream(upstream);
+                    relay_proxy.dispatch_port_override_fallback =
+                        crate::config::types::dispatch_port_override_fallback_from_upstream(
+                            upstream,
+                        );
                     let relay_proxy = Arc::new(relay_proxy);
                     let service_fqdn = upstream.name.clone().unwrap_or_else(|| {
                         format!("{}.{}", spec.service.name, spec.service.namespace)
@@ -3054,6 +3065,10 @@ impl RouterCache {
                         // DR (codex r5 P2).
                         relay_proxy.dispatch_port_overrides =
                             dispatch_port_overrides_for_upstream(upstream);
+                        relay_proxy.dispatch_port_override_fallback =
+                            crate::config::types::dispatch_port_override_fallback_from_upstream(
+                                upstream,
+                            );
                         let relay_proxy = Arc::new(relay_proxy);
                         let service_fqdn = upstream
                             .name
@@ -3109,6 +3124,10 @@ impl RouterCache {
                     );
                     relay_proxy.dispatch_port_overrides =
                         dispatch_port_overrides_for_upstream(upstream);
+                    relay_proxy.dispatch_port_override_fallback =
+                        crate::config::types::dispatch_port_override_fallback_from_upstream(
+                            upstream,
+                        );
                     MeshTcpEgressDecision::Relay(Arc::new(MeshTcpEgressEntry {
                         upstream_id: route.upstream_id.clone(),
                         relay_proxy: Arc::new(relay_proxy),

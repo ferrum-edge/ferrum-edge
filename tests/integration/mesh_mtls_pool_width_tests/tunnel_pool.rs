@@ -29,10 +29,13 @@ use ferrum_edge::config::types::{
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain, spiffe_id_to_san};
 use ferrum_edge::identity::{SharedSvidBundle, SvidBundle, TrustBundle, TrustBundleSet};
-use ferrum_edge::proxy::hbone_pool::{H2ConnectTunnel, HbonePoolError};
+use ferrum_edge::proxy::hbone_pool::{
+    ConnectMultiplexFlowControl, H2_MAX_FLOW_CONTROL_WINDOW, H2ConnectTunnel, HbonePoolError,
+    connect_multiplex_flow_control,
+};
 use ferrum_edge::proxy::mesh_mtls_pool::{
     MeshMtlsConnectionPool, mesh_mtls_tunnel_pool_key_for_tests,
-    tunnel_carrier_window_sizes_for_tests,
+    tunnel_carrier_flow_control_for_tests,
 };
 use ferrum_edge::proxy::mesh_trust_registry::{MeshTrustRegistry, TrustWithdrawalReason};
 use ferrum_edge::time_compat::UtcTimestamp;
@@ -141,18 +144,30 @@ impl Ca {
 
     /// A CRL from this root revoking `serial`.
     fn crl_revoking(&self, serial: u64) -> CertificateRevocationListDer<'static> {
+        self.crl(&[serial], time::Duration::days(1))
+    }
+
+    /// A CRL from this root revoking `serials`, valid for `lifetime` more.
+    fn crl(
+        &self,
+        serials: &[u64],
+        lifetime: time::Duration,
+    ) -> CertificateRevocationListDer<'static> {
         let now = time::OffsetDateTime::now_utc();
         let params = CertificateRevocationListParams {
             this_update: now - time::Duration::minutes(1),
-            next_update: now + time::Duration::days(1),
+            next_update: now + lifetime,
             crl_number: SerialNumber::from(1u64),
             issuing_distribution_point: None,
-            revoked_certs: vec![RevokedCertParams {
-                serial_number: SerialNumber::from(serial),
-                revocation_time: now - time::Duration::minutes(1),
-                reason_code: Some(RevocationReason::KeyCompromise),
-                invalidity_date: None,
-            }],
+            revoked_certs: serials
+                .iter()
+                .map(|serial| RevokedCertParams {
+                    serial_number: SerialNumber::from(*serial),
+                    revocation_time: now - time::Duration::minutes(1),
+                    reason_code: Some(RevocationReason::KeyCompromise),
+                    invalidity_date: None,
+                })
+                .collect(),
             key_identifier_method: rcgen::KeyIdMethod::Sha256,
         };
         params
@@ -254,6 +269,9 @@ struct Peer {
     accepted: Arc<AtomicUsize>,
     per_connection_active: Arc<Mutex<Vec<Arc<AtomicUsize>>>>,
     flood_pushed: Arc<Mutex<Vec<Arc<AtomicUsize>>>>,
+    /// While `true`, accepted connections wait before their TLS handshake, so
+    /// a dial stays in flight until the test releases it.
+    hold: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 impl Peer {
@@ -269,6 +287,8 @@ impl Peer {
         let accepted_task = accepted.clone();
         let per_connection_task = per_connection_active.clone();
         let flood_task = flood_pushed.clone();
+        let hold = Arc::new(tokio::sync::watch::channel(false).0);
+        let hold_task = hold.clone();
         tokio::spawn(async move {
             let inbound = build_spiffe_inbound_config(server_slot, true, Arc::new(Vec::new()))
                 .expect("server config");
@@ -285,7 +305,13 @@ impl Peer {
                     .push(active.clone());
                 let acceptor = acceptor.clone();
                 let flood = flood_task.clone();
+                let mut hold_rx = hold_task.subscribe();
                 tokio::spawn(async move {
+                    while *hold_rx.borrow_and_update() {
+                        if hold_rx.changed().await.is_err() {
+                            return;
+                        }
+                    }
                     let Ok(tls) = acceptor.accept(tcp).await else {
                         return;
                     };
@@ -320,7 +346,12 @@ impl Peer {
             accepted,
             per_connection_active,
             flood_pushed,
+            hold,
         }
+    }
+
+    fn hold_handshakes(&self, hold: bool) {
+        self.hold.send_replace(hold);
     }
 
     fn accepted(&self) -> usize {
@@ -442,6 +473,7 @@ struct Options {
     connect_timeout_ms: u64,
     max_connections: Option<u32>,
     proxy_windows: Option<(u32, u32)>,
+    idle_timeout_seconds: Option<u64>,
 }
 
 impl Default for Options {
@@ -454,6 +486,7 @@ impl Default for Options {
             connect_timeout_ms: 5_000,
             max_connections: None,
             proxy_windows: None,
+            idle_timeout_seconds: None,
         }
     }
 }
@@ -487,10 +520,13 @@ impl Fixture {
         ));
         let peer_slot = svid_slot(ca.bundle(peer_id.clone(), peer_leaf, peer_key));
         let peer = Peer::start(peer_slot, options.peer_max_streams).await;
-        let pool_config = PoolConfig {
+        let mut pool_config = PoolConfig {
             http2_connections_per_host: options.width,
             ..PoolConfig::default()
         };
+        if let Some(idle) = options.idle_timeout_seconds {
+            pool_config.idle_timeout_seconds = idle;
+        }
         let crls = ferrum_edge::tls::shared_crl_list(Arc::new(Vec::new()));
         let pool = MeshMtlsConnectionPool::new_with_svid_generation_and_shared_crls(
             pool_config.clone(),
@@ -1241,14 +1277,49 @@ async fn gateway_trust_withdrawal_retires_pooled_tunnels_and_redials() {
 // ===== flow control: back-pressure under a stalled reader =====
 
 #[test]
-fn carrier_windows_leave_room_for_live_streams_beside_stalled_ones() {
-    // Defaults: 8 MiB streams, 32 MiB connection, cap 1000 -> the connection
-    // window covers 16 stream windows within the 128 MiB ceiling.
-    let (stream, connection) = tunnel_carrier_window_sizes_for_tests(&PoolConfig::default());
-    assert_eq!(stream, 8 * 1024 * 1024);
-    assert_eq!(connection, 128 * 1024 * 1024);
+fn flow_control_covers_every_admitted_stream_at_a_full_window() {
+    let ceiling = u64::from(H2_MAX_FLOW_CONTROL_WINDOW);
+    let covers = |flow: ConnectMultiplexFlowControl| {
+        u64::from(flow.max_streams) * u64::from(flow.stream_window)
+            <= u64::from(flow.connection_window)
+            && u64::from(flow.connection_window) <= ceiling
+            && flow.max_streams >= 1
+            && flow.stream_window >= 65_535
+    };
+    for stream in [65_535u32, 262_144, 1 << 20, 8 << 20, 128 << 20] {
+        for connection in [65_535u32, 2 << 20, 32 << 20, 128 << 20] {
+            for cap in [None, Some(1), Some(4), Some(100), Some(1000), Some(100_000)] {
+                let flow = connect_multiplex_flow_control(stream, connection, cap);
+                assert!(covers(flow), "{stream}/{connection}/{cap:?} -> {flow:?}");
+                assert!(
+                    u64::from(flow.connection_window) >= u64::from(connection).min(ceiling),
+                    "never lowers the configured connection window"
+                );
+                if let Some(cap) = cap {
+                    assert!(flow.max_streams <= cap.max(1));
+                }
+            }
+        }
+    }
 
-    // A cap below the headroom covers every stream.
+    // Destination defaults (frontend 256 KiB / 2 MiB, 1000 streams): only the
+    // connection window grows.
+    let destination = connect_multiplex_flow_control(256 * 1024, 2 << 20, Some(1000));
+    assert_eq!(destination.stream_window, 256 * 1024);
+    assert_eq!(destination.max_streams, 1000);
+    assert_eq!(destination.connection_window, 1000 * 256 * 1024);
+    // Equal stream and connection windows (a valid frontend configuration).
+    let tight = connect_multiplex_flow_control(65_535, 65_535, Some(1000));
+    assert_eq!(tight.connection_window, 1000 * 65_535);
+
+    // Source carrier defaults: 1000 streams cannot each hold 8 MiB within the
+    // HTTP/2 maximum, so the stream window shrinks to fit.
+    let (stream, connection, streams) =
+        tunnel_carrier_flow_control_for_tests(&PoolConfig::default());
+    assert_eq!(streams, Some(1000));
+    assert!(u64::from(stream) * 1000 <= u64::from(connection));
+    assert!(stream >= 2 * 1024 * 1024 - 1024, "{stream}");
+
     let capped = PoolConfig {
         http2_max_concurrent_streams: Some(4),
         http2_initial_stream_window_size: 1024 * 1024,
@@ -1256,51 +1327,52 @@ fn carrier_windows_leave_room_for_live_streams_beside_stalled_ones() {
         ..PoolConfig::default()
     };
     assert_eq!(
-        tunnel_carrier_window_sizes_for_tests(&capped),
-        (1024 * 1024, 4 * 1024 * 1024)
+        tunnel_carrier_flow_control_for_tests(&capped),
+        (1024 * 1024, 4 * 1024 * 1024, Some(4))
     );
-
-    // A stream window as large as the ceiling is halved so one stalled stream
-    // can never hold the whole connection window.
-    let huge = PoolConfig {
-        http2_initial_stream_window_size: 128 * 1024 * 1024,
-        http2_initial_connection_window_size: 128 * 1024 * 1024,
-        ..PoolConfig::default()
-    };
-    let (stream, connection) = tunnel_carrier_window_sizes_for_tests(&huge);
-    assert!(stream * 2 <= connection, "{stream} vs {connection}");
 }
 
+/// Every stream but one on a carrier has a reader that never reads again;
+/// the remaining tunnel keeps receiving at full speed, and each stalled
+/// stream's buffered bytes stay within its own window (its writer blocks).
 #[tokio::test(flavor = "multi_thread")]
-async fn a_stalled_client_reader_neither_overflows_nor_starves_its_sibling() {
-    // 1 MiB stream and connection windows: without the carrier window sizing
-    // one stalled stream would hold the whole connection window.
+async fn stalled_readers_on_every_other_stream_never_starve_the_live_one() {
     const WINDOW: u32 = 1024 * 1024;
+    const CAP: u32 = 4;
     let fixture = Fixture::new(Options {
+        proxy_stream_cap: Some(CAP),
+        // Equal stream and connection windows: without the carrier sizing a
+        // single stalled stream would hold the whole connection window.
         proxy_windows: Some((WINDOW, WINDOW)),
         ..Options::default()
     })
     .await;
-    let (stream_window, connection_window) =
-        tunnel_carrier_window_sizes_for_tests(&fixture.pool_config.for_proxy(&fixture.proxy));
-    assert_eq!(stream_window, WINDOW);
-    assert!(connection_window >= 2 * WINDOW);
+    let (stream_window, connection_window, streams) =
+        tunnel_carrier_flow_control_for_tests(&fixture.pool_config.for_proxy(&fixture.proxy));
+    assert_eq!(
+        (stream_window, connection_window, streams),
+        (WINDOW, CAP * WINDOW, Some(CAP))
+    );
 
-    // Tunnel A: the peer floods, the captured client never reads.
-    let mut stalled = fixture.open_ok().await;
-    stalled.write_all(b"FLOOD\n").await.expect("flood command");
-    // Tunnel B on the same connection: also flooded, and read.
+    let mut stalled = Vec::new();
+    for _ in 0..(CAP - 1) {
+        let mut tunnel = fixture.open_ok().await;
+        tunnel.write_all(b"FLOOD\n").await.expect("flood command");
+        stalled.push(tunnel);
+    }
     let mut live = fixture.open_ok().await;
     live.write_all(b"FLOOD\n").await.expect("flood command");
     assert_eq!(
         fixture.peer.accepted(),
         1,
-        "both tunnels share one connection"
+        "all tunnels share one connection"
     );
 
+    // Let the stalled streams fill their windows first.
+    tokio::time::sleep(Duration::from_millis(500)).await;
     let mut received = 0usize;
     let mut buf = vec![0u8; 64 * 1024];
-    let target = 4 * WINDOW as usize;
+    let target = 8 * WINDOW as usize;
     tokio::time::timeout(Duration::from_secs(20), async {
         while received < target {
             let n = live.read(&mut buf).await.expect("live tunnel read");
@@ -1309,27 +1381,27 @@ async fn a_stalled_client_reader_neither_overflows_nor_starves_its_sibling() {
         }
     })
     .await
-    .expect("the live sibling keeps receiving beside a stalled stream");
+    .expect("the live tunnel keeps receiving beside stalled siblings");
 
-    // The stalled stream's buffered bytes are bounded by its own window and
-    // the peer's writer is blocked (back-pressure), not growing.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let stalled_counter = loop {
-        let counters: Vec<_> = (0..2).map(|i| fixture.peer.flood_counter(i)).collect();
-        if let Some(stalled) = counters
-            .iter()
-            .find(|counter| counter.load(Ordering::SeqCst) <= stream_window as usize)
-        {
-            break stalled.clone();
-        }
-        assert!(tokio::time::Instant::now() < deadline);
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
-    let first = stalled_counter.load(Ordering::SeqCst);
+    let counters: Vec<_> = (0..CAP as usize)
+        .map(|i| fixture.peer.flood_counter(i))
+        .collect();
+    let stalled_counters: Vec<_> = counters
+        .iter()
+        .filter(|counter| counter.load(Ordering::SeqCst) <= stream_window as usize)
+        .cloned()
+        .collect();
+    assert_eq!(stalled_counters.len(), (CAP - 1) as usize);
+    let first: Vec<usize> = stalled_counters
+        .iter()
+        .map(|c| c.load(Ordering::SeqCst))
+        .collect();
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let second = stalled_counter.load(Ordering::SeqCst);
-    assert_eq!(first, second, "the stalled stream's writer must be blocked");
-    assert!(second <= stream_window as usize);
+    let second: Vec<usize> = stalled_counters
+        .iter()
+        .map(|c| c.load(Ordering::SeqCst))
+        .collect();
+    assert_eq!(first, second, "every stalled stream's writer is blocked");
     drop(stalled);
 }
 
@@ -1376,4 +1448,174 @@ async fn a_stalled_destination_reader_back_pressures_the_writer_only() {
     echo_round_trip(&mut sibling, b"not-starved").await;
     assert_eq!(fixture.peer.accepted(), 1);
     writer.abort();
+}
+
+// ===== review follow-ups: drain fence, CRL expiry, DR overrides, idle, peer cap =====
+
+/// A drain that runs while a carrier's dial is in flight (here a trust-change
+/// `force_drain_all`, which changes neither the SVID nor the CRL slot) must
+/// keep that carrier out of the pool: the dial serves its own tunnel only, and
+/// the next tunnel dials afresh.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drain_during_a_dial_keeps_the_dialed_connection_out_of_the_pool() {
+    let fixture = Fixture::new(Options::default()).await;
+    fixture.peer.hold_handshakes(true);
+    let open = fixture.open();
+    tokio::pin!(open);
+    // Drive the open until its dial is parked on the held handshake.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), &mut open)
+            .await
+            .is_err(),
+        "the dial must be in flight"
+    );
+    assert_eq!(fixture.peer.accepted(), 1);
+
+    fixture.pool.force_drain_all();
+    fixture.peer.hold_handshakes(false);
+
+    let mut first = open
+        .await
+        .expect("the in-flight dial serves its own tunnel");
+    first.write_all(b"ECHO\n").await.expect("echo command");
+    echo_round_trip(&mut first, b"own-tunnel").await;
+    assert_eq!(
+        fixture.pool.tunnel_pool_size(),
+        0,
+        "a carrier dialed before the drain is never published after it"
+    );
+
+    let mut second = fixture.open_echo().await;
+    echo_round_trip(&mut second, b"fresh").await;
+    assert_eq!(fixture.peer.accepted(), 2, "the next tunnel dialed afresh");
+    assert_eq!(fixture.pool.tunnel_pool_size(), 1);
+}
+
+/// A carrier stops being handed out once an enforced CRL reaches its
+/// `nextUpdate`, even with the CRL slot unchanged and both leaves valid: a
+/// fresh handshake would be refused then, so a pooled one must not serve.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_expiring_crl_retires_carriers_verified_under_it() {
+    let fixture = Fixture::new(Options::default()).await;
+    fixture.crls.store(Arc::new(vec![
+        fixture.ca.crl(&[], time::Duration::seconds(3)),
+    ]));
+    let mut before = fixture.open_echo().await;
+    echo_round_trip(&mut before, b"crl-valid").await;
+    assert_eq!(fixture.peer.accepted(), 1);
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let err = fixture
+        .open()
+        .await
+        .map(drop)
+        .expect_err("an expired CRL refuses the next tunnel");
+    assert!(
+        matches!(err, HbonePoolError::TlsHandshake { .. }),
+        "unexpected error: {err:?}"
+    );
+    assert_eq!(
+        fixture.peer.accepted(),
+        2,
+        "the carrier verified under the now-expired CRL was not reused"
+    );
+}
+
+/// The captured-egress relay proxy carries DestinationRule `connectionPool`
+/// settings as `dispatch_port_overrides` (per port) and
+/// `dispatch_port_override_fallback` (inherited top level). The tunnel lane
+/// honours `maxConcurrentStreams` from them exactly as the HTTP lane does.
+#[tokio::test(flavor = "multi_thread")]
+async fn destination_rule_stream_cap_on_the_relay_proxy_bounds_streams_per_carrier() {
+    let mut fixture = Fixture::new(Options::default()).await;
+    let mut overrides = HashMap::new();
+    overrides.insert(
+        APP_PORT,
+        ResolvedPortOverride {
+            h2_max_concurrent_streams: Some(1),
+            ..Default::default()
+        },
+    );
+    fixture.proxy.dispatch_port_overrides = Some(overrides);
+    let _a = fixture.open_echo().await;
+    let _b = fixture.open_echo().await;
+    fixture.peer.wait_for_active(&[1, 1]).await;
+    assert_eq!(fixture.peer.accepted(), 2);
+
+    // The inherited top-level value applies when the port sets none.
+    let mut fixture = Fixture::new(Options::default()).await;
+    fixture.proxy.dispatch_port_override_fallback = Some(ResolvedPortOverride {
+        h2_max_concurrent_streams: Some(2),
+        ..Default::default()
+    });
+    let mut held = Vec::new();
+    for _ in 0..3 {
+        held.push(fixture.open_echo().await);
+    }
+    fixture.peer.wait_for_active(&[2, 1]).await;
+    assert_eq!(fixture.peer.accepted(), 2);
+}
+
+#[test]
+fn captured_egress_relay_proxies_carry_the_inherited_connection_pool_overlay() {
+    let router = include_str!("../../../src/router_cache.rs");
+    let synthesized = router
+        .matches("relay_proxy.dispatch_port_override_fallback =")
+        .count();
+    let per_port = router
+        .matches("relay_proxy.dispatch_port_overrides =")
+        .count();
+    assert!(per_port >= 2, "VIP and by-workload relay proxies");
+    assert_eq!(
+        synthesized, per_port,
+        "every relay proxy that carries per-port overrides also carries the inherited overlay"
+    );
+}
+
+/// A carrier with an open tunnel is never idle-evicted, so with
+/// `maxConnections: 1` a second tunnel past the idle timeout still rides it
+/// instead of being refused a second connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_carrier_with_an_open_tunnel_outlives_the_idle_timeout() {
+    let fixture = Fixture::new(Options {
+        idle_timeout_seconds: Some(1),
+        max_connections: Some(1),
+        ..Options::default()
+    })
+    .await;
+    let mut busy = fixture.open_echo().await;
+    echo_round_trip(&mut busy, b"busy").await;
+    // Well past the idle timeout and several idle sweeps.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(fixture.pool.tunnel_pool_size(), 1);
+    let mut second = fixture.open_echo().await;
+    echo_round_trip(&mut second, b"same-carrier").await;
+    assert_eq!(fixture.peer.accepted(), 1);
+    echo_round_trip(&mut busy, b"still-busy").await;
+
+    // Once the last tunnel closes the idle clock starts and the carrier goes.
+    drop(busy);
+    drop(second);
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(fixture.pool.tunnel_pool_size(), 0);
+}
+
+/// A peer that advertises fewer concurrent streams than the client cap:
+/// concurrent cold opens must widen to a second carrier rather than park the
+/// second stream behind the first inside `h2` until its connect timeout.
+#[tokio::test(flavor = "multi_thread")]
+async fn cold_burst_respects_the_peers_advertised_stream_cap() {
+    let fixture = Fixture::new(Options {
+        peer_max_streams: 1,
+        width: 2,
+        connect_timeout_ms: 3_000,
+        ..Options::default()
+    })
+    .await;
+    let (a, b) = tokio::join!(fixture.open_echo(), fixture.open_echo());
+    let (mut a, mut b) = (a, b);
+    echo_round_trip(&mut a, b"a").await;
+    echo_round_trip(&mut b, b"b").await;
+    fixture.peer.wait_for_active(&[1, 1]).await;
+    assert_eq!(fixture.peer.accepted(), 2);
 }
