@@ -659,11 +659,21 @@ impl NodeWaypointBranchKey {
                 host: candidate,
                 port: candidate_port,
             } => {
-                *candidate_port == port
-                    && host
-                        .trim()
-                        .trim_end_matches('.')
-                        .eq_ignore_ascii_case(candidate)
+                *candidate_port == port && {
+                    // `normalize_destination_backend_host` keeps the root dot
+                    // of an absolute two-label host (review F6, round 5).
+                    let trimmed = host.trim();
+                    let stripped = trimmed.trim_end_matches('.');
+                    if trimmed.ends_with('.') && stripped.matches('.').count() == 1 {
+                        candidate.len() == stripped.len() + 1
+                            && candidate.ends_with('.')
+                            && candidate
+                                .get(..stripped.len())
+                                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(stripped))
+                    } else {
+                        stripped.eq_ignore_ascii_case(candidate)
+                    }
+                }
             }
             Self::Upstream(_) => false,
         }
@@ -1560,11 +1570,64 @@ pub(crate) fn node_waypoint_destination_scope_index(
 ) -> Result<DestinationPolicyScopeIndex, String> {
     let cluster_domains = normalized_cluster_domains(config);
     let (_, route_upstreams) = parse_node_waypoint_route_upstreams(config)?;
+    let destination_workloads = parse_node_waypoint_route_destination_workloads(config)?;
     Ok(destination_policy_scope_index(
         slice,
         &cluster_domains,
         &route_upstreams,
+        &destination_workloads,
     ))
+}
+
+/// The workloads that back authorized cross-namespace route destinations only
+/// (issue #7499), which the data plane keeps out of the routing view and so
+/// out of the embedded `mesh_slice` (review F4, round 5): they scope ONLY the
+/// cross-namespace destination clones a carried route dials, never an
+/// ordinary Service upstream.
+fn parse_node_waypoint_route_destination_workloads(
+    config: &Value,
+) -> Result<Vec<crate::modes::mesh::config::Workload>, String> {
+    match config.get("node_waypoint_route_destination_workloads") {
+        Some(value) => crate::util::json_object::from_json_object_vec_value::<
+            crate::modes::mesh::config::Workload,
+        >(value.clone())
+        .map_err(|error| {
+            format!("mesh_authz: invalid `node_waypoint_route_destination_workloads`: {error}")
+        }),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// The `(namespace, name)` of every AuthorizationPolicy the slice carries
+/// only because it selects an authorized cross-namespace route destination
+/// (issue #7499). They govern those destinations' scopes like any policy,
+/// but never decide whether an unresolved SOURCE scope fails closed: without
+/// the grant they would not be loaded at all (review F4, round 5).
+fn parse_node_waypoint_route_destination_policies(
+    config: &Value,
+) -> Result<HashSet<(String, String)>, String> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct PolicyRef {
+        namespace: String,
+        name: String,
+    }
+    match config.get("node_waypoint_route_destination_policies") {
+        Some(value) => {
+            crate::util::json_object::from_json_object_vec_value::<PolicyRef>(value.clone())
+                .map(|refs| {
+                    refs.into_iter()
+                        .map(|policy| (policy.namespace, policy.name))
+                        .collect()
+                })
+                .map_err(|error| {
+                    format!(
+                        "mesh_authz: invalid `node_waypoint_route_destination_policies`: {error}"
+                    )
+                })
+        }
+        None => Ok(HashSet::new()),
+    }
 }
 
 /// One `node_waypoint_route_upstreams` entry. Closed with its `targets`
@@ -1652,8 +1715,20 @@ impl ConditionAttributeKeys {
 }
 
 fn normalize_destination_backend_host(host: &str) -> Option<String> {
-    let normalized = host.trim().trim_end_matches('.').to_ascii_lowercase();
-    (!normalized.is_empty()).then_some(normalized)
+    let trimmed = host.trim();
+    let normalized = trimmed.trim_end_matches('.').to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+    // An ABSOLUTE two-label name (`ratings.other.`) is an external host that
+    // no cluster DNS search suffix completes (issue #7499), so it must never
+    // fold onto the relative `<svc>.<ns>` Service alias and inherit that
+    // Service's destination policy (review F6, round 5). It keeps its root
+    // dot, which no Service alias, workload address or namespace carries.
+    if trimmed.ends_with('.') && normalized.matches('.').count() == 1 {
+        return Some(format!("{normalized}."));
+    }
+    Some(normalized)
 }
 
 fn node_waypoint_generated_route_upstream_id(upstream_id: &str) -> bool {
@@ -1972,6 +2047,7 @@ fn destination_policy_scope_index(
     slice: &MeshSlice,
     cluster_domains: &[String],
     route_upstreams: &[NodeWaypointRouteUpstreamConfig],
+    destination_workloads: &[crate::modes::mesh::config::Workload],
 ) -> DestinationPolicyScopeIndex {
     let mut index = DestinationPolicyScopeIndex::default();
     let mut service_port_scopes = HashMap::new();
@@ -2098,7 +2174,61 @@ fn destination_policy_scope_index(
             }
         }
     }
+    // Review F4 (round 5): every ordinary Service upstream above is scoped
+    // from the routing view alone, exactly as without any grant. Only a
+    // cross-namespace destination clone (issue #7499) also reaches the
+    // workloads the data plane holds apart for authorized routes, so only its
+    // targets resolve against the complete destination view.
+    let mut clone_service_port_scopes = HashMap::new();
+    let mut clone_service_port_endpoints = HashMap::new();
+    let mut clone_workload_backend_hosts = workload_backend_hosts.clone();
+    if !destination_workloads.is_empty() {
+        let complete: Vec<crate::modes::mesh::config::Workload> = slice
+            .workloads
+            .iter()
+            .chain(destination_workloads)
+            .cloned()
+            .collect();
+        for workload in destination_workloads {
+            for address in &workload.addresses {
+                if let Some(address) = normalize_destination_backend_host(address) {
+                    clone_workload_backend_hosts.insert(address);
+                }
+            }
+        }
+        for service in &slice.services {
+            for service_port in &service.ports {
+                let scopes = destination_policy_scopes_for_service_port(
+                    service,
+                    service_port,
+                    &complete,
+                    slice.multi_cluster.as_ref(),
+                );
+                if scopes.scopes.is_empty() {
+                    continue;
+                }
+                let service_key = ServicePortKey::new(service, service_port.port);
+                clone_service_port_scopes.insert(service_key.clone(), scopes.scopes);
+                clone_service_port_endpoints.insert(service_key, scopes.endpoint_backends);
+            }
+        }
+    }
     for upstream in route_upstreams {
+        let clone = !destination_workloads.is_empty()
+            && crate::modes::mesh::is_cross_namespace_destination_clone_id(&upstream.id);
+        let (service_port_scopes, service_port_endpoints, workload_backend_hosts) = if clone {
+            (
+                &clone_service_port_scopes,
+                &clone_service_port_endpoints,
+                &clone_workload_backend_hosts,
+            )
+        } else {
+            (
+                &service_port_scopes,
+                &service_port_endpoints,
+                &workload_backend_hosts,
+            )
+        };
         // Two ports of one Service carry the same scopes; collapse them too.
         let mut route_scopes = DestinationScopeSet::default();
         let mut requires_destination_scope = false;
@@ -2137,7 +2267,7 @@ fn destination_policy_scope_index(
             ) && !route_target_uses_modeled_endpoint(
                 target,
                 &service_key,
-                &service_port_endpoints,
+                service_port_endpoints,
             ) {
                 unscoped_target_seen = true;
                 continue;
@@ -2903,6 +3033,8 @@ pub const MESH_AUTHZ_CONFIG_KEYS: &[&str] = &[
     "cluster_domains",
     "node_waypoint_route_upstreams",
     "node_waypoint_route_branches",
+    "node_waypoint_route_destination_workloads",
+    "node_waypoint_route_destination_policies",
 ];
 
 fn ambient_udp_source_scope_index(
@@ -3099,8 +3231,33 @@ impl MeshAuthz {
         // closed, but it does not turn an unresolved SOURCE scope (UDP/DTLS
         // sessions, outbound capture) into a refusal that no supplied scope
         // could ever satisfy.
-        let has_scoped_ordinary_policies =
-            per_pod_policy_scoping && policies_enforce_scoped_rules(&slice.mesh_policies);
+        // Review F4 (round 5): the AuthorizationPolicies carried only for
+        // authorized cross-namespace route destinations govern those
+        // destinations' scopes, but never the source-scope census: without the
+        // grant they would not be loaded, and a grant changes only the routes
+        // that name its target.
+        let route_destination_policies = if per_pod_policy_scoping {
+            parse_node_waypoint_route_destination_policies(config)?
+        } else {
+            HashSet::new()
+        };
+        let route_destination_workloads = if per_pod_policy_scoping {
+            parse_node_waypoint_route_destination_workloads(config)?
+        } else {
+            Vec::new()
+        };
+        let has_scoped_ordinary_policies = per_pod_policy_scoping && {
+            let ordinary: Vec<MeshPolicy> = slice
+                .mesh_policies
+                .iter()
+                .filter(|policy| {
+                    !route_destination_policies
+                        .contains(&(policy.namespace.clone(), policy.name.clone()))
+                })
+                .cloned()
+                .collect();
+            policies_enforce_scoped_rules(&ordinary)
+        };
         let has_scoped_capture_destination_policies = per_pod_policy_scoping
             && policies_enforce_scoped_rules(&slice.node_waypoint_capture_mesh_policies);
         // The merge APPENDS capture-only policies and never reorders; later
@@ -3218,7 +3375,12 @@ impl MeshAuthz {
                 } else {
                     Vec::new()
                 };
-                destination_policy_scope_index(&slice, &cluster_domains, &route_upstreams)
+                destination_policy_scope_index(
+                    &slice,
+                    &cluster_domains,
+                    &route_upstreams,
+                    &route_destination_workloads,
+                )
             } else {
                 DestinationPolicyScopeIndex::default()
             };
@@ -5090,6 +5252,27 @@ impl Plugin for MeshAuthz {
         // entry point that skipped that refusal would still fail closed.
         let stripped_path =
             crate::modes::mesh::policy::mesh_authz_stripped_path(&authorization_path);
+        // Review F2 (round 5): a NodeWaypoint relay from a trusted NodeWaypoint
+        // assertor that fronts the source it asserts was already judged at
+        // Layer 7 by that source waypoint against this destination's policy
+        // (or as a strict Layer-4 session for a raw stream). The tunnel stays
+        // opaque here, but its HTTP-only predicates are the upstream's
+        // decision, not an unobservable attribute that refuses every ALLOW.
+        let upstream_enforced_l7 = connect_relay
+            && self.per_pod_policy_scoping
+            && baggage_outcome == BaggageOutcome::Honored
+            && match (ctx.peer_spiffe_id.as_ref(), source_principal.as_ref()) {
+                (Some(peer), Some(asserted)) => {
+                    hbone_assertor_fronts_identity(&self.trusted_hbone_assertors, peer, asserted)
+                }
+                _ => false,
+            };
+        if upstream_enforced_l7 {
+            ctx.metadata.insert(
+                "mesh_authz.upstream_enforced_l7".to_string(),
+                "true".to_string(),
+            );
+        }
         let mut request = if connect_relay {
             MeshAuthzRequest {
                 source_principal,
@@ -5099,7 +5282,11 @@ impl Plugin for MeshAuthz {
                 remote_ip,
                 destination_ip,
                 // Only transport facts are observable on a relayed tunnel.
-                protocol: MeshAuthzProtocol::L4,
+                protocol: if upstream_enforced_l7 {
+                    MeshAuthzProtocol::UpstreamEnforcedL7
+                } else {
+                    MeshAuthzProtocol::L4
+                },
                 ..MeshAuthzRequest::default()
             }
         } else {
@@ -6352,6 +6539,25 @@ pub(crate) fn hbone_assertion_verdict(
             }
         }
     }
+}
+
+/// Whether `peer`'s exact-SPIFFE entry carries an explicit grant fronting
+/// `asserted` (a CP-derived NodeWaypoint assertor, or an operator object entry
+/// `{"assertor": "spiffe://…", "asserts": [...]}`): an assertor that
+/// terminates the asserted source's traffic itself, as opposed to a
+/// same-namespace or mesh-wide relay grant (review F2, round 5).
+pub(crate) fn hbone_assertor_fronts_identity(
+    assertors: &TrustedAssertorIndex,
+    peer: &SpiffeId,
+    asserted: &SpiffeId,
+) -> bool {
+    matches!(
+        assertors.exact.get(peer),
+        Some(CompiledGrant::Restricted {
+            fronted: Some(ids),
+            ..
+        }) if ids.contains(asserted.as_str())
+    )
 }
 
 /// Disposition of one compiled baggage trust gate (assertor index + aliases).
@@ -7669,7 +7875,7 @@ mod tests {
         use super::{DestinationBackendKey, destination_policy_scope_index};
 
         let replicas = (0..300).map(|index| reviews_replica(index, "v1")).collect();
-        let index = destination_policy_scope_index(&reviews_slice(replicas), &[], &[]);
+        let index = destination_policy_scope_index(&reviews_slice(replicas), &[], &[], &[]);
 
         let upstream = crate::modes::mesh::mesh_outbound_upstream_id("shop", "reviews", 9080);
         assert_eq!(
@@ -7694,7 +7900,7 @@ mod tests {
         let mut replicas: Vec<_> = (0..50).map(|index| reviews_replica(index, "v1")).collect();
         replicas.extend((50..100).map(|index| reviews_replica(index, "v2")));
         replicas.push(reviews_replica(100, "v1"));
-        let index = destination_policy_scope_index(&reviews_slice(replicas), &[], &[]);
+        let index = destination_policy_scope_index(&reviews_slice(replicas), &[], &[], &[]);
 
         let upstream = crate::modes::mesh::mesh_outbound_upstream_id("shop", "reviews", 9080);
         let versions: Vec<_> = index
@@ -7758,7 +7964,7 @@ mod tests {
             ]
         }))
         .expect("route upstream");
-        let index = destination_policy_scope_index(&slice, &[], &[route]);
+        let index = destination_policy_scope_index(&slice, &[], &[route], &[]);
 
         let endpoint = DestinationBackendKey::new("10.1.0.1", 9080).expect("endpoint key");
         assert_eq!(

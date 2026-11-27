@@ -29,6 +29,7 @@ use ferrum_edge::config::types::{
 };
 use ferrum_edge::config_sources::k8s::{
     K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
+    translate_k8s_objects_collecting_skips,
 };
 use ferrum_edge::grpc::cp_server::CpScope;
 use ferrum_edge::identity::spiffe::TrustDomain;
@@ -172,23 +173,38 @@ pub(super) fn ninety_ten_spec() -> Value {
 /// Translate `objects` (with the `other/ratings` Service, its grant and the
 /// importing Sidecar), then add the mesh inventory both namespaces hold.
 pub(super) fn translated(objects: Vec<K8sObject>) -> GatewayConfig {
+    translated_with_grant(objects, true)
+}
+
+/// [`translated`], with or without the `other/ratings` ReferenceGrant.
+pub(super) fn translated_with_grant(objects: Vec<K8sObject>, with_grant: bool) -> GatewayConfig {
     let mut all = vec![
         k8s_service("reviews", DEFAULT_NAMESPACE),
         k8s_service("ratings", OTHER),
-        grant(),
         importing_sidecar(),
     ];
+    if with_grant {
+        all.push(grant());
+    }
     all.extend(objects);
-    let translated = translate_k8s_objects(
-        &all,
-        K8sTranslationOptions::new(
-            DEFAULT_NAMESPACE.to_string(),
-            TrustDomain::new("cluster.local").expect("trust domain"),
-        )
-        .with_source_namespaces(Vec::new()),
+    let options = K8sTranslationOptions::new(
+        DEFAULT_NAMESPACE.to_string(),
+        TrustDomain::new("cluster.local").expect("trust domain"),
     )
-    .expect("resources translate");
-    let mut config = translated.config;
+    .with_source_namespaces(Vec::new())
+    .with_pod_discovery_enabled(true);
+    let mut config = if with_grant {
+        translate_k8s_objects(&all, options)
+            .expect("resources translate")
+            .config
+    } else {
+        // Without the grant a VirtualService naming `other/ratings` is
+        // refused (and dropped) exactly as the controller drops it.
+        translate_k8s_objects_collecting_skips(&all, options)
+            .expect("translation runs")
+            .0
+            .config
+    };
     let reviews = workload_for(
         "reviews",
         DEFAULT_NAMESPACE,
@@ -274,13 +290,19 @@ pub(super) fn ratings_source(prepared: &GatewayConfig) -> &Upstream {
 
 /// The clone a route-namespace reference to `other/ratings:8080` dials. With
 /// no independent backend on this data plane, the clone is admitted as the
-/// destination source (the Service port's lane).
+/// destination source (the Service port's lane) and dials the ratings Pod.
 fn assert_ratings_clone(prepared: &GatewayConfig, clone_id: &str) {
-    assert_ratings_clone_admitted_as(prepared, clone_id, &ratings_source(prepared).id.clone());
+    assert_ratings_clone_admission(prepared, clone_id, &ratings_source(prepared).id.clone());
+    assert_ratings_clone_targets(
+        prepared,
+        clone_id,
+        &[("10.0.1.12", "spiffe://cluster.local/ns/other/sa/ratings")],
+    );
 }
 
-/// [`assert_ratings_clone`], admitted as upstream `admission_id` of `other`.
-fn assert_ratings_clone_admitted_as(prepared: &GatewayConfig, clone_id: &str, admission_id: &str) {
+/// The clone lives in the route namespace and is admitted as upstream
+/// `admission_id` of `other` (the lane the destination Service port shares).
+fn assert_ratings_clone_admission(prepared: &GatewayConfig, clone_id: &str, admission_id: &str) {
     assert!(clone_id.starts_with(CLONE_PREFIX), "{clone_id}");
     let clone = upstream(prepared, clone_id);
     assert_eq!(
@@ -295,26 +317,43 @@ fn assert_ratings_clone_admitted_as(prepared: &GatewayConfig, clone_id: &str, ad
         }),
         "the clone is admitted as the destination Service port's lane"
     );
-    let hosts: Vec<&str> = clone
+}
+
+/// The clone dials exactly `expected` (host, workload identity) backends,
+/// each over the Sidecar SVID-mTLS transport, pinned to its own workload
+/// identity and sent the destination Service's own authority.
+fn assert_ratings_clone_targets(
+    prepared: &GatewayConfig,
+    clone_id: &str,
+    expected: &[(&str, &str)],
+) {
+    let clone = upstream(prepared, clone_id);
+    let mut dialed: Vec<(&str, &str)> = clone
         .targets
         .iter()
-        .map(|target| target.host.as_str())
+        .map(|target| {
+            (
+                target.host.as_str(),
+                target
+                    .tags
+                    .get("mesh.spiffe_id")
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+            )
+        })
         .collect();
+    dialed.sort_unstable();
+    let mut expected = expected.to_vec();
+    expected.sort_unstable();
     assert_eq!(
-        hosts,
-        vec!["10.0.1.12"],
-        "the clone dials the destination workloads"
+        dialed, expected,
+        "the clone dials the destination backends, each pinned to its own identity"
     );
     for target in &clone.targets {
         assert_eq!(
             target.tags.get("mesh.mtls").map(String::as_str),
             Some("true"),
             "over the Sidecar SVID-mTLS transport"
-        );
-        assert_eq!(
-            target.tags.get("mesh.spiffe_id").map(String::as_str),
-            Some("spiffe://cluster.local/ns/other/sa/ratings"),
-            "pinned to the destination workload identity"
         );
         assert_eq!(
             mesh_mtls_dispatch_authority_for_test(
@@ -1221,9 +1260,10 @@ fn a_grant_keeps_the_ordinary_route_of_a_service_with_its_own_backends() {
         .expect("other/ratings")
         .workloads
         .push(WorkloadRef {
-            spiffe_id: entry_identity,
+            spiffe_id: entry_identity.clone(),
         });
     mesh.workloads.push(entry);
+    let entry_identity = entry_identity.to_string();
 
     let runtime = sidecar_runtime();
     let prepared = prepare_gateway_config_from_mesh_slice(&slice_for(&config, &runtime), &runtime)
@@ -1252,7 +1292,18 @@ fn a_grant_keeps_the_ordinary_route_of_a_service_with_its_own_backends() {
         .upstream_id
         .clone()
         .expect("bound upstream");
-    assert_ratings_clone_admitted_as(&prepared, &clone_id, RATINGS_OTHER_UPSTREAM);
+    // Review F5 (round 5): the clone shares the ordinary Service upstream's
+    // admission lane, and dials both backends, each pinned to its own
+    // workload identity.
+    assert_ratings_clone_admission(&prepared, &clone_id, RATINGS_OTHER_UPSTREAM);
+    assert_ratings_clone_targets(
+        &prepared,
+        &clone_id,
+        &[
+            ("10.0.0.50", entry_identity.as_str()),
+            ("10.0.1.12", "spiffe://cluster.local/ns/other/sa/ratings"),
+        ],
+    );
 }
 
 /// Review F1 (round 4): a split with an authorized cross-namespace leg is

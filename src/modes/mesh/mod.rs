@@ -1690,6 +1690,18 @@ pub fn prepare_gateway_config_from_mesh_slice(
     gateway_config_from_mesh_slice_with_federation(slice, runtime, None, None)
 }
 
+/// [`prepare_gateway_config_from_mesh_slice`] with poller-discovered
+/// multicluster endpoints merged in exactly as slice apply merges them
+/// (tests only).
+#[doc(hidden)]
+pub fn prepare_gateway_config_from_mesh_slice_with_remote_endpoints_for_test(
+    slice: &MeshSlice,
+    runtime: &MeshRuntimeConfig,
+    remote_endpoints: &multicluster::RemoteEndpointSnapshot,
+) -> Result<GatewayConfig, anyhow::Error> {
+    gateway_config_from_mesh_slice_with_federation(slice, runtime, None, Some(remote_endpoints))
+}
+
 fn prepare_gateway_config_for_native_slice(
     mut config: GatewayConfig,
     runtime: &MeshRuntimeConfig,
@@ -1746,9 +1758,10 @@ fn prepare_normalized_gateway_config_for_mesh(
     let (mesh_slice, cross_namespace_destination_workloads): (&MeshSlice, &[config::Workload]) =
         match &routing_split {
             Some((routing_slice, destination_workloads)) => {
+                let keys = cross_namespace_destination_workload_keys(full_mesh_slice);
                 if let Some(mesh) = config.mesh.as_deref_mut() {
                     mesh.workloads
-                        .retain(|workload| !destination_workloads.contains(workload));
+                        .retain(|workload| !is_cross_namespace_destination_record(&keys, workload));
                 }
                 (routing_slice, destination_workloads.as_slice())
             }
@@ -1761,6 +1774,9 @@ fn prepare_normalized_gateway_config_for_mesh(
         &mut config,
         runtime,
         cross_namespace_destination_workloads,
+        &full_mesh_slice
+            .http_routes
+            .cross_namespace_destination_policies,
     );
     materialize_east_west_gateway_proxies(&mut config, runtime, mesh_slice);
     materialize_egress_gateway_proxies(&mut config, runtime, mesh_slice);
@@ -1779,11 +1795,16 @@ fn prepare_normalized_gateway_config_for_mesh(
     // After rebinding, so each candidate names the destination route dispatch
     // actually selects (the Service port's upstream, not its DNS name).
     thread_node_waypoint_route_branches_to_authz(&mut config, runtime);
-    // RequestAuthentication destination scoping resolves each route's
-    // destination workloads, cross-namespace destination workloads included
-    // (issue #7499), so it reads the complete slice.
-    let refused_destination_routes =
-        scope_request_auth_to_node_waypoint_destinations(&mut config, runtime, full_mesh_slice);
+    // RequestAuthentication destination scoping resolves each ordinary route
+    // over the routing view, exactly as without any grant, and only a
+    // cross-namespace destination clone over its destination workloads
+    // (issue #7499, review F4 round 5).
+    let refused_destination_routes = scope_request_auth_to_node_waypoint_destinations(
+        &mut config,
+        runtime,
+        mesh_slice,
+        cross_namespace_destination_workloads,
+    );
     scope_request_auth_refusal_to_inbound_routes(&mut config, runtime, &refused_destination_routes);
     // VirtualService-derived CORS attaches to the just-materialized outbound
     // routes (issue #1973) — after materialization so the proxy ids exist,
@@ -4532,6 +4553,59 @@ fn decode_http_route_set(
             ));
         }
     }
+    // Review F3 (round 5): the records the control plane added only for those
+    // destinations, each once, never of this slice's own namespace. A
+    // well-formed entry only ever REMOVES records from ordinary routing.
+    let destination_workloads = &set.cross_namespace_destination_workloads;
+    if destination_workloads.len() > slice::MAX_HTTP_ROUTE_CROSS_NAMESPACE_DESTINATION_WORKLOADS {
+        return Err(anyhow::anyhow!(
+            "Mesh slice HTTP route set lists more than {} cross-namespace destination workloads",
+            slice::MAX_HTTP_ROUTE_CROSS_NAMESPACE_DESTINATION_WORKLOADS
+        ));
+    }
+    let mut seen_destination_workloads: HashSet<&slice::MeshHttpRouteDestinationWorkload> =
+        HashSet::new();
+    for (index, entry) in destination_workloads.iter().enumerate() {
+        let well_formed = !entry.namespace.is_empty()
+            && entry.namespace.trim() == entry.namespace
+            && entry.namespace.len() <= config::MAX_VIRTUAL_SERVICE_CROSS_NAMESPACE_TARGET_LEN
+            && entry.namespace != slice.namespace
+            && crate::identity::spiffe::SpiffeId::new(&entry.spiffe_id).is_ok()
+            && seen_destination_workloads.insert(entry);
+        if !well_formed {
+            return Err(anyhow::anyhow!(
+                "Mesh slice HTTP route cross-namespace destination workload {index} is malformed"
+            ));
+        }
+    }
+    // The AuthorizationPolicies carried only for those destinations: each
+    // once, never of this slice's own namespace. An entry only ever keeps a
+    // policy out of the missing-source-scope census.
+    let destination_policies = &set.cross_namespace_destination_policies;
+    if destination_policies.len() > slice::MAX_HTTP_ROUTE_CROSS_NAMESPACE_DESTINATION_WORKLOADS {
+        return Err(anyhow::anyhow!(
+            "Mesh slice HTTP route set lists more than {} cross-namespace destination policies",
+            slice::MAX_HTTP_ROUTE_CROSS_NAMESPACE_DESTINATION_WORKLOADS
+        ));
+    }
+    let mut seen_destination_policies: HashSet<&slice::MeshHttpRouteDestinationPolicy> =
+        HashSet::new();
+    for (index, entry) in destination_policies.iter().enumerate() {
+        let well_formed = [entry.namespace.as_str(), entry.name.as_str()]
+            .iter()
+            .all(|value| {
+                !value.is_empty()
+                    && value.trim() == *value
+                    && value.len() <= config::MAX_VIRTUAL_SERVICE_CROSS_NAMESPACE_TARGET_LEN
+            })
+            && entry.namespace != slice.namespace
+            && seen_destination_policies.insert(entry);
+        if !well_formed {
+            return Err(anyhow::anyhow!(
+                "Mesh slice HTTP route cross-namespace destination policy {index} is malformed"
+            ));
+        }
+    }
 
     let carried_upstreams: BTreeSet<&str> = upstreams
         .iter()
@@ -6054,61 +6128,112 @@ pub(crate) fn cross_namespace_destination_source_id(
 }
 
 /// Give a NodeWaypoint's `__mesh_authz` the workloads of its authorized
-/// cross-namespace route destinations (issue #7499).
+/// cross-namespace route destinations (issue #7499), and the policies the
+/// slice carries only for them.
 ///
 /// Those workloads are kept out of the routing view
 /// ([`split_cross_namespace_destination_workloads`]), but a NodeWaypoint
 /// judges a carried route's destination policy itself: the destination
 /// policy index resolves a route-namespace clone's targets to the destination
-/// workloads' policy scopes from the embedded slice's workloads. Without them
-/// the destination would be unscoped and every request to it refused. Only
-/// the embedded authorization view gains them; nothing routes by it.
+/// workloads' policy scopes. They ride their own config key
+/// (`node_waypoint_route_destination_workloads`), never the embedded slice's
+/// `workloads` (review F4, round 5), so they scope only the clones: every
+/// ordinary Service upstream keeps the scopes the routing view gives it, as
+/// without the grant. The policies carried only for them
+/// (`node_waypoint_route_destination_policies`) stay out of the
+/// missing-source-scope census for the same reason.
 fn embed_cross_namespace_destination_workloads_in_authz(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
     destination_workloads: &[config::Workload],
+    destination_policies: &[slice::MeshHttpRouteDestinationPolicy],
 ) {
-    if runtime.topology != MeshTopology::NodeWaypoint || destination_workloads.is_empty() {
+    if runtime.topology != MeshTopology::NodeWaypoint
+        || (destination_workloads.is_empty() && destination_policies.is_empty())
+    {
         return;
     }
-    let Some(embedded) = config
+    let Some(authz) = config
         .plugin_configs
         .iter_mut()
         .find(|plugin| plugin.id == MESH_AUTHZ_PLUGIN_ID)
-        .and_then(|plugin| plugin.config.get_mut("mesh_slice"))
-        .and_then(serde_json::Value::as_object_mut)
-        .and_then(|slice| {
-            slice
-                .entry("workloads")
-                .or_insert_with(|| serde_json::Value::Array(Vec::new()))
-                .as_array_mut()
-        })
+        .and_then(|plugin| plugin.config.as_object_mut())
     else {
         return;
     };
-    for workload in destination_workloads {
-        if let Ok(value) = serde_json::to_value(workload) {
-            embedded.push(value);
-        }
+    if !destination_workloads.is_empty() {
+        let workloads: Vec<serde_json::Value> = destination_workloads
+            .iter()
+            .filter_map(|workload| serde_json::to_value(workload).ok())
+            .collect();
+        authz.insert(
+            "node_waypoint_route_destination_workloads".to_string(),
+            serde_json::Value::Array(workloads),
+        );
     }
+    if !destination_policies.is_empty() {
+        let policies: Vec<serde_json::Value> = destination_policies
+            .iter()
+            .map(|policy| serde_json::json!({"namespace": policy.namespace, "name": policy.name}))
+            .collect();
+        authz.insert(
+            "node_waypoint_route_destination_policies".to_string(),
+            serde_json::Value::Array(policies),
+        );
+    }
+}
+
+/// The `(namespace, SPIFFE id)` keys of the workload records the control
+/// plane added to a slice only for authorized cross-namespace route
+/// destinations (`MeshHttpRouteSet::cross_namespace_destination_workloads`,
+/// issue #7499).
+fn cross_namespace_destination_workload_keys(mesh_slice: &MeshSlice) -> HashSet<(&str, &str)> {
+    mesh_slice
+        .http_routes
+        .cross_namespace_destination_workloads
+        .iter()
+        .map(|key| (key.namespace.as_str(), key.spiffe_id.as_str()))
+        .collect()
+}
+
+/// Whether `workload` is one of the records the control plane added only for
+/// authorized cross-namespace route destinations (issue #7499). A record the
+/// data plane merged from a multicluster poller (`remote_provenance`) is
+/// never one, whatever identity it shares (review F3, round 5).
+fn is_cross_namespace_destination_record(
+    keys: &HashSet<(&str, &str)>,
+    workload: &config::Workload,
+) -> bool {
+    !workload.remote_provenance
+        && keys.contains(&(workload.namespace.as_str(), workload.spiffe_id.as_str()))
 }
 
 /// Split the workloads the control plane added to a slice only for an
 /// authorized cross-namespace VirtualService destination (issue #7499) off
 /// the slice's routing view.
 ///
-/// A Sidecar or NodeWaypoint slice's workload view is namespace-local; the
-/// control plane adds the own-namespace workloads of each Service a carried
-/// route is authorized to reach in another namespace
-/// (`MeshHttpRouteSet::authorized_cross_namespace_targets`). Those workloads
-/// back the authorized routes only, so they are returned apart and the
-/// routing slice (every ordinary materializer's input) no longer holds them.
-/// A workload of the subscriber's own namespace attached to the Service (a
-/// `WorkloadEntry`) is an independent backend and stays in the routing view.
-/// `None` when the slice carries no such workload (nothing is cloned).
+/// The control plane lists exactly the records it added
+/// (`MeshHttpRouteSet::cross_namespace_destination_workloads`, review F3
+/// round 5), so every other record keeps routing as it did without the
+/// grant: a subscriber-namespace `WorkloadEntry` attached to the Service, a
+/// record the ordinary view already held, a multicluster endpoint merged on
+/// this data plane. The listed records back the authorized routes only: those
+/// of an authorized target Service (own namespace, attached in it) are
+/// returned apart, and none stays in the routing slice (every ordinary
+/// materializer's input). A listed record no authorization names backs
+/// nothing at all. `None` when the slice lists no such record present here.
 fn split_cross_namespace_destination_workloads(
     mesh_slice: &MeshSlice,
 ) -> Option<(MeshSlice, Vec<config::Workload>)> {
+    let keys = cross_namespace_destination_workload_keys(mesh_slice);
+    if keys.is_empty()
+        || !mesh_slice
+            .workloads
+            .iter()
+            .any(|workload| is_cross_namespace_destination_record(&keys, workload))
+    {
+        return None;
+    }
     let targets: HashSet<(&str, &str)> = mesh_slice
         .http_routes
         .authorized_cross_namespace_targets
@@ -6116,22 +6241,18 @@ fn split_cross_namespace_destination_workloads(
         .filter(|target| target.namespace != mesh_slice.namespace)
         .map(|target| (target.namespace.as_str(), target.name.as_str()))
         .collect();
-    if targets.is_empty() {
-        return None;
-    }
-    let is_destination_workload = |workload: &config::Workload| {
-        workload.namespace != mesh_slice.namespace
+    let mut routing = Vec::with_capacity(mesh_slice.workloads.len());
+    let mut destination = Vec::new();
+    for workload in &mesh_slice.workloads {
+        if !is_cross_namespace_destination_record(&keys, workload) {
+            routing.push(workload.clone());
+        } else if workload.namespace != mesh_slice.namespace
             && workload.attached_service_namespace() == workload.namespace
             && targets.contains(&(workload.namespace.as_str(), workload.service_name.as_str()))
-    };
-    if !mesh_slice.workloads.iter().any(is_destination_workload) {
-        return None;
+        {
+            destination.push(workload.clone());
+        }
     }
-    let (destination, routing): (Vec<config::Workload>, Vec<config::Workload>) = mesh_slice
-        .workloads
-        .iter()
-        .cloned()
-        .partition(is_destination_workload);
     Some((
         MeshSlice {
             workloads: routing,
@@ -18591,6 +18712,7 @@ fn scope_request_auth_to_node_waypoint_destinations(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
+    cross_namespace_destination_workloads: &[config::Workload],
 ) -> Vec<(String, String)> {
     use crate::modes::mesh::config::scope_applies_to_workload;
 
@@ -18617,6 +18739,7 @@ fn scope_request_auth_to_node_waypoint_destinations(
         "cluster_domain": runtime.cluster_domain,
         "cluster_domains": node_waypoint_authz_cluster_domains(&runtime.cluster_domain),
         "node_waypoint_route_upstreams": node_waypoint_authz_route_upstreams(config),
+        "node_waypoint_route_destination_workloads": cross_namespace_destination_workloads,
     });
     let index = match crate::plugins::mesh::authz::node_waypoint_destination_scope_index(
         mesh_slice,

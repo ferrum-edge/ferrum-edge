@@ -28268,6 +28268,36 @@ components:
                       format: uint16
                       minimum: 0
                       maximum: 65535
+        node_waypoint_route_destination_workloads:
+          type: array
+          readOnly: true
+          description: >-
+            Mesh-generated workloads that back authorized cross-namespace
+            VirtualService route destinations only (issue #7499). They scope
+            the destination policy of the cross-namespace destination clones a
+            carried route dials, never an ordinary Service upstream. Each
+            entry is a closed mesh `Workload` record.
+          items:
+            type: object
+            additionalProperties: true
+        node_waypoint_route_destination_policies:
+          type: array
+          readOnly: true
+          description: >-
+            Mesh-generated `(namespace, name)` of every AuthorizationPolicy the
+            slice carries only because it selects an authorized
+            cross-namespace route destination (issue #7499). They govern those
+            destinations' scopes but are excluded from the missing-source-scope
+            census.
+          items:
+            type: object
+            required: [namespace, name]
+            additionalProperties: false
+            properties:
+              namespace:
+                type: string
+              name:
+                type: string
         node_waypoint_route_branches:
           type: array
           readOnly: true

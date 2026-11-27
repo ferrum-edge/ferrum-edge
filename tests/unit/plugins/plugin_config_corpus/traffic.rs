@@ -216,6 +216,23 @@ pub(super) fn contract(name: &str) -> Option<PluginConfigContract> {
                     ]
                 }]
             }),
+            // NodeWaypoint per-pod form with authorized cross-namespace route
+            // destinations (issue #7499).
+            json!({
+                "per_pod_policy_scoping": true,
+                "node_waypoint_route_destination_workloads": [{
+                    "spiffe_id": "spiffe://cluster.local/ns/other/sa/ratings",
+                    "selector": {"labels": {"app": "ratings"}, "namespace": "other"},
+                    "service_name": "ratings",
+                    "addresses": ["10.0.1.12"],
+                    "ports": [{"port": 8080, "protocol": "http", "name": "http"}],
+                    "trust_domain": "cluster.local",
+                    "namespace": "other"
+                }],
+                "node_waypoint_route_destination_policies": [
+                    {"namespace": "other", "name": "ratings-allow"}
+                ]
+            }),
         ])
         // Label maps are keyed by operator-chosen label names, and `to.headers`
         // by request header names.
@@ -226,6 +243,7 @@ pub(super) fn contract(name: &str) -> Option<PluginConfigContract> {
             "mesh_policies[].rules[].to[].headers",
             "mesh_slice.request_authentications[].scope.selector.labels",
             "mesh_slice.peer_authentications[].scope.selector.labels",
+            "node_waypoint_route_destination_workloads[].selector.labels",
         ]),
         "mesh_route_dispatch" => PluginConfigContract::closed(vec![
             json!({

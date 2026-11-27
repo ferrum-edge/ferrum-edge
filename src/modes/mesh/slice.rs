@@ -702,6 +702,26 @@ pub struct MeshHttpRouteSet {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub authorized_cross_namespace_targets: Vec<MeshHttpRouteCrossNamespaceTarget>,
+    /// The workload records the slice builder added to this slice's
+    /// `workloads` ONLY to back authorized cross-namespace route destinations
+    /// (issue #7499, review F3 round 5), keyed `(namespace, SPIFFE id)`.
+    /// The data plane keeps exactly these records out of every ordinary
+    /// route; every other workload record of the slice (a subscriber-local
+    /// `WorkloadEntry`, a record the ordinary view already held, a
+    /// multicluster endpoint the data plane merges later) keeps routing the
+    /// way it did without the grant. Each entry's namespace is the namespace
+    /// of an authorized target; a data plane refuses any other entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
+    pub cross_namespace_destination_workloads: Vec<MeshHttpRouteDestinationWorkload>,
+    /// The AuthorizationPolicies a NodeWaypoint slice carries ONLY because
+    /// they select one of those destination records (issue #7499, review F4
+    /// round 5). They govern those destinations' scopes like any policy, but
+    /// `mesh_authz` keeps them out of the missing-source-scope census, which
+    /// they would not be part of without the grant.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
+    pub cross_namespace_destination_policies: Vec<MeshHttpRouteDestinationPolicy>,
 }
 
 impl MeshHttpRouteSet {
@@ -710,8 +730,33 @@ impl MeshHttpRouteSet {
             && self.upstreams.is_empty()
             && self.plugin_configs.is_empty()
             && self.authorized_cross_namespace_targets.is_empty()
+            && self.cross_namespace_destination_workloads.is_empty()
+            && self.cross_namespace_destination_policies.is_empty()
     }
 }
+
+/// One AuthorizationPolicy a NodeWaypoint slice carries only for authorized
+/// cross-namespace route destinations (issue #7499).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeshHttpRouteDestinationPolicy {
+    pub namespace: String,
+    pub name: String,
+}
+
+/// One workload key the slice builder added only for authorized
+/// cross-namespace route destinations (issue #7499): every slice workload
+/// record with this `namespace` and `spiffe_id` backs those routes only.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeshHttpRouteDestinationWorkload {
+    pub namespace: String,
+    pub spiffe_id: String,
+}
+
+/// Most `cross_namespace_destination_workloads` entries one carried route set
+/// may hold (issue #7499): a data plane refuses a larger set as malformed.
+pub const MAX_HTTP_ROUTE_CROSS_NAMESPACE_DESTINATION_WORKLOADS: usize = 16_384;
 
 /// One authorized cross-namespace destination of one carried VirtualService
 /// HTTP route (issue #7499): the route `proxy_id` (in the slice namespace) may
@@ -2430,23 +2475,32 @@ impl MeshSlice {
         // Issue #7499: a Sidecar dials an authorized cross-namespace carried
         // route destination through that Service's own workloads, which the
         // namespace-local workload view above never holds.
-        let workloads =
+        let (workloads, cross_namespace_destination_workloads) =
             with_cross_namespace_destination_workloads(workloads, &http_routes, &services, mesh);
+        let http_routes = MeshHttpRouteSet {
+            cross_namespace_destination_workloads,
+            ..http_routes
+        };
         // A NodeWaypoint judges the destination's AuthorizationPolicy and
         // RequestAuthentication itself (a Sidecar source judges none, #4158),
         // so its slice also carries the destination namespace's resources
         // that select those destination workloads.
-        let (mesh_policies, request_authentications) = if request.node_waypoint_capture_scoping {
-            with_cross_namespace_destination_policies(
-                mesh_policies,
-                request_authentications,
-                mesh,
-                &workloads,
-                &http_routes,
-                &namespace,
-            )
-        } else {
-            (mesh_policies, request_authentications)
+        let (mesh_policies, request_authentications, cross_namespace_destination_policies) =
+            if request.node_waypoint_capture_scoping {
+                with_cross_namespace_destination_policies(
+                    mesh_policies,
+                    request_authentications,
+                    mesh,
+                    &workloads,
+                    &http_routes,
+                    &namespace,
+                )
+            } else {
+                (mesh_policies, request_authentications, Vec::new())
+            };
+        let http_routes = MeshHttpRouteSet {
+            cross_namespace_destination_policies,
+            ..http_routes
         };
 
         // Bind `request.namespace` so we can both move it into `self` and
@@ -2897,9 +2951,9 @@ fn with_cross_namespace_destination_workloads(
     http_routes: &MeshHttpRouteSet,
     services: &[MeshService],
     mesh: &MeshConfig,
-) -> Vec<Workload> {
+) -> (Vec<Workload>, Vec<MeshHttpRouteDestinationWorkload>) {
     if http_routes.authorized_cross_namespace_targets.is_empty() {
-        return workloads;
+        return (workloads, Vec::new());
     }
     let targets = cross_namespace_target_services(http_routes);
     // Index once: the inventory workloads of each `(namespace, Service)`
@@ -2957,7 +3011,17 @@ fn with_cross_namespace_destination_workloads(
             }
         }
     }
-    workloads
+    // Every added record's key. A key the ordinary view already held was
+    // never added (`present`), so none of its records leaves ordinary routing.
+    let added_keys: BTreeSet<MeshHttpRouteDestinationWorkload> = added
+        .iter()
+        .filter_map(|&index| mesh.workloads.get(index))
+        .map(|workload| MeshHttpRouteDestinationWorkload {
+            namespace: workload.namespace.clone(),
+            spiffe_id: workload.spiffe_id.as_str().to_string(),
+        })
+        .collect();
+    (workloads, added_keys.into_iter().collect())
 }
 
 /// Add the AuthorizationPolicy and RequestAuthentication resources that
@@ -2981,43 +3045,69 @@ fn with_cross_namespace_destination_policies(
     workloads: &[Workload],
     http_routes: &MeshHttpRouteSet,
     subscriber_namespace: &str,
-) -> (Vec<MeshPolicy>, Vec<MeshRequestAuthentication>) {
+) -> (
+    Vec<MeshPolicy>,
+    Vec<MeshRequestAuthentication>,
+    Vec<MeshHttpRouteDestinationPolicy>,
+) {
     let targets = cross_namespace_target_services(http_routes);
     if targets.is_empty() {
-        return (mesh_policies, request_authentications);
+        return (mesh_policies, request_authentications, Vec::new());
     }
+    // Only the records added for authorized routes (review F4, round 5): a
+    // record the ordinary view already held keeps the resources it had.
+    let added: HashSet<(&str, &str)> = http_routes
+        .cross_namespace_destination_workloads
+        .iter()
+        .map(|key| (key.namespace.as_str(), key.spiffe_id.as_str()))
+        .collect();
     let destinations: Vec<&Workload> = workloads
         .iter()
         .filter(|workload| {
-            workload.namespace != subscriber_namespace
+            added.contains(&(workload.namespace.as_str(), workload.spiffe_id.as_str()))
+                && workload.namespace != subscriber_namespace
                 && workload.attached_service_namespace() == workload.namespace
                 && targets.contains(&(workload.namespace.as_str(), workload.service_name.as_str()))
         })
         .collect();
     if destinations.is_empty() {
-        return (mesh_policies, request_authentications);
+        return (mesh_policies, request_authentications, Vec::new());
     }
+    let mut added_policies: BTreeSet<MeshHttpRouteDestinationPolicy> = BTreeSet::new();
+    // A workload selector governs only workloads of its resource's own
+    // namespace (Istio semantics); a selector without an explicit namespace
+    // must never broaden a third namespace's resource onto the destination.
+    let governs = |resource_namespace: &str, scope: &PolicyScope, workload: &Workload| {
+        (matches!(scope, PolicyScope::MeshWide) || resource_namespace == workload.namespace)
+            && scope_applies_to_workload(scope, &workload.namespace, &workload.selector.labels)
+    };
     for policy in &mesh.mesh_policies {
-        if destinations.iter().any(|workload| {
-            policy_scope_applies_to_workload(policy, &workload.namespace, &workload.selector.labels)
-        }) && !mesh_policies.contains(policy)
+        if destinations
+            .iter()
+            .any(|workload| governs(&policy.namespace, &policy.scope, workload))
+            && !mesh_policies.contains(policy)
         {
+            added_policies.insert(MeshHttpRouteDestinationPolicy {
+                namespace: policy.namespace.clone(),
+                name: policy.name.clone(),
+            });
             mesh_policies.push(policy.clone());
         }
     }
     for resource in &mesh.request_authentications {
-        if destinations.iter().any(|workload| {
-            crate::modes::mesh::config::scope_applies_to_workload(
-                &resource.scope,
-                &workload.namespace,
-                &workload.selector.labels,
-            )
-        }) && !request_authentications.contains(resource)
+        if destinations
+            .iter()
+            .any(|workload| governs(&resource.namespace, &resource.scope, workload))
+            && !request_authentications.contains(resource)
         {
             request_authentications.push(resource.clone());
         }
     }
-    (mesh_policies, request_authentications)
+    (
+        mesh_policies,
+        request_authentications,
+        added_policies.into_iter().collect(),
+    )
 }
 
 fn resource_namespace_visible(

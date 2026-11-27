@@ -467,6 +467,7 @@ pub const BUILTIN_SAFE_METADATA_KEYS: &[&str] = &[
     "mesh_authz.non_canonical_path",
     "mesh_authz.reevaluation",
     "mesh_authz.scope_missing",
+    "mesh_authz.upstream_enforced_l7",
     "mesh_request_auth.permissive_missing_token",
     "mesh_route_dispatch.rule_index",
     "mesh_route_dispatch.rule_name",

@@ -26,12 +26,20 @@ const ROUTE_NAMESPACE: &str = "default";
 const TARGET_NAMESPACE: &str = "other";
 const TARGET_HOST: &str = "ratings.other.svc.cluster.local";
 
-fn options() -> K8sTranslationOptions {
+/// Pod discovery off: the controller cannot attribute any EndpointSlice, so
+/// every cross-namespace destination is refused as unverifiable.
+fn options_without_pod_discovery() -> K8sTranslationOptions {
     K8sTranslationOptions::new(
         ROUTE_NAMESPACE.to_string(),
         TrustDomain::new("cluster.local").expect("trust domain"),
     )
     .with_source_namespaces(Vec::new())
+}
+
+/// Pod discovery on with a cluster-wide Pod watch: EndpointSlice attribution
+/// can vouch for a destination's endpoints.
+fn options() -> K8sTranslationOptions {
+    options_without_pod_discovery().with_pod_discovery_enabled(true)
 }
 
 fn object(api_version: &str, kind: &str, name: &str, namespace: &str, spec: Value) -> K8sObject {
@@ -508,6 +516,51 @@ fn a_missing_named_port_is_a_reference_refusal() {
     assert!(message.contains("port named"), "{message}");
 }
 
+/// Review F7 (round 5): a named port resolves in route translation exactly
+/// as admission resolved it, under every custom-domain spelling admission
+/// accepts (case folded, root dots on the host and on the configured domain).
+#[test]
+fn a_named_port_resolves_under_every_admitted_custom_domain_spelling() {
+    for domain in ["Corp.Example.", "corp.example", ".corp.example."] {
+        for host in [
+            "ratings.other.svc.corp.example",
+            "ratings.other.svc.corp.example.",
+            "Ratings.Other.Svc.Corp.Example",
+            "ratings.other.svc",
+            "ratings.other",
+        ] {
+            let mut objects = base_objects();
+            objects.push(virtual_service_grant());
+            objects.push(virtual_service(
+                "named",
+                json!({
+                    "hosts": ["reviews.default.svc.cluster.local"],
+                    "http": [{"route": [{"destination": {"host": host, "port": {"name": "http"}}}]}]
+                }),
+            ));
+            let (translation, skipped) = translate_k8s_objects_collecting_skips(
+                &objects,
+                options().with_cluster_domain(domain.to_string()),
+            )
+            .expect("translation runs");
+            assert!(
+                refusal(&skipped, "named").is_none(),
+                "{domain:?} {host:?}: {skipped:?}"
+            );
+            let binding = binding(&translation, "named")
+                .unwrap_or_else(|| panic!("{domain:?} {host:?}: mesh binding"));
+            assert_eq!(
+                binding.authorized_cross_namespace_targets,
+                vec![MeshWaypointServiceRef {
+                    namespace: TARGET_NAMESPACE.to_string(),
+                    name: "ratings".to_string(),
+                }],
+                "{domain:?} {host:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn more_than_the_binding_budget_of_target_services_is_refused() {
     let limit = ferrum_edge::modes::mesh::config::MAX_VIRTUAL_SERVICE_CROSS_NAMESPACE_TARGETS;
@@ -679,7 +732,43 @@ fn an_unverifiable_selectorless_target_fails_closed() {
         virtual_service_grant(),
         virtual_service("direct", direct_spec(TARGET_HOST)),
     ];
-    assert_refused_with(&objects, options(), "Unverifiable");
+    assert_refused_with(&objects, options_without_pod_discovery(), "Unverifiable");
+}
+
+/// Review F1 (round 5): a selector-backed destination whose slices the
+/// controller cannot attribute (pod discovery off, or its namespace outside
+/// the Pod watch scope) is refused too. A dual-bound VirtualService's gateway
+/// leg dials the Service's DNS name, and Kubernetes Service routing follows
+/// every EndpointSlice labelled with it, selector or not.
+#[test]
+fn an_unverifiable_selector_backed_target_fails_closed() {
+    // The manual slice points the selector-backed `other/ratings` at an
+    // address a third namespace owns; nothing here can see it.
+    let mesh_and_gateway = json!({
+        "hosts": ["reviews.default.svc.cluster.local"],
+        "gateways": ["mesh", "default/edge"],
+        "http": [{
+            "route": [{"destination": {"host": TARGET_HOST, "port": {"number": 8080}}}]
+        }]
+    });
+    for spec in [direct_spec(TARGET_HOST), mesh_and_gateway] {
+        let objects = vec![
+            service("reviews", ROUTE_NAMESPACE),
+            service("ratings", TARGET_NAMESPACE),
+            ratings_slice("10.2.0.20"),
+            virtual_service_grant(),
+            virtual_service("direct", spec),
+        ];
+        assert_refused_with(&objects, options_without_pod_discovery(), "Unverifiable");
+        // The Pod watch covers only the route namespace.
+        assert_refused_with(
+            &objects,
+            options_without_pod_discovery()
+                .with_pod_discovery_enabled(true)
+                .with_pod_source_namespaces(vec![ROUTE_NAMESPACE.to_string()]),
+            "Unverifiable",
+        );
+    }
 }
 
 #[test]

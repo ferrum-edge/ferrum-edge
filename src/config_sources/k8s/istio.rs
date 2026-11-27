@@ -5607,6 +5607,22 @@ fn check_virtual_service_cross_namespace_destination(
     if !acc.service_port_exists(namespace, name, port) {
         return Err(refuse(format!("does not declare port \"{port}\"")));
     }
+    // Review F1 (round 5): the guard records an unverifiable finding only for
+    // a selector-less Service, and admits a selector-backed one it cannot
+    // check (Gateway API keeps that). A dual-bound VirtualService's gateway
+    // leg dials the destination's DNS name, so Kubernetes Service routing
+    // follows EVERY EndpointSlice labelled with it, selector or not; a
+    // cross-namespace destination whose slices this controller cannot
+    // attribute is refused whatever its selector.
+    if !acc.options.pod_discovery_enabled || !acc.options.includes_pod_namespace(namespace) {
+        return Err(refuse(
+            "is refused by EndpointSlice attribution (Unverifiable): the controller observes \
+             no Pods in its namespace (pod discovery is off, or the namespace is outside the \
+             Pod watch scope), so it cannot attribute the Service's endpoints; enable \
+             FERRUM_K8S_POD_DISCOVERY_ENABLED and watch that namespace"
+                .to_string(),
+        ));
+    }
     if let Some(refusal) = acc
         .endpoint_slice_guard()
         .refusal(route_namespace, namespace, name)
@@ -6252,10 +6268,15 @@ fn route_backends(
             let trimmed = host.trim();
             trimmed.ends_with('.') && trimmed.trim_end_matches('.').matches('.').count() == 1
         };
+        // The Service identity is parsed the way cross-namespace admission
+        // parses it (review F7, round 5): host folded and stripped of its root
+        // dot, cluster domain normalized like the data plane's.
+        let normalized_host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        let cluster_domain = normalized_mesh_cluster_domain(&acc.options.cluster_domain);
         let service_identity = service_host_components(
-            host,
+            &normalized_host,
             &object.metadata.namespace,
-            &acc.options.cluster_domain,
+            &cluster_domain,
         )
         .filter(|_| !absolute_two_label)
         .and_then(|(svc, ns)| {
@@ -6314,9 +6335,17 @@ fn resolve_destination_port(
     let Some(name) = string_field(port_value, "name") else {
         return Ok(None);
     };
-    let cluster_domain = &acc.options.cluster_domain;
-    let Some((svc, ns)) = service_host_components(host, &object.metadata.namespace, cluster_domain)
-    else {
+    // Review F7 (round 5): resolve the Service the way cross-namespace
+    // admission does (host folded and stripped of its root dot, the cluster
+    // domain normalized like the data plane's), so a host admission accepted
+    // never fails here on case or a trailing dot in either spelling.
+    let cluster_domain = normalized_mesh_cluster_domain(&acc.options.cluster_domain);
+    let normalized_host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    let Some((svc, ns)) = service_host_components(
+        &normalized_host,
+        &object.metadata.namespace,
+        &cluster_domain,
+    ) else {
         return Err(invalid_resource(
             object,
             format!(

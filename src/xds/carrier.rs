@@ -1221,6 +1221,8 @@ mod tests {
                 upstreams: vec![serde_json::json!({"id": "istio-vs-upstream-default-api-0"})],
                 plugin_configs: vec![serde_json::json!({"id": "istio-vs-mrd-default-api-0"})],
                 authorized_cross_namespace_targets: Vec::new(),
+                cross_namespace_destination_workloads: Vec::new(),
+                cross_namespace_destination_policies: Vec::new(),
             }),
             MeshSliceCarrier::MeshPolicies(Vec::new()),
             MeshSliceCarrier::ExtAuthzProviders(Vec::new()),

@@ -1671,7 +1671,13 @@ fn vs_cross_namespace_destination_requires_reference_grant() {
             "port": {"number": 8080}
         }}]}]
     }));
-    let all_namespaces = || options().with_source_namespaces(Vec::new());
+    // Pod discovery on with a cluster-wide Pod watch, so EndpointSlice
+    // attribution can vouch for the destination's endpoints.
+    let all_namespaces = || {
+        options()
+            .with_source_namespaces(Vec::new())
+            .with_pod_discovery_enabled(true)
+    };
 
     translate_k8s_objects(&[service.clone(), route.clone()], all_namespaces())
         .expect_err("an ungranted cross-namespace destination refuses the VirtualService");

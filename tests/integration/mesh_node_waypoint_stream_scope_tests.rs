@@ -2130,6 +2130,10 @@ mod cross_namespace_routes;
 /// destination namespace's policy (issue #7499).
 mod cross_namespace_node_waypoint;
 
+/// The ReferenceGrant invariant: adding or removing a grant changes only the
+/// routes that name the granted target (issue #7499).
+mod cross_namespace_grant_invariant;
+
 /// Per-destination authorization for `mesh_route_dispatch` branches of a
 /// carried VirtualService route (issue #7383).
 mod route_branch_authz;

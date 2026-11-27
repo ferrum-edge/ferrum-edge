@@ -673,13 +673,25 @@ fn prepare_destination_waypoint(config: &GatewayConfig, cp_scope: &CpScope) -> G
     prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("waypoint B materializes")
 }
 
-/// A's decision for `source` on its carried route to `other/ratings`.
+/// A's decision for a `GET` from `source` on its carried route to
+/// `other/ratings`.
 async fn source_waypoint_allows(authz: &MeshAuthz, route: &Proxy, source: &str) -> PluginResult {
+    source_waypoint_allows_method(authz, route, source, "GET").await
+}
+
+/// A's decision for a `method` request from `source` on its carried route to
+/// `other/ratings`.
+async fn source_waypoint_allows_method(
+    authz: &MeshAuthz,
+    route: &Proxy,
+    source: &str,
+    method: &str,
+) -> PluginResult {
     let identity = SpiffeId::new(source).expect("spiffe");
     let namespace = identity.namespace().expect("namespaced source").to_string();
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
-        "GET".to_string(),
+        method.to_string(),
         "/api".to_string(),
     );
     ctx.peer_spiffe_id = Some(identity.clone());
@@ -697,7 +709,10 @@ async fn source_waypoint_allows(authz: &MeshAuthz, route: &Proxy, source: &str) 
 }
 
 /// B's decision for an HBONE relay from `peer` asserting `asserted`, to
-/// `ratings`. Returns the result and the recorded deny policy.
+/// `ratings`, in the production relay context: an opaque CONNECT tunnel
+/// (`mark_hbone_connect_relay`, as `hbone_proxy` tags it), never judged on
+/// the CONNECT's own method or path. Returns the result and the recorded deny
+/// policy.
 async fn destination_waypoint_relays(
     authz: &MeshAuthz,
     peer: &str,
@@ -712,6 +727,7 @@ async fn destination_waypoint_relays(
     ctx.mesh_direction = Some(ferrum_edge::modes::mesh::MeshTrafficDirection::Inbound);
     ctx.metadata
         .insert("request_protocol".to_string(), "hbone".to_string());
+    ctx.mark_hbone_connect_relay();
     ctx.headers.insert(
         "baggage".to_string(),
         ferrum_edge::modes::mesh::hbone::baggage_header_for_source(
@@ -877,5 +893,137 @@ async fn a_destination_node_waypoint_ignores_assertions_outside_its_scope() {
     assert!(
         !allowed(&relayed),
         "B does not trust A to assert a `default` source it may not see"
+    );
+}
+
+/// `other`'s method-scoped policy: ALLOW `GET` for `default/client`, DENY
+/// `DELETE` for everyone.
+fn method_scoped_policies() -> Vec<MeshPolicy> {
+    use ferrum_edge::modes::mesh::config::{PolicyAction, RequestMatch};
+    let mut allow_get = source_rule(Some(CLIENT), None, PolicyAction::Allow);
+    allow_get.to = vec![RequestMatch {
+        methods: vec!["GET".to_string()],
+        ..RequestMatch::default()
+    }];
+    let deny_delete = ferrum_edge::modes::mesh::config::MeshRule {
+        from: Vec::new(),
+        to: vec![RequestMatch {
+            methods: vec!["DELETE".to_string()],
+            ..RequestMatch::default()
+        }],
+        ..source_rule(None, None, PolicyAction::Deny)
+    };
+    vec![
+        ratings_policy("allow-client-get", vec![allow_get]),
+        ratings_policy("deny-delete", vec![deny_delete]),
+    ]
+}
+
+/// Review F2 (round 5): a method-scoped destination policy is enforced by the
+/// source NodeWaypoint at Layer 7, and the destination NodeWaypoint admits
+/// the opaque relay that waypoint forwards for a source it fronts: the relay's
+/// HTTP-only predicates were decided upstream, its identity predicates are
+/// still judged here. A relay from a waypoint that fronts nothing gets no such
+/// standing and is judged as a Layer-4 session on its own identity.
+#[tokio::test]
+async fn a_destination_node_waypoint_admits_what_the_source_waypoint_authorized_at_layer_7() {
+    let config = two_waypoint_config(method_scoped_policies());
+    let source = prepare_source_waypoint(&config);
+    let route = carried_routes(&source)[0].clone();
+    let source_authz = authz(&source);
+    let destination = prepare_destination_waypoint(
+        &config,
+        &scope(&[DEFAULT_NAMESPACE, OTHER, "gamma", "ferrum"]),
+    );
+    let destination_authz = authz(&destination);
+
+    // Waypoint A judges the HTTP request against `other`'s policy.
+    assert!(
+        allowed(&source_waypoint_allows_method(&source_authz, &route, CLIENT, "GET").await),
+        "A allows the client's GET"
+    );
+    assert!(
+        !allowed(&source_waypoint_allows_method(&source_authz, &route, CLIENT, "POST").await),
+        "A refuses a method the ALLOW does not name"
+    );
+    assert!(
+        !allowed(&source_waypoint_allows_method(&source_authz, &route, CLIENT, "DELETE").await),
+        "A applies the method-scoped DENY"
+    );
+    assert!(
+        !allowed(&source_waypoint_allows_method(&source_authz, &route, INTRUDER, "GET").await),
+        "A refuses a principal the ALLOW does not name"
+    );
+
+    // Waypoint B admits the relay A forwards for the client: its HTTP-only
+    // predicates were A's to decide.
+    let (relayed, recorded) =
+        destination_waypoint_relays(&destination_authz, WAYPOINT_A, CLIENT).await;
+    assert!(
+        allowed(&relayed),
+        "B admits A's relay of the client's authorized request: {recorded:?}"
+    );
+    // The identity half of the ALLOW is still judged at B.
+    let (relayed, _) = destination_waypoint_relays(&destination_authz, WAYPOINT_A, INTRUDER).await;
+    assert!(
+        !allowed(&relayed),
+        "B refuses a relayed principal no ALLOW names"
+    );
+    // A relay from a waypoint that fronts none of these sources is judged as
+    // a Layer-4 session on that waypoint's own identity, where an ALLOW
+    // reading a method never matches.
+    let (relayed, _) = destination_waypoint_relays(&destination_authz, WAYPOINT_C, CLIENT).await;
+    assert!(!allowed(&relayed), "an unproven assertion is refused");
+}
+
+/// Review F6 (round 5): on a NodeWaypoint, a route to the absolute two-label
+/// DNS name `ratings.other.` is an external route and never inherits the
+/// destination policy of the modeled Service `other/ratings`, which an
+/// authorized route of the same slice reaches under that policy.
+#[tokio::test]
+async fn an_absolute_two_label_route_never_inherits_the_service_policy() {
+    let mut config = config_with(
+        direct_spec(RATINGS_OTHER),
+        vec![virtual_service(
+            "external",
+            json!({
+                "hosts": ["reviews.default.svc.cluster.local"],
+                "http": [{
+                    "match": [{"uri": {"prefix": "/external"}}],
+                    "route": [{"destination": {"host": "ratings.other.", "port": {"number": 8080}}}]
+                }]
+            }),
+        )],
+        vec![ratings_trusted_only()],
+        Vec::new(),
+    );
+    // No Sidecar egress scope narrows the external host here.
+    config.mesh.as_mut().expect("mesh block").sidecars.clear();
+    let prepared = prepare(&slice_for(&config, &node_waypoint_runtime()));
+    let routes = carried_routes(&prepared);
+    let external = routes
+        .iter()
+        .find(|route| route.backend_host == "ratings.other.")
+        .map(|route| (*route).clone())
+        .expect("the external route is served");
+    assert_eq!(external.upstream_id, None, "a direct external backend");
+    let authorized = routes
+        .iter()
+        .find(|route| {
+            route
+                .upstream_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with(CLONE_PREFIX))
+        })
+        .map(|route| (*route).clone())
+        .expect("the authorized route is served");
+
+    let authz = authz(&prepared);
+    let (result, _, _) = serve(&authz, &[], &authorized, UNTRUSTED, false).await;
+    assert_denied(&result, "the Service route keeps its destination policy");
+    let (result, _, _) = serve(&authz, &[], &external, UNTRUSTED, false).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "the external DNS route is not the Service: {result:?}"
     );
 }
