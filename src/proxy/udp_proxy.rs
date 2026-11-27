@@ -484,7 +484,7 @@ struct UdpSession {
     /// this clock; wall timestamps are stored separately for rendering.
     created_at: AtomicU64,
     /// Civil/UTC connect time for human-readable `timestamp_connected` only.
-    connected_wall_at: chrono::DateTime<chrono::Utc>,
+    connected_wall_at: crate::time_compat::UtcTimestamp,
     /// Backend target for logging (e.g., "10.0.2.10:5353").
     backend_target: String,
     /// DNS-resolved IP address of the backend for logging.
@@ -2726,7 +2726,7 @@ struct UdpDisconnectContext<'a> {
     /// Process-monotonic disconnect instant (same clock as `created_at`).
     disconnected_ms: u64,
     /// Civil/UTC disconnect time for `timestamp_disconnected` rendering only.
-    disconnected_wall_at: chrono::DateTime<chrono::Utc>,
+    disconnected_wall_at: crate::time_compat::UtcTimestamp,
     connection_error: Option<String>,
     error_class: Option<crate::retry::ErrorClass>,
     disconnect_direction: Option<crate::plugins::Direction>,
@@ -3077,7 +3077,7 @@ pub(crate) struct UdpSetupFailureContext<'a> {
     pub(crate) proxy_id: &'a str,
     pub(crate) client_ip: &'a str,
     pub(crate) listen_port: u16,
-    pub(crate) connected_wall_at: chrono::DateTime<chrono::Utc>,
+    pub(crate) connected_wall_at: crate::time_compat::UtcTimestamp,
     pub(crate) duration_ms: f64,
     pub(crate) error: &'a anyhow::Error,
 }
@@ -3112,7 +3112,7 @@ pub(crate) struct DtlsPluginRejection<'a> {
     pub(crate) proxy_id: &'a str,
     pub(crate) client_ip: &'a str,
     pub(crate) listen_port: u16,
-    pub(crate) connected_wall_at: chrono::DateTime<chrono::Utc>,
+    pub(crate) connected_wall_at: crate::time_compat::UtcTimestamp,
     pub(crate) duration_ms: f64,
 }
 
@@ -3165,9 +3165,9 @@ struct DtlsDisconnectContext<'a> {
     backend_scheme: BackendScheme,
     listen_port: u16,
     /// Civil/UTC connect time for human-readable rendering only.
-    connected_at: chrono::DateTime<chrono::Utc>,
+    connected_at: crate::time_compat::UtcTimestamp,
     /// Civil/UTC disconnect time for human-readable rendering only.
-    disconnected_at: chrono::DateTime<chrono::Utc>,
+    disconnected_at: crate::time_compat::UtcTimestamp,
     /// Elapsed session duration from `Instant` (monotonic), never wall delta.
     duration_ms: f64,
     bytes_sent: u64,
@@ -5545,7 +5545,7 @@ fn spawn_new_session_datagram(
     let client_addr = identity.socket_peer;
     let client_ip = udp_session_client_ip(identity.resolved());
     let setup_started = Instant::now();
-    let connected_wall_at = chrono::Utc::now();
+    let connected_wall_at = crate::time_compat::UtcTimestamp::now();
     tokio::spawn(async move {
         // The gate removes the pending entry (dropping any queued follow-up
         // datagrams wholesale) on every path that doesn't complete the
@@ -6372,7 +6372,7 @@ fn spawn_session_cleanup(
                                     backend_scheme: session.backend_scheme,
                                     listen_port: session.listen_port,
                                     disconnected_ms: now,
-                                    disconnected_wall_at: chrono::Utc::now(),
+                                    disconnected_wall_at: crate::time_compat::UtcTimestamp::now(),
                                     connection_error: None,
                                     error_class: None,
                                     disconnect_direction: None,
@@ -6739,7 +6739,7 @@ async fn start_dtls_frontend_listener(
                 // for human-readable connect/disconnect timestamps. Captured
                 // at accept so admission wait is included in the summary.
                 let connected_mono = Instant::now();
-                let connected_at = chrono::Utc::now();
+                let connected_at = crate::time_compat::UtcTimestamp::now();
                 tokio::spawn(async move {
                     // Owns the listener-wide session slot AND the per-source-IP
                     // slot for the whole handler; `Drop` releases both on every
@@ -7085,7 +7085,7 @@ async fn start_dtls_frontend_listener(
 
                     if !plugins.is_empty() || error_class.is_some() {
                         let duration_ms = connected_mono.elapsed().as_millis() as f64;
-                        let disconnected_at = chrono::Utc::now();
+                        let disconnected_at = crate::time_compat::UtcTimestamp::now();
                         // Merge per-datagram WAF metadata recorded during
                         // forwarding with any on_stream_connect metadata so DTLS
                         // hits ride the transaction summary by default.
@@ -9785,7 +9785,7 @@ async fn create_session(
     }
 
     let now = coarse_epoch_millis();
-    let connected_wall_at = chrono::Utc::now();
+    let connected_wall_at = crate::time_compat::UtcTimestamp::now();
     let (consumer_username, principal_origin) = stream_ctx.summary_identity();
     let auth_method = stream_ctx.auth_method;
     let datagram_client_ip = Arc::clone(&client_ip);
@@ -11913,7 +11913,7 @@ async fn create_session(
                                                     backend_scheme: reply_backend_scheme,
                                                     listen_port: reply_listen_port,
                                                     disconnected_ms: now,
-                                                    disconnected_wall_at: chrono::Utc::now(),
+                                                    disconnected_wall_at: crate::time_compat::UtcTimestamp::now(),
                                                     connection_error: Some(error_message.clone()),
                                                     error_class: Some(
                                                         crate::retry::classify_boxed_error(&e),
@@ -12154,7 +12154,7 @@ async fn create_session(
             )
         {
             let disconnected_ms = coarse_epoch_millis();
-            let disconnected_wall_at = chrono::Utc::now();
+            let disconnected_wall_at = crate::time_compat::UtcTimestamp::now();
             emit_udp_stream_disconnect(
                 &reply_plugins,
                 UdpDisconnectContext {
@@ -12535,7 +12535,7 @@ impl UdpAuthorizationSessionProbe {
             dtls_conn: None,
             last_activity: AtomicU64::new(now),
             created_at: AtomicU64::new(now),
-            connected_wall_at: chrono::Utc::now(),
+            connected_wall_at: crate::time_compat::UtcTimestamp::now(),
             expired: std::sync::atomic::AtomicBool::new(false),
             bytes_sent: AtomicU64::new(0),
             bytes_received: crossbeam_utils::CachePadded::new(AtomicU64::new(0)),
@@ -12739,7 +12739,7 @@ impl UdpAuthorizationSessionProbe {
             backend_scheme: self.session.backend_scheme,
             listen_port: self.session.listen_port,
             disconnected_ms: coarse_epoch_millis(),
-            disconnected_wall_at: chrono::Utc::now(),
+            disconnected_wall_at: crate::time_compat::UtcTimestamp::now(),
             connection_error,
             error_class,
             disconnect_direction,
@@ -12937,7 +12937,7 @@ impl UdpEgressWriterProbe {
             dtls_conn: None,
             last_activity: AtomicU64::new(now),
             created_at: AtomicU64::new(now),
-            connected_wall_at: chrono::Utc::now(),
+            connected_wall_at: crate::time_compat::UtcTimestamp::now(),
             expired: std::sync::atomic::AtomicBool::new(false),
             bytes_sent: AtomicU64::new(0),
             bytes_received: crossbeam_utils::CachePadded::new(AtomicU64::new(0)),
@@ -13200,6 +13200,13 @@ mod tests {
     use tokio::net::UdpSocket;
     use tokio::sync::oneshot;
 
+    fn shift_wall(
+        wall: crate::time_compat::UtcTimestamp,
+        by: ::time::SignedDuration,
+    ) -> crate::time_compat::UtcTimestamp {
+        wall.checked_add(by).expect("test wall time stays in range")
+    }
+
     fn make_udp_session() -> UdpSession {
         UdpSession {
             plugin_trigger_decisions: Default::default(),
@@ -13207,8 +13214,10 @@ mod tests {
             dtls_conn: None,
             last_activity: AtomicU64::new(1_710_000_000_500),
             created_at: AtomicU64::new(1_710_000_000_000),
-            connected_wall_at: chrono::DateTime::from_timestamp_millis(1_710_000_000_000)
-                .expect("fixed test wall connect time"),
+            connected_wall_at: crate::time_compat::UtcTimestamp::from_unix_timestamp_millis(
+                1_710_000_000_000,
+            )
+            .expect("fixed test wall connect time"),
             expired: std::sync::atomic::AtomicBool::new(false),
             bytes_sent: AtomicU64::new(128),
             bytes_received: crossbeam_utils::CachePadded::new(AtomicU64::new(256)),
@@ -13416,8 +13425,14 @@ backend_tls_verify_server_cert: false
         let client_addr: SocketAddr = "127.0.0.1:54000".parse().unwrap();
         // Wall timestamps deliberately disagree with the monotonic duration to
         // prove duration_ms is not derived from civil-clock subtraction.
-        let connected_at = chrono::Utc::now() - chrono::TimeDelta::hours(2);
-        let disconnected_at = chrono::Utc::now() - chrono::TimeDelta::hours(3);
+        let connected_at = shift_wall(
+            crate::time_compat::UtcTimestamp::now(),
+            ::time::SignedDuration::hours(-2),
+        );
+        let disconnected_at = shift_wall(
+            crate::time_compat::UtcTimestamp::now(),
+            ::time::SignedDuration::hours(-3),
+        );
         let metadata = crate::plugins::MetadataMap::from_iter([(
             "request_id".to_string(),
             "dtls-123".to_string(),
@@ -13486,8 +13501,8 @@ backend_tls_verify_server_cert: false
         // and StreamConnectionContext; the disconnect summary must keep the same
         // value for logging sinks (issue #2531).
         let client_addr: SocketAddr = "127.0.0.1:54000".parse().unwrap();
-        let connected_at = chrono::Utc::now();
-        let disconnected_at = connected_at + chrono::TimeDelta::milliseconds(42);
+        let connected_at = crate::time_compat::UtcTimestamp::now();
+        let disconnected_at = shift_wall(connected_at, ::time::SignedDuration::milliseconds(42));
         let metadata = crate::plugins::MetadataMap::default();
         let correlation_ids = Default::default();
         let sni = Some("device.example".to_string());
@@ -13554,7 +13569,8 @@ backend_tls_verify_server_cert: false
     fn test_build_udp_stream_summary_preserves_bytes_error_and_metadata() {
         let session = make_udp_session();
         let disconnected_wall_at =
-            chrono::DateTime::from_timestamp_millis(1_710_000_001_500).unwrap();
+            crate::time_compat::UtcTimestamp::from_unix_timestamp_millis(1_710_000_001_500)
+                .unwrap();
 
         let summary = build_udp_stream_summary(UdpDisconnectContext {
             namespace: "ferrum",
@@ -13614,7 +13630,8 @@ backend_tls_verify_server_cert: false
         let mut session = make_udp_session();
         session.sni_hostname = Some("passthrough.example".to_string());
         let disconnected_wall_at =
-            chrono::DateTime::from_timestamp_millis(1_710_000_001_500).unwrap();
+            crate::time_compat::UtcTimestamp::from_unix_timestamp_millis(1_710_000_001_500)
+                .unwrap();
 
         let summary = build_udp_stream_summary(UdpDisconnectContext {
             namespace: "ferrum",
@@ -13655,7 +13672,8 @@ backend_tls_verify_server_cert: false
         // Wall disconnect is an hour *before* connect — the old wall-delta
         // path would clamp toward zero / go negative. Mono endpoints still
         // report the real 1500 ms session.
-        let wall_disconnect = session.connected_wall_at - chrono::TimeDelta::hours(1);
+        let wall_disconnect =
+            shift_wall(session.connected_wall_at, ::time::SignedDuration::hours(-1));
         let summary = build_udp_stream_summary(UdpDisconnectContext {
             namespace: "ferrum",
             proxy_id: "udp-proxy",
@@ -13693,7 +13711,7 @@ backend_tls_verify_server_cert: false
 
         // Forward wall jump without mono advance: duration stays at the mono
         // delta (not inflated by civil-clock skew).
-        let forward_wall = session.connected_wall_at + chrono::TimeDelta::hours(5);
+        let forward_wall = shift_wall(session.connected_wall_at, ::time::SignedDuration::hours(5));
         let forward_summary = build_udp_stream_summary(UdpDisconnectContext {
             namespace: "ferrum",
             proxy_id: "udp-proxy",
@@ -13713,9 +13731,9 @@ backend_tls_verify_server_cert: false
 
     #[test]
     fn dtls_summary_duration_ignores_wall_clock_rollback() {
-        let connected_at = chrono::Utc::now();
+        let connected_at = crate::time_compat::UtcTimestamp::now();
         // Wall jumped backward an hour while the Instant-derived duration is 900 ms.
-        let disconnected_at = connected_at - chrono::TimeDelta::hours(1);
+        let disconnected_at = shift_wall(connected_at, ::time::SignedDuration::hours(-1));
         let correlation_ids = Default::default();
         let metadata = crate::plugins::MetadataMap::default();
         let summary = build_dtls_stream_summary(DtlsDisconnectContext {
@@ -13747,7 +13765,7 @@ backend_tls_verify_server_cert: false
         });
         assert_eq!(summary.duration_ms, 900.0);
         assert!(
-            (disconnected_at - connected_at).num_milliseconds() < 0,
+            (disconnected_at - connected_at).whole_milliseconds() < 0,
             "fixture must keep a negative wall delta"
         );
     }
@@ -13760,8 +13778,9 @@ backend_tls_verify_server_cert: false
         use std::time::Instant;
 
         let connected_mono = Instant::now();
-        let connected_wall = chrono::Utc::now();
-        let disconnected_wall_rollback = connected_wall - chrono::TimeDelta::hours(1);
+        let connected_wall = crate::time_compat::UtcTimestamp::now();
+        let disconnected_wall_rollback =
+            shift_wall(connected_wall, ::time::SignedDuration::hours(-1));
         let correlation_ids = Default::default();
         let metadata = crate::plugins::MetadataMap::default();
 
@@ -13801,7 +13820,7 @@ backend_tls_verify_server_cert: false
             summary.duration_ms
         );
         assert!(
-            (disconnected_wall_rollback - connected_wall).num_milliseconds() < 0,
+            (disconnected_wall_rollback - connected_wall).whole_milliseconds() < 0,
             "fixture must keep a negative wall delta"
         );
         assert_eq!(
@@ -13816,7 +13835,8 @@ backend_tls_verify_server_cert: false
         );
 
         // Forward civil-clock step: duration still Instant-based (not inflated).
-        let disconnected_wall_forward = connected_wall + chrono::TimeDelta::hours(5);
+        let disconnected_wall_forward =
+            shift_wall(connected_wall, ::time::SignedDuration::hours(5));
         let duration_forward = connected_mono.elapsed().as_millis() as f64;
         let forward_summary = build_dtls_stream_summary(DtlsDisconnectContext {
             plugin_trigger_decisions: Default::default(),
@@ -13897,7 +13917,7 @@ backend_tls_verify_server_cert: false
                 backend_scheme: BackendScheme::Dtls,
                 listen_port: 7443,
                 disconnected_ms: 1_710_000_002_000,
-                disconnected_wall_at: chrono::Utc::now(),
+                disconnected_wall_at: crate::time_compat::UtcTimestamp::now(),
                 connection_error: Some(STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED.to_string()),
                 error_class: Some(crate::retry::ErrorClass::TlsError),
                 disconnect_direction: Some(crate::plugins::Direction::BackendToClient),
@@ -14686,7 +14706,7 @@ backend_tls_verify_server_cert: false
             dtls_conn: None,
             last_activity: AtomicU64::new(0),
             created_at: AtomicU64::new(0),
-            connected_wall_at: chrono::Utc::now(),
+            connected_wall_at: crate::time_compat::UtcTimestamp::now(),
             expired: std::sync::atomic::AtomicBool::new(false),
             bytes_sent: AtomicU64::new(0),
             bytes_received: crossbeam_utils::CachePadded::new(AtomicU64::new(0)),
