@@ -108,6 +108,28 @@ impl std::error::Error for TimestampError {}
 /// serde, and SQL compatibility with `chrono::DateTime<chrono::Utc>`.
 ///
 /// The wrapped [`OffsetDateTime`] is always normalized to [`UtcOffset::UTC`].
+///
+/// # Leap seconds (issue #7419 owner decision)
+///
+/// chrono's `DateTime<Utc>` can hold a leap second (`23:59:60.f`, stored as
+/// second 59 with a sub-second part of `1_000_000_000 + f`); `UtcTimestamp`
+/// cannot. The chrono-compatible parsers accept `:60` exactly as chrono does,
+/// and [`ChronoParsedDateTime::to_utc_timestamp`] stores it as the
+/// next-second instant chrono's `timestamp_nanos_opt()` reports (`:00.f` of
+/// the following minute). As a result:
+///
+/// - Unix nanoseconds and milliseconds equal chrono's `timestamp_nanos_opt()`
+///   and `timestamp_millis()` for the same input, and values order by those
+///   nanoseconds.
+/// - Known, accepted differences for leap-second inputs only:
+///   - Formatting prints `:00.f` of the next minute instead of chrono's `:60.f`.
+///   - `unix_timestamp()` is one more than chrono's `timestamp()`, which
+///     reports the `:59` second.
+///   - chrono orders a leap second before every instant of the following
+///     second; here it sorts at `:00.f`.
+///
+/// Every non-leap value is unaffected, so database text and other encodings
+/// stay byte-identical.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct UtcTimestamp(OffsetDateTime);
 
@@ -1182,13 +1204,21 @@ impl ChronoParsedDateTime {
 
     /// Convert to a [`UtcTimestamp`].
     ///
-    /// Fails with [`TimestampError::OutOfRange`] outside `UtcTimestamp`'s
-    /// `-9999..=9999` year range and with [`TimestampError::InvalidComponent`]
-    /// for a leap second, which `UtcTimestamp` cannot represent; a caller that
-    /// must accept leap seconds decides how to map them explicitly.
+    /// A leap second (`:60.f`) is normalized to the next-second instant that
+    /// chrono's `timestamp_nanos_opt()` reports for it (`:00.f` of the
+    /// following minute), per the #7419 owner decision; see the leap-second
+    /// note on [`UtcTimestamp`]. Fails with [`TimestampError::OutOfRange`]
+    /// outside `UtcTimestamp`'s `-9999..=9999` year range.
     pub fn to_utc_timestamp(&self) -> Result<UtcTimestamp, TimestampError> {
         if self.is_leap_second() {
-            return Err(TimestampError::InvalidComponent);
+            let next_second = self
+                .unix_timestamp()
+                .checked_add(1)
+                .ok_or(TimestampError::OutOfRange)?;
+            return UtcTimestamp::from_unix_timestamp_nanos(
+                next_second,
+                self.nanosecond - 1_000_000_000,
+            );
         }
         UtcTimestamp::from_unix_timestamp_nanos(self.unix_timestamp(), self.nanosecond)
     }

@@ -193,7 +193,13 @@ fn assert_fixed_parity(
                 ),
                 "{what}: local field mismatch for {input:?}"
             );
-            assert_utc_conversion(what, input, &o);
+            assert_utc_conversion(
+                what,
+                input,
+                &o,
+                t.timestamp_nanos_opt(),
+                t.timestamp_millis(),
+            );
             true
         }
         (Err(_), Err(_)) => false,
@@ -234,7 +240,14 @@ fn assert_naive_parity(
                 ),
                 "{what}: naive mismatch for {input:?}"
             );
-            assert_utc_conversion(what, input, &o);
+            let utc = t.and_utc();
+            assert_utc_conversion(
+                what,
+                input,
+                &o,
+                utc.timestamp_nanos_opt(),
+                utc.timestamp_millis(),
+            );
             true
         }
         (Err(_), Err(_)) => false,
@@ -244,19 +257,41 @@ fn assert_naive_parity(
 }
 
 /// `to_utc_timestamp` must be exact where `UtcTimestamp` can represent the
-/// value and refuse leap seconds and out-of-range years explicitly.
-fn assert_utc_conversion(what: &str, input: &str, parsed: &ChronoParsedDateTime) {
+/// value, normalize a leap second to chrono's next-second linear instant
+/// (#7419 owner decision: millis and nanos equal chrono's), and refuse
+/// out-of-range years.
+fn assert_utc_conversion(
+    what: &str,
+    input: &str,
+    parsed: &ChronoParsedDateTime,
+    chrono_nanos: Option<i64>,
+    chrono_millis: i64,
+) {
     let converted = parsed.to_utc_timestamp();
-    if parsed.is_leap_second() {
-        assert_eq!(
-            converted,
-            Err(TimestampError::InvalidComponent),
-            "{what}: leap second conversion for {input:?}"
-        );
-        return;
-    }
-    match UtcTimestamp::from_unix_timestamp_nanos(parsed.unix_timestamp(), parsed.nanosecond()) {
-        Ok(expected) => assert_eq!(converted, Ok(expected), "{what}: conversion for {input:?}"),
+    let expected = if parsed.is_leap_second() {
+        UtcTimestamp::from_unix_timestamp_nanos(
+            parsed.unix_timestamp() + 1,
+            parsed.nanosecond() - 1_000_000_000,
+        )
+    } else {
+        UtcTimestamp::from_unix_timestamp_nanos(parsed.unix_timestamp(), parsed.nanosecond())
+    };
+    match expected {
+        Ok(expected) => {
+            assert_eq!(converted, Ok(expected), "{what}: conversion for {input:?}");
+            assert_eq!(
+                expected.unix_timestamp_millis(),
+                chrono_millis,
+                "{what}: converted millis differ from chrono for {input:?}"
+            );
+            if let Some(nanos) = chrono_nanos {
+                assert_eq!(
+                    expected.unix_timestamp_nanos(),
+                    i128::from(nanos),
+                    "{what}: converted nanos differ from chrono for {input:?}"
+                );
+            }
+        }
         Err(_) => assert!(
             converted.is_err(),
             "{what}: out-of-range conversion for {input:?}"
@@ -350,9 +385,10 @@ fn rfc3339_leap_second_unicode_minus_and_signed_years_follow_chrono() {
     let chrono_leap = DateTime::parse_from_rfc3339("2026-11-26T12:30:60.25+01:00").unwrap();
     assert_eq!(leap.unix_timestamp(), chrono_leap.timestamp());
     assert_eq!(leap.unix_timestamp_millis(), chrono_leap.timestamp_millis());
+    // Normalized to the next-second instant (owner decision, see below).
     assert_eq!(
-        leap.to_utc_timestamp(),
-        Err(TimestampError::InvalidComponent)
+        leap.to_utc_timestamp().map(|ts| ts.to_rfc3339_z()),
+        Ok("2026-11-26T11:31:00.250Z".to_string())
     );
 
     // Unicode minus sign in the offset.
@@ -482,4 +518,59 @@ fn boundary_and_specifier_cases_follow_chrono() {
     assert!(parse_naive_from_str_chrono("2026/27 11 26 10:20", "%Y/%y %m %d %H:%M").is_err());
     assert!(parse_naive_from_str_chrono("2026-11-26 10:20.5", "%Y-%m-%d %H:%M%.f").is_err());
     assert!(parse_naive_from_str_chrono("2026-11-26 10:20", "%Y-%m-%d %H:%M%.f").is_ok());
+}
+
+/// #7419 owner decision (option B): a parsed leap second is stored as the
+/// next-second instant chrono's `timestamp_nanos_opt()` reports. Millis and
+/// nanos equal chrono's; the formatting, whole-second and in-window ordering
+/// differences below are known and accepted, and pinned here so they stay
+/// deliberate.
+#[test]
+fn leap_second_normalization_matches_chrono_nanos_and_documents_differences() {
+    let input = "1999-12-31T23:59:60.5Z";
+    let chrono_leap = DateTime::parse_from_rfc3339(input).unwrap().to_utc();
+    let stored = parse_rfc3339_chrono(input)
+        .and_then(|parsed| parsed.to_utc_timestamp())
+        .expect("leap second normalizes");
+
+    // Equal to chrono.
+    assert_eq!(
+        stored.unix_timestamp_nanos(),
+        i128::from(chrono_leap.timestamp_nanos_opt().unwrap())
+    );
+    assert_eq!(
+        stored.unix_timestamp_millis(),
+        chrono_leap.timestamp_millis()
+    );
+    let before = DateTime::parse_from_rfc3339("1999-12-31T23:59:59.999999999Z")
+        .unwrap()
+        .to_utc();
+    let after = DateTime::parse_from_rfc3339("2000-01-01T00:00:01Z")
+        .unwrap()
+        .to_utc();
+    let as_stored = |dt: DateTime<chrono::Utc>| {
+        UtcTimestamp::from_unix_timestamp_nanos(dt.timestamp(), dt.timestamp_subsec_nanos())
+            .unwrap()
+    };
+    assert_eq!(stored.cmp(&as_stored(before)), chrono_leap.cmp(&before));
+    assert_eq!(stored.cmp(&as_stored(after)), chrono_leap.cmp(&after));
+
+    // Known, accepted differences.
+    assert_eq!(chrono_leap.to_rfc3339(), "1999-12-31T23:59:60.500+00:00");
+    assert_eq!(stored.to_rfc3339(), "2000-01-01T00:00:00.500+00:00");
+    assert_eq!(stored.unix_timestamp(), chrono_leap.timestamp() + 1);
+    let inside_window = DateTime::parse_from_rfc3339("2000-01-01T00:00:00.25Z")
+        .unwrap()
+        .to_utc();
+    assert_eq!(chrono_leap.cmp(&inside_window), std::cmp::Ordering::Less);
+    assert_eq!(
+        stored.cmp(&as_stored(inside_window)),
+        std::cmp::Ordering::Greater
+    );
+
+    // Non-leap values are untouched.
+    let plain = parse_rfc3339_chrono("1999-12-31T23:59:59.5Z")
+        .and_then(|parsed| parsed.to_utc_timestamp())
+        .unwrap();
+    assert_eq!(plain.to_rfc3339(), "1999-12-31T23:59:59.500+00:00");
 }
