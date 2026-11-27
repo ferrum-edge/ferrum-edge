@@ -2284,7 +2284,7 @@ async fn hmac_auth_reuses_prebuffered_native_grpc_body_for_primary_dispatch() {
 
     let path = "/grpc-hmac/my.Service/Echo";
     let grpc_message = b"\x00\x00\x00\x00\x0bsigned body";
-    let date = UtcTimestamp::now().to_rfc2822();
+    let date = UtcTimestamp::now().to_rfc2822().unwrap();
     let digest = format!(
         "sha-256={}",
         base64::engine::general_purpose::STANDARD.encode(Sha256::digest(grpc_message))
@@ -2356,7 +2356,7 @@ async fn hmac_auth_rfc9530_content_digest_preserves_grpc_body_and_rejects_ambigu
 
     let path = "/grpc-hmac-cd/my.Service/Echo";
     let grpc_message = b"\x00\x00\x00\x00\x0bsigned body";
-    let date = UtcTimestamp::now().to_rfc2822();
+    let date = UtcTimestamp::now().to_rfc2822().unwrap();
     let digest = crate::common::content_digest_sha256_header(grpc_message);
     let authorization = crate::common::hmac_v2_authorization(
         "POST",
@@ -2386,7 +2386,7 @@ async fn hmac_auth_rfc9530_content_digest_preserves_grpc_body_and_rejects_ambigu
     assert_eq!(body, grpc_message);
 
     let empty_body: &[u8] = b"";
-    let empty_date = UtcTimestamp::now().to_rfc2822();
+    let empty_date = UtcTimestamp::now().to_rfc2822().unwrap();
     let empty_digest = crate::common::content_digest_sha256_header(empty_body);
     let empty_authorization = crate::common::hmac_v2_authorization(
         "POST",
@@ -2417,7 +2417,7 @@ async fn hmac_auth_rfc9530_content_digest_preserves_grpc_body_and_rejects_ambigu
     assert_eq!(empty_response, empty_body);
 
     let legacy = crate::common::empty_digest_header();
-    let ambiguous_date = UtcTimestamp::now().to_rfc2822();
+    let ambiguous_date = UtcTimestamp::now().to_rfc2822().unwrap();
     let ambiguous_authorization = crate::common::hmac_v2_authorization(
         "POST",
         path,
