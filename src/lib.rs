@@ -5745,7 +5745,7 @@ pub mod _test_support {
                 proxy_id,
                 client_ip,
                 listen_port,
-                connected_wall_at: chrono::Utc::now(),
+                connected_wall_at: crate::time_compat::UtcTimestamp::now(),
                 duration_ms: 0.0,
                 error,
             };
@@ -5778,7 +5778,7 @@ pub mod _test_support {
                 proxy_id: &proxy.id,
                 client_ip,
                 listen_port,
-                connected_wall_at: chrono::Utc::now(),
+                connected_wall_at: crate::time_compat::UtcTimestamp::now(),
                 duration_ms: 0.0,
             },
         )
@@ -5806,8 +5806,8 @@ pub mod _test_support {
     /// parity regression tests (WebSocket/UDP/DTLS must match this split).
     pub fn tcp_stream_disconnect_clocks_for_test(
         connected_mono: std::time::Instant,
-        connected_wall_at: chrono::DateTime<chrono::Utc>,
-        disconnected_wall_at: chrono::DateTime<chrono::Utc>,
+        connected_wall_at: crate::time_compat::UtcTimestamp,
+        disconnected_wall_at: crate::time_compat::UtcTimestamp,
     ) -> (f64, String, String) {
         let clocks = crate::proxy::tcp_proxy::stream_disconnect_clocks(
             connected_mono,
@@ -11895,7 +11895,7 @@ pub mod _test_support {
         listen_port: u16,
         consumer_username: Option<String>,
         metadata: crate::plugins::MetadataMap,
-        session_start: chrono::DateTime<chrono::Utc>,
+        session_start: crate::time_compat::UtcTimestamp,
     ) -> crate::proxy::WsSessionMeta {
         crate::proxy::WsSessionMeta {
             namespace,
@@ -11931,7 +11931,7 @@ pub mod _test_support {
         listen_port: u16,
         consumer_username: Option<String>,
         metadata: crate::plugins::MetadataMap,
-        session_start: chrono::DateTime<chrono::Utc>,
+        session_start: crate::time_compat::UtcTimestamp,
         session_start_mono: std::time::Instant,
     ) -> crate::proxy::WsSessionMeta {
         crate::proxy::WsSessionMeta {

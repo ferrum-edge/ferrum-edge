@@ -1041,7 +1041,7 @@ async fn policy_close_reaches_h2_backend_before_transport_drop_in_both_direction
             443,
             None,
             Default::default(),
-            chrono::Utc::now(),
+            ferrum_edge::time_compat::UtcTimestamp::now(),
         );
         let relay = run_framed_websocket_relay_for_test(
             gateway_client,

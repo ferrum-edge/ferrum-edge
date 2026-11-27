@@ -122,7 +122,9 @@ fn session_meta_with_id(connection_id: u64) -> ferrum_edge::proxy::WsSessionMeta
         8000,
         Some("user-42".to_string()),
         ferrum_edge::plugins::MetadataMap::default(),
-        chrono::Utc::now() - chrono::Duration::seconds(2),
+        ferrum_edge::time_compat::UtcTimestamp::now()
+            .checked_add(::time::SignedDuration::seconds(-2))
+            .expect("test wall time in range"),
     );
     meta.connection_id = connection_id;
     meta
@@ -280,7 +282,9 @@ async fn test_tunnel_disconnect_duration_ignores_wall_clock_skew() {
         8000,
         None,
         ferrum_edge::plugins::MetadataMap::default(),
-        chrono::Utc::now() - chrono::Duration::hours(1),
+        ferrum_edge::time_compat::UtcTimestamp::now()
+            .checked_add(::time::SignedDuration::hours(-1))
+            .expect("test wall time in range"),
         Instant::now(),
     );
 
@@ -307,7 +311,9 @@ async fn test_framed_disconnect_duration_ignores_wall_clock_skew() {
     // skew must not clamp/inflate duration_ms; frame counters stay non-zero.
     let (plugin, captured) = CapturingDisconnectPlugin::new();
     let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(plugin)];
-    let wall_connect = chrono::Utc::now() - chrono::Duration::hours(1);
+    let wall_connect = ferrum_edge::time_compat::UtcTimestamp::now()
+        .checked_add(::time::SignedDuration::hours(-1))
+        .expect("test wall time in range");
     let meta = make_ws_session_meta_with_mono(
         "ferrum".to_string(),
         Some("ws-framed".to_string()),
@@ -347,7 +353,9 @@ async fn test_framed_disconnect_duration_ignores_wall_clock_skew() {
     // elapsed from session_start_mono = now.
     let (plugin_fwd, captured_fwd) = CapturingDisconnectPlugin::new();
     let plugins_fwd: Vec<Arc<dyn Plugin>> = vec![Arc::new(plugin_fwd)];
-    let wall_forward = chrono::Utc::now() + chrono::Duration::hours(1);
+    let wall_forward = ferrum_edge::time_compat::UtcTimestamp::now()
+        .checked_add(::time::SignedDuration::hours(1))
+        .expect("test wall time in range");
     let meta_fwd = make_ws_session_meta_with_mono(
         "ferrum".to_string(),
         Some("ws-framed".to_string()),
