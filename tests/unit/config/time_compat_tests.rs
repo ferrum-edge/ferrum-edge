@@ -844,6 +844,7 @@ fn chrono_try_seconds_accepts_exactly_what_chrono_does() {
             );
         }
     }
+}
 
 /// Phase 11 replaced `DateTime::from_timestamp_millis(..).unwrap_or(UNIX_EPOCH)`
 /// with `UtcTimestamp::from_unix_timestamp_millis(..).unwrap_or(UNIX_EPOCH)`.
