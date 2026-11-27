@@ -836,6 +836,18 @@ pub(crate) enum MeshOutboundPortSelectError {
 }
 
 impl HostRouteTable {
+    /// This generation's ServiceWaypoint L7 target index and per-bound-Service
+    /// route partitions (issues #7500, #7501). Empty outside a
+    /// ServiceWaypoint. Read from the request epoch, so the outer `CONNECT`
+    /// classification, every inner request's partition lookup and the
+    /// admission fence's bound-Service gate judge the same generation as the
+    /// rest of the request.
+    pub(crate) fn service_waypoint_l7_routes(
+        &self,
+    ) -> &crate::modes::mesh::service_waypoint_l7::ServiceWaypointL7Routes {
+        &self.service_waypoint_l7
+    }
+
     /// Swap a matched mesh outbound representative route for the sibling
     /// matching the connection's captured original-destination port.
     ///

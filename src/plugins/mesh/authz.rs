@@ -1534,6 +1534,9 @@ impl DestinationPolicyScopeIndex {
     ) -> bool {
         if let Some(upstream_id) = upstream_id {
             return upstream_id.starts_with("__mesh-out-upstream-")
+                || upstream_id.starts_with(
+                    crate::modes::mesh::service_waypoint_l7::SERVICE_WAYPOINT_L7_UPSTREAM_ID_PREFIX,
+                )
                 || (node_waypoint_generated_route_upstream_id(upstream_id)
                     && self
                         .route_upstreams_requiring_scope
@@ -2033,6 +2036,15 @@ fn destination_policy_scope_index(
                 ),
                 Some(service_port.port),
             );
+            index.upstream_policy_ports.insert(
+                &service.namespace,
+                crate::modes::mesh::service_waypoint_l7::service_waypoint_l7_upstream_id(
+                    &service.namespace,
+                    &service.name,
+                    service_port.port,
+                ),
+                Some(service_port.port),
+            );
             let scopes = destination_policy_scopes_for_service_port(
                 service,
                 service_port,
@@ -2047,6 +2059,17 @@ fn destination_policy_scope_index(
             index.by_upstream.insert(
                 &service.namespace,
                 crate::modes::mesh::mesh_outbound_upstream_id(
+                    &service.namespace,
+                    &service.name,
+                    service_port.port,
+                ),
+                scopes.scopes.clone(),
+            );
+            // The ServiceWaypoint default L7 upstream of the same Service port
+            // (issues #7500, #7501) reaches exactly the same backing workloads.
+            index.by_upstream.insert(
+                &service.namespace,
+                crate::modes::mesh::service_waypoint_l7::service_waypoint_l7_upstream_id(
                     &service.namespace,
                     &service.name,
                     service_port.port,
@@ -2178,6 +2201,17 @@ fn destination_policy_scope_index(
         }
     }
     index
+}
+
+/// How a carried route's alternative candidate destinations are judged.
+#[derive(Clone, Copy)]
+enum RouteBranchJudge<'a> {
+    /// NodeWaypoint per-pod scoping: the request's source pod scope, `None`
+    /// when absent (candidates are then judged on mesh-wide policies only).
+    NodeWaypoint(Option<&'a crate::modes::mesh::runtime::PolicyScopeCache>),
+    /// An inner request of an L7-terminated ServiceWaypoint tunnel (issue
+    /// #7501): each candidate on its own destination workloads.
+    ServiceWaypoint,
 }
 
 /// Evaluate every applicable destination scope, in Istio's CUSTOM → DENY →
@@ -3209,14 +3243,12 @@ impl MeshAuthz {
         let destination_policy_scope_index =
             if per_pod_policy_scoping || service_waypoint_destination_scope_required {
                 let cluster_domains = normalized_cluster_domains(config);
-                let route_upstreams = if per_pod_policy_scoping {
-                    let (route_metadata_present, route_upstreams) =
-                        parse_node_waypoint_route_upstreams(config)?;
-                    has_route_upstream_metadata = route_metadata_present;
-                    route_upstreams
-                } else {
-                    Vec::new()
-                };
+                // NodeWaypoint and ServiceWaypoint (issue #7501) both serve
+                // carried VirtualService routes, whose route upstreams this
+                // index resolves to destination workloads.
+                let (route_metadata_present, route_upstreams) =
+                    parse_node_waypoint_route_upstreams(config)?;
+                has_route_upstream_metadata = route_metadata_present;
                 destination_policy_scope_index(&slice, &cluster_domains, &route_upstreams)
             } else {
                 DestinationPolicyScopeIndex::default()
@@ -3409,7 +3441,7 @@ impl MeshAuthz {
             waypoint_gateway_class,
             udp_principal_pod_mismatch_warn_last_ms: std::sync::atomic::AtomicU64::new(0),
         };
-        if per_pod_policy_scoping {
+        if per_pod_policy_scoping || service_waypoint_destination_scope_required {
             authz.route_branches_evaluate_always = route_branch_configs
                 .iter()
                 .any(|config| config.weighted_split || config.own_is_weighted_split);
@@ -3477,6 +3509,28 @@ impl MeshAuthz {
             );
         }
         tables
+    }
+
+    /// Whether a policy applies to EVERY request this waypoint serves,
+    /// whatever its destination: a mesh-wide policy, or one whose `targetRefs`
+    /// name this waypoint's `Gateway` or `GatewayClass`. The policy set a
+    /// ServiceWaypoint judges an external (non-workload) destination on
+    /// (issue #7501).
+    fn waypoint_wide_policy(&self, policy: &MeshPolicy) -> bool {
+        match &policy.scope {
+            PolicyScope::MeshWide => true,
+            PolicyScope::TargetRefs { attachments } => {
+                let waypoint = self.waypoint_attachment();
+                attachments.iter().any(|attachment| match attachment {
+                    crate::modes::mesh::config::PolicyTargetAttachment::Gateway { .. }
+                    | crate::modes::mesh::config::PolicyTargetAttachment::GatewayClass { .. } => {
+                        waypoint.matches(attachment)
+                    }
+                    crate::modes::mesh::config::PolicyTargetAttachment::Service { .. } => false,
+                })
+            }
+            _ => false,
+        }
     }
 
     /// This proxy's authoritative waypoint identity for `targetRefs` matching.
@@ -3983,7 +4037,7 @@ impl MeshAuthz {
         &self,
         table: &Arc<NodeWaypointRouteBranches>,
         request: &mut MeshAuthzRequest,
-        source_scope: Option<&crate::modes::mesh::runtime::PolicyScopeCache>,
+        judge: RouteBranchJudge<'_>,
     ) -> (
         NodeWaypointRouteBranchAuthz,
         Vec<(usize, MeshAuthzCustomDelegation)>,
@@ -4006,8 +4060,7 @@ impl MeshAuthz {
         {
             let bit = 1u64 << index;
             record.evaluated |= bit;
-            let (allowed, outcome, delegation) =
-                self.evaluate_route_branch(branch, request, source_scope);
+            let (allowed, outcome, delegation) = self.evaluate_route_branch(branch, request, judge);
 
             if allowed {
                 record.allowed |= bit;
@@ -4031,7 +4084,7 @@ impl MeshAuthz {
         &self,
         branch: &NodeWaypointRouteBranch,
         request: &mut MeshAuthzRequest,
-        source_scope: Option<&crate::modes::mesh::runtime::PolicyScopeCache>,
+        judge: RouteBranchJudge<'_>,
     ) -> (
         bool,
         Option<NodeWaypointBranchOutcome>,
@@ -4054,7 +4107,12 @@ impl MeshAuthz {
         // enforcing scoped policy exists); every candidate is judged the same
         // way. An unresolved modeled destination refuses only where the own
         // destination's would (`has_scoped_policies`).
-        if branch.scopes.is_none() && branch.requires_scope && self.has_scoped_policies {
+        // A ServiceWaypoint (issue #7501) has no source scope to fall back on:
+        // an unresolved modeled destination always refuses.
+        if branch.scopes.is_none()
+            && branch.requires_scope
+            && (matches!(judge, RouteBranchJudge::ServiceWaypoint) || self.has_scoped_policies)
+        {
             return (
                 false,
                 Some(NodeWaypointBranchOutcome::Deny {
@@ -4065,14 +4123,36 @@ impl MeshAuthz {
             );
         }
         let saved = self.enter_candidate_destination(request, policy_port);
-        let evaluation = match (source_scope, branch.scopes.as_deref()) {
-            (Some(_), Some(scopes)) => evaluate_destination_policy_scopes(
-                &self.slice.mesh_policies,
-                scopes,
-                self.waypoint_attachment(),
+        let evaluation = match (judge, branch.scopes.as_deref()) {
+            // ServiceWaypoint (issue #7501): every candidate is judged on its
+            // OWN destination workloads against the full destination-policy
+            // superset (the waypoint's own namespace filter never applies to
+            // a destination it fronts), and an external candidate on the
+            // waypoint-wide policies (mesh-wide, or attached to this
+            // waypoint's Gateway / GatewayClass).
+            (RouteBranchJudge::ServiceWaypoint, Some(scopes)) => {
+                evaluate_destination_policy_scopes(
+                    &self.relay_policy_superset,
+                    scopes,
+                    self.waypoint_attachment(),
+                    request,
+                )
+            }
+            (RouteBranchJudge::ServiceWaypoint, None) => evaluate_mesh_authorization_full(
+                self.relay_policy_superset
+                    .iter()
+                    .filter(|policy| self.waypoint_wide_policy(policy)),
                 request,
             ),
-            _ => evaluate_mesh_authorization_full(
+            (RouteBranchJudge::NodeWaypoint(Some(_)), Some(scopes)) => {
+                evaluate_destination_policy_scopes(
+                    &self.slice.mesh_policies,
+                    scopes,
+                    self.waypoint_attachment(),
+                    request,
+                )
+            }
+            (RouteBranchJudge::NodeWaypoint(source_scope), _) => evaluate_mesh_authorization_full(
                 self.slice
                     .mesh_policies
                     .iter()
@@ -4174,10 +4254,10 @@ impl MeshAuthz {
         table: &Arc<NodeWaypointRouteBranches>,
         evaluation: &MeshAuthzEvaluation,
         request: &mut MeshAuthzRequest,
-        source_scope: Option<&crate::modes::mesh::runtime::PolicyScopeCache>,
+        judge: RouteBranchJudge<'_>,
         source_for_log: Option<&str>,
     ) -> Option<bool> {
-        let (mut record, mut pending) = self.route_branch_record(table, request, source_scope);
+        let (mut record, mut pending) = self.route_branch_record(table, request, judge);
         if !table.own_admissible {
             // The own destination is a weighted split (issue #7387): it is
             // never reached unselected, so it has no verdict, and the request
@@ -4264,7 +4344,11 @@ impl MeshAuthz {
         backend_port: u16,
     ) -> bool {
         if let Some(upstream_id) = upstream_id {
-            if upstream_id.starts_with("__mesh-out-upstream-") {
+            if upstream_id.starts_with("__mesh-out-upstream-")
+                || upstream_id.starts_with(
+                    crate::modes::mesh::service_waypoint_l7::SERVICE_WAYPOINT_L7_UPSTREAM_ID_PREFIX,
+                )
+            {
                 return true;
             }
             if node_waypoint_generated_route_upstream_id(upstream_id) {
@@ -4819,6 +4903,16 @@ impl Plugin for MeshAuthz {
         }
         let relay_policy_superset_request =
             ambient_udp_source_scope_request || service_waypoint_destination_scope_request;
+        // An inner HTTP request of an L7-terminated ServiceWaypoint tunnel
+        // (issue #7501): judged at L7 on its matched route's DESTINATION
+        // workloads (and each `mesh_route_dispatch` branch / weighted-split
+        // leg on its own), against the full destination-policy superset,
+        // never against the waypoint's own namespace filter.
+        let service_waypoint_l7_request = self.service_waypoint_destination_scope_required
+            && ctx.service_waypoint_l7.is_some()
+            && !inbound_hbone_relay_request;
+        let destination_superset_request =
+            relay_policy_superset_request || service_waypoint_l7_request;
         let unauthenticated_hbone_baggage = is_hbone_request(ctx)
             && has_baggage_header_from_request(ctx)
             && !is_authenticated_hbone_request(ctx);
@@ -4994,7 +5088,7 @@ impl Plugin for MeshAuthz {
             .map(str::to_string);
         let header_rule_names: &[String] = if connect_relay {
             &[]
-        } else if relay_policy_superset_request {
+        } else if destination_superset_request {
             &self.relay_policy_superset_header_rule_names
         } else {
             &self.header_rule_names
@@ -5024,14 +5118,33 @@ impl Plugin for MeshAuthz {
             BTreeMap::new()
         };
         let request_principal = ctx.metadata.get("mesh.request_principal").cloned();
-        let port = mesh_authz_destination_port(
-            ctx.mesh_direction,
-            ctx.matched_proxy.as_deref(),
-            ctx.mesh_inbound_listener_authz_port,
-            ctx.mesh_outbound_destination_authz_port,
-            ctx.orig_dst,
-            ctx.frontend_listen_port,
-        );
+        let port = match ctx.service_waypoint_l7.as_deref() {
+            // A ServiceWaypoint inner request (issue #7501) is judged on the
+            // destination port of the Service its matched route dispatches to
+            // (a default L7 route's is the bound Service port the outer
+            // CONNECT named), never on `:15008` or a client-supplied `Host`.
+            Some(service_waypoint) => Some(
+                ctx.matched_proxy
+                    .as_ref()
+                    .and_then(|proxy| {
+                        proxy.upstream_id.as_deref().and_then(|upstream_id| {
+                            self.destination_upstream_policy_ports
+                                .get(&proxy.namespace, upstream_id)
+                                .copied()
+                                .flatten()
+                        })
+                    })
+                    .unwrap_or(service_waypoint.bound_service_port()),
+            ),
+            None => mesh_authz_destination_port(
+                ctx.mesh_direction,
+                ctx.matched_proxy.as_deref(),
+                ctx.mesh_inbound_listener_authz_port,
+                ctx.mesh_outbound_destination_authz_port,
+                ctx.orig_dst,
+                ctx.frontend_listen_port,
+            ),
+        };
         // Istio source IP matchers. `source.ip` is the immediate downstream
         // socket peer captured before trusted-proxy rewriting; `remote.ip` is
         // the gateway-resolved client IP after XFF / real-IP resolution.
@@ -5043,7 +5156,7 @@ impl Plugin for MeshAuthz {
         // the keys some loaded policy references (`condition_keys`). Without
         // this, condition-gated DENY rules never fired and condition-gated
         // ALLOW rules never matched — a fail-open hole this closes.
-        let condition_keys = if relay_policy_superset_request {
+        let condition_keys = if destination_superset_request {
             &self.relay_policy_superset_condition_keys
         } else {
             &self.condition_keys
@@ -5130,8 +5243,13 @@ impl Plugin for MeshAuthz {
         // the census below and judged mesh-wide, like the own destination.
         // A weighted-split route (issue #7387) records verdicts even with no
         // policy loaded, so a split no leg was selected for is never admitted.
-        let route_branches = if self.per_pod_policy_scoping
-            && (!self.slice.mesh_policies.is_empty() || self.route_branches_evaluate_always)
+        let branch_policies_empty = if service_waypoint_l7_request {
+            self.relay_policy_superset.is_empty()
+        } else {
+            self.slice.mesh_policies.is_empty()
+        };
+        let route_branches = if (self.per_pod_policy_scoping || service_waypoint_l7_request)
+            && (!branch_policies_empty || self.route_branches_evaluate_always)
             && !relay_policy_superset_request
             && !connect_relay
             && !asserted_identity_rejected
@@ -5140,7 +5258,7 @@ impl Plugin for MeshAuthz {
             ctx.matched_proxy
                 .as_ref()
                 .and_then(|proxy| self.route_branch_table_for_proxy(proxy))
-                .filter(|table| !self.slice.mesh_policies.is_empty() || table.evaluate_always)
+                .filter(|table| !branch_policies_empty || table.evaluate_always)
         } else {
             None
         };
@@ -5263,6 +5381,97 @@ impl Plugin for MeshAuthz {
                     &request,
                 )
             }
+        } else if service_waypoint_l7_request {
+            // ServiceWaypoint L7 (issue #7501): the matched route of the
+            // bound Service's partition names the destination this request
+            // reaches by default; its workloads' policies decide, with full L7
+            // attributes and the tunnel's resolved source principal. Missing
+            // destination evidence fails closed, never to waypoint-namespace
+            // filtering.
+            let matched_proxy = ctx.matched_proxy.clone();
+            let destination_scope_match = matched_proxy
+                .as_deref()
+                .and_then(|proxy| self.destination_scope_match_for_proxy(proxy));
+            match destination_scope_match {
+                Some(destination_scope_match) => {
+                    authorized_destination =
+                        Some(destination_scope_match.authorized_destination.clone());
+                    if own_is_weighted_split {
+                        // Never used: `defer_route_branches` judges the legs.
+                        MeshAuthzEvaluation {
+                            custom: None,
+                            custom_provider_conflict: false,
+                            decision: MeshAuthzDecision::Allow,
+                        }
+                    } else {
+                        evaluate_destination_policy_scopes(
+                            &self.relay_policy_superset,
+                            destination_scope_match.scopes,
+                            self.waypoint_attachment(),
+                            &request,
+                        )
+                    }
+                }
+                None if matched_proxy
+                    .as_deref()
+                    .is_some_and(|proxy| self.proxy_requires_destination_scope(proxy)) =>
+                {
+                    // The route's own destination cannot be resolved, but
+                    // route dispatch may still select another candidate:
+                    // record the own destination as refused and let each
+                    // candidate's verdict decide.
+                    if let Some(table) = route_branches.as_ref() {
+                        let (mut record, pending) = self.route_branch_record(
+                            table,
+                            &mut request,
+                            RouteBranchJudge::ServiceWaypoint,
+                        );
+                        if record.allowed != 0 || own_is_weighted_split {
+                            if !own_is_weighted_split {
+                                record.evaluated |= 1;
+                                record.outcomes.push((
+                                    0,
+                                    NodeWaypointBranchOutcome::Deny {
+                                        policy: "destination_scope_missing".to_string(),
+                                        kind: NodeWaypointBranchDenyKind::DestinationScopeMissing,
+                                    },
+                                ));
+                            }
+                            self.install_route_branch_record(
+                                ctx,
+                                record,
+                                pending,
+                                &request,
+                                source_for_log.as_deref(),
+                            );
+                            return PluginResult::Continue;
+                        }
+                    }
+                    ctx.metadata.insert(
+                        "mesh_authz.destination_scope_missing".to_string(),
+                        "true".to_string(),
+                    );
+                    ctx.metadata.insert(
+                        "mesh_authz.deny_policy".to_string(),
+                        "destination_scope_missing".to_string(),
+                    );
+                    self.record_policy_deny(&ctx.metadata, source_for_log.as_deref());
+                    return PluginResult::Reject {
+                        status_code: 403,
+                        body: r#"{"error":"Mesh authorization denied: missing destination policy scope"}"#
+                            .into(),
+                        headers: HashMap::new(),
+                    };
+                }
+                // A destination that is no mesh workload (an external host a
+                // carried route names): the waypoint-wide policies decide.
+                None => evaluate_mesh_authorization_full(
+                    self.relay_policy_superset
+                        .iter()
+                        .filter(|policy| self.waypoint_wide_policy(policy)),
+                    &request,
+                ),
+            }
         } else if self.per_pod_policy_scoping {
             // The synthesized inbound relay's destination is a capture
             // destination (the NodeWaypoint relay guard admits only those), so
@@ -5367,7 +5576,7 @@ impl Plugin for MeshAuthz {
                         let (mut record, pending) = self.route_branch_record(
                             table,
                             &mut request,
-                            branch_source_scope.as_deref(),
+                            RouteBranchJudge::NodeWaypoint(branch_source_scope.as_deref()),
                         );
                         // A weighted-split own destination is never reached,
                         // so its missing scope refuses nothing: the selected
@@ -5438,7 +5647,11 @@ impl Plugin for MeshAuthz {
                 table,
                 &evaluation,
                 &mut request,
-                branch_source_scope.as_deref(),
+                if service_waypoint_l7_request {
+                    RouteBranchJudge::ServiceWaypoint
+                } else {
+                    RouteBranchJudge::NodeWaypoint(branch_source_scope.as_deref())
+                },
                 source_for_log.as_deref(),
             ),
             None => None,
@@ -6206,9 +6419,11 @@ impl MeshAuthz {
         let Some(peer) = ctx.peer_spiffe_id.as_ref() else {
             return (None, BaggageOutcome::NoBaggageOrNonHbone);
         };
-        let baggage_principal =
-            hbone_baggage_identity(ctx, ctx.headers.get(BAGGAGE_HEADER).map(String::as_str))
-                .source_principal;
+        // An inner request of an L7-terminated ServiceWaypoint tunnel (issue
+        // #7501) is judged on the OUTER CONNECT's assertion only: its own
+        // `baggage` header is application data and never an HBONE identity
+        // assertion (`request_hbone_assertion`).
+        let baggage_principal = request_hbone_assertion(ctx).source_principal;
         // No asserted identity means there is nothing to authorize and nothing
         // observable for operators to triage — the assertor relation is not
         // consulted at all, so ordinary non-assertor HBONE flows stay quiet.
@@ -6801,7 +7016,27 @@ pub(crate) fn parse_trust_domain_aliases(config: &Value) -> Result<Vec<TrustDoma
 }
 
 fn is_authenticated_hbone_request(ctx: &RequestContext) -> bool {
-    ctx.peer_spiffe_id.is_some() && is_hbone_request(ctx)
+    ctx.peer_spiffe_id.is_some() && (is_hbone_request(ctx) || ctx.service_waypoint_l7.is_some())
+}
+
+/// The HBONE identity assertion a request carries, read from the one place an
+/// assertion may come from.
+///
+/// An HBONE CONNECT asserts through its own pristine wire `baggage` (plus the
+/// folded request-map value, [`hbone_baggage_identity`]). An inner request of
+/// an L7-terminated ServiceWaypoint tunnel (issue #7501) carries the assertion
+/// of its OUTER `CONNECT`, captured once when the tunnel was admitted
+/// (`ServiceWaypointL7Context::outer_baggage`); the inner request's own
+/// `baggage` header is ignored entirely, so nothing a client writes inside the
+/// tunnel can assert an identity. The trusted-assertor and trust-domain gates
+/// then apply exactly as to the CONNECT itself.
+pub(crate) fn request_hbone_assertion(ctx: &RequestContext) -> HboneIdentity {
+    match ctx.service_waypoint_l7.as_deref() {
+        Some(service_waypoint) => {
+            HboneIdentity::from_baggage_values(service_waypoint.outer_baggage.as_deref())
+        }
+        None => hbone_baggage_identity(ctx, ctx.headers.get(BAGGAGE_HEADER).map(String::as_str)),
+    }
 }
 
 fn can_use_inbound_relay_destination_scope_without_source_scope(

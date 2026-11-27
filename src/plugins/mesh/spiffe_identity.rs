@@ -376,6 +376,56 @@ pub(crate) fn has_verified_peer_spiffe_identity(ctx: &RequestContext) -> bool {
     }
 }
 
+/// Publish the connection's verified certificate SPIFFE principal on `ctx`
+/// exactly as [`SpiffeIdentity::on_request_received`] would, before any plugin
+/// runs, and return it.
+///
+/// The ServiceWaypoint L7 termination (issue #7501) decides its outer HBONE
+/// `CONNECT` without running the plugin chain: an `AuthorizationPolicy` with
+/// HTTP-only rules cannot be judged against a tunnel, and every inner request
+/// runs the full chain instead. That path still needs the same credential
+/// facts the relay handler reads after `spiffe_identity` ran: the identity,
+/// its leaf deadline and the certificate provenance
+/// (`RequestContext::has_certificate_spiffe_principal`) the admission fence's
+/// credential gate requires. The derivation, validity window and deadline are
+/// this plugin's own; per-instance policy (`allowed_trust_domains`,
+/// `require_identity`) is not consulted here, because every inner request
+/// runs the plugin, which applies it there.
+///
+/// `None` (and nothing published) for a connection without a client
+/// certificate, a certificate without exactly one valid SPIFFE URI SAN, or a
+/// leaf outside its validity window.
+pub(crate) fn admit_verified_peer_certificate_principal(
+    ctx: &mut RequestContext,
+) -> Option<SpiffeId> {
+    let der = ctx.tls_client_cert_der.clone()?;
+    let cache = ctx.peer_spiffe_extraction_cache.clone();
+    let derived;
+    let outcome = match cache.as_deref() {
+        Some(cache) => cache.outcome(der.as_ref()),
+        None => {
+            derived = derive_peer_spiffe_extraction(der.as_ref());
+            &derived
+        }
+    };
+    let PeerSpiffeExtraction::Id {
+        id,
+        validity,
+        monotonic_expiry,
+    } = outcome
+    else {
+        return None;
+    };
+    let deadline = match admission_deadline(validity, monotonic_expiry) {
+        CredentialDeadline::Bounded(deadline) => Some(deadline),
+        CredentialDeadline::Unbounded => None,
+        CredentialDeadline::Invalid => return None,
+    };
+    let id = id.clone();
+    ctx.admit_certificate_spiffe_principal(id.clone(), deadline);
+    Some(id)
+}
+
 /// The `spiffe_identity` plugin instance.
 ///
 /// The default (`{}` / `null`) is the historical extraction-only behavior: no

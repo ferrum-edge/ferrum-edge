@@ -1444,15 +1444,17 @@ fn accepted_status(
 }
 
 /// `status.ferrum.translation.mesh_http_routes` for a mesh-bound
-/// VirtualService with `http[]` routes (issues #7390, #7423): mesh data planes
-/// apply those routes on the Sidecar and NodeWaypoint topologies only.
-pub const VIRTUAL_SERVICE_MESH_HTTP_ROUTES_SCOPE: &str = "sidecar_and_node_waypoint";
+/// VirtualService with `http[]` routes (issues #7390, #7423, #7501): mesh data
+/// planes apply those routes on the Sidecar, NodeWaypoint and ServiceWaypoint
+/// topologies (a ServiceWaypoint for the Services bound to it, after HTTP
+/// termination inside its HBONE tunnels).
+pub const VIRTUAL_SERVICE_MESH_HTTP_ROUTES_SCOPE: &str = "sidecar_node_and_service_waypoint";
 
-/// The `FerrumAccepted` message note naming the topologies that do NOT apply a
-/// mesh-bound VirtualService's `http[]` routes (issues #7390, #7423).
-pub const VIRTUAL_SERVICE_MESH_HTTP_ROUTES_NOTE: &str = "mesh http[] routes are applied only by \
-     Sidecar and NodeWaypoint data planes; Ambient and ServiceWaypoint data planes ignore them \
-     and route to the destination Service";
+/// The `FerrumAccepted` message note naming the topology that does NOT apply a
+/// mesh-bound VirtualService's `http[]` routes (issues #7390, #7423, #7501).
+pub const VIRTUAL_SERVICE_MESH_HTTP_ROUTES_NOTE: &str = "mesh http[] routes are applied by \
+     Sidecar, NodeWaypoint and ServiceWaypoint data planes; Ambient data planes (the L4 data \
+     plane) ignore them and route to the destination Service";
 
 /// Status for `VirtualService`. The translator consumes `spec.http` routes
 /// (incl. `mirror` / `rewrite` / `redirect` / `corsPolicy`) and `spec.tcp` /

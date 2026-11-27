@@ -1797,7 +1797,7 @@ elif accepted[0].get("status") != "True":
         "ferrum-accepted-not-true status=%s reason=%s"
         % (accepted[0].get("status"), accepted[0].get("reason"))
     )
-elif scope != "sidecar_and_node_waypoint":
+elif scope != "sidecar_node_and_service_waypoint":
     print("mesh-http-routes-scope-unexpected scope=%s" % scope)
 else:
     print("accepted reason=%s mesh_http_routes=%s" % (accepted[0].get("reason"), scope))
@@ -1986,7 +1986,7 @@ vs_sample_passes() {
 
 # Two assertions, both always recorded (immediately, if a prerequisite fails):
 #   sidecar.virtual_service.weighted_split_90_10
-#     FerrumAccepted=True (with the sidecar_and_node_waypoint route scope) on
+#     FerrumAccepted=True (with the sidecar_node_and_service_waypoint route scope) on
 #     the applied VirtualService; both split destinations refuse a TLS client
 #     without a certificate (STRICT, so every 200 below required vs-client's
 #     SVID); the route converged on vs-client; and VS_SPLIT_REQUESTS captured

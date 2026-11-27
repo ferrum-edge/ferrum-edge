@@ -3644,6 +3644,44 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_mesh_service_waypoint_l7_tunnel_terminations_total",
+    "type": "counter",
+    "help": "L7-terminated ServiceWaypoint HBONE tunnels ended, by closed reason.",
+    "labels": [
+      "reason",
+      "namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_service_waypoint_l7_tunnels_active",
+    "type": "gauge",
+    "help": "Concurrent L7-terminated ServiceWaypoint HBONE CONNECT tunnels.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_service_waypoint_route_refusals_total",
+    "type": "counter",
+    "help": "ServiceWaypoint inner requests and carried VirtualService routes refused, by closed reason.",
+    "labels": [
+      "reason",
+      "namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_mesh_slice_drift_data_planes",
     "type": "gauge",
     "help": "Tracked mesh data planes by CP-side slice convergence state.",

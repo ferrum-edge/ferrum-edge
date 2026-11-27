@@ -5468,6 +5468,9 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
     // Service in another namespace: every one refuses its route (issue
     // #7499; the VirtualService status reports them).
     let mut cross_namespace_refused = 0usize;
+    // Routes refused for naming an in-cluster Service this data plane does not
+    // model (no materialized Service upstream for it).
+    let mut unmodeled_service_refused = 0usize;
     for (namespace, id) in split_ids {
         let Some(split) = config
             .upstreams
@@ -5502,7 +5505,10 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                     legs.push((target.weight, vec![target.clone()]));
                     external_targets.push(target.clone());
                 }
-                CarriedRouteHost::UnmodeledService => rebound = false,
+                CarriedRouteHost::UnmodeledService => {
+                    unmodeled_service_refused += 1;
+                    rebound = false;
+                }
                 // A leg is dispatched through a namespace-local reference
                 // (the split's own targets, or a route override naming the
                 // Service upstream), so a Service in another namespace is
@@ -5733,7 +5739,10 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                         }
                         candidates.insert(format!("{backend_host}|{backend_port}"));
                     }
-                    CarriedRouteHost::UnmodeledService => keep = false,
+                    CarriedRouteHost::UnmodeledService => {
+                        unmodeled_service_refused += 1;
+                        keep = false;
+                    }
                     // A Service upstream lives in its own namespace while the
                     // route and its references resolve in the route's, so a
                     // cross-namespace destination would leave a dangling
@@ -5756,7 +5765,10 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                                 candidates.insert(id.clone());
                                 proxy_upstream = Some(id);
                             }
-                            None => keep = false,
+                            None => {
+                                unmodeled_service_refused += 1;
+                                keep = false;
+                            }
                         }
                     }
                 }
@@ -5852,7 +5864,10 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                         }
                         candidates.insert(format!("{host}|{port}"));
                     }
-                    CarriedRouteHost::UnmodeledService => keep = false,
+                    CarriedRouteHost::UnmodeledService => {
+                        unmodeled_service_refused += 1;
+                        keep = false;
+                    }
                     CarriedRouteHost::Service(service_namespace, _)
                         if service_namespace != namespace =>
                     {
@@ -5882,7 +5897,10 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                                 candidates.insert(id.clone());
                                 rule_rewrites.push((plugin_index, rule_index, id));
                             }
-                            None => keep = false,
+                            None => {
+                                unmodeled_service_refused += 1;
+                                keep = false;
+                            }
                         }
                     }
                 }
@@ -6021,9 +6039,34 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
             }
         }
     }
+    if runtime.topology == MeshTopology::ServiceWaypoint {
+        // Issue #7501: the ServiceWaypoint refusal family counts each refusal
+        // this preparation made (a refused route is refused again on every
+        // slice apply until its configuration changes).
+        use crate::proxy::service_waypoint_l7_proxy::{
+            ServiceWaypointRouteRefusal, record_route_refusals,
+        };
+        record_route_refusals(
+            ServiceWaypointRouteRefusal::CrossNamespaceRefused,
+            cross_namespace_refused as u64,
+        );
+        record_route_refusals(
+            ServiceWaypointRouteRefusal::UnmodeledService,
+            unmodeled_service_refused as u64,
+        );
+        record_route_refusals(
+            ServiceWaypointRouteRefusal::AuthorityRewriteRefused,
+            authority_rewrite_refused as u64,
+        );
+        record_route_refusals(
+            ServiceWaypointRouteRefusal::UnrepresentableSplit,
+            (unrepresentable_splits + oversized_weighted_routes) as u64,
+        );
+    }
     if !dropped.is_empty() {
         warn!(
             routes = dropped.len(),
+            unmodeled_service_refused,
             unrepresentable_weighted_splits = unrepresentable_splits,
             oversized_weighted_routes,
             tls_origination_refused,
@@ -6648,7 +6691,13 @@ fn thread_node_waypoint_route_branches_to_authz(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
 ) {
-    if runtime.topology != MeshTopology::NodeWaypoint {
+    // A ServiceWaypoint terminates the bound Services' carried routes at L7
+    // inside its HBONE tunnels (issue #7501) and judges every branch and leg
+    // on its own destination exactly as a NodeWaypoint does.
+    if !matches!(
+        runtime.topology,
+        MeshTopology::NodeWaypoint | MeshTopology::ServiceWaypoint
+    ) {
         return;
     }
     let route_dispatch_rules: HashMap<(&str, &str), &serde_json::Value> = config
@@ -8356,10 +8405,13 @@ pub(crate) fn mesh_route_admitted_for_direction(
 ) -> bool {
     // A ServiceWaypoint default L7 Service route (issue #7500) is served only
     // through its bound Service's route partition, after HTTP termination
-    // inside an admitted HBONE tunnel (issue #7501). No listener's shared
-    // route lookup may serve it: on the `:15008` listener a direct request
-    // would otherwise reach the bound Service's workloads outside the
-    // CONNECT admission path.
+    // inside an admitted HBONE tunnel (issue #7501,
+    // `ServiceWaypointL7RoutePartition::resolve`), which never consults this
+    // predicate. No listener's shared route lookup may serve it: on the
+    // `:15008` listener a direct request would otherwise reach the bound
+    // Service's workloads outside the CONNECT admission path. The same holds
+    // for carried `istio-vs-*` routes below: the partition serves them inside
+    // a tunnel, and every direct inbound listener keeps refusing them.
     if service_waypoint_l7::is_service_waypoint_l7_route_id(id) {
         return false;
     }
@@ -17368,7 +17420,13 @@ fn inject_mesh_global_plugins(
     {
         embedded.remove("http_routes");
     }
-    if runtime.topology == MeshTopology::NodeWaypoint {
+    // Both waypoints serve carried VirtualService routes (NodeWaypoint since
+    // #7233, ServiceWaypoint since #7501), so both resolve route upstreams to
+    // destination workloads.
+    if matches!(
+        runtime.topology,
+        MeshTopology::NodeWaypoint | MeshTopology::ServiceWaypoint
+    ) {
         mesh_authz_config["cluster_domains"] =
             serde_json::json!(node_waypoint_authz_cluster_domains(&runtime.cluster_domain));
         mesh_authz_config["node_waypoint_route_upstreams"] =
@@ -18076,8 +18134,14 @@ fn scope_request_auth_to_node_waypoint_destinations(
                 .starts_with(MESH_REQUEST_AUTH_DESTINATION_PLUGIN_ID_PREFIX)
         });
     }
-    if runtime.topology != MeshTopology::NodeWaypoint
-        || mesh_slice.request_authentications.is_empty()
+    // ServiceWaypoint (issue #7501): the bound Services' default L7 routes and
+    // carried routes are terminated at L7 inside the HBONE tunnel, so their
+    // JWTs are validated against the DESTINATION's resources exactly like a
+    // NodeWaypoint's routes.
+    if !matches!(
+        runtime.topology,
+        MeshTopology::NodeWaypoint | MeshTopology::ServiceWaypoint
+    ) || mesh_slice.request_authentications.is_empty()
     {
         return Vec::new();
     }
@@ -18132,7 +18196,10 @@ fn scope_request_auth_to_node_waypoint_destinations(
     // exist, a route that reaches a modeled destination this index cannot
     // resolve cannot be shown to be outside them.
     let carries_destination_resources = (0..resources.len()).any(|index| !own.contains(&index));
-    let secured_transport = runtime.node_waypoint_secured_transport_required();
+    // Only a secured NodeWaypoint dials through node-waypoint metadata; a
+    // ServiceWaypoint dials every local backing workload.
+    let secured_transport = runtime.topology == MeshTopology::NodeWaypoint
+        && runtime.node_waypoint_secured_transport_required();
     // The workloads each mesh Service upstream can actually dial, keyed by
     // `(namespace, id)` and derived with the same rules as
     // `build_outbound_mesh_targets`: the Service's LOCAL members, with a
@@ -18153,7 +18220,7 @@ fn scope_request_auth_to_node_waypoint_destinations(
             continue;
         }
         for port in &service.ports {
-            let dialable = local
+            let dialable: Vec<&config::Workload> = local
                 .iter()
                 .copied()
                 .filter(|workload| {
@@ -18162,6 +18229,19 @@ fn scope_request_auth_to_node_waypoint_destinations(
                         && port.backend_port_for(&workload.ports).is_some()
                 })
                 .collect();
+            // The ServiceWaypoint default L7 upstream of the same Service
+            // port dials exactly the same workloads.
+            dialable_upstream_workloads.insert(
+                (
+                    service.namespace.as_str(),
+                    service_waypoint_l7::service_waypoint_l7_upstream_id(
+                        &service.namespace,
+                        &service.name,
+                        port.port,
+                    ),
+                ),
+                Vec::clone(&dialable),
+            );
             dialable_upstream_workloads.insert(
                 (
                     service.namespace.as_str(),
@@ -18311,7 +18391,12 @@ fn scope_request_auth_to_node_waypoint_destinations(
         };
         for (upstream_id, backend_host, backend_port) in destinations {
             if let Some(dialable) = upstream_id
-                .filter(|id| id.starts_with(MESH_OUTBOUND_UPSTREAM_ID_PREFIX))
+                .filter(|id| {
+                    id.starts_with(MESH_OUTBOUND_UPSTREAM_ID_PREFIX)
+                        || id.starts_with(
+                            service_waypoint_l7::SERVICE_WAYPOINT_L7_UPSTREAM_ID_PREFIX,
+                        )
+                })
                 .and_then(|id| {
                     dialable_upstream_workloads.get(&(proxy.namespace.as_str(), id.to_string()))
                 })
@@ -18332,8 +18417,12 @@ fn scope_request_auth_to_node_waypoint_destinations(
                 // above, so a missing one here has none locally.
                 unresolved_modeled |=
                     index.target_requires_scope(&proxy.namespace, upstream_id, backend_host)
-                        && upstream_id
-                            .is_none_or(|id| !id.starts_with(MESH_OUTBOUND_UPSTREAM_ID_PREFIX));
+                        && upstream_id.is_none_or(|id| {
+                            !id.starts_with(MESH_OUTBOUND_UPSTREAM_ID_PREFIX)
+                                && !id.starts_with(
+                                    service_waypoint_l7::SERVICE_WAYPOINT_L7_UPSTREAM_ID_PREFIX,
+                                )
+                        });
                 admit(own.clone());
                 continue;
             };
@@ -18995,6 +19084,11 @@ pub async fn run(
     // monotonic across reload/SVID rotation; enabling only gates new increments.
     crate::modes::mesh::node_waypoint_observability::set_enabled(
         runtime.topology == MeshTopology::NodeWaypoint,
+    );
+    // ServiceWaypoint L7 termination families (issue #7501): advertised by a
+    // ServiceWaypoint from startup, so dashboards can pin a zero baseline.
+    crate::proxy::service_waypoint_l7_proxy::set_metrics_enabled(
+        runtime.topology == MeshTopology::ServiceWaypoint,
     );
 
     // Configure the process-singleton policy-deny recorder before anything can

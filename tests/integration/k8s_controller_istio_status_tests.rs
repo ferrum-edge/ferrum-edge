@@ -1873,7 +1873,7 @@ fn mesh_bound_virtual_service_status_reports_where_http_routes_apply() {
         assert_eq!(
             scope,
             json!(VIRTUAL_SERVICE_MESH_HTTP_ROUTES_SCOPE),
-            "{name}: the status records that only NodeWaypoint applies the routes"
+            "{name}: the status records the topologies that apply the routes"
         );
         assert!(
             message.contains(VIRTUAL_SERVICE_MESH_HTTP_ROUTES_NOTE),

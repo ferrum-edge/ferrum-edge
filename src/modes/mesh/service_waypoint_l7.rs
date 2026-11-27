@@ -25,12 +25,19 @@
 //!   Service port: its admitted host set, the carried routes bound to that
 //!   Service, and its default route.
 //!
-//! Until issue #7501 lands nothing on the request path terminates HTTP inside
-//! an HBONE tunnel: the `:15008` listener keeps its L4 transparent relay, the
-//! default L7 routes are kept out of the shared route tiers entirely
-//! (`RouterCache::build_route_table`), and
+//! The HBONE `:15008` L7 termination (issue #7501,
+//! `crate::proxy::service_waypoint_l7_proxy`) classifies an outer `CONNECT`
+//! through the index, serves the upgraded stream with an inner HTTP/1.1 and
+//! HTTP/2 server, and resolves every inner request ONLY through the bound
+//! Service's partition ([`ServiceWaypointL7RoutePartition::resolve`]), after
+//! the inner `Host` / `:authority` passed
+//! [`ServiceWaypointL7RoutePartition::admits_request_host`]. The shared route
+//! lookup never serves these routes: the default L7 routes are kept out of the
+//! shared route tiers entirely (`RouterCache::build_route_table`), and
 //! [`super::mesh_route_admitted_for_direction`] refuses both them and every
-//! carried `istio-vs-*` route on every inbound listener.
+//! carried `istio-vs-*` route on every inbound listener, so a direct request
+//! on `:15008` (outside an admitted tunnel), the Sidecar `:15006` and the
+//! NodeWaypoint `:15008` listeners never reach them.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::IpAddr;
@@ -74,6 +81,48 @@ pub struct ServiceWaypointL7Target {
     pub namespace: String,
     pub service: String,
     pub service_port: u16,
+}
+
+/// The unforgeable, runtime-only provenance of one inner HTTP request served
+/// inside an L7-terminated ServiceWaypoint HBONE tunnel (issue #7501).
+///
+/// Built ONCE per admitted outer `CONNECT`, from facts the outer tunnel
+/// verified, and carried on every inner `RequestContext`
+/// (`RequestContext::service_waypoint_l7`). No outer listener sets it, it is
+/// never serialized, and nothing an inner request carries can change it:
+///
+/// * `target` pins the inner request to its bound Service's route partition;
+/// * `outer_baggage` is the folded `baggage` value of the OUTER `CONNECT`, the
+///   only input `mesh_authz` and `workload_metrics` evaluate a trusted HBONE
+///   `source.principal` assertion from for the inner requests (an inner
+///   request's own `baggage` header is application data, never an HBONE
+///   identity assertion).
+///
+/// The verified outer peer identity itself rides the inner context as its
+/// certificate principal (the outer connection's client certificate), so the
+/// ordinary `spiffe_identity` / `mesh_authz` resolution applies to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceWaypointL7Context {
+    pub target: ServiceWaypointL7Target,
+    pub outer_baggage: Option<String>,
+}
+
+impl ServiceWaypointL7Context {
+    /// The bound Service's namespace.
+    pub fn bound_service_namespace(&self) -> &str {
+        &self.target.namespace
+    }
+
+    /// The bound Service's name.
+    pub fn bound_service_name(&self) -> &str {
+        &self.target.service
+    }
+
+    /// The bound Service port the outer `CONNECT` named (the trusted
+    /// `destination.port` of every inner request).
+    pub fn bound_service_port(&self) -> u16 {
+        self.target.service_port
+    }
 }
 
 /// The materialized L7 surface of one bound Service HTTP port, back-projected
@@ -248,6 +297,28 @@ impl ServiceWaypointL7TargetIndex {
     }
 }
 
+/// The carried-route router of one partition: a dedicated route table over the
+/// partition's carried routes only, built once per generation, so an inner
+/// request is matched with exactly the shared router's host-tier, prefix,
+/// exact (`=`) and regex (`~`) semantics without ever consulting a route of
+/// another bound Service.
+#[derive(Clone)]
+struct PartitionRouter(Arc<crate::router_cache::RouterCache>);
+
+impl std::fmt::Debug for PartitionRouter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PartitionRouter")
+            .field("routes", &self.0.route_count())
+            .finish()
+    }
+}
+
+/// Route-cache capacity of one partition router: one partition carries at
+/// most the routes of one Service, so a small bounded cache suffices.
+const PARTITION_ROUTER_CACHE_ENTRIES: usize = 256;
+/// Shard count of one partition router's caches (power of two, >= 2).
+const PARTITION_ROUTER_SHARDS: usize = 2;
+
 /// The route table of one bound Service HTTP port.
 #[derive(Debug, Clone)]
 pub struct ServiceWaypointL7RoutePartition {
@@ -264,6 +335,9 @@ pub struct ServiceWaypointL7RoutePartition {
     pub carried_routes: Vec<Arc<Proxy>>,
     /// The default L7 Service route, used when no carried route matches.
     pub default_route: Arc<Proxy>,
+    /// Router over `carried_routes` only; `None` when the partition carries
+    /// none.
+    carried_router: Option<PartitionRouter>,
 }
 
 impl ServiceWaypointL7RoutePartition {
@@ -274,6 +348,43 @@ impl ServiceWaypointL7RoutePartition {
         self.admitted_hosts
             .iter()
             .any(|admitted| admitted.eq_ignore_ascii_case(trimmed))
+    }
+
+    /// Whether an inner request may be served by this bound Service at all
+    /// (issue #7501 host pinning): its normalized `Host` / `:authority` host
+    /// must be one this Service admits, and an explicit authority port must be
+    /// the bound Service port the outer `CONNECT` named. A request with no
+    /// host at all is refused (fail closed): it cannot be shown to address
+    /// this Service.
+    pub fn admits_request_host(&self, host: Option<&str>, authority_port: Option<u16>) -> bool {
+        let Some(host) = host else {
+            return false;
+        };
+        if authority_port.is_some_and(|port| port != self.target.service_port) {
+            return false;
+        }
+        self.admits_host(host)
+    }
+
+    /// Resolve an admitted inner request to a route of THIS partition only:
+    /// the carried VirtualService route matching `host` and `path` (shared
+    /// router semantics), else the bound Service's default L7 route. Never a
+    /// route of another bound Service, never a route of the shared table.
+    pub fn resolve(&self, host: &str, path: &str) -> crate::router_cache::RouteMatch {
+        if let Some(router) = self.carried_router.as_ref()
+            && let Some(matched) = router.0.find_proxy(Some(host), path)
+        {
+            return matched;
+        }
+        crate::router_cache::RouteMatch {
+            proxy: Arc::clone(&self.default_route),
+            path_params: Vec::new(),
+            matched_prefix_len: self
+                .default_route
+                .listen_path
+                .as_deref()
+                .map_or(0, str::len),
+        }
     }
 
     /// Number of carried VirtualService routes bound to this Service port.
@@ -372,6 +483,25 @@ impl ServiceWaypointL7Routes {
                     }
                 }
             }
+            // A dedicated route table over the carried routes only. Built from
+            // a configuration with no `mesh` block, so it can never build
+            // partitions of its own.
+            let carried_router = (!carried_routes.is_empty()).then(|| {
+                let carried_config = GatewayConfig {
+                    proxies: carried_routes
+                        .iter()
+                        .map(|route| route.as_ref().clone())
+                        .collect(),
+                    ..GatewayConfig::default()
+                };
+                PartitionRouter(Arc::new(
+                    crate::router_cache::RouterCache::with_shard_amount(
+                        &carried_config,
+                        PARTITION_ROUTER_CACHE_ENTRIES,
+                        PARTITION_ROUTER_SHARDS,
+                    ),
+                ))
+            });
             partitions.insert(
                 target.clone(),
                 ServiceWaypointL7RoutePartition {
@@ -379,6 +509,7 @@ impl ServiceWaypointL7Routes {
                     admitted_hosts: admitted_hosts.into_iter().collect(),
                     carried_routes,
                     default_route: Arc::new(default_route.clone()),
+                    carried_router,
                 },
             );
         }

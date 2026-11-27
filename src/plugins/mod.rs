@@ -3812,6 +3812,15 @@ pub struct RequestContext {
     /// the shared listener carries no single proxy identity that fits
     /// the slice-level filter that other topologies use.
     pub node_waypoint_policy_scope: Option<Arc<crate::modes::mesh::runtime::PolicyScopeCache>>,
+    /// ServiceWaypoint L7 provenance (issue #7501): set ONLY on an inner HTTP
+    /// request served inside an L7-terminated ServiceWaypoint HBONE tunnel,
+    /// from facts the outer `CONNECT` verified (the bound Service port and the
+    /// outer `baggage`). Never set by any outer listener, never derived from
+    /// the inner request, never serialized. `mesh_authz` reads a trusted
+    /// `source.principal` assertion only from its `outer_baggage`, and the
+    /// router resolves the request only inside its bound Service's partition.
+    pub service_waypoint_l7:
+        Option<Arc<crate::modes::mesh::service_waypoint_l7::ServiceWaypointL7Context>>,
     /// Per-destination authorization verdicts `mesh_authz` records for a
     /// carried NodeWaypoint VirtualService route whose `mesh_route_dispatch`
     /// rules can select a destination other than the route's own (issue
@@ -5037,6 +5046,7 @@ impl RequestContext {
             ai_stream_router_claim: None,
             node_waypoint_pod_uid: None,
             node_waypoint_policy_scope: None,
+            service_waypoint_l7: None,
             node_waypoint_route_branch_authz: None,
             mesh_direction: None,
             orig_dst: None,
@@ -6871,6 +6881,7 @@ impl RequestContext {
             ai_stream_router_claim: self.ai_stream_router_claim.clone(),
             node_waypoint_pod_uid: self.node_waypoint_pod_uid,
             node_waypoint_policy_scope: self.node_waypoint_policy_scope.clone(),
+            service_waypoint_l7: self.service_waypoint_l7.clone(),
             node_waypoint_route_branch_authz: self.node_waypoint_route_branch_authz.clone(),
             mesh_direction: self.mesh_direction,
             orig_dst: self.orig_dst,
