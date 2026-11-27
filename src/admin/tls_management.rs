@@ -4,7 +4,6 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
 use http_body_util::Full;
 use hyper::{Response, StatusCode};
 use rustls::ServerConfig;
@@ -1627,9 +1626,13 @@ fn parse_event_filter(query: Option<&str>) -> Result<crate::tls::events::TlsEven
             "surface" => filter.surface = Some(value),
             "outcome" => filter.outcome = Some(value),
             "since" => {
-                let parsed = DateTime::parse_from_rfc3339(&value)
+                // chrono-compatible parse (issue #7419): the same inputs are
+                // accepted; a leap second normalizes and an instant outside
+                // UtcTimestamp's range is rejected like any invalid value.
+                let parsed = crate::time_compat::parse_rfc3339_chrono(&value)
+                    .and_then(|parsed| parsed.to_utc_timestamp())
                     .map_err(|error| format!("invalid since timestamp: {error}"))?;
-                filter.since = Some(parsed.with_timezone(&Utc));
+                filter.since = Some(parsed);
             }
             _ => {}
         }

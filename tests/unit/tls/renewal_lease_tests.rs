@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use ferrum_edge::time_compat::UtcTimestamp;
 use ferrum_edge::tls::lease::{
     FencedCommit, GuardedCleanup, LeaseClock, RenewalLeaseKeeper, TlsLeaseError, TlsLeaseStore,
     acme_renewal_lease_name,
@@ -37,25 +37,28 @@ const SETTLE_BUDGET: Duration = Duration::from_secs(30);
 /// Each test owns one clock shared by all its replicas and blocking workers.
 /// Reading time never advances it, regardless of filesystem or runner latency.
 #[derive(Debug)]
-struct ManualClock(Mutex<DateTime<Utc>>);
+struct ManualClock(Mutex<UtcTimestamp>);
 
 impl ManualClock {
     fn new() -> Arc<Self> {
         Arc::new(Self(Mutex::new(
-            DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
-                .expect("fixed test timestamp")
-                .with_timezone(&Utc),
+            "2026-01-01T00:00:00Z"
+                .parse::<UtcTimestamp>()
+                .expect("fixed test timestamp"),
         )))
     }
 
     fn advance(&self, duration: Duration) {
         let mut now = self.0.lock().expect("clock lock");
-        *now += chrono::TimeDelta::from_std(duration).expect("representable clock step");
+        *now = ::time::SignedDuration::try_from(duration)
+            .ok()
+            .and_then(|step| now.checked_add(step))
+            .expect("representable clock step");
     }
 }
 
 impl LeaseClock for ManualClock {
-    fn now(&self) -> DateTime<Utc> {
+    fn now(&self) -> UtcTimestamp {
         *self.0.lock().expect("clock lock")
     }
 }
@@ -162,9 +165,9 @@ fn open_store_lock_file(dir: &Path) -> File {
 async fn wait_for_extension(
     store: &Arc<TlsLeaseStore>,
     name: &str,
-    beyond: DateTime<Utc>,
+    beyond: UtcTimestamp,
     timeout: Duration,
-) -> Option<DateTime<Utc>> {
+) -> Option<UtcTimestamp> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if let Ok(Some(record)) = store.peek(name)
@@ -1243,7 +1246,7 @@ async fn the_cleanup_preflight_refreshes_the_claim_before_the_hook_runs() {
     // authoritative record the instant it is polled, with no await in front.
     let cleanup = async move {
         let sampled = sampling.peek(&sample_name).expect("read").expect("present");
-        Ok::<DateTime<Utc>, String>(sampled.expires_at)
+        Ok::<UtcTimestamp, String>(sampled.expires_at)
     };
     let at_first_poll = match keeper.guarded_cleanup(cleanup).await {
         GuardedCleanup::Completed(expires_at) => expires_at,
