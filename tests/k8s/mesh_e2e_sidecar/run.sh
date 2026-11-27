@@ -1886,8 +1886,10 @@ vs_settle() {
 }
 
 vs_settled() {
-  local out="$1"
-  [[ "${out%%$'\t'*}" == "0" && "$(printf '%s' "$out" | cut -f2)" == "200" ]]
+  local out="$1" rc status
+  rc="$(printf '%s' "$out" | cut -f1)"
+  status="$(printf '%s' "$out" | cut -f2)"
+  [[ "$rc" == "0" && "$status" == "200" ]]
 }
 
 # Issue up to N sequential captured vs-client requests (optional extra header)
