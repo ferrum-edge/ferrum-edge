@@ -6,9 +6,15 @@ Keep this root memory compact and always relevant. Subsystem details live in pat
 
 Ferrum Edge is a high-performance Rust edge proxy for HTTP/1.1, HTTP/2, HTTP/3, WebSocket, gRPC, raw TCP, and UDP. It ships as one `ferrum-edge` binary with CLI subcommands, env/config-file configuration, load balancing, health checks, and 75+ plugins. Rust edition 2024, tokio, hyper 1.x. License: PolyForm Noncommercial 1.0.0 with dual commercial licensing.
 
-## Build-Out Policy
+## Compatibility Policy
 
-Ferrum Edge is in active build-out with no deployed-user compatibility obligation. Do not add schema DB migrations for new schema changes; fold schema changes into the current baseline schema. Do not add startup ALTER/backfill/index-replacement passes or compatibility tracking tables; recreate development databases when the baseline changes. Do not add or preserve legacy shims for old fields, env vars, config shapes, or database values unless explicitly requested. Custom plugin migrations under `custom_plugins/` are unaffected. Breaking changes are acceptable during this phase.
+From 1.0.0 onward, deployed users depend on Ferrum Edge, so there are no silent breaking changes:
+
+- Database schema: the `V001` baseline (`src/config/migrations/sql_dialect.rs`) is frozen and pinned by `V001_BASELINE_CHECKSUM` plus its golden test. Every SQL schema change ships as the next forward migration (`V002`+) appended to `MigrationRunner::shipped_migrations()`; never edit, reorder, or remove a shipped migration. MongoDB index changes bump `MONGO_INDEX_PLAN_VERSION` and drop old indexes only through `RETIRED_MONGO_INDEXES`. No ad hoc startup ALTER/backfill/index-replacement passes outside a declared migration. See `docs/migrations.md`.
+- Env vars, config-file shapes, Admin API shapes, and stored database values are compatibility surfaces: a removal or incompatible change needs a documented deprecation path (for example, keep accepting the old form with a warning before removing it in a later release; support windows live in `docs/support_policy.md`) and a release-notes / upgrade-guide entry.
+- Custom plugin migrations under `custom_plugins/` keep their own versioned sequences.
+
+Releases before 1.0.0 followed a build-out policy (fold schema changes into `V001`, recreate databases, no legacy shims). Upgrading a 0.9.x database to 1.0.0 is a one-time rebuild-and-restore (`docs/migrations.md`, `docs/admin_backup_restore.md`). Existing documented exceptions that keep tolerating old shapes stay.
 
 ## Read Before Touching
 

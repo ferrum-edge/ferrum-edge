@@ -1,9 +1,11 @@
 # Explicit migrate mode: apply pending database schema migrations, then exit.
 #
 # Neither ferrum-gateway nor ferrum-mesh deploys FERRUM_MODE=migrate. Use this
-# Job to initialize a fresh database under the build-out baseline policy. A
-# changed V001 baseline requires a fresh database and logical import; this Job
-# does not provide an online schema upgrade. Keep the old database for rollback.
+# Job to initialize a fresh database, or (from 1.0.0 onward) to apply the
+# release's pending forward migrations before rolling out the new image. A
+# database created by a release before 1.0.0 is not migrated in place: rebuild
+# it from a logical export (docs/migrations.md, "Build-Out Schema Policy").
+# Take a backup first; rolling back a migrated schema means restoring it.
 #
 # Prerequisites (same Secrets as examples/database-values.yaml):
 #   kubectl -n ferrum create secret generic ferrum-gateway-db \

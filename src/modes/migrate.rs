@@ -12,7 +12,9 @@ use tracing::{error, info};
 
 use crate::config::EnvConfig;
 use crate::config::config_migration::ConfigMigrator;
-use crate::config::migrations::{MigrationRunner, bounded_migration_diagnostic_field};
+use crate::config::migrations::{
+    CustomPluginMigration, MigrationRunner, bounded_migration_diagnostic_field,
+};
 use crate::config::types::CURRENT_CONFIG_VERSION;
 
 fn sql_migration_pool_options(db_type: &str) -> sqlx::any::AnyPoolOptions {
@@ -90,7 +92,10 @@ async fn run_db_migrations(env_config: &EnvConfig, dry_run: bool) -> Result<(), 
         .await?;
         use crate::config::db_backend::DatabaseBackend;
         store.run_migrations().await?;
-        println!("MongoDB indexes ensured successfully.");
+        println!(
+            "MongoDB indexes ensured successfully (index plan version {}).",
+            crate::config::mongo_index_plan::MONGO_INDEX_PLAN_VERSION
+        );
         return Ok(());
     }
 
@@ -145,45 +150,59 @@ async fn run_db_migrations(env_config: &EnvConfig, dry_run: bool) -> Result<(), 
         }
     } else {
         info!("Running pending database migrations...");
-        let (applied, plugin_applied) = runner.run_all_pending(&plugin_migrations).await?;
+        let report = sql_up_report(&runner, &plugin_migrations).await?;
+        println!("{report}");
+    }
 
-        if applied.is_empty() {
-            println!("Database schema is up to date. No migrations applied.");
+    Ok(())
+}
+
+/// Apply pending SQL migrations and render exactly what `migrate up` prints.
+pub(crate) async fn sql_up_report(
+    runner: &MigrationRunner,
+    plugin_migrations: &[(&str, Vec<CustomPluginMigration>)],
+) -> Result<String, anyhow::Error> {
+    let (applied, plugin_applied) = runner.run_all_pending(plugin_migrations).await?;
+    let mut lines = Vec::new();
+
+    if applied.is_empty() {
+        lines.push("Database schema is up to date. No migrations applied.".to_string());
+    } else {
+        lines.push(format!("Applied {} migration(s):", applied.len()));
+        for m in &applied {
+            lines.push(format!(
+                "  V{}: {} ({}ms)",
+                m.version,
+                bounded_migration_diagnostic_field(&m.name),
+                m.execution_time_ms
+            ));
+        }
+    }
+
+    // Custom plugin migrations
+    if !plugin_migrations.is_empty() {
+        if plugin_applied.is_empty() {
+            lines.push(
+                "\nCustom plugin migrations are up to date. No migrations applied.".to_string(),
+            );
         } else {
-            println!("Applied {} migration(s):", applied.len());
-            for m in &applied {
-                println!(
-                    "  V{}: {} ({}ms)",
+            lines.push(format!(
+                "\nApplied {} custom plugin migration(s):",
+                plugin_applied.len()
+            ));
+            for m in &plugin_applied {
+                lines.push(format!(
+                    "  [{}] V{}: {} ({}ms)",
+                    bounded_migration_diagnostic_field(&m.plugin_name),
                     m.version,
                     bounded_migration_diagnostic_field(&m.name),
                     m.execution_time_ms
-                );
-            }
-        }
-
-        // Custom plugin migrations
-        if !plugin_migrations.is_empty() {
-            if plugin_applied.is_empty() {
-                println!("\nCustom plugin migrations are up to date. No migrations applied.");
-            } else {
-                println!(
-                    "\nApplied {} custom plugin migration(s):",
-                    plugin_applied.len()
-                );
-                for m in &plugin_applied {
-                    println!(
-                        "  [{}] V{}: {} ({}ms)",
-                        bounded_migration_diagnostic_field(&m.plugin_name),
-                        m.version,
-                        bounded_migration_diagnostic_field(&m.name),
-                        m.execution_time_ms
-                    );
-                }
+                ));
             }
         }
     }
 
-    Ok(())
+    Ok(lines.join("\n"))
 }
 
 async fn show_db_status(env_config: &EnvConfig) -> Result<(), anyhow::Error> {
@@ -218,7 +237,23 @@ async fn show_db_status(env_config: &EnvConfig) -> Result<(), anyhow::Error> {
         use crate::config::mongo_index_plan::IndexPresence;
 
         println!("=== Ferrum Edge Migration Status (MongoDB) ===\n");
-        println!("MongoDB uses idempotent index creation instead of versioned migrations.");
+        println!("MongoDB applies a versioned, forward-only index plan instead of SQL migrations.");
+        match status.recorded_plan_version {
+            Some(recorded) => println!(
+                "Index plan version: {recorded} recorded; this binary applies {}.",
+                status.plan_version
+            ),
+            None => println!(
+                "Index plan version: none recorded; this binary applies {}.",
+                status.plan_version
+            ),
+        }
+        if let Some(in_progress) = status.in_progress_plan_version {
+            println!(
+                "An upgrade to index plan version {in_progress} started and has not finished; \
+                 run 'FERRUM_MIGRATE_ACTION=up' to complete it."
+            );
+        }
         println!(
             "Compared live indexes and guard collections to the canonical plan \
              (listIndexes/listCollections only; no mutations).\n"
@@ -267,7 +302,9 @@ async fn show_db_status(env_config: &EnvConfig) -> Result<(), anyhow::Error> {
             status.indexes.len(),
             status.guard_collections.len()
         );
-        if missing > 0 || mismatched > 0 || guard_collections_missing > 0 {
+        let plan_version_pending = status.recorded_plan_version != Some(status.plan_version)
+            || status.in_progress_plan_version.is_some();
+        if missing > 0 || mismatched > 0 || guard_collections_missing > 0 || plan_version_pending {
             println!("Run 'FERRUM_MIGRATE_ACTION=up' to ensure the full plan exists.");
         } else {
             println!("All required indexes and guard collections are present.");
@@ -286,80 +323,90 @@ async fn show_db_status(env_config: &EnvConfig) -> Result<(), anyhow::Error> {
     .await?;
 
     let runner = MigrationRunner::new(pool, db_type.to_string());
-    let status = runner.status().await?;
     let plugin_migrations = crate::custom_plugins::collect_all_custom_plugin_migrations();
-    let plugin_status = runner.plugin_status(&plugin_migrations).await?;
+    let report = sql_status_report(&runner, &plugin_migrations).await?;
+    println!("{report}");
 
-    println!("=== Ferrum Edge Migration Status ===\n");
+    Ok(())
+}
+
+/// Validate history and render exactly what `migrate status` prints for SQL.
+pub(crate) async fn sql_status_report(
+    runner: &MigrationRunner,
+    plugin_migrations: &[(&str, Vec<CustomPluginMigration>)],
+) -> Result<String, anyhow::Error> {
+    let status = runner.status().await?;
+    let plugin_status = runner.plugin_status(plugin_migrations).await?;
+    let mut lines = vec!["=== Ferrum Edge Migration Status ===\n".to_string()];
 
     if status.applied.is_empty() {
-        println!("Applied migrations: (none)");
+        lines.push("Applied migrations: (none)".to_string());
     } else {
-        println!("Applied migrations:");
+        lines.push("Applied migrations:".to_string());
         for m in &status.applied {
-            println!(
+            lines.push(format!(
                 "  V{}: {} (applied: {}, checksum: {})",
                 m.version,
                 bounded_migration_diagnostic_field(&m.name),
                 bounded_migration_diagnostic_field(&m.applied_at),
                 bounded_migration_diagnostic_field(&m.checksum)
-            );
+            ));
         }
     }
 
-    println!();
+    lines.push(String::new());
 
     if status.pending.is_empty() {
-        println!("Pending migrations: (none — schema is up to date)");
+        lines.push("Pending migrations: (none — schema is up to date)".to_string());
     } else {
-        println!("Pending migrations:");
+        lines.push("Pending migrations:".to_string());
         for m in &status.pending {
-            println!(
+            lines.push(format!(
                 "  V{}: {}",
                 m.version,
                 bounded_migration_diagnostic_field(&m.name)
-            );
+            ));
         }
     }
 
     // Custom plugin migration status
     if !plugin_migrations.is_empty() {
-        println!("\n=== Custom Plugin Migration Status ===\n");
+        lines.push("\n=== Custom Plugin Migration Status ===\n".to_string());
 
         if plugin_status.applied.is_empty() {
-            println!("Applied plugin migrations: (none)");
+            lines.push("Applied plugin migrations: (none)".to_string());
         } else {
-            println!("Applied plugin migrations:");
+            lines.push("Applied plugin migrations:".to_string());
             for m in &plugin_status.applied {
-                println!(
+                lines.push(format!(
                     "  [{}] V{}: {} (applied: {}, checksum: {})",
                     bounded_migration_diagnostic_field(&m.plugin_name),
                     m.version,
                     bounded_migration_diagnostic_field(&m.name),
                     bounded_migration_diagnostic_field(&m.applied_at),
                     bounded_migration_diagnostic_field(&m.checksum)
-                );
+                ));
             }
         }
 
-        println!();
+        lines.push(String::new());
 
         if plugin_status.pending.is_empty() {
-            println!("Pending plugin migrations: (none — all plugins up to date)");
+            lines.push("Pending plugin migrations: (none — all plugins up to date)".to_string());
         } else {
-            println!("Pending plugin migrations:");
+            lines.push("Pending plugin migrations:".to_string());
             for m in &plugin_status.pending {
-                println!(
+                lines.push(format!(
                     "  [{}] V{}: {}",
                     bounded_migration_diagnostic_field(&m.plugin_name),
                     m.version,
                     bounded_migration_diagnostic_field(&m.name)
-                );
+                ));
             }
         }
     }
 
-    Ok(())
+    Ok(lines.join("\n"))
 }
 
 fn run_config_migration(env_config: &EnvConfig, dry_run: bool) -> Result<(), anyhow::Error> {

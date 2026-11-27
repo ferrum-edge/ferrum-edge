@@ -774,8 +774,9 @@ field must agree, or the whole rename aborts as typed registry corruption.
 ## Schema and Migrations
 
 MongoDB uses **indexes** instead of SQL table migrations. Indexes are created
-automatically at startup or via `FERRUM_MODE=migrate` from the canonical plan
-in `src/config/mongo_index_plan.rs` (shared by `up`, dry-run, and status):
+automatically at startup or via `FERRUM_MODE=migrate` from the versioned,
+forward-only plan in `src/config/mongo_index_plan.rs` (shared by `up`, dry-run,
+and status):
 
 ```bash
 FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=up \
@@ -787,16 +788,21 @@ FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=up \
 
 `FERRUM_MIGRATE_ACTION=status` connects and compares live indexes with that
 plan via `listIndexes` (present / missing / mismatched) without mutating;
-it also reports required guard-collection shells. Unreachable or unauthorized
-MongoDB fails the status command.
+it also reports required guard-collection shells and the recorded and binary
+index-plan versions. Unreachable or unauthorized MongoDB fails the status
+command.
 `FERRUM_MIGRATE_DRY_RUN=true` prints the same plan without connecting.
 
 Index creation is idempotent (`createIndex` is a no-op if the full index spec
-already matches). See [docs/migrations.md](migrations.md#mongodb-migrations).
+already matches). `up` records the plan version it applied in the
+`_ferrum_migrations` collection (`_id: "core_index_plan"`); a binary whose plan
+version is older than the recorded one refuses to start or migrate, and an old
+index is dropped only when a later plan version explicitly retires it by name.
+See [docs/migrations.md](migrations.md#mongodb-migrations).
 
 ### Adding New Fields
 
-New fields added to the Rust domain types (`Proxy`, `Consumer`, `Upstream`, `PluginConfig`) are automatically persisted to MongoDB via serde BSON serialization — no ALTER TABLE equivalent needed. SQL backends instead need the column added to the V001 baseline (and, during build-out, a fresh database); see [migrations.md](migrations.md#build-out-schema-policy).
+New fields added to the Rust domain types (`Proxy`, `Consumer`, `Upstream`, `PluginConfig`) are automatically persisted to MongoDB via serde BSON serialization — no ALTER TABLE equivalent needed. From 1.0.0 onward, SQL backends instead need the column added by a new forward migration (`V002`+), since the `V001` baseline is frozen; releases before 1.0.0 folded such columns into `V001` and required a fresh database. See [migrations.md](migrations.md#schema-compatibility-policy). A new field that is queried still needs an index, added through the versioned index plan.
 
 ## Incremental Polling
 
