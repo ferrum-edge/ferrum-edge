@@ -844,4 +844,43 @@ fn chrono_try_seconds_accepts_exactly_what_chrono_does() {
             );
         }
     }
+
+/// Phase 11 replaced `DateTime::from_timestamp_millis(..).unwrap_or(UNIX_EPOCH)`
+/// with `UtcTimestamp::from_unix_timestamp_millis(..).unwrap_or(UNIX_EPOCH)`.
+/// In range the instant and its RFC 3339 bytes match chrono exactly,
+/// including pre-epoch flooring; outside UtcTimestamp's range conversion fails
+/// (issue #7419 owner decision) and the caller's fallback applies.
+#[test]
+fn from_unix_timestamp_millis_matches_chrono_in_range() {
+    assert_eq!(
+        UtcTimestamp::UNIX_EPOCH.to_rfc3339(),
+        DateTime::<Utc>::UNIX_EPOCH.to_rfc3339()
+    );
+    for millis in [
+        0_i64,
+        1,
+        -1,
+        -999,
+        -1_000,
+        -1_001,
+        999,
+        1_767_323_045_123,
+        -30_610_224_000_000,
+        253_402_300_799_999,
+    ] {
+        let ours = UtcTimestamp::from_unix_timestamp_millis(millis).expect("in range");
+        let theirs = DateTime::<Utc>::from_timestamp_millis(millis).expect("chrono in range");
+        assert_eq!(ours.to_rfc3339(), theirs.to_rfc3339(), "millis {millis}");
+        assert_eq!(ours.unix_timestamp_millis(), millis, "round trip {millis}");
+    }
+    // Year 10000 is representable in chrono but not in UtcTimestamp.
+    assert!(DateTime::<Utc>::from_timestamp_millis(253_402_300_800_000).is_some());
+    assert_eq!(
+        UtcTimestamp::from_unix_timestamp_millis(253_402_300_800_000),
+        Err(TimestampError::OutOfRange)
+    );
+    assert_eq!(
+        UtcTimestamp::from_unix_timestamp_millis(i64::MIN),
+        Err(TimestampError::OutOfRange)
+    );
 }
