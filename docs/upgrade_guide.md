@@ -363,26 +363,29 @@ builder setter) are now `ferrum_edge::time_compat::UtcTimestamp` instead of
 (#7527, #7529): `GatewayConfig.loaded_at`; `created_at`/`updated_at` on
 `Proxy`, `Consumer`, `PluginConfig`, `Upstream`, `ApiSpec`, `NamespaceRecord`
 and `GatewayTrustBundleRecord` (and `updated_at` on `GatewayTrustBundleSummary`);
-`AuditEvent.ts`; and the `ApiSpecListFilter.updated_since` and
+`AuditEvent.ts`; `ApiSpecSnapshotView`'s `created_at`/`updated_at`; and the
+`ApiSpecListFilter.updated_since` and
 `AuditListFilter.start`/`end` list filters. The CP/DP and mesh status types
 follow (#7530): `DpNodeInfo` and `MeshNodeInfo` connection and update stamps,
 `DpCpConnectionState`'s `last_config_received_at` / `connected_since` /
 `config_diverged_since`, mesh policy-deny events and aggregates, mesh slice-drift
 entries, the mesh revision gate and runtime install/apply stamps; registry TTLs
-and retention windows are now `time::SignedDuration`. `UtcTimestamp` renders the same bytes as chrono
-through `to_rfc3339()` and exposes `unix_timestamp()` and
+and retention windows are now `time::SignedDuration`. For non-leap-second
+values `UtcTimestamp` renders the same bytes as chrono through `to_rfc3339()`;
+it exposes `unix_timestamp()` and
 `unix_timestamp_millis()`. Plugins also gain an optional
 `ON_RESPONSE_STREAM_TERMINATED` lifecycle hook bit (#7471); custom plugins keep
 the conservative dispatch path whether or not they declare it.
 
 Converting: `UtcTimestamp::now()` replaces `Utc::now()`; `to_rfc3339()`,
-`to_rfc3339_opts(..)` and serde produce the same text as chrono for in-range
-values; `unix_timestamp()` / `unix_timestamp_millis()` replace `timestamp()` /
+`to_rfc3339_opts(..)` and serde produce the same text as chrono for in-range,
+non-leap-second values; `unix_timestamp()` / `unix_timestamp_millis()` replace `timestamp()` /
 `timestamp_millis()`; `checked_add` / `checked_sub` take a
 `time::SignedDuration`; and `"...".parse::<UtcTimestamp>()` or
 `UtcTimestamp::from_unix_timestamp(secs)` builds one from text or epoch
 seconds. If you still hold a `chrono::DateTime<Utc>`, convert it with
-`UtcTimestamp::from_unix_timestamp_nanos(dt.timestamp(), dt.timestamp_subsec_nanos())`.
+`dt.to_rfc3339().parse::<UtcTimestamp>()`, which also applies the leap-second
+rule below.
 Two edge cases differ from chrono: an instant outside years -9999..=9999 is
 rejected (`TimestampError::OutOfRange`) rather than represented, and a leap
 second (`:60`) is stored as the following second.
