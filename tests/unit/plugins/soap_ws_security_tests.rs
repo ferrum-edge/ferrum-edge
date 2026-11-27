@@ -1742,10 +1742,10 @@ fn test_saml_unreadable_signing_cert_is_error() {
 mod saml_fixtures {
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as B64;
+    use ferrum_edge::time_compat::UtcTimestamp;
     use ring::rand::SystemRandom;
     use ring::signature::{RSA_PKCS1_SHA256, RsaKeyPair};
     use std::path::PathBuf;
-    use ferrum_edge::time_compat::UtcTimestamp;
     use tempfile::TempDir;
 
     // ────────────────────────────────────────────────────────────────────
