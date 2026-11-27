@@ -119,7 +119,9 @@ impl CertificateAuthority for JwtCapableCa {
             spiffe_id,
             cert_chain_der: vec![b"stub-cert".to_vec()],
             private_key_pkcs8_der: b"stub-key".to_vec().into(),
-            not_after: chrono::Utc::now() + chrono::Duration::seconds(ttl_secs as i64),
+            not_after: ferrum_edge::time_compat::UtcTimestamp::now()
+                .checked_add(::time::SignedDuration::seconds(ttl_secs as i64))
+                .expect("SVID expiry in range"),
         })
     }
 
@@ -172,7 +174,9 @@ impl CertificateAuthority for JwtlessCa {
             spiffe_id,
             cert_chain_der: vec![b"stub-cert".to_vec()],
             private_key_pkcs8_der: b"stub-key".to_vec().into(),
-            not_after: chrono::Utc::now() + chrono::Duration::seconds(ttl_secs as i64),
+            not_after: ferrum_edge::time_compat::UtcTimestamp::now()
+                .checked_add(::time::SignedDuration::seconds(ttl_secs as i64))
+                .expect("SVID expiry in range"),
         })
     }
 
@@ -304,7 +308,7 @@ fn forged_bundles(key: &ForgeKey, kid: &str) -> BTreeMap<TrustDomain, Vec<Publis
 }
 
 fn now() -> i64 {
-    chrono::Utc::now().timestamp()
+    ferrum_edge::time_compat::UtcTimestamp::now().unix_timestamp()
 }
 
 /// Project a returned `google.protobuf.Struct` back to JSON so claim
@@ -446,7 +450,7 @@ fn mint_clamps_the_lifetime_to_the_authority_ceiling() {
     let minted = signer
         .mint(&workload_id(), &["aud".to_string()], u64::MAX)
         .expect("mint succeeds");
-    let lifetime = (minted.expires_at - minted.issued_at).num_seconds();
+    let lifetime = (minted.expires_at - minted.issued_at).whole_seconds();
     assert!(
         lifetime <= 3600,
         "a caller must not be able to raise the JWT-SVID ceiling (got {lifetime}s)"
@@ -1932,7 +1936,7 @@ async fn a_token_at_the_maximum_lifetime_survives_a_restart() {
             MAX_JWT_SVID_TTL_SECS,
         )
         .expect("mint succeeds");
-    let lifetime = (minted.expires_at - minted.issued_at).num_seconds();
+    let lifetime = (minted.expires_at - minted.issued_at).whole_seconds();
     assert_eq!(lifetime, MAX_JWT_SVID_TTL_SECS as i64);
     drop(before_restart);
 

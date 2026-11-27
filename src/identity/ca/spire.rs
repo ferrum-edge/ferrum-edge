@@ -208,7 +208,7 @@ impl Drop for SpireAgentCa {
 }
 
 /// Extract `not_after` from the leaf certificate in a snapshot.
-fn leaf_not_after(cert_chain_der: &[Vec<u8>]) -> Result<chrono::DateTime<chrono::Utc>, CaError> {
+fn leaf_not_after(cert_chain_der: &[Vec<u8>]) -> Result<crate::time_compat::UtcTimestamp, CaError> {
     use x509_parser::prelude::*;
 
     let leaf = cert_chain_der
@@ -216,8 +216,8 @@ fn leaf_not_after(cert_chain_der: &[Vec<u8>]) -> Result<chrono::DateTime<chrono:
         .ok_or_else(|| CaError::Internal("SPIRE agent returned empty cert chain".to_string()))?;
     let (_, parsed) = X509Certificate::from_der(leaf)
         .map_err(|e| CaError::Internal(format!("failed to parse SPIRE leaf cert: {e}")))?;
-    chrono::DateTime::<chrono::Utc>::from_timestamp(parsed.validity().not_after.timestamp(), 0)
-        .ok_or_else(|| {
+    crate::time_compat::UtcTimestamp::from_unix_timestamp(parsed.validity().not_after.timestamp())
+        .map_err(|_| {
             CaError::Internal(
                 "SPIRE leaf cert notAfter is outside supported timestamp range".to_string(),
             )

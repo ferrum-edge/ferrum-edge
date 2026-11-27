@@ -815,3 +815,33 @@ fn rfc2822_formatting_matches_chrono_byte_for_byte() {
     );
     assert_eq!(negative_year.to_rfc2822(), None);
 }
+
+/// `chrono_try_seconds` replaces `chrono::Duration::try_seconds` in migrated
+/// configuration paths (issue #7419) and must accept exactly the same values.
+#[test]
+fn chrono_try_seconds_accepts_exactly_what_chrono_does() {
+    const MAX_SECS: i64 = i64::MAX / 1_000;
+    for secs in [
+        0,
+        1,
+        -1,
+        86_400,
+        MAX_SECS,
+        MAX_SECS + 1,
+        -MAX_SECS,
+        -MAX_SECS - 1,
+        i64::MAX,
+        i64::MIN,
+    ] {
+        let ours = ferrum_edge::time_compat::chrono_try_seconds(secs);
+        let theirs = chrono::TimeDelta::try_seconds(secs);
+        assert_eq!(ours.is_some(), theirs.is_some(), "acceptance for {secs}");
+        if let (Some(ours), Some(theirs)) = (ours, theirs) {
+            assert_eq!(
+                ours.whole_seconds(),
+                theirs.num_seconds(),
+                "value for {secs}"
+            );
+        }
+    }
+}

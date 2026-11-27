@@ -1236,6 +1236,19 @@ impl ChronoParsedDateTime {
     }
 }
 
+/// `chrono::TimeDelta::try_seconds(secs)` acceptance as a [`SignedDuration`]:
+/// `Some` exactly when chrono's millisecond-bounded `TimeDelta` can represent
+/// `secs` whole seconds (`|secs| <= i64::MAX / 1000`), so migrated
+/// configuration bounds accept and reject the same values (issue #7419).
+pub fn chrono_try_seconds(secs: i64) -> Option<SignedDuration> {
+    const MAX_SECS: i64 = i64::MAX / 1_000;
+    if (-MAX_SECS..=MAX_SECS).contains(&secs) {
+        Some(SignedDuration::seconds(secs))
+    } else {
+        None
+    }
+}
+
 /// Days from `1970-01-01` to a proleptic-Gregorian civil date.
 fn civil_days(year: i32, month: u8, day: u8) -> i64 {
     let month = i64::from(month);
