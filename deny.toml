@@ -147,10 +147,10 @@ ignore = [
     # informational advisory, not a known vulnerability. Re-evaluated
     # 2026-11-22 (issue #7419 Phase 1) against cargo-deny's own inclusion graph
     # (all features):
-    #   - ferrum-edge itself: a direct dependency (~535 Rust files when added;
-    #     as of 2026-11-27, 156 Rust files under src/ and custom_plugins/ and 326 under tests/
-    #     still mention chrono, comments included)
-    #     (config-model timestamps, the database layer, Admin API output);
+    #   - ferrum-edge itself: a direct dependency (config-model timestamps,
+    #     the database layer, Admin API output). ~535 Rust files when added;
+    #     as of 2026-11-27, 156 Rust files under src/ and custom_plugins/ and
+    #     326 under tests/ still mention chrono, comments included.
     #     tests/performance/mesh/ also declares it directly.
     #   - sqlx 0.9.1 through our `chrono` feature: sqlx-core (vendored),
     #     sqlx-postgres, sqlx-mysql and sqlx-sqlite.
