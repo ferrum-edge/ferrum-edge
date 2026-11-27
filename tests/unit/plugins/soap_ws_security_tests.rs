@@ -1127,8 +1127,8 @@ async fn test_timestamp_without_zone_designator_rejected() {
     let now = UtcTimestamp::now();
     let expires_at = now.checked_add(::time::SignedDuration::minutes(5)).unwrap();
 
-    // Each case renders `now`/`expires_at` the way the chrono strftime pattern
-    // in its comment did.
+    // Each case renders `now`/`expires_at` the way its labelled strftime
+    // pattern would.
     use ferrum_edge::time_compat::SecondsFormat;
     let millis_zoneless = |t: UtcTimestamp| {
         t.to_rfc3339_opts(SecondsFormat::Millis, true)
@@ -1142,13 +1142,13 @@ async fn test_timestamp_without_zone_designator_rejected() {
     };
     let millis_z = |t: UtcTimestamp| t.to_rfc3339_opts(SecondsFormat::Millis, true);
     let secs_offset = |t: UtcTimestamp| t.to_rfc3339_opts(SecondsFormat::Secs, false);
-    let cases: [(&dyn Fn(UtcTimestamp) -> String, bool); 4] = [
-        (&millis_zoneless, false), // %Y-%m-%dT%H:%M:%S%.3f
-        (&secs_zoneless, false),   // %Y-%m-%dT%H:%M:%S
-        (&millis_z, true),         // %Y-%m-%dT%H:%M:%S%.3fZ
-        (&secs_offset, true),      // %Y-%m-%dT%H:%M:%S%:z
+    let cases: [(&str, &dyn Fn(UtcTimestamp) -> String, bool); 4] = [
+        ("%Y-%m-%dT%H:%M:%S%.3f", &millis_zoneless, false),
+        ("%Y-%m-%dT%H:%M:%S", &secs_zoneless, false),
+        ("%Y-%m-%dT%H:%M:%S%.3fZ", &millis_z, true),
+        ("%Y-%m-%dT%H:%M:%S%:z", &secs_offset, true),
     ];
-    for (render, accepted) in cases {
+    for (format, render, accepted) in cases {
         let ts = format!(
             r#"<wsu:Timestamp wsu:Id="TS-1">
             <wsu:Created>{}</wsu:Created>
