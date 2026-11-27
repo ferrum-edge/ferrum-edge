@@ -5294,7 +5294,7 @@ pub mod _test_support {
         config: &serde_json::Value,
         security_block: &str,
         created: &str,
-        now: chrono::DateTime<chrono::Utc>,
+        now: crate::time_compat::UtcTimestamp,
     ) -> Result<Result<(), String>, String> {
         let plugin = crate::plugins::soap_ws_security::SoapWsSecurity::new(config)?;
         Ok(plugin.username_token_created_outcome_for_tests(security_block, created, now))
