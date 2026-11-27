@@ -907,8 +907,9 @@ async fn serve_tunnel(
         }
     });
 
-    let conn = builder.serve_connection_with_upgrades(io, svc);
-    tokio::pin!(conn);
+    // Boxed (not stack-pinned) so the teardown below drops the connection,
+    // and with it the tunnel transport, at a known point.
+    let mut conn = Box::pin(builder.serve_connection_with_upgrades(io, svc));
     let mut shutdown_rx = facts.shutdown_rx.clone();
     let revocation = tunnel.revocation_token();
 
