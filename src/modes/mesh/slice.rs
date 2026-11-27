@@ -3767,6 +3767,7 @@ pub(crate) fn mesh_route_dispatch_rule_upstream_ids(config: &serde_json::Value) 
 /// not translator-owned — or one with a destination the applicable Sidecar
 /// egress scope does not admit is dropped, fail-closed: the waypoint then
 /// serves that host through its materialized Service route instead.
+#[allow(clippy::too_many_arguments)]
 fn node_waypoint_http_route_set(
     config: &GatewayConfig,
     mesh: &MeshConfig,
