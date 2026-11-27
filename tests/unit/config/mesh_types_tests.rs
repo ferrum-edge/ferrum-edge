@@ -191,10 +191,11 @@ fn mesh_service_path_parameter_opt_in_defaults_off_and_round_trips() {
 }
 
 #[test]
-fn unknown_mesh_fields_are_tolerated() {
-    // Forwards-compat: a newer ferrum schema may add fields under a mesh
-    // resource. Older binaries must ignore them. Serde's default-on-unknown
-    // is fine for our struct shape; this test confirms that.
+fn unknown_mesh_fields_are_rejected() {
+    // 1.0 config freeze: native mesh resources, inventory types included, are
+    // closed. A misspelled or unknown member is refused by name instead of
+    // being dropped. CP and data planes must run the same build, so a field
+    // added by a newer build is never silently ignored by an older one.
     let json = r#"{
         "version": "1",
         "proxies": [],
@@ -217,9 +218,14 @@ fn unknown_mesh_fields_are_tolerated() {
             ]
         }
     }"#;
-    let cfg: GatewayConfig = serde_json::from_str(json).expect("future fields are tolerated");
-    let mesh = cfg.mesh.as_ref().expect("mesh present");
-    assert_eq!(mesh.workloads.len(), 1);
+    let error = serde_json::from_str::<GatewayConfig>(json)
+        .expect_err("unknown workload members are rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("future_field_that_does_not_exist"),
+        "the error must name the unknown member: {error}"
+    );
 }
 
 // ── Per-type smoke tests ─────────────────────────────────────────────────
@@ -1009,6 +1015,69 @@ fn telemetry_resource_rejects_unknown_members_at_every_level() {
         assert!(
             result.is_err(),
             "unknown member at {pointer:?} must be rejected"
+        );
+    }
+}
+
+fn mesh_config_fixture() -> serde_json::Value {
+    serde_json::json!({
+        "services": [{
+            "name": "reviews",
+            "namespace": "default",
+            "ports": [{"port": 9080, "name": "http"}]
+        }],
+        "destination_rules": [{
+            "name": "reviews-dr",
+            "namespace": "default",
+            "host": "reviews.default.svc.cluster.local",
+            "traffic_policy": {
+                "connect_timeout_ms": 100,
+                "outlier_detection": {"consecutive_errors": 5}
+            },
+            "subsets": [{
+                "name": "v1",
+                "labels": {"version": "v1"},
+                "traffic_policy": {"connect_timeout_ms": 50}
+            }]
+        }]
+    })
+}
+
+/// Native mesh config (mesh file YAML, ConfigMap, MeshSubscribe slices) is a
+/// closed schema for 1.0: a misspelled member at any level is refused instead
+/// of being dropped, while the fixture's own serialized form round-trips.
+#[test]
+fn mesh_config_rejects_unknown_members_at_every_level() {
+    use ferrum_edge::modes::mesh::config::MeshConfig;
+
+    let parsed: MeshConfig =
+        serde_json::from_value(mesh_config_fixture()).expect("fixture is valid");
+    let reparsed: MeshConfig =
+        serde_json::from_value(serde_json::to_value(&parsed).expect("serializes"))
+            .expect("serialized form is accepted by the closed schema");
+    assert_eq!(parsed, reparsed);
+
+    for pointer in [
+        "",
+        "/services/0",
+        "/services/0/ports/0",
+        "/destination_rules/0",
+        "/destination_rules/0/traffic_policy",
+        "/destination_rules/0/traffic_policy/outlier_detection",
+        "/destination_rules/0/subsets/0",
+        "/destination_rules/0/subsets/0/traffic_policy",
+    ] {
+        let mut document = mesh_config_fixture();
+        document
+            .pointer_mut(pointer)
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap_or_else(|| panic!("fixture has an object at {pointer:?}"))
+            .insert("misspelled_member".to_string(), serde_json::json!(true));
+        let error = serde_json::from_value::<MeshConfig>(document)
+            .expect_err("unknown mesh member must be rejected");
+        assert!(
+            error.to_string().contains("misspelled_member"),
+            "unknown member at {pointer:?} must be named: {error}"
         );
     }
 }

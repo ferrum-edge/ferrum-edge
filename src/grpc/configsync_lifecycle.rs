@@ -957,7 +957,12 @@ pub fn check_peer_version_compatibility(
 /// `gateway_error_codes` and `split_external_local_origin_errors` fields and
 /// now denies unknown fields, so a revision-6 peer's snapshot or delta that
 /// carries either key no longer decodes.
-pub const CONFIG_SYNC_PROTOCOL_REVISION: u32 = 7;
+///
+/// Revision 8: every nested proxy/upstream/plugin-association object and
+/// every native mesh resource object denies unknown fields (1.0 config
+/// freeze), so a snapshot or delta member that a revision-7 peer tolerated as
+/// ignorable now fails to decode.
+pub const CONFIG_SYNC_PROTOCOL_REVISION: u32 = 8;
 
 /// Leading text of every ConfigSync build-mismatch refusal. The DP recognises
 /// the CP's `FAILED_PRECONDITION` Subscribe status by this prefix.

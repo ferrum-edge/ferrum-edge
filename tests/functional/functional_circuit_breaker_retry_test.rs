@@ -404,8 +404,7 @@ async fn test_retry_on_backend_failure() {
             "max_retries": 2,
             "retryable_status_codes": [500, 502, 503],
             "retryable_methods": ["GET", "HEAD"],
-            "backoff_strategy": "fixed",
-            "backoff_base_ms": 100
+            "backoff": {"fixed": {"delay_ms": 100}}
         }
     });
 
@@ -471,8 +470,7 @@ async fn test_retry_succeeds_on_second_attempt() {
             "max_retries": 3,
             "retryable_status_codes": [500],
             "retryable_methods": ["GET"],
-            "backoff_strategy": "fixed",
-            "backoff_base_ms": 200
+            "backoff": {"fixed": {"delay_ms": 200}}
         }
     });
 
@@ -549,8 +547,7 @@ async fn test_retry_on_connect_failure() {
             "max_retries": 2,
             "retry_on_connect_failure": true,
             "retryable_methods": ["GET"],
-            "backoff_strategy": "fixed",
-            "backoff_base_ms": 100
+            "backoff": {"fixed": {"delay_ms": 100}}
         }
     });
 
