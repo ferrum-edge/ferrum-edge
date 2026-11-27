@@ -800,6 +800,26 @@ version is older than the recorded one refuses to start or migrate, and an old
 index is dropped only when a later plan version explicitly retires it by name.
 See [docs/migrations.md](migrations.md#mongodb-migrations).
 
+### Databases created by 0.9.x releases are refused
+
+0.9.x releases never recorded an index-plan version. A 1.0.0 binary therefore
+treats a database that holds a document in any Ferrum collection (`proxies`,
+`consumers`, `plugin_configs`, `upstreams`, `api_specs`,
+`gateway_trust_bundles`, `namespaces`, `config_changes`,
+`consumer_identity_index`, `audit_events`) but has no `core_index_plan`
+record as a 0.9.x database. Startup, `FERRUM_MIGRATE_ACTION=up` and
+`FERRUM_MIGRATE_ACTION=status` refuse it before any write with
+`migration history integrity check failed: kind=pre_release_database
+backend=mongodb`, naming the collection and the rebuild-and-restore
+procedure, the same outcome a 0.9.x PostgreSQL, MySQL or SQLite database gets.
+Rebuild it: export each namespace with `GET /backup` from the 0.9.x
+deployment, check each export with `ferrum-edge validate --backup`, point
+1.0.0 at an empty database, and `POST /restore` each export (see
+[upgrade_guide.md](upgrade_guide.md#every-09x-database-is-rebuilt-and-restored-7523)
+and [admin_backup_restore.md](admin_backup_restore.md)). An empty database is
+never refused, and every 1.0.0+ `up` writes its plan record before it creates
+a collection or document, so a 1.x database always has one.
+
 ### Adding New Fields
 
 New fields added to the Rust domain types (`Proxy`, `Consumer`, `Upstream`, `PluginConfig`) are automatically persisted to MongoDB via serde BSON serialization — no ALTER TABLE equivalent needed. From 1.0.0 onward, SQL backends instead need the column added by a new forward migration (`V002`+), since the `V001` baseline is frozen; releases before 1.0.0 folded such columns into `V001` and required a fresh database. See [migrations.md](migrations.md#schema-compatibility-policy). A new field that is queried still needs an index, added through the versioned index plan.

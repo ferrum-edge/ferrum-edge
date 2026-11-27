@@ -1599,3 +1599,326 @@ async fn backup_rejects_undecodable_duplicate_and_whitespace_filters() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Issue #7532: `ferrum-edge validate --backup` ⇔ `POST /restore`, stored spec
+// extension admission, and the namespace registry section.
+// ---------------------------------------------------------------------------
+
+async fn post_restore_in_namespace(
+    base: &str,
+    bearer: &str,
+    namespace: &str,
+    body: &str,
+) -> (u16, Value) {
+    let response = reqwest::Client::new()
+        .post(format!("{base}/restore?confirm=true"))
+        .bearer_auth(bearer)
+        .header("Content-Type", "application/json")
+        .header("X-Ferrum-Namespace", namespace)
+        .body(body.to_string())
+        .send()
+        .await
+        .expect("POST restore");
+    let status = response.status().as_u16();
+    let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+    (status, body)
+}
+
+fn backup_check(dir: &TempDir, namespace: &str, body: &str) -> Result<(), Vec<String>> {
+    let path = dir
+        .path()
+        .join(format!("backup-{}.json", uuid::Uuid::new_v4()));
+    std::fs::write(&path, body).unwrap();
+    // Mirrors `base_admin_state()`: unrestricted egress, 25 MiB specs, 100 MiB
+    // restore bodies, no `ProxyState`, no cached mesh.
+    ferrum_edge::_test_support::backup_export_check_for_test(
+        &path,
+        namespace,
+        ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        25,
+        100,
+    )
+}
+
+fn plain_proxy(id: &str, listen_path: &str) -> Value {
+    json!({
+        "id": id,
+        "listen_path": listen_path,
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": 8080
+    })
+}
+
+/// A backup `api_specs` item for `document`, owned by proxy `proxy_id`.
+fn spec_item(spec_id: &str, proxy_id: &str, document: &Value) -> Value {
+    use base64::Engine as _;
+    let raw = serde_json::to_vec(document).unwrap();
+    let compressed = ferrum_edge::admin::spec_codec::compress_gzip(&raw).unwrap();
+    json!({
+        "id": spec_id,
+        "proxy_id": proxy_id,
+        "spec_version": document["openapi"],
+        "spec_format": "json",
+        "spec_content_base64": base64::engine::general_purpose::STANDARD.encode(&compressed),
+        "content_encoding": "gzip",
+        "uncompressed_size": raw.len(),
+        "content_hash": ferrum_edge::admin::spec_codec::sha256_hex(&raw),
+        "title": "t",
+        "info_version": "1",
+        "resource_hash": "a".repeat(64),
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z"
+    })
+}
+
+fn spec_backup(upstream_extension: Option<Value>) -> Value {
+    let mut document = json!({
+        "openapi": "3.0.3",
+        "info": {"title": "t", "version": "1"},
+        "paths": {},
+        "x-ferrum-proxy": {
+            "id": "spec-proxy",
+            "listen_path": "/spec",
+            "backend_host": "127.0.0.1",
+            "backend_port": 8080
+        }
+    });
+    if let Some(upstream) = upstream_extension {
+        document["x-ferrum-upstream"] = upstream;
+    }
+    let mut proxy = plain_proxy("spec-proxy", "/spec");
+    proxy["api_spec_id"] = json!("spec-1");
+    json!({
+        "version": "1",
+        "proxies": [proxy],
+        "api_specs": {
+            "section_version": "2",
+            "items": [spec_item("spec-1", "spec-proxy", &document)]
+        }
+    })
+}
+
+/// The invariant of issue #7532: on the same build, the offline backup check
+/// accepts a payload exactly when `POST /restore` accepts it, section by
+/// section — resources, trust bundles, API specs (including each stored
+/// document's extension admission) and the namespace registry row.
+#[tokio::test]
+async fn backup_export_check_agrees_with_restore_for_every_section() {
+    let tmp = TempDir::new().unwrap();
+    let (base, _shutdown) = start_admin(admin_state(make_store(&tmp).await)).await;
+    let admin = token("preflight-admin", Some("admin"));
+    let trust_record = json!({
+        "trust_domain": "example.org",
+        "bundle": {"local": {
+            "trust_domain": "example.org",
+            "jwt_authorities": [{"key_id": "k1", "public_key_pem": "pem"}]
+        }}
+    });
+
+    let cases: Vec<(&str, Value, bool)> = vec![
+        (
+            "valid resources",
+            json!({"version": "1", "proxies": [plain_proxy("p1", "/a")]}),
+            true,
+        ),
+        ("explicit empty", json!({}), true),
+        (
+            "unknown envelope key",
+            json!({"version": "1", "proxise": []}),
+            false,
+        ),
+        ("incompatible version", json!({"version": "9"}), false),
+        (
+            "missing resource id",
+            json!({"proxies": [{"listen_path": "/a", "backend_host": "h", "backend_port": 1}]}),
+            false,
+        ),
+        (
+            "nested unknown key",
+            json!({"upstreams": [{
+                "id": "u1",
+                "targets": [{"host": "127.0.0.1", "port": 8080}],
+                "health_checks": {"pasive": {"unhealthy_threshold": 1}}
+            }]}),
+            false,
+        ),
+        (
+            "trust bundles not a singleton",
+            json!({"gateway_trust_bundles": [trust_record.clone(), trust_record.clone()]}),
+            false,
+        ),
+        ("api spec admitted", spec_backup(None), true),
+        (
+            "api spec with a removed passive-health key",
+            spec_backup(Some(json!({
+                "id": "spec-upstream",
+                "targets": [{"host": "127.0.0.1", "port": 8080}],
+                "health_checks": {"passive": {"gateway_error_codes": [502]}}
+            }))),
+            false,
+        ),
+        (
+            "api spec with an unknown proxy key",
+            {
+                let mut backup = spec_backup(None);
+                // Re-encode the document with a stale proxy extension key.
+                let document = json!({
+                    "openapi": "3.0.3",
+                    "info": {"title": "t", "version": "1"},
+                    "paths": {},
+                    "x-ferrum-proxy": {
+                        "id": "spec-proxy",
+                        "listen_path": "/spec",
+                        "backend_host": "127.0.0.1",
+                        "backend_port": 8080,
+                        "pool_max_requests_per_connection": 10
+                    }
+                });
+                backup["api_specs"]["items"][0] = spec_item("spec-1", "spec-proxy", &document);
+                backup
+            },
+            false,
+        ),
+        (
+            "namespace registry with an unknown section version",
+            json!({"namespace_registry": {"section_version": "2", "name": "tenant"}}),
+            false,
+        ),
+        (
+            "namespace registry with an unknown member",
+            json!({"namespace_registry": {
+                "section_version": "1", "name": "tenant", "descripton": "typo"
+            }}),
+            false,
+        ),
+        (
+            "namespace registry admitted",
+            json!({"namespace_registry": {
+                "section_version": "1", "name": "tenant", "description": "Tenant"
+            }}),
+            true,
+        ),
+    ];
+
+    for (index, (label, payload, expected)) in cases.into_iter().enumerate() {
+        let namespace = format!("preflight-{index}");
+        let body = payload.to_string();
+        let checked = backup_check(&tmp, &namespace, &body);
+        let (status, response) = post_restore_in_namespace(&base, &admin, &namespace, &body).await;
+        assert_eq!(
+            checked.is_ok(),
+            expected,
+            "{label}: offline check verdict {checked:?}"
+        );
+        assert_eq!(
+            status == 200,
+            expected,
+            "{label}: restore answered {status}: {response}"
+        );
+        if !expected {
+            assert_eq!(status, 400, "{label}: restore refusal is a 400: {response}");
+        }
+    }
+}
+
+/// A missing file and a file over the restore body limit are refused by the
+/// check, as restore refuses an oversized body with `413`.
+#[tokio::test]
+async fn backup_export_check_refuses_missing_and_oversized_files() {
+    let tmp = TempDir::new().unwrap();
+    let missing = ferrum_edge::_test_support::backup_export_check_for_test(
+        &tmp.path().join("no-such-backup.json"),
+        "ferrum",
+        ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        25,
+        100,
+    )
+    .expect_err("a missing file must fail the check");
+    assert!(missing[0].contains("not found"), "{missing:?}");
+
+    let oversized = json!({"version": "1", "padding": "x".repeat(1024 * 1024 + 16)}).to_string();
+    let path = tmp.path().join("oversized.json");
+    std::fs::write(&path, &oversized).unwrap();
+    let refused = ferrum_edge::_test_support::backup_export_check_for_test(
+        &path,
+        "ferrum",
+        ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        25,
+        1,
+    )
+    .expect_err("a file over the restore body limit must fail the check");
+    assert!(refused[0].contains("body limit"), "{refused:?}");
+
+    let mut state = admin_state(make_store(&tmp).await);
+    state.admin_restore_max_body_size_mib = 1;
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("preflight-admin", Some("admin"));
+    let (status, _) = post_restore_in_namespace(&base, &admin, "ferrum", &oversized).await;
+    assert_eq!(status, 413, "restore refuses the same body by size");
+}
+
+/// `GET /backup` carries the namespace registry row, and restoring the export
+/// into the same namespace on an empty database recreates it, including for a
+/// registered namespace that holds no resources. A different target namespace
+/// is never relabelled with the source's row.
+#[tokio::test]
+async fn namespace_registry_row_round_trips_through_backup_and_restore() {
+    let tmp = TempDir::new().unwrap();
+    let (source, _source_shutdown) = start_admin(admin_state(make_store(&tmp).await)).await;
+    let admin = token("registry-admin", Some("admin"));
+    let (status, created) = post_admin_raw(
+        &source,
+        "/namespaces",
+        &admin,
+        &json!({"name": "tenant-a", "description": "Tenant A production"}).to_string(),
+    )
+    .await;
+    assert_eq!(status, 201, "create namespace: {created}");
+
+    let (status, backup, _) =
+        get_backup_with_headers(&source, "/backup", &admin, None, None, Some("tenant-a")).await;
+    assert_eq!(status, 200, "backup: {backup}");
+    assert_eq!(
+        backup["namespace_registry"],
+        json!({
+            "section_version": "1",
+            "name": "tenant-a",
+            "description": "Tenant A production"
+        }),
+        "a full export carries the registry row: {backup}"
+    );
+    // A filtered export omits it.
+    let (status, filtered, _) = get_backup_with_headers(
+        &source,
+        "/backup?resources=proxies",
+        &admin,
+        None,
+        None,
+        Some("tenant-a"),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(filtered.get("namespace_registry").is_none(), "{filtered}");
+
+    let body = backup.to_string();
+    backup_check(&tmp, "tenant-a", &body).expect("the export passes the offline check");
+
+    // Rebuild: an empty database, the same namespace.
+    let (target, _target_shutdown) = start_admin(admin_state(make_store(&tmp).await)).await;
+    let (status, restored) = post_restore_in_namespace(&target, &admin, "tenant-a", &body).await;
+    assert_eq!(status, 200, "restore: {restored}");
+    let (status, row) = get_admin_json(&target, "/namespaces/tenant-a", &admin).await;
+    assert_eq!(status, 200, "the registry row is recreated: {row}");
+    assert_eq!(row["description"], "Tenant A production");
+
+    // A different target is not relabelled with tenant-a's row.
+    let (status, restored) = post_restore_in_namespace(&target, &admin, "tenant-b", &body).await;
+    assert_eq!(status, 200, "cross-namespace restore: {restored}");
+    let (status, row) = get_admin_json(&target, "/namespaces/tenant-b", &admin).await;
+    assert_ne!(
+        row["description"], "Tenant A production",
+        "a cross-namespace restore must not copy the source registry row ({status}): {row}"
+    );
+}

@@ -539,7 +539,7 @@ async fn lock_local_namespace_config_admission_multi<K: AsRef<str>>(
     guards
 }
 
-fn validate_candidate_plugin_graph(
+pub(crate) fn validate_candidate_plugin_graph(
     candidate: &GatewayConfig,
     http_client: &crate::plugins::PluginHttpClient,
 ) -> Result<(), AfterValidateError> {

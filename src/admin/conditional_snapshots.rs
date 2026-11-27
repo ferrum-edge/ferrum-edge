@@ -197,6 +197,7 @@ fn serialize_snapshot(
     state: &AdminState,
     namespace: &str,
     snapshot: &ConditionalNamespaceSnapshot,
+    namespace_registry: Option<&super::backup::NamespaceRegistryBackupSection>,
 ) -> Result<(Vec<u8>, String), anyhow::Error> {
     let config = &snapshot.config;
     let tag = namespace_tag(state, namespace, &snapshot.digest()?)?;
@@ -232,6 +233,10 @@ fn serialize_snapshot(
         plugin_configs: &config.plugin_configs,
         api_specs: Some(&specs),
         gateway_trust_bundles: Some(&config.gateway_trust_bundles),
+        // The registry row is carried for restore but is not part of the
+        // namespace ETag: conditional restore guards resources, not the
+        // registry (issue #7532).
+        namespace_registry,
         conditional: Some(&metadata),
     };
     Ok((serde_json::to_vec(&backup)?, metadata.namespace_etag))
@@ -256,14 +261,22 @@ pub(super) async fn backup(
             .load_conditional_namespace_snapshot(namespace)
             .await
             .map_err(|error| store_error(&error))?;
+        let namespace_registry = db
+            .get_namespace(namespace)
+            .await
+            .map_err(|error| store_error(&error))?
+            .as_ref()
+            .map(super::backup::NamespaceRegistryBackupSection::from_record);
         let (body_bytes, tag) =
-            serialize_snapshot(state, namespace, &snapshot).map_err(|error| {
-                if is_namespace_snapshot_too_large(&error) {
-                    snapshot_too_large()
-                } else {
-                    unavailable()
-                }
-            })?;
+            serialize_snapshot(state, namespace, &snapshot, namespace_registry.as_ref()).map_err(
+                |error| {
+                    if is_namespace_snapshot_too_large(&error) {
+                        snapshot_too_large()
+                    } else {
+                        unavailable()
+                    }
+                },
+            )?;
         let config = snapshot.config;
         let response = super::finalize_backup_export(
             state,

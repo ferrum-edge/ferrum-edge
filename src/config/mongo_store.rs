@@ -121,8 +121,9 @@ mod inner {
     use crate::config::mongo_index_plan::{
         HMAC_SECRET_HASHES_FIELD, MONGO_INDEX_PLAN_VERSION, MONGO_INDEX_PLAN_VERSION_COLLECTION,
         MONGO_INDEX_PLAN_VERSION_DOCUMENT_ID, MongoIndexPlan, MongoMigrationStatus,
-        REQUIRED_GUARD_COLLECTIONS, RecordedIndexPlanState, RequiredMongoIndex, RetiredMongoIndex,
-        classify_guard_collections, classify_plan_against_live, recorded_plan_state_from_document,
+        PRE_RELEASE_MARKER_COLLECTIONS, REQUIRED_GUARD_COLLECTIONS, RecordedIndexPlanState,
+        RequiredMongoIndex, RetiredMongoIndex, classify_guard_collections,
+        classify_plan_against_live, recorded_plan_state_from_document, refuse_pre_release_database,
         required_mongo_indexes,
     };
     use crate::config::namespace_registry::{
@@ -348,12 +349,41 @@ mod inner {
         Ok(recorded_plan_state_from_document(document.as_ref())?)
     }
 
+    /// Refuse a database a 0.9.x release initialized: it holds Ferrum
+    /// documents (see `PRE_RELEASE_MARKER_COLLECTIONS`) but records no index
+    /// plan. A database with a plan record, or with no Ferrum document at all,
+    /// passes. Read-only, so a refusal changes nothing.
+    async fn ensure_not_pre_release_database(
+        db: &Database,
+        recorded: &RecordedIndexPlanState,
+    ) -> Result<(), anyhow::Error> {
+        if recorded.version.is_some() || recorded.in_progress.is_some() {
+            return Ok(());
+        }
+        let mut populated = None;
+        for &collection in PRE_RELEASE_MARKER_COLLECTIONS {
+            if db
+                .collection::<Document>(collection)
+                .find_one(doc! {})
+                .projection(doc! { "_id": 1 })
+                .await?
+                .is_some()
+            {
+                populated = Some(collection);
+                break;
+            }
+        }
+        refuse_pre_release_database(recorded, populated)?;
+        Ok(())
+    }
+
     /// Refuse to publish a reconnect candidate whose database a newer release
-    /// started or finished upgrading: this binary's plan assumptions would no
-    /// longer hold for it.
+    /// started or finished upgrading, or that a 0.9.x release initialized:
+    /// this binary's plan assumptions would no longer hold for it.
     async fn ensure_candidate_index_plan_compatible(db: &Database) -> Result<(), anyhow::Error> {
         let recorded = read_recorded_index_plan_state(db).await?;
         MongoIndexPlan::current().upgrade_from_state(&recorded)?;
+        ensure_not_pre_release_database(db, &recorded).await?;
         Ok(())
     }
 
@@ -2517,6 +2547,8 @@ mod inner {
             // that a newer release upgraded as merely "missing" indexes.
             let recorded = self.recorded_index_plan_state().await?;
             MongoIndexPlan::current().upgrade_from_state(&recorded)?;
+            // A 0.9.x database is refused by status as well as by `up`.
+            ensure_not_pre_release_database(&self.db(), &recorded).await?;
 
             Ok(MongoMigrationStatus {
                 indexes: classify_plan_against_live(&live_by_collection),
@@ -2577,7 +2609,9 @@ mod inner {
         ) -> Result<(), anyhow::Error> {
             // Read-only refusal: an incompatible database is rejected before
             // the lease (an upsert into `_ferrum_migration_locks`) is taken.
-            plan.upgrade_from_state(&self.recorded_index_plan_state().await?)?;
+            let recorded = self.recorded_index_plan_state().await?;
+            plan.upgrade_from_state(&recorded)?;
+            ensure_not_pre_release_database(&self.db(), &recorded).await?;
 
             let mut migration_lease = self.acquire_migration_lease().await?;
             // Run every initialization step inside a scoped future so a failure

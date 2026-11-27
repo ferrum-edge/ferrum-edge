@@ -4930,3 +4930,105 @@ async fn functional_cli_stream_port_rejection_sanitizes_early_emissions() {
         );
     }
 }
+
+/// `ferrum-edge validate --backup` (issue #7532): a missing file exits 1, an
+/// admitted export exits 0, a refused one exits 1, and `validate -m database`
+/// says plainly when the configured fallback file does not exist.
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_backup_export() {
+    let dir = TempDir::new().unwrap();
+    let validate = || {
+        let mut command = validate();
+        command.env(
+            "FERRUM_ADMIN_JWT_SECRET",
+            "functional-backup-check-admin-secret-over-32-bytes",
+        );
+        command
+    };
+
+    let mut command = validate();
+    command
+        .args(["--backup"])
+        .arg(dir.path().join("no-such-backup.json"));
+    let output = cli_contract_output(command).await;
+    let diagnostic = cli_contract_diagnostic(&output);
+    assert_eq!(output.status.code(), Some(1), "{diagnostic}");
+    assert!(diagnostic.contains("not found"), "{diagnostic}");
+
+    let admitted = dir.path().join("admitted.json");
+    std::fs::write(
+        &admitted,
+        serde_json::json!({
+            "version": "1",
+            "proxies": [{
+                "id": "p1",
+                "listen_path": "/a",
+                "backend_scheme": "http",
+                "backend_host": "127.0.0.1",
+                "backend_port": 8080
+            }],
+            "namespace_registry": {"section_version": "1", "name": "ferrum"}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut command = validate();
+    command.args(["--backup"]).arg(&admitted);
+    let output = cli_contract_output(command).await;
+    let diagnostic = cli_contract_diagnostic(&output);
+    assert_eq!(output.status.code(), Some(0), "{diagnostic}");
+    assert!(diagnostic.contains("Backup export: OK"), "{diagnostic}");
+    assert!(diagnostic.contains("Proxies: 1"), "{diagnostic}");
+    assert!(
+        diagnostic.contains("written to the target namespace"),
+        "{diagnostic}"
+    );
+
+    let refused = dir.path().join("refused.json");
+    std::fs::write(
+        &refused,
+        serde_json::json!({
+            "version": "1",
+            "upstreams": [{
+                "id": "u1",
+                "targets": [{"host": "127.0.0.1", "port": 8080}],
+                "health_checks": {"passive": {"gateway_error_codes": [502]}}
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut command = validate();
+    command.args(["--backup"]).arg(&refused);
+    let output = cli_contract_output(command).await;
+    let diagnostic = cli_contract_diagnostic(&output);
+    assert_eq!(output.status.code(), Some(1), "{diagnostic}");
+    assert!(
+        diagnostic.contains("Backup validation failed"),
+        "{diagnostic}"
+    );
+
+    let mut command = validate();
+    command
+        .args(["--backup"])
+        .arg(&admitted)
+        .args(["-m", "file"]);
+    let output = cli_contract_output(command).await;
+    let diagnostic = cli_contract_diagnostic(&output);
+    assert_eq!(output.status.code(), Some(1), "{diagnostic}");
+    assert!(diagnostic.contains("database"), "{diagnostic}");
+
+    let mut command = validate();
+    command.env(
+        "FERRUM_DB_CONFIG_BACKUP_PATH",
+        dir.path().join("no-such-fallback.json"),
+    );
+    let output = cli_contract_output(command).await;
+    let diagnostic = cli_contract_diagnostic(&output);
+    assert_eq!(output.status.code(), Some(0), "{diagnostic}");
+    assert!(
+        diagnostic.contains("file not found; nothing was checked"),
+        "{diagnostic}"
+    );
+}

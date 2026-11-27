@@ -812,3 +812,56 @@ fn dry_run_lists_the_plan_version_and_destructive_steps() {
         )));
     }
 }
+
+/// A populated database with no `core_index_plan` record was initialized by a
+/// 0.9.x release and is refused with the rebuild-and-restore instruction; a
+/// database with a plan record, or with no Ferrum document, is never refused.
+#[test]
+fn pre_release_database_marker_is_exact() {
+    use ferrum_edge::config::mongo_index_plan::{
+        PRE_RELEASE_MARKER_COLLECTIONS, refuse_pre_release_database,
+    };
+
+    let unrecorded = RecordedIndexPlanState::default();
+    assert!(refuse_pre_release_database(&unrecorded, None).is_ok());
+    for &collection in PRE_RELEASE_MARKER_COLLECTIONS {
+        let error = refuse_pre_release_database(&unrecorded, Some(collection))
+            .expect_err("a populated unrecorded database is a 0.9.x database");
+        assert_eq!(
+            error,
+            MongoIndexPlanError::PreReleaseDatabase { collection }
+        );
+        let rendered = error.to_string();
+        assert!(rendered.contains("kind=pre_release_database"), "{rendered}");
+        assert!(rendered.contains(collection), "{rendered}");
+        assert!(rendered.contains("rebuild the database"), "{rendered}");
+        assert!(rendered.contains("admin_backup_restore.md"), "{rendered}");
+    }
+    for recorded in [
+        RecordedIndexPlanState {
+            version: Some(MONGO_INDEX_PLAN_VERSION),
+            in_progress: None,
+        },
+        RecordedIndexPlanState {
+            version: None,
+            in_progress: Some(MONGO_INDEX_PLAN_VERSION),
+        },
+    ] {
+        assert!(refuse_pre_release_database(&recorded, Some("proxies")).is_ok());
+    }
+    for collection in ["proxies", "consumers", "namespaces", "config_changes"] {
+        assert!(PRE_RELEASE_MARKER_COLLECTIONS.contains(&collection));
+    }
+}
+
+/// `up`, `status` and reconnect all run the same refusal.
+#[test]
+fn pre_release_refusal_is_wired_into_up_status_and_reconnect() {
+    assert!(
+        MONGO_STORE_SOURCE
+            .matches("ensure_not_pre_release_database(")
+            .count()
+            >= 4,
+        "definition plus up, status and reconnect call sites"
+    );
+}

@@ -482,211 +482,7 @@ pub fn extract_with_external_refs(
         }
     }
 
-    // --- x-ferrum-consumers guard ----------------------------------------
-    if root.get("x-ferrum-consumers").is_some() {
-        return Err(ExtractError::ConsumerExtensionNotAllowed);
-    }
-
-    // --- x-ferrum-proxy (required) ---------------------------------------
-    let proxy_val = root
-        .get("x-ferrum-proxy")
-        .ok_or(ExtractError::MissingProxyExtension)?;
-
-    let mut proxy: Proxy = serde_json::from_value(proxy_val.clone()).map_err(|e| {
-        ExtractError::MalformedExtension {
-            which: "x-ferrum-proxy",
-            error: e.to_string(),
-        }
-    })?;
-    proxy.namespace = namespace.to_string();
-
-    // --- ID validation for proxy (BEFORE auto-linking) ----------------------
-    // Non-empty id → validate format; malformed ids are rejected here rather
-    // than at the DB layer so the error message is actionable.
-    // Empty id → leave empty; the route handler (assign_ids_for_post /
-    // assign_ids_for_put) is responsible for assigning or reusing IDs so that
-    // PUT idempotency works correctly.
-    if !proxy.id.is_empty()
-        && let Err(e) = validate_resource_id(&proxy.id)
-    {
-        return Err(ExtractError::MalformedExtension {
-            which: "x-ferrum-proxy",
-            error: format!("invalid id: {}", e),
-        });
-    }
-
-    // --- x-ferrum-upstream (optional) ------------------------------------
-    let upstream = if let Some(up_val) = root.get("x-ferrum-upstream") {
-        let mut up: Upstream = serde_json::from_value(up_val.clone()).map_err(|e| {
-            ExtractError::MalformedExtension {
-                which: "x-ferrum-upstream",
-                error: e.to_string(),
-            }
-        })?;
-        up.namespace = namespace.to_string();
-
-        // --- ID validation for upstream (BEFORE auto-linking) ---------------
-        // Empty id → leave empty; handler assigns / reuses IDs.
-        if !up.id.is_empty()
-            && let Err(e) = validate_resource_id(&up.id)
-        {
-            return Err(ExtractError::MalformedExtension {
-                which: "x-ferrum-upstream",
-                error: format!("invalid id: {}", e),
-            });
-        }
-
-        Some(up)
-    } else {
-        None
-    };
-
-    // --- Auto-link upstream to proxy ----------------------------------------
-    // If the spec includes an upstream, set proxy.upstream_id to the upstream's
-    // id unless the operator already pinned a different one (which is an error).
-    if let Some(ref u) = upstream {
-        match proxy.upstream_id.as_deref() {
-            None => proxy.upstream_id = Some(u.id.clone()),
-            Some(existing) if existing == u.id => {} // explicit + same → ok
-            Some(existing) => {
-                return Err(ExtractError::ProxyUpstreamIdMismatch {
-                    proxy_id: proxy.id.clone(),
-                    proxy_upstream_id: existing.to_string(),
-                    spec_upstream_id: u.id.clone(),
-                });
-            }
-        }
-    }
-
-    // --- x-ferrum-plugins (optional array) --------------------------------
-    let mut plugins = if let Some(plugins_val) = root.get("x-ferrum-plugins") {
-        let arr = plugins_val
-            .as_array()
-            .ok_or_else(|| ExtractError::MalformedExtension {
-                which: "x-ferrum-plugins",
-                error: "expected an array".to_string(),
-            })?;
-
-        let mut out = Vec::with_capacity(arr.len());
-        for entry in arr {
-            // Reject positional array entries before `serde_json::from_value`
-            // so every plugin definition must be a JSON object and cannot
-            // bypass the literal `config` extraction & reserved-key guard.
-            if !entry.is_object() {
-                return Err(ExtractError::MalformedExtension {
-                    which: "x-ferrum-plugins",
-                    error: "each plugin entry must be a JSON object".to_string(),
-                });
-            }
-            // Default scope to "proxy" when the spec omits it — proxy-scope
-            // is the only allowed value here (enforced below), so requiring
-            // explicit `scope: proxy` everywhere would just be friction.
-            // Explicit non-proxy scopes still fail downstream with a clear
-            // error.
-            let mut entry_with_default = entry.clone();
-            let raw_config = if let Some(map) = entry_with_default.as_object_mut() {
-                map.entry("scope".to_string())
-                    .or_insert(serde_json::Value::String("proxy".to_string()));
-                // Carry the already-parsed literal `config` value out before
-                // `serde_json::from_value` so serde_json's `raw_value` feature
-                // cannot reinterpret a `$serde_json::private::RawValue` key
-                // inside `config` into an uncharged nested JSON tree.
-                map.remove("config")
-            } else {
-                None
-            };
-            // Fail closed on serde_json's reserved internal RawValue sentinel
-            // at any depth of `config`: keeping it literal would bypass
-            // forbidden-key and plugin validation while DB/Mongo reload (which
-            // decodes plain `serde_json::Value` with `raw_value` enabled) would
-            // reinterpret or fail to decode it.
-            if raw_config
-                .as_ref()
-                .is_some_and(contains_reserved_serde_raw_value_key)
-            {
-                return Err(ExtractError::MalformedExtension {
-                    which: "x-ferrum-plugins",
-                    error: format!(
-                        "plugin config must not contain reserved key \"{SERDE_JSON_RAW_VALUE_KEY}\""
-                    ),
-                });
-            }
-
-            let mut pc: PluginConfig = serde_json::from_value(entry_with_default).map_err(|e| {
-                ExtractError::MalformedExtension {
-                    which: "x-ferrum-plugins",
-                    error: e.to_string(),
-                }
-            })?;
-            if let Some(config) = raw_config {
-                pc.config = config;
-            }
-
-            // --- ID validation for plugin (BEFORE auto-linking) -------------
-            // Empty id → leave empty; handler assigns / reuses IDs.
-            if !pc.id.is_empty()
-                && let Err(e) = validate_resource_id(&pc.id)
-            {
-                return Err(ExtractError::MalformedExtension {
-                    which: "x-ferrum-plugins",
-                    error: format!("invalid id: {}", e),
-                });
-            }
-
-            // Scope must be proxy (or absent/defaulted to proxy).
-            if pc.scope != PluginScope::Proxy {
-                let scope_str = match pc.scope {
-                    PluginScope::Global => "global".to_string(),
-                    PluginScope::ProxyGroup => "proxy_group".to_string(),
-                    PluginScope::Proxy => "proxy".to_string(),
-                };
-                return Err(ExtractError::PluginInvalidScope {
-                    plugin_id: pc.id,
-                    scope: scope_str,
-                });
-            }
-
-            // proxy_id must be absent or match the spec's proxy id.
-            if let Some(ref pid) = pc.proxy_id
-                && pid != &proxy.id
-            {
-                return Err(ExtractError::PluginProxyIdMismatch {
-                    plugin_id: pc.id,
-                    plugin_proxy_id: pid.clone(),
-                    spec_proxy_id: proxy.id.clone(),
-                });
-            }
-
-            // Walk config for forbidden credential / consumer keys.
-            if let Some(key) = find_forbidden_key_for_plugin(&pc.plugin_name, &pc.config) {
-                return Err(ExtractError::PluginContainsCredentials {
-                    plugin_id: pc.id,
-                    key: key.to_string(),
-                });
-            }
-
-            // Reject duplicate non-empty plugin IDs within the same spec.
-            if !pc.id.is_empty()
-                && out
-                    .iter()
-                    .any(|existing: &PluginConfig| existing.id == pc.id)
-            {
-                return Err(ExtractError::MalformedExtension {
-                    which: "x-ferrum-plugins",
-                    error: format!("duplicate plugin id '{}'", pc.id),
-                });
-            }
-
-            // Stamp namespace and link to proxy.
-            pc.namespace = namespace.to_string();
-            pc.proxy_id = Some(proxy.id.clone());
-
-            out.push(pc);
-        }
-        out
-    } else {
-        Vec::new()
-    };
+    let (mut proxy, upstream, mut plugins) = admit_spec_resource_extensions(&root, namespace)?;
 
     let validate_ext = parse_x_ferrum_validate_extension(&root)?;
     let validate_enabled = validate_ext.is_some();
@@ -839,6 +635,252 @@ pub fn extract_with_external_refs(
         },
         metadata,
     ))
+}
+
+/// Strict admission of a spec's resource extensions: `x-ferrum-consumers` is
+/// refused, and `x-ferrum-proxy` (required), `x-ferrum-upstream` and
+/// `x-ferrum-plugins` are decoded into the closed resource types with their
+/// id, scope, ownership and credential checks.
+///
+/// Shared by spec extraction (`POST` / `PUT /api-specs`) and by
+/// [`admit_stored_spec_extensions`], which `POST /restore` and
+/// `ferrum-edge validate --backup` run on every stored spec document, so a
+/// backup that restores carries only spec documents that can be re-submitted.
+fn admit_spec_resource_extensions(
+    root: &Value,
+    namespace: &str,
+) -> Result<(Proxy, Option<Upstream>, Vec<PluginConfig>), ExtractError> {
+    // --- x-ferrum-consumers guard ----------------------------------------
+    if root.get("x-ferrum-consumers").is_some() {
+        return Err(ExtractError::ConsumerExtensionNotAllowed);
+    }
+
+    // --- x-ferrum-proxy (required) ---------------------------------------
+    let proxy_val = root
+        .get("x-ferrum-proxy")
+        .ok_or(ExtractError::MissingProxyExtension)?;
+
+    let mut proxy: Proxy = serde_json::from_value(proxy_val.clone()).map_err(|e| {
+        ExtractError::MalformedExtension {
+            which: "x-ferrum-proxy",
+            error: e.to_string(),
+        }
+    })?;
+    proxy.namespace = namespace.to_string();
+
+    // --- ID validation for proxy (BEFORE auto-linking) ----------------------
+    // Non-empty id → validate format; malformed ids are rejected here rather
+    // than at the DB layer so the error message is actionable.
+    // Empty id → leave empty; the route handler (assign_ids_for_post /
+    // assign_ids_for_put) is responsible for assigning or reusing IDs so that
+    // PUT idempotency works correctly.
+    if !proxy.id.is_empty()
+        && let Err(e) = validate_resource_id(&proxy.id)
+    {
+        return Err(ExtractError::MalformedExtension {
+            which: "x-ferrum-proxy",
+            error: format!("invalid id: {}", e),
+        });
+    }
+
+    // --- x-ferrum-upstream (optional) ------------------------------------
+    let upstream = if let Some(up_val) = root.get("x-ferrum-upstream") {
+        let mut up: Upstream = serde_json::from_value(up_val.clone()).map_err(|e| {
+            ExtractError::MalformedExtension {
+                which: "x-ferrum-upstream",
+                error: e.to_string(),
+            }
+        })?;
+        up.namespace = namespace.to_string();
+
+        // --- ID validation for upstream (BEFORE auto-linking) ---------------
+        // Empty id → leave empty; handler assigns / reuses IDs.
+        if !up.id.is_empty()
+            && let Err(e) = validate_resource_id(&up.id)
+        {
+            return Err(ExtractError::MalformedExtension {
+                which: "x-ferrum-upstream",
+                error: format!("invalid id: {}", e),
+            });
+        }
+
+        Some(up)
+    } else {
+        None
+    };
+
+    // --- Auto-link upstream to proxy ----------------------------------------
+    // If the spec includes an upstream, set proxy.upstream_id to the upstream's
+    // id unless the operator already pinned a different one (which is an error).
+    if let Some(ref u) = upstream {
+        match proxy.upstream_id.as_deref() {
+            None => proxy.upstream_id = Some(u.id.clone()),
+            Some(existing) if existing == u.id => {} // explicit + same → ok
+            Some(existing) => {
+                return Err(ExtractError::ProxyUpstreamIdMismatch {
+                    proxy_id: proxy.id.clone(),
+                    proxy_upstream_id: existing.to_string(),
+                    spec_upstream_id: u.id.clone(),
+                });
+            }
+        }
+    }
+
+    // --- x-ferrum-plugins (optional array) --------------------------------
+    let plugins = if let Some(plugins_val) = root.get("x-ferrum-plugins") {
+        let arr = plugins_val
+            .as_array()
+            .ok_or_else(|| ExtractError::MalformedExtension {
+                which: "x-ferrum-plugins",
+                error: "expected an array".to_string(),
+            })?;
+
+        let mut out = Vec::with_capacity(arr.len());
+        for entry in arr {
+            // Reject positional array entries before `serde_json::from_value`
+            // so every plugin definition must be a JSON object and cannot
+            // bypass the literal `config` extraction & reserved-key guard.
+            if !entry.is_object() {
+                return Err(ExtractError::MalformedExtension {
+                    which: "x-ferrum-plugins",
+                    error: "each plugin entry must be a JSON object".to_string(),
+                });
+            }
+            // Default scope to "proxy" when the spec omits it — proxy-scope
+            // is the only allowed value here (enforced below), so requiring
+            // explicit `scope: proxy` everywhere would just be friction.
+            // Explicit non-proxy scopes still fail downstream with a clear
+            // error.
+            let mut entry_with_default = entry.clone();
+            let raw_config = if let Some(map) = entry_with_default.as_object_mut() {
+                map.entry("scope".to_string())
+                    .or_insert(serde_json::Value::String("proxy".to_string()));
+                // Carry the already-parsed literal `config` value out before
+                // `serde_json::from_value` so serde_json's `raw_value` feature
+                // cannot reinterpret a `$serde_json::private::RawValue` key
+                // inside `config` into an uncharged nested JSON tree.
+                map.remove("config")
+            } else {
+                None
+            };
+            // Fail closed on serde_json's reserved internal RawValue sentinel
+            // at any depth of `config`: keeping it literal would bypass
+            // forbidden-key and plugin validation while DB/Mongo reload (which
+            // decodes plain `serde_json::Value` with `raw_value` enabled) would
+            // reinterpret or fail to decode it.
+            if raw_config
+                .as_ref()
+                .is_some_and(contains_reserved_serde_raw_value_key)
+            {
+                return Err(ExtractError::MalformedExtension {
+                    which: "x-ferrum-plugins",
+                    error: format!(
+                        "plugin config must not contain reserved key \"{SERDE_JSON_RAW_VALUE_KEY}\""
+                    ),
+                });
+            }
+
+            let mut pc: PluginConfig = serde_json::from_value(entry_with_default).map_err(|e| {
+                ExtractError::MalformedExtension {
+                    which: "x-ferrum-plugins",
+                    error: e.to_string(),
+                }
+            })?;
+            if let Some(config) = raw_config {
+                pc.config = config;
+            }
+
+            // --- ID validation for plugin (BEFORE auto-linking) -------------
+            // Empty id → leave empty; handler assigns / reuses IDs.
+            if !pc.id.is_empty()
+                && let Err(e) = validate_resource_id(&pc.id)
+            {
+                return Err(ExtractError::MalformedExtension {
+                    which: "x-ferrum-plugins",
+                    error: format!("invalid id: {}", e),
+                });
+            }
+
+            // Scope must be proxy (or absent/defaulted to proxy).
+            if pc.scope != PluginScope::Proxy {
+                let scope_str = match pc.scope {
+                    PluginScope::Global => "global".to_string(),
+                    PluginScope::ProxyGroup => "proxy_group".to_string(),
+                    PluginScope::Proxy => "proxy".to_string(),
+                };
+                return Err(ExtractError::PluginInvalidScope {
+                    plugin_id: pc.id,
+                    scope: scope_str,
+                });
+            }
+
+            // proxy_id must be absent or match the spec's proxy id.
+            if let Some(ref pid) = pc.proxy_id
+                && pid != &proxy.id
+            {
+                return Err(ExtractError::PluginProxyIdMismatch {
+                    plugin_id: pc.id,
+                    plugin_proxy_id: pid.clone(),
+                    spec_proxy_id: proxy.id.clone(),
+                });
+            }
+
+            // Walk config for forbidden credential / consumer keys.
+            if let Some(key) = find_forbidden_key_for_plugin(&pc.plugin_name, &pc.config) {
+                return Err(ExtractError::PluginContainsCredentials {
+                    plugin_id: pc.id,
+                    key: key.to_string(),
+                });
+            }
+
+            // Reject duplicate non-empty plugin IDs within the same spec.
+            if !pc.id.is_empty()
+                && out
+                    .iter()
+                    .any(|existing: &PluginConfig| existing.id == pc.id)
+            {
+                return Err(ExtractError::MalformedExtension {
+                    which: "x-ferrum-plugins",
+                    error: format!("duplicate plugin id '{}'", pc.id),
+                });
+            }
+
+            // Stamp namespace and link to proxy.
+            pc.namespace = namespace.to_string();
+            pc.proxy_id = Some(proxy.id.clone());
+
+            out.push(pc);
+        }
+        out
+    } else {
+        Vec::new()
+    };
+
+    Ok((proxy, upstream, plugins))
+}
+
+/// Extension admission for an already admitted, stored spec document (issue
+/// #7532): the same strict decode of `x-ferrum-proxy`, `x-ferrum-upstream`
+/// and `x-ferrum-plugins` that spec submission runs, plus the shape checks of
+/// `x-ferrum-validate` and `x-ferrum-mcp`. Operation-schema generation is not
+/// re-run, because it may need external `$ref` documents the restoring node is
+/// not configured to fetch; a stored document's external-ref snapshot is
+/// validated separately.
+pub(crate) fn admit_stored_spec_extensions(
+    body: &[u8],
+    declared_format: SpecFormat,
+    namespace: &str,
+) -> Result<(), ExtractError> {
+    let (root, _) = parse_root_document(body, Some(declared_format))?;
+    admit_spec_resource_extensions(&root, namespace)?;
+    let validate_enabled = parse_x_ferrum_validate_extension(&root)?.is_some();
+    if parse_x_ferrum_mcp_extension(&root)?.is_some() && validate_enabled {
+        return Err(mcp_extension_error(
+            "`x-ferrum-mcp` cannot be combined with `x-ferrum-validate` in one document"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Return plugin IDs explicitly listed in `x-ferrum-proxy.plugins`.

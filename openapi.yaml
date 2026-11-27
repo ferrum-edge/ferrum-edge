@@ -5873,19 +5873,38 @@ paths:
         batch-shaped body without ids is a `400` and does not delete existing
         config.
 
-        ### Namespace registry metadata is out of scope
+        ### Namespace registry row
 
-        The payload carries namespace-scoped configuration resources, not the
-        namespace registry row. Restoring **in place** therefore preserves the
-        target namespace's registry metadata (description and registry
-        timestamps) unchanged, including across the destructive clear.
-        Importing into a **fresh target** yields a namespace that holds
-        resources but has no registry row and therefore no description — a
-        derived-only namespace, for which `GET /namespaces/{name}` synthesizes
-        a record with observation timestamps. Use `POST /namespaces` or
-        `PUT /namespaces/{name}` to materialize a durable registry row. This is
-        intentional: restore targets an authenticated namespace and must not
-        transplant source-tenant metadata into a different target.
+        A full, unfiltered database-backed `GET /backup` carries the exported
+        namespace's registry row in `namespace_registry` (issue #7532). Restore
+        admits that section with the rest of the payload, before anything is
+        deleted. When the section's `name` is the target namespace
+        (`X-Ferrum-Namespace`), restore writes the row after the restored
+        configuration commits: an existing row's description is replaced and
+        its `created_at` kept, a derived-only namespace is registered, and an
+        empty unregistered namespace — a registered namespace that held no
+        resources when it was exported — is created with new timestamps. A
+        section from another namespace is not applied, so a cross-namespace
+        restore never relabels its target. A backup without the section (every
+        0.9.x export, filtered and cached-fallback exports) leaves the target's
+        registry row untouched. The registry write happens after the
+        namespace configuration admission guard is released; if it fails, the
+        response is a `500` with `configuration_restored: true`, and retrying
+        the restore or `PUT /namespaces/{name}` completes it.
+
+        ### Stored API-spec documents are admitted
+
+        Each `api_specs` item's stored document goes through the same strict
+        extension admission `POST` / `PUT /api-specs` runs (`x-ferrum-proxy`,
+        `x-ferrum-upstream` and `x-ferrum-plugins` decoded into the closed
+        resource types, plus the `x-ferrum-validate` / `x-ferrum-mcp` shape
+        checks), so a document that carries an unknown or removed key is
+        refused with `400` before anything is deleted, rather than restoring and
+        failing on its next submission. External `$ref`s are not re-fetched; the
+        stored external-ref snapshot is integrity-checked instead.
+
+        `ferrum-edge validate --backup <file>` runs the same payload admission
+        offline (see docs/cli.md).
 
         ### MongoDB: malformed split identities are refused
 
@@ -6052,6 +6071,15 @@ paths:
                       Operator guidance to verify API specs with GET /api-specs
                       and re-submit originals via POST /api-specs if missing.
                       Present only when `api_specs_not_restored` is set.
+                  configuration_restored:
+                    type: boolean
+                    enum: [true]
+                    description: >-
+                      Present (`true`) only when the namespace configuration
+                      was restored and committed but the registry row from the
+                      backup's `namespace_registry` section could not be
+                      written afterwards. Retry the restore, or set the
+                      description with `PUT /namespaces/{name}`.
         "400":
           description: Missing `?confirm=true`, malformed JSON/headers, or backup validation errors (`validation_errors`)
           content:
@@ -21386,6 +21414,11 @@ components:
             `POST /restore` or `/gateway-trust-bundles` to persist trust.
           items:
             $ref: "#/components/schemas/GatewayTrustBundle"
+        namespace_registry:
+          $ref: "#/components/schemas/NamespaceRegistryBackupSection"
+          description: >-
+            Backup-only section. Accepted and ignored on `POST /batch`; use
+            `POST /restore` or `/namespaces` to write the namespace registry.
 
     BatchCreateResponse:
       type: object
@@ -21752,6 +21785,45 @@ components:
             $ref: "#/components/schemas/GatewayTrustBundle"
         api_specs:
           $ref: "#/components/schemas/ApiSpecsBackupSection"
+        namespace_registry:
+          $ref: "#/components/schemas/NamespaceRegistryBackupSection"
+
+    NamespaceRegistryBackupSection:
+      type: object
+      description: |
+        The exported namespace's registry row (issue #7532). `GET /backup`
+        includes it only on a full, unfiltered database-backed export of a
+        namespace that has a registry row; resource-filtered and
+        cached-fallback exports, and exports taken before this section
+        existed (every 0.9.x export), omit it.
+
+        `POST /restore` admits it before anything is deleted. When `name`
+        equals the target namespace (`X-Ferrum-Namespace`), restore writes the
+        row after the restored configuration commits: an existing row's
+        description is replaced (its `created_at` is kept), a namespace that
+        only has derived existence is registered, and an empty unregistered
+        namespace is created with new timestamps. A section taken from another
+        namespace is validated but not applied, so restoring one tenant's
+        export into a different namespace never relabels that namespace. An
+        absent section leaves the target registry row untouched. Accepted and
+        ignored on `POST /batch`.
+      required: [section_version, name]
+      additionalProperties: false
+      properties:
+        section_version:
+          type: string
+          enum: ["1"]
+          description: Section version. `"1"` is the only version.
+        name:
+          type: string
+          description: The namespace the export was taken from.
+        description:
+          type: [string, "null"]
+          maxLength: 1024
+          description: |
+            The registry description, normalized as on `POST /namespaces`
+            (trimmed; empty or whitespace-only is no description). Omitted when
+            the namespace has none.
 
     ApiSpecsBackupSection:
       type: object
@@ -22003,6 +22075,8 @@ components:
               refused rather than silently reduced to the first.
           items:
             $ref: "#/components/schemas/GatewayTrustBundle"
+        namespace_registry:
+          $ref: "#/components/schemas/NamespaceRegistryBackupSection"
         ferrum_version:
           type: string
           description: >-

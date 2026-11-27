@@ -3924,6 +3924,99 @@ async fn test_mongodb_index_plan_version_is_recorded_and_forward_only() {
     db.drop().await.unwrap();
 }
 
+/// A MongoDB database a 0.9.x release initialized holds Ferrum documents but
+/// no `core_index_plan` record. `up` (also run at startup) and `status` refuse
+/// it read-only with the rebuild-and-restore instruction; an empty database is
+/// initialized normally.
+#[tokio::test]
+#[ignore = "requires a live MongoDB server"]
+async fn test_mongodb_pre_release_database_is_refused() {
+    use ferrum_edge::config::db_backend::DatabaseBackend;
+    use ferrum_edge::config::mongo_index_plan::MONGO_INDEX_PLAN_VERSION_COLLECTION;
+    use ferrum_edge::config::mongo_store::MongoStore;
+
+    let url =
+        std::env::var("FERRUM_TEST_MONGO_URL").unwrap_or_else(|_| DEFAULT_MONGO_URL.to_string());
+    if !continue_if_backend_available("mongodb", mongodb_is_available(&url).await, "unreachable") {
+        return;
+    }
+    let client = MongoClient::with_uri_str(&url).await.unwrap();
+    let connect = |database_name: String| {
+        let url = url.clone();
+        async move {
+            MongoStore::connect(
+                &url,
+                &database_name,
+                None,
+                None,
+                None,
+                Some(10),
+                Some(10),
+                false,
+                None,
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    // A 0.9.x-shaped database: Ferrum documents, no plan record.
+    let legacy_name = format!("ferrum_pre_release_{}", Uuid::new_v4().simple());
+    let legacy = client.database(&legacy_name);
+    legacy
+        .collection::<Document>("proxies")
+        .insert_one(doc! { "_id": "ferrum:legacy", "namespace": "ferrum", "id": "legacy" })
+        .await
+        .unwrap();
+    let store = connect(legacy_name.clone()).await;
+    for (label, result) in [
+        ("up", store.run_migrations().await.map(|_| ())),
+        ("status", store.migration_status().await.map(|_| ())),
+    ] {
+        let error = result.expect_err("a 0.9.x database must be refused");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("kind=pre_release_database") && rendered.contains("proxies"),
+            "{label}: unexpected refusal: {rendered}"
+        );
+        assert!(
+            rendered.contains("rebuild the database"),
+            "{label}: the refusal must name the rebuild-and-restore procedure: {rendered}"
+        );
+    }
+    // Read-only: no plan record, migration lease or guard collection appears.
+    let collections = legacy.list_collection_names().await.unwrap();
+    assert!(
+        !collections
+            .iter()
+            .any(|name| name == MONGO_INDEX_PLAN_VERSION_COLLECTION
+                || name == "_ferrum_migration_locks"),
+        "a refused database must not be written: {collections:?}"
+    );
+    legacy.drop().await.unwrap();
+
+    // An empty database is new: initialized and recorded, then re-run cleanly.
+    let fresh_name = format!("ferrum_pre_release_fresh_{}", Uuid::new_v4().simple());
+    let fresh = connect(fresh_name.clone()).await;
+    fresh
+        .run_migrations()
+        .await
+        .expect("an empty database initializes");
+    fresh
+        .run_migrations()
+        .await
+        .expect("a 1.x database re-runs");
+    let status = fresh
+        .migration_status()
+        .await
+        .expect("status of a 1.x database");
+    assert!(status.recorded_plan_version.is_some());
+    client.database(&fresh_name).drop().await.unwrap();
+}
+
 /// The periodic audit age-retention sweep must reach MongoDB namespaces that
 /// receive no new audit events (insert-path pruning never revisits them), and
 /// must prune by age only.

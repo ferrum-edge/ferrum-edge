@@ -879,6 +879,7 @@ fn test_validate_explicit_spec_does_not_override_conf_file_mode() {
                 verbose: 0,
                 fips_mode: None,
                 allow_empty_namespace: false,
+                backup: None,
             };
             ferrum_edge::cli::apply_validate_overrides(&args);
             ferrum_edge::cli::infer_file_mode_from_conf(Some("cp"), None);
@@ -913,6 +914,7 @@ fn test_apply_validate_overrides_sets_spec_path() {
                 verbose: 0,
                 fips_mode: None,
                 allow_empty_namespace: false,
+                backup: None,
             };
             ferrum_edge::cli::apply_validate_overrides(&args);
             assert_eq!(
@@ -939,6 +941,7 @@ fn test_apply_validate_overrides_sets_mode() {
                 verbose: 0,
                 fips_mode: None,
                 allow_empty_namespace: false,
+                backup: None,
             };
             ferrum_edge::cli::apply_validate_overrides(&args);
             assert_eq!(std::env::var("FERRUM_MODE").unwrap(), "file");
@@ -960,6 +963,7 @@ fn test_apply_validate_overrides_explicit_mode_not_overridden_by_spec() {
                 verbose: 0,
                 fips_mode: None,
                 allow_empty_namespace: false,
+                backup: None,
             };
             ferrum_edge::cli::apply_validate_overrides(&args);
             ferrum_edge::cli::infer_file_mode();
@@ -986,6 +990,7 @@ fn test_apply_validate_overrides_verbose_levels() {
                     verbose: level,
                     fips_mode: None,
                     allow_empty_namespace: false,
+                    backup: None,
                 };
                 ferrum_edge::cli::apply_validate_overrides(&args);
                 assert_eq!(std::env::var("FERRUM_LOG_LEVEL").unwrap(), expected);
@@ -1015,6 +1020,7 @@ fn test_apply_validate_overrides_no_verbose_does_not_set_log_level() {
                 verbose: 0,
                 fips_mode: None,
                 allow_empty_namespace: false,
+                backup: None,
             };
             ferrum_edge::cli::apply_validate_overrides(&args);
             assert!(std::env::var("FERRUM_LOG_LEVEL").is_err());
@@ -1036,6 +1042,7 @@ fn test_validate_mode_and_spec_sets_env_before_infer() {
                 verbose: 0,
                 fips_mode: None,
                 allow_empty_namespace: false,
+                backup: None,
             };
             ferrum_edge::cli::apply_validate_overrides(&args);
             assert_eq!(
@@ -1063,6 +1070,7 @@ fn test_apply_validate_overrides_mode_wins_over_env() {
                 verbose: 0,
                 fips_mode: None,
                 allow_empty_namespace: false,
+                backup: None,
             };
             ferrum_edge::cli::apply_validate_overrides(&args);
             assert_eq!(
@@ -1093,6 +1101,7 @@ fn test_apply_validate_overrides_verbose_wins_over_env() {
                 verbose: 2,
                 fips_mode: None,
                 allow_empty_namespace: false,
+                backup: None,
             };
             ferrum_edge::cli::apply_validate_overrides(&args);
             assert_eq!(
