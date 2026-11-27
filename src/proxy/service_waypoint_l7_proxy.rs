@@ -418,7 +418,7 @@ pub(super) fn terminate_connect(
     epoch: &RequestEpoch,
     mut req: Request<Incoming>,
     ctx: &mut RequestContext,
-    target: ServiceWaypointL7Target,
+    target: Arc<ServiceWaypointL7Target>,
     remote_addr: SocketAddr,
     is_tls: bool,
     mesh_inbound_pre_handshake_app_port: Option<u16>,
@@ -535,7 +535,7 @@ pub(super) fn terminate_connect(
     // requests are judged by. Read from the pristine wire block.
     let outer_baggage = crate::plugins::mesh::authz::hbone_wire_folded_baggage(ctx);
     let context = Arc::new(ServiceWaypointL7Context {
-        target: target.clone(),
+        target: ServiceWaypointL7Target::clone(&target),
         outer_baggage,
     });
 
@@ -547,7 +547,9 @@ pub(super) fn terminate_connect(
         is_tls,
         has_verified_peer_certificate: ctx.tls_client_cert_der.is_some(),
         mesh_inbound_pre_handshake_app_port,
-        destination_gate: HboneRelayDestinationGate::ServiceWaypointL7(target.clone()),
+        destination_gate: HboneRelayDestinationGate::ServiceWaypointL7(
+            ServiceWaypointL7Target::clone(&target),
+        ),
         resolved_ip: None,
         // Not a configured proxy: the bound-Service gate is the presence check.
         proxy_lifecycle_generation: None,
