@@ -27,8 +27,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::time_compat::UtcTimestamp;
 use arc_swap::ArcSwap;
-use chrono::{DateTime, Utc};
 use tracing::debug;
 
 use super::inventory::TlsInventory;
@@ -53,7 +53,7 @@ pub trait TlsInventoryCollector: Send + Sync + 'static {
 pub struct TlsInventorySnapshot {
     pub inventory: Arc<TlsInventory>,
     /// Wall-clock collection time, exported as the freshness gauge.
-    pub collected_at: DateTime<Utc>,
+    pub collected_at: UtcTimestamp,
     /// Monotonic publication counter for diagnostics and cache owners.
     pub generation: u64,
     /// Monotonic collection instant: wall-clock jumps cannot pin or expire it.
@@ -257,7 +257,7 @@ impl TlsInventoryCache {
     fn publish(&self, inventory: TlsInventory, collector_generation: u64) {
         let snapshot = Arc::new(TlsInventorySnapshot {
             inventory: Arc::new(inventory),
-            collected_at: Utc::now(),
+            collected_at: UtcTimestamp::now(),
             generation: self.generation.fetch_add(1, Ordering::Relaxed) + 1,
             collected_at_instant: Instant::now(),
             collector_generation,

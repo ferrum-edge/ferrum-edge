@@ -102,8 +102,6 @@ fn test_passive_health_marks_unhealthy() {
         unhealthy_window_seconds: 60,
         healthy_after_seconds: 30,
         max_ejection_percent: None,
-        gateway_error_codes: None,
-        split_external_local_origin_errors: None,
         consecutive_error_mode: false,
         consecutive_5xx_ejection_disabled: false,
     };
@@ -133,8 +131,6 @@ fn test_passive_health_recovers() {
         unhealthy_window_seconds: 60,
         healthy_after_seconds: 30,
         max_ejection_percent: None,
-        gateway_error_codes: None,
-        split_external_local_origin_errors: None,
         consecutive_error_mode: false,
         consecutive_5xx_ejection_disabled: false,
     };
@@ -174,8 +170,6 @@ fn test_success_does_not_mark_unhealthy() {
         unhealthy_window_seconds: 60,
         healthy_after_seconds: 30,
         max_ejection_percent: None,
-        gateway_error_codes: None,
-        split_external_local_origin_errors: None,
         consecutive_error_mode: false,
         consecutive_5xx_ejection_disabled: false,
     };
@@ -205,8 +199,6 @@ fn test_connection_error_counts_as_failure_regardless_of_status_codes() {
         unhealthy_window_seconds: 60,
         healthy_after_seconds: 30,
         max_ejection_percent: None,
-        gateway_error_codes: None,
-        split_external_local_origin_errors: None,
         consecutive_error_mode: false,
         consecutive_5xx_ejection_disabled: false,
     };
@@ -239,8 +231,6 @@ fn test_connection_error_recovery_on_success() {
         unhealthy_window_seconds: 60,
         healthy_after_seconds: 30,
         max_ejection_percent: None,
-        gateway_error_codes: None,
-        split_external_local_origin_errors: None,
         consecutive_error_mode: false,
         consecutive_5xx_ejection_disabled: false,
     };
@@ -281,8 +271,6 @@ fn test_remove_stale_passive_targets_for_proxy_cleans_unhealthy() {
         unhealthy_window_seconds: 60,
         healthy_after_seconds: 30,
         max_ejection_percent: None,
-        gateway_error_codes: None,
-        split_external_local_origin_errors: None,
         consecutive_error_mode: false,
         consecutive_5xx_ejection_disabled: false,
     };
@@ -331,8 +319,6 @@ fn test_remove_stale_passive_targets_for_proxy_empty_list_clears_all() {
         unhealthy_window_seconds: 60,
         healthy_after_seconds: 30,
         max_ejection_percent: None,
-        gateway_error_codes: None,
-        split_external_local_origin_errors: None,
         consecutive_error_mode: false,
         consecutive_5xx_ejection_disabled: false,
     };
@@ -365,8 +351,6 @@ fn test_remove_stale_targets_no_op_when_all_present() {
         unhealthy_window_seconds: 60,
         healthy_after_seconds: 30,
         max_ejection_percent: None,
-        gateway_error_codes: None,
-        split_external_local_origin_errors: None,
         consecutive_error_mode: false,
         consecutive_5xx_ejection_disabled: false,
     };
@@ -412,8 +396,6 @@ fn test_passive_health_isolated_across_proxies_sharing_upstream() {
         unhealthy_window_seconds: 60,
         healthy_after_seconds: 30,
         max_ejection_percent: None,
-        gateway_error_codes: None,
-        split_external_local_origin_errors: None,
         consecutive_error_mode: false,
         consecutive_5xx_ejection_disabled: false,
     };
@@ -472,8 +454,6 @@ fn test_active_and_passive_health_are_independent() {
         unhealthy_window_seconds: 60,
         healthy_after_seconds: 30,
         max_ejection_percent: None,
-        gateway_error_codes: None,
-        split_external_local_origin_errors: None,
         consecutive_error_mode: false,
         consecutive_5xx_ejection_disabled: false,
     };
@@ -541,8 +521,6 @@ fn test_prune_removed_proxies() {
         unhealthy_window_seconds: 60,
         healthy_after_seconds: 30,
         max_ejection_percent: None,
-        gateway_error_codes: None,
-        split_external_local_origin_errors: None,
         consecutive_error_mode: false,
         consecutive_5xx_ejection_disabled: false,
     };
@@ -620,8 +598,6 @@ fn test_passive_window_only_counts_recent_failures() {
         unhealthy_window_seconds: 1, // 1 second window
         healthy_after_seconds: 30,
         max_ejection_percent: None,
-        gateway_error_codes: None,
-        split_external_local_origin_errors: None,
         consecutive_error_mode: false,
         consecutive_5xx_ejection_disabled: false,
     };
@@ -679,8 +655,6 @@ fn test_passive_window_failures_within_window_accumulate() {
         unhealthy_window_seconds: 60,
         healthy_after_seconds: 30,
         max_ejection_percent: None,
-        gateway_error_codes: None,
-        split_external_local_origin_errors: None,
         consecutive_error_mode: false,
         consecutive_5xx_ejection_disabled: false,
     };
@@ -731,8 +705,6 @@ fn test_passive_failure_ring_matches_threshold_sequences() {
         unhealthy_window_seconds: 60,
         healthy_after_seconds: 30,
         max_ejection_percent: None,
-        gateway_error_codes: None,
-        split_external_local_origin_errors: None,
         consecutive_error_mode: false,
         consecutive_5xx_ejection_disabled: false,
     };
@@ -765,8 +737,6 @@ fn test_passive_failure_ring_stays_capped_past_max() {
         unhealthy_window_seconds: 60,
         healthy_after_seconds: 30,
         max_ejection_percent: None,
-        gateway_error_codes: None,
-        split_external_local_origin_errors: None,
         consecutive_error_mode: false,
         consecutive_5xx_ejection_disabled: false,
     };
@@ -808,8 +778,6 @@ fn test_passive_failure_ring_is_isolated_per_proxy() {
         unhealthy_window_seconds: 60,
         healthy_after_seconds: 30,
         max_ejection_percent: None,
-        gateway_error_codes: None,
-        split_external_local_origin_errors: None,
         consecutive_error_mode: false,
         consecutive_5xx_ejection_disabled: false,
     };
@@ -849,8 +817,6 @@ fn test_passive_failure_ring_clears_on_success_recovery() {
         unhealthy_window_seconds: 60,
         healthy_after_seconds: 30,
         max_ejection_percent: None,
-        gateway_error_codes: None,
-        split_external_local_origin_errors: None,
         consecutive_error_mode: false,
         consecutive_5xx_ejection_disabled: false,
     };
@@ -887,8 +853,6 @@ fn test_remove_stale_passive_targets_drops_failure_ring() {
         unhealthy_window_seconds: 60,
         healthy_after_seconds: 30,
         max_ejection_percent: None,
-        gateway_error_codes: None,
-        split_external_local_origin_errors: None,
         consecutive_error_mode: false,
         consecutive_5xx_ejection_disabled: false,
     };
@@ -917,8 +881,6 @@ fn test_passive_failure_ring_clears_on_timer_recovery() {
         unhealthy_window_seconds: 60,
         healthy_after_seconds: 30,
         max_ejection_percent: None,
-        gateway_error_codes: None,
-        split_external_local_origin_errors: None,
         consecutive_error_mode: false,
         consecutive_5xx_ejection_disabled: false,
     };
@@ -951,8 +913,6 @@ fn test_passive_health_threshold_1_immediate_unhealthy() {
         unhealthy_window_seconds: 60,
         healthy_after_seconds: 30,
         max_ejection_percent: None,
-        gateway_error_codes: None,
-        split_external_local_origin_errors: None,
         consecutive_error_mode: false,
         consecutive_5xx_ejection_disabled: false,
     };
@@ -982,8 +942,6 @@ fn wall_clock_jumps_do_not_change_passive_window_or_recovery_deadline() {
         unhealthy_window_seconds: 10,
         healthy_after_seconds: 5,
         max_ejection_percent: None,
-        gateway_error_codes: None,
-        split_external_local_origin_errors: None,
         consecutive_error_mode: false,
         consecutive_5xx_ejection_disabled: false,
     };
@@ -1052,8 +1010,6 @@ fn overflowing_passive_deadline_disables_timer_recovery() {
         unhealthy_window_seconds: 10,
         healthy_after_seconds: 1,
         max_ejection_percent: None,
-        gateway_error_codes: None,
-        split_external_local_origin_errors: None,
         consecutive_error_mode: false,
         consecutive_5xx_ejection_disabled: false,
     };
@@ -1093,8 +1049,6 @@ fn test_connection_error_ignores_status_code_list() {
         unhealthy_window_seconds: 60,
         healthy_after_seconds: 30,
         max_ejection_percent: None,
-        gateway_error_codes: None,
-        split_external_local_origin_errors: None,
         consecutive_error_mode: false,
         consecutive_5xx_ejection_disabled: false,
     };
@@ -1128,8 +1082,6 @@ fn test_passive_health_per_target_isolation() {
         unhealthy_window_seconds: 60,
         healthy_after_seconds: 30,
         max_ejection_percent: None,
-        gateway_error_codes: None,
-        split_external_local_origin_errors: None,
         consecutive_error_mode: false,
         consecutive_5xx_ejection_disabled: false,
     };
@@ -1173,8 +1125,6 @@ fn test_recovery_clears_failures_then_re_threshold() {
         unhealthy_window_seconds: 60,
         healthy_after_seconds: 30,
         max_ejection_percent: None,
-        gateway_error_codes: None,
-        split_external_local_origin_errors: None,
         consecutive_error_mode: false,
         consecutive_5xx_ejection_disabled: false,
     };
@@ -2418,8 +2368,6 @@ fn consecutive_policy(threshold: u32) -> PassiveHealthCheck {
         unhealthy_window_seconds: 600,
         healthy_after_seconds: 30,
         max_ejection_percent: None,
-        gateway_error_codes: None,
-        split_external_local_origin_errors: None,
         consecutive_error_mode: true,
         consecutive_5xx_ejection_disabled: false,
     }

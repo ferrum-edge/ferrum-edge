@@ -614,10 +614,13 @@ upstreams:
 | `unhealthy_window_seconds` | integer | `30` | Time window for windowed failure counting; not consulted in consecutive mode |
 | `healthy_after_seconds` | integer | `30` | Seconds before an unhealthy target is automatically restored (0 to disable) |
 | `max_ejection_percent` | integer/null | `null` | Maximum percentage of targets that may remain passively ejected; uses Envoy's integer prospective-ejection gate, which can permit zero ejections in a small pool; null is uncapped |
-| `gateway_error_codes` | array/null | `null` | Reserved DestinationRule gateway-error bucket; validated and persisted but not yet applied |
-| `split_external_local_origin_errors` | boolean/null | `null` | Reserved separate local/external-origin buckets; validated and persisted but not yet applied |
 | `consecutive_error_mode` | boolean | `false` | Evaluate the threshold against a consecutive failure streak; one success resets it |
 | `consecutive_5xx_ejection_disabled` | boolean | `false` | Ignore configured unhealthy status codes and connection errors for this detector (Istio `consecutive5xxErrors: 0` sentinel) |
+
+The `passive` object rejects unknown keys, so a misspelled field fails
+validation instead of being ignored. Passive health keeps one failure bucket:
+HTTP status failures and connection errors count together, and there is no
+separate gateway-error (`502`/`503`/`504`) detector or local-origin bucket.
 
 **How it works:**
 

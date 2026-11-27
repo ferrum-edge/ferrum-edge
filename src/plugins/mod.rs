@@ -143,8 +143,8 @@ pub use builtin_parity::{
 pub use config_contract::PluginConfigContract;
 pub use utils::PluginHttpClient;
 
+use crate::time_compat::UtcTimestamp;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use http::HeaderMap;
 use percent_encoding::percent_decode_str;
 use serde::ser::{Serialize, SerializeMap};
@@ -2752,7 +2752,7 @@ pub struct RequestContext {
     /// and the H1/H2 body-hook context hands it back to the live context in
     /// [`Self::adopt_final_request_body_hook_terminals`].
     pub(crate) grpc_web_request_trailers: grpc_web::StagedRequestTrailers,
-    pub timestamp_received: DateTime<Utc>,
+    pub timestamp_received: UtcTimestamp,
     /// Whether the request's gRPC deadline state has been initialized from the
     /// inbound `grpc-timeout` value. Initialization happens once, immediately
     /// after routing and before any request-plugin or body-buffering await.
@@ -3837,8 +3837,11 @@ pub struct RequestContext {
     /// (`SO_ORIGINAL_DST`) and shared by every request on the connection.
     /// `None` on non-capture listeners, non-Linux platforms, and
     /// non-redirected (direct-dial) traffic. Mesh outbound routing uses the
-    /// port to disambiguate multi-port services; the address is reserved for
-    /// the raw-TCP egress follow-up.
+    /// port to disambiguate multi-port services; the full address is the
+    /// `loadBalancer.simple=PASSTHROUGH` target hint passed to
+    /// `backend_dispatch::select_upstream_target` (including the HBONE paths
+    /// in `src/proxy/hbone_proxy.rs`), and is preferred for
+    /// [`Self::destination_ip`].
     pub orig_dst: Option<std::net::SocketAddr>,
     /// Local (destination) IP of the frontend connection this request arrived
     /// on, stamped once at accept from the listener's bound address or the
@@ -4888,7 +4891,7 @@ impl RequestContext {
             client_trust_session: None,
             soap_ws_security_authenticated_body_digest: None,
             grpc_web_request_trailers: grpc_web::StagedRequestTrailers::default(),
-            timestamp_received: Utc::now(),
+            timestamp_received: UtcTimestamp::now(),
             grpc_deadline_initialized: false,
             grpc_deadline_had_valid_client_timeout: false,
             request_body_integrity_retirement: false,

@@ -2714,10 +2714,10 @@ impl MetricsRegistry {
             let Some(not_after) = entry.not_after else {
                 continue;
             };
-            let not_after_ts = not_after.timestamp();
+            let not_after_ts = not_after.unix_timestamp();
             let not_before_ts = entry
                 .not_before
-                .map(|not_before| not_before.timestamp())
+                .map(|not_before| not_before.unix_timestamp())
                 .unwrap_or(0);
             let mut surfaces = entry
                 .used_by
@@ -2771,10 +2771,10 @@ impl MetricsRegistry {
             seen_revocation.insert(key.clone());
             match self.tls_revocation_gauges.entry(key) {
                 dashmap::mapref::entry::Entry::Occupied(existing) => {
-                    changed |= existing.get().update(next_update.timestamp());
+                    changed |= existing.get().update(next_update.unix_timestamp());
                 }
                 dashmap::mapref::entry::Entry::Vacant(vacant) => {
-                    vacant.insert(TlsRevocationGaugeValues::new(next_update.timestamp()));
+                    vacant.insert(TlsRevocationGaugeValues::new(next_update.unix_timestamp()));
                     changed = true;
                 }
             }
@@ -7617,10 +7617,10 @@ impl Plugin for PrometheusMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::time_compat::UtcTimestamp;
     use crate::tls::inventory::{
         TlsInventory, TlsInventoryEntry, TlsInventorySource, TlsInventoryState, TlsInventoryUsage,
     };
-    use chrono::Utc;
 
     fn mesh_summary() -> TransactionSummary {
         TransactionSummary {
@@ -7639,10 +7639,13 @@ mod tests {
         }
     }
 
-    fn test_inventory(
-        not_before: chrono::DateTime<Utc>,
-        not_after: chrono::DateTime<Utc>,
-    ) -> TlsInventory {
+    fn days_from_now(days: i64) -> UtcTimestamp {
+        UtcTimestamp::now()
+            .checked_add(::time::SignedDuration::days(days))
+            .expect("test instant in range")
+    }
+
+    fn test_inventory(not_before: UtcTimestamp, not_after: UtcTimestamp) -> TlsInventory {
         TlsInventory {
             entries: vec![TlsInventoryEntry {
                 id: "certificate-test".to_string(),
@@ -7680,8 +7683,8 @@ mod tests {
     #[test]
     fn renders_tls_certificate_inventory_gauges() {
         let registry = MetricsRegistry::new();
-        let not_before = Utc::now() - chrono::Duration::days(1);
-        let not_after = Utc::now() + chrono::Duration::days(30);
+        let not_before = days_from_now(-1);
+        let not_after = days_from_now(30);
         let inventory = test_inventory(not_before, not_after);
 
         registry.refresh_tls_certificate_inventory(&inventory);
@@ -7729,10 +7732,7 @@ mod tests {
     #[test]
     fn unchanged_tls_inventory_preserves_render_cache() {
         let registry = MetricsRegistry::new();
-        let inventory = test_inventory(
-            Utc::now() - chrono::Duration::days(1),
-            Utc::now() + chrono::Duration::days(30),
-        );
+        let inventory = test_inventory(days_from_now(-1), days_from_now(30));
         registry.refresh_tls_certificate_inventory(&inventory);
         let _ = registry.render();
         let before = registry.render_cache.load_full();
@@ -7747,14 +7747,11 @@ mod tests {
     #[test]
     fn changed_or_removed_tls_inventory_invalidates_render_cache() {
         let registry = MetricsRegistry::new();
-        let mut inventory = test_inventory(
-            Utc::now() - chrono::Duration::days(1),
-            Utc::now() + chrono::Duration::days(30),
-        );
+        let mut inventory = test_inventory(days_from_now(-1), days_from_now(30));
         registry.refresh_tls_certificate_inventory(&inventory);
         let _ = registry.render();
 
-        inventory.entries[0].not_after = Some(Utc::now() + chrono::Duration::days(60));
+        inventory.entries[0].not_after = Some(days_from_now(60));
         registry.refresh_tls_certificate_inventory(&inventory);
         assert!(registry.render_cache.load().is_none());
 

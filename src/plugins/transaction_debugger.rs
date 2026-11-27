@@ -701,14 +701,10 @@ impl TransactionDebugger {
         ctx: &RequestContext,
         selector_headers: &HashMap<String, String>,
     ) -> Option<&'static str> {
-        // `RequestContext::timestamp_received` is still chrono-typed (issue
-        // #7419); compare the exact (seconds, nanoseconds) pair until it moves.
-        if self.capture_expires_at.is_some_and(|expires_at| {
-            (
-                ctx.timestamp_received.timestamp(),
-                ctx.timestamp_received.timestamp_subsec_nanos(),
-            ) >= (expires_at.unix_timestamp(), expires_at.subsec_nanos())
-        }) {
+        if self
+            .capture_expires_at
+            .is_some_and(|expires_at| ctx.timestamp_received >= expires_at)
+        {
             return Some("capture_expired");
         }
         if self.capture_request_header.is_some() {
@@ -2796,11 +2792,8 @@ fn segment_decodes_to_json_object_start(segment: &str) -> bool {
 /// the buffering predicates and both emission hooks agree. FNV-1a folded
 /// through the splitmix64 finalizer for an even spread.
 fn request_sample_point(ctx: &RequestContext) -> u64 {
-    let seconds = ctx.timestamp_received.timestamp().to_le_bytes();
-    let nanos = ctx
-        .timestamp_received
-        .timestamp_subsec_nanos()
-        .to_le_bytes();
+    let seconds = ctx.timestamp_received.unix_timestamp().to_le_bytes();
+    let nanos = ctx.timestamp_received.subsec_nanos().to_le_bytes();
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in seconds
         .iter()

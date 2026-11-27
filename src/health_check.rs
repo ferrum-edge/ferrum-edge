@@ -2206,7 +2206,7 @@ impl HealthChecker {
 
         // Istio `consecutive5xxErrors: 0` disables the consecutive-5xx
         // detector. With default `splitExternalLocalOriginErrors=false`
-        // (the split mode is deferred and unused), Envoy counts locally
+        // (Ferrum has no split local-origin bucket), Envoy counts locally
         // originated connection failures in that same bucket, so this
         // sentinel must fail closed for both matching HTTP status codes
         // and `connection_error`. Translated DestinationRules normally set it;

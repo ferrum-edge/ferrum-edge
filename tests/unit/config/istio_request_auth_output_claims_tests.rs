@@ -461,7 +461,8 @@ fn unenforced_outlier_fields_do_not_reject_the_resource() {
             "consecutive5xxErrors": 5,
             "consecutiveGatewayErrors": 3,
             "consecutiveLocalOriginFailures": 2,
-            "minHealthPercent": 40
+            "minHealthPercent": 40,
+            "splitExternalLocalOriginErrors": true
         }))],
     )
     .expect("deferred outlier fields are accepted, not rejected");

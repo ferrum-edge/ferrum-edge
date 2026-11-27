@@ -1262,7 +1262,8 @@ fn has_failover_priority(locality: &Value) -> bool {
 /// `outlierDetection` fields the translator parses past but never applies
 /// (issue #4292), across top-level, `portLevelSettings`, and subset policies.
 ///
-/// Kept in sync with `DEFERRED_OUTLIER_DETECTION_FIELDS` in
+/// Kept in sync with `DEFERRED_OUTLIER_DETECTION_FIELDS` and
+/// `SPLIT_EXTERNAL_LOCAL_ORIGIN_ERRORS_FIELD` in
 /// `src/config_sources/k8s/istio.rs`. Labels name the FIELD only, never the
 /// operator's configured value.
 fn deferred_outlier_detection_fields(spec: &Value) -> Vec<&'static str> {
@@ -1290,8 +1291,59 @@ fn deferred_outlier_detection_fields(spec: &Value) -> Vec<&'static str> {
              maxEjectionPercent only)",
         );
     }
+    deferred.extend(deferred_split_local_origin_fields(spec));
     deferred
 }
+
+/// `outlierDetection.splitExternalLocalOriginErrors: true`, labelled with the
+/// policy tier that carries it. Only `true` is a gap: `false` (Istio's
+/// default) is the single shared bucket Ferrum always uses.
+///
+/// Covers exactly the tiers the translator inspects: top-level,
+/// top-level `portLevelSettings[]`, and `subsets[].trafficPolicy`. A subset's
+/// own `portLevelSettings` are never parsed and are reported as a whole by
+/// [`DEFERRED_SUBSET_PORT_LEVEL_SETTINGS`].
+fn deferred_split_local_origin_fields(spec: &Value) -> Vec<&'static str> {
+    fn split_enabled(policy: Option<&Value>) -> bool {
+        policy
+            .and_then(|policy| policy.get("outlierDetection"))
+            .and_then(|outlier| outlier.get("splitExternalLocalOriginErrors"))
+            .and_then(Value::as_bool)
+            == Some(true)
+    }
+
+    let mut deferred = Vec::new();
+    let top_level = spec.get("trafficPolicy");
+    if split_enabled(top_level) {
+        deferred.push(DEFERRED_SPLIT_LOCAL_ORIGIN_TOP_LEVEL);
+    }
+    if top_level
+        .and_then(|policy| policy.get("portLevelSettings"))
+        .and_then(Value::as_array)
+        .is_some_and(|ports| ports.iter().any(|port| split_enabled(Some(port))))
+    {
+        deferred.push(DEFERRED_SPLIT_LOCAL_ORIGIN_PORT_LEVEL);
+    }
+    if spec
+        .get("subsets")
+        .and_then(Value::as_array)
+        .is_some_and(|subsets| {
+            subsets
+                .iter()
+                .any(|subset| split_enabled(subset.get("trafficPolicy")))
+        })
+    {
+        deferred.push(DEFERRED_SPLIT_LOCAL_ORIGIN_SUBSET);
+    }
+    deferred
+}
+
+const DEFERRED_SPLIT_LOCAL_ORIGIN_TOP_LEVEL: &str = "trafficPolicy.outlierDetection.splitExternalLocalOriginErrors (not applied: local-origin \
+     failures share the consecutive5xxErrors bucket)";
+const DEFERRED_SPLIT_LOCAL_ORIGIN_PORT_LEVEL: &str = "trafficPolicy.portLevelSettings[].outlierDetection.splitExternalLocalOriginErrors (not \
+     applied: local-origin failures share the consecutive5xxErrors bucket)";
+const DEFERRED_SPLIT_LOCAL_ORIGIN_SUBSET: &str = "subsets[].trafficPolicy.outlierDetection.splitExternalLocalOriginErrors (not applied: \
+     local-origin failures share the consecutive5xxErrors bucket)";
 
 /// Every `outlierDetection` block in a DestinationRule spec: top-level,
 /// per-port, per-subset, and per-subset-per-port.

@@ -530,8 +530,6 @@ fn partial_subset_and_port_outlier_overlays_share_field_level_precedence() {
         .and_then(|override_slot| override_slot.passive_health_check.as_mut())
         .expect("port passive health");
     authored_port_passive.unhealthy_status_codes = vec![429, 503];
-    authored_port_passive.gateway_error_codes = Some(vec![502, 504]);
-    authored_port_passive.split_external_local_origin_errors = Some(true);
     prepared.resolve_dispatch_port_overrides();
 
     let reprojected = prepared.proxies[0]
@@ -541,8 +539,6 @@ fn partial_subset_and_port_outlier_overlays_share_field_level_precedence() {
         .and_then(|override_slot| override_slot.passive_health_check.as_ref())
         .expect("reprojected port passive health");
     assert_eq!(reprojected.unhealthy_status_codes, vec![429, 503]);
-    assert_eq!(reprojected.gateway_error_codes, Some(vec![502, 504]));
-    assert_eq!(reprojected.split_external_local_origin_errors, Some(true));
     assert_eq!(reprojected.unhealthy_threshold, 7);
     assert_eq!(reprojected.unhealthy_window_seconds, 15);
     assert_eq!(reprojected.healthy_after_seconds, 45);

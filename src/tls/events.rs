@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::fips::approved::Sha256;
-use chrono::{DateTime, Utc};
+use crate::time_compat::UtcTimestamp;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -65,7 +65,7 @@ pub struct TlsSourceFailure {
     pub outcome: String,
     /// Closed failure class as normalized by the event log boundary.
     pub error: Option<String>,
-    pub at: DateTime<Utc>,
+    pub at: UtcTimestamp,
 }
 
 /// Return the most recent event naming `source_id` when — and only when — that
@@ -89,13 +89,13 @@ pub struct TlsEventFilter {
     pub source_id: Option<String>,
     pub surface: Option<String>,
     pub outcome: Option<String>,
-    pub since: Option<DateTime<Utc>>,
+    pub since: Option<UtcTimestamp>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TlsSourceEvent {
     pub id: u64,
-    pub at: DateTime<Utc>,
+    pub at: UtcTimestamp,
     pub surface: String,
     pub outcome: String,
     pub sources: Vec<TlsSourceEventMaterial>,
@@ -398,7 +398,7 @@ pub fn record_rotation_success(
     record_rotation_metrics(&sources, "source_refresh", "success");
     global_event_log().record(TlsSourceEvent {
         id: 0,
-        at: Utc::now(),
+        at: UtcTimestamp::now(),
         surface: surface.to_string(),
         outcome: "rotated".to_string(),
         sources,
@@ -423,7 +423,7 @@ pub fn record_rebuild_error(
     record_rotation_metrics(&sources, "source_refresh", "failure");
     global_event_log().record(TlsSourceEvent {
         id: 0,
-        at: Utc::now(),
+        at: UtcTimestamp::now(),
         surface: surface.to_string(),
         outcome: "rebuild_error".to_string(),
         sources,
@@ -443,7 +443,7 @@ pub fn record_load_error(surface: &'static str, sources: &[WatchedMaterialSource
     record_rotation_metrics(&sources, "source_refresh", "failure");
     global_event_log().record(TlsSourceEvent {
         id: 0,
-        at: Utc::now(),
+        at: UtcTimestamp::now(),
         surface: surface.to_string(),
         outcome: "load_error".to_string(),
         sources,
@@ -465,7 +465,7 @@ pub fn record_load_recovery(surface: &'static str, sources: &[WatchedMaterialSou
         .collect::<Vec<_>>();
     global_event_log().record(TlsSourceEvent {
         id: 0,
-        at: Utc::now(),
+        at: UtcTimestamp::now(),
         surface: surface.to_string(),
         outcome: "recovered".to_string(),
         sources,
@@ -630,7 +630,7 @@ mod tests {
     fn event_with(id: u64, surface: &str, outcome: &str, cert_id: &str) -> TlsSourceEvent {
         TlsSourceEvent {
             id,
-            at: Utc::now(),
+            at: UtcTimestamp::now(),
             surface: surface.to_string(),
             outcome: outcome.to_string(),
             sources: vec![TlsSourceEventMaterial {
