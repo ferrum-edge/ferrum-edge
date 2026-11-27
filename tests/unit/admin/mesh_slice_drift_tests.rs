@@ -3,7 +3,6 @@
 use std::sync::{Arc, Barrier};
 
 use arc_swap::ArcSwap;
-use chrono::Duration;
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::grpc::admission::authenticated_principal_key;
 use ferrum_edge::grpc::cp_server::CpScope;
@@ -330,7 +329,7 @@ fn maintenance_republishes_advancing_ages_without_removal() {
         .checked_add(::time::SignedDuration::seconds(42))
         .unwrap();
     assert_eq!(
-        registry.reap_expired(maintenance_at, Duration::seconds(300)),
+        registry.reap_expired(maintenance_at, ::time::SignedDuration::seconds(300)),
         0
     );
     let snapshot = registry.snapshot();
@@ -363,7 +362,7 @@ fn disconnect_retention_and_reap_are_session_safe() {
         connected_at
             .checked_add(::time::SignedDuration::seconds(302))
             .unwrap(),
-        Duration::seconds(300),
+        ::time::SignedDuration::seconds(300),
     );
     assert_eq!(removed, 1);
     assert!(registry.is_empty());
