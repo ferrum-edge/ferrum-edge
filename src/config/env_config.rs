@@ -4364,12 +4364,6 @@ pub struct EnvConfig {
     /// Values: `auto` (detect kernel support), `true` (force on), `false` (force off).
     /// Default: `auto`.
     pub io_uring_splice_enabled: AutoBool,
-    /// Enable UDP GRO (Generic Receive Offload) on frontend UDP sockets (Linux 5.0+).
-    /// Kernel coalesces multiple same-size UDP datagrams into a single large buffer,
-    /// more efficient than recvmmsg.
-    /// Values: `auto` (probe setsockopt on temp socket), `true`, `false`.
-    /// Default: `auto`.
-    pub udp_gro_enabled: AutoBool,
     /// Enable UDP GSO (Generic Segmentation Offload) for batched UDP sending (Linux 4.18+).
     /// Sends multiple datagrams in a single sendmsg() by specifying a segment size via
     /// ancillary data. The kernel splits them at the NIC level.
@@ -4886,7 +4880,6 @@ impl Default for EnvConfig {
             tcp_fastopen_queue_len: 256,
             ktls_enabled: AutoBool::Auto,
             io_uring_splice_enabled: AutoBool::Auto,
-            udp_gro_enabled: AutoBool::Auto,
             udp_gso_enabled: AutoBool::Auto,
             udp_pktinfo_enabled: AutoBool::Auto,
             so_busy_poll_us: 0,
@@ -5769,11 +5762,6 @@ impl EnvConfig {
             "FERRUM_IO_URING_SPLICE_ENABLED",
             || AutoBool::Auto,
         )?;
-        let udp_gro_enabled = env_config_macro::resolve_default::<AutoBool, _>(
-            conf,
-            "FERRUM_UDP_GRO_ENABLED",
-            || AutoBool::Auto,
-        )?;
         let udp_gso_enabled = env_config_macro::resolve_default::<AutoBool, _>(
             conf,
             "FERRUM_UDP_GSO_ENABLED",
@@ -6450,7 +6438,6 @@ impl EnvConfig {
             tcp_fastopen_queue_len,
             ktls_enabled,
             io_uring_splice_enabled,
-            udp_gro_enabled,
             udp_gso_enabled,
             udp_pktinfo_enabled,
             so_busy_poll_us,

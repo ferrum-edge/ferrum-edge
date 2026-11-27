@@ -144,6 +144,7 @@ impl NamespaceRecord {
 /// value fails deserialization and the handler answers `400` before touching
 /// persistence.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateNamespaceRequest {
     pub name: String,
     #[serde(default)]
@@ -176,6 +177,7 @@ pub struct UpdateNamespaceBody {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UpdateNamespaceObject {
     #[serde(default, deserialize_with = "deserialize_present_json_value")]
     name: Option<serde_json::Value>,
