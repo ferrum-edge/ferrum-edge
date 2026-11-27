@@ -102,8 +102,15 @@ ignore = [
     # Input trust: file-backed gateway/mesh config, config-migration input, and
     # the Kubernetes MeshConfig ConfigMap are operator-controlled; API-spec
     # bodies come from authenticated Admin API callers under body-size,
-    # node, depth, alias, and work budgets. No unauthenticated network input
-    # reaches libyaml. The serde_yaml forks (e.g. serde_yaml_ng) still depend
+    # node, depth, alias, and work budgets. One network path exists and is
+    # off by default: opt-in external `$ref` resolution
+    # (src/admin/api_specs/external_refs.rs) feeds documents fetched from
+    # other origins to the same bounded parser. It needs both
+    # FERRUM_ADMIN_SPEC_EXTERNAL_REFS_ENABLED and the per-spec
+    # x-ferrum-external-refs extension, fetches only allowlisted HTTPS origins
+    # (cleartext HTTP only for explicitly listed origins), screens addresses
+    # for SSRF, and caps documents, bytes, refs, redirects, nesting and time.
+    # The serde_yaml forks (e.g. serde_yaml_ng) still depend
     # on unsafe-libyaml, so retiring this needs a migration of both serde_yaml
     # and the two event parsers to a safe-Rust YAML parser (saphyr /
     # serde-saphyr).
@@ -112,7 +119,7 @@ ignore = [
     # 0.9.34+deprecated are still the latest crates.io releases. Retirement
     # remains a parser migration, not a dependency bump. It is also in the
     # tests/performance/mesh/ lockfile through ferrum-edge.
-    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml 0.2.11 unmaintained (archived 2024-03-25, patched = [], informational, no known vulnerability; still the latest release, re-checked 2026-11-27). Parents: serde_yaml 0.9.34+deprecated (still latest) and the direct bounded-alias event parsers (api_specs/bounded_yaml.rs, config/yaml_alias_budget.rs). Inputs are operator-controlled config files/ConfigMap or authenticated, budget-bounded Admin API spec bodies. serde_yaml forks still use unsafe-libyaml; retire by migrating serde_yaml and both event parsers to a safe-Rust parser (saphyr/serde-saphyr). [expires:2027-03-31]" },
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml 0.2.11 unmaintained (archived 2024-03-25, patched = [], informational, no known vulnerability; still the latest release, re-checked 2026-11-27). Parents: serde_yaml 0.9.34+deprecated (still latest) and the direct bounded-alias event parsers (api_specs/bounded_yaml.rs, config/yaml_alias_budget.rs). Inputs are operator-controlled config files/ConfigMap or authenticated, budget-bounded Admin API spec bodies, plus (only when opt-in external $ref resolution is enabled) documents fetched from allowlisted origins under SSRF screening and size/count/depth/time budgets. serde_yaml forks still use unsafe-libyaml; retire by migrating serde_yaml and both event parsers to a safe-Rust parser (saphyr/serde-saphyr). [expires:2027-03-31]" },
 
     # ── astral-tokio-tar 0.6.2 — RUSTSEC-2026-0440, unmaintained (Astral ended
     # maintenance on 2026-11-03; `patched = []`, every version deprecated). An

@@ -955,7 +955,12 @@ pub fn check_peer_version_compatibility(
 /// Revision 6: plugin triggers gained the `external_identity` and
 /// `external_identity_authority` leaf predicates (GHSA-rxwj-x6c6-f4j5), which
 /// a pre-change peer's closed `PluginTriggerMatch` refuses.
-pub const CONFIG_SYNC_PROTOCOL_REVISION: u32 = 6;
+///
+/// Revision 7: `PassiveHealthCheck` dropped the never-applied
+/// `gateway_error_codes` and `split_external_local_origin_errors` fields and
+/// now denies unknown fields, so a revision-6 peer's snapshot or delta that
+/// carries either key no longer decodes.
+pub const CONFIG_SYNC_PROTOCOL_REVISION: u32 = 7;
 
 /// Leading text of every ConfigSync build-mismatch refusal. The DP recognises
 /// the CP's `FAILED_PRECONDITION` Subscribe status by this prefix.
