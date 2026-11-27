@@ -344,7 +344,7 @@ impl ServiceWaypointL7Routes {
             };
             let names_service = |host: &str| {
                 let host = canonical_host(host);
-                binding.hosts.iter().any(|candidate| *candidate == host)
+                binding.hosts.contains(&host)
             };
             let carried_routes: Vec<Arc<Proxy>> = config
                 .proxies
