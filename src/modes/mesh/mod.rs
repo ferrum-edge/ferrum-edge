@@ -5119,6 +5119,10 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
     let mut leg_dispatched: HashMap<(String, String), WeightedSplitLegs> = HashMap::new();
     let mut residual_upstreams: Vec<Upstream> = Vec::new();
     let mut unrepresentable_splits = 0usize;
+    // Destinations (direct, dispatch-rule, or weighted-split leg) that are a
+    // Service in another namespace: every one refuses its route (issue
+    // #7499; the VirtualService status reports them).
+    let mut cross_namespace_refused = 0usize;
     for (namespace, id) in split_ids {
         let Some(split) = config
             .upstreams
@@ -5138,7 +5142,6 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
         let mut service_targets: Vec<(u32, Vec<UpstreamTarget>)> = Vec::new();
         let mut rebound = true;
         let mut governed_by_destination_rule = false;
-        let mut cross_namespace_leg = false;
         for target in &split.targets {
             match hosts.classify(&namespace, &target.host) {
                 CarriedRouteHost::External => {
@@ -5155,6 +5158,19 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                     external_targets.push(target.clone());
                 }
                 CarriedRouteHost::UnmodeledService => rebound = false,
+                // A leg is dispatched through a namespace-local reference
+                // (the split's own targets, or a route override naming the
+                // Service upstream), so a Service in another namespace is
+                // refused as a leg on every path, DestinationRule-governed or
+                // not, before either rebinding is chosen (issue #7499): the
+                // split fails and every route naming it is refused, while the
+                // rest of the slice keeps applying.
+                CarriedRouteHost::Service(service_namespace, _)
+                    if service_namespace != namespace =>
+                {
+                    cross_namespace_refused += 1;
+                    rebound = false;
+                }
                 CarriedRouteHost::Service(service_namespace, service_name) => {
                     if service_has_destination_rule(
                         mesh_slice,
@@ -5211,10 +5227,6 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                         rebound = false;
                         continue;
                     }
-                    // A leg is dispatched through its Service upstream by a
-                    // namespace-local route override, so a Service in another
-                    // namespace cannot be a leg.
-                    cross_namespace_leg |= service_namespace != namespace;
                     match service_legs
                         .iter_mut()
                         .find(|(leg_id, _)| *leg_id == service_upstream_id)
@@ -5233,12 +5245,7 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
         }
         if governed_by_destination_rule {
             let first_external = external_targets.first().cloned();
-            let legs_for_dispatch = if cross_namespace_leg {
-                None
-            } else {
-                weighted_split_legs(config, split, service_legs, external_targets)
-            };
-            match legs_for_dispatch {
+            match weighted_split_legs(config, split, service_legs, external_targets) {
                 Some((split_legs, residuals)) => {
                     residual_upstreams.extend(residuals);
                     leg_dispatched.insert((namespace.clone(), id.clone()), split_legs);
@@ -5299,10 +5306,12 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
     let mut wildcard_direct_backend_refused = 0usize;
     // Sidecar routes that claim the local workload's own inbound route slot.
     let mut local_inbound_route_conflicts = 0usize;
-    // Direct or dispatch-rule destinations in another namespace.
-    let mut cross_namespace_refused = 0usize;
     // Sidecar `rewrite.authority` that does not name the selected destination.
     let mut authority_rewrite_refused = 0usize;
+    // Routes that answer every request with the translator's unconditional
+    // `request_termination` 404 while naming a refused split: they never
+    // dial it, so they keep serving their 404 with the split detached.
+    let mut detached_terminating_routes: Vec<usize> = Vec::new();
     for index in 0..config.proxies.len() {
         let proxy = &config.proxies[index];
         if !config::is_virtual_service_http_route_proxy_id(&proxy.id) {
@@ -5344,6 +5353,17 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                 }
             };
         match proxy.upstream_id.as_deref() {
+            Some(upstream_id)
+                if failed_splits.contains(&(namespace.clone(), upstream_id.to_string()))
+                    && carried_route_terminates_unconditionally(config, proxy) =>
+            {
+                // The route never dials its split (the translator attached
+                // the unconditional 404 because an unsupported predicate left
+                // no dispatch rule). Refusing the route would drop that 404
+                // and hand its requests to the plain Service route, so the
+                // refused split is detached instead and pruned below.
+                detached_terminating_routes.push(index);
+            }
             Some(upstream_id) => {
                 if failed_splits.contains(&(namespace.clone(), upstream_id.to_string())) {
                     keep = false;
@@ -5566,6 +5586,13 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
             proxy.upstream_id = Some(upstream_id);
         }
     }
+    for index in detached_terminating_routes {
+        if let Some(proxy) = config.proxies.get_mut(index) {
+            proxy.upstream_id = None;
+            proxy.backend_host = REFUSED_SPLIT_BLACKHOLE_HOST.to_string();
+            proxy.backend_port = REFUSED_SPLIT_BLACKHOLE_PORT;
+        }
+    }
     for (plugin_index, rule_index, upstream_id) in rule_updates {
         let Some(destination) = config
             .plugin_configs
@@ -5718,6 +5745,34 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
         materialize_mesh_outbound_proxies(config, runtime, mesh_slice);
     }
     Ok(())
+}
+
+/// The never-resolving destination a carried route keeps when its refused
+/// split is detached because the route answers every request with its
+/// unconditional `request_termination` 404 (issue #7499). `.invalid` never
+/// resolves (RFC 6761), so even a dispatch that somehow got past the 404
+/// fails closed; the same blackhole the translator uses for all-zero-weight
+/// splits.
+const REFUSED_SPLIT_BLACKHOLE_HOST: &str = "ferrum-zero-weight.invalid.";
+
+/// The port of [`REFUSED_SPLIT_BLACKHOLE_HOST`].
+const REFUSED_SPLIT_BLACKHOLE_PORT: u16 = 80;
+
+/// Whether a carried route answers every request with the translator's
+/// unconditional `request_termination` 404 (`istio-vs-rt-<route id>`, enabled,
+/// no trigger; `decode_http_route_set` pinned its body to the translator's
+/// 404), so it never dials its own upstream.
+fn carried_route_terminates_unconditionally(config: &GatewayConfig, proxy: &Proxy) -> bool {
+    proxy.plugins.iter().any(|association| {
+        config.plugin_configs.iter().any(|plugin| {
+            plugin.plugin_name == "request_termination"
+                && plugin.namespace == proxy.namespace
+                && plugin.id == association.plugin_config_id
+                && plugin.proxy_id.as_deref() == Some(proxy.id.as_str())
+                && plugin.enabled
+                && plugin.trigger.is_none()
+        })
+    })
 }
 
 /// Pin the destination Service authority on a Sidecar mesh-mTLS target a
