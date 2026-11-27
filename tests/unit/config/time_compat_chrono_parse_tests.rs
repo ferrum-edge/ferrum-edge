@@ -712,3 +712,227 @@ fn from_str_and_deserialize_match_chrono_on_the_mutation_corpus() {
             .is_err()
     );
 }
+
+// ---- TEMPORARY chrono oracle recorder (issue #7419 Phase 21). It prints
+// chrono 0.4.45's results for every parse input as JSON lines, then fails so
+// the captured output reaches the CI log. Removed before review.
+
+fn rec_fnv(corpus: &[String]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for s in corpus {
+        for b in s.as_bytes().iter().chain(std::iter::once(&b'\n')) {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    h
+}
+
+fn rec_fixed(r: chrono::ParseResult<DateTime<FixedOffset>>) -> serde_json::Value {
+    match r {
+        Err(_) => serde_json::Value::Null,
+        Ok(t) => {
+            let n = t.naive_local();
+            serde_json::json!([
+                t.timestamp(),
+                t.timestamp_subsec_nanos(),
+                t.offset().local_minus_utc(),
+                t.timestamp_nanos_opt(),
+                t.timestamp_millis(),
+                n.year(),
+                n.month(),
+                n.day(),
+                n.hour(),
+                n.minute(),
+                n.second()
+            ])
+        }
+    }
+}
+
+fn rec_naive(r: chrono::ParseResult<NaiveDateTime>) -> serde_json::Value {
+    match r {
+        Err(_) => serde_json::Value::Null,
+        Ok(t) => {
+            let u = t.and_utc();
+            serde_json::json!([
+                u.timestamp(),
+                t.nanosecond(),
+                t.year(),
+                t.month(),
+                t.day(),
+                t.hour(),
+                t.minute(),
+                t.second(),
+                u.timestamp_nanos_opt(),
+                u.timestamp_millis()
+            ])
+        }
+    }
+}
+
+fn rec_utc(input: &str) -> serde_json::Value {
+    let s = input.parse::<DateTime<chrono::Utc>>();
+    let j = serde_json::from_value::<DateTime<chrono::Utc>>(serde_json::Value::from(input));
+    assert_eq!(s.is_ok(), j.is_ok(), "{input:?}");
+    if let (Ok(a), Ok(b)) = (&s, &j) {
+        assert_eq!(a, b, "{input:?}");
+    }
+    match s {
+        Err(_) => serde_json::Value::Null,
+        Ok(t) => {
+            let (mut secs, mut nanos) = (t.timestamp(), t.timestamp_subsec_nanos());
+            if nanos >= 1_000_000_000 {
+                secs += 1;
+                nanos -= 1_000_000_000;
+            }
+            let year = DateTime::<chrono::Utc>::from_timestamp(secs, nanos)
+                .map_or(i32::MAX, |normalized| normalized.year());
+            serde_json::json!([
+                t.timestamp(),
+                t.timestamp_subsec_nanos(),
+                t.timestamp_nanos_opt(),
+                t.timestamp_millis(),
+                year
+            ])
+        }
+    }
+}
+
+fn rec_all(input: &str) -> Vec<serde_json::Value> {
+    let mut v = vec![
+        rec_fixed(DateTime::parse_from_rfc3339(input)),
+        rec_fixed(input.parse::<DateTime<FixedOffset>>()),
+        rec_fixed(DateTime::parse_from_rfc2822(input)),
+    ];
+    for fmt in OFFSET_FORMATS {
+        v.push(rec_fixed(DateTime::parse_from_str(input, fmt)));
+    }
+    for fmt in NAIVE_FORMATS {
+        v.push(rec_naive(NaiveDateTime::parse_from_str(input, fmt)));
+    }
+    v.push(rec_utc(input));
+    v
+}
+
+#[test]
+fn zz_record_chrono_parse_oracle() {
+    let corpus = corpus();
+    println!(
+        "CHRONO_REC {}",
+        serde_json::json!({
+            "k": "meta",
+            "len": corpus.len(),
+            "fnv": format!("{:016x}", rec_fnv(&corpus)),
+            "offset_formats": OFFSET_FORMATS,
+            "naive_formats": NAIVE_FORMATS,
+        })
+    );
+    let mut lines = 0usize;
+    for input in &corpus {
+        let r = rec_all(input);
+        if r.iter().any(|x| !x.is_null()) {
+            lines += 1;
+            println!(
+                "CHRONO_REC {}",
+                serde_json::json!({"k": "c", "i": input, "r": r})
+            );
+        }
+    }
+    let extras = [
+        "2026-11-26T12:30:60.25+01:00",
+        "2026-11-26T10:20:30\u{2212}05:30",
+        "+2026-11-26T10:20:30Z",
+        "-2026-11-26T10:20:30Z",
+        "12026-11-26T10:20:30Z",
+        "+012026-11-26T10:20:30Z",
+        "2026-11-26T12:30:60Z",
+        "Sun, 06 Nov 1994 08:49:37 GMT",
+        "Mon, 06 Nov 1994 08:49:37 GMT",
+        "Mon, 31 Dec 262142 23:59:59 -2359",
+        "Mon, 31 Dec 262142 23:59:59 +2359",
+        "-262143-01-01T00:00:00+00:01",
+        "-262143-01-01T00:00:00-00:01",
+        "1999-12-31T23:59:60.5Z",
+        "1999-12-31T23:59:59.999999999Z",
+        "2000-01-01T00:00:01Z",
+        "2000-01-01T00:00:00.25Z",
+        "1999-12-31T23:59:59.5Z",
+        "9999-12-31T23:30:00-01:00",
+        "Mon, 26 Nov 12345 10:20:30 GMT",
+        "+12345-01-01T00:00:00Z",
+        "9999-12-31T23:30:00+00:00",
+        "2026-1-2T3:4:5Z",
+        " 2026 - 11 - 26T10 : 20 : 30.5 Z ",
+        "2026-11-26T10:20:30 UTC",
+        "2026-11-26T10:20:30+0530",
+        "2026-11-26T10:20:30 +05 30",
+        "2026-11-26T10:20:30+9959",
+        "2026/26 11 26 10:20",
+        "2026/27 11 26 10:20",
+        "-2026/26 11 26 10:20",
+        "2026-11-26 10:20.5",
+        "2026-11-26 10:20",
+        "Sunday, 06-Nov-94 08:49:37 GMT",
+        "Sun Nov  6 08:49:37 1994",
+    ];
+    for input in extras {
+        println!(
+            "CHRONO_REC {}",
+            serde_json::json!({"k": "x", "i": input, "r": rec_all(input)})
+        );
+    }
+    let fmt_cases: &[(&str, &str)] = &[
+        ("2026-11-26T10:20:30+9959", "%Y-%m-%dT%H:%M:%S%z"),
+        (
+            "26 November 2026 10:20:30.5 +05:30",
+            "%d %B %Y %H:%M:%S%.f %:z",
+        ),
+        ("26 Nov 2026 10:20:30 +0530", "%-d %h %Y %_H:%0M:%S %z"),
+        ("26 Nov 2026 10:20:30 +0530", "%-d %-h %Y %H:%M:%S %z"),
+        ("2026-11-26 10:20:30 +0530", "%Y-%m-%d %H:%M:%S %-z"),
+        ("2026/26 11 26 10:20", "%Y/%y %m %d %H:%M"),
+        ("2026/27 11 26 10:20", "%Y/%y %m %d %H:%M"),
+        ("-2026/26 11 26 10:20", "%Y/%y %m %d %H:%M"),
+        ("2026-11-26 10:20.5", "%Y-%m-%d %H:%M%.f"),
+        ("2026-11-26 10:20", "%Y-%m-%d %H:%M%.f"),
+        ("%2026-11-26 10:20:30", "%%%Y-%m-%d %H:%M:%S"),
+        ("26 november 2026 10:20:30", "%e %B %Y %H:%M:%S"),
+        ("Thu 26 Nov 2026 10:20:30", "%-a %d %b %Y %H:%M:%S"),
+        ("2026-11-26 10:20:30.5", "%Y-%m-%d %H:%M:%S%-.f"),
+        ("2026-11-26 10:20:30", "%Y-%m-%d %H:%M:%-%"),
+        (
+            "Sunday, 06-Nov-94 08:49:37 GMT",
+            "%A, %d-%b-%y %H:%M:%S GMT",
+        ),
+        ("Sun Nov  6 08:49:37 1994", "%a %b %e %H:%M:%S %Y"),
+        ("1994", "%G"),
+    ];
+    for (input, fmt) in fmt_cases {
+        println!(
+            "CHRONO_REC {}",
+            serde_json::json!({
+                "k": "f",
+                "i": input,
+                "f": fmt,
+                "fixed": rec_fixed(DateTime::parse_from_str(input, fmt)),
+                "naive": rec_naive(NaiveDateTime::parse_from_str(input, fmt)),
+            })
+        );
+    }
+    let leap = DateTime::parse_from_rfc3339("1999-12-31T23:59:60.5Z")
+        .unwrap()
+        .to_utc();
+    let at = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().to_utc();
+    println!(
+        "CHRONO_REC {}",
+        serde_json::json!({
+            "k": "leap",
+            "rfc3339": leap.to_rfc3339(),
+            "cmp_before": format!("{:?}", leap.cmp(&at("1999-12-31T23:59:59.999999999Z"))),
+            "cmp_after": format!("{:?}", leap.cmp(&at("2000-01-01T00:00:01Z"))),
+            "cmp_inside": format!("{:?}", leap.cmp(&at("2000-01-01T00:00:00.25Z"))),
+        })
+    );
+    panic!("chrono parse oracle recorded: {} corpus lines", lines);
+}

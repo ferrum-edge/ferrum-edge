@@ -747,6 +747,17 @@ async fn mysql_utc_timestamp_roundtrips_byte_identically_with_chrono_and_legacy_
         let ts_chrono_str: String = row.try_get(1).expect("ts_chrono text");
         let dt_compat_str: String = row.try_get(2).expect("dt_compat text");
         let dt_chrono_str: String = row.try_get(3).expect("dt_chrono text");
+        println!(
+            "CHRONO_REC {}",
+            serde_json::json!({
+                "k": "mysql_svc",
+                "secs": secs,
+                "nanos": nanos,
+                "ts_cast": ts_chrono_str,
+                "dt_cast": dt_chrono_str,
+                "vc": ch.to_rfc3339(),
+            })
+        );
         assert_eq!(ts_compat_str.as_bytes(), ts_chrono_str.as_bytes());
         assert_eq!(dt_compat_str.as_bytes(), dt_chrono_str.as_bytes());
 
@@ -802,4 +813,5 @@ async fn mysql_utc_timestamp_roundtrips_byte_identically_with_chrono_and_legacy_
         .try_get(0)
         .expect("decode legacy MySQL VARCHAR timestamp");
     assert_eq!(legacy_ts.to_rfc3339_z(), "2026-01-02T03:04:05Z");
+    panic!("TEMPORARY chrono oracle recorder (issue #7419 Phase 21): MySQL values recorded");
 }

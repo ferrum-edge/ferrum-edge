@@ -930,3 +930,351 @@ fn from_unix_timestamp_millis_matches_chrono_in_range() {
         Err(TimestampError::OutOfRange)
     );
 }
+
+// ---- TEMPORARY chrono oracle recorder (issue #7419 Phase 21). It prints
+// chrono 0.4.45's outputs for every parity case as JSON lines, then fails so
+// the captured output reaches the CI log. Removed before review.
+
+fn rec_emit(v: serde_json::Value) {
+    println!("CHRONO_REC {v}");
+}
+
+#[tokio::test]
+async fn zz_record_chrono_value_oracle() {
+    use serde_json::json;
+
+    let modes = [
+        ChronoSecondsFormat::Secs,
+        ChronoSecondsFormat::Millis,
+        ChronoSecondsFormat::Micros,
+        ChronoSecondsFormat::Nanos,
+        ChronoSecondsFormat::AutoSi,
+    ];
+    let mut instants = representative_instants();
+    instants.extend([
+        (-1, 999_500_000),
+        (-1, 999_999_999),
+        (-1, 1),
+        (-1, 0),
+        (0, 999_999),
+        (0, 1_000_000),
+    ]);
+    let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+    sqlx::query(
+        "CREATE TABLE rec (id INTEGER PRIMARY KEY, dt DATETIME NOT NULL, txt TEXT NOT NULL)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    for (idx, (secs, nanos)) in instants.into_iter().enumerate() {
+        let ch = DateTime::<Utc>::from_timestamp(secs, nanos).unwrap();
+        let mut opts = Vec::new();
+        for m in modes {
+            for z in [false, true] {
+                opts.push(ch.to_rfc3339_opts(m, z));
+            }
+        }
+        let mut my = Vec::new();
+        let my_null = <DateTime<Utc> as Encode<'_, MySql>>::encode_by_ref(&ch, &mut my).unwrap();
+        assert!(matches!(my_null, IsNull::No));
+        let mut pg = PgArgumentBuffer::default();
+        let pg_null = <DateTime<Utc> as Encode<'_, Postgres>>::encode_by_ref(&ch, &mut pg).unwrap();
+        assert!(matches!(pg_null, IsNull::No));
+        sqlx::query("INSERT INTO rec (id, dt, txt) VALUES (?1, ?2, ?3)")
+            .bind(idx as i64)
+            .bind(ch)
+            .bind(ch)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let row = sqlx::query("SELECT CAST(dt AS BLOB), CAST(txt AS BLOB) FROM rec WHERE id = ?1")
+            .bind(idx as i64)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let dt_b: Vec<u8> = row.try_get(0).unwrap();
+        let txt_b: Vec<u8> = row.try_get(1).unwrap();
+        rec_emit(json!({
+            "k": "inst",
+            "secs": secs,
+            "nanos": nanos,
+            "rfc3339": ch.to_rfc3339(),
+            "opts": opts,
+            "display": ch.to_string(),
+            "debug": format!("{ch:?}"),
+            "json": serde_json::to_string(&ch).unwrap(),
+            "yaml": serde_yaml::to_string(&ch).unwrap(),
+            "ts": ch.timestamp(),
+            "subsec": ch.timestamp_subsec_nanos(),
+            "millis": ch.timestamp_millis(),
+            "secs_z": ch.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            "ymd": ch.format("%Y%m%d").to_string(),
+            "ymdhms": ch.format("%Y%m%d%H%M%S").to_string(),
+            "rfc2822": ch.to_rfc2822(),
+            "clf": ch.format("%d/%b/%Y:%H:%M:%S %z").to_string(),
+            "mysql": hex::encode(&my),
+            "mysql_hint": <DateTime<Utc> as Encode<'_, MySql>>::size_hint(&ch),
+            "pg": hex::encode(pg.as_slice()),
+            "pg_hint": <DateTime<Utc> as Encode<'_, Postgres>>::size_hint(&ch),
+            "sqlite_dt": hex::encode(&dt_b),
+            "sqlite_txt": hex::encode(&txt_b),
+        }));
+    }
+
+    for year in [-9999, -1, 0, 1, 9999] {
+        let date = Date::from_calendar_date(year, Month::December, 31).unwrap();
+        let ts = UtcTimestamp::from_utc_date_time(date, Time::MIDNIGHT);
+        let ch = DateTime::<Utc>::from_timestamp(ts.unix_timestamp(), 0).unwrap();
+        rec_emit(json!({
+            "k": "year_display",
+            "year": year,
+            "ts": ts.unix_timestamp(),
+            "display": ch.to_string(),
+            "rfc3339": ch.to_rfc3339(),
+        }));
+    }
+    for year in [-1, 10_000] {
+        let Ok(date) = Date::from_calendar_date(year, Month::December, 31) else {
+            rec_emit(json!({"k": "compact_year", "year": year, "skipped": true}));
+            continue;
+        };
+        let ts = UtcTimestamp::from_utc_date_time(date, Time::from_hms(10, 20, 30).unwrap());
+        let ch = DateTime::<Utc>::from_timestamp(ts.unix_timestamp(), 0).unwrap();
+        rec_emit(json!({
+            "k": "compact_year",
+            "year": year,
+            "ts": ts.unix_timestamp(),
+            "ymd": ch.format("%Y%m%d").to_string(),
+            "ymdhms": ch.format("%Y%m%d%H%M%S").to_string(),
+        }));
+    }
+
+    let y1 = DateTime::parse_from_rfc3339("0001-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    rec_emit(json!({
+        "k": "misc",
+        "default_rfc3339": DateTime::<Utc>::default().to_rfc3339(),
+        "epoch_rfc3339": DateTime::<Utc>::UNIX_EPOCH.to_rfc3339(),
+        "year1_ts": y1.timestamp(),
+        "year1_rfc3339": y1.to_rfc3339(),
+        "year1_rfc2822": y1.to_rfc2822(),
+    }));
+
+    for input in [
+        "\"2026-01-02T05:04:05+02:00\"",
+        "\"2026-01-01T21:34:05.123-05:30\"",
+        "\"2026-01-02t03:04:05.123456789z\"",
+        "\"2026-01-02 03:04:05-00:00\"",
+        "\"2026-01-02T03:04:05.12345678999Z\"",
+    ] {
+        let ch: DateTime<Utc> = serde_json::from_str(input).unwrap();
+        rec_emit(json!({
+            "k": "serde_in",
+            "i": input,
+            "ts": ch.timestamp(),
+            "subsec": ch.timestamp_subsec_nanos(),
+        }));
+    }
+
+    for raw in [
+        "2026-01-02 03:04:05",
+        "2026-01-02 03:04:05.123",
+        "2026-01-02 03:04:05.123456",
+        "2026-01-02 03:04:05.123456789",
+        "2026-01-02 03:04:05Z",
+        "2026-01-02 05:04:05+02:00",
+        "2026-01-01 21:34:05.5-05:30",
+        "2026-01-02 03:04",
+        "2026-01-02 03:04Z",
+        "2026-01-02 05:04+02:00",
+        "2026-01-02T03:04",
+        "2026-01-02T03:04Z",
+        "2026-01-02T05:04+02:00",
+        "2026-01-02T03:04:05",
+        "2026-01-02T03:04:05.25",
+        "2026-01-02T03:04:05Z",
+        "2026-01-02T03:04:05+00:00",
+        "not-a-date",
+    ] {
+        let row = sqlx::query("SELECT ?1")
+            .bind(raw)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let v = row.try_get::<DateTime<Utc>, _>(0);
+        rec_emit(json!({
+            "k": "sqlite_text",
+            "i": raw,
+            "ok": v.is_ok(),
+            "ts": v.as_ref().ok().map(|d| d.timestamp()),
+            "subsec": v.as_ref().ok().map(|d| d.timestamp_subsec_nanos()),
+        }));
+    }
+    let bad = sqlx::query("SELECT 'not-a-date'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    rec_emit(json!({
+        "k": "sqlite_bad_literal",
+        "ok": bad.try_get::<DateTime<Utc>, _>(0).is_ok(),
+    }));
+    for unix_secs in [1_767_323_045_i64, 0, -86_400] {
+        let row = sqlx::query("SELECT ?1")
+            .bind(unix_secs)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let v: DateTime<Utc> = row.try_get(0).unwrap();
+        rec_emit(json!({
+            "k": "sqlite_int",
+            "i": unix_secs,
+            "ts": v.timestamp(),
+            "subsec": v.timestamp_subsec_nanos(),
+        }));
+    }
+    for (unix_secs, subsec_nanos) in [(-1_i64, 500_000_000_u32), (1, 500_000_000)] {
+        let julian = 2_440_587.5 + (unix_secs as f64 + f64::from(subsec_nanos) / 1e9) / 86_400.0;
+        let row = sqlx::query("SELECT ?1")
+            .bind(julian)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let v: DateTime<Utc> = row.try_get(0).unwrap();
+        rec_emit(json!({
+            "k": "sqlite_julian",
+            "secs": unix_secs,
+            "nanos": subsec_nanos,
+            "julian_bits": format!("{:016x}", julian.to_bits()),
+            "ts": v.timestamp(),
+            "subsec": v.timestamp_subsec_nanos(),
+        }));
+    }
+
+    let sqlite_eq = <DateTime<Utc> as Type<Sqlite>>::type_info()
+        == <time::OffsetDateTime as Type<Sqlite>>::type_info();
+    let mysql_eq = <DateTime<Utc> as Type<MySql>>::type_info()
+        == <time::OffsetDateTime as Type<MySql>>::type_info();
+    let pg_eq = <DateTime<Utc> as Type<Postgres>>::type_info()
+        == <time::OffsetDateTime as Type<Postgres>>::type_info();
+    let pg_arr_eq = <DateTime<Utc> as PgHasArrayType>::array_type_info()
+        == <time::OffsetDateTime as PgHasArrayType>::array_type_info();
+    let sqlite_chrono = format!("{:?}", <DateTime<Utc> as Type<Sqlite>>::type_info());
+    let sqlite_time = format!("{:?}", <time::OffsetDateTime as Type<Sqlite>>::type_info());
+    let mysql_chrono = format!("{:?}", <DateTime<Utc> as Type<MySql>>::type_info());
+    let mysql_time = format!("{:?}", <time::OffsetDateTime as Type<MySql>>::type_info());
+    let pg_chrono = format!("{:?}", <DateTime<Utc> as Type<Postgres>>::type_info());
+    let pg_time = format!(
+        "{:?}",
+        <time::OffsetDateTime as Type<Postgres>>::type_info()
+    );
+    let pg_arr_chrono = format!("{:?}", <DateTime<Utc> as PgHasArrayType>::array_type_info());
+    let pg_arr_time = format!(
+        "{:?}",
+        <time::OffsetDateTime as PgHasArrayType>::array_type_info()
+    );
+    rec_emit(json!({
+        "k": "type_info",
+        "sqlite_chrono": sqlite_chrono,
+        "sqlite_time": sqlite_time,
+        "sqlite_eq": sqlite_eq,
+        "mysql_chrono": mysql_chrono,
+        "mysql_time": mysql_time,
+        "mysql_eq": mysql_eq,
+        "pg_chrono": pg_chrono,
+        "pg_time": pg_time,
+        "pg_eq": pg_eq,
+        "pg_arr_chrono": pg_arr_chrono,
+        "pg_arr_time": pg_arr_time,
+        "pg_arr_eq": pg_arr_eq,
+    }));
+
+    for raw in [
+        "2026-01-02 03:04:05",
+        "2026-01-02 03:04:05.5",
+        "2026-01-02 03:04:05.123456",
+    ] {
+        let ch = NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f")
+            .unwrap()
+            .and_utc();
+        rec_emit(json!({
+            "k": "mysql_text",
+            "i": raw,
+            "ts": ch.timestamp(),
+            "subsec": ch.timestamp_subsec_nanos(),
+        }));
+    }
+    for raw in [
+        "2026-01-02 03:04:05+00",
+        "2026-01-02 03:04:05.123456+00",
+        "2026-01-02 03:04:05+00:00",
+        "2026-01-02 03:04:05.5-05",
+        "2026-01-01 21:34:05.123456-05:30",
+        "1999-12-31 23:59:59.999999+00",
+        "2000-01-01 00:00:00+00",
+        "1969-12-31 23:59:59.5-00",
+        "2026-01-02 03:04:05",
+        "2026-01-02 03:04:05.123456",
+    ] {
+        let ch_utc = if raw.len() > 19 && (raw[19..].contains('+') || raw[19..].contains('-')) {
+            DateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f%#z")
+                .unwrap()
+                .with_timezone(&Utc)
+        } else {
+            NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f")
+                .unwrap()
+                .and_utc()
+        };
+        rec_emit(json!({
+            "k": "pg_text",
+            "i": raw,
+            "ts": ch_utc.timestamp(),
+            "subsec": ch_utc.timestamp_subsec_nanos(),
+        }));
+    }
+
+    const MAX_SECS: i64 = i64::MAX / 1_000;
+    for secs in [
+        0,
+        1,
+        -1,
+        86_400,
+        MAX_SECS,
+        MAX_SECS + 1,
+        -MAX_SECS,
+        -MAX_SECS - 1,
+        i64::MAX,
+        i64::MIN,
+    ] {
+        let theirs = chrono::TimeDelta::try_seconds(secs);
+        rec_emit(json!({
+            "k": "try_seconds",
+            "i": secs,
+            "secs": theirs.map(|d| d.num_seconds()),
+        }));
+    }
+
+    for millis in [
+        0_i64,
+        1,
+        -1,
+        -999,
+        -1_000,
+        -1_001,
+        999,
+        1_767_323_045_123,
+        -30_610_224_000_000,
+        253_402_300_799_999,
+        253_402_300_800_000,
+        i64::MIN,
+    ] {
+        let theirs = DateTime::<Utc>::from_timestamp_millis(millis);
+        rec_emit(json!({
+            "k": "from_millis",
+            "i": millis,
+            "rfc3339": theirs.map(|d| d.to_rfc3339()),
+        }));
+    }
+
+    panic!("chrono value oracle recorded");
+}
