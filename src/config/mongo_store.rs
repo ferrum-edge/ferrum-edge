@@ -9925,8 +9925,37 @@ mod inner {
     /// `doc_to_*` helper strips MongoDB's `_id` before deserialization.
     fn doc_to_proxy(mut doc: Document) -> Result<Proxy, anyhow::Error> {
         doc.remove("_id");
+        project_stored_plugin_associations(&mut doc);
         let proxy: Proxy = deserialize_config_document(doc)?;
         Ok(proxy)
+    }
+
+    /// Typed view of the embedded `plugins[]` association documents.
+    ///
+    /// Stored association objects deliberately retain opaque metadata
+    /// members: deployment mutations keep the raw objects as store evidence
+    /// and write them back whenever the association identity survives (see
+    /// `crate::config::deployment_mutation`). `PluginAssociation` itself is
+    /// closed, so admission refuses such members; the typed decode of a
+    /// stored row keeps only the members the type declares, so a stored row
+    /// never becomes unreadable (or uncorrectable) because of association
+    /// metadata. Every other proxy member is still decoded strictly, and a
+    /// non-document entry still fails decoding.
+    fn project_stored_plugin_associations(doc: &mut Document) {
+        let Some(Bson::Array(associations)) = doc.get_mut("plugins") else {
+            return;
+        };
+        for entry in associations.iter_mut() {
+            if let Bson::Document(association) = entry {
+                let mut typed = Document::new();
+                for field in crate::config::types::PLUGIN_ASSOCIATION_FIELDS {
+                    if let Some(value) = association.get(*field) {
+                        typed.insert(*field, value.clone());
+                    }
+                }
+                *association = typed;
+            }
+        }
     }
 
     /// Keep BSON field paths separate from the bare serde error just like the

@@ -265,6 +265,16 @@ renamed, filtered out, or tagged GA without a manifest entry. The emitted
 `coverage.json` and `coverage.md` include the manifest-backed GA contract so
 reviewers can compare the generated matrix to the declared product promise.
 
+A row's `maturity` governs only that semantic gate. Live assertions are
+enforced on every row that declares them, whatever its maturity, unless the
+row is `live_deferred`: `tests/conformance/live_contract.rs` validates a live
+suite's `live-assertions.json` against all of them, and the generated
+matrix lists Beta and Experimental rows beside the GA ones (the Maturity
+column tells them apart). A non-GA row is live-blocking without being a
+product promise; `mesh.virtual_service.sidecar_http_routes` (Sidecar
+VirtualService `http[]` weighted split and header-match dispatch, issue
+#7502) is the current example.
+
 ## Status values
 
 The matrix tags each feature with one of three statuses:

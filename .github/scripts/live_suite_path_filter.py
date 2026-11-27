@@ -41,6 +41,21 @@ def exact_path_patterns(paths: frozenset[str]) -> list[str]:
     return [rf"^{re.escape(path)}$" for path in sorted(paths)]
 
 
+# Runtime inputs of the mesh-e2e-sidecar suite that live outside its harness
+# directory: the pinned CRD fixtures `tests/k8s/mesh_e2e_sidecar/run.sh`
+# installs (issue #7502). Exact paths, so an unrelated fixture under
+# `tests/fixtures/k8s/` (for example the Istio Status CAS lane's
+# AuthorizationPolicy CRD) does not schedule a Sidecar kind run.
+MESH_E2E_SIDECAR_CRD_FIXTURE_PATHS: frozenset[str] = frozenset(
+    {
+        "tests/fixtures/k8s/istio_virtualservice_crd.yaml",
+        "tests/fixtures/k8s/istio_destinationrule_crd.yaml",
+        "tests/fixtures/k8s/istio_peerauthentication_crd.yaml",
+        "tests/fixtures/k8s/gateway_api_referencegrant_crd.yaml",
+    }
+)
+
+
 # Pull-request relevance for the dedicated Kind live suites. Each list names
 # the surfaces that suite EXISTS to exercise: its own harness, workflow, and
 # tooling, plus the Kubernetes-facing runtime modules it drives. Broad shared
@@ -95,6 +110,9 @@ SUITE_PATTERNS: dict[str, list[str]] = {
         r"^\.github/actions/package-ferrum-runtime-image/",
         r"^\.github/actions/setup-kubernetes-tools/",
         r"^tests/k8s/mesh_e2e_sidecar/",
+        # Pinned offline CRDs run.sh installs before ferrum-cp starts (issue
+        # #7502): a change to one of them changes what the live gate runs.
+        *exact_path_patterns(MESH_E2E_SIDECAR_CRD_FIXTURE_PATHS),
         r"^tests/k8s/lib/(live_assertions|spire)\.sh$",
         r"^tests/k8s/lib/native_probe_classify\.py$",
         r"^tests/conformance/(ga_contract\.yaml|contract\.rs|live_contract\.rs|mod\.rs)$",
@@ -1334,6 +1352,11 @@ def self_test() -> int:
         ("mesh-federation", ["Cargo.toml"], False),
         ("mesh-e2e-sidecar", ["tests/k8s/mesh_e2e_sidecar/run.sh"], True),
         ("mesh-e2e-sidecar", ["tests/k8s/lib/native_probe_classify.py"], True),
+        ("mesh-e2e-sidecar", ["tests/fixtures/k8s/istio_virtualservice_crd.yaml"], True),
+        ("mesh-e2e-sidecar", ["tests/fixtures/k8s/istio_destinationrule_crd.yaml"], True),
+        ("mesh-e2e-sidecar", ["tests/fixtures/k8s/istio_peerauthentication_crd.yaml"], True),
+        ("mesh-e2e-sidecar", ["tests/fixtures/k8s/gateway_api_referencegrant_crd.yaml"], True),
+        ("mesh-e2e-sidecar", ["tests/fixtures/k8s/istio_authorizationpolicy_status_crd.yaml"], False),
         ("mesh-e2e-sidecar", [".github/actions/setup-kubernetes-tools/action.yml"], True),
         ("mesh-e2e-sidecar", ["tests/conformance/ga_contract.yaml"], True),
         ("mesh-e2e-sidecar", ["tests/conformance/mod.rs"], True),

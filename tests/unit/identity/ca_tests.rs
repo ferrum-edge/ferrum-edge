@@ -27,12 +27,14 @@ fn dev_root(td: &str) -> bootstrap::BootstrappedRoot {
     dev_root_inside_guard(td, &guard)
 }
 
-fn leaf_not_after(cert_der: &[u8]) -> chrono::DateTime<chrono::Utc> {
+fn leaf_not_after(cert_der: &[u8]) -> ferrum_edge::time_compat::UtcTimestamp {
     use x509_parser::prelude::*;
 
     let (_, parsed) = X509Certificate::from_der(cert_der).expect("issued cert parses");
-    chrono::DateTime::<chrono::Utc>::from_timestamp(parsed.validity().not_after.timestamp(), 0)
-        .expect("issued cert validity is representable")
+    ferrum_edge::time_compat::UtcTimestamp::from_unix_timestamp(
+        parsed.validity().not_after.timestamp(),
+    )
+    .expect("issued cert validity is representable")
 }
 
 #[test]
@@ -42,7 +44,7 @@ fn signed_svid_debug_redacts_private_key() {
         spiffe_id: SpiffeId::from_parts(&trust_domain, "ns/test/sa/debug").unwrap(),
         cert_chain_der: vec![b"leaf".to_vec()],
         private_key_pkcs8_der: b"secret-test-key".to_vec().into(),
-        not_after: chrono::Utc::now(),
+        not_after: ferrum_edge::time_compat::UtcTimestamp::now(),
     };
 
     let debug = format!("{svid:?}");

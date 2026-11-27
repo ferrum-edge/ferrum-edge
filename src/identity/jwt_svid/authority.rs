@@ -95,8 +95,8 @@
 use std::fmt;
 use std::sync::Arc;
 
+use crate::time_compat::UtcTimestamp;
 use arc_swap::ArcSwap;
-use chrono::{DateTime, Utc};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::Serialize;
 use tracing::{debug, info, warn};
@@ -178,8 +178,8 @@ pub struct MintedJwtSvid {
     pub spiffe_id: SpiffeId,
     pub token: String,
     pub key_id: String,
-    pub issued_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
+    pub issued_at: UtcTimestamp,
+    pub expires_at: UtcTimestamp,
 }
 
 impl fmt::Debug for MintedJwtSvid {
@@ -368,12 +368,12 @@ struct RetiredJwtKey {
     /// restart resurrect a key the previous process had already dropped.
     /// `Some(instant)` only for a key this process retired itself, which is
     /// reachable only on the ephemeral (dev/test) rotation path.
-    verifiable_until: Option<DateTime<Utc>>,
+    verifiable_until: Option<UtcTimestamp>,
 }
 
 impl RetiredJwtKey {
     /// Whether this key is still published at `now`.
-    fn is_live_at(&self, now: DateTime<Utc>) -> bool {
+    fn is_live_at(&self, now: UtcTimestamp) -> bool {
         match self.verifiable_until {
             None => true,
             Some(until) => until > now,
@@ -385,7 +385,7 @@ impl RetiredJwtKey {
 struct AuthorityState {
     generation: u64,
     active: Arc<JwtSigningKey>,
-    active_since: DateTime<Utc>,
+    active_since: UtcTimestamp,
     retired: Vec<RetiredJwtKey>,
 }
 
@@ -486,7 +486,7 @@ impl LocalJwtAuthority {
         // an out-of-range overlap must be a startup failure, not a surprise on
         // the first rotation.
         let _ = overlap_duration(max_ttl_secs)?;
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
 
         // Retired material first: it is published for verification only, and a
         // `kid` collision with the primary must be caught before either is
@@ -636,7 +636,7 @@ impl LocalJwtAuthority {
                  primary key with the previous one configured for verification instead",
             ));
         }
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let overlap = overlap_duration(self.max_ttl_secs)?;
         let previous = self.state.load_full();
 
@@ -648,7 +648,9 @@ impl LocalJwtAuthority {
             // the superseded `AuthorityState` and is released with it, so a
             // retired key is never a signing capability.
             key: Arc::new(RetainedPublicKey::from_signing_key(&previous.active)),
-            verifiable_until: Some(now + overlap),
+            verifiable_until: Some(now.checked_add(overlap).ok_or_else(|| {
+                JwtSvidError::Internal("JWT-SVID rotation overlap is out of range".to_string())
+            })?),
         });
         for entry in &previous.retired {
             if !entry.is_live_at(now) {
@@ -697,9 +699,7 @@ impl LocalJwtAuthority {
         if self.key_lifetime_secs == 0 {
             return false;
         }
-        let age = Utc::now()
-            .signed_duration_since(state.active_since)
-            .num_seconds();
+        let age = (UtcTimestamp::now() - state.active_since).whole_seconds();
         // A configured cadence is a `u64`. Casting it to `i64` would turn a
         // value above `i64::MAX` negative and make a brand-new key appear due
         // immediately. Convert the non-negative observed age instead: a clock
@@ -764,11 +764,12 @@ impl JwtSvidSigner for LocalJwtAuthority {
         let audiences = canonical_audiences(audiences)?;
         let ttl = self.clamp_ttl(ttl_secs);
 
-        let now = Utc::now();
-        let lifetime = chrono::Duration::try_seconds(ttl as i64).ok_or_else(|| {
-            JwtSvidError::Internal("JWT-SVID lifetime is out of range".to_string())
-        })?;
-        let expires_at = now + lifetime;
+        let now = UtcTimestamp::now();
+        let expires_at = crate::time_compat::chrono_try_seconds(ttl as i64)
+            .and_then(|lifetime| now.checked_add(lifetime))
+            .ok_or_else(|| {
+                JwtSvidError::Internal("JWT-SVID lifetime is out of range".to_string())
+            })?;
 
         let state = self.state.load();
         let key = Arc::clone(&state.active);
@@ -781,9 +782,9 @@ impl JwtSvidSigner for LocalJwtAuthority {
         let claims = JwtSvidClaims {
             sub: spiffe_id.as_str(),
             aud: &audiences,
-            exp: expires_at.timestamp(),
-            iat: now.timestamp(),
-            nbf: now.timestamp(),
+            exp: expires_at.unix_timestamp(),
+            iat: now.unix_timestamp(),
+            nbf: now.unix_timestamp(),
             jti: random_token_id()?,
         };
 
@@ -811,7 +812,7 @@ impl JwtSvidSigner for LocalJwtAuthority {
 
     fn authorities(&self) -> Vec<PublishedJwtAuthority> {
         let state = self.state.load();
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let mut published = Vec::with_capacity(1 + state.retired.len());
         published.push(PublishedJwtAuthority {
             trust_domain: self.trust_domain.clone(),
@@ -891,11 +892,11 @@ struct JwtSvidClaims<'a> {
     jti: String,
 }
 
-/// The rotation overlap as a `chrono::Duration`.
-fn overlap_duration(max_ttl_secs: u64) -> Result<chrono::Duration, JwtSvidError> {
-    chrono::Duration::try_seconds(rotation_overlap_secs(max_ttl_secs) as i64).ok_or_else(|| {
-        JwtSvidError::Internal("JWT-SVID rotation overlap is out of range".to_string())
-    })
+/// The rotation overlap, with chrono's former `TimeDelta` range check.
+fn overlap_duration(max_ttl_secs: u64) -> Result<time::SignedDuration, JwtSvidError> {
+    crate::time_compat::chrono_try_seconds(rotation_overlap_secs(max_ttl_secs) as i64).ok_or_else(
+        || JwtSvidError::Internal("JWT-SVID rotation overlap is out of range".to_string()),
+    )
 }
 
 /// Maximum accepted private-key PEM size. An ES256 PKCS#8 key is a few hundred

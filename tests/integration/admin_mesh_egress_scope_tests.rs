@@ -412,6 +412,21 @@ async fn mesh_egress_scope_test_endpoint_rejects_bad_request_bodies() {
         .await
         .unwrap();
     assert_eq!(response.status().as_u16(), 400);
+
+    // A positional array is not an object body, and the body is closed.
+    for body in [
+        json!(["reviews.alpha.svc.cluster.local", 8080]),
+        json!({"host": "reviews.alpha.svc.cluster.local", "prot": 8080}),
+    ] {
+        let response = client
+            .post(format!("{base_url}/mesh/egress-scope/test"))
+            .header("authorization", format!("Bearer {token}"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 400, "{body}");
+    }
 }
 
 #[tokio::test]

@@ -772,42 +772,6 @@ pub fn set_so_prefer_busy_poll(_fd: i32, _enable: bool) -> std::io::Result<()> {
     Ok(())
 }
 
-// ── UDP GRO (Generic Receive Offload) ──────────────────────────────────
-
-/// Enable `UDP_GRO` on a UDP socket (Linux 5.0+ only).
-///
-/// Tells the kernel to coalesce multiple same-size UDP datagrams into a single
-/// large buffer on receive. The application reads one large buffer and splits
-/// it by the GRO segment size. More efficient than `recvmmsg` because it avoids
-/// per-datagram metadata overhead and reduces cache pressure.
-///
-/// No-op on non-Linux platforms.
-#[cfg(target_os = "linux")]
-pub fn set_udp_gro(fd: std::os::unix::io::RawFd, enable: bool) -> std::io::Result<()> {
-    // UDP_GRO = 104 (Linux 5.0+)
-    const UDP_GRO: libc::c_int = 104;
-    let val: libc::c_int = if enable { 1 } else { 0 };
-    let ret = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::IPPROTO_UDP,
-            UDP_GRO,
-            &val as *const libc::c_int as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if ret != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    debug!("UDP_GRO enabled on socket");
-    Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn set_udp_gro(_fd: i32, _enable: bool) -> std::io::Result<()> {
-    Ok(())
-}
-
 // ── UDP GSO (Generic Segmentation Offload) ─────────────────────────────
 
 /// Bytes reserved for one `sendmsg` control block: an `IPV6_PKTINFO` cmsg
@@ -3804,36 +3768,6 @@ pub fn is_tcp_fastopen_available() -> bool {
 
 #[cfg(not(target_os = "linux"))]
 pub fn is_tcp_fastopen_available() -> bool {
-    false
-}
-
-/// Check if UDP GRO is available by probing `setsockopt(UDP_GRO)` on a temp socket.
-///
-/// Creates a temporary UDP socket, attempts to set `UDP_GRO=1`, and closes it.
-/// Returns `true` if the setsockopt succeeds (Linux 5.0+).
-#[cfg(target_os = "linux")]
-pub fn is_udp_gro_available() -> bool {
-    const UDP_GRO: libc::c_int = 104;
-    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
-    if fd < 0 {
-        return false;
-    }
-    let val: libc::c_int = 1;
-    let ret = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::IPPROTO_UDP,
-            UDP_GRO,
-            &val as *const libc::c_int as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    unsafe { libc::close(fd) };
-    ret == 0
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn is_udp_gro_available() -> bool {
     false
 }
 

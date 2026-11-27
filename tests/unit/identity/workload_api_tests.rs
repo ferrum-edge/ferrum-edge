@@ -56,7 +56,9 @@ impl CertificateAuthority for StubCa {
             spiffe_id: id,
             cert_chain_der: vec![format!("stub-cert-{n}").into_bytes()],
             private_key_pkcs8_der: b"stub-key".to_vec().into(),
-            not_after: chrono::Utc::now() + chrono::Duration::seconds(ttl as i64),
+            not_after: ferrum_edge::time_compat::UtcTimestamp::now()
+                .checked_add(::time::SignedDuration::seconds(ttl as i64))
+                .expect("SVID expiry in range"),
         })
     }
 
@@ -106,7 +108,9 @@ impl CertificateAuthority for FederatedStubCa {
             spiffe_id: id,
             cert_chain_der: vec![format!("stub-cert-{n}").into_bytes()],
             private_key_pkcs8_der: b"stub-key".to_vec().into(),
-            not_after: chrono::Utc::now() + chrono::Duration::seconds(ttl as i64),
+            not_after: ferrum_edge::time_compat::UtcTimestamp::now()
+                .checked_add(::time::SignedDuration::seconds(ttl as i64))
+                .expect("SVID expiry in range"),
         })
     }
 
@@ -2471,7 +2475,9 @@ impl CertificateAuthority for InjectedCa {
             spiffe_id: id,
             cert_chain_der: vec![b"injected-cert".to_vec()],
             private_key_pkcs8_der: b"injected-key".to_vec().into(),
-            not_after: chrono::Utc::now() + chrono::Duration::seconds(ttl as i64),
+            not_after: ferrum_edge::time_compat::UtcTimestamp::now()
+                .checked_add(::time::SignedDuration::seconds(ttl as i64))
+                .expect("SVID expiry in range"),
         })
     }
 
@@ -2781,7 +2787,9 @@ async fn workload_api_rotation_keeps_stream_open_on_transient_ca_failure() {
                 spiffe_id: id,
                 cert_chain_der: vec![format!("flip-cert-{n}").into_bytes()],
                 private_key_pkcs8_der: b"flip-key".to_vec().into(),
-                not_after: chrono::Utc::now() + chrono::Duration::seconds(ttl as i64),
+                not_after: ferrum_edge::time_compat::UtcTimestamp::now()
+                    .checked_add(::time::SignedDuration::seconds(ttl as i64))
+                    .expect("SVID expiry in range"),
             })
         }
 

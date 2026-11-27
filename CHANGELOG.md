@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **The `chrono` advisory exception (RUSTSEC-2026-0543, unmaintained, no
+  known vulnerability) is extended from 2026-12-31 to 2027-03-31** in
+  `deny.toml` and the dependency-policy register. Issue #7419 Phases 2-16 have
+  moved most standalone uses to `time_compat`; the config model, persistence
+  layer and CP/DP, mesh, K8s and xDS consumers remain.
 - **`url` is updated from 2.5.8 to 2.5.9** (with `form_urlencoded` 1.2.2 ->
   1.2.3) in the root, `fuzz/`, and `tests/performance/mesh/` lockfiles to fix
   RUSTSEC-2026-0592 (`Url::origin()` stack overflow on nested `blob:` URLs).

@@ -2,14 +2,16 @@
 //!
 //! The live Kubernetes suites under `tests/k8s/` emit a `live-assertions.json`
 //! artifact through `tests/k8s/lib/live_assertions.sh`. This module validates
-//! such an artifact against `ga_contract.yaml`: every GA capability whose
+//! such an artifact against `ga_contract.yaml`: every capability whose
 //! `live_suite` matches the artifact must have each declared live assertion
 //! PRESENT with status `pass` — a required `skip` is a failure, exactly as the
 //! emitter's header prescribes — for the expected suite, platform profile, and
-//! commit, with no duplicate assertion ids and no stale artifact. Capabilities
-//! marked `live_deferred` are REPORTED, not enforced (see the field docs in
-//! [`super::contract`]); deleting the marker is the act of enrolling a row in
-//! this gate.
+//! commit, with no duplicate assertion ids and no stale artifact. That holds
+//! for rows of every maturity ([`Contract::live_gated_capabilities`]): a Beta
+//! or Experimental row with enrolled live assertions is live-blocking without
+//! being a GA promise. Capabilities marked `live_deferred` are REPORTED, not
+//! enforced (see the field docs in [`super::contract`]); deleting the marker
+//! is the act of enrolling a row in this gate.
 //!
 //! The enforcing test ([`live_contract_artifact_gate`]) is env-gated: it
 //! validates only when `FERRUM_LIVE_ASSERTIONS_FILE` points at an artifact.
@@ -158,7 +160,7 @@ pub(crate) fn validate_live_artifact(
 
     let mut summary = Vec::new();
     let mut enforced_rows = 0usize;
-    for capability in contract.ga_capabilities() {
+    for capability in contract.live_gated_capabilities() {
         if capability.live_suite != artifact.suite {
             continue;
         }
@@ -201,12 +203,12 @@ pub(crate) fn validate_live_artifact(
     // fine — the deferral is the documented state.
     if enforced_rows == 0
         && !contract
-            .ga_capabilities()
+            .live_gated_capabilities()
             .iter()
             .any(|capability| capability.live_suite == artifact.suite)
     {
         errors.push(format!(
-            "artifact suite `{}` matches no GA-contract capability — nothing to gate \
+            "artifact suite `{}` matches no live-gated contract capability — nothing to gate \
              (suite name typo, or the contract rows were removed?)",
             artifact.suite
         ));
@@ -214,7 +216,7 @@ pub(crate) fn validate_live_artifact(
 
     if errors.is_empty() {
         summary.push(format!(
-            "validated {} enforced GA capability row(s) for suite `{}` at commit `{}`",
+            "validated {} enforced contract capability row(s) for suite `{}` at commit `{}`",
             enforced_rows, artifact.suite, artifact.commit
         ));
         Ok(summary)
@@ -453,6 +455,84 @@ fn live_contract_does_not_enforce_deferred_assertions() {
     );
 }
 
+/// Issue #7502: maturity governs the semantic gate only. A non-GA row that
+/// enrolls live assertions (no `live_deferred`) is enforced exactly like a GA
+/// row — missing, failed, or skipped ids fail the artifact — and a suite whose
+/// only rows are non-GA still counts as gated, not as a suite-name typo.
+#[test]
+fn live_contract_enforces_live_assertions_of_non_ga_rows() {
+    for maturity in ["experimental", "beta"] {
+        let yaml = format!(
+            r#"
+schema_version: 1
+capabilities:
+  - id: mesh.sample.experimental
+    display_name: Sample live-gated non-GA capability
+    maturity: {maturity}
+    topology: sidecar
+    config_protocol: istio
+    semantic_assertions:
+      - category: sample
+        feature: experimental.feature
+    live_suite: sample-suite
+    live_assertions:
+      - sample.experimental.assertion
+    platform_profile: sample-profile
+    docs_anchor: docs/mesh.md#sample
+    owner: mesh
+"#
+        );
+        let contract: Contract = serde_yaml::from_str(&yaml).expect("test contract parses");
+        contract.validate().expect("test contract is schema-valid");
+        assert!(
+            contract.ga_capabilities().is_empty(),
+            "the sample row must not be GA"
+        );
+
+        let passing = artifact_json(
+            "sample-suite",
+            "abc123",
+            "sample-profile",
+            "2026-07-01T11:00:00Z",
+            &[("sample.experimental.assertion", "pass")],
+        );
+        let summary = validate_live_artifact(&contract, &passing, &expected_all(), fixed_now())
+            .expect("a passing non-GA live assertion validates");
+        assert!(
+            summary
+                .iter()
+                .any(|line| line.contains("validated 1 enforced contract capability row(s)")),
+            "{maturity}: the non-GA row must count as enforced: {summary:?}"
+        );
+
+        for (assertions, needle) in [
+            (vec![], "missing from the artifact"),
+            (
+                vec![("sample.experimental.assertion", "fail")],
+                "has status `fail`",
+            ),
+            (
+                vec![("sample.experimental.assertion", "skip")],
+                "has status `skip`",
+            ),
+        ] {
+            let artifact = artifact_json(
+                "sample-suite",
+                "abc123",
+                "sample-profile",
+                "2026-07-01T11:00:00Z",
+                &assertions,
+            );
+            let errors = validate_live_artifact(&contract, &artifact, &expected_all(), fixed_now())
+                .expect_err("a non-GA enrolled live assertion must gate");
+            assert!(
+                errors.iter().any(|error| error.contains(needle)),
+                "{maturity}: expected `{needle}` in {errors:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn live_contract_rejects_duplicate_assertion_ids() {
     let contract = deferred_contract();
@@ -496,7 +576,7 @@ fn live_contract_rejects_suite_commit_profile_and_schema_mismatches() {
     assert!(
         errors
             .iter()
-            .any(|error| error.contains("matches no GA-contract capability")),
+            .any(|error| error.contains("matches no live-gated contract capability")),
         "a typo'd suite must not pass vacuously: {errors:?}"
     );
 
@@ -592,10 +672,11 @@ fn live_contract_real_contract_declares_the_sidecar_suite_rows() {
     // RequestAuth JWT, DR connectTimeout + maxConnections, VS CORS, SPIFFE
     // identity plumbing, DestinationRule namespace security, and the native
     // MeshSubscribe config transport are ENFORCED and emitted by
-    // tests/k8s/mesh_e2e_sidecar/run.sh.
+    // tests/k8s/mesh_e2e_sidecar/run.sh. The Experimental Sidecar
+    // VirtualService http[] routing row (issue #7502) is live-gated too.
     let contract = load_contract().expect("real contract loads");
     let sidecar_rows: Vec<_> = contract
-        .ga_capabilities()
+        .live_gated_capabilities()
         .into_iter()
         .filter(|capability| capability.live_suite == "mesh-e2e-sidecar")
         .collect();
@@ -621,6 +702,8 @@ fn live_contract_real_contract_declares_the_sidecar_suite_rows() {
         "sidecar.destination_rule.lookup_tier_client_wins",
         "sidecar.destination_rule.tcp_max_connections",
         "sidecar.virtual_service.cors_policy",
+        "sidecar.virtual_service.weighted_split_90_10",
+        "sidecar.virtual_service.header_match_dispatch",
         "sidecar.config.native_subscribe_delivered",
         "sidecar.config.native_subscribe_mtls_omitted_client_rejected",
         "sidecar.config.native_subscribe_mtls_foreign_client_rejected",
@@ -631,9 +714,31 @@ fn live_contract_real_contract_declares_the_sidecar_suite_rows() {
     ] {
         assert!(
             enforced_ids.contains(&required),
-            "`{required}` must be an enforced GA live assertion"
+            "`{required}` must be an enforced live assertion"
         );
     }
+    // Issue #7502: the split gate makes VirtualService http[] routing on a
+    // Sidecar live-gated, NOT GA. Promoting the row is an owner decision that
+    // must also move the sidecar GA headline in docs/mesh_supported_matrix.md
+    // (pinned by docs_backlog_parity_tests) and tag its semantic assertions
+    // `Maturity::Ga`.
+    let http_routes_row = sidecar_rows
+        .iter()
+        .find(|capability| capability.id == "mesh.virtual_service.sidecar_http_routes")
+        .expect("the Sidecar VirtualService http[] routing row is live-gated");
+    assert_eq!(
+        http_routes_row.maturity,
+        ContractMaturity::Experimental,
+        "VirtualService http[] routing on a Sidecar stays Experimental until an owner-reviewed promotion"
+    );
+    assert_eq!(
+        http_routes_row.live_assertions,
+        vec![
+            "sidecar.virtual_service.weighted_split_90_10".to_string(),
+            "sidecar.virtual_service.header_match_dispatch".to_string(),
+        ],
+        "the Sidecar VirtualService http[] routing row enrolls exactly the split and header-match assertions"
+    );
     let deferred: Vec<&str> = sidecar_rows
         .iter()
         .filter(|capability| capability.live_deferred.is_some())
@@ -659,7 +764,7 @@ fn live_contract_real_contract_declares_the_sidecar_suite_rows() {
 }
 
 /// Bind the sidecar fixture's `REQUIRED_LIVE_ASSERTIONS` to the enforced
-/// `mesh-e2e-sidecar` GA-contract ids (same shape as the multicluster
+/// `mesh-e2e-sidecar` contract ids (every maturity) (same shape as the multicluster
 /// fixture/gate tests). Dropping a native mTLS/JWT/SAN/rotation negative from
 /// the array, or adding an enforced contract row the fixture never requires,
 /// fails ordinary conformance CI.
@@ -698,7 +803,7 @@ fn live_contract_sidecar_fixture_requires_exactly_the_enforced_rows() {
 
     let contract = load_contract().expect("real contract loads");
     let contract_required: BTreeSet<&str> = contract
-        .ga_capabilities()
+        .live_gated_capabilities()
         .into_iter()
         .filter(|capability| {
             capability.live_suite == "mesh-e2e-sidecar" && capability.live_deferred.is_none()
@@ -2274,7 +2379,7 @@ fn live_contract_real_contract_declares_the_multicluster_suite_rows() {
     // ENFORCED and emitted by tests/k8s/multicluster-federation/run.sh.
     let contract = load_contract().expect("real contract loads");
     let multicluster_rows: Vec<_> = contract
-        .ga_capabilities()
+        .live_gated_capabilities()
         .into_iter()
         .filter(|capability| capability.live_suite == "multicluster-federation")
         .collect();
@@ -2376,8 +2481,10 @@ fn live_contract_multicluster_fixture_requires_exactly_the_enforced_rows() {
     );
 
     let contract = load_contract().expect("real contract loads");
+    // Every enrolled, non-deferred row is enforced whatever its maturity
+    // (issue #7502), so a non-GA multicluster row must be required here too.
     let contract_required: BTreeSet<&str> = contract
-        .ga_capabilities()
+        .live_gated_capabilities()
         .into_iter()
         .filter(|capability| {
             capability.live_suite == "multicluster-federation" && capability.live_deferred.is_none()
@@ -2386,7 +2493,7 @@ fn live_contract_multicluster_fixture_requires_exactly_the_enforced_rows() {
         .collect();
     assert!(
         !contract_required.is_empty(),
-        "the multicluster-federation suite must have enforced GA contract rows"
+        "the multicluster-federation suite must have enforced contract rows"
     );
 
     let missing_in_fixture: Vec<&&str> = contract_required.difference(&fixture_required).collect();
@@ -2476,8 +2583,10 @@ fn live_contract_multicluster_release_gate_requires_exactly_the_enforced_rows() 
     );
 
     let contract = load_contract().expect("real contract loads");
+    // Every enrolled, non-deferred row is enforced whatever its maturity
+    // (issue #7502), so a non-GA multicluster row must be required here too.
     let contract_required: BTreeSet<&str> = contract
-        .ga_capabilities()
+        .live_gated_capabilities()
         .into_iter()
         .filter(|capability| {
             capability.live_suite == "multicluster-federation" && capability.live_deferred.is_none()
@@ -2486,7 +2595,7 @@ fn live_contract_multicluster_release_gate_requires_exactly_the_enforced_rows() 
         .collect();
     assert!(
         !contract_required.is_empty(),
-        "the multicluster-federation suite must have enforced GA contract rows"
+        "the multicluster-federation suite must have enforced contract rows"
     );
 
     let missing_in_workflow: Vec<&&str> =
