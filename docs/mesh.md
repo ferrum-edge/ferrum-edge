@@ -1081,6 +1081,8 @@ All config sources share the same startup contract:
 
 The mesh data model lives in `src/modes/mesh/config.rs`. Namespaced resource types carry `namespace` for scope isolation, and optional fields commonly use `#[serde(default)]`; structural types such as `TrustBundleSet` and `MultiClusterConfig` are not namespace-owned rows, and some fields (for example `MeshRule.action`) are required. `GatewayConfig.mesh` is optional and omitted when absent, preserving the non-mesh representation.
 
+The native mesh schema is closed: every mesh resource object (workloads, services and their ports, ServiceEntries, DestinationRules with their traffic policies, subsets, outlier detection, locality and TLS settings, Sidecars, trust bundles, ProxyConfig, waypoint bindings and extension configs) rejects an unknown key with a deserialization error that names it. This applies to the localized file document, the Kubernetes MeshConfig ConfigMap and CP-delivered slices alike. Free-form maps such as `labels` and selectors stay open.
+
 ### Workload
 
 The unit of identity. Every SPIFFE SVID is issued to one workload.

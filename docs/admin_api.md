@@ -220,7 +220,15 @@ First-time Admin API creates often fail on three naming rules that diverge from
 naive REST guesses. The bodies below are the smallest `POST` shapes that match
 [`openapi.yaml`](../openapi.yaml) (`ProxyCreate`, `PluginConfigCreate`,
 `ConsumerCreate`, `UpstreamCreate`) and the example file-mode document
-[`tests/config.yaml`](../tests/config.yaml). Unknown fields are rejected.
+[`tests/config.yaml`](../tests/config.yaml). Unknown fields are rejected at
+every level of a resource, not only at the top: a misspelled key inside
+`health_checks`, `health_checks.active`/`passive`, `targets[]`,
+`service_discovery` (and its provider object), `subsets[]`,
+`port_overrides`, `locality_lb_setting`, `hash_on_cookie_config`,
+`circuit_breaker`, `retry` or `plugins[]` fails validation with a `400` that
+names the key. The OpenAPI schemas say so with `additionalProperties: false`.
+Free-form maps stay open: `labels`, plugin `config` (each plugin validates its
+own config), and consumer `credentials`.
 
 Mint `$TOKEN` as in [Authentication](#authentication) (`role` `admin` is
 required for consumers; `operator` can create proxies, plugin configs, and

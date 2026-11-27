@@ -805,6 +805,7 @@ pub enum LoadBalancerAlgorithm {
 /// When a subset is selected for routing, these overrides replace the upstream's
 /// default settings for the matching subset targets.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct SubsetTrafficPolicy {
     /// Override the upstream's load balancer algorithm for this subset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -955,6 +956,7 @@ pub enum H2UpgradePolicy {
 /// `Proxy` during config resolution so request dispatch can consult a
 /// precomputed map instead of re-deriving DestinationRule policy.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct UpstreamPortOverride {
     /// Per-port backend connect timeout override (milliseconds). Consulted on
     /// the dispatch hot path when the resolved destination port matches a key
@@ -1137,6 +1139,7 @@ pub struct UpstreamPortOverride {
 /// `TCP_KEEPIDLE` / `TCP_KEEPINTVL` socket options are specified in seconds on
 /// every supported platform.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct TcpKeepaliveCfg {
     /// Idle time before the first keepalive probe (`TCP_KEEPIDLE` on Linux,
     /// `TCP_KEEPALIVE` on macOS/iOS). Always positive when set.
@@ -1403,6 +1406,7 @@ pub(crate) fn dispatch_port_overrides_for_selected_subset(
 /// field selects a named subset, and the load balancer pre-filters targets
 /// to only those matching the subset's labels.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct SubsetDefinition {
     pub name: String,
     pub labels: HashMap<String, String>,
@@ -1483,6 +1487,7 @@ pub const UPSTREAM_TARGET_SERVICE_NAME_TAG: &str = "_ferrum_service_name";
 pub const UPSTREAM_TARGET_SERVICE_PORT_TAG: &str = "_ferrum_service_port";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct UpstreamTarget {
     pub host: String,
     pub port: u16,
@@ -1592,6 +1597,7 @@ fn default_weight() -> u32 {
 /// [`Upstream::source_labels`] and target `tags`). Without an applicable health
 /// policy it is inert, matching Istio.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpstreamLocalityLbSetting {
     #[serde(default = "default_true_locality_lb_enabled")]
     pub enabled: bool,
@@ -1698,6 +1704,7 @@ pub fn merge_derived_topology_labels(
 /// them as ratios so non-summing operator configs still produce a
 /// deterministic split.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LocalityDistribute {
     pub from: String,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -1707,6 +1714,7 @@ pub struct LocalityDistribute {
 /// One `localityLbSetting.failover[]` entry. `from` and `to` are Istio
 /// region names (the first `region/zone/subzone` segment of a locality).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LocalityFailover {
     pub from: String,
     pub to: String,
@@ -1729,6 +1737,7 @@ pub enum HealthProbeType {
 
 /// Active health check configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActiveHealthCheck {
     #[serde(default = "default_health_path")]
     pub http_path: String,
@@ -1884,6 +1893,7 @@ fn default_passive_window() -> u64 {
 
 /// Health check configuration for an upstream.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HealthCheckConfig {
     #[serde(default)]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
@@ -1899,6 +1909,7 @@ pub struct HealthCheckConfig {
 /// present in the request, the gateway sets a `Set-Cookie` response header so
 /// subsequent requests from the same client stick to the same backend target.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HashOnCookieConfig {
     /// Cookie `Path` attribute. Default: `"/"`.
     #[serde(default = "default_cookie_path")]
@@ -1961,6 +1972,7 @@ pub const MAX_COOKIE_DOMAIN_LENGTH: usize = 253;
 /// All runtime code (connection pools, health checks, proxy dispatch) reads
 /// from this resolved config rather than raw proxy/upstream fields.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackendTlsConfig {
     #[serde(default)]
     pub client_cert_path: Option<String>,
@@ -2401,6 +2413,7 @@ pub enum SdProvider {
 /// falling over to the next tier when a tier goes fully unhealthy and returning
 /// as soon as it recovers (see `docs/dns_resolver.md`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct DnsSdConfig {
     /// The DNS name to query for SRV records (e.g., "_http._tcp.my-service.example.com").
     pub service_name: String,
@@ -2420,6 +2433,7 @@ pub enum KubernetesAddressType {
 
 /// Kubernetes service discovery configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct KubernetesConfig {
     /// Select one address family. When omitted, prefer IPv4 if eligible IPv4
     /// targets exist in the snapshot, otherwise use IPv6.
@@ -2443,6 +2457,7 @@ pub struct KubernetesConfig {
 
 /// Consul service discovery configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ConsulConfig {
     /// Consul HTTP API address (e.g., "http://consul:8500").
     pub address: String,
@@ -2467,6 +2482,7 @@ pub struct ConsulConfig {
 
 /// Ferrum mesh service discovery configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct MeshSdConfig {
     /// Mesh service name to resolve from the CP-delivered mesh model.
     pub service_name: String,
@@ -2578,6 +2594,7 @@ impl SdStalePolicy {
 /// staleness window** (`max_stale_seconds` / `stale_policy`, issue #3717);
 /// past that window the configured expiry policy applies.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ServiceDiscoveryConfig {
     /// The service discovery provider to use.
     pub provider: SdProvider,
@@ -2633,6 +2650,7 @@ fn default_sd_healthy_only() -> bool {
 
 /// Circuit breaker configuration for a proxy.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CircuitBreakerConfig {
     #[serde(default = "default_failure_threshold")]
     pub failure_threshold: u32,
@@ -2702,6 +2720,7 @@ impl Default for BackoffStrategy {
 
 /// Retry configuration for a proxy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RetryConfig {
     #[serde(default = "default_max_retries")]
     pub max_retries: u32,
@@ -3500,6 +3519,7 @@ pub struct Proxy {
 
 /// Links a proxy to a plugin configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PluginAssociation {
     pub plugin_config_id: String,
 }

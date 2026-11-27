@@ -6773,6 +6773,7 @@ fn tls_mutation_audit_descriptor(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MeshEgressScopeTestRequest {
     host: String,
     #[serde(default)]

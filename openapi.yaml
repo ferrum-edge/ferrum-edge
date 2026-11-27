@@ -3863,6 +3863,7 @@ paths:
           application/json:
             schema:
               type: object
+              additionalProperties: false
               required: [host]
               properties:
                 host:
@@ -10347,6 +10348,7 @@ components:
           format: date-time
     CreateNamespaceRequest:
       type: object
+      additionalProperties: false
       required: [name]
       properties:
         name:
@@ -10363,6 +10365,7 @@ components:
           maxLength: 1024
     UpdateNamespaceRequest:
       type: object
+      additionalProperties: false
       properties:
         name:
           type: string
@@ -10569,6 +10572,7 @@ components:
 
     AcmeCertificateRequest:
       type: object
+      additionalProperties: false
       required: [domains, directory_url, cert_pem, key_pem]
       properties:
         id:
@@ -10753,6 +10757,7 @@ components:
 
     AcmeOrderRequest:
       type: object
+      additionalProperties: false
       required: [domains, directory_url]
       properties:
         id:
@@ -10806,6 +10811,7 @@ components:
 
     AcmeOrderFinalizeRequest:
       type: object
+      additionalProperties: false
       properties:
         certificate_id:
           type: string
@@ -10842,6 +10848,7 @@ components:
 
     AcmeRenewRequest:
       type: object
+      additionalProperties: false
       properties:
         id:
           type: string
@@ -10944,6 +10951,7 @@ components:
 
     ManagedTlsCertificateRequest:
       type: object
+      additionalProperties: false
       required: [cert_pem, key_pem]
       properties:
         id:
@@ -10980,6 +10988,7 @@ components:
 
     ManagedTlsCaBundleRequest:
       type: object
+      additionalProperties: false
       required: [ca_bundle_pem]
       properties:
         id:
@@ -11008,6 +11017,7 @@ components:
 
     ManagedTlsCrlRequest:
       type: object
+      additionalProperties: false
       required: [crl_pem]
       properties:
         id:
@@ -11034,6 +11044,7 @@ components:
 
     ManagedTlsOcspResponseRequest:
       type: object
+      additionalProperties: false
       required: [ocsp_der_base64]
       properties:
         id:
@@ -11068,6 +11079,7 @@ components:
 
     ManagedTlsJwksRequest:
       type: object
+      additionalProperties: false
       required: [jwks_json]
       properties:
         id:
@@ -11302,6 +11314,7 @@ components:
 
     TlsValidateRequest:
       type: object
+      additionalProperties: false
       properties:
         cert_pem:
           type: string
@@ -11570,6 +11583,7 @@ components:
 
     Proxy:
       type: object
+      additionalProperties: false
       properties:
         labels:
           $ref: "#/components/schemas/ResourceLabels"
@@ -12611,6 +12625,7 @@ components:
 
     PluginAssociation:
       type: object
+      additionalProperties: false
       required: [plugin_config_id]
       properties:
         plugin_config_id:
@@ -13736,6 +13751,7 @@ components:
         /plugins/config/{id}` uses `PluginConfigReplace` (`enabled` required).
         GET/list/backup responses use `PluginConfig` (`enabled` always present).
       type: object
+      additionalProperties: false
       required: [plugin_name, scope]
       properties:
         labels:
@@ -15368,6 +15384,7 @@ components:
     # ── Circuit Breaker ─────────────────────────────────────────────
     CircuitBreakerConfig:
       type: object
+      additionalProperties: false
       properties:
         failure_threshold:
           type: integer
@@ -15436,6 +15453,7 @@ components:
     # ── Retry ───────────────────────────────────────────────────────
     RetryConfig:
       type: object
+      additionalProperties: false
       properties:
         max_retries:
           type: integer
@@ -15841,6 +15859,7 @@ components:
 
     Upstream:
       type: object
+      additionalProperties: false
       required: [targets]
       anyOf:
         - properties:
@@ -16091,6 +16110,7 @@ components:
 
     UpstreamTarget:
       type: object
+      additionalProperties: false
       required: [host, port]
       properties:
         host:
@@ -16137,6 +16157,7 @@ components:
 
     SubsetDefinition:
       type: object
+      additionalProperties: false
       required: [name, labels]
       properties:
         name:
@@ -16161,6 +16182,7 @@ components:
 
     SubsetTrafficPolicy:
       type: object
+      additionalProperties: false
       properties:
         load_balancer_algorithm:
           oneOf:
@@ -16260,6 +16282,7 @@ components:
 
     MeshTrafficPolicyTls:
       type: object
+      additionalProperties: false
       required: [mode, insecure_skip_verify]
       properties:
         mode:
@@ -16296,6 +16319,7 @@ components:
 
     UpstreamLocalityLbSetting:
       type: object
+      additionalProperties: false
       required: [enabled]
       properties:
         enabled:
@@ -16326,6 +16350,7 @@ components:
 
     LocalityDistribute:
       type: object
+      additionalProperties: false
       required: [from]
       properties:
         from:
@@ -16340,6 +16365,7 @@ components:
 
     LocalityFailover:
       type: object
+      additionalProperties: false
       required: [from, to]
       properties:
         from:
@@ -16351,6 +16377,7 @@ components:
 
     BackendTlsConfig:
       type: object
+      additionalProperties: false
       properties:
         client_cert_path:
           type: [string, "null"]
@@ -16537,6 +16564,7 @@ components:
 
     TcpKeepaliveCfg:
       type: object
+      additionalProperties: false
       properties:
         time_seconds:
           type: [integer, "null"]
@@ -16558,6 +16586,7 @@ components:
 
     UpstreamPortOverride:
       type: object
+      additionalProperties: false
       properties:
         connect_timeout_ms:
           type: [integer, "null"]
@@ -16648,6 +16677,7 @@ components:
     # ── Hash-On Cookie Config ────────────────────────────────────────
     HashOnCookieConfig:
       type: object
+      additionalProperties: false
       description: >-
         Cookie attributes for `hash_on: "cookie:<name>"` sticky sessions.
         Controls the Set-Cookie header injected when a new session is established.
@@ -16698,6 +16728,7 @@ components:
     # ── Health Checks ───────────────────────────────────────────────
     HealthCheckConfig:
       type: object
+      additionalProperties: false
       properties:
         active:
           oneOf:
@@ -16710,6 +16741,7 @@ components:
 
     ActiveHealthCheck:
       type: object
+      additionalProperties: false
       properties:
         http_path:
           type: string
@@ -16862,6 +16894,7 @@ components:
     # ── Service Discovery ──────────────────────────────────────────
     ServiceDiscoveryConfig:
       type: object
+      additionalProperties: false
       required: [provider]
       description: >-
         The selected provider requires its matching configuration object. Its
@@ -16875,6 +16908,7 @@ components:
           description: Service discovery provider type
         dns_sd:
           type: [object, "null"]
+          additionalProperties: false
           description: |
             DNS-SD (SRV record) configuration. Required when provider is `dns_sd`.
             The poller queries `service_name` off the request path. It discards
@@ -16905,6 +16939,7 @@ components:
               description: Re-query interval in seconds
         kubernetes:
           type: [object, "null"]
+          additionalProperties: false
           description: Kubernetes EndpointSlice configuration. Required when provider is `kubernetes`.
           required: [service_name]
           properties:
@@ -16942,6 +16977,7 @@ components:
               default: 30
         consul:
           type: [object, "null"]
+          additionalProperties: false
           description: HashiCorp Consul configuration. Required when provider is `consul`.
           required: [address, service_name]
           properties:
@@ -16972,6 +17008,7 @@ components:
               default: 30
         mesh:
           type: [object, "null"]
+          additionalProperties: false
           description: Ferrum mesh service configuration. Required when provider is `mesh`.
           required: [service_name]
           properties:

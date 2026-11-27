@@ -1648,6 +1648,7 @@ fn validate_filter_value(key: &str, value: &str) -> Result<(), String> {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TlsValidateRequest {
     #[serde(default)]
     cert_pem: Option<String>,
@@ -1664,6 +1665,7 @@ struct TlsValidateRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManagedCertificateRequest {
     #[serde(default)]
     id: Option<String>,
@@ -1684,6 +1686,7 @@ struct ManagedCertificateRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManagedCaBundleRequest {
     #[serde(default)]
     id: Option<String>,
@@ -1701,6 +1704,7 @@ struct ManagedCaBundleRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManagedCrlRequest {
     #[serde(default)]
     id: Option<String>,
@@ -1714,6 +1718,7 @@ struct ManagedCrlRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManagedOcspResponseRequest {
     #[serde(default)]
     id: Option<String>,
@@ -1727,6 +1732,7 @@ struct ManagedOcspResponseRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManagedJwksRequest {
     #[serde(default)]
     id: Option<String>,
@@ -1740,6 +1746,7 @@ struct ManagedJwksRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AcmeCertificateRequest {
     #[serde(default)]
     id: Option<String>,
@@ -1773,6 +1780,7 @@ enum AcmeChallengeType {
 
 #[cfg(feature = "acme")]
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AcmeOrderRequest {
     #[serde(default)]
     id: Option<String>,
@@ -1794,6 +1802,7 @@ struct AcmeOrderRequest {
 
 #[cfg(feature = "acme")]
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct AcmeOrderFinalizeRequest {
     #[serde(default)]
     certificate_id: Option<String>,
@@ -1809,6 +1818,7 @@ struct AcmeOrderFinalizeRequest {
 
 #[cfg(feature = "acme")]
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct AcmeRenewRequest {
     #[serde(default)]
     id: Option<String>,
