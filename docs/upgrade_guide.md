@@ -365,8 +365,9 @@ builder setter) are now `ferrum_edge::time_compat::UtcTimestamp` instead of
 and `GatewayTrustBundleRecord` (and `updated_at` on `GatewayTrustBundleSummary`);
 `AuditEvent.ts`; `ApiSpecSnapshotView`'s `created_at`/`updated_at`; and the
 `ApiSpecListFilter.updated_since` and
-`AuditListFilter.start`/`end` list filters. `UtcTimestamp` renders the same bytes as chrono
-through `to_rfc3339()` and exposes `unix_timestamp()` and
+`AuditListFilter.start`/`end` list filters. For non-leap-second values
+`UtcTimestamp` renders the same bytes as chrono through `to_rfc3339()`; it
+exposes `unix_timestamp()` and
 `unix_timestamp_millis()`. Plugins also gain an optional
 `ON_RESPONSE_STREAM_TERMINATED` lifecycle hook bit (#7471); custom plugins keep
 the conservative dispatch path whether or not they declare it.
