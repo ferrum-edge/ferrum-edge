@@ -143,8 +143,8 @@ pub use builtin_parity::{
 pub use config_contract::PluginConfigContract;
 pub use utils::PluginHttpClient;
 
+use crate::time_compat::UtcTimestamp;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use http::HeaderMap;
 use percent_encoding::percent_decode_str;
 use serde::ser::{Serialize, SerializeMap};
@@ -2752,7 +2752,7 @@ pub struct RequestContext {
     /// and the H1/H2 body-hook context hands it back to the live context in
     /// [`Self::adopt_final_request_body_hook_terminals`].
     pub(crate) grpc_web_request_trailers: grpc_web::StagedRequestTrailers,
-    pub timestamp_received: DateTime<Utc>,
+    pub timestamp_received: UtcTimestamp,
     /// Whether the request's gRPC deadline state has been initialized from the
     /// inbound `grpc-timeout` value. Initialization happens once, immediately
     /// after routing and before any request-plugin or body-buffering await.
@@ -4888,7 +4888,7 @@ impl RequestContext {
             client_trust_session: None,
             soap_ws_security_authenticated_body_digest: None,
             grpc_web_request_trailers: grpc_web::StagedRequestTrailers::default(),
-            timestamp_received: Utc::now(),
+            timestamp_received: UtcTimestamp::now(),
             grpc_deadline_initialized: false,
             grpc_deadline_had_valid_client_timeout: false,
             request_body_integrity_retirement: false,
