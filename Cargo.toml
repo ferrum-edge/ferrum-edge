@@ -172,7 +172,7 @@ memchr = "2"
 # fails that login at runtime without it. `sqlite-bundled` +
 # `sqlite-unlock-notify` replace the `sqlite` umbrella, which would also enable
 # `sqlite-load-extension` and `sqlite-deserialize`; Ferrum uses neither.
-sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "mysql", "mysql-rsa", "sqlite-bundled", "sqlite-unlock-notify", "chrono", "time", "json"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "mysql", "mysql-rsa", "sqlite-bundled", "sqlite-unlock-notify", "time", "json"] }
 
 # Logging
 tracing = "0.1"
@@ -239,8 +239,7 @@ quinn = { version = "0.11.9", default-features = false, features = ["log", "plat
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
 
-# Time/date
-chrono = { version = "0.4", features = ["serde"] }
+# Time/date (timestamps use `time` through `src/time_compat.rs`; issue #7419)
 httpdate = "1"
 
 # Other utilities
@@ -614,6 +613,12 @@ panic = "abort"         # inherit release fail-fast; no unwind tables
 tonic-prost-build = "0.14.6"
 
 [dev-dependencies]
+# chrono is test-only (issue #7419): it is the reference oracle for the
+# `time_compat` parity tests and backs a few test-side JWT/HTTP-date helpers.
+# sqlx's `chrono` feature is enabled here, for test builds only, so the parity
+# tests can encode and decode chrono values through the same drivers.
+chrono = { version = "0.4", features = ["serde"] }
+sqlx = { version = "0.9", default-features = false, features = ["chrono"] }
 # Independent reference implementations for cryptographic test vectors and
 # request-signing fixtures. Production code routes SHA-2/HMAC-SHA-2 through
 # `crate::fips::approved` and must not depend on these RustCrypto crates.
