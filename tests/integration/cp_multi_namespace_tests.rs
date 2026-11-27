@@ -14,7 +14,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use chrono::Utc;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde_json::json;
 use tokio::time::timeout;
@@ -51,7 +50,7 @@ fn mint_token_with_ns_and_audience(
     ns: Option<serde_json::Value>,
     audience: Option<&str>,
 ) -> String {
-    let now = Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let mut claims = json!({
         "sub": node_id,
         "iat": now,

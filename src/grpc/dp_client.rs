@@ -24,7 +24,6 @@
 //! SNI is extracted from the CP URL so TLS certificate validation works
 //! correctly even when connecting via IP address with a hostname-based cert.
 use arc_swap::ArcSwap;
-use chrono::{DateTime, Utc};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::Serialize;
 use serde_json::json;
@@ -85,15 +84,15 @@ pub struct DpCpConnectionState {
     pub is_primary: bool,
     /// Timestamp of the last *accepted* config update received from CP.
     /// Rejected resource deltas must not advance this stamp.
-    pub last_config_received_at: Option<DateTime<Utc>>,
+    pub last_config_received_at: Option<UtcTimestamp>,
     /// When the current connection was established (None if disconnected).
-    pub connected_since: Option<DateTime<Utc>>,
+    pub connected_since: Option<UtcTimestamp>,
     /// Sticky operator signal: a non-empty ConfigSync DELTA was rejected and
     /// the DP has not yet accepted an authoritative FULL_SNAPSHOT recovery
     /// (issue #2394). Last-known-good config continues to serve.
     pub config_diverged: bool,
     /// When sticky divergence was first raised (cleared on FULL_SNAPSHOT recovery).
-    pub config_diverged_since: Option<DateTime<Utc>>,
+    pub config_diverged_since: Option<UtcTimestamp>,
     /// Count of divergence → FULL_SNAPSHOT recovery transitions.
     pub config_divergence_recoveries_total: u64,
 }
@@ -125,7 +124,7 @@ impl DpCpConnectionState {
         &self,
         cp_url: &str,
         is_primary: bool,
-        connected_since: DateTime<Utc>,
+        connected_since: UtcTimestamp,
     ) -> Self {
         Self {
             connected: true,
@@ -1652,7 +1651,7 @@ fn update_state_config_received(connection_state: Option<&Arc<ArcSwap<DpCpConnec
             connected: true,
             cp_url: prev.cp_url.clone(),
             is_primary: prev.is_primary,
-            last_config_received_at: Some(Utc::now()),
+            last_config_received_at: Some(UtcTimestamp::now()),
             connected_since: prev.connected_since,
             config_diverged: prev.config_diverged,
             config_diverged_since: prev.config_diverged_since,
@@ -1676,7 +1675,7 @@ fn update_state_config_diverged(
         .invalidate_configsync_divergence_metrics_cache();
     if let Some(cs) = connection_state {
         let prev = cs.load();
-        let since = prev.config_diverged_since.unwrap_or_else(Utc::now);
+        let since = prev.config_diverged_since.unwrap_or_else(UtcTimestamp::now);
         cs.store(Arc::new(DpCpConnectionState {
             connected: prev.connected,
             cp_url: prev.cp_url.clone(),
@@ -2346,7 +2345,11 @@ async fn connect_and_subscribe_with_startup_ready_inner(
     // divergence across reconnects (see `DpCpConnectionState::reconnected`).
     if let Some(cs) = connection_state {
         let prev = cs.load();
-        cs.store(Arc::new(prev.reconnected(cp_url, is_primary, Utc::now())));
+        cs.store(Arc::new(prev.reconnected(
+            cp_url,
+            is_primary,
+            UtcTimestamp::now(),
+        )));
     }
     // An authoritative source is reachable again, so the stale-config bound
     // stops accruing (issue #3726). Reachability is NOT freshness: this never

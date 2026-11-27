@@ -1856,7 +1856,11 @@ async fn remote_discovery_loop(
             // endpoint sets share one identity (issue #3611).
             let content = remote_endpoints_content_identity(&candidate.endpoints);
             ctx.revision_gate
-                .admit(candidate.revision.as_ref(), content, chrono::Utc::now())
+                .admit(
+                    candidate.revision.as_ref(),
+                    content,
+                    crate::time_compat::UtcTimestamp::now(),
+                )
                 .map_err(|rejection| {
                     RemoteDiscoveryFailure::RevisionRejected(rejection.reason())
                 })?;
@@ -5250,7 +5254,11 @@ mod tests {
             .expect("the fresh remote baseline must be fetched");
         let fresh_content = remote_endpoints_content_identity(&fresh.endpoints);
         ctx.revision_gate
-            .admit(fresh.revision.as_ref(), fresh_content, chrono::Utc::now())
+            .admit(
+                fresh.revision.as_ref(),
+                fresh_content,
+                crate::time_compat::UtcTimestamp::now(),
+            )
             .expect("the fresh remote baseline must pass the shared gate");
         let token = ctx
             .revision_gate
@@ -5271,7 +5279,11 @@ mod tests {
         let stale_content = remote_endpoints_content_identity(&stale.endpoints);
         let error = ctx
             .revision_gate
-            .admit(stale.revision.as_ref(), stale_content, chrono::Utc::now())
+            .admit(
+                stale.revision.as_ref(),
+                stale_content,
+                crate::time_compat::UtcTimestamp::now(),
+            )
             .expect_err("a reconnect must not roll remote endpoints backwards");
         assert!(
             error.to_string().contains("stale_revision"),
@@ -5352,7 +5364,11 @@ mod tests {
                 .expect("the complete remote baseline must be fetched"),
         );
         ctx.revision_gate
-            .admit(full.revision.as_ref(), full_content, chrono::Utc::now())
+            .admit(
+                full.revision.as_ref(),
+                full_content,
+                crate::time_compat::UtcTimestamp::now(),
+            )
             .expect("the complete remote baseline establishes the watermark");
         let token = ctx
             .revision_gate
@@ -5381,7 +5397,7 @@ mod tests {
             .admit(
                 partial.revision.as_ref(),
                 partial_content,
-                chrono::Utc::now(),
+                crate::time_compat::UtcTimestamp::now(),
             )
             .expect_err("a lagging remote replica must not replace live endpoints");
         assert!(
@@ -5405,7 +5421,11 @@ mod tests {
         );
         assert_eq!(replay_content, full_content);
         ctx.revision_gate
-            .admit(replay.revision.as_ref(), replay_content, chrono::Utc::now())
+            .admit(
+                replay.revision.as_ref(),
+                replay_content,
+                crate::time_compat::UtcTimestamp::now(),
+            )
             .expect("an exact-content replay at an equal revision is not a rollback");
 
         full_handle.shutdown().await;

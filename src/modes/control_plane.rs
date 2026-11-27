@@ -4354,7 +4354,7 @@ pub async fn run(
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        let now = chrono::Utc::now();
+                        let now = crate::time_compat::UtcTimestamp::now();
                         let removed = registry.remove_stale_heartbeats(
                             now,
                             mesh_node_registry_stale_ttl(),
@@ -4367,7 +4367,7 @@ pub async fn run(
                         }
                         let drift_removed = drift.reap_expired(
                             now,
-                            chrono::Duration::seconds(
+                            ::time::SignedDuration::seconds(
                                 crate::grpc::mesh_slice_drift::MESH_SLICE_DRIFT_RETENTION_SECONDS,
                             ),
                         );

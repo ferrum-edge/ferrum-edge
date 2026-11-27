@@ -44,8 +44,8 @@
 //! closed when that evidence is missing, and stamp the authorized destination
 //! so later route dispatch cannot substitute a different backend.
 
+use crate::time_compat::UtcTimestamp;
 use async_trait::async_trait;
-use chrono::Utc;
 use serde::Deserialize;
 use serde_json::Value;
 use std::borrow::Cow;
@@ -1209,7 +1209,7 @@ fn refuse_node_waypoint_route_branch(
         source,
         destination: deny_destination,
         reason: policy,
-        at: Utc::now(),
+        at: UtcTimestamp::now(),
         reevaluation: ctx
             .metadata
             .contains_key(MESH_AUTHZ_REEVALUATION_METADATA_KEY),
@@ -4394,7 +4394,7 @@ impl MeshAuthz {
             source: source_principal.map(str::to_string),
             destination: self.slice.workload_spiffe_id.clone(),
             reason: rule,
-            at: Utc::now(),
+            at: UtcTimestamp::now(),
             // An HBONE admission-fence sweep re-judging a live tunnel is not a
             // request the peer made; the drilldown must be able to separate the
             // two instead of showing byte-identical rows. Read from the same

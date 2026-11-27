@@ -51,8 +51,8 @@
 //! be able to deny mesh config delivery. See
 //! [`super::mesh_server::MeshGrpcServer::mesh_subscribe`].
 
+use crate::time_compat::UtcTimestamp;
 use arc_swap::ArcSwap;
-use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -235,13 +235,13 @@ impl MeshSliceConvergenceState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MeshSliceVersionStamp {
     pub version: String,
-    pub at: DateTime<Utc>,
+    pub at: UtcTimestamp,
     /// `now - at` in seconds, clamped to zero on clock skew.
     pub age_seconds: u64,
 }
 
 impl MeshSliceVersionStamp {
-    fn from_parts(version: String, at: DateTime<Utc>, now: DateTime<Utc>) -> Self {
+    fn from_parts(version: String, at: UtcTimestamp, now: UtcTimestamp) -> Self {
         Self {
             version,
             at,
@@ -257,9 +257,9 @@ pub struct MeshSliceDriftEntry {
     pub node_id: String,
     pub namespace: String,
     pub connected: bool,
-    pub session_connected_at: DateTime<Utc>,
+    pub session_connected_at: UtcTimestamp,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub disconnected_at: Option<DateTime<Utc>>,
+    pub disconnected_at: Option<UtcTimestamp>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub desired: Option<MeshSliceVersionStamp>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -280,7 +280,7 @@ pub struct MeshSliceDriftEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MeshSliceRejectedStamp {
     pub version: String,
-    pub at: DateTime<Utc>,
+    pub at: UtcTimestamp,
     pub age_seconds: u64,
     /// Which of the data plane's two gates refused the slice: `install` (the
     /// receive/revision gates) or `runtime` (the proxy runtime).
@@ -314,7 +314,7 @@ pub struct MeshSliceDriftSummary {
 /// Immutable admin/metrics view.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct MeshSliceDriftSnapshot {
-    pub generated_at: DateTime<Utc>,
+    pub generated_at: UtcTimestamp,
     pub data_planes: Vec<MeshSliceDriftEntry>,
     pub summary: MeshSliceDriftSummary,
 }
@@ -323,19 +323,19 @@ pub struct MeshSliceDriftSnapshot {
 struct LiveEntry {
     node_id: String,
     namespace: String,
-    connected_at: DateTime<Utc>,
+    connected_at: UtcTimestamp,
     connected: bool,
-    disconnected_at: Option<DateTime<Utc>>,
+    disconnected_at: Option<UtcTimestamp>,
     desired_version: Option<String>,
-    desired_at: Option<DateTime<Utc>>,
+    desired_at: Option<UtcTimestamp>,
     sent_version: Option<String>,
-    sent_at: Option<DateTime<Utc>>,
+    sent_at: Option<UtcTimestamp>,
     acknowledged_version: Option<String>,
-    acknowledged_at: Option<DateTime<Utc>>,
+    acknowledged_at: Option<UtcTimestamp>,
     applied_version: Option<String>,
-    applied_at: Option<DateTime<Utc>>,
+    applied_at: Option<UtcTimestamp>,
     rejected_version: Option<String>,
-    rejected_at: Option<DateTime<Utc>>,
+    rejected_at: Option<UtcTimestamp>,
     rejected_stage: Option<&'static str>,
     rejected_reason: Option<String>,
     /// Opaque, per-stream generation. Never published or logged.
@@ -458,7 +458,7 @@ struct RegistryState {
     pending_publish: bool,
     /// Wall clock of the last snapshot publication, used only to bound
     /// fan-out coalescing. `None` until the first publication.
-    last_published_at: Option<DateTime<Utc>>,
+    last_published_at: Option<UtcTimestamp>,
     /// Monotonic counter taken by every desired-state reconcile, in the order
     /// the reconciles observed published configs.
     desired_epoch: u64,
@@ -484,7 +484,7 @@ impl MeshSliceDriftRegistry {
         Self {
             state: Mutex::new(RegistryState::default()),
             snapshot: ArcSwap::from_pointee(MeshSliceDriftSnapshot {
-                generated_at: Utc::now(),
+                generated_at: UtcTimestamp::now(),
                 data_planes: Vec::new(),
                 summary: MeshSliceDriftSummary::default(),
             }),
@@ -501,7 +501,7 @@ impl MeshSliceDriftRegistry {
         Self {
             state: Mutex::new(RegistryState::default()),
             snapshot: ArcSwap::from_pointee(MeshSliceDriftSnapshot {
-                generated_at: Utc::now(),
+                generated_at: UtcTimestamp::now(),
                 data_planes: Vec::new(),
                 summary: MeshSliceDriftSummary::default(),
             }),
@@ -517,7 +517,7 @@ impl MeshSliceDriftRegistry {
         &self,
         node_id: &str,
         namespace: &str,
-        connected_at: DateTime<Utc>,
+        connected_at: UtcTimestamp,
         desired_version: Option<&str>,
     ) -> Result<String, MeshSliceDriftAdmitError> {
         self.open_session_inner(
@@ -539,7 +539,7 @@ impl MeshSliceDriftRegistry {
         &self,
         node_id: &str,
         namespace: &str,
-        connected_at: DateTime<Utc>,
+        connected_at: UtcTimestamp,
         initial_slice: &MeshSlice,
         request: MeshSliceRequest,
         scope: CpScope,
@@ -565,7 +565,7 @@ impl MeshSliceDriftRegistry {
         node_id: &str,
         registry_key: &str,
         namespace: &str,
-        connected_at: DateTime<Utc>,
+        connected_at: UtcTimestamp,
         initial_slice: &MeshSlice,
         request: MeshSliceRequest,
         scope: CpScope,
@@ -594,7 +594,7 @@ impl MeshSliceDriftRegistry {
         node_id: &str,
         registry_key: &str,
         namespace: &str,
-        connected_at: DateTime<Utc>,
+        connected_at: UtcTimestamp,
         desired_version: Option<&str>,
         projection: Option<ProjectionContext>,
         desired_content_digest: Option<[u8; 32]>,
@@ -640,7 +640,7 @@ impl MeshSliceDriftRegistry {
                 desired_epoch,
             },
         );
-        self.publish_locked(&mut state, Utc::now());
+        self.publish_locked(&mut state, UtcTimestamp::now());
         Ok(session_token)
     }
 
@@ -653,7 +653,7 @@ impl MeshSliceDriftRegistry {
         node_id: &str,
         session_token: &str,
         slice: &MeshSlice,
-        at: DateTime<Utc>,
+        at: UtcTimestamp,
     ) -> Result<(), MeshSliceDriftAdmitError> {
         self.record_sent_inner(node_id, session_token, &slice.version, at)
     }
@@ -666,7 +666,7 @@ impl MeshSliceDriftRegistry {
         node_id: &str,
         session_token: &str,
         version: &str,
-        at: DateTime<Utc>,
+        at: UtcTimestamp,
     ) -> Result<(), MeshSliceDriftAdmitError> {
         self.record_sent_inner(node_id, session_token, version, at)
     }
@@ -676,7 +676,7 @@ impl MeshSliceDriftRegistry {
         node_id: &str,
         session_token: &str,
         version: &str,
-        at: DateTime<Utc>,
+        at: UtcTimestamp,
     ) -> Result<(), MeshSliceDriftAdmitError> {
         validate_version(version)?;
         let mut state = self.state_locked();
@@ -693,7 +693,7 @@ impl MeshSliceDriftRegistry {
             entry.rejected_stage = None;
             entry.rejected_reason = None;
         }
-        self.publish_fanout_locked(&mut state, Utc::now());
+        self.publish_fanout_locked(&mut state, UtcTimestamp::now());
         Ok(())
     }
 
@@ -711,7 +711,7 @@ impl MeshSliceDriftRegistry {
     /// results are applied under the lock only to rows still on the same
     /// session that no newer reconcile has decided, so a slow publication can
     /// never overwrite a newer desired state.
-    pub fn reconcile_desired(&self, config: &GatewayConfig, at: DateTime<Utc>) -> usize {
+    pub fn reconcile_desired(&self, config: &GatewayConfig, at: UtcTimestamp) -> usize {
         let (epoch, rows) = {
             let mut state = self.state_locked();
             state.desired_epoch = state.desired_epoch.wrapping_add(1);
@@ -786,7 +786,7 @@ impl MeshSliceDriftRegistry {
         node_id: &str,
         session_token: &str,
         config: &ArcSwap<GatewayConfig>,
-        at: DateTime<Utc>,
+        at: UtcTimestamp,
     ) -> bool {
         let mut state = self.state_locked();
         let Some(entry) = state.entries.get_mut(node_id) else {
@@ -839,7 +839,7 @@ impl MeshSliceDriftRegistry {
         session_token: &str,
         version: &str,
         status: MeshSliceReportStatus,
-        at: DateTime<Utc>,
+        at: UtcTimestamp,
     ) -> Result<(), MeshSliceDriftAdmitError> {
         let node_id = validate_identity(node_id)?;
         validate_version(version)?;
@@ -877,13 +877,13 @@ impl MeshSliceDriftRegistry {
                 entry.rejected_reason = Some(rejection.as_label().to_string());
             }
         }
-        self.publish_fanout_locked(&mut state, Utc::now());
+        self.publish_fanout_locked(&mut state, UtcTimestamp::now());
         Ok(())
     }
 
     /// Mark a matching opaque session disconnected; retain until reaper expiry.
     // Public integration-test helper; see `with_max_entries`.
-    pub fn mark_disconnected(&self, node_id: &str, session_token: &str, now: DateTime<Utc>) {
+    pub fn mark_disconnected(&self, node_id: &str, session_token: &str, now: UtcTimestamp) {
         let mut state = self.state_locked();
         let Some(entry) = state.entries.get_mut(node_id) else {
             return;
@@ -904,7 +904,7 @@ impl MeshSliceDriftRegistry {
         node_id: &str,
         session_token: &str,
         config: &ArcSwap<GatewayConfig>,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
     ) {
         let mut state = self.state_locked();
         let Some(entry) = state.entries.get_mut(node_id) else {
@@ -951,16 +951,17 @@ impl MeshSliceDriftRegistry {
     }
 
     /// Remove expired disconnected rows. Returns how many were deleted.
-    pub fn reap_expired(&self, now: DateTime<Utc>, retention: chrono::Duration) -> usize {
+    pub fn reap_expired(&self, now: UtcTimestamp, retention: ::time::SignedDuration) -> usize {
         let mut state = self.state_locked();
-        let stale_before = now - retention;
+        // An unrepresentable cutoff means nothing can be older than it.
+        let stale_before = now.checked_sub(retention);
         let before = state.entries.len();
         state.entries.retain(|_, entry| {
             if entry.connected {
                 return true;
             }
             match entry.disconnected_at {
-                Some(at) => at >= stale_before,
+                Some(at) => stale_before.is_none_or(|cutoff| at >= cutoff),
                 None => false,
             }
         });
@@ -1001,7 +1002,7 @@ impl MeshSliceDriftRegistry {
 
     /// Structural publication: always rebuilds and clears any coalesced
     /// fan-out state.
-    fn publish_locked(&self, state: &mut RegistryState, now: DateTime<Utc>) {
+    fn publish_locked(&self, state: &mut RegistryState, now: UtcTimestamp) {
         state.pending_publish = false;
         state.last_published_at = Some(now);
         self.refresh_snapshot_locked(state, now);
@@ -1013,14 +1014,14 @@ impl MeshSliceDriftRegistry {
     /// exact-current behaviour; larger fleets rebuild at most once per
     /// [`SNAPSHOT_COALESCE_WINDOW_MS`] and are flushed by the next structural
     /// mutation or retention sweep.
-    fn publish_fanout_locked(&self, state: &mut RegistryState, now: DateTime<Utc>) {
+    fn publish_fanout_locked(&self, state: &mut RegistryState, now: UtcTimestamp) {
         // A negative delta means the clock moved backwards (or a caller mixed
         // fixture and wall-clock stamps); publish rather than coalesce so skew
         // can never wedge the snapshot.
         let coalesce = state.entries.len() >= SNAPSHOT_COALESCE_MIN_ENTRIES
             && state.last_published_at.is_some_and(|last| {
-                (0..SNAPSHOT_COALESCE_WINDOW_MS)
-                    .contains(&now.signed_duration_since(last).num_milliseconds())
+                (0..i128::from(SNAPSHOT_COALESCE_WINDOW_MS))
+                    .contains(&(now - last).whole_milliseconds())
             });
         if coalesce {
             state.pending_publish = true;
@@ -1029,7 +1030,7 @@ impl MeshSliceDriftRegistry {
         }
     }
 
-    fn refresh_snapshot_locked(&self, state: &RegistryState, now: DateTime<Utc>) {
+    fn refresh_snapshot_locked(&self, state: &RegistryState, now: UtcTimestamp) {
         let mut data_planes: Vec<MeshSliceDriftEntry> = state
             .entries
             .values()
@@ -1091,7 +1092,7 @@ fn project_desired(
 
 /// Apply a projected desired state. Returns `true` when the content changed;
 /// a version-only change keeps the existing desired watermark.
-fn apply_desired(entry: &mut LiveEntry, desired: ([u8; 32], String), at: DateTime<Utc>) -> bool {
+fn apply_desired(entry: &mut LiveEntry, desired: ([u8; 32], String), at: UtcTimestamp) -> bool {
     let (digest, version) = desired;
     if entry.desired_content_digest == Some(digest) {
         return false;
@@ -1128,7 +1129,7 @@ fn clear_rejection(entry: &mut LiveEntry) {
     entry.rejected_reason = None;
 }
 
-fn publish_entry(entry: &LiveEntry, now: DateTime<Utc>) -> MeshSliceDriftEntry {
+fn publish_entry(entry: &LiveEntry, now: UtcTimestamp) -> MeshSliceDriftEntry {
     let desired = entry
         .desired_version
         .as_ref()
@@ -1254,8 +1255,8 @@ fn versions_differ(left: Option<&str>, right: Option<&str>) -> bool {
     }
 }
 
-fn age_seconds(now: DateTime<Utc>, at: DateTime<Utc>) -> u64 {
-    now.signed_duration_since(at).num_seconds().max(0) as u64
+fn age_seconds(now: UtcTimestamp, at: UtcTimestamp) -> u64 {
+    (now - at).whole_seconds().max(0) as u64
 }
 
 fn validate_identity(node_id: &str) -> Result<&str, MeshSliceDriftAdmitError> {

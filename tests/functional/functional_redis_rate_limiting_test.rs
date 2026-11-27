@@ -24,6 +24,7 @@ use crate::scaffolding::port_registry::TestSocket;
 use crate::common::TestGateway;
 
 use ferrum_edge::plugins::utils::redis_rate_limiter::RedisRateLimitClient;
+use ferrum_edge::time_compat::UtcTimestamp;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use std::sync::Arc;
@@ -4733,7 +4734,7 @@ fn build_dpop_replay_fixture() -> DpopReplayFixture {
         serde_json::from_value(jwk.clone()).expect("JWK parses");
     let jkt = jwk_thumbprint_sha256(&parsed_jwk).expect("JWK thumbprint");
 
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let mut access_header = Header::new(jsonwebtoken::Algorithm::RS256);
     access_header.kid = Some("dpop-replay-key".to_string());
     let access_token = encode(
@@ -4765,7 +4766,7 @@ fn build_dpop_replay_fixture() -> DpopReplayFixture {
 fn dpop_replay_proof(fixture: &DpopReplayFixture, jti: &str) -> String {
     use jsonwebtoken::{EncodingKey, Header, encode};
 
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
     header.typ = Some("dpop+jwt".to_string());
     header.jwk = Some(serde_json::from_value(fixture.jwk.clone()).expect("JWK parses"));

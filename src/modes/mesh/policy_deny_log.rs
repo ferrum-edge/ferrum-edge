@@ -19,7 +19,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
-use chrono::{DateTime, Utc};
+use crate::time_compat::UtcTimestamp;
 use serde::Serialize;
 
 /// Default capacity when no `FERRUM_MESH_POLICY_DENY_LOG_CAPACITY` override is
@@ -69,7 +69,7 @@ pub struct PolicyDenyEvent {
     /// Wall-clock time the deny was observed. Recorded as UTC `DateTime` so
     /// admin payloads can render RFC 3339 without re-deriving from an
     /// `Instant`.
-    pub at: DateTime<Utc>,
+    pub at: UtcTimestamp,
     /// `true` when this deny came from an HBONE admission-fence sweep
     /// re-judging an ALREADY-ADMITTED live tunnel (the `mesh_authz.reevaluation`
     /// metadata marker), not from a request the peer just made.
@@ -153,7 +153,7 @@ impl PolicyDenyRecorder {
     /// `limit == 0` is treated as "no grouped output" and returns an empty
     /// grouping slice with the total filtered count preserved so the admin
     /// payload can still report `total_denies` for the window.
-    pub fn aggregate_recent(&self, cutoff: DateTime<Utc>, limit: usize) -> PolicyDenyAggregate {
+    pub fn aggregate_recent(&self, cutoff: UtcTimestamp, limit: usize) -> PolicyDenyAggregate {
         let snapshot: Vec<PolicyDenyEvent> = {
             let guard = match self.inner.lock() {
                 Ok(g) => g,
@@ -291,8 +291,8 @@ pub struct PolicyDenyGroup {
     /// [`PolicyDenyEvent::reevaluation`].
     pub reevaluation: bool,
     pub count: u64,
-    pub first_at: DateTime<Utc>,
-    pub last_at: DateTime<Utc>,
+    pub first_at: UtcTimestamp,
+    pub last_at: UtcTimestamp,
 }
 
 /// Borrow the process-singleton recorder. Cheap (clone of an `Arc`).
@@ -344,9 +344,8 @@ pub fn configure_global_capacity(capacity: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Duration as ChronoDuration;
 
-    fn event(rule: &str, reason: &str, at: DateTime<Utc>) -> PolicyDenyEvent {
+    fn event(rule: &str, reason: &str, at: UtcTimestamp) -> PolicyDenyEvent {
         event_full(
             rule,
             Some("spiffe://cluster.local/ns/staging/sa/web"),
@@ -361,7 +360,7 @@ mod tests {
         source: Option<&str>,
         destination: Option<&str>,
         reason: &str,
-        at: DateTime<Utc>,
+        at: UtcTimestamp,
     ) -> PolicyDenyEvent {
         PolicyDenyEvent {
             rule: rule.to_string(),
@@ -383,12 +382,16 @@ mod tests {
     #[test]
     fn zero_capacity_recorder_is_a_noop() {
         let recorder = PolicyDenyRecorder::with_capacity(0);
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         recorder.record(event("rule-a", "deny", now));
         recorder.record(event("rule-b", "deny", now));
         assert!(recorder.is_empty());
         assert_eq!(recorder.capacity(), 0);
-        let aggregate = recorder.aggregate_recent(now - ChronoDuration::seconds(60), 50);
+        let aggregate = recorder.aggregate_recent(
+            now.checked_sub(::time::SignedDuration::seconds(60))
+                .unwrap(),
+            50,
+        );
         assert_eq!(aggregate.total_denies, 0);
         assert!(aggregate.grouped.is_empty());
     }
@@ -396,18 +399,23 @@ mod tests {
     #[test]
     fn ring_evicts_oldest_when_full() {
         let recorder = PolicyDenyRecorder::with_capacity(3);
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         for i in 0..5u32 {
             recorder.record(event(
                 &format!("rule-{i}"),
                 "deny",
-                now + ChronoDuration::seconds(i as i64),
+                now.checked_add(::time::SignedDuration::seconds(i as i64))
+                    .unwrap(),
             ));
         }
         assert_eq!(recorder.len(), 3);
         // Confirm the three retained events are the newest by aggregating —
         // older rules ("rule-0", "rule-1") must not appear.
-        let aggregate = recorder.aggregate_recent(now - ChronoDuration::seconds(60), 50);
+        let aggregate = recorder.aggregate_recent(
+            now.checked_sub(::time::SignedDuration::seconds(60))
+                .unwrap(),
+            50,
+        );
         let retained_rules: Vec<_> = aggregate.grouped.iter().map(|g| g.rule.as_str()).collect();
         assert!(retained_rules.contains(&"rule-2"));
         assert!(retained_rules.contains(&"rule-3"));
@@ -419,24 +427,30 @@ mod tests {
     #[test]
     fn aggregate_filters_by_window() {
         let recorder = PolicyDenyRecorder::with_capacity(16);
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         recorder.record(event(
             "rule-old",
             "deny",
-            now - ChronoDuration::seconds(600),
+            now.checked_sub(::time::SignedDuration::seconds(600))
+                .unwrap(),
         ));
         recorder.record(event(
             "rule-recent",
             "deny",
-            now - ChronoDuration::seconds(10),
+            now.checked_sub(::time::SignedDuration::seconds(10))
+                .unwrap(),
         ));
         recorder.record(event(
             "rule-recent",
             "deny",
-            now - ChronoDuration::seconds(5),
+            now.checked_sub(::time::SignedDuration::seconds(5)).unwrap(),
         ));
 
-        let aggregate = recorder.aggregate_recent(now - ChronoDuration::seconds(60), 50);
+        let aggregate = recorder.aggregate_recent(
+            now.checked_sub(::time::SignedDuration::seconds(60))
+                .unwrap(),
+            50,
+        );
         assert_eq!(aggregate.total_denies, 2);
         assert_eq!(aggregate.grouped.len(), 1);
         let group = &aggregate.grouped[0];
@@ -447,7 +461,7 @@ mod tests {
     #[test]
     fn aggregate_groups_by_four_tuple() {
         let recorder = PolicyDenyRecorder::with_capacity(16);
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         recorder.record(event("rule-a", "namespace_mismatch", now));
         recorder.record(event("rule-a", "namespace_mismatch", now));
         recorder.record(event_full(
@@ -459,7 +473,11 @@ mod tests {
         ));
         recorder.record(event("rule-a", "different_reason", now));
 
-        let aggregate = recorder.aggregate_recent(now - ChronoDuration::seconds(60), 50);
+        let aggregate = recorder.aggregate_recent(
+            now.checked_sub(::time::SignedDuration::seconds(60))
+                .unwrap(),
+            50,
+        );
         assert_eq!(aggregate.total_denies, 4);
         // Three distinct groups: (rule, src, dst, reason) all participate
         // (different source ⇒ separate group; different reason ⇒ separate).
@@ -473,7 +491,7 @@ mod tests {
     #[test]
     fn aggregate_sorts_by_count_desc_then_last_at_desc() {
         let recorder = PolicyDenyRecorder::with_capacity(16);
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         // Group A: 3 events, oldest last_at
         for delta in [60, 50, 40] {
             recorder.record(event_full(
@@ -481,7 +499,8 @@ mod tests {
                 Some("spiffe://cluster.local/ns/a/sa/x"),
                 Some("spiffe://cluster.local/ns/api/sa/y"),
                 "deny",
-                now - ChronoDuration::seconds(delta),
+                now.checked_sub(::time::SignedDuration::seconds(delta))
+                    .unwrap(),
             ));
         }
         // Group B: 3 events, newest last_at — should sort BEFORE A on tie.
@@ -491,7 +510,8 @@ mod tests {
                 Some("spiffe://cluster.local/ns/b/sa/x"),
                 Some("spiffe://cluster.local/ns/api/sa/y"),
                 "deny",
-                now - ChronoDuration::seconds(delta),
+                now.checked_sub(::time::SignedDuration::seconds(delta))
+                    .unwrap(),
             ));
         }
         // Group C: 1 event, alone — should sort after both 3-count groups.
@@ -500,10 +520,14 @@ mod tests {
             Some("spiffe://cluster.local/ns/c/sa/x"),
             Some("spiffe://cluster.local/ns/api/sa/y"),
             "deny",
-            now - ChronoDuration::seconds(1),
+            now.checked_sub(::time::SignedDuration::seconds(1)).unwrap(),
         ));
 
-        let aggregate = recorder.aggregate_recent(now - ChronoDuration::seconds(120), 50);
+        let aggregate = recorder.aggregate_recent(
+            now.checked_sub(::time::SignedDuration::seconds(120))
+                .unwrap(),
+            50,
+        );
         assert_eq!(aggregate.total_denies, 7);
         assert_eq!(aggregate.grouped.len(), 3);
         assert_eq!(aggregate.grouped[0].rule, "rule-b");
@@ -517,11 +541,15 @@ mod tests {
     #[test]
     fn aggregate_respects_limit_cap() {
         let recorder = PolicyDenyRecorder::with_capacity(16);
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         for i in 0..5u32 {
             recorder.record(event(&format!("rule-{i}"), "deny", now));
         }
-        let aggregate = recorder.aggregate_recent(now - ChronoDuration::seconds(60), 2);
+        let aggregate = recorder.aggregate_recent(
+            now.checked_sub(::time::SignedDuration::seconds(60))
+                .unwrap(),
+            2,
+        );
         assert_eq!(aggregate.total_denies, 5);
         assert_eq!(aggregate.grouped.len(), 2);
     }
@@ -529,10 +557,14 @@ mod tests {
     #[test]
     fn aggregate_zero_limit_skips_grouping_but_keeps_total() {
         let recorder = PolicyDenyRecorder::with_capacity(16);
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         recorder.record(event("rule-a", "deny", now));
         recorder.record(event("rule-b", "deny", now));
-        let aggregate = recorder.aggregate_recent(now - ChronoDuration::seconds(60), 0);
+        let aggregate = recorder.aggregate_recent(
+            now.checked_sub(::time::SignedDuration::seconds(60))
+                .unwrap(),
+            0,
+        );
         assert_eq!(aggregate.total_denies, 2);
         assert!(aggregate.grouped.is_empty());
     }
@@ -540,25 +572,59 @@ mod tests {
     #[test]
     fn aggregate_first_at_tracks_earliest_in_group() {
         let recorder = PolicyDenyRecorder::with_capacity(16);
-        let now = Utc::now();
-        recorder.record(event("rule-a", "deny", now - ChronoDuration::seconds(50)));
-        recorder.record(event("rule-a", "deny", now - ChronoDuration::seconds(10)));
-        recorder.record(event("rule-a", "deny", now - ChronoDuration::seconds(30)));
-        let aggregate = recorder.aggregate_recent(now - ChronoDuration::seconds(60), 50);
+        let now = UtcTimestamp::now();
+        recorder.record(event(
+            "rule-a",
+            "deny",
+            now.checked_sub(::time::SignedDuration::seconds(50))
+                .unwrap(),
+        ));
+        recorder.record(event(
+            "rule-a",
+            "deny",
+            now.checked_sub(::time::SignedDuration::seconds(10))
+                .unwrap(),
+        ));
+        recorder.record(event(
+            "rule-a",
+            "deny",
+            now.checked_sub(::time::SignedDuration::seconds(30))
+                .unwrap(),
+        ));
+        let aggregate = recorder.aggregate_recent(
+            now.checked_sub(::time::SignedDuration::seconds(60))
+                .unwrap(),
+            50,
+        );
         let group = &aggregate.grouped[0];
         assert_eq!(group.count, 3);
         // Earliest of the three.
-        assert!(group.first_at <= now - ChronoDuration::seconds(49));
-        assert!(group.first_at >= now - ChronoDuration::seconds(51));
+        assert!(
+            group.first_at
+                <= now
+                    .checked_sub(::time::SignedDuration::seconds(49))
+                    .unwrap()
+        );
+        assert!(
+            group.first_at
+                >= now
+                    .checked_sub(::time::SignedDuration::seconds(51))
+                    .unwrap()
+        );
         // Latest of the three.
-        assert!(group.last_at <= now - ChronoDuration::seconds(9));
-        assert!(group.last_at >= now - ChronoDuration::seconds(11));
+        assert!(group.last_at <= now.checked_sub(::time::SignedDuration::seconds(9)).unwrap());
+        assert!(
+            group.last_at
+                >= now
+                    .checked_sub(::time::SignedDuration::seconds(11))
+                    .unwrap()
+        );
     }
 
     #[test]
     fn recorder_handles_null_principals() {
         let recorder = PolicyDenyRecorder::with_capacity(8);
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         recorder.record(event_full(
             "unauthenticated_baggage",
             None,
@@ -573,7 +639,11 @@ mod tests {
             "unauthenticated_baggage",
             now,
         ));
-        let aggregate = recorder.aggregate_recent(now - ChronoDuration::seconds(60), 50);
+        let aggregate = recorder.aggregate_recent(
+            now.checked_sub(::time::SignedDuration::seconds(60))
+                .unwrap(),
+            50,
+        );
         assert_eq!(aggregate.grouped.len(), 1);
         assert_eq!(aggregate.grouped[0].count, 2);
         assert!(aggregate.grouped[0].source.is_none());
@@ -583,7 +653,7 @@ mod tests {
     #[test]
     fn reset_capacity_for_tests_clears_state() {
         let recorder = PolicyDenyRecorder::with_capacity(4);
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         recorder.record(event("rule-a", "deny", now));
         assert_eq!(recorder.len(), 1);
         recorder.reset_capacity_for_tests(8);

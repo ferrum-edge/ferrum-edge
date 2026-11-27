@@ -19,6 +19,7 @@ use reqwest::StatusCode;
 use serde_json::{Value, json};
 
 use crate::scaffolding::port_registry::TestSocket;
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const PRIMARY_SECRET: &str = "egress-primary-secret-0123456789abcdef";
 const VIEWER_SECRET: &str = "egress-viewer-secret-0123456789abcdef";
@@ -27,7 +28,7 @@ const ISSUER: &str = "egress-policy-test";
 const PATH: &str = "/backend-egress-policy";
 
 fn token(secret: &str, additional: Value) -> String {
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let mut claims = json!({
         "iss": ISSUER,
         "sub": "policy-reader",
@@ -309,7 +310,7 @@ fn connect_dp(
     namespace: &str,
     policy: Option<BackendEgressPolicy>,
 ) -> DpStreamKey {
-    let connected_at = chrono::Utc::now();
+    let connected_at = UtcTimestamp::now();
     let info = DpNodeInfo {
         node_id: node_id.to_string(),
         version: "0.9.13".to_string(),
@@ -680,7 +681,7 @@ async fn anonymous_metrics_credentials_and_invalid_jwts_never_disclose_policy() 
         allowed_cidrs: TrustedProxies::parse_strict("127.0.0.0/8", "test").unwrap(),
     });
     let harness = AdminHarness::start(state).await;
-    let expired = chrono::Utc::now().timestamp() - 600;
+    let expired = UtcTimestamp::now().unix_timestamp() - 600;
     let invalid = [
         token(VIEWER_SECRET, json!({})),
         token(PRIMARY_SECRET, json!({"iss": "wrong-issuer"})),

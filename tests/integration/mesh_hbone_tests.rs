@@ -1,7 +1,6 @@
 use crate::scaffolding::port_registry::TestSocket;
 
 use bytes::Bytes;
-use chrono::Utc;
 use hyper::{Method, Request, StatusCode};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
@@ -803,7 +802,9 @@ async fn hbone_connect_with_body_auth_plugin_is_rejected() {
 
     let method = "CONNECT";
     let path = "/";
-    let date = Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+    let date = chrono::Utc::now()
+        .format("%a, %d %b %Y %H:%M:%S GMT")
+        .to_string();
     let authorization = hmac_v2_authorization(
         method,
         path,
