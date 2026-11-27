@@ -558,6 +558,69 @@ fn vs_tcp_l4_weighted_multi_destination() {
     );
 }
 
+/// VS `http[].route[]` weighted multi-destination split (issue #7502). The
+/// translator materializes an `istio-vs-upstream-*` upstream behind the route,
+/// one target per destination carrying its weight, balanced by
+/// weighted round robin. Experimental: the Sidecar data plane applies it and
+/// the `mesh-e2e-sidecar` live suite gates a 90/10 split
+/// (`sidecar.virtual_service.weighted_split_90_10`), but the capability is not
+/// a GA promise yet.
+#[test]
+fn vs_http_weighted_multi_destination_split() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "http[].route[].weight multi-destination split",
+        status = Status::Supported,
+        maturity = Maturity::Experimental,
+        notes = "Weighted http[] routes materialize istio-vs-upstream-<ns>-<name>-<index> with one target per destination (weight preserved; Service identity tagged when the Service is in the inventory) and WeightedRoundRobin; mesh-bound routes ride NodeWaypoint and Sidecar slices (live 90/10 gate in mesh-e2e-sidecar, issue #7502).",
+    );
+    let result = translate_k8s_objects(
+        &[virtual_service(json!({
+            "hosts": ["reviews.default.svc.cluster.local"],
+            "http": [{
+                "route": [
+                    {"destination": {"host": "reviews-v1.default.svc.cluster.local", "port": {"number": 8080}}, "weight": 90},
+                    {"destination": {"host": "reviews-v2.default.svc.cluster.local", "port": {"number": 8080}}, "weight": 10}
+                ]
+            }]
+        }))],
+        options(),
+    )
+    .expect("weighted http[] route translates");
+    let upstream = result
+        .config
+        .upstreams
+        .iter()
+        .find(|upstream| upstream.id.starts_with("istio-vs-upstream-"))
+        .expect("weighted http[] route materializes an istio-vs-upstream-* upstream");
+    assert!(
+        result
+            .config
+            .proxies
+            .iter()
+            .any(|proxy| proxy.upstream_id.as_deref() == Some(upstream.id.as_str())),
+        "the route proxy dispatches through the split upstream"
+    );
+    let mut weights: Vec<(&str, u32)> = upstream
+        .targets
+        .iter()
+        .map(|target| (target.host.as_str(), target.weight))
+        .collect();
+    weights.sort_unstable();
+    assert_eq!(
+        weights,
+        vec![
+            ("reviews-v1.default.svc.cluster.local", 90),
+            ("reviews-v2.default.svc.cluster.local", 10)
+        ],
+        "each destination keeps its configured weight"
+    );
+    assert_eq!(
+        upstream.algorithm,
+        ferrum_edge::config::types::LoadBalancerAlgorithm::WeightedRoundRobin
+    );
+}
+
 /// VS `tcp[]`/`tls[]` L4 match predicates compile onto `Proxy.stream_match`
 /// (AND within one match, OR across match blocks / candidates) and are
 /// evaluated from trustworthy connection metadata at accept time.

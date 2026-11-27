@@ -13,8 +13,8 @@ pub mod bootstrap;
 pub mod internal;
 pub mod spire;
 
+use crate::time_compat::UtcTimestamp;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use std::fmt;
 use std::sync::Arc;
 
@@ -31,7 +31,7 @@ pub struct SignedSvid {
     /// PKCS#8 DER-encoded private key for `cert_chain[0]`.
     pub private_key_pkcs8_der: SvidPrivateKeyDer,
     /// notAfter for the leaf certificate. Used by the rotation task.
-    pub not_after: DateTime<Utc>,
+    pub not_after: UtcTimestamp,
 }
 
 impl fmt::Debug for SignedSvid {

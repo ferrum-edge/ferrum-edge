@@ -2,7 +2,9 @@
 //!
 //! `ga_contract.yaml` is the source of truth for the semantic GA rows the
 //! conformance suite treats as prescriptive, plus the live datapath assertions
-//! future Kubernetes suites must emit.
+//! the Kubernetes suites must emit. Live assertions are enforced on every row
+//! that declares them (GA, Beta, or Experimental) unless the row is
+//! `live_deferred`; only the semantic gate is GA-specific.
 
 use std::collections::BTreeSet;
 
@@ -74,6 +76,22 @@ impl Contract {
         self.capabilities
             .iter()
             .filter(|capability| capability.maturity == ContractMaturity::Ga)
+            .collect()
+    }
+
+    /// Every row whose live assertions the live-artifact gate considers:
+    /// all GA rows (which must declare live assertions) plus any Beta or
+    /// Experimental row that declares them. Maturity governs the SEMANTIC
+    /// gate only ([`Self::ga_semantic_assertions`]); an enrolled,
+    /// non-`live_deferred` live assertion is release-blocking at every
+    /// maturity, so a capability can be live-gated before it is promoted
+    /// (issue #7502: the Sidecar VirtualService `http[]` routing row stays
+    /// Experimental while its weighted-split and header-match assertions
+    /// block).
+    pub(crate) fn live_gated_capabilities(&self) -> Vec<&Capability> {
+        self.capabilities
+            .iter()
+            .filter(|capability| !capability.live_assertions.is_empty())
             .collect()
     }
 

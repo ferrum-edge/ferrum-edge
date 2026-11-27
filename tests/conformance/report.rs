@@ -164,9 +164,12 @@ pub(crate) fn emit_artifacts() -> std::io::Result<()> {
             ga,
             by_category,
         },
+        // Every contract row, GA or not: a non-GA row with enrolled live
+        // assertions is live-blocking (issue #7502), so its required ids must
+        // be listed beside the GA rows. The Maturity column tells them apart.
         ga_contract: contract
-            .ga_capabilities()
-            .into_iter()
+            .capabilities
+            .iter()
             .map(GaCapabilityReport::from)
             .collect(),
         categories: category_reports,
@@ -252,7 +255,9 @@ fn render_markdown(w: &mut std::fs::File, report: &CoverageReport) -> std::io::R
     writeln!(w)?;
     writeln!(
         w,
-        "Rows below come from `tests/conformance/ga_contract.yaml`, the machine-readable product contract."
+        "Rows below come from `tests/conformance/ga_contract.yaml`, the machine-readable product contract. \
+         Only `ga` rows are a product promise; a `beta` or `experimental` row is listed because its \
+         enrolled live assertions are release-blocking all the same."
     )?;
     writeln!(w)?;
     writeln!(

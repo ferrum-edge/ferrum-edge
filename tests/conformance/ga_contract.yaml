@@ -109,6 +109,50 @@ capabilities:
       - NodeWaypoint topology remains Experimental and is excluded from this sidecar GA contract.
       - Cross-cluster endpoint discovery is Beta and remains excluded from this sidecar GA contract.
 
+  # Live-gated but NOT GA (issue #7502). Maturity governs only the semantic
+  # gate; this row's live assertions are enforced like every non-deferred row
+  # (tests/conformance/live_contract.rs). Promotion to `ga` is an owner
+  # decision that also moves the sidecar GA headline in
+  # docs/mesh_supported_matrix.md and tags the semantic assertions GA.
+  - id: mesh.virtual_service.sidecar_http_routes
+    display_name: VirtualService http[] routing on Sidecar (weighted split, header match)
+    maturity: experimental
+    topology: sidecar
+    config_protocol: istio
+    semantic_assertions:
+      - category: istio_virtual_service
+        feature: http[].route[].weight multi-destination split
+      - category: istio_virtual_service
+        feature: headers.X.exact
+    live_suite: mesh-e2e-sidecar
+    # Live backing: run.sh installs pinned VirtualService, DestinationRule,
+    # PeerAuthentication (and ReferenceGrant) CRDs; ferrum-cp watches the Istio
+    # kinds (FERRUM_K8S_WATCH_ISTIO_CRDS=true, namespaced RBAC), enforces a
+    # selector-scoped STRICT PeerAuthentication on both split destinations, and
+    # writes FerrumAccepted=True on a kubectl-applied VirtualService whose
+    # header rule (x-canary: true) targets vssvc-v2 and whose fallback splits
+    # 90/10 across vssvc-v1/vssvc-v2. The native vs-client Sidecar receives the
+    # carried http routes over production mTLS + JWT MeshSubscribe; its curl
+    # dials http://vssvc.<ns>.svc.cluster.local:8080/ through real outbound
+    # iptables capture, and each leg is dialed over pinned SVID-mTLS (a
+    # certificate-less TLS client is refused by both destinations). 1000
+    # completed requests must all answer from a leg with the v1 count in
+    # [850, 950] (the design's 85-95%; false-failure probability ~2.8e-7 even
+    # under an independent Bernoulli model; 100/0, 50/50 and 96/4 fail), every
+    # x-canary: true request must reach vssvc-v2, and 1000 x-canary: false
+    # requests must fall through to the split inside the same window.
+    live_assertions:
+      - sidecar.virtual_service.weighted_split_90_10
+      - sidecar.virtual_service.header_match_dispatch
+    platform_profile: kind-spire-sidecar
+    docs_anchor: docs/mesh.md#mesh-data-planes-nodewaypoint-route-carriage
+    owner: mesh
+    exclusions:
+      - Ambient and ServiceWaypoint data planes apply no mesh http[] routes and are excluded.
+      - NodeWaypoint route carriage is Experimental with its topology and is not covered by this live row.
+      - Cross-namespace carried destinations are refused on every topology until issue #7499.
+      - The live split rides one Sidecar client in one namespace; DestinationRule-governed leg-by-leg dispatch is covered by integration tests only.
+
   - id: mesh.peer_authentication.strict_mtls
     display_name: PeerAuthentication STRICT inbound mTLS
     maturity: ga
