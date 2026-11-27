@@ -44,7 +44,7 @@ cargo test --test service_integration oidc
 cargo test --test service_integration oauth2_introspection
 cargo test --test service_integration clickhouse
 cargo test --test service_integration db_tls
-cargo test --test service_integration schema_forward_migrations
+cargo test --test service_integration forward_migrations_sqlite_postgres_mysql
 ```
 
 The MySQL custom-plugin recovery test requires the pedagogical example at

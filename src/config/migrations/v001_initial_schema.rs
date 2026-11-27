@@ -18,7 +18,7 @@ use super::sql_dialect::V001SqlBuilder;
 /// forward migration (`V002`, `V003`, ...) instead. Releases before 1.0.0
 /// updated it by copying the value that failing test prints.
 pub const V001_BASELINE_CHECKSUM: &str =
-    "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    "sha256:4daeac1eeac715ef55084b92b863c36e042b648334ce16f3379717d0406dc17b";
 
 /// Header of the canonical V001 rendering. Changing it changes the identity.
 const CANONICAL_V001_HEADER: &str = "ferrum-edge core migration V001; canonical DDL format 1";

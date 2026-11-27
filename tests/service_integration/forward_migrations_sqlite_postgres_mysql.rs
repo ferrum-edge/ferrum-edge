@@ -15,6 +15,10 @@
 //! - an edited `V002` (checksum drift on an applied migration) is fatal;
 //! - a binary that does not know `V002` (a downgrade) refuses the database;
 //! - drift on the frozen `V001` row remains fatal.
+//!
+//! The module name contains `mysql` so the Service Integration job's
+//! exhaustive filter list (whose `mysql` entry matches test paths by
+//! substring) runs all three backends.
 
 use std::time::Duration;
 

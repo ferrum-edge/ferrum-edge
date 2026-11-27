@@ -2594,10 +2594,7 @@ mod inner {
                     self.record_index_plan_version(plan.version).await?;
                 }
 
-                info!(
-                    "MongoDB indexes ensured (index plan version {})",
-                    plan.version
-                );
+                info!("MongoDB indexes ensured from the versioned index plan");
                 Ok(())
             }
             .await;

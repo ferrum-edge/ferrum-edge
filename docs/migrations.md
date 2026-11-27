@@ -109,7 +109,7 @@ ConfigSync build-identity gate rejects any other build at `Subscribe` (see
 
 The runner, its integrity checks, and the `migrate status` / `up` reports
 already handle `V002`+: the forward path is exercised against SQLite,
-PostgreSQL, and MySQL by `tests/service_integration/schema_forward_migrations.rs`
+PostgreSQL, and MySQL by `tests/service_integration/forward_migrations_sqlite_postgres_mysql.rs`
 with a test-only `V002`. No shipped `V002` exists until the first schema change
 after 1.0.0 needs one.
 
@@ -568,7 +568,7 @@ From 1.0.0 onward, a core SQL schema change never edits `sql_dialect.rs`'s
    where the changed field is exposed, and document the change in the release
    notes and upgrade guide.
 5. Test the migration on a database created at the previous release's schema.
-   `tests/service_integration/schema_forward_migrations.rs` shows the pattern
+   `tests/service_integration/forward_migrations_sqlite_postgres_mysql.rs` shows the pattern
    (SQLite plus PostgreSQL and MySQL containers) through the production runner.
 
 The golden test `tests/unit/config/v001_baseline_golden_tests.rs` fails if a

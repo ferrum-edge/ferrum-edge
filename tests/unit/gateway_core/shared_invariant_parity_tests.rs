@@ -2606,7 +2606,7 @@ const CONTAINER_START_SOURCES: [&str; 7] = [
     "tests/service_integration/clickhouse.rs",
     "tests/service_integration/db_tls.rs",
     "tests/service_integration/mysql.rs",
-    "tests/service_integration/schema_forward_migrations.rs",
+    "tests/service_integration/forward_migrations_sqlite_postgres_mysql.rs",
     "tests/secrets_functional/common/containers.rs",
 ];
 

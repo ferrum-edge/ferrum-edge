@@ -25,7 +25,7 @@ pub(super) struct MySqlFixture {
 }
 
 /// Fresh MySQL 8.4 container with an empty `ferrum` database (also used by
-/// `schema_forward_migrations`).
+/// `forward_migrations_sqlite_postgres_mysql`).
 pub(super) async fn start_mysql() -> Result<MySqlFixture, BoxError> {
     const PASSWORD: &str = "ferrum-mysql-test-password";
     let (container, port) = retry_on_host_port_collision(|| async {
