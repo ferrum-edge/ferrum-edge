@@ -151,7 +151,11 @@ fn config_with_mesh_tags(tags: &[(&str, &str)], stamp: UtcTimestamp) -> GatewayC
         consumers: Vec::new(),
         plugin_configs: Vec::new(),
         upstreams: vec![upstream],
-        loaded_at: stamp,
+        loaded_at: UtcTimestamp::from_unix_timestamp_nanos(
+            stamp.timestamp(),
+            stamp.timestamp_subsec_nanos(),
+        )
+        .unwrap(),
         known_namespaces: Vec::new(),
         ..GatewayConfig::default()
     };

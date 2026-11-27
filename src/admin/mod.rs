@@ -10926,7 +10926,7 @@ async fn handle_batch_create(
         consumers: batch.consumers.clone(),
         plugin_configs: batch.plugin_configs.clone(),
         upstreams: batch.upstreams.clone(),
-        loaded_at: now,
+        loaded_at: crate::time_compat::UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         mesh: state
             .cached_gateway_config()
