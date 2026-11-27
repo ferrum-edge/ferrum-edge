@@ -283,7 +283,7 @@ pub(crate) async fn handle_mesh_tcp_inbound(
     stream_ctx.first_bytes = first_bytes;
     stream_ctx.first_bytes_kind = first_bytes_kind;
 
-    let connected_wall_at = chrono::Utc::now();
+    let connected_wall_at = crate::time_compat::UtcTimestamp::now();
     let connected_at = std::time::Instant::now();
 
     for plugin in plugins.iter() {
@@ -644,7 +644,7 @@ async fn emit_disconnect(
     proxy: &crate::config::types::Proxy,
     client_ip: &str,
     backend_target: String,
-    connected_wall_at: chrono::DateTime<chrono::Utc>,
+    connected_wall_at: crate::time_compat::UtcTimestamp,
     connected_at: std::time::Instant,
     bytes_sent: u64,
     bytes_received: u64,

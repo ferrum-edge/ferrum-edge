@@ -2732,10 +2732,14 @@ fn tcp_stream_duration_uses_instant_not_wall_clock() {
     let connected_mono = Instant::now()
         .checked_sub(Duration::from_millis(1_500))
         .expect("monotonic clock is past 1.5 s");
-    let connected_wall = chrono::Utc::now() - chrono::TimeDelta::hours(1);
-    let disconnected_wall_rollback = chrono::Utc::now() - chrono::TimeDelta::hours(2);
+    let connected_wall = ferrum_edge::time_compat::UtcTimestamp::now()
+        .checked_add(::time::SignedDuration::hours(-1))
+        .expect("test wall time in range");
+    let disconnected_wall_rollback = ferrum_edge::time_compat::UtcTimestamp::now()
+        .checked_add(::time::SignedDuration::hours(-2))
+        .expect("test wall time in range");
     assert!(
-        (disconnected_wall_rollback - connected_wall).num_milliseconds() < 0,
+        (disconnected_wall_rollback - connected_wall).whole_milliseconds() < 0,
         "fixture must keep a negative wall delta"
     );
 
@@ -2760,7 +2764,9 @@ fn tcp_stream_duration_uses_instant_not_wall_clock() {
         "wall disconnect preserved for rendering"
     );
 
-    let disconnected_wall_forward = connected_wall + chrono::TimeDelta::hours(5);
+    let disconnected_wall_forward = connected_wall
+        .checked_add(::time::SignedDuration::hours(5))
+        .expect("test wall time in range");
     let (forward_ms, _, forward_disconnected) = tcp_stream_disconnect_clocks_for_test(
         connected_mono,
         connected_wall,
