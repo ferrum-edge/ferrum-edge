@@ -659,9 +659,9 @@ fn from_str_and_deserialize_match_chrono_on_the_mutation_corpus() {
                     secs += 1;
                     nanos -= 1_000_000_000;
                 }
+                // Past chrono's own maximum, the year is certainly out of range.
                 let year = DateTime::<chrono::Utc>::from_timestamp(secs, nanos)
-                    .map(|normalized| normalized.year())
-                    .expect("chrono represents its own normalized instant");
+                    .map_or(i32::MAX, |normalized| normalized.year());
                 assert!(
                     !(-9999..=9999).contains(&year),
                     "{input:?} refused although its UTC year {year} is in range"
