@@ -201,11 +201,7 @@ fn config_with(socket_path: &str, h2c: bool, stamp: UtcTimestamp) -> GatewayConf
         consumers: Vec::new(),
         plugin_configs: Vec::new(),
         upstreams: vec![unix_upstream(socket_path, h2c, stamp)],
-        loaded_at: UtcTimestamp::from_unix_timestamp_nanos(
-            stamp.timestamp(),
-            stamp.timestamp_subsec_nanos(),
-        )
-        .unwrap(),
+        loaded_at: stamp,
         known_namespaces: Vec::new(),
         ..GatewayConfig::default()
     };
@@ -286,11 +282,7 @@ fn delta_removing_the_proxy(stamp: UtcTimestamp) -> IncrementalResult {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
         sequence_cursor: 0,
-        poll_timestamp: UtcTimestamp::from_unix_timestamp_nanos(
-            stamp.timestamp(),
-            stamp.timestamp_subsec_nanos(),
-        )
-        .unwrap(),
+        poll_timestamp: stamp,
     }
 }
 
@@ -305,11 +297,7 @@ fn delta_repointing_the_socket(socket_path: &str, stamp: UtcTimestamp) -> Increm
         added_or_modified_upstreams: vec![unix_upstream(socket_path, false, stamp)],
         removed_upstream_ids: vec![],
         sequence_cursor: 0,
-        poll_timestamp: UtcTimestamp::from_unix_timestamp_nanos(
-            stamp.timestamp(),
-            stamp.timestamp_subsec_nanos(),
-        )
-        .unwrap(),
+        poll_timestamp: stamp,
     }
 }
 
