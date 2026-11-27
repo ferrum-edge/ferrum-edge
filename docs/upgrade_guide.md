@@ -102,7 +102,7 @@ and [admin_backup_restore.md](admin_backup_restore.md):
    either step names on 0.9.21. Rehearsal exports are not the cutover data.
 2. **Record the namespace registry.** A backup carries only namespace-scoped
    resources, never the namespace registry row
-   ([admin_backup_restore.md](admin_backup_restore.md#namespace-metadata-is-not-part-of-a-backup)).
+   ([admin_backup_restore.md](admin_backup_restore.md#the-namespace-registry-row-is-part-of-a-full-backup)).
    Record every registered namespace and its `description` with
    `GET /namespaces` and `GET /namespaces/{name}`.
 3. **Freeze configuration writes** from the final exports through cutover: stop
@@ -5526,7 +5526,7 @@ Two things are **not** carried by the export, and the steps below handle them:
 
 - **The namespace registry.** A backup never contains the namespace registry
   row (its `description` and timestamps), and restore never creates one
-  ([details](admin_backup_restore.md#namespace-metadata-is-not-part-of-a-backup)).
+  ([details](admin_backup_restore.md#the-namespace-registry-row-is-part-of-a-full-backup)).
   Record each registered namespace and description with `GET /namespaces` and
   `GET /namespaces/{name}` before exporting, and recreate them on the fresh
   database with `POST /namespaces` (or `PUT /namespaces/{name}` for one that

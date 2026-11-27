@@ -197,9 +197,15 @@ fn serialize_snapshot(
     state: &AdminState,
     namespace: &str,
     snapshot: &ConditionalNamespaceSnapshot,
-    namespace_registry: Option<&super::backup::NamespaceRegistryBackupSection>,
 ) -> Result<(Vec<u8>, String), anyhow::Error> {
     let config = &snapshot.config;
+    // The registry section comes from the snapshot's own registry row, which
+    // is a member of the namespace ETag's representation: the body and the
+    // `ETag` always describe one generation (issue #7532).
+    let namespace_registry = snapshot
+        .namespace_record
+        .as_ref()
+        .map(super::backup::NamespaceRegistryBackupSection::from_record);
     let tag = namespace_tag(state, namespace, &snapshot.digest()?)?;
     let metadata = ConditionalBackupMetadata {
         namespace_etag: preconditions::quoted(&tag),
@@ -233,10 +239,10 @@ fn serialize_snapshot(
         plugin_configs: &config.plugin_configs,
         api_specs: Some(&specs),
         gateway_trust_bundles: Some(&config.gateway_trust_bundles),
-        // The registry row is carried for restore but is not part of the
-        // namespace ETag: conditional restore guards resources, not the
-        // registry (issue #7532).
-        namespace_registry,
+        // Part of the namespace ETag: a conditional restore of this body is
+        // refused (`412`) once the registry row changed, and otherwise writes
+        // the row inside its replacement transaction.
+        namespace_registry: namespace_registry.as_ref(),
         conditional: Some(&metadata),
     };
     Ok((serde_json::to_vec(&backup)?, metadata.namespace_etag))
@@ -261,22 +267,14 @@ pub(super) async fn backup(
             .load_conditional_namespace_snapshot(namespace)
             .await
             .map_err(|error| store_error(&error))?;
-        let namespace_registry = db
-            .get_namespace(namespace)
-            .await
-            .map_err(|error| store_error(&error))?
-            .as_ref()
-            .map(super::backup::NamespaceRegistryBackupSection::from_record);
         let (body_bytes, tag) =
-            serialize_snapshot(state, namespace, &snapshot, namespace_registry.as_ref()).map_err(
-                |error| {
-                    if is_namespace_snapshot_too_large(&error) {
-                        snapshot_too_large()
-                    } else {
-                        unavailable()
-                    }
-                },
-            )?;
+            serialize_snapshot(state, namespace, &snapshot).map_err(|error| {
+                if is_namespace_snapshot_too_large(&error) {
+                    snapshot_too_large()
+                } else {
+                    unavailable()
+                }
+            })?;
         let config = snapshot.config;
         let response = super::finalize_backup_export(
             state,
@@ -339,6 +337,7 @@ pub(super) async fn restore(
     namespace: &str,
     payload: &RestorePayload,
     validated_api_specs: &[crate::config::types::ApiSpec],
+    namespace_registry: Option<Option<String>>,
     if_match: &IfMatch,
     mode: &BatchConfigWriteMode,
     admission: &mut crud::NamespaceConfigAdmissionGuard,
@@ -378,6 +377,7 @@ pub(super) async fn restore(
         expected,
         api_specs: validated_api_specs,
         gateway_trust_bundles: payload.gateway_trust_bundles.as_deref(),
+        namespace_registry,
     };
     if let Err(error) = db.restore_namespace_conditionally(&restore, mode).await {
         return store_error(&error);

@@ -343,14 +343,17 @@ namespace's registry row in a `namespace_registry` section (issue #7532):
 
 The section is emitted only when the namespace has a registry row, and is
 omitted from `?resources=` filtered exports and cached-fallback exports.
-Registry timestamps are not carried.
+Registry timestamps are not carried. A conditional export
+(`?conditional=true`) reads the section from the same snapshot as its
+namespace `ETag`, and that `ETag` covers the registry row.
 
 On `POST /restore` the section is validated with the rest of the payload,
 before anything is deleted (`section_version` must be `"1"`, `name` must be a
 valid namespace name, and `description` follows the `POST /namespaces` rules).
-After the restored configuration commits, restore writes the row:
+Restore then writes the row:
 
-- **Same namespace** (the section's `name` is the target namespace): an
+- **Same namespace** (the section's `name` is the target namespace): a row
+  that already matches the backup is left as it is; otherwise an
   existing row's description is replaced and its `created_at` kept; a namespace
   that only had derived existence is registered; an empty, unregistered
   namespace — a registered namespace that held no resources when it was
@@ -365,11 +368,30 @@ After the restored configuration commits, restore writes the row:
   the target's registry row is left exactly as it is, including across the
   destructive clear.
 
-The registry write runs after the namespace's configuration admission guard is
-released, because it takes the registry admission keys. If it fails, restore
-returns `500` with `configuration_restored: true`: the configuration is
-restored and committed, and retrying the restore (or
-`PUT /namespaces/{name}`) writes the row.
+When the section names the target namespace, restore takes registry
+admission — the global namespace-registry lease, then the namespace's own
+lease, the order `POST`, `PUT` and `DELETE /namespaces` use — instead of plain
+namespace admission, and holds it from before the clear until the row is
+written. No registry mutation can interleave with the restore, and the two
+cannot deadlock.
+
+- **Conditional restore** (`If-Match`): the row is written inside the
+  replacement transaction, after the namespace `ETag` comparison. The `ETag`
+  covers the registry row, so a description changed after the backup makes the
+  restore a `412` with nothing applied, and the write can never replace a
+  newer description.
+- **Non-conditional restore**: the row is written after the chunked import
+  commits, still under the registry admission and the write-topology permit,
+  and before live apply is awaited. If that single write fails, restore
+  returns `500` with `configuration_restored: true`: the configuration is
+  restored and committed, and retrying the restore (or
+  `PUT /namespaces/{name}`) writes the row.
+
+On standalone MongoDB, which cannot write the registry atomically, an
+unchanged row (for example the seeded `ferrum` row) restores normally, while a
+backup that would change the row is refused with `501` before anything is
+deleted. Configure `FERRUM_MONGO_REPLICA_SET`, or remove the
+`namespace_registry` section to restore the configuration alone.
 
 The section is additive, so the backup's top-level `version` stays `"1"`
 (see [support_policy.md](support_policy.md#backup-export-and-file-config-format)):
@@ -400,9 +422,19 @@ refusals depend on the target database rather than on the file and are only
 decided by the restore itself: another namespace already owning the
 process-global `prometheus_metrics` instance, the `confirm_api_spec_deletion`
 confirmation a backup *without* an `api_specs` section needs when the target
-holds specs, and a conditional restore's `If-Match` precondition. On a control
-plane whose cached configuration carries a mesh model, restore also validates
-mesh references against that model, which the offline check does not have.
+holds specs, a conditional restore's `If-Match` precondition, and on
+standalone MongoDB whether the `namespace_registry` section would change the
+registry row (`501`). On a control plane whose cached configuration carries a
+mesh model, restore also validates mesh references against that model, which
+the offline check does not have.
+
+The check also prepares the payload as restore does: plaintext Basic-auth
+passwords are hashed with `FERRUM_BASIC_AUTH_HMAC_SECRET`, so a deployment
+without a usable secret is refused offline as restore refuses it. With
+`-m database` plugins are validated with the serving node's client, so
+node-local egress checks (for example a `load_testing` instance whose loopback
+dial the backend egress policy denies) refuse the file as database-mode
+restore does; `-m cp` checks plugin shape only, as a control plane does.
 
 `FERRUM_DB_CONFIG_BACKUP_PATH` is a different, narrower check: `validate -m
 database` loads it through the startup fallback loader (the namespace's

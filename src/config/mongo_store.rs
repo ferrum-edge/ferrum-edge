@@ -353,6 +353,13 @@ mod inner {
     /// documents (see `PRE_RELEASE_MARKER_COLLECTIONS`) but records no index
     /// plan. A database with a plan record, or with no Ferrum document at all,
     /// passes. Read-only, so a refusal changes nothing.
+    ///
+    /// `recorded` was read before the collection scan. A concurrent 1.x
+    /// initializer on a fresh database writes its in-progress marker before
+    /// any Ferrum document (the seeded registry row included), so when the
+    /// scan finds a document the plan record is read again on the same
+    /// handle and the database is refused only if it is still unrecorded:
+    /// a replica that lost the initialization race is not told to rebuild.
     async fn ensure_not_pre_release_database(
         db: &Database,
         recorded: &RecordedIndexPlanState,
@@ -373,7 +380,11 @@ mod inner {
                 break;
             }
         }
-        refuse_pre_release_database(recorded, populated)?;
+        if populated.is_none() {
+            return Ok(());
+        }
+        let recorded_after_scan = read_recorded_index_plan_state(db).await?;
+        refuse_pre_release_database(&recorded_after_scan, populated)?;
         Ok(())
     }
 
@@ -8086,6 +8097,7 @@ mod inner {
                 trust: restore
                     .gateway_trust_bundles
                     .map(|records| records.to_vec()),
+                namespace_registry: restore.namespace_registry.clone(),
             };
             let plan =
                 Self::prepare_atomic_batch_plan(graph, chunk_size, fault, Some(replacement))?;
@@ -8468,6 +8480,30 @@ mod inner {
                             .await?;
                     }
                 }
+                // The backup's registry row (issue #7532), behind the same
+                // digest comparison and lease pin as every resource above.
+                if let Some(description) = &replacement.namespace_registry {
+                    let existing = self
+                        .get_namespace_in_session(&mut *session, &plan.lease_namespace)
+                        .await?;
+                    if existing
+                        .as_ref()
+                        .is_none_or(|record| &record.description != description)
+                    {
+                        let now = UtcTimestamp::now();
+                        let mut record = existing.unwrap_or_else(|| {
+                            NamespaceRecord::new(plan.lease_namespace.clone(), None, now)
+                        });
+                        record.description = description.clone();
+                        record.updated_at = now;
+                        self.upsert_namespace_registry_document_in_session(
+                            &mut *session,
+                            &plan.lease_namespace,
+                            &record,
+                        )
+                        .await?;
+                    }
+                }
             }
 
             if let Some((owner, generation)) = &plan.admission_lease {
@@ -8760,27 +8796,13 @@ mod inner {
             } else {
                 // Upsert materializes a derived-only tenant (resources but no
                 // registry document) so a description-only update has the same
-                // well-defined atomic outcome. An explicit `null` clears the
-                // field on both backends.
-                let description_bson = match &record.description {
-                    Some(value) => Bson::String(value.clone()),
-                    None => Bson::Null,
-                };
-                self.namespaces()
-                    .update_one(
-                        doc! { "_id": current_name },
-                        doc! {
-                            "$set": {
-                                "name": current_name,
-                                "description": description_bson,
-                                "created_at": record.created_at.to_rfc3339(),
-                                "updated_at": record.updated_at.to_rfc3339(),
-                            }
-                        },
-                    )
-                    .upsert(true)
-                    .session(&mut *session)
-                    .await?;
+                // well-defined atomic outcome.
+                self.upsert_namespace_registry_document_in_session(
+                    &mut *session,
+                    current_name,
+                    &record,
+                )
+                .await?;
                 Self::check_namespace_registry_fault_in_session(
                     plan.fault,
                     NamespaceRegistryPhase::RegistryRow,
@@ -9313,6 +9335,37 @@ mod inner {
                 .await?;
             self.upstream_ref_guards()
                 .delete_many(prefix_filter)
+                .session(&mut *session)
+                .await?;
+            Ok(())
+        }
+
+        /// Insert-or-update the registry document for `name` inside the
+        /// caller's session. An explicit `null` description clears the field
+        /// on both backends.
+        async fn upsert_namespace_registry_document_in_session(
+            &self,
+            session: &mut ClientSession,
+            name: &str,
+            record: &NamespaceRecord,
+        ) -> mongodb::error::Result<()> {
+            let description_bson = match &record.description {
+                Some(value) => Bson::String(value.clone()),
+                None => Bson::Null,
+            };
+            self.namespaces()
+                .update_one(
+                    doc! { "_id": name },
+                    doc! {
+                        "$set": {
+                            "name": name,
+                            "description": description_bson,
+                            "created_at": record.created_at.to_rfc3339(),
+                            "updated_at": record.updated_at.to_rfc3339(),
+                        }
+                    },
+                )
+                .upsert(true)
                 .session(&mut *session)
                 .await?;
             Ok(())
@@ -9900,6 +9953,8 @@ mod inner {
         expected: SnapshotDigest,
         spec_docs: Vec<Document>,
         trust: Option<Vec<GatewayTrustBundleRecord>>,
+        /// See `ConditionalNamespaceRestore::namespace_registry`.
+        namespace_registry: Option<Option<String>>,
     }
 
     // -----------------------------------------------------------------------

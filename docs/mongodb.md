@@ -441,10 +441,18 @@ deletion, and ignoring it would leave the target namespace half-cleared before
 the import, so this check is deliberately fail-closed. Repair or deliberately
 remove the offending document and re-run the restore.
 
-Namespace backup payloads carry namespace-scoped configuration resources, never
-the registry document itself, so restore never transplants a source tenant's
-description or registry timestamps into the authenticated target namespace. See
-[admin_api.md](admin_api.md) for the full boundary.
+A full, unfiltered `GET /backup` also carries the exported namespace's registry
+document as the `namespace_registry` section (its `name` and `description`;
+filtered and cached-fallback exports omit it). `POST /restore` applies it only
+when `name` is the target namespace, so restore never transplants a source
+tenant's description into a different namespace, and registry timestamps are
+never exported. A registry document that already matches the backup is not
+rewritten, so an unchanged backup (including the seeded `ferrum` row) restores
+on a standalone `mongod`. A backup that would change the registry document is
+refused with `501` before anything is deleted, because standalone MongoDB
+cannot write the registry atomically: configure `FERRUM_MONGO_REPLICA_SET`, or
+remove the `namespace_registry` section to restore the configuration alone. See
+[admin_backup_restore.md](admin_backup_restore.md) for the full rules.
 
 A direct `DELETE /proxies/{id}` for an API-spec-owned proxy is different: its
 ownership cascade spans the proxy, scoped plugins, the `api_specs` owner

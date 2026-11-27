@@ -8337,14 +8337,6 @@ fn normalize_restore_payload_timestamps(payload: &mut RestorePayload, restored_a
     }
 }
 
-fn hash_payload_consumers(consumers: &mut [Consumer], errors: &mut Vec<String>) {
-    for consumer in consumers {
-        if let Err(e) = crud::hash_consumer_credentials(consumer) {
-            errors.push(format!("consumer {} secret hashing: {}", consumer.id, e));
-        }
-    }
-}
-
 fn restore_payload_from_config(config: GatewayConfig) -> RestorePayload {
     RestorePayload {
         version: config.version,
@@ -12481,25 +12473,6 @@ async fn handle_restore(
             return Ok(atomic_batch_unsupported_response(&unsupported));
         }
     }
-    let mut namespace_config_admission_guard = match crud::lock_namespace_config_admission(
-        db.clone(),
-        namespace,
-    )
-    .await
-    {
-        Ok(guard) => guard,
-        Err(_error) => {
-            warn_persistence_failure_redacted("restore_namespace_admission_acquire");
-            return Ok(json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &json!({
-                    "error": "Restore aborted: config admission unavailable. Existing config was NOT deleted.",
-                    "failure_class": "connectivity",
-                }),
-            ));
-        }
-    };
-
     // Phase 1: Parse the body straight into typed structs before deleting
     // anything. `from_json_object_slice` forces the JSON-object branch, and
     // `RestorePayload` denies unknown fields (issue #5538): a top-level array,
@@ -12510,6 +12483,45 @@ async fn handle_restore(
         Ok(payload) => payload,
         Err(error) => return Ok(restore_admission_error_response(&error)),
     };
+
+    // A `namespace_registry` section taken from this namespace makes restore
+    // a registry mutation too (issue #7532). It then takes registry admission
+    // — the global registry key, then this namespace's key, the total order
+    // every registry mutation uses — instead of plain namespace config
+    // admission. The namespace guard is the same lease plain admission takes
+    // and serves as restore's config admission guard; the global lease is
+    // held beside it until the registry row is written, so no registry
+    // mutation can interleave and the two acquisitions cannot deadlock.
+    let registry_section_applies = payload
+        .namespace_registry
+        .as_ref()
+        .is_some_and(|section| section.name == namespace);
+    let admission_unavailable = || {
+        warn_persistence_failure_redacted("restore_namespace_admission_acquire");
+        json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({
+                "error": "Restore aborted: config admission unavailable. Existing config was NOT deleted.",
+                "failure_class": "connectivity",
+            }),
+        )
+    };
+    let (mut namespace_registry_lease, mut namespace_config_admission_guard) =
+        if registry_section_applies {
+            match crud::lock_namespace_registry_admission(db.clone(), &[namespace])
+                .await
+                .ok()
+                .and_then(crud::NamespaceRegistryAdmission::into_global_and_namespace)
+            {
+                Some((registry_lease, guard)) => (Some(registry_lease), guard),
+                None => return Ok(admission_unavailable()),
+            }
+        } else {
+            match crud::lock_namespace_config_admission(db.clone(), namespace).await {
+                Ok(guard) => (None, guard),
+                Err(_error) => return Ok(admission_unavailable()),
+            }
+        };
     info!(
         "Restore: parsed payload — {} proxies, {} consumers, {} plugin_configs, {} upstreams, {} api_specs ({} bytes)",
         payload.proxies.len(),
@@ -12639,23 +12651,29 @@ async fn handle_restore(
         }
     };
 
-    // Complete all fallible payload preparation before changing durable state.
-    let mut preparation_errors = Vec::new();
+    // Complete all payload preparation before changing durable state. The
+    // fallible step (Basic-auth credential hashing) already ran inside
+    // admission, so the offline check refuses what it would refuse.
     normalize_restore_payload_timestamps(&mut payload, UtcTimestamp::now());
     // Namespace was already stamped on the validated candidate; re-apply
     // idempotently so preparation stays fail-closed if a resource somehow
     // lost its boundary.
     apply_payload_namespace(&mut payload, namespace);
-    hash_payload_consumers(&mut payload.consumers, &mut preparation_errors);
-    if !preparation_errors.is_empty() {
-        return Ok(json_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &json!({
-                "error": "Restore preparation failed; existing config was not changed and prior config retained",
-                "restore_errors": preparation_errors,
-            }),
-        ));
-    }
+
+    // Decide the registry row write under the held registry admission, before
+    // anything is deleted (issue #7532): an identical row needs no write, and
+    // a change the backend cannot make atomically (standalone MongoDB) is
+    // refused here, while the existing configuration is untouched.
+    let namespace_registry_write = match plan_restore_namespace_registry(
+        db.as_ref(),
+        namespace,
+        namespace_registry_description,
+    )
+    .await
+    {
+        Ok(write) => write,
+        Err(response) => return Ok(response),
+    };
 
     // Acquire one datastore owner before the authoritative rollback snapshot
     // and retain it through clear, import, and any compensating replay. This is
@@ -12684,6 +12702,14 @@ async fn handle_restore(
     };
 
     if let Some(if_match) = if_match {
+        // The registry row is written inside the conditional replacement
+        // transaction itself, which compares the namespace ETag (whose
+        // representation includes the registry row) under the same pinned
+        // namespace lease: a registry change after the backup is a `412`, and
+        // the write can never overwrite a newer description.
+        let registry_description = namespace_registry_write
+            .as_ref()
+            .map(|write| write.description.clone());
         let response = conditional_snapshots::restore(
             state,
             actor,
@@ -12691,6 +12717,7 @@ async fn handle_restore(
             namespace,
             &payload,
             &validated_api_specs,
+            registry_description,
             if_match,
             &restore_mode,
             &mut namespace_config_admission_guard,
@@ -12704,23 +12731,21 @@ async fn handle_restore(
             ));
         }
         if response.status().is_success() {
-            let completed = state
+            if let Some(write) = namespace_registry_write {
+                record_restore_namespace_registry_audit(state, actor, db.clone(), namespace, write)
+                    .await;
+            }
+            // The registry row committed with the replacement; the global
+            // registry lease is not needed for live apply.
+            drop(namespace_registry_lease);
+            return Ok(state
                 .complete_live_config_mutation_after_commit_boxed(
                     namespace,
                     (namespace_config_admission_guard, _write_permit),
                     response,
                     apply_mode,
                 )
-                .await;
-            return Ok(restore_namespace_registry_after_commit(
-                state,
-                actor,
-                db.clone(),
-                namespace,
-                namespace_registry_description,
-                completed,
-            )
-            .await);
+                .await);
         }
         return Ok(response);
     }
@@ -12820,6 +12845,10 @@ async fn handle_restore(
         {
             restore_guard.retain_restore_cleared();
         }
+        // Recovery never writes the registry row. Release the global registry
+        // lease first, so reacquiring the namespace key alone cannot wait on a
+        // registry mutation that is itself waiting for this global key.
+        drop(namespace_registry_lease.take());
         drop(namespace_config_admission_guard);
         namespace_config_admission_guard = match crud::lock_namespace_config_admission(
             db.clone(),
@@ -13104,7 +13133,8 @@ async fn handle_restore(
             // durable fence across the lease reacquisition and carries the
             // rollback. Every early return below drops it in the failed-import
             // phase, so its Drop retains the fence over the partially imported
-            // namespace.
+            // namespace. The registry lease goes first, as after a lost clear.
+            drop(namespace_registry_lease.take());
             drop(namespace_config_admission_guard);
             let rollback_guard = match crud::lock_namespace_config_admission(db.clone(), namespace)
                 .await
@@ -13287,23 +13317,45 @@ async fn handle_restore(
         log_audit_enqueue_failure(&error);
     }
 
-    let completed = state
+    // The registry row is written while restore still holds the registry
+    // admission it took before the clear and the write-topology permit, and
+    // before live apply is awaited (issue #7532). It runs after the restore
+    // guard is released because a registry write takes that same namespace
+    // fence without an owner.
+    let response = match namespace_registry_write {
+        Some(write) => match namespace_registry_lease.as_ref() {
+            Some(registry_lease) => match write_restore_namespace_registry(
+                state,
+                actor,
+                db.clone(),
+                namespace,
+                registry_lease,
+                &namespace_config_admission_guard,
+                write,
+            )
+            .await
+            {
+                Ok(()) => json_response(StatusCode::OK, &response),
+                Err(partial) => partial,
+            },
+            // A write is planned only when the section applies, which is
+            // exactly when the registry lease was taken; fail closed anyway.
+            None => restore_namespace_registry_partial_failure(),
+        },
+        None => json_response(StatusCode::OK, &response),
+    };
+    // The registry row is settled; live apply needs only the namespace guard
+    // and the write-topology permit.
+    drop(namespace_registry_lease);
+
+    Ok(state
         .complete_live_config_mutation_after_commit_boxed(
             namespace,
             (namespace_config_admission_guard, _write_permit),
-            json_response(StatusCode::OK, &response),
+            response,
             apply_mode,
         )
-        .await;
-    Ok(restore_namespace_registry_after_commit(
-        state,
-        actor,
-        db.clone(),
-        namespace,
-        namespace_registry_description,
-        completed,
-    )
-    .await)
+        .await)
 }
 
 /// Map a restore admission refusal onto the response restore has always
@@ -13322,6 +13374,13 @@ fn restore_admission_error_response(
                 "validation_errors": errors,
             }),
         ),
+        restore_admission::RestoreAdmissionError::Preparation(errors) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({
+                "error": "Restore preparation failed; existing config was not changed and prior config retained",
+                "restore_errors": errors,
+            }),
+        ),
         restore_admission::RestoreAdmissionError::Unavailable(_detail) => {
             warn_persistence_failure_redacted("restore_plugin_validation_client");
             json_response(
@@ -13334,112 +13393,192 @@ fn restore_admission_error_response(
     }
 }
 
-/// Recreate the target namespace's registry row from the backup's
-/// `namespace_registry` section after the restored configuration committed
-/// (issue #7532).
+/// The registry row write a restore with a same-namespace `namespace_registry`
+/// section performs (issue #7532), decided before anything is deleted.
+struct RestoreNamespaceRegistryWrite {
+    /// The row as it stood under the held registry admission.
+    existing: Option<crate::config::namespace_registry::NamespaceRecord>,
+    /// The description the backup's section carries.
+    description: Option<String>,
+}
+
+/// `error` of the `501` a restore whose `namespace_registry` section would
+/// change the registry row returns when the backend cannot change it
+/// atomically (standalone MongoDB).
+const RESTORE_NAMESPACE_REGISTRY_UNSUPPORTED_MESSAGE: &str = "Restore aborted: this backup's namespace_registry section changes the namespace registry row, which this database cannot write atomically. Existing config was NOT deleted. Configure a MongoDB replica set (FERRUM_MONGO_REPLICA_SET), or remove the namespace_registry section to restore the configuration alone.";
+
+/// Decide what restore does with the target namespace's registry row, under
+/// the registry admission restore already holds.
 ///
-/// It runs after the namespace config admission guard is released, because
-/// registry writes take the registry admission keys (the global registry key
-/// plus this namespace's key) and would deadlock against the held guard. A row
-/// that exists, or a namespace that now holds the restored resources, is
-/// updated (which also registers a namespace that had only derived
-/// existence); an empty, unregistered namespace is created. `None` (no
-/// section in the backup) leaves the registry untouched and returns
-/// `completed` unchanged. A registry failure after the committed restore is a
-/// `500` that says the configuration was restored and the registry row was
-/// not, so the operator can retry the restore or `PUT /namespaces/{name}`.
-async fn restore_namespace_registry_after_commit(
-    state: &AdminState,
-    actor: &AuditActor,
-    db: Arc<dyn DatabaseBackend>,
+/// `None` description (no applicable section) and a row that already matches
+/// the backup need no write, so an unchanged backup restores on every backend,
+/// standalone MongoDB included. A change on a backend without atomic registry
+/// writes is refused with `501` before the clear.
+#[allow(clippy::result_large_err)]
+async fn plan_restore_namespace_registry(
+    db: &dyn DatabaseBackend,
     namespace: &str,
     description: Option<Option<String>>,
-    completed: Response<Full<Bytes>>,
-) -> Response<Full<Bytes>> {
+) -> Result<Option<RestoreNamespaceRegistryWrite>, Response<Full<Bytes>>> {
     let Some(description) = description else {
-        return completed;
-    };
-    if !completed.status().is_success() {
-        return completed;
-    }
-    let partial_failure = || {
-        json_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &json!({
-                "error": "Restore committed the namespace configuration, but the namespace registry row from the backup's namespace_registry section was not written. Retry the restore, or set the description with PUT /namespaces/{name}.",
-                "restore_errors": ["namespace registry write failed after the configuration was restored"],
-                "configuration_restored": true,
-            }),
-        )
-    };
-    if db.ensure_namespace_registry_atomicity_supported().is_err() {
-        warn_persistence_failure_redacted("restore_namespace_registry_atomicity");
-        return partial_failure();
-    }
-    let admission = match acquire_namespace_registry_admission(db.clone(), &[namespace]).await {
-        Ok(admission) => admission,
-        Err(_response) => return partial_failure(),
+        return Ok(None);
     };
     let existing = match db.get_namespace(namespace).await {
         Ok(existing) => existing,
         Err(_error) => {
             warn_persistence_failure_redacted("restore_namespace_registry_read");
-            return partial_failure();
+            return Err(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({
+                    "error": "Restore aborted: the namespace registry row could not be read. Existing config was NOT deleted.",
+                    "failure_class": "connectivity",
+                }),
+            ));
         }
     };
-    let occupied = match existing {
+    if existing
+        .as_ref()
+        .is_some_and(|record| record.description == description)
+    {
+        return Ok(None);
+    }
+    if let Err(unsupported) = db.ensure_namespace_registry_atomicity_supported() {
+        return Err(json_response(
+            StatusCode::NOT_IMPLEMENTED,
+            &json!({
+                "error": RESTORE_NAMESPACE_REGISTRY_UNSUPPORTED_MESSAGE,
+                "detail": unsupported.detail(),
+            }),
+        ));
+    }
+    Ok(Some(RestoreNamespaceRegistryWrite {
+        existing,
+        description,
+    }))
+}
+
+/// The `500` a restore returns when its configuration committed but the
+/// registry row write that follows it failed.
+fn restore_namespace_registry_partial_failure() -> Response<Full<Bytes>> {
+    json_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        &json!({
+            "error": "Restore committed the namespace configuration, but the namespace registry row from the backup's namespace_registry section was not written. Retry the restore, or set the description with PUT /namespaces/{name}.",
+            "restore_errors": ["namespace registry write failed after the configuration was restored"],
+            "configuration_restored": true,
+        }),
+    )
+}
+
+/// Write the planned registry row after a non-conditional restore committed
+/// its configuration, under the registry admission (global key plus the
+/// namespace's key) restore took before the clear and while the
+/// write-topology permit is still held.
+///
+/// A row that exists, or a namespace that now holds the restored resources,
+/// is updated (which also registers a namespace that had only derived
+/// existence); an empty, unregistered namespace is created. A failure is the
+/// partial `500`: resource writes are chunked, so there is no transaction the
+/// row could join.
+#[allow(clippy::result_large_err)]
+async fn write_restore_namespace_registry(
+    state: &AdminState,
+    actor: &AuditActor,
+    db: Arc<dyn DatabaseBackend>,
+    namespace: &str,
+    registry_lease: &crud::NamespaceRegistryGlobalLease,
+    namespace_guard: &crud::NamespaceConfigAdmissionGuard,
+    write: RestoreNamespaceRegistryWrite,
+) -> Result<(), Response<Full<Bytes>>> {
+    let occupied = match write.existing {
         Some(_) => true,
         None => match db.namespace_has_resources(namespace).await {
             Ok(occupied) => occupied,
             Err(_error) => {
                 warn_persistence_failure_redacted("restore_namespace_registry_occupancy");
-                return partial_failure();
+                return Err(restore_namespace_registry_partial_failure());
             }
         },
     };
-    let holds = admission.holds();
-    let (action, record) = if occupied {
-        if existing
-            .as_ref()
-            .is_some_and(|record| record.description == description)
-        {
-            return completed;
-        }
-        match run_namespace_registry_mutation(
-            &admission,
-            db.update_namespace(namespace, namespace, Some(description), &holds),
+    let holds = registry_lease.holds_with(namespace_guard);
+    let written = if occupied {
+        settle_namespace_registry_completion(
+            registry_lease
+                .run_to_completion_while_held(db.update_namespace(
+                    namespace,
+                    namespace,
+                    Some(write.description.clone()),
+                    &holds,
+                ))
+                .await,
         )
-        .await
-        {
-            Ok(record) => ("update", record),
-            Err(_response) => return partial_failure(),
-        }
     } else {
         let record = crate::config::namespace_registry::NamespaceRecord::new(
             namespace.to_string(),
-            description,
+            write.description.clone(),
             UtcTimestamp::now(),
         );
-        match run_namespace_registry_mutation(&admission, db.create_namespace(&record, &holds))
-            .await
-        {
-            Ok(()) => ("create", record),
-            Err(_response) => return partial_failure(),
+        settle_namespace_registry_completion(
+            registry_lease
+                .run_to_completion_while_held(db.create_namespace(&record, &holds))
+                .await,
+        )
+        .map(|()| record)
+    };
+    drop(holds);
+    match written {
+        Ok(_record) => {
+            record_restore_namespace_registry_audit(state, actor, db, namespace, write).await;
+            Ok(())
+        }
+        Err(_response) => {
+            warn_persistence_failure_redacted("restore_namespace_registry_write");
+            Err(restore_namespace_registry_partial_failure())
+        }
+    }
+}
+
+/// Audit the registry row a restore wrote: `create` for a namespace that had
+/// no row, otherwise `update` with the before/after descriptions.
+async fn record_restore_namespace_registry_audit(
+    state: &AdminState,
+    actor: &AuditActor,
+    db: Arc<dyn DatabaseBackend>,
+    namespace: &str,
+    write: RestoreNamespaceRegistryWrite,
+) {
+    let event = match write.existing {
+        Some(before) => {
+            let mut after = before.clone();
+            after.description = write.description;
+            audit::AuditEvent::new(
+                actor,
+                "update",
+                "namespace",
+                namespace,
+                namespace,
+                audit::update_diff(before.audit_body(), after.audit_body()),
+            )
+        }
+        None => {
+            let record = crate::config::namespace_registry::NamespaceRecord::new(
+                namespace.to_string(),
+                write.description,
+                UtcTimestamp::now(),
+            );
+            audit::AuditEvent::new(
+                actor,
+                "create",
+                "namespace",
+                namespace,
+                namespace,
+                audit::create_diff(record.audit_body()),
+            )
         }
     };
-    drop(admission);
-    let event = audit::AuditEvent::new(
-        actor,
-        action,
-        "namespace",
-        &record.name,
-        &record.name,
-        audit::create_diff(record.audit_body()),
-    );
     if let Err(error) = audit::record(state.admin_audit_enabled, db, event).await {
         log_audit_enqueue_failure(&error);
     }
-    completed
 }
 
 fn parse_audit_filter(
@@ -13742,7 +13881,19 @@ async fn run_namespace_registry_mutation<T, F>(
 where
     F: std::future::Future<Output = Result<T, anyhow::Error>>,
 {
-    let completion = match admission.run_to_completion_while_held(future).await {
+    settle_namespace_registry_completion(admission.run_to_completion_while_held(future).await)
+}
+
+/// The outcome mapping of [`run_namespace_registry_mutation`], shared with
+/// restore's registry row write, which observes a split registry lease.
+#[allow(clippy::result_large_err)]
+fn settle_namespace_registry_completion<T>(
+    completion: Result<
+        crud::NamespaceConfigAdmissionCompletion<Result<T, anyhow::Error>>,
+        anyhow::Error,
+    >,
+) -> Result<T, Response<Full<Bytes>>> {
+    let completion = match completion {
         Ok(completion) => completion,
         Err(_error) => {
             warn_persistence_failure_redacted("namespace_registry_admission_lost_before_write");

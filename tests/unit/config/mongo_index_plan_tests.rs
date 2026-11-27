@@ -864,4 +864,43 @@ fn pre_release_refusal_is_wired_into_up_status_and_reconnect() {
             >= 4,
         "definition plus up, status and reconnect call sites"
     );
+    // A concurrent 1.x initializer records its in-progress marker before it
+    // writes any marker document, so a populated scan re-reads the plan record
+    // and refuses only a database that is still unrecorded.
+    let guard = MONGO_STORE_SOURCE
+        .split("async fn ensure_not_pre_release_database(")
+        .nth(1)
+        .and_then(|tail| tail.split("\n    }\n").next())
+        .expect("the refusal is inspectable");
+    let scan = guard
+        .find("PRE_RELEASE_MARKER_COLLECTIONS")
+        .expect("the guard scans the marker collections");
+    let reread = guard
+        .find("let recorded_after_scan = read_recorded_index_plan_state(db).await?;")
+        .expect("a populated scan re-reads the plan record");
+    assert!(scan < reread, "the plan record is re-read after the scan");
+    assert!(guard.contains("refuse_pre_release_database(&recorded_after_scan, populated)"));
+}
+
+/// The fresh-database initialization race: no plan record before the scan, a
+/// recorded (or in-progress) plan after it. Refusal is decided on the state
+/// read after the scan, so the losing replica is admitted.
+#[test]
+fn pre_release_refusal_uses_the_plan_state_read_after_the_scan() {
+    use ferrum_edge::config::mongo_index_plan::refuse_pre_release_database;
+
+    let before_scan = RecordedIndexPlanState::default();
+    assert!(refuse_pre_release_database(&before_scan, Some("namespaces")).is_err());
+    for after_scan in [
+        RecordedIndexPlanState {
+            version: None,
+            in_progress: Some(MONGO_INDEX_PLAN_VERSION),
+        },
+        RecordedIndexPlanState {
+            version: Some(MONGO_INDEX_PLAN_VERSION),
+            in_progress: None,
+        },
+    ] {
+        assert!(refuse_pre_release_database(&after_scan, Some("namespaces")).is_ok());
+    }
 }

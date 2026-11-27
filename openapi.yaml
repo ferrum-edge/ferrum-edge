@@ -5687,13 +5687,16 @@ paths:
         resources always include `id`s; `POST /restore` requires those ids,
         while `POST /batch` will auto-generate them if a caller strips them.
 
-        The payload carries namespace-**scoped configuration resources** only.
-        It deliberately does NOT carry the namespace registry row itself — the
-        namespace `description` and its registry `created_at`/`updated_at` are
-        not exported, because `POST /restore` writes into the authenticated
-        target namespace and must not transplant a source tenant's metadata
-        into a different target. Manage that metadata with
-        `POST /namespaces` and `PUT /namespaces/{name}`.
+        The payload carries the namespace-**scoped configuration resources**
+        and, on a full (unfiltered) database-backed export of a namespace that
+        has a registry row, that row's `name` and `description` in the
+        `namespace_registry` section (issue #7532). Resource-filtered exports
+        and the cached fallback omit the section. `POST /restore` applies it
+        only when its `name` is the restore's target namespace, so restoring
+        one tenant's export into a different namespace never transplants the
+        source tenant's description; the registry `created_at`/`updated_at`
+        timestamps are not exported. On a conditional export the section is
+        read from the same snapshot as the namespace ETag, which covers it.
 
         Falls back to the in-memory cached configuration when the database is
         unavailable, indicated by the `X-Data-Source: cached` response header.
@@ -5879,18 +5882,34 @@ paths:
         namespace's registry row in `namespace_registry` (issue #7532). Restore
         admits that section with the rest of the payload, before anything is
         deleted. When the section's `name` is the target namespace
-        (`X-Ferrum-Namespace`), restore writes the row after the restored
-        configuration commits: an existing row's description is replaced and
-        its `created_at` kept, a derived-only namespace is registered, and an
-        empty unregistered namespace — a registered namespace that held no
-        resources when it was exported — is created with new timestamps. A
-        section from another namespace is not applied, so a cross-namespace
-        restore never relabels its target. A backup without the section (every
-        0.9.x export, filtered and cached-fallback exports) leaves the target's
-        registry row untouched. The registry write happens after the
-        namespace configuration admission guard is released; if it fails, the
-        response is a `500` with `configuration_restored: true`, and retrying
-        the restore or `PUT /namespaces/{name}` completes it.
+        (`X-Ferrum-Namespace`), restore takes registry admission (the global
+        namespace-registry lease, then the namespace's lease — the order every
+        registry mutation uses) instead of plain namespace admission and holds
+        it from before the clear until the row is written, so no
+        `POST`/`PUT`/`DELETE /namespaces` can interleave. A row that already
+        matches the backup is not rewritten, so an unchanged backup restores on
+        every backend, standalone MongoDB included. Otherwise an existing row's
+        description is replaced and its `created_at` kept, a derived-only
+        namespace is registered, and an empty unregistered namespace — a
+        registered namespace that held no resources when it was exported — is
+        created with new timestamps. A change on a backend that cannot write
+        the registry atomically (standalone MongoDB) is refused with `501`
+        before anything is deleted; remove the `namespace_registry` section to
+        restore the configuration alone. A section from another namespace is
+        not applied, so a cross-namespace restore never relabels its target. A
+        backup without the section (every 0.9.x export, filtered and
+        cached-fallback exports) leaves the target's registry row untouched.
+
+        A conditional restore (`If-Match`) writes the row inside its
+        replacement transaction, after the namespace ETag comparison: the ETag
+        covers the registry row, so a registry change after the backup is a
+        `412` with nothing applied, and the write can never replace a newer
+        description. A non-conditional restore writes the row after the
+        chunked import commits, still under the registry admission and the
+        write-topology permit and before live apply is awaited; if that single
+        write fails, the response is a `500` with `configuration_restored:
+        true`, and retrying the restore or `PUT /namespaces/{name}` completes
+        it.
 
         ### Stored API-spec documents are admitted
 
@@ -5986,7 +6005,13 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "501":
-          description: Conditional restore requires a transaction-capable MongoDB deployment.
+          description: >-
+            Nothing was deleted. Either a conditional restore needs a
+            transaction-capable MongoDB deployment, or the backup's
+            `namespace_registry` section would change the target namespace's
+            registry row, which standalone MongoDB cannot write atomically
+            (`detail` names `FERRUM_MONGO_REPLICA_SET`). An unchanged registry
+            row restores on standalone MongoDB.
           content:
             application/json:
               schema:
@@ -6075,11 +6100,13 @@ paths:
                     type: boolean
                     enum: [true]
                     description: >-
-                      Present (`true`) only when the namespace configuration
-                      was restored and committed but the registry row from the
-                      backup's `namespace_registry` section could not be
-                      written afterwards. Retry the restore, or set the
-                      description with `PUT /namespaces/{name}`.
+                      Present (`true`) only when a non-conditional restore
+                      committed the namespace configuration but the registry
+                      row from the backup's `namespace_registry` section could
+                      not be written afterwards. Retry the restore, or set the
+                      description with `PUT /namespaces/{name}`. A conditional
+                      restore writes the row in its replacement transaction
+                      and never returns this.
         "400":
           description: Missing `?confirm=true`, malformed JSON/headers, or backup validation errors (`validation_errors`)
           content:
@@ -21799,14 +21826,18 @@ components:
 
         `POST /restore` admits it before anything is deleted. When `name`
         equals the target namespace (`X-Ferrum-Namespace`), restore writes the
-        row after the restored configuration commits: an existing row's
-        description is replaced (its `created_at` is kept), a namespace that
-        only has derived existence is registered, and an empty unregistered
-        namespace is created with new timestamps. A section taken from another
-        namespace is validated but not applied, so restoring one tenant's
-        export into a different namespace never relabels that namespace. An
-        absent section leaves the target registry row untouched. Accepted and
-        ignored on `POST /batch`.
+        row under registry admission: a matching row is left as is, an
+        existing row's description is replaced (its `created_at` is kept), a
+        namespace that only has derived existence is registered, and an empty
+        unregistered namespace is created with new timestamps. A conditional
+        restore writes it inside its replacement transaction (the namespace
+        ETag covers the row); a non-conditional restore writes it after the
+        import commits and before live apply. A change standalone MongoDB
+        cannot write atomically is refused with `501` before the clear. A
+        section taken from another namespace is validated but not applied, so
+        restoring one tenant's export into a different namespace never
+        relabels that namespace. An absent section leaves the target registry
+        row untouched. Accepted and ignored on `POST /batch`.
       required: [section_version, name]
       additionalProperties: false
       properties:

@@ -487,17 +487,7 @@ pub fn extract_with_external_refs(
     let validate_ext = parse_x_ferrum_validate_extension(&root)?;
     let validate_enabled = validate_ext.is_some();
     if let Some(validate_ext) = validate_ext {
-        let reject_unsupported_parameters = match validate_ext.get("reject_unsupported_parameters")
-        {
-            None => false,
-            Some(Value::Bool(reject)) => *reject,
-            Some(_) => {
-                return Err(validator_parameter_error(
-                    "`x-ferrum-validate.reject_unsupported_parameters` must be a boolean"
-                        .to_string(),
-                ));
-            }
-        };
+        let reject_unsupported_parameters = admit_validate_extension_shape(&validate_ext)?;
         let operations = extract_operation_schemas(
             &root,
             &version,
@@ -530,26 +520,7 @@ pub fn extract_with_external_refs(
                     .to_string(),
             ));
         }
-        let listen_prefix = match proxy.listen_path.as_deref() {
-            None => "",
-            Some(path) if path.starts_with('/') => path.trim_end_matches('/'),
-            Some(_) => {
-                return Err(mcp_extension_error(
-                    "`x-ferrum-mcp` requires `x-ferrum-proxy.listen_path` to be a literal path prefix"
-                        .to_string(),
-                ));
-            }
-        };
-        // The MCP endpoint itself is a `POST` endpoint on this proxy.
-        if let Some(allowed) = proxy.allowed_methods.as_deref()
-            && !crate::proxy::request_method_is_allowed(allowed, "POST")
-        {
-            return Err(mcp_extension_error(
-                "`x-ferrum-mcp` requires `x-ferrum-proxy.allowed_methods` to allow POST, the MCP request method"
-                    .to_string(),
-            ));
-        }
-        let endpoint_path = mcp_bridge_endpoint_path(&mcp_ext, listen_prefix)?;
+        let (listen_prefix, endpoint_path) = mcp_bridge_static_route(&mcp_ext, &proxy)?;
         let operations = extract_mcp_bridge_operations(
             &root,
             &version,
@@ -861,26 +832,89 @@ fn admit_spec_resource_extensions(
 
 /// Extension admission for an already admitted, stored spec document (issue
 /// #7532): the same strict decode of `x-ferrum-proxy`, `x-ferrum-upstream`
-/// and `x-ferrum-plugins` that spec submission runs, plus the shape checks of
-/// `x-ferrum-validate` and `x-ferrum-mcp`. Operation-schema generation is not
-/// re-run, because it may need external `$ref` documents the restoring node is
-/// not configured to fetch; a stored document's external-ref snapshot is
-/// validated separately.
+/// and `x-ferrum-plugins` that spec submission runs, plus every static check
+/// submission runs on `x-ferrum-validate` (the boolean import flag and the
+/// root, `request`, `response` and `bypass` shapes) and on `x-ferrum-mcp`
+/// (its keys, the literal listen-path prefix, the `POST` method allowance and
+/// the endpoint path), and the refusal to combine the two. Operation-schema
+/// generation is not re-run, because it may need external `$ref` documents
+/// the restoring node is not configured to fetch; a stored document's
+/// external-ref snapshot is validated separately.
 pub(crate) fn admit_stored_spec_extensions(
     body: &[u8],
     declared_format: SpecFormat,
     namespace: &str,
 ) -> Result<(), ExtractError> {
     let (root, _) = parse_root_document(body, Some(declared_format))?;
-    admit_spec_resource_extensions(&root, namespace)?;
-    let validate_enabled = parse_x_ferrum_validate_extension(&root)?.is_some();
-    if parse_x_ferrum_mcp_extension(&root)?.is_some() && validate_enabled {
+    let (proxy, _upstream, _plugins) = admit_spec_resource_extensions(&root, namespace)?;
+    let validate_ext = parse_x_ferrum_validate_extension(&root)?;
+    let validate_enabled = validate_ext.is_some();
+    if let Some(validate_ext) = validate_ext {
+        admit_validate_extension_shape(&validate_ext)?;
+    }
+    if let Some(mcp_ext) = parse_x_ferrum_mcp_extension(&root)? {
+        if validate_enabled {
+            return Err(mcp_extension_error(
+                "`x-ferrum-mcp` cannot be combined with `x-ferrum-validate` in one document"
+                    .to_string(),
+            ));
+        }
+        mcp_bridge_static_route(&mcp_ext, &proxy)?;
+    }
+    Ok(())
+}
+
+/// The static checks of an enabled `x-ferrum-validate` extension, shared by
+/// spec submission and stored-spec admission: the import-only
+/// `reject_unsupported_parameters` flag must be a boolean, and the root,
+/// `request`, `response` and `bypass` members must have the shapes the
+/// generated `openapi_validator` config is built from. Returns the import
+/// flag. Needs no external document.
+fn admit_validate_extension_shape(validate_ext: &Value) -> Result<bool, ExtractError> {
+    let reject_unsupported_parameters = match validate_ext.get("reject_unsupported_parameters") {
+        None => false,
+        Some(Value::Bool(reject)) => *reject,
+        Some(_) => {
+            return Err(validator_parameter_error(
+                "`x-ferrum-validate.reject_unsupported_parameters` must be a boolean".to_string(),
+            ));
+        }
+    };
+    // The same mapping onto a scratch config that generation applies, so a
+    // member generation would refuse is refused here too.
+    apply_validate_extension(&mut Map::new(), validate_ext.clone())?;
+    Ok(reject_unsupported_parameters)
+}
+
+/// The static route of an enabled `x-ferrum-mcp` extension, shared by spec
+/// submission and stored-spec admission: the proxy's literal listen-path
+/// prefix (the bridge cannot route under a regex listen path), the `POST`
+/// allowance the MCP endpoint needs, and the endpoint path under that prefix.
+fn mcp_bridge_static_route<'p>(
+    mcp_ext: &McpBridgeExtension,
+    proxy: &'p Proxy,
+) -> Result<(&'p str, String), ExtractError> {
+    let listen_prefix = match proxy.listen_path.as_deref() {
+        None => "",
+        Some(path) if path.starts_with('/') => path.trim_end_matches('/'),
+        Some(_) => {
+            return Err(mcp_extension_error(
+                "`x-ferrum-mcp` requires `x-ferrum-proxy.listen_path` to be a literal path prefix"
+                    .to_string(),
+            ));
+        }
+    };
+    // The MCP endpoint itself is a `POST` endpoint on this proxy.
+    if let Some(allowed) = proxy.allowed_methods.as_deref()
+        && !crate::proxy::request_method_is_allowed(allowed, "POST")
+    {
         return Err(mcp_extension_error(
-            "`x-ferrum-mcp` cannot be combined with `x-ferrum-validate` in one document"
+            "`x-ferrum-mcp` requires `x-ferrum-proxy.allowed_methods` to allow POST, the MCP request method"
                 .to_string(),
         ));
     }
-    Ok(())
+    let endpoint_path = mcp_bridge_endpoint_path(mcp_ext, listen_prefix)?;
+    Ok((listen_prefix, endpoint_path))
 }
 
 /// Return plugin IDs explicitly listed in `x-ferrum-proxy.plugins`.

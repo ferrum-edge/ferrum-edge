@@ -674,10 +674,6 @@ pub mod _test_support {
         http_body_util::Either::Right(body)
     }
 
-    /// Structural admission of a `POST /restore` envelope (issue #5538).
-    ///
-    /// Preserve the parser error so tests can distinguish object admission
-    /// from a later required-field or value-shape rejection.
     /// `ferrum-edge validate --backup` over `path` with the policy a
     /// control-plane-shaped test `AdminState` (no `ProxyState`, no cached
     /// mesh) gives `POST /restore` (issue #7532). `Ok(())` exactly when the
@@ -693,6 +689,7 @@ pub mod _test_support {
             backend_allow_ips,
             max_spec_body_mib,
             restore_max_body_mib,
+            false,
         );
         crate::admin::restore_admission::check_backup_file(
             path,
@@ -703,6 +700,22 @@ pub mod _test_support {
         .map(|_| ())
     }
 
+    /// The production `ferrum-edge validate --backup` entry point over `path`
+    /// for an explicit `EnvConfig`: `serves_proxy` is `true` for database mode
+    /// (the serving node's plugin client) and `false` for a control plane.
+    pub fn backup_export_check_with_env_for_test(
+        path: &std::path::Path,
+        env_config: &crate::config::EnvConfig,
+        serves_proxy: bool,
+    ) -> Result<(), Vec<String>> {
+        crate::admin::restore_admission::check_backup_export(path, env_config, serves_proxy)
+            .map(|_| ())
+    }
+
+    /// Structural admission of a `POST /restore` envelope (issue #5538).
+    ///
+    /// Preserve the parser error so tests can distinguish object admission
+    /// from a later required-field or value-shape rejection.
     pub fn restore_envelope_admission_for_test(body: &[u8]) -> Result<(), serde_json::Error> {
         crate::admin::restore_envelope_admission_for_test(body)
     }

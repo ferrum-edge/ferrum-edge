@@ -4939,7 +4939,7 @@ async fn functional_cli_stream_port_rejection_sanitizes_early_emissions() {
 async fn functional_cli_validate_backup_export() {
     let dir = TempDir::new().unwrap();
     let validate = || {
-        let mut command = validate();
+        let mut command = validate_database_mode_command(&dir);
         command.env(
             "FERRUM_ADMIN_JWT_SECRET",
             "functional-backup-check-admin-secret-over-32-bytes",

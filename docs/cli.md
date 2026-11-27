@@ -183,12 +183,20 @@ validation refuses is refused by the check, for every section:
 
 - the closed restore envelope and its `version`;
 - every proxy, consumer, plugin config and upstream (ids, field validation,
-  uniqueness, references, plugin construction and composition);
+  uniqueness, references, plugin construction and composition), with plugins
+  constructed by the serving node's client under `-m database` (node-local
+  egress checks included) and checked for shape only under `-m cp`;
+- consumer credential preparation: plaintext Basic-auth passwords are hashed
+  with `FERRUM_BASIC_AUTH_HMAC_SECRET`, so a missing or too-short secret is
+  refused as restore refuses it;
 - `gateway_trust_bundles` (singleton rule and record validation);
 - `api_specs`: size, compression and hash checks, document format and
   version, the ownership graph, and the same strict extension admission of
   each stored document that `POST` / `PUT /api-specs` run, so stale or removed
-  keys in `x-ferrum-proxy` / `x-ferrum-upstream` are found here;
+  keys in `x-ferrum-proxy` / `x-ferrum-upstream` are found here, plus the
+  static `x-ferrum-validate` (import flag, `request` / `response` / `bypass`
+  shapes) and `x-ferrum-mcp` (keys, literal listen path, `POST` allowance,
+  endpoint path) checks;
 - `namespace_registry` (section version, name, description).
 
 Behaviour:
@@ -208,8 +216,9 @@ Behaviour:
 - Not decided offline, because they depend on the target database: another
   namespace already owning the process-global `prometheus_metrics` instance,
   the `confirm_api_spec_deletion` confirmation for a backup without an
-  `api_specs` section when the target holds specs, and a conditional
-  restore's `If-Match`. On a control plane whose cached configuration carries a
+  `api_specs` section when the target holds specs, a conditional
+  restore's `If-Match`, and on standalone MongoDB whether the
+  `namespace_registry` section would change the registry row (`501`). On a control plane whose cached configuration carries a
   mesh model, restore also checks mesh references against that model.
 
 The `FERRUM_DB_CONFIG_BACKUP_PATH` check in database mode is unchanged in scope

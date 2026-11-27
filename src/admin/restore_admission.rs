@@ -6,6 +6,11 @@
 //! collections, `gateway_trust_bundles`, `api_specs` (including the strict
 //! extension admission of each stored spec document) and `namespace_registry`.
 //!
+//! Admission also prepares the payload the way restore persists it: plaintext
+//! Basic-auth passwords are hashed with `FERRUM_BASIC_AUTH_HMAC_SECRET`, so a
+//! deployment without that secret is refused by the offline check exactly as
+//! restore refuses it.
+//!
 //! What stays in the handler is what depends on the target database, not on
 //! the payload: another namespace already owning the process-global
 //! `prometheus_metrics` instance, the `confirm_api_spec_deletion` confirmation
@@ -63,20 +68,16 @@ impl RestoreAdmissionPolicy {
     ///
     /// The plugin validation client carries the same backend egress policy,
     /// real-IP header and compression admission policy a serving node's plugin
-    /// cache admits under; it makes no connection while validating.
+    /// cache admits under; it makes no connection while validating. On a
+    /// serving node (database mode) it is also marked as the serving node's
+    /// client, as the restore handler's client is, so node-local plugin
+    /// egress checks (for example `load_testing` dialling loopback) run.
     pub(crate) fn from_env_config(
         env_config: &crate::config::EnvConfig,
         serves_proxy: bool,
     ) -> Self {
-        let plugin_http_client = crate::config::CompressionAdmissionPolicy::from_process_env().map(
-            |compression_policy| {
-                crate::plugins::PluginHttpClient::default_with_backend_allow_ips(
-                    env_config.backend_allow_ips.clone(),
-                )
-                .with_real_ip_header(crate::config::env_config::resolve_real_ip_header())
-                .with_compression_admission_policy(compression_policy)
-            },
-        );
+        let plugin_http_client =
+            offline_plugin_http_client(env_config.backend_allow_ips.clone(), serves_proxy);
         Self {
             cert_expiry_days: if serves_proxy {
                 env_config.tls_cert_expiry_warning_days
@@ -92,6 +93,25 @@ impl RestoreAdmissionPolicy {
             ),
         }
     }
+}
+
+/// The plugin validation client of the offline check (see
+/// [`RestoreAdmissionPolicy::from_env_config`]).
+fn offline_plugin_http_client(
+    backend_allow_ips: BackendEgressPolicy,
+    serves_proxy: bool,
+) -> Result<crate::plugins::PluginHttpClient, String> {
+    crate::config::CompressionAdmissionPolicy::from_process_env().map(|compression_policy| {
+        let client =
+            crate::plugins::PluginHttpClient::default_with_backend_allow_ips(backend_allow_ips)
+                .with_real_ip_header(crate::config::env_config::resolve_real_ip_header())
+                .with_compression_admission_policy(compression_policy);
+        if serves_proxy {
+            client.for_serving_node()
+        } else {
+            client
+        }
+    })
 }
 
 /// `FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB` in bytes, the request-body ceiling
@@ -111,7 +131,8 @@ pub(crate) struct AdmittedRestore {
     pub(crate) api_specs: Option<Vec<ApiSpec>>,
     /// `Some(description)` when the payload carried a `namespace_registry`
     /// section taken from the target namespace itself; that is the row restore
-    /// writes after the configuration commits. A section taken from another
+    /// writes under registry admission (inside a conditional restore's
+    /// transaction, or after a non-conditional import). A section taken from another
     /// namespace is admitted but never applied: restoring tenant A's export
     /// into tenant B must not relabel B with A's registry metadata.
     pub(crate) namespace_registry_description: Option<Option<String>>,
@@ -175,6 +196,10 @@ pub(crate) enum RestoreAdmissionError {
     /// `503`: validation could not run (the plugin validation client could
     /// not be built). Nothing about the payload was decided.
     Unavailable(String),
+    /// `500 {"error": ..., "restore_errors": [...]}`: the payload is valid but
+    /// this deployment cannot prepare it for persistence (a plaintext
+    /// Basic-auth password with no usable `FERRUM_BASIC_AUTH_HMAC_SECRET`).
+    Preparation(Vec<String>),
 }
 
 impl RestoreAdmissionError {
@@ -182,7 +207,7 @@ impl RestoreAdmissionError {
     pub(crate) fn messages(&self) -> Vec<String> {
         match self {
             Self::Invalid(message) | Self::Unavailable(message) => vec![message.clone()],
-            Self::Validation(errors) => errors.clone(),
+            Self::Validation(errors) | Self::Preparation(errors) => errors.clone(),
         }
     }
 }
@@ -300,6 +325,23 @@ pub(crate) fn admit_restore_payload(
     payload.consumers = candidate.consumers;
     payload.plugin_configs = candidate.plugin_configs;
     payload.upstreams = candidate.upstreams;
+
+    // Credential preparation: plaintext Basic-auth passwords become HMAC
+    // hashes here, on the canonical consumers restore persists. A missing or
+    // unusable `FERRUM_BASIC_AUTH_HMAC_SECRET` is refused before anything is
+    // deleted, and by the offline check on the same environment.
+    let mut preparation_errors = Vec::new();
+    for consumer in &mut payload.consumers {
+        if let Err(error) = super::crud::hash_consumer_credentials(consumer) {
+            preparation_errors.push(format!(
+                "consumer {:?} secret hashing: {error}",
+                consumer.id
+            ));
+        }
+    }
+    if !preparation_errors.is_empty() {
+        return Err(RestoreAdmissionError::Preparation(preparation_errors));
+    }
 
     // Gateway trust bundles: forced into the target namespace, attributed to
     // the restoring subject, revision reset, and validated before anything is
@@ -424,22 +466,17 @@ pub(crate) fn check_backup_file(
 
 /// The offline check's policy for an explicit environment slice (tests use
 /// it to mirror a test `AdminState` without process-environment mutation).
+/// `serves_proxy` selects the database-mode (serving node) client, as
+/// [`RestoreAdmissionPolicy::from_env_config`] does.
 pub(crate) fn offline_policy_for_test(
     backend_allow_ips: BackendEgressPolicy,
     max_spec_body_mib: usize,
     restore_max_body_mib: usize,
+    serves_proxy: bool,
 ) -> RestoreAdmissionPolicy {
     RestoreAdmissionPolicy {
         cert_expiry_days: crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS,
-        plugin_http_client: crate::config::CompressionAdmissionPolicy::from_process_env().map(
-            |compression_policy| {
-                crate::plugins::PluginHttpClient::default_with_backend_allow_ips(
-                    backend_allow_ips.clone(),
-                )
-                .with_real_ip_header(crate::config::env_config::resolve_real_ip_header())
-                .with_compression_admission_policy(compression_policy)
-            },
-        ),
+        plugin_http_client: offline_plugin_http_client(backend_allow_ips.clone(), serves_proxy),
         backend_allow_ips,
         mesh: None,
         max_spec_body_mib,

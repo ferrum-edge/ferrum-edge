@@ -1115,6 +1115,82 @@ impl NamespaceRegistryAdmission {
     }
 }
 
+impl NamespaceRegistryAdmission {
+    /// Split a single-namespace registry admission into its global registry
+    /// lease and the namespace's own config-admission guard (issue #7532).
+    ///
+    /// `POST /restore` with a same-namespace `namespace_registry` section
+    /// acquires registry admission (global key, then the namespace) instead of
+    /// plain namespace config admission, so restore and every registry
+    /// mutation take their leases in one total order and cannot deadlock. The
+    /// namespace guard is the same lease plain config admission takes, so
+    /// restore uses it as its config admission guard; the global lease rides
+    /// beside it until the registry row is written. `None` unless exactly one
+    /// namespace was locked.
+    pub(crate) fn into_global_and_namespace(
+        mut self,
+    ) -> Option<(NamespaceRegistryGlobalLease, NamespaceConfigAdmissionGuard)> {
+        if self.guards.len() != 2 || self.keys.len() != 2 {
+            return None;
+        }
+        let namespace_guard = self.guards.pop()?;
+        let global_guard = self.guards.pop()?;
+        let key = self.keys.swap_remove(0);
+        Some((
+            NamespaceRegistryGlobalLease {
+                key,
+                guard: global_guard,
+            },
+            namespace_guard,
+        ))
+    }
+}
+
+/// The global registry lease split off a single-namespace
+/// [`NamespaceRegistryAdmission`] by
+/// [`NamespaceRegistryAdmission::into_global_and_namespace`].
+///
+/// It carries no process-local shard guard (the namespace guard carries the
+/// whole set, as the last guard of the acquisition), so dropping it first
+/// releases only its datastore lease.
+pub(crate) struct NamespaceRegistryGlobalLease {
+    key: String,
+    guard: NamespaceConfigAdmissionGuard,
+}
+
+impl NamespaceRegistryGlobalLease {
+    /// The registry lease identities — this global key, then `namespace_guard`
+    /// — exactly as [`NamespaceRegistryAdmission::holds`] lists them for the
+    /// same single namespace.
+    pub(crate) fn holds_with<'a>(
+        &'a self,
+        namespace_guard: &'a NamespaceConfigAdmissionGuard,
+    ) -> Vec<crate::config::db_backend::NamespaceAdmissionLeaseHold<'a>> {
+        vec![
+            crate::config::db_backend::NamespaceAdmissionLeaseHold {
+                key: self.key.as_str(),
+                lease: self.guard.lease_ref(),
+            },
+            crate::config::db_backend::NamespaceAdmissionLeaseHold {
+                key: namespace_guard.namespace.as_str(),
+                lease: namespace_guard.lease_ref(),
+            },
+        ]
+    }
+
+    /// Observe the global registry lease across a persistence future, as
+    /// [`NamespaceRegistryAdmission::run_to_completion_while_held`] does.
+    pub(crate) async fn run_to_completion_while_held<F, T>(
+        &self,
+        future: F,
+    ) -> Result<NamespaceConfigAdmissionCompletion<T>, anyhow::Error>
+    where
+        F: Future<Output = T>,
+    {
+        self.guard.run_to_completion_while_held(future).await
+    }
+}
+
 /// Acquire the global registry lease plus one lease per affected namespace.
 ///
 /// `names` may contain duplicates (a description-only update passes the same
@@ -2560,18 +2636,6 @@ pub(crate) async fn validate_transaction_log_schema_api_spec_deletion_candidate(
     let http_client = super::plugin_validation_http_client(state)
         .map_err(|error| AfterValidateError::Db(anyhow::anyhow!(error)))?;
     validate_transaction_log_schema_graph_on_blocking_pool(candidate, http_client).await
-}
-
-/// Validate a wholesale namespace replacement without retaining resources that
-/// the restore will delete. Runtime plugin chains are namespace-scoped, so the
-/// normalized replacement is the complete authoritative candidate.
-pub(crate) fn validate_plugin_graph_restore_candidate(
-    state: &AdminState,
-    replacement: &GatewayConfig,
-) -> Result<(), AfterValidateError> {
-    let http_client = super::plugin_validation_http_client(state)
-        .map_err(|error| AfterValidateError::Db(anyhow::anyhow!(error)))?;
-    validate_candidate_plugin_graph(replacement, &http_client)
 }
 
 async fn consumer_candidate_config(

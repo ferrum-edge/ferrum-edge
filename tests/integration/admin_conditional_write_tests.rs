@@ -1649,6 +1649,7 @@ async fn standalone_mongo_refuses_conditional_snapshots_and_restore_without_io()
         expected,
         api_specs: &[],
         gateway_trust_bundles: None,
+        namespace_registry: None,
     };
     let error = store
         .restore_namespace_conditionally(&restore, &BatchConfigWriteMode::Admission)
@@ -1787,6 +1788,7 @@ async fn assert_transaction_precondition(db: &dyn DatabaseBackend) {
         expected,
         api_specs: &[],
         gateway_trust_bundles: None,
+        namespace_registry: None,
     };
     let error = db
         .restore_namespace_conditionally(&restore, &BatchConfigWriteMode::Admission)
@@ -2187,6 +2189,7 @@ async fn assert_batch_proxy_scoped_plugin_association_parity(db: &dyn DatabaseBa
         expected,
         api_specs: &[],
         gateway_trust_bundles: None,
+        namespace_registry: None,
     };
     db.restore_namespace_conditionally(&restore, &BatchConfigWriteMode::Admission)
         .await
@@ -2396,6 +2399,7 @@ where
         expected,
         api_specs: &[],
         gateway_trust_bundles: None,
+        namespace_registry: None,
     };
     let competitor = uuid::Uuid::new_v4().to_string();
     let observer = async {
