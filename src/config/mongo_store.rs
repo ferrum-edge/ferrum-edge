@@ -10547,8 +10547,8 @@ mod inner {
     ) -> Result<crate::admin::audit::AuditEvent, anyhow::Error> {
         doc.remove("_id");
         // `audit_event_to_doc` is the only writer: `ts` is always a BSON
-        // DateTime and `diff` always JSON text. Build-out keeps no decoders
-        // for other shapes (issue #7218).
+        // DateTime and `diff` always JSON text. No decoders are kept for
+        // shapes retired before 1.0.0 (issue #7218).
         let Some(Bson::DateTime(ts)) = doc.remove("ts") else {
             anyhow::bail!("audit event ts must be a BSON DateTime");
         };
@@ -10625,8 +10625,8 @@ mod inner {
         validate_snapshot_sync: bool,
     ) -> Result<ApiSpec, anyhow::Error> {
         doc.remove("_id");
-        // `api_spec_to_doc` writes both blobs as BSON Binary; build-out keeps
-        // no decoder for the retired integer-array shape (issue #7218).
+        // `api_spec_to_doc` writes both blobs as BSON Binary; no decoder is
+        // kept for the integer-array shape retired before 1.0.0 (issue #7218).
         let spec_content = match doc.remove("spec_content") {
             Some(Bson::Binary(binary)) => binary.bytes,
             Some(_) => anyhow::bail!("api_specs.spec_content has an unexpected BSON type"),
@@ -20255,7 +20255,7 @@ mod inner {
 
         #[test]
         fn decoders_refuse_shapes_no_writer_produces() {
-            // Issue #7218: build-out keeps no decoders for retired shapes.
+            // Issue #7218: no decoders are kept for shapes retired before 1.0.0.
             let mut audit = doc! {
                 "_id": "event-1",
                 "ts": "2026-05-18T01:00:00Z",

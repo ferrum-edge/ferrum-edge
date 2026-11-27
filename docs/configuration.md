@@ -356,9 +356,9 @@ remain distinct. Servers older than 8.0.17 reject the baseline schema DDL
 because the required collation is unavailable. The older `utf8mb4_bin` binary
 collation uses `PAD SPACE` semantics, while a UCA collation such as
 `utf8mb4_0900_as_cs` still folds canonically equivalent sequences; either
-would diverge from the runtime's byte-keyed identity indexes. Under the
-build-out schema policy a database is created from the current V001 baseline,
-so every identity column carries the required collation; Ferrum ships no
+would diverge from the runtime's byte-keyed identity indexes. A database is
+created from the `V001` baseline (plus any later forward migrations), so every
+identity column carries the required collation; Ferrum ships no
 startup probe or repair for databases created with another collation.
 
 MySQL full runtime loads require `REPEATABLE READ` transaction isolation. If the

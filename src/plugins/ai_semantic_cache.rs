@@ -298,8 +298,8 @@ const MIN_REDIS_INTEGRITY_KEY_BYTES: usize = 32;
 /// header name/value so embedded NUL bytes cannot repartition header fields;
 /// v4 authenticates the seal timestamp so Redis retention cannot extend replay
 /// beyond the configured cache TTL; v5 drops the never-written semantic scope
-/// and embedding fields (Redis holds exact entries only). There is no legacy
-/// unauthenticated read path during build-out.
+/// and embedding fields (Redis holds exact entries only). There is no
+/// unauthenticated read path for older entry versions.
 const SEMANTIC_CACHE_ENTRY_VERSION: u8 = 5;
 
 /// Wall-clock skew tolerated between the replica that sealed an authenticated
@@ -1338,7 +1338,7 @@ impl AiSemanticCache {
 
         // Redis envelopes must be authenticated. Fail closed when Redis mode is
         // enabled without a narrowly scoped integrity secret; there is no
-        // unauthenticated legacy read path during build-out.
+        // unauthenticated legacy read path.
         let redis_integrity_key = match optional_string(config, "redis_integrity_key")? {
             Some(raw) => {
                 let key = raw.into_bytes();
