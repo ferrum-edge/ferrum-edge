@@ -25,10 +25,22 @@ plane:
   `Sec-WebSocket-Accept` and **holds** the session — the target of the DR
   `maxConnections=1` probe.
 - **ferrum-cp** — a Ferrum **control plane** (`FERRUM_MODE=cp`, sqlite on an
-  emptyDir, namespaced pod-discovery RBAC only, Istio/Gateway-API CRD
-  watching disabled) whose K8s controller builds the mesh model from the
-  cluster's **real** Services/Pods/EndpointSlices — the only path that
-  populates a CP's mesh block — and serves it over the native
+  emptyDir, namespaced RBAC only) whose K8s controller builds the mesh model
+  from the cluster's **real** Services/Pods/EndpointSlices and Istio
+  objects — the only path that populates a CP's mesh block. Istio CRD
+  watching is on (`FERRUM_K8S_WATCH_ISTIO_CRDS=true`) for the three kinds the
+  suite installs from pinned offline fixtures
+  (`tests/fixtures/k8s/istio_virtualservice_crd.yaml`,
+  `tests/fixtures/k8s/istio_destinationrule_crd.yaml`,
+  `tests/fixtures/k8s/istio_peerauthentication_crd.yaml`), with read access in
+  the watch namespace and in the Istio root namespace `istio-system`, plus
+  `get`/`patch`/`update` on their `status` subresources so the controller
+  writes real `FerrumAccepted` conditions. The pinned Gateway API
+  `ReferenceGrant` CRD (`tests/fixtures/k8s/gateway_api_referencegrant_crd.yaml`)
+  is installed and Established alongside them, but Gateway API watching stays
+  off (the split gate is same-namespace). The CRD fixtures are exact paths in
+  the trusted relevance filter, so a change to one runs this suite. It
+  serves the mesh model over the native
   `MeshConfigSync.MeshSubscribe` gRPC stream on `:50051` with production
   **mTLS + JWT**. The CP server certificate SAN is the Kubernetes Service
   DNS hostname the DP dials (`https://ferrum-cp.<ns>.svc.cluster.local:50051`);
@@ -59,6 +71,28 @@ plane:
   round-robin vs sticky DestinationRule outcomes on the captured client
   egress path. Plain ServiceEntry endpoints are intentionally not used —
   Sidecar outbound materialization only iterates MeshService workloads.
+- **vs-client / vssvc-v1 / vssvc-v2 / vssvc** — the VirtualService `http[]`
+  split gate (issue #7502). `vs-client` is a Sidecar **client** on
+  `FERRUM_MESH_CONFIG_PROTOCOL=native` (same mTLS + JWT channel as capp,
+  SPIRE identity `sa/vs-client`): the file-source clients above cannot carry
+  the gateway proxies/upstreams a VirtualService `http[]` route translates
+  into, so the routes reach a Sidecar only through a CP-delivered slice
+  (`MeshSubscribeRequest.sidecar_http_routes`). Its init container installs
+  the injector's outbound capture chain (pod-local and proxy-UID 1337
+  `RETURN`s, then `REDIRECT` of all other TCP to `:15001`), so the probes dial
+  `http://vssvc.<ns>.svc.cluster.local:8080/` like an application and reach
+  Ferrum only through real capture. `vssvc-v1` / `vssvc-v2` are capp-shaped
+  native destinations with their own identities answering `vs-backend-v1` /
+  `vs-backend-v2`, made **STRICT** by a selector-scoped PeerAuthentication
+  (`vs-split-backend: "true"`) that run.sh applies through the control plane
+  before they start. `vssvc` is a frontend Service whose selector matches no
+  pod (one pod backs exactly one Service), so the client has no plain Service
+  route for it: only the carried VirtualService route can answer. run.sh
+  applies the VirtualService (`x-canary: true` → `vssvc-v2`, otherwise 90/10
+  `vssvc-v1`/`vssvc-v2`) as the LAST probe, after every other assertion is
+  recorded, under a 900 s budget (each request bounded by `curl -m 5`; every
+  sample stops as soon as it can no longer pass; a failed prerequisite records
+  both rows as failed at once).
 
 ## What it asserts
 
@@ -68,7 +102,7 @@ shared schema from `tests/k8s/lib/live_assertions.sh` (suite
 
 | Assertion | Proof |
 |---|---|
-| `sidecar.spire.workload_entries` | svc/wssvc/client/rogue/capp/native-mtls-probe/drsvc-a/drsvc-b SPIRE entries registered |
+| `sidecar.spire.workload_entries` | svc/wssvc/client/rogue/capp/native-mtls-probe/drsvc-a/drsvc-b/vs-client/vssvc-v1/vssvc-v2 SPIRE entries registered |
 | `sidecar.peer_auth.strict_mtls_authenticated` | captured client request → mesh-mTLS → STRICT inbound → 200 with the app marker |
 | `sidecar.peer_auth.strict_mtls_plaintext_rejected` | plaintext dial at the **captured** app port never reaches the app (REDIRECT → STRICT rejects) |
 | `sidecar.authz.denied_principal_rejected` | rogue → 403 with `Mesh authorization denied` (dest-side `mesh_authz`) |
@@ -79,6 +113,8 @@ shared schema from `tests/k8s/lib/live_assertions.sh` (suite
 | `sidecar.destination_rule.lookup_tier_client_wins` | three visible rules at client, service, and root tiers on that same live host; the client-tier round-robin rule wins over sticky lower-priority rules (both backends serve) |
 | `sidecar.destination_rule.tcp_connect_timeout` | two-phase timing: the black-holed mesh-mTLS dial fails at ~8s under `connect_timeout_ms: 8000`, then ~2s after a re-render + rollout restart to `2000` — the observed time must **track** the configured value (both windows exclude the built-in 5000ms default) |
 | `sidecar.virtual_service.cors_policy` | VS-derived CORS on the client sidecar: allowed `Origin` → backend 200 with the origin reflected, allowed `OPTIONS` preflight → **200 by the sidecar** with `access-control-allow-methods`, and unmatched actual/preflight requests → backend 200 with the app marker and no gateway-added `access-control-allow-origin` (Istio omitted/FORWARD semantics) |
+| `sidecar.virtual_service.weighted_split_90_10` | a `kubectl`-applied VirtualService reports `FerrumAccepted=True` with `status.ferrum.translation.mesh_http_routes: sidecar_and_node_waypoint`; both split destinations refuse a TLS client that presents no certificate (curl fails at the TLS layer with no HTTP status), so they are STRICT and every counted answer required `vs-client`'s SVID; the route converges; and **1000** captured requests to `http://vssvc.<ns>.svc.cluster.local:8080/` all complete (curl exit 0) with 200 from a leg, with the `vssvc-v1` count in **[850, 950]** (the design's 85–95%). With `X ~ Binomial(1000, 0.9)` (sd 9.49) that window is ±5.3 sd: a correct split fails with probability ~2.8e-7 (`P(X<850)=2.8e-7`, `P(X>950)=2.8e-9`), while 100/0 (`X=1000`, no v2 marker), 50/50, and a 96/4 drift fail. Ferrum's leg selection is a deterministic weighted round robin, so real runs land within a few requests of 900 |
+| `sidecar.virtual_service.header_match_dispatch` | all **100** `x-canary: true` requests complete with 200 from `vssvc-v2` (an ignored rule would follow the split: 0.1^100), and **1000** `x-canary: false` requests fall through to the split inside the same **[850, 950]** `vssvc-v1` window (a route pinned to either leg fails) |
 | `sidecar.destination_rule.tcp_max_connections` | WebSocket flow (`wssvc`, maxConnections=1): one **held** WS session admitted (101), a concurrent second upgrade rejected **503** by the client sidecar's `BackendConnectionGuard` before dialing, and a fresh upgrade admitted after the held session closes — cap enforcement **and** release |
 | `sidecar.config.native_subscribe_delivered` | native MeshSubscribe delivery over production mTLS + JWT (issues #2002 / #3855): a captured client request to `capp` answers 200 with the `-native` marker — capp's inbound routes exist **only** if the ferrum-cp MeshSubscribe stream delivered a slice whose K8s-built `sa/capp` workload resolved locally — **and** capp's JWT-authenticated `GET /mesh/config-drift` reports a received slice with `source_protocol=native` from the `https://ferrum-cp...` URL and ≥1 service |
 | `sidecar.config.native_subscribe_mtls_omitted_client_rejected` | dedicated probe DP omits its client certificate; MeshSubscribe never accepts a slice |
@@ -97,7 +133,7 @@ node ID cannot supply client evidence. The CP must still accept that exact
 node ID after its own TLS reload, and both event histories must retain the
 pre-swap baseline.
 
-Every assertion backs a GA-contract capability row in
+Every assertion backs a contract capability row in
 `tests/conformance/ga_contract.yaml` — STRICT mTLS, AuthorizationPolicy
 allow/deny, RequestAuthentication JWT, DR namespace visibility/lookup precedence, DR connectTimeout, DR maxConnections,
 VirtualService CORS, SPIFFE identity plumbing
@@ -109,7 +145,12 @@ transport (`mesh.config_transport.native_subscribe`, backed by
 `sidecar.config.native_subscribe_delivered` plus the mTLS/JWT/SAN negatives
 and projected-Secret rotation assertions); the artifact is validated
 against the contract by `tests/conformance/live_contract.rs` (the live
-workflow runs it right after the fixture). No contract row for this suite is
+workflow runs it right after the fixture). The two `sidecar.virtual_service.*`
+split-gate assertions back the **Experimental** row
+`mesh.virtual_service.sidecar_http_routes`: they are enforced exactly like
+the GA rows (live validation covers every non-deferred row whatever its
+maturity), but VirtualService `http[]` routing on a Sidecar is not a GA
+promise until an owner-reviewed promotion. No contract row for this suite is
 `live_deferred`.
 
 This contract is **PR- and release-blocking**: the dedicated workflow's

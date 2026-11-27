@@ -76,7 +76,9 @@ cargo test --test functional_tests -- --ignored --nocapture
 ### Mesh Conformance and Live Evidence
 
 `tests/conformance/ga_contract.yaml` is the machine-readable GA product
-contract for mesh semantic coverage. `cargo test --test conformance_tests --
+contract for mesh semantic coverage; its rows of every maturity also name the
+live assertion IDs the Kubernetes suites must emit and pass (see
+`CONFORMANCE.md`). `cargo test --test conformance_tests --
 --test-threads=1` validates the manifest and emits
 `target/conformance/coverage.json` plus `target/conformance/coverage.md` (a
 multi-threaded run can emit an incomplete matrix).
