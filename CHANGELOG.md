@@ -125,8 +125,10 @@ gateways, control planes, mesh data planes, charts or contract consumers.
   members, and the gateway trust-bundle objects that reuse them), and the
   managed TLS, ACME, namespace and mesh egress-scope test Admin API request
   bodies. Those request bodies must also be JSON objects: a positional array is
-  refused. Previously nested objects silently dropped unknown keys, so a typo
-  such as `health_checks.pasive` built a resource with that policy missing.
+  refused. In 0.9.21 these objects silently dropped unknown keys (top-level
+  resources, stream match criteria, plugin triggers and the mesh policy
+  objects already refused them), so a typo such as `health_checks.pasive`
+  built a resource with that policy missing.
   The Admin API, `/batch`, `POST /restore`, API-spec `x-ferrum-proxy` /
   `x-ferrum-upstream`, file mode, `ferrum-edge validate`, mesh documents and
   the MeshConfig ConfigMap, database and MongoDB loads and CP-to-DP sync

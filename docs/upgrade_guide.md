@@ -184,9 +184,12 @@ remove it from manifests and Helm `extraEnv` anyway.
 
 ### Unknown configuration keys are rejected (#7520, #7524)
 
-Before 1.0.0 only the top-level resources (`Proxy`, `Upstream`, `Consumer`,
-`PluginConfig`, `ApiSpec`) rejected unknown keys; nested objects dropped them
-silently, so a misspelled `health_checks.pasive` or
+In 0.9.21 the top-level resources (`GatewayConfig`, `Proxy`, `Upstream`,
+`Consumer`, `PluginConfig`, `ApiSpec`, `FrontendTlsCertificateSource`) and some
+nested objects (stream `stream_match` criteria and arms, plugin trigger
+objects, and the mesh policy, authentication, telemetry and VirtualService
+route objects) already refused unknown keys, but the nested objects listed
+below dropped them silently, so a misspelled `health_checks.pasive` or
 `circuit_breaker.failure_treshold` produced a resource with that policy
 missing. 1.0.0 closes these nested objects:
 
