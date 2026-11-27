@@ -18039,7 +18039,7 @@ mod inner {
             // is at most one second of resource writes (typically empty), so
             // this is a small, index-bounded scan that fetches only timestamps.
             let boundary_overage = match filter.updated_since {
-                Some(since) if since.timestamp_subsec_nanos() != 0 => {
+                Some(since) if since.subsec_nanos() != 0 => {
                     self.count_updated_before_in_boundary_second(&filter_doc, since)
                         .await?
                 }
@@ -18078,7 +18078,7 @@ mod inner {
             // matches the SQL backend, which applies the exact `updated_at >= ?`
             // predicate before `LIMIT/OFFSET`.
             let exact_postfilter_since = match filter.updated_since {
-                Some(since) if since.timestamp_subsec_nanos() != 0 => Some(since),
+                Some(since) if since.subsec_nanos() != 0 => Some(since),
                 _ => None,
             };
 
@@ -19794,13 +19794,13 @@ mod inner {
             assert_eq!(
                 range.get("$gte"),
                 Some(&Bson::DateTime(BsonDateTime::from_millis(
-                    start.timestamp_millis()
+                    start.unix_timestamp_millis()
                 )))
             );
             assert_eq!(
                 range.get("$lte"),
                 Some(&Bson::DateTime(BsonDateTime::from_millis(
-                    end.timestamp_millis()
+                    end.unix_timestamp_millis()
                 )))
             );
         }
@@ -19935,7 +19935,7 @@ mod inner {
             // Whole-second `since`: the floor is already exact, so the boundary
             // window holds nothing `< since` and no overage is subtracted.
             let whole = parse_stored("2026-05-18T01:00:00Z");
-            assert_eq!(whole.timestamp_subsec_nanos(), 0);
+            assert_eq!(whole.subsec_nanos(), 0);
             assert!(in_boundary_window("2026-05-18T01:00:00.000000001Z", whole));
             assert!(
                 parse_stored("2026-05-18T01:00:00.000000001Z") >= whole,
@@ -20056,7 +20056,7 @@ mod inner {
             assert_eq!(
                 doc.get("ts"),
                 Some(&Bson::DateTime(BsonDateTime::from_millis(
-                    ts.timestamp_millis()
+                    ts.unix_timestamp_millis()
                 )))
             );
             assert!(

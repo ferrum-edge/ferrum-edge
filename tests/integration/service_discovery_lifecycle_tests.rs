@@ -2698,7 +2698,7 @@ async fn apply_passive_reload(state: &ferrum_edge::proxy::ProxyState, incrementa
         .updated_at
         .checked_add(::time::SignedDuration::seconds(1))
         .unwrap();
-    filler.backend_path = Some(format!("/revision-{}", filler.updated_at.timestamp()));
+    filler.backend_path = Some(format!("/revision-{}", filler.updated_at.unix_timestamp()));
     let outcome = if incremental {
         state
             .apply_incremental(IncrementalResult {
