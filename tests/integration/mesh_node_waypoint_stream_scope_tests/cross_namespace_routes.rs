@@ -578,16 +578,30 @@ fn a_cross_namespace_clone_shares_the_destination_active_request_lane() {
     let mut prepared =
         prepare_gateway_config_from_mesh_slice(&slice_for(&config, &runtime), &runtime)
             .expect("slice materializes");
+    // The granted Service gets no ordinary route on this Sidecar; stand in for
+    // any other route dialing the Service upstream itself (another subscriber
+    // of the destination's lane) with a route in its own namespace.
+    let carried = carried_routes(&prepared)[0].clone();
+    let mut plain = carried.clone();
+    plain.id = "plain-ratings".to_string();
+    plain.namespace = OTHER.to_string();
+    plain.plugins.clear();
+    plain.upstream_id = Some(RATINGS_OTHER_UPSTREAM.to_string());
+    prepared.proxies.push(plain);
     // Publication normalizes the prepared generation (`update_config`).
     prepared.normalize_fields();
-    let carried = carried_routes(&prepared)[0].clone();
+    let carried = prepared
+        .proxies
+        .iter()
+        .find(|proxy| proxy.id == carried.id)
+        .expect("carried route")
+        .clone();
     let plain = prepared
         .proxies
         .iter()
-        .find(|proxy| proxy.upstream_id.as_deref() == Some(RATINGS_OTHER_UPSTREAM))
-        .expect("the other/ratings Service route")
+        .find(|proxy| proxy.id == "plain-ratings")
+        .expect("Service route")
         .clone();
-    assert_eq!(plain.namespace, OTHER);
 
     let limiter = BackendActiveRequestLimiter::new();
     let held = try_acquire_destination_active_request_for_test(&limiter, &plain, 8080)
@@ -952,29 +966,10 @@ fn the_projection_withholds_routes_beyond_the_authorization_budget() {
         .expect("a set at the budget materializes");
 }
 
-/// Review F4: DestinationRules naming the destination workloads' own
-/// addresses never match the route-namespace clone (it takes its policy from
-/// the Service upstream it copies), so they cannot reject the slice before
-/// the clone is refreshed.
-#[test]
-fn endpoint_host_destination_rules_do_not_reject_a_slice_with_a_clone() {
+/// Back `other/ratings` with two DNS-addressed workloads (`vm-a`, `vm-b`).
+fn back_ratings_with_dns_workloads(config: &mut GatewayConfig) {
     use ferrum_edge::modes::mesh::config::WorkloadRef;
 
-    let mut config = translated(vec![
-        virtual_service("direct", direct_spec(RATINGS_OTHER)),
-        destination_rule(
-            "vm-a",
-            DEFAULT_NAMESPACE,
-            "vm-a.example.com",
-            json!({"loadBalancer": {"simple": "RANDOM"}}),
-        ),
-        destination_rule(
-            "vm-b",
-            DEFAULT_NAMESPACE,
-            "vm-b.example.com",
-            json!({"loadBalancer": {"simple": "ROUND_ROBIN"}}),
-        ),
-    ]);
     let vm_a = workload_for("ratings", OTHER, [("app", "ratings")], ["vm-a.example.com"]);
     let mut vm_b = workload_for(
         "ratings-b",
@@ -1001,11 +996,35 @@ fn endpoint_host_destination_rules_do_not_reject_a_slice_with_a_clone() {
     ];
     mesh.workloads.push(vm_a);
     mesh.workloads.push(vm_b);
-    let rules = mesh.destination_rules.clone();
+}
 
-    let runtime = sidecar_runtime();
-    let mut slice = slice_for(&config, &runtime);
-    // Both endpoint-host rules are visible to the subscriber.
+/// Two client-namespace rules naming the two DNS endpoints with different
+/// policies.
+fn endpoint_host_rules() -> Vec<K8sObject> {
+    vec![
+        destination_rule(
+            "vm-a",
+            DEFAULT_NAMESPACE,
+            "vm-a.example.com",
+            json!({"loadBalancer": {"simple": "RANDOM"}}),
+        ),
+        destination_rule(
+            "vm-b",
+            DEFAULT_NAMESPACE,
+            "vm-b.example.com",
+            json!({"loadBalancer": {"simple": "ROUND_ROBIN"}}),
+        ),
+    ]
+}
+
+/// The Sidecar slice with every translated DestinationRule visible.
+fn slice_with_all_rules(config: &GatewayConfig, runtime: &MeshRuntimeConfig) -> MeshSlice {
+    let mut slice = slice_for(config, runtime);
+    let rules = config
+        .mesh
+        .as_ref()
+        .map(|mesh| mesh.destination_rules.clone())
+        .unwrap_or_default();
     for rule in rules {
         if !slice
             .destination_rules
@@ -1015,6 +1034,21 @@ fn endpoint_host_destination_rules_do_not_reject_a_slice_with_a_clone() {
             slice.destination_rules.push(rule);
         }
     }
+    slice
+}
+
+/// Review F4 (round 2): DestinationRules naming the destination workloads' own
+/// addresses never match the route-namespace clone (it takes its policy from
+/// the Service upstream it copies), so they cannot reject the slice before
+/// the clone is refreshed.
+#[test]
+fn endpoint_host_destination_rules_do_not_reject_a_slice_with_a_clone() {
+    let mut objects = vec![virtual_service("direct", direct_spec(RATINGS_OTHER))];
+    objects.extend(endpoint_host_rules());
+    let mut config = translated(objects);
+    back_ratings_with_dns_workloads(&mut config);
+    let runtime = sidecar_runtime();
+    let slice = slice_with_all_rules(&config, &runtime);
     let prepared = prepare_gateway_config_from_mesh_slice(&slice, &runtime)
         .expect("endpoint-host rules do not reject the slice");
     let routes = carried_routes(&prepared);
@@ -1032,4 +1066,212 @@ fn endpoint_host_destination_rules_do_not_reject_a_slice_with_a_clone() {
         upstream(&prepared, RATINGS_OTHER_UPSTREAM).algorithm,
         "the clone carries the Service upstream's policy, not an endpoint rule's"
     );
+}
+
+/// Review F3 (round 3): a weighted split dispatched leg by leg is never
+/// dialed, so the same endpoint-host rules cannot reject the slice through
+/// the split upstream either.
+#[test]
+fn endpoint_host_destination_rules_do_not_reject_a_leg_dispatched_split() {
+    let mut objects = vec![
+        virtual_service("split", ninety_ten_spec()),
+        destination_rule(
+            "ratings-dr",
+            OTHER,
+            RATINGS_OTHER,
+            json!({"loadBalancer": {"simple": "RANDOM"}}),
+        ),
+    ];
+    objects.extend(endpoint_host_rules());
+    let mut config = translated(objects);
+    back_ratings_with_dns_workloads(&mut config);
+    let runtime = sidecar_runtime();
+    let slice = slice_with_all_rules(&config, &runtime);
+    let prepared = prepare_gateway_config_from_mesh_slice(&slice, &runtime)
+        .expect("endpoint-host rules do not reject a leg-dispatched split");
+    let routes = carried_routes(&prepared);
+    assert_eq!(routes.len(), 1, "the split route is served");
+    let dispatch = prepared
+        .plugin_configs
+        .iter()
+        .find(|plugin| {
+            plugin.plugin_name == "mesh_route_dispatch"
+                && plugin.proxy_id.as_deref() == Some(routes[0].id.as_str())
+        })
+        .expect("the split is dispatched leg by leg");
+    let legs: Vec<&str> = dispatch.config["weighted_splits"][0]["legs"]
+        .as_array()
+        .expect("legs")
+        .iter()
+        .filter_map(|leg| leg["upstream_id"].as_str())
+        .collect();
+    assert!(
+        legs.iter().any(|leg| leg.starts_with(CLONE_PREFIX)),
+        "{legs:?}"
+    );
+    assert_eq!(
+        upstream(
+            &prepared,
+            legs.iter()
+                .find(|leg| leg.starts_with(CLONE_PREFIX))
+                .expect("clone leg")
+        )
+        .algorithm,
+        LoadBalancerAlgorithm::Random,
+        "the cross-namespace leg carries the destination Service's own rule"
+    );
+}
+
+/// Review F1 (round 3): a WorkloadEntry of the subscriber's own namespace
+/// that legitimately attaches to the granted target Service keeps both its
+/// workload and the Service's reference to it, so the slice stays consistent
+/// through data-plane decode and validation.
+#[test]
+fn a_subscriber_namespace_workload_entry_attached_to_the_target_stays_consistent() {
+    use ferrum_edge::modes::mesh::config::WorkloadRef;
+
+    let mut config = translated(vec![virtual_service("direct", direct_spec(RATINGS_OTHER))]);
+    let mut entry = workload_for("vm", DEFAULT_NAMESPACE, [("app", "vm")], ["10.0.0.50"]);
+    entry.service_name = "ratings".to_string();
+    entry.service_namespace = Some(OTHER.to_string());
+    let entry_identity = entry.spiffe_id.clone();
+    let mesh = config.mesh.as_mut().expect("mesh block");
+    mesh.services
+        .iter_mut()
+        .find(|service| service.namespace == OTHER && service.name == "ratings")
+        .expect("other/ratings")
+        .workloads
+        .push(WorkloadRef {
+            spiffe_id: entry_identity.clone(),
+        });
+    mesh.workloads.push(entry);
+
+    let runtime = sidecar_runtime();
+    let slice = slice_for(&config, &runtime);
+    assert!(
+        slice
+            .workloads
+            .iter()
+            .any(|workload| workload.spiffe_id == entry_identity),
+        "the subscriber-namespace attachment is kept"
+    );
+    assert!(
+        slice
+            .services
+            .iter()
+            .find(|service| service.namespace == OTHER && service.name == "ratings")
+            .expect("target Service")
+            .workloads
+            .iter()
+            .any(|reference| reference.spiffe_id == entry_identity),
+        "and the target Service still references it"
+    );
+    // Through the wire and data-plane decode and validation.
+    let native: MeshSlice =
+        serde_json::from_value(serde_json::to_value(&slice).expect("serialize"))
+            .expect("native slice JSON decodes");
+    let prepared =
+        prepare_gateway_config_from_mesh_slice(&native, &runtime).expect("slice materializes");
+    let clone = upstream(
+        &prepared,
+        carried_routes(&prepared)[0]
+            .upstream_id
+            .as_deref()
+            .expect("bound upstream"),
+    );
+    let mut hosts: Vec<&str> = clone
+        .targets
+        .iter()
+        .map(|target| target.host.as_str())
+        .collect();
+    hosts.sort_unstable();
+    assert_eq!(hosts, vec!["10.0.0.50", "10.0.1.12"]);
+}
+
+/// The proxy an outbound request for `host` resolves to.
+fn routed_outbound_proxy(prepared: &GatewayConfig, host: &str) -> Option<(String, String)> {
+    use ferrum_edge::RouterCache;
+    use ferrum_edge::modes::mesh::MeshTrafficDirection;
+    use ferrum_edge::router_cache::{MeshRouteScope, MeshScopedResolution};
+
+    let cache = RouterCache::new(prepared, 1024);
+    match cache.resolve_mesh_scoped_route_for_test(
+        Some(host),
+        "/",
+        None,
+        false,
+        MeshRouteScope {
+            direction: Some(MeshTrafficDirection::Outbound),
+            ..MeshRouteScope::default()
+        },
+    ) {
+        MeshScopedResolution::Routed(route) => {
+            let proxy = &route.route_match().proxy;
+            Some((proxy.namespace.clone(), proxy.id.clone()))
+        }
+        MeshScopedResolution::NotFound | MeshScopedResolution::Refused => None,
+    }
+}
+
+/// Review F2 (round 3): the granted Service of another namespace gets no
+/// ordinary Service route on the Sidecar, so its short name can never capture
+/// requests for the same-named Service of the Sidecar's own namespace,
+/// whatever order the Services arrive in.
+#[test]
+fn a_granted_target_never_captures_a_same_named_local_service() {
+    let local = workload_for(
+        "ratings",
+        DEFAULT_NAMESPACE,
+        [("app", "ratings")],
+        ["10.0.0.12"],
+    );
+    for target_first in [true, false] {
+        let mut config = translated(vec![virtual_service("direct", direct_spec(RATINGS_OTHER))]);
+        let mesh = config.mesh.as_mut().expect("mesh block");
+        let local_service = service_for("ratings", DEFAULT_NAMESPACE, &[&local]);
+        if target_first {
+            mesh.services.push(local_service);
+        } else {
+            mesh.services.insert(0, local_service);
+        }
+        mesh.workloads.push(local.clone());
+
+        let runtime = sidecar_runtime();
+        let prepared =
+            prepare_gateway_config_from_mesh_slice(&slice_for(&config, &runtime), &runtime)
+                .expect("slice materializes");
+        assert!(
+            !prepared
+                .proxies
+                .iter()
+                .any(|proxy| proxy.namespace == OTHER),
+            "target first = {target_first}: the granted Service gets no ordinary route"
+        );
+        for host in [
+            "ratings",
+            "ratings.default",
+            "ratings.default.svc.cluster.local",
+        ] {
+            assert_eq!(
+                routed_outbound_proxy(&prepared, host),
+                Some((
+                    DEFAULT_NAMESPACE.to_string(),
+                    "__mesh-outbound-default-ratings-8080".to_string()
+                )),
+                "target first = {target_first}: {host} reaches the local Service"
+            );
+        }
+        assert_eq!(
+            routed_outbound_proxy(&prepared, "ratings.other.svc.cluster.local"),
+            None,
+            "target first = {target_first}: the granted Service is reachable only through \
+             the authorized route"
+        );
+        // The authorized route still reaches it through its clone.
+        let clone_id = carried_routes(&prepared)[0]
+            .upstream_id
+            .clone()
+            .expect("bound upstream");
+        assert_ratings_clone(&prepared, &clone_id);
+    }
 }

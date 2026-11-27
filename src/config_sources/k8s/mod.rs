@@ -1317,13 +1317,6 @@ impl K8sAccumulator {
         }
     }
 
-    /// Whether the translator collected at least one Service in `namespace`.
-    pub(crate) fn namespace_has_services(&self, namespace: &str) -> bool {
-        self.service_port_names
-            .get(namespace)
-            .is_some_and(|services| !services.is_empty())
-    }
-
     pub(crate) fn service_exists(&self, namespace: &str, service: &str) -> bool {
         self.service_port_names
             .get(namespace)

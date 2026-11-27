@@ -2417,13 +2417,18 @@ impl MeshSlice {
             waypoint_resources
         };
 
+        // Issue #7499: an authorized cross-namespace target Service keeps only
+        // the workload references of namespaces this subscriber may see. Done
+        // BEFORE attachment retention below, so a workload whose reference is
+        // removed here cannot survive as a dangling attachment.
+        let services =
+            narrow_cross_namespace_target_service_refs(services, &http_routes, mesh, &namespace);
         // A cross-namespace attachment must survive narrowing together with the
         // MeshService that AUTHORIZES it, or not at all.
         let workloads = retain_authorized_cross_namespace_attachments(workloads, &services);
         // Issue #7499: a Sidecar dials an authorized cross-namespace carried
         // route destination through that Service's own workloads, which the
         // namespace-local workload view above never holds.
-        let services = narrow_cross_namespace_target_service_refs(services, &http_routes, mesh);
         let workloads =
             with_cross_namespace_destination_workloads(workloads, &http_routes, &services, mesh);
 
@@ -2816,31 +2821,41 @@ fn cross_namespace_target_services(http_routes: &MeshHttpRouteSet) -> BTreeSet<(
 }
 
 /// Narrow each authorized cross-namespace target Service's workload
-/// references to workloads of the Service's OWN namespace (issue #7499).
+/// references to workloads of the Service's own namespace or of the
+/// subscriber's namespace (issue #7499).
 ///
-/// That namespace already passed the control plane's scope ceiling and the
-/// subscriber's bearer `ns` claim (`filter_mesh_config_to_request`). A
-/// workload attached from a third namespace (a `WorkloadEntry` naming the
-/// Service across namespaces) did not, so neither its identity nor its
-/// address may reach this subscriber through the target Service.
+/// Those two namespaces passed the control plane's scope ceiling and the
+/// subscriber's bearer `ns` claim (`filter_mesh_config_to_request`; the
+/// subscription namespace is the claim's own). A workload attached from a
+/// third namespace (a `WorkloadEntry` naming the Service across namespaces)
+/// did not, so neither its identity nor its address may reach this
+/// subscriber through the target Service. Runs before attachment retention,
+/// so a removed reference never leaves a dangling attachment.
 fn narrow_cross_namespace_target_service_refs(
     mut services: Vec<MeshService>,
     http_routes: &MeshHttpRouteSet,
     mesh: &MeshConfig,
+    subscriber_namespace: &str,
 ) -> Vec<MeshService> {
     let targets = cross_namespace_target_services(http_routes);
     if targets.is_empty() {
         return services;
     }
+    // `(SPIFFE id, workload namespace)` of every workload, built once.
+    let identities: HashSet<(&str, &str)> = mesh
+        .workloads
+        .iter()
+        .map(|workload| (workload.spiffe_id.as_str(), workload.namespace.as_str()))
+        .collect();
     for service in &mut services {
         if !targets.contains(&(service.namespace.as_str(), service.name.as_str())) {
             continue;
         }
         let namespace = service.namespace.clone();
         service.workloads.retain(|reference| {
-            mesh.workloads.iter().any(|workload| {
-                workload.spiffe_id == reference.spiffe_id && workload.namespace == namespace
-            })
+            let spiffe = reference.spiffe_id.as_str();
+            identities.contains(&(spiffe, namespace.as_str()))
+                || identities.contains(&(spiffe, subscriber_namespace))
         });
     }
     services
@@ -2868,22 +2883,57 @@ fn with_cross_namespace_destination_workloads(
         return workloads;
     }
     let targets = cross_namespace_target_services(http_routes);
+    // Index once: the inventory workloads of each `(namespace, Service)`
+    // attached in their OWN namespace. Only those can back a target here:
+    // the target namespace passed the CP scope and bearer ceilings, a third
+    // namespace attaching to the Service did not.
+    let mut own_namespace_backers: HashMap<(&str, &str), Vec<usize>> = HashMap::new();
+    for (index, workload) in mesh.workloads.iter().enumerate() {
+        if workload.attached_service_namespace() == workload.namespace
+            && targets.contains(&(workload.namespace.as_str(), workload.service_name.as_str()))
+        {
+            own_namespace_backers
+                .entry((workload.namespace.as_str(), workload.service_name.as_str()))
+                .or_default()
+                .push(index);
+        }
+    }
+    // Workloads already in the view, so none is serialized twice.
+    let present: HashSet<(String, String)> = workloads
+        .iter()
+        .map(|workload| {
+            (
+                workload.namespace.clone(),
+                workload.spiffe_id.as_str().to_string(),
+            )
+        })
+        .collect();
+    let mut added: HashSet<usize> = HashSet::new();
     for service in services
         .iter()
         .filter(|service| targets.contains(&(service.namespace.as_str(), service.name.as_str())))
     {
-        for workload in &mesh.workloads {
-            // Only workloads of the Service's own namespace: that namespace
-            // passed the CP scope and bearer ceilings, a third namespace
-            // attaching to the Service did not.
-            let backs_service = workload.namespace == service.namespace
-                && workload.attached_service_namespace() == service.namespace
-                && workload.service_name == service.name
-                && service
-                    .workloads
-                    .iter()
-                    .any(|reference| reference.spiffe_id == workload.spiffe_id);
-            if backs_service && !workloads.contains(workload) {
+        let referenced: HashSet<&str> = service
+            .workloads
+            .iter()
+            .map(|reference| reference.spiffe_id.as_str())
+            .collect();
+        let Some(backers) =
+            own_namespace_backers.get(&(service.namespace.as_str(), service.name.as_str()))
+        else {
+            continue;
+        };
+        for &index in backers {
+            let Some(workload) = mesh.workloads.get(index) else {
+                continue;
+            };
+            if referenced.contains(workload.spiffe_id.as_str())
+                && !present.contains(&(
+                    workload.namespace.clone(),
+                    workload.spiffe_id.as_str().to_string(),
+                ))
+                && added.insert(index)
+            {
                 workloads.push(workload.clone());
             }
         }

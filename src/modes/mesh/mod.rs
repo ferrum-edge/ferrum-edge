@@ -10635,6 +10635,19 @@ fn materialize_mesh_outbound_proxies(
         .proxies
         .iter()
         .any(|proxy| config::is_virtual_service_http_route_proxy_id(&proxy.id));
+    // Issue #7499: a Service in another namespace a carried route is
+    // authorized to reach is in the slice (with its workloads) only for that
+    // route. It gets no ordinary Service route of its own: its short name
+    // would compete with a same-named Service of this namespace in the shared
+    // host table, and nothing but the authorized route may reach it. Its
+    // upstream is kept as the source of the route-namespace clone.
+    let grant_only_services: HashSet<(&str, &str)> = mesh_slice
+        .http_routes
+        .authorized_cross_namespace_targets
+        .iter()
+        .filter(|target| target.namespace != mesh_slice.namespace)
+        .map(|target| (target.namespace.as_str(), target.name.as_str()))
+        .collect();
     let mut materialized = 0usize;
     for service in &mesh_slice.services {
         // HTTP-family routability is read from the SERVICE port protocol
@@ -10720,7 +10733,8 @@ fn materialize_mesh_outbound_proxies(
             // routes (issue #7423): a carried route can name a Service whose
             // own route yields to a carried route or to the local inbound
             // route, and it still needs that Service's secured upstream.
-            let mut shadowed = false;
+            let mut shadowed =
+                grant_only_services.contains(&(service.namespace.as_str(), service.name.as_str()));
             for p in &config.proxies {
                 if (p.namespace == proxy.namespace && p.id == proxy.id)
                     || p.dispatch_kind.is_stream()
@@ -13774,12 +13788,45 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
         |idx: usize| sni_passthrough_upstreams.get(idx).copied().unwrap_or(false);
     let mut winning_tier_by_upstream_host: Vec<Vec<Option<DestinationRuleWinner>>> =
         Vec::with_capacity(config.upstreams.len());
+    // The weighted splits a `mesh_route_dispatch` instance dispatches leg by
+    // leg (`weighted_splits[].upstream_id`), as `(namespace, split id)`.
+    let dispatch_only_splits: HashSet<(String, String)> = config
+        .plugin_configs
+        .iter()
+        .filter(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+        .flat_map(|plugin| {
+            plugin
+                .config
+                .get("weighted_splits")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|split| split.get("upstream_id").and_then(serde_json::Value::as_str))
+                .map(|id| (plugin.namespace.clone(), id.to_string()))
+        })
+        .collect();
+    // Per upstream index, whether it is such a split or a cross-namespace
+    // destination clone (issue #7499): neither is matched against rules.
+    let unmatched_upstreams: Vec<bool> = config
+        .upstreams
+        .iter()
+        .map(|upstream| {
+            is_cross_namespace_destination_clone_id(&upstream.id)
+                || dispatch_only_splits.contains(&(upstream.namespace.clone(), upstream.id.clone()))
+        })
+        .collect();
     for (upstream_idx, upstream) in config.upstreams.iter().enumerate() {
         // A cross-namespace destination clone (issue #7499) takes its policy
         // from the destination Service upstream it is refreshed from after
-        // rules apply, never from a rule matched against its own workload
-        // addresses: no host of it participates.
-        if is_cross_namespace_destination_clone_id(&upstream.id) {
+        // rules apply, and a weighted split dispatched leg by leg (issue
+        // #7387) is never dialed (each leg carries its own policy): neither is
+        // matched against its own workload addresses, so neither can reject
+        // the slice.
+        if unmatched_upstreams
+            .get(upstream_idx)
+            .copied()
+            .unwrap_or(false)
+        {
             winning_tier_by_upstream_host.push(Vec::new());
             continue;
         }
@@ -13870,7 +13917,7 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
             .iter()
             .enumerate()
             .filter_map(|(idx, upstream)| {
-                if is_cross_namespace_destination_clone_id(&upstream.id) {
+                if unmatched_upstreams.get(idx).copied().unwrap_or(false) {
                     return None;
                 }
                 let winners = winning_tier_by_upstream_host.get(idx)?;
