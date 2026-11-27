@@ -57,9 +57,9 @@ gateways, control planes, mesh data planes, charts or contract consumers.
   `tests/fixtures/time_compat/`, and `chrono` and sqlx's `chrono` feature are
   gone from `[dev-dependencies]`, so nothing compiles `chrono`. The root
   `Cargo.lock` still lists a `chrono` entry that is never compiled. It is
-  there because `serde_with`, a dependency of the test-only `testcontainers`,
-  names `chrono` as an optional dependency (rust-lang/cargo#10801). See the
-  dependency-policy register.
+  there because `serde_with` (reached through the test-only `testcontainers`
+  and the `secrets-gcp` Google Cloud crates) names `chrono` as an optional
+  dependency (rust-lang/cargo#10801). See the dependency-policy register.
 - **Three other advisory exceptions were re-reviewed on 2026-11-27 and
   re-affirmed until 2027-03-31** (#7520): RUSTSEC-2024-0436 (`paste`),
   RUSTSEC-2024-0449 (`unsafe-libyaml`) and RUSTSEC-2026-0440

@@ -456,13 +456,32 @@ fn unix_epoch_accessors_and_secs_z_format_match_chrono() {
         );
     }
 
-    // The wall clock: millis floor the nanosecond instant, and the RFC 3339
-    // text parses back to the same instant.
+    // The wall clock. Millis floor the nanosecond instant, and `to_rfc3339()`
+    // follows chrono's rule pinned per instant above: `AutoSi` fractional
+    // seconds (none when zero, else 3, 6 or 9 digits) and a `+00:00` suffix.
     let ts = UtcTimestamp::now();
     assert_eq!(
         i128::from(ts.unix_timestamp_millis()),
         ts.unix_timestamp_nanos().div_euclid(1_000_000)
     );
+    let nanos = ts.subsec_nanos();
+    let fraction = if nanos == 0 {
+        String::new()
+    } else if nanos % 1_000_000 == 0 {
+        format!(".{:03}", nanos / 1_000_000)
+    } else if nanos % 1_000 == 0 {
+        format!(".{:06}", nanos / 1_000)
+    } else {
+        format!(".{nanos:09}")
+    };
+    let whole_seconds = ts.to_rfc3339_opts(SecondsFormat::Secs, false);
+    let expected = format!(
+        "{}{fraction}+00:00",
+        whole_seconds
+            .strip_suffix("+00:00")
+            .expect("Secs rendering ends in +00:00")
+    );
+    assert_eq!(ts.to_rfc3339(), expected);
     assert_eq!(parse_rfc3339(&ts.to_rfc3339()), Ok(ts));
 }
 

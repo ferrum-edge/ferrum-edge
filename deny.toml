@@ -76,10 +76,13 @@ unused-ignored-advisory = "deny"
 # 0.4.45, unmaintained). ferrum-edge no longer depends on chrono, not even as
 # a dev-dependency, and sqlx's `chrono` feature is off, so chrono is never
 # compiled. The root Cargo.lock still records a chrono entry under serde_with
-# 3.21.0 only because testcontainers 0.28.0 (dev-dependency) enables
-# serde_with's default `std`/`alloc` features, whose weak `chrono_0_4?/...`
-# references Cargo's resolver always locks (rust-lang/cargo#10801); cargo-deny's
-# feature-resolved graph does not include it. See docs/dependency-policy.md.
+# 3.21.0 because serde_with's `std`/`alloc` features carry weak
+# `chrono_0_4?/...` references, which Cargo's resolver always locks
+# (rust-lang/cargo#10801). Those features are enabled by testcontainers 0.28.0
+# (dev-dependency, default features) and by the google-cloud-* crates behind
+# the optional `secrets-gcp` feature. serde_with's `chrono_0_4` feature stays
+# off, and cargo-deny's feature-resolved graph does not include chrono. See
+# docs/dependency-policy.md.
 ignore = [
     # ── paste 1.0.15 — RUSTSEC-2024-0436, unmaintained (repository archived).
     # A proc-macro only: it runs at compile time and has no runtime or network
