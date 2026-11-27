@@ -45761,9 +45761,12 @@ components:
           format: int64
           minimum: 0
           description: |
-            Number of distinct VirtualService `http[]` routes attached to this
-            bound Service in the generation the proxy serves (issue #7500).
-            Raw route rules and match predicates are not exposed.
+            Number of distinct materialized VirtualService route proxies
+            attached to this bound Service in the generation the proxy serves
+            (issue #7500). This counts data-plane routes, not authored
+            `http[]` entries: one entry with several `match` clauses can
+            materialize several route proxies. Raw route rules and match
+            predicates are not exposed.
           example: 1
 
     ServiceWaypointServicesResponse:

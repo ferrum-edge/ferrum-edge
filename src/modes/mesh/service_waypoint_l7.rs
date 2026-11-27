@@ -345,7 +345,9 @@ impl ServiceWaypointL7RoutePartition {
 pub struct ServiceWaypointL7ServiceSummary {
     /// HTTP-family ports with a materialized default L7 route, ascending.
     pub l7_http_ports: Vec<u16>,
-    /// Distinct carried VirtualService routes bound to the Service.
+    /// Distinct materialized VirtualService route proxies attached to the
+    /// Service (not authored `http[]` entries: one entry with several
+    /// matches can materialize several route proxies).
     pub virtual_service_route_count: usize,
 }
 

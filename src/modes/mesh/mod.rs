@@ -4836,8 +4836,9 @@ fn decode_http_route_set(
             .map(|upstream| (upstream.namespace.as_str(), upstream.id.as_str())),
     )?;
     // ServiceWaypoint route attachments (issue #7500): only a ServiceWaypoint
-    // carries them, within the bound, and each names a carried route and a
-    // Service this waypoint is bound to.
+    // carries them, each once, and each names a carried route and a Service
+    // this waypoint is bound to, so the list is bounded by the carried routes
+    // times the bound Services.
     let attachments = &set.service_waypoint_attachments;
     if !attachments.is_empty() {
         if runtime.topology != MeshTopology::ServiceWaypoint {
@@ -4845,10 +4846,13 @@ fn decode_http_route_set(
                 "Mesh slice carries ServiceWaypoint route attachments on another topology"
             ));
         }
-        if attachments.len() > slice::MAX_SERVICE_WAYPOINT_ROUTE_ATTACHMENTS {
+        let mut seen_attachments: HashSet<&slice::MeshHttpRouteServiceAttachment> = HashSet::new();
+        if !attachments
+            .iter()
+            .all(|attachment| seen_attachments.insert(attachment))
+        {
             return Err(anyhow::anyhow!(
-                "Mesh slice carries more than {} ServiceWaypoint route attachments",
-                slice::MAX_SERVICE_WAYPOINT_ROUTE_ATTACHMENTS
+                "Mesh slice carries a duplicate ServiceWaypoint route attachment"
             ));
         }
         let bound: BTreeSet<(&str, &str)> = slice

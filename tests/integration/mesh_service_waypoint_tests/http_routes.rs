@@ -607,7 +607,9 @@ fn third_namespace_virtual_service_exported_everywhere_is_excluded() {
 
 #[test]
 fn waypoint_namespace_route_on_a_tenant_service_needs_export_to_that_tenant() {
-    let route = |export_to: &[&str]| {
+    // A waypoint-namespace route on the tenant's bound Service, reaching a
+    // bound backend in the waypoint's own namespace.
+    let route = |export_to: &[&str], destination: &str| {
         vec![(
             WAYPOINT_NAMESPACE,
             vec![virtual_service(
@@ -615,35 +617,132 @@ fn waypoint_namespace_route_on_a_tenant_service_needs_export_to_that_tenant() {
                 WAYPOINT_NAMESPACE,
                 direct_spec(
                     &host("orders", TENANT_NAMESPACE),
-                    &host("orders", TENANT_NAMESPACE),
+                    destination,
                     Some(export_to),
                 ),
             )],
         )]
     };
     let request = service_waypoint_runtime().mesh_slice_request();
+    let carried = |export_to: &[&str], destination: &str| {
+        carried_route_ids(&served_slice(
+            &cp_config(Some(binding("service")), &route(export_to, destination)),
+            &request,
+        ))
+        .iter()
+        .any(|id| id.contains("orders-from-waypoint"))
+    };
+    let same_namespace_backend = host("reviews", WAYPOINT_NAMESPACE);
 
-    let local = served_slice(
-        &cp_config(Some(binding("service")), &route(&["."])),
-        &request,
-    );
     assert!(
-        !carried_route_ids(&local)
-            .iter()
-            .any(|id| id.contains("orders-from-waypoint")),
+        !carried(&["."], &same_namespace_backend),
         "a waypoint-namespace route not exported to the Service's namespace is refused"
     );
-
-    let exported = served_slice(
-        &cp_config(Some(binding("service")), &route(&[".", TENANT_NAMESPACE])),
-        &request,
-    );
     assert!(
-        carried_route_ids(&exported)
-            .iter()
-            .any(|id| id.contains("orders-from-waypoint")),
+        carried(&[".", TENANT_NAMESPACE], &same_namespace_backend),
         "istio.io/use-waypoint-namespace: the waypoint namespace may route its bound \
          tenant Service when it exports the route to that tenant"
+    );
+    // Review round 2 F5: a destination in another namespace (here the tenant
+    // Service itself, from a waypoint-namespace route) is never carried until
+    // the cross-namespace authorization contract (#7499) lands, since the
+    // data plane would refuse it; the VirtualService status lists it in
+    // `deferred_fields`.
+    assert!(
+        !carried(&[".", TENANT_NAMESPACE], &host("orders", TENANT_NAMESPACE)),
+        "a cross-namespace destination is not carried until #7499"
+    );
+}
+
+/// Review round 2 F2: `Workload::mesh_transport` rides only to a subscriber
+/// that announced the ServiceWaypoint route capability; every other
+/// subscriber (an older data plane included) gets workloads without it.
+#[test]
+fn workload_mesh_transport_rides_only_to_service_waypoint_subscribers() {
+    use ferrum_edge::modes::mesh::config::WorkloadMeshTransport;
+
+    let mut config = cp_config(Some(binding("service")), &default_virtual_services());
+    for workload in &mut config.mesh.as_mut().expect("mesh block").workloads {
+        workload.mesh_transport = Some(WorkloadMeshTransport::SidecarMtls);
+    }
+    let request = service_waypoint_runtime().mesh_slice_request();
+    let with = served_slice(&config, &request);
+    assert!(!with.workloads.is_empty());
+    assert!(
+        with.workloads
+            .iter()
+            .all(|workload| workload.mesh_transport == Some(WorkloadMeshTransport::SidecarMtls))
+    );
+    let json = serde_json::to_value(&with).expect("serialize");
+    assert!(json.to_string().contains("mesh_transport"));
+
+    for request in [
+        MeshSliceRequest {
+            service_waypoint_http_routes: false,
+            ..request.clone()
+        },
+        runtime_for_topology(MeshTopology::Sidecar).mesh_slice_request(),
+        runtime_for_topology(MeshTopology::Ambient).mesh_slice_request(),
+        runtime_for_topology(MeshTopology::NodeWaypoint).mesh_slice_request(),
+    ] {
+        let slice = served_slice(&config, &request);
+        assert!(
+            slice
+                .workloads
+                .iter()
+                .chain(slice.ambient_udp_source_workloads.iter())
+                .chain(slice.node_waypoint_capture_destinations.iter())
+                .chain(slice.local_inbound_workloads.iter().flatten())
+                .all(|workload| workload.mesh_transport.is_none()),
+            "no mesh_transport for a subscriber without the capability"
+        );
+        let json = serde_json::to_string(&slice).expect("serialize");
+        assert!(
+            !json.contains("mesh_transport"),
+            "the field never reaches a subscriber that did not announce it"
+        );
+    }
+}
+
+/// Review round 2 F6: `virtual_service_route_count` counts the materialized
+/// route proxies attached to a bound Service. One `http[]` entry with two URI
+/// matches can materialize two of them.
+#[test]
+fn virtual_service_route_count_counts_materialized_route_proxies() {
+    let mut spec = direct_spec(
+        &host("reviews", WAYPOINT_NAMESPACE),
+        &host("reviews", WAYPOINT_NAMESPACE),
+        None,
+    );
+    spec["http"][0]["match"] = json!([{"uri": {"prefix": "/a"}}, {"uri": {"prefix": "/b"}}]);
+    let namespaces = vec![(
+        WAYPOINT_NAMESPACE,
+        vec![virtual_service("two-matches", WAYPOINT_NAMESPACE, spec)],
+    )];
+    let runtime = service_waypoint_runtime();
+    let slice = served_slice(
+        &cp_config(Some(binding("service")), &namespaces),
+        &runtime.mesh_slice_request(),
+    );
+    let carried = carried_route_ids(&slice)
+        .into_iter()
+        .filter(|id| id.contains("two-matches"))
+        .count();
+    assert!(carried >= 1, "fixture: the route is carried");
+    let prepared =
+        prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("slice materializes");
+    let materialized = prepared
+        .proxies
+        .iter()
+        .filter(|proxy| proxy.id.contains("two-matches"))
+        .count();
+    let routes = RouterCache::new(&prepared, 1024).service_waypoint_l7_routes();
+    assert_eq!(
+        routes
+            .service_summary(WAYPOINT_NAMESPACE, "reviews")
+            .virtual_service_route_count,
+        materialized,
+        "the count is the materialized route proxies attached to the Service"
     );
 }
 
@@ -1375,6 +1474,68 @@ fn waypoint_narrowing_keeps_policy_for_external_route_destinations() {
     );
 }
 
+/// Review round 2 F3: a service-tier WILDCARD DestinationRule that proves its
+/// ownership only through a broader wildcard ServiceEntry survives admission
+/// and narrowing for a DIRECT external backend, so the data plane refuses the
+/// route instead of keeping a plaintext backend.
+#[test]
+fn wildcard_rule_for_a_direct_external_backend_survives_to_the_data_plane() {
+    let mut namespaces = default_virtual_services();
+    namespaces[1].1.extend([
+        virtual_service(
+            "orders-partner",
+            TENANT_NAMESPACE,
+            direct_spec(
+                &host("orders", TENANT_NAMESPACE),
+                "api.partner.example.com",
+                None,
+            ),
+        ),
+        istio_object(
+            "ServiceEntry",
+            "example",
+            TENANT_NAMESPACE,
+            json!({
+                "hosts": ["*.example.com"],
+                "location": "MESH_EXTERNAL",
+                "ports": [{"number": 8080, "name": "http", "protocol": "HTTP"}],
+                "resolution": "NONE"
+            }),
+        ),
+        istio_object(
+            "DestinationRule",
+            "partner-tls",
+            TENANT_NAMESPACE,
+            json!({"host": "*.partner.example.com", "trafficPolicy": {"tls": {"mode": "SIMPLE"}}}),
+        ),
+    ]);
+    let config = cp_config(Some(binding("service")), &namespaces);
+    let runtime = service_waypoint_runtime();
+    let slice = served_slice(&config, &runtime.mesh_slice_request());
+    assert!(
+        carried_route_ids(&slice)
+            .iter()
+            .any(|id| id.contains("orders-partner")),
+        "fixture: the direct external route is projected"
+    );
+    assert!(
+        slice
+            .destination_rules
+            .iter()
+            .any(|rule| rule.host == "*.partner.example.com"),
+        "the wildcard rule naming the direct backend survives admission and narrowing"
+    );
+    let prepared =
+        prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("slice materializes");
+    assert!(
+        !prepared
+            .proxies
+            .iter()
+            .any(|proxy| proxy.id.contains("orders-partner")),
+        "a direct external backend a wildcard DestinationRule names is refused"
+    );
+}
+
 /// F3: a waypoint-namespace route exported to a bound tenant Service attaches
 /// to that Service's partition when it reaches a same-namespace bound backend.
 #[test]
@@ -1647,6 +1808,18 @@ mod admin_endpoint {
                 .any(|proxy| is_service_waypoint_l7_route_id(&proxy.id)),
             "fixture: the generation holds default L7 routes"
         );
+        // No listener: neither a default L7 route nor a carried route claims
+        // a listen port or a stream lane of its own.
+        for proxy in prepared.proxies.iter().filter(|proxy| {
+            is_service_waypoint_l7_route_id(&proxy.id) || proxy.id.starts_with("istio-vs-")
+        }) {
+            assert_eq!(proxy.listen_port, None, "{} binds no listener", proxy.id);
+            assert!(
+                !proxy.dispatch_kind.is_stream(),
+                "{} is no stream lane",
+                proxy.id
+            );
+        }
         let env_config = EnvConfig {
             mode: OperatingMode::Mesh,
             log_level: "error".to_string(),

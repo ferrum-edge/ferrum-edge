@@ -739,13 +739,9 @@ impl MeshHttpRouteSet {
     }
 }
 
-/// Most ServiceWaypoint route attachments one carried route set may hold
-/// (issue #7500).
-pub const MAX_SERVICE_WAYPOINT_ROUTE_ATTACHMENTS: usize = 4096;
-
 /// One carried route admitted for one Service bound to a ServiceWaypoint
 /// ([`MeshHttpRouteSet::service_waypoint_attachments`], issue #7500).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MeshHttpRouteServiceAttachment {
     pub proxy_namespace: String,
@@ -2392,7 +2388,10 @@ impl MeshSlice {
             // must survive the narrowing, or the data plane cannot originate
             // a leg's TLS or refuse a direct backend that needs it. They add
             // nothing to the bound-Service or relay inventories.
-            let route_destination_hosts = service_waypoint_route_destination_hosts(&http_routes);
+            let route_destination_hosts: BTreeSet<String> =
+                carried_route_destination_hosts(&http_routes, &[])
+                    .into_iter()
+                    .collect();
             narrow_for_service_waypoint(
                 waypoint,
                 &request.namespace,
@@ -2515,7 +2514,33 @@ impl MeshSlice {
             mesh.istio_root_namespace.as_str(),
             &cluster_domain,
         );
+        // `Workload::mesh_transport` (issue #7500) is read only by a
+        // ServiceWaypoint, and it is a field a data plane built before it
+        // refuses (`Workload` denies unknown fields). Carry it only to a
+        // subscriber that announced the ServiceWaypoint route capability, the
+        // one consumer, so a control plane upgraded ahead of its Sidecar,
+        // Ambient or NodeWaypoint data planes never sends them a slice they
+        // cannot decode. Both transports serialize this slice, so stripping it
+        // here covers native `MeshSubscribe` and every xDS workload carrier.
+        if !request.service_waypoint_http_routes {
+            strip_workload_mesh_transport(&mut slice);
+        }
         slice
+    }
+}
+
+/// Remove [`Workload::mesh_transport`] from every workload a slice carries
+/// (issue #7500; see the negotiation note in `MeshSlice::from_gateway_config`).
+fn strip_workload_mesh_transport(slice: &mut MeshSlice) {
+    let local = slice.local_inbound_workloads.iter_mut().flatten();
+    for workload in slice
+        .workloads
+        .iter_mut()
+        .chain(slice.ambient_udp_source_workloads.iter_mut())
+        .chain(slice.node_waypoint_capture_destinations.iter_mut())
+        .chain(local)
+    {
+        workload.mesh_transport = None;
     }
 }
 
@@ -2973,57 +2998,6 @@ fn narrow_for_service_waypoint(
             })
             .collect(),
     }
-}
-
-/// Every destination host the ServiceWaypoint routes in `routes` can dial
-/// (issue #7500): direct backends, `mesh_route_dispatch` rule backends, and
-/// weighted-split targets, canonical (trimmed, no trailing dot, lowercase).
-fn service_waypoint_route_destination_hosts(routes: &MeshHttpRouteSet) -> BTreeSet<String> {
-    let mut hosts: BTreeSet<String> = BTreeSet::new();
-    let mut insert = |host: &str| {
-        let host = canonical_destination_rule_host(host);
-        if !host.is_empty() {
-            hosts.insert(host);
-        }
-    };
-    for proxy in &routes.proxies {
-        if let Some(host) = proxy
-            .get("backend_host")
-            .and_then(serde_json::Value::as_str)
-        {
-            insert(host);
-        }
-    }
-    for plugin in &routes.plugin_configs {
-        for rule in plugin
-            .get("config")
-            .and_then(|config| config.get("rules"))
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            if let Some(host) = rule
-                .get("destination")
-                .and_then(|destination| destination.get("backend_host"))
-                .and_then(serde_json::Value::as_str)
-            {
-                insert(host);
-            }
-        }
-    }
-    for upstream in &routes.upstreams {
-        for target in upstream
-            .get("targets")
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            if let Some(host) = target.get("host").and_then(serde_json::Value::as_str) {
-                insert(host);
-            }
-        }
-    }
-    hosts
 }
 
 /// Whether ServiceEntry host `entry_host` (exact, or a `*.suffix` wildcard)
@@ -4134,10 +4108,9 @@ fn service_waypoint_http_route_set(
             }
         }
     }
-    set.service_waypoint_attachments = attachments
-        .into_iter()
-        .take(MAX_SERVICE_WAYPOINT_ROUTE_ATTACHMENTS)
-        .collect();
+    // Never truncated: each attachment is one carried route host naming one
+    // bound Service, so the list is bounded by the carried routes themselves.
+    set.service_waypoint_attachments = attachments.into_iter().collect();
     set
 }
 
@@ -4307,7 +4280,13 @@ fn service_waypoint_route_destination_admitted(
             &canonical,
         )
     }) {
-        return bound.contains(&(service.namespace.as_str(), service.name.as_str()));
+        // A bound Service in the route's own namespace. A Service in another
+        // namespace is never carried until the cross-namespace authorization
+        // contract (issue #7499) lands: the data plane would refuse it anyway
+        // (`cross_namespace_refused`), and the VirtualService status already
+        // lists every such destination in `deferred_fields`.
+        return service.namespace == route_namespace
+            && bound.contains(&(service.namespace.as_str(), service.name.as_str()));
     }
     let cluster_domain = cluster_domain
         .trim()
@@ -4703,15 +4682,50 @@ where
     false
 }
 
-/// The canonical target hosts of carried VirtualService HTTP route and L4
-/// route upstreams (`targets[].host`), deduplicated and sorted. Shared by
-/// wildcard admission and host-exclusion resolution so both see the same
-/// destination inventory.
+/// The canonical destination hosts of carried VirtualService HTTP and L4
+/// routes, deduplicated and sorted: route upstream targets (`targets[].host`),
+/// and the HTTP routes' direct backends and `mesh_route_dispatch` rule
+/// backends (`backend_host`). Shared by wildcard DestinationRule admission,
+/// host-exclusion resolution and ServiceWaypoint narrowing (issue #7500), so
+/// all three see the same destination inventory: a direct external backend's
+/// rule must survive admission for the data plane to refuse a TLS-originating
+/// one.
 fn carried_route_destination_hosts(
     http_routes: &MeshHttpRouteSet,
     virtual_service_l4_upstreams: &[serde_json::Value],
 ) -> Vec<String> {
     let mut hosts: BTreeSet<String> = BTreeSet::new();
+    let mut insert_backend = |host: &str| {
+        let host = canonical_destination_rule_host(host);
+        if !host.is_empty() {
+            hosts.insert(host);
+        }
+    };
+    for proxy in &http_routes.proxies {
+        if let Some(host) = proxy
+            .get("backend_host")
+            .and_then(serde_json::Value::as_str)
+        {
+            insert_backend(host);
+        }
+    }
+    for plugin in &http_routes.plugin_configs {
+        for rule in plugin
+            .get("config")
+            .and_then(|config| config.get("rules"))
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(host) = rule
+                .get("destination")
+                .and_then(|destination| destination.get("backend_host"))
+                .and_then(serde_json::Value::as_str)
+            {
+                insert_backend(host);
+            }
+        }
+    }
     for upstream in http_routes
         .upstreams
         .iter()

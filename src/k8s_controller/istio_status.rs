@@ -1529,8 +1529,8 @@ fn virtual_service_status(
             if !cross_namespace.is_empty() {
                 notes.push(format!(
                     "{} http[] destination(s) name a Service in another namespace and are not \
-                     served by Sidecar or NodeWaypoint mesh data planes in this release (issue \
-                     #7499); see status.ferrum.translation.deferred_fields (a fully qualified \
+                     served by Sidecar, NodeWaypoint or ServiceWaypoint mesh data planes in this \
+                     release (issue #7499); see status.ferrum.translation.deferred_fields (a fully qualified \
                      host is read with this controller's cluster domain, which must match the \
                      data planes' FERRUM_MESH_CLUSTER_DOMAIN for this report to predict their \
                      refusal)",
