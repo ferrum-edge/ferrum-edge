@@ -53,12 +53,14 @@ paths:
 
 - New config fields go in `src/config/types.rs` with `#[serde(default)]` when optional.
 - Env-driven fields also update `src/config/env_config.rs`, `docs/configuration.md`, and `ferrum.conf`.
-- SQL storage changes are folded into the V001 baseline in `src/config/migrations/sql_dialect.rs` (`v001_initial_schema.rs` only delegates to it) during build-out, with parsing in `db_loader.rs`.
+- From 1.0.0 onward the V001 baseline in `src/config/migrations/sql_dialect.rs` is frozen (identity pinned by `V001_BASELINE_CHECKSUM` and `tests/unit/config/v001_baseline_golden_tests.rs`). SQL storage changes ship as the next forward migration (`SqlMigration`, appended to `MigrationRunner::shipped_migrations()` in `src/config/migrations/mod.rs`), with parsing in `db_loader.rs`. Releases before 1.0.0 folded changes into V001; see `docs/migrations.md`.
 - MongoDB persists through serde BSON unless a queried field needs an index in
   `src/config/mongo_index_plan.rs` (consumed by `MongoStore::run_migrations()`,
-  migrate dry-run, and migrate status).
+  migrate dry-run, and migrate status). Index changes bump
+  `MONGO_INDEX_PLAN_VERSION`; old indexes are dropped only via
+  `RETIRED_MONGO_INDEXES`.
 - Add unit tests under `tests/unit/config/` and update `openapi.yaml` when admin-exposed.
-- During build-out, required-field changes update the current schema, config examples, and validation directly. Document the breaking change; do not add legacy transforms, startup schema repairs/backfills, or compatibility tracking tables. Recreate development databases after a baseline change.
+- From 1.0.0 onward, env vars, config shapes, and stored DB values are compatibility surfaces: a required-field or other incompatible change needs a forward migration (for storage) and a documented deprecation path, plus release notes. No startup schema repairs/backfills outside a declared migration. Releases before 1.0.0 changed the schema in place and recreated databases.
 - Check parent structs for `#[serde(deny_unknown_fields)]` before adding fields.
 - Deliberate exception to the no-legacy-shims policy (issue #7218): the
   security read paths keep tolerating pre-contract stored Consumer credential

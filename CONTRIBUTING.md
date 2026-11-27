@@ -198,20 +198,36 @@ For significant features, please open an issue first to discuss the design:
 
 For new plugins, see [CUSTOM_PLUGINS.md](CUSTOM_PLUGINS.md) for the plugin development guide.
 
-## Build-Out Schema Policy
+## Schema Compatibility Policy
 
-Ferrum Edge has no deployed-user compatibility obligation during active build-out.
-Fold core SQL changes into `src/config/migrations/sql_dialect.rs`, behind the
-single `V001InitialSchema` declaration. Edit MongoDB's `mongo_index_plan.rs` and
-external ClickHouse's `schemas/clickhouse/charges.sql` directly. Do not add new
-core migration versions, startup schema-repair/backfill passes, or legacy config
-transforms. Recreate development databases after baseline changes. Custom-plugin
-migrations remain independently owned. See [database baselines](docs/migrations.md).
+From 1.0.0 onward the core SQL baseline `V001` is frozen: its identity is the
+committed `V001_BASELINE_CHECKSUM`, and
+`tests/unit/config/v001_baseline_golden_tests.rs` fails on any change to the
+statements it executes. Ship every core SQL schema change as the next forward
+migration (`V002`, `V003`, ...) appended to `MigrationRunner::shipped_migrations()`
+and never edit a shipped migration. MongoDB index changes bump
+`MONGO_INDEX_PLAN_VERSION` in `src/config/mongo_index_plan.rs` and drop old
+indexes only through `RETIRED_MONGO_INDEXES`. External ClickHouse DDL in
+`schemas/clickhouse/charges.sql` is applied separately. Environment variables,
+config shapes, and stored database values change only with a documented
+deprecation path. Custom-plugin migrations remain independently owned. See
+[Adding a forward migration](docs/migrations.md#adding-a-forward-migration).
+
+### Build-Out Schema Policy
+
+Releases before 1.0.0 had no deployed-user compatibility obligation: core SQL
+changes were folded into `V001` in `src/config/migrations/sql_dialect.rs`,
+development databases were recreated after baseline changes, and no legacy
+shims were kept. Upgrading a 0.9.x database to 1.0.0 is a one-time
+rebuild-and-restore; see
+[migrations.md → Build-Out Schema Policy](docs/migrations.md#build-out-schema-policy).
 
 ## Changelog Policy
 
-Ferrum Edge is in active build-out, so breaking changes are permitted without
-legacy compatibility shims. Any breaking change to configuration shapes,
+From 1.0.0 onward, a breaking change needs a deprecation path (see
+[Schema Compatibility Policy](#schema-compatibility-policy)); releases before
+1.0.0 permitted breaking changes without legacy compatibility shims. Any
+breaking change to configuration shapes,
 environment variables, schema, defaults, or other user-facing behavior **must**
 add an entry under the appropriate heading in `CHANGELOG.md`'s `Unreleased`
 section in the same pull request.

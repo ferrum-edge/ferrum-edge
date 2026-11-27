@@ -4,9 +4,12 @@
 //! present / missing / mismatched classification without a live MongoDB.
 
 use ferrum_edge::config::mongo_index_plan::{
-    HMAC_SECRET_HASHES_FIELD, IndexPresence, REQUIRED_GUARD_COLLECTIONS,
-    classify_guard_collections, classify_plan_against_live, classify_required_index,
-    default_index_name, dry_run_lines, required_mongo_indexes, summarize_index,
+    HMAC_SECRET_HASHES_FIELD, IndexPresence, MONGO_INDEX_PLAN_VERSION, MongoIndexPlan,
+    MongoIndexPlanError, REQUIRED_GUARD_COLLECTIONS, RETIRED_MONGO_INDEXES, RecordedIndexPlanState,
+    RequiredMongoIndex, RetiredMongoIndex, classify_guard_collections, classify_plan_against_live,
+    classify_required_index, default_index_name, dry_run_lines, planned_index_name,
+    recorded_plan_state_from_document, recorded_plan_version_from_document, required_mongo_indexes,
+    summarize_index,
 };
 use mongodb::IndexModel;
 use mongodb::bson::doc;
@@ -223,12 +226,12 @@ fn run_migrations_and_status_consume_canonical_plan() {
 
     // Orphan-reconcile documentation stays on the migration path.
     let migrations_start = MONGO_STORE_SOURCE
-        .find("async fn run_migrations(&self)")
-        .expect("run_migrations");
+        .find("pub(crate) async fn apply_index_plan(")
+        .expect("apply_index_plan");
     let migrations = &MONGO_STORE_SOURCE[migrations_start..];
     let migrations_end = migrations
-        .find("\n        async fn list_namespaces")
-        .unwrap_or(migrations.len());
+        .find("\n        async fn ensure_migration_lease_held")
+        .expect("apply_index_plan body end");
     let migrations = &migrations[..migrations_end];
     assert!(
         migrations.contains("Intentionally no automatic orphan reconcile"),
@@ -412,12 +415,12 @@ fn plan_module_is_the_sole_index_definition_home() {
     // `up` must not re-declare IndexModel builders inline once the plan module
     // owns definitions — keep the migration body as an apply loop.
     let migrations_start = MONGO_STORE_SOURCE
-        .find("async fn run_migrations(&self)")
-        .expect("run_migrations");
+        .find("pub(crate) async fn apply_index_plan(")
+        .expect("apply_index_plan");
     let migrations = &MONGO_STORE_SOURCE[migrations_start..];
     let migrations_end = migrations
-        .find("\n        async fn list_namespaces")
-        .unwrap_or(migrations.len());
+        .find("\n        async fn ensure_migration_lease_held")
+        .expect("apply_index_plan body end");
     let migrations = &migrations[..migrations_end];
     assert!(
         !migrations.contains("IndexModel::builder()"),
@@ -472,8 +475,340 @@ fn plan_declares_unique_consumer_credential_indexes() {
             "MongoDB must enforce {field} uniqueness with an index"
         );
     }
-    assert!(
-        !MONGO_STORE_SOURCE.contains("drop_index("),
-        "MongoDB index setup must never drop the credential uniqueness backstops"
+    // The only index drop in the store is the retirement step, which drops
+    // exactly the names a later plan version lists. None of the credential
+    // uniqueness backstops may ever be retired.
+    assert_eq!(
+        MONGO_STORE_SOURCE.matches("drop_index(").count(),
+        1,
+        "MongoDB index setup must drop indexes only through declared retirements"
     );
+    for retired in RETIRED_MONGO_INDEXES {
+        assert!(
+            !(retired.collection == "consumers"
+                && (retired.name.contains("credentials")
+                    || retired.name.contains(HMAC_SECRET_HASHES_FIELD))),
+            "a credential uniqueness backstop must never be retired: {retired:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Versioned, forward-only index plan
+// ---------------------------------------------------------------------------
+
+#[test]
+fn current_plan_is_the_shipped_versioned_plan() {
+    let plan = MongoIndexPlan::current();
+    assert_eq!(plan.version, MONGO_INDEX_PLAN_VERSION);
+    assert_eq!(plan.indexes.len(), required_mongo_indexes().len());
+    assert_eq!(plan.retired, RETIRED_MONGO_INDEXES.to_vec());
+    // A fresh or pre-versioning database and an up-to-date one both upgrade
+    // cleanly. `upgrade_from` also rejects a plan version below 1 and any
+    // retirement outside `2..=version`, so this proves the shipped plan is
+    // well formed.
+    plan.upgrade_from(None).expect("fresh database");
+    assert!(
+        plan.upgrade_from(Some(MONGO_INDEX_PLAN_VERSION))
+            .expect("current database")
+            .is_empty()
+    );
+}
+
+fn later_plan() -> MongoIndexPlan {
+    MongoIndexPlan {
+        version: 3,
+        indexes: Vec::new(),
+        retired: vec![
+            RetiredMongoIndex {
+                retired_in: 2,
+                collection: "proxies",
+                name: "legacy_v1_index",
+            },
+            RetiredMongoIndex {
+                retired_in: 3,
+                collection: "upstreams",
+                name: "legacy_v2_index",
+            },
+        ],
+    }
+}
+
+#[test]
+fn upgrade_drops_only_retirements_after_the_recorded_version() {
+    let plan = later_plan();
+    let names = |recorded| {
+        plan.upgrade_from(recorded)
+            .unwrap()
+            .into_iter()
+            .map(|retired| retired.name)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names(None), ["legacy_v1_index", "legacy_v2_index"]);
+    assert_eq!(names(Some(1)), ["legacy_v1_index", "legacy_v2_index"]);
+    assert_eq!(names(Some(2)), ["legacy_v2_index"]);
+    assert!(names(Some(3)).is_empty());
+}
+
+#[test]
+fn upgrade_refuses_a_newer_recorded_version_and_bad_declarations() {
+    let plan = later_plan();
+    let error = plan.upgrade_from(Some(4)).unwrap_err();
+    assert_eq!(
+        error,
+        MongoIndexPlanError::RecordedVersionNewer {
+            recorded: 4,
+            supported: 3
+        }
+    );
+    let rendered = error.to_string();
+    assert!(rendered.contains("\"4\" recorded in this database is newer"));
+    assert!(rendered.contains("binary against a database a newer release upgraded"));
+    assert!(rendered.contains("docs/admin_backup_restore.md"));
+
+    assert_eq!(
+        plan.upgrade_from(Some(0)).unwrap_err(),
+        MongoIndexPlanError::InvalidRecordedVersion
+    );
+
+    let mut bad = later_plan();
+    bad.retired[0].retired_in = 1;
+    assert!(matches!(
+        bad.upgrade_from(None),
+        Err(MongoIndexPlanError::InvalidRetirement {
+            retired_in: 1,
+            version: 3
+        })
+    ));
+    let mut ahead = later_plan();
+    ahead.retired[1].retired_in = 4;
+    assert!(matches!(
+        ahead.upgrade_from(Some(3)),
+        Err(MongoIndexPlanError::InvalidRetirement {
+            retired_in: 4,
+            version: 3
+        })
+    ));
+}
+
+#[test]
+fn recorded_plan_version_parsing_fails_closed() {
+    assert_eq!(recorded_plan_version_from_document(None), Ok(None));
+    assert_eq!(
+        recorded_plan_version_from_document(Some(&doc! { "version": 2_i64 })),
+        Ok(Some(2))
+    );
+    assert_eq!(
+        recorded_plan_version_from_document(Some(&doc! { "version": 1_i32 })),
+        Ok(Some(1))
+    );
+    for invalid in [
+        doc! {},
+        doc! { "version": "1" },
+        doc! { "version": 1.0_f64 },
+        doc! { "version": 0_i64 },
+        doc! { "version": -1_i32 },
+    ] {
+        assert_eq!(
+            recorded_plan_version_from_document(Some(&invalid)),
+            Err(MongoIndexPlanError::InvalidRecordedVersion),
+            "{invalid:?}"
+        );
+    }
+}
+
+#[test]
+fn run_migrations_applies_the_current_versioned_plan() {
+    let start = MONGO_STORE_SOURCE
+        .find("async fn run_migrations(&self)")
+        .expect("run_migrations");
+    let body = &MONGO_STORE_SOURCE[start..];
+    let body = &body[..body
+        .find("\n        async fn list_namespaces")
+        .expect("run_migrations body end")];
+    assert!(
+        body.contains("self.apply_index_plan(&MongoIndexPlan::current())"),
+        "startup and migrate up must apply the shipped versioned plan"
+    );
+    let apply_start = MONGO_STORE_SOURCE
+        .find("pub(crate) async fn apply_index_plan(")
+        .expect("apply_index_plan");
+    let apply = &MONGO_STORE_SOURCE[apply_start..];
+    let apply = &apply[..apply
+        .find("\n        async fn ensure_migration_lease_held")
+        .expect("apply_index_plan body end")];
+    let position = |needle: &str| {
+        apply
+            .find(needle)
+            .unwrap_or_else(|| panic!("apply_index_plan must contain {needle:?}"))
+    };
+    // The downgrade refusal is read-only: it precedes even the lease upsert.
+    assert!(position("plan.upgrade_from_state(") < position("self.acquire_migration_lease()"));
+    // The in-progress marker precedes the first schema change, and the
+    // version record (which clears it) follows the complete plan.
+    assert!(position("self.mark_index_plan_in_progress(") < position("create_collection"));
+    assert!(
+        position("self.ensure_planned_index(entry)") < position("self.record_index_plan_version(")
+    );
+    // Every drop and the version record first prove lease ownership.
+    let drop = position("self.retire_planned_index(retired)");
+    let guard_before_drop = apply[..drop]
+        .rfind("self.ensure_migration_lease_held(")
+        .expect("lease check before retirement");
+    assert_eq!(
+        apply[guard_before_drop..drop].matches(';').count(),
+        1,
+        "the lease check must immediately precede each retirement"
+    );
+    let record = position("self.record_index_plan_version(");
+    assert!(
+        apply[..record]
+            .rfind("self.ensure_migration_lease_held(")
+            .is_some_and(|guard| apply[guard..record].matches(';').count() == 1),
+        "the lease check must immediately precede the version record"
+    );
+}
+
+#[test]
+fn reconnect_paths_check_the_candidate_plan_version_before_publishing() {
+    for (marker, publish) in [
+        (
+            "async fn reconnect_failover(&self, db_url: &str)",
+            "self.publish_reconnected_bundle(",
+        ),
+        (
+            "async fn reconnect(&self, db_url: &str)",
+            "self.install_reconnected_bundle(",
+        ),
+    ] {
+        let start = MONGO_STORE_SOURCE.find(marker).expect(marker);
+        let body = &MONGO_STORE_SOURCE[start..];
+        let check = body
+            .find("ensure_candidate_index_plan_compatible(&new_connection.db)")
+            .unwrap_or_else(|| panic!("{marker} must check the candidate plan version"));
+        let publish = body.find(publish).expect(publish);
+        assert!(check < publish, "{marker} must check before publishing");
+    }
+}
+
+#[test]
+fn plan_rejects_reusing_a_retired_index_name() {
+    let mut plan = MongoIndexPlan {
+        version: 2,
+        indexes: vec![RequiredMongoIndex {
+            collection: "proxies",
+            model: IndexModel::builder()
+                .keys(doc! { "legacy_field": 1 })
+                .options(IndexOptions::builder().unique(true).build())
+                .build(),
+        }],
+        retired: vec![RetiredMongoIndex {
+            retired_in: 2,
+            collection: "proxies",
+            name: "legacy_field_1",
+        }],
+    };
+    // The replacement keeps the old keys and therefore the old default name.
+    assert_eq!(
+        plan.upgrade_from(Some(1)).unwrap_err(),
+        MongoIndexPlanError::RetiredNameReused {
+            collection: "proxies",
+            name: "legacy_field_1",
+        }
+    );
+    // An explicit new name makes the replacement valid.
+    plan.indexes[0].model = IndexModel::builder()
+        .keys(doc! { "legacy_field": 1 })
+        .options(
+            IndexOptions::builder()
+                .unique(true)
+                .name("legacy_field_unique_v2".to_string())
+                .build(),
+        )
+        .build();
+    assert_eq!(
+        planned_index_name(&plan.indexes[0].model),
+        "legacy_field_unique_v2"
+    );
+    assert_eq!(plan.upgrade_from(Some(1)).unwrap().len(), 1);
+    // The same name on another collection is unrelated.
+    plan.indexes[0].collection = "upstreams";
+    plan.indexes[0].model = IndexModel::builder()
+        .keys(doc! { "legacy_field": 1 })
+        .build();
+    assert!(plan.upgrade_from(Some(1)).is_ok());
+}
+
+#[test]
+fn in_progress_upgrades_are_refused_by_older_plans_and_resumed_by_their_own() {
+    let plan = later_plan();
+    let state = |version, in_progress| RecordedIndexPlanState {
+        version,
+        in_progress,
+    };
+    let error = plan
+        .upgrade_from_state(&state(Some(3), Some(4)))
+        .unwrap_err();
+    assert_eq!(
+        error,
+        MongoIndexPlanError::InProgressVersionNewer {
+            in_progress: 4,
+            supported: 3
+        }
+    );
+    assert!(error.to_string().contains("has not finished"));
+    // The interrupted run's own version (or an older one) resumes from the
+    // last applied version: retirements after it are still pending.
+    let resumed = plan.upgrade_from_state(&state(Some(1), Some(3))).unwrap();
+    assert_eq!(resumed.len(), 2);
+    assert_eq!(
+        plan.upgrade_from_state(&state(None, Some(2)))
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn recorded_plan_state_parsing_reads_the_in_progress_marker() {
+    assert_eq!(
+        recorded_plan_state_from_document(Some(
+            &doc! { "version": 1_i64, "in_progress_version": 2_i64 }
+        )),
+        Ok(RecordedIndexPlanState {
+            version: Some(1),
+            in_progress: Some(2)
+        })
+    );
+    // A first upgrade interrupted after its marker records no version yet.
+    assert_eq!(
+        recorded_plan_state_from_document(Some(&doc! { "in_progress_version": 1_i32 })),
+        Ok(RecordedIndexPlanState {
+            version: None,
+            in_progress: Some(1)
+        })
+    );
+    assert_eq!(
+        recorded_plan_state_from_document(Some(
+            &doc! { "version": 1_i64, "in_progress_version": "2" }
+        )),
+        Err(MongoIndexPlanError::InvalidRecordedVersion)
+    );
+}
+
+#[test]
+fn dry_run_lists_the_plan_version_and_destructive_steps() {
+    let joined = dry_run_lines().join("\n");
+    assert!(joined.contains(&format!(
+        "index plan version applied and recorded: {MONGO_INDEX_PLAN_VERSION}"
+    )));
+    if RETIRED_MONGO_INDEXES.is_empty() {
+        assert!(joined.contains("indexes dropped (retired by a later plan version): none"));
+    }
+    for retired in RETIRED_MONGO_INDEXES {
+        assert!(joined.contains(&format!(
+            "{}.{} (retired in plan version {})",
+            retired.collection, retired.name, retired.retired_in
+        )));
+    }
 }

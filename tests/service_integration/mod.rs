@@ -26,6 +26,11 @@
 //!     concurrency regression against ER_LOCK_DEADLOCK 1213 plus per-namespace
 //!     sequence-lock isolation (issue #4130), and byte-exact
 //!     NFC/NFD consumer identity uniqueness under `utf8mb4_0900_bin` (#2994).
+//!   - **forward_migrations_sqlite_postgres_mysql** — SQLite, PostgreSQL 17,
+//!     and MySQL 8.4 (selected by the CI job's `mysql` filter).
+//!     Drives a test-only `V002` forward migration through the production
+//!     migration runner and `migrate status` / `up` reports: apply, idempotent
+//!     re-run, checksum drift, and refusal of an unknown future version.
 //!   - **db_tls** — PostgreSQL 17 and MySQL 8.4. Verifies chain-only and full
 //!     hostname policies, expired/untrusted certificate rejection, and writes
 //!     after a rejected CA reload followed by fresh TLS connections.
@@ -57,6 +62,7 @@
 //!   cargo test --test service_integration oidc
 //!   cargo test --test service_integration oauth2_introspection
 //!   cargo test --test service_integration clickhouse
+//!   cargo test --test service_integration forward_migrations_sqlite_postgres_mysql
 
 mod common;
 #[path = "../scaffolding/mod.rs"]
@@ -66,6 +72,9 @@ mod clickhouse;
 mod consul;
 mod container_start_retry;
 mod db_tls;
+// Its name contains `mysql` on purpose: the CI job's exhaustive filter list
+// (`mysql`) selects all three backends' tests without a workflow change.
+mod forward_migrations_sqlite_postgres_mysql;
 mod host_port_allocation;
 mod kafka;
 mod ldap;

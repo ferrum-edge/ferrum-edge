@@ -1,51 +1,88 @@
-# Ferrum Edge Database Baselines and Initialization
+# Ferrum Edge Database Baselines and Migrations
 
-This guide covers database initialization, migration-history integrity checks,
-and independently owned custom-plugin migrations.
+This guide covers database initialization, forward-only core schema
+migrations, migration-history integrity checks, and independently owned
+custom-plugin migrations.
 
 ## Overview
 
-- SQL databases initialize from one core baseline, `V001`, tracked in
-  `_ferrum_migrations` with a content-derived checksum.
-- MongoDB initializes from one canonical index plan.
-- `database` and `cp` startup initialize fresh databases automatically;
+- SQL databases initialize from one frozen core baseline, `V001`, tracked in
+  `_ferrum_migrations`. Its checksum is derived from the canonical DDL it
+  executes, not from Rust source text.
+- From 1.0.0 onward, every core schema change ships as a new forward migration
+  (`V002`, `V003`, ...) that runs after `V001`; shipped migrations are never
+  edited.
+- MongoDB applies a versioned, forward-only index plan and records the plan
+  version it applied.
+- `database` and `cp` startup apply pending core migrations automatically;
   `FERRUM_MODE=migrate` provides explicit `up`, `status`, `config`, and dry-run
   actions.
-- A changed SQL baseline requires a fresh database. Startup does not alter old
-  columns, replace indexes, backfill old records, or rewrite migration history.
+- Startup never alters schema outside a declared migration, never backfills
+  outside one, and never rewrites migration history. A database whose history
+  the binary cannot verify (an unknown, missing, or changed migration) refuses
+  to start.
 
-## Build-Out Schema Policy
+## Schema Compatibility Policy
 
-Ferrum Edge is in active build-out with no deployed-user compatibility
-obligation. During this phase, core database schema changes are
-folded into the current baseline schema (`V001`) instead of being added as new
-core schema migrations (`V002`, `V003`, etc.). Breaking database-schema changes
-are acceptable, and compatibility shims for legacy columns, fields, environment variables, config shapes, or
-database values are not required unless explicitly requested.
+From 1.0.0 onward, the database schema is a compatibility surface:
 
-Operationally, anyone running a build-out branch or recent `main` snapshot
-should treat core schema changes as requiring a fresh database or an explicit
-operator-managed rebuild of the affected tables. The canonical procedure is
-[upgrade_guide.md → Build-Out Database Upgrade](upgrade_guide.md#build-out-database-upgrade-postgresql-mysql-sqlite-mongodb).
-Custom plugin migrations still use the plugin migration system because plugin
-storage is independently owned.
+- The `V001` baseline is frozen. Its identity is pinned by the committed
+  constant `V001_BASELINE_CHECKSUM` and the golden test
+  `tests/unit/config/v001_baseline_golden_tests.rs`, which fails on any change
+  to the statements `V001` executes.
+- Every change to a built-in table, column, or index ships as the next forward
+  migration. See [Adding a forward migration](#adding-a-forward-migration).
+- A shipped migration is never edited, reordered, or removed: its recorded
+  checksum makes an edit a fatal integrity error on every database that already
+  applied it.
+- An older binary refuses a database that a newer release migrated (an unknown
+  applied version), so a downgrade means restoring the matching binary or the
+  pre-upgrade backup.
+- Stored database values, like environment variables and config shapes, change
+  only with a documented deprecation path; see the compatibility policy in
+  [CLAUDE.md](../CLAUDE.md#compatibility-policy).
+
+MongoDB follows the same rule through its versioned index plan; see
+[MongoDB Migrations](#mongodb-migrations). Custom plugin migrations keep their
+own versioned sequences because plugin storage is independently owned.
+
+### Build-Out Schema Policy
+
+Releases before 1.0.0 (the 0.9.x line and earlier `main` snapshots) had no
+deployed-user compatibility obligation. Core schema changes were folded into
+the editable `V001` baseline instead of being shipped as `V002`+ migrations,
+and any baseline change required a fresh database or an operator-managed
+rebuild. That policy ends at 1.0.0.
+
+**Upgrading any 0.9.x database to 1.0.0 is a final rebuild-and-restore.** The
+1.0.0 baseline identity differs from every identity a 0.9.x release recorded:
+1.0.0 derives the `V001` checksum from canonical DDL instead of source text, and
+the baseline itself changed after v0.9.21 (#7485 added
+`config_change_locks.changes_since_compaction` and a MySQL `listen_path`
+collation; #7504 changed the source text 0.9.x hashed). A 1.0.0 binary started
+against a 0.9.x SQL database
+therefore refuses it with a `V001` checksum-mismatch integrity error, by
+design. Export a namespace-complete logical backup with the 0.9.x binary,
+initialize an empty database with 1.0.0, and restore into it, as described in
+[admin_backup_restore.md](admin_backup_restore.md) and the step-by-step
+[database rebuild procedure](upgrade_guide.md#build-out-database-upgrade-postgresql-mysql-sqlite-mongodb).
+MongoDB databases take the same path. From 1.0.0 onward, upgrades between
+releases apply forward migrations in place.
 
 ### Canonical schema locations
 
 | Storage | Complete baseline |
 |---|---|
-| PostgreSQL, MySQL, SQLite | `src/config/migrations/v001_initial_schema.rs` delegates to `src/config/migrations/sql_dialect.rs` for the complete dialect-specific schema and initial `ferrum` namespace |
-| MongoDB | `src/config/mongo_index_plan.rs`; `MongoStore` initializes an empty namespace registry with `ferrum` |
+| PostgreSQL, MySQL, SQLite | `src/config/migrations/v001_initial_schema.rs` (identity, `V001_BASELINE_CHECKSUM`) delegates to `src/config/migrations/sql_dialect.rs` for the complete dialect-specific schema and initial `ferrum` namespace; forward migrations are appended in `MigrationRunner::shipped_migrations()` (`src/config/migrations/mod.rs`) |
+| MongoDB | `src/config/mongo_index_plan.rs` (`MONGO_INDEX_PLAN_VERSION`, `required_mongo_indexes`, `RETIRED_MONGO_INDEXES`); `MongoStore` initializes an empty namespace registry with `ferrum` |
 | ClickHouse chargeback sink | [`schemas/clickhouse/charges.sql`](../schemas/clickhouse/charges.sql), applied separately to the external analytics database |
 | Custom plugins | `plugin_migrations()` in each compiled `custom_plugins/*.rs`; independent plugin-owned tables |
 
-There is no separate core SQL patch directory or startup compatibility pass.
-The `migrations` module name and `migrate` mode describe the initialization and
-tracking framework; they do not imply a supported upgrade chain for core data.
+There is no separate core SQL patch directory or startup compatibility pass:
+the ordered migration list is the only way schema changes reach a database.
 
 ## Stability & Upgrade Contract
 
-Ferrum Edge is in active build-out (crate version `0.9.x`, DB baseline `V001`).
 This section states, in one place, what stability you can rely on across
 branches and releases, when the schema freeze happens, and how breaking changes
 are announced.
@@ -54,7 +91,7 @@ are announced.
 
 | Channel | What it is | Schema / config / API stability |
 |---|---|---|
-| `main` / build-out branches | Main CI validates each push and publishes no production artifacts (see [ci_cd.md](ci_cd.md)); the `latest` / `main-<sha>` container tags are development builds of `main` commits that passed CI. | **No cross-commit stability.** Core schema changes are folded into the `V001` baseline (see [Build-Out Schema Policy](#build-out-schema-policy)); breaking changes to schema, env vars, config shapes, and DB values are acceptable and are **not** shimmed. Treat any schema change as requiring a fresh database or an operator-managed rebuild. Do not run `latest` in production with data you cannot recreate. |
+| `main` | Main CI validates each push and publishes no production artifacts (see [ci_cd.md](ci_cd.md)); the `latest` / `main-<sha>` container tags are development builds of `main` commits that passed CI. | No promise between arbitrary commits: a forward migration can still change shape before it is first released. From 1.0.0 onward, `main` never edits `V001` or a released migration, so a database created by a tagged release keeps upgrading forward. Before 1.0.0, schema changes were folded into `V001` (see [Build-Out Schema Policy](#build-out-schema-policy)). Do not run `latest` in production with data you cannot recreate. |
 | Tagged release `vX.Y.Z` | A `v*` tag cuts a versioned GitHub Release + Docker tags from a green CI/coverage SHA. | Semantic versioning per [ci_cd.md → Version Numbering](ci_cd.md#version-numbering). The promises in [Version Compatibility](upgrade_guide.md#version-compatibility) apply **between tagged releases**, not between arbitrary `main` commits. |
 
 The CP↔DP gRPC protocol requires CP and DP to run the **same build**; mixed
@@ -64,36 +101,30 @@ ConfigSync build-identity gate rejects any other build at `Subscribe` (see
 
 ### When V002+ migrations start (the schema freeze)
 
-Today there is exactly one core migration, `V001` (`initial_schema`), and all
-built-in schema changes are folded into it rather than shipped as `V002`,
-`V003`, … The transition from *fold-into-baseline* to *incremental migrations*
-happens at a single, declared point:
+> **The `V001` baseline freezes at 1.0.0.** From 1.0.0 onward, any change to a
+> built-in table, column, or index ships as a new versioned forward migration
+> (`V002`+), and the fold-into-`V001` and no-legacy-shims allowances are
+> retired. Releases before 1.0.0 edited `V001` in place, as described in
+> [Build-Out Schema Policy](#build-out-schema-policy).
 
-> **The `V001` baseline freezes at the first tagged release designated stable —
-> the first `v1.0.0`, or an earlier `vX.Y.Z` whose release notes explicitly
-> declare the stable schema baseline.** From that release onward, any change to
-> a built-in table/column/index ships as a new versioned migration (`V002`+), and the
-> fold-into-`V001` and no-legacy-shims allowances are retired. Before that
-> release, `V001` remains editable and breaking, as above.
-
-Until that release is cut, "add a `V002`" is **not** the workflow — update the
-`V001` baseline in `v001_initial_schema.rs` / `sql_dialect.rs`. The `V002+`
-workflow is deferred until that policy change is explicitly declared.
+The runner, its integrity checks, and the `migrate status` / `up` reports
+already handle `V002`+: the forward path is exercised against SQLite,
+PostgreSQL, and MySQL by `tests/service_integration/forward_migrations_sqlite_postgres_mysql.rs`
+with a test-only `V002`. No shipped `V002` exists until the first schema change
+after 1.0.0 needs one.
 
 ### How breaking changes are announced
 
 - **Between tagged releases:** breaking schema / config / env / API changes are
   called out in that release's GitHub Release notes, keyed to the migration or
   the env/config surface that changed. Operators upgrade tag-to-tag using
-  [upgrade_guide.md](upgrade_guide.md) (during build-out:
-  [fresh-database rebuild](upgrade_guide.md#build-out-database-upgrade-postgresql-mysql-sqlite-mongodb);
-  after the schema freeze: versioned forward migrations).
-- **On `main` / build-out branches:** there is no per-commit changelog promise.
-  New `FERRUM_*` env vars land with `docs/configuration.md` + `ferrum.conf`
-  updates in the same change, and schema-affecting changes update the `V001`
-  baseline and its tests. The authoritative "we are still folding" statement is
-  the [Build-Out Schema Policy](#build-out-schema-policy) above; its end
-  condition is the schema freeze defined here.
+  [upgrade_guide.md](upgrade_guide.md): from 1.0.0 onward through versioned
+  forward migrations applied at startup or by `migrate up`; from any 0.9.x
+  release to 1.0.0 through the one-time
+  [rebuild-and-restore](#build-out-schema-policy).
+- **On `main`:** there is no per-commit changelog promise. New `FERRUM_*` env
+  vars land with `docs/configuration.md` + `ferrum.conf` updates in the same
+  change, and schema-affecting changes add a forward migration and its tests.
 
 ## Database Migrations
 
@@ -157,12 +188,13 @@ does nothing if the row already exists. As a result:
 
 Do not rely on adoption. Back up the database and rebuild it from the current
 baseline before starting a current binary against a database that predates
-migration tracking. The same applies whenever the `V001` baseline changes
-during build-out (see [Build-Out Schema Policy](#build-out-schema-policy)).
+migration tracking. The same applies to every database created by a release
+before 1.0.0 (see [Build-Out Schema Policy](#build-out-schema-policy)).
 Once tracking rows exist, the history checks in
 [Migration History Integrity](#migration-history-integrity) apply instead. The
-stored `V001` checksum covers the migration source, not the live schema, so a
-changed baseline is refused as checksum drift.
+stored `V001` checksum identifies the baseline DDL the binary executes, not the
+live schema, so a database recorded with a different baseline is refused as
+checksum drift.
 
 ### Cross-Database Support
 
@@ -177,9 +209,14 @@ Each migration is a Rust function that can dispatch different SQL based on the d
 
 ### Migration History Integrity
 
-Each migration has a checksum. V001 uses a `sha256:<hex>` digest derived from
-the V001 wrapper and dialect schema source, so changing the baseline changes the
-stored value and makes later source tampering visible. Before any write, Ferrum
+Each migration has a checksum. Core migrations use a `sha256:<hex>` digest of
+their canonical DDL: every statement the migration executes on PostgreSQL,
+MySQL, and SQLite, in order, exactly as sent (MySQL index statements without
+`IF NOT EXISTS`), with runs of whitespace outside quoted text and SQL comments
+collapsed. Quoted literals and identifiers and SQL comments are hashed byte for
+byte. Rust comments, formatting, and helper refactors do not change it; any
+change to an executed statement's content does. `V001`'s value is committed as `V001_BASELINE_CHECKSUM` and
+pinned by a golden test. Before any write, Ferrum
 first requires unique namespaces, unique version IDs in the inclusive
 `1..=2147483647` tracking-column range, and increasing
 declaration order. It then requires every applied namespace to be an exact
@@ -193,9 +230,12 @@ Ferrum does not apply pending core or plugin migrations, create tracking
 tables, overwrite history, or re-run changed migration source after a refusal.
 Automatic `database` / `cp` startup and
 explicit `up`, `status`, and database dry-run commands all return an error;
-command-line use therefore exits non-zero. During build-out there is
-deliberately no compatibility shim for the former fixed
-`v001_initial_schema` label and no migration-integrity override.
+command-line use therefore exits non-zero. There is deliberately no
+compatibility shim for the former fixed `v001_initial_schema` label or for
+0.9.x source-derived `V001` checksums, and no migration-integrity override.
+An unknown applied core version is how a binary downgrade surfaces: the older
+binary reports `kind=unknown_applied_version` with the version it does not
+know and refuses to start.
 
 ## Custom Plugin Migrations
 
@@ -398,9 +438,11 @@ When the `version` field is absent, validation fails before migrations run. New 
 The current format is `version: "1"`. `ConfigMigrator::migration_chain()` is
 empty: there are no shipped config transforms or older formats to upgrade.
 `FERRUM_MIGRATE_ACTION=config` reports no migration for a current-version file;
-unsupported versions fail. During build-out, edit configuration to the current
-shape and run `ferrum-edge validate` before starting the gateway. Do not add
-legacy field aliases or speculative migration steps.
+unsupported versions fail. Run `ferrum-edge validate` before starting the
+gateway on a changed file. From 1.0.0 onward the `version: "1"` shape is a
+compatibility surface: a change that would reject existing files needs a
+documented deprecation path (or a new config version with a `ConfigMigrator`
+step). Do not add speculative migration steps before a change needs one.
 
 ## Running Migrations Explicitly
 
@@ -502,31 +544,87 @@ same error a real run returns. It never creates a backup or rewrites the file.
 | `FERRUM_FILE_CONFIG_PATH` | Path to config file | Required for `config` action |
 | `FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS` | `true` / `false` (default) | `database` / `cp` startup only: apply pending custom-plugin migrations instead of warning |
 
-## Updating Baselines (Developer Guide)
+## Changing the Schema (Developer Guide)
 
-### Updating the Core Baseline
+### Adding a forward migration
 
-1. Edit the complete table/column/index definition in
-   `src/config/migrations/sql_dialect.rs`. Keep PostgreSQL, MySQL, and SQLite
-   aligned; `V001InitialSchema` remains the sole core declaration.
-2. Update persistence, config types, validation, documentation, and OpenAPI
-   where the changed field is exposed.
-3. Test fresh initialization, relevant CRUD behavior, and repeated startup.
-   Do not add `V002` files, `ALTER`-based startup repairs, namespace backfills,
-   or compatibility tracking tables.
-4. Recreate development databases after baseline changes. Keep checksum
-   validation intact; do not edit applied tracking rows to disguise a mismatch.
+From 1.0.0 onward, a core SQL schema change never edits `sql_dialect.rs`'s
+`V001` statements. Instead:
 
-Update MongoDB indexes in `src/config/mongo_index_plan.rs` and external
-ClickHouse DDL in `schemas/clickhouse/charges.sql` directly. Their storage is
-separate from the core SQL database. Custom-plugin changes follow
+1. Declare the next migration as a `SqlMigration` constant
+   (`src/config/migrations/mod.rs`) with the next unused `version`, a `name`,
+   and the statements for each of PostgreSQL, MySQL, and SQLite. Keep the
+   dialects aligned the way the `V001` baseline does. Use a dedicated
+   `MigrationEntry` only when plain DDL is not enough (for example a data
+   backfill).
+2. Register it at the end of `MigrationRunner::shipped_migrations()` through
+   the same constructor the tests use. Never reorder, edit, or remove a
+   shipped entry; the next change is another migration.
+
+   ```rust
+   const V002_ADD_EXAMPLE: SqlMigration = SqlMigration {
+       version: 2,
+       name: "add_example",
+       postgres: &["CREATE TABLE IF NOT EXISTS example (id TEXT PRIMARY KEY)"],
+       mysql: &[
+           "CREATE TABLE IF NOT EXISTS example (id VARCHAR(64) NOT NULL PRIMARY KEY, note VARCHAR(255) NOT NULL)",
+           "DROP INDEX idx_example_note ON example",
+           "CREATE INDEX idx_example_note ON example (note)",
+       ],
+       sqlite: &["CREATE TABLE IF NOT EXISTS example (id TEXT PRIMARY KEY)"],
+   };
+
+   fn shipped_migrations() -> Vec<Box<dyn MigrationEntry>> {
+       vec![
+           Box::new(MigrationEntryV001(v001_initial_schema::V001InitialSchema)),
+           sql_migration_entry(V002_ADD_EXAMPLE),
+       ]
+   }
+   ```
+
+3. Make every statement safe to re-run after a partial failure: MySQL commits
+   DDL implicitly and PostgreSQL runs these statements outside an explicit
+   transaction, and the tracking row is written only after every statement
+   succeeds. Use `IF NOT EXISTS` forms where the dialect has them. MySQL has
+   no `CREATE INDEX IF NOT EXISTS`, and a duplicate-key-name error (1061)
+   proves only that the name is taken, not that the index has the intended
+   definition, so forward migrations never tolerate it: write each MySQL
+   index as `DROP INDEX name ON table` (its missing-key error 1091 is
+   tolerated) followed by the exact `CREATE INDEX`, as above. A retry then
+   always rebuilds the intended definition.
+4. Update persistence, config types, validation, documentation, and OpenAPI
+   where the changed field is exposed, and document the change in the release
+   notes and upgrade guide.
+5. Test the migration on a database created at the previous release's schema.
+   `tests/service_integration/forward_migrations_sqlite_postgres_mysql.rs` shows the pattern
+   (SQLite plus PostgreSQL and MySQL containers) through the production runner.
+
+The golden test `tests/unit/config/v001_baseline_golden_tests.rs` fails if a
+change alters what `V001` executes; its message points back here.
+
+### Refreshing the V001 golden checksum (before 1.0.0 only)
+
+Releases before 1.0.0 changed the baseline in place. To record a deliberate
+pre-1.0.0 baseline change, copy the value the failing golden test prints
+(`computed: sha256:...`, also shown as a ready-to-paste
+`pub const V001_BASELINE_CHECKSUM` line in the CI log of the Unit Tests job)
+into `V001_BASELINE_CHECKSUM` in
+`src/config/migrations/v001_initial_schema.rs`. That one line is the only edit.
+After 1.0.0 is tagged this constant never changes again.
+
+### Other stores
+
+MongoDB index changes follow the versioned plan rules in
+[MongoDB Migrations](#mongodb-migrations). External ClickHouse DDL in
+`schemas/clickhouse/charges.sql` is applied separately to the analytics
+database. Custom-plugin changes follow
 [Custom Plugin Migrations](#custom-plugin-migrations).
 
 ### Updating Config Files
 
-Update the current config shape and its validation directly during build-out.
-No compatibility transform is required. Document breaking changes and update
-examples alongside the implementation.
+Update the config shape, its validation, and the examples together. From 1.0.0
+onward a change that existing files would fail is a compatibility break: give
+it a deprecation path and call it out in the release notes and upgrade guide.
 
 ## Troubleshooting
 
@@ -554,8 +652,13 @@ Treat the mismatch as an incident until provenance is understood:
    place database credentials, migration SQL, or secrets in shared diagnostics.
 3. Restore the original immutable migration/binary that matches the applied
    database, or restore the correct database backup for the intended binary.
-4. For an intentional build-out baseline change, rebuild the core database
-   from the current schema. Do not add a forward repair migration. Independently
+4. A `V001` checksum mismatch on a database created by a release before
+   1.0.0 is expected when that database meets a 1.0.0 or later binary: take
+   the one-time [rebuild-and-restore](#build-out-schema-policy) path. From
+   1.0.0 onward `V001` and every released migration are immutable, so a
+   mismatch between two releases is never an expected upgrade outcome. An
+   unknown applied version means the binary is older than the database:
+   run the newer release or restore the pre-upgrade backup. Independently
    owned custom-plugin histories remain immutable; restore their matching code
    or use their own versioned migration mechanism.
 5. Re-run `FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=status`, then `up`, only
@@ -588,16 +691,65 @@ For config files, restore from the `.backup.*` file that was created before the 
 ## MongoDB Migrations
 
 MongoDB does not use SQL migrations. Instead, `MongoStore::run_migrations()`
-creates indexes from the canonical plan in
-`src/config/mongo_index_plan.rs` using idempotent `createIndex` operations.
-Conflicting existing index options fail initialization and require a fresh
-build-out database; Ferrum never drops an old index automatically.
-Running the same baseline multiple times is safe — `createIndex` is a no-op if
-the full index spec (keys + options) already matches. Migrate dry-run prints
-that same plan without connecting; migrate status connects, runs `listIndexes`,
-and reports each required index as present, missing, or mismatched, plus whether
-the required guard-collection shells exist (connectivity or authentication
-failures return nonzero).
+(run by `database` / `cp` startup and `migrate up`) applies the versioned index
+plan in `src/config/mongo_index_plan.rs`:
+
+1. Read the recorded plan state from the `_ferrum_migrations` collection
+   (document `_id: "core_index_plan"`: `version`, the last plan applied
+   completely, and `in_progress_version`, the target of an upgrade that has
+   started changing indexes but not finished). If either is newer than the
+   binary's `MONGO_INDEX_PLAN_VERSION`, refuse before any write, including the
+   migration-lease document: an older binary must not run against a database
+   a newer release upgraded or started upgrading. A record that is not a
+   positive integer is also refused.
+2. Take the migration lease and repeat that check under it.
+3. If this plan version is not yet recorded as applied, set
+   `in_progress_version` to it before the first schema change.
+4. Create the guard collections; drop, by exact name, each index in
+   `RETIRED_MONGO_INDEXES` whose `retired_in` version is above the recorded
+   version (an index that is already absent is fine; nothing else is ever
+   dropped); ensure every planned index with idempotent `createIndex`; seed
+   the namespace registry.
+5. Record the plan version and clear `in_progress_version` in one
+   single-document update.
+
+Before each drop and before the final record, the runner proves it still owns
+the migration lease (valid renewal and an owner-qualified lock document), so a
+runner that lost its lease stops instead of changing another runner's indexes.
+A failure before step 5 leaves the marker in place: an older binary keeps
+refusing the database, and a rerun of the same release resumes and finishes
+the same idempotent forward step. A database with no record (fresh, or
+initialized by a release before 1.0.0) is treated as version 0. Reconnecting
+to the primary or a failover URL reads the candidate database's plan state and
+keeps the current connection if the candidate was upgraded by a newer release.
+
+Conflicting existing index options still fail initialization: `createIndex` is
+a no-op only when the full index spec (keys + options) matches. Migrate
+dry-run prints the plan without connecting, including the plan version and
+every retirement it would drop (each only when the recorded version is below
+its `retired_in`). Migrate status connects, runs `listIndexes`, reports the
+recorded, in-progress, and binary plan versions and each required index as
+present, missing, or mismatched, plus whether the required guard-collection
+shells exist. Status refuses a newer applied or in-progress plan version, and
+connectivity or authentication failures return nonzero.
+
+### Changing the MongoDB index plan
+
+Each change bumps `MONGO_INDEX_PLAN_VERSION` by one in the release that makes it:
+
+- **Add an index:** add it to `required_mongo_indexes()`.
+- **Drop an index:** remove it from the plan and add a `RetiredMongoIndex`
+  with its exact index name and `retired_in` set to the new version.
+- **Replace an index** (new keys or options): retire the old name and add the
+  new definition under a new name. A planned index may never reuse a retired
+  name (the plan is rejected), so a definition that keeps the old keys needs
+  an explicit `name` option. This keeps a retried retirement from ever
+  dropping the replacement.
+
+Never edit an existing plan entry's keys or options in place (MongoDB refuses
+a same-key index with different options) and never edit or remove a shipped
+retirement. Upgrading a MongoDB database created before 1.0.0 to 1.0.0 follows
+the same one-time [rebuild-and-restore](#build-out-schema-policy) as SQL.
 
 ### What Gets Created
 
@@ -653,7 +805,7 @@ FERRUM_MODE=migrate \
 
 - **No junction tables**: SQL uses `proxy_plugins` — keyed `(namespace, proxy_id, plugin_config_id)` — to associate proxies with plugins. MongoDB embeds plugin associations directly in proxy documents.
 - **Composite document keys**: the `proxies`, `upstreams`, `plugin_configs`, `api_specs`, and `consumers` collections use `_id = "{namespace}:{id}"`, matching the SQL `PRIMARY KEY (namespace, id)`. Hand-written queries must build that key, not the bare resource id.
-- **No migration tracking table**: SQL tracks applied migrations in `_ferrum_migrations`. MongoDB indexes are idempotent and don't need tracking.
+- **Plan version instead of a migration ledger**: SQL tracks every applied migration in the `_ferrum_migrations` table. MongoDB records only the applied index-plan version, in the `_ferrum_migrations` collection (`_id: "core_index_plan"`).
 - **Automatic field propagation**: New fields added to domain types (`Proxy`, `Consumer`, etc.) are automatically persisted to MongoDB via serde BSON serialization — no ALTER TABLE equivalent needed. See [mongodb.md](mongodb.md#adding-new-fields).
 
 ### MongoDB Custom Plugin Storage

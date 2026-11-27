@@ -99,6 +99,48 @@ pub use router_cache::RouterCache;
 /// The leading underscore signals that this module is not part of the public API.
 #[doc(hidden)]
 pub mod _test_support {
+    /// Build a core SQL migration runner whose declarations are the shipped
+    /// list followed by `migrations`. Tests drive a real forward migration
+    /// (`V002`+) through the production runner with it; no fake migration ships.
+    #[cfg(feature = "test-support")]
+    pub fn migration_runner_with_test_migrations_for_test(
+        pool: sqlx::AnyPool,
+        db_type: &str,
+        migrations: Vec<crate::config::migrations::SqlMigration>,
+    ) -> crate::config::migrations::MigrationRunner {
+        crate::config::migrations::MigrationRunner::new(pool, db_type.to_string())
+            .with_test_only_migrations(migrations)
+    }
+
+    /// The exact report `FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=status`
+    /// prints for a SQL database, rendered through `runner`.
+    pub async fn sql_migrate_status_report_for_test(
+        runner: &crate::config::migrations::MigrationRunner,
+        plugin_migrations: &[(&str, Vec<crate::config::migrations::CustomPluginMigration>)],
+    ) -> Result<String, anyhow::Error> {
+        crate::modes::migrate::sql_status_report(runner, plugin_migrations).await
+    }
+
+    /// Apply pending migrations through `runner` and return the exact report
+    /// `FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=up` prints for SQL.
+    pub async fn sql_migrate_up_report_for_test(
+        runner: &crate::config::migrations::MigrationRunner,
+        plugin_migrations: &[(&str, Vec<crate::config::migrations::CustomPluginMigration>)],
+    ) -> Result<String, anyhow::Error> {
+        crate::modes::migrate::sql_up_report(runner, plugin_migrations).await
+    }
+
+    /// Apply an explicit MongoDB index plan through the production
+    /// `run_migrations` path (lease, version check, retirements, creates,
+    /// version record). Tests use it to exercise a later plan version.
+    #[cfg(feature = "test-support")]
+    pub async fn apply_mongo_index_plan_for_test(
+        store: &crate::config::mongo_store::MongoStore,
+        plan: &crate::config::mongo_index_plan::MongoIndexPlan,
+    ) -> Result<(), anyhow::Error> {
+        store.apply_index_plan(plan).await
+    }
+
     /// Test helper exposing external-ref media-type allowlist validation
     /// without widening the public API surface of `api_specs::external_refs`.
     pub fn api_spec_external_ref_content_type_allowed_for_test(content_type: &str) -> bool {

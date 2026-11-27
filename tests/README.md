@@ -149,6 +149,9 @@ cargo test --test service_integration clickhouse
 cargo test --test service_integration kafka
 cargo test --test service_integration mysql
 cargo test --test service_integration db_tls
+
+# Forward-only core schema migrations on SQLite, PostgreSQL, and MySQL
+cargo test --test service_integration forward_migrations_sqlite_postgres_mysql
 ```
 
 ### Performance Tests

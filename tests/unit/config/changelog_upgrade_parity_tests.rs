@@ -1,21 +1,28 @@
 //! Unreleased CHANGELOG `BREAKING` entries must appear in the upgrade guide.
 //!
-//! `include_str!` inspection only — no runtime. The test parses the current
-//! `[Unreleased]` section, extracts issue numbers from each `BREAKING` bullet,
-//! and requires every such number in `docs/upgrade_guide.md`. A future
-//! `BREAKING` entry without a citation, or without upgrade guidance, fails CI.
-//! The count of entries is not hard-coded.
+//! `include_str!` inspection only, plus the shipped core-migration list. The
+//! test parses the current `[Unreleased]` section, extracts issue numbers from
+//! each `BREAKING` bullet, and requires every such number in
+//! `docs/upgrade_guide.md`. A future `BREAKING` entry without a citation, or
+//! without upgrade guidance, fails CI. The count of entries is not hard-coded.
+
+use ferrum_edge::config::migrations::MigrationRunner;
 
 const CHANGELOG: &str = include_str!("../../../CHANGELOG.md");
 const UPGRADE_GUIDE: &str = include_str!("../../../docs/upgrade_guide.md");
 const MIGRATIONS_DOC: &str = include_str!("../../../docs/migrations.md");
 
-/// Present while build-out folds core schema into the editable `V001` baseline.
-const BUILD_OUT_BASELINE_POLICY_MARKER: &str = "folded into the current baseline schema (`V001`)";
+/// docs/migrations.md must keep stating the one-time 0.9.x -> 1.0.0 database
+/// path: the 1.0.0 `V001` identity differs from every 0.9.x one, so no 0.9.x
+/// database can be upgraded in place, before or after a forward migration ships.
+const PRE_1_0_REBUILD_STATEMENT: &str =
+    "Upgrading any 0.9.x database to 1.0.0 is a final rebuild-and-restore.";
 
 /// Phrases that imply an in-place or automatic **core database schema** migration
-/// workflow. Must stay absent from the upgrade guide while `MIGRATIONS_DOC`
-/// still states the build-out baseline-only policy above.
+/// workflow. They must stay absent from the upgrade guide while the binary
+/// ships no core forward migration (only the frozen `V001` baseline): until a
+/// real `V002` exists, no database has an in-place upgrade path, and upgrading
+/// a 0.9.x database to 1.0.0 is a rebuild-and-restore.
 const IN_PLACE_CORE_SCHEMA_MIGRATION_CLAIMS: &[&str] = &[
     "auto-migrates forward",
     "Let the new binary auto-migrate on startup",
@@ -186,8 +193,10 @@ fn unreleased_breaking_changelog_issues_appear_in_upgrade_guide() {
 }
 
 #[test]
-fn upgrade_guide_does_not_claim_in_place_migration_during_build_out() {
-    if !MIGRATIONS_DOC.contains(BUILD_OUT_BASELINE_POLICY_MARKER) {
+fn upgrade_guide_does_not_claim_in_place_migration_before_a_forward_migration_ships() {
+    // Gated on the real declaration list, not on documentation wording: the
+    // check applies exactly while `V001` is the only shipped core migration.
+    if MigrationRunner::shipped_core_migration_versions() != [1] {
         return;
     }
 
@@ -200,8 +209,21 @@ fn upgrade_guide_does_not_claim_in_place_migration_during_build_out() {
     assert!(
         violations.is_empty(),
         "docs/upgrade_guide.md must not claim in-place/automatic core schema \
-         migration while docs/migrations.md states build-out baseline-only \
-         policy; found: {}",
+         migration while V001 is the only shipped core migration (0.9.x -> 1.0.0 \
+         is a rebuild-and-restore); found: {}",
         violations.join(", ")
+    );
+}
+
+#[test]
+fn migrations_doc_states_the_pre_1_0_rebuild_and_restore() {
+    assert!(
+        MIGRATIONS_DOC.contains(PRE_1_0_REBUILD_STATEMENT),
+        "docs/migrations.md must state that upgrading a 0.9.x database to 1.0.0 is a \
+         rebuild-and-restore (the 1.0.0 V001 identity differs from every 0.9.x one)"
+    );
+    assert!(
+        MIGRATIONS_DOC.contains("admin_backup_restore.md"),
+        "docs/migrations.md must point to the documented backup/restore procedure"
     );
 }
