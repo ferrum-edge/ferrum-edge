@@ -184,9 +184,12 @@ remove it from manifests and Helm `extraEnv` anyway.
 
 ### Unknown configuration keys are rejected (#7520, #7524)
 
-Before 1.0.0 only the top-level resources (`Proxy`, `Upstream`, `Consumer`,
-`PluginConfig`, `ApiSpec`) rejected unknown keys; nested objects dropped them
-silently, so a misspelled `health_checks.pasive` or
+In 0.9.21 the top-level resources (`GatewayConfig`, `Proxy`, `Upstream`,
+`Consumer`, `PluginConfig`, `ApiSpec`, `FrontendTlsCertificateSource`) and some
+nested objects (stream `stream_match` criteria and arms, plugin trigger
+objects, and the mesh policy, authentication, telemetry and VirtualService
+route objects) already refused unknown keys, but the nested objects listed
+below dropped them silently, so a misspelled `health_checks.pasive` or
 `circuit_breaker.failure_treshold` produced a resource with that policy
 missing. 1.0.0 closes these nested objects:
 
@@ -352,18 +355,35 @@ VirtualServices for entries that start with `http[].route[].destination`.
 clients should be regenerated from the 1.0.0 `openapi.yaml`, which also marks
 every closed schema `additionalProperties: false`.
 
-### Custom plugins: request and notification timestamps use `UtcTimestamp` (issue #7419)
+### Custom plugins: timestamps use `UtcTimestamp` instead of chrono (issue #7419)
 
 `RequestContext::timestamp_received` and `Notification::fired_at` (and its
 builder setter) are now `ferrum_edge::time_compat::UtcTimestamp` instead of
-`chrono::DateTime<Utc>`. `UtcTimestamp` renders the same bytes as chrono
+`chrono::DateTime<Utc>`. So are the config-model and record timestamps
+(#7527, #7529): `GatewayConfig.loaded_at`; `created_at`/`updated_at` on
+`Proxy`, `Consumer`, `PluginConfig`, `Upstream`, `ApiSpec`, `NamespaceRecord`
+and `GatewayTrustBundleRecord` (and `updated_at` on `GatewayTrustBundleSummary`);
+`AuditEvent.ts`; and the `ApiSpecListFilter.updated_since` and
+`AuditListFilter.start`/`end` list filters. `UtcTimestamp` renders the same bytes as chrono
 through `to_rfc3339()` and exposes `unix_timestamp()` and
 `unix_timestamp_millis()`. Plugins also gain an optional
 `ON_RESPONSE_STREAM_TERMINATED` lifecycle hook bit (#7471); custom plugins keep
 the conservative dispatch path whether or not they declare it.
 
+Converting: `UtcTimestamp::now()` replaces `Utc::now()`; `to_rfc3339()`,
+`to_rfc3339_opts(..)` and serde produce the same text as chrono for in-range
+values; `unix_timestamp()` / `unix_timestamp_millis()` replace `timestamp()` /
+`timestamp_millis()`; `checked_add` / `checked_sub` take a
+`time::SignedDuration`; and `"...".parse::<UtcTimestamp>()` or
+`UtcTimestamp::from_unix_timestamp(secs)` builds one from text or epoch
+seconds. If you still hold a `chrono::DateTime<Utc>`, convert it with
+`UtcTimestamp::from_unix_timestamp_nanos(dt.timestamp(), dt.timestamp_subsec_nanos())`.
+Two edge cases differ from chrono: an instant outside years -9999..=9999 is
+rejected (`TimestampError::OutOfRange`) rather than represented, and a leap
+second (`:60`) is stored as the following second.
+
 **Operator action:** rebuild custom plugins against 1.0.0 and replace chrono
-calls on these two fields with the `UtcTimestamp` equivalents. The
+calls on these fields with the `UtcTimestamp` equivalents. The
 custom-plugin Rust API stays unstable after 1.0.0
 ([support policy](support_policy.md#custom-plugin-rust-api)).
 
@@ -384,8 +404,10 @@ custom-plugin Rust API stays unstable after 1.0.0
   -9999..=9999 that chrono accepted is now invalid: `GET /admin/tls/events`
   `since`, `transaction_debugger` `capture_expires_at`, `response_caching`
   HTTP dates and `soap_ws_security` instants take their existing
-  invalid-timestamp path. The `invalid since timestamp: ` detail text of the
-  TLS events `400` changed; the status and envelope did not.
+  invalid-timestamp path, and a file-mode config or backup whose `loaded_at`
+  is outside that range fails to load (#7527). The `invalid since timestamp: `
+  detail text of the TLS events `400` changed; the status and envelope did
+  not.
 - **Charts.** Both charts' `appVersion` is `1.0.0`, which is the default image
   tag. Pin a published release tag when you override `image.tag`, and keep the
   migration Job and gateway pins on the same build.
