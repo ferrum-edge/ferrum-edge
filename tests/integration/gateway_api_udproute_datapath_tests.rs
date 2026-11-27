@@ -437,7 +437,6 @@ async fn try_serve_translated_config(
             recvmmsg_batch_size: 64,
             overload: Arc::clone(&overload),
             so_busy_poll_us: 0,
-            udp_gro_enabled: false,
             udp_gso_enabled: false,
             udp_pktinfo_enabled: false,
             mesh_outbound_enforcement: empty_slot(),

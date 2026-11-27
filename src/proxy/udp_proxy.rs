@@ -3881,8 +3881,6 @@ pub struct UdpListenerConfig {
     pub overload: Arc<crate::overload::OverloadState>,
     /// SO_BUSY_POLL duration in microseconds for low-latency receive.
     pub so_busy_poll_us: u32,
-    /// Enable UDP GRO on the frontend socket.
-    pub udp_gro_enabled: bool,
     /// Enable UDP GSO for batched sending.
     pub udp_gso_enabled: bool,
     /// Enable IP(v6)_PKTINFO on the frontend socket (Linux only). When enabled
@@ -4173,7 +4171,6 @@ pub async fn start_udp_listener_holding_port(
         session_shard_amount,
         overload,
         so_busy_poll_us,
-        udp_gro_enabled,
         udp_gso_enabled,
         udp_pktinfo_enabled,
         mesh_outbound_enforcement,
@@ -4240,9 +4237,9 @@ pub async fn start_udp_listener_holding_port(
         );
     }
     let session_shard_amount = udp_session_shard_amount(session_shard_amount);
-    // so_busy_poll_us and udp_gro_enabled are used in #[cfg(target_os = "linux")] blocks below.
+    // so_busy_poll_us and udp_pktinfo_enabled are used in #[cfg(target_os = "linux")] blocks below.
     #[cfg(not(target_os = "linux"))]
-    let _ = (so_busy_poll_us, udp_gro_enabled, udp_pktinfo_enabled);
+    let _ = (so_busy_poll_us, udp_pktinfo_enabled);
 
     if let Some(dtls_config) = frontend_dtls_config {
         return start_dtls_frontend_listener(
@@ -4473,15 +4470,11 @@ pub async fn start_udp_listener_holding_port(
                 "IP_PKTINFO disabled (FERRUM_UDP_PKTINFO_ENABLED=false or auto-probe failed at startup); reply path uses routing lookup"
             );
         }
-        // UDP_GRO cannot be enabled yet. The pktinfo-active primary receive
-        // branch below already receives through readable() + recvmmsg with
-        // cmsg metadata, but the pktinfo-inactive fallback still uses tokio's
-        // recv_from() in the select! loop, which doesn't expose cmsg.
-        // GRO-coalesced buffers from recv_from would be forwarded as single
-        // oversized datagrams, breaking UDP message boundaries. GRO requires
-        // correct cmsg/GRO handling on ALL enabled receive paths, not only the
-        // pktinfo branch.
-        let _ = udp_gro_enabled;
+        // UDP_GRO is never enabled on the frontend socket. The pktinfo-active
+        // receive branch reads cmsg metadata through readable() + recvmmsg,
+        // but the pktinfo-inactive fallback uses tokio's recv_from(), which
+        // does not expose cmsg; GRO-coalesced buffers there would be forwarded
+        // as single oversized datagrams, breaking UDP message boundaries.
     }
 
     // GSO is applied at send time in the reply handler — the flag is threaded through

@@ -1342,8 +1342,6 @@ pub struct StreamListenerManager {
     stream_sni_plaintext_fallback: AtomicBool,
     /// SO_BUSY_POLL duration in microseconds for UDP sockets.
     so_busy_poll_us: u32,
-    /// Enable UDP GRO on frontend sockets.
-    udp_gro_enabled: bool,
     /// Enable UDP GSO for batched sending.
     udp_gso_enabled: bool,
     /// Enable IP_PKTINFO / IPV6_PKTINFO on frontend UDP sockets.
@@ -1519,7 +1517,6 @@ impl StreamListenerManager {
         io_uring_splice_enabled: bool,
         record_mesh_mtls_metric: bool,
         so_busy_poll_us: u32,
-        udp_gro_enabled: bool,
         udp_gso_enabled: bool,
         udp_pktinfo_enabled: bool,
         trusted_proxies: Arc<crate::proxy::client_ip::TrustedProxies>,
@@ -1551,7 +1548,6 @@ impl StreamListenerManager {
             io_uring_splice_enabled,
             record_mesh_mtls_metric,
             so_busy_poll_us,
-            udp_gro_enabled,
             udp_gso_enabled,
             udp_pktinfo_enabled,
             0,
@@ -1590,7 +1586,6 @@ impl StreamListenerManager {
         io_uring_splice_enabled: bool,
         record_mesh_mtls_metric: bool,
         so_busy_poll_us: u32,
-        udp_gro_enabled: bool,
         udp_gso_enabled: bool,
         udp_pktinfo_enabled: bool,
         pool_shard_amount: usize,
@@ -1653,7 +1648,6 @@ impl StreamListenerManager {
             io_uring_splice_enabled,
             record_mesh_mtls_metric,
             so_busy_poll_us,
-            udp_gro_enabled,
             udp_gso_enabled,
             udp_pktinfo_enabled,
             global_shutdown_rx: arc_swap::ArcSwap::new(Arc::new(None)),
@@ -3508,7 +3502,6 @@ impl StreamListenerManager {
                 let session_shards = self.pool_shard_amount;
                 let overload = self.overload.clone();
                 let so_busy_poll_us = self.so_busy_poll_us;
-                let udp_gro_enabled = self.udp_gro_enabled;
                 let udp_gso_enabled = self.udp_gso_enabled;
                 let udp_pktinfo_enabled = self.udp_pktinfo_enabled;
                 let listener_udp_metrics = Some(metrics.clone());
@@ -3630,7 +3623,6 @@ impl StreamListenerManager {
                         session_shard_amount: session_shards,
                         overload,
                         so_busy_poll_us,
-                        udp_gro_enabled,
                         udp_gso_enabled,
                         udp_pktinfo_enabled,
                         mesh_outbound_enforcement,

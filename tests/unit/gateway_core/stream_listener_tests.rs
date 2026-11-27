@@ -499,7 +499,6 @@ fn create_manager_runtime(
         false, // io_uring_splice_enabled
         false, // record_mesh_mtls_metric
         0,     // so_busy_poll_us
-        false, // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
         false, // udp_gso_enabled
         false, // udp_pktinfo_enabled
         Arc::new(TrustedProxies::none()),
@@ -680,7 +679,6 @@ fn create_datagram_reload_manager_runtime(
         false,
         false,
         0,
-        false,
         false,
         false,
         trusted_proxies,
@@ -1478,7 +1476,6 @@ fn direct_udp_listener_config(
         session_shard_amount: 0,
         overload: Arc::new(ferrum_edge::overload::OverloadState::new()),
         so_busy_poll_us: 0,
-        udp_gro_enabled: false,
         udp_gso_enabled: false,
         udp_pktinfo_enabled: false,
         mesh_outbound_enforcement: ferrum_edge::modes::mesh::outbound_enforcement::empty_slot(),

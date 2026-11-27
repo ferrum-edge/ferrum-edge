@@ -11616,14 +11616,6 @@ impl ProxyState {
                 env_config_arc.so_busy_poll_us,
                 {
                     let v = env_config_arc
-                        .udp_gro_enabled
-                        .resolve(crate::socket_opts::is_udp_gro_available);
-                    // GRO is probed but not active (recv_from lacks cmsg) — log for completeness.
-                    tracing::info!(enabled = v, config = %env_config_arc.udp_gro_enabled, "UDP GRO auto-detection (reserved, not active)");
-                    v
-                },
-                {
-                    let v = env_config_arc
                         .udp_gso_enabled
                         .resolve(crate::socket_opts::is_udp_gso_available);
                     if v {

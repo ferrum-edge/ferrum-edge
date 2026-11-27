@@ -328,7 +328,6 @@ async fn try_spawn_gateway(
         recvmmsg_batch_size: 64,
         overload: Arc::new(OverloadState::new()),
         so_busy_poll_us: 0,
-        udp_gro_enabled: false,
         udp_gso_enabled: false,
         udp_pktinfo_enabled: false,
         mesh_outbound_enforcement: empty_slot(),
