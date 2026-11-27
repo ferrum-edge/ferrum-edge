@@ -10,6 +10,13 @@ use ferrum_edge::config::migrations::MigrationRunner;
 
 const CHANGELOG: &str = include_str!("../../../CHANGELOG.md");
 const UPGRADE_GUIDE: &str = include_str!("../../../docs/upgrade_guide.md");
+const MIGRATIONS_DOC: &str = include_str!("../../../docs/migrations.md");
+
+/// docs/migrations.md must keep stating the one-time 0.9.x -> 1.0.0 database
+/// path: the 1.0.0 `V001` identity differs from every 0.9.x one, so no 0.9.x
+/// database can be upgraded in place, before or after a forward migration ships.
+const PRE_1_0_REBUILD_STATEMENT: &str =
+    "Upgrading any 0.9.x database to 1.0.0 is a final rebuild-and-restore.";
 
 /// Phrases that imply an in-place or automatic **core database schema** migration
 /// workflow. They must stay absent from the upgrade guide while the binary
@@ -205,5 +212,18 @@ fn upgrade_guide_does_not_claim_in_place_migration_before_a_forward_migration_sh
          migration while V001 is the only shipped core migration (0.9.x -> 1.0.0 \
          is a rebuild-and-restore); found: {}",
         violations.join(", ")
+    );
+}
+
+#[test]
+fn migrations_doc_states_the_pre_1_0_rebuild_and_restore() {
+    assert!(
+        MIGRATIONS_DOC.contains(PRE_1_0_REBUILD_STATEMENT),
+        "docs/migrations.md must state that upgrading a 0.9.x database to 1.0.0 is a \
+         rebuild-and-restore (the 1.0.0 V001 identity differs from every 0.9.x one)"
+    );
+    assert!(
+        MIGRATIONS_DOC.contains("admin_backup_restore.md"),
+        "docs/migrations.md must point to the documented backup/restore procedure"
     );
 }
