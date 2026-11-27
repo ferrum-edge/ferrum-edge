@@ -74,6 +74,7 @@ use crate::plugins::PluginHttpClient;
 use crate::plugins::mesh::ext_authz::{
     MeshExtAuthzCheckRequest, MeshExtAuthzExecutor, MeshExtAuthzOutcome,
 };
+use crate::plugins::utils::log_sampling::warn_sampled;
 use crate::plugins::{
     ALL_PROTOCOLS, JwtAuthAttributeValue, Plugin, PluginResult, ProxyProtocol, RequestContext,
     StreamConnectionContext, priority,
@@ -4911,9 +4912,31 @@ impl Plugin for MeshAuthz {
                 crate::modes::mesh::node_waypoint_observability::record_asserted_identity_rejected(
                     crate::modes::mesh::node_waypoint_observability::NodeWaypointAssertedIdentityRejectReason::UntrustedAssertor,
                 );
+                // Fixed text only: neither identity is echoed (the asserted
+                // one is attacker-controlled). Issue #7499: a source pod in
+                // another namespace is asserted by its own NodeWaypoint, which
+                // this waypoint trusts only for workloads its own slice lists.
+                warn_sampled!(
+                    plugin = "mesh_authz",
+                    reason = "untrusted_assertor",
+                    "NodeWaypoint ignored an HBONE source assertion: the peer is not a trusted \
+                     assertor for any workload this waypoint's slice lists, so the request is \
+                     judged on the peer's own identity. A source pod is honoured only when this \
+                     waypoint's control-plane scope (FERRUM_CP_NAMESPACES) and bearer `ns` claim \
+                     cover the source pod's namespace; see GET /mesh/policy-denies/recent"
+                );
             } else if assertion_out_of_scope {
                 crate::modes::mesh::node_waypoint_observability::record_asserted_identity_rejected(
                     crate::modes::mesh::node_waypoint_observability::NodeWaypointAssertedIdentityRejectReason::AssertionOutOfScope,
+                );
+                warn_sampled!(
+                    plugin = "mesh_authz",
+                    reason = "assertion_out_of_scope",
+                    "NodeWaypoint ignored an HBONE source assertion: the peer is a trusted \
+                     assertor, but not for the asserted identity, so the request is judged on the \
+                     peer's own identity. A source pod is honoured only when this waypoint's \
+                     control-plane scope (FERRUM_CP_NAMESPACES) and bearer `ns` claim cover the \
+                     source pod's namespace; see GET /mesh/policy-denies/recent"
                 );
             } else if trust_domain_mismatch {
                 crate::modes::mesh::node_waypoint_observability::record_asserted_identity_rejected(
