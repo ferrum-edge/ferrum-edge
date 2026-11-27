@@ -8,9 +8,9 @@
 use crate::plugins::utils::log_sampling::warn_sampled;
 
 use crate::fips::approved::Sha256;
+use crate::time_compat::UtcTimestamp;
 use async_trait::async_trait;
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use futures_util::StreamExt;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
@@ -1054,7 +1054,7 @@ struct ToolCatalogEntry {
     output_validator: Option<Arc<jsonschema::Validator>>,
     /// When the refresh that produced this entry ran; the Admin API tool
     /// catalog read reports it.
-    discovered_at: DateTime<Utc>,
+    discovered_at: UtcTimestamp,
     schema_hash: String,
 }
 
@@ -1155,7 +1155,7 @@ struct McpCatalog {
     last_refreshed_at: Option<Instant>,
     resource_templates_refreshed_at: Option<Instant>,
     resource_templates_last_attempted_at: HashMap<String, Instant>,
-    tools_refreshed_wall: Option<DateTime<Utc>>,
+    tools_refreshed_wall: Option<UtcTimestamp>,
     // `(server_id, catalog family)` pairs whose most recent list refresh
     // failed and whose entries (if any) are being served stale from the last
     // good refresh. Bounded by configured servers x catalog families; exposed
@@ -4226,7 +4226,7 @@ impl McpGateway {
         ctx: &RequestContext,
         downstream_session_id: &str,
         server: &McpServerConfig,
-        discovered_at: DateTime<Utc>,
+        discovered_at: UtcTimestamp,
         old_catalog: &McpCatalog,
     ) -> Result<Vec<ToolCatalogEntry>, String> {
         if let Some(parts) = self.bridge_tools.get(&server.server_id) {
@@ -4255,7 +4255,7 @@ impl McpGateway {
         ctx: &RequestContext,
         downstream_session_id: &str,
         server: &McpServerConfig,
-        discovered_at: DateTime<Utc>,
+        discovered_at: UtcTimestamp,
         old_catalog: &McpCatalog,
     ) -> ServerFamilyListings {
         let tools = if self.discovery.aggregate_tools && server.expose_tools {
@@ -4328,7 +4328,7 @@ impl McpGateway {
         let mut degraded: Vec<(String, &'static str)> = Vec::new();
         let mut last_good: BTreeSet<(String, &'static str)> = BTreeSet::new();
         let mut families: BTreeMap<&'static str, FamilyRefreshStats> = BTreeMap::new();
-        let discovered_at = Utc::now();
+        let discovered_at = UtcTimestamp::now();
 
         // Upstream I/O fans out across servers (bounded), so one slow upstream
         // no longer serializes ahead of every other server's lists. Each
@@ -4801,7 +4801,7 @@ impl McpGateway {
         &self,
         server: &McpServerConfig,
         item: Value,
-        discovered_at: DateTime<Utc>,
+        discovered_at: UtcTimestamp,
         old_catalog: &McpCatalog,
     ) -> Option<ToolCatalogEntry> {
         let parts = tool_definition_parts(
@@ -4820,7 +4820,7 @@ impl McpGateway {
         &self,
         server: &McpServerConfig,
         parts: ToolDefinitionParts,
-        discovered_at: DateTime<Utc>,
+        discovered_at: UtcTimestamp,
         old_catalog: &McpCatalog,
     ) -> ToolCatalogEntry {
         let ToolDefinitionParts {
@@ -7376,7 +7376,7 @@ pub(crate) struct McpAdminCatalogSnapshot {
     pub(crate) cached_sessions: usize,
     /// Wall-clock time of the reported catalog's last refresh; `None` when no
     /// session has refreshed one yet.
-    pub(crate) refreshed_at: Option<DateTime<Utc>>,
+    pub(crate) refreshed_at: Option<UtcTimestamp>,
     /// True when no catalog was refreshed, or the newest one is older than
     /// `discovery.cache_ttl_seconds`.
     pub(crate) stale: bool,
@@ -7433,7 +7433,7 @@ pub(crate) struct McpAdminToolSnapshot {
     pub(crate) allowed_groups: Option<Vec<String>>,
     pub(crate) denied_groups: Vec<String>,
     pub(crate) schema_hash: String,
-    pub(crate) discovered_at: DateTime<Utc>,
+    pub(crate) discovered_at: UtcTimestamp,
 }
 
 impl McpGateway {

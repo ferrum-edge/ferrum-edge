@@ -13,8 +13,8 @@
 //! userinfo, path token, query, or fragment is ever returned. Admins who need
 //! the stored URL read the plugin config.
 
+use crate::time_compat::UtcTimestamp;
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
 use http_body_util::Full;
 use hyper::{Response, StatusCode};
 use serde_json::{Value, json};
@@ -309,8 +309,8 @@ fn runtime_snapshots(
 /// them has never been refreshed on this node.
 fn oldest_refresh(
     catalogs: &[(&PluginConfig, Option<McpAdminCatalogSnapshot>)],
-) -> Option<DateTime<Utc>> {
-    let mut oldest: Option<DateTime<Utc>> = None;
+) -> Option<UtcTimestamp> {
+    let mut oldest: Option<UtcTimestamp> = None;
     for (_, snapshot) in catalogs {
         let refreshed = snapshot.as_ref()?.refreshed_at?;
         if oldest.is_none_or(|current| refreshed < current) {
