@@ -366,13 +366,21 @@ and `GatewayTrustBundleRecord` (and `updated_at` on `GatewayTrustBundleSummary`)
 `AuditEvent.ts`; `ApiSpecSnapshotView`'s `created_at`/`updated_at`; and the
 `ApiSpecListFilter.updated_since` and
 `AuditListFilter.start`/`end` list filters. The CP/DP and mesh status types
-follow (#7530): `DpNodeInfo` and `MeshNodeInfo` connection and update stamps,
-`DpCpConnectionState`'s `last_config_received_at` / `connected_since` /
-`config_diverged_since`, mesh policy-deny events and aggregates, mesh slice-drift
-entries, the mesh revision gate and runtime install/apply stamps; registry TTLs
-and retention windows are now `time::SignedDuration`. For non-leap-second
-values `UtcTimestamp` renders the same bytes as chrono through `to_rfc3339()`;
-it exposes `unix_timestamp()` and
+follow (#7530): `DpNodeInfo` (`connected_at`, `last_update_at`),
+`MeshNodeInfo` (`connected_at`, `last_heartbeat_at`, `last_update_at`),
+`DpCpConnectionState` (`last_config_received_at`, `connected_since`,
+`config_diverged_since`), mesh policy-deny events and aggregates, the mesh
+slice-drift registry types (`MeshSliceDriftSnapshot.generated_at`, and
+`MeshSliceDriftEntry.session_connected_at` / `disconnected_at` with the `at`
+stamps of its nested version and rejection records), the Admin drift view
+(`MeshSliceDriftView`, `MeshConfigDriftInputs`), and the mesh revision gate and
+runtime install/apply stamps. `mesh_node_registry_stale_ttl()` now returns a
+`time::SignedDuration`, and `MeshNodeRegistry::remove_stale_heartbeats` /
+`MeshSliceDriftRegistry::reap_expired` now take `now: UtcTimestamp` and a
+`time::SignedDuration` instead of `chrono::DateTime<Utc>` and
+`chrono::Duration`. For non-leap-second values
+`UtcTimestamp` renders the same bytes as chrono through `to_rfc3339()`; it
+exposes `unix_timestamp()` and
 `unix_timestamp_millis()`. Plugins also gain an optional
 `ON_RESPONSE_STREAM_TERMINATED` lifecycle hook bit (#7471); custom plugins keep
 the conservative dispatch path whether or not they declare it.
