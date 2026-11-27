@@ -231,7 +231,6 @@ async fn dynamic_tls_listener_serves_rotated_cert_after_slot_swap() {
 
 #[test]
 fn repeated_tls_source_failures_record_only_transitions_but_count_every_attempt() {
-    use chrono::TimeZone;
     use ferrum_edge::tls::events::{
         TlsEventFilter, TlsEventLog, TlsSourceEvent, TlsSourceEventMaterial, event_source_id,
     };
@@ -253,9 +252,7 @@ fn repeated_tls_source_failures_record_only_transitions_but_count_every_attempt(
     let raw_source_id = source.source_id();
     let expected_source_id = event_source_id(&raw_source_id);
     let cert_id = "cert-transition-test".to_string();
-    let at = chrono::Utc
-        .timestamp_opt(1_700_000_000, 0)
-        .single()
+    let at = ferrum_edge::time_compat::UtcTimestamp::from_unix_timestamp(1_700_000_000)
         .expect("fixed timestamp");
     let event = |outcome: &str, error: Option<&str>| TlsSourceEvent {
         id: 0,

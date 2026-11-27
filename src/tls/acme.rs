@@ -32,9 +32,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(any(feature = "acme", test))]
 use std::time::Duration;
 
+use crate::time_compat::UtcTimestamp;
 use base64::Engine;
 use base64::prelude::{BASE64_STANDARD, BASE64_URL_SAFE_NO_PAD};
-use chrono::{DateTime, Utc};
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem::PemObject;
 use serde::{Deserialize, Serialize};
@@ -166,11 +166,11 @@ pub struct AcmeCertificateRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain_pem: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub issued_at: Option<DateTime<Utc>>,
+    pub issued_at: Option<UtcTimestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub not_after: Option<DateTime<Utc>>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub not_after: Option<UtcTimestamp>,
+    pub created_at: UtcTimestamp,
+    pub updated_at: UtcTimestamp,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -444,8 +444,8 @@ pub struct AcmeOrderRecord {
     pub finalization: Option<AcmeOrderFinalization>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: UtcTimestamp,
+    pub updated_at: UtcTimestamp,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -453,10 +453,10 @@ pub struct AcmeAccountRecord {
     pub account_id: String,
     pub directory_url: String,
     pub credentials_json: String,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: UtcTimestamp,
+    pub updated_at: UtcTimestamp,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_used_at: Option<DateTime<Utc>>,
+    pub last_used_at: Option<UtcTimestamp>,
 }
 
 #[derive(Debug, Clone)]
@@ -509,9 +509,9 @@ pub struct AcmeCertificateSummary {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sans: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub not_before: Option<DateTime<Utc>>,
+    pub not_before: Option<UtcTimestamp>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub not_after: Option<DateTime<Utc>>,
+    pub not_after: Option<UtcTimestamp>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fingerprint_sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -519,9 +519,9 @@ pub struct AcmeCertificateSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub byte_length: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub issued_at: Option<DateTime<Utc>>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub issued_at: Option<UtcTimestamp>,
+    pub created_at: UtcTimestamp,
+    pub updated_at: UtcTimestamp,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -568,8 +568,8 @@ pub struct AcmeOrderSummary {
     pub dns01_challenges: Vec<AcmeDns01ChallengeSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: UtcTimestamp,
+    pub updated_at: UtcTimestamp,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -580,9 +580,9 @@ pub struct AcmeAccountSummary {
     pub certificate_count: usize,
     pub has_persisted_credentials: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_order_at: Option<DateTime<Utc>>,
+    pub last_order_at: Option<UtcTimestamp>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_certificate_updated_at: Option<DateTime<Utc>>,
+    pub last_certificate_updated_at: Option<UtcTimestamp>,
 }
 
 #[derive(Debug, Clone)]
@@ -770,11 +770,11 @@ pub struct AcmeAccountStore {
 
 /// Lightweight non-secret reference from a stored ACME certificate to its
 /// account: `(account_id, directory_url, updated_at)`.
-pub type AcmeCertificateAccountRef = (Option<String>, String, DateTime<Utc>);
+pub type AcmeCertificateAccountRef = (Option<String>, String, UtcTimestamp);
 
 /// Lightweight non-secret metadata for a persisted ACME account:
 /// `(account_id, directory_url, last_used_at)`.
-pub type AcmeAccountMeta = (String, String, Option<DateTime<Utc>>);
+pub type AcmeAccountMeta = (String, String, Option<UtcTimestamp>);
 
 impl AcmeCertificateStore {
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self, AcmeError> {
@@ -889,7 +889,7 @@ impl AcmeCertificateStore {
         let max_certificates = self.max_certificates;
         let outcome = self.file.mutate(move |document| {
             let mut record = record;
-            let now = Utc::now();
+            let now = UtcTimestamp::now();
             if let Some(existing) = document.certificates.get(&record.id) {
                 if !allow_overwrite {
                     return Err(AcmeError::AlreadyExists(record.id));
@@ -927,7 +927,7 @@ impl AcmeCertificateStore {
         validate_acme_certificate_material_size(&record, self.max_material_bytes)?;
         let outcome = self.file.mutate(move |document| {
             let mut record = record;
-            let now = Utc::now();
+            let now = UtcTimestamp::now();
             let Some(existing) = document.certificates.get(&record.id) else {
                 return Err(AcmeError::NotFound(record.id));
             };
@@ -1142,7 +1142,7 @@ impl AcmeOrderStore {
         let terminal_history = self.terminal_history;
         let outcome = self.file.mutate(move |document| {
             let mut record = record;
-            let now = Utc::now();
+            let now = UtcTimestamp::now();
             if let Some(existing) = document.orders.get(&record.id) {
                 if !allow_overwrite {
                     return Err(AcmeError::OrderAlreadyExists(record.id));
@@ -1250,7 +1250,7 @@ impl AcmeOrderStore {
             if commit_would_hide_active_order(document, &committed) {
                 return Ok((false, (None, 0)));
             }
-            committed.updated_at = Utc::now();
+            committed.updated_at = UtcTimestamp::now();
             document
                 .orders
                 .insert(committed.id.clone(), committed.clone());
@@ -1462,7 +1462,7 @@ impl AcmeAccountStore {
         let key = acme_account_store_key(&directory_url, &account_id);
         let max_accounts = self.max_accounts;
         let outcome = self.file.mutate(move |document| {
-            let now = Utc::now();
+            let now = UtcTimestamp::now();
             let created_at = match document.accounts.get(&key) {
                 Some(existing) => existing.created_at,
                 None => {
@@ -1510,9 +1510,9 @@ fn account_summary_entry<'a>(
 }
 
 fn max_datetime(
-    current: Option<DateTime<Utc>>,
-    candidate: Option<DateTime<Utc>>,
-) -> Option<DateTime<Utc>> {
+    current: Option<UtcTimestamp>,
+    candidate: Option<UtcTimestamp>,
+) -> Option<UtcTimestamp> {
     match (current, candidate) {
         (Some(current), Some(candidate)) => Some(current.max(candidate)),
         (Some(current), None) => Some(current),
@@ -1524,7 +1524,7 @@ fn max_datetime(
 impl AcmeCertificateRecord {
     pub fn new_issued(input: AcmeIssuedCertificateInput) -> Result<Self, AcmeError> {
         validate_acme_domains(&input.domains)?;
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let not_after = certificate_metadata(
             combined_public_material(&input.cert_pem, input.chain_pem.as_deref()).as_bytes(),
         )
@@ -1607,7 +1607,7 @@ impl AcmeOrderRecord {
                 .validate(&input.domains)
                 .map_err(|_| AcmeError::UnusableFinalizationMaterial(input.id.clone()))?;
         }
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         Ok(Self {
             id: input.id,
             certificate_id: input.certificate_id,
@@ -1836,8 +1836,8 @@ struct CertificateMetadata {
     subject: Option<String>,
     issuer: Option<String>,
     sans: Vec<String>,
-    not_before: Option<DateTime<Utc>>,
-    not_after: Option<DateTime<Utc>>,
+    not_before: Option<UtcTimestamp>,
+    not_after: Option<UtcTimestamp>,
     count: usize,
 }
 
@@ -1852,8 +1852,9 @@ fn certificate_metadata(bytes: &[u8]) -> Result<CertificateMetadata, String> {
         X509Certificate::from_der(first.as_ref()).map_err(|error| error.to_string())?;
     let subject = Some(parsed.subject().to_string());
     let issuer = Some(parsed.issuer().to_string());
-    let not_before = DateTime::<Utc>::from_timestamp(parsed.validity().not_before.timestamp(), 0);
-    let not_after = DateTime::<Utc>::from_timestamp(parsed.validity().not_after.timestamp(), 0);
+    let not_before =
+        UtcTimestamp::from_unix_timestamp(parsed.validity().not_before.timestamp()).ok();
+    let not_after = UtcTimestamp::from_unix_timestamp(parsed.validity().not_after.timestamp()).ok();
     let sans = crate::tls::san::certificate_san_strings(&parsed);
     Ok(CertificateMetadata {
         subject,
@@ -2113,7 +2114,7 @@ fn prune_terminal_order_history(document: &mut AcmeOrderStoreFile, max_terminal:
 
     // Group by `Option<String>` so a corrupt/external `certificate_id` equal to
     // any sentinel can never collide with the orphan (`None`) bucket.
-    let mut terminal_by_group: HashMap<Option<String>, Vec<(String, DateTime<Utc>)>> =
+    let mut terminal_by_group: HashMap<Option<String>, Vec<(String, UtcTimestamp)>> =
         HashMap::new();
     for (id, order) in &document.orders {
         if order.status.is_active() {
@@ -2992,8 +2993,15 @@ pub async fn run_due_renewals(
     // whether another replica is already renewing, so nothing is renewed.
     let lease_store = crate::tls::lease::global_lease_store().map_err(AcmeError::Read)?;
     let mut summary = AcmeRenewalRunSummary::default();
-    let renew_before = Utc::now()
-        + chrono::Duration::days(i64::try_from(config.renew_when_remaining_days).unwrap_or(30));
+    // `renew_when_remaining_days` is clamped to 1..=365, so the window and the
+    // addition are always in range; the fallback only avoids a panic.
+    let now = UtcTimestamp::now();
+    let window_days = i64::try_from(config.renew_when_remaining_days).unwrap_or(30);
+    let renew_before = window_days
+        .checked_mul(86_400)
+        .map(::time::SignedDuration::seconds)
+        .and_then(|window| now.checked_add(window))
+        .unwrap_or(now);
 
     for certificate in certificate_store.list_certificate_records()? {
         summary.checked += 1;

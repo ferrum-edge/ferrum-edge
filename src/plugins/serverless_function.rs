@@ -2215,15 +2215,11 @@ fn api_gateway_v2_request_context(ctx: &RequestContext, user_agent: Option<&str>
     context.insert("stage".to_string(), Value::from("$default"));
     context.insert(
         "time".to_string(),
-        Value::String(
-            ctx.timestamp_received
-                .format("%d/%b/%Y:%H:%M:%S %z")
-                .to_string(),
-        ),
+        Value::String(ctx.timestamp_received.to_common_log_format()),
     );
     context.insert(
         "timeEpoch".to_string(),
-        Value::from(ctx.timestamp_received.timestamp_millis()),
+        Value::from(ctx.timestamp_received.unix_timestamp_millis()),
     );
     let mut lambda = serde_json::Map::new();
     if let Some(consumer) = ctx.identified_consumer.as_ref() {

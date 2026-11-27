@@ -5040,7 +5040,7 @@ async fn handle_admin_request_inner(
         }
         match tls_inventory_cache(&state).snapshot() {
             Some(snapshot) => {
-                let collected_at = snapshot.collected_at.timestamp();
+                let collected_at = snapshot.collected_at.unix_timestamp();
                 registry.refresh_tls_certificate_inventory(&snapshot.inventory);
                 registry.set_tls_inventory_freshness(Some((collected_at, snapshot_ttl_seconds)));
             }
