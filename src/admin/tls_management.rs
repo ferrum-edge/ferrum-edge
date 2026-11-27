@@ -2,7 +2,6 @@ use std::sync::{Arc, OnceLock};
 #[cfg(feature = "acme")]
 use std::time::Duration;
 
-use crate::time_compat::UtcTimestamp;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use http_body_util::Full;
