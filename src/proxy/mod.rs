@@ -14685,6 +14685,18 @@ impl ProxyState {
         self.update_config_with_mesh_ids(new_config, Some(trusted_mesh_ids), Some(trust))
     }
 
+    /// Test support for `_test_support::publish_prepared_mesh_config_for_test`:
+    /// publish a mesh-prepared configuration trusting exactly the reserved ids
+    /// its preparation materialized, with no gateway trust commit.
+    #[doc(hidden)]
+    pub(crate) fn update_prepared_mesh_config_for_test(
+        &self,
+        new_config: GatewayConfig,
+    ) -> ConfigApplyOutcome {
+        let trusted = TrustedMeshGeneratedResourceIds::from_materialized_config(&new_config);
+        self.update_config_with_mesh_ids(new_config, Some(&trusted), None)
+    }
+
     fn update_config_with_mesh_ids(
         &self,
         mut new_config: GatewayConfig,

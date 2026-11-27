@@ -1,0 +1,1411 @@
+//! ServiceWaypoint L7 termination on HBONE `:15008` (issue #7501).
+//!
+//! Every test here drives a REAL HBONE tunnel: a mutually authenticated
+//! HTTP/2 `CONNECT` to the production listener and dispatcher
+//! (`start_proxy_listener_with_bound_listener_and_mesh_direction`, inbound
+//! direction), whose upgraded stream then carries inner HTTP/1.1 or HTTP/2
+//! requests that the waypoint terminates and dispatches through the bound
+//! Service's route partition to real HTTP backends.
+//!
+//! The configuration is built the way production builds it: the Kubernetes
+//! translator writes the VirtualServices, the control plane filters and
+//! projects the ServiceWaypoint slice, and the data plane materializes it
+//! (`prepare_gateway_config_from_mesh_slice`). The waypoint runs the explicit
+//! no-identity development posture, so it dials its backing workloads (real
+//! loopback HTTP servers) in plaintext; the tunnel itself is always mTLS.
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll, ready};
+use std::time::Duration;
+
+use bytes::Bytes;
+use http_body_util::{BodyExt, Empty};
+use hyper::{Method, Request, StatusCode};
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::net::TcpListener;
+use tokio::sync::watch;
+
+use crate::scaffolding::port_registry::TestSocket;
+
+use ferrum_edge::_test_support::{
+    cp_filter_config_to_mesh_request_for_test, publish_prepared_mesh_config_for_test,
+};
+use ferrum_edge::config::types::GatewayConfig;
+use ferrum_edge::config::{EnvConfig, OperatingMode};
+use ferrum_edge::config_sources::k8s::{
+    K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
+};
+use ferrum_edge::dns::{DnsCache, DnsConfig};
+use ferrum_edge::identity::spiffe::TrustDomain;
+use ferrum_edge::modes::mesh::config::{
+    AppProtocol, MeshPolicy, MeshRule, MeshService, MeshWaypointBinding, MeshWaypointServiceRef,
+    PolicyAction, PolicyScope, PolicyTargetAttachment, PrincipalMatch, ServicePort,
+    ServiceTargetPort, Workload, WorkloadPort, WorkloadRef,
+};
+use ferrum_edge::modes::mesh::slice::MeshSlice;
+use ferrum_edge::modes::mesh::{
+    MeshRuntimeConfig, MeshTopology, MeshTrafficDirection, prepare_gateway_config_from_mesh_slice,
+};
+use ferrum_edge::proxy::hbone_admission_fence::HboneRevocationReason;
+use ferrum_edge::proxy::service_waypoint_l7_proxy::{
+    ServiceWaypointL7TunnelTermination, ServiceWaypointRouteRefusal, l7_tunnel_terminations,
+    l7_tunnels_active, route_refusals,
+};
+use ferrum_edge::proxy::{
+    ConfigApplyOutcome, ProxyState, start_proxy_listener_with_bound_listener_and_mesh_direction,
+};
+use serde_json::json;
+
+use super::super::mesh_hbone_tests::{
+    HboneMtlsCerts, connect_hbone_h2_mtls, frame_datagram, generate_hbone_mtls_certs,
+    hbone_client_config, hbone_server_config, read_framed_datagram, start_external_udp_echo,
+    udp_connect_request,
+};
+use super::super::mesh_test_support::{
+    BackendCaptureLog, BackendResponder, runtime_for_topology, start_http_backend, workload_for,
+};
+
+const NAMESPACE: &str = "default";
+const WAYPOINT_NAME: &str = "waypoint";
+const CLIENT_SPIFFE: &str = "spiffe://cluster.local/ns/default/sa/client";
+/// A peer the waypoint trusts to assert a source principal over HBONE baggage
+/// (`trusted_hbone_assertors: ["ztunnel"]`, same-namespace grant).
+const ZTUNNEL_SPIFFE: &str = "spiffe://cluster.local/ns/default/sa/ztunnel";
+const FRONTEND_SPIFFE: &str = "spiffe://cluster.local/ns/default/sa/frontend";
+const SERVICE_PORT: u16 = 8080;
+const STREAM_SERVICE_PORT: u16 = 9000;
+const UDP_SERVICE_PORT: u16 = 5353;
+const REVIEWS_VIP: &str = "10.96.0.11";
+const RATINGS_VIP: &str = "10.96.0.12";
+const DEADLINE: Duration = Duration::from_secs(10);
+
+fn host(service: &str) -> String {
+    format!("{service}.{NAMESPACE}.svc.cluster.local")
+}
+
+// ── Configuration ──────────────────────────────────────────────────────────
+
+fn virtual_service(name: &str, spec: serde_json::Value) -> K8sObject {
+    K8sObject {
+        api_version: "networking.istio.io/v1".to_string(),
+        kind: "VirtualService".to_string(),
+        metadata: K8sMetadata {
+            name: name.to_string(),
+            uid: String::new(),
+            namespace: NAMESPACE.to_string(),
+            generation: None,
+            labels: Default::default(),
+            annotations: Default::default(),
+            creation_timestamp: None,
+            deletion_timestamp: None,
+        },
+        spec,
+        status: serde_json::Value::Object(serde_json::Map::new()),
+    }
+}
+
+/// The reviews VirtualService most tests use: a 90/10 split between the two
+/// bound Services.
+fn split_90_10() -> serde_json::Value {
+    json!({
+        "hosts": [host("reviews")],
+        "http": [{
+            "route": [
+                {"destination": {"host": host("reviews"), "port": {"number": SERVICE_PORT}}, "weight": 90},
+                {"destination": {"host": host("ratings"), "port": {"number": SERVICE_PORT}}, "weight": 10}
+            ]
+        }]
+    })
+}
+
+/// Header, URI and method match dispatch plus a rewrite, a fault and CORS on
+/// the reviews host.
+fn match_dispatch_spec() -> serde_json::Value {
+    json!({
+        "hosts": [host("reviews")],
+        "http": [
+            {
+                "match": [{"headers": {"x-canary": {"exact": "true"}}}],
+                "route": [{"destination": {"host": host("ratings"), "port": {"number": SERVICE_PORT}}}]
+            },
+            {
+                "match": [{"uri": {"prefix": "/legacy"}}],
+                "rewrite": {"uri": "/modern"},
+                "route": [{"destination": {"host": host("reviews"), "port": {"number": SERVICE_PORT}}}]
+            },
+            {
+                "match": [{"uri": {"prefix": "/teapot"}}],
+                "fault": {"abort": {"httpStatus": 418, "percentage": {"value": 100}}},
+                "route": [{"destination": {"host": host("reviews"), "port": {"number": SERVICE_PORT}}}]
+            },
+            {
+                "match": [{"method": {"exact": "DELETE"}}],
+                "route": [{"destination": {"host": host("ratings"), "port": {"number": SERVICE_PORT}}}]
+            },
+            {
+                "match": [{"sourceNamespace": "default", "uri": {"prefix": "/same-namespace"}}],
+                "route": [{"destination": {"host": host("ratings"), "port": {"number": SERVICE_PORT}}}]
+            },
+            {
+                "corsPolicy": {
+                    "allowOrigins": [{"exact": "https://ui.example"}],
+                    "allowMethods": ["GET"]
+                },
+                "route": [{"destination": {"host": host("reviews"), "port": {"number": SERVICE_PORT}}}]
+            }
+        ]
+    })
+}
+
+fn translate(config: &mut GatewayConfig, objects: &[K8sObject]) {
+    if objects.is_empty() {
+        return;
+    }
+    let translated = translate_k8s_objects(
+        objects,
+        K8sTranslationOptions::new(
+            NAMESPACE.to_string(),
+            TrustDomain::new("cluster.local").expect("trust domain"),
+        ),
+    )
+    .expect("VirtualService translates")
+    .config;
+    config.proxies.extend(translated.proxies);
+    config.upstreams.extend(translated.upstreams);
+    config.plugin_configs.extend(translated.plugin_configs);
+    if let Some(mesh) = translated.mesh {
+        config
+            .mesh
+            .get_or_insert_with(Box::default)
+            .virtual_service_http_routes
+            .extend(mesh.virtual_service_http_routes);
+    }
+}
+
+fn workload_port(port: u16, protocol: AppProtocol, name: &str) -> WorkloadPort {
+    WorkloadPort {
+        port,
+        protocol,
+        name: Some(name.to_string()),
+    }
+}
+
+fn service_port(port: u16, protocol: AppProtocol, name: &str, target: u16) -> ServicePort {
+    ServicePort {
+        port,
+        protocol,
+        name: Some(name.to_string()),
+        target_port: Some(ServiceTargetPort::Number(target)),
+    }
+}
+
+fn mesh_service(
+    name: &str,
+    cluster_ip: &str,
+    ports: Vec<ServicePort>,
+    workload: &Workload,
+) -> MeshService {
+    MeshService {
+        cluster_ips: vec![cluster_ip.to_string()],
+        name: name.to_string(),
+        namespace: NAMESPACE.to_string(),
+        ports,
+        workloads: vec![WorkloadRef {
+            spiffe_id: workload.spiffe_id.clone(),
+        }],
+        protocol_overrides: HashMap::new(),
+        uid: None,
+        allow_path_parameters: false,
+    }
+}
+
+/// The real loopback backends behind the bound Services.
+struct Backends {
+    reviews: SocketAddr,
+    reviews_log: BackendCaptureLog,
+    ratings: SocketAddr,
+    ratings_log: BackendCaptureLog,
+    /// Raw TCP echo on the reviews workload's stream-family port.
+    tcp_echo: SocketAddr,
+    /// UDP echo on the reviews workload's datagram port.
+    udp_echo: SocketAddr,
+    handles: Vec<tokio::task::JoinHandle<()>>,
+}
+
+/// Answers `<marker>\n<request head>` so a test can see which Service served
+/// a request and the request line and headers it received.
+fn marker_responder(marker: &'static str) -> (BackendResponder, BackendCaptureLog) {
+    let log: BackendCaptureLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = Arc::clone(&log);
+    let responder: BackendResponder = Arc::new(move |request: &str| {
+        if let Ok(mut guard) = captured.lock() {
+            guard.push(request.to_string());
+        }
+        format!("{marker}\n{request}").into_bytes()
+    });
+    (responder, log)
+}
+
+async fn start_tcp_echo() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind tcp echo");
+    let addr = listener.local_addr().expect("tcp echo addr");
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0_u8; 4096];
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if stream.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    (addr, handle)
+}
+
+async fn start_backends() -> Backends {
+    let (reviews_responder, reviews_log) = marker_responder("reviews");
+    let (ratings_responder, ratings_log) = marker_responder("ratings");
+    let (reviews, reviews_handle) = start_http_backend(reviews_responder).await;
+    let (ratings, ratings_handle) = start_http_backend(ratings_responder).await;
+    let (tcp_echo, tcp_handle) = start_tcp_echo().await;
+    let (udp_echo, udp_handle) = start_external_udp_echo().await;
+    Backends {
+        reviews,
+        reviews_log,
+        ratings,
+        ratings_log,
+        tcp_echo,
+        udp_echo,
+        handles: vec![reviews_handle, ratings_handle, tcp_handle, udp_handle],
+    }
+}
+
+impl Backends {
+    fn requests_to(&self, log: &BackendCaptureLog) -> Vec<String> {
+        let _ = self;
+        log.lock().map(|guard| guard.clone()).unwrap_or_default()
+    }
+
+    fn stop(&self) {
+        for handle in &self.handles {
+            handle.abort();
+        }
+    }
+}
+
+/// What a fixture binds and attaches.
+#[derive(Default)]
+struct Scenario {
+    virtual_services: Vec<K8sObject>,
+    policies: Vec<MeshPolicy>,
+    /// Bind `ratings` to the waypoint too (it is always modeled).
+    unbind_ratings: bool,
+    /// A second bound Service sharing the reviews workload's HTTP endpoint,
+    /// making that backing endpoint ambiguous.
+    ambiguous_alias: bool,
+}
+
+fn cp_config(backends: &Backends, scenario: &Scenario) -> GatewayConfig {
+    let mut config = GatewayConfig::default();
+    translate(&mut config, &scenario.virtual_services);
+    let mut reviews = workload_for("reviews", NAMESPACE, [("app", "reviews")], ["127.0.0.1"]);
+    reviews.ports = vec![
+        workload_port(backends.reviews.port(), AppProtocol::Http, "http"),
+        workload_port(backends.tcp_echo.port(), AppProtocol::Tcp, "tcp"),
+        workload_port(backends.udp_echo.port(), AppProtocol::Udp, "udp"),
+    ];
+    let mut ratings = workload_for("ratings", NAMESPACE, [("app", "ratings")], ["127.0.0.1"]);
+    ratings.ports = vec![workload_port(
+        backends.ratings.port(),
+        AppProtocol::Http,
+        "http",
+    )];
+    let mut services = vec![
+        mesh_service(
+            "reviews",
+            REVIEWS_VIP,
+            vec![
+                service_port(
+                    SERVICE_PORT,
+                    AppProtocol::Http,
+                    "http",
+                    backends.reviews.port(),
+                ),
+                service_port(
+                    STREAM_SERVICE_PORT,
+                    AppProtocol::Tcp,
+                    "tcp",
+                    backends.tcp_echo.port(),
+                ),
+                service_port(
+                    UDP_SERVICE_PORT,
+                    AppProtocol::Udp,
+                    "udp",
+                    backends.udp_echo.port(),
+                ),
+            ],
+            &reviews,
+        ),
+        mesh_service(
+            "ratings",
+            RATINGS_VIP,
+            vec![service_port(
+                SERVICE_PORT,
+                AppProtocol::Http,
+                "http",
+                backends.ratings.port(),
+            )],
+            &ratings,
+        ),
+    ];
+    let mut bound = vec!["reviews".to_string()];
+    if !scenario.unbind_ratings {
+        bound.push("ratings".to_string());
+    }
+    if scenario.ambiguous_alias {
+        services.push(mesh_service(
+            "reviews-alias",
+            "10.96.0.13",
+            vec![service_port(
+                SERVICE_PORT,
+                AppProtocol::Http,
+                "http",
+                backends.reviews.port(),
+            )],
+            &reviews,
+        ));
+        bound.push("reviews-alias".to_string());
+    }
+    let mesh = config.mesh.get_or_insert_with(Box::default);
+    mesh.services = services;
+    mesh.workloads = vec![reviews, ratings];
+    mesh.waypoint_bindings = vec![MeshWaypointBinding {
+        name: WAYPOINT_NAME.to_string(),
+        namespace: NAMESPACE.to_string(),
+        waypoint_for: "service".to_string(),
+        gateway_class_name: Some("istio-waypoint".to_string()),
+        services: bound
+            .into_iter()
+            .map(|name| MeshWaypointServiceRef {
+                namespace: NAMESPACE.to_string(),
+                name,
+            })
+            .collect(),
+    }];
+    mesh.mesh_policies = scenario.policies.clone();
+    config.normalize_fields();
+    config.normalize_mesh_fields();
+    config
+}
+
+fn waypoint_runtime() -> MeshRuntimeConfig {
+    let mut runtime = runtime_for_topology(MeshTopology::ServiceWaypoint);
+    runtime.namespace = NAMESPACE.to_string();
+    runtime.waypoint_name = Some(WAYPOINT_NAME.to_string());
+    runtime.trusted_hbone_assertors = vec!["ztunnel".to_string()];
+    runtime
+}
+
+fn prepared(backends: &Backends, scenario: &Scenario) -> GatewayConfig {
+    let runtime = waypoint_runtime();
+    let request = runtime.mesh_slice_request();
+    let filtered =
+        cp_filter_config_to_mesh_request_for_test(&cp_config(backends, scenario), &request);
+    let slice = MeshSlice::from_gateway_config(&filtered, request);
+    let mut prepared =
+        prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("slice materializes");
+    // The kind suites relay to pod IPs; these backends listen on loopback, so
+    // the L4 relay is given the own-namespace loopback privilege a Sidecar
+    // holds. The L7 path never consults it (it dials materialized upstreams).
+    if let Some(mesh) = prepared.mesh.as_deref_mut() {
+        mesh.inbound_relay_admits_loopback_namespace = true;
+    }
+    prepared
+}
+
+fn build_state(prepared: GatewayConfig) -> ProxyState {
+    let env_config = EnvConfig {
+        mode: OperatingMode::Mesh,
+        log_level: "error".to_string(),
+        proxy_http_port: 0,
+        proxy_https_port: 0,
+        admin_http_port: 0,
+        admin_https_port: 0,
+        shutdown_drain_seconds: 0,
+        max_connections: 0,
+        namespace: NAMESPACE.to_string(),
+        ..EnvConfig::default()
+    };
+    ProxyState::new(
+        prepared,
+        DnsCache::new(DnsConfig::default()),
+        env_config,
+        None,
+        None,
+    )
+    .expect("the ServiceWaypoint generation is accepted by the proxy runtime")
+    .0
+}
+
+/// A running ServiceWaypoint and the client side of one mTLS HTTP/2 session.
+struct Waypoint {
+    state: ProxyState,
+    backends: Backends,
+    sender: h2::client::SendRequest<Bytes>,
+    conn_task: tokio::task::JoinHandle<Result<(), h2::Error>>,
+    shutdown_tx: watch::Sender<bool>,
+    certs: HboneMtlsCerts,
+    addr: SocketAddr,
+}
+
+impl Waypoint {
+    async fn start(scenario: Scenario) -> Self {
+        Self::start_as(scenario, CLIENT_SPIFFE).await
+    }
+
+    async fn start_as(scenario: Scenario, client_spiffe: &str) -> Self {
+        let backends = start_backends().await;
+        let state = build_state(prepared(&backends, &scenario));
+        assert!(
+            !state.router_cache.service_waypoint_l7_routes().is_empty(),
+            "fixture: the waypoint builds bound-Service partitions"
+        );
+        let certs = generate_hbone_mtls_certs(client_spiffe);
+        let listener = TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .expect("bind waypoint");
+        let addr = listener.local_addr().expect("waypoint addr");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let serve_state = state.clone();
+        let server_config = hbone_server_config(&certs);
+        tokio::spawn(async move {
+            let _ = start_proxy_listener_with_bound_listener_and_mesh_direction(
+                listener,
+                serve_state,
+                shutdown_rx,
+                Some(server_config),
+                Some(MeshTrafficDirection::Inbound),
+            )
+            .await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (sender, conn_task) = connect_hbone_h2_mtls(addr, hbone_client_config(&certs)).await;
+        Self {
+            state,
+            backends,
+            sender,
+            conn_task,
+            shutdown_tx,
+            certs,
+            addr,
+        }
+    }
+
+    /// Send an HBONE CONNECT for `authority` with optional extra headers.
+    async fn connect_with(
+        &mut self,
+        authority: &str,
+        headers: &[(&str, &str)],
+    ) -> (hyper::Response<h2::RecvStream>, h2::SendStream<Bytes>) {
+        let mut builder = Request::builder().method(Method::CONNECT).uri(authority);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let request = builder.body(()).expect("CONNECT request");
+        let (response, send) = self
+            .sender
+            .send_request(request, false)
+            .expect("send CONNECT");
+        let response = tokio::time::timeout(DEADLINE, response)
+            .await
+            .expect("CONNECT answered within the deadline")
+            .expect("CONNECT response");
+        (response, send)
+    }
+
+    /// Open an admitted L7 tunnel to `authority`.
+    async fn tunnel(&mut self, authority: &str, headers: &[(&str, &str)]) -> TunnelStream {
+        let (response, send) = self.connect_with(authority, headers).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "an authenticated CONNECT to a bound Service HTTP port is admitted"
+        );
+        TunnelStream {
+            send,
+            recv: response.into_body(),
+            buffered: Bytes::new(),
+        }
+    }
+
+    async fn teardown(self) {
+        let _ = self.shutdown_tx.send(true);
+        self.conn_task.abort();
+        self.backends.stop();
+    }
+}
+
+// ── The tunnel as an inner-HTTP transport ──────────────────────────────────
+
+/// One HBONE CONNECT stream as a byte transport for an inner HTTP client.
+struct TunnelStream {
+    send: h2::SendStream<Bytes>,
+    recv: h2::RecvStream,
+    buffered: Bytes,
+}
+
+impl AsyncRead for TunnelStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        loop {
+            if !this.buffered.is_empty() {
+                let n = buf.remaining().min(this.buffered.len());
+                let chunk = this.buffered.split_to(n);
+                buf.put_slice(&chunk);
+                return Poll::Ready(Ok(()));
+            }
+            match ready!(this.recv.poll_data(cx)) {
+                None => return Poll::Ready(Ok(())),
+                Some(Ok(chunk)) => {
+                    let _ = this.recv.flow_control().release_capacity(chunk.len());
+                    this.buffered = chunk;
+                }
+                Some(Err(error)) => return Poll::Ready(Err(std::io::Error::other(error))),
+            }
+        }
+    }
+}
+
+impl AsyncWrite for TunnelStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        this.send.reserve_capacity(buf.len());
+        match ready!(this.send.poll_capacity(cx)) {
+            None => Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))),
+            Some(Err(error)) => Poll::Ready(Err(std::io::Error::other(error))),
+            Some(Ok(capacity)) => {
+                let n = capacity.min(buf.len());
+                this.send
+                    .send_data(Bytes::copy_from_slice(&buf[..n]), false)
+                    .map_err(std::io::Error::other)?;
+                Poll::Ready(Ok(n))
+            }
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let _ = self.get_mut().send.send_data(Bytes::new(), true);
+        Poll::Ready(Ok(()))
+    }
+}
+
+type InnerH1 = hyper::client::conn::http1::SendRequest<Empty<Bytes>>;
+
+async fn inner_http1(tunnel: TunnelStream) -> InnerH1 {
+    let (sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tunnel))
+        .await
+        .expect("inner HTTP/1.1 handshake");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    sender
+}
+
+/// An inner response: status, headers and body text.
+struct InnerResponse {
+    status: StatusCode,
+    headers: hyper::HeaderMap,
+    body: String,
+}
+
+impl InnerResponse {
+    /// The serving backend's marker (first body line).
+    fn served_by(&self) -> &str {
+        self.body.lines().next().unwrap_or_default()
+    }
+}
+
+async fn send_h1(sender: &mut InnerH1, request: Request<Empty<Bytes>>) -> InnerResponse {
+    sender.ready().await.expect("inner HTTP/1.1 sender ready");
+    let response = tokio::time::timeout(DEADLINE, sender.send_request(request))
+        .await
+        .expect("inner response within the deadline")
+        .expect("inner response");
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("inner body")
+        .to_bytes();
+    InnerResponse {
+        status,
+        headers,
+        body: String::from_utf8_lossy(&body).into_owned(),
+    }
+}
+
+fn get(path: &str, host_header: &str) -> Request<Empty<Bytes>> {
+    Request::builder()
+        .method(Method::GET)
+        .uri(path)
+        .header("host", host_header)
+        .body(Empty::new())
+        .expect("inner request")
+}
+
+/// The peer must see its CONNECT stream reset with `RST_STREAM(CONNECT_ERROR)`,
+/// never a clean `END_STREAM`. Bytes buffered before the reset are drained.
+async fn assert_reset_with_connect_error(recv: &mut h2::RecvStream) {
+    let error = tokio::time::timeout(DEADLINE, async {
+        loop {
+            match recv.data().await {
+                None => return None,
+                Some(Err(error)) => return Some(error),
+                Some(Ok(chunk)) => {
+                    let _ = recv.flow_control().release_capacity(chunk.len());
+                }
+            }
+        }
+    })
+    .await
+    .expect("the tunnel ends toward the peer")
+    .expect("the tunnel is reset, not ended with END_STREAM");
+    assert_eq!(error.reason(), Some(h2::Reason::CONNECT_ERROR));
+}
+
+async fn wait_until(mut condition: impl FnMut() -> bool, what: &str) {
+    tokio::time::timeout(DEADLINE, async {
+        while !condition() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────────
+
+/// Acceptance: a 90/10 weighted split checked over 1000 selections, through
+/// one real HBONE tunnel carrying 1000 inner HTTP/1.1 keep-alive requests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inner_http1_requests_follow_the_bound_services_90_10_split_over_1000_selections() {
+    let mut waypoint = Waypoint::start(Scenario {
+        virtual_services: vec![virtual_service("reviews-split", split_90_10())],
+        ..Scenario::default()
+    })
+    .await;
+    let tunnel = waypoint
+        .tunnel(&format!("{}:{SERVICE_PORT}", host("reviews")), &[])
+        .await;
+    let mut inner = inner_http1(tunnel).await;
+    let mut reviews = 0usize;
+    let mut ratings = 0usize;
+    for _ in 0..1000 {
+        let response = send_h1(&mut inner, get("/", &host("reviews"))).await;
+        assert_eq!(response.status, StatusCode::OK, "{}", response.body);
+        match response.served_by() {
+            "reviews" => reviews += 1,
+            "ratings" => ratings += 1,
+            other => panic!("unexpected backend marker {other:?}"),
+        }
+    }
+    assert_eq!(reviews + ratings, 1000);
+    assert!(
+        (850..=950).contains(&reviews),
+        "the 90/10 split holds over 1000 selections: reviews={reviews} ratings={ratings}"
+    );
+    assert!(ratings > 0, "the 10% leg is selected");
+    assert_eq!(
+        l7_tunnels_active(),
+        1,
+        "the live tunnel holds one active-tunnel gauge slot"
+    );
+    waypoint.teardown().await;
+}
+
+/// Acceptance: URI, header, method and `sourceNamespace` match dispatch, a
+/// URI rewrite, a fault and CORS, served at L7 inside the tunnel over inner
+/// HTTP/2.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inner_http2_requests_apply_match_dispatch_rewrite_fault_and_cors() {
+    let mut waypoint = Waypoint::start(Scenario {
+        virtual_services: vec![virtual_service("reviews-matches", match_dispatch_spec())],
+        ..Scenario::default()
+    })
+    .await;
+    let tunnel = waypoint
+        .tunnel(&format!("{}:{SERVICE_PORT}", host("reviews")), &[])
+        .await;
+    let (mut inner, connection) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tunnel))
+            .await
+            .expect("inner HTTP/2 handshake");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let authority = format!("http://{}:{SERVICE_PORT}", host("reviews"));
+    let mut send = |method: Method, path: &str, headers: &[(&str, &str)]| {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(format!("{authority}{path}"));
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let request = builder.body(Empty::<Bytes>::new()).expect("inner request");
+        inner.send_request(request)
+    };
+    let collect = |response: hyper::Response<hyper::body::Incoming>| async move {
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        InnerResponse {
+            status,
+            headers,
+            body: String::from_utf8_lossy(&body).into_owned(),
+        }
+    };
+
+    let plain = collect(send(Method::GET, "/", &[]).await.expect("plain")).await;
+    assert_eq!(plain.status, StatusCode::OK);
+    assert_eq!(plain.served_by(), "reviews");
+
+    let canary = collect(
+        send(Method::GET, "/", &[("x-canary", "true")])
+            .await
+            .expect("canary"),
+    )
+    .await;
+    assert_eq!(canary.served_by(), "ratings", "header match dispatches");
+
+    let deleted = collect(send(Method::DELETE, "/item", &[]).await.expect("delete")).await;
+    assert_eq!(deleted.served_by(), "ratings", "method match dispatches");
+
+    let same_namespace = collect(
+        send(Method::GET, "/same-namespace", &[])
+            .await
+            .expect("source namespace"),
+    )
+    .await;
+    assert_eq!(
+        same_namespace.served_by(),
+        "ratings",
+        "sourceNamespace is matched on the tunnel's verified source principal"
+    );
+
+    let legacy = collect(
+        send(Method::GET, "/legacy/page", &[])
+            .await
+            .expect("rewrite"),
+    )
+    .await;
+    assert_eq!(legacy.served_by(), "reviews");
+    assert!(
+        legacy.body.contains("GET /modern"),
+        "the URI rewrite reaches the backend: {}",
+        legacy.body
+    );
+
+    let teapot = collect(send(Method::GET, "/teapot", &[]).await.expect("fault")).await;
+    assert_eq!(teapot.status.as_u16(), 418, "the fault abort answers");
+
+    let preflight = collect(
+        send(
+            Method::OPTIONS,
+            "/",
+            &[
+                ("origin", "https://ui.example"),
+                ("access-control-request-method", "GET"),
+            ],
+        )
+        .await
+        .expect("preflight"),
+    )
+    .await;
+    assert_eq!(
+        preflight
+            .headers
+            .get("access-control-allow-origin")
+            .and_then(|value| value.to_str().ok()),
+        Some("https://ui.example"),
+        "the CORS policy answers the preflight"
+    );
+    waypoint.teardown().await;
+}
+
+/// Acceptance: an inner `Host` naming another bound Service (or any other
+/// host) inside a tunnel admitted for reviews is refused `403
+/// service_waypoint_host_mismatch` and never reaches another Service.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inner_host_spoofing_is_refused_403_and_never_reaches_another_bound_service() {
+    let mut waypoint = Waypoint::start(Scenario::default()).await;
+    let tunnel = waypoint
+        .tunnel(&format!("{}:{SERVICE_PORT}", host("reviews")), &[])
+        .await;
+    let mut inner = inner_http1(tunnel).await;
+    let cutoff = ferrum_edge::time_compat::UtcTimestamp::now();
+    for spoofed in [
+        host("ratings"),
+        "ratings".to_string(),
+        format!("{}:{SERVICE_PORT}", host("ratings")),
+        "attacker.example.com".to_string(),
+        // The bound host on a port the tunnel was not admitted for.
+        format!("{}:9999", host("reviews")),
+    ] {
+        let response = send_h1(&mut inner, get("/", &spoofed)).await;
+        assert_eq!(
+            response.status,
+            StatusCode::FORBIDDEN,
+            "inner Host {spoofed:?} is refused"
+        );
+        assert!(
+            response.body.contains("does not match"),
+            "the refusal names the host mismatch: {}",
+            response.body
+        );
+    }
+    assert!(
+        waypoint
+            .backends
+            .requests_to(&waypoint.backends.ratings_log)
+            .is_empty(),
+        "a spoofed host never reaches the other bound Service"
+    );
+    assert_eq!(route_refusals(ServiceWaypointRouteRefusal::HostMismatch), 5);
+    let denies = ferrum_edge::modes::mesh::policy_deny_log::global().aggregate_recent(cutoff, 50);
+    assert!(
+        denies
+            .grouped
+            .iter()
+            .any(|group| group.rule == "service_waypoint_host_mismatch"
+                && group.source.as_deref() == Some(CLIENT_SPIFFE)),
+        "the refusal is on /mesh/policy-denies/recent with the tunnel's principal"
+    );
+    // The bound Service itself, short name included, still answers.
+    for admitted in [host("reviews"), "reviews".to_string()] {
+        let response = send_h1(&mut inner, get("/", &admitted)).await;
+        assert_eq!(response.status, StatusCode::OK, "{admitted}");
+        assert_eq!(response.served_by(), "reviews");
+    }
+    waypoint.teardown().await;
+}
+
+/// Acceptance: non-HTTP bytes inside an HTTP-port CONNECT reset the tunnel
+/// with `CONNECT_ERROR` and are never relayed at L4.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn non_http_bytes_inside_an_http_port_connect_reset_with_connect_error() {
+    let mut waypoint = Waypoint::start(Scenario::default()).await;
+    let (response, mut send) = waypoint
+        .connect_with(&format!("{REVIEWS_VIP}:{SERVICE_PORT}"), &[])
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the ClusterIP authority of a bound Service HTTP port is terminated"
+    );
+    let mut recv = response.into_body();
+    // A TLS ClientHello prefix: not HTTP/1.1, not the HTTP/2 preface.
+    send.send_data(
+        Bytes::from_static(b"\x16\x03\x01\x00\xa5\x01\x00\x00\xa1\x03\x03\xd4\xfe\x81\x07"),
+        false,
+    )
+    .expect("send non-HTTP bytes");
+    assert_reset_with_connect_error(&mut recv).await;
+    wait_until(
+        || l7_tunnel_terminations(ServiceWaypointL7TunnelTermination::InnerProtocolError) == 1,
+        "the inner protocol error termination",
+    )
+    .await;
+    assert!(
+        waypoint
+            .backends
+            .requests_to(&waypoint.backends.reviews_log)
+            .is_empty(),
+        "nothing reached the backing workload: the bytes were never relayed"
+    );
+    assert_eq!(l7_tunnels_active(), 0);
+    waypoint.teardown().await;
+}
+
+/// Acceptance: removing the Service's waypoint binding revokes the live L7
+/// tunnel through the admission fence and cuts it with `CONNECT_ERROR`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn withdrawing_the_binding_revokes_the_live_l7_tunnel_with_connect_error() {
+    let mut waypoint = Waypoint::start(Scenario::default()).await;
+    let (response, send) = waypoint
+        .connect_with(&format!("{}:{SERVICE_PORT}", host("ratings")), &[])
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut tunnel = TunnelStream {
+        send,
+        recv: response.into_body(),
+        buffered: Bytes::new(),
+    };
+    tunnel
+        .write_all(b"GET / HTTP/1.1\r\nhost: ratings\r\n\r\n")
+        .await
+        .expect("inner request");
+    let mut head = vec![0_u8; 12];
+    tokio::time::timeout(DEADLINE, tunnel.read_exact(&mut head))
+        .await
+        .expect("inner response within the deadline")
+        .expect("inner response head");
+    assert_eq!(&head, b"HTTP/1.1 200");
+    assert_eq!(waypoint.state.hbone_admission_fence.live_tunnels(), 1);
+
+    // `istio.io/use-waypoint` is removed from ratings.
+    let withdrawn = prepared(
+        &waypoint.backends,
+        &Scenario {
+            unbind_ratings: true,
+            ..Scenario::default()
+        },
+    );
+    assert_eq!(
+        publish_prepared_mesh_config_for_test(&waypoint.state, withdrawn),
+        ConfigApplyOutcome::Applied
+    );
+    assert_reset_with_connect_error(&mut tunnel.recv).await;
+    wait_until(
+        || {
+            waypoint
+                .state
+                .hbone_admission_fence
+                .revocations(HboneRevocationReason::RelayDestination)
+                == 1
+        },
+        "the relay_destination revocation",
+    )
+    .await;
+    wait_until(
+        || l7_tunnel_terminations(ServiceWaypointL7TunnelTermination::FenceRevoked) == 1,
+        "the fence_revoked termination",
+    )
+    .await;
+    // The next CONNECT for the unbound Service is no longer terminated.
+    let (refused, _send) = waypoint
+        .connect_with(&format!("{}:{SERVICE_PORT}", host("ratings")), &[])
+        .await;
+    assert_ne!(refused.status(), StatusCode::OK);
+    waypoint.teardown().await;
+}
+
+/// Acceptance: live peer-trust revocation (the enforced CRL now revokes the
+/// peer's leaf) cuts the outer L7 tunnel with `CONNECT_ERROR`, and the
+/// revoked peer's next CONNECT is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revoking_the_peer_credential_cuts_the_live_l7_tunnel() {
+    let mut waypoint = Waypoint::start(Scenario::default()).await;
+    // The inbound admission trust the peer's chain anchors in, so the
+    // tunnel's credential is judged by the fence for its whole life.
+    let slot = ferrum_edge::tls::shared_bundle_slot(Some(inbound_trust_bundle(&waypoint.certs)));
+    waypoint.state.install_mesh_inbound_admission_trust(&slot);
+
+    let (response, _send) = waypoint
+        .connect_with(&format!("{}:{SERVICE_PORT}", host("reviews")), &[])
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut recv = response.into_body();
+    assert_eq!(waypoint.state.hbone_admission_fence.live_tunnels(), 1);
+
+    assert!(
+        waypoint.state.publish_mesh_inbound_crls(Arc::new(vec![
+            waypoint
+                .certs
+                .signed_crl(&[super::super::mesh_hbone_tests::HBONE_CLIENT_LEAF_SERIAL])
+        ])),
+        "the enforced CRL set changes"
+    );
+    assert_reset_with_connect_error(&mut recv).await;
+    wait_until(
+        || {
+            waypoint
+                .state
+                .hbone_admission_fence
+                .revocations(HboneRevocationReason::PeerRevoked)
+                == 1
+        },
+        "the peer_revoked revocation",
+    )
+    .await;
+    wait_until(
+        || l7_tunnel_terminations(ServiceWaypointL7TunnelTermination::FenceRevoked) == 1,
+        "the fence_revoked termination",
+    )
+    .await;
+    let (refused, _send) = waypoint
+        .connect_with(&format!("{}:{SERVICE_PORT}", host("reviews")), &[])
+        .await;
+    assert_eq!(
+        refused.status(),
+        StatusCode::FORBIDDEN,
+        "the revoked peer's next CONNECT is refused"
+    );
+    waypoint.teardown().await;
+}
+
+/// The inbound admission trust for the fixture CA: the peer's own trust
+/// domain anchored on the CA that issued its leaf.
+fn inbound_trust_bundle(certs: &HboneMtlsCerts) -> ferrum_edge::identity::SvidBundle {
+    use ferrum_edge::identity::{SpiffeId, SvidBundle, TrustBundle, TrustBundleSet};
+    SvidBundle {
+        spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/default/sa/waypoint")
+            .expect("waypoint spiffe id"),
+        cert_chain_der: vec![certs.client_leaf_der()],
+        private_key_pkcs8_der: vec![8, 8, 8].into(),
+        trust_bundles: TrustBundleSet {
+            local: TrustBundle {
+                trust_domain: TrustDomain::new("cluster.local").expect("trust domain"),
+                x509_authorities: vec![certs.ca_der()],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            },
+            federated: Default::default(),
+        },
+    }
+}
+
+/// Acceptance: a CONNECT authority that two bound Services own on the same
+/// backing endpoint is refused before any upgrade, never guessed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_ambiguous_backing_endpoint_authority_is_refused_before_any_upgrade() {
+    let mut waypoint = Waypoint::start(Scenario {
+        ambiguous_alias: true,
+        ..Scenario::default()
+    })
+    .await;
+    let reviews_endpoint = format!("127.0.0.1:{}", waypoint.backends.reviews.port());
+    let (response, _send) = waypoint.connect_with(&reviews_endpoint, &[]).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(l7_tunnels_active(), 0);
+    // Each Service's own host stays unambiguous.
+    let tunnel = waypoint
+        .tunnel(&format!("{}:{SERVICE_PORT}", host("reviews")), &[])
+        .await;
+    let mut inner = inner_http1(tunnel).await;
+    assert_eq!(
+        send_h1(&mut inner, get("/", &host("reviews"))).await.status,
+        StatusCode::OK
+    );
+    waypoint.teardown().await;
+}
+
+/// Acceptance: stream-family ports and `connect-udp` on bound Services stay
+/// on the L4 relay: the bytes are relayed verbatim, nothing is terminated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stream_family_ports_and_connect_udp_stay_on_the_l4_relay() {
+    let mut waypoint = Waypoint::start(Scenario::default()).await;
+    // A raw TCP stream to the reviews workload's stream-family port.
+    let tcp_endpoint = format!("127.0.0.1:{}", waypoint.backends.tcp_echo.port());
+    let (response, mut send) = waypoint.connect_with(&tcp_endpoint, &[]).await;
+    assert_eq!(response.status(), StatusCode::OK, "the L4 relay admits it");
+    let mut recv = response.into_body();
+    send.send_data(Bytes::from_static(b"not-http\x00\x01"), false)
+        .expect("send raw bytes");
+    let echoed = tokio::time::timeout(DEADLINE, recv.data())
+        .await
+        .expect("echo within the deadline")
+        .expect("echo chunk")
+        .expect("echo bytes");
+    assert_eq!(&echoed[..], b"not-http\x00\x01", "relayed verbatim at L4");
+
+    // A connect-udp tunnel naming the reviews workload's UDP port.
+    let udp_endpoint = format!("127.0.0.1:{}", waypoint.backends.udp_echo.port());
+    let (udp_response, mut udp_send) = {
+        let (response, send) = waypoint
+            .sender
+            .send_request(udp_connect_request(&udp_endpoint), false)
+            .expect("send connect-udp");
+        (
+            tokio::time::timeout(DEADLINE, response)
+                .await
+                .expect("connect-udp answered")
+                .expect("connect-udp response"),
+            send,
+        )
+    };
+    assert_eq!(udp_response.status(), StatusCode::OK);
+    let mut udp_recv = udp_response.into_body();
+    udp_send
+        .send_data(frame_datagram(b"datagram"), false)
+        .expect("send datagram");
+    let reply = tokio::time::timeout(DEADLINE, read_framed_datagram(&mut udp_recv))
+        .await
+        .expect("datagram reply within the deadline");
+    assert_eq!(reply, b"datagram");
+
+    // Neither tunnel was terminated at L7.
+    assert_eq!(l7_tunnels_active(), 0);
+    for reason in ServiceWaypointL7TunnelTermination::ALL {
+        assert_eq!(l7_tunnel_terminations(reason), 0, "{}", reason.as_str());
+    }
+    waypoint.teardown().await;
+}
+
+/// Acceptance: per-branch AuthorizationPolicy. A DENY attached to the
+/// ratings Service (`targetRefs`) refuses the header-dispatched branch to
+/// ratings while the route's own destination keeps serving; an ALLOW
+/// attached to the waypoint's Gateway admits only the client principal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn per_branch_authorization_policy_judges_the_selected_branch() {
+    let deny_ratings = MeshPolicy {
+        name: "deny-ratings".to_string(),
+        namespace: NAMESPACE.to_string(),
+        scope: PolicyScope::TargetRefs {
+            attachments: vec![PolicyTargetAttachment::Service {
+                namespace: NAMESPACE.to_string(),
+                name: "ratings".to_string(),
+            }],
+        },
+        rules: vec![MeshRule {
+            action: PolicyAction::Deny,
+            ..MeshRule::default()
+        }],
+    };
+    let allow_client_at_gateway = MeshPolicy {
+        name: "allow-client-at-waypoint".to_string(),
+        namespace: NAMESPACE.to_string(),
+        scope: PolicyScope::TargetRefs {
+            attachments: vec![PolicyTargetAttachment::Gateway {
+                namespace: NAMESPACE.to_string(),
+                name: WAYPOINT_NAME.to_string(),
+            }],
+        },
+        rules: vec![MeshRule {
+            from: vec![PrincipalMatch {
+                spiffe_id_pattern: Some(CLIENT_SPIFFE.to_string()),
+                namespace_pattern: None,
+                trust_domain: None,
+                trust_domain_pattern: None,
+            }],
+            action: PolicyAction::Allow,
+            ..MeshRule::default()
+        }],
+    };
+    let mut waypoint = Waypoint::start(Scenario {
+        virtual_services: vec![virtual_service("reviews-matches", match_dispatch_spec())],
+        policies: vec![deny_ratings, allow_client_at_gateway],
+        ..Scenario::default()
+    })
+    .await;
+    let tunnel = waypoint
+        .tunnel(&format!("{}:{SERVICE_PORT}", host("reviews")), &[])
+        .await;
+    let mut inner = inner_http1(tunnel).await;
+    let own = send_h1(&mut inner, get("/", &host("reviews"))).await;
+    assert_eq!(own.status, StatusCode::OK, "{}", own.body);
+    assert_eq!(own.served_by(), "reviews");
+
+    let mut canary = get("/", &host("reviews"));
+    canary
+        .headers_mut()
+        .insert("x-canary", hyper::header::HeaderValue::from_static("true"));
+    let branch = send_h1(&mut inner, canary).await;
+    assert_eq!(
+        branch.status,
+        StatusCode::FORBIDDEN,
+        "the ratings branch is judged on ratings' own DENY: {}",
+        branch.body
+    );
+    assert!(
+        waypoint
+            .backends
+            .requests_to(&waypoint.backends.ratings_log)
+            .is_empty(),
+        "the denied branch is never dialed"
+    );
+    waypoint.teardown().await;
+}
+
+/// Acceptance: the verified outer peer identity and an honored outer baggage
+/// `source.principal` reach every inner request; an inner request's own
+/// `baggage` header can never assert an identity.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn outer_baggage_principal_is_honored_and_inner_baggage_is_ignored() {
+    let allow_frontend = MeshPolicy {
+        name: "allow-frontend".to_string(),
+        namespace: NAMESPACE.to_string(),
+        scope: PolicyScope::TargetRefs {
+            attachments: vec![PolicyTargetAttachment::Service {
+                namespace: NAMESPACE.to_string(),
+                name: "reviews".to_string(),
+            }],
+        },
+        rules: vec![MeshRule {
+            from: vec![PrincipalMatch {
+                spiffe_id_pattern: Some(FRONTEND_SPIFFE.to_string()),
+                namespace_pattern: None,
+                trust_domain: None,
+                trust_domain_pattern: None,
+            }],
+            action: PolicyAction::Allow,
+            ..MeshRule::default()
+        }],
+    };
+    let mut waypoint = Waypoint::start_as(
+        Scenario {
+            policies: vec![allow_frontend],
+            ..Scenario::default()
+        },
+        ZTUNNEL_SPIFFE,
+    )
+    .await;
+    let authority = format!("{}:{SERVICE_PORT}", host("reviews"));
+    let baggage = format!("source.principal={FRONTEND_SPIFFE}");
+
+    // The trusted assertor asserts frontend on the OUTER CONNECT.
+    let asserted = waypoint
+        .tunnel(&authority, &[("baggage", baggage.as_str())])
+        .await;
+    let mut inner = inner_http1(asserted).await;
+    let response = send_h1(&mut inner, get("/", &host("reviews"))).await;
+    assert_eq!(
+        response.status,
+        StatusCode::OK,
+        "the honored outer assertion authorizes the inner request: {}",
+        response.body
+    );
+
+    // No outer assertion: an inner `baggage` header asserting frontend is
+    // application data, never an identity.
+    let plain = waypoint.tunnel(&authority, &[]).await;
+    let mut inner = inner_http1(plain).await;
+    let mut forged = get("/", &host("reviews"));
+    forged.headers_mut().insert(
+        "baggage",
+        hyper::header::HeaderValue::from_str(&baggage).expect("baggage value"),
+    );
+    let response = send_h1(&mut inner, forged).await;
+    assert_eq!(
+        response.status,
+        StatusCode::FORBIDDEN,
+        "an inner baggage header cannot assert the principal"
+    );
+    waypoint.teardown().await;
+}
+
+/// Hop-limit loop prevention applies to every inner request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_inner_request_at_the_hop_limit_is_refused_loop_detected() {
+    let mut waypoint = Waypoint::start(Scenario::default()).await;
+    let limit = waypoint.state.env_config.max_proxy_hops;
+    assert!(limit > 0, "fixture: the hop limit is enabled by default");
+    let tunnel = waypoint
+        .tunnel(&format!("{}:{SERVICE_PORT}", host("reviews")), &[])
+        .await;
+    let mut inner = inner_http1(tunnel).await;
+    let mut looping = get("/", &host("reviews"));
+    looping.headers_mut().insert(
+        "x-ferrum-hops",
+        hyper::header::HeaderValue::from_str(&limit.to_string()).expect("hop value"),
+    );
+    let response = send_h1(&mut inner, looping).await;
+    assert_eq!(response.status, StatusCode::LOOP_DETECTED);
+    assert!(
+        waypoint
+            .backends
+            .requests_to(&waypoint.backends.reviews_log)
+            .is_empty()
+    );
+    waypoint.teardown().await;
+}
+
+/// Acceptance: a direct (non-CONNECT) request on the ServiceWaypoint `:15008`
+/// listener never reaches a carried `istio-vs-*` route or a default L7 route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn direct_requests_on_the_waypoint_listener_never_reach_l7_routes() {
+    let mut waypoint = Waypoint::start(Scenario {
+        virtual_services: vec![virtual_service("reviews-split", split_90_10())],
+        ..Scenario::default()
+    })
+    .await;
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(format!("https://{}:{SERVICE_PORT}/", host("reviews")))
+        .body(())
+        .expect("direct request");
+    let (response, _send) = waypoint
+        .sender
+        .send_request(request, true)
+        .expect("send direct request");
+    let response = tokio::time::timeout(DEADLINE, response)
+        .await
+        .expect("direct request answered")
+        .expect("direct response");
+    assert_ne!(response.status(), StatusCode::OK);
+    assert!(
+        waypoint
+            .backends
+            .requests_to(&waypoint.backends.reviews_log)
+            .is_empty()
+            && waypoint
+                .backends
+                .requests_to(&waypoint.backends.ratings_log)
+                .is_empty(),
+        "a direct request reaches no bound Service"
+    );
+    let _ = waypoint.addr;
+    waypoint.teardown().await;
+}
+
+/// A peer that closes its tunnel ends it cleanly (`END_STREAM`), and the
+/// active-tunnel gauge follows the tunnel's life.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tunnel_the_peer_closes_ends_cleanly_and_releases_its_gauge_slot() {
+    let mut waypoint = Waypoint::start(Scenario::default()).await;
+    let tunnel = waypoint
+        .tunnel(&format!("{}:{SERVICE_PORT}", host("reviews")), &[])
+        .await;
+    let mut inner = inner_http1(tunnel).await;
+    assert_eq!(
+        send_h1(&mut inner, get("/", &host("reviews"))).await.status,
+        StatusCode::OK
+    );
+    assert_eq!(l7_tunnels_active(), 1);
+    drop(inner);
+    wait_until(
+        || l7_tunnel_terminations(ServiceWaypointL7TunnelTermination::CleanClose) == 1,
+        "the clean_close termination",
+    )
+    .await;
+    wait_until(|| l7_tunnels_active() == 0, "the gauge release").await;
+    assert_eq!(waypoint.state.hbone_admission_fence.live_tunnels(), 0);
+    waypoint.teardown().await;
+}

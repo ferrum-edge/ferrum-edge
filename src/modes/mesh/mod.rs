@@ -160,7 +160,7 @@ pub(crate) struct TrustedMeshGeneratedResourceIds {
 }
 
 impl TrustedMeshGeneratedResourceIds {
-    fn from_materialized_config(config: &GatewayConfig) -> Self {
+    pub(crate) fn from_materialized_config(config: &GatewayConfig) -> Self {
         let mut trusted = Self::default();
         for proxy in &config.proxies {
             if proxy.id.starts_with("__mesh") {

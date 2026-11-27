@@ -638,6 +638,18 @@ pub mod _test_support {
         )
     }
 
+    /// Publish a configuration `prepare_gateway_config_from_mesh_slice`
+    /// produced on a live `ProxyState`, trusting exactly the reserved mesh ids
+    /// that preparation materialized: the mesh runtime's own publication
+    /// path, without the slice apply's TLS / trust staging. The public
+    /// `update_config` refuses those reserved ids by design.
+    pub fn publish_prepared_mesh_config_for_test(
+        state: &crate::proxy::ProxyState,
+        config: crate::config::types::GatewayConfig,
+    ) -> crate::proxy::ConfigApplyOutcome {
+        state.update_prepared_mesh_config_for_test(config)
+    }
+
     /// Whether two filtered configurations have the same xDS stream/snapshot
     /// cache fingerprint (`xds::server::config_fingerprint`): equal means an
     /// xDS stream would keep serving its cached snapshot.
