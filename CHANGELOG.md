@@ -38,8 +38,10 @@ accepted but never applied are removed: `FERRUM_TLS_OFFLOAD_THREADS`,
 `FERRUM_UDP_GRO_ENABLED`, and the passive-health `gateway_error_codes` and
 `split_external_local_origin_errors` fields. The release also fixes database
 outage detection and SQL and MongoDB store defects, aligns the Admin API with
-`openapi.yaml`, and speeds up `key_auth`, the built-in plugins and TCP and
-WebSocket tunnel relays.
+`openapi.yaml`, speeds up `key_auth`, the built-in plugins and TCP and
+WebSocket tunnel relays, and replaces the unmaintained `chrono` crate with
+Ferrum's own timestamp layer (custom plugins that use `chrono` now depend on it
+themselves).
 
 Upgrading from 0.9.21 is a one-time step. Every PostgreSQL, MySQL, SQLite and
 MongoDB database created by a 0.9.x release is rebuilt from a validated logical
@@ -55,11 +57,16 @@ gateways, control planes, mesh data planes, charts or contract consumers.
   `src/`, `custom_plugins/` and the tests uses `time_compat`. The parity tests
   now compare against chrono 0.4.45 outputs recorded in
   `tests/fixtures/time_compat/`, and `chrono` and sqlx's `chrono` feature are
-  gone from `[dev-dependencies]`, so nothing compiles `chrono`. The root
-  `Cargo.lock` still lists a `chrono` entry that is never compiled. It is
-  there because `serde_with` (reached through the test-only `testcontainers`
-  and the `secrets-gcp` Google Cloud crates) names `chrono` as an optional
-  dependency (rust-lang/cargo#10801). See the dependency-policy register.
+  gone from `[dev-dependencies]`, so nothing compiles `chrono` and cargo-deny
+  no longer reports it. The root `Cargo.lock` still records a `chrono` 0.4.45
+  entry that is never compiled: `serde_with` 3.21.0's `std` / `alloc` features
+  carry weak `chrono_0_4?/...` references, which Cargo's resolver always locks
+  (rust-lang/cargo#10801), even though `serde_with`'s `chrono_0_4` feature is
+  off. Those features are enabled by the test-only `testcontainers` and the
+  Google Cloud crates behind the optional `secrets-gcp` feature. Because
+  cargo-audit reads `Cargo.lock`, the informational cargo-audit step of the
+  weekly `dependency-audit` workflow (`|| true`, not blocking) still lists
+  RUSTSEC-2026-0543. See the dependency-policy register.
 - **Three other advisory exceptions were re-reviewed on 2026-11-27 and
   re-affirmed until 2027-03-31** (#7520): RUSTSEC-2024-0436 (`paste`),
   RUSTSEC-2024-0449 (`unsafe-libyaml`) and RUSTSEC-2026-0440
@@ -209,59 +216,49 @@ gateways, control planes, mesh data planes, charts or contract consumers.
   backends receive `%5E` for a literal `^` in the path on both the direct
   HTTP/1.1 pool and the `reqwest` dispatch path (a `^` in the query string
   remains literal) (#7479).
-- **TLS events `since` filter: new 400 message text and a range limit**
-  (issue #7419, `chrono` replacement). An invalid timestamp still gets `400`
-  with the same error envelope, but the human-readable detail after
-  `invalid since timestamp: ` now comes from Ferrum's timestamp parser instead
-  of chrono's. The filter parses the same syntax chrono did, with two
-  differences: a value whose UTC instant falls outside years -9999..=9999 is
-  now rejected with that `400` (for example `9999-12-31T23:59:59-00:01`, which
-  is in year 10000 in UTC), and a leap second (`:60`) is treated as the
-  following second.
-- **Audit log `start`/`end` filters: new 400 message text and a range limit**
-  (issue #7419, `chrono` replacement). An invalid timestamp still gets `400`
-  with the same error envelope, but the detail after
-  `Invalid audit start timestamp: ` / `Invalid audit end timestamp: ` now comes
-  from Ferrum's timestamp parser. The filters parse the same syntax chrono did,
-  with two differences: a value whose UTC instant falls outside years
-  -9999..=9999 is now rejected with that `400` (for example
-  `9999-12-31T23:59:59-00:01`), and a leap second (`:60`) is treated as the
-  following second. The API-spec `updated_since` filter applies the same two
-  rules; its `400` message is unchanged (#7529).
-- **Timestamp parsing outside the TLS events filter follows the same two
-  rules** (issue #7419). Parse sites accept the same syntax chrono did, with
-  two differences: a leap second (`:60`) is stored as the following second, and
-  an instant chrono accepted outside years -9999..=9999 takes the site's normal
-  invalid-timestamp path: `response_caching` treats such an HTTP date header
-  as unparseable, `transaction_debugger` refuses such a `capture_expires_at`,
-  and `soap_ws_security` refuses a `9999-12-31T23:59:60Z` leap second as out
-  of range (#7512, #7513, #7514, #7516). The same applies to the config
-  snapshot stamps (#7527): a config document (file, backup, ConfigSync
-  snapshot) whose `loaded_at`, or a ConfigSync delta whose `poll_timestamp`,
-  is outside that range fails to decode instead of loading; a ConfigSync
-  envelope version outside it is refused as unparseable (fail closed); and a
-  mesh slice version outside it is treated like any unparseable slice version
-  (the data plane stamps the slice with its wall clock). The resource, namespace,
-  trust-bundle and audit timestamps follow suit (#7529): a stored `created_at`,
-  `updated_at` or audit `ts` outside that range takes the loader's existing
-  undecodable-value path (SQL resource and audit rows log a warning and use the
-  current time; MongoDB resource and audit documents, namespace and trust-bundle
-  rows, and config or backup documents fail to decode, so an audit list that
-  selects such a MongoDB row fails with `503`), and the API-spec `updated_since`
-  and audit `start`/`end` filters reject such a value with their `400`. A
-  Kubernetes `metadata.creationTimestamp` outside that range is treated like a
-  missing one wherever resources are ordered by creation time (Gateway API route
-  conflicts, ListenerSets, Gateway frontend TLS certificate precedence,
-  BackendTLSPolicy, `BackendLBPolicy` / `XBackendTrafficPolicy` session
-  persistence and UDP amplification policies), and a leap-second
-  `creationTimestamp` sorts as the following second (#7530).
-  Rendered timestamps of in-range, non-leap-second values, and the wire and
-  storage text of these stamps, are byte-identical. For in-range values no
-  Admin API status or envelope changes; message changes are limited to the TLS
-  events and audit filter details noted above and to the deserializer detail
-  for an invalid timestamp field (for example in `POST /batch` and
-  `POST /restore` `400` bodies and config-load errors), which now comes from
-  Ferrum's timestamp parser instead of chrono's.
+- **Timestamps no longer use `chrono`; two edge cases change** (issue #7419:
+  #7512, #7513, #7514, #7516, #7517, #7527, #7529, #7530). Every timestamp
+  parser accepts the same syntax chrono 0.4.45 did, and the rendered text, wire
+  text and storage text of in-range, non-leap-second values are byte-identical.
+  Two kinds of input behave differently:
+  - A leap second (`:60`) is stored as the following second, and a
+    leap-second Kubernetes `creationTimestamp` sorts as the following second.
+  - An instant whose UTC year is outside -9999..=9999, which chrono accepted
+    (for example `9999-12-31T23:59:59-00:01`, which is in year 10000 in UTC),
+    takes each site's existing invalid-value path:
+    - **Admin API filters:** `GET /admin/tls/events` `since`, the audit
+      `start` / `end` filters and the API-spec `updated_since` filter reject it
+      with their `400`.
+    - **Plugins:** `response_caching` treats such an HTTP date header as
+      unparseable, `transaction_debugger` refuses such a `capture_expires_at`,
+      and `soap_ws_security` refuses a `9999-12-31T23:59:60Z` leap second as
+      out of range.
+    - **Config snapshots:** a config document (file, backup, ConfigSync
+      snapshot) whose `loaded_at`, or a ConfigSync delta whose
+      `poll_timestamp`, is out of range fails to decode; a ConfigSync envelope
+      version out of range is refused as unparseable (fail closed); a mesh
+      slice version out of range is treated like any unparseable slice version
+      (the data plane stamps the slice with its wall clock).
+    - **Stored records:** a stored `created_at`, `updated_at` or audit `ts`
+      out of range takes the loader's existing undecodable-value path. SQL
+      resource and audit rows log a warning and use the current time. MongoDB
+      resource and audit documents, namespace and trust-bundle rows, and config
+      or backup documents fail to decode, so an audit list that selects such a
+      MongoDB row fails with `503`.
+    - **Kubernetes:** a `metadata.creationTimestamp` out of range is treated
+      like a missing one wherever resources are ordered by creation time
+      (Gateway API route conflicts, ListenerSets, Gateway frontend TLS
+      certificate precedence, BackendTLSPolicy, `BackendLBPolicy` /
+      `XBackendTrafficPolicy` session persistence and UDP amplification
+      policies).
+  - **Messages:** apart from the out-of-range cases above, no Admin API status
+    or envelope changes. The detail text after `invalid since timestamp: `
+    (TLS events), after `Invalid audit start timestamp: ` /
+    `Invalid audit end timestamp: `, and in a deserializer error for an
+    invalid timestamp field (for example in `POST /batch` and `POST /restore`
+    `400` bodies and config-load errors) now comes from Ferrum's timestamp
+    parser instead of chrono's. The API-spec `updated_since` message is
+    unchanged.
 - Docs: the support, versioning and deprecation policy
   (`docs/support_policy.md`) is adopted for Ferrum Edge 1.0.0 onward (#7521).
   It also states the compatibility rules for CP/DP versions (identical build
