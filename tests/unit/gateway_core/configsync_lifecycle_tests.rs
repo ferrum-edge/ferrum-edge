@@ -1326,9 +1326,11 @@ fn reconnect_preserves_last_config_received_at_and_divergence() {
     // instead of mirroring the field-carry logic in the test. A reconnect
     // (including CP failover) preserves applied-config age and sticky divergence
     // while marking the new stream connected to the new target.
-    let stamp = "2026-07-24T01:02:03Z".parse::<UtcTimestamp>().unwrap();
-    let diverged_since = "2026-07-24T01:00:00Z".parse::<UtcTimestamp>().unwrap();
-    let connected_since = "2026-07-24T02:00:00Z".parse::<UtcTimestamp>().unwrap();
+    // DpCpConnectionState still stamps with chrono until its own #7419 phase.
+    use chrono::TimeZone;
+    let stamp = chrono::Utc.with_ymd_and_hms(2026, 7, 24, 1, 2, 3).unwrap();
+    let diverged_since = chrono::Utc.with_ymd_and_hms(2026, 7, 24, 1, 0, 0).unwrap();
+    let connected_since = chrono::Utc.with_ymd_and_hms(2026, 7, 24, 2, 0, 0).unwrap();
     let prev = DpCpConnectionState {
         connected: false,
         cp_url: "http://cp-old:50051".to_string(),
