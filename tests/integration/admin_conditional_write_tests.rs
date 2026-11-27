@@ -480,9 +480,14 @@ async fn weak_malformed_and_list_tags_are_evaluated_strictly() {
         "\"unterminated",
         "\"a\" \"b\"",
         "*, \"a\"",
-        // A repeated wildcard is malformed, never an existence-only write.
+        // A wildcard is the whole header or nothing: repeated, or beside a
+        // list separator, it is malformed, never an existence-only write.
         "*, *",
         "* *",
+        "*,",
+        ",*",
+        ", *",
+        "*, ",
     ] {
         let reply = send(
             Method::PUT,
@@ -6449,22 +6454,40 @@ async fn assert_tls_record_conditional_writes(db: Arc<dyn DatabaseBackend>) {
     .await;
     assert_eq!(unconditional.status, 200, "{}", unconditional.body);
 
-    // A repeated wildcard is malformed, never an existence-only write.
-    let repeated_wildcard = send(
+    // A wildcard repeated or beside a list separator is malformed, never an
+    // existence-only write, and the record is left unchanged.
+    let unchanged_tag = get(&base, &path).await.etag.expect("tag");
+    for wildcard in ["*, *", "*,", ",*"] {
+        let refused = send(
+            Method::PUT,
+            &base,
+            &path,
+            &token,
+            Some(wildcard),
+            Some(&json!({"ca_bundle_pem": tls_ca_pem()})),
+        )
+        .await;
+        assert_eq!(refused.status, 400, "{wildcard:?}: {}", refused.body);
+    }
+    assert_eq!(get(&base, &path).await.etag, Some(unchanged_tag));
+
+    // Every successful write invalidates earlier tags, even when it stores
+    // exactly the same material: seed the PEM first, so the conditional write
+    // below changes nothing but the record's revision and timestamp.
+    let same_material = json!({"ca_bundle_pem": tls_ca_pem()});
+    let seeded = send(
         Method::PUT,
         &base,
         &path,
         &token,
-        Some("*, *"),
-        Some(&json!({"ca_bundle_pem": tls_ca_pem()})),
+        None,
+        Some(&same_material),
     )
     .await;
-    assert_eq!(repeated_wildcard.status, 400, "{}", repeated_wildcard.body);
-
-    // Every successful write invalidates earlier tags, even when it stores
-    // exactly the same material.
-    let same_material = json!({"ca_bundle_pem": tls_ca_pem()});
-    let before_same = get(&base, &path).await.etag.expect("tag");
+    assert_eq!(seeded.status, 200, "{}", seeded.body);
+    let before_same = get(&base, &path).await;
+    let before_fingerprint = before_same.body["fingerprint_sha256"].clone();
+    let before_same = before_same.etag.expect("tag");
     let same_once = send(
         Method::PUT,
         &base,
@@ -6475,7 +6498,12 @@ async fn assert_tls_record_conditional_writes(db: Arc<dyn DatabaseBackend>) {
     )
     .await;
     assert_eq!(same_once.status, 200, "{}", same_once.body);
-    let after_same = get(&base, &path).await.etag.expect("tag");
+    let after_same = get(&base, &path).await;
+    assert_eq!(
+        after_same.body["fingerprint_sha256"], before_fingerprint,
+        "the material really is unchanged"
+    );
+    let after_same = after_same.etag.expect("tag");
     assert_ne!(after_same, before_same);
     let reused = send(
         Method::PUT,

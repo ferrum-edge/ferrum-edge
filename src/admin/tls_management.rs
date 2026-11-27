@@ -1387,16 +1387,9 @@ pub(super) async fn handle_delete_acme_certificate(
         Ok(found) => found,
         Err(response) => return Ok(*response),
     };
-    if !usage.is_empty() {
-        return Ok(super::json_response(
-            StatusCode::CONFLICT,
-            &json!({
-                "error": "ACME certificate is still referenced",
-                "id": id,
-                "used_by": usage,
-            }),
-        ));
-    }
+    // Carried into the locked delete so the authoritative existence check
+    // answers before the reference conflict.
+    let referenced = !usage.is_empty();
     let precondition = TlsWritePrecondition::new(state, if_match);
     let owned_id = id.to_string();
     let settlement_state = state.clone();
@@ -1407,6 +1400,7 @@ pub(super) async fn handle_delete_acme_certificate(
             tls_store_delete_hook(&delete_id);
             let deleted = store.delete_certificate_if_authorized_and(
                 &delete_id,
+                referenced,
                 |current| {
                     precondition.holds(
                         ACME_CERTIFICATE_ETAG_KIND,
@@ -1424,6 +1418,14 @@ pub(super) async fn handle_delete_acme_certificate(
             Err(response) => return *response,
         };
         match deleted {
+            Err(AcmeError::CertificateStillReferenced(_)) => super::json_response(
+                StatusCode::CONFLICT,
+                &json!({
+                    "error": "ACME certificate is still referenced",
+                    "id": owned_id,
+                    "used_by": usage,
+                }),
+            ),
             Ok(None) => tls_reference_fence_lost_response(),
             Ok(Some(record)) => {
                 request_managed_source_reloads();
@@ -1665,16 +1667,11 @@ pub(super) async fn handle_delete_managed(
         Ok(found) => found,
         Err(response) => return Ok(*response),
     };
-    if !usage.is_empty() {
-        return Ok(super::json_response(
-            StatusCode::CONFLICT,
-            &json!({
-                "error": "managed TLS record is still referenced",
-                "id": id,
-                "used_by": usage,
-            }),
-        ));
-    }
+    // The scan verdict is carried into the locked delete rather than answered
+    // here: the scan matches the id under any kind, so the authoritative
+    // existence and kind checks must answer first (a record replaced under
+    // another kind is a kind mismatch, not this route's reference conflict).
+    let referenced = !usage.is_empty();
     let (resource_type, path_segment, refresh_jwks) = managed_tls_audit_metadata(kind);
     let precondition = TlsWritePrecondition::new(state, if_match);
     let owned_id = id.to_string();
@@ -1687,6 +1684,7 @@ pub(super) async fn handle_delete_managed(
             let deleted = store.delete_kind_if_authorized_and(
                 &delete_id,
                 kind,
+                referenced,
                 |current| {
                     precondition.holds(MANAGED_TLS_ETAG_KIND, Some((current.id.as_str(), current)))
                 },
@@ -1701,6 +1699,14 @@ pub(super) async fn handle_delete_managed(
             Err(response) => return *response,
         };
         match deleted {
+            Err(ManagedTlsError::StillReferenced(_)) => super::json_response(
+                StatusCode::CONFLICT,
+                &json!({
+                    "error": "managed TLS record is still referenced",
+                    "id": owned_id,
+                    "used_by": usage,
+                }),
+            ),
             Ok(None) => tls_reference_fence_lost_response(),
             Ok(Some(record)) => {
                 request_managed_source_reloads();
@@ -3013,6 +3019,9 @@ fn managed_error_response(error: ManagedTlsError) -> Response<Full<Bytes>> {
         // Same status and envelope as a stale `If-Match` on `/proxies/{id}`;
         // the rendering names only the record id, never its material.
         ManagedTlsError::PreconditionFailed(_) => StatusCode::PRECONDITION_FAILED,
+        // The delete handler renders this with its `used_by` list; this
+        // mapping is the fallback for any other caller.
+        ManagedTlsError::StillReferenced(_) => StatusCode::CONFLICT,
         ManagedTlsError::InvalidId(_)
         | ManagedTlsError::InvalidPath(_)
         | ManagedTlsError::MissingMaterial { .. }
@@ -3049,6 +3058,7 @@ fn acme_error_response(error: AcmeError) -> Response<Full<Bytes>> {
         AcmeError::AlreadyExists(_) => StatusCode::CONFLICT,
         AcmeError::OrderAlreadyExists(_) => StatusCode::CONFLICT,
         AcmeError::CertificatePreconditionFailed(_) => StatusCode::PRECONDITION_FAILED,
+        AcmeError::CertificateStillReferenced(_) => StatusCode::CONFLICT,
         // The request is well-formed but the stored order's lifecycle state
         // forbids it (a terminal order cannot be reopened).
         AcmeError::IllegalOrderTransition { .. } => StatusCode::CONFLICT,
@@ -4165,6 +4175,65 @@ fn tls_record_usage_unavailable_response() -> Response<Full<Bytes>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The production tag helper must tell apart two records that differ
+    /// only by their store revision — same material, same clock-derived
+    /// timestamps — so no write can leave an earlier tag valid, and the
+    /// precondition must honour exactly that distinction.
+    #[test]
+    fn tls_record_tag_changes_with_the_revision_alone() {
+        let key = preconditions::etag_key("tls-record-tag-test-secret-0123456789abcdef")
+            .expect("tag key");
+        let mut first = ManagedTlsRecord::new_ca_bundle(
+            "rev-ca".to_string(),
+            "rev-ca".to_string(),
+            None,
+            "pem".to_string(),
+        );
+        first.revision = 3;
+        let mut second = first.clone();
+        second.revision = 4;
+        let first_tag =
+            tls_record_etag(&key, MANAGED_TLS_ETAG_KIND, "rev-ca", &first).expect("tag");
+        assert_eq!(
+            Some(first_tag.clone()),
+            tls_record_etag(&key, MANAGED_TLS_ETAG_KIND, "rev-ca", &first.clone()),
+            "one representation, one tag"
+        );
+        assert_ne!(
+            Some(first_tag.clone()),
+            tls_record_etag(&key, MANAGED_TLS_ETAG_KIND, "rev-ca", &second),
+            "a revision bump alone must change the tag"
+        );
+        let precondition = TlsWritePrecondition {
+            if_match: Some(IfMatch::Tags(vec![preconditions::EntityTag {
+                weak: false,
+                opaque: first_tag,
+            }])),
+            key: Some(key.clone()),
+        };
+        assert!(precondition.holds(MANAGED_TLS_ETAG_KIND, Some(("rev-ca", &first))));
+        assert!(!precondition.holds(MANAGED_TLS_ETAG_KIND, Some(("rev-ca", &second))));
+
+        let mut certificate = AcmeCertificateRecord::new_issued(AcmeIssuedCertificateInput {
+            id: "rev-cert".to_string(),
+            domains: vec!["example.com".to_string()],
+            directory_url: "https://acme.example/directory".to_string(),
+            account_id: None,
+            order_url: None,
+            cert_pem: "cert".to_string(),
+            key_pem: "key".to_string(),
+            chain_pem: None,
+        })
+        .expect("record");
+        certificate.revision = 1;
+        let mut renewed = certificate.clone();
+        renewed.revision = 2;
+        assert_ne!(
+            tls_record_etag(&key, ACME_CERTIFICATE_ETAG_KIND, "rev-cert", &certificate),
+            tls_record_etag(&key, ACME_CERTIFICATE_ETAG_KIND, "rev-cert", &renewed)
+        );
+    }
 
     /// Issue #3737: a read-side whole-document refusal is shared-state
     /// unavailability and returns `500`; a candidate document rejected before

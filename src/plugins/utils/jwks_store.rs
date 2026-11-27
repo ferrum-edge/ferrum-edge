@@ -332,6 +332,7 @@ fn managed_read_failure_class(error: &ManagedTlsError) -> Option<JwksFailureClas
         | ManagedTlsError::DocumentTooLarge { .. }
         | ManagedTlsError::RecordLimitReached
         | ManagedTlsError::PreconditionFailed(_)
+        | ManagedTlsError::StillReferenced(_)
         | ManagedTlsError::Read(_)
         | ManagedTlsError::Write(_)
         | ManagedTlsError::Parse(_)

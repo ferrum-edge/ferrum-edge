@@ -109,7 +109,10 @@ pub struct ManagedTlsRecord {
     /// a delete-then-recreate — gives the record a value it never had before.
     /// The Admin API `ETag` covers it, so every write invalidates every tag
     /// issued earlier.
-    #[serde(default)]
+    #[serde(
+        default,
+        skip_serializing_if = "crate::tls::shared_store::revision_is_unset"
+    )]
     pub revision: u64,
 }
 
@@ -169,6 +172,12 @@ pub enum ManagedTlsError {
          re-read it and reapply your changes"
     )]
     PreconditionFailed(String),
+    /// The caller's reference scan found the record still referenced. Raised
+    /// under the exclusive lock only after the authoritative existence and
+    /// kind checks, so a record replaced under another kind reports that
+    /// mismatch instead of the replacement's references. Carries only the id.
+    #[error("managed TLS record '{0}' is still referenced")]
+    StillReferenced(String),
     /// Cross-kind ID collision on create-with-overwrite or typed update.
     ///
     /// Managed TLS IDs are globally unique across certificates, CA bundles,
@@ -547,7 +556,7 @@ impl ManagedTlsStore {
         id: &str,
         still_authorized: impl Fn() -> bool,
     ) -> Result<Option<ManagedTlsRecord>, ManagedTlsError> {
-        self.delete_if_authorized_inner(id, None, |_| true, still_authorized)
+        self.delete_if_authorized_inner(id, None, false, |_| true, still_authorized)
     }
 
     /// Delete `id` only when its stored kind matches `expected_kind` and
@@ -560,28 +569,38 @@ impl ManagedTlsStore {
         expected_kind: ManagedTlsMaterialKind,
         still_authorized: impl Fn() -> bool,
     ) -> Result<Option<ManagedTlsRecord>, ManagedTlsError> {
-        self.delete_if_authorized_inner(id, Some(expected_kind), |_| true, still_authorized)
+        self.delete_if_authorized_inner(id, Some(expected_kind), false, |_| true, still_authorized)
     }
 
-    /// [`Self::delete_kind_if_authorized`] guarded by a caller precondition,
-    /// evaluated against the authoritative record (after the existence, kind,
-    /// and authorization checks, immediately before removal) under the
-    /// exclusive lock that commits the removal. `false` refuses with
-    /// [`ManagedTlsError::PreconditionFailed`] and removes nothing.
+    /// [`Self::delete_kind_if_authorized`] with the caller's reference-scan
+    /// verdict and precondition, decided under the exclusive lock that
+    /// commits the removal in one fixed order: existence (`NotFound`), kind
+    /// (`WrongKind`), `referenced` ([`ManagedTlsError::StillReferenced`]),
+    /// the authorization fence (`Ok(None)`), then `precondition`
+    /// ([`ManagedTlsError::PreconditionFailed`]). Any refusal removes
+    /// nothing.
     pub fn delete_kind_if_authorized_and(
         &self,
         id: &str,
         expected_kind: ManagedTlsMaterialKind,
+        referenced: bool,
         precondition: impl FnOnce(&ManagedTlsRecord) -> bool,
         still_authorized: impl Fn() -> bool,
     ) -> Result<Option<ManagedTlsRecord>, ManagedTlsError> {
-        self.delete_if_authorized_inner(id, Some(expected_kind), precondition, still_authorized)
+        self.delete_if_authorized_inner(
+            id,
+            Some(expected_kind),
+            referenced,
+            precondition,
+            still_authorized,
+        )
     }
 
     fn delete_if_authorized_inner(
         &self,
         id: &str,
         expected_kind: Option<ManagedTlsMaterialKind>,
+        referenced: bool,
         precondition: impl FnOnce(&ManagedTlsRecord) -> bool,
         still_authorized: impl Fn() -> bool,
     ) -> Result<Option<ManagedTlsRecord>, ManagedTlsError> {
@@ -600,6 +619,9 @@ impl ManagedTlsStore {
                         expected: expected.as_str(),
                         actual: existing.kind.as_str(),
                     });
+                }
+                if referenced {
+                    return Err(ManagedTlsError::StillReferenced(id.clone()));
                 }
                 // A lapsed authorization fence answers before the caller's
                 // precondition, so a delete that lost its fence always reports

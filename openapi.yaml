@@ -9616,7 +9616,8 @@ components:
         `412` unless the stored resource still has that representation, so a
         draft opened before someone else's accepted change can never revert
         it. `*` requires only that the resource exists and must be the whole
-        header (a repeated `*` is `400`). Comparison is strong: a weak (`W/`)
+        header (`*` combined with anything else, such as `*, *`, `*,` or
+        `,*`, is `400`). Comparison is strong: a weak (`W/`)
         tag never matches. A comma-separated list matches when any member
         does.
 
@@ -9679,8 +9680,10 @@ components:
         is free (`412`), so a conditional overwrite never creates a record.
 
         Omitting the header keeps the write unconditional. A malformed or
-        empty header (including a repeated `*`) is `400`, never treated as
-        absent.
+        empty header (including `*` combined with anything else, such as
+        `*, *`, `*,` or `,*`) is `400`, never treated as absent. The reference
+        scan's verdict is applied under the store lock after the existence and
+        kind checks.
     ExpectedProxyIds:
       name: expected_proxy_ids
       in: query

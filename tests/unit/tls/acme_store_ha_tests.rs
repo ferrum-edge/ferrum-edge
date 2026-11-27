@@ -514,7 +514,7 @@ fn conditional_certificate_replacement_from_two_instances_commits_exactly_once()
         Err(AcmeError::CertificatePreconditionFailed(_))
     ));
     assert!(matches!(
-        seed.delete_certificate_if_authorized_and("edge-cert", |_| false, || true),
+        seed.delete_certificate_if_authorized_and("edge-cert", false, |_| false, || true),
         Err(AcmeError::CertificatePreconditionFailed(_))
     ));
     assert_eq!(
@@ -558,8 +558,47 @@ fn certificate_writes_stamp_revisions_and_keep_rule_precedence() {
         Err(AcmeError::AlreadyExists(_))
     ));
     assert!(matches!(
-        store.delete_certificate_if_authorized_and("rev-cert", |_| false, || false),
+        store.delete_certificate_if_authorized_and("rev-cert", false, |_| false, || false),
         Ok(None)
     ));
     assert!(store.get_certificate("rev-cert").is_ok(), "nothing removed");
+}
+
+/// Review round 2, F1: an unstamped (legacy) ACME certificate record keeps
+/// its serialized shape, so rewriting the document for another record never
+/// grows it.
+#[test]
+fn an_unstamped_certificate_record_serializes_without_a_revision() {
+    let record = certificate("legacy-cert", "pem");
+    assert_eq!(record.revision, 0);
+    let value = serde_json::to_value(&record).expect("serialize");
+    assert!(value.get("revision").is_none(), "{value}");
+    let stamped = AcmeCertificateRecord {
+        revision: 7,
+        ..record
+    };
+    assert_eq!(
+        serde_json::to_value(&stamped).expect("serialize")["revision"],
+        serde_json::json!(7)
+    );
+}
+
+/// Review round 2, F3 for ACME certificates: a reference verdict never masks
+/// a missing record, and answers before a lapsed fence or a stale tag.
+#[test]
+fn a_certificate_reference_verdict_keeps_its_place_in_the_order() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = AcmeCertificateStore::open(dir.path()).expect("open");
+    store
+        .upsert_certificate(certificate("ref-cert", "pem"), false)
+        .expect("seed");
+    assert!(matches!(
+        store.delete_certificate_if_authorized_and("absent-cert", true, |_| false, || false),
+        Err(AcmeError::NotFound(_))
+    ));
+    assert!(matches!(
+        store.delete_certificate_if_authorized_and("ref-cert", true, |_| false, || false),
+        Err(AcmeError::CertificateStillReferenced(ref id)) if id == "ref-cert"
+    ));
+    assert!(store.get_certificate("ref-cert").is_ok());
 }

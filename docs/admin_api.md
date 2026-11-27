@@ -845,7 +845,10 @@ rotating the same record cannot silently overwrite each other:
   record with a new store revision (the monotonic version of the commit that
   wrote it), so the tag changes on every write, including a same-material
   rotation, a write whose clock repeats `updated_at`, and a
-  delete-then-recreate: no write ever leaves an earlier tag valid.
+  delete-then-recreate: no write ever leaves an earlier tag valid. A record
+  stored before this release carries no revision until it is next written,
+  and only the written record gains one, so upgrading never grows the
+  untouched records of a store close to `FERRUM_TLS_STORE_MAX_DOCUMENT_BYTES`.
 - `PUT .../{id}` and `DELETE .../{id}` with `If-Match` are refused with
   `412 Precondition Failed` and `{"error": "managed TLS record '<id>' has changed since the supplied If-Match entity-tag was issued; re-read it and reapply your changes"}`
   (`ACME certificate '<id>' ...` for ACME records) unless the stored record
@@ -860,15 +863,18 @@ rotating the same record cannot silently overwrite each other:
   same-kind record the write could replace.
 - Strict parsing, `*` (the record must exist), strong comparison, tag lists,
   and `400` for a malformed or empty header are identical to the
-  configuration resources; a repeated wildcard (`*, *`) is malformed (`400`)
-  there as here.
+  configuration resources; `*` combined with anything else (`*, *`, `*,`,
+  `,*`) is malformed (`400`) there as here.
 - **Status precedence**, the same on `PUT`, `DELETE`, and overwrite `POST`
   and in every interleaving, because each later check is re-made under the
   store lock: `400` malformed `If-Match`; `404` missing id; the kind mismatch
   (`409` on `PUT` and `POST`, `400` on `DELETE`); `409` existing id without
   `allow_overwrite` (`POST`); on `DELETE`, `409` while the record is still
   referenced and `503` when the reference fence lapsed before the removal;
-  then `412` for a stale tag.
+  then `412` for a stale tag. The reference scan runs before the store
+  lock is taken, but its verdict is applied under the lock after the
+  authoritative existence and kind checks, so references to a replacement of
+  another kind never mask the kind mismatch.
 - **Atomic across instances.** The comparison is made by the TLS store against
   the authoritative record inside the exclusive cross-process lock that also
   commits the write (the same read-modify-write that already makes
@@ -1780,7 +1786,8 @@ curl -X PUT -H "Authorization: Bearer $TOKEN" -H "If-Match: $ETAG" \
   value; replicas sharing that secret issue identical tags, and rotating it
   invalidates outstanding tags (writes then return `412` until re-read).
 - **Strict parsing for row writes.** `*` requires only that the resource exists;
-  it must be the whole header, so a repeated wildcard (`*, *`) is `400`.
+  it must be the whole header, so `*` combined with anything else (`*, *`,
+  `*,`, `,*`, or `*` beside a tag) is `400`.
   Comparison is strong, so a weak `W/"…"` tag never matches. A comma-separated list
   matches if any member does. A malformed or empty `If-Match` is `400`, never
   treated as absent. Row preconditions apply only to `PUT`/`DELETE` on the

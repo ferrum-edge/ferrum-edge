@@ -378,6 +378,7 @@ fn a_refused_precondition_changes_nothing_on_any_write_path() {
         .delete_kind_if_authorized_and(
             "held-ca",
             ManagedTlsMaterialKind::CaBundle,
+            false,
             |_| false,
             || true,
         )
@@ -420,6 +421,7 @@ fn a_refused_precondition_changes_nothing_on_any_write_path() {
         store.delete_kind_if_authorized_and(
             "held-ca",
             ManagedTlsMaterialKind::Crl,
+            false,
             |_| false,
             || true,
         ),
@@ -436,6 +438,7 @@ fn a_refused_precondition_changes_nothing_on_any_write_path() {
         .delete_kind_if_authorized_and(
             "held-ca",
             ManagedTlsMaterialKind::CaBundle,
+            false,
             |current| current.ca_bundle_pem.as_deref() == Some("rotated"),
             || true,
         )
@@ -488,6 +491,7 @@ fn existing_record_rules_and_a_lapsed_fence_take_precedence_over_the_preconditio
         store.delete_kind_if_authorized_and(
             "shared-id",
             ManagedTlsMaterialKind::CaBundle,
+            false,
             |_| false,
             || false,
         ),
@@ -541,4 +545,123 @@ fn every_write_stamps_a_new_revision_independent_of_the_clock() {
         recreated.revision > overwritten.revision,
         "a recreate never reuses a revision the deleted record had"
     );
+}
+
+/// Review round 2, F1: a document written before records carried a revision
+/// must keep its exact shape for every record a write does not touch, so a
+/// store sitting at its byte ceiling can still delete a record (and is not
+/// refused 413 because every untouched record grew a `"revision": 0`).
+#[test]
+fn legacy_records_keep_their_shape_so_a_full_store_can_still_delete() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("managed-tls.json");
+    {
+        let seeding = ManagedTlsStore::open(dir.path()).expect("open seeding store");
+        for index in 0..40 {
+            seeding
+                .upsert(ca_record(&format!("legacy-{index:02}"), "x"), false)
+                .expect("seed");
+        }
+    }
+
+    // Rewrite the document as a pre-revision gateway left it: no record
+    // carries the field. Same pretty-printed form the store itself writes.
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read store")).expect("parse");
+    for record in document["records"]
+        .as_object_mut()
+        .expect("records map")
+        .values_mut()
+    {
+        record
+            .as_object_mut()
+            .expect("record object")
+            .remove("revision");
+    }
+    let legacy = serde_json::to_vec_pretty(&document).expect("serialize legacy");
+    std::fs::write(&path, &legacy).expect("write legacy store");
+    assert!(!String::from_utf8_lossy(&legacy).contains("\"revision\""));
+
+    // The ceiling is exactly the legacy document's size: any growth of the
+    // untouched records would refuse the delete.
+    let full = ManagedTlsStore::open_with_limits(dir.path(), 64 * 1024, 1000, Some(legacy.len()))
+        .expect("open at the ceiling");
+    let removed = full
+        .delete("legacy-00")
+        .expect("delete at the byte ceiling");
+    assert_eq!(removed.id, "legacy-00");
+
+    let after = String::from_utf8(std::fs::read(&path).expect("read back")).expect("utf8");
+    assert!(
+        !after.contains("\"revision\""),
+        "untouched legacy records keep their serialized shape"
+    );
+    assert!(after.len() < legacy.len());
+
+    // A record a write does touch is stamped, and only that one.
+    full.update_existing(ca_record("legacy-01", "x"))
+        .expect("rewrite one record");
+    let after = String::from_utf8(std::fs::read(&path).expect("read back")).expect("utf8");
+    assert_eq!(after.matches("\"revision\"").count(), 1);
+    assert!(full.get("legacy-01").expect("stamped").revision > 0);
+    assert_eq!(full.get("legacy-02").expect("untouched").revision, 0);
+}
+
+/// Review round 2, F3: the caller's reference-scan verdict is decided under
+/// the lock after the authoritative existence and kind checks. A scan that
+/// matched the id of a replacement under another kind reports the kind
+/// mismatch, never the replacement's references; on the right kind the
+/// reference conflict answers before the fence and the tag.
+#[test]
+fn a_reference_verdict_never_masks_a_missing_record_or_a_kind_mismatch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = ManagedTlsStore::open(dir.path()).expect("open");
+    // The CA bundle the caller meant was replaced by a certificate.
+    store
+        .upsert(
+            ManagedTlsRecord::new_certificate(
+                "replaced".to_string(),
+                "replaced".to_string(),
+                None,
+                "cert".to_string(),
+                "key".to_string(),
+                None,
+            ),
+            false,
+        )
+        .expect("seed replacement");
+
+    assert!(matches!(
+        store.delete_kind_if_authorized_and(
+            "replaced",
+            ManagedTlsMaterialKind::CaBundle,
+            true,
+            |_| false,
+            || false,
+        ),
+        Err(ManagedTlsError::WrongKind { .. })
+    ));
+    assert!(matches!(
+        store.delete_kind_if_authorized_and(
+            "never-existed",
+            ManagedTlsMaterialKind::CaBundle,
+            true,
+            |_| false,
+            || false,
+        ),
+        Err(ManagedTlsError::NotFound(_))
+    ));
+    // Right kind: the reference conflict answers before a lapsed fence or a
+    // stale tag.
+    assert!(matches!(
+        store.delete_kind_if_authorized_and(
+            "replaced",
+            ManagedTlsMaterialKind::Certificate,
+            true,
+            |_| false,
+            || false,
+        ),
+        Err(ManagedTlsError::StillReferenced(ref id)) if id == "replaced"
+    ));
+    assert!(store.get("replaced").is_ok(), "no refusal removes anything");
 }

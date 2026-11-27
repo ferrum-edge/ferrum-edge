@@ -176,7 +176,10 @@ pub struct AcmeCertificateRecord {
     /// successful create or replacement, renewal included, stamps a value the
     /// record never had before, so the Admin API `ETag` (which covers it)
     /// changes on every write even when material and clock repeat.
-    #[serde(default)]
+    #[serde(
+        default,
+        skip_serializing_if = "crate::tls::shared_store::revision_is_unset"
+    )]
     pub revision: u64,
 }
 
@@ -620,6 +623,11 @@ pub enum AcmeError {
          re-read it and reapply your changes"
     )]
     CertificatePreconditionFailed(String),
+    /// The caller's reference scan found the certificate still referenced,
+    /// raised under the exclusive lock after the authoritative existence
+    /// check. Carries only the id.
+    #[error("ACME certificate '{0}' is still referenced")]
+    CertificateStillReferenced(String),
     #[error("ACME order '{0}' was not found")]
     OrderNotFound(String),
     #[error("ACME order '{0}' already exists")]
@@ -1033,17 +1041,20 @@ impl AcmeCertificateStore {
         id: &str,
         still_authorized: impl Fn() -> bool,
     ) -> Result<Option<AcmeCertificateRecord>, AcmeError> {
-        self.delete_certificate_if_authorized_and(id, |_| true, still_authorized)
+        self.delete_certificate_if_authorized_and(id, false, |_| true, still_authorized)
     }
 
-    /// [`Self::delete_certificate_if_authorized`] guarded by a caller
-    /// precondition, evaluated against the authoritative record (after the
-    /// existence and authorization checks, immediately before removal) under
-    /// the exclusive lock that commits the removal. `false` refuses with
-    /// [`AcmeError::CertificatePreconditionFailed`] and removes nothing.
+    /// [`Self::delete_certificate_if_authorized`] with the caller's
+    /// reference-scan verdict and precondition, decided under the exclusive
+    /// lock that commits the removal in one fixed order: existence
+    /// (`NotFound`), `referenced` ([`AcmeError::CertificateStillReferenced`]),
+    /// the authorization fence (`Ok(None)`), then `precondition`
+    /// ([`AcmeError::CertificatePreconditionFailed`]). Any refusal removes
+    /// nothing.
     pub fn delete_certificate_if_authorized_and(
         &self,
         id: &str,
+        referenced: bool,
         precondition: impl FnOnce(&AcmeCertificateRecord) -> bool,
         still_authorized: impl Fn() -> bool,
     ) -> Result<Option<AcmeCertificateRecord>, AcmeError> {
@@ -1054,6 +1065,9 @@ impl AcmeCertificateStore {
                 let Some(existing) = document.certificates.get(&id) else {
                     return Err(AcmeError::NotFound(id.clone()));
                 };
+                if referenced {
+                    return Err(AcmeError::CertificateStillReferenced(id.clone()));
+                }
                 // A lapsed authorization fence answers before the caller's
                 // precondition, so a stale tag never hides a lost fence.
                 if !still_authorized() {
