@@ -21,6 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backends receive `%5E` for a literal `^` in the path on both the direct
   HTTP/1.1 pool and the `reqwest` dispatch path (a `^` in the query string
   remains literal).
+- **TLS events `since` filter: new 400 message text for an invalid timestamp**
+  (issue #7419, `chrono` replacement). The status code, error envelope and the
+  set of rejected inputs are unchanged; only the human-readable detail after
+  `invalid since timestamp: ` now comes from Ferrum's timestamp parser instead
+  of chrono's. A value chrono accepted whose UTC instant falls outside years
+  -9999..=9999 is now rejected the same way, and a leap second (`:60`) is
+  treated as the following second.
 
 ### Fixed
 

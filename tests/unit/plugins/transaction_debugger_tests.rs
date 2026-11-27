@@ -2941,13 +2941,13 @@ async fn test_capture_expires_at_switches_capture_off_by_receive_time() {
     // the deadline is still captured in both directions.
     let deadline = targeted_plugin(json!({"capture_expires_at": "2026-01-01T00:00:00Z"}));
     let mut early = capturable_ctx();
-    early.timestamp_received = chrono::DateTime::parse_from_rfc3339("2025-12-31T23:59:59Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
+    early.timestamp_received = "2025-12-31T23:59:59Z"
+        .parse::<ferrum_edge::time_compat::UtcTimestamp>()
+        .unwrap();
     let mut late = capturable_ctx();
-    late.timestamp_received = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
+    late.timestamp_received = "2026-01-01T00:00:00Z"
+        .parse::<ferrum_edge::time_compat::UtcTimestamp>()
+        .unwrap();
     with_debug_target(|| {
         assert!(deadline.should_buffer_request_body(&early));
         assert!(deadline.should_buffer_response_body(&early));
@@ -2963,11 +2963,12 @@ fn test_capture_sample_rate_is_deterministic_and_proportional() {
     with_debug_target(|| {
         for i in 0..1000i64 {
             let mut ctx = capturable_ctx();
-            ctx.timestamp_received = chrono::DateTime::from_timestamp(
-                1_800_000_000 + i,
-                ((i * 7_919) % 1_000_000_000) as u32,
-            )
-            .expect("valid timestamp");
+            ctx.timestamp_received =
+                ferrum_edge::time_compat::UtcTimestamp::from_unix_timestamp_nanos(
+                    1_800_000_000 + i,
+                    ((i * 7_919) % 1_000_000_000) as u32,
+                )
+                .expect("valid timestamp");
             let request = half.should_buffer_request_body(&ctx);
             assert_eq!(
                 request,

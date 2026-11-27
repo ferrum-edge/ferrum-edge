@@ -26,7 +26,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::fips::approved::Sha256;
-use chrono::{DateTime, Utc};
+use crate::time_compat::UtcTimestamp;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, CertificateRevocationListDer};
 use serde::Serialize;
@@ -82,16 +82,16 @@ pub struct TlsInventoryEntry {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sans: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub not_before: Option<DateTime<Utc>>,
+    pub not_before: Option<UtcTimestamp>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub not_after: Option<DateTime<Utc>>,
+    pub not_after: Option<UtcTimestamp>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub days_until_expiry: Option<i64>,
     /// `nextUpdate` of this entry's revocation material: the soonest across a
     /// CRL bundle, or the matched `SingleResponse`'s for an OCSP staple.
     /// Absent for every other material kind (issue #4505).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_update: Option<DateTime<Utc>>,
+    pub next_update: Option<UtcTimestamp>,
     /// Whole days until [`Self::next_update`], computed the same way
     /// [`Self::days_until_expiry`] is so a certificate deadline and a
     /// revocation deadline cannot be read on different scales.
@@ -991,8 +991,8 @@ fn populate_certificate_metadata(
     entry.subject = Some(parsed_leaf.subject().to_string());
     entry.issuer = Some(parsed_leaf.issuer().to_string());
     entry.sans = crate::tls::san::certificate_san_strings(&parsed_leaf);
-    entry.not_before = DateTime::<Utc>::from_timestamp(not_before_ts, 0);
-    entry.not_after = DateTime::<Utc>::from_timestamp(not_after_ts, 0);
+    entry.not_before = UtcTimestamp::from_unix_timestamp(not_before_ts).ok();
+    entry.not_after = UtcTimestamp::from_unix_timestamp(not_after_ts).ok();
     entry.days_until_expiry = Some((not_after_ts - now_ts) / 86_400);
     entry.fingerprint_sha256 = Some(hex::encode(Sha256::digest(leaf.as_ref())));
     entry.certificate_count = Some(certs.len());
@@ -1092,7 +1092,7 @@ fn apply_dropped_staple_state(entry: &mut TlsInventoryEntry, next_update_unix: i
 /// Store `next_update` and its whole-day countdown on `entry`.
 fn set_next_update(entry: &mut TlsInventoryEntry, next_update_unix: i64) {
     let now_ts = ASN1Time::now().timestamp();
-    entry.next_update = DateTime::<Utc>::from_timestamp(next_update_unix, 0);
+    entry.next_update = UtcTimestamp::from_unix_timestamp(next_update_unix).ok();
     entry.days_until_next_update =
         Some(crate::tls::days_until_next_update(next_update_unix, now_ts));
 }

@@ -816,6 +816,22 @@ fn rfc2822_formatting_matches_chrono_byte_for_byte() {
     assert_eq!(negative_year.to_rfc2822(), None);
 }
 
+/// Phase 15 replaced the Lambda `requestContext.time` rendering
+/// `format("%d/%b/%Y:%H:%M:%S %z")` with `to_common_log_format()`.
+#[test]
+fn common_log_format_matches_chrono_strftime() {
+    for (secs, nanos) in representative_instants() {
+        let (ts, ch) = pair_for(secs, nanos);
+        assert_eq!(
+            ts.to_common_log_format(),
+            ch.format("%d/%b/%Y:%H:%M:%S %z").to_string(),
+            "({secs}, {nanos})"
+        );
+    }
+    let fixed: UtcTimestamp = "2026-11-07T08:09:10Z".parse().unwrap();
+    assert_eq!(fixed.to_common_log_format(), "07/Nov/2026:08:09:10 +0000");
+}
+
 /// Phase 11 replaced `DateTime::from_timestamp_millis(..).unwrap_or(UNIX_EPOCH)`
 /// with `UtcTimestamp::from_unix_timestamp_millis(..).unwrap_or(UNIX_EPOCH)`.
 /// In range the instant and its RFC 3339 bytes match chrono exactly,

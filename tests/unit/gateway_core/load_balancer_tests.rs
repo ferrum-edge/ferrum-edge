@@ -2077,8 +2077,6 @@ fn test_passive_health_filters_targets() {
         unhealthy_window_seconds: 60,
         healthy_after_seconds: 30,
         max_ejection_percent: None,
-        gateway_error_codes: None,
-        split_external_local_origin_errors: None,
         consecutive_error_mode: false,
         consecutive_5xx_ejection_disabled: false,
     };
@@ -2142,8 +2140,6 @@ fn ejection_cap_readmits_when_too_many_passively_ejected() {
         unhealthy_window_seconds: 60,
         healthy_after_seconds: 30,
         max_ejection_percent: None,
-        gateway_error_codes: None,
-        split_external_local_origin_errors: None,
         consecutive_error_mode: false,
         consecutive_5xx_ejection_disabled: false,
     };
@@ -2267,8 +2263,6 @@ fn ejection_cap_zero_percent_readmits_all() {
         unhealthy_window_seconds: 60,
         healthy_after_seconds: 30,
         max_ejection_percent: None,
-        gateway_error_codes: None,
-        split_external_local_origin_errors: None,
         consecutive_error_mode: false,
         consecutive_5xx_ejection_disabled: false,
     };
@@ -2334,8 +2328,6 @@ fn ejection_cap_rounds_down_like_envoy_for_small_pools() {
         unhealthy_window_seconds: 60,
         healthy_after_seconds: 30,
         max_ejection_percent: None,
-        gateway_error_codes: None,
-        split_external_local_origin_errors: None,
         consecutive_error_mode: false,
         consecutive_5xx_ejection_disabled: false,
     };
@@ -2390,8 +2382,6 @@ fn ejection_cap_matches_envoy_integer_boundary() {
         unhealthy_window_seconds: 60,
         healthy_after_seconds: 30,
         max_ejection_percent: None,
-        gateway_error_codes: None,
-        split_external_local_origin_errors: None,
         consecutive_error_mode: false,
         consecutive_5xx_ejection_disabled: false,
     };
@@ -2453,8 +2443,6 @@ fn ejection_cap_does_not_affect_active_health_ejections() {
         unhealthy_window_seconds: 60,
         healthy_after_seconds: 30,
         max_ejection_percent: None,
-        gateway_error_codes: None,
-        split_external_local_origin_errors: None,
         consecutive_error_mode: false,
         consecutive_5xx_ejection_disabled: false,
     };
@@ -2570,8 +2558,6 @@ fn passthrough_ejection_cap_scoped_to_candidate_pool_not_whole_upstream() {
         unhealthy_window_seconds: 60,
         healthy_after_seconds: 30,
         max_ejection_percent: None,
-        gateway_error_codes: None,
-        split_external_local_origin_errors: None,
         consecutive_error_mode: false,
         consecutive_5xx_ejection_disabled: false,
     };
@@ -3343,8 +3329,6 @@ fn family_eligibility_skips_passively_ejected_same_family_target() {
         unhealthy_window_seconds: 60,
         healthy_after_seconds: 30,
         max_ejection_percent: None,
-        gateway_error_codes: None,
-        split_external_local_origin_errors: None,
         consecutive_error_mode: false,
         consecutive_5xx_ejection_disabled: false,
     };

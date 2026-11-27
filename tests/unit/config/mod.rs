@@ -83,7 +83,6 @@ mod stream_proxy_config_tests;
 mod test_db_fault_tests;
 mod time_compat_chrono_parse_tests;
 mod time_compat_tests;
-mod tls_offload_threads_tests;
 mod udp_amplification_default_tests;
 mod v001_baseline_golden_tests;
 mod websocket_permessage_deflate_tests;

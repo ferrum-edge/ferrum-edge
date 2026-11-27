@@ -1231,8 +1231,7 @@ async fn run_upstream_field_variant_crud(
                 "unhealthy_window_seconds": 30,
                 "healthy_after_seconds": 5,
                 "max_ejection_percent": 50,
-                "gateway_error_codes": [502, 503, 504],
-                "split_external_local_origin_errors": true
+                "consecutive_error_mode": true
             }
         },
         "subsets": [
@@ -1270,8 +1269,12 @@ async fn run_upstream_field_variant_crud(
     assert_eq!(value["targets"][1]["tags"]["version"], "v2");
     assert_eq!(value["health_checks"]["active"]["probe_type"], "http");
     assert_eq!(
-        value["health_checks"]["passive"]["gateway_error_codes"],
-        json!([502, 503, 504])
+        value["health_checks"]["passive"]["max_ejection_percent"],
+        50
+    );
+    assert_eq!(
+        value["health_checks"]["passive"]["consecutive_error_mode"],
+        true
     );
     assert_eq!(
         value["subsets"][0]["traffic_policy"]["load_balancer_algorithm"],
@@ -1365,8 +1368,7 @@ async fn run_upstream_field_variant_crud(
                     "unhealthy_threshold": 3,
                     "unhealthy_window_seconds": 20,
                     "healthy_after_seconds": 2,
-                    "max_ejection_percent": 25,
-                    "split_external_local_origin_errors": false
+                    "max_ejection_percent": 25
                 }
             }
         });

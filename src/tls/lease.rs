@@ -66,7 +66,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use crate::time_compat::UtcTimestamp;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::watch;
@@ -119,8 +119,8 @@ pub enum TlsLeaseError {
 pub struct TlsLeaseRecord {
     /// Opaque instance identity of the current holder.
     pub holder: String,
-    pub acquired_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
+    pub acquired_at: UtcTimestamp,
+    pub expires_at: UtcTimestamp,
     /// Monotonic per-name counter bumped on every acquisition. A guard whose
     /// fence no longer matches has been superseded and must not renew, release,
     /// or act on the claim.
@@ -128,7 +128,7 @@ pub struct TlsLeaseRecord {
 }
 
 impl TlsLeaseRecord {
-    pub fn is_live_at(&self, now: DateTime<Utc>) -> bool {
+    pub fn is_live_at(&self, now: UtcTimestamp) -> bool {
         self.expires_at > now
     }
 }
@@ -160,15 +160,15 @@ impl VersionedStoreFile for TlsLeaseStoreFile {
 /// Stores sharing a directory must use the same time basis. Production uses
 /// UTC wall time; tests can share a manually advanced clock across replicas.
 pub trait LeaseClock: std::fmt::Debug + Send + Sync {
-    fn now(&self) -> DateTime<Utc>;
+    fn now(&self) -> UtcTimestamp;
 }
 
 #[derive(Debug)]
 struct SystemLeaseClock;
 
 impl LeaseClock for SystemLeaseClock {
-    fn now(&self) -> DateTime<Utc> {
-        Utc::now()
+    fn now(&self) -> UtcTimestamp {
+        UtcTimestamp::now()
     }
 }
 
@@ -283,7 +283,7 @@ impl TlsLeaseStore {
                 TlsLeaseRecord {
                     holder: holder.clone(),
                     acquired_at: now,
-                    expires_at: now + lease_delta(ttl),
+                    expires_at: lease_deadline(now, ttl),
                     fence,
                 },
             );
@@ -336,7 +336,7 @@ impl TlsLeaseStore {
             if existing.holder != holder || existing.fence != fence || !existing.is_live_at(now) {
                 return Ok((false, false));
             }
-            existing.expires_at = now + lease_delta(ttl);
+            existing.expires_at = lease_deadline(now, ttl);
             Ok((true, true))
         })?;
         Ok(renewed)
@@ -1088,20 +1088,27 @@ impl Drop for TlsLeaseGuard {
     }
 }
 
-fn prune_expired(document: &mut TlsLeaseStoreFile, now: DateTime<Utc>) {
-    let retention = chrono::TimeDelta::try_seconds(EXPIRED_LEASE_RETENTION_SECONDS)
-        .unwrap_or_else(chrono::TimeDelta::zero);
-    let cutoff = now - retention;
+fn prune_expired(document: &mut TlsLeaseStoreFile, now: UtcTimestamp) {
+    let retention = ::time::SignedDuration::seconds(EXPIRED_LEASE_RETENTION_SECONDS);
+    // Unreachable underflow keeps every record rather than panicking.
+    let Some(cutoff) = now.checked_sub(retention) else {
+        return;
+    };
     document.leases.retain(|_, lease| lease.expires_at > cutoff);
 }
 
-/// Clamp a lease TTL into `chrono` space. Callers pass operator-clamped values;
-/// this only guards against an unrepresentable duration.
-fn lease_delta(ttl: Duration) -> chrono::TimeDelta {
-    let millis = i64::try_from(ttl.as_millis());
-    let millis = millis.unwrap_or(FALLBACK_LEASE_TTL_MILLIS);
-    let delta = chrono::TimeDelta::try_milliseconds(millis);
-    delta.unwrap_or_else(chrono::TimeDelta::zero)
+/// Convert a lease TTL to a duration. Callers pass operator-clamped values;
+/// this only guards against an unrepresentable duration (as before: an
+/// out-of-range millisecond count falls back to the default TTL).
+fn lease_delta(ttl: Duration) -> ::time::SignedDuration {
+    let millis = i64::try_from(ttl.as_millis()).unwrap_or(FALLBACK_LEASE_TTL_MILLIS);
+    ::time::SignedDuration::milliseconds(millis)
+}
+
+/// `now + ttl`. The TTL is operator-clamped, so the sum is always in range;
+/// an unrepresentable deadline would lapse immediately instead of panicking.
+fn lease_deadline(now: UtcTimestamp, ttl: Duration) -> UtcTimestamp {
+    now.checked_add(lease_delta(ttl)).unwrap_or(now)
 }
 
 /// Accept a configured instance id verbatim, or reject it.

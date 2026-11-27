@@ -65,14 +65,27 @@ unused-ignored-advisory = "deny"
 #     `patched = [">= 0.10.0"]`, and sqlx-mysql 0.9.1 resolves rsa 0.10.0.
 #   - RUSTSEC-2026-0459 (libsqlite3-sys bundling SQLite < 3.54.0): sqlx-sqlite
 #     0.9.1 allows `>=0.30.1, <0.41`, and the lockfiles resolve 0.40.0.
+#
+# Re-reviewed 2026-11-27 (1.0 release candidate): RUSTSEC-2024-0436 (paste),
+# RUSTSEC-2024-0449 (unsafe-libyaml) and RUSTSEC-2026-0440 (astral-tokio-tar)
+# were checked against the RustSec advisory-db and crates.io. None has a
+# patched release or a released parent that drops it, so each is re-affirmed
+# to 2027-03-31 with the evidence in its entry. RUSTSEC-2026-0543 (chrono) is
+# re-evaluated separately under issue #7419.
 ignore = [
     # ── paste 1.0.15 — RUSTSEC-2024-0436, unmaintained (repository archived).
     # A proc-macro only: it runs at compile time and has no runtime or network
-    # surface. Parents: tikv-jemalloc-ctl (0.6.1, and still `paste ^1` in the
-    # latest 0.7.0, checked 2026-09-24) and our own test matrix macro
+    # surface. Parents: tikv-jemalloc-ctl (0.6.1 locked; root, fuzz/ and
+    # tests/performance/mesh/ lockfiles) and our own test matrix macro
     # (tests/scaffolding/matrix.rs, dev-dependency). Dropping our dev-dependency
     # alone would not remove the crate while tikv-jemalloc-ctl keeps it.
-    { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15 unmaintained; proc-macro only (tikv-jemalloc-ctl, still paste ^1 in 0.7.0 as of 2026-09-24, plus the test matrix dev-dependency), no runtime or network surface. Re-evaluate when tikv-jemalloc-ctl drops paste. [expires:2026-12-31]" },
+    # Re-reviewed 2026-11-27: RustSec still lists `patched = []`; paste 1.0.15
+    # is the last release. The latest tikv-jemalloc-ctl on crates.io, 0.7.0,
+    # still declares `paste ^1`. Upstream removed the dependency on its main
+    # branch (tikv/jemallocator#189, merged 2026-09-25) but has not released
+    # it. Retire once a tikv-jemalloc-ctl release without paste ships and the
+    # test matrix moves to a maintained alternative (e.g. pastey).
+    { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15 unmaintained (patched = []); proc-macro only, no runtime or network surface. Parents: tikv-jemalloc-ctl (latest release 0.7.0 still paste ^1; removed on upstream main by tikv/jemallocator#189 but unreleased, checked 2026-11-27) and the test matrix dev-dependency. Retire when a tikv-jemalloc-ctl release drops paste and the test matrix migrates. [expires:2027-03-31]" },
 
     # ── unsafe-libyaml 0.2.11 — RUSTSEC-2024-0449, unmaintained (repository
     # archived 2024-03-25; `patched = []`, 0.2.11 is the last release). An
@@ -89,12 +102,24 @@ ignore = [
     # Input trust: file-backed gateway/mesh config, config-migration input, and
     # the Kubernetes MeshConfig ConfigMap are operator-controlled; API-spec
     # bodies come from authenticated Admin API callers under body-size,
-    # node, depth, alias, and work budgets. No unauthenticated network input
-    # reaches libyaml. The serde_yaml forks (e.g. serde_yaml_ng) still depend
+    # node, depth, alias, and work budgets. One network path exists and is
+    # off by default: opt-in external `$ref` resolution
+    # (src/admin/api_specs/external_refs.rs) feeds documents fetched from
+    # other origins to the same bounded parser. It needs both
+    # FERRUM_ADMIN_SPEC_EXTERNAL_REFS_ENABLED and the per-spec
+    # x-ferrum-external-refs extension, fetches only allowlisted HTTPS origins
+    # (cleartext HTTP only for explicitly listed origins), screens addresses
+    # for SSRF, and caps documents, bytes, refs, redirects, nesting and time.
+    # The serde_yaml forks (e.g. serde_yaml_ng) still depend
     # on unsafe-libyaml, so retiring this needs a migration of both serde_yaml
     # and the two event parsers to a safe-Rust YAML parser (saphyr /
     # serde-saphyr).
-    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml 0.2.11 unmaintained (archived 2024-03-25, patched = [], informational, no known vulnerability). Parents: serde_yaml 0.9.34+deprecated and the direct bounded-alias event parsers (api_specs/bounded_yaml.rs, config/yaml_alias_budget.rs). Inputs are operator-controlled config files/ConfigMap or authenticated, budget-bounded Admin API spec bodies. serde_yaml forks still use unsafe-libyaml; retire by migrating serde_yaml and both event parsers to a safe-Rust parser (saphyr/serde-saphyr). [expires:2026-12-31]" },
+    # Re-reviewed 2026-11-27: RustSec still lists `patched = []` and
+    # `unaffected = []`; unsafe-libyaml 0.2.11 and serde_yaml
+    # 0.9.34+deprecated are still the latest crates.io releases. Retirement
+    # remains a parser migration, not a dependency bump. It is also in the
+    # tests/performance/mesh/ lockfile through ferrum-edge.
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml 0.2.11 unmaintained (archived 2024-03-25, patched = [], informational, no known vulnerability; still the latest release, re-checked 2026-11-27). Parents: serde_yaml 0.9.34+deprecated (still latest) and the direct bounded-alias event parsers (api_specs/bounded_yaml.rs, config/yaml_alias_budget.rs). Inputs are operator-controlled config files/ConfigMap or authenticated, budget-bounded Admin API spec bodies, plus (only when opt-in external $ref resolution is enabled) documents fetched from allowlisted origins under SSRF screening and size/count/depth/time budgets. serde_yaml forks still use unsafe-libyaml; retire by migrating serde_yaml and both event parsers to a safe-Rust parser (saphyr/serde-saphyr). [expires:2027-03-31]" },
 
     # ── astral-tokio-tar 0.6.2 — RUSTSEC-2026-0440, unmaintained (Astral ended
     # maintenance on 2026-11-03; `patched = []`, every version deprecated). An
@@ -108,7 +133,13 @@ ignore = [
     # payloads built from repository test fixtures. Upstream is replacing it
     # with `tar` (testcontainers/testcontainers-rs#1006, open); retire this
     # when a testcontainers release ships that change.
-    { id = "RUSTSEC-2026-0440", reason = "astral-tokio-tar 0.6.2 unmaintained (Astral ended maintenance 2026-11-03, patched = [], informational, no known vulnerability). Only parent is testcontainers 0.28.0 (latest, checked 2026-11-06), a dev-dependency of the secrets_functional and service_integration test targets; not in the shipped binary or images. Retire when a testcontainers release replaces it (testcontainers-rs#1006). [expires:2026-12-31]" },
+    # Re-reviewed 2026-11-27: RustSec still lists `patched = []` (every
+    # version, including the final 0.7.1, is deprecated). testcontainers 0.28.0
+    # is still the latest crates.io release and declares
+    # `astral-tokio-tar ^0.6.1`; its main branch moved to astral-tokio-tar
+    # 0.7.0, and testcontainers-rs#1006 (replace it with `tar`) is still open
+    # and unmerged. No lockfile-only change removes the crate.
+    { id = "RUSTSEC-2026-0440", reason = "astral-tokio-tar 0.6.2 unmaintained (Astral ended maintenance 2026-11-03, patched = [], informational, no known vulnerability). Only parent is testcontainers 0.28.0 (still the latest release, re-checked 2026-11-27; testcontainers-rs#1006 replacing it with tar still open), a dev-dependency of the secrets_functional and service_integration test targets; not in the shipped binary or images. Retire when a testcontainers release replaces it. [expires:2027-03-31]" },
 
     # ── chrono 0.4.45 — RUSTSEC-2026-0543, unmaintained (announced in
     # chronotope/chrono#1768, opened 2026-01-22; RustSec advisory issued

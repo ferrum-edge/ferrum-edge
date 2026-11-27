@@ -272,7 +272,6 @@ fn status_code_lists_share_runtime_bounds_and_cardinality() {
             vec![
                 "/health_checks/active/healthy_status_codes",
                 "/health_checks/passive/unhealthy_status_codes",
-                "/health_checks/passive/gateway_error_codes",
             ],
         ),
     ] {
@@ -293,6 +292,29 @@ fn status_code_lists_share_runtime_bounds_and_cardinality() {
                 set_field(&mut body, field, codes);
                 assert_parity(&schema, component, &body, expected);
             }
+        }
+    }
+}
+
+/// The passive-health object is closed in both the schema and admission: the
+/// removed reserved fields and any misspelled key are rejected, never ignored.
+#[test]
+fn passive_health_unknown_keys_are_rejected_by_schema_and_runtime() {
+    let spec = spec();
+    for component in ["Upstream", "UpstreamCreate"] {
+        let schema = validator(&spec, component);
+        assert_parity(&schema, component, &upstream(), true);
+        for (field, value, expected) in [
+            ("max_ejection_percent", json!(50), true),
+            ("consecutive_error_mode", json!(true), true),
+            ("gateway_error_codes", json!([502, 503, 504]), false),
+            ("split_external_local_origin_errors", json!(true), false),
+            ("split_external_local_origin_errors", json!(false), false),
+            ("unhealthy_treshold", json!(3), false),
+        ] {
+            let mut body = upstream();
+            set_field(&mut body, &format!("/health_checks/passive/{field}"), value);
+            assert_parity(&schema, component, &body, expected);
         }
     }
 }

@@ -81,7 +81,6 @@ pub mod startup;
 pub mod system_metrics;
 pub mod time_compat;
 pub mod tls;
-pub mod tls_offload;
 pub mod udp_amplification;
 pub mod util;
 pub mod xds;
