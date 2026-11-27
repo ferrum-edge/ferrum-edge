@@ -184,9 +184,12 @@ remove it from manifests and Helm `extraEnv` anyway.
 
 ### Unknown configuration keys are rejected (#7520, #7524)
 
-Before 1.0.0 only the top-level resources (`Proxy`, `Upstream`, `Consumer`,
-`PluginConfig`, `ApiSpec`) rejected unknown keys; nested objects dropped them
-silently, so a misspelled `health_checks.pasive` or
+In 0.9.21 the top-level resources (`GatewayConfig`, `Proxy`, `Upstream`,
+`Consumer`, `PluginConfig`, `ApiSpec`, `FrontendTlsCertificateSource`) and some
+nested objects (stream `stream_match` criteria and arms, plugin trigger
+objects, and the mesh policy, authentication, telemetry and VirtualService
+route objects) already refused unknown keys, but the nested objects listed
+below dropped them silently, so a misspelled `health_checks.pasive` or
 `circuit_breaker.failure_treshold` produced a resource with that policy
 missing. 1.0.0 closes these nested objects:
 
@@ -384,8 +387,10 @@ custom-plugin Rust API stays unstable after 1.0.0
   -9999..=9999 that chrono accepted is now invalid: `GET /admin/tls/events`
   `since`, `transaction_debugger` `capture_expires_at`, `response_caching`
   HTTP dates and `soap_ws_security` instants take their existing
-  invalid-timestamp path. The `invalid since timestamp: ` detail text of the
-  TLS events `400` changed; the status and envelope did not.
+  invalid-timestamp path, and a file-mode config or backup whose `loaded_at`
+  is outside that range fails to load (#7527). The `invalid since timestamp: `
+  detail text of the TLS events `400` changed; the status and envelope did
+  not.
 - **Charts.** Both charts' `appVersion` is `1.0.0`, which is the default image
   tag. Pin a published release tag when you override `image.tag`, and keep the
   migration Job and gateway pins on the same build.
