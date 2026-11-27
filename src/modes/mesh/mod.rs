@@ -4113,9 +4113,11 @@ fn unprepared_gateway_config_from_mesh_slice(
     federation: Option<&federation::FederationSnapshot>,
     remote_endpoints: Option<&multicluster::RemoteEndpointSnapshot>,
 ) -> Result<(GatewayConfig, Option<MeshSlice>), anyhow::Error> {
-    let loaded_at = chrono::DateTime::parse_from_rfc3339(&slice.version)
-        .map(|ts| ts.with_timezone(&chrono::Utc))
-        .unwrap_or_else(|_| chrono::Utc::now());
+    // chrono-compatible strict RFC 3339 acceptance (issue #7419); an
+    // unparseable or out-of-range version falls back to the wall clock.
+    let loaded_at = crate::time_compat::parse_rfc3339_chrono(&slice.version)
+        .and_then(|parsed| parsed.to_utc_timestamp())
+        .unwrap_or_else(|_| crate::time_compat::UtcTimestamp::now());
     // Keep CP-provided federation bootstrap bundles visible to structural mesh
     // validation even in fail-closed mode. Traffic-facing verifier slots are
     // published separately from `effective_trust_bundles_for_slice` only after
@@ -37605,7 +37607,12 @@ mod tests {
         // fresh wall-clock timestamp instead. Seed the upstream's `updated_at`
         // to `loaded_at` so a buggy clobber-to-`loaded_at` would be a no-op and
         // the assertion below would catch it.
-        let loaded_at = config.loaded_at;
+        // Upstream still stamps with chrono until its own #7419 phase.
+        let loaded_at = chrono::DateTime::<chrono::Utc>::from_timestamp(
+            config.loaded_at.unix_timestamp(),
+            config.loaded_at.subsec_nanos(),
+        )
+        .unwrap();
         let before = chrono::Utc::now();
         config.upstreams.push(Upstream {
             labels: Default::default(),

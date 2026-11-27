@@ -33,6 +33,7 @@ use ferrum_edge::proxy::udp_proxy::{
     UdpListenerConfig, UdpProxyMetrics, start_udp_listener_holding_port,
 };
 use ferrum_edge::request_epoch::RequestEpochStore;
+use ferrum_edge::time_compat::UtcTimestamp;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -520,7 +521,7 @@ fn empty_config() -> GatewayConfig {
         consumers: vec![],
         upstreams: vec![],
         plugin_configs: vec![],
-        loaded_at: chrono::Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     }

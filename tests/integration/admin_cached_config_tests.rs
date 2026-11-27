@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::scaffolding::ports;
+use ferrum_edge::time_compat::UtcTimestamp;
 
 /// Test configuration
 #[derive(Clone)]
@@ -192,7 +193,7 @@ fn create_test_gateway_config() -> GatewayConfig {
             updated_at: Utc::now(),
         }],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     }
@@ -1537,7 +1538,7 @@ fn create_pagination_test_config() -> GatewayConfig {
         consumers,
         plugin_configs,
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     }
@@ -2034,7 +2035,7 @@ async fn test_list_plugin_configs_filtered_by_proxy_id() {
             proxy_filter_plugin_config("other-ns-1", other_ns, PluginScope::Proxy, Some("proxy-a")),
         ],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };

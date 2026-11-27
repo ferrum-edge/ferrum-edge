@@ -10,6 +10,7 @@ use ferrum_edge::router_cache::{
     path_parameter_direct_workload_route_admitted, path_parameter_route_admitted,
     path_parameter_scoped_route_admitted,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 
 // This suite intentionally exercises the public RouterCache facade.
 // Request hot paths use epoch-loaded route snapshots and are covered by
@@ -94,7 +95,7 @@ fn test_config(proxies: Vec<Proxy>) -> GatewayConfig {
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     }

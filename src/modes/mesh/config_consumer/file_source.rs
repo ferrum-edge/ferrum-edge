@@ -237,7 +237,7 @@ pub fn normalized_mesh_gateway_config(
     let mut config = GatewayConfig {
         version: CURRENT_CONFIG_VERSION.to_string(),
         mesh: Some(mesh),
-        loaded_at: chrono::Utc::now(),
+        loaded_at: crate::time_compat::UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     config.normalize_fields();

@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 
 use super::plugin_utils::{capture_logs, create_test_proxy};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 fn make_ctx() -> RequestContext {
     RequestContext::new(
@@ -2735,7 +2736,7 @@ fn gateway_with_cors_proxy(cors_origins: Value, allowed_ws_origins: Vec<String>)
             Some("ws-api"),
         )],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     }

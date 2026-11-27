@@ -398,6 +398,22 @@ impl UtcTimestamp {
         out
     }
 
+    /// Format like chrono's `DateTime<Utc>` `Display` impl
+    /// (`YYYY-MM-DD HH:MM:SS[.fff|.ffffff|.fffffffff] UTC`), byte-for-byte for
+    /// every non-leap value. `UtcTimestamp`'s own [`fmt::Display`] prints
+    /// RFC 3339 with `Z` instead.
+    pub fn to_chrono_display(&self) -> String {
+        let mut out = self.to_rfc3339_opts(SecondsFormat::AutoSi, true);
+        // The first `T` is always the date/time separator.
+        if let Some(pos) = out.find('T') {
+            out.replace_range(pos..=pos, " ");
+        }
+        // Swap the trailing `Z` for chrono's ` UTC` offset text.
+        out.pop();
+        out.push_str(" UTC");
+        out
+    }
+
     /// Write RFC 3339 output into any [`fmt::Write`] without allocating.
     pub fn write_rfc3339_opts(
         &self,
@@ -598,6 +614,14 @@ impl fmt::Debug for UtcTimestamp {
 impl fmt::Display for UtcTimestamp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.write_rfc3339_opts(f, SecondsFormat::AutoSi, true)
+    }
+}
+
+/// [`UtcTimestamp::UNIX_EPOCH`], matching `chrono::DateTime::<Utc>::default()`,
+/// so `#[derive(Default)]` config types keep the same default stamp.
+impl Default for UtcTimestamp {
+    fn default() -> Self {
+        Self::UNIX_EPOCH
     }
 }
 

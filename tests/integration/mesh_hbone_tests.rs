@@ -47,6 +47,7 @@ use ferrum_edge::proxy::{
     ProxyState, start_proxy_listener_with_bound_listener,
     start_proxy_listener_with_bound_listener_and_mesh_direction,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 
 pub(super) fn create_mesh_proxy(backend_port: u16) -> Proxy {
     Proxy {
@@ -169,7 +170,7 @@ fn create_mesh_proxy_state_with_upstreams(
         consumers,
         plugin_configs,
         upstreams,
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         frontend_tls_cert_path: None,
         frontend_tls_key_path: None,
@@ -1356,7 +1357,7 @@ fn create_inbound_relay_gateway_state(mesh: Option<MeshConfig>) -> ProxyState {
         consumers: vec![],
         plugin_configs: vec![spiffe_plugin],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         frontend_tls_cert_path: None,
         frontend_tls_key_path: None,
@@ -2156,7 +2157,7 @@ fn materialize_source_side_external_udp(
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         frontend_tls_cert_path: None,
         frontend_tls_key_path: None,
@@ -5419,7 +5420,7 @@ fn create_post_plugin_third_workload_state(
         consumers: vec![],
         plugin_configs: vec![spiffe_plugin, route_override],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         frontend_tls_cert_path: None,
         frontend_tls_key_path: None,

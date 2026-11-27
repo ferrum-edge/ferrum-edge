@@ -22,7 +22,6 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use chrono::Utc;
 use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -46,6 +45,7 @@ use ferrum_edge::proxy::{
     ProxyState, start_global_proxy_listener_with_dynamic_tls_and_signal,
     start_proxy_listener_with_bound_listener_and_proxy_protocol,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use ferrum_edge::tls::SharedFrontendTls;
 
 /// Upper bound for any single expected outcome. The header deadline is 5s, so
@@ -237,7 +237,7 @@ fn proxy_state(backend_port: u16, env: EnvConfig) -> ProxyState {
     let config = GatewayConfig {
         version: "1".to_string(),
         proxies: vec![proxy],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     ProxyState::new(config, DnsCache::new(DnsConfig::default()), env, None, None)

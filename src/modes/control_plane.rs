@@ -723,7 +723,7 @@ async fn load_incremental_config_multi<B: CpIncrementalLoadSource + ?Sized>(
             .filter_map(|ns| after_sequences.get(ns).copied())
             .max()
             .unwrap_or(0),
-        poll_timestamp: chrono::Utc::now(),
+        poll_timestamp: crate::time_compat::UtcTimestamp::now(),
     };
     let mut any_success = false;
     let mut last_hard_error: Option<anyhow::Error> = None;
@@ -954,7 +954,7 @@ struct MultiNsFullLoadAcc {
     /// `Utc::now()`) so the stamp still precedes every query, preserving the
     /// full-load safety margin. The minimum, not the first in namespace order,
     /// because namespace loads run concurrently and may stamp in any order.
-    fresh_loaded_at: Option<chrono::DateTime<chrono::Utc>>,
+    fresh_loaded_at: Option<crate::time_compat::UtcTimestamp>,
     rejected_namespaces: Vec<(String, String)>,
     refreshed_namespaces: Vec<String>,
     failed_namespaces: Vec<String>,
@@ -1871,9 +1871,10 @@ pub(crate) fn publish_cp_full_reload(
         return;
     }
     // `loaded_at` is stamped before the first namespace's snapshot queries.
-    let load = (chrono::Utc::now() - db_config.loaded_at)
-        .to_std()
-        .unwrap_or_default();
+    let load = std::time::Duration::try_from(
+        crate::time_compat::UtcTimestamp::now() - db_config.loaded_at,
+    )
+    .unwrap_or_default();
     let resources = db_config.proxies.len()
         + db_config.consumers.len()
         + db_config.plugin_configs.len()
@@ -1935,7 +1936,7 @@ pub(crate) fn publish_cp_full_reload(
 fn union_accepted_deltas(
     outcome: &PartitionComposeOutcome,
     sequence_cursor: u64,
-    poll_timestamp: chrono::DateTime<chrono::Utc>,
+    poll_timestamp: crate::time_compat::UtcTimestamp,
 ) -> IncrementalResult {
     let sequence_cursor = outcome
         .accepted
@@ -2001,7 +2002,7 @@ pub(crate) fn publish_cp_incremental(
     partitions: &HashMap<String, IncrementalResult>,
     version: &str,
     sequence_cursor: u64,
-    poll_timestamp: chrono::DateTime<chrono::Utc>,
+    poll_timestamp: crate::time_compat::UtcTimestamp,
     broadcasts: &crate::grpc::cp_server::NamespaceBroadcasts,
     dp_registry: &crate::grpc::cp_server::DpNodeRegistry,
     cp_scope: &CpScope,
@@ -2241,7 +2242,7 @@ fn partition_incremental_by_namespace(
     let poll_timestamp = result.poll_timestamp;
     let sequence_cursor = result.sequence_cursor;
 
-    let make_empty = |ts: chrono::DateTime<chrono::Utc>| IncrementalResult {
+    let make_empty = |ts: crate::time_compat::UtcTimestamp| IncrementalResult {
         added_or_modified_proxies: Vec::new(),
         removed_proxy_ids: Vec::new(),
         added_or_modified_consumers: Vec::new(),
@@ -4746,7 +4747,8 @@ mod tests {
     use super::*;
     use crate::config::db_backend::{IncrementalResult, NamespacedResourceId};
     use crate::config::types::*;
-    use chrono::{TimeZone, Utc};
+    use crate::time_compat::UtcTimestamp;
+    use chrono::Utc;
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -4834,7 +4836,7 @@ mod tests {
             added_or_modified_upstreams: vec![],
             removed_upstream_ids: vec![],
             sequence_cursor: 0,
-            poll_timestamp: Utc::now(),
+            poll_timestamp: UtcTimestamp::now(),
         }
     }
 
@@ -5001,7 +5003,7 @@ mod tests {
                 added_or_modified_upstreams: Vec::new(),
                 removed_upstream_ids: Vec::new(),
                 sequence_cursor: after_sequence + 1,
-                poll_timestamp: Utc::now(),
+                poll_timestamp: UtcTimestamp::now(),
             })
         }
     }
@@ -5077,8 +5079,8 @@ mod tests {
         // namespace with a fixed fresh stamp. Failed-ns LKG is retained,
         // successful-ns resources are replaced, and the combined snapshot must
         // carry the fresh stamp (not previous.loaded_at).
-        let old_loaded_at = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
-        let fresh_loaded_at = Utc.with_ymd_and_hms(2026, 7, 26, 12, 0, 0).unwrap();
+        let old_loaded_at: UtcTimestamp = "2020-01-01T00:00:00Z".parse().unwrap();
+        let fresh_loaded_at: UtcTimestamp = "2026-07-26T12:00:00Z".parse().unwrap();
 
         let mut previous = GatewayConfig {
             loaded_at: old_loaded_at,

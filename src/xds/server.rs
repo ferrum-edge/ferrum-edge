@@ -2620,7 +2620,7 @@ mod tests {
         MeshWaypointBinding, MeshWaypointServiceRef, MtlsMode, PeerAuthentication, PolicyScope,
         ServicePort, Workload, WorkloadSelector,
     };
-    use chrono::{TimeZone, Utc};
+    use crate::time_compat::UtcTimestamp;
     use prost::Message;
 
     fn gateway_config_with_service(include_service: bool, version_second: u32) -> GatewayConfig {
@@ -2632,8 +2632,8 @@ mod tests {
                     services: Vec::new(),
                     ..MeshConfig::default()
                 })),
-                loaded_at: Utc
-                    .with_ymd_and_hms(2026, 5, 5, 12, 0, version_second)
+                loaded_at: format!("2026-05-05T12:00:{version_second:02}Z")
+                    .parse::<UtcTimestamp>()
                     .unwrap(),
                 ..GatewayConfig::default()
             }
@@ -2650,8 +2650,8 @@ mod tests {
                 services: names.iter().map(|name| mesh_service(name)).collect(),
                 ..MeshConfig::default()
             })),
-            loaded_at: Utc
-                .with_ymd_and_hms(2026, 5, 5, 12, 0, version_second)
+            loaded_at: format!("2026-05-05T12:00:{version_second:02}Z")
+                .parse::<UtcTimestamp>()
                 .unwrap(),
             ..GatewayConfig::default()
         }
@@ -2672,8 +2672,8 @@ mod tests {
                 }],
                 ..MeshConfig::default()
             })),
-            loaded_at: Utc
-                .with_ymd_and_hms(2026, 5, 5, 12, 0, version_second)
+            loaded_at: format!("2026-05-05T12:00:{version_second:02}Z")
+                .parse::<UtcTimestamp>()
                 .unwrap(),
             ..GatewayConfig::default()
         }
@@ -2717,8 +2717,8 @@ mod tests {
                 }],
                 ..MeshConfig::default()
             })),
-            loaded_at: Utc
-                .with_ymd_and_hms(2026, 5, 5, 12, 0, version_second)
+            loaded_at: format!("2026-05-05T12:00:{version_second:02}Z")
+                .parse::<UtcTimestamp>()
                 .unwrap(),
             ..GatewayConfig::default()
         }
@@ -2803,8 +2803,8 @@ mod tests {
             added_or_modified_upstreams: Vec::new(),
             removed_upstream_ids: Vec::new(),
             sequence_cursor: 0,
-            poll_timestamp: Utc
-                .with_ymd_and_hms(2026, 5, 5, 12, 0, version_second)
+            poll_timestamp: format!("2026-05-05T12:00:{version_second:02}Z")
+                .parse::<UtcTimestamp>()
                 .unwrap(),
         }
     }
@@ -3027,7 +3027,7 @@ mod tests {
                 }],
                 ..MeshConfig::default()
             })),
-            loaded_at: Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 0).unwrap(),
+            loaded_at: "2026-05-05T12:00:00Z".parse::<UtcTimestamp>().unwrap(),
             ..GatewayConfig::default()
         };
         let server = test_server_with_sidecar_enforcement(config.clone(), true);
@@ -3064,7 +3064,7 @@ mod tests {
                 }],
                 ..MeshConfig::default()
             })),
-            loaded_at: Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 0).unwrap(),
+            loaded_at: "2026-05-05T12:00:00Z".parse::<UtcTimestamp>().unwrap(),
             ..GatewayConfig::default()
         };
         let server = test_server_with_sidecar_enforcement(config.clone(), true);

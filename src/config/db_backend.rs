@@ -1945,7 +1945,7 @@ pub struct IncrementalResult {
     /// Highest durable config change sequence included in this poll.
     pub sequence_cursor: u64,
     /// Timestamp to use as the in-memory/gRPC config version for this delta.
-    pub poll_timestamp: DateTime<Utc>,
+    pub poll_timestamp: crate::time_compat::UtcTimestamp,
 }
 
 impl IncrementalResult {

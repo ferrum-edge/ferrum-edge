@@ -8,6 +8,7 @@ use ferrum_edge::config::types::{
 use ferrum_edge::proxy::stream_match::{
     MAX_STREAM_MATCH_ARMS, StreamMatchArm, StreamMatchCriteria,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use std::collections::BTreeMap;
 
 fn make_stream_proxy(id: &str, scheme: BackendScheme, port: u16) -> Proxy {
@@ -159,7 +160,7 @@ fn test_config(proxies: Vec<Proxy>) -> GatewayConfig {
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     }

@@ -52,6 +52,7 @@ use ferrum_edge::modes::mesh::policy::{
     BareServiceFqdnSniCondition, find_bare_service_fqdn_sni_conditions,
 };
 use ferrum_edge::modes::mesh::{MESH_AUTHZ_PLUGIN_ID, prepare_gateway_config_via_mesh_slice};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const CLIENT_SPIFFE: &str = "spiffe://cluster.local/ns/default/sa/client";
 const ROGUE_SPIFFE: &str = "spiffe://cluster.local/ns/default/sa/rogue";
@@ -113,7 +114,7 @@ fn prepared_mesh_plugin_configs(
         upstreams: Vec::new(),
         consumers: Vec::new(),
         plugin_configs: Vec::new(),
-        loaded_at: chrono::Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         frontend_tls_cert_path: None,
         frontend_tls_key_path: None,
@@ -1912,7 +1913,7 @@ async fn trust_domain_alias_accepts_baggage_principal_from_aliased_domain() {
         upstreams: Vec::new(),
         consumers: Vec::new(),
         plugin_configs: Vec::new(),
-        loaded_at: chrono::Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         frontend_tls_cert_path: None,
         frontend_tls_key_path: None,

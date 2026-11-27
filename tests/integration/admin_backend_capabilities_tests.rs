@@ -26,6 +26,7 @@ use ferrum_edge::proxy::ProxyState;
 use ferrum_edge::proxy::backend_capabilities::{
     BackendCapabilityRecord, ProtocolSupport, capability_key_for_proxy_target,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -95,7 +96,7 @@ fn admin_state_with_capability_registry(jwt: JwtManager) -> AdminState {
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };
@@ -128,7 +129,7 @@ fn admin_state_with_http_probe_proxy(jwt: JwtManager, backend_port: u16) -> Admi
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };

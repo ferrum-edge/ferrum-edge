@@ -30,6 +30,7 @@ use ferrum_edge::config::types::{
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::plugins::{Plugin, ProxyProtocol};
 use ferrum_edge::proxy::{ConfigApplyOutcome, ProxyState};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const PROXY_ID: &str = "grpc-audit-proxy";
 const AUDIT_PLUGIN_ID: &str = "grpc-audit";
@@ -227,7 +228,7 @@ fn empty_delta() -> IncrementalResult {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
         sequence_cursor: 0,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     }
 }
 

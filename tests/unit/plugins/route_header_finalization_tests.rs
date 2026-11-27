@@ -19,6 +19,7 @@ use ferrum_edge::plugins::utils::route_header_transform::{
     RawRouteHeaderTransformRule, RouteHeaderTransformRule, parse_route_header_transforms,
 };
 use ferrum_edge::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext};
+use ferrum_edge::time_compat::UtcTimestamp;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -135,7 +136,7 @@ fn make_config(plugin_configs: Vec<PluginConfig>) -> GatewayConfig {
         consumers: vec![],
         plugin_configs,
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     }

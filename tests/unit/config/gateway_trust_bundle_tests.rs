@@ -41,6 +41,7 @@ use ferrum_edge::modes::mesh::config::{JwtAuthority, TrustBundle, TrustBundleSet
 
 use async_trait::async_trait;
 use base64::Engine;
+use ferrum_edge::time_compat::UtcTimestamp;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -675,7 +676,7 @@ fn delta_side_channel(trust: GatewayTrustPublication<'_>) -> String {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
         sequence_cursor: 0,
-        poll_timestamp: chrono::Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     };
     let version = delta.poll_timestamp.to_rfc3339();
     assert!(

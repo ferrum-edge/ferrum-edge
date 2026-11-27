@@ -3,6 +3,7 @@ use ferrum_edge::proxy::sni::{
     extract_sni_from_tcp_stream, initial_peek_capacity, next_peek_capacity,
     no_deadline_peek_capacity, normalize_received_server_name, resolve_proxy_by_sni,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 
 fn build_tls_client_hello(hostname: &str) -> Vec<u8> {
     build_tls_client_hello_with_padding_before_sni(hostname, 0)
@@ -162,7 +163,7 @@ fn make_test_config(
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: chrono::Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     }

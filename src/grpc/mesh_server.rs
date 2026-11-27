@@ -1172,7 +1172,7 @@ mod tests {
         AppProtocol, MeshConfig, MeshService, NodeWaypointEndpoint, ServicePort, Workload,
         WorkloadSelector,
     };
-    use chrono::{TimeZone, Utc};
+    use crate::time_compat::UtcTimestamp;
 
     fn mesh_config_with_service(version_second: u32) -> GatewayConfig {
         mesh_config_with_named_service("api", version_second)
@@ -1198,8 +1198,8 @@ mod tests {
                 }],
                 ..MeshConfig::default()
             })),
-            loaded_at: Utc
-                .with_ymd_and_hms(2026, 5, 5, 12, 0, version_second)
+            loaded_at: format!("2026-05-05T12:00:{version_second:02}Z")
+                .parse::<UtcTimestamp>()
                 .unwrap(),
             ..GatewayConfig::default()
         }
@@ -1320,7 +1320,7 @@ mod tests {
     #[test]
     fn mesh_delta_update_skips_unchanged_mesh_slice_content() {
         let mut stream_config = mesh_config_with_service(0);
-        let poll_timestamp = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 42).unwrap();
+        let poll_timestamp = "2026-05-05T12:00:42Z".parse::<UtcTimestamp>().unwrap();
         let delta = IncrementalResult {
             added_or_modified_proxies: Vec::new(),
             removed_proxy_ids: Vec::new(),
@@ -1372,7 +1372,7 @@ mod tests {
                 ],
                 ..MeshConfig::default()
             })),
-            loaded_at: Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 0).unwrap(),
+            loaded_at: "2026-05-05T12:00:00Z".parse::<UtcTimestamp>().unwrap(),
             ..GatewayConfig::default()
         };
         let slice_request = MeshSliceRequest {
@@ -1400,7 +1400,7 @@ mod tests {
             vec![waypoint_alpha, waypoint_beta]
         );
         let previous_slice = MeshSlice::from_gateway_config(&stream_config, slice_request.clone());
-        let poll_timestamp = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 42).unwrap();
+        let poll_timestamp = "2026-05-05T12:00:42Z".parse::<UtcTimestamp>().unwrap();
         let delta = IncrementalResult {
             added_or_modified_proxies: Vec::new(),
             removed_proxy_ids: Vec::new(),
@@ -1544,7 +1544,7 @@ mod tests {
         }];
         let config = GatewayConfig {
             mesh: Some(Box::new(mesh)),
-            loaded_at: Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 0).unwrap(),
+            loaded_at: "2026-05-05T12:00:00Z".parse::<UtcTimestamp>().unwrap(),
             ..GatewayConfig::default()
         };
         let slice_request = MeshSliceRequest::from_native(

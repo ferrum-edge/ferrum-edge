@@ -21,6 +21,7 @@ use rustls::pki_types::pem::PemObject;
 use tracing::info;
 
 use crate::scaffolding::clients::{bind_quinn_client_endpoint, bind_quinn_server_endpoint};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 // Initialize rustls crypto provider for tests
 fn init_crypto_provider() {
@@ -142,7 +143,7 @@ fn create_http3_test_gateway_config() -> GatewayConfig {
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: chrono::Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     }
@@ -1054,7 +1055,7 @@ async fn test_http3_streaming_decision_logic() {
             updated_at: chrono::Utc::now(),
         }],
         upstreams: vec![],
-        loaded_at: chrono::Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };
@@ -1650,7 +1651,7 @@ fn sticky_cookie_epoch() -> (
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![upstream],
-        loaded_at: chrono::Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };

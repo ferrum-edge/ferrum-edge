@@ -29,6 +29,7 @@ use ferrum_edge::grpc::mesh_server::MeshGrpcServer;
 use ferrum_edge::identity::TrustDomain;
 use ferrum_edge::modes::mesh::config::{MeshConfig, MeshService, TrustBundle, TrustBundleSet};
 use ferrum_edge::modes::mesh::slice::MeshSlice;
+use ferrum_edge::time_compat::UtcTimestamp;
 use ferrum_edge::xds::{LDS_TYPE_URL, XdsAdsServer};
 
 const TEST_JWT_SECRET: &str = "test-grpc-secret-multi-ns-2026-jeremyjpj";
@@ -172,7 +173,7 @@ fn mesh_service(name: &str, namespace: &str) -> MeshService {
 fn multi_tenant_mesh_config() -> GatewayConfig {
     GatewayConfig {
         version: "1".to_string(),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         mesh: Some(Box::new(MeshConfig {
             services: vec![
                 mesh_service("svc-tenant-a", "tenant-a"),
@@ -347,7 +348,7 @@ async fn start_xds_with_scope(
 async fn back_compat_single_scope_accepts_matching_namespace() {
     let mut cfg = GatewayConfig {
         version: "1".to_string(),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..Default::default()
     };
     cfg.proxies.push(proxy_in("p-1", "ferrum"));
@@ -391,7 +392,7 @@ async fn back_compat_single_scope_accepts_matching_namespace() {
 async fn back_compat_single_scope_rejects_mismatched_namespace() {
     let cfg = GatewayConfig {
         version: "1".to_string(),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..Default::default()
     };
     let (addr, handle) =
@@ -431,7 +432,7 @@ async fn back_compat_single_scope_rejects_mismatched_namespace() {
 async fn multi_ns_set_scope_partitions_broadcasts_per_namespace() {
     let mut cfg = GatewayConfig {
         version: "1".to_string(),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..Default::default()
     };
     cfg.proxies.push(proxy_in("p-prod-1", "prod"));
@@ -522,7 +523,7 @@ async fn multi_ns_set_scope_partitions_broadcasts_per_namespace() {
 async fn multi_ns_all_scope_filters_initial_snapshot_per_subscriber() {
     let mut cfg = GatewayConfig {
         version: "1".to_string(),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..Default::default()
     };
     cfg.proxies.push(proxy_in("p-a", "ns-a"));
@@ -570,7 +571,7 @@ async fn multi_ns_all_scope_filters_initial_snapshot_per_subscriber() {
 async fn multi_ns_set_scope_rejects_token_without_ns_by_default() {
     let cfg = GatewayConfig {
         version: "1".to_string(),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..Default::default()
     };
     let mut set = HashSet::new();
@@ -598,7 +599,7 @@ async fn multi_ns_set_scope_rejects_token_without_ns_by_default() {
 async fn multi_ns_rejects_malformed_ns_claim_before_snapshot() {
     let cfg = GatewayConfig {
         version: "1".to_string(),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         proxies: vec![proxy_in("p-prod", "prod")],
         ..Default::default()
     };
@@ -624,7 +625,7 @@ async fn multi_ns_rejects_malformed_ns_claim_before_snapshot() {
 async fn multi_ns_trust_bundles_are_not_sent_to_tenant_side_channel() {
     let cfg = GatewayConfig {
         version: "1".to_string(),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         proxies: vec![proxy_in("p-prod", "prod")],
         trust_bundles: Some(Box::new(test_trust_bundles())),
         ..Default::default()
@@ -780,7 +781,7 @@ async fn xds_rejects_missing_and_ambiguous_namespace_claims_in_multi_scope() {
 async fn require_claim_rejects_token_without_ns() {
     let cfg = GatewayConfig {
         version: "1".to_string(),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..Default::default()
     };
     let (addr, handle) = start_cp_with_scope(cfg, CpScope::Single("prod".to_string()), true).await;
@@ -811,7 +812,7 @@ async fn require_claim_rejects_token_without_ns() {
 async fn require_claim_accepts_matching_string_claim() {
     let cfg = GatewayConfig {
         version: "1".to_string(),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..Default::default()
     };
     let (addr, handle) = start_cp_with_scope(cfg, CpScope::Single("prod".to_string()), true).await;
@@ -846,7 +847,7 @@ async fn require_claim_accepts_matching_string_claim() {
 async fn array_claim_authorises_multiple_namespaces() {
     let cfg = GatewayConfig {
         version: "1".to_string(),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..Default::default()
     };
     let mut set = HashSet::new();
@@ -897,7 +898,7 @@ async fn array_claim_authorises_multiple_namespaces() {
 async fn claim_overrides_cp_scope_when_more_restrictive() {
     let cfg = GatewayConfig {
         version: "1".to_string(),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..Default::default()
     };
     let mut set = HashSet::new();
@@ -927,7 +928,7 @@ async fn claim_overrides_cp_scope_when_more_restrictive() {
 async fn get_full_config_filters_to_dp_namespace() {
     let mut cfg = GatewayConfig {
         version: "1".to_string(),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..Default::default()
     };
     cfg.proxies.push(proxy_in("p-prod", "prod"));
@@ -964,7 +965,7 @@ async fn get_full_config_filters_to_dp_namespace() {
 async fn get_full_config_applies_native_stream_admission() {
     let cfg = GatewayConfig {
         version: "1".to_string(),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..Default::default()
     };
     let (addr, handle) = start_cp_with_scope(cfg, CpScope::Single("prod".into()), false).await;

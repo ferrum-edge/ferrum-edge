@@ -33,6 +33,7 @@ use ferrum_edge::modes::mesh::config_consumer::stock_xds_client::{
 use ferrum_edge::modes::mesh::runtime::MeshRuntimeState;
 use ferrum_edge::modes::mesh::slice::MeshSliceRequest;
 use ferrum_edge::proxy::ProxyState;
+use ferrum_edge::time_compat::UtcTimestamp;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
 use std::io::Write;
@@ -106,7 +107,7 @@ fn mint_admin_token() -> String {
 fn build_mesh_admin_state(config_rejected: Arc<AtomicBool>) -> AdminState {
     let cfg = GatewayConfig {
         version: "1".to_string(),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         mesh: Some(Box::new(MeshConfig::default())),
         ..GatewayConfig::default()
     };

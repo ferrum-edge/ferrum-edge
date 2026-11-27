@@ -33,6 +33,7 @@ use ferrum_edge::request_epoch::RequestEpochStore;
 
 use crate::scaffolding::clients::dtls::DtlsClient;
 use crate::scaffolding::ports::{reserve_port, reserve_udp_port};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const PROXY_ID: &str = "dtls-accept-isolation";
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -266,7 +267,7 @@ async fn try_spawn_dtls_gateway(
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };

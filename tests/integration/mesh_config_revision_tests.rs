@@ -98,6 +98,7 @@ use ferrum_edge::modes::mesh::runtime::{
 };
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::plugins::mesh::prometheus_helpers::render_mesh_observability_metrics;
+use ferrum_edge::time_compat::UtcTimestamp;
 use kube::runtime::watcher::Event;
 
 const NODE_ID: &str = "dp-node-a";
@@ -364,7 +365,7 @@ fn full_load_consumer_config(namespace: &str, generation: &str, timestamp: i64) 
             created_at: Utc.timestamp_opt(timestamp, 0).single().expect("timestamp"),
             updated_at: Utc.timestamp_opt(timestamp, 0).single().expect("timestamp"),
         }],
-        loaded_at: Utc.timestamp_opt(timestamp, 0).single().expect("timestamp"),
+        loaded_at: UtcTimestamp::from_unix_timestamp(timestamp).expect("timestamp"),
         ..GatewayConfig::default()
     }
 }

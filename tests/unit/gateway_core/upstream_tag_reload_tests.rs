@@ -11,6 +11,7 @@
 use chrono::{DateTime, Utc};
 use ferrum_edge::config::types::*;
 use ferrum_edge::proxy::{ConfigApplyOutcome, ProxyState};
+use ferrum_edge::time_compat::UtcTimestamp;
 use std::collections::HashMap;
 
 fn ts(secs: i64) -> DateTime<Utc> {
@@ -151,7 +152,11 @@ fn config_with_mesh_tags(tags: &[(&str, &str)], stamp: DateTime<Utc>) -> Gateway
         consumers: Vec::new(),
         plugin_configs: Vec::new(),
         upstreams: vec![upstream],
-        loaded_at: stamp,
+        loaded_at: UtcTimestamp::from_unix_timestamp_nanos(
+            stamp.timestamp(),
+            stamp.timestamp_subsec_nanos(),
+        )
+        .unwrap(),
         known_namespaces: Vec::new(),
         ..GatewayConfig::default()
     };

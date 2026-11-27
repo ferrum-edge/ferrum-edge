@@ -1,4 +1,3 @@
-use chrono::Utc;
 use ferrum_edge::_test_support::admin_mtls_dns_admission_drop_should_release;
 use ferrum_edge::config::db_backend::{
     AtomicClearVerification, DbFailoverTopologyState, DeleteAllResourcesError, DeleteMode,
@@ -6,6 +5,7 @@ use ferrum_edge::config::db_backend::{
     classify_atomic_clear_verification, extract_db_hostname, extract_known_ids, redact_url,
 };
 use ferrum_edge::config::types::GatewayConfig;
+use ferrum_edge::time_compat::UtcTimestamp;
 use std::collections::HashMap;
 
 #[test]
@@ -566,7 +566,7 @@ fn incremental_result_is_empty_when_default() {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
         sequence_cursor: 0,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     };
     assert!(result.is_empty());
 }
@@ -612,7 +612,7 @@ fn incremental_result_not_empty_with_added_proxy() {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
         sequence_cursor: 0,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     };
     assert!(!result.is_empty());
 }
@@ -629,7 +629,7 @@ fn incremental_result_not_empty_with_removed_proxy_id() {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
         sequence_cursor: 0,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     };
     assert!(!result.is_empty());
 }
@@ -646,7 +646,7 @@ fn incremental_result_not_empty_with_removed_consumer() {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
         sequence_cursor: 0,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     };
     assert!(!result.is_empty());
 }
@@ -665,7 +665,7 @@ fn incremental_result_removed_consumer_ids_must_be_namespace_qualified() {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
         sequence_cursor: 1,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     };
     let mut value = serde_json::to_value(result).unwrap();
     value["removed_consumer_ids"] = serde_json::json!(["c1"]);
@@ -689,7 +689,7 @@ fn incremental_result_removed_consumer_ids_must_be_namespace_qualified() {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
         sequence_cursor: 1,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     })
     .unwrap();
     malformed["removed_consumer_ids"] = serde_json::json!([{"unexpected_key": 1}]);
@@ -708,7 +708,7 @@ fn incremental_result_not_empty_with_removed_plugin_config() {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
         sequence_cursor: 0,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     };
     assert!(!result.is_empty());
 }
@@ -725,7 +725,7 @@ fn incremental_result_not_empty_with_removed_upstream() {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![NamespacedResourceId::new("ferrum", "u1")],
         sequence_cursor: 0,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     };
     assert!(!result.is_empty());
 }
@@ -749,7 +749,7 @@ fn incremental_result_not_empty_with_added_consumer() {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
         sequence_cursor: 0,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     };
     assert!(!result.is_empty());
 }

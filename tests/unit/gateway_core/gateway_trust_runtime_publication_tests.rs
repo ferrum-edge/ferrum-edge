@@ -32,6 +32,7 @@ use ferrum_edge::proxy::mesh_trust_registry::{MeshTransportGate, MeshTransportKi
 use ferrum_edge::proxy::{
     ConfigApplyOutcome, DatabaseGatewayTrustInstall, GatewayTrustCommit, ProxyState,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const TEST_NAMESPACE: &str = "ferrum";
 
@@ -859,7 +860,7 @@ fn empty_delta() -> ferrum_edge::config::db_loader::IncrementalResult {
         added_or_modified_upstreams: Vec::new(),
         removed_upstream_ids: Vec::new(),
         sequence_cursor: 0,
-        poll_timestamp: chrono::DateTime::from_timestamp(1_700_000_000, 0)
+        poll_timestamp: UtcTimestamp::from_unix_timestamp(1_700_000_000)
             .expect("valid test timestamp"),
     }
 }

@@ -20,7 +20,6 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bytes::Bytes;
-use chrono::Utc;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -35,6 +34,7 @@ use tokio::net::{TcpListener, TcpStream};
 use ferrum_edge::config::types::{GatewayConfig, Proxy};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::proxy::{ProxyState, start_proxy_listener_with_bound_listener};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const SHORT: u64 = 1;
 const LONG: u64 = 30;
@@ -99,7 +99,7 @@ impl ProxyHarness {
             consumers: vec![],
             plugin_configs: vec![],
             upstreams: vec![],
-            loaded_at: Utc::now(),
+            loaded_at: UtcTimestamp::now(),
             known_namespaces: Vec::new(),
             frontend_tls_cert_path: None,
             frontend_tls_key_path: None,

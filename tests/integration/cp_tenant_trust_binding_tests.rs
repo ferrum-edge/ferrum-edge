@@ -48,6 +48,7 @@ use ferrum_edge::grpc::mesh_registry::MeshNodeRegistry;
 use ferrum_edge::grpc::mesh_server::MeshGrpcServer;
 use ferrum_edge::identity::TrustDomain;
 use ferrum_edge::modes::mesh::config::{MeshConfig, MeshService, TrustBundle, TrustBundleSet};
+use ferrum_edge::time_compat::UtcTimestamp;
 use ferrum_edge::xds::proto::aggregated_discovery_service_client::AggregatedDiscoveryServiceClient;
 use ferrum_edge::xds::proto::{DeltaDiscoveryRequest, DiscoveryRequest, Node};
 use ferrum_edge::xds::{LDS_TYPE_URL, XdsAdsServer};
@@ -201,7 +202,7 @@ fn mint_with_nbf(
 fn tenant_marked_config() -> GatewayConfig {
     GatewayConfig {
         version: "1".to_string(),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: vec![TENANT_A.to_string(), TENANT_B.to_string()],
         mesh: Some(Box::new(MeshConfig {
             services: vec![

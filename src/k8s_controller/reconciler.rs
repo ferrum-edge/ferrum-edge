@@ -2666,7 +2666,10 @@ mod tests {
             json!({"limits": [{"scope": "default", "window_seconds": 60, "max_requests": 100}]}),
         ));
         let mut new_config = old_config.clone();
-        new_config.loaded_at = old_config.loaded_at + ChronoDuration::seconds(5);
+        new_config.loaded_at = old_config
+            .loaded_at
+            .checked_add(::time::SignedDuration::seconds(5))
+            .unwrap();
         new_config.plugin_configs[0].updated_at =
             old_config.plugin_configs[0].updated_at + ChronoDuration::seconds(5);
 

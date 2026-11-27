@@ -24,6 +24,7 @@ use ferrum_edge::modes::mesh::node_waypoint::{
     NodeWaypointIdentity, NodeWaypointIdentityResolver, parse_pod_uid,
 };
 use ferrum_edge::proxy::ProxyState;
+use ferrum_edge::time_compat::UtcTimestamp;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
@@ -79,7 +80,7 @@ fn make_admin_state(jwt: JwtManager, with_resolver: bool) -> AdminState {
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };

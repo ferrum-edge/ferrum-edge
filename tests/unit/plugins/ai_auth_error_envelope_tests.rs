@@ -1,6 +1,5 @@
 //! Authentication rejects on AI gateway routes use the OpenAI nested envelope.
 
-use chrono::Utc;
 use ferrum_edge::ConsumerIndex;
 use ferrum_edge::config::types::{
     AuthMode, GatewayConfig, PluginConfig, PluginScope, default_namespace,
@@ -17,6 +16,7 @@ use std::sync::Arc;
 
 use super::plugin_utils::{create_test_consumer, create_test_context};
 use super::plugin_utils::{make_plugin_config, make_proxy};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 fn ai_federation_plugin_config(proxy_id: &str) -> PluginConfig {
     let mut plugin = make_plugin_config(
@@ -44,7 +44,7 @@ fn gateway_with_plugins(proxy_id: &str, plugin_configs: Vec<PluginConfig>) -> Ga
         consumers: vec![],
         plugin_configs,
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     }
@@ -90,7 +90,7 @@ fn plugin_cache_sets_openai_auth_error_envelope_flag_for_ai_plugins() {
             true,
         )],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };

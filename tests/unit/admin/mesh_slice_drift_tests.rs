@@ -16,6 +16,7 @@ use ferrum_edge::grpc::mesh_slice_drift::{
 };
 use ferrum_edge::modes::mesh::config::{AppProtocol, MeshConfig, MeshService, ServicePort};
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 fn at(second: u32) -> chrono::DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 8, 2, 12, 0, second).unwrap()
@@ -486,7 +487,9 @@ fn service(name: &str, namespace: &str) -> MeshService {
 
 fn projected_config(second: u32, services: Vec<MeshService>) -> GatewayConfig {
     GatewayConfig {
-        loaded_at: at(second),
+        loaded_at: format!("2026-08-02T12:00:{second:02}Z")
+            .parse::<UtcTimestamp>()
+            .unwrap(),
         mesh: Some(Box::new(MeshConfig {
             services,
             ..MeshConfig::default()

@@ -44,6 +44,7 @@ use ferrum_edge::modes::mesh::config_consumer::native_client::{
 use ferrum_edge::modes::mesh::config_consumer::stream_lifecycle::MeshStreamTimings;
 use ferrum_edge::modes::mesh::runtime::MeshRuntimeState;
 use ferrum_edge::proxy::ProxyState;
+use ferrum_edge::time_compat::UtcTimestamp;
 use ferrum_edge::xds::{LDS_TYPE_URL, XdsAdsServer};
 
 const TEST_JWT_SECRET: &str = "test-grpc-secret-key";
@@ -213,7 +214,7 @@ fn create_test_config(proxy_count: usize) -> GatewayConfig {
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     }
@@ -257,7 +258,7 @@ fn test_root_ca_der(common_name: &str) -> Vec<u8> {
 fn create_test_mesh_config() -> GatewayConfig {
     let trust_domain = TrustDomain::new("cluster.local").unwrap();
     let mut config = GatewayConfig {
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     config.mesh = Some(Box::new(MeshConfig {
@@ -752,7 +753,7 @@ async fn test_dp_stores_gateway_trust_bundles_from_delta_side_channel() {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
         sequence_cursor: 0,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     };
     let trust_bundles = create_test_trust_bundles();
     let version = delta.poll_timestamp.to_rfc3339();
@@ -831,7 +832,7 @@ async fn invalid_trust_delta_terminates_without_mutating_last_known_good_generat
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
         sequence_cursor: 0,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     };
     let invalid_trust = TrustBundleSet {
         local: TrustBundle {
@@ -927,7 +928,7 @@ async fn test_dp_rejects_gateway_trust_bundles_from_rejected_delta() {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
         sequence_cursor: 0,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     };
     let trust_bundles = create_test_trust_bundles();
     let version = delta.poll_timestamp.to_rfc3339();
@@ -949,7 +950,7 @@ async fn test_dp_rejects_gateway_trust_bundles_from_rejected_delta() {
     authoritative
         .proxies
         .push(create_test_proxy("proxy-conflict", "/api-fixed"));
-    authoritative.loaded_at = Utc::now();
+    authoritative.loaded_at = UtcTimestamp::now();
     config_arc.store(Arc::new(authoritative));
     let partial_fix = IncrementalResult {
         added_or_modified_proxies: vec![create_test_proxy("proxy-conflict", "/api-fixed")],
@@ -961,7 +962,7 @@ async fn test_dp_rejects_gateway_trust_bundles_from_rejected_delta() {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
         sequence_cursor: 0,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     };
     let partial_version = partial_fix.poll_timestamp.to_rfc3339();
     CpGrpcServer::broadcast_delta(&update_tx, &partial_fix, &partial_version);
@@ -1101,7 +1102,7 @@ async fn test_mesh_subscribe_receives_initial_mesh_slice() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mesh_subscribe_waypoint_name_narrows_initial_slice() {
     let mut cp_config = GatewayConfig {
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     cp_config.mesh = Some(Box::new(MeshConfig {
@@ -3037,7 +3038,7 @@ async fn test_dp_applies_delta_update_adding_proxy() {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
         sequence_cursor: 0,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     };
     let version = delta.poll_timestamp.to_rfc3339();
     CpGrpcServer::broadcast_delta(&update_tx, &delta, &version);
@@ -3115,7 +3116,7 @@ async fn test_dp_applies_delta_update_removing_proxy() {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
         sequence_cursor: 0,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     };
     let version = delta.poll_timestamp.to_rfc3339();
     CpGrpcServer::broadcast_delta(&update_tx, &delta, &version);
@@ -3190,7 +3191,7 @@ async fn test_dp_applies_delta_then_full_snapshot() {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
         sequence_cursor: 0,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     };
     let version = delta.poll_timestamp.to_rfc3339();
     CpGrpcServer::broadcast_delta(&update_tx, &delta, &version);
@@ -3286,7 +3287,7 @@ async fn test_dp_keeps_last_good_config_after_unparseable_delta_shape() {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
         sequence_cursor: 0,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     })
     .unwrap();
     malformed_delta["removed_consumer_ids"] = serde_json::json!([{"unexpected_key": 1}]);
@@ -3317,7 +3318,7 @@ async fn test_dp_keeps_last_good_config_after_unparseable_delta_shape() {
     recovered_config
         .proxies
         .push(create_test_proxy("proxy-after", "/api-after"));
-    recovered_config.loaded_at = Utc::now();
+    recovered_config.loaded_at = UtcTimestamp::now();
     config_arc.store(Arc::new(recovered_config));
 
     let recovered = timeout(Duration::from_secs(5), async {
@@ -3354,7 +3355,7 @@ async fn test_incremental_result_serde_roundtrip() {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![NamespacedResourceId::new("ferrum", "upstream-x")],
         sequence_cursor: 0,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     };
 
     let json = serde_json::to_string(&original).expect("Failed to serialize IncrementalResult");
@@ -3434,7 +3435,7 @@ async fn test_dp_applies_delta_modifying_proxy() {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
         sequence_cursor: 0,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     };
     let version = delta.poll_timestamp.to_rfc3339();
     CpGrpcServer::broadcast_delta(&update_tx, &delta, &version);
@@ -3522,7 +3523,7 @@ async fn test_dp_applies_delta_with_mixed_operations() {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
         sequence_cursor: 0,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     };
     let version = delta.poll_timestamp.to_rfc3339();
     CpGrpcServer::broadcast_delta(&update_tx, &delta, &version);
@@ -3844,7 +3845,7 @@ async fn test_dp_applies_delta_adding_upstream() {
         )],
         removed_upstream_ids: vec![],
         sequence_cursor: 0,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     };
     let version = delta.poll_timestamp.to_rfc3339();
     CpGrpcServer::broadcast_delta(&update_tx, &delta, &version);
@@ -3915,7 +3916,7 @@ async fn test_dp_applies_delta_removing_upstream() {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![NamespacedResourceId::new("ferrum", "u1")],
         sequence_cursor: 0,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     };
     let version = delta.poll_timestamp.to_rfc3339();
     CpGrpcServer::broadcast_delta(&update_tx, &delta, &version);
@@ -3983,7 +3984,7 @@ async fn test_dp_applies_delta_modifying_upstream_targets() {
         added_or_modified_upstreams: vec![modified_upstream],
         removed_upstream_ids: vec![],
         sequence_cursor: 0,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     };
     let version = delta.poll_timestamp.to_rfc3339();
     CpGrpcServer::broadcast_delta(&update_tx, &delta, &version);
@@ -4045,7 +4046,7 @@ async fn test_dp_applies_delta_adding_consumer() {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
         sequence_cursor: 0,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     };
     let version = delta.poll_timestamp.to_rfc3339();
     CpGrpcServer::broadcast_delta(&update_tx, &delta, &version);
@@ -4116,7 +4117,7 @@ async fn test_dp_applies_delta_removing_consumer() {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
         sequence_cursor: 0,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     };
     let version = delta.poll_timestamp.to_rfc3339();
     CpGrpcServer::broadcast_delta(&update_tx, &delta, &version);
@@ -4191,7 +4192,7 @@ async fn test_cp_broadcasts_delta_to_multiple_dps() {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
         sequence_cursor: 0,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     };
     let version = delta.poll_timestamp.to_rfc3339();
     CpGrpcServer::broadcast_delta(&update_tx, &delta, &version);
@@ -4277,7 +4278,7 @@ async fn test_dp_applies_delta_with_all_entity_types() {
         added_or_modified_upstreams: vec![modified_upstream],
         removed_upstream_ids: vec![],
         sequence_cursor: 0,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     };
     let version = delta.poll_timestamp.to_rfc3339();
     CpGrpcServer::broadcast_delta(&update_tx, &delta, &version);
@@ -4448,9 +4449,11 @@ async fn test_dp_recovers_from_broadcast_channel_overflow() {
 /// observe `Lagged` with older distinct deltas still retained.
 #[tokio::test]
 async fn lag_recovery_snapshot_is_not_followed_by_older_retained_deltas() {
-    let base = Utc::now();
+    let base = UtcTimestamp::now();
     let mut initial_config = create_test_config(1);
-    initial_config.loaded_at = base - chrono::Duration::seconds(60);
+    initial_config.loaded_at = base
+        .checked_sub(::time::SignedDuration::seconds(60))
+        .unwrap();
     let (addr, update_tx, config_arc, _server_handle) =
         start_test_cp_server_with_capacity(initial_config, 2).await;
 
@@ -4493,7 +4496,9 @@ async fn lag_recovery_snapshot_is_not_followed_by_older_retained_deltas() {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
         sequence_cursor: 0,
-        poll_timestamp: base - chrono::Duration::seconds(50 - index),
+        poll_timestamp: base
+            .checked_sub(::time::SignedDuration::seconds(50 - index))
+            .unwrap(),
     };
 
     // The CP has committed every flood delta (t1 < t2 < ...) and then a
@@ -4505,7 +4510,9 @@ async fn lag_recovery_snapshot_is_not_followed_by_older_retained_deltas() {
             &format!("/flood-{index}"),
         ));
     }
-    recovered_config.loaded_at = base - chrono::Duration::seconds(30);
+    recovered_config.loaded_at = base
+        .checked_sub(::time::SignedDuration::seconds(30))
+        .unwrap();
     config_arc.store(Arc::new(recovered_config));
 
     // No await between sends: the 2-slot channel overflows and the two newest
@@ -4542,7 +4549,9 @@ async fn lag_recovery_snapshot_is_not_followed_by_older_retained_deltas() {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
         sequence_cursor: 0,
-        poll_timestamp: base - chrono::Duration::seconds(10),
+        poll_timestamp: base
+            .checked_sub(::time::SignedDuration::seconds(10))
+            .unwrap(),
     };
     let fresh_version = fresh.poll_timestamp.to_rfc3339();
     let receivers = update_tx.receiver_count();
@@ -4586,7 +4595,7 @@ async fn lag_recovery_snapshot_is_not_followed_by_older_retained_deltas() {
 /// deliver it, and the DP accepts it as a same-source snapshot.
 #[tokio::test]
 async fn snapshot_published_after_a_clock_step_back_is_still_delivered() {
-    let base = Utc::now();
+    let base = UtcTimestamp::now();
     let mut initial_config = create_test_config(1);
     initial_config.loaded_at = base;
     let (addr, update_tx, config_arc, _server_handle) =
@@ -4619,7 +4628,9 @@ async fn snapshot_published_after_a_clock_step_back_is_still_delivered() {
     stepped
         .proxies
         .push(create_test_proxy("after-clock-step", "/after-clock-step"));
-    stepped.loaded_at = base - chrono::Duration::seconds(10);
+    stepped.loaded_at = base
+        .checked_sub(::time::SignedDuration::seconds(10))
+        .unwrap();
     config_arc.store(Arc::new(stepped.clone()));
     assert!(
         CpGrpcServer::broadcast_update(&update_tx, &stepped),
@@ -5394,7 +5405,7 @@ fn add_proxy_delta(proxy: Proxy) -> IncrementalResult {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
         sequence_cursor: 1,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     }
 }
 
@@ -5415,7 +5426,7 @@ async fn dp_blackholed_configsync_stream_fails_over_to_fallback_cp() {
     let (primary_addr, _primary_tx, _primary_handle) = start_test_cp_server(primary_config).await;
 
     let mut fallback_config = create_test_config(3);
-    fallback_config.loaded_at = Utc::now();
+    fallback_config.loaded_at = UtcTimestamp::now();
     let (fallback_addr, _fallback_tx, _fallback_handle) =
         start_test_cp_server(fallback_config).await;
 
@@ -5524,7 +5535,7 @@ async fn dp_snapshot_apply_is_never_detached_by_a_lifecycle_select_arm() {
     // A deliberately large snapshot so the apply has real work to do, pushed
     // immediately before shutdown so both land in the same select! iteration.
     let mut large = create_test_config(400);
-    large.loaded_at = Utc::now();
+    large.loaded_at = UtcTimestamp::now();
     CpGrpcServer::broadcast_update(&update_tx, &large);
     let _ = shutdown_tx.send(true);
 
@@ -5558,14 +5569,16 @@ async fn dp_failover_refuses_older_snapshot_and_preserves_newer_config() {
     // stale CP's next delta can never apply against newer config), and keep
     // serving the newer active config.
     let mut newer = create_test_config(3);
-    newer.loaded_at = Utc::now();
+    newer.loaded_at = UtcTimestamp::now();
     // Severable: aborting a `start_test_cp_server` handle leaves the DP's
     // established stream alive, so the DP would never fail over and every
     // assertion below would hold vacuously.
     let mut newer_cp = start_severable_test_cp_server(newer).await;
 
     let mut older = create_test_config(1);
-    older.loaded_at = Utc::now() - chrono::Duration::hours(6);
+    older.loaded_at = UtcTimestamp::now()
+        .checked_sub(::time::SignedDuration::hours(6))
+        .unwrap();
     let (older_addr, older_tx, _older_handle) = start_test_cp_server(older).await;
 
     let proxy_state = create_test_proxy_state();
@@ -5653,7 +5666,7 @@ async fn dp_failover_refuses_older_snapshot_and_preserves_newer_config() {
 ///
 /// The freshness fence reads the body stamp, so tests that exercise it must be
 /// able to place a delta before or after the applied watermark.
-fn add_proxy_delta_at(proxy: Proxy, poll_timestamp: chrono::DateTime<Utc>) -> IncrementalResult {
+fn add_proxy_delta_at(proxy: Proxy, poll_timestamp: UtcTimestamp) -> IncrementalResult {
     IncrementalResult {
         poll_timestamp,
         ..add_proxy_delta(proxy)
@@ -5783,10 +5796,13 @@ async fn dp_refuses_stale_delta_after_equivalent_older_failover_snapshot_takes_t
     // the config that superseded it. The delta must be refused before
     // `apply_incremental` and the stream terminated.
     let mut newer = create_test_config(3);
-    newer.loaded_at = Utc::now();
+    newer.loaded_at = UtcTimestamp::now();
     newer.trust_bundles = Some(Box::new(create_test_trust_bundles()));
     let mut equivalent_older = newer.clone();
-    equivalent_older.loaded_at = newer.loaded_at - chrono::Duration::hours(6);
+    equivalent_older.loaded_at = newer
+        .loaded_at
+        .checked_sub(::time::SignedDuration::hours(6))
+        .unwrap();
     // Severable: the primary must genuinely go away. Aborting a
     // `start_test_cp_server` handle only drops tonic's accept loop — the
     // already-established ConfigSync stream is served by a detached
@@ -5863,7 +5879,12 @@ async fn dp_refuses_stale_delta_after_equivalent_older_failover_snapshot_takes_t
     // The ABA delta: stamped inside the history the applied authority already
     // superseded, and structurally valid, so only the freshness fence stops it.
     let rollback = create_test_proxy("aba-rollback", "/aba");
-    let stale = add_proxy_delta_at(rollback, Utc::now() - chrono::Duration::hours(3));
+    let stale = add_proxy_delta_at(
+        rollback,
+        UtcTimestamp::now()
+            .checked_sub(::time::SignedDuration::hours(3))
+            .unwrap(),
+    );
     assert!(
         stale.poll_timestamp < primary_watermark,
         "ABA candidate must predate the monotonic authority watermark"
@@ -5928,7 +5949,7 @@ async fn dp_fences_a_stale_delta_then_still_applies_a_fresh_one() {
     // an authoritative base, and ordinary forward-progress deltas keep applying.
     // Without the second half, a fence that rejected everything would pass.
     let mut base = create_test_config(1);
-    base.loaded_at = Utc::now();
+    base.loaded_at = UtcTimestamp::now();
     let (addr, update_tx, _server_handle) = start_test_cp_server(base).await;
 
     let proxy_state = create_test_proxy_state();
@@ -5964,7 +5985,12 @@ async fn dp_fences_a_stale_delta_then_still_applies_a_fresh_one() {
     let watermark = proxy_state.config.load().loaded_at;
 
     let rolled_back = create_test_proxy("stale-delta", "/stale-delta");
-    let stale = add_proxy_delta_at(rolled_back, watermark - chrono::Duration::hours(1));
+    let stale = add_proxy_delta_at(
+        rolled_back,
+        watermark
+            .checked_sub(::time::SignedDuration::hours(1))
+            .unwrap(),
+    );
     // The accepted snapshot above proves a subscription is live, so this frame
     // must be queued to it; a dropped broadcast would make the negative
     // assertion below vacuous.
@@ -5994,7 +6020,7 @@ async fn dp_fences_a_stale_delta_then_still_applies_a_fresh_one() {
     let mut applied = false;
     while std::time::Instant::now() < deadline {
         let forward = create_test_proxy("fresh-delta", "/fresh-delta");
-        let fresh = add_proxy_delta_at(forward, Utc::now());
+        let fresh = add_proxy_delta_at(forward, UtcTimestamp::now());
         let _ = send_delta(&update_tx, &fresh);
         if wait_for_proxy_id(&proxy_state, "fresh-delta", Duration::from_millis(500)).await {
             applied = true;
@@ -6312,7 +6338,7 @@ async fn delta_broadcast_body_carries_namespace_qualified_removal_keys() {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![NamespacedResourceId::new("ferrum", "upstream-gone")],
         sequence_cursor: 3,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     };
     let (_addr, update_tx, _server_handle) = start_test_cp_server(create_test_config(1)).await;
     let mut receiver = update_tx.subscribe();
@@ -8222,7 +8248,7 @@ mod configsync_size_bounds {
             added_or_modified_upstreams: vec![],
             removed_upstream_ids: vec![],
             sequence_cursor: 0,
-            poll_timestamp: Utc::now(),
+            poll_timestamp: UtcTimestamp::now(),
         }
     }
 

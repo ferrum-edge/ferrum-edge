@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::io::Write as _;
 
 use super::plugin_utils::{assert_continue, assert_reject};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 fn content_type_headers(content_type: &str) -> HashMap<String, String> {
     HashMap::from([("content-type".to_string(), content_type.to_string())])
@@ -898,7 +899,7 @@ fn non_proxy_scoped_validators_are_refused_by_shared_config_validation() {
         let config = GatewayConfig {
             version: "1".to_string(),
             plugin_configs: vec![plugin],
-            loaded_at: Utc::now(),
+            loaded_at: UtcTimestamp::now(),
             ..Default::default()
         };
         let load_errors = config

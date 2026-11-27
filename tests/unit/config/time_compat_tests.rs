@@ -112,6 +112,35 @@ fn rfc3339_formatting_matches_chrono_byte_for_byte() {
 }
 
 #[test]
+fn chrono_display_and_default_match_chrono_byte_for_byte() {
+    for (secs, nanos) in representative_instants() {
+        let (ts, ch) = pair_for(secs, nanos);
+        assert_eq!(
+            ts.to_chrono_display(),
+            ch.to_string(),
+            "to_chrono_display mismatch for ({secs}, {nanos})"
+        );
+        assert_eq!(
+            format!("{ts:?}"),
+            format!("{ch:?}"),
+            "Debug mismatch for ({secs}, {nanos})"
+        );
+    }
+    for year in [-9999, -1, 0, 1, 9999] {
+        let date = Date::from_calendar_date(year, Month::December, 31).unwrap();
+        let ts = UtcTimestamp::from_utc_date_time(date, Time::MIDNIGHT);
+        let ch = DateTime::<Utc>::from_timestamp(ts.unix_timestamp(), 0).unwrap();
+        assert_eq!(ts.to_chrono_display(), ch.to_string(), "year {year}");
+    }
+
+    assert_eq!(UtcTimestamp::default(), UtcTimestamp::UNIX_EPOCH);
+    assert_eq!(
+        UtcTimestamp::default().to_rfc3339(),
+        DateTime::<Utc>::default().to_rfc3339()
+    );
+}
+
+#[test]
 fn serde_json_and_yaml_match_chrono_byte_for_byte() {
     for (secs, nanos) in representative_instants() {
         let (ts, ch) = pair_for(secs, nanos);

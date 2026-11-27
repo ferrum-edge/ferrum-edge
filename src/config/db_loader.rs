@@ -59,6 +59,7 @@ use crate::config::validation_pipeline::{
 };
 use crate::fips::approved::Sha256;
 use crate::proxy::stream_match::StreamMatchCriteria;
+use crate::time_compat::UtcTimestamp;
 use crate::util::deserialization as config_decode;
 use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
@@ -1573,7 +1574,7 @@ impl DatabaseStore {
             version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
             proxies,
             plugin_configs,
-            loaded_at: Utc::now(),
+            loaded_at: UtcTimestamp::now(),
             ..Default::default()
         };
         candidate.normalize_fields();
@@ -2757,7 +2758,7 @@ impl DatabaseStore {
     ) -> Result<GatewayConfig, anyhow::Error> {
         let start = Instant::now();
         // Config version stamp for this load; captured before the queries run.
-        let loaded_at = Utc::now();
+        let loaded_at = UtcTimestamp::now();
         let mut tx = self.pool().begin().await?;
         self.configure_full_load_snapshot(&mut tx).await?;
 
@@ -2975,7 +2976,7 @@ impl DatabaseStore {
         namespace: &str,
     ) -> Result<GatewayConfig, anyhow::Error> {
         let start = Instant::now();
-        let loaded_at = Utc::now();
+        let loaded_at = UtcTimestamp::now();
         // Authoritative read: the primary pool, not `admin_read_pool()`.
         let mut tx = self.pool().begin().await?;
         self.configure_full_load_snapshot(&mut tx).await?;
@@ -3031,7 +3032,7 @@ impl DatabaseStore {
         namespace: &str,
     ) -> Result<GatewayConfig, anyhow::Error> {
         let start = Instant::now();
-        let loaded_at = Utc::now();
+        let loaded_at = UtcTimestamp::now();
         let mut tx = self.pool().begin().await?;
         self.configure_full_load_snapshot(&mut tx).await?;
         let purpose = FullLoadPurpose::AdmissionValidation;
@@ -3061,7 +3062,7 @@ impl DatabaseStore {
         namespace: &str,
     ) -> Result<GatewayConfig, anyhow::Error> {
         let start = Instant::now();
-        let loaded_at = Utc::now();
+        let loaded_at = UtcTimestamp::now();
         let mut tx = self.pool().begin().await?;
         self.configure_full_load_snapshot(&mut tx).await?;
         let purpose = FullLoadPurpose::AdmissionValidation;
@@ -3095,7 +3096,7 @@ impl DatabaseStore {
         scope: &PolicyGraphScope,
     ) -> Result<GatewayConfig, anyhow::Error> {
         let start = Instant::now();
-        let loaded_at = Utc::now();
+        let loaded_at = UtcTimestamp::now();
         let purpose = FullLoadPurpose::AdmissionValidation;
         let operation = purpose.operation();
         let mut tx = self.pool().begin().await?;
@@ -6976,7 +6977,7 @@ impl DatabaseStore {
         after_sequence: u64,
     ) -> Result<IncrementalResult, anyhow::Error> {
         let start = Instant::now();
-        let poll_timestamp = Utc::now();
+        let poll_timestamp = UtcTimestamp::now();
         // Run change-log cursor checks, change-log reads, and every point-load
         // (including `proxies` + `proxy_plugins`) inside one REPEATABLE READ
         // snapshot transaction so a concurrent delete/update cannot produce a

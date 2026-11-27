@@ -28,6 +28,7 @@ use ferrum_edge::service_discovery::{
     DiscoverySnapshot, ServiceDiscoverer, ServiceDiscoveryManager,
     spawn_supervised_discovery_task_for_test,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 
 /// The health registry and the Prometheus registry are process-global.
 static REGISTRY_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -2707,7 +2708,7 @@ async fn apply_passive_reload(state: &ferrum_edge::proxy::ProxyState, incrementa
                 added_or_modified_upstreams: vec![],
                 removed_upstream_ids: vec![],
                 sequence_cursor: 0,
-                poll_timestamp: chrono::Utc::now(),
+                poll_timestamp: UtcTimestamp::now(),
             })
             .await
     } else {
