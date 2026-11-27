@@ -2411,8 +2411,10 @@ else:
 ' "$XDST/xremote"
 }
 
-# Poll the status until it starts with `want` ("accepted" / "refused") or the
-# budget runs out; echoes the last observation.
+# Poll the status until it starts with `want` ("accepted destinations=" /
+# "refused reason=RefNotPermitted") or the budget runs out; echoes the last
+# observation. The positive prefix never matches the explicit
+# "accepted-without-destination" diagnostic.
 xns_wait_status() {
   local want="$1" verdict="status-never-read" _
   for _ in $(seq 1 90); do
@@ -2568,10 +2570,10 @@ probe_virtual_service_cross_namespace() {
   fi
 
   local accepted
-  accepted="$(xns_wait_status accepted)"
+  accepted="$(xns_wait_status "accepted destinations=")"
   log "cross-namespace VirtualService status: $accepted"
   printf 'status (granted): %s\n' "$accepted" >>"$diagnostics"
-  if [[ "$accepted" != accepted* ]]; then
+  if [[ "$accepted" != "accepted destinations="* ]]; then
     record_xns_failure_all "status=$accepted" "$diagnostics"
     return 1
   fi
@@ -2619,7 +2621,7 @@ probe_virtual_service_cross_namespace() {
   local w_local w_remote w_other w_issued
   if timeout 60 kubectl --context "$CONTEXT" -n "$XDST" delete \
     "referencegrants.gateway.networking.k8s.io/$XNS_GRANT_NAME" >>"$diagnostics" 2>&1; then
-    refused="$(xns_wait_status refused)"
+    refused="$(xns_wait_status "refused reason=RefNotPermitted")"
   else
     refused="grant-delete-failed"
   fi
@@ -2636,11 +2638,13 @@ probe_virtual_service_cross_namespace() {
   w_summary="status=$refused withdrawn n=$XNS_WITHDRAWN_REQUESTS issued=$w_issued leg_answers=$(( ${w_local:-0} + ${w_remote:-0} )) misses=$w_other ordinary-xlocal=${local_ok//$'\t'/ }"
   printf 'withdrawn %s\n' "$w_summary" >>"$diagnostics"
   log "cross-namespace withdrawal: $w_summary"
-  if [[ "$refused" == refused* && "$w_issued" == "$XNS_WITHDRAWN_REQUESTS" \
-    && "$w_local" == "0" && "$w_remote" == "0" ]] \
-    && [[ "$(printf '%s' "$local_ok" | cut -f1)" == "0" \
-      && "$(printf '%s' "$local_ok" | cut -f2)" == "200" \
-      && "$(printf '%s' "$local_ok" | cut -f3)" == "$XNS_LOCAL_MARKER" ]]; then
+  local local_rc local_status local_body
+  local_rc="$(printf '%s' "$local_ok" | cut -f1)"
+  local_status="$(printf '%s' "$local_ok" | cut -f2)"
+  local_body="$(printf '%s' "$local_ok" | cut -f3)"
+  if [[ "$refused" == "refused reason=RefNotPermitted" && "$w_issued" == "$XNS_WITHDRAWN_REQUESTS" \
+    && "$w_local" == "0" && "$w_remote" == "0" && "$local_rc" == "0" \
+    && "$local_status" == "200" && "$local_body" == "$XNS_LOCAL_MARKER" ]]; then
     withdrawn_ok=true
   fi
 
