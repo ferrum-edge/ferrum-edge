@@ -22,7 +22,6 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use chrono::Utc;
 use ferrum_edge::admin::jwt_auth::{JwtConfig, JwtManager};
 use ferrum_edge::config::EnvConfig;
 use ferrum_edge::config::env_config::OperatingMode;
@@ -36,6 +35,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::scaffolding::ports::reserve_colocated_tcp_udp;
+use ferrum_edge::time_compat::UtcTimestamp;
 
 /// Run an in-process trusted-projection regression on the same 8 MiB stack
 /// budget configured for production Tokio workers in `src/main.rs`.
@@ -255,14 +255,14 @@ impl TrustedProjectedGateway {
     }
 
     pub fn admin_token(&self) -> String {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let claims = json!({
             "iss": self.jwt_issuer,
             "sub": "test-admin",
             "role": "admin",
-            "iat": now.timestamp(),
-            "nbf": now.timestamp(),
-            "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
+            "iat": now.unix_timestamp(),
+            "nbf": now.unix_timestamp(),
+            "exp": (now.checked_add(::time::SignedDuration::seconds(3600)).unwrap()).unix_timestamp(),
             "jti": Uuid::new_v4().to_string(),
         });
         let header = Header::new(jsonwebtoken::Algorithm::HS256);

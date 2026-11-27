@@ -802,9 +802,7 @@ async fn hbone_connect_with_body_auth_plugin_is_rejected() {
 
     let method = "CONNECT";
     let path = "/";
-    let date = chrono::Utc::now()
-        .format("%a, %d %b %Y %H:%M:%S GMT")
-        .to_string();
+    let date = httpdate::fmt_http_date(std::time::SystemTime::now());
     let authorization = hmac_v2_authorization(
         method,
         path,

@@ -30,6 +30,7 @@ use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::config::{EnvConfig, OperatingMode};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::proxy::client_ip::TrustedProxies;
+use ferrum_edge::time_compat::UtcTimestamp;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use reqwest::Method;
 use serde_json::{Value, json};
@@ -105,14 +106,14 @@ fn viewer_token(additional: Value) -> String {
 
 /// Mint an admin JWT signed with `secret`, `additional` merged into its claims.
 fn signed_token(secret: &str, role: &str, additional: Value) -> String {
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let mut claims = json!({
         "iss": JWT_ISSUER,
         "sub": "ns-claim-global-route-test",
         "role": role,
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(600)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(600)).unwrap()).unix_timestamp(),
         "jti": uuid::Uuid::new_v4().to_string(),
     });
     if let Some(additional) = additional.as_object() {

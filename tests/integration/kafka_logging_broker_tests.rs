@@ -14,10 +14,10 @@
 
 use std::time::Duration;
 
-use chrono::Utc;
 use ferrum_edge::plugins::kafka_logging::KafkaLogging;
 use ferrum_edge::plugins::utils::PluginHttpClient;
 use ferrum_edge::plugins::{Plugin, TransactionSummary};
+use ferrum_edge::time_compat::UtcTimestamp;
 use serde_json::json;
 use tokio::time::{Instant, sleep};
 
@@ -34,7 +34,7 @@ fn summary() -> TransactionSummary {
         // `log_with_mirror` from the authoritative RequestContext.
         plugin_trigger_decisions: Default::default(),
         namespace: "ferrum".to_string(),
-        timestamp_received: Utc::now().to_rfc3339(),
+        timestamp_received: UtcTimestamp::now().to_rfc3339(),
         client_ip: "203.0.113.10".to_string(),
         consumer_username: None,
         principal_origin: None,

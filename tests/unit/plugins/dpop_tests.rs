@@ -19,6 +19,7 @@ use ferrum_edge::plugins::utils::dpop::{
     MAX_DPOP_CLOCK_SKEW_SECS, canonical_htu, canonical_htu_from_url, jwk_thumbprint_sha256,
 };
 use ferrum_edge::plugins::utils::replay_authority::ReplayDomain;
+use ferrum_edge::time_compat::UtcTimestamp;
 use jsonwebtoken::jwk::Jwk;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde_json::{Value, json};
@@ -70,7 +71,7 @@ fn token_claims_for(jkt: &str) -> Value {
 }
 
 fn now() -> i64 {
-    chrono::Utc::now().timestamp()
+    UtcTimestamp::now().unix_timestamp()
 }
 
 /// Base proof claims for a `GET https://api.example.com/resource` request.

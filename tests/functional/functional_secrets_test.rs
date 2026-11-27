@@ -28,7 +28,7 @@
 
 use crate::common::{DbType, TestGateway};
 
-use chrono::Utc;
+use ferrum_edge::time_compat::UtcTimestamp;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use std::fs;
 use std::time::Duration;
@@ -38,14 +38,14 @@ use uuid::Uuid;
 /// Encode a valid admin API JWT using the given HS256 secret + issuer.
 /// Mirrors the pattern in `functional_admin_operations_test.rs`.
 fn encode_admin_jwt(secret: &str, issuer: &str) -> String {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = serde_json::json!({
         "iss": issuer,
         "sub": "test-admin-secrets",
         "role": "admin",
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(3600)).unwrap()).unix_timestamp(),
         "jti": Uuid::new_v4().to_string()
     });
     let header = Header::new(jsonwebtoken::Algorithm::HS256);

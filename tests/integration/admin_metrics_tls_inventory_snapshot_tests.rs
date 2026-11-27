@@ -15,7 +15,6 @@
 use crate::scaffolding::port_registry::TestSocket;
 
 use arc_swap::ArcSwap;
-use chrono::{Duration as ChronoDuration, Utc};
 use ferrum_edge::admin::{
     AdminState,
     jwt_auth::{JwtConfig, JwtManager},
@@ -27,6 +26,7 @@ use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::plugins::prometheus_metrics::MetricsRegistry;
 use ferrum_edge::proxy::client_ip::TrustedProxies;
 use ferrum_edge::proxy::{ConfigApplyOutcome, ProxyState};
+use ferrum_edge::time_compat::UtcTimestamp;
 use ferrum_edge::tls::inventory::{
     TlsInventory, TlsInventoryEntry, TlsInventorySource, TlsInventoryState, TlsInventoryUsage,
 };
@@ -150,14 +150,14 @@ fn jwt_manager() -> JwtManager {
 }
 
 fn admin_token() -> String {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "iss": JWT_ISSUER,
         "sub": "tls-inventory-snapshot-test",
         "role": "admin",
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + ChronoDuration::seconds(600)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(600)).unwrap()).unix_timestamp(),
         "jti": uuid::Uuid::new_v4().to_string(),
     });
     encode(

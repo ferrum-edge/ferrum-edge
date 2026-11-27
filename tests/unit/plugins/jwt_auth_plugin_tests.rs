@@ -7,7 +7,6 @@ use ferrum_edge::plugins::{
 use serde_json::json;
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use chrono::Utc;
 use ferrum_edge::config::types::Consumer;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -449,7 +448,7 @@ async fn leeway_allows_token_within_skew_window() {
     let token = create_jwt_token_exact(
         &json!({
             "sub": "testuser",
-            "exp": Utc::now().timestamp() - 30,
+            "exp": UtcTimestamp::now().unix_timestamp() - 30,
             "nbf": 0
         }),
         "test-jwt-secret-0123456789abcdefghij",

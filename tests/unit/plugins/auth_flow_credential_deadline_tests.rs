@@ -45,6 +45,7 @@ use super::jwks_auth_support::{build_rsa_jwks_from_pem, create_rs256_token_exact
 use super::plugin_utils::{
     assert_continue, assert_no_effective_credential_deadline, create_test_consumer,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 
 fn make_ctx() -> RequestContext {
     RequestContext::new(
@@ -431,7 +432,7 @@ fn unrepresentable_and_non_numeric_dates_publish_no_bound() {
 async fn jwt_auth_publishes_a_fractional_exp_as_a_deadline() {
     let plugin = JwtAuth::new(&json!({})).expect("default jwt_auth config");
     let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
-    let exp = chrono::Utc::now().timestamp() as f64 + 3_600.25;
+    let exp = UtcTimestamp::now().unix_timestamp() as f64 + 3_600.25;
     let token = create_hs256_token(
         &json!({"sub": "testuser", "exp": exp}),
         "test-jwt-secret-0123456789abcdefghij",
@@ -466,7 +467,7 @@ async fn jwks_auth_publishes_a_fractional_exp_as_a_deadline() {
     .expect("inline JWKS provider");
     plugin.warmup_jwks().await;
 
-    let exp = chrono::Utc::now().timestamp() as f64 + 3_600.25;
+    let exp = UtcTimestamp::now().unix_timestamp() as f64 + 3_600.25;
     let token = create_rs256_token_exact(
         &json!({
             "iss": "https://issuer.example.com",

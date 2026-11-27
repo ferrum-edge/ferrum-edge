@@ -4,13 +4,13 @@
 //! signed token whose `iss` is an array containing the expected issuer used to
 //! authenticate. RFC 7519 §4.1.1 allows exactly one StringOrURI.
 
-use chrono::Utc;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde_json::{Value, json};
 
 use ferrum_edge::grpc::cp_server::DEFAULT_CP_DP_JWT_ISSUER;
 use ferrum_edge::grpc::cp_trust::{CpDpVerifier, CpDpVerifierStore, TenantAuthRejectReason};
 use ferrum_edge::grpc::dp_client::generate_dp_jwt_with_issuer;
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const TEST_SECRET: &str = "test-cp-dp-grpc-jwt-secret-iss-shape";
 
@@ -25,7 +25,7 @@ fn bearer_metadata(token: &str) -> tonic::metadata::MetadataMap {
 }
 
 fn mint_with_iss(iss: Value, subject: &str) -> String {
-    let now = Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let claims = json!({
         "sub": subject,
         "iat": now,

@@ -103,7 +103,7 @@
 
 use super::port_registry::TestSocket;
 
-use chrono::Utc;
+use ferrum_edge::time_compat::UtcTimestamp;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use reqwest::Client;
 use serde_json::json;
@@ -218,14 +218,14 @@ impl TestGateway {
 
     /// Mint a fresh admin JWT bearer token (1-hour TTL, fresh `jti`).
     pub fn admin_token(&self) -> String {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let claims = json!({
             "iss": self.jwt_issuer,
             "sub": "test-admin",
             "role": "admin",
-            "iat": now.timestamp(),
-            "nbf": now.timestamp(),
-            "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
+            "iat": now.unix_timestamp(),
+            "nbf": now.unix_timestamp(),
+            "exp": (now.checked_add(::time::SignedDuration::seconds(3600)).unwrap()).unix_timestamp(),
             "jti": Uuid::new_v4().to_string(),
         });
         let header = Header::new(jsonwebtoken::Algorithm::HS256);
@@ -1643,14 +1643,14 @@ impl SpawnedGatewayIdentity {
 
     /// Mint an HS256 admin JWT (1-hour TTL, fresh `jti`).
     pub fn admin_token(&self) -> String {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let claims = json!({
             "iss": self.jwt_issuer,
             "sub": "test-admin",
             "role": "admin",
-            "iat": now.timestamp(),
-            "nbf": now.timestamp(),
-            "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
+            "iat": now.unix_timestamp(),
+            "nbf": now.unix_timestamp(),
+            "exp": (now.checked_add(::time::SignedDuration::seconds(3600)).unwrap()).unix_timestamp(),
             "jti": Uuid::new_v4().to_string(),
         });
         let header = Header::new(jsonwebtoken::Algorithm::HS256);

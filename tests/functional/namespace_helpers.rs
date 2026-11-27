@@ -9,7 +9,7 @@
 //! subset of helpers relevant to them.
 #![allow(dead_code)]
 
-use chrono::Utc;
+use ferrum_edge::time_compat::UtcTimestamp;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -19,14 +19,14 @@ pub const JWT_ISSUER: &str = "ferrum-edge-namespace-test";
 
 /// Mint a short-lived admin JWT using `JWT_SECRET` / `JWT_ISSUER`.
 pub fn admin_jwt() -> String {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "iss": JWT_ISSUER,
         "sub": "namespace-test-admin",
         "role": "admin",
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(3600)).unwrap()).unix_timestamp(),
         "jti": Uuid::new_v4().to_string(),
     });
     let header = Header::new(jsonwebtoken::Algorithm::HS256);

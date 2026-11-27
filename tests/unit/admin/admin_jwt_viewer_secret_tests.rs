@@ -12,7 +12,6 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use chrono::{Duration, Utc};
 use ferrum_edge::admin::audit::{AuditActor, NamespaceCeilingDecision};
 use ferrum_edge::admin::jwt_auth::{
     ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET_REUSED_ERROR,
@@ -25,6 +24,7 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde_json::{Value, json};
 
 use crate::unit::env_lock::EnvGuard;
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const PRIMARY_SECRET: &str = "primary-admin-secret-0123456789abcdef";
 const VIEWER_SECRET: &str = "viewer-ceiling-secret-0123456789abcdef";
@@ -47,13 +47,13 @@ fn manager_with_viewer_secret() -> JwtManager {
 }
 
 fn claims_window(role: Option<&str>, iat_offset: i64, exp_offset: i64) -> Value {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let mut claims = json!({
         "iss": ISSUER,
         "sub": "drift-monitor",
-        "iat": (now + Duration::seconds(iat_offset)).timestamp(),
-        "nbf": (now + Duration::seconds(iat_offset)).timestamp(),
-        "exp": (now + Duration::seconds(exp_offset)).timestamp(),
+        "iat": (now.checked_add(::time::SignedDuration::seconds(iat_offset)).unwrap()).unix_timestamp(),
+        "nbf": (now.checked_add(::time::SignedDuration::seconds(iat_offset)).unwrap()).unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(exp_offset)).unwrap()).unix_timestamp(),
         "jti": uuid::Uuid::new_v4().to_string(),
     });
     if let Some(role) = role {

@@ -74,7 +74,7 @@ fn consumer_jwt_minting_stays_separate_from_the_admin_workflow_ttl() {
         .next()
         .expect("consumer JWT helper body");
     assert!(
-        consumer_fn.contains("chrono::Duration::seconds(3600)"),
+        consumer_fn.contains("::time::SignedDuration::seconds(3600)"),
         "consumer JWTs must remain on the 1-hour mint path"
     );
     assert!(

@@ -14,6 +14,7 @@ use ferrum_edge::plugins::{
     ALL_PROTOCOLS, Direction, DisconnectCause, Plugin, StreamTransactionSummary,
     TransactionSummary, WsDisconnectContext,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -6281,14 +6282,14 @@ async fn test_only_collector_scoped_charges_reads_acknowledge_delivery() {
     .with_viewer_secret(VIEWER_KEY.to_string())
     .expect("distinct viewer secret");
     let bearer = |secret: &str, role: &str, scope: Option<&str>| {
-        let now = chrono::Utc::now();
+        let now = UtcTimestamp::now();
         let mut claims = json!({
             "iss": ISSUER,
             "sub": "billing",
             "role": role,
-            "iat": now.timestamp(),
-            "nbf": now.timestamp(),
-            "exp": (now + chrono::Duration::seconds(600)).timestamp(),
+            "iat": now.unix_timestamp(),
+            "nbf": now.unix_timestamp(),
+            "exp": (now.checked_add(::time::SignedDuration::seconds(600)).unwrap()).unix_timestamp(),
             "jti": uuid::Uuid::new_v4().to_string(),
         });
         if let Some(scope) = scope {

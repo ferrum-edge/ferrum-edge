@@ -1,11 +1,11 @@
 //! Tests for admin JWT authentication
 
-use chrono::{Duration, Utc};
 use ferrum_edge::admin::jwt_auth::{AdminClaims, AdminRole, JwtConfig, JwtError, JwtManager};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde_json::json;
 
 use crate::unit::env_lock::EnvGuard;
+use ferrum_edge::time_compat::UtcTimestamp;
 
 fn test_jwt_config() -> JwtConfig {
     JwtConfig {
@@ -28,13 +28,16 @@ fn test_jwt_verification() {
     let manager = JwtManager::new(test_jwt_config());
 
     // Create a test token manually (as a client would)
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = AdminClaims {
         iss: "test-issuer".to_string(),
         sub: "admin-user".to_string(),
-        iat: now.timestamp(),
-        nbf: now.timestamp(),
-        exp: (now + Duration::seconds(1800)).timestamp(),
+        iat: now.unix_timestamp(),
+        nbf: now.unix_timestamp(),
+        exp: (now
+            .checked_add(::time::SignedDuration::seconds(1800))
+            .unwrap())
+        .unix_timestamp(),
         jti: uuid::Uuid::new_v4().to_string(),
         additional: json!({"role": "admin"}),
     };
@@ -77,13 +80,13 @@ fn test_authorization_header_extraction_is_case_insensitive_and_strict() {
 #[test]
 fn test_verify_request_maps_header_failures_and_accepts_lowercase_bearer() {
     let manager = JwtManager::new(test_jwt_config());
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "iss": "test-issuer",
         "sub": "admin-user",
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + Duration::seconds(1800)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(1800)).unwrap()).unix_timestamp(),
         "jti": uuid::Uuid::new_v4().to_string(),
         "role": "admin",
     });
@@ -159,7 +162,7 @@ fn test_verify_request_failure_never_echoes_token_content() {
 #[test]
 fn test_admin_token_with_malformed_or_unexpected_audience_is_rejected() {
     let manager = JwtManager::new(test_jwt_config());
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     for aud in [
         json!(null),
         json!(123),
@@ -171,9 +174,9 @@ fn test_admin_token_with_malformed_or_unexpected_audience_is_rejected() {
             json!({
                 "iss": "test-issuer",
                 "sub": "admin-user",
-                "iat": now.timestamp(),
-                "nbf": now.timestamp(),
-                "exp": (now + Duration::seconds(600)).timestamp(),
+                "iat": now.unix_timestamp(),
+                "nbf": now.unix_timestamp(),
+                "exp": (now.checked_add(::time::SignedDuration::seconds(600)).unwrap()).unix_timestamp(),
                 "jti": uuid::Uuid::new_v4().to_string(),
                 "role": "admin",
                 "aud": aud
@@ -191,9 +194,9 @@ fn test_admin_token_with_malformed_or_unexpected_audience_is_rejected() {
         json!({
             "iss": "test-issuer",
             "sub": "admin-user",
-            "iat": now.timestamp(),
-            "nbf": now.timestamp(),
-            "exp": (now + Duration::seconds(600)).timestamp(),
+            "iat": now.unix_timestamp(),
+            "nbf": now.unix_timestamp(),
+            "exp": (now.checked_add(::time::SignedDuration::seconds(600)).unwrap()).unix_timestamp(),
             "jti": uuid::Uuid::new_v4().to_string(),
             "role": "admin"
         }),
@@ -209,13 +212,13 @@ fn test_admin_token_with_malformed_or_unexpected_audience_is_rejected() {
 #[test]
 fn test_jwt_required_claims_are_enforced() {
     let manager = JwtManager::new(test_jwt_config());
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims_without_jti = json!({
         "iss": "test-issuer",
         "sub": "admin-user",
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + Duration::seconds(1800)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(1800)).unwrap()).unix_timestamp(),
         "role": "admin",
     });
     let token = encode_json_claims(claims_without_jti, "test-secret", Algorithm::HS256);
@@ -229,13 +232,13 @@ fn test_jwt_required_claims_are_enforced() {
 #[test]
 fn test_jwt_not_before_and_algorithm_are_enforced() {
     let manager = JwtManager::new(test_jwt_config());
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let future_nbf_claims = json!({
         "iss": "test-issuer",
         "sub": "admin-user",
-        "iat": now.timestamp(),
-        "nbf": (now + Duration::hours(1)).timestamp(),
-        "exp": (now + Duration::hours(2)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": (now.checked_add(::time::SignedDuration::hours(1)).unwrap()).unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::hours(2)).unwrap()).unix_timestamp(),
         "jti": uuid::Uuid::new_v4().to_string(),
         "role": "admin",
     });
@@ -249,9 +252,9 @@ fn test_jwt_not_before_and_algorithm_are_enforced() {
     let wrong_algorithm_claims = json!({
         "iss": "test-issuer",
         "sub": "admin-user",
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + Duration::seconds(1800)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(1800)).unwrap()).unix_timestamp(),
         "jti": uuid::Uuid::new_v4().to_string(),
         "role": "admin",
     });
@@ -266,13 +269,16 @@ fn test_jwt_not_before_and_algorithm_are_enforced() {
 
 #[test]
 fn test_admin_role_claim_parses_and_requires_explicit_role() {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let mut claims = AdminClaims {
         iss: "test-issuer".to_string(),
         sub: "admin-user".to_string(),
-        iat: now.timestamp(),
-        nbf: now.timestamp(),
-        exp: (now + Duration::seconds(1800)).timestamp(),
+        iat: now.unix_timestamp(),
+        nbf: now.unix_timestamp(),
+        exp: (now
+            .checked_add(::time::SignedDuration::seconds(1800))
+            .unwrap())
+        .unix_timestamp(),
         jti: uuid::Uuid::new_v4().to_string(),
         additional: json!({"role": "operator"}),
     };
@@ -296,13 +302,16 @@ fn test_admin_role_claim_parses_and_requires_explicit_role() {
 /// malformed claim, a substring, or the `admin` role never grants it.
 #[test]
 fn test_scope_claim_grants_only_an_exact_listed_scope() {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let mut claims = AdminClaims {
         iss: "test-issuer".to_string(),
         sub: "diagnostics-reader".to_string(),
-        iat: now.timestamp(),
-        nbf: now.timestamp(),
-        exp: (now + Duration::seconds(1800)).timestamp(),
+        iat: now.unix_timestamp(),
+        nbf: now.unix_timestamp(),
+        exp: (now
+            .checked_add(::time::SignedDuration::seconds(1800))
+            .unwrap())
+        .unix_timestamp(),
         jti: uuid::Uuid::new_v4().to_string(),
         additional: json!({"role": "viewer", "scope": "config:read diagnostics:read"}),
     };
@@ -334,13 +343,16 @@ fn test_scope_claim_grants_only_an_exact_listed_scope() {
 
 #[test]
 fn test_admin_role_claim_rejects_unknown_role() {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = AdminClaims {
         iss: "test-issuer".to_string(),
         sub: "admin-user".to_string(),
-        iat: now.timestamp(),
-        nbf: now.timestamp(),
-        exp: (now + Duration::seconds(1800)).timestamp(),
+        iat: now.unix_timestamp(),
+        nbf: now.unix_timestamp(),
+        exp: (now
+            .checked_add(::time::SignedDuration::seconds(1800))
+            .unwrap())
+        .unix_timestamp(),
         jti: uuid::Uuid::new_v4().to_string(),
         additional: json!({"role": "root"}),
     };
@@ -369,13 +381,16 @@ fn test_jwt_invalid_issuer() {
     let manager2 = JwtManager::new(config2);
 
     // Create token with issuer-1
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = AdminClaims {
         iss: "issuer-1".to_string(),
         sub: "admin-user".to_string(),
-        iat: now.timestamp(),
-        nbf: now.timestamp(),
-        exp: (now + Duration::seconds(1800)).timestamp(),
+        iat: now.unix_timestamp(),
+        nbf: now.unix_timestamp(),
+        exp: (now
+            .checked_add(::time::SignedDuration::seconds(1800))
+            .unwrap())
+        .unix_timestamp(),
         jti: uuid::Uuid::new_v4().to_string(),
         additional: json!({}),
     };
@@ -402,13 +417,19 @@ fn test_jwt_expired_token() {
     let manager = JwtManager::new(config);
 
     // Create expired token (expired 10 minutes ago)
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = AdminClaims {
         iss: "test-issuer".to_string(),
         sub: "admin-user".to_string(),
-        iat: (now - Duration::minutes(10)).timestamp(),
-        nbf: (now - Duration::minutes(10)).timestamp(),
-        exp: (now - Duration::minutes(5)).timestamp(),
+        iat: (now
+            .checked_sub(::time::SignedDuration::minutes(10))
+            .unwrap())
+        .unix_timestamp(),
+        nbf: (now
+            .checked_sub(::time::SignedDuration::minutes(10))
+            .unwrap())
+        .unix_timestamp(),
+        exp: (now.checked_sub(::time::SignedDuration::minutes(5)).unwrap()).unix_timestamp(),
         jti: uuid::Uuid::new_v4().to_string(),
         additional: json!({}),
     };
@@ -436,13 +457,13 @@ fn test_jwt_negative_ttl_rejected() {
 
     // Create a token where iat > exp (negative TTL)
     // Token is still not expired (exp is in the future), but iat is even further in the future.
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = AdminClaims {
         iss: "test-issuer".to_string(),
         sub: "admin-user".to_string(),
-        iat: (now + Duration::hours(2)).timestamp(), // issued "in the future"
-        nbf: now.timestamp(),
-        exp: (now + Duration::hours(1)).timestamp(), // expires before iat
+        iat: (now.checked_add(::time::SignedDuration::hours(2)).unwrap()).unix_timestamp(), // issued "in the future"
+        nbf: now.unix_timestamp(),
+        exp: (now.checked_add(::time::SignedDuration::hours(1)).unwrap()).unix_timestamp(), // expires before iat
         jti: uuid::Uuid::new_v4().to_string(),
         additional: json!({}),
     };
@@ -471,13 +492,13 @@ fn test_jwt_zero_ttl_rejected() {
     let manager = JwtManager::new(config);
 
     // Create a token where iat == exp (zero TTL)
-    let now = Utc::now();
-    let exp_time = (now + Duration::hours(1)).timestamp();
+    let now = UtcTimestamp::now();
+    let exp_time = (now.checked_add(::time::SignedDuration::hours(1)).unwrap()).unix_timestamp();
     let claims = AdminClaims {
         iss: "test-issuer".to_string(),
         sub: "admin-user".to_string(),
         iat: exp_time, // same as exp
-        nbf: now.timestamp(),
+        nbf: now.unix_timestamp(),
         exp: exp_time,
         jti: uuid::Uuid::new_v4().to_string(),
         additional: json!({}),
@@ -506,13 +527,16 @@ fn test_jwt_valid_ttl_within_max() {
 
     let manager = JwtManager::new(config);
 
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = AdminClaims {
         iss: "test-issuer".to_string(),
         sub: "admin-user".to_string(),
-        iat: now.timestamp(),
-        nbf: now.timestamp(),
-        exp: (now + Duration::seconds(3600)).timestamp(),
+        iat: now.unix_timestamp(),
+        nbf: now.unix_timestamp(),
+        exp: (now
+            .checked_add(::time::SignedDuration::seconds(3600))
+            .unwrap())
+        .unix_timestamp(),
         jti: uuid::Uuid::new_v4().to_string(),
         additional: json!({}),
     };
@@ -540,13 +564,16 @@ fn test_jwt_ttl_exceeds_max_rejected() {
 
     let manager = JwtManager::new(config);
 
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = AdminClaims {
         iss: "test-issuer".to_string(),
         sub: "admin-user".to_string(),
-        iat: now.timestamp(),
-        nbf: now.timestamp(),
-        exp: (now + Duration::seconds(3600)).timestamp(), // 1 hour > 30 min max
+        iat: now.unix_timestamp(),
+        nbf: now.unix_timestamp(),
+        exp: (now
+            .checked_add(::time::SignedDuration::seconds(3600))
+            .unwrap())
+        .unix_timestamp(), // 1 hour > 30 min max
         jti: uuid::Uuid::new_v4().to_string(),
         additional: json!({}),
     };
@@ -578,13 +605,15 @@ fn test_jwt_future_iat_within_cap_rejected() {
 
     let manager = JwtManager::new(config);
 
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = AdminClaims {
         iss: "test-issuer".to_string(),
         sub: "admin-user".to_string(),
-        iat: (now + Duration::days(3650)).timestamp(), // ~10 years in the future
-        nbf: now.timestamp(),                          // immediately usable
-        exp: (now + Duration::days(3650) + Duration::seconds(3600)).timestamp(),
+        iat: (now.checked_add(::time::SignedDuration::days(3650)).unwrap()).unix_timestamp(), // ~10 years in the future
+        nbf: now.unix_timestamp(), // immediately usable
+        exp: (now.checked_add(::time::SignedDuration::days(3650)).unwrap()
+            + ::time::SignedDuration::seconds(3600))
+        .unix_timestamp(),
         jti: uuid::Uuid::new_v4().to_string(),
         additional: json!({}),
     };
@@ -614,13 +643,19 @@ fn test_jwt_future_iat_beyond_clock_skew_rejected() {
 
     // jsonwebtoken's default leeway is 60 seconds; an iat further in the
     // future than that skew must be rejected.
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = AdminClaims {
         iss: "test-issuer".to_string(),
         sub: "admin-user".to_string(),
-        iat: (now + Duration::seconds(600)).timestamp(),
-        nbf: now.timestamp(),
-        exp: (now + Duration::seconds(600 + 1800)).timestamp(),
+        iat: (now
+            .checked_add(::time::SignedDuration::seconds(600))
+            .unwrap())
+        .unix_timestamp(),
+        nbf: now.unix_timestamp(),
+        exp: (now
+            .checked_add(::time::SignedDuration::seconds(600 + 1800))
+            .unwrap())
+        .unix_timestamp(),
         jti: uuid::Uuid::new_v4().to_string(),
         additional: json!({}),
     };
@@ -650,13 +685,19 @@ fn test_jwt_iat_within_clock_skew_accepted() {
 
     // A slightly future iat from a skewed-but-honest issuer clock remains
     // acceptable (jsonwebtoken's default leeway is 60 seconds).
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = AdminClaims {
         iss: "test-issuer".to_string(),
         sub: "admin-user".to_string(),
-        iat: (now + Duration::seconds(30)).timestamp(),
-        nbf: now.timestamp(),
-        exp: (now + Duration::seconds(30 + 1800)).timestamp(),
+        iat: (now
+            .checked_add(::time::SignedDuration::seconds(30))
+            .unwrap())
+        .unix_timestamp(),
+        nbf: now.unix_timestamp(),
+        exp: (now
+            .checked_add(::time::SignedDuration::seconds(30 + 1800))
+            .unwrap())
+        .unix_timestamp(),
         jti: uuid::Uuid::new_v4().to_string(),
         additional: json!({}),
     };
@@ -687,13 +728,13 @@ fn test_jwt_zero_max_ttl_disables_cap() {
 
     let manager = JwtManager::new(config);
 
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = AdminClaims {
         iss: "test-issuer".to_string(),
         sub: "admin-user".to_string(),
-        iat: now.timestamp(),
-        nbf: now.timestamp(),
-        exp: (now + Duration::days(365)).timestamp(),
+        iat: now.unix_timestamp(),
+        nbf: now.unix_timestamp(),
+        exp: (now.checked_add(::time::SignedDuration::days(365)).unwrap()).unix_timestamp(),
         jti: uuid::Uuid::new_v4().to_string(),
         additional: json!({}),
     };
@@ -734,7 +775,7 @@ fn sign_claims(claims: &AdminClaims) -> String {
 /// Claims with explicit `iat`/`exp` offsets (seconds) from the current time
 /// and `nbf` pinned to now, matching the shape a minter would emit.
 fn claims_at(iat_offset: i64, exp_offset: i64) -> AdminClaims {
-    let now = Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     AdminClaims {
         iss: "test-issuer".to_string(),
         sub: "admin-user".to_string(),
@@ -749,7 +790,7 @@ fn claims_at(iat_offset: i64, exp_offset: i64) -> AdminClaims {
 /// Sign and verify `claims_at(iat_offset, exp_offset)`, retrying until the whole
 /// sign-then-verify cycle stays inside one wall-clock second.
 ///
-/// `claims_at()` floors `Utc::now()` to seconds while `verify_token()` reads its
+/// `claims_at()` floors `UtcTimestamp::now()` to seconds while `verify_token()` reads its
 /// own fresh timestamp. A whole-second tick landing between the two shifts every
 /// verifier-time bound by one second, so an assertion placed exactly one second
 /// outside a bound can legitimately flip. Requiring both samples to land in the
@@ -768,13 +809,13 @@ fn verify_within_one_second(
     // effectively immediate. The bound exists only so a pathological
     // environment fails loudly instead of spinning forever.
     for _ in 0..64 {
-        let before = Utc::now().timestamp();
+        let before = UtcTimestamp::now().unix_timestamp();
         let token = sign_claims(&claims_at(iat_offset, exp_offset));
         let result = manager.verify_token(&token);
         // Both `claims_at()`'s clock read and the verifier's fall between
         // `before` and this sample, so an unchanged second forces all three
         // to be equal.
-        if Utc::now().timestamp() == before {
+        if UtcTimestamp::now().unix_timestamp() == before {
             return result.map(|_| ()).map_err(|err| err.to_string());
         }
     }
@@ -1041,13 +1082,13 @@ fn config_with_audience(audience: Option<&str>) -> JwtConfig {
 }
 
 fn admin_claims_json(aud: Option<&str>) -> serde_json::Value {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let mut claims = json!({
         "iss": "test-issuer",
         "sub": "admin-user",
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + Duration::seconds(1800)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(1800)).unwrap()).unix_timestamp(),
         "jti": uuid::Uuid::new_v4().to_string(),
         "role": "admin",
     });
@@ -1134,13 +1175,16 @@ fn test_audience_unset_rejects_aud_bearing_token() {
 #[test]
 fn test_admin_token_with_unsupported_crit_header_is_rejected() {
     let manager = JwtManager::new(test_jwt_config());
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = AdminClaims {
         iss: "test-issuer".to_string(),
         sub: "admin-user".to_string(),
-        iat: now.timestamp(),
-        nbf: now.timestamp(),
-        exp: (now + Duration::seconds(1800)).timestamp(),
+        iat: now.unix_timestamp(),
+        nbf: now.unix_timestamp(),
+        exp: (now
+            .checked_add(::time::SignedDuration::seconds(1800))
+            .unwrap())
+        .unix_timestamp(),
         jti: uuid::Uuid::new_v4().to_string(),
         additional: json!({"role": "admin"}),
     };
@@ -1180,14 +1224,14 @@ fn test_admin_manager_with_empty_secret_rejects_every_token() {
         secret: String::new(),
         ..test_jwt_config()
     });
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let token = encode_json_claims(
         json!({
             "iss": "test-issuer",
             "sub": "admin-user",
-            "iat": now.timestamp(),
-            "nbf": now.timestamp(),
-            "exp": (now + Duration::seconds(1800)).timestamp(),
+            "iat": now.unix_timestamp(),
+            "nbf": now.unix_timestamp(),
+            "exp": (now.checked_add(::time::SignedDuration::seconds(1800)).unwrap()).unix_timestamp(),
             "jti": uuid::Uuid::new_v4().to_string(),
             "role": "admin",
         }),

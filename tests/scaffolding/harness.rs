@@ -99,11 +99,11 @@
 use crate::common::gateway_harness::{DbType, GatewayChildGuard, TestGateway, TestGatewayBuilder};
 use crate::scaffolding::clients::Http1Client;
 use crate::scaffolding::ports::{PortReservation, reserve_port_pair};
-use chrono::Utc;
 use ferrum_edge::admin::jwt_auth::{JwtConfig, JwtManager};
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy, EnvConfig, OperatingMode};
 use ferrum_edge::modes::file::{ServeHandles, ServeOptions};
+use ferrum_edge::time_compat::UtcTimestamp;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -1039,14 +1039,14 @@ impl GatewayHarness {
 }
 
 fn mint_jwt(secret: &str, issuer: &str) -> String {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "iss": issuer,
         "sub": "test-admin",
         "role": "admin",
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(3600)).unwrap()).unix_timestamp(),
         "jti": Uuid::new_v4().to_string(),
     });
     let header = Header::new(jsonwebtoken::Algorithm::HS256);

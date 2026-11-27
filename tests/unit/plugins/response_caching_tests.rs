@@ -6,7 +6,6 @@
 #![allow(clippy::await_holding_lock)]
 
 use super::plugin_utils::create_test_proxy;
-use chrono::Utc;
 use ferrum_edge::_test_support::{
     advance_response_caching_clock_for_test, clone_log_metadata,
     is_gateway_generated_correlation_header_for_test, record_backend_dispatch_outcome_for_test,
@@ -136,9 +135,12 @@ fn assert_size_accounting_exact(plugin: &ResponseCaching) -> usize {
 }
 
 fn http_date_seconds_ago(seconds: i64) -> String {
-    (Utc::now() - chrono::Duration::seconds(seconds))
-        .format("%a, %d %b %Y %H:%M:%S GMT")
-        .to_string()
+    httpdate::fmt_http_date(std::time::SystemTime::from(
+        UtcTimestamp::now()
+            .checked_sub(::time::SignedDuration::seconds(seconds))
+            .unwrap()
+            .into_offset_date_time(),
+    ))
 }
 
 // Helper to simulate a full cache flow: before_proxy (miss) -> after_proxy -> on_final_response_body

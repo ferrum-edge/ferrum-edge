@@ -15,7 +15,6 @@
 use crate::scaffolding::port_registry::TestSocket;
 
 use arc_swap::ArcSwap;
-use chrono::Utc;
 use ferrum_edge::admin::{
     AdminState,
     jwt_auth::{JwtConfig, JwtManager},
@@ -25,6 +24,7 @@ use ferrum_edge::config::db_backend::{
     BatchConfigWriteMode, DatabaseBackend, NamespaceConfigAdmissionLeaseBackend,
 };
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
+use ferrum_edge::time_compat::UtcTimestamp;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use reqwest::Method;
 use serde_json::{Value, json};
@@ -46,14 +46,14 @@ fn jwt_manager_with_secret(secret: &str) -> JwtManager {
 }
 
 fn token_with_role(secret: &str, role: &str) -> String {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "iss": JWT_ISSUER,
         "sub": "conditional-writer",
         "role": role,
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(3600)).unwrap()).unix_timestamp(),
         "jti": uuid::Uuid::new_v4().to_string(),
     });
     encode(
@@ -2809,7 +2809,7 @@ async fn serve_mongo_lease_wire_connection(
                             .ok()
                             .and_then(|u| u.get_document("$set").ok())
                             .and_then(|set| set.get_datetime("expires_at").ok())
-                            .is_some_and(|expiry| expiry.timestamp_millis() == 0);
+                            .is_some_and(|expiry| expiry.unix_timestamp_millis() == 0);
                         let mode = fault.mode.load(Ordering::SeqCst);
                         if mode == 1 {
                             if releasing {
@@ -3009,7 +3009,7 @@ async fn assert_mongo_cancelled_renewals_cannot_revive(url: &str) {
             released
                 .get_datetime("expires_at")
                 .unwrap()
-                .timestamp_millis(),
+                .unix_timestamp_millis(),
             0
         );
         drop(local);
@@ -3035,7 +3035,7 @@ async fn assert_mongo_cancelled_renewals_cannot_revive(url: &str) {
             before
                 .get_datetime("expires_at")
                 .unwrap()
-                .timestamp_millis(),
+                .unix_timestamp_millis(),
             0
         );
         let expected_generation = if after_takeover {

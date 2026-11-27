@@ -9,6 +9,7 @@ use ferrum_edge::admin::{
     AdminState,
     jwt_auth::{JwtConfig, JwtManager},
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
 
@@ -91,14 +92,14 @@ fn create_test_admin_state(config: &TestConfig, read_only: bool) -> AdminState {
 
 /// Generate a valid JWT token for testing
 fn generate_test_token(config: &TestConfig, subject: &str) -> String {
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "iss": config.jwt_issuer,
         "sub": subject,
         "role": "admin",
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(config.max_ttl as i64)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(config.max_ttl as i64)).unwrap()).unix_timestamp(),
         "jti": uuid::Uuid::new_v4().to_string()
     });
 
