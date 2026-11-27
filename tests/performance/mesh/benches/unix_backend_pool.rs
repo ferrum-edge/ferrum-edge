@@ -46,8 +46,8 @@ mod unix_bench {
     use criterion::{Criterion, black_box};
     use ferrum_edge::config::PoolConfig;
     use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, Proxy};
-    use ferrum_edge::time_compat::UtcTimestamp;
     use ferrum_edge::proxy::unix_backend_pool::UnixBackendConnectionPool;
+    use ferrum_edge::time_compat::UtcTimestamp;
 
     /// A backend that accepts connections and retains at most `retain` of them.
     ///

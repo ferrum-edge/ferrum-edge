@@ -10,6 +10,7 @@ use ferrum_edge::_test_support::DbPoolConfig;
 use ferrum_edge::config::db_loader::DatabaseStore;
 use ferrum_edge::config::migrations::MigrationRunner;
 use ferrum_edge::config::types::{Consumer, LoadBalancerAlgorithm, Upstream, UpstreamTarget};
+use ferrum_edge::time_compat::UtcTimestamp;
 use sqlx::Row;
 use testcontainers::core::IntoContainerPort;
 use testcontainers::runners::AsyncRunner;
@@ -18,13 +19,15 @@ use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use super::common::containers::{BoxError, fail_in_ci_else_skip, start_within_deadline};
 use super::common::host_ports::{allocate_host_port, retry_on_host_port_collision};
 
-struct MySqlFixture {
+pub(super) struct MySqlFixture {
     _container: ContainerAsync<GenericImage>,
-    url: String,
-    pool: sqlx::AnyPool,
+    pub(super) url: String,
+    pub(super) pool: sqlx::AnyPool,
 }
 
-async fn start_mysql() -> Result<MySqlFixture, BoxError> {
+/// Fresh MySQL 8.4 container with an empty `ferrum` database (also used by
+/// `forward_migrations_sqlite_postgres_mysql`).
+pub(super) async fn start_mysql() -> Result<MySqlFixture, BoxError> {
     const PASSWORD: &str = "ferrum-mysql-test-password";
     let (container, port) = retry_on_host_port_collision(|| async {
         let host_port = allocate_host_port()?;
@@ -662,8 +665,6 @@ async fn mysql_byte_exact_identity_accepts_unicode_and_space_variants() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mysql_utc_timestamp_roundtrips_byte_identically_with_chrono_and_legacy_rows() {
-    use ferrum_edge::time_compat::UtcTimestamp;
-
     let fixture = match start_mysql().await {
         Ok(fixture) => fixture,
         Err(error) => {
