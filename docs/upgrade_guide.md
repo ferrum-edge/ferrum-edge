@@ -66,16 +66,20 @@ Do these in order; each step links to the section that explains it.
    export per namespace, which you also restore into a scratch 1.0.0 database
    ([Unknown configuration keys](#unknown-configuration-keys-are-rejected-7520-7524)).
    Fix what they name on 0.9.21.
-3. **Rebuild each database under a configuration-write freeze**: record the
+3. **If you build Ferrum Edge with custom plugins, rebuild them against
+   1.0.0** before staging: public timestamp types are now `UtcTimestamp`, and
+   a plugin that still uses `chrono` must depend on it itself
+   ([Custom plugins](#custom-plugins-timestamps-use-utctimestamp-instead-of-chrono-issue-7419)).
+4. **Rebuild each database under a configuration-write freeze**: record the
    namespace registry, freeze writes, take the final exports, recreate the
    namespaces and restore with the 1.0.0 binary on staging ports, and cut over
    before lifting the freeze, keeping the 0.9.21 database untouched for
    rollback
    ([Database rebuild-and-restore](#every-09x-database-is-rebuilt-and-restored-7523)).
-4. **Upgrade the control plane, then every data plane, in one window**
+5. **Upgrade the control plane, then every data plane, in one window**
    ([ConfigSync revision 8](#configsync-revision-8-and-the-cp-first-upgrade-7520-7524)),
    including native mesh data planes.
-5. **Move contract pins** to `contracts-edge-1.0.0` once it is published and
+6. **Move contract pins** to `contracts-edge-1.0.0` once it is published and
    each consumer adopts Edge 1.0.0.
 
 ### Every 0.9.x database is rebuilt and restored (#7523)
@@ -357,51 +361,54 @@ every closed schema `additionalProperties: false`.
 
 ### Custom plugins: timestamps use `UtcTimestamp` instead of chrono (issue #7419)
 
-`RequestContext::timestamp_received` and `Notification::fired_at` (and its
-builder setter) are now `ferrum_edge::time_compat::UtcTimestamp` instead of
-`chrono::DateTime<Utc>`. So are the config-model and record timestamps
-(#7527, #7529): `GatewayConfig.loaded_at`; `created_at`/`updated_at` on
-`Proxy`, `Consumer`, `PluginConfig`, `Upstream`, `ApiSpec`, `NamespaceRecord`
-and `GatewayTrustBundleRecord` (and `updated_at` on `GatewayTrustBundleSummary`);
-`AuditEvent.ts`; `ApiSpecSnapshotView`'s `created_at`/`updated_at`; and the
-`ApiSpecListFilter.updated_since` and
-`AuditListFilter.start`/`end` list filters. The CP/DP and mesh status types
-follow (#7530): `DpNodeInfo` (`connected_at`, `last_update_at`),
-`MeshNodeInfo` (`connected_at`, `last_heartbeat_at`, `last_update_at`),
-`DpCpConnectionState` (`last_config_received_at`, `connected_since`,
-`config_diverged_since`), mesh policy-deny events and aggregates, the mesh
-slice-drift registry types (`MeshSliceDriftSnapshot.generated_at`, and
-`MeshSliceDriftEntry.session_connected_at` / `disconnected_at` with the `at`
-stamps of its nested version and rejection records), the Admin drift view
-(`MeshSliceDriftView`, `MeshConfigDriftInputs`), and the mesh revision gate and
-runtime install/apply stamps. `mesh_node_registry_stale_ttl()` now returns a
-`time::SignedDuration`, and `MeshNodeRegistry::remove_stale_heartbeats` /
-`MeshSliceDriftRegistry::reap_expired` now take `now: UtcTimestamp` and a
-`time::SignedDuration` instead of `chrono::DateTime<Utc>` and
-`chrono::Duration`. For non-leap-second values
-`UtcTimestamp` renders the same bytes as chrono through `to_rfc3339()`; it
-exposes `unix_timestamp()` and
-`unix_timestamp_millis()`. Plugins also gain an optional
-`ON_RESPONSE_STREAM_TERMINATED` lifecycle hook bit (#7471); custom plugins keep
-the conservative dispatch path whether or not they declare it.
+Ferrum Edge no longer depends on `chrono`. Every timestamp in its public Rust
+types is now `ferrum_edge::time_compat::UtcTimestamp`, and durations passed to
+its APIs are `time::SignedDuration`. A custom plugin that touches any of the
+following must be updated:
 
-Converting: `UtcTimestamp::now()` replaces `Utc::now()`; `to_rfc3339()`,
+- **Request and notifications:** `RequestContext::timestamp_received`;
+  `Notification::fired_at` and its builder setter.
+- **Config model and records** (#7527, #7529): `GatewayConfig.loaded_at`;
+  `created_at` / `updated_at` on `Proxy`, `Consumer`, `PluginConfig`,
+  `Upstream`, `ApiSpec`, `NamespaceRecord` and `GatewayTrustBundleRecord`
+  (and `updated_at` on `GatewayTrustBundleSummary`); `AuditEvent.ts`;
+  `ApiSpecSnapshotView`'s `created_at` / `updated_at`; and the
+  `ApiSpecListFilter.updated_since` and `AuditListFilter.start` / `end` list
+  filters.
+- **CP/DP and mesh status** (#7530): `DpNodeInfo` (`connected_at`,
+  `last_update_at`), `MeshNodeInfo` (`connected_at`, `last_heartbeat_at`,
+  `last_update_at`), `DpCpConnectionState` (`last_config_received_at`,
+  `connected_since`, `config_diverged_since`), mesh policy-deny events and
+  aggregates, the mesh slice-drift registry types
+  (`MeshSliceDriftSnapshot.generated_at`, and
+  `MeshSliceDriftEntry.session_connected_at` / `disconnected_at` with the `at`
+  stamps of its nested version and rejection records), the Admin drift view
+  (`MeshSliceDriftView`, `MeshConfigDriftInputs`), and the mesh revision gate
+  and runtime install/apply stamps. `mesh_node_registry_stale_ttl()` returns a
+  `time::SignedDuration`, and `MeshNodeRegistry::remove_stale_heartbeats` /
+  `MeshSliceDriftRegistry::reap_expired` take `now: UtcTimestamp` and a
+  `time::SignedDuration`.
+
+**Converting.** `UtcTimestamp::now()` replaces `Utc::now()`. `to_rfc3339()`,
 `to_rfc3339_opts(..)` and serde produce the same text as chrono for in-range,
-non-leap-second values; `unix_timestamp()` / `unix_timestamp_millis()` replace `timestamp()` /
-`timestamp_millis()`; `checked_add` / `checked_sub` take a
-`time::SignedDuration`; and `"...".parse::<UtcTimestamp>()` or
+non-leap-second values. `unix_timestamp()` / `unix_timestamp_millis()` replace
+`timestamp()` / `timestamp_millis()`. `checked_add` / `checked_sub` take a
+`time::SignedDuration`. `"...".parse::<UtcTimestamp>()` or
 `UtcTimestamp::from_unix_timestamp(secs)` builds one from text or epoch
-seconds. If you still hold a `chrono::DateTime<Utc>`, convert it with
-`dt.to_rfc3339().parse::<UtcTimestamp>()`, which also applies the leap-second
-rule below.
-Two edge cases differ from chrono: an instant outside years -9999..=9999 is
-rejected (`TimestampError::OutOfRange`) rather than represented, and a leap
-second (`:60`) is stored as the following second.
+seconds. A `chrono::DateTime<Utc>` you still hold converts with
+`dt.to_rfc3339().parse::<UtcTimestamp>()`. Two edge cases differ from chrono:
+an instant outside years -9999..=9999 is rejected
+(`TimestampError::OutOfRange`) rather than represented, and a leap second
+(`:60`) is stored as the following second.
+
+Plugins also gain an optional `ON_RESPONSE_STREAM_TERMINATED` lifecycle hook
+bit (#7471); custom plugins keep the conservative dispatch path whether or not
+they declare it.
 
 **Operator action:** rebuild custom plugins against 1.0.0 and replace chrono
-calls on these fields with the `UtcTimestamp` equivalents. Ferrum Edge no
-longer depends on `chrono` (#7419), so a custom plugin that still calls
-`chrono` directly must add it to `[dependencies]` in `Cargo.toml` itself
+types on these fields with the `UtcTimestamp` equivalents. A custom plugin that
+still calls `chrono` itself must add it to `[dependencies]` in its own
+`Cargo.toml`, because Ferrum Edge no longer brings it in
 ([Adding Dependencies](../CUSTOM_PLUGINS.md#adding-dependencies)). The
 custom-plugin Rust API stays unstable after 1.0.0
 ([support policy](support_policy.md#custom-plugin-rust-api)).
@@ -418,15 +425,26 @@ custom-plugin Rust API stays unstable after 1.0.0
   the backend as `%5E`, matching `url` 2.5.9's WHATWG path encoding; `^` in the
   query string is unchanged. A backend that matched the raw byte must accept
   the encoded form.
-- **Timestamp edge cases (issue #7419).** A leap second (`:60`) in a parsed
-  timestamp is stored as the following second, and an instant outside years
-  -9999..=9999 that chrono accepted is now invalid: `GET /admin/tls/events`
-  `since`, `transaction_debugger` `capture_expires_at`, `response_caching`
-  HTTP dates and `soap_ws_security` instants take their existing
-  invalid-timestamp path, and a file-mode config or backup whose `loaded_at`
-  is outside that range fails to load (#7527). The `invalid since timestamp: `
-  detail text of the TLS events `400` changed; the status and envelope did
-  not.
+- **Timestamp edge cases (issue #7419).** Timestamps parse with the same
+  syntax chrono accepted, with two differences. A leap second (`:60`) is stored
+  as the following second. An instant outside years -9999..=9999 that chrono
+  accepted is now invalid and takes each site's existing invalid-value path:
+  - the `GET /admin/tls/events` `since`, audit `start` / `end` and API-spec
+    `updated_since` filters return their `400`;
+  - `transaction_debugger` `capture_expires_at`, `response_caching` HTTP dates
+    and `soap_ws_security` instants are treated as invalid;
+  - a file-mode config or backup whose `loaded_at` is out of range fails to
+    load (#7527);
+  - a stored `created_at`, `updated_at` or audit `ts` out of range is read with
+    the current time and a warning from SQL, but fails to decode from MongoDB,
+    where an audit list that selects such a row returns `503` (#7529);
+  - a Kubernetes `metadata.creationTimestamp` out of range is treated like a
+    missing one wherever resources are ordered by creation time (#7530).
+
+  The detail text after `invalid since timestamp: ` and
+  `Invalid audit start timestamp: ` / `Invalid audit end timestamp: ` changed;
+  the status codes and envelopes did not. See the CHANGELOG for the full
+  list.
 - **Charts.** Both charts' `appVersion` is `1.0.0`, which is the default image
   tag. Pin a published release tag when you override `image.tag`, and keep the
   migration Job and gateway pins on the same build.
