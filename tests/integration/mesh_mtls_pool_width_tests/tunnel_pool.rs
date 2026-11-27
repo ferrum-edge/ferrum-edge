@@ -1146,7 +1146,7 @@ async fn crl_revocation_of_the_peer_never_reuses_its_pooled_connection() {
 fn backend_tls_reload_drains_the_tunnel_lane() {
     // The CRL drain above is the production path only if a reload reaches
     // the tunnel lane through `force_drain_all`.
-    let proxy_mod = include_str!("../../src/proxy/mod.rs");
+    let proxy_mod = include_str!("../../../src/proxy/mod.rs");
     let reload = proxy_mod
         .split("fn reload_backend_tls_material(&self)")
         .nth(1)
@@ -1166,7 +1166,7 @@ fn backend_tls_reload_drains_the_tunnel_lane() {
         .next()
         .expect("bounded BackendPoolFamily::force_drain_all");
     assert!(family.contains("self.mesh_mtls_pool.force_drain_all()"));
-    let pool = include_str!("../../src/proxy/mesh_mtls_pool.rs");
+    let pool = include_str!("../../../src/proxy/mesh_mtls_pool.rs");
     let drain_all = pool
         .split("pub fn force_drain_all(&self) {")
         .nth(1)

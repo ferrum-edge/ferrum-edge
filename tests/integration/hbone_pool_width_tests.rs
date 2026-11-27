@@ -51,6 +51,15 @@ fn synthetic_root(td: &TrustDomain) -> (Vec<u8>, String, String) {
 }
 
 fn issue_svid(spiffe_id: &SpiffeId, root_pem: &str, root_key_pem: &str) -> (Vec<u8>, Vec<u8>) {
+    issue_svid_for(spiffe_id, root_pem, root_key_pem, time::Duration::hours(1))
+}
+
+fn issue_svid_for(
+    spiffe_id: &SpiffeId,
+    root_pem: &str,
+    root_key_pem: &str,
+    lifetime: time::Duration,
+) -> (Vec<u8>, Vec<u8>) {
     let issuer_key = KeyPair::from_pem(root_key_pem).expect("issuer key");
     let issuer = Issuer::from_ca_cert_pem(root_pem, issuer_key).expect("issuer");
     let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("leaf key");
@@ -69,8 +78,8 @@ fn issue_svid(spiffe_id: &SpiffeId, root_pem: &str, root_key_pem: &str) -> (Vec<
         ExtendedKeyUsagePurpose::ClientAuth,
     ];
     let now = time::OffsetDateTime::now_utc();
-    params.not_before = now;
-    params.not_after = now + time::Duration::hours(1);
+    params.not_before = now - time::Duration::minutes(1);
+    params.not_after = now + lifetime;
     let cert = params.signed_by(&leaf_key, &issuer).expect("leaf cert");
     (cert.der().to_vec(), leaf_key.serialize_der())
 }
@@ -590,4 +599,82 @@ async fn failed_growth_dial_backs_off_from_the_failure_not_the_dial_start() {
         .peer
         .wait_for_active(&[HBONE_GROWTH_ACTIVE_STREAMS_PER_CONNECTION + 2])
         .await;
+}
+
+/// Issue #7537: a pooled HBONE connection is never handed out past the peer
+/// certificate's `notAfter` as seen at its handshake. The next tunnel dials a
+/// fresh connection, whose handshake then refuses the expired certificate.
+#[tokio::test(flavor = "multi_thread")]
+async fn pooled_connection_is_never_reused_past_the_peer_certificate_expiry() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let td = TrustDomain::new("cluster.local").expect("trust domain");
+    let (root_der, root_pem, root_key_pem) = synthetic_root(&td);
+    let gateway_id = SpiffeId::from_parts(&td, "ns/edge/sa/gateway").expect("gateway id");
+    let workload_id = SpiffeId::from_parts(&td, "ns/default/sa/workload").expect("workload");
+    let server_id = SpiffeId::from_parts(&td, "ns/default/sa/orders").expect("server id");
+    let (gateway_leaf, gateway_key) = issue_svid(&gateway_id, &root_pem, &root_key_pem);
+    let (server_leaf, server_key) = issue_svid_for(
+        &server_id,
+        &root_pem,
+        &root_key_pem,
+        time::Duration::seconds(3),
+    );
+    let gateway_slot = svid_slot(bundle_for(
+        gateway_id,
+        gateway_leaf,
+        gateway_key,
+        root_der.clone(),
+    ));
+    let server_slot = svid_slot(bundle_for(server_id, server_leaf, server_key, root_der));
+    let peer = Peer::start(server_slot, Some(1024)).await;
+    let pool = HboneConnectionPool::new(
+        PoolConfig {
+            http2_connections_per_host: 4,
+            ..PoolConfig::default()
+        },
+        DnsCache::new(DnsConfig::default()),
+        gateway_slot,
+        4,
+    );
+    let proxy = proxy_for_test();
+    let open = || {
+        pool.get_tunnel_via(
+            &proxy,
+            "127.0.0.1",
+            "127.0.0.1",
+            APP_PORT,
+            APP_PORT,
+            peer.port,
+            None,
+            None,
+            None,
+            Some(&workload_id),
+        )
+    };
+
+    let mut first = tokio::time::timeout(OPEN_TIMEOUT, open())
+        .await
+        .expect("timely tunnel open")
+        .expect("open tunnel");
+    echo_round_trip(&mut first).await;
+    assert_eq!(peer.accepted(), 1);
+    assert_eq!(pool.pool_size(), 1);
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let err = tokio::time::timeout(OPEN_TIMEOUT, open())
+        .await
+        .expect("open returns within its budget")
+        .expect_err("an expired peer gets no new tunnel");
+    assert!(
+        matches!(
+            err,
+            ferrum_edge::proxy::hbone_pool::HbonePoolError::TlsHandshake { .. }
+        ),
+        "unexpected error: {err:?}"
+    );
+    assert_eq!(
+        peer.accepted(),
+        2,
+        "the expired carrier was not reused; the next tunnel dialed"
+    );
 }
