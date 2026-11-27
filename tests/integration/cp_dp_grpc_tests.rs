@@ -14,7 +14,6 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use chrono::Utc;
 use tokio::time::timeout;
 use tonic::transport::server::ServerTlsConfig;
 use tonic::transport::{Certificate, Identity, Server};
@@ -100,7 +99,7 @@ fn generate_near_expiry_jwt(node_id: &str, audience: Option<&str>) -> String {
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use serde_json::json;
 
-    let now = Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let mut claims = json!({
         "sub": node_id,
         "iat": now,
@@ -847,7 +846,7 @@ async fn invalid_trust_delta_terminates_without_mutating_last_known_good_generat
         update_type: 1,
         config_json: serde_json::to_string(&delta).expect("delta serializes"),
         version: delta.poll_timestamp.to_rfc3339(),
-        timestamp: Utc::now().timestamp(),
+        timestamp: UtcTimestamp::now().unix_timestamp(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         config_sync_build: config_sync_build_identity().to_string(),
         trust_bundles_json: serde_json::to_string(&invalid_trust)
@@ -1541,7 +1540,7 @@ async fn test_cp_rejects_token_missing_required_claims() {
     let (addr, _update_tx, _server_handle) = start_test_cp_server(cp_config).await;
 
     // Create a token signed with the correct secret but missing required claims (no sub, no iat)
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let minimal_claims = json!({"exp": now + 3600, "role": "data_plane"});
     let token_no_sub = encode(
         &Header::new(Algorithm::HS256),
@@ -1909,7 +1908,7 @@ async fn test_cp_rejects_token_with_no_issuer_claim() {
 
     // Hand-craft a token that has all OLD required claims (exp/iat/sub) but
     // no `iss` claim, signed with the correct shared secret.
-    let now = chrono::Utc::now().timestamp();
+    let now = UtcTimestamp::now().unix_timestamp();
     let claims = json!({
         "sub": "iss-missing",
         "iat": now,
@@ -2330,7 +2329,7 @@ async fn test_dp_handles_malformed_config() {
         update_type: 0,
         config_json: "{invalid json!!!}".to_string(),
         version: "bad".to_string(),
-        timestamp: chrono::Utc::now().timestamp(),
+        timestamp: UtcTimestamp::now().unix_timestamp(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         config_sync_build: config_sync_build_identity().to_string(),
         trust_bundles_json: String::new(),
@@ -3295,7 +3294,7 @@ async fn test_dp_keeps_last_good_config_after_unparseable_delta_shape() {
         update_type: 1, // DELTA
         config_json: serde_json::to_string(&malformed_delta).unwrap(),
         version: "bad".to_string(),
-        timestamp: Utc::now().timestamp(),
+        timestamp: UtcTimestamp::now().unix_timestamp(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         config_sync_build: config_sync_build_identity().to_string(),
         trust_bundles_json: String::new(),
@@ -5193,7 +5192,7 @@ async fn test_dp_consumes_heartbeat_without_applying_or_tearing_down_stream() {
         update_type: 0,
         config_json: heartbeat_payload,
         version: String::new(),
-        timestamp: Utc::now().timestamp(),
+        timestamp: UtcTimestamp::now().unix_timestamp(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         config_sync_build: config_sync_build_identity().to_string(),
         trust_bundles_json: String::new(),
@@ -5382,14 +5381,14 @@ async fn wait_for_flag(flag: &std::sync::atomic::AtomicBool, budget: Duration) -
 /// Build a DELTA envelope carrying `body` as its config JSON.
 ///
 /// `version` must be the RFC3339 encoding of the body's `poll_timestamp`
-/// (same instant the production CP puts on the wire). A second `Utc::now()`
+/// (same instant the production CP puts on the wire). A second `UtcTimestamp::now()`
 /// here fails `reconcile_snapshot_version` and the DP refuses the delta.
 fn delta_update(body: String, version: &str) -> ferrum_edge::grpc::proto::ConfigUpdate {
     ferrum_edge::grpc::proto::ConfigUpdate {
         update_type: 1,
         config_json: body,
         version: version.to_string(),
-        timestamp: Utc::now().timestamp(),
+        timestamp: UtcTimestamp::now().unix_timestamp(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         config_sync_build: config_sync_build_identity().to_string(),
         trust_bundles_json: String::new(),
@@ -5768,7 +5767,7 @@ async fn wait_for_cp_url(
 /// snapshot that established a delta base from one that was fenced.
 async fn wait_for_new_accepted_config(
     connection_state: &Arc<ArcSwap<DpCpConnectionState>>,
-    previous: Option<chrono::DateTime<Utc>>,
+    previous: Option<UtcTimestamp>,
 ) -> bool {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
@@ -6302,7 +6301,7 @@ async fn dp_applies_namespace_qualified_removal_delta() {
 
     // Envelope version must match the body's poll_timestamp instant
     // (production CP contract).
-    let poll_timestamp = Utc::now();
+    let poll_timestamp = UtcTimestamp::now();
     let version = poll_timestamp.to_rfc3339();
     let qualified_body = serde_json::json!({
         "added_or_modified_proxies": [],
@@ -8275,7 +8274,9 @@ mod configsync_size_bounds {
         let broadcasts = server.broadcasts();
         let mut rx = tx.subscribe();
         let registry = DpNodeRegistry::new();
-        let before = Utc::now() - chrono::Duration::seconds(60);
+        let before = UtcTimestamp::now()
+            .checked_sub(::time::SignedDuration::seconds(60))
+            .unwrap();
         registry.register_stream(
             "size-bound-dp",
             DpNodeInfo {

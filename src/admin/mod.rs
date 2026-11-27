@@ -30,7 +30,6 @@ pub use tls_management::{
 
 use crate::time_compat::UtcTimestamp;
 use bytes::Bytes;
-use chrono::Utc;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::header::{HeaderName, HeaderValue, RETRY_AFTER};
@@ -7070,7 +7069,7 @@ async fn handle_mesh_config_drift_get(
         match mesh_config_drift::try_build_response(mesh_config_drift::MeshConfigDriftInputs {
             slice: slice_snapshot.as_ref().as_ref(),
             last_install_at,
-            now: chrono::Utc::now(),
+            now: UtcTimestamp::now(),
             source_protocol: &source_protocol,
             source_cp_url: &source_cp_url,
             include_overlay,
@@ -7273,20 +7272,24 @@ async fn handle_mesh_policy_denies_recent_get(
         }
     };
     let recorder = crate::modes::mesh::policy_deny_log::global();
-    let window_chrono = match chrono::Duration::from_std(window) {
-        Ok(d) => d,
+    // Should be unreachable — `parse_mesh_policy_denies_query` clamps to
+    // MESH_POLICY_DENIES_MAX_WINDOW, far inside the representable range — but
+    // treat overflow defensively rather than panic in production.
+    let cutoff = match ::time::SignedDuration::try_from(window)
+        .map_err(|e| e.to_string())
+        .and_then(|window| {
+            UtcTimestamp::now()
+                .checked_sub(window)
+                .ok_or_else(|| "out of range".to_string())
+        }) {
+        Ok(cutoff) => cutoff,
         Err(e) => {
-            // Should be unreachable — `parse_mesh_policy_denies_query` clamps
-            // to MESH_POLICY_DENIES_MAX_WINDOW which is well under the
-            // chrono limit — but treat overflow defensively rather than
-            // panic in production.
             return Ok(json_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &json!({"error": format!("window overflow: {e}")}),
             ));
         }
     };
-    let cutoff = Utc::now() - window_chrono;
     let aggregate = recorder.aggregate_recent(cutoff, limit);
     Ok(json_response(
         StatusCode::OK,

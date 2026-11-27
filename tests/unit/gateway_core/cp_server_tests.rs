@@ -1,10 +1,10 @@
 //! Tests for CP gRPC server public API (DpNodeRegistry).
 
-use chrono::Utc;
 use ferrum_edge::grpc::cp_server::{DpNodeInfo, DpNodeRegistry};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 fn make_node(id: &str) -> DpNodeInfo {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     DpNodeInfo {
         node_id: id.to_string(),
         version: "0.9.0".to_string(),

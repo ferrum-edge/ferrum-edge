@@ -13,7 +13,6 @@
 use crate::scaffolding::port_registry::TestSocket;
 
 use arc_swap::ArcSwap;
-use chrono::{Duration as ChronoDuration, Utc};
 use ferrum_edge::admin::{
     AdminState,
     jwt_auth::{JwtConfig, JwtManager},
@@ -22,6 +21,7 @@ use ferrum_edge::admin::{
 use ferrum_edge::modes::mesh::policy_deny_log::{self, PolicyDenyEvent, PolicyDenyRecorder};
 use ferrum_edge::modes::mesh::runtime::MeshRuntimeState;
 use ferrum_edge::modes::mesh::slice::MeshSlice;
+use ferrum_edge::time_compat::UtcTimestamp;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -56,14 +56,14 @@ fn create_test_jwt_manager(config: &TestConfig) -> JwtManager {
 }
 
 fn generate_test_token(config: &TestConfig) -> String {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "iss": config.jwt_issuer,
         "sub": "test-user",
         "role": "admin",
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(config.max_ttl as i64)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(config.max_ttl as i64)).unwrap()).unix_timestamp(),
         "jti": uuid::Uuid::new_v4().to_string(),
     });
     let header = Header::new(jsonwebtoken::Algorithm::HS256);
@@ -245,13 +245,15 @@ async fn mesh_policy_denies_endpoint_returns_grouped_recent_denies() {
     // Seed three denies grouped into two tuples: rule_a appears twice
     // (different times) and rule_b once. Verify count, ordering, and
     // first/last timestamps for our uniquely-tagged groups only.
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     policy_deny_log::record_global(PolicyDenyEvent {
         rule: rule_a.clone(),
         source: Some("spiffe://cluster.local/ns/staging/sa/web".to_string()),
         destination: Some("spiffe://cluster.local/ns/prod/sa/api".to_string()),
         reason: "namespace_mismatch".to_string(),
-        at: now - ChronoDuration::seconds(30),
+        at: now
+            .checked_sub(::time::SignedDuration::seconds(30))
+            .unwrap(),
         reevaluation: false,
     });
     policy_deny_log::record_global(PolicyDenyEvent {
@@ -259,7 +261,7 @@ async fn mesh_policy_denies_endpoint_returns_grouped_recent_denies() {
         source: Some("spiffe://cluster.local/ns/staging/sa/web".to_string()),
         destination: Some("spiffe://cluster.local/ns/prod/sa/api".to_string()),
         reason: "namespace_mismatch".to_string(),
-        at: now - ChronoDuration::seconds(5),
+        at: now.checked_sub(::time::SignedDuration::seconds(5)).unwrap(),
         reevaluation: false,
     });
     policy_deny_log::record_global(PolicyDenyEvent {
@@ -267,7 +269,7 @@ async fn mesh_policy_denies_endpoint_returns_grouped_recent_denies() {
         source: Some("spiffe://cluster.local/ns/test/sa/runner".to_string()),
         destination: Some("spiffe://cluster.local/ns/prod/sa/api".to_string()),
         reason: "namespace_mismatch".to_string(),
-        at: now - ChronoDuration::seconds(2),
+        at: now.checked_sub(::time::SignedDuration::seconds(2)).unwrap(),
         reevaluation: false,
     });
 
@@ -332,13 +334,15 @@ async fn mesh_policy_denies_endpoint_window_filter_drops_old_records() {
     let ancient = unique_rule("ancient-deny");
     let recent = unique_rule("recent-deny");
 
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     policy_deny_log::record_global(PolicyDenyEvent {
         rule: ancient.clone(),
         source: None,
         destination: None,
         reason: "ancient".to_string(),
-        at: now - ChronoDuration::seconds(3600),
+        at: now
+            .checked_sub(::time::SignedDuration::seconds(3600))
+            .unwrap(),
         reevaluation: false,
     });
     policy_deny_log::record_global(PolicyDenyEvent {
@@ -346,7 +350,9 @@ async fn mesh_policy_denies_endpoint_window_filter_drops_old_records() {
         source: None,
         destination: None,
         reason: "recent".to_string(),
-        at: now - ChronoDuration::seconds(10),
+        at: now
+            .checked_sub(::time::SignedDuration::seconds(10))
+            .unwrap(),
         reevaluation: false,
     });
 
@@ -418,13 +424,13 @@ async fn mesh_policy_denies_endpoint_honours_custom_window_and_limit() {
     let rule_a = unique_rule("limit-case-a");
     let rule_b = unique_rule("limit-case-b");
 
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     policy_deny_log::record_global(PolicyDenyEvent {
         rule: rule_a.clone(),
         source: None,
         destination: None,
         reason: "a".to_string(),
-        at: now - ChronoDuration::seconds(2),
+        at: now.checked_sub(::time::SignedDuration::seconds(2)).unwrap(),
         reevaluation: false,
     });
     policy_deny_log::record_global(PolicyDenyEvent {
@@ -432,7 +438,7 @@ async fn mesh_policy_denies_endpoint_honours_custom_window_and_limit() {
         source: None,
         destination: None,
         reason: "b".to_string(),
-        at: now - ChronoDuration::seconds(1),
+        at: now.checked_sub(::time::SignedDuration::seconds(1)).unwrap(),
         reevaluation: false,
     });
 
@@ -475,7 +481,7 @@ async fn mesh_policy_denies_endpoint_separates_live_tunnel_reevaluations() {
     let token = generate_test_token(&tc);
     let rule = unique_rule("deny-reevaluated");
 
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     // Same rule, same source, same destination, same reason — only the origin
     // differs.
     for (reevaluation, count) in [(false, 2), (true, 1)] {
@@ -485,7 +491,7 @@ async fn mesh_policy_denies_endpoint_separates_live_tunnel_reevaluations() {
                 source: Some("spiffe://cluster.local/ns/staging/sa/web".to_string()),
                 destination: Some("spiffe://cluster.local/ns/prod/sa/api".to_string()),
                 reason: "namespace_mismatch".to_string(),
-                at: now - ChronoDuration::seconds(5),
+                at: now.checked_sub(::time::SignedDuration::seconds(5)).unwrap(),
                 reevaluation,
             });
         }
@@ -533,7 +539,7 @@ async fn recorder_unit_smoke_test_via_admin_payload() {
     // Keeps the wire schema and the recorder's `Serialize` impl in lockstep
     // without needing the global recorder.
     let recorder = PolicyDenyRecorder::with_capacity(8);
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     recorder.record(PolicyDenyEvent {
         rule: "deny-foo".to_string(),
         source: Some("spiffe://cluster.local/ns/staging/sa/web".to_string()),
@@ -542,7 +548,11 @@ async fn recorder_unit_smoke_test_via_admin_payload() {
         at: now,
         reevaluation: false,
     });
-    let aggregate = recorder.aggregate_recent(now - ChronoDuration::seconds(60), 10);
+    let aggregate = recorder.aggregate_recent(
+        now.checked_sub(::time::SignedDuration::seconds(60))
+            .unwrap(),
+        10,
+    );
     let serialised = serde_json::to_value(&aggregate).unwrap();
     assert_eq!(serialised["total_denies"], 1);
     assert_eq!(serialised["grouped"][0]["rule"], "deny-foo");

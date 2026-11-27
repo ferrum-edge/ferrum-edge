@@ -40,7 +40,6 @@
 //! `docs/cp_namespace_tenancy.md` for the operator guide.
 
 use arc_swap::ArcSwap;
-use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use futures_util::stream;
 use prost::Message;
@@ -89,6 +88,7 @@ use crate::modes::mesh::slice::{
     MeshSliceRequest, node_waypoint_assertors_from_workloads,
     node_waypoint_capture_destinations_from_workloads,
 };
+use crate::time_compat::UtcTimestamp;
 
 /// Application-level ConfigSync heartbeat interval (matches DP silence budget).
 pub const CONFIGSYNC_SUBSCRIBE_HEARTBEAT_INTERVAL: Duration =
@@ -392,8 +392,8 @@ pub struct DpNodeInfo {
     pub node_id: String,
     pub version: String,
     pub namespace: String,
-    pub connected_at: DateTime<Utc>,
-    pub last_update_at: DateTime<Utc>,
+    pub connected_at: UtcTimestamp,
+    pub last_update_at: UtcTimestamp,
     /// Backend egress policy metadata the DP reported on Subscribe (#6020).
     /// `None` means unknown: the DP sent no report or an unrecognised mode.
     pub backend_egress_policy: Option<ReportedEgressPolicy>,
@@ -456,7 +456,7 @@ impl DpNodeRegistry {
     /// Used by the per-namespace broadcast path so a delta for namespace A
     /// does not bump the `last_update_at` of namespace B's DPs.
     pub fn touch_namespace(&self, namespace: &str) {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         for mut entry in self.streams.iter_mut() {
             if entry.namespace == namespace {
                 entry.last_update_at = now;
@@ -2695,7 +2695,7 @@ impl ConfigSync for CpGrpcServer {
                 &[]
             )
         );
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         // One entry per admitted stream, keyed by namespace, principal, node
         // id and a fresh stream sequence number (#6020).
         let stream_key = self.registry.register_stream(
@@ -2968,9 +2968,7 @@ impl ConfigSync for CpGrpcServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::time_compat::UtcTimestamp;
     use base64::Engine;
-    use chrono::{TimeZone, Utc};
     use std::collections::HashMap;
 
     fn test_root_ca_der_base64(common_name: &str) -> String {
@@ -3037,7 +3035,7 @@ mod tests {
         record
     }
 
-    fn registry_info(node_id: &str, version: &str, connected_at: DateTime<Utc>) -> DpNodeInfo {
+    fn registry_info(node_id: &str, version: &str, connected_at: UtcTimestamp) -> DpNodeInfo {
         DpNodeInfo {
             node_id: node_id.to_string(),
             version: version.to_string(),
@@ -3051,8 +3049,8 @@ mod tests {
     #[test]
     fn registry_keeps_each_stream_of_the_same_dp_node() {
         let registry = DpNodeRegistry::new();
-        let first_connected_at = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 1).unwrap();
-        let second_connected_at = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 2).unwrap();
+        let first_connected_at = "2026-05-05T12:00:01Z".parse::<UtcTimestamp>().unwrap();
+        let second_connected_at = "2026-05-05T12:00:02Z".parse::<UtcTimestamp>().unwrap();
 
         let first = registry_info("node-a", "old-version", first_connected_at);
         let second = registry_info("node-a", "new-version", second_connected_at);
@@ -3159,8 +3157,8 @@ mod tests {
     #[test]
     fn registry_stale_drop_does_not_remove_newer_dp_entry() {
         let registry = DpNodeRegistry::new();
-        let old_connected_at = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 1).unwrap();
-        let new_connected_at = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 2).unwrap();
+        let old_connected_at = "2026-05-05T12:00:01Z".parse::<UtcTimestamp>().unwrap();
+        let new_connected_at = "2026-05-05T12:00:02Z".parse::<UtcTimestamp>().unwrap();
 
         let old = registry_info("node-a", "old-version", old_connected_at);
         let new = registry_info("node-a", "new-version", new_connected_at);

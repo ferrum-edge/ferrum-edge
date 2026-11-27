@@ -162,7 +162,7 @@
 use std::sync::Mutex;
 use std::time::Instant;
 
-use chrono::{DateTime, Utc};
+use crate::time_compat::UtcTimestamp;
 use serde::{Deserialize, Serialize};
 
 /// Maximum accepted length of a control-plane-supplied `authority` string.
@@ -520,8 +520,8 @@ pub struct MeshRevisionQuarantine {
     pub reason: String,
     /// Consecutive quarantines of this same (authority, reason) pair.
     pub consecutive: u64,
-    pub first_seen_at: DateTime<Utc>,
-    pub last_seen_at: DateTime<Utc>,
+    pub first_seen_at: UtcTimestamp,
+    pub last_seen_at: UtcTimestamp,
 }
 
 /// Full revision block on `GET /mesh/config-drift`.
@@ -848,7 +848,7 @@ impl MeshRevisionGate {
         &self,
         candidate: Option<&MeshConfigRevision>,
         content: MeshRevisionContentIdentity,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
     ) -> Result<MeshRevisionOrder, MeshRevisionRejection> {
         self.admit_at(candidate, content, now, Instant::now())
     }
@@ -858,7 +858,7 @@ impl MeshRevisionGate {
     /// Production callers use [`Self::admit`]. This seam exists so adversarial
     /// ordering tests can advance the adoption clock without sleeping. Foreign
     /// authority adoption is deliberately based on this monotonic clock rather
-    /// than `DateTime<Utc>`: NTP/manual wall-clock jumps must not prematurely
+    /// than `UtcTimestamp`: NTP/manual wall-clock jumps must not prematurely
     /// expire the fail-closed grace period. Wall time remains only for
     /// operator-facing first/last-seen diagnostics.
     #[doc(hidden)]
@@ -866,7 +866,7 @@ impl MeshRevisionGate {
         &self,
         candidate: Option<&MeshConfigRevision>,
         content: MeshRevisionContentIdentity,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
         monotonic_now: Instant,
     ) -> Result<MeshRevisionOrder, MeshRevisionRejection> {
         let adopt_secs = self.policy().foreign_authority_adopt_secs;
@@ -1130,7 +1130,7 @@ mod emission_tests {
             sequence: 817263,
         };
         let content = MeshRevisionContentIdentity::from_digest([1; 32]);
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let instant = Instant::now();
         let ((), logs) = crate::modes::tests::capture_logs(|| {
             gate.admit(Some(&accepted), content, now).unwrap();

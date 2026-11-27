@@ -71,7 +71,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, SecondsFormat, Utc};
+use crate::time_compat::{SecondsFormat, UtcTimestamp};
 use serde::Serialize;
 
 use crate::fips::backend::rand::{SecureRandom, SystemRandom};
@@ -1074,7 +1074,7 @@ pub(crate) fn record_request_detail(
     slot.record_detail(detail);
 }
 
-fn rfc3339_millis(at: DateTime<Utc>) -> String {
+fn rfc3339_millis(at: UtcTimestamp) -> String {
     at.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
@@ -1169,8 +1169,8 @@ pub fn reference_replica(reference: &str) -> Option<DiagnosticReplicaId> {
 
 #[derive(Debug)]
 struct Entry {
-    created_at: DateTime<Utc>,
-    expires_at_wall: DateTime<Utc>,
+    created_at: UtcTimestamp,
+    expires_at_wall: UtcTimestamp,
     expires_at: Instant,
     protocol: DiagnosticProtocol,
     status: u16,
@@ -1295,7 +1295,7 @@ pub struct DiagnosticRefStore {
     /// for the untagged `fd1_` format (the default).
     replica: Option<DiagnosticReplicaId>,
     ttl: Duration,
-    ttl_wall: chrono::Duration,
+    ttl_wall: ::time::SignedDuration,
     per_shard_capacity: usize,
     lookup_rate_per_second: u32,
     per_subject_lookup_rate_per_second: u32,
@@ -1332,7 +1332,7 @@ impl DiagnosticRefStore {
             mode: DiagnosticRefMode::Errors,
             replica: None,
             ttl,
-            ttl_wall: chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::zero()),
+            ttl_wall: ::time::SignedDuration::try_from(ttl).unwrap_or(::time::SignedDuration::ZERO),
             per_shard_capacity: (max_entries / SHARD_COUNT).max(1),
             lookup_rate_per_second,
             per_subject_lookup_rate_per_second: (lookup_rate_per_second / 2).max(1),
@@ -1459,12 +1459,10 @@ impl DiagnosticRefStore {
             // A concurrent stamp of the same request won the slot.
             return slot.minted.get().cloned();
         }
-        let created_at = Utc::now();
+        let created_at = UtcTimestamp::now();
         let entry = Entry {
             created_at,
-            expires_at_wall: created_at
-                .checked_add_signed(self.ttl_wall)
-                .unwrap_or(created_at),
+            expires_at_wall: created_at.checked_add(self.ttl_wall).unwrap_or(created_at),
             // An unrepresentable deadline expires immediately (fail closed).
             expires_at: now.checked_add(self.ttl).unwrap_or(now),
             protocol,

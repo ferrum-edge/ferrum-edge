@@ -26,7 +26,6 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use chrono::DateTime;
 use serde_json::Value;
 
 use super::gateway_api::{
@@ -904,7 +903,11 @@ fn listenerset_precedence_index(objects: &[&K8sObject]) -> BTreeMap<(String, Str
                     .metadata
                     .creation_timestamp
                     .as_deref()
-                    .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok()),
+                    .and_then(|timestamp| {
+                        crate::time_compat::parse_rfc3339_chrono(timestamp)
+                            .and_then(|parsed| parsed.to_utc_timestamp())
+                            .ok()
+                    }),
                 object.metadata.namespace.as_str(),
                 object.metadata.name.as_str(),
             )

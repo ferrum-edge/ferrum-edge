@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use crate::time_compat::UtcTimestamp;
 use arc_swap::ArcSwap;
-use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tokio::sync::{Notify, watch};
 use tracing::{info, warn};
@@ -374,12 +374,12 @@ pub struct MeshRuntimeState {
     /// `ferrum_mesh_config_last_received_timestamp_seconds` gauge) so dashboard
     /// staleness alerts observe the same receive events. `None` until the first
     /// slice arrives.
-    last_install_at: Arc<ArcSwap<Option<DateTime<Utc>>>>,
+    last_install_at: Arc<ArcSwap<Option<UtcTimestamp>>>,
     /// Wall-clock timestamp of the most recent slice accepted by the proxy
     /// runtime. This intentionally differs from `last_install_at`: invalid
     /// updates may be received and rejected while the proxy continues serving
     /// the previous accepted slice.
-    last_applied_at: Arc<ArcSwap<Option<DateTime<Utc>>>>,
+    last_applied_at: Arc<ArcSwap<Option<UtcTimestamp>>>,
     first_ready: Arc<Notify>,
     has_first: Arc<AtomicBool>,
     revision_tx: Arc<watch::Sender<u64>>,
@@ -541,13 +541,13 @@ impl MeshRuntimeState {
     /// Wall-clock timestamp of the most recent slice install, or `None` if no
     /// slice has been installed yet. Read lock-free by the
     /// `/mesh/config-drift` admin handler to compute slice staleness.
-    pub fn last_install_at(&self) -> Option<DateTime<Utc>> {
+    pub fn last_install_at(&self) -> Option<UtcTimestamp> {
         *self.last_install_at.load_full().as_ref()
     }
 
     /// Wall-clock timestamp of the most recent accepted slice, or `None` if
     /// no slice has been accepted by the proxy runtime yet.
-    pub fn last_applied_at(&self) -> Option<DateTime<Utc>> {
+    pub fn last_applied_at(&self) -> Option<UtcTimestamp> {
         *self.last_applied_at.load_full().as_ref()
     }
 
@@ -621,7 +621,7 @@ impl MeshRuntimeState {
         let content = slice_content_identity(&slice);
         if let Err(rejection) =
             self.revision_gate
-                .admit(slice.revision.as_ref(), content, Utc::now())
+                .admit(slice.revision.as_ref(), content, UtcTimestamp::now())
         {
             return MeshSliceInstall::Quarantined(rejection);
         }
@@ -636,7 +636,8 @@ impl MeshRuntimeState {
         // Stamp the receive timestamp before publishing the revision bump so
         // any observer that reacts to the revision sees a fresh
         // `last_install_at` rather than the stale one.
-        self.last_install_at.store(Arc::new(Some(Utc::now())));
+        self.last_install_at
+            .store(Arc::new(Some(UtcTimestamp::now())));
         self.revision_tx.send_modify(|revision| *revision += 1);
         let was_first = self.has_first.swap(true, Ordering::AcqRel);
         if !was_first {
@@ -699,7 +700,8 @@ impl MeshRuntimeState {
         crate::modes::mesh::runtime_overlay_consumers::apply_overlay(&slice.runtime_overlay);
         self.egress_scope.install_from_slice(slice);
         self.applied.store(Arc::new(Some(slice.clone())));
-        self.last_applied_at.store(Arc::new(Some(Utc::now())));
+        self.last_applied_at
+            .store(Arc::new(Some(UtcTimestamp::now())));
         self.applied_revision_tx
             .send_modify(|revision| *revision += 1);
         // Issue #4812: the control plane's slice-drift surface must learn the
@@ -1069,7 +1071,7 @@ mod tests {
         // so verify it is `None` pre-install, populated after the first install,
         // and advances on each
         // subsequent install (no caching/clamping). Use an explicit
-        // delay between installs because two `Utc::now()` calls inside
+        // delay between installs because two `UtcTimestamp::now()` calls inside
         // the same nanosecond would compare equal on fast machines and
         // mask a bug where the second install failed to swap the slot.
         let state = MeshRuntimeState::new();

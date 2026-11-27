@@ -21,7 +21,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
 use ferrum_edge::capture::CaptureMode;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, DispatchKind, GatewayConfig, LoadBalancerAlgorithm, MAX_TARGET_WEIGHT,
@@ -329,7 +328,7 @@ pub fn mesh_slice_with(
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect::<BTreeMap<_, _>>(),
-        version: Utc::now().to_rfc3339(),
+        version: UtcTimestamp::now().to_rfc3339(),
         workloads,
         services,
         mesh_policies,

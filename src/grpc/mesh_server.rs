@@ -1,7 +1,6 @@
 //! Mesh gRPC server implementing the `MeshConfigSync` service.
 
 use arc_swap::ArcSwap;
-use chrono::{DateTime, Utc};
 use futures_util::stream;
 use std::collections::HashSet;
 use std::pin::Pin;
@@ -40,6 +39,7 @@ use crate::FERRUM_VERSION;
 use crate::config::incremental_apply::apply_incremental_to_config_snapshot;
 use crate::config::types::{GatewayConfig, default_namespace};
 use crate::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
+use crate::time_compat::UtcTimestamp;
 
 pub const MESH_SUBSCRIBE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -60,7 +60,7 @@ struct TrackedMeshStream<S> {
     config: Arc<ArcSwap<GatewayConfig>>,
     node_id: String,
     drift_key: String,
-    connected_at: DateTime<Utc>,
+    connected_at: UtcTimestamp,
     /// Opaque drift-session generation. Never logged or published.
     session_token: Option<String>,
 }
@@ -74,7 +74,7 @@ impl<S> Drop for TrackedMeshStream<S> {
                 &self.drift_key,
                 session_token,
                 self.config.as_ref(),
-                Utc::now(),
+                UtcTimestamp::now(),
             );
         }
         info!(
@@ -560,7 +560,7 @@ impl MeshGrpcServer {
         node_id: &str,
         drift_key: &str,
         namespace: &str,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
         initial_slice: &MeshSlice,
         slice_request: MeshSliceRequest,
         bearer_namespaces: Option<HashSet<String>>,
@@ -592,8 +592,12 @@ impl MeshGrpcServer {
         // (and records as sent) the newer slice. Re-stamping desired from the
         // currently published config prevents a permanently drifted row.
         let published = self.config.as_ref();
-        self.drift
-            .reconcile_session_desired(drift_key, &session_token, published, Utc::now());
+        self.drift.reconcile_session_desired(
+            drift_key,
+            &session_token,
+            published,
+            UtcTimestamp::now(),
+        );
         Some(session_token)
     }
 
@@ -603,7 +607,7 @@ impl MeshGrpcServer {
         registry: &MeshNodeRegistry,
     ) {
         if let Some(drift) = registry.drift() {
-            drift.reconcile_desired(config.as_ref(), Utc::now());
+            drift.reconcile_desired(config.as_ref(), UtcTimestamp::now());
         }
         let _ = tx.send(MeshConfigBroadcast::Full(config));
         registry.touch_all();
@@ -617,7 +621,7 @@ impl MeshGrpcServer {
         registry: &MeshNodeRegistry,
     ) {
         if let Some(drift) = registry.drift() {
-            drift.reconcile_desired(config.as_ref(), Utc::now());
+            drift.reconcile_desired(config.as_ref(), UtcTimestamp::now());
         }
         let _ = tx.send(MeshConfigBroadcast::Delta {
             result: Box::new(result),
@@ -801,7 +805,7 @@ impl MeshConfigSync for MeshGrpcServer {
         })?;
         let initial_slice = MeshSlice::from_gateway_config(&initial_config, slice_request.clone());
         let mut initial = Self::build_mesh_config_update_from_slice(initial_slice.clone(), "")?;
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         // Remote-discovery one-shots are not long-lived DPs and must not
         // inflate the CP drift registry, so they subscribe untracked.
         //
@@ -1060,7 +1064,7 @@ impl MeshConfigSync for MeshGrpcServer {
                 &report.session_token,
                 &report.version,
                 status,
-                Utc::now(),
+                UtcTimestamp::now(),
             ) {
                 Ok(()) => {
                     recorded = true;
@@ -1124,7 +1128,9 @@ fn record_sent_best_effort(
     session_token: &str,
     slice: &MeshSlice,
 ) {
-    if let Err(error) = drift.record_projected_sent(node_id, session_token, slice, Utc::now()) {
+    if let Err(error) =
+        drift.record_projected_sent(node_id, session_token, slice, UtcTimestamp::now())
+    {
         warn!(
             field = error.field_name(),
             "Mesh slice drift could not record a sent slice; mesh config delivery continues"
@@ -1172,7 +1178,6 @@ mod tests {
         AppProtocol, MeshConfig, MeshService, NodeWaypointEndpoint, ServicePort, Workload,
         WorkloadSelector,
     };
-    use crate::time_compat::UtcTimestamp;
 
     fn mesh_config_with_service(version_second: u32) -> GatewayConfig {
         mesh_config_with_named_service("api", version_second)
