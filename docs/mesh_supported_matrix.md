@@ -124,7 +124,7 @@ enrolled rows and required live assertion IDs; fixture detail is in the
   |---|---|
   | NodeWaypoint | Applied (Experimental). |
   | Sidecar | Applied (Experimental), client-side on the outbound capture listener, over SVID-mTLS to each destination workload. Never served on the inbound `:15006` listener. Deterministic integration coverage only: no live weighted-split assertion in `mesh-e2e-sidecar` yet. |
-  | ServiceWaypoint (GAMMA) | **Not applied** — follow-up: projection for the bound Services, where Istio applies waypoint L7 routing. |
+  | ServiceWaypoint (GAMMA) | **Not applied** — a ServiceWaypoint is an L4 HBONE relay with no HTTP route table; projection for the bound Services, where Istio applies waypoint L7 routing, is open work (#7500, #7501). |
   | Ambient | **Not applied** — as in Istio, the L4 ambient data plane does not do L7 routing; bind a waypoint. |
   | Ingress gateways (`spec.gateways` naming a Gateway) | Applied as gateway routes; unrelated to the mesh slice. |
 
@@ -334,7 +334,14 @@ ledger unless they change the support contract.
 
 | Deferral | Issue | Doc anchor |
 |---|---|---|
-| _None open._ | — | — |
+| Cross-namespace VirtualService `http[]` destinations on Sidecar and NodeWaypoint (today the carried route is refused and the host keeps its Service route, while status still reports `FerrumAccepted`) | [#7499](https://github.com/ferrum-edge/ferrum-edge/issues/7499) | [mesh.md → NodeWaypoint route carriage](mesh.md#mesh-data-planes-nodewaypoint-route-carriage) |
+| ServiceWaypoint `http_routes` control-plane projection, wire contract, and data-plane materialization (today a ServiceWaypoint receives no HTTP routes) | [#7500](https://github.com/ferrum-edge/ferrum-edge/issues/7500) | [mesh.md → Service Waypoint](mesh.md#service-waypoint) |
+| ServiceWaypoint L7 HTTP/1.1 and HTTP/2 termination and bound-Service dispatch on HBONE `:15008` (today an L4 relay only) | [#7501](https://github.com/ferrum-edge/ferrum-edge/issues/7501) | [mesh.md → Service Waypoint](mesh.md#service-waypoint) |
+| Live 90/10 VirtualService weighted-split gate in `mesh-e2e-sidecar` (today Sidecar `http[]` routes are Experimental with deterministic integration coverage only) | [#7502](https://github.com/ferrum-edge/ferrum-edge/issues/7502) | [Current headline state](#current-headline-state) |
+| Live ServiceWaypoint end-to-end suite in kind (today ServiceWaypoint has no live data-path suite) | [#7503](https://github.com/ferrum-edge/ferrum-edge/issues/7503) | [mesh.md → Topology maturity](mesh.md#topology-maturity) |
+
+All mesh limitations, including these, are also summarized with workarounds in
+[known_limitations.md](known_limitations.md#service-mesh).
 
 Completed historical rows (do **not** re-list as open): EgressGateway UDP `ServiceEntry` materialization (#3263 — external UDP ports materialize a datagram-over-mesh destination allowlist consumed by the gateway's authenticated mesh CONNECT terminator, plus the source-side `Sidecar`/`Ambient` producer that originates the identity-pinned `udp` CONNECT to the configured gateway; still no UDP/DTLS listener, by design); Ambient UDP capture producer + privileged live source-capture **and enrolled-destination** e2e (#2013 / #2038 / #3621 — `functional_mesh_live_source_capture_udp_manager_hbone_round_trip` covers source-capture through HBONE to an echo bound inside the enrolled destination pod netns, and `node-waypoint-ebpf-live` independently proves the marked backend datagram is admitted through the enrolled-pod `tc_inbound` guard while unmarked traffic is dropped); Ambient native gRPC over HBONE on the standard H1/H2 frontend (#3728 — the shared nested-HTTP/2 transport now serves every frontend; native gRPC still deliberately bypasses the generic HTTP/1.1 HBONE dispatch); VirtualService `tls[]` SNI passthrough L4 routing (`sniHosts` + port); general opaque-TLS SNI L4 routing outside passthrough (#3264 — an ordinary `tcp` stream listener that terminates nothing routes by normalized `server_name`, with fail-closed admission for indeterminate ClientHellos; see [`docs/tcp_udp_proxy.md`](tcp_udp_proxy.md#opaque-tls-sni-routing)); VirtualService `tcp[]`/`tls[]` weighted multi-destination splitting (#3251); remote-discovery JWT audience binding (#2475); subset-scoped DestinationRule HTTP connection-pool policy (#3228 / #3240–#3242); the poller-driven partition and bounded last-good-retention live gate (#3331); NodeWaypoint observability contract + maturity promotion gates (#3334 — ADR evidence table + Experimental→Beta/Beta→GA gates documented; maturity remains Experimental until promotion criteria close).
 
