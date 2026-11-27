@@ -58,6 +58,12 @@ gateways, control planes, mesh data planes, charts or contract consumers.
   binary, `fuzz/` and the mesh benchmark no longer compile it. Remaining work:
   replacing the parity tests' chrono oracle with recorded values and removing
   `chrono` entirely. The
+  2-19 have moved every timestamp in `src/` and `custom_plugins/` to
+  `time_compat`: the standalone uses, the config snapshot stamps, the resource,
+  namespace, trust-bundle and audit timestamps, and the mesh, CP/DP status, K8s
+  and diagnostic timestamps. Remaining work: moving the test code and the mesh
+  benchmark off `chrono`, then dropping the direct `chrono` dependency and
+  sqlx's `chrono` feature. The
   exception can be retired only once no dependency still resolves `chrono`.
 - **Three other advisory exceptions were re-reviewed on 2026-11-27 and
   re-affirmed until 2027-03-31** (#7520): RUSTSEC-2024-0436 (`paste`),
