@@ -216,14 +216,16 @@ gateways, control planes, mesh data planes, charts or contract consumers.
   now rejected with that `400` (for example `9999-12-31T23:59:59-00:01`, which
   is in year 10000 in UTC), and a leap second (`:60`) is treated as the
   following second.
-- **Audit log `start`/`end` filters: new 400 message text for an invalid
-  timestamp** (issue #7419, `chrono` replacement). The status code, error
-  envelope and the set of rejected inputs are unchanged; only the detail after
+- **Audit log `start`/`end` filters: new 400 message text and a range limit**
+  (issue #7419, `chrono` replacement). An invalid timestamp still gets `400`
+  with the same error envelope, but the detail after
   `Invalid audit start timestamp: ` / `Invalid audit end timestamp: ` now comes
-  from Ferrum's timestamp parser. As with the API-spec `updated_since` filter
-  (whose message is unchanged), a value chrono accepted whose UTC instant falls
-  outside years -9999..=9999 is now rejected the same way, and a leap second
-  (`:60`) is treated as the following second.
+  from Ferrum's timestamp parser. The filters parse the same syntax chrono did,
+  with two differences: a value whose UTC instant falls outside years
+  -9999..=9999 is now rejected with that `400` (for example
+  `9999-12-31T23:59:59-00:01`), and a leap second (`:60`) is treated as the
+  following second. The API-spec `updated_since` filter applies the same two
+  rules; its `400` message is unchanged (#7529).
 - **Timestamp parsing outside the TLS events filter follows the same two
   rules** (issue #7419). Parse sites accept the same syntax chrono did, with
   two differences: a leap second (`:60`) is stored as the following second, and
@@ -240,12 +242,15 @@ gateways, control planes, mesh data planes, charts or contract consumers.
   (the data plane stamps the slice with its wall clock). The resource, namespace,
   trust-bundle and audit timestamps follow suit (#7529): a stored `created_at`,
   `updated_at` or audit `ts` outside that range takes the loader's existing
-  undecodable-value path (SQL resource rows log a warning and use the current
-  time; MongoDB resource documents, namespace and trust-bundle rows, and config
-  or backup documents fail to decode), and the API-spec `updated_since` and audit
-  `start`/`end` filters reject such a value with their existing `400`. Rendered timestamps
-  of in-range values, and the wire and storage text of these stamps, are
-  byte-identical, and no Admin API status, envelope or message changes.
+  undecodable-value path (SQL resource and audit rows log a warning and use the
+  current time; MongoDB resource and audit documents, namespace and trust-bundle
+  rows, and config or backup documents fail to decode, so an audit list that
+  selects such a MongoDB row fails with `503`), and the API-spec `updated_since`
+  and audit `start`/`end` filters reject such a value with their `400`.
+  Rendered timestamps of in-range, non-leap-second values, and the wire and
+  storage text of these stamps, are byte-identical, and no Admin API status or
+  envelope changes; the only message changes are the TLS events and audit
+  filter details noted above.
 - Docs: the support, versioning and deprecation policy
   (`docs/support_policy.md`) is adopted for Ferrum Edge 1.0.0 onward (#7521).
   It also states the compatibility rules for CP/DP versions (identical build

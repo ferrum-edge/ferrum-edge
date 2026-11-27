@@ -363,7 +363,8 @@ builder setter) are now `ferrum_edge::time_compat::UtcTimestamp` instead of
 (#7527, #7529): `GatewayConfig.loaded_at`; `created_at`/`updated_at` on
 `Proxy`, `Consumer`, `PluginConfig`, `Upstream`, `ApiSpec`, `NamespaceRecord`
 and `GatewayTrustBundleRecord` (and `updated_at` on `GatewayTrustBundleSummary`);
-`AuditEvent.ts`; and the `ApiSpecListFilter.updated_since` and
+`AuditEvent.ts`; `ApiSpecSnapshotView`'s `created_at`/`updated_at`; and the
+`ApiSpecListFilter.updated_since` and
 `AuditListFilter.start`/`end` list filters. `UtcTimestamp` renders the same bytes as chrono
 through `to_rfc3339()` and exposes `unix_timestamp()` and
 `unix_timestamp_millis()`. Plugins also gain an optional
@@ -371,13 +372,14 @@ through `to_rfc3339()` and exposes `unix_timestamp()` and
 the conservative dispatch path whether or not they declare it.
 
 Converting: `UtcTimestamp::now()` replaces `Utc::now()`; `to_rfc3339()`,
-`to_rfc3339_opts(..)` and serde produce the same text as chrono for in-range
-values; `unix_timestamp()` / `unix_timestamp_millis()` replace `timestamp()` /
+`to_rfc3339_opts(..)` and serde produce the same text as chrono for in-range,
+non-leap-second values; `unix_timestamp()` / `unix_timestamp_millis()` replace `timestamp()` /
 `timestamp_millis()`; `checked_add` / `checked_sub` take a
 `time::SignedDuration`; and `"...".parse::<UtcTimestamp>()` or
 `UtcTimestamp::from_unix_timestamp(secs)` builds one from text or epoch
 seconds. If you still hold a `chrono::DateTime<Utc>`, convert it with
-`UtcTimestamp::from_unix_timestamp_nanos(dt.timestamp(), dt.timestamp_subsec_nanos())`.
+`dt.to_rfc3339().parse::<UtcTimestamp>()`, which also applies the leap-second
+rule below.
 Two edge cases differ from chrono: an instant outside years -9999..=9999 is
 rejected (`TimestampError::OutOfRange`) rather than represented, and a leap
 second (`:60`) is stored as the following second.
