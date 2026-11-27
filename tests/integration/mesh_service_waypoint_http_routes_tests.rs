@@ -1629,6 +1629,52 @@ mod admin_endpoint {
         (port, shutdown_tx)
     }
 
+    /// Authorize before dial: a ServiceWaypoint generation's not-yet-served
+    /// routes (default L7 routes and carried VirtualService routes, the
+    /// `TerminateL7` surface #7501 will serve) are never capability-probed or
+    /// warmed, so no bound backend sees a connection the `:15008`
+    /// authorization did not admit. The functional
+    /// `functional_mesh_waypoint_target_refs_*` suite proves the same for the
+    /// L4 relay end to end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unserved_service_waypoint_routes_are_never_probed_or_warmed() {
+        let runtime = service_waypoint_runtime();
+        let (_, prepared) = prepared_service_waypoint(&runtime);
+        assert!(
+            prepared
+                .proxies
+                .iter()
+                .any(|proxy| is_service_waypoint_l7_route_id(&proxy.id)),
+            "fixture: the generation holds default L7 routes"
+        );
+        let env_config = EnvConfig {
+            mode: OperatingMode::Mesh,
+            log_level: "error".to_string(),
+            proxy_http_port: 0,
+            proxy_https_port: 0,
+            admin_http_port: 0,
+            admin_https_port: 0,
+            shutdown_drain_seconds: 0,
+            max_connections: 0,
+            namespace: runtime.namespace.clone(),
+            ..EnvConfig::default()
+        };
+        let (proxy_state, _handles) = ProxyState::new(
+            prepared,
+            DnsCache::new(DnsConfig::default()),
+            env_config,
+            None,
+            None,
+        )
+        .expect("proxy state");
+        proxy_state.refresh_backend_capabilities().await;
+        proxy_state.warmup_connection_pools().await;
+        assert!(
+            proxy_state.backend_capabilities.snapshot().is_empty(),
+            "no capability probe target may name an unserved ServiceWaypoint route's backend"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn service_waypoint_services_reports_l7_ports_and_route_counts() {
         let runtime = service_waypoint_runtime();

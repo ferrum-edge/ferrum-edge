@@ -68,6 +68,26 @@ pub fn is_service_waypoint_l7_route_id(id: &str) -> bool {
     id.starts_with(SERVICE_WAYPOINT_L7_ROUTE_ID_PREFIX)
 }
 
+/// Whether `proxy_id` names a route a ServiceWaypoint generation materializes
+/// but does not serve yet (issue #7500): a default L7 Service route, or a
+/// carried VirtualService route on a ServiceWaypoint (no listener admits
+/// either until HTTP termination inside the HBONE tunnel lands, issue #7501).
+///
+/// Nothing may dial such a route's backends ahead of a request: capability
+/// probes and pool warmup skip them, so a backend never sees a connection the
+/// `:15008` authorization did not admit, and the L4 relay's
+/// authorize-before-dial contract holds.
+pub fn service_waypoint_route_unserved(config: &GatewayConfig, proxy_id: &str) -> bool {
+    if is_service_waypoint_l7_route_id(proxy_id) {
+        return true;
+    }
+    super::config::is_virtual_service_http_route_proxy_id(proxy_id)
+        && config.mesh.as_deref().is_some_and(|mesh| {
+            !mesh.service_waypoint_l7_inventory.bound_services.is_empty()
+                || !mesh.service_waypoint_l7_bindings.is_empty()
+        })
+}
+
 /// One HTTP-family port of a Service bound to this ServiceWaypoint.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ServiceWaypointL7Target {
