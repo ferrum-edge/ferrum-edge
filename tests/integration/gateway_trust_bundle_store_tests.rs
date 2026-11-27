@@ -12,7 +12,6 @@
 //! asserted here.
 
 use base64::Engine;
-use chrono::Utc;
 use ferrum_edge::config::db_backend::{
     FullConfigLoadPurpose, IncrementalFullReloadReason, IncrementalResult,
     gateway_trust_bundle_revision_conflict, is_incremental_full_reload_required,
