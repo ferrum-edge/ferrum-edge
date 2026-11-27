@@ -43,7 +43,7 @@ use ferrum_edge::xds::carrier::{
 use ferrum_edge::xds::translate_mesh_slice_to_snapshot;
 use serde_json::json;
 
-use super::mesh_test_support::{runtime_for_topology, service_for, workload_for};
+use super::super::mesh_test_support::{runtime_for_topology, service_for, workload_for};
 
 /// The waypoint's own namespace (the subscription namespace).
 const WAYPOINT_NAMESPACE: &str = "default";

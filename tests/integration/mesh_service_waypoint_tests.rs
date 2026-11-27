@@ -12,6 +12,11 @@
 //! - The slice builder preserves admit behavior for unrelated topologies
 //!   (no `waypoint_name`) — no regression for existing Sidecar/Ambient.
 
+// ServiceWaypoint VirtualService `http[]` route projection and materialization
+// (issue #7500). A submodule so the existing `mesh-protocols` integration shard
+// filter (`integration::mesh_service_waypoint_tests`) selects it.
+mod http_routes;
+
 use std::collections::HashMap;
 
 use ferrum_edge::config::types::GatewayConfig;
