@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use super::plugin_utils::{assert_continue, assert_reject, create_test_context};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 /// Mirror of the crate-internal `crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY`
 /// (which is `pub(crate)` and not reachable from this external test crate). The
@@ -8402,7 +8403,7 @@ fn composition_config(
             ),
         ],
         upstreams: vec![],
-        loaded_at: chrono::Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     }

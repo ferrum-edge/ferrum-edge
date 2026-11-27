@@ -19,6 +19,7 @@ use ferrum_edge::plugins::TransactionSummary;
 use ferrum_edge::proxy::ProxyState;
 use ferrum_edge::retry::ErrorClass;
 use ferrum_edge::runtime_metrics::{LogLevel, PoolKind};
+use ferrum_edge::time_compat::UtcTimestamp;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -72,7 +73,7 @@ fn generate_test_token(config: &TestConfig) -> String {
 fn admin_state_with_runtime_metrics(jwt: JwtManager) -> AdminState {
     let cfg = GatewayConfig {
         version: "1".to_string(),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };

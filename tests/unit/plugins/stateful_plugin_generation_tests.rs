@@ -28,6 +28,7 @@ use ferrum_edge::plugins::request_deduplication::RequestDeduplication;
 use ferrum_edge::plugins::{
     Plugin, PluginHttpClient, PluginResult, RequestContext, StreamConnectionContext,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -97,7 +98,7 @@ fn gateway_config(proxies: Vec<Proxy>, plugin_configs: Vec<PluginConfig>) -> Gat
         version: "1".to_string(),
         proxies,
         plugin_configs,
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..Default::default()
     };
     config.resolve_dispatch_kind();

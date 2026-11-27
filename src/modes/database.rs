@@ -3348,9 +3348,10 @@ async fn try_publish_full_reload_after_gate(
     runtime_config_apply: &RuntimeConfigApply,
 ) -> Option<bool> {
     // `loaded_at` is stamped before the snapshot queries run.
-    let load = (chrono::Utc::now() - new_config.loaded_at)
-        .to_std()
-        .unwrap_or_default();
+    let load = std::time::Duration::try_from(
+        crate::time_compat::UtcTimestamp::now() - new_config.loaded_at,
+    )
+    .unwrap_or_default();
     let resources = new_config.proxies.len()
         + new_config.consumers.len()
         + new_config.plugin_configs.len()
@@ -3875,7 +3876,7 @@ async fn record_config_validation_rejection_after_recovery_migration_gate(
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use chrono::{DateTime, Utc};
+    use crate::time_compat::UtcTimestamp;
 
     // A scoped subscriber and a file writer also capture current-thread Tokio
     // tasks without installing a process-global subscriber or environment.
@@ -4633,7 +4634,7 @@ pub(super) mod tests {
 
     fn incremental_with_removed_proxy(
         proxy_id: &str,
-        poll_timestamp: DateTime<Utc>,
+        poll_timestamp: UtcTimestamp,
     ) -> db_backend::IncrementalResult {
         db_backend::IncrementalResult {
             added_or_modified_proxies: vec![],
@@ -4651,9 +4652,14 @@ pub(super) mod tests {
 
     fn incremental_with_plugin_config(
         config: serde_json::Value,
-        poll_timestamp: DateTime<Utc>,
+        poll_timestamp: UtcTimestamp,
     ) -> db_backend::IncrementalResult {
-        let timestamp = poll_timestamp;
+        // PluginConfig still stamps with chrono until its own #7419 phase.
+        let timestamp = chrono::DateTime::from_timestamp(
+            poll_timestamp.unix_timestamp(),
+            poll_timestamp.subsec_nanos(),
+        )
+        .unwrap();
         db_backend::IncrementalResult {
             added_or_modified_proxies: vec![],
             removed_proxy_ids: vec![],
@@ -4685,9 +4691,13 @@ pub(super) mod tests {
     #[test]
     fn rejected_delta_identity_ignores_poll_timestamp_for_same_effective_delta() {
         let after_sequence = 9;
-        let first = incremental_with_removed_proxy("proxy-a", Utc::now());
-        let second =
-            incremental_with_removed_proxy("proxy-a", Utc::now() + chrono::Duration::seconds(5));
+        let first = incremental_with_removed_proxy("proxy-a", UtcTimestamp::now());
+        let second = incremental_with_removed_proxy(
+            "proxy-a",
+            UtcTimestamp::now()
+                .checked_add(::time::SignedDuration::seconds(5))
+                .unwrap(),
+        );
 
         assert_eq!(
             RejectedDeltaIdentity::from_incremental(after_sequence, &first),
@@ -4699,7 +4709,7 @@ pub(super) mod tests {
     #[test]
     fn rejected_delta_identity_includes_content_for_same_ids() {
         let after_sequence = 9;
-        let poll_timestamp = Utc::now();
+        let poll_timestamp = UtcTimestamp::now();
         let first = incremental_with_plugin_config(
             serde_json::json!({"limit": 10, "window_seconds": 60}),
             poll_timestamp,
@@ -4770,7 +4780,7 @@ pub(super) mod tests {
             metrics.clone(),
         );
         let after_sequence = 9;
-        let result = incremental_with_removed_proxy("proxy-a", Utc::now());
+        let result = incremental_with_removed_proxy("proxy-a", UtcTimestamp::now());
         let identity = RejectedDeltaIdentity::from_incremental(after_sequence, &result);
         let errors = vec!["duplicate listen path '/api'".to_string()];
 
@@ -4821,8 +4831,8 @@ pub(super) mod tests {
             metrics.clone(),
         );
         let after_sequence = 9;
-        let first_delta = incremental_with_removed_proxy("proxy-a", Utc::now());
-        let second_delta = incremental_with_removed_proxy("proxy-b", Utc::now());
+        let first_delta = incremental_with_removed_proxy("proxy-a", UtcTimestamp::now());
+        let second_delta = incremental_with_removed_proxy("proxy-b", UtcTimestamp::now());
         let errors = vec!["duplicate listen path '/api'".to_string()];
 
         let first_identity = RejectedDeltaIdentity::from_incremental(after_sequence, &first_delta);
@@ -4862,7 +4872,7 @@ pub(super) mod tests {
             metrics.clone(),
         );
         let after_sequence = 9;
-        let delta = incremental_with_removed_proxy("secret-proxy-id", Utc::now());
+        let delta = incremental_with_removed_proxy("secret-proxy-id", UtcTimestamp::now());
         let identity = RejectedDeltaIdentity::from_incremental(after_sequence, &delta);
 
         tracker.record_rejection(
@@ -4908,7 +4918,7 @@ pub(super) mod tests {
             metrics.clone(),
         );
         let after_sequence = 9;
-        let delta = incremental_with_removed_proxy("proxy-a", Utc::now());
+        let delta = incremental_with_removed_proxy("proxy-a", UtcTimestamp::now());
         let identity = RejectedDeltaIdentity::from_incremental(after_sequence, &delta);
         let decision = tracker
             .record_rejection(identity.with_validation(&["missing plugin reference".to_string()]));
@@ -4993,7 +5003,7 @@ pub(super) mod tests {
         ));
 
         let after_sequence = 9;
-        let delta = incremental_with_removed_proxy("proxy-a", Utc::now());
+        let delta = incremental_with_removed_proxy("proxy-a", UtcTimestamp::now());
         let identity = RejectedDeltaIdentity::from_incremental(after_sequence, &delta);
         tracker.record_rejection(identity.with_validation(&["missing upstream".to_string()]));
 

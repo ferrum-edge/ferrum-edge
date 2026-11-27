@@ -36,6 +36,7 @@ use tokio::net::TcpListener;
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::proxy::{ProxyState, start_proxy_listener_with_bound_listener};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 // ── Test fixtures (mirrors grpc_proxy_tests + connection_pool_tests) ───────
 
@@ -136,7 +137,7 @@ fn create_test_proxy_state(proxies: Vec<Proxy>) -> ProxyState {
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         frontend_tls_cert_path: None,
         frontend_tls_key_path: None,
@@ -737,7 +738,7 @@ fn create_test_proxy_state_with_env(
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         frontend_tls_cert_path: None,
         frontend_tls_key_path: None,

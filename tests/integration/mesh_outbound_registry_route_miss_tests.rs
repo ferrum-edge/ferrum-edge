@@ -18,7 +18,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use chrono::Utc;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -36,6 +35,7 @@ use ferrum_edge::proxy::ProxyState;
 use super::mesh_test_support::{
     default_mesh_runtime, gateway_config_with_mesh, mesh_config_with, service_for, workload_for,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const OUTBOUND_CAPTURE_PORT: u16 = 15001;
 const INBOUND_MTLS_PORT: u16 = 15006;
@@ -82,7 +82,7 @@ fn make_proxy_state(
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };
@@ -497,7 +497,7 @@ fn make_sidecar_policy_proxy_state(
     let config = GatewayConfig {
         version: "1".to_string(),
         proxies: Vec::<Proxy>::new(),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..Default::default()
     };
     let env = make_env(OUTBOUND_CAPTURE_PORT);

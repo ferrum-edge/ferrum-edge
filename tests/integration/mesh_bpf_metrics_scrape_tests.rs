@@ -23,6 +23,7 @@ use ferrum_edge::plugins::PluginHttpClient;
 use ferrum_edge::plugins::mesh::bpf_metrics::{DEFAULT_METRIC_PREFIX, PLUGIN_NAME};
 use ferrum_edge::proxy::client_ip::TrustedProxies;
 use ferrum_edge::proxy::{ConfigApplyOutcome, ProxyState};
+use ferrum_edge::time_compat::UtcTimestamp;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
 use std::collections::HashSet;
@@ -88,7 +89,7 @@ fn bpf_metrics_plugin_config(prefix: Option<&str>) -> PluginConfig {
 fn gateway_with_bpf_metrics(prefix: Option<&str>) -> GatewayConfig {
     GatewayConfig {
         version: "1".to_string(),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         plugin_configs: vec![bpf_metrics_plugin_config(prefix)],
         ..Default::default()
     }
@@ -97,7 +98,7 @@ fn gateway_with_bpf_metrics(prefix: Option<&str>) -> GatewayConfig {
 fn empty_gateway(version: &str) -> GatewayConfig {
     GatewayConfig {
         version: version.to_string(),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..Default::default()
     }
 }

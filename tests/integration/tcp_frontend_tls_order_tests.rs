@@ -37,6 +37,7 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::scaffolding::ports::reserve_port;
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const PROXY_ID: &str = "frontend-tls-order-proxy";
 const DENY_LOCALHOST_PLUGIN_ID: &str = "deny-localhost";
@@ -308,7 +309,7 @@ async fn try_spawn_tcp_tls_gateway(
         consumers: vec![],
         plugin_configs,
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };

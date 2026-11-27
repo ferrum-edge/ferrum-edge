@@ -24,6 +24,7 @@ use ferrum_edge::retry::{
     OBS_CONFIG_STALE, OBS_OVERLOAD, intern_http_metrics_error_class,
     intern_http_observability_error_class,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use serde_json::json;
 use serial_test::serial;
 use std::collections::HashMap;
@@ -3336,7 +3337,7 @@ fn prometheus_gateway_config(plugin_configs: Vec<PluginConfig>) -> GatewayConfig
         consumers: vec![],
         plugin_configs,
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     }

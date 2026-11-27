@@ -34,6 +34,7 @@ use ferrum_edge::config::types::{
 };
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::proxy::ProxyState;
+use ferrum_edge::time_compat::UtcTimestamp;
 
 /// Create a test proxy configured for gRPC backend.
 fn create_grpc_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
@@ -277,7 +278,7 @@ fn create_test_proxy_state_with_plugins_upstreams_and_consumers(
         consumers,
         plugin_configs,
         upstreams,
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };
@@ -425,7 +426,7 @@ fn create_test_proxy_state_with_env(
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };

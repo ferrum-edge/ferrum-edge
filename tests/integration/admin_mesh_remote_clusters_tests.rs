@@ -29,6 +29,7 @@ use ferrum_edge::modes::mesh::config::{MeshConfig, MultiClusterConfig, RemoteClu
 use ferrum_edge::modes::mesh::runtime::MeshRuntimeState;
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::proxy::ProxyState;
+use ferrum_edge::time_compat::UtcTimestamp;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
@@ -86,7 +87,7 @@ fn build_admin_state(
 ) -> AdminState {
     let cfg = GatewayConfig {
         version: "1".to_string(),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         mesh: Some(Box::new(MeshConfig::default())),
         ..GatewayConfig::default()
     };

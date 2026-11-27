@@ -36,6 +36,7 @@ use ferrum_edge::proxy::udp_proxy::{UdpListenerConfig, UdpProxyMetrics, start_ud
 use ferrum_edge::request_epoch::RequestEpochStore;
 
 use crate::scaffolding::ports::reserve_udp_port;
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const PROXY_ID: &str = "udp-fault-injection";
 const PLUGIN_CONFIG_ID: &str = "udp-fault-plugin";
@@ -262,7 +263,7 @@ async fn try_spawn_udp_gateway(
         consumers: vec![],
         plugin_configs: vec![fault_plugin_config(fault_config)],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };
@@ -655,7 +656,7 @@ async fn plugin_cache_reload_removes_udp_fault_injection() {
             "abort": { "status_code": 503, "percentage": 100.0 }
         }))],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };
@@ -677,7 +678,7 @@ async fn plugin_cache_reload_removes_udp_fault_injection() {
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };

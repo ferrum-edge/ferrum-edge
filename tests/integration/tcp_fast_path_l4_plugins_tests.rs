@@ -52,6 +52,7 @@ use ferrum_edge::proxy::tcp_proxy::{TcpListenerConfig, TcpProxyMetrics, start_tc
 use ferrum_edge::request_epoch::RequestEpochStore;
 
 use crate::scaffolding::ports::reserve_port;
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const PROXY_ID: &str = "fast-path-throttle-proxy";
 const PLUGIN_CONFIG_ID: &str = "throttle-1";
@@ -294,7 +295,7 @@ async fn try_spawn_fast_path_gateway(
         consumers: vec![],
         plugin_configs,
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };

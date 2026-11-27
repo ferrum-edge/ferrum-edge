@@ -36,6 +36,7 @@ use ferrum_edge::proxy::{ConfigApplyOutcome, ProxyState};
 use tempfile::TempDir;
 
 use crate::scaffolding::ports::{BIND_DROP_SPAWN_ATTEMPTS, reserve_port};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const COUNTRY_MMDB_B64: &str = include_str!("../fixtures/maxmind/GeoIP2-Country-Test.mmdb.b64");
 
@@ -361,7 +362,7 @@ fn empty_proxy_state() -> ProxyState {
     proxy_state_with_config(GatewayConfig::default())
 }
 
-fn empty_delta_at(poll_timestamp: chrono::DateTime<Utc>) -> IncrementalResult {
+fn empty_delta_at(poll_timestamp: UtcTimestamp) -> IncrementalResult {
     IncrementalResult {
         added_or_modified_proxies: vec![],
         removed_proxy_ids: vec![],
@@ -376,7 +377,7 @@ fn empty_delta_at(poll_timestamp: chrono::DateTime<Utc>) -> IncrementalResult {
     }
 }
 
-fn delta_with_proxy(proxy: Proxy, poll_timestamp: chrono::DateTime<Utc>) -> IncrementalResult {
+fn delta_with_proxy(proxy: Proxy, poll_timestamp: UtcTimestamp) -> IncrementalResult {
     IncrementalResult {
         added_or_modified_proxies: vec![proxy],
         removed_proxy_ids: vec![],
@@ -393,7 +394,7 @@ fn delta_with_proxy(proxy: Proxy, poll_timestamp: chrono::DateTime<Utc>) -> Incr
 
 fn delta_with_plugin(
     plugin_config: PluginConfig,
-    poll_timestamp: chrono::DateTime<Utc>,
+    poll_timestamp: UtcTimestamp,
 ) -> IncrementalResult {
     IncrementalResult {
         added_or_modified_proxies: vec![],
@@ -501,7 +502,7 @@ async fn update_config_applies_accepted_mmdb_only_reload_without_config_delta() 
             },
             test_plugin_config("unrelated-logging", true),
         ],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
@@ -627,7 +628,7 @@ async fn incremental_preloads_geo_for_adaptive_route_rebuild_scope_expansion() {
                 updated_at: Utc::now(),
             },
         ],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     let state = proxy_state_with_config(config);
@@ -642,7 +643,7 @@ async fn incremental_preloads_geo_for_adaptive_route_rebuild_scope_expansion() {
     p1.backend_host = "replacement.local".to_string();
     p1.updated_at = Utc::now() + Duration::milliseconds(1);
     let outcome = state
-        .apply_incremental(delta_with_proxy(p1, Utc::now()))
+        .apply_incremental(delta_with_proxy(p1, UtcTimestamp::now()))
         .await;
     assert_eq!(outcome, ConfigApplyOutcome::Applied);
 
@@ -700,7 +701,7 @@ async fn incremental_preloaded_geo_handoff_normalizes_padded_db_path() {
         version: ferrum_edge::config::types::CURRENT_CONFIG_VERSION.to_string(),
         proxies: vec![proxy],
         plugin_configs: vec![geo_policy.clone()],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     });
 
@@ -709,7 +710,7 @@ async fn incremental_preloaded_geo_handoff_normalizes_padded_db_path() {
     updated_policy.updated_at = Utc::now() + Duration::milliseconds(1);
     assert_eq!(
         state
-            .apply_incremental(delta_with_plugin(updated_policy, Utc::now()))
+            .apply_incremental(delta_with_plugin(updated_policy, UtcTimestamp::now()))
             .await,
         ConfigApplyOutcome::Applied,
         "the incremental PreloadedOnly cache stage must claim the trimmed validation handoff"
@@ -798,7 +799,7 @@ async fn incremental_geo_refresh_preserves_out_of_scope_policy_snapshot() {
         version: ferrum_edge::config::types::CURRENT_CONFIG_VERSION.to_string(),
         proxies: vec![first_proxy, second_proxy],
         plugin_configs: vec![first_policy.clone(), second_policy],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     });
     let unaffected_before = state
@@ -816,7 +817,7 @@ async fn incremental_geo_refresh_preserves_out_of_scope_policy_snapshot() {
     updated_first_policy.updated_at = Utc::now() + Duration::milliseconds(1);
     assert_eq!(
         state
-            .apply_incremental(delta_with_plugin(updated_first_policy, Utc::now()))
+            .apply_incremental(delta_with_plugin(updated_first_policy, UtcTimestamp::now()))
             .await,
         ConfigApplyOutcome::Applied,
         "an out-of-scope corrupt MMDB must not reject another geo policy's delta"
@@ -897,7 +898,7 @@ async fn dp_full_snapshots_refresh_mmdb_with_and_without_serialized_delta() {
             },
             test_plugin_config("unrelated-logging", true),
         ],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     let mut candidate = config.clone();
@@ -1098,7 +1099,7 @@ async fn dp_full_snapshot_applies_new_geo_policy_over_retained_mmdb() {
             "deny_countries": ["SE"],
             "on_lookup_failure": "allow"
         }))],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     let state = proxy_state_with_config_and_mode(
@@ -1226,7 +1227,7 @@ async fn update_config_rejected_candidate_reports_rejected() {
 
     let candidate = GatewayConfig {
         proxies: vec![p1, p2],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     let outcome = state.update_config(candidate);
@@ -1268,7 +1269,7 @@ async fn update_config_quarantines_invalid_hmac_credentials_before_full_snapshot
 
     let outcome = state.update_config(GatewayConfig {
         consumers: vec![first, duplicate, weak, malformed],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     });
 
@@ -1300,7 +1301,7 @@ async fn update_config_preserves_same_hmac_secret_across_namespaces() {
     assert_eq!(
         state.update_config(GatewayConfig {
             consumers: vec![tenant_a, tenant_b],
-            loaded_at: Utc::now(),
+            loaded_at: UtcTimestamp::now(),
             ..GatewayConfig::default()
         }),
         ConfigApplyOutcome::Applied
@@ -1332,7 +1333,7 @@ async fn full_snapshot_rehydrates_quarantined_hmac_after_conflict_repair() {
     assert_eq!(
         state.update_config(GatewayConfig {
             consumers: vec![first, second],
-            loaded_at: Utc::now(),
+            loaded_at: UtcTimestamp::now(),
             ..GatewayConfig::default()
         }),
         ConfigApplyOutcome::Applied
@@ -1352,7 +1353,7 @@ async fn full_snapshot_rehydrates_quarantined_hmac_after_conflict_repair() {
     assert_eq!(
         state.update_config(GatewayConfig {
             consumers: vec![repaired_first, rehydrated_second],
-            loaded_at: Utc::now(),
+            loaded_at: UtcTimestamp::now(),
             ..GatewayConfig::default()
         }),
         ConfigApplyOutcome::Applied
@@ -1379,7 +1380,7 @@ async fn request_termination_invalid_reload_keeps_last_known_good_policy() {
     let valid = GatewayConfig {
         proxies: vec![test_proxy("p1", "/api")],
         plugin_configs: vec![plugin],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     assert_eq!(
@@ -1437,7 +1438,7 @@ async fn security_headers_unknown_key_reload_keeps_last_known_good_policy() {
     let valid = GatewayConfig {
         proxies: vec![test_proxy("p1", "/api")],
         plugin_configs: vec![plugin],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     assert_eq!(
@@ -1499,7 +1500,7 @@ async fn load_testing_unknown_key_reload_keeps_last_known_good_generation() {
     let valid = GatewayConfig {
         proxies: vec![test_proxy("p1", "/api")],
         plugin_configs: vec![plugin],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     assert_eq!(
@@ -1567,7 +1568,7 @@ async fn ai_stream_router_unknown_key_reload_keeps_last_known_good_policy() {
     let valid = GatewayConfig {
         proxies: vec![test_proxy("p1", "/api")],
         plugin_configs: vec![plugin],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     assert_eq!(
@@ -1676,7 +1677,7 @@ async fn compression_unknown_key_reload_keeps_last_known_good_generation() {
     let valid = GatewayConfig {
         proxies: vec![test_proxy("p1", "/api")],
         plugin_configs: vec![plugin],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     assert_eq!(
@@ -1739,7 +1740,7 @@ async fn correlation_id_invalid_reload_keeps_last_known_good_plugin_generation()
     let valid = GatewayConfig {
         proxies: vec![test_proxy("p1", "/api")],
         plugin_configs: vec![internal, external],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     assert_eq!(
@@ -1857,7 +1858,7 @@ async fn ip_restriction_typo_reload_keeps_last_known_good_policy() {
     let valid = GatewayConfig {
         proxies: vec![test_proxy("p1", "/api")],
         plugin_configs: vec![plugin],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     assert_eq!(
@@ -1923,7 +1924,7 @@ async fn ai_tool_governor_unknown_key_reload_keeps_last_known_good_policy() {
     let valid = GatewayConfig {
         proxies: vec![test_proxy("p1", "/api")],
         plugin_configs: vec![plugin],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     assert_eq!(
@@ -1984,7 +1985,7 @@ async fn grpc_web_typo_reload_keeps_last_known_good_expose_policy() {
     let valid = GatewayConfig {
         proxies: vec![test_proxy("p1", "/api")],
         plugin_configs: vec![plugin],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     assert_eq!(
@@ -2044,7 +2045,7 @@ async fn ldap_plaintext_reload_keeps_last_known_good_dial_policy() {
     let valid = GatewayConfig {
         proxies: vec![test_proxy("p1", "/api")],
         plugin_configs: vec![plugin],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     assert_eq!(
@@ -2108,7 +2109,7 @@ async fn ai_transcript_audit_unknown_key_reload_keeps_last_known_good_instance()
     let valid = GatewayConfig {
         proxies: vec![test_proxy("p1", "/api")],
         plugin_configs: vec![plugin],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     assert_eq!(
@@ -2169,7 +2170,9 @@ async fn ai_transcript_audit_unknown_key_reload_keeps_last_known_good_instance()
 #[tokio::test(flavor = "multi_thread")]
 async fn apply_incremental_empty_result_returns_unchanged() {
     let state = empty_proxy_state();
-    let result = state.apply_incremental(empty_delta_at(Utc::now())).await;
+    let result = state
+        .apply_incremental(empty_delta_at(UtcTimestamp::now()))
+        .await;
     assert_eq!(result, ConfigApplyOutcome::Unchanged);
 }
 
@@ -2179,7 +2182,7 @@ async fn apply_incremental_valid_changes_returns_applied() {
     let state = empty_proxy_state();
     assert!(state.config.load().proxies.is_empty());
 
-    let delta = delta_with_proxy(test_proxy("p1", "/api/v1"), Utc::now());
+    let delta = delta_with_proxy(test_proxy("p1", "/api/v1"), UtcTimestamp::now());
     let result = state.apply_incremental(delta).await;
 
     assert_eq!(result, ConfigApplyOutcome::Applied);
@@ -2204,7 +2207,7 @@ async fn apply_incremental_mixed_resource_mutations_are_atomic() {
             test_upstream("u1", "old.example.test", 8080),
             test_upstream("u2", "remove.example.test", 8080),
         ],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     let state = proxy_state_with_config(initial_config);
@@ -2217,7 +2220,7 @@ async fn apply_incremental_mixed_resource_mutations_are_atomic() {
     let mut pc1 = test_plugin_config("pc1", false);
     pc1.priority_override = Some(50);
     let u1 = test_upstream("u1", "new.example.test", 9090);
-    let poll_timestamp = Utc::now();
+    let poll_timestamp = UtcTimestamp::now();
     let delta = IncrementalResult {
         added_or_modified_proxies: vec![p1, p3],
         removed_proxy_ids: vec![NamespacedResourceId::new("ferrum", "p2")],
@@ -2285,7 +2288,7 @@ async fn apply_incremental_consumer_keys_include_namespace() {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
         sequence_cursor: 1,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     };
 
     assert_eq!(
@@ -2328,7 +2331,7 @@ async fn apply_incremental_proxy_upsert_keys_include_namespace() {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
         sequence_cursor: 1,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     };
 
     assert_eq!(
@@ -2370,7 +2373,7 @@ async fn apply_incremental_plugin_config_upsert_keys_include_namespace() {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
         sequence_cursor: 1,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     };
 
     assert_eq!(
@@ -2416,7 +2419,7 @@ async fn apply_incremental_upstream_upsert_keys_include_namespace() {
         added_or_modified_upstreams: vec![updated_staging],
         removed_upstream_ids: vec![],
         sequence_cursor: 1,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     };
 
     assert_eq!(
@@ -2464,7 +2467,7 @@ async fn apply_incremental_rejected_returns_rejected_variant() {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
         sequence_cursor: 0,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     };
 
     let result = state.apply_incremental(delta).await;
@@ -2494,14 +2497,16 @@ async fn polling_cursor_only_advances_on_applied_or_unchanged() {
     let state = empty_proxy_state();
 
     // ------ Cycle 1: rejected delta. ------
-    let cursor_before = Utc::now() - Duration::seconds(60);
+    let cursor_before = UtcTimestamp::now()
+        .checked_sub(::time::SignedDuration::seconds(60))
+        .unwrap();
     let mut last_poll_at = Some(cursor_before);
 
     let mut p1 = test_proxy("p1", "/dup");
     let mut p2 = test_proxy("p2", "/dup");
     p1.hosts = vec![];
     p2.hosts = vec![];
-    let rejected_ts = Utc::now();
+    let rejected_ts = UtcTimestamp::now();
     let rejected_delta = IncrementalResult {
         added_or_modified_proxies: vec![p1, p2],
         removed_proxy_ids: vec![],
@@ -2533,7 +2538,7 @@ async fn polling_cursor_only_advances_on_applied_or_unchanged() {
     );
 
     // ------ Cycle 2: empty delta. ------
-    let empty_ts = Utc::now();
+    let empty_ts = UtcTimestamp::now();
     let outcome = state.apply_incremental(empty_delta_at(empty_ts)).await;
     assert_eq!(outcome, ConfigApplyOutcome::Unchanged);
     match outcome {
@@ -2549,7 +2554,7 @@ async fn polling_cursor_only_advances_on_applied_or_unchanged() {
     );
 
     // ------ Cycle 3: applied delta. ------
-    let applied_ts = Utc::now();
+    let applied_ts = UtcTimestamp::now();
     let applied_delta = delta_with_proxy(test_proxy("p3", "/api/v3"), applied_ts);
     let outcome = state.apply_incremental(applied_delta).await;
     assert_eq!(outcome, ConfigApplyOutcome::Applied);
@@ -2703,7 +2708,7 @@ async fn start_tls_stream_proxy_with_retry(
         let mut config = GatewayConfig {
             proxies: vec![proxy],
             upstreams: vec![upstream.clone()],
-            loaded_at: Utc::now(),
+            loaded_at: UtcTimestamp::now(),
             ..GatewayConfig::default()
         };
         config.normalize_fields();
@@ -2810,7 +2815,7 @@ async fn apply_incremental_upstream_only_tls_change_reconciles_stream_listeners(
         added_or_modified_upstreams: vec![rotated_upstream],
         removed_upstream_ids: vec![],
         sequence_cursor: 0,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     };
     let outcome = state.apply_incremental(delta).await;
     assert_eq!(outcome, ConfigApplyOutcome::Applied);
@@ -2865,7 +2870,7 @@ async fn plugin_only_delta_reuses_route_table_for_same_id_proxies_in_two_namespa
         version: ferrum_edge::config::types::CURRENT_CONFIG_VERSION.to_string(),
         proxies: vec![tenant_a, tenant_b],
         plugin_configs: vec![plugin.clone()],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     });
 
@@ -2881,7 +2886,7 @@ async fn plugin_only_delta_reuses_route_table_for_same_id_proxies_in_two_namespa
     plugin.enabled = false;
     plugin.updated_at = Utc::now() + Duration::milliseconds(1);
     let outcome = state
-        .apply_incremental(delta_with_plugin(plugin, Utc::now()))
+        .apply_incremental(delta_with_plugin(plugin, UtcTimestamp::now()))
         .await;
     assert_eq!(outcome, ConfigApplyOutcome::Applied);
 
@@ -2911,7 +2916,7 @@ async fn proxy_delta_updates_only_the_owning_namespace_for_a_shared_proxy_id() {
     let state = proxy_state_with_config(GatewayConfig {
         version: ferrum_edge::config::types::CURRENT_CONFIG_VERSION.to_string(),
         proxies: vec![tenant_b.clone(), tenant_a],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     });
 
@@ -2919,7 +2924,7 @@ async fn proxy_delta_updates_only_the_owning_namespace_for_a_shared_proxy_id() {
     updated_b.backend_host = "tenant-b-v2.local".to_string();
     updated_b.updated_at = Utc::now() + Duration::milliseconds(1);
     let outcome = state
-        .apply_incremental(delta_with_proxy(updated_b, Utc::now()))
+        .apply_incremental(delta_with_proxy(updated_b, UtcTimestamp::now()))
         .await;
     assert_eq!(outcome, ConfigApplyOutcome::Applied);
 
@@ -3004,7 +3009,7 @@ async fn ai_rate_limiter_is_never_installed_on_native_grpc_across_config_paths()
         version: ferrum_edge::config::types::CURRENT_CONFIG_VERSION.to_string(),
         proxies: vec![test_proxy("ai-proxy", "/ai")],
         plugin_configs: vec![ai_rate_limiter_plugin_config("ai-limit")],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
 
@@ -3058,7 +3063,7 @@ async fn ai_rate_limiter_is_never_installed_on_native_grpc_across_config_paths()
     updated.updated_at = Utc::now();
     assert_eq!(
         dp_state
-            .apply_incremental(delta_with_plugin(updated, Utc::now()))
+            .apply_incremental(delta_with_plugin(updated, UtcTimestamp::now()))
             .await,
         ConfigApplyOutcome::Applied
     );
@@ -3110,7 +3115,7 @@ async fn consumer_delta_keeps_full_build_precedence_for_shared_api_keys() {
         .labels
         .insert("tier".to_string(), "gold".to_string());
     relabeled.updated_at = Utc::now() + chrono::Duration::seconds(1);
-    let mut delta = empty_delta_at(Utc::now());
+    let mut delta = empty_delta_at(UtcTimestamp::now());
     delta.added_or_modified_consumers = vec![relabeled];
     let outcome = state.apply_incremental(delta).await;
     assert!(
@@ -3130,7 +3135,11 @@ async fn consumer_delta_keeps_full_build_precedence_for_shared_api_keys() {
 
     // Deleting the current winner hands the key to the remaining consumer.
     let winner = live_winner(&state).expect("winner");
-    let mut delta = empty_delta_at(Utc::now() + chrono::Duration::seconds(2));
+    let mut delta = empty_delta_at(
+        UtcTimestamp::now()
+            .checked_add(::time::SignedDuration::seconds(2))
+            .unwrap(),
+    );
     delta.removed_consumer_ids = vec![NamespacedResourceId::new(
         ferrum_edge::config::types::default_namespace(),
         winner.clone(),
@@ -3170,7 +3179,7 @@ async fn consumer_delta_introducing_shared_api_key_is_rejected() {
     };
 
     // The delta must not publish at all, whichever id sorts first.
-    let mut delta = empty_delta_at(Utc::now());
+    let mut delta = empty_delta_at(UtcTimestamp::now());
     delta.added_or_modified_consumers = vec![keyed("c-a", "zulu-api-key-0123456789")];
     let outcome = state.apply_incremental(delta).await;
     assert!(
@@ -3192,7 +3201,11 @@ async fn consumer_delta_introducing_shared_api_key_is_rejected() {
     );
 
     // A non-colliding delta still applies.
-    let mut delta = empty_delta_at(Utc::now() + chrono::Duration::seconds(1));
+    let mut delta = empty_delta_at(
+        UtcTimestamp::now()
+            .checked_add(::time::SignedDuration::seconds(1))
+            .unwrap(),
+    );
     delta.added_or_modified_consumers = vec![keyed("c-a", "alpha-api-key-0123456789")];
     assert_eq!(
         state.apply_incremental(delta).await,
@@ -3223,7 +3236,7 @@ fn delta_with_consumers(consumers: Vec<Consumer>) -> IncrementalResult {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
         sequence_cursor: 0,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     }
 }
 
@@ -3306,7 +3319,7 @@ async fn delta_after_quarantining_full_snapshot_keeps_shared_jwt_secret_out() {
             jwt_test_consumer("alice", SHARED),
             jwt_test_consumer("eve", SHARED),
         ],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     let _ = state.update_config(full);
@@ -3332,7 +3345,7 @@ async fn loader_stripped_full_snapshot_seeds_the_shared_secret_history() {
             jwt_test_consumer("alice", SHARED),
             jwt_test_consumer("eve", SHARED),
         ],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     // What the SQL/Mongo full loaders do before returning the snapshot.
@@ -3382,7 +3395,7 @@ async fn rejected_candidate_does_not_record_shared_jwt_secrets() {
             jwt_test_consumer("alice", SHARED),
             jwt_test_consumer("eve", SHARED),
         ],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     assert!(matches!(
@@ -3483,7 +3496,11 @@ async fn comparing_stale_or_rejected_snapshots_does_not_record_jwt_history() {
                 jwt_test_consumer("alice", SHARED),
                 jwt_test_consumer("eve", SHARED),
             ],
-            loaded_at: state.current_config().loaded_at - Duration::hours(1),
+            loaded_at: state
+                .current_config()
+                .loaded_at
+                .checked_sub(::time::SignedDuration::hours(1))
+                .unwrap(),
             ..GatewayConfig::default()
         };
         if loader_stripped {

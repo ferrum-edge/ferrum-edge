@@ -7,6 +7,7 @@ use ferrum_edge::config::types::{
     default_namespace,
 };
 use ferrum_edge::health_check::HealthChecker;
+use ferrum_edge::time_compat::UtcTimestamp;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -1289,7 +1290,7 @@ fn config_with_upstreams(upstreams: Vec<Upstream>) -> GatewayConfig {
         consumers: Vec::new(),
         plugin_configs: Vec::new(),
         upstreams,
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         frontend_tls_cert_path: None,
         frontend_tls_key_path: None,

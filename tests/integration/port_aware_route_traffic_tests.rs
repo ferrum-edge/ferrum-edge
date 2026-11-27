@@ -42,6 +42,7 @@ use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, GatewayC
 use ferrum_edge::modes::file::{ServeOptions, serve};
 use ferrum_edge::proxy::gateway_listener::GatewayListenerBindFailure;
 use ferrum_edge::proxy::gateway_listener_status::GatewayListenerFailureCategory;
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const HOST: &str = "app.example.com";
 
@@ -121,7 +122,7 @@ fn config_with(proxies: Vec<Proxy>) -> GatewayConfig {
     GatewayConfig {
         version: "1".to_string(),
         proxies,
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     }
 }

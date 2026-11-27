@@ -60,6 +60,7 @@ use ferrum_edge::proxy::udp_proxy::{UdpListenerConfig, UdpProxyMetrics, start_ud
 use ferrum_edge::request_epoch::RequestEpochStore;
 
 use crate::scaffolding::ports::reserve_udp_port;
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const PROXY_ID: &str = "udp-datagram-client-address";
 const SECRET: &str = "0123456789abcdef0123456789abcdef";
@@ -248,7 +249,7 @@ async fn try_spawn_gateway(
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };

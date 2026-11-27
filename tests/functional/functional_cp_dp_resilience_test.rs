@@ -46,6 +46,7 @@ use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::grpc::cp_server::{CpGrpcServer, DpNodeRegistry};
 use ferrum_edge::grpc::dp_client::{self, DpCpConnectionState};
 use ferrum_edge::proxy::ProxyState;
+use ferrum_edge::time_compat::UtcTimestamp;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
 use tokio::time::{sleep, timeout};
@@ -413,7 +414,7 @@ async fn test_broadcast_overflow_triggers_full_snapshot_recovery() {
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };
@@ -481,7 +482,7 @@ async fn test_broadcast_overflow_triggers_full_snapshot_recovery() {
             consumers: vec![],
             plugin_configs: vec![],
             upstreams: vec![],
-            loaded_at: Utc::now(),
+            loaded_at: UtcTimestamp::now(),
             known_namespaces: Vec::new(),
             ..Default::default()
         };
@@ -550,7 +551,7 @@ async fn test_multi_cp_failover_connects_to_fallback() {
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };
@@ -663,7 +664,7 @@ async fn test_primary_retry_reconnects_to_primary() {
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };
@@ -724,7 +725,7 @@ async fn test_primary_retry_reconnects_to_primary() {
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };
@@ -828,7 +829,7 @@ async fn test_cluster_endpoint_shape_cp_and_dp() {
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };

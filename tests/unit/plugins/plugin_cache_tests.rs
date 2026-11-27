@@ -35,6 +35,7 @@ use std::collections::{HashMap, HashSet};
 pub(crate) use super::plugin_utils::{
     make_plugin_config, make_plugin_config_with_json, make_proxy, minimal_plugin_config,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use std::sync::Arc;
 
 struct NameOnlyPlugin(&'static str);
@@ -240,7 +241,7 @@ fn make_config(proxies: Vec<Proxy>, plugin_configs: Vec<PluginConfig>) -> Gatewa
         consumers: vec![],
         plugin_configs,
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     }

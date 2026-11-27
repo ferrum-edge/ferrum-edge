@@ -44,6 +44,7 @@ use ferrum_edge::proxy::{
     ProxyState, start_proxy_listener_with_bound_listener,
     start_proxy_listener_with_bound_listener_and_mesh_direction,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
@@ -473,7 +474,7 @@ pub fn gateway_config_with_mesh(
         upstreams,
         consumers: Vec::new(),
         plugin_configs: Vec::new(),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         frontend_tls_cert_path: None,
         frontend_tls_key_path: None,

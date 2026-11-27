@@ -9,6 +9,7 @@ use ferrum_edge::config::types::{
 use ferrum_edge::modes::mesh::config::{
     AppProtocol, MeshConfig, MeshService, MeshTracingConfig, ServicePort, TracingProvider,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use std::collections::HashMap;
 
 /// Helper to create a minimal proxy with required fields.
@@ -950,7 +951,7 @@ fn empty_config() -> GatewayConfig {
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     }
@@ -1529,7 +1530,7 @@ fn test_unique_listen_paths_valid() {
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };
@@ -1681,7 +1682,7 @@ fn test_unique_listen_paths_duplicate() {
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };

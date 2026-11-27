@@ -8,6 +8,7 @@ use ferrum_edge::config::types::{
 use ferrum_edge::plugins::{ProxyProtocol, RequestContext};
 use ferrum_edge::proxy::backend_dispatch::detect_http_flavor;
 use ferrum_edge::proxy::run_authentication_phase;
+use ferrum_edge::time_compat::UtcTimestamp;
 use ferrum_edge::{ConsumerIndex, PluginCache};
 use http::Request;
 use serde_json::{Map, Value, json};
@@ -136,7 +137,7 @@ fn gateway_config() -> GatewayConfig {
         consumers: vec![keyauth_consumer()],
         plugin_configs: vec![keyauth_plugin_config()],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     }

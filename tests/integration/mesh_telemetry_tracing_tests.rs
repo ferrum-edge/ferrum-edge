@@ -1,4 +1,3 @@
-use chrono::Utc;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
@@ -15,6 +14,7 @@ use ferrum_edge::modes::mesh::{
 use ferrum_edge::plugins::{
     TransactionSummary, create_plugin, mesh::workload_metrics::WorkloadMetrics,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use serde_json::{Value, json};
 
 fn test_addr(s: &str) -> SocketAddr {
@@ -140,7 +140,7 @@ fn workload_metrics_plugin_config(tracing: MeshTracingConfig) -> Value {
     };
     let config = GatewayConfig {
         mesh: Some(Box::new(mesh)),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     let prepared = prepare_gateway_config_via_mesh_slice(config, &test_runtime())

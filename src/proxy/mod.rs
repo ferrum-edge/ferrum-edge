@@ -81154,7 +81154,7 @@ mod tests {
             consumers: vec![],
             plugin_configs: vec![],
             upstreams: vec![],
-            loaded_at: chrono::Utc::now(),
+            loaded_at: crate::time_compat::UtcTimestamp::now(),
             known_namespaces: Vec::new(),
             frontend_tls_cert_path: None,
             frontend_tls_key_path: None,
@@ -82121,7 +82121,7 @@ mod tests {
                 added_or_modified_upstreams: Vec::new(),
                 removed_upstream_ids: Vec::new(),
                 sequence_cursor: 0,
-                poll_timestamp: now,
+                poll_timestamp: crate::time_compat::UtcTimestamp::now(),
             })
             .await;
 

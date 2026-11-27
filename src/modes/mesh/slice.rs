@@ -8411,7 +8411,7 @@ mod tests {
             })),
             ..GatewayConfig::default()
         };
-        config.loaded_at = chrono::Utc::now();
+        config.loaded_at = crate::time_compat::UtcTimestamp::now();
 
         let slice = MeshSlice::from_gateway_config(
             &config,

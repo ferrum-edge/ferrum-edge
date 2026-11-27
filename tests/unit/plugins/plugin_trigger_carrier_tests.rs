@@ -10,7 +10,6 @@
 //! `tests/unit/config/plugin_trigger_tests.rs`; request/stream-phase gating
 //! lives in `plugin_trigger_gate_tests.rs`.
 
-use chrono::Utc;
 use ferrum_edge::_test_support::{
     admitted_datagram_plugins_for_test, attach_transaction_trigger_decisions_for_test,
     collect_websocket_disconnect_plugins_for_test,
@@ -34,6 +33,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use super::{make_plugin_config_with_json, make_proxy, minimal_plugin_config};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const NS: &str = "ferrum";
 
@@ -61,7 +61,7 @@ fn config(proxies: Vec<Proxy>, plugin_configs: Vec<PluginConfig>) -> GatewayConf
         version: "1".to_string(),
         proxies,
         plugin_configs,
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..Default::default()
     }
 }

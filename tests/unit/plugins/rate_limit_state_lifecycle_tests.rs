@@ -33,6 +33,7 @@ use std::time::Instant;
 
 use super::make_proxy;
 use super::plugin_utils::create_test_context;
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const NS: &str = "ferrum";
 
@@ -72,7 +73,7 @@ fn gateway_config(proxies: Vec<Proxy>, plugin_configs: Vec<PluginConfig>) -> Gat
         consumers: vec![],
         plugin_configs,
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     }

@@ -15,7 +15,6 @@
 use crate::scaffolding::port_registry::TestSocket;
 
 use arc_swap::ArcSwap;
-use chrono::Utc;
 use ferrum_edge::admin::{
     AdminState,
     jwt_auth::{JwtConfig, JwtManager},
@@ -23,6 +22,7 @@ use ferrum_edge::admin::{
 };
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
 use ferrum_edge::config::types::GatewayConfig;
+use ferrum_edge::time_compat::UtcTimestamp;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
@@ -80,7 +80,7 @@ fn stale_empty_cached_config() -> Option<Arc<ArcSwap<GatewayConfig>>> {
     // write admitted here is admitted on policy rather than on a cache miss.
     Some(Arc::new(ArcSwap::from_pointee(GatewayConfig {
         version: "1".to_string(),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     })))
 }

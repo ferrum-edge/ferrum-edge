@@ -30,6 +30,7 @@ use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::grpc::cp_server::{CpGrpcServer, CpScope, DpNodeRegistry};
 use ferrum_edge::grpc::dp_client;
 use ferrum_edge::proxy::ProxyState;
+use ferrum_edge::time_compat::UtcTimestamp;
 use tokio::time::sleep;
 use tonic::transport::Server;
 
@@ -272,7 +273,7 @@ async fn test_cp_dp_grpc_config_sync() {
         }],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };
@@ -355,7 +356,7 @@ async fn test_cp_dp_grpc_config_sync() {
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };
@@ -665,7 +666,7 @@ async fn test_cp_dp_namespace_isolation_over_grpc() {
         }],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: vec!["production".to_string(), "staging".to_string()],
         ..Default::default()
     };
@@ -751,7 +752,7 @@ async fn test_cp_dp_namespace_isolation_over_grpc() {
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: vec!["production".to_string(), "staging".to_string()],
         ..Default::default()
     };

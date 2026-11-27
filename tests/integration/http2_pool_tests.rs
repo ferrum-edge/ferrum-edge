@@ -23,6 +23,7 @@ use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::proxy::grpc_proxy::{GrpcBody, GrpcConnectionPool};
 use ferrum_edge::proxy::http2_pool::{Http2ConnectionPool, Http2PoolError};
 use ferrum_edge::proxy::{ProxyState, handle_proxy_request};
+use ferrum_edge::time_compat::UtcTimestamp;
 use hickory_resolver::proto::{
     op::Message,
     rr::{RData, Record, RecordType},
@@ -3310,7 +3311,7 @@ async fn assert_unclassified_https_uploads(
         version: "1".to_string(),
         proxies: vec![proxy.clone()],
         plugin_configs: vec![policy],
-        loaded_at: chrono::Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..Default::default()
     };
     let env_config = ferrum_edge::config::EnvConfig {
@@ -3504,7 +3505,7 @@ async fn assert_direct_h2_host_and_authority(h2_frontend: bool) {
     let config = GatewayConfig {
         version: "1".to_string(),
         proxies: vec![proxy],
-        loaded_at: chrono::Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..Default::default()
     };
     let (state, _health_handles) =
@@ -5401,7 +5402,7 @@ async fn start_adaptive_direct_h2_gateway(
         version: "1".to_string(),
         proxies: vec![proxy],
         plugin_configs: vec![policy],
-        loaded_at: chrono::Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..Default::default()
     };
     let (state, _health_handles) =

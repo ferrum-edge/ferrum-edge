@@ -20012,7 +20012,7 @@ pub mod _test_support {
         >,
         version: &str,
         sequence_cursor: u64,
-        poll_timestamp: chrono::DateTime<chrono::Utc>,
+        poll_timestamp: crate::time_compat::UtcTimestamp,
         broadcasts: &crate::grpc::cp_server::NamespaceBroadcasts,
         dp_registry: &crate::grpc::cp_server::DpNodeRegistry,
         cp_scope: &crate::grpc::cp_server::CpScope,

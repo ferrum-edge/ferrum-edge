@@ -22551,7 +22551,7 @@ mod build_h3_backend_headers_tests {
             consumers: vec![],
             plugin_configs: vec![],
             upstreams: vec![],
-            loaded_at: chrono::Utc::now(),
+            loaded_at: crate::time_compat::UtcTimestamp::now(),
             known_namespaces: Vec::new(),
             frontend_tls_cert_path: None,
             frontend_tls_key_path: None,

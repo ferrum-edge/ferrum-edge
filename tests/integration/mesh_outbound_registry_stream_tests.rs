@@ -49,6 +49,7 @@ use ferrum_edge::request_epoch::RequestEpochStore;
 use serde_json::json;
 
 use crate::scaffolding::ports::reserve_port;
+use ferrum_edge::time_compat::UtcTimestamp;
 
 // Each test that asserts on the Prometheus stream-decision counter MUST
 // scope its enforcement to a unique namespace label. The Prometheus
@@ -240,7 +241,7 @@ async fn try_spawn_tcp_listener(
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };
@@ -575,7 +576,7 @@ async fn try_spawn_udp_listener(
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };

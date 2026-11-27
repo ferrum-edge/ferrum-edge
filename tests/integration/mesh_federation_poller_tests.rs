@@ -28,6 +28,7 @@ use ferrum_edge::modes::mesh::federation::{
 use ferrum_edge::modes::mesh::runtime::MeshRuntimeState;
 use ferrum_edge::plugins::PluginHttpClient;
 use ferrum_edge::proxy::ProxyState;
+use ferrum_edge::time_compat::UtcTimestamp;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -422,7 +423,7 @@ fn admin_token(config: &AdminTestConfig) -> String {
 fn build_admin_state(jwt: JwtManager, mesh_runtime_state: Option<MeshRuntimeState>) -> AdminState {
     let cfg = GatewayConfig {
         version: "1".to_string(),
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     let env_config = EnvConfig {

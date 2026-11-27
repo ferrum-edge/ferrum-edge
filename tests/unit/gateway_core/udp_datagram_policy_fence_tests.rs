@@ -7,7 +7,6 @@
 
 use std::sync::Arc;
 
-use chrono::Utc;
 use ferrum_edge::_test_support::udp_datagram_policy_fence_for_test;
 use ferrum_edge::PluginCache;
 use ferrum_edge::config::types::{
@@ -21,6 +20,7 @@ use ferrum_edge::request_epoch::RequestEpochStore;
 use serde_json::json;
 
 use crate::unit::plugins::plugin_utils::{make_plugin_config_with_json, make_proxy};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 fn udp_proxy(id: &str, port: u16, plugin_ids: Vec<&str>) -> Proxy {
     let mut proxy = make_proxy(id, "/", plugin_ids);
@@ -46,7 +46,7 @@ fn gateway_config(proxies: Vec<Proxy>, plugin_configs: Vec<PluginConfig>) -> Gat
         version: "1".to_string(),
         proxies,
         plugin_configs,
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..Default::default()
     }
 }

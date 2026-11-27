@@ -538,7 +538,7 @@ mod tests {
             consumers: vec![],
             plugin_configs,
             upstreams: vec![],
-            loaded_at: ts(0),
+            loaded_at: crate::time_compat::UtcTimestamp::UNIX_EPOCH,
             known_namespaces: vec![],
             frontend_tls_cert_path: None,
             frontend_tls_key_path: None,

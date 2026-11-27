@@ -199,13 +199,13 @@ fn subscribe_update_dedupe_ignores_version_stamp() {
     );
 
     let mut config_a = gateway_config_with_mesh(two_namespace_mesh("ferrum", "other"));
-    config_a.loaded_at = chrono::DateTime::parse_from_rfc3339("2026-07-03T00:00:00Z")
-        .expect("fixture timestamp")
-        .with_timezone(&chrono::Utc);
+    config_a.loaded_at = "2026-07-03T00:00:00Z"
+        .parse::<ferrum_edge::time_compat::UtcTimestamp>()
+        .expect("fixture timestamp");
     let mut config_b = config_a.clone();
-    config_b.loaded_at = chrono::DateTime::parse_from_rfc3339("2026-07-03T00:05:00Z")
-        .expect("fixture timestamp")
-        .with_timezone(&chrono::Utc);
+    config_b.loaded_at = "2026-07-03T00:05:00Z"
+        .parse::<ferrum_edge::time_compat::UtcTimestamp>()
+        .expect("fixture timestamp");
 
     let slice_a = build_slice(&config_a, "ferrum");
     let slice_b = build_slice(&config_b, "ferrum");

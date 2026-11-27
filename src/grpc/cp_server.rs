@@ -2968,6 +2968,7 @@ impl ConfigSync for CpGrpcServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::time_compat::UtcTimestamp;
     use base64::Engine;
     use chrono::{TimeZone, Utc};
     use std::collections::HashMap;
@@ -3068,7 +3069,7 @@ mod tests {
             version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
             // Fixed so the numeric metadata assertion below cannot collide with
             // digits from a wall-clock timestamp.
-            loaded_at: Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 0).unwrap(),
+            loaded_at: "2026-05-05T12:00:00Z".parse::<UtcTimestamp>().unwrap(),
             trust_bundles: Some(Box::new(test_trust_bundles())),
             gateway_trust_bundles: vec![test_gateway_trust_record("ferrum")],
             ..Default::default()
@@ -3108,7 +3109,7 @@ mod tests {
     fn broadcast_update_sends_trust_bundles_only_in_side_channel() {
         let config = GatewayConfig {
             version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
-            loaded_at: Utc::now(),
+            loaded_at: UtcTimestamp::now(),
             trust_bundles: Some(Box::new(test_trust_bundles())),
             gateway_trust_bundles: vec![test_gateway_trust_record("ferrum")],
             ..Default::default()
@@ -3139,7 +3140,7 @@ mod tests {
     fn broadcast_update_refuses_invalid_trust_bundle_without_emitting_clear() {
         let config = GatewayConfig {
             version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
-            loaded_at: Utc::now(),
+            loaded_at: UtcTimestamp::now(),
             trust_bundles: Some(Box::new(invalid_test_trust_bundles())),
             ..Default::default()
         };
@@ -3587,7 +3588,7 @@ mod tests {
         // Send to ns-a only.
         let config_a = GatewayConfig {
             version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
-            loaded_at: Utc::now(),
+            loaded_at: UtcTimestamp::now(),
             ..Default::default()
         };
         CpGrpcServer::broadcast_update(&tx_a, &config_a);
@@ -3624,7 +3625,7 @@ mod tests {
 
         let config = GatewayConfig {
             version: CURRENT_CONFIG_VERSION.to_string(),
-            loaded_at: Utc::now(),
+            loaded_at: UtcTimestamp::now(),
             proxies: vec![p_a, p_b],
             ..Default::default()
         };
@@ -3666,7 +3667,7 @@ mod tests {
         };
         let mut config = GatewayConfig {
             version: CURRENT_CONFIG_VERSION.to_string(),
-            loaded_at: Utc::now(),
+            loaded_at: UtcTimestamp::now(),
             proxies: vec![
                 proxy("p-b1", "ns-b"),
                 proxy("p-a1", "ns-a"),
@@ -3728,7 +3729,7 @@ mod tests {
 
         let mut config = GatewayConfig {
             version: CURRENT_CONFIG_VERSION.to_string(),
-            loaded_at: Utc::now(),
+            loaded_at: UtcTimestamp::now(),
             proxies: vec![p_a],
             ..Default::default()
         };
@@ -5474,7 +5475,7 @@ mod tests {
 
         let config = GatewayConfig {
             version: CURRENT_CONFIG_VERSION.to_string(),
-            loaded_at: Utc::now(),
+            loaded_at: UtcTimestamp::now(),
             frontend_tls_cert_path: Some("k8s://ns-b/gateway-cert#tls.crt".to_string()),
             frontend_tls_key_path: Some("k8s://ns-b/gateway-cert#tls.key".to_string()),
             frontend_tls_source_namespace: Some("ns-a".to_string()),
@@ -5498,7 +5499,7 @@ mod tests {
 
         let config = GatewayConfig {
             version: CURRENT_CONFIG_VERSION.to_string(),
-            loaded_at: Utc::now(),
+            loaded_at: UtcTimestamp::now(),
             frontend_tls_cert_path: Some("k8s://ns-a/gateway-cert#tls.crt".to_string()),
             frontend_tls_key_path: Some("k8s://ns-a/gateway-cert#tls.key".to_string()),
             frontend_tls_source_namespace: Some("ns-a".to_string()),
@@ -5549,7 +5550,7 @@ mod tests {
 
         let config = GatewayConfig {
             version: CURRENT_CONFIG_VERSION.to_string(),
-            loaded_at: Utc::now(),
+            loaded_at: UtcTimestamp::now(),
             frontend_tls_cert_path: Some("k8s://ns-b/gateway-cert#tls.crt".to_string()),
             frontend_tls_key_path: Some("k8s://ns-b/gateway-cert#tls.key".to_string()),
             frontend_tls_source_namespace: Some("ns-b".to_string()),

@@ -12,6 +12,7 @@
 
 use crate::config::plugin_trigger::PluginTrigger;
 use crate::startup::sanitize_startup_cause;
+use crate::time_compat::UtcTimestamp;
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -3727,8 +3728,8 @@ pub struct GatewayConfig {
     #[serde(default)]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub upstreams: Vec<Upstream>,
-    #[serde(default = "Utc::now")]
-    pub loaded_at: DateTime<Utc>,
+    #[serde(default = "UtcTimestamp::now")]
+    pub loaded_at: UtcTimestamp,
     /// All distinct namespaces discovered at config load time (before namespace
     /// filtering). Populated by file mode so `GET /namespaces` can return all
     /// namespaces even though the in-memory config only holds one namespace's

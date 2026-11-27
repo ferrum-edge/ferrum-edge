@@ -3136,7 +3136,7 @@ mod inner {
             &self,
             namespace: &str,
         ) -> Result<GatewayConfig, anyhow::Error> {
-            let loaded_at = Utc::now();
+            let loaded_at = crate::time_compat::UtcTimestamp::now();
             let (proxies, plugin_configs) = if self.replica_set_configured() {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
@@ -3204,7 +3204,7 @@ mod inner {
             namespace: &str,
             scope: &crate::config::policy_graph_scope::PolicyGraphScope,
         ) -> Result<GatewayConfig, anyhow::Error> {
-            let loaded_at = Utc::now();
+            let loaded_at = crate::time_compat::UtcTimestamp::now();
             let scoped_proxy_ids: Vec<String> = scope.proxy_ids.iter().cloned().collect();
             let changed_ids: Vec<&str> = scope
                 .changed_plugin_config_ids
@@ -10783,7 +10783,7 @@ mod inner {
             proxies,
             plugin_configs,
             upstreams,
-            loaded_at: Utc::now(),
+            loaded_at: crate::time_compat::UtcTimestamp::now(),
             ..Default::default()
         };
         candidate.normalize_fields();
@@ -11224,7 +11224,7 @@ mod inner {
             purpose: FullConfigLoadPurpose,
         ) -> Result<GatewayConfig, anyhow::Error> {
             let start = std::time::Instant::now();
-            let loaded_at = Utc::now();
+            let loaded_at = crate::time_compat::UtcTimestamp::now();
             let (proxies, consumers, plugin_configs, upstreams, gateway_trust_bundles) =
                 if self.replica_set_configured.load(Ordering::Acquire) {
                     let connection = self.connection();
@@ -11592,7 +11592,7 @@ mod inner {
             // the snapshot inside a majority/snapshot transaction; standalone
             // reads directly from the primary.
             let start = std::time::Instant::now();
-            let loaded_at = Utc::now();
+            let loaded_at = crate::time_compat::UtcTimestamp::now();
             let (proxies, consumers, plugin_configs, upstreams, gateway_trust_bundles) =
                 if self.replica_set_configured.load(Ordering::Acquire) {
                     let connection = self.connection();
@@ -11714,7 +11714,7 @@ mod inner {
             &self,
             namespace: &str,
         ) -> Result<GatewayConfig, anyhow::Error> {
-            let loaded_at = Utc::now();
+            let loaded_at = crate::time_compat::UtcTimestamp::now();
             let proxies = self
                 .load_full_proxies_opt_session(namespace, None, true)
                 .await?;
@@ -11861,7 +11861,7 @@ mod inner {
                 );
             }
             let start = std::time::Instant::now();
-            let poll_timestamp = Utc::now();
+            let poll_timestamp = crate::time_compat::UtcTimestamp::now();
             // Run the cursor retention checks, change-log scan, and changed-doc
             // point-loads inside one `ReadConcern::snapshot()` transaction so
             // concurrent writes cannot cause torn views between `config_changes`

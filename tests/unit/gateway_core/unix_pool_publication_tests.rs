@@ -26,6 +26,7 @@ use chrono::{DateTime, Duration, Utc};
 use ferrum_edge::config::db_loader::{IncrementalResult, NamespacedResourceId};
 use ferrum_edge::config::types::*;
 use ferrum_edge::proxy::{ConfigApplyOutcome, ProxyState};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const UNIX_SOCKET_TAG: &str = "mesh.unix_socket";
 const UNIX_SOCKET_H2C_TAG: &str = "mesh.unix_socket_h2c";
@@ -201,7 +202,11 @@ fn config_with(socket_path: &str, h2c: bool, stamp: DateTime<Utc>) -> GatewayCon
         consumers: Vec::new(),
         plugin_configs: Vec::new(),
         upstreams: vec![unix_upstream(socket_path, h2c, stamp)],
-        loaded_at: stamp,
+        loaded_at: UtcTimestamp::from_unix_timestamp_nanos(
+            stamp.timestamp(),
+            stamp.timestamp_subsec_nanos(),
+        )
+        .unwrap(),
         known_namespaces: Vec::new(),
         ..GatewayConfig::default()
     };
@@ -282,7 +287,11 @@ fn delta_removing_the_proxy(stamp: DateTime<Utc>) -> IncrementalResult {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
         sequence_cursor: 0,
-        poll_timestamp: stamp,
+        poll_timestamp: UtcTimestamp::from_unix_timestamp_nanos(
+            stamp.timestamp(),
+            stamp.timestamp_subsec_nanos(),
+        )
+        .unwrap(),
     }
 }
 
@@ -297,7 +306,11 @@ fn delta_repointing_the_socket(socket_path: &str, stamp: DateTime<Utc>) -> Incre
         added_or_modified_upstreams: vec![unix_upstream(socket_path, false, stamp)],
         removed_upstream_ids: vec![],
         sequence_cursor: 0,
-        poll_timestamp: stamp,
+        poll_timestamp: UtcTimestamp::from_unix_timestamp_nanos(
+            stamp.timestamp(),
+            stamp.timestamp_subsec_nanos(),
+        )
+        .unwrap(),
     }
 }
 

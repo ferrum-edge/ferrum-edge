@@ -4,6 +4,7 @@ use bytes::Bytes;
 use ferrum_edge::_test_support::finalize_synthetic_response_for_test;
 use ferrum_edge::plugins::response_size_limiting::ResponseSizeLimiting;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext, validate_plugin_config};
+use ferrum_edge::time_compat::UtcTimestamp;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -770,7 +771,7 @@ fn route_stamped_ctx(plugins: &[(&str, serde_json::Value)]) -> RequestContext {
         version: "1".to_string(),
         proxies: vec![proxy],
         plugin_configs,
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..Default::default()
     };
     let cache = ferrum_edge::PluginCache::new(&config).expect("route plugin chain must admit");

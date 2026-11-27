@@ -8,6 +8,7 @@ use ferrum_edge::config::types::{
     CircuitBreakerConfig, GatewayConfig, LoadBalancerAlgorithm, UpstreamTarget,
 };
 use ferrum_edge::proxy::{ConfigApplyOutcome, HalfOpenProbeGuard, ProxyState};
+use ferrum_edge::time_compat::UtcTimestamp;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -2966,7 +2967,7 @@ async fn apply_incremental_preserves_live_breaker_state_for_all_target_kinds() {
             added_or_modified_upstreams: vec![],
             removed_upstream_ids: vec![],
             sequence_cursor: 0,
-            poll_timestamp: chrono::Utc::now(),
+            poll_timestamp: UtcTimestamp::now(),
         })
         .await;
     assert_eq!(outcome, ConfigApplyOutcome::Applied);

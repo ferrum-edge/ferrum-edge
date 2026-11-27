@@ -35,6 +35,7 @@ use ferrum_edge::grpc::mesh_registry::MeshNodeRegistry;
 use ferrum_edge::grpc::mesh_server::MeshConfigBroadcast;
 use ferrum_edge::grpc::proto::ConfigUpdate;
 use ferrum_edge::modes::mesh::config::{MeshConfig, MeshService};
+use ferrum_edge::time_compat::UtcTimestamp;
 use tokio::sync::broadcast;
 
 fn empty_incremental() -> IncrementalResult {
@@ -48,7 +49,7 @@ fn empty_incremental() -> IncrementalResult {
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
         sequence_cursor: 0,
-        poll_timestamp: Utc::now(),
+        poll_timestamp: UtcTimestamp::now(),
     }
 }
 
@@ -497,7 +498,7 @@ impl PublicationHarness {
             partitions,
             &format!("delta-{round}"),
             round as u64,
-            Utc::now(),
+            UtcTimestamp::now(),
             self.broadcasts.as_ref(),
             self.dp_registry.as_ref(),
             &self.cp_scope,
@@ -755,7 +756,9 @@ fn subscribe_snapshot_coverage_cannot_straddle_a_concurrent_publication() {
     // uncovered and forward it afterwards. The DP's source-blind freshness
     // fence refuses that delta, ends the stream, and raises divergence. The
     // capture seam injects exactly that publisher between the two reads.
-    let base = Utc::now() - chrono::Duration::seconds(60);
+    let base = UtcTimestamp::now()
+        .checked_sub(::time::SignedDuration::seconds(60))
+        .unwrap();
     let mut initial = GatewayConfig::default();
     initial.proxies.push(make_proxy("db-base", "ferrum"));
     initial.loaded_at = base;
@@ -776,7 +779,9 @@ fn subscribe_snapshot_coverage_cannot_straddle_a_concurrent_publication() {
                     let mut delta = empty_incremental();
                     delta.added_or_modified_proxies =
                         vec![make_proxy(&format!("db-delta-{round}"), "ferrum")];
-                    delta.poll_timestamp = base + chrono::Duration::seconds(offset);
+                    delta.poll_timestamp = base
+                        .checked_add(::time::SignedDuration::seconds(offset))
+                        .unwrap();
                     let partitions = HashMap::from([("ferrum".to_string(), delta)]);
                     harness.publish_incremental(&partitions, round);
                 }

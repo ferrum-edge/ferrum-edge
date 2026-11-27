@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::plugin_utils::{assert_continue, assert_reject, create_test_proxy};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 /// Stable client/log message for response-side decode/conversion failures.
 /// Backend-controlled encoding details must not cross this boundary.
@@ -5955,7 +5956,7 @@ async fn multipart_encoding_header_content_plugin_cache_rebuild_replaces_and_del
                 updated_at: Utc::now(),
             }],
             upstreams: vec![],
-            loaded_at: Utc::now(),
+            loaded_at: UtcTimestamp::now(),
             known_namespaces: Vec::new(),
             ..Default::default()
         }

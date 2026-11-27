@@ -13,6 +13,7 @@ use ferrum_edge::proxy::{
     retry_target_preserves_backend_path,
 };
 use ferrum_edge::router_cache::RouterCache;
+use ferrum_edge::time_compat::UtcTimestamp;
 use std::collections::HashMap;
 
 #[test]
@@ -907,7 +908,7 @@ fn test_longest_prefix_match() {
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };
@@ -928,7 +929,7 @@ fn test_no_match() {
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };

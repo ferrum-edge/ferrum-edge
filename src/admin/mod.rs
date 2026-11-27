@@ -10925,7 +10925,7 @@ async fn handle_batch_create(
         consumers: batch.consumers.clone(),
         plugin_configs: batch.plugin_configs.clone(),
         upstreams: batch.upstreams.clone(),
-        loaded_at: now,
+        loaded_at: crate::time_compat::UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         mesh: state
             .cached_gateway_config()
@@ -12526,7 +12526,7 @@ async fn handle_restore(
         consumers: std::mem::take(&mut payload.consumers),
         plugin_configs: std::mem::take(&mut payload.plugin_configs),
         upstreams: std::mem::take(&mut payload.upstreams),
-        loaded_at: Utc::now(),
+        loaded_at: crate::time_compat::UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         mesh: state
             .cached_gateway_config()

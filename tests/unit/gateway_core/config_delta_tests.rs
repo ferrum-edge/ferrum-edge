@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 use ferrum_edge::config::db_backend::NamespacedResourceId;
 use ferrum_edge::config::types::*;
 use ferrum_edge::config_delta::ConfigDelta;
+use ferrum_edge::time_compat::UtcTimestamp;
 use std::collections::HashMap;
 
 fn make_proxy(id: &str, listen_path: &str, updated_at: DateTime<Utc>) -> Proxy {
@@ -171,7 +172,7 @@ fn test_empty_delta_when_configs_identical() {
         consumers: vec![],
         plugin_configs: vec![],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
     };

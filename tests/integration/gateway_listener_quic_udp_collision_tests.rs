@@ -36,6 +36,7 @@ use ferrum_edge::proxy::gateway_listener::{
 use ferrum_edge::proxy::gateway_listener_status::{
     GatewayListenerFailureCategory, GatewayListenerProtocolHalf,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use ferrum_edge::tls::{NoVerifier, TlsPolicy};
 
 const HOST: &str = "app.example.com";
@@ -133,7 +134,7 @@ fn tls_config_with(proxies: Vec<Proxy>, listen_port: u16) -> GatewayConfig {
     let mut config = GatewayConfig {
         version: "1".into(),
         proxies,
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     config.resolve_dispatch_kind();
@@ -147,7 +148,7 @@ fn plaintext_config_with(proxies: Vec<Proxy>) -> GatewayConfig {
     let mut config = GatewayConfig {
         version: "1".into(),
         proxies,
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         ..GatewayConfig::default()
     };
     config.resolve_dispatch_kind();

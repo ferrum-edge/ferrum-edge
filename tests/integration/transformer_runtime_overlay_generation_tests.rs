@@ -42,6 +42,7 @@ use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::modes::mesh::config::{MeshRuntimeOverlay, RuntimeValue};
 use ferrum_edge::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext};
 use ferrum_edge::proxy::ProxyState;
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const SCOPE: &str = "gen-barrier";
 const REQUEST_GATE_KEY: &str = "ferrum.request_transformer.gen-barrier.enabled";
@@ -191,7 +192,7 @@ fn generation(
         consumers: vec![],
         plugin_configs: vec![plugin_config("gate", plugin_name, static_config)],
         upstreams: vec![],
-        loaded_at: Utc::now(),
+        loaded_at: UtcTimestamp::now(),
         known_namespaces: Vec::new(),
         frontend_tls_cert_path: None,
         frontend_tls_key_path: None,
