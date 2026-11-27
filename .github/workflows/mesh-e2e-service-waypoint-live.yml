@@ -214,12 +214,19 @@ jobs:
           # workflow and the `mesh-e2e-service-waypoint` suite in the trusted
           # classifier land in the same pull request, so while that pull
           # request is open the TRUSTED copy extracted above predates the suite
-          # name and argparse rejects it. Ask the trusted copy's own usage text
-          # whether it knows the suite and force the suite to RUN when it does
-          # not. The verdict never comes from the pull request's checkout, and
-          # every other failure below still fails the job closed. Delete this
-          # block once the suite is on the trusted base (the gate-on follow-up).
-          if ! python3 -I "$trusted_filter" --help | grep -Fq -- 'mesh-e2e-service-waypoint'; then
+          # name and argparse rejects it. Probe the trusted copy with the suite
+          # name and force the suite to RUN only on argparse's exact
+          # invalid-choice refusal for that name. (The extracted file's own
+          # name contains the suite name, so the usage text cannot be used.)
+          # The verdict never comes from the pull request's checkout, and every
+          # other failure below still fails the job closed. Delete this block
+          # once the suite is on the trusted base (the gate-on follow-up).
+          probe_status=0
+          python3 -I "$trusted_filter" --suite mesh-e2e-service-waypoint \
+            --changed-files "$changed_files" > /dev/null 2> "$RUNNER_TEMP/swp-suite-probe.err" \
+            || probe_status=$?
+          if [ "$probe_status" -eq 2 ] \
+            && grep -Fq -- "invalid choice: 'mesh-e2e-service-waypoint'" "$RUNNER_TEMP/swp-suite-probe.err"; then
             echo "relevant=true" >> "$GITHUB_OUTPUT"
             {
               echo "## Mesh e2e ServiceWaypoint trigger"
