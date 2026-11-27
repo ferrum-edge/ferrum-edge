@@ -649,10 +649,8 @@ impl AiPromptCompressor {
         }
         let mut hasher = DefaultHasher::new();
         self.instance_id.hash(&mut hasher);
-        ctx.timestamp_received.timestamp().hash(&mut hasher);
-        ctx.timestamp_received
-            .timestamp_subsec_nanos()
-            .hash(&mut hasher);
+        ctx.timestamp_received.unix_timestamp().hash(&mut hasher);
+        ctx.timestamp_received.subsec_nanos().hash(&mut hasher);
         // The top 53 bits give a uniform draw in [0, 1).
         let draw = (hasher.finish() >> 11) as f64 / (1u64 << 53) as f64;
         draw < self.sample_rate

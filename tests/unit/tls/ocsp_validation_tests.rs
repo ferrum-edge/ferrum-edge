@@ -2916,7 +2916,7 @@ fn a_dropped_staple_is_reported_by_the_tls_inventory_without_a_deadline() {
     ));
     assert!(matches!(before.state, TlsInventoryState::Loaded));
     assert_eq!(
-        before.next_update.map(|at| at.timestamp()),
+        before.next_update.map(|at| at.unix_timestamp()),
         Some(expires_at),
         "a served staple reports its deadline"
     );
@@ -3214,7 +3214,7 @@ fn retiring_a_pinned_older_resolver_preserves_the_refreshed_source_inventory() {
         .unwrap();
     assert_eq!(entry.state, TlsInventoryState::Loaded);
     assert_eq!(
-        entry.next_update.map(|at| at.timestamp()),
+        entry.next_update.map(|at| at.unix_timestamp()),
         Some(new_deadline)
     );
 

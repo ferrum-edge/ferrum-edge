@@ -8,7 +8,6 @@ use crate::plugins::utils::log_sampling::warn_sampled;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use chrono::Utc;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -2175,9 +2174,8 @@ impl Plugin for A2aGateway {
             if self.observability.emit_metadata {
                 ctx.metadata
                     .insert("a2a.streaming".to_string(), "true".to_string());
-                let latency = Utc::now()
-                    .signed_duration_since(ctx.timestamp_received)
-                    .num_milliseconds()
+                let latency = (crate::time_compat::UtcTimestamp::now() - ctx.timestamp_received)
+                    .whole_milliseconds()
                     .max(0);
                 ctx.metadata
                     .insert("a2a.ttfb_ms".to_string(), latency.to_string());

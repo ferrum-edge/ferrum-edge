@@ -236,7 +236,8 @@ section is canonical for the detail.
   honored. Express per-port policy at top level or via subset `connectionPool`
   fields.
 - **DR `outlierDetection.consecutiveGatewayErrors` /
-  `consecutiveLocalOriginFailures` / `minHealthPercent`** — **Deferred** with a
+  `consecutiveLocalOriginFailures` / `minHealthPercent` /
+  `splitExternalLocalOriginErrors: true`** — **Deferred** with a
   translate-time warning (issue #4292): passive health keeps one failure bucket
   and bounds ejection with `maxEjectionPercent` alone. `consecutive5xxErrors`
   IS applied with Istio's consecutive-streak semantics. Omitting both

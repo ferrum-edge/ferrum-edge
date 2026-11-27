@@ -1671,7 +1671,7 @@ fn a_crl_inventory_entry_carries_next_update_and_reaches_the_prometheus_gauge() 
         .expect("gauge row")
         .next_update_unix_seconds
         .load(std::sync::atomic::Ordering::Relaxed);
-    assert_eq!(stored, next_update.timestamp());
+    assert_eq!(stored, next_update.unix_timestamp());
 }
 
 /// Issue #7206: a probe verifier that fails to build for a reason unrelated to

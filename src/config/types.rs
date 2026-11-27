@@ -1807,7 +1807,11 @@ fn default_healthy_status_codes() -> Vec<u16> {
 /// 2. **On-success recovery**: If a request to the target succeeds
 ///    (e.g., via the all-unhealthy fallback path), it is immediately
 ///    marked healthy.
+///
+/// Unknown keys are rejected (`deny_unknown_fields`) so a misspelled or
+/// removed field fails admission instead of being silently ignored.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PassiveHealthCheck {
     #[serde(default = "default_passive_unhealthy_codes")]
     pub unhealthy_status_codes: Vec<u16>,
@@ -1828,20 +1832,6 @@ pub struct PassiveHealthCheck {
     /// `None` (default) = no cap (existing behavior).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_ejection_percent: Option<u8>,
-    /// Reserved for DestinationRule parity: subset of HTTP status codes (e.g., 502, 503, 504) that count as
-    /// gateway errors for outlier detection, tracked separately from the
-    /// general `unhealthy_status_codes`. When `split_external_local_origin_errors`
-    /// is true, these codes will be used for the external-origin error bucket.
-    /// Currently validated and persisted, but not yet applied by passive health.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gateway_error_codes: Option<Vec<u16>>,
-    /// Reserved for DestinationRule parity: when true, track local-origin errors (connection failures, timeouts)
-    /// separately from external errors (HTTP 5xx responses). This allows
-    /// different thresholds and windows for network-level vs application-level
-    /// failures in outlier detection. Currently validated and persisted, but
-    /// not yet applied by passive health.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub split_external_local_origin_errors: Option<bool>,
     /// Evaluate `unhealthy_threshold` against the target's CONSECUTIVE failure
     /// streak instead of the sliding-window failure count (issue #4292).
     ///
@@ -1860,8 +1850,8 @@ pub struct PassiveHealthCheck {
     /// (`consecutive5xxErrors: 0`). Matching `unhealthy_status_codes` and
     /// locally originated `connection_error` values are ignored (Envoy's
     /// default `splitExternalLocalOriginErrors=false` puts those connection
-    /// failures in the same 5xx bucket; Ferrum's split mode is deferred and
-    /// unused). Normally set by translated DestinationRules; direct native
+    /// failures in the same 5xx bucket; Ferrum has no split local-origin
+    /// bucket). Normally set by translated DestinationRules; direct native
     /// configuration may opt into the same sentinel explicitly.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub consecutive_5xx_ejection_disabled: bool,
@@ -1875,8 +1865,6 @@ impl Default for PassiveHealthCheck {
             unhealthy_window_seconds: default_passive_window(),
             healthy_after_seconds: default_passive_healthy_after(),
             max_ejection_percent: None,
-            gateway_error_codes: None,
-            split_external_local_origin_errors: None,
             consecutive_error_mode: false,
             consecutive_5xx_ejection_disabled: false,
         }
@@ -11387,12 +11375,6 @@ impl HealthCheckConfig {
                     "`passive.max_ejection_percent` must be between 0 and 100 (got \"{}\")",
                     pct
                 ));
-            }
-            // gateway_error_codes: valid HTTP status codes
-            if let Some(ref codes) = passive.gateway_error_codes
-                && let Err(e) = validate_status_codes("passive.gateway_error_codes", codes)
-            {
-                errors.push(e);
             }
         }
 

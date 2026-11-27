@@ -358,7 +358,8 @@ impl MeshTopology {
     /// slice carries (`MeshSlice::http_routes`, issues #7233 and #7423): the
     /// NodeWaypoint capture listener and the Sidecar outbound capture
     /// listener. Ambient is the L4 data plane and does no L7 routing (as in
-    /// Istio); ServiceWaypoint projection is a documented follow-up.
+    /// Istio). ServiceWaypoint does not serve them yet: its control-plane
+    /// projection and data-plane materialization are tracked in issue #7500.
     #[inline]
     pub(crate) fn serves_virtual_service_http_routes(self) -> bool {
         matches!(self, Self::NodeWaypoint | Self::Sidecar)
