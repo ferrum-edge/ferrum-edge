@@ -1739,6 +1739,187 @@ fn sidecar_refuses_cross_namespace_carried_destinations() {
     }
 }
 
+/// Issue #7499 (1.0 refusal): a weighted split with a leg in another
+/// namespace and NO DestinationRule used to install that Service's workloads
+/// in the route's own split upstream and serve them. Every cross-namespace
+/// leg now refuses its split (and the routes naming it) before either
+/// rebinding path is chosen, on Sidecar and NodeWaypoint, in either leg
+/// order; the host keeps its Service route and the rest of the slice applies.
+#[test]
+fn a_split_with_a_leg_in_another_namespace_is_refused_without_a_destination_rule() {
+    let foreign_leg = json!({
+        "destination": {"host": "ratings.other.svc.cluster.local", "port": {"number": 8080}},
+        "weight": 10
+    });
+    let local_leg = json!({
+        "destination": {"host": "reviews.default.svc.cluster.local", "port": {"number": 8080}},
+        "weight": 90
+    });
+    for (order, legs) in [
+        (
+            "local first",
+            json!([local_leg.clone(), foreign_leg.clone()]),
+        ),
+        (
+            "foreign first",
+            json!([foreign_leg.clone(), local_leg.clone()]),
+        ),
+    ] {
+        let config = translated_config(&[virtual_service(
+            "split",
+            json!({"hosts": ["reviews.default.svc.cluster.local"], "http": [{"route": legs}]}),
+        )]);
+        for (topology, runtime) in [
+            ("Sidecar", sidecar_runtime()),
+            ("NodeWaypoint", node_waypoint_runtime()),
+        ] {
+            let mut slice = MeshSlice::from_gateway_config(&config, runtime.mesh_slice_request());
+            assert!(
+                slice.destination_rules.is_empty(),
+                "{order}/{topology}: no DestinationRule governs either leg"
+            );
+            assert!(
+                !slice.http_routes.proxies.is_empty(),
+                "{order}/{topology}: carried"
+            );
+            import_other_namespace_ratings(&mut slice);
+            let prepared =
+                prepare_gateway_config_from_mesh_slice(&slice, &runtime).unwrap_or_else(|error| {
+                    panic!("{order}/{topology}: the slice still materializes: {error}")
+                });
+            assert_references_resolve(&prepared);
+            assert!(
+                carried_route_proxies(&prepared).is_empty(),
+                "{order}/{topology}: the split route is refused"
+            );
+            assert!(
+                !prepared.upstreams.iter().any(|upstream| {
+                    upstream.id.starts_with("istio-vs-upstream-")
+                        || (upstream.namespace == DEFAULT_NAMESPACE
+                            && upstream
+                                .targets
+                                .iter()
+                                .any(|target| target.host == "10.0.1.12"))
+                }),
+                "{order}/{topology}: no route-namespace upstream dials the other namespace"
+            );
+            assert!(
+                prepared.proxies.iter().any(|proxy| {
+                    proxy.namespace == DEFAULT_NAMESPACE
+                        && proxy.upstream_id.as_deref().is_some_and(|id| {
+                            id.starts_with("__mesh-out") && id.contains("reviews")
+                        })
+                }),
+                "{order}/{topology}: the host keeps its Service route"
+            );
+        }
+    }
+}
+
+/// Issue #7499 review: a route the translator terminates unconditionally (an
+/// unsupported match predicate left no dispatch rule) still names its split,
+/// but never dials it. Refusing the split must not drop that route and its
+/// 404, or the plain Service route would serve the requests it refuses: the
+/// route keeps its 404 with the refused split detached and pruned.
+#[test]
+fn a_terminating_route_keeps_its_404_when_its_cross_namespace_split_is_refused() {
+    let config = translated_config(&[virtual_service(
+        "guarded",
+        json!({
+            "hosts": ["reviews.default.svc.cluster.local"],
+            "http": [{
+                "match": [{"uri": {"prefix": "/legacy"}, "withoutHeaders": {}}],
+                "route": [
+                    {
+                        "destination": {"host": "reviews.default.svc.cluster.local", "port": {"number": 8080}},
+                        "weight": 90
+                    },
+                    {
+                        "destination": {"host": "ratings.other.svc.cluster.local", "port": {"number": 8080}},
+                        "weight": 10
+                    }
+                ]
+            }]
+        }),
+    )]);
+    for (topology, runtime) in [
+        ("Sidecar", sidecar_runtime()),
+        ("NodeWaypoint", node_waypoint_runtime()),
+    ] {
+        let mut slice = MeshSlice::from_gateway_config(&config, runtime.mesh_slice_request());
+        assert!(
+            slice
+                .http_routes
+                .plugin_configs
+                .iter()
+                .any(|plugin| { plugin["plugin_name"].as_str() == Some("request_termination") }),
+            "{topology}: the translator terminates the unsupported route"
+        );
+        import_other_namespace_ratings(&mut slice);
+        let prepared = prepare_gateway_config_from_mesh_slice(&slice, &runtime)
+            .unwrap_or_else(|error| panic!("{topology}: the slice materializes: {error}"));
+        assert_references_resolve(&prepared);
+        let route = carried_route_proxies(&prepared)
+            .into_iter()
+            .find(|proxy| proxy.listen_path.as_deref() == Some("/legacy"))
+            .unwrap_or_else(|| panic!("{topology}: the terminating route is kept"))
+            .clone();
+        assert_eq!(
+            route.upstream_id, None,
+            "{topology}: the refused split is detached"
+        );
+        assert_eq!(route.backend_host, "ferrum-zero-weight.invalid.");
+        let termination = prepared
+            .plugin_configs
+            .iter()
+            .find(|plugin| {
+                plugin.plugin_name == "request_termination"
+                    && plugin.proxy_id.as_deref() == Some(route.id.as_str())
+            })
+            .unwrap_or_else(|| panic!("{topology}: the 404 is kept"));
+        assert_eq!(termination.config["status_code"], json!(404));
+        assert!(
+            route
+                .plugins
+                .iter()
+                .any(|association| association.plugin_config_id == termination.id),
+            "{topology}: the route still runs its 404"
+        );
+        assert!(
+            !prepared
+                .upstreams
+                .iter()
+                .any(|upstream| upstream.id.starts_with("istio-vs-upstream-")),
+            "{topology}: the refused split is pruned"
+        );
+    }
+}
+
+/// Issue #7499 (1.0 refusal): a direct destination in another namespace is
+/// refused on NodeWaypoint as on Sidecar (see
+/// `sidecar_refuses_cross_namespace_carried_destinations`).
+#[test]
+fn node_waypoint_refuses_a_direct_destination_in_another_namespace() {
+    let config = translated_config(&[virtual_service(
+        "direct",
+        json!({
+            "hosts": ["reviews.default.svc.cluster.local"],
+            "http": [{"route": [{"destination": {
+                "host": "ratings.other.svc.cluster.local",
+                "port": {"number": 8080}
+            }}]}]
+        }),
+    )]);
+    let runtime = node_waypoint_runtime();
+    let mut slice = node_waypoint_slice(&config, &runtime);
+    assert!(!slice.http_routes.proxies.is_empty(), "carried");
+    import_other_namespace_ratings(&mut slice);
+    let prepared =
+        prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("slice materializes");
+    assert_references_resolve(&prepared);
+    assert!(carried_route_proxies(&prepared).is_empty());
+}
+
 /// Issue #7423 acceptance: a 90/10 VirtualService split on a Sidecar sends
 /// 90% of N requests to one leg and 10% to the other, through the production
 /// load balancer over the prepared Sidecar config.

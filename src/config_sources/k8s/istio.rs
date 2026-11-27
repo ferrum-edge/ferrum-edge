@@ -5310,6 +5310,82 @@ pub(crate) fn virtual_service_binds_mesh(object: &K8sObject) -> bool {
     })
 }
 
+/// One `http[].route[].destination` of a mesh-bound VirtualService that names
+/// a Service in another namespace (issue #7499).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VirtualServiceCrossNamespaceDestination {
+    pub(crate) route_index: usize,
+    pub(crate) destination_index: usize,
+    pub(crate) host: String,
+    pub(crate) namespace: String,
+    pub(crate) name: String,
+    /// A zero-weight leg of a multi-destination route: translation drops it
+    /// (`route_backends`), so it never reaches a data plane. A single
+    /// destination is kept whatever its weight, as translation keeps it.
+    pub(crate) omitted_by_translation: bool,
+}
+
+/// The `http[].route[].destination` hosts of a mesh-bound VirtualService that
+/// name a Service in a namespace other than the VirtualService's own (issue
+/// #7499), every leg included (zero-weight legs and dispatch branches).
+///
+/// Sidecar and NodeWaypoint data planes refuse such a carried route and serve
+/// its host through the plain Service route, so the status writer reports
+/// each one. The host is read with the alias forms the data plane's
+/// carried-route host classification recognizes as a Service (`<svc>.<ns>`,
+/// `<svc>.<ns>.svc`, `<svc>.<ns>.svc.<cluster domain>`, any case, an optional
+/// trailing dot); a short name is the VirtualService's own namespace and any
+/// other host is external. A VirtualService that does not bind the mesh is
+/// never carried to a mesh data plane and yields nothing.
+pub(crate) fn virtual_service_mesh_cross_namespace_destinations(
+    object: &K8sObject,
+    cluster_domain: &str,
+) -> Vec<VirtualServiceCrossNamespaceDestination> {
+    if object.kind != "VirtualService" || !virtual_service_binds_mesh(object) {
+        return Vec::new();
+    }
+    let route_namespace = object.metadata.namespace.to_ascii_lowercase();
+    // The data plane's host index compares against the configured suffix
+    // with surrounding dots trimmed and case folded; so does this scan.
+    let cluster_domain = cluster_domain.trim().trim_matches('.').to_ascii_lowercase();
+    let mut destinations = Vec::new();
+    let http_routes = object.spec.get("http").and_then(Value::as_array);
+    for (route_index, http) in http_routes.into_iter().flatten().enumerate() {
+        let legs = http.get("route").and_then(Value::as_array);
+        let multi_destination = legs.is_some_and(|legs| legs.len() > 1);
+        for (destination_index, leg) in legs.into_iter().flatten().enumerate() {
+            let Some(host) = leg
+                .get("destination")
+                .and_then(|destination| string_field(destination, "host"))
+            else {
+                continue;
+            };
+            let normalized = host.trim().to_ascii_lowercase();
+            if normalized.contains('*') {
+                continue;
+            }
+            let Some((name, namespace)) =
+                service_host_components(&normalized, &route_namespace, &cluster_domain)
+            else {
+                continue;
+            };
+            if namespace == route_namespace {
+                continue;
+            }
+            destinations.push(VirtualServiceCrossNamespaceDestination {
+                route_index,
+                destination_index,
+                host: host.to_string(),
+                namespace: namespace.to_string(),
+                name: name.to_string(),
+                omitted_by_translation: multi_destination
+                    && route_weight(object, leg).is_ok_and(|weight| weight == 0),
+            });
+        }
+    }
+    destinations
+}
+
 fn virtual_service_routes(
     object: &K8sObject,
     acc: &mut K8sAccumulator,
