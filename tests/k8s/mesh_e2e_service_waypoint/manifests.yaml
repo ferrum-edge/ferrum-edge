@@ -11,10 +11,15 @@
 #     AuthorizationPolicy) and Gateway API CRD watching (Gateway,
 #     ReferenceGrant) over a two-namespace scope (__NAMESPACE__ and
 #     __BETA_NAMESPACE__, FERRUM_CP_NAMESPACES). It serves native
-#     MeshSubscribe on :50051 with production mTLS + JWT (same per-run PKI
-#     shape as mesh-e2e-sidecar).
+#     MeshSubscribe on :50051 with production mTLS + JWT. A multi-namespace
+#     CP verifies data-plane tokens against a trust bundle of
+#     namespace-bound RS256 credentials (run.sh mints the keys and every
+#     data plane's token); no data plane holds a signing secret.
 #   - `__WAYPOINT__` — a waypoint Gateway (gatewayClassName: istio-waypoint,
-#     istio.io/waypoint-for: service) and the ServiceWaypoint Deployment
+#     istio.io/waypoint-for: service) and two ServiceWaypoint replicas of
+#     that waypoint: `__WAYPOINT__` subscribes with a token whose `ns` claim
+#     covers both namespaces, `__WAYPOINT__-narrow` with `ns` = __NAMESPACE__
+#     only (the cross-namespace negative). Each is a Deployment
 #     (FERRUM_MESH_TOPOLOGY=service_waypoint, FERRUM_MESH_WAYPOINT_NAME=__WAYPOINT__,
 #     native MeshSubscribe, SPIRE identity sa/__WAYPOINT__) listening for HBONE
 #     on :15008.
@@ -37,9 +42,15 @@
 # Backends answer GET /slow after 90 s so the suite can hold one inner request
 # (and its L7 tunnel) open across a binding withdrawal.
 #
-# Secrets (`ferrum-mesh-e2e-secrets`, `ferrum-native-mtls-cp`,
-# `ferrum-native-mtls-dp`) are minted per run by run.sh in both namespaces;
-# this manifest references but does not define them.
+# Secrets (`ferrum-mesh-e2e-secrets` with the admin JWT secret,
+# `ferrum-native-mtls-cp`, `ferrum-native-mtls-dp`, `ferrum-cp-trust`, and one
+# `ferrum-cp-token-<node>` per data plane) are minted per run by run.sh; this
+# manifest references but does not define them.
+#
+# Backend transport: swsvc-v1, swsvc-v2 and xsvc run Ferrum Sidecars and carry
+# the pod annotation `ferrum.io/injected: "true"`, which the K8s translator
+# records as the Sidecar transport, so the ServiceWaypoint dials them over
+# SVID-mTLS to :15006. The suite has no HBONE-terminating (ambient) backend.
 #
 # Substituted placeholders:
 #   __NAMESPACE__        waypoint namespace (ferrum)
@@ -305,11 +316,12 @@ spec:
                 secretKeyRef:
                   name: ferrum-mesh-e2e-secrets
                   key: admin-jwt-secret
-            - name: FERRUM_CP_DP_GRPC_JWT_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: ferrum-mesh-e2e-secrets
-                  key: cp-dp-grpc-jwt-secret
+            # A multi-namespace CP refuses the fleet-wide HS256 secret: it
+            # verifies data-plane tokens against namespace-bound credentials
+            # (docs/cp_namespace_tenancy.md "Trust binding"). run.sh mints
+            # one RS256 key per credential; the bundle holds only public keys.
+            - name: FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH
+              value: /cp-trust/bundle.json
             - name: FERRUM_CP_GRPC_LISTEN_ADDR
               value: 0.0.0.0:50051
             - name: FERRUM_CP_GRPC_TLS_CERT_PATH
@@ -342,9 +354,16 @@ spec:
             - name: transport
               mountPath: /transport
               readOnly: true
+            - name: cp-trust
+              mountPath: /cp-trust
+              readOnly: true
       volumes:
         - name: cp-data
           emptyDir: {}
+        - name: cp-trust
+          secret:
+            secretName: ferrum-cp-trust
+            defaultMode: 0440
         - name: transport
           projected:
             defaultMode: 0440
@@ -425,11 +444,13 @@ spec:
               value: /transport/client.pem
             - name: FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH
               value: /transport/client-key.pem
-            - name: FERRUM_CP_DP_GRPC_JWT_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: ferrum-mesh-e2e-secrets
-                  key: cp-dp-grpc-jwt-secret
+            # Externally issued MeshSubscribe token minted by run.sh (RS256,
+            # `kid` bound by the CP trust bundle, `sub` = this node id); no
+            # signing secret exists on the node.
+            - name: FERRUM_DP_CP_GRPC_TOKEN_FILE
+              value: /cp-token/token
+            - name: FERRUM_MESH_NODE_ID
+              value: __WAYPOINT__
             - name: FERRUM_NAMESPACE
               value: __NAMESPACE__
             - name: FERRUM_MESH_PRODUCTION_MODE
@@ -460,6 +481,9 @@ spec:
             - name: transport
               mountPath: /transport
               readOnly: true
+            - name: cp-token
+              mountPath: /cp-token
+              readOnly: true
         # Loopback admin prober (the admin API binds 127.0.0.1).
         - name: curl
           image: curlimages/curl:8.10.1
@@ -469,6 +493,127 @@ spec:
           hostPath:
             path: /run/spire/sockets
             type: DirectoryOrCreate
+        - name: cp-token
+          secret:
+            secretName: ferrum-cp-token-swp
+            defaultMode: 0440
+        - name: transport
+          projected:
+            defaultMode: 0440
+            sources:
+              - secret:
+                  name: ferrum-native-mtls-dp
+                  items:
+                    - key: ca.pem
+                      path: ca.pem
+                    - key: client.pem
+                      path: client.pem
+                    - key: client-key.pem
+                      path: client-key.pem
+---
+# The same ServiceWaypoint (FERRUM_MESH_WAYPOINT_NAME=__WAYPOINT__, same
+# identity) subscribing with a token whose `ns` claim is only __NAMESPACE__.
+# The data-plane token's `ns` is a hard ceiling (design spec 2.1 item 5), so
+# this replica must keep refusing the __BETA_NAMESPACE__ leg that the wide
+# replica above routes once a ReferenceGrant admits it.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: __WAYPOINT__-narrow
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: __WAYPOINT__-narrow
+  template:
+    metadata:
+      labels:
+        app: __WAYPOINT__-narrow
+    spec:
+      serviceAccountName: __WAYPOINT__
+      containers:
+        - name: ferrum-edge
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          args: ["run"]
+          securityContext:
+            runAsUser: 1337
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+          ports:
+            - name: hbone
+              containerPort: 15008
+          env:
+            - name: FERRUM_MODE
+              value: mesh
+            - name: FERRUM_MESH_TOPOLOGY
+              value: service_waypoint
+            - name: FERRUM_MESH_WAYPOINT_NAME
+              value: __WAYPOINT__
+            - name: FERRUM_MESH_CONFIG_PROTOCOL
+              value: native
+            - name: FERRUM_DP_CP_GRPC_URLS
+              value: https://ferrum-cp.__NAMESPACE__.svc.cluster.local:50051
+            - name: FERRUM_DP_GRPC_TLS_CA_CERT_PATH
+              value: /transport/ca.pem
+            - name: FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH
+              value: /transport/client.pem
+            - name: FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH
+              value: /transport/client-key.pem
+            # Externally issued MeshSubscribe token minted by run.sh (RS256,
+            # `kid` bound by the CP trust bundle, `sub` = this node id); no
+            # signing secret exists on the node.
+            - name: FERRUM_DP_CP_GRPC_TOKEN_FILE
+              value: /cp-token/token
+            - name: FERRUM_MESH_NODE_ID
+              value: __WAYPOINT__-narrow
+            - name: FERRUM_NAMESPACE
+              value: __NAMESPACE__
+            - name: FERRUM_MESH_PRODUCTION_MODE
+              value: "true"
+            - name: FERRUM_MESH_CA_BACKEND
+              value: spire_agent
+            - name: FERRUM_MESH_SPIRE_AGENT_SOCKET
+              value: /run/spire/sockets/agent.sock
+            - name: FERRUM_MESH_WORKLOAD_SPIFFE_ID
+              value: spiffe://__TRUST_DOMAIN__/ns/__NAMESPACE__/sa/__WAYPOINT__
+            - name: FERRUM_ADMIN_HTTP_PORT
+              value: "15020"
+            # Admin JWT for /metrics, /service-waypoint/services and
+            # /mesh/policy-denies/recent (run.sh mints the HS256 bearer).
+            - name: FERRUM_ADMIN_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: ferrum-mesh-e2e-secrets
+                  key: admin-jwt-secret
+            - name: FERRUM_POOL_WARMUP_ENABLED
+              value: "false"
+            - name: FERRUM_LOG_LEVEL
+              value: info
+          volumeMounts:
+            - name: spire-agent-socket
+              mountPath: /run/spire/sockets
+              readOnly: true
+            - name: transport
+              mountPath: /transport
+              readOnly: true
+            - name: cp-token
+              mountPath: /cp-token
+              readOnly: true
+        # Loopback admin prober (the admin API binds 127.0.0.1).
+        - name: curl
+          image: curlimages/curl:8.10.1
+          command: ["sh", "-c", "sleep 365d"]
+      volumes:
+        - name: spire-agent-socket
+          hostPath:
+            path: /run/spire/sockets
+            type: DirectoryOrCreate
+        - name: cp-token
+          secret:
+            secretName: ferrum-cp-token-swp-narrow
+            defaultMode: 0440
         - name: transport
           projected:
             defaultMode: 0440
@@ -518,6 +663,12 @@ spec:
       app: swsvc-v1
   template:
     metadata:
+      annotations:
+        # Ferrum Sidecar backend: the ServiceWaypoint dials it over SVID-mTLS
+        # to :15006 (WorkloadMeshTransport::SidecarMtls, issue #7500). An
+        # unmarked pod would be dialed over HBONE, which a Sidecar does not
+        # terminate, so a 200 through the waypoint proves the mTLS path.
+        ferrum.io/injected: "true"
       labels:
         app: swsvc-v1
         ferrum.io/mesh: enabled
@@ -577,11 +728,13 @@ spec:
               value: /transport/client.pem
             - name: FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH
               value: /transport/client-key.pem
-            - name: FERRUM_CP_DP_GRPC_JWT_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: ferrum-mesh-e2e-secrets
-                  key: cp-dp-grpc-jwt-secret
+            # Externally issued MeshSubscribe token minted by run.sh (RS256,
+            # `kid` bound by the CP trust bundle, `sub` = this node id); no
+            # signing secret exists on the node.
+            - name: FERRUM_DP_CP_GRPC_TOKEN_FILE
+              value: /cp-token/token
+            - name: FERRUM_MESH_NODE_ID
+              value: swsvc-v1
             - name: FERRUM_NAMESPACE
               value: __NAMESPACE__
             - name: FERRUM_MESH_PRODUCTION_MODE
@@ -604,6 +757,9 @@ spec:
               readOnly: true
             - name: transport
               mountPath: /transport
+              readOnly: true
+            - name: cp-token
+              mountPath: /cp-token
               readOnly: true
         - name: app
           image: python:3.12-alpine
@@ -659,6 +815,10 @@ spec:
           hostPath:
             path: /run/spire/sockets
             type: DirectoryOrCreate
+        - name: cp-token
+          secret:
+            secretName: ferrum-cp-token-swsvc-v1
+            defaultMode: 0440
         - name: transport
           projected:
             defaultMode: 0440
@@ -707,6 +867,12 @@ spec:
       app: swsvc-v2
   template:
     metadata:
+      annotations:
+        # Ferrum Sidecar backend: the ServiceWaypoint dials it over SVID-mTLS
+        # to :15006 (WorkloadMeshTransport::SidecarMtls, issue #7500). An
+        # unmarked pod would be dialed over HBONE, which a Sidecar does not
+        # terminate, so a 200 through the waypoint proves the mTLS path.
+        ferrum.io/injected: "true"
       labels:
         app: swsvc-v2
         ferrum.io/mesh: enabled
@@ -766,11 +932,13 @@ spec:
               value: /transport/client.pem
             - name: FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH
               value: /transport/client-key.pem
-            - name: FERRUM_CP_DP_GRPC_JWT_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: ferrum-mesh-e2e-secrets
-                  key: cp-dp-grpc-jwt-secret
+            # Externally issued MeshSubscribe token minted by run.sh (RS256,
+            # `kid` bound by the CP trust bundle, `sub` = this node id); no
+            # signing secret exists on the node.
+            - name: FERRUM_DP_CP_GRPC_TOKEN_FILE
+              value: /cp-token/token
+            - name: FERRUM_MESH_NODE_ID
+              value: swsvc-v2
             - name: FERRUM_NAMESPACE
               value: __NAMESPACE__
             - name: FERRUM_MESH_PRODUCTION_MODE
@@ -793,6 +961,9 @@ spec:
               readOnly: true
             - name: transport
               mountPath: /transport
+              readOnly: true
+            - name: cp-token
+              mountPath: /cp-token
               readOnly: true
         - name: app
           image: python:3.12-alpine
@@ -848,6 +1019,10 @@ spec:
           hostPath:
             path: /run/spire/sockets
             type: DirectoryOrCreate
+        - name: cp-token
+          secret:
+            secretName: ferrum-cp-token-swsvc-v2
+            defaultMode: 0440
         - name: transport
           projected:
             defaultMode: 0440
@@ -933,6 +1108,12 @@ spec:
       app: xsvc
   template:
     metadata:
+      annotations:
+        # Ferrum Sidecar backend: the ServiceWaypoint dials it over SVID-mTLS
+        # to :15006 (WorkloadMeshTransport::SidecarMtls, issue #7500). An
+        # unmarked pod would be dialed over HBONE, which a Sidecar does not
+        # terminate, so a 200 through the waypoint proves the mTLS path.
+        ferrum.io/injected: "true"
       labels:
         app: xsvc
         ferrum.io/mesh: enabled
@@ -992,11 +1173,13 @@ spec:
               value: /transport/client.pem
             - name: FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH
               value: /transport/client-key.pem
-            - name: FERRUM_CP_DP_GRPC_JWT_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: ferrum-mesh-e2e-secrets
-                  key: cp-dp-grpc-jwt-secret
+            # Externally issued MeshSubscribe token minted by run.sh (RS256,
+            # `kid` bound by the CP trust bundle, `sub` = this node id); no
+            # signing secret exists on the node.
+            - name: FERRUM_DP_CP_GRPC_TOKEN_FILE
+              value: /cp-token/token
+            - name: FERRUM_MESH_NODE_ID
+              value: xsvc
             - name: FERRUM_NAMESPACE
               value: __BETA_NAMESPACE__
             - name: FERRUM_MESH_PRODUCTION_MODE
@@ -1019,6 +1202,9 @@ spec:
               readOnly: true
             - name: transport
               mountPath: /transport
+              readOnly: true
+            - name: cp-token
+              mountPath: /cp-token
               readOnly: true
         - name: app
           image: python:3.12-alpine
@@ -1074,6 +1260,10 @@ spec:
           hostPath:
             path: /run/spire/sockets
             type: DirectoryOrCreate
+        - name: cp-token
+          secret:
+            secretName: ferrum-cp-token-xsvc
+            defaultMode: 0440
         - name: transport
           projected:
             defaultMode: 0440

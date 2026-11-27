@@ -41,8 +41,11 @@ set -euo pipefail
 #   service_waypoint.virtual_service.cross_namespace_reference_grant
 #                       a destination in namespace beta is refused without a
 #                       ReferenceGrant (FerrumAccepted=False/RefNotPermitted,
-#                       backend not reached), admitted after applying one, and
-#                       withdrawn after deleting it
+#                       backend not reached), admitted after applying one on
+#                       the waypoint replica whose token `ns` covers beta,
+#                       still refused (a completed 4xx/5xx, not a timeout) on
+#                       the replica whose token `ns` is only ferrum, and
+#                       withdrawn after deleting the grant
 #   service_waypoint.hbone.fence_revocation_on_binding_withdrawal
 #                       removing istio.io/use-waypoint from swsvc-v1 cuts an
 #                       open L7 tunnel with RST_STREAM(CONNECT_ERROR) and moves
@@ -152,8 +155,8 @@ LIVE_ASSERTIONS_INITIALIZED=false
 L7_STATE="unknown"
 L7_ABSENT_REASON=""
 SWP_POD_IP=""
-CP_DP_JWT_SECRET=""
 ADMIN_JWT_SECRET=""
+SWP_NARROW_POD_IP=""
 NATIVE_MTLS_DIR=""
 # Metric deltas collected by the probes for the metrics row.
 METRIC_ACTIVE_MAX=""
@@ -242,14 +245,123 @@ ensure_namespaces() {
 }
 
 render_shared_secrets() {
-  CP_DP_JWT_SECRET="$(openssl rand -hex 32)"
   ADMIN_JWT_SECRET="$(openssl rand -hex 32)"
   local ns
   for ns in "$NS" "$BETA_NS"; do
     kubectl --context "$CONTEXT" -n "$ns" create secret generic ferrum-mesh-e2e-secrets \
-      --from-literal=cp-dp-grpc-jwt-secret="$CP_DP_JWT_SECRET" \
       --from-literal=admin-jwt-secret="$ADMIN_JWT_SECRET" \
       --dry-run=client -o yaml | kubectl --context "$CONTEXT" apply -f -
+  done
+}
+
+# ── CP trust bundle and data-plane tokens ───────────────────────────────────
+#
+# A multi-namespace CP (FERRUM_CP_NAMESPACES=ferrum,beta) refuses the
+# fleet-wide HS256 secret and verifies every data-plane token against a trust
+# bundle of namespace-bound credentials (docs/cp_namespace_tenancy.md). One
+# RS256 key per credential; the CP holds only the public halves, and each data
+# plane gets an externally issued token (FERRUM_DP_CP_GRPC_TOKEN_FILE), so no
+# data plane can sign anything:
+#
+#   kid ferrum-dp  ceiling [ferrum]        swsvc-v1, swsvc-v2, swp-narrow
+#   kid beta-dp    ceiling [beta]          xsvc
+#   kid swp-wide   ceiling [ferrum, beta]  swp (the cross-namespace positive)
+#
+# Token claims follow the CP/DP contract for native MeshSubscribe: JWS `kid`,
+# `iss` = ferrum-edge-cp-dp (the default FERRUM_CP_DP_GRPC_JWT_ISSUER), `sub`
+# = the data plane's FERRUM_MESH_NODE_ID (the CP stamps it as the slice
+# node_id the data plane checks), `iat`, `exp`, `ns`, and `aud` =
+# ferrum-mesh-subscribe:local.
+CP_TRUST_KIDS=(ferrum-dp beta-dp swp-wide)
+
+mint_cp_token() {
+  local kid="$1" sub="$2" ns_json="$3"
+  local header payload signing_input signature
+  header="$(python3 - "$kid" <<'PY'
+import base64
+import json
+import sys
+
+print(base64.urlsafe_b64encode(
+    json.dumps({"alg": "RS256", "typ": "JWT", "kid": sys.argv[1]}, separators=(",", ":")).encode()
+).rstrip(b"=").decode())
+PY
+)"
+  payload="$(python3 - "$sub" "$ns_json" <<'PY'
+import base64
+import json
+import sys
+import time
+import uuid
+
+now = int(time.time())
+claims = {
+    "iss": "ferrum-edge-cp-dp",
+    "sub": sys.argv[1],
+    "iat": now,
+    "nbf": now - 60,
+    "exp": now + 4 * 3600,
+    "jti": str(uuid.uuid4()),
+    "ns": json.loads(sys.argv[2]),
+    "aud": "ferrum-mesh-subscribe:local",
+}
+print(base64.urlsafe_b64encode(json.dumps(claims, separators=(",", ":")).encode()).rstrip(b"=").decode())
+PY
+)"
+  signing_input="$header.$payload"
+  signature="$(printf '%s' "$signing_input" |
+    openssl dgst -sha256 -sign "$NATIVE_MTLS_DIR/$kid-key.pem" -binary |
+    python3 -c 'import base64,sys;print(base64.urlsafe_b64encode(sys.stdin.buffer.read()).rstrip(b"=").decode())')"
+  printf '%s.%s' "$signing_input" "$signature"
+}
+
+apply_cp_trust_and_tokens() {
+  log "minting the CP trust bundle and data-plane tokens"
+  local kid
+  local -a files=()
+  for kid in "${CP_TRUST_KIDS[@]}"; do
+    openssl genrsa -out "$NATIVE_MTLS_DIR/$kid-key.pem" 2048 >/dev/null 2>&1
+    openssl rsa -in "$NATIVE_MTLS_DIR/$kid-key.pem" -pubout \
+      -out "$NATIVE_MTLS_DIR/$kid.pub" >/dev/null 2>&1
+    files+=(--from-file="$kid.pub=$NATIVE_MTLS_DIR/$kid.pub")
+  done
+  python3 - "$NATIVE_MTLS_DIR" "$NS" "$BETA_NS" > "$NATIVE_MTLS_DIR/bundle.json" <<'PY'
+import hashlib
+import json
+import sys
+
+directory, ns, beta = sys.argv[1], sys.argv[2], sys.argv[3]
+ceilings = {"ferrum-dp": [ns], "beta-dp": [beta], "swp-wide": [ns, beta]}
+keys = []
+for kid, namespaces in ceilings.items():
+    with open(f"{directory}/{kid}.pub", "rb") as handle:
+        digest = hashlib.sha256(handle.read()).hexdigest()
+    keys.append({
+        "kid": kid,
+        "algorithm": "RS256",
+        "public_key_path": f"/cp-trust/{kid}.pub",
+        "material_sha256": digest,
+        "namespaces": namespaces,
+    })
+print(json.dumps({"version": 1, "keys": keys}, indent=2))
+PY
+  kubectl --context "$CONTEXT" -n "$NS" create secret generic ferrum-cp-trust \
+    --from-file="bundle.json=$NATIVE_MTLS_DIR/bundle.json" "${files[@]}" \
+    --dry-run=client -o yaml | kubectl --context "$CONTEXT" apply -f -
+
+  local entry ns node kid_for ns_json token
+  for entry in "$NS:swsvc-v1:ferrum-dp" "$NS:swsvc-v2:ferrum-dp" \
+    "$NS:$WAYPOINT-narrow:ferrum-dp" "$NS:$WAYPOINT:swp-wide" "$BETA_NS:xsvc:beta-dp"; do
+    IFS=: read -r ns node kid_for <<<"$entry"
+    if [[ "$kid_for" == "swp-wide" ]]; then
+      ns_json="[\"$NS\", \"$BETA_NS\"]"
+    else
+      ns_json="\"$ns\""
+    fi
+    token="$(mint_cp_token "$kid_for" "$node" "$ns_json")"
+    kubectl --context "$CONTEXT" -n "$ns" create secret generic "ferrum-cp-token-$node" \
+      --from-literal=token="$token" \
+      --dry-run=client -o yaml | kubectl --context "$CONTEXT" apply -f - >/dev/null
   done
 }
 
@@ -419,8 +531,8 @@ apply_workloads() {
 
 wait_for_rollouts() {
   local entry ns deploy
-  for entry in "$NS:ferrum-cp" "$NS:$WAYPOINT" "$NS:swsvc-v1" "$NS:swsvc-v2" \
-    "$BETA_NS:xsvc" "$NS:hbone-client"; do
+  for entry in "$NS:ferrum-cp" "$NS:$WAYPOINT" "$NS:$WAYPOINT-narrow" "$NS:swsvc-v1" \
+    "$NS:swsvc-v2" "$BETA_NS:xsvc" "$NS:hbone-client"; do
     ns="${entry%%:*}"
     deploy="${entry#*:}"
     kubectl --context "$CONTEXT" -n "$ns" rollout status "deploy/$deploy" --timeout=5m
@@ -462,10 +574,10 @@ for pod in data.get("items", []):
 # ── admin and metrics helpers (waypoint admin binds loopback) ───────────────
 
 waypoint_admin_get() {
-  local path="$1" token
+  local path="$1" deploy="${2:-$WAYPOINT}" token
   token="$(mint_admin_jwt)"
   # shellcheck disable=SC2016
-  timeout 30 kubectl --context "$CONTEXT" -n "$NS" exec "deploy/$WAYPOINT" -c curl -- \
+  timeout 30 kubectl --context "$CONTEXT" -n "$NS" exec "deploy/$deploy" -c curl -- \
     sh -c 'curl -s -m 10 -H "Authorization: Bearer $1" "http://127.0.0.1:15020$2"' \
     sh "$token" "$path" 2>/dev/null || true
 }
@@ -524,6 +636,7 @@ remaining() {
 # Echoes "<curl exit>\t<status>\t<body>".
 hbone_request() {
   local url="$1" header="${2:-}" host_override="${3:-}" max_time="${4:-10}"
+  local proxy_ip="${5:-$SWP_POD_IP}"
   # shellcheck disable=SC2016
   timeout "$(( max_time + 20 ))" kubectl --context "$CONTEXT" -n "$NS" exec deploy/hbone-client -c curl -- \
     sh -c '
@@ -540,7 +653,7 @@ hbone_request() {
       [ -n "$code" ] || code=000
       body="$(tr -d "\r\n\t" </tmp/hb 2>/dev/null | cut -c1-160)"
       printf "%s\t%s\t%s\n" "$rc" "$code" "$body"
-    ' sh "$url" "$header" "$host_override" "https://$SWP_POD_IP:15008" "$max_time" \
+    ' sh "$url" "$header" "$host_override" "https://$proxy_ip:15008" "$max_time" \
     2>/dev/null || printf 'EXECFAIL\t000\t\n'
 }
 
@@ -780,13 +893,15 @@ else:
 
 # ── probes ──────────────────────────────────────────────────────────────────
 
-probe_binding() {
-  log "checking the waypoint's bound-Service projection"
-  local json verdict _
+# Both waypoint replicas must project exactly the four bound Services (the
+# narrow token changes which cross-namespace route legs ride the slice, never
+# which Services are bound).
+binding_verdict() {
+  local deploy="$1" json verdict _
   verdict="no-response"
   for _ in $(seq 1 60); do
-    json="$(waypoint_admin_get /service-waypoint/services)"
-    printf '%s\n' "$json" > "$RESULTS_DIR/service-waypoint-services.txt"
+    json="$(waypoint_admin_get /service-waypoint/services "$deploy")"
+    printf '%s\n' "$json" > "$RESULTS_DIR/service-waypoint-services-$deploy.txt"
     verdict="$(printf '%s' "$json" | python3 -c '
 import json
 import sys
@@ -809,13 +924,21 @@ else:
     [[ "$verdict" == bound* ]] && break
     sleep 2
   done
-  log "binding: $verdict"
-  if [[ "$verdict" == bound* ]]; then
+  printf '%s' "$verdict"
+}
+
+probe_binding() {
+  log "checking both waypoint replicas' bound-Service projection"
+  local wide narrow
+  wide="$(binding_verdict "$WAYPOINT")"
+  narrow="$(binding_verdict "$WAYPOINT-narrow")"
+  log "binding: $WAYPOINT=[$wide] $WAYPOINT-narrow=[$narrow]"
+  if [[ "$wide" == bound* && "$narrow" == bound* ]]; then
     record service_waypoint.binding.bound_services_projected pass "$WAYPOINT" "" \
-      "$verdict" service-waypoint-services.txt
+      "$WAYPOINT=[$wide] $WAYPOINT-narrow=[$narrow]" "service-waypoint-services-$WAYPOINT.txt"
   else
     record service_waypoint.binding.bound_services_projected fail "$WAYPOINT" "" \
-      "$verdict" service-waypoint-services.txt
+      "$WAYPOINT=[$wide] $WAYPOINT-narrow=[$narrow]" "service-waypoint-services-$WAYPOINT.txt"
     return 1
   fi
 }
@@ -1026,6 +1149,27 @@ probe_cross_namespace() {
   printf 'phase2 (grant applied): status=%s reach=%s\n' "$s2" "$r2" >> "$diagnostics"
   [[ "${s2%% *}" == "True" && "$r2" == "reached" ]] || ok=false
 
+  # Same grant, same VirtualService, but the narrow replica's token `ns` is
+  # only ferrum: the beta leg must stay refused there. A refusal is a
+  # completed response (curl exit 0) with a gateway status and no beta
+  # marker, never a timeout or a transport error.
+  local narrow_ok=true narrow_out narrow_rc narrow_code narrow_body narrow_seen=""
+  for _ in 1 2 3 4 5; do
+    narrow_out="$(hbone_request "http://$XNS_FRONTEND_HOST:8080/" "" "" 10 "$SWP_NARROW_POD_IP")"
+    narrow_rc="$(field "$narrow_out" 1)"
+    narrow_code="$(field "$narrow_out" 2)"
+    narrow_body="$(field "$narrow_out" 3)"
+    narrow_seen="$narrow_seen rc=$narrow_rc/$narrow_code"
+    case "$narrow_code" in
+      403|404|502|503) ;;
+      *) narrow_ok=false ;;
+    esac
+    [[ "$narrow_rc" == "0" && "$narrow_body" != "$XSVC_MARKER" ]] || narrow_ok=false
+  done
+  printf 'phase2 narrow replica (token ns=%s only):%s refused=%s\n' "$NS" "$narrow_seen" \
+    "$narrow_ok" >> "$diagnostics"
+  [[ "$narrow_ok" == "true" ]] || ok=false
+
   kubectl --context "$CONTEXT" -n "$BETA_NS" delete referencegrant "$REFERENCE_GRANT" \
     >> "$diagnostics" 2>&1 || ok=false
   s3="$(vs_status_until "$XNS_VS" rejected)"
@@ -1033,14 +1177,15 @@ probe_cross_namespace() {
   printf 'phase3 (grant deleted): status=%s reach=%s\n' "$s3" "$r3" >> "$diagnostics"
   [[ "${s3%% *}" == "False" && "$r3" == "unreached" ]] || ok=false
 
-  log "cross-namespace: no-grant=[$s1/$r1] grant=[$s2/$r2] deleted=[$s3/$r3]"
+  log "cross-namespace: no-grant=[$s1/$r1] grant=[$s2/$r2] narrow-token=[$narrow_ok:$narrow_seen] deleted=[$s3/$r3]"
   if [[ "$ok" == "true" ]]; then
     record service_waypoint.virtual_service.cross_namespace_reference_grant pass \
-      hbone-client "xsvc.$BETA_NS" "refused->admitted->withdrawn" swp-cross-namespace.txt
+      hbone-client "xsvc.$BETA_NS" "refused->admitted(wide token; narrow token refused)->withdrawn" \
+      swp-cross-namespace.txt
   else
     record service_waypoint.virtual_service.cross_namespace_reference_grant fail \
       hbone-client "xsvc.$BETA_NS" \
-      "no-grant=[$s1/$r1] grant=[$s2/$r2] deleted=[$s3/$r3]" swp-cross-namespace.txt
+      "no-grant=[$s1/$r1] grant=[$s2/$r2] narrow-token-refused=$narrow_ok deleted=[$s3/$r3]" swp-cross-namespace.txt
   fi
 }
 
@@ -1250,11 +1395,13 @@ main() {
   render_shared_secrets
   mint_native_mtls_pki
   apply_native_mtls_secrets
+  apply_cp_trust_and_tokens
   register_spire_workloads
   apply_workloads
   wait_for_rollouts
   SWP_POD_IP="$(wait_for_pod_ip "$WAYPOINT")"
-  log "waypoint pod IP=$SWP_POD_IP"
+  SWP_NARROW_POD_IP="$(wait_for_pod_ip "$WAYPOINT-narrow")"
+  log "waypoint pod IPs: $WAYPOINT=$SWP_POD_IP $WAYPOINT-narrow=$SWP_NARROW_POD_IP"
 
   if [[ "${FERRUM_MESH_E2E_DEPLOY_ONLY:-0}" == "1" ]]; then
     log "deploy-only complete; artifacts in $ARTIFACT_DIR"
