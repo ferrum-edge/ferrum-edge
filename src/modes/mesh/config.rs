@@ -4856,6 +4856,7 @@ pub struct MeshVirtualServiceHttpRoutes {
     /// scope, the subscriber's bearer `ns` claim, and the subscriber's own
     /// Service visibility before any target reaches a data plane.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub authorized_cross_namespace_targets: Vec<MeshWaypointServiceRef>,
 }
 
