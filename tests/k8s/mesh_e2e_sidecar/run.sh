@@ -65,6 +65,22 @@ set -euo pipefail
 #                                               1000 x-canary: false requests
 #                                               fall through to the split
 #                                               inside the same window
+#   sidecar.virtual_service.cross_namespace_direct_destination
+#   sidecar.virtual_service.cross_namespace_weighted_split_leg
+#   sidecar.virtual_service.cross_namespace_grant_withdrawal_refused
+#                                               issue #7499, on a second,
+#                                               multi-namespace control plane
+#                                               (xns_manifests.yaml): a
+#                                               ReferenceGrant-admitted
+#                                               destination in another
+#                                               namespace answers a carried
+#                                               direct route and a
+#                                               DestinationRule-governed 50/50
+#                                               split leg through real capture;
+#                                               deleting the grant turns the
+#                                               VirtualService RefNotPermitted
+#                                               and removes the route while
+#                                               the rest of the slice serves
 #   sidecar.config.native_subscribe_delivered   a Ferrum CP (cp mode, sqlite,
 #                                               K8s pod discovery) serves the
 #                                               mesh model over native
@@ -246,6 +262,42 @@ VS_HEADER_CONTROL_REQUESTS=1000
 # this long. A healthy run needs a few minutes (about 2100 requests).
 VS_PROBE_BUDGET_SECS=900
 VS_PROBE_DEADLINE=0
+# Cross-namespace VirtualService gate (issue #7499, xns_manifests.yaml). Two
+# namespaces the main ferrum-cp never watches, served by their own
+# multi-namespace control plane `ferrum-cp-xns`.
+XNS_MANIFESTS="$ROOT_DIR/tests/k8s/mesh_e2e_sidecar/xns_manifests.yaml"
+XNS_SIDECAR_CRD="$ROOT_DIR/tests/k8s/mesh_e2e_sidecar/istio_sidecar_crd.yaml"
+XSRC="${NS}-xsrc"
+XDST="${NS}-xdst"
+XNS_VS_NAME="xns-route"
+XNS_GRANT_NAME="allow-xsrc-virtualservices"
+XNS_DR_NAME="xremote-dr"
+XNS_KID="xns"
+XNS_FRONT_HOST="xfront.$XSRC.svc.cluster.local"
+XNS_REMOTE_HOST="xremote.$XDST.svc.cluster.local"
+XNS_LOCAL_HOST="xlocal.$XSRC.svc.cluster.local"
+XNS_DIRECT_URL="http://$XNS_FRONT_HOST:8080/direct"
+XNS_SPLIT_URL="http://$XNS_FRONT_HOST:8080/"
+XNS_LOCAL_URL="http://$XNS_LOCAL_HOST:8080/"
+XNS_LOCAL_MARKER="xns-local"
+XNS_REMOTE_MARKER="xns-remote"
+XNS_CP_DNS="ferrum-cp-xns.$XSRC.svc.cluster.local"
+# Every /direct request must answer from xremote.
+XNS_DIRECT_REQUESTS=20
+# 50/50 split over 400 requests: X ~ Binomial(400, 0.5), sd 10; accepting
+# xlocal in [150, 250] is +-5 sd (a correct split fails with probability
+# ~5.7e-7 even under an independent model; Ferrum's leg selection is a
+# deterministic weighted round robin landing within a few requests of 200).
+# A split pinned to either leg (0 or 400) fails.
+XNS_SPLIT_REQUESTS=400
+XNS_SPLIT_LOCAL_MIN=150
+XNS_SPLIT_LOCAL_MAX=250
+# After the grant is deleted: requests that must all miss the withdrawn route.
+XNS_WITHDRAWN_REQUESTS=20
+XNS_PROBE_BUDGET_SECS=900
+XNS_PROBE_DEADLINE=0
+XNS_DP_JWT_SECRET=""
+XNS_ADMIN_JWT_SECRET=""
 JWT_ISSUER="mesh-e2e-issuer"
 JWT_KID="fixture-key"
 # The capp echo answers "<APP_BODY>-native" (manifests.yaml) so a native-leg
@@ -315,6 +367,9 @@ REQUIRED_LIVE_ASSERTIONS=(
   sidecar.virtual_service.cors_policy
   sidecar.virtual_service.weighted_split_90_10
   sidecar.virtual_service.header_match_dispatch
+  sidecar.virtual_service.cross_namespace_direct_destination
+  sidecar.virtual_service.cross_namespace_weighted_split_leg
+  sidecar.virtual_service.cross_namespace_grant_withdrawal_refused
   sidecar.config.native_subscribe_delivered
   sidecar.config.native_subscribe_mtls_omitted_client_rejected
   sidecar.config.native_subscribe_mtls_foreign_client_rejected
@@ -339,6 +394,8 @@ REQUIRED_LIVE_ASSERTIONS=(
 # `mesh.virtual_service.sidecar_http_routes` (issue #7502): the capability
 # stays Experimental, but its enrolled live assertions are enforced like
 # every other non-deferred row.
+# The three `sidecar.virtual_service.cross_namespace_*` ids (issue #7499) back
+# the same Experimental row.
 
 mkdir -p "$ARTIFACT_DIR" "$RESULTS_DIR"
 
@@ -751,6 +808,11 @@ install_istio_crds() {
     kubectl --context "$CONTEXT" apply -f "$ROOT_DIR/tests/fixtures/k8s/$fixture.yaml"
     crds+=("crd/$crd")
   done
+  # The Istio Sidecar CRD lives in the suite directory: the cross-namespace
+  # gate's client namespace imports the destination namespace through a
+  # Sidecar egress scope (issue #7499).
+  kubectl --context "$CONTEXT" apply -f "$XNS_SIDECAR_CRD"
+  crds+=("crd/sidecars.networking.istio.io")
   kubectl --context "$CONTEXT" wait --for=condition=Established "${crds[@]}" --timeout=60s
 }
 
@@ -2097,6 +2159,521 @@ probe_virtual_service_http_routes() {
   fi
 }
 
+# ── cross-namespace VirtualService gate (issue #7499) ───────────────────────
+#
+# Runs after every other assertion is recorded, on its own control plane and
+# namespaces (xns_manifests.yaml), bounded by XNS_PROBE_BUDGET_SECS. Three
+# assertions, all recorded on every path:
+#   sidecar.virtual_service.cross_namespace_direct_destination
+#     the VirtualService in $XSRC is FerrumAccepted=True and lists
+#     $XDST/xremote in status.ferrum.translation.cross_namespace_destinations;
+#     every captured xclient request to the carried direct route
+#     (xfront /direct, no backing pod) answers from xremote in $XDST.
+#   sidecar.virtual_service.cross_namespace_weighted_split_leg
+#     the 50/50 split xlocal ($XSRC) / xremote ($XDST), whose remote leg a
+#     DestinationRule in $XDST governs, answers every captured request from a
+#     leg with the xlocal count in [XNS_SPLIT_LOCAL_MIN, XNS_SPLIT_LOCAL_MAX].
+#   sidecar.virtual_service.cross_namespace_grant_withdrawal_refused
+#     after the ReferenceGrant is deleted the VirtualService turns
+#     FerrumAccepted=False / RefNotPermitted, no captured request to the
+#     withdrawn routes answers from a leg, and the client's ordinary xlocal
+#     Service route still answers (the rest of the slice keeps serving).
+
+xns_remaining() {
+  local left
+  left=$(( XNS_PROBE_DEADLINE - $(date +%s) ))
+  (( left < 0 )) && left=0
+  printf '%s' "$left"
+}
+
+xns_apply_secret() {
+  local namespace="$1" name="$2"
+  shift 2
+  kubectl --context "$CONTEXT" -n "$namespace" create secret generic "$name" \
+    "$@" --dry-run=client -o yaml | kubectl --context "$CONTEXT" apply -f -
+}
+
+# The xclient bearer: HS256 under the trust bundle's `xns` credential, `sub`
+# equal to the node id the Sidecar sends, the native MeshSubscribe audience,
+# and an `ns` claim naming BOTH namespaces (the bearer ceiling every
+# cross-namespace destination must pass).
+xns_mint_client_token() {
+  python3 - "$XNS_DP_JWT_SECRET" "$XNS_KID" "$XSRC" "$XDST" <<'PY'
+import base64
+import hashlib
+import hmac
+import json
+import sys
+import time
+
+secret, kid, src, dst = sys.argv[1:5]
+now = int(time.time())
+
+def b64url(value):
+    raw = json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+header = {"alg": "HS256", "typ": "JWT", "kid": kid}
+claims = {
+    "sub": "xclient",
+    "iss": "ferrum-edge-cp-dp",
+    "aud": "ferrum-mesh-subscribe:local",
+    "iat": now,
+    "exp": now + 3 * 3600,
+    "role": "data_plane",
+    "ns": [src, dst],
+}
+signing_input = f"{b64url(header)}.{b64url(claims)}"
+signature = hmac.new(secret.encode(), signing_input.encode(), hashlib.sha256).digest()
+print(f"{signing_input}.{base64.urlsafe_b64encode(signature).rstrip(b'=').decode()}")
+PY
+}
+
+# Namespaces, secrets, PKI leaf, SPIRE entries and the workloads of the gate.
+xns_deploy() {
+  local ns
+  for ns in "$XSRC" "$XDST"; do
+    kubectl --context "$CONTEXT" create namespace "$ns" \
+      --dry-run=client -o yaml | kubectl --context "$CONTEXT" apply -f - || return 1
+  done
+
+  XNS_DP_JWT_SECRET="$(openssl rand -hex 32)"
+  XNS_ADMIN_JWT_SECRET="$(openssl rand -hex 32)"
+  for ns in "$XSRC" "$XDST"; do
+    xns_apply_secret "$ns" ferrum-xns-secrets \
+      --from-literal=dp-jwt-secret="$XNS_DP_JWT_SECRET" \
+      --from-literal=admin-jwt-secret="$XNS_ADMIN_JWT_SECRET" || return 1
+    xns_apply_secret "$ns" ferrum-native-mtls-dp \
+      --from-file=ca.pem="$NATIVE_MTLS_DIR/ca.pem" \
+      --from-file=client.pem="$NATIVE_MTLS_DIR/client.pem" \
+      --from-file=client-key.pem="$NATIVE_MTLS_DIR/client-key.pem" || return 1
+  done
+
+  # The second control plane's server leaf: same generation-1 CA the DP
+  # trust anchor names, SAN = its own Service DNS name.
+  printf 'subjectAltName=DNS:%s\nextendedKeyUsage=serverAuth\n' "$XNS_CP_DNS" \
+    > "$NATIVE_MTLS_DIR/server-xns.ext"
+  mint_native_leaf "$NATIVE_MTLS_DIR/ca.pem" "$NATIVE_MTLS_DIR/ca-key.pem" \
+    ferrum-native-mtls-cp-xns "$NATIVE_MTLS_DIR/server-xns.pem" \
+    "$NATIVE_MTLS_DIR/server-xns-key.pem" "$NATIVE_MTLS_DIR/server-xns.ext" || return 1
+  xns_apply_secret "$XSRC" ferrum-native-mtls-cp-xns \
+    --from-file=server.pem="$NATIVE_MTLS_DIR/server-xns.pem" \
+    --from-file=server-key.pem="$NATIVE_MTLS_DIR/server-xns-key.pem" \
+    --from-file=client-ca.pem="$NATIVE_MTLS_DIR/client-ca.pem" || return 1
+
+  local bundle
+  bundle="$(printf '{"version":1,"keys":[{"kid":"%s","algorithm":"HS256","secret_env":"FERRUM_XNS_DP_SECRET","namespaces":["%s","%s"]}]}' \
+    "$XNS_KID" "$XSRC" "$XDST")"
+  xns_apply_secret "$XSRC" ferrum-xns-trust \
+    --from-literal=bundle.json="$bundle" || return 1
+  xns_apply_secret "$XSRC" ferrum-xns-client-token \
+    --from-literal=token="$(xns_mint_client_token)" || return 1
+
+  # SPIRE entries before the pods start, so each Sidecar's first SVID fetch
+  # succeeds.
+  local -a spire_nodes
+  mapfile -t spire_nodes < <(ferrum_spire_agent_nodes "$CONTEXT" "$SPIRE_NS")
+  if [[ "${#spire_nodes[@]}" -eq 0 ]]; then
+    echo "no attested SPIRE agent node for the cross-namespace gate" >&2
+    return 1
+  fi
+  local node parent_id entry entry_ns entry_sa
+  for node in "${spire_nodes[@]}"; do
+    parent_id="$(ferrum_spire_k8s_psat_agent_parent_id_for_node \
+      "$CONTEXT" "$SPIRE_NS" "$TRUST_DOMAIN" "$node")" || return 1
+    for entry in "$XSRC:xclient" "$XSRC:xlocal" "$XDST:xremote"; do
+      entry_ns="${entry%%:*}"
+      entry_sa="${entry#*:}"
+      ferrum_spire_register_k8s_workload \
+        "$CONTEXT" "$SPIRE_NS" \
+        "spiffe://$TRUST_DOMAIN/ns/$entry_ns/sa/$entry_sa" \
+        "$parent_id" "$entry_ns" "$entry_sa" \
+        "k8s:node-name:$node" || return 1
+    done
+  done
+
+  awk -v xsrc="$XSRC" -v xdst="$XDST" -v td="$TRUST_DOMAIN" -v image="$IMAGE" '
+    {
+      gsub(/__XSRC__/, xsrc)
+      gsub(/__XDST__/, xdst)
+      gsub(/__TRUST_DOMAIN__/, td)
+      gsub(/__IMAGE__/, image)
+      print
+    }
+  ' "$XNS_MANIFESTS" | kubectl --context "$CONTEXT" apply -f - || return 1
+
+  kubectl --context "$CONTEXT" -n "$XSRC" rollout status deploy/ferrum-cp-xns --timeout=5m || return 1
+  kubectl --context "$CONTEXT" -n "$XSRC" rollout status deploy/xlocal --timeout=5m || return 1
+  kubectl --context "$CONTEXT" -n "$XDST" rollout status deploy/xremote --timeout=5m || return 1
+  kubectl --context "$CONTEXT" -n "$XSRC" rollout status deploy/xclient --timeout=5m || return 1
+}
+
+xns_apply_grant() {
+  kubectl --context "$CONTEXT" --request-timeout=60s apply -f - <<YAML
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: $XNS_GRANT_NAME
+  namespace: $XDST
+spec:
+  from:
+    - group: networking.istio.io
+      kind: VirtualService
+      namespace: $XSRC
+  to:
+    - group: ""
+      kind: Service
+      name: xremote
+YAML
+}
+
+# The DestinationRule in the destination namespace governs the remote split
+# leg; the VirtualService routes /direct to xremote and splits / 50/50.
+xns_apply_routes() {
+  kubectl --context "$CONTEXT" --request-timeout=60s apply -f - <<YAML
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: $XNS_DR_NAME
+  namespace: $XDST
+spec:
+  host: $XNS_REMOTE_HOST
+  trafficPolicy:
+    loadBalancer:
+      simple: ROUND_ROBIN
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: $XNS_VS_NAME
+  namespace: $XSRC
+spec:
+  hosts:
+    - $XNS_FRONT_HOST
+  http:
+    - match:
+        - uri:
+            prefix: /direct
+      route:
+        - destination:
+            host: $XNS_REMOTE_HOST
+            port:
+              number: 8080
+    - route:
+        - destination:
+            host: $XNS_LOCAL_HOST
+            port:
+              number: 8080
+          weight: 50
+        - destination:
+            host: $XNS_REMOTE_HOST
+            port:
+              number: 8080
+          weight: 50
+YAML
+}
+
+# One status read of the VirtualService. Echoes
+#   "accepted destinations=<list>"            FerrumAccepted=True listing
+#                                             $XDST/xremote
+#   "refused reason=RefNotPermitted"          FerrumAccepted=False/RefNotPermitted
+#   anything else                             the observation
+xns_vs_status_once() {
+  local json
+  json="$(timeout 20 kubectl --context "$CONTEXT" -n "$XSRC" get \
+    "virtualservices.networking.istio.io/$XNS_VS_NAME" -o json 2>/dev/null || true)"
+  printf '%s\n' "$json" > "$RESULTS_DIR/xns-vs-status.txt"
+  printf '%s' "$json" | python3 -c '
+import json
+import sys
+
+expected = sys.argv[1]
+try:
+    doc = json.load(sys.stdin)
+except Exception:
+    print("status-unparseable")
+    sys.exit(0)
+status = doc.get("status") or {}
+accepted = [c for c in status.get("conditions") or [] if c.get("type") == "FerrumAccepted"]
+translation = (status.get("ferrum") or {}).get("translation") or {}
+destinations = translation.get("cross_namespace_destinations") or []
+if not accepted:
+    print("ferrum-accepted-missing")
+elif accepted[0].get("status") == "True":
+    if expected in destinations:
+        print("accepted destinations=%s" % ",".join(destinations))
+    else:
+        print("accepted-without-destination destinations=%s" % ",".join(destinations))
+elif accepted[0].get("reason") == "RefNotPermitted":
+    print("refused reason=RefNotPermitted")
+else:
+    print("ferrum-accepted-%s reason=%s" % (accepted[0].get("status"), accepted[0].get("reason")))
+' "$XDST/xremote"
+}
+
+# Poll the status until it starts with `want` ("accepted" / "refused") or the
+# budget runs out; echoes the last observation.
+xns_wait_status() {
+  local want="$1" verdict="status-never-read" _
+  for _ in $(seq 1 90); do
+    (( $(xns_remaining) > 0 )) || { verdict="deadline-before-status $verdict"; break; }
+    verdict="$(xns_vs_status_once)"
+    [[ "$verdict" == "$want"* ]] && break
+    sleep 2
+  done
+  printf '%s' "$verdict"
+}
+
+# Retry a captured xclient GET of `url` until curl completes with 200 and the
+# body is one of the accepted markers ("m1|m2"), or (with `mode` = miss) until
+# a request completes WITHOUT any accepted marker. Echoes the final
+# "<curl exit>\t<status>\t<body>".
+xns_settle() {
+  local url="$1" accept="$2" mode="${3:-hit}" budget
+  budget="$(xns_remaining)"
+  (( budget > 0 )) || { printf 'DEADLINE\t000\t\n'; return 0; }
+  (( budget > 180 )) && budget=180
+  # shellcheck disable=SC2016
+  timeout "$(( budget + 15 ))" kubectl --context "$CONTEXT" -n "$XSRC" exec deploy/xclient -c curl -- \
+    sh -c '
+      url="$1"; accept="$2"; mode="$3"; budget="$4"
+      end=$(( $(date +%s) + budget ))
+      rc=-1; out=000; body=""
+      while [ "$(date +%s)" -lt "$end" ]; do
+        : >/tmp/xns 2>/dev/null || true
+        rc=0
+        out="$(curl -s -m 5 -o /tmp/xns -w "%{http_code}" "$url" 2>/dev/null)" || rc=$?
+        [ -n "$out" ] || out=000
+        body="$(tr -d "\r\n\t" </tmp/xns 2>/dev/null || true)"
+        hit=no
+        if [ "$rc" = "0" ] && [ "$out" = "200" ]; then
+          case "|$accept|" in
+            *"|$body|"*) hit=yes ;;
+          esac
+        fi
+        if [ "$mode" = "hit" ] && [ "$hit" = "yes" ]; then
+          printf "%s\t%s\t%s\n" "$rc" "$out" "$body"; exit 0
+        fi
+        if [ "$mode" = "miss" ] && [ "$hit" = "no" ]; then
+          printf "%s\t%s\t%s\n" "$rc" "$out" "$body"; exit 0
+        fi
+        sleep 2
+      done
+      printf "%s\t%s\t%s\n" "$rc" "$out" "$body"
+    ' sh "$url" "$accept" "$mode" "$budget" 2>/dev/null || printf 'EXECFAIL\t000\t\n'
+}
+
+# Issue N sequential captured xclient GETs of `url` and classify each: "l" a
+# completed 200 with the xlocal marker, "r" the xremote marker, "x" anything
+# else. Echoes "<local>\t<remote>\t<other>\t<issued>\t<first other>". The
+# sample stops at the budget deadline (issued < N then).
+xns_sample() {
+  local url="$1" n="$2" budget
+  budget="$(xns_remaining)"
+  (( budget > 0 )) || { printf '0\t0\t0\t0\tdeadline\n'; return 0; }
+  # shellcheck disable=SC2016
+  timeout "$(( budget + 15 ))" kubectl --context "$CONTEXT" -n "$XSRC" exec deploy/xclient -c curl -- \
+    sh -c '
+      url="$1"; n="$2"; ml="$3"; mr="$4"; budget="$5"
+      end=$(( $(date +%s) + budget ))
+      l=0; r=0; other=0; i=0; first=""
+      while [ "$i" -lt "$n" ]; do
+        if [ "$(date +%s)" -ge "$end" ]; then break; fi
+        i=$((i + 1))
+        : >/tmp/xnsb 2>/dev/null || true
+        rc=0
+        code="$(curl -s -m 5 -o /tmp/xnsb -w "%{http_code}" "$url" 2>/dev/null)" || rc=$?
+        [ -n "$code" ] || code=000
+        body="$(tr -d "\r\n\t" </tmp/xnsb 2>/dev/null || true)"
+        if [ "$rc" = "0" ] && [ "$code" = "200" ] && [ "$body" = "$ml" ]; then
+          l=$((l + 1))
+        elif [ "$rc" = "0" ] && [ "$code" = "200" ] && [ "$body" = "$mr" ]; then
+          r=$((r + 1))
+        else
+          other=$((other + 1))
+          [ -n "$first" ] || first="rc=$rc:$code:$(printf "%s" "$body" | cut -c1-120)"
+        fi
+      done
+      printf "%s\t%s\t%s\t%s\t%s\n" "$l" "$r" "$other" "$i" "$first"
+    ' sh "$url" "$n" "$XNS_LOCAL_MARKER" "$XNS_REMOTE_MARKER" "$budget" \
+    2>/dev/null || printf '0\t0\t0\t0\texec-failed\n'
+}
+
+xns_dump_client_config_drift() {
+  local admin_token
+  admin_token="$(python3 - "$XNS_ADMIN_JWT_SECRET" <<'PY'
+import base64
+import hashlib
+import hmac
+import json
+import sys
+import time
+import uuid
+
+secret = sys.argv[1]
+now = int(time.time())
+
+def b64url(value):
+    raw = json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+header = {"alg": "HS256", "typ": "JWT"}
+claims = {
+    "iss": "ferrum-edge",
+    "sub": "mesh-e2e-sidecar",
+    "iat": now,
+    "nbf": now - 1,
+    "exp": now + 600,
+    "jti": str(uuid.uuid4()),
+    "role": "admin",
+}
+signing_input = f"{b64url(header)}.{b64url(claims)}"
+signature = hmac.new(secret.encode(), signing_input.encode(), hashlib.sha256).digest()
+print(f"{signing_input}.{base64.urlsafe_b64encode(signature).rstrip(b'=').decode()}")
+PY
+)"
+  # shellcheck disable=SC2016
+  timeout 30 kubectl --context "$CONTEXT" -n "$XSRC" exec deploy/xclient -c curl -- \
+    sh -c 'curl -s -m 10 -H "Authorization: Bearer $1" http://127.0.0.1:15020/mesh/config-drift' \
+    sh "$admin_token" > "$RESULTS_DIR/xns-client-config-drift.txt" 2>/dev/null || true
+}
+
+record_xns_failure_all() {
+  local reason="$1" diagnostics="$2"
+  log "cross-namespace VirtualService gate prerequisite failed: $reason"
+  printf 'prerequisite failed: %s\n' "$reason" >>"$diagnostics"
+  record_live_assertion sidecar.virtual_service.cross_namespace_direct_destination fail \
+    xclient xremote "$reason" "$(basename "$diagnostics")"
+  record_live_assertion sidecar.virtual_service.cross_namespace_weighted_split_leg fail \
+    xclient "xlocal+xremote" "$reason" "$(basename "$diagnostics")"
+  record_live_assertion sidecar.virtual_service.cross_namespace_grant_withdrawal_refused fail \
+    xclient xremote "$reason" "$(basename "$diagnostics")"
+  xns_dump_client_config_drift
+  cat "$diagnostics" >&2
+}
+
+probe_virtual_service_cross_namespace() {
+  local diagnostics="$RESULTS_DIR/xns.txt"
+  : >"$diagnostics"
+  XNS_PROBE_DEADLINE=$(( $(date +%s) + XNS_PROBE_BUDGET_SECS ))
+  log "probing cross-namespace VirtualService destinations ($XSRC -> $XDST on ferrum-cp-xns; budget ${XNS_PROBE_BUDGET_SECS}s)"
+
+  if ! xns_deploy >>"$diagnostics" 2>&1; then
+    record_xns_failure_all "cross-namespace fixture deploy failed" "$diagnostics"
+    return 1
+  fi
+  if ! xns_apply_grant >>"$diagnostics" 2>&1 || ! xns_apply_routes >>"$diagnostics" 2>&1; then
+    record_xns_failure_all "grant/route apply failed" "$diagnostics"
+    return 1
+  fi
+
+  local accepted
+  accepted="$(xns_wait_status accepted)"
+  log "cross-namespace VirtualService status: $accepted"
+  printf 'status (granted): %s\n' "$accepted" >>"$diagnostics"
+  if [[ "$accepted" != accepted* ]]; then
+    record_xns_failure_all "status=$accepted" "$diagnostics"
+    return 1
+  fi
+
+  # Direct destination.
+  local direct_ok=false direct_settle direct_summary
+  direct_settle="$(xns_settle "$XNS_DIRECT_URL" "$XNS_REMOTE_MARKER")"
+  printf 'direct settle: %s\n' "$direct_settle" >>"$diagnostics"
+  local d_local d_remote d_other d_issued d_first sample
+  sample="$(xns_sample "$XNS_DIRECT_URL" "$XNS_DIRECT_REQUESTS")"
+  d_local="$(printf '%s' "$sample" | cut -f1)"
+  d_remote="$(printf '%s' "$sample" | cut -f2)"
+  d_other="$(printf '%s' "$sample" | cut -f3)"
+  d_issued="$(printf '%s' "$sample" | cut -f4)"
+  d_first="$(printf '%s' "$sample" | cut -f5)"
+  direct_summary="n=$XNS_DIRECT_REQUESTS issued=$d_issued remote=$d_remote local=$d_local other=$d_other first_other=$d_first"
+  printf 'direct %s\n' "$direct_summary" >>"$diagnostics"
+  log "cross-namespace direct: $direct_summary"
+  [[ "$d_issued" == "$XNS_DIRECT_REQUESTS" && "$d_remote" == "$XNS_DIRECT_REQUESTS" ]] && direct_ok=true
+
+  # DestinationRule-governed split leg.
+  local split_ok=false split_settle split_summary s_local s_remote s_other s_issued s_first
+  split_settle="$(xns_settle "$XNS_SPLIT_URL" "$XNS_LOCAL_MARKER|$XNS_REMOTE_MARKER")"
+  printf 'split settle: %s\n' "$split_settle" >>"$diagnostics"
+  sample="$(xns_sample "$XNS_SPLIT_URL" "$XNS_SPLIT_REQUESTS")"
+  s_local="$(printf '%s' "$sample" | cut -f1)"
+  s_remote="$(printf '%s' "$sample" | cut -f2)"
+  s_other="$(printf '%s' "$sample" | cut -f3)"
+  s_issued="$(printf '%s' "$sample" | cut -f4)"
+  s_first="$(printf '%s' "$sample" | cut -f5)"
+  split_summary="n=$XNS_SPLIT_REQUESTS issued=$s_issued local=$s_local remote=$s_remote other=$s_other first_other=$s_first"
+  printf 'split %s\n' "$split_summary" >>"$diagnostics"
+  log "cross-namespace split: $split_summary (accept local in [$XNS_SPLIT_LOCAL_MIN,$XNS_SPLIT_LOCAL_MAX])"
+  if [[ "$s_issued" == "$XNS_SPLIT_REQUESTS" && "$s_other" == "0" \
+    && "$s_local" =~ ^[0-9]+$ && "$s_remote" =~ ^[0-9]+$ ]] \
+    && (( s_local >= XNS_SPLIT_LOCAL_MIN && s_local <= XNS_SPLIT_LOCAL_MAX \
+      && s_local + s_remote == XNS_SPLIT_REQUESTS )); then
+    split_ok=true
+  fi
+
+  xns_dump_client_config_drift
+
+  # Withdrawal: delete the grant.
+  local withdrawn_ok=false refused="not-run" missed local_ok w_summary
+  local w_local w_remote w_other w_issued
+  if timeout 60 kubectl --context "$CONTEXT" -n "$XDST" delete \
+    "referencegrants.gateway.networking.k8s.io/$XNS_GRANT_NAME" >>"$diagnostics" 2>&1; then
+    refused="$(xns_wait_status refused)"
+  else
+    refused="grant-delete-failed"
+  fi
+  printf 'status (grant deleted): %s\n' "$refused" >>"$diagnostics"
+  log "cross-namespace VirtualService status after grant deletion: $refused"
+  missed="$(xns_settle "$XNS_DIRECT_URL" "$XNS_LOCAL_MARKER|$XNS_REMOTE_MARKER" miss)"
+  printf 'withdrawn settle: %s\n' "$missed" >>"$diagnostics"
+  sample="$(xns_sample "$XNS_DIRECT_URL" "$XNS_WITHDRAWN_REQUESTS")"
+  w_local="$(printf '%s' "$sample" | cut -f1)"
+  w_remote="$(printf '%s' "$sample" | cut -f2)"
+  w_other="$(printf '%s' "$sample" | cut -f3)"
+  w_issued="$(printf '%s' "$sample" | cut -f4)"
+  local_ok="$(xns_settle "$XNS_LOCAL_URL" "$XNS_LOCAL_MARKER")"
+  w_summary="status=$refused withdrawn n=$XNS_WITHDRAWN_REQUESTS issued=$w_issued leg_answers=$(( ${w_local:-0} + ${w_remote:-0} )) misses=$w_other ordinary-xlocal=${local_ok//$'\t'/ }"
+  printf 'withdrawn %s\n' "$w_summary" >>"$diagnostics"
+  log "cross-namespace withdrawal: $w_summary"
+  if [[ "$refused" == refused* && "$w_issued" == "$XNS_WITHDRAWN_REQUESTS" \
+    && "$w_local" == "0" && "$w_remote" == "0" ]] \
+    && [[ "$(printf '%s' "$local_ok" | cut -f1)" == "0" \
+      && "$(printf '%s' "$local_ok" | cut -f2)" == "200" \
+      && "$(printf '%s' "$local_ok" | cut -f3)" == "$XNS_LOCAL_MARKER" ]]; then
+    withdrawn_ok=true
+  fi
+
+  if [[ "$direct_ok" == "true" ]]; then
+    record_live_assertion sidecar.virtual_service.cross_namespace_direct_destination pass \
+      xclient xremote "$direct_summary $accepted" "$(basename "$diagnostics")"
+  else
+    record_live_assertion sidecar.virtual_service.cross_namespace_direct_destination fail \
+      xclient xremote "$direct_summary" "$(basename "$diagnostics")"
+  fi
+  if [[ "$split_ok" == "true" ]]; then
+    record_live_assertion sidecar.virtual_service.cross_namespace_weighted_split_leg pass \
+      xclient "xlocal+xremote" \
+      "$split_summary window=$XNS_SPLIT_LOCAL_MIN-$XNS_SPLIT_LOCAL_MAX destination-rule=$XDST/$XNS_DR_NAME" \
+      "$(basename "$diagnostics")"
+  else
+    record_live_assertion sidecar.virtual_service.cross_namespace_weighted_split_leg fail \
+      xclient "xlocal+xremote" "$split_summary" "$(basename "$diagnostics")"
+  fi
+  if [[ "$withdrawn_ok" == "true" ]]; then
+    record_live_assertion sidecar.virtual_service.cross_namespace_grant_withdrawal_refused pass \
+      xclient xremote "$w_summary" "$(basename "$diagnostics")"
+  else
+    record_live_assertion sidecar.virtual_service.cross_namespace_grant_withdrawal_refused fail \
+      xclient xremote "$w_summary" "$(basename "$diagnostics")"
+  fi
+
+  if [[ "$direct_ok" != "true" || "$split_ok" != "true" || "$withdrawn_ok" != "true" ]]; then
+    cat "$diagnostics" >&2
+    return 1
+  fi
+}
+
 # Redact PEM, bearer tokens, and long hex secrets from probe evidence so
 # readiness/diagnostics stay at class/reason level.
 redact_native_transport_evidence() {
@@ -3272,6 +3849,20 @@ collect_diagnostics() {
       --all-containers --tail=500 \
       > "$ARTIFACT_DIR/${deploy}.log" 2>&1 || true
   done
+  local xns_entry xns_ns xns_deploy_name
+  for xns_entry in "$XSRC:ferrum-cp-xns" "$XSRC:xclient" "$XSRC:xlocal" "$XDST:xremote"; do
+    xns_ns="${xns_entry%%:*}"
+    xns_deploy_name="${xns_entry#*:}"
+    kubectl --context "$CONTEXT" -n "$xns_ns" logs "deploy/$xns_deploy_name" \
+      --all-containers --tail=500 \
+      > "$ARTIFACT_DIR/xns-${xns_deploy_name}.log" 2>&1 || true
+  done
+  kubectl --context "$CONTEXT" -n "$XSRC" get virtualservices.networking.istio.io,sidecars.networking.istio.io -o yaml \
+    > "$ARTIFACT_DIR/xns-istio.yaml" 2>&1 || true
+  kubectl --context "$CONTEXT" -n "$XSRC" get events --sort-by=.lastTimestamp \
+    > "$ARTIFACT_DIR/xns-src-events.txt" 2>&1 || true
+  kubectl --context "$CONTEXT" -n "$XDST" get events --sort-by=.lastTimestamp \
+    > "$ARTIFACT_DIR/xns-dst-events.txt" 2>&1 || true
   kubectl --context "$CONTEXT" -n "$NS" logs deploy/svc -c ferrum-edge-init \
     --tail=50 > "$ARTIFACT_DIR/svc-iptables.txt" 2>&1 || true
   kubectl --context "$CONTEXT" -n "$NS" logs deploy/client -c ferrum-blackhole-init \
@@ -3374,6 +3965,10 @@ main() {
   # budget. It records both of its assertions on every path; the single
   # fail-closed gate below decides.
   probe_virtual_service_http_routes || true
+  # Issue #7499: the cross-namespace gate runs on its own control plane and
+  # namespaces, last, bounded by XNS_PROBE_BUDGET_SECS, recording all three of
+  # its assertions on every path.
+  probe_virtual_service_cross_namespace || true
 
   require_live_assertions
   log "mesh-e2e-sidecar suite PASSED; artifacts in $ARTIFACT_DIR"

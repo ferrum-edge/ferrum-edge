@@ -478,3 +478,404 @@ fn node_waypoint_scopes_request_authentication_to_the_destination_namespace() {
         json!("https://ratings-jwt.example.com")
     );
 }
+
+// ---------------------------------------------------------------------------
+// Two NodeWaypoints, cross-namespace (issue #7499).
+//
+// The source pods (`default/client`, `default/intruder`, `gamma/client`) are
+// enrolled on NodeWaypoint A; the destination `other/ratings` on NodeWaypoint
+// B, on another node. A applies the carried route and dials B over HBONE,
+// pinned to B's identity, asserting the source pod's principal in baggage. B
+// relays to `ratings` and authorizes the relay against `other`'s policy for
+// the destination workload, with the asserted principal when it trusts A to
+// assert it (its slice's assertor inventory, derived from the workloads A
+// fronts). The destination namespace's policy is therefore evaluated twice,
+// once on each waypoint, and these tests prove the two decisions agree for
+// ALLOW and DENY by source principal and by source namespace.
+
+const WAYPOINT_A: &str = "spiffe://cluster.local/ns/ferrum/sa/node-waypoint-a";
+const WAYPOINT_B: &str = "spiffe://cluster.local/ns/ferrum/sa/node-waypoint-b";
+const WAYPOINT_C: &str = "spiffe://cluster.local/ns/ferrum/sa/node-waypoint-c";
+const CLIENT: &str = "spiffe://cluster.local/ns/default/sa/client";
+const INTRUDER: &str = "spiffe://cluster.local/ns/default/sa/intruder";
+const GAMMA_CLIENT: &str = "spiffe://cluster.local/ns/gamma/sa/client";
+const RATINGS_ADDRESS: &str = "10.0.1.12";
+
+fn node_waypoint_endpoint(
+    spiffe: &str,
+    address: &str,
+    node: &str,
+) -> ferrum_edge::modes::mesh::config::NodeWaypointEndpoint {
+    ferrum_edge::modes::mesh::config::NodeWaypointEndpoint {
+        address: address.to_string(),
+        hbone_port: 15008,
+        spiffe_id: SpiffeId::new(spiffe).expect("node waypoint SPIFFE ID"),
+        node_name: Some(node.to_string()),
+        node_uid: Some(format!("{node}-uid")),
+        network: None,
+        cluster: None,
+    }
+}
+
+/// A rule matching one source principal or one source namespace.
+fn source_rule(
+    principal: Option<&str>,
+    namespace: Option<&str>,
+    action: ferrum_edge::modes::mesh::config::PolicyAction,
+) -> ferrum_edge::modes::mesh::config::MeshRule {
+    use ferrum_edge::identity::spiffe::TrustDomain;
+    use ferrum_edge::modes::mesh::config::{MeshRule, PrincipalMatch};
+    MeshRule {
+        from: vec![PrincipalMatch {
+            spiffe_id_pattern: principal.map(str::to_string),
+            namespace_pattern: namespace.map(str::to_string),
+            trust_domain: Some(TrustDomain::new("cluster.local").expect("trust domain")),
+            trust_domain_pattern: None,
+        }],
+        to: Vec::new(),
+        when: Vec::new(),
+        request_principals: Vec::new(),
+        not_request_principals: Vec::new(),
+        source_negation: Default::default(),
+        never_matches: false,
+        action,
+    }
+}
+
+fn ratings_policy(
+    name: &str,
+    rules: Vec<ferrum_edge::modes::mesh::config::MeshRule>,
+) -> MeshPolicy {
+    MeshPolicy {
+        name: name.to_string(),
+        namespace: OTHER.to_string(),
+        scope: selector("ratings"),
+        rules,
+    }
+}
+
+/// `other`'s policy by namespace and principal: ALLOW sources from
+/// `default`, DENY `default/intruder`.
+fn allow_namespace_deny_principal() -> Vec<MeshPolicy> {
+    use ferrum_edge::modes::mesh::config::PolicyAction;
+    vec![
+        ratings_policy(
+            "allow-default",
+            vec![source_rule(None, Some("default"), PolicyAction::Allow)],
+        ),
+        ratings_policy(
+            "deny-intruder",
+            vec![source_rule(Some(INTRUDER), None, PolicyAction::Deny)],
+        ),
+    ]
+}
+
+/// `other`'s policy by principal and namespace: ALLOW `default/client` and
+/// `gamma/client`, DENY every source from `gamma`.
+fn allow_principal_deny_namespace() -> Vec<MeshPolicy> {
+    use ferrum_edge::modes::mesh::config::PolicyAction;
+    vec![
+        ratings_policy(
+            "allow-clients",
+            vec![
+                source_rule(Some(CLIENT), None, PolicyAction::Allow),
+                source_rule(Some(GAMMA_CLIENT), None, PolicyAction::Allow),
+            ],
+        ),
+        ratings_policy(
+            "deny-gamma",
+            vec![source_rule(None, Some("gamma"), PolicyAction::Deny)],
+        ),
+    ]
+}
+
+/// The granted direct route to `other/ratings`, `ratings` enrolled on B and
+/// the three sources enrolled on A.
+fn two_waypoint_config(policies: Vec<MeshPolicy>) -> GatewayConfig {
+    use super::super::mesh_test_support::workload_for;
+
+    let mut config = config_with(direct_spec(RATINGS_OTHER), Vec::new(), policies, Vec::new());
+    let mesh = config.mesh.as_mut().expect("mesh block");
+    for workload in &mut mesh.workloads {
+        if workload.namespace == OTHER && workload.service_name == "ratings" {
+            workload.node_waypoint =
+                Some(node_waypoint_endpoint(WAYPOINT_B, "10.9.0.2", "worker-b"));
+        }
+    }
+    for (name, namespace, address) in [
+        ("client", DEFAULT_NAMESPACE, "10.0.0.21"),
+        ("intruder", DEFAULT_NAMESPACE, "10.0.0.22"),
+        ("client", "gamma", "10.0.3.21"),
+    ] {
+        let mut source = workload_for(name, namespace, [("app", "client")], [address]);
+        source.node_waypoint = Some(node_waypoint_endpoint(WAYPOINT_A, "10.9.0.1", "worker-a"));
+        mesh.workloads.push(source);
+    }
+    config
+}
+
+/// An identity-backed NodeWaypoint (secured HBONE transport) subscribing in
+/// `namespace` as `identity`.
+fn identity_backed_node_waypoint(
+    identity: &str,
+    namespace: &str,
+) -> ferrum_edge::modes::mesh::MeshRuntimeConfig {
+    ferrum_edge::modes::mesh::MeshRuntimeConfig {
+        namespace: namespace.to_string(),
+        workload_spiffe_id: Some(identity.to_string()),
+        workload_svid_cert_path: Some("/var/run/ferrum/svid.pem".to_string()),
+        workload_svid_key_path: Some("/var/run/ferrum/svid.key".to_string()),
+        workload_svid_trust_bundle_path: Some("/var/run/ferrum/bundle.pem".to_string()),
+        ..node_waypoint_runtime()
+    }
+}
+
+fn scope(namespaces: &[&str]) -> CpScope {
+    CpScope::Set(
+        namespaces
+            .iter()
+            .map(|namespace| namespace.to_string())
+            .collect(),
+    )
+}
+
+/// Waypoint A's prepared config, from its control-plane-filtered slice.
+fn prepare_source_waypoint(config: &GatewayConfig) -> GatewayConfig {
+    let runtime = identity_backed_node_waypoint(WAYPOINT_A, DEFAULT_NAMESPACE);
+    let request = runtime.mesh_slice_request();
+    let filtered = filter_config_to_mesh_request_for_test(
+        config,
+        &request,
+        &scope(&[DEFAULT_NAMESPACE, OTHER, "gamma", "ferrum"]),
+        None,
+    );
+    let slice = MeshSlice::from_gateway_config(&filtered, request);
+    let prepared =
+        prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("waypoint A materializes");
+    assert_references_resolve(&prepared);
+    prepared
+}
+
+/// Waypoint B's prepared config, from its control-plane-filtered slice under
+/// `cp_scope`.
+fn prepare_destination_waypoint(config: &GatewayConfig, cp_scope: &CpScope) -> GatewayConfig {
+    let runtime = identity_backed_node_waypoint(WAYPOINT_B, "ferrum");
+    let request = runtime.mesh_slice_request();
+    let filtered = filter_config_to_mesh_request_for_test(config, &request, cp_scope, None);
+    let slice = MeshSlice::from_gateway_config(&filtered, request);
+    assert!(
+        slice
+            .node_waypoint_capture_destinations
+            .iter()
+            .any(|workload| workload.namespace == OTHER && workload.service_name == "ratings"),
+        "B terminates capture for ratings"
+    );
+    prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("waypoint B materializes")
+}
+
+/// A's decision for `source` on its carried route to `other/ratings`.
+async fn source_waypoint_allows(authz: &MeshAuthz, route: &Proxy, source: &str) -> PluginResult {
+    let identity = SpiffeId::new(source).expect("spiffe");
+    let namespace = identity.namespace().expect("namespaced source").to_string();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api".to_string(),
+    );
+    ctx.peer_spiffe_id = Some(identity.clone());
+    ctx.node_waypoint_policy_scope = Some(Arc::new(PolicyScopeCache::new(
+        identity,
+        &namespace,
+        HashMap::from([("app".to_string(), "client".to_string())]),
+    )));
+    ctx.matched_proxy = Some(Arc::new(route.clone()));
+    ctx.headers = HashMap::from([(
+        "host".to_string(),
+        "reviews.default.svc.cluster.local".to_string(),
+    )]);
+    authz.authorize(&mut ctx).await
+}
+
+/// B's decision for an HBONE relay from `peer` asserting `asserted`, to
+/// `ratings`. Returns the result and the recorded deny policy.
+async fn destination_waypoint_relays(
+    authz: &MeshAuthz,
+    peer: &str,
+    asserted: &str,
+) -> (PluginResult, Option<String>) {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "CONNECT".to_string(),
+        "/".to_string(),
+    );
+    ctx.peer_spiffe_id = Some(SpiffeId::new(peer).expect("spiffe"));
+    ctx.mesh_direction = Some(ferrum_edge::modes::mesh::MeshTrafficDirection::Inbound);
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    ctx.headers.insert(
+        "baggage".to_string(),
+        ferrum_edge::modes::mesh::hbone::baggage_header_for_source(
+            &SpiffeId::new(asserted).expect("spiffe"),
+        ),
+    );
+    ctx.matched_proxy = Some(Arc::new(
+        serde_json::from_value::<Proxy>(json!({
+            "id": "__mesh-inbound-hbone-relay",
+            "namespace": "ferrum",
+            "hosts": [],
+            "listen_path": "/",
+            "backend_scheme": "http",
+            "backend_host": RATINGS_ADDRESS,
+            "backend_port": 8080
+        }))
+        .expect("relay proxy"),
+    ));
+    let result = authz.authorize(&mut ctx).await;
+    let deny_policy = ctx.metadata.get("mesh_authz.deny_policy").cloned();
+    (result, deny_policy)
+}
+
+fn allowed(result: &PluginResult) -> bool {
+    match result {
+        PluginResult::Continue => true,
+        PluginResult::Reject { status_code, .. } => {
+            assert_eq!(*status_code, 403, "a refusal is a 403: {result:?}");
+            false
+        }
+        other => panic!("unexpected authorization outcome {other:?}"),
+    }
+}
+
+/// Acceptance (cross-node NodeWaypoint trust): A dials B over HBONE pinned to
+/// B, B trusts A's assertion of each source A fronts, and both waypoints
+/// reach the same decision under the destination namespace's policy, for
+/// ALLOW and DENY by source principal and by source namespace.
+#[tokio::test]
+async fn two_node_waypoints_agree_on_the_destination_namespace_policy() {
+    for (case, policies, expectations) in [
+        (
+            "ALLOW by namespace, DENY by principal",
+            allow_namespace_deny_principal(),
+            [
+                (CLIENT, true, None),
+                (INTRUDER, false, Some("deny-intruder")),
+                (GAMMA_CLIENT, false, None),
+            ],
+        ),
+        (
+            "ALLOW by principal, DENY by namespace",
+            allow_principal_deny_namespace(),
+            [
+                (CLIENT, true, None),
+                (GAMMA_CLIENT, false, Some("deny-gamma")),
+                (INTRUDER, false, None),
+            ],
+        ),
+    ] {
+        let config = two_waypoint_config(policies);
+
+        // Waypoint A: the carried route dials B over HBONE, pinned to B.
+        let source = prepare_source_waypoint(&config);
+        let routes = carried_routes(&source);
+        assert_eq!(routes.len(), 1, "{case}: A serves the route");
+        let route = routes[0].clone();
+        let clone = upstream(&source, route.upstream_id.as_deref().expect("bound"));
+        assert!(clone.id.starts_with(CLONE_PREFIX), "{case}");
+        for target in &clone.targets {
+            assert_eq!(target.host, RATINGS_ADDRESS, "{case}: inner authority");
+            assert_eq!(
+                target.tags.get("mesh.hbone").map(String::as_str),
+                Some("true"),
+                "{case}: over HBONE"
+            );
+            assert_eq!(
+                target.tags.get("mesh.hbone_dial_host").map(String::as_str),
+                Some("10.9.0.2"),
+                "{case}: to B's node"
+            );
+            assert_eq!(
+                target
+                    .tags
+                    .get("mesh.hbone_peer_spiffe_id")
+                    .map(String::as_str),
+                Some(WAYPOINT_B),
+                "{case}: pinned to B"
+            );
+        }
+        let source_authz = authz(&source);
+
+        // Waypoint B trusts A to assert exactly the sources A fronts.
+        let destination = prepare_destination_waypoint(
+            &config,
+            &scope(&[DEFAULT_NAMESPACE, OTHER, "gamma", "ferrum"]),
+        );
+        let destination_authz_config = &destination
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_AUTHZ_PLUGIN_ID)
+            .expect("mesh_authz injected")
+            .config;
+        let assertors = destination_authz_config["trusted_hbone_assertors"]
+            .as_array()
+            .expect("an exact assertor inventory");
+        let waypoint_a = assertors
+            .iter()
+            .find(|entry| entry["assertor"].as_str() == Some(WAYPOINT_A))
+            .expect("B trusts A");
+        let asserts: HashSet<&str> = waypoint_a["asserts"]
+            .as_array()
+            .expect("asserts")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            [CLIENT, INTRUDER, GAMMA_CLIENT]
+                .iter()
+                .all(|source| asserts.contains(source)),
+            "{case}: A may assert every source it fronts, across namespaces: {asserts:?}"
+        );
+        let destination_authz = authz(&destination);
+
+        for (principal, expected, deny_policy) in expectations {
+            let at_source =
+                allowed(&source_waypoint_allows(&source_authz, &route, principal).await);
+            let (relayed, recorded) =
+                destination_waypoint_relays(&destination_authz, WAYPOINT_A, principal).await;
+            let at_destination = allowed(&relayed);
+            assert_eq!(at_source, expected, "{case}: A decides {principal}");
+            assert_eq!(at_destination, expected, "{case}: B decides {principal}");
+            if let Some(deny_policy) = deny_policy {
+                assert_eq!(
+                    recorded.as_deref(),
+                    Some(deny_policy),
+                    "{case}: B's refusal of {principal} is the destination namespace's DENY"
+                );
+            }
+        }
+
+        // A waypoint that fronts none of these sources cannot assert one: B
+        // judges the relay on that waypoint's own identity and refuses it.
+        let (relayed, _) =
+            destination_waypoint_relays(&destination_authz, WAYPOINT_C, CLIENT).await;
+        assert!(
+            !allowed(&relayed),
+            "{case}: an unproven assertion is refused"
+        );
+    }
+}
+
+/// A destination NodeWaypoint trusts an assertion only for source namespaces
+/// its own control-plane scope (and bearer `ns` claim) covers: outside them
+/// the assertion is ignored and the relay is refused, never admitted on the
+/// source waypoint's say-so.
+#[tokio::test]
+async fn a_destination_node_waypoint_ignores_assertions_outside_its_scope() {
+    let config = two_waypoint_config(allow_namespace_deny_principal());
+    let destination = prepare_destination_waypoint(&config, &scope(&[OTHER, "ferrum"]));
+    let destination_authz = authz(&destination);
+    let (relayed, _) = destination_waypoint_relays(&destination_authz, WAYPOINT_A, CLIENT).await;
+    assert!(
+        !allowed(&relayed),
+        "B does not trust A to assert a `default` source it may not see"
+    );
+}

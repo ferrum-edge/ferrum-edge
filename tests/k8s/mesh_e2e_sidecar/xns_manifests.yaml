@@ -1,0 +1,895 @@
+# Cross-namespace VirtualService gate (issue #7499) for the mesh-e2e-sidecar
+# live suite. run.sh applies this file at the start of
+# probe_virtual_service_cross_namespace, after every other assertion is
+# recorded, with __XSRC__ / __XDST__ / __IMAGE__ / __TRUST_DOMAIN__ rendered.
+#
+# A cross-namespace destination needs a control plane that serves both
+# namespaces (a single-namespace control plane never routes into another
+# namespace), and a multi-namespace control plane authorizes data planes only
+# through a namespace-bound trust bundle. The suite's main ferrum-cp is
+# single-namespace and its probes depend on that, so this gate runs its OWN
+# control plane, `ferrum-cp-xns`, in two namespaces the main one never sees:
+#
+#   __XSRC__  ferrum-cp-xns, the client (`xclient`, Sidecar, native, outbound
+#             capture), the local split leg (`xlocal`), the frontend Service
+#             `xfront` (no backing pod: only the carried route answers it), the
+#             VirtualService and a namespace Sidecar importing __XDST__/*
+#   __XDST__  the destination (`xremote`), its DestinationRule and the
+#             ReferenceGrant admitting VirtualServices from __XSRC__
+#
+# ferrum-cp-xns: FERRUM_CP_NAMESPACES=__XSRC__,__XDST__, a trust bundle with one
+# HS256 credential (`kid: xns`, namespaces __XSRC__ and __XDST__), the same
+# production gRPC mTLS as ferrum-cp (server SAN
+# ferrum-cp-xns.__XSRC__.svc.cluster.local, client CA required), Istio CRD and
+# Gateway API (ReferenceGrant) watching, namespaced RBAC in both namespaces and
+# the Istio root namespace. xlocal / xremote self-mint their bearer with
+# `kid: xns` and their own namespace; xclient presents an externally minted
+# token (FERRUM_DP_CP_GRPC_TOKEN_FILE) whose `ns` claim names both namespaces,
+# the bearer ceiling a cross-namespace destination must pass.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: __XSRC__
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: __XDST__
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ferrum-cp-xns
+  namespace: __XSRC__
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ferrum-cp-xns
+  namespace: __XSRC__
+rules:
+  - apiGroups: [""]
+    resources:
+      - pods
+      - services
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources:
+      - endpointslices
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.istio.io"]
+    resources:
+      - virtualservices
+      - destinationrules
+      - sidecars
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["security.istio.io"]
+    resources:
+      - peerauthentications
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.istio.io"]
+    resources:
+      - virtualservices/status
+      - destinationrules/status
+      - sidecars/status
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["security.istio.io"]
+    resources:
+      - peerauthentications/status
+    verbs: ["get", "patch", "update"]
+  # Gateway API watching serves only ReferenceGrant here (the only Gateway API
+  # CRD the suite installs).
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources:
+      - referencegrants
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ferrum-cp-xns
+  namespace: __XSRC__
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ferrum-cp-xns
+subjects:
+  - kind: ServiceAccount
+    name: ferrum-cp-xns
+    namespace: __XSRC__
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ferrum-cp-xns
+  namespace: __XDST__
+rules:
+  - apiGroups: [""]
+    resources:
+      - pods
+      - services
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources:
+      - endpointslices
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.istio.io"]
+    resources:
+      - virtualservices
+      - destinationrules
+      - sidecars
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["security.istio.io"]
+    resources:
+      - peerauthentications
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.istio.io"]
+    resources:
+      - virtualservices/status
+      - destinationrules/status
+      - sidecars/status
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["security.istio.io"]
+    resources:
+      - peerauthentications/status
+    verbs: ["get", "patch", "update"]
+  # Gateway API watching serves only ReferenceGrant here (the only Gateway API
+  # CRD the suite installs).
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources:
+      - referencegrants
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ferrum-cp-xns
+  namespace: __XDST__
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ferrum-cp-xns
+subjects:
+  - kind: ServiceAccount
+    name: ferrum-cp-xns
+    namespace: __XSRC__
+---
+# The Istio root namespace watch reuses the main control plane's read-only
+# Role there (manifests.yaml).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ferrum-cp-xns-istio-root
+  namespace: istio-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ferrum-cp-istio-root
+subjects:
+  - kind: ServiceAccount
+    name: ferrum-cp-xns
+    namespace: __XSRC__
+---
+# ReferenceGrants are watched in the control plane's scope; grant the root
+# namespace read too so no Gateway API scope can stall on a forbidden list.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ferrum-cp-xns-gateway-root
+  namespace: istio-system
+rules:
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources:
+      - referencegrants
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ferrum-cp-xns-gateway-root
+  namespace: istio-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ferrum-cp-xns-gateway-root
+subjects:
+  - kind: ServiceAccount
+    name: ferrum-cp-xns
+    namespace: __XSRC__
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ferrum-cp-xns
+  namespace: __XSRC__
+spec:
+  selector:
+    app: ferrum-cp-xns
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: 50051
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ferrum-cp-xns
+  namespace: __XSRC__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ferrum-cp-xns
+  template:
+    metadata:
+      labels:
+        app: ferrum-cp-xns
+    spec:
+      serviceAccountName: ferrum-cp-xns
+      securityContext:
+        fsGroup: 1337
+      containers:
+        - name: ferrum-edge
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          args: ["run"]
+          securityContext:
+            runAsUser: 1337
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+          ports:
+            - name: grpc
+              containerPort: 50051
+          readinessProbe:
+            tcpSocket:
+              port: 50051
+            initialDelaySeconds: 1
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 60
+          env:
+            - name: FERRUM_MODE
+              value: cp
+            - name: FERRUM_NAMESPACE
+              value: __XSRC__
+            # A Set scope: the control plane serves both namespaces and may
+            # route a carried route from one into the other.
+            - name: FERRUM_CP_NAMESPACES
+              value: __XSRC__,__XDST__
+            - name: FERRUM_DB_TYPE
+              value: sqlite
+            - name: FERRUM_DB_URL
+              value: sqlite:/data/ferrum.db?mode=rwc
+            - name: FERRUM_ADMIN_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: ferrum-xns-secrets
+                  key: admin-jwt-secret
+            # A multi-namespace control plane authorizes data planes only
+            # through a namespace-bound trust bundle (it refuses to start with
+            # a shared FERRUM_CP_DP_GRPC_JWT_SECRET alone).
+            - name: FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH
+              value: /trust/bundle.json
+            - name: FERRUM_XNS_DP_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: ferrum-xns-secrets
+                  key: dp-jwt-secret
+            - name: FERRUM_CP_GRPC_LISTEN_ADDR
+              value: 0.0.0.0:50051
+            - name: FERRUM_CP_GRPC_TLS_CERT_PATH
+              value: /transport/server.pem
+            - name: FERRUM_CP_GRPC_TLS_KEY_PATH
+              value: /transport/server-key.pem
+            - name: FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH
+              value: /transport/client-ca.pem
+            - name: FERRUM_K8S_CONTROLLER_ENABLED
+              value: "true"
+            - name: FERRUM_K8S_POD_DISCOVERY_ENABLED
+              value: "true"
+            - name: FERRUM_K8S_WATCH_IDLE_RELIST_SECS
+              value: "2"
+            - name: FERRUM_K8S_WATCH_ISTIO_CRDS
+              value: "true"
+            # ReferenceGrant admission of the cross-namespace destination.
+            - name: FERRUM_K8S_WATCH_GATEWAY_API_CRDS
+              value: "true"
+            - name: FERRUM_K8S_WATCH_MESH_CONFIG
+              value: "false"
+            - name: FERRUM_K8S_TRUST_DOMAIN
+              value: __TRUST_DOMAIN__
+            # The slice builder applies Sidecar egress scopes: the client
+            # namespace's Sidecar import of the destination namespace is what
+            # makes xremote visible to xclient (a cross-namespace destination
+            # rides only to a data plane that sees it).
+            - name: FERRUM_MESH_SIDECAR_ENFORCED
+              value: "true"
+            - name: FERRUM_POOL_WARMUP_ENABLED
+              value: "false"
+            - name: FERRUM_LOG_LEVEL
+              value: info
+          volumeMounts:
+            - name: cp-data
+              mountPath: /data
+            - name: transport
+              mountPath: /transport
+              readOnly: true
+            - name: trust
+              mountPath: /trust
+              readOnly: true
+      volumes:
+        - name: cp-data
+          emptyDir: {}
+        - name: transport
+          projected:
+            defaultMode: 0440
+            sources:
+              - secret:
+                  name: ferrum-native-mtls-cp-xns
+                  items:
+                    - key: server.pem
+                      path: server.pem
+                    - key: server-key.pem
+                      path: server-key.pem
+                    - key: client-ca.pem
+                      path: client-ca.pem
+        - name: trust
+          projected:
+            defaultMode: 0440
+            sources:
+              - secret:
+                  name: ferrum-xns-trust
+                  items:
+                    - key: bundle.json
+                      path: bundle.json
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: xlocal
+  namespace: __XSRC__
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: xlocal
+  namespace: __XSRC__
+spec:
+  selector:
+    app: xlocal
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      appProtocol: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: xlocal
+  namespace: __XSRC__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: xlocal
+  template:
+    metadata:
+      labels:
+        app: xlocal
+        ferrum.io/mesh: enabled
+    spec:
+      serviceAccountName: xlocal
+      securityContext:
+        fsGroup: 1337
+      initContainers:
+        - name: ferrum-edge-init
+          image: alpine:3.21
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["NET_ADMIN", "NET_RAW"]
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              apk add --no-cache iptables
+              iptables -t nat -N FERRUM_INBOUND 2>/dev/null || true
+              iptables -t nat -C PREROUTING -p tcp -j FERRUM_INBOUND 2>/dev/null || \
+                iptables -t nat -A PREROUTING -p tcp -j FERRUM_INBOUND
+              iptables -t nat -C FERRUM_INBOUND -p tcp --dport 15006 -j RETURN 2>/dev/null || \
+                iptables -t nat -A FERRUM_INBOUND -p tcp --dport 15006 -j RETURN
+              iptables -t nat -C FERRUM_INBOUND -p tcp --dport 8080 -j REDIRECT --to-ports 15006 2>/dev/null || \
+                iptables -t nat -A FERRUM_INBOUND -p tcp --dport 8080 -j REDIRECT --to-ports 15006
+              echo "ferrum inbound capture installed (8080 -> 15006)"
+              iptables -t nat -L FERRUM_INBOUND -n
+      containers:
+        - name: ferrum-edge
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          args: ["run"]
+          securityContext:
+            runAsUser: 1337
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+          ports:
+            - name: inbound
+              containerPort: 15006
+          env:
+            - name: FERRUM_MODE
+              value: mesh
+            - name: FERRUM_MESH_TOPOLOGY
+              value: sidecar
+            - name: FERRUM_MESH_CONFIG_PROTOCOL
+              value: native
+            - name: FERRUM_DP_CP_GRPC_URLS
+              value: https://ferrum-cp-xns.__XSRC__.svc.cluster.local:50051
+            - name: FERRUM_DP_GRPC_TLS_CA_CERT_PATH
+              value: /transport/ca.pem
+            - name: FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH
+              value: /transport/client.pem
+            - name: FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH
+              value: /transport/client-key.pem
+            - name: FERRUM_BACKEND_TLS_WATCH_INTERVAL_SECONDS
+              value: "2"
+            - name: FERRUM_CP_DP_GRPC_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: ferrum-xns-secrets
+                  key: dp-jwt-secret
+            # The multi-namespace control plane selects this tenant's
+            # verification credential by `kid` (trust bundle, run.sh).
+            - name: FERRUM_CP_DP_GRPC_JWT_KEY_ID
+              value: xns
+            - name: FERRUM_NAMESPACE
+              value: __XSRC__
+            - name: FERRUM_MESH_PRODUCTION_MODE
+              value: "true"
+            - name: FERRUM_MESH_CA_BACKEND
+              value: spire_agent
+            - name: FERRUM_MESH_SPIRE_AGENT_SOCKET
+              value: /run/spire/sockets/agent.sock
+            - name: FERRUM_MESH_WORKLOAD_SPIFFE_ID
+              value: spiffe://__TRUST_DOMAIN__/ns/__XSRC__/sa/xlocal
+            - name: FERRUM_ADMIN_HTTP_PORT
+              value: "15020"
+            - name: FERRUM_POOL_WARMUP_ENABLED
+              value: "false"
+            - name: FERRUM_LOG_LEVEL
+              value: info
+          volumeMounts:
+            - name: spire-agent-socket
+              mountPath: /run/spire/sockets
+              readOnly: true
+            - name: transport
+              mountPath: /transport
+              readOnly: true
+        - name: app
+          image: python:3.12-alpine
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 1
+            periodSeconds: 1
+            timeoutSeconds: 1
+            failureThreshold: 30
+          command:
+            - python
+            - -u
+            - -c
+            - |
+              import socket, threading, time
+              BODY = b"xns-local\n"
+              RESPONSE = (
+                  b"HTTP/1.1 200 OK\r\n"
+                  b"content-length: " + str(len(BODY)).encode() + b"\r\n"
+                  b"\r\n" + BODY
+              )
+              def serve():
+                  s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                  s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                  s.bind(("0.0.0.0", 8080))
+                  s.listen(128)
+                  while True:
+                      conn, _ = s.accept()
+                      data = conn.recv(4096)
+                      if data:
+                          conn.sendall(RESPONSE)
+                      conn.close()
+              threading.Thread(target=serve, daemon=True).start()
+              while True:
+                  time.sleep(3600)
+      volumes:
+        - name: spire-agent-socket
+          hostPath:
+            path: /run/spire/sockets
+            type: DirectoryOrCreate
+        - name: transport
+          projected:
+            defaultMode: 0440
+            sources:
+              - secret:
+                  name: ferrum-native-mtls-dp
+                  items:
+                    - key: ca.pem
+                      path: ca.pem
+                    - key: client.pem
+                      path: client.pem
+                    - key: client-key.pem
+                      path: client-key.pem
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: xremote
+  namespace: __XDST__
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: xremote
+  namespace: __XDST__
+spec:
+  selector:
+    app: xremote
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      appProtocol: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: xremote
+  namespace: __XDST__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: xremote
+  template:
+    metadata:
+      labels:
+        app: xremote
+        ferrum.io/mesh: enabled
+    spec:
+      serviceAccountName: xremote
+      securityContext:
+        fsGroup: 1337
+      initContainers:
+        - name: ferrum-edge-init
+          image: alpine:3.21
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["NET_ADMIN", "NET_RAW"]
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              apk add --no-cache iptables
+              iptables -t nat -N FERRUM_INBOUND 2>/dev/null || true
+              iptables -t nat -C PREROUTING -p tcp -j FERRUM_INBOUND 2>/dev/null || \
+                iptables -t nat -A PREROUTING -p tcp -j FERRUM_INBOUND
+              iptables -t nat -C FERRUM_INBOUND -p tcp --dport 15006 -j RETURN 2>/dev/null || \
+                iptables -t nat -A FERRUM_INBOUND -p tcp --dport 15006 -j RETURN
+              iptables -t nat -C FERRUM_INBOUND -p tcp --dport 8080 -j REDIRECT --to-ports 15006 2>/dev/null || \
+                iptables -t nat -A FERRUM_INBOUND -p tcp --dport 8080 -j REDIRECT --to-ports 15006
+              echo "ferrum inbound capture installed (8080 -> 15006)"
+              iptables -t nat -L FERRUM_INBOUND -n
+      containers:
+        - name: ferrum-edge
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          args: ["run"]
+          securityContext:
+            runAsUser: 1337
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+          ports:
+            - name: inbound
+              containerPort: 15006
+          env:
+            - name: FERRUM_MODE
+              value: mesh
+            - name: FERRUM_MESH_TOPOLOGY
+              value: sidecar
+            - name: FERRUM_MESH_CONFIG_PROTOCOL
+              value: native
+            - name: FERRUM_DP_CP_GRPC_URLS
+              value: https://ferrum-cp-xns.__XSRC__.svc.cluster.local:50051
+            - name: FERRUM_DP_GRPC_TLS_CA_CERT_PATH
+              value: /transport/ca.pem
+            - name: FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH
+              value: /transport/client.pem
+            - name: FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH
+              value: /transport/client-key.pem
+            - name: FERRUM_BACKEND_TLS_WATCH_INTERVAL_SECONDS
+              value: "2"
+            - name: FERRUM_CP_DP_GRPC_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: ferrum-xns-secrets
+                  key: dp-jwt-secret
+            # The multi-namespace control plane selects this tenant's
+            # verification credential by `kid` (trust bundle, run.sh).
+            - name: FERRUM_CP_DP_GRPC_JWT_KEY_ID
+              value: xns
+            - name: FERRUM_NAMESPACE
+              value: __XDST__
+            - name: FERRUM_MESH_PRODUCTION_MODE
+              value: "true"
+            - name: FERRUM_MESH_CA_BACKEND
+              value: spire_agent
+            - name: FERRUM_MESH_SPIRE_AGENT_SOCKET
+              value: /run/spire/sockets/agent.sock
+            - name: FERRUM_MESH_WORKLOAD_SPIFFE_ID
+              value: spiffe://__TRUST_DOMAIN__/ns/__XDST__/sa/xremote
+            - name: FERRUM_ADMIN_HTTP_PORT
+              value: "15020"
+            - name: FERRUM_POOL_WARMUP_ENABLED
+              value: "false"
+            - name: FERRUM_LOG_LEVEL
+              value: info
+          volumeMounts:
+            - name: spire-agent-socket
+              mountPath: /run/spire/sockets
+              readOnly: true
+            - name: transport
+              mountPath: /transport
+              readOnly: true
+        - name: app
+          image: python:3.12-alpine
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 1
+            periodSeconds: 1
+            timeoutSeconds: 1
+            failureThreshold: 30
+          command:
+            - python
+            - -u
+            - -c
+            - |
+              import socket, threading, time
+              BODY = b"xns-remote\n"
+              RESPONSE = (
+                  b"HTTP/1.1 200 OK\r\n"
+                  b"content-length: " + str(len(BODY)).encode() + b"\r\n"
+                  b"\r\n" + BODY
+              )
+              def serve():
+                  s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                  s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                  s.bind(("0.0.0.0", 8080))
+                  s.listen(128)
+                  while True:
+                      conn, _ = s.accept()
+                      data = conn.recv(4096)
+                      if data:
+                          conn.sendall(RESPONSE)
+                      conn.close()
+              threading.Thread(target=serve, daemon=True).start()
+              while True:
+                  time.sleep(3600)
+      volumes:
+        - name: spire-agent-socket
+          hostPath:
+            path: /run/spire/sockets
+            type: DirectoryOrCreate
+        - name: transport
+          projected:
+            defaultMode: 0440
+            sources:
+              - secret:
+                  name: ferrum-native-mtls-dp
+                  items:
+                    - key: ca.pem
+                      path: ca.pem
+                    - key: client.pem
+                      path: client.pem
+                    - key: client-key.pem
+                      path: client-key.pem
+---
+# Frontend Service the VirtualService routes; no pod backs it, so a 200 from
+# it can only come from the carried route.
+apiVersion: v1
+kind: Service
+metadata:
+  name: xfront
+  namespace: __XSRC__
+spec:
+  selector:
+    app: xfront-unbacked
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      appProtocol: http
+---
+# The client namespace's Sidecar imports the destination namespace, so the
+# xclient Sidecar sees xremote (ferrum-cp-xns applies Sidecar egress scopes,
+# FERRUM_MESH_SIDECAR_ENFORCED=true): a cross-namespace destination rides only
+# to a data plane that sees it.
+apiVersion: networking.istio.io/v1
+kind: Sidecar
+metadata:
+  name: default
+  namespace: __XSRC__
+spec:
+  egress:
+    - hosts:
+        - "./*"
+        - "__XDST__/*"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: xclient
+  namespace: __XSRC__
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: xclient
+  namespace: __XSRC__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: xclient
+  template:
+    metadata:
+      labels:
+        app: xclient
+        ferrum.io/mesh: enabled
+    spec:
+      serviceAccountName: xclient
+      securityContext:
+        fsGroup: 1337
+      initContainers:
+        - name: ferrum-edge-init
+          image: alpine:3.21
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["NET_ADMIN", "NET_RAW"]
+          command: ["/bin/sh", "-c"]
+          # `set -e` fails the pod closed if the iptables install or any rule
+          # fails. Order matters: pod-local and proxy-UID RETURNs precede the
+          # catch-all REDIRECT, as in the injector's chain.
+          args:
+            - |
+              set -e
+              apk add --no-cache iptables
+              iptables -t nat -N FERRUM_MESH_OUTBOUND 2>/dev/null || true
+              iptables -t nat -C OUTPUT -p tcp -j FERRUM_MESH_OUTBOUND 2>/dev/null || \
+                iptables -t nat -A OUTPUT -p tcp -j FERRUM_MESH_OUTBOUND
+              iptables -t nat -C FERRUM_MESH_OUTBOUND -m addrtype --dst-type LOCAL -j RETURN 2>/dev/null || \
+                iptables -t nat -A FERRUM_MESH_OUTBOUND -m addrtype --dst-type LOCAL -j RETURN
+              iptables -t nat -C FERRUM_MESH_OUTBOUND -m owner --uid-owner 1337 -j RETURN 2>/dev/null || \
+                iptables -t nat -A FERRUM_MESH_OUTBOUND -m owner --uid-owner 1337 -j RETURN
+              iptables -t nat -C FERRUM_MESH_OUTBOUND -p tcp -j REDIRECT --to-ports 15001 2>/dev/null || \
+                iptables -t nat -A FERRUM_MESH_OUTBOUND -p tcp -j REDIRECT --to-ports 15001
+              echo "ferrum outbound capture installed (tcp -> 15001, uid 1337 + local exempt)"
+              iptables -t nat -L FERRUM_MESH_OUTBOUND -n
+      containers:
+        - name: ferrum-edge
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          args: ["run"]
+          securityContext:
+            runAsUser: 1337
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+          ports:
+            - name: outbound
+              containerPort: 15001
+          env:
+            - name: FERRUM_MODE
+              value: mesh
+            - name: FERRUM_MESH_TOPOLOGY
+              value: sidecar
+            - name: FERRUM_MESH_CONFIG_PROTOCOL
+              value: native
+            - name: FERRUM_DP_CP_GRPC_URLS
+              value: https://ferrum-cp-xns.__XSRC__.svc.cluster.local:50051
+            - name: FERRUM_DP_GRPC_TLS_CA_CERT_PATH
+              value: /transport/ca.pem
+            - name: FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH
+              value: /transport/client.pem
+            - name: FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH
+              value: /transport/client-key.pem
+            - name: FERRUM_BACKEND_TLS_WATCH_INTERVAL_SECONDS
+              value: "2"
+            # Externally minted bearer (run.sh): `kid: xns`, `sub` = this
+            # node id, `ns` naming both namespaces. Self-minting would claim
+            # only __XSRC__, and the bearer `ns` claim is a ceiling on every
+            # cross-namespace destination.
+            - name: FERRUM_DP_CP_GRPC_TOKEN_FILE
+              value: /token/token
+            - name: FERRUM_MESH_NODE_ID
+              value: xclient
+            - name: FERRUM_NAMESPACE
+              value: __XSRC__
+            - name: FERRUM_MESH_PRODUCTION_MODE
+              value: "true"
+            - name: FERRUM_MESH_CA_BACKEND
+              value: spire_agent
+            - name: FERRUM_MESH_SPIRE_AGENT_SOCKET
+              value: /run/spire/sockets/agent.sock
+            - name: FERRUM_MESH_WORKLOAD_SPIFFE_ID
+              value: spiffe://__TRUST_DOMAIN__/ns/__XSRC__/sa/xclient
+            - name: FERRUM_MESH_OUTBOUND_LISTEN_ADDR
+              value: 0.0.0.0:15001
+            - name: FERRUM_ADMIN_HTTP_PORT
+              value: "15020"
+            # JWT-authenticated GET /mesh/config-drift diagnostics.
+            - name: FERRUM_ADMIN_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: ferrum-xns-secrets
+                  key: admin-jwt-secret
+            - name: FERRUM_POOL_WARMUP_ENABLED
+              value: "false"
+            - name: FERRUM_LOG_LEVEL
+              value: info
+          volumeMounts:
+            - name: spire-agent-socket
+              mountPath: /run/spire/sockets
+              readOnly: true
+            - name: transport
+              mountPath: /transport
+              readOnly: true
+            - name: token
+              mountPath: /token
+              readOnly: true
+        - name: curl
+          image: curlimages/curl:8.10.1
+          command: ["sh", "-c", "sleep 365d"]
+      volumes:
+        - name: spire-agent-socket
+          hostPath:
+            path: /run/spire/sockets
+            type: DirectoryOrCreate
+        - name: transport
+          projected:
+            defaultMode: 0440
+            sources:
+              - secret:
+                  name: ferrum-native-mtls-dp
+                  items:
+                    - key: ca.pem
+                      path: ca.pem
+                    - key: client.pem
+                      path: client.pem
+                    - key: client-key.pem
+                      path: client-key.pem
+        - name: token
+          projected:
+            defaultMode: 0440
+            sources:
+              - secret:
+                  name: ferrum-xns-client-token
+                  items:
+                    - key: token
+                      path: token

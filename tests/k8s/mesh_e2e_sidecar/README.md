@@ -94,6 +94,29 @@ plane:
   sample stops as soon as it can no longer pass; a failed prerequisite records
   both rows as failed at once).
 
+- **cross-namespace sub-fixture** (`xns_manifests.yaml`, issue #7499) — applied
+  by the last probe, after every other assertion is recorded. A
+  cross-namespace destination needs a control plane that serves both
+  namespaces, and a multi-namespace control plane authorizes data planes only
+  through a namespace-bound trust bundle; the main `ferrum-cp` is
+  single-namespace and its probes depend on that, so this gate runs its own
+  control plane `ferrum-cp-xns` (`FERRUM_CP_NAMESPACES=<ns>-xsrc,<ns>-xdst`, one
+  HS256 trust-bundle credential `kid: xns` for both namespaces, the same
+  production gRPC mTLS with its own server SAN, Istio CRD and Gateway API
+  ReferenceGrant watching, namespaced RBAC in both namespaces and
+  `istio-system`) in two namespaces the main control plane never watches.
+  `ferrum-cp-xns` applies Sidecar egress scopes
+  (`FERRUM_MESH_SIDECAR_ENFORCED=true`). `<ns>-xsrc` holds the native Sidecar
+  client `xclient` (outbound capture, an externally minted bearer whose `ns`
+  claim names both namespaces, presented through
+  `FERRUM_DP_CP_GRPC_TOKEN_FILE`), the local split leg `xlocal`, the unbacked
+  frontend Service `xfront`, the VirtualService and a namespace `Sidecar`
+  importing `<ns>-xdst/*` (CRD `istio_sidecar_crd.yaml` in this directory,
+  installed with the other CRDs; the main control plane's Roles grant
+  `sidecars` too). `<ns>-xdst` holds the destination `xremote`, its
+  DestinationRule and the ReferenceGrant from `networking.istio.io/VirtualService`
+  in `<ns>-xsrc` to Service `xremote`. Bounded by a 900 s budget.
+
 ## What it asserts
 
 Each run writes `target/mesh-e2e-sidecar/live-assertions.json` using the
@@ -115,6 +138,9 @@ shared schema from `tests/k8s/lib/live_assertions.sh` (suite
 | `sidecar.virtual_service.cors_policy` | VS-derived CORS on the client sidecar: allowed `Origin` → backend 200 with the origin reflected, allowed `OPTIONS` preflight → **200 by the sidecar** with `access-control-allow-methods`, and unmatched actual/preflight requests → backend 200 with the app marker and no gateway-added `access-control-allow-origin` (Istio omitted/FORWARD semantics) |
 | `sidecar.virtual_service.weighted_split_90_10` | a `kubectl`-applied VirtualService reports `FerrumAccepted=True` with `status.ferrum.translation.mesh_http_routes: sidecar_and_node_waypoint`; both split destinations refuse a TLS client that presents no certificate (curl fails at the TLS layer with no HTTP status), so they are STRICT and every counted answer required `vs-client`'s SVID; the route converges; and **1000** captured requests to `http://vssvc.<ns>.svc.cluster.local:8080/` all complete (curl exit 0) with 200 from a leg, with the `vssvc-v1` count in **[850, 950]** (the design's 85–95%). With `X ~ Binomial(1000, 0.9)` (sd 9.49) that window is ±5.3 sd: a correct split fails with probability ~2.8e-7 (`P(X<850)=2.8e-7`, `P(X>950)=2.8e-9`), while 100/0 (`X=1000`, no v2 marker), 50/50, and a 96/4 drift fail. Ferrum's leg selection is a deterministic weighted round robin, so real runs land within a few requests of 900 |
 | `sidecar.virtual_service.header_match_dispatch` | all **100** `x-canary: true` requests complete with 200 from `vssvc-v2` (an ignored rule would follow the split: 0.1^100), and **1000** `x-canary: false` requests fall through to the split inside the same **[850, 950]** `vssvc-v1` window (a route pinned to either leg fails) |
+| `sidecar.virtual_service.cross_namespace_direct_destination` | issue #7499, on the cross-namespace sub-fixture below: the VirtualService in `<ns>-xsrc` reports `FerrumAccepted=True` and lists `<ns>-xdst/xremote` in `status.ferrum.translation.cross_namespace_destinations`, and all **20** captured `xclient` requests to the carried direct route (`http://xfront.<ns>-xsrc.svc.cluster.local:8080/direct`, a Service no pod backs) complete with 200 from `xremote` in the other namespace |
+| `sidecar.virtual_service.cross_namespace_weighted_split_leg` | the same VirtualService's 50/50 split `xlocal` (`<ns>-xsrc`) / `xremote` (`<ns>-xdst`), whose remote leg a DestinationRule in `<ns>-xdst` governs: all **400** captured requests complete with 200 from a leg and the `xlocal` count is in **[150, 250]** (±5 sd of Binomial(400, 0.5); a leg pinned to either side fails) |
+| `sidecar.virtual_service.cross_namespace_grant_withdrawal_refused` | after the ReferenceGrant is deleted the VirtualService turns `FerrumAccepted=False` / `RefNotPermitted`, none of **20** captured requests to the withdrawn route answers from a leg, and the client's ordinary `xlocal` Service route still answers 200 (the rest of the slice keeps serving) |
 | `sidecar.destination_rule.tcp_max_connections` | WebSocket flow (`wssvc`, maxConnections=1): one **held** WS session admitted (101), a concurrent second upgrade rejected **503** by the client sidecar's `BackendConnectionGuard` before dialing, and a fresh upgrade admitted after the held session closes — cap enforcement **and** release |
 | `sidecar.config.native_subscribe_delivered` | native MeshSubscribe delivery over production mTLS + JWT (issues #2002 / #3855): a captured client request to `capp` answers 200 with the `-native` marker — capp's inbound routes exist **only** if the ferrum-cp MeshSubscribe stream delivered a slice whose K8s-built `sa/capp` workload resolved locally — **and** capp's JWT-authenticated `GET /mesh/config-drift` reports a received slice with `source_protocol=native` from the `https://ferrum-cp...` URL and ≥1 service |
 | `sidecar.config.native_subscribe_mtls_omitted_client_rejected` | dedicated probe DP omits its client certificate; MeshSubscribe never accepts a slice |

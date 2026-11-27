@@ -1,0 +1,29 @@
+# Minimal Istio Sidecar CRD for the mesh-e2e-sidecar cross-namespace gate
+# (issue #7499). Serves networking.istio.io/v1 (the version Ferrum's CRD
+# watcher registers, src/k8s_controller/watcher.rs ISTIO_CRDS) and declares
+# subresources.status so Ferrum's IstioStatusWriter can write FerrumAccepted.
+# x-kubernetes-preserve-unknown-fields keeps spec/status free of Istio's full
+# schema. Kept in the suite directory so a change to it schedules this suite.
+# Not an Istio install.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: sidecars.networking.istio.io
+spec:
+  group: networking.istio.io
+  names:
+    kind: Sidecar
+    listKind: SidecarList
+    plural: sidecars
+    singular: sidecar
+  scope: Namespaced
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          type: object
+          x-kubernetes-preserve-unknown-fields: true
