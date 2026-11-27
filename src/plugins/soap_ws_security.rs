@@ -2834,12 +2834,12 @@ impl SoapWsSecurity {
                 self.ut_created_max_timestamp_divergence_seconds
             ));
         }
-        if let Some(outer_expires) = outer_expires {
-            if created - outer_expires > skew {
-                return Err(
-                    "WS-Security: UsernameToken Created is past the Timestamp Expires".to_string(),
-                );
-            }
+        if let Some(outer_expires) = outer_expires
+            && created - outer_expires > skew
+        {
+            return Err(
+                "WS-Security: UsernameToken Created is past the Timestamp Expires".to_string(),
+            );
         }
 
         Ok(())
