@@ -2705,8 +2705,12 @@ fn default_trip_on_connection_errors() -> bool {
 }
 
 /// Retry backoff strategy.
+///
+/// `deny_unknown_fields` on the enum closes each struct variant's body: a
+/// container attribute on [`RetryConfig`] does not reach into the variant
+/// payloads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum BackoffStrategy {
     Fixed { delay_ms: u64 },
     Exponential { base_ms: u64, max_ms: u64 },
@@ -3523,6 +3527,10 @@ pub struct Proxy {
 pub struct PluginAssociation {
     pub plugin_config_id: String,
 }
+
+/// Serde member names of [`PluginAssociation`]. Stored-row readers that must
+/// tolerate historical association metadata project onto exactly these.
+pub const PLUGIN_ASSOCIATION_FIELDS: &[&str] = &["plugin_config_id"];
 
 /// A consumer resource (API user).
 #[derive(Debug, Clone, Serialize, Deserialize)]

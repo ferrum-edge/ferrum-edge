@@ -225,8 +225,9 @@ every level of a resource, not only at the top: a misspelled key inside
 `health_checks`, `health_checks.active`/`passive`, `targets[]`,
 `service_discovery` (and its provider object), `subsets[]`,
 `port_overrides`, `locality_lb_setting`, `hash_on_cookie_config`,
-`circuit_breaker`, `retry` or `plugins[]` fails validation with a `400` that
-names the key. The OpenAPI schemas say so with `additionalProperties: false`.
+`circuit_breaker`, `retry` (including the `retry.backoff` variant body) or
+`plugins[]` fails validation with a `400` that names the key. Admin request
+bodies must be JSON objects; a positional array is refused. The OpenAPI schemas say so with `additionalProperties: false`.
 Free-form maps stay open: `labels`, plugin `config` (each plugin validates its
 own config), and consumer `credentials`.
 

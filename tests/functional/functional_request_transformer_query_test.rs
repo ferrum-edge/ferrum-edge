@@ -532,8 +532,7 @@ fn transformer_retry_config(backend_port: u16) -> String {
                 "max_retries": 2,
                 "retryable_status_codes": [500],
                 "retryable_methods": ["GET"],
-                "backoff_strategy": "fixed",
-                "backoff_base_ms": 20
+                "backoff": {"fixed": {"delay_ms": 20}}
             },
             "plugins": [{"plugin_config_id": "transformer-retry-plugin"}]
         }],

@@ -15496,10 +15496,12 @@ components:
       oneOf:
         - type: object
           title: Fixed delay
+          additionalProperties: false
           required: [fixed]
           properties:
             fixed:
               type: object
+              additionalProperties: false
               required: [delay_ms]
               properties:
                 delay_ms:
@@ -15511,10 +15513,12 @@ components:
                   description: Fixed delay between retries in milliseconds
         - type: object
           title: Exponential backoff
+          additionalProperties: false
           required: [exponential]
           properties:
             exponential:
               type: object
+              additionalProperties: false
               required: [base_ms, max_ms]
               properties:
                 base_ms:
@@ -15656,6 +15660,7 @@ components:
 
     GatewayTrustBundleSet:
       type: object
+      additionalProperties: false
       description: |
         SPIFFE trust material for gateway trust-bundle resources (issue #3727),
         in the same shape the mesh configuration model uses. Bounded on
@@ -15679,6 +15684,7 @@ components:
 
     TrustBundle:
       type: object
+      additionalProperties: false
       description: |
         One trust domain's authorities. Every `x509_authorities` entry must be
         valid base64 AND parse as an X.509 certificate; every
@@ -15702,6 +15708,7 @@ components:
           maxItems: 16
           items:
             type: object
+            additionalProperties: false
             required: [key_id, public_key_pem]
             properties:
               key_id:

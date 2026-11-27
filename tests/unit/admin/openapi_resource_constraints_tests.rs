@@ -378,6 +378,60 @@ fn nested_unknown_keys_are_rejected_by_schema_and_runtime() {
         assert_parity(&schema, component, &body, true);
         body["plugins"][0]["plugin_confg_id"] = json!("p2");
         assert_parity(&schema, component, &body, false);
+
+        // Externally tagged enum variant bodies are closed too: a container
+        // attribute on `RetryConfig` does not reach into `BackoffStrategy`.
+        for (backoff, expected) in [
+            (json!({"fixed": {"delay_ms": 100}}), true),
+            (json!({"exponential": {"base_ms": 10, "max_ms": 100}}), true),
+            (json!({"fixed": {"delay_ms": 100, "jiter_ms": 50}}), false),
+            (
+                json!({"exponential": {"base_ms": 10, "max_ms": 100, "factor": 2}}),
+                false,
+            ),
+            (json!({"fixed": {"delay_ms": 100}, "jitter": true}), false),
+        ] {
+            let mut body = proxy();
+            body["retry"] = json!({"backoff": backoff});
+            assert_parity(&schema, component, &body, expected);
+        }
+    }
+}
+
+/// Gateway trust-bundle CRUD and restore reuse the closed mesh trust-bundle
+/// types, so the published schema must refuse the same unknown members.
+#[test]
+fn gateway_trust_bundle_unknown_keys_are_rejected_by_schema_and_runtime() {
+    use ferrum_edge::config::gateway_trust::GatewayTrustBundleRecord;
+
+    let spec = spec();
+    let schema = validator(&spec, "GatewayTrustBundleCreate");
+    let baseline = json!({
+        "trust_domain": "example.org",
+        "bundle": {
+            "local": {
+                "trust_domain": "example.org",
+                "jwt_authorities": [{"key_id": "k1", "public_key_pem": "pem"}]
+            }
+        }
+    });
+    assert!(schema.is_valid(&baseline), "baseline schema");
+    serde_json::from_value::<GatewayTrustBundleRecord>(baseline.clone())
+        .expect("baseline runtime decode");
+    for pointer in [
+        "/bundle",
+        "/bundle/local",
+        "/bundle/local/jwt_authorities/0",
+    ] {
+        let mut body = baseline.clone();
+        set_field(&mut body, &format!("{pointer}/misspelled_member"), json!(1));
+        assert!(!schema.is_valid(&body), "schema accepted {pointer}: {body}");
+        let error = serde_json::from_value::<GatewayTrustBundleRecord>(body)
+            .expect_err("runtime must reject the unknown member");
+        assert!(
+            error.to_string().contains("misspelled_member"),
+            "{pointer}: {error}"
+        );
     }
 }
 

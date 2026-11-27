@@ -633,8 +633,7 @@ fn boundary_config(mode: BoundaryMode, provider_port: u16, normal_backend_port: 
             "max_retries": 2,
             "retryable_status_codes": [500],
             "retryable_methods": ["POST"],
-            "backoff_strategy": "fixed",
-            "backoff_base_ms": 20
+            "backoff": {"fixed": {"delay_ms": 20}}
         });
     }
 
