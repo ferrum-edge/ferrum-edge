@@ -68,6 +68,19 @@ pub fn service_waypoint_l7_upstream_id(namespace: &str, name: &str, port: u16) -
         .replace(['/', '.'], "-")
 }
 
+/// Id of the tag-free clone of a bound Service port's default L7 upstream
+/// that a carried rule rewriting the authority dials when the Service is
+/// reached over Sidecar mTLS (issue #7501). Keeps the default upstream's
+/// prefix, so every consumer that admits a ServiceWaypoint upstream admits
+/// it, and ends in `-rw`, which no default upstream id (ending in its port)
+/// can.
+pub fn service_waypoint_l7_rewrite_upstream_id(namespace: &str, name: &str, port: u16) -> String {
+    format!(
+        "{}-rw",
+        service_waypoint_l7_upstream_id(namespace, name, port)
+    )
+}
+
 /// Whether a proxy id names a ServiceWaypoint default L7 Service route.
 /// Operator ids cannot start with `_` (resource-id validation), so only the
 /// mesh materializer creates one.

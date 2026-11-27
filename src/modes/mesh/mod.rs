@@ -1815,6 +1815,7 @@ fn prepare_normalized_gateway_config_for_mesh(
     // After DestinationRules and locality, so the route-scoped clones carry
     // the same projected policy as the Service upstreams they copy.
     clone_sidecar_carried_destination_upstreams(&mut config, runtime, mesh_slice);
+    clone_service_waypoint_authority_rewrite_upstreams(&mut config, &service_waypoint_l7_bindings);
     // Project slice-filtered ServiceEntries back into the prepared mesh
     // block so introspection consumers (admin diagnostics, projected-config
     // snapshots, future helpers) see the same `export_to` / sidecar-narrowed
@@ -5530,6 +5531,22 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
             .then_some(id)
     };
 
+    // Whether a bound Service port's materialized upstream dials any backing
+    // workload over Sidecar mTLS (the transport that routes by `:authority`).
+    let service_upstream_dials_sidecar_mtls =
+        |config: &GatewayConfig, namespace: &str, name: &str, port: u16| {
+            service_upstream(config, namespace, name, port).is_some_and(|id| {
+                config.upstreams.iter().any(|upstream| {
+                    upstream.namespace == namespace
+                        && upstream.id == id
+                        && upstream
+                            .targets
+                            .iter()
+                            .any(crate::proxy::mesh_mtls_pool::target_mesh_mtls_enabled)
+                })
+            })
+        };
+
     // 1. Weighted splits. Each leg is resolved to its dial targets first, then
     // ONE scale is applied to every leg (external legs included) so the
     // configured ratios survive, and each leg's share is divided across its
@@ -5680,7 +5697,13 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
             failed_splits.insert((namespace, id));
             continue;
         }
-        if governed_by_destination_rule {
+        // A ServiceWaypoint (issue #7501) dispatches EVERY split leg by leg:
+        // its inner requests are authorized per destination, so each leg
+        // must be judged on its own Service's policies and port. A flattened
+        // split would be authorized as one merged destination, where a DENY
+        // scoped to one leg's Service refuses every leg and a port-specific
+        // rule has no single port to read.
+        if governed_by_destination_rule || service_waypoint {
             let first_external = external_targets.first().cloned();
             match weighted_split_legs(config, split, service_legs, external_targets) {
                 Some((split_legs, residuals)) => {
@@ -5892,8 +5915,11 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                 };
                 // Sidecar: an explicit `rewrite.authority` is forwarded as the
                 // `:authority` the destination Sidecar routes by, so it must
-                // name the selected destination Service (checked below).
-                let rewrite_authority = sidecar
+                // name the selected destination Service (checked below). A
+                // ServiceWaypoint (issue #7501) applies the same rule to a
+                // destination it dials over Sidecar mTLS; one it dials over
+                // HBONE forwards the rewritten `Host` to the application.
+                let rewrite_authority = (sidecar || service_waypoint)
                     .then(|| {
                         rule.get("rewrite")
                             .and_then(|rewrite| rewrite.get("authority"))
@@ -5962,6 +5988,13 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                     }
                     CarriedRouteHost::Service(service_namespace, service_name) => {
                         if let Some(authority) = rewrite_authority
+                            && (sidecar
+                                || service_upstream_dials_sidecar_mtls(
+                                    config,
+                                    &service_namespace,
+                                    &service_name,
+                                    port,
+                                ))
                             && !authority_names_service(
                                 authority,
                                 &service_namespace,
@@ -5980,6 +6013,29 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                         }
                         match service_upstream(config, &service_namespace, &service_name, port) {
                             Some(id) => {
+                                // ServiceWaypoint (issue #7501): an admitted
+                                // authority rewrite to a Service reached over
+                                // Sidecar mTLS dials a tag-free clone of its
+                                // upstream (created after DestinationRules,
+                                // `clone_service_waypoint_authority_rewrite_upstreams`),
+                                // so the rewritten authority is forwarded
+                                // instead of the stamped Service authority.
+                                let id = if service_waypoint
+                                    && rewrite_authority.is_some()
+                                    && service_upstream_dials_sidecar_mtls(
+                                        config,
+                                        &service_namespace,
+                                        &service_name,
+                                        port,
+                                    ) {
+                                    service_waypoint_l7::service_waypoint_l7_rewrite_upstream_id(
+                                        &service_namespace,
+                                        &service_name,
+                                        port,
+                                    )
+                                } else {
+                                    id
+                                };
                                 candidates.insert(id.clone());
                                 rule_rewrites.push((plugin_index, rule_index, id));
                             }
@@ -6498,6 +6554,83 @@ fn clone_sidecar_carried_destination_upstreams(
                 *service_port,
                 stamp_host,
             );
+        }
+        config.upstreams.push(clone);
+    }
+}
+
+/// Create the tag-free clones of ServiceWaypoint bound-Service upstreams that
+/// authority-rewriting carried rules dial (issue #7501), after
+/// DestinationRules and locality, so each clone carries the same projected
+/// policy as the upstream it copies.
+///
+/// A ServiceWaypoint's Sidecar targets permanently carry the destination
+/// Service authority (`MESH_MTLS_AUTHORITY_HOST_TAG` / `_PORT_TAG`), which
+/// Sidecar dispatch presents in place of the request's own authority, so the
+/// destination Sidecar routes ordinary requests onto its inbound table. A rule
+/// with `rewrite.authority` must forward the rewritten authority instead: the
+/// binding admits it only when the rewrite names the selected Service in a
+/// form its Sidecar routes, and points the rule at
+/// [`service_waypoint_l7::service_waypoint_l7_rewrite_upstream_id`]. That
+/// clone has the same targets with no authority tags, and the Service
+/// upstream's admission identity, so the destination's request lanes are
+/// shared. Plain destinations and HBONE-only upstreams are left unchanged.
+/// Identities are read forward from the generation's bindings, never parsed
+/// from ids.
+fn clone_service_waypoint_authority_rewrite_upstreams(
+    config: &mut GatewayConfig,
+    bindings: &[service_waypoint_l7::ServiceWaypointL7Binding],
+) {
+    let referenced: HashSet<(String, String)> = config
+        .plugin_configs
+        .iter()
+        .filter(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+        .flat_map(|plugin| {
+            plugin
+                .config
+                .get("rules")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|rule| {
+                    rule.get("destination")
+                        .and_then(|destination| destination.get("upstream_id"))
+                        .and_then(serde_json::Value::as_str)
+                })
+                .map(|id| (plugin.namespace.clone(), id.to_string()))
+        })
+        .collect();
+    for binding in bindings {
+        let clone_id = service_waypoint_l7::service_waypoint_l7_rewrite_upstream_id(
+            &binding.target.namespace,
+            &binding.target.service,
+            binding.target.service_port,
+        );
+        let namespace = &binding.target.namespace;
+        if !referenced.contains(&(namespace.clone(), clone_id.clone()))
+            || config
+                .upstreams
+                .iter()
+                .any(|upstream| &upstream.namespace == namespace && upstream.id == clone_id)
+        {
+            continue;
+        }
+        let Some(service_upstream) = config.upstreams.iter().find(|upstream| {
+            &upstream.namespace == namespace && upstream.id == binding.upstream_id
+        }) else {
+            continue;
+        };
+        let mut clone = service_upstream.clone();
+        clone.id = clone_id.clone();
+        clone.name = Some(clone_id);
+        clone.admission_upstream_id = Some(binding.upstream_id.clone());
+        for target in &mut clone.targets {
+            target
+                .tags
+                .remove(crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_HOST_TAG);
+            target
+                .tags
+                .remove(crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_PORT_TAG);
         }
         config.upstreams.push(clone);
     }
@@ -18321,6 +18454,18 @@ fn scope_request_auth_to_node_waypoint_destinations(
                 (
                     service.namespace.as_str(),
                     service_waypoint_l7::service_waypoint_l7_upstream_id(
+                        &service.namespace,
+                        &service.name,
+                        port.port,
+                    ),
+                ),
+                Vec::clone(&dialable),
+            );
+            // And so does its authority-rewrite clone (issue #7501).
+            dialable_upstream_workloads.insert(
+                (
+                    service.namespace.as_str(),
+                    service_waypoint_l7::service_waypoint_l7_rewrite_upstream_id(
                         &service.namespace,
                         &service.name,
                         port.port,

@@ -17787,7 +17787,7 @@ async fn handle_websocket_request_authenticated(
                         // telemetry see the source workload, not the gateway SVID.
                         // `None` on an unauthenticated client → gateway SVID
                         // (HTTP-path parity).
-                        ctx.peer_spiffe_id.as_ref(),
+                        ctx.mesh_source_principal(),
                     )
                     .await
                     .map(|handshake| WsBackendHandshake::Mesh(Box::new(handshake))),
@@ -42794,7 +42794,7 @@ async fn handle_proxy_request_inner(
         let grpc_transport = match resolve_grpc_dispatch_transport(
             &state,
             upstream_target.as_deref(),
-            ctx.peer_spiffe_id.as_ref(),
+            ctx.mesh_source_principal(),
         ) {
             Ok(transport) => transport,
             Err(transport_error) => {
@@ -44305,7 +44305,7 @@ async fn handle_proxy_request_inner(
                 let grpc_retry_transport = match resolve_grpc_dispatch_transport(
                     &state,
                     grpc_current_target.as_deref(),
-                    ctx.peer_spiffe_id.as_ref(),
+                    ctx.mesh_source_principal(),
                 ) {
                     Ok(transport) => transport,
                     Err(transport_error) => {
@@ -63882,7 +63882,8 @@ async fn proxy_to_backend_hbone(
     // 2). `None` means this gateway has no resolvable SVID identity — nothing
     // to key a reusable connection under — and the dial below then reports the
     // same refusal it always did.
-    let asserted_source_identity = source_identity_ctx.and_then(|ctx| ctx.peer_spiffe_id.as_ref());
+    let asserted_source_identity =
+        source_identity_ctx.and_then(RequestContext::mesh_source_principal);
     let inner_pool_config = state.hbone_pool.pool_config_for(proxy);
     let inner_plan = state
         .hbone_pool

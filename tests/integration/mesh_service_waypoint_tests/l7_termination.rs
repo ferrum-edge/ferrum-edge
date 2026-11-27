@@ -332,6 +332,11 @@ struct Scenario {
     /// A second bound Service sharing the reviews workload's HTTP endpoint,
     /// making that backing endpoint ambiguous.
     ambiguous_alias: bool,
+    /// The waypoint's tunnel idle timeout (`FERRUM_TCP_IDLE_TIMEOUT_SECONDS`).
+    tcp_idle_timeout_seconds: Option<u64>,
+    /// A `trusted_hbone_assertors` value written onto the mesh-managed
+    /// `mesh_authz` instance (object grants exist only on a plugin override).
+    assertor_grants: Option<serde_json::Value>,
 }
 
 fn cp_config(backends: &Backends, scenario: &Scenario) -> GatewayConfig {
@@ -405,9 +410,18 @@ fn cp_config(backends: &Backends, scenario: &Scenario) -> GatewayConfig {
         ));
         bound.push("reviews-alias".to_string());
     }
+    let mut workloads = vec![reviews, ratings];
+    if scenario.ambiguous_alias {
+        // The alias Service's own backing record: the SAME pod (identity,
+        // address and port) attached to `reviews-alias`, so both bound
+        // Services materialize an L7 binding on one backing endpoint.
+        let mut alias = workloads[0].clone();
+        alias.service_name = "reviews-alias".to_string();
+        workloads.push(alias);
+    }
     let mesh = config.mesh.get_or_insert_with(Box::default);
     mesh.services = services;
-    mesh.workloads = vec![reviews, ratings];
+    mesh.workloads = workloads;
     mesh.waypoint_bindings = vec![MeshWaypointBinding {
         name: WAYPOINT_NAME.to_string(),
         namespace: NAMESPACE.to_string(),
@@ -452,14 +466,26 @@ fn prepared(backends: &Backends, scenario: &Scenario) -> GatewayConfig {
     if let Some(mesh) = prepared.mesh.as_deref_mut() {
         mesh.inbound_relay_admits_loopback_namespace = true;
     }
+    if let Some(grants) = scenario.assertor_grants.as_ref() {
+        let authz = prepared
+            .plugin_configs
+            .iter_mut()
+            .find(|plugin| plugin.id == "__mesh_authz")
+            .expect("fixture: the mesh-managed mesh_authz instance");
+        authz.config["trusted_hbone_assertors"] = grants.clone();
+    }
     prepared
 }
 
 fn build_state(prepared: GatewayConfig) -> ProxyState {
-    build_state_with_dns(prepared, &[])
+    build_state_with_dns(prepared, &[], None)
 }
 
-fn build_state_with_dns(prepared: GatewayConfig, loopback_hosts: &[String]) -> ProxyState {
+fn build_state_with_dns(
+    prepared: GatewayConfig,
+    loopback_hosts: &[String],
+    tcp_idle_timeout_seconds: Option<u64>,
+) -> ProxyState {
     let dns = DnsConfig {
         global_overrides: loopback_hosts
             .iter()
@@ -467,7 +493,7 @@ fn build_state_with_dns(prepared: GatewayConfig, loopback_hosts: &[String]) -> P
             .collect(),
         ..DnsConfig::default()
     };
-    let env_config = EnvConfig {
+    let mut env_config = EnvConfig {
         mode: OperatingMode::Mesh,
         log_level: "error".to_string(),
         proxy_http_port: 0,
@@ -479,6 +505,9 @@ fn build_state_with_dns(prepared: GatewayConfig, loopback_hosts: &[String]) -> P
         namespace: NAMESPACE.to_string(),
         ..EnvConfig::default()
     };
+    if let Some(seconds) = tcp_idle_timeout_seconds {
+        env_config.tcp_idle_timeout_seconds = seconds;
+    }
     ProxyState::new(prepared, DnsCache::new(dns), env_config, None, None)
         .expect("the ServiceWaypoint generation is accepted by the proxy runtime")
         .0
@@ -501,8 +530,16 @@ impl Waypoint {
     }
 
     async fn start_as(scenario: Scenario, client_spiffe: &str) -> Self {
-        let backends = start_backends().await;
-        let state = build_state_with_dns(prepared(&backends, &scenario), &scenario.dns_overrides);
+        Self::start_with(start_backends().await, scenario, client_spiffe).await
+    }
+
+    /// Start a waypoint over caller-supplied backends.
+    async fn start_with(backends: Backends, scenario: Scenario, client_spiffe: &str) -> Self {
+        let state = build_state_with_dns(
+            prepared(&backends, &scenario),
+            &scenario.dns_overrides,
+            scenario.tcp_idle_timeout_seconds,
+        );
         assert!(
             !state.router_cache.service_waypoint_l7_routes().is_empty(),
             "fixture: the waypoint builds bound-Service partitions"
@@ -1132,7 +1169,29 @@ async fn an_ambiguous_backing_endpoint_authority_is_refused_before_any_upgrade()
         ..Scenario::default()
     })
     .await;
-    let reviews_endpoint = format!("127.0.0.1:{}", waypoint.backends.reviews.port());
+    // Both bound Services materialized an L7 binding on the one backing
+    // endpoint, so the ambiguity under test is real.
+    let reviews_port = waypoint.backends.reviews.port();
+    {
+        let config = waypoint.state.config.load();
+        let bindings = &config
+            .mesh
+            .as_ref()
+            .expect("prepared mesh config")
+            .service_waypoint_l7_bindings;
+        for service in ["reviews", "reviews-alias"] {
+            assert!(
+                bindings
+                    .iter()
+                    .any(|binding| binding.target.service == service
+                        && binding.backing_endpoints.iter().any(|(address, port)| {
+                            address.is_loopback() && *port == reviews_port
+                        })),
+                "fixture: {service} materializes an L7 binding on the shared endpoint"
+            );
+        }
+    }
+    let reviews_endpoint = format!("127.0.0.1:{reviews_port}");
     let (response, _send) = waypoint.connect_with(&reviews_endpoint, &[]).await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert_eq!(l7_tunnels_active(), 0);
@@ -1955,7 +2014,8 @@ async fn start_tls_backend(hostname: &str) -> (SocketAddr, tokio::task::JoinHand
 /// external leg is dialed over TLS, the Service leg keeps its transport.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_external_residual_leg_originates_the_tls_its_destination_rule_requires() {
-    const EXTERNAL_HOST: &str = "tls-external.test";
+    // Three labels: a two-label host is a Service alias (`<svc>.<ns>`).
+    const EXTERNAL_HOST: &str = "api.tls-external.test";
     let (tls_addr, tls_handle) = start_tls_backend(EXTERNAL_HOST).await;
     let split = json!({
         "hosts": [host("reviews")],
@@ -2031,4 +2091,606 @@ async fn an_external_residual_leg_originates_the_tls_its_destination_rule_requir
     );
     tls_handle.abort();
     waypoint.teardown().await;
+}
+
+// ── Review findings (#7545) ────────────────────────────────────────────────
+
+/// The reviews VirtualService of the identity-matrix tests: a header-matched
+/// branch to the bound ratings Service, every other request to an external
+/// host (whose destination is judged on waypoint-wide policies only and
+/// stamps no authorized destination).
+fn external_fallback_spec(external_host: &str, external_port: u16) -> serde_json::Value {
+    json!({
+        "hosts": [host("reviews")],
+        "http": [
+            {
+                "match": [{"headers": {"x-canary": {"exact": "true"}}}],
+                "route": [{"destination": {"host": host("ratings"), "port": {"number": SERVICE_PORT}}}]
+            },
+            {
+                "route": [{"destination": {"host": external_host, "port": {"number": external_port}}}]
+            }
+        ]
+    })
+}
+
+fn principal_policy(name: &str, service: &str, action: PolicyAction) -> MeshPolicy {
+    MeshPolicy {
+        name: name.to_string(),
+        namespace: NAMESPACE.to_string(),
+        scope: PolicyScope::TargetRefs {
+            attachments: vec![PolicyTargetAttachment::Service {
+                namespace: NAMESPACE.to_string(),
+                name: service.to_string(),
+            }],
+        },
+        rules: vec![MeshRule {
+            from: vec![PrincipalMatch {
+                spiffe_id_pattern: Some(FRONTEND_SPIFFE.to_string()),
+                namespace_pattern: None,
+                trust_domain: None,
+                trust_domain_pattern: None,
+            }],
+            action,
+            ..MeshRule::default()
+        }],
+    }
+}
+
+fn canary_request() -> Request<Empty<Bytes>> {
+    let mut request = get("/", &host("reviews"));
+    request
+        .headers_mut()
+        .insert("x-canary", hyper::header::HeaderValue::from_static("true"));
+    request
+}
+
+/// Review F1: every outer identity case (an allowed assertor, a disallowed
+/// assertor, no baggage, malformed baggage) against an ALLOW and a DENY on
+/// the ratings branch of a route whose own destination is external. The
+/// branch is always judged on its own verdict for the principal the tunnel
+/// actually carries (a discarded assertion leaves the verified certificate
+/// principal), never admitted for lack of one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_outer_identity_case_is_judged_on_the_selected_branch_verdict() {
+    const EXTERNAL_HOST: &str = "api.plain-external.test";
+    let frontend = format!("source.principal={FRONTEND_SPIFFE}");
+    // (case, peer, outer baggage, ALLOW-frontend outcome, DENY-frontend outcome)
+    let cases: [(&str, &str, Option<&str>, StatusCode, StatusCode); 4] = [
+        (
+            "allowed assertor",
+            ZTUNNEL_SPIFFE,
+            Some(frontend.as_str()),
+            StatusCode::OK,
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "disallowed assertor",
+            CLIENT_SPIFFE,
+            Some(frontend.as_str()),
+            StatusCode::FORBIDDEN,
+            StatusCode::OK,
+        ),
+        (
+            "absent baggage",
+            ZTUNNEL_SPIFFE,
+            None,
+            StatusCode::FORBIDDEN,
+            StatusCode::OK,
+        ),
+        (
+            "malformed baggage",
+            ZTUNNEL_SPIFFE,
+            Some("source.principal=%%not-a-spiffe-id%%"),
+            StatusCode::FORBIDDEN,
+            StatusCode::OK,
+        ),
+    ];
+    for action in [PolicyAction::Allow, PolicyAction::Deny] {
+        let allow = matches!(action, PolicyAction::Allow);
+        for (case, peer, baggage, allow_status, deny_status) in &cases {
+            let (external_responder, _external_log) = marker_responder("external");
+            let (external_addr, external_handle) = start_http_backend(external_responder).await;
+            let mut waypoint = Waypoint::start_as(
+                Scenario {
+                    virtual_services: vec![virtual_service(
+                        "reviews-external-fallback",
+                        external_fallback_spec(EXTERNAL_HOST, external_addr.port()),
+                    )],
+                    policies: vec![principal_policy(
+                        "ratings-frontend",
+                        "ratings",
+                        action.clone(),
+                    )],
+                    dns_overrides: vec![EXTERNAL_HOST.to_string()],
+                    ..Scenario::default()
+                },
+                peer,
+            )
+            .await;
+            let headers: Vec<(&str, &str)> = baggage
+                .map(|value| vec![("baggage", value)])
+                .unwrap_or_default();
+            let tunnel = waypoint
+                .tunnel(&format!("{}:{SERVICE_PORT}", host("reviews")), &headers)
+                .await;
+            let mut inner = inner_http1(tunnel).await;
+            let own = send_h1(&mut inner, get("/", &host("reviews"))).await;
+            assert_eq!(
+                own.status,
+                StatusCode::OK,
+                "{case}: the external own destination serves: {}",
+                own.body
+            );
+            assert_eq!(own.served_by(), "external", "{case}");
+            let branch = send_h1(&mut inner, canary_request()).await;
+            let expected = if allow { *allow_status } else { *deny_status };
+            assert_eq!(
+                branch.status,
+                expected,
+                "{case} with {} on ratings: {}",
+                if allow { "ALLOW" } else { "DENY" },
+                branch.body
+            );
+            if expected == StatusCode::OK {
+                assert_eq!(branch.served_by(), "ratings", "{case}");
+            } else {
+                assert!(
+                    waypoint
+                        .backends
+                        .requests_to(&waypoint.backends.ratings_log)
+                        .is_empty(),
+                    "{case}: a refused branch is never dialed"
+                );
+            }
+            external_handle.abort();
+            waypoint.teardown().await;
+        }
+    }
+}
+
+/// Review F2: a 90/10 split between two bound Services with NO
+/// DestinationRule is still dispatched leg by leg on a ServiceWaypoint, so a
+/// DENY attached to the 10% Service refuses only that leg and the 90% leg
+/// keeps serving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_split_without_a_destination_rule_is_authorized_leg_by_leg() {
+    let deny_ratings = MeshPolicy {
+        name: "deny-ratings".to_string(),
+        namespace: NAMESPACE.to_string(),
+        scope: PolicyScope::TargetRefs {
+            attachments: vec![PolicyTargetAttachment::Service {
+                namespace: NAMESPACE.to_string(),
+                name: "ratings".to_string(),
+            }],
+        },
+        rules: vec![MeshRule {
+            action: PolicyAction::Deny,
+            ..MeshRule::default()
+        }],
+    };
+    let mut waypoint = Waypoint::start(Scenario {
+        virtual_services: vec![virtual_service("reviews-split", split_90_10())],
+        policies: vec![deny_ratings],
+        ..Scenario::default()
+    })
+    .await;
+    let leg_dispatched = waypoint
+        .state
+        .config
+        .load()
+        .plugin_configs
+        .iter()
+        .any(|plugin| {
+            plugin.plugin_name == "mesh_route_dispatch"
+                && plugin
+                    .config
+                    .get("weighted_splits")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|splits| !splits.is_empty())
+        });
+    assert!(
+        leg_dispatched,
+        "a ServiceWaypoint split is dispatched leg by leg without a DestinationRule"
+    );
+    let tunnel = waypoint
+        .tunnel(&format!("{}:{SERVICE_PORT}", host("reviews")), &[])
+        .await;
+    let mut inner = inner_http1(tunnel).await;
+    let (mut served, mut refused) = (0usize, 0usize);
+    for _ in 0..200 {
+        let response = send_h1(&mut inner, get("/", &host("reviews"))).await;
+        match response.status {
+            StatusCode::OK => {
+                assert_eq!(response.served_by(), "reviews");
+                served += 1;
+            }
+            StatusCode::FORBIDDEN => refused += 1,
+            other => panic!("unexpected status {other}: {}", response.body),
+        }
+    }
+    assert!(
+        (160..=195).contains(&served) && refused > 0,
+        "only the denied 10% leg is refused: served={served} refused={refused}"
+    );
+    assert!(
+        waypoint
+            .backends
+            .requests_to(&waypoint.backends.ratings_log)
+            .is_empty(),
+        "the denied leg is never dialed"
+    );
+    waypoint.teardown().await;
+}
+
+/// Review F3: an inner HTTP/1 head the framing guard refuses (conflicting
+/// `Content-Length`) ends the inner connection "cleanly" for hyper, yet the
+/// outer stream is reset with `CONNECT_ERROR`, never ended with `END_STREAM`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_framing_guard_reject_inside_the_tunnel_resets_with_connect_error() {
+    let mut waypoint = Waypoint::start(Scenario::default()).await;
+    let (response, mut send) = waypoint
+        .connect_with(&format!("{}:{SERVICE_PORT}", host("reviews")), &[])
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut recv = response.into_body();
+    let head = format!(
+        "POST / HTTP/1.1\r\nHost: {}\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nxx",
+        host("reviews")
+    );
+    send.send_data(Bytes::from(head), false)
+        .expect("send the conflicting head");
+    assert_reset_with_connect_error(&mut recv).await;
+    wait_until(
+        || l7_tunnel_terminations(ServiceWaypointL7TunnelTermination::InnerProtocolError) == 1,
+        "the inner protocol error termination",
+    )
+    .await;
+    assert_eq!(
+        l7_tunnel_terminations(ServiceWaypointL7TunnelTermination::CleanClose),
+        0
+    );
+    assert!(
+        waypoint
+            .backends
+            .requests_to(&waypoint.backends.reviews_log)
+            .is_empty(),
+        "the refused head never reached the backend"
+    );
+    waypoint.teardown().await;
+}
+
+/// Review F4: `match.sourceNamespace` follows the caller the tunnel's trusted
+/// outer assertion names, not the asserting transport peer, when the two are
+/// in different namespaces.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn source_namespace_matches_the_honored_caller_not_the_asserting_peer() {
+    const INFRA_ZTUNNEL: &str = "spiffe://cluster.local/ns/infra/sa/ztunnel";
+    const TENANT_CALLER: &str = "spiffe://cluster.local/ns/tenant/sa/app";
+    let spec = json!({
+        "hosts": [host("reviews")],
+        "http": [
+            {
+                "match": [{"sourceNamespace": "tenant"}],
+                "route": [{"destination": {"host": host("ratings"), "port": {"number": SERVICE_PORT}}}]
+            },
+            {
+                "route": [{"destination": {"host": host("reviews"), "port": {"number": SERVICE_PORT}}}]
+            }
+        ]
+    });
+    let mut waypoint = Waypoint::start_as(
+        Scenario {
+            virtual_services: vec![virtual_service("reviews-by-source", spec)],
+            assertor_grants: Some(json!([
+                {"assertor": INFRA_ZTUNNEL, "asserts": [TENANT_CALLER]}
+            ])),
+            ..Scenario::default()
+        },
+        INFRA_ZTUNNEL,
+    )
+    .await;
+    let authority = format!("{}:{SERVICE_PORT}", host("reviews"));
+    let baggage = format!("source.principal={TENANT_CALLER}");
+    let asserted = waypoint
+        .tunnel(&authority, &[("baggage", baggage.as_str())])
+        .await;
+    let mut inner = inner_http1(asserted).await;
+    let response = send_h1(&mut inner, get("/", &host("reviews"))).await;
+    assert_eq!(response.status, StatusCode::OK, "{}", response.body);
+    assert_eq!(
+        response.served_by(),
+        "ratings",
+        "the honored tenant caller matches sourceNamespace: tenant"
+    );
+    // The peer alone (infra) does not match.
+    let plain = waypoint.tunnel(&authority, &[]).await;
+    let mut inner = inner_http1(plain).await;
+    let response = send_h1(&mut inner, get("/", &host("reviews"))).await;
+    assert_eq!(response.status, StatusCode::OK, "{}", response.body);
+    assert_eq!(response.served_by(), "reviews");
+    waypoint.teardown().await;
+}
+
+/// Review F5: `match.port` and a `FROM_REQUEST_PORT` redirect read the bound
+/// Service port the tunnel was admitted for, never the HBONE listener port.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn match_port_and_request_port_redirects_use_the_bound_service_port() {
+    let spec = json!({
+        "hosts": [host("reviews")],
+        "http": [
+            {
+                "match": [{"uri": {"prefix": "/moved"}}],
+                "redirect": {"uri": "/new", "derivePort": "FROM_REQUEST_PORT"}
+            },
+            {
+                "match": [{"port": SERVICE_PORT, "uri": {"prefix": "/by-port"}}],
+                "route": [{"destination": {"host": host("ratings"), "port": {"number": SERVICE_PORT}}}]
+            },
+            {
+                "route": [{"destination": {"host": host("reviews"), "port": {"number": SERVICE_PORT}}}]
+            }
+        ]
+    });
+    let mut waypoint = Waypoint::start(Scenario {
+        virtual_services: vec![virtual_service("reviews-ports", spec)],
+        ..Scenario::default()
+    })
+    .await;
+    let listener_port = waypoint.addr.port();
+    assert_ne!(listener_port, SERVICE_PORT, "fixture: distinct ports");
+    let tunnel = waypoint
+        .tunnel(&format!("{}:{SERVICE_PORT}", host("reviews")), &[])
+        .await;
+    let mut inner = inner_http1(tunnel).await;
+    let by_port = send_h1(&mut inner, get("/by-port", &host("reviews"))).await;
+    assert_eq!(by_port.status, StatusCode::OK, "{}", by_port.body);
+    assert_eq!(
+        by_port.served_by(),
+        "ratings",
+        "match.port {SERVICE_PORT} matches the bound Service port"
+    );
+    let moved = send_h1(&mut inner, get("/moved", &host("reviews"))).await;
+    assert!(
+        moved.status.is_redirection(),
+        "the redirect answers: {}",
+        moved.status
+    );
+    let location = moved
+        .headers
+        .get("location")
+        .and_then(|value| value.to_str().ok())
+        .expect("redirect Location")
+        .to_string();
+    assert!(
+        location.contains(&format!(":{SERVICE_PORT}/new")),
+        "FROM_REQUEST_PORT advertises the bound Service port: {location}"
+    );
+    assert!(
+        !location.contains(&format!(":{listener_port}")),
+        "never the HBONE listener port: {location}"
+    );
+    waypoint.teardown().await;
+}
+
+/// A backend that answers with a chunked body: one chunk, a pause of
+/// `pause`, then a final chunk.
+async fn start_pausing_backend(pause: Duration) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind pausing backend");
+    let addr = listener.local_addr().expect("pausing backend addr");
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0_u8; 4096];
+                if matches!(stream.read(&mut buf).await, Ok(0) | Err(_)) {
+                    return;
+                }
+                let head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\
+                            Content-Type: text/plain\r\nConnection: close\r\n\r\n";
+                if stream.write_all(head.as_bytes()).await.is_err()
+                    || stream.write_all(b"8\r\nreviews\n\r\n").await.is_err()
+                {
+                    return;
+                }
+                let _ = stream.flush().await;
+                tokio::time::sleep(pause).await;
+                let _ = stream.write_all(b"6\r\nlater\n\r\n0\r\n\r\n").await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    (addr, handle)
+}
+
+/// Review F6: a streaming response body that pauses longer than the tunnel
+/// idle timeout is still an active request, so the tunnel is not cut and the
+/// whole body arrives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_response_body_pausing_past_the_idle_timeout_is_not_cut() {
+    let (pausing_addr, pausing_handle) = start_pausing_backend(Duration::from_millis(2_500)).await;
+    let mut backends = start_backends().await;
+    backends.reviews = pausing_addr;
+    backends.handles.push(pausing_handle);
+    let mut waypoint = Waypoint::start_with(
+        backends,
+        Scenario {
+            tcp_idle_timeout_seconds: Some(1),
+            ..Scenario::default()
+        },
+        CLIENT_SPIFFE,
+    )
+    .await;
+    let tunnel = waypoint
+        .tunnel(&format!("{}:{SERVICE_PORT}", host("reviews")), &[])
+        .await;
+    let mut inner = inner_http1(tunnel).await;
+    let response = send_h1(&mut inner, get("/", &host("reviews"))).await;
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(
+        response.body, "reviews\nlater\n",
+        "the body survives a pause past the idle timeout"
+    );
+    assert_eq!(
+        l7_tunnel_terminations(ServiceWaypointL7TunnelTermination::IdleTimeout),
+        0,
+        "the idle timer did not fire during the active body"
+    );
+    waypoint.teardown().await;
+}
+
+/// The prepared configuration of a SECURED ServiceWaypoint whose bound
+/// Services are Sidecar-backed, so their default upstreams dial over Sidecar
+/// mTLS with the destination Service authority stamped on every target.
+fn prepared_secured_sidecar_waypoint(virtual_services: Vec<K8sObject>) -> GatewayConfig {
+    use ferrum_edge::modes::mesh::config::WorkloadMeshTransport;
+    let backends = Backends {
+        reviews: "127.0.0.1:18080".parse().expect("addr"),
+        reviews_log: Arc::new(std::sync::Mutex::new(Vec::new())),
+        ratings: "127.0.0.1:18081".parse().expect("addr"),
+        ratings_log: Arc::new(std::sync::Mutex::new(Vec::new())),
+        tcp_echo: "127.0.0.1:18082".parse().expect("addr"),
+        udp_echo: "127.0.0.1:18083".parse().expect("addr"),
+        handles: Vec::new(),
+    };
+    let mut cp = cp_config(
+        &backends,
+        &Scenario {
+            virtual_services,
+            ..Scenario::default()
+        },
+    );
+    for workload in &mut cp.mesh.as_deref_mut().expect("mesh").workloads {
+        workload.mesh_transport = Some(WorkloadMeshTransport::SidecarMtls);
+    }
+    let mut runtime = waypoint_runtime();
+    runtime.workload_svid_cert_path = Some("/fixture/svid.pem".to_string());
+    runtime.workload_svid_key_path = Some("/fixture/svid.key".to_string());
+    runtime.workload_svid_trust_bundle_path = Some("/fixture/bundle.pem".to_string());
+    let request = runtime.mesh_slice_request();
+    let filtered = cp_filter_config_to_mesh_request_for_test(&cp, &request);
+    let slice = MeshSlice::from_gateway_config(&filtered, request);
+    prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("slice materializes")
+}
+
+/// Review F7: on a ServiceWaypoint, a carried rule's `rewrite.authority` to a
+/// Sidecar-backed destination is validated like a Sidecar's (it must name the
+/// selected Service) and dials a route-scoped clone with no stamped
+/// authority, so the rewritten authority is forwarded; ordinary dispatch
+/// keeps the stamped Service authority.
+#[test]
+fn a_service_waypoint_authority_rewrite_to_a_sidecar_destination_is_forwarded() {
+    use ferrum_edge::proxy::mesh_mtls_pool::{
+        MESH_MTLS_AUTHORITY_HOST_TAG, MESH_MTLS_AUTHORITY_PORT_TAG,
+    };
+    let rewrite = |authority: &str| {
+        virtual_service(
+            "reviews-rewrite",
+            json!({
+                "hosts": [host("reviews")],
+                "http": [
+                    {
+                        "match": [{"headers": {"x-alias": {"exact": "true"}}}],
+                        "rewrite": {"authority": authority},
+                        "route": [{"destination": {"host": host("ratings"), "port": {"number": SERVICE_PORT}}}]
+                    },
+                    {
+                        "route": [{"destination": {"host": host("reviews"), "port": {"number": SERVICE_PORT}}}]
+                    }
+                ]
+            }),
+        )
+    };
+    let carried_routes = |config: &GatewayConfig| {
+        config
+            .proxies
+            .iter()
+            .filter(|proxy| proxy.id.starts_with("istio-vs-"))
+            .count()
+    };
+
+    // An alias of the selected destination (ratings) is admitted.
+    let admitted = prepared_secured_sidecar_waypoint(vec![rewrite("ratings.default.svc")]);
+    assert!(carried_routes(&admitted) > 0, "the rewriting route is kept");
+    let default_upstream =
+        ferrum_edge::modes::mesh::service_waypoint_l7::service_waypoint_l7_upstream_id(
+            NAMESPACE,
+            "ratings",
+            SERVICE_PORT,
+        );
+    let rewrite_upstream =
+        ferrum_edge::modes::mesh::service_waypoint_l7::service_waypoint_l7_rewrite_upstream_id(
+            NAMESPACE,
+            "ratings",
+            SERVICE_PORT,
+        );
+    let rule_destinations: Vec<String> = admitted
+        .plugin_configs
+        .iter()
+        .filter(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+        .flat_map(|plugin| {
+            plugin
+                .config
+                .get("rules")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        })
+        .filter_map(|rule| {
+            rule.get("destination")
+                .and_then(|destination| destination.get("upstream_id"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    assert!(
+        rule_destinations.contains(&rewrite_upstream),
+        "the rewriting rule dials the tag-free clone: {rule_destinations:?}"
+    );
+    let upstream = |id: &str| {
+        admitted
+            .upstreams
+            .iter()
+            .find(|upstream| upstream.id == id)
+            .unwrap_or_else(|| panic!("upstream {id} materialized"))
+    };
+    let clone = upstream(&rewrite_upstream);
+    assert!(!clone.targets.is_empty());
+    for target in &clone.targets {
+        assert!(
+            ferrum_edge::proxy::mesh_mtls_pool::target_mesh_mtls_enabled(target),
+            "the clone still dials over Sidecar mTLS"
+        );
+        assert!(
+            !target.tags.contains_key(MESH_MTLS_AUTHORITY_HOST_TAG)
+                && !target.tags.contains_key(MESH_MTLS_AUTHORITY_PORT_TAG),
+            "the clone carries no stamped authority"
+        );
+    }
+    assert_eq!(
+        clone.admission_upstream_id.as_deref(),
+        Some(default_upstream.as_str()),
+        "the clone shares the Service upstream's admission lanes"
+    );
+    for target in &upstream(&default_upstream).targets {
+        assert!(
+            target.tags.contains_key(MESH_MTLS_AUTHORITY_HOST_TAG),
+            "ordinary dispatch keeps the stamped Service authority"
+        );
+    }
+
+    // A rewrite naming something the destination Sidecar cannot route is
+    // refused with its route.
+    let before = route_refusals(ServiceWaypointRouteRefusal::AuthorityRewriteRefused);
+    let refused = prepared_secured_sidecar_waypoint(vec![rewrite("attacker.example.com")]);
+    assert_eq!(
+        carried_routes(&refused),
+        0,
+        "a rewrite that does not name the selected Service refuses its route"
+    );
+    assert!(route_refusals(ServiceWaypointRouteRefusal::AuthorityRewriteRefused) > before);
 }

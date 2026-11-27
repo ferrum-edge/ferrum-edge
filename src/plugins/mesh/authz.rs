@@ -2045,6 +2045,15 @@ fn destination_policy_scope_index(
                 ),
                 Some(service_port.port),
             );
+            index.upstream_policy_ports.insert(
+                &service.namespace,
+                crate::modes::mesh::service_waypoint_l7::service_waypoint_l7_rewrite_upstream_id(
+                    &service.namespace,
+                    &service.name,
+                    service_port.port,
+                ),
+                Some(service_port.port),
+            );
             let scopes = destination_policy_scopes_for_service_port(
                 service,
                 service_port,
@@ -2070,6 +2079,16 @@ fn destination_policy_scope_index(
             index.by_upstream.insert(
                 &service.namespace,
                 crate::modes::mesh::service_waypoint_l7::service_waypoint_l7_upstream_id(
+                    &service.namespace,
+                    &service.name,
+                    service_port.port,
+                ),
+                scopes.scopes.clone(),
+            );
+            // Its authority-rewrite clone (Sidecar-mTLS destinations) too.
+            index.by_upstream.insert(
+                &service.namespace,
+                crate::modes::mesh::service_waypoint_l7::service_waypoint_l7_rewrite_upstream_id(
                     &service.namespace,
                     &service.name,
                     service_port.port,
@@ -4924,6 +4943,13 @@ impl Plugin for MeshAuthz {
             );
         }
         let (mut source_principal, baggage_outcome) = self.resolve_source_principal(ctx);
+        // ServiceWaypoint L7 (issue #7501): the honored caller of the outer
+        // tunnel is what source-based routing and the outbound HBONE asserted
+        // source act as (`RequestContext::mesh_source_principal`), never the
+        // asserting transport peer.
+        if service_waypoint_l7_request && baggage_outcome == BaggageOutcome::Honored {
+            ctx.mesh_asserted_source_principal = source_principal.clone();
+        }
         let ambient_udp_source_scope =
             if ambient_udp_source_scope_request && baggage_outcome == BaggageOutcome::Honored {
                 match self.ambient_udp_source_scope(ctx, source_principal.as_ref()) {
@@ -5248,17 +5274,29 @@ impl Plugin for MeshAuthz {
         } else {
             self.slice.mesh_policies.is_empty()
         };
+        //
+        // A ServiceWaypoint L7 request (issue #7501) ALWAYS records verdicts on
+        // a route with alternative destinations, whatever is loaded and even
+        // when the tunnel's outer assertion was discarded: its source
+        // principal is then the verified certificate principal (the
+        // assertion never applied), and every candidate is judged on it. A
+        // route override is then admitted only by the selected candidate's
+        // own verdict, never by the absence of one.
         let route_branches = if (self.per_pod_policy_scoping || service_waypoint_l7_request)
-            && (!branch_policies_empty || self.route_branches_evaluate_always)
+            && (service_waypoint_l7_request
+                || !branch_policies_empty
+                || self.route_branches_evaluate_always)
             && !relay_policy_superset_request
             && !connect_relay
-            && !asserted_identity_rejected
+            && (service_waypoint_l7_request || !asserted_identity_rejected)
             && !live_admission_reevaluation
         {
             ctx.matched_proxy
                 .as_ref()
                 .and_then(|proxy| self.route_branch_table_for_proxy(proxy))
-                .filter(|table| !branch_policies_empty || table.evaluate_always)
+                .filter(|table| {
+                    service_waypoint_l7_request || !branch_policies_empty || table.evaluate_always
+                })
         } else {
             None
         };
@@ -5388,6 +5426,15 @@ impl Plugin for MeshAuthz {
             // attributes and the tunnel's resolved source principal. Missing
             // destination evidence fails closed, never to waypoint-namespace
             // filtering.
+            //
+            // Scoped authorization is always active here: a route override to a
+            // destination that needs authorization is refused unless an
+            // authorized destination was stamped or a per-destination verdict
+            // admits it (`reject_node_waypoint_authz_destination_override`).
+            ctx.metadata.insert(
+                NODE_WAYPOINT_SCOPED_AUTHZ_ACTIVE_METADATA.to_string(),
+                "true".to_string(),
+            );
             let matched_proxy = ctx.matched_proxy.clone();
             let destination_scope_match = matched_proxy
                 .as_deref()

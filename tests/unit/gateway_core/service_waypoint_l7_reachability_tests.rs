@@ -226,3 +226,37 @@ fn the_direction_filter_is_skipped_only_for_partition_routes() {
     ));
     assert!(body.contains("|| !config::is_virtual_service_http_route_proxy_id(id)"));
 }
+
+/// Review F4 (#7545): the caller a ServiceWaypoint tunnel's trusted outer
+/// assertion names is recorded ONLY by `mesh_authz` (only when it honored the
+/// assertion), and source-based routing plus every outbound mesh
+/// asserted-source site read it through `mesh_source_principal`, never the
+/// raw transport peer.
+#[test]
+fn source_routing_and_outbound_assertions_follow_the_honored_caller() {
+    assert_eq!(
+        occurrences(".mesh_asserted_source_principal = "),
+        vec![("plugins/mesh/authz.rs".to_string(), 1)],
+        "only mesh_authz records the honored caller"
+    );
+    let proxy = code(PROXY_SOURCE);
+    assert!(
+        !proxy.contains("source_identity_ctx.and_then(|ctx| ctx.peer_spiffe_id"),
+        "the HTTP HBONE asserted source reads mesh_source_principal"
+    );
+    assert_eq!(
+        proxy.matches("ctx.mesh_source_principal(),").count(),
+        3,
+        "the WebSocket and both native-gRPC asserted-source sites"
+    );
+    assert!(proxy.contains("source_identity_ctx.and_then(RequestContext::mesh_source_principal)"));
+    let dispatch = code(include_str!("../../../src/plugins/mesh_route_dispatch.rs"));
+    let matcher = dispatch
+        .find("if let Some(expected_ns) = m.source_namespace.as_deref()")
+        .expect("the sourceNamespace matcher");
+    let window = &dispatch[matcher..matcher + dispatch[matcher..].find("\n    }\n").expect("end")];
+    assert!(
+        window.contains(".mesh_source_principal()") && !window.contains(".peer_spiffe_id"),
+        "match.sourceNamespace reads the honored caller"
+    );
+}

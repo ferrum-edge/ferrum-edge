@@ -665,7 +665,7 @@ struct TunnelActivity {
     last_activity_ms: AtomicU64,
     /// Set when the tunnel ends in a way that must reset the outer stream.
     reset_on_drop: AtomicBool,
-    /// Inner requests whose response head has not yet been produced.
+    /// Inner requests whose response body has not yet ended.
     requests_in_flight: AtomicUsize,
 }
 
@@ -718,8 +718,15 @@ impl AsyncWrite for TunnelIo {
         Pin::new(&mut self.inner).poll_flush(cx)
     }
 
+    /// Flush only. Shutting the upgraded writer down would queue the outer
+    /// `END_STREAM` from inside the inner server (hyper's HTTP/1 dispatcher
+    /// shuts its transport down before it returns the protocol result), before
+    /// the tunnel supervisor has decided between a clean end and
+    /// `RST_STREAM(CONNECT_ERROR)`. The supervisor owns the outer close: it
+    /// drops this transport, and `Drop` sends the reset when one was
+    /// requested, else the clean `END_STREAM` a dropped writer sends.
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+        Pin::new(&mut self.inner).poll_flush(cx)
     }
 
     fn poll_write_vectored(
@@ -762,8 +769,9 @@ async fn tunnel_idle(activity: Arc<TunnelActivity>, timeout: Option<Duration>) {
     }
 }
 
-/// Decrements the in-flight count when an inner request's service future
-/// ends, however it ends.
+/// Decrements the in-flight count when an inner request ends, however it
+/// ends: carried by the service future and then by the response body
+/// ([`TunnelResponseBody`]), so a request counts until its body is done.
 struct InFlightRequest(Arc<TunnelActivity>);
 
 impl InFlightRequest {
@@ -778,6 +786,40 @@ impl Drop for InFlightRequest {
     fn drop(&mut self) {
         self.0.requests_in_flight.fetch_sub(1, Ordering::AcqRel);
         self.0.touch();
+    }
+}
+
+/// An inner response body that keeps its request counted in flight on the
+/// tunnel until the body reaches its end or is dropped (hyper finished or
+/// abandoned the stream). Every frame also counts as tunnel activity.
+struct TunnelResponseBody {
+    inner: ProxyBody,
+    in_flight: InFlightRequest,
+}
+
+impl hyper::body::Body for TunnelResponseBody {
+    type Data = <ProxyBody as hyper::body::Body>::Data;
+    type Error = <ProxyBody as hyper::body::Body>::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        // `ProxyBody` and `InFlightRequest` are both `Unpin`.
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.inner).poll_frame(cx);
+        if matches!(polled, Poll::Ready(Some(Ok(_)))) {
+            this.in_flight.0.touch();
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
     }
 }
 
@@ -885,7 +927,6 @@ async fn serve_tunnel(
             ..RequestConnectionMetadata::default()
         };
         async move {
-            let _in_flight = in_flight;
             let mut response = super::construct_frontend_proxy_request(
                 req,
                 state,
@@ -903,7 +944,16 @@ async fn serve_tunnel(
             {
                 signals.disable_observation();
             }
-            response
+            // The tunnel counts this request in flight until its RESPONSE
+            // BODY ends (or is dropped), not when the head is produced: a
+            // streaming body that pauses longer than the idle timeout is
+            // still an active request, and the idle timer must not cut it.
+            response.map(|response| {
+                response.map(|body| TunnelResponseBody {
+                    inner: body,
+                    in_flight,
+                })
+            })
         }
     });
 

@@ -3441,7 +3441,15 @@ fn resolve_redirect_authority_port(
 /// Prefer the kernel/conntrack original destination when capture rewrote the
 /// accept socket (sidecar/ambient), then fall back to the frontend listener
 /// port (gateways and direct dials). Never consult forwarding headers.
+///
+/// An inner request of an L7-terminated ServiceWaypoint tunnel (issue #7501)
+/// reached the bound Service port its outer `CONNECT` named and the tunnel
+/// admission pinned; the HBONE listener port it arrived on is transport, not
+/// the port the client addressed.
 fn trusted_request_port(ctx: &RequestContext) -> Option<u16> {
+    if let Some(service_waypoint) = ctx.service_waypoint_l7.as_deref() {
+        return Some(service_waypoint.bound_service_port());
+    }
     ctx.orig_dst
         .map(|addr| addr.port())
         .or(ctx.frontend_listen_port)
@@ -3725,9 +3733,13 @@ fn rule_matches_with_host(
         // `SpiffeId::namespace` reuses the same path-segment walk that
         // `mesh_authz` uses for `namespace_pattern` matching, so the
         // two surfaces never disagree on what `ns/<value>` means.
+        //
+        // The principal is `mesh_source_principal`: the caller `mesh_authz`
+        // honored from a ServiceWaypoint tunnel's trusted outer assertion
+        // when there is one (issue #7501), so routing follows the identity
+        // authorization evaluated, never the asserting transport peer.
         let Some(peer_ns) = ctx
-            .peer_spiffe_id
-            .as_ref()
+            .mesh_source_principal()
             .and_then(crate::identity::SpiffeId::namespace)
         else {
             return false;

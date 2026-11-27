@@ -3821,6 +3821,15 @@ pub struct RequestContext {
     /// router resolves the request only inside its bound Service's partition.
     pub service_waypoint_l7:
         Option<Arc<crate::modes::mesh::service_waypoint_l7::ServiceWaypointL7Context>>,
+    /// The caller principal `mesh_authz` honored from the OUTER `CONNECT`'s
+    /// trusted HBONE `source.principal` assertion for a ServiceWaypoint L7
+    /// inner request (issue #7501). Set ONLY by `mesh_authz`, and only when
+    /// the assertion passed every assertor gate; `None` everywhere else. Read
+    /// through [`RequestContext::mesh_source_principal`], which source-based
+    /// routing (`match.sourceNamespace`) and the outbound HBONE asserted
+    /// source use, so both follow the caller authorization evaluated, never
+    /// the asserting transport peer.
+    pub(crate) mesh_asserted_source_principal: Option<crate::identity::SpiffeId>,
     /// Per-destination authorization verdicts `mesh_authz` records for a
     /// carried NodeWaypoint VirtualService route whose `mesh_route_dispatch`
     /// rules can select a destination other than the route's own (issue
@@ -5047,6 +5056,7 @@ impl RequestContext {
             node_waypoint_pod_uid: None,
             node_waypoint_policy_scope: None,
             service_waypoint_l7: None,
+            mesh_asserted_source_principal: None,
             node_waypoint_route_branch_authz: None,
             mesh_direction: None,
             orig_dst: None,
@@ -6882,6 +6892,7 @@ impl RequestContext {
             node_waypoint_pod_uid: self.node_waypoint_pod_uid,
             node_waypoint_policy_scope: self.node_waypoint_policy_scope.clone(),
             service_waypoint_l7: self.service_waypoint_l7.clone(),
+            mesh_asserted_source_principal: self.mesh_asserted_source_principal.clone(),
             node_waypoint_route_branch_authz: self.node_waypoint_route_branch_authz.clone(),
             mesh_direction: self.mesh_direction,
             orig_dst: self.orig_dst,
@@ -8349,6 +8360,18 @@ impl RequestContext {
     /// authorization-lifetime authentication predicate.
     pub fn has_certificate_spiffe_principal(&self) -> bool {
         self.peer_spiffe_certificate_principal
+    }
+
+    /// The mesh source principal this request acts as: the caller principal
+    /// `mesh_authz` honored from a ServiceWaypoint L7 tunnel's outer trusted
+    /// HBONE assertion when there is one, else the verified peer
+    /// (`peer_spiffe_id`). Source-based routing and the outbound HBONE
+    /// asserted source read this, so they follow the principal authorization
+    /// evaluated (issue #7501).
+    pub fn mesh_source_principal(&self) -> Option<&crate::identity::SpiffeId> {
+        self.mesh_asserted_source_principal
+            .as_ref()
+            .or(self.peer_spiffe_id.as_ref())
     }
 
     /// Whether this request is a mesh CONNECT whose payload is relayed
