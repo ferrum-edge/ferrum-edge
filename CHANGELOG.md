@@ -7,24 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-
-- **Audit log `start`/`end` filters: new 400 message text for an invalid
-  timestamp** (issue #7419, `chrono` replacement). The status code, error
-  envelope and the set of rejected inputs are unchanged; only the detail after
-  `Invalid audit start timestamp: ` / `Invalid audit end timestamp: ` now comes
-  from Ferrum's timestamp parser. As with the API-spec `updated_since` filter
-  (whose message is unchanged), a value chrono accepted whose UTC instant falls
-  outside years -9999..=9999 is now rejected the same way, and a leap second
-  (`:60`) is treated as the following second.
-- **`chrono` is no longer compiled into the shipped Ferrum Edge binary**
-  (issue #7419). All timestamps use `time` through `time_compat`; `chrono` and
-  sqlx's `chrono` feature remain only as dev-dependencies (test code and the
-  `time_compat` parity tests; Cargo also enables dev-dependencies when building
-  examples), so the
-  RUSTSEC-2026-0543 exception stays in `deny.toml` (cargo-deny also audits
-  dev-dependencies). Serialized timestamps are unchanged.
-
 ## [1.0.0] - 2026-11-27
 
 1.0.0 is the first stable release of Ferrum Edge. It follows published 0.9.21
@@ -70,11 +52,12 @@ gateways, control planes, mesh data planes, charts or contract consumers.
 - **The `chrono` advisory exception (RUSTSEC-2026-0543, unmaintained, no
   known vulnerability) is extended from 2026-12-31 to 2027-03-31** in
   `deny.toml` and the dependency-policy register (#7526). Issue #7419 Phases
-  2-19 have moved every timestamp in `src/` and `custom_plugins/` to
-  `time_compat`: the standalone uses, the config snapshot stamps, the resource,
-  namespace, trust-bundle and audit timestamps, and the mesh, CP/DP status, K8s
-  and diagnostic timestamps. Remaining work: dropping the direct `chrono`
-  dependency and sqlx's `chrono` feature. The
+  2-20 have moved every timestamp in `src/`, `custom_plugins/` and the test
+  helpers to `time_compat`, and `chrono` (with sqlx's `chrono` feature) is now
+  only a dev-dependency used by the `time_compat` parity tests; the shipped
+  binary, `fuzz/` and the mesh benchmark no longer compile it. Remaining work:
+  replacing the parity tests' chrono oracle with recorded values and removing
+  `chrono` entirely. The
   exception can be retired only once no dependency still resolves `chrono`.
 - **Three other advisory exceptions were re-reviewed on 2026-11-27 and
   re-affirmed until 2027-03-31** (#7520): RUSTSEC-2024-0436 (`paste`),
