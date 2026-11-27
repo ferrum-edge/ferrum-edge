@@ -467,9 +467,9 @@ fn unix_epoch_accessors_and_secs_z_format_match_chrono() {
     let nanos = ts.subsec_nanos();
     let fraction = if nanos == 0 {
         String::new()
-    } else if nanos % 1_000_000 == 0 {
+    } else if nanos.is_multiple_of(1_000_000) {
         format!(".{:03}", nanos / 1_000_000)
-    } else if nanos % 1_000 == 0 {
+    } else if nanos.is_multiple_of(1_000) {
         format!(".{:06}", nanos / 1_000)
     } else {
         format!(".{nanos:09}")
