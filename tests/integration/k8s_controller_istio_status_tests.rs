@@ -1411,8 +1411,8 @@ fn request_authentication_output_claim_to_headers_is_not_deferred() {
     assert!(deferred.is_empty(), "{deferred:?}");
 }
 
-/// The three `outlierDetection` knobs Ferrum parses past must be visible, with
-/// no operator-configured value echoed into the status object.
+/// The `outlierDetection` knobs Ferrum parses past must be visible, with no
+/// operator-configured value echoed into the status object.
 #[test]
 fn destination_rule_reports_unenforced_outlier_fields_as_deferred() {
     let deferred = deferred_fields_for(object(
@@ -1426,7 +1426,8 @@ fn destination_rule_reports_unenforced_outlier_fields_as_deferred() {
                     "consecutive5xxErrors": 5,
                     "consecutiveGatewayErrors": 3,
                     "consecutiveLocalOriginFailures": 2,
-                    "minHealthPercent": 40
+                    "minHealthPercent": 40,
+                    "splitExternalLocalOriginErrors": true
                 }
             }
         }),
@@ -1436,6 +1437,7 @@ fn destination_rule_reports_unenforced_outlier_fields_as_deferred() {
         "consecutiveGatewayErrors",
         "consecutiveLocalOriginFailures",
         "minHealthPercent",
+        "splitExternalLocalOriginErrors",
     ] {
         assert!(
             deferred.iter().any(|entry| entry.contains(field)),
@@ -1445,6 +1447,114 @@ fn destination_rule_reports_unenforced_outlier_fields_as_deferred() {
     assert!(
         !deferred.iter().any(|entry| entry.contains("40")),
         "labels must not echo configured values: {deferred:?}"
+    );
+    assert!(
+        deferred.iter().any(|entry| entry == SPLIT_TOP_LEVEL_LABEL),
+        "top-level split=true must carry the top-level label: {deferred:?}"
+    );
+}
+
+const SPLIT_TOP_LEVEL_LABEL: &str = "trafficPolicy.outlierDetection.splitExternalLocalOriginErrors \
+     (not applied: local-origin failures share the consecutive5xxErrors bucket)";
+const SPLIT_PORT_LEVEL_LABEL: &str = "trafficPolicy.portLevelSettings[].outlierDetection.\
+     splitExternalLocalOriginErrors (not applied: local-origin failures share the \
+     consecutive5xxErrors bucket)";
+const SPLIT_SUBSET_LABEL: &str = "subsets[].trafficPolicy.outlierDetection.\
+     splitExternalLocalOriginErrors (not applied: local-origin failures share the \
+     consecutive5xxErrors bucket)";
+
+fn split_labels(deferred: &[String]) -> Vec<&str> {
+    deferred
+        .iter()
+        .map(String::as_str)
+        .filter(|entry| entry.contains("splitExternalLocalOriginErrors"))
+        .collect()
+}
+
+/// `splitExternalLocalOriginErrors: false` is Istio's default and the only
+/// mode Ferrum implements, so it must not be reported as a deferred gap; a
+/// `true` value is reported under the scope of the tier that carries it.
+#[test]
+fn destination_rule_split_local_origin_is_reported_per_tier() {
+    let deferred = deferred_fields_for(object(
+        "networking.istio.io/v1",
+        "DestinationRule",
+        "dr-outlier-split-false",
+        json!({
+            "host": "reviews.default.svc.cluster.local",
+            "trafficPolicy": {
+                "outlierDetection": {
+                    "consecutive5xxErrors": 5,
+                    "splitExternalLocalOriginErrors": false
+                }
+            }
+        }),
+    ));
+    assert!(split_labels(&deferred).is_empty(), "{deferred:?}");
+
+    // Top-level false, subset true: only the subset scope is named.
+    let deferred = deferred_fields_for(object(
+        "networking.istio.io/v1",
+        "DestinationRule",
+        "dr-outlier-split-subset",
+        json!({
+            "host": "reviews.default.svc.cluster.local",
+            "trafficPolicy": {
+                "outlierDetection": {"splitExternalLocalOriginErrors": false}
+            },
+            "subsets": [{
+                "name": "v1",
+                "labels": {"version": "v1"},
+                "trafficPolicy": {
+                    "outlierDetection": {"splitExternalLocalOriginErrors": true}
+                }
+            }]
+        }),
+    ));
+    assert_eq!(split_labels(&deferred), vec![SPLIT_SUBSET_LABEL]);
+
+    let deferred = deferred_fields_for(object(
+        "networking.istio.io/v1",
+        "DestinationRule",
+        "dr-outlier-split-port",
+        json!({
+            "host": "reviews.default.svc.cluster.local",
+            "trafficPolicy": {
+                "portLevelSettings": [{
+                    "port": {"number": 8080},
+                    "outlierDetection": {"splitExternalLocalOriginErrors": true}
+                }]
+            }
+        }),
+    ));
+    assert_eq!(split_labels(&deferred), vec![SPLIT_PORT_LEVEL_LABEL]);
+
+    // A subset's own portLevelSettings are never parsed: the generic
+    // unsupported-tier entry covers them and no split label is invented.
+    let deferred = deferred_fields_for(object(
+        "networking.istio.io/v1",
+        "DestinationRule",
+        "dr-outlier-split-subset-port",
+        json!({
+            "host": "reviews.default.svc.cluster.local",
+            "subsets": [{
+                "name": "v1",
+                "labels": {"version": "v1"},
+                "trafficPolicy": {
+                    "portLevelSettings": [{
+                        "port": {"number": 8080},
+                        "outlierDetection": {"splitExternalLocalOriginErrors": true}
+                    }]
+                }
+            }]
+        }),
+    ));
+    assert!(split_labels(&deferred).is_empty(), "{deferred:?}");
+    assert!(
+        deferred
+            .iter()
+            .any(|entry| entry.starts_with("subsets[].trafficPolicy.portLevelSettings")),
+        "subset port-level settings keep the unsupported-tier entry: {deferred:?}"
     );
 }
 

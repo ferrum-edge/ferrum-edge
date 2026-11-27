@@ -3159,6 +3159,13 @@ pub(crate) const DEFERRED_OUTLIER_DETECTION_FIELDS: &[&str] = &[
     "minHealthPercent",
 ];
 
+/// `outlierDetection.splitExternalLocalOriginErrors`. Ferrum always counts
+/// locally originated failures in the consecutive-5xx bucket, which is Istio's
+/// `false` default, so only an explicit `true` is a deferred gap. Kept in sync
+/// with `deferred_outlier_detection_fields` in
+/// `src/k8s_controller/istio_status.rs`.
+pub(crate) const SPLIT_EXTERNAL_LOCAL_ORIGIN_ERRORS_FIELD: &str = "splitExternalLocalOriginErrors";
+
 fn translate_outlier_detection(
     object: &K8sObject,
     value: &Value,
@@ -3235,22 +3242,29 @@ fn translate_outlier_detection(
     // Recognized-but-unenforced fields. Warn by FIELD NAME only (a threshold
     // value is operator configuration, not a secret, but the status projection
     // is value-redacted and these two surfaces must agree).
-    for field in DEFERRED_OUTLIER_DETECTION_FIELDS {
-        if value.get(field).is_some() {
-            tracing::warn!(
-                namespace = %sanitize_startup_cause(
-                    format!("{:?}", object.metadata.namespace.to_string()),
-                    &[]
-                ),
-                resource = %sanitize_startup_cause(
-                    format!("{:?}", object.metadata.name.to_string()),
-                    &[]
-                ),
-                field = field,
-                "DestinationRule outlierDetection field is parsed but not applied; surfaced in \
-                 status deferred_fields",
-            );
-        }
+    let split_local_origin = value
+        .get(SPLIT_EXTERNAL_LOCAL_ORIGIN_ERRORS_FIELD)
+        .and_then(Value::as_bool)
+        == Some(true);
+    let deferred_fields = DEFERRED_OUTLIER_DETECTION_FIELDS
+        .iter()
+        .copied()
+        .filter(|field| value.get(field).is_some())
+        .chain(split_local_origin.then_some(SPLIT_EXTERNAL_LOCAL_ORIGIN_ERRORS_FIELD));
+    for field in deferred_fields {
+        tracing::warn!(
+            namespace = %sanitize_startup_cause(
+                format!("{:?}", object.metadata.namespace.to_string()),
+                &[]
+            ),
+            resource = %sanitize_startup_cause(
+                format!("{:?}", object.metadata.name.to_string()),
+                &[]
+            ),
+            field = field,
+            "DestinationRule outlierDetection field is parsed but not applied; surfaced in \
+             status deferred_fields",
+        );
     }
 
     Ok(MeshOutlierDetection {

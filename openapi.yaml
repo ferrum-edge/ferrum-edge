@@ -16785,6 +16785,9 @@ components:
 
     PassiveHealthCheck:
       type: object
+      additionalProperties: false
+      description: |
+        Passive health (outlier detection) policy. Unknown keys are rejected.
       properties:
         unhealthy_status_codes:
           type: array
@@ -16832,22 +16835,6 @@ components:
             Maximum percentage of targets that may be passively ejected at the
             same time. When passive ejections exceed this cap, the earliest
             passive ejections are re-admitted first. Null means no cap.
-        gateway_error_codes:
-          type: [array, "null"]
-          maxItems: 500
-          items:
-            type: integer
-            format: uint16
-            minimum: 100
-            maximum: 599
-          description: |
-            Reserved for DestinationRule parity. Validated and persisted, but
-            not yet applied by passive health at runtime.
-        split_external_local_origin_errors:
-          type: [boolean, "null"]
-          description: |
-            Reserved for DestinationRule parity. Validated and persisted, but
-            not yet applied by passive health at runtime.
         consecutive_error_mode:
           type: boolean
           default: false
@@ -16867,8 +16854,8 @@ components:
             (`consecutive5xxErrors: 0`). Matching `unhealthy_status_codes` and
             locally originated connection failures are ignored — Envoy's
             default `splitExternalLocalOriginErrors=false` puts those
-            connection failures in the same 5xx bucket, and Ferrum's split
-            mode is deferred and unused. Set automatically for translated
+            connection failures in the same 5xx bucket, and Ferrum has no
+            split local-origin bucket. Set automatically for translated
             Istio DestinationRules that explicitly disable the 5xx detector.
             Direct native configuration may opt into the same sentinel.
 
