@@ -1487,6 +1487,9 @@ fn mesh_config_fields_are_accounted_for_in_overlay_ownership() {
         // Live handle to the node-agent's enrolled-pod registry (issue #4249):
         // installed by the mesh serving runtime, never Kubernetes-owned.
         inbound_relay_node_local_registry: _,
+        // ServiceWaypoint L7 bound-Service surface (issue #7500): materialized
+        // from the slice on every mesh apply, never Kubernetes-owned.
+        service_waypoint_l7_bindings: _,
     } = MeshConfig::default();
 
     // Every namespaced collection is visible to the ownership accounting.

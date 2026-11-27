@@ -147,6 +147,7 @@ mod mesh_peer_auth_live_reload_tests;
 mod mesh_proxy_config_tests;
 mod mesh_retry_rotation_tests;
 mod mesh_runtime_overlay_consumers_tests;
+mod mesh_service_waypoint_http_routes_tests;
 mod mesh_service_waypoint_tests;
 mod mesh_sidecar_e2e_tests;
 mod mesh_stock_xds_tests;

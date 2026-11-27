@@ -2342,6 +2342,7 @@ async fn fetch_remote_slice(
             remote_discovery: true,
             node_waypoint_capture_scoping: false,
             sidecar_http_routes: false,
+            service_waypoint_http_routes: false,
         };
         // Derive the expectation from the request actually sent, so the two can
         // never drift apart.

@@ -140,6 +140,7 @@ fn mesh_slice_is_per_namespace_and_policy_scoped() {
         ambient_udp_source_scoping: false,
         node_waypoint_capture_scoping: false,
         sidecar_http_routes: false,
+        service_waypoint_http_routes: false,
         waypoint_name: None,
     };
     let slice = MeshSlice::from_gateway_config(&gateway_config(), request);
@@ -277,6 +278,7 @@ fn service_entry_workload_selector_does_not_hide_visible_entry() {
         ambient_udp_source_scoping: false,
         node_waypoint_capture_scoping: false,
         sidecar_http_routes: false,
+        service_waypoint_http_routes: false,
         waypoint_name: None,
     };
 
@@ -576,6 +578,7 @@ fn slice_with_extension_configs(configs: Vec<MeshExtensionConfig>) -> MeshSlice 
         ambient_udp_source_scoping: false,
         node_waypoint_capture_scoping: false,
         sidecar_http_routes: false,
+        service_waypoint_http_routes: false,
         waypoint_name: None,
     };
     let config = GatewayConfig {

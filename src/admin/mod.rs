@@ -14921,16 +14921,29 @@ async fn handle_service_waypoint_services_get(
             &json!({"error": "service-waypoint topology not enabled"}),
         ));
     };
+    // The bound-Service L7 surface of the generation the proxy currently
+    // serves (issue #7500): read from the router's per-generation snapshot,
+    // never rebuilt here. Empty when no proxy runtime is wired.
+    let l7_routes = state
+        .proxy_state
+        .as_ref()
+        .map(|proxy_state| proxy_state.router_cache.service_waypoint_l7_routes());
     let services: Vec<serde_json::Value> = slice
         .services
         .iter()
         .map(|svc| {
             let ports: Vec<u16> = svc.ports.iter().map(|p| p.port).collect();
+            let l7 = l7_routes
+                .as_ref()
+                .map(|routes| routes.service_summary(&svc.namespace, &svc.name))
+                .unwrap_or_default();
             json!({
                 "namespace": svc.namespace,
                 "name": svc.name,
                 "ports": ports,
                 "workload_count": svc.workloads.len(),
+                "l7_http_ports": l7.l7_http_ports,
+                "virtual_service_route_count": l7.virtual_service_route_count,
             })
         })
         .collect();

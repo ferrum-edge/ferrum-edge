@@ -5581,6 +5581,23 @@ pub struct MeshConfig {
     #[serde(skip)]
     pub inbound_relay_node_local_registry:
         crate::modes::mesh::enrolled_destinations::NodeLocalEnrolledDestinationsHandle,
+    /// The ServiceWaypoint L7 surface materialized for this generation (issue
+    /// #7500): one record per HTTP-family port of a Service bound to THIS
+    /// waypoint that materialized a default L7 route and upstream. The router
+    /// builds `ServiceWaypointL7TargetIndex` and the per-bound-Service route
+    /// partitions from it once per generation.
+    ///
+    /// Derived only from explicit binding evidence
+    /// (`MeshSlice.service_waypoint_bound_services` for this runtime's exact
+    /// waypoint identity), never from the fail-open `services` view, and
+    /// independent of [`Self::inbound_relay_destinations`]: a carried
+    /// VirtualService route or split leg never adds a record. Assigned
+    /// UNCONDITIONALLY on every mesh apply (empty outside a ServiceWaypoint),
+    /// so an unbound Service leaves at once. `serde(skip)`: runtime-only,
+    /// never operator-settable and never on the `config_json` wire.
+    #[serde(skip)]
+    pub service_waypoint_l7_bindings:
+        Vec<crate::modes::mesh::service_waypoint_l7::ServiceWaypointL7Binding>,
 }
 
 /// One destination the authenticated inbound CONNECT terminator may relay to,
@@ -6691,6 +6708,7 @@ impl Default for MeshConfig {
             sidecar_inbound_http_app_ports: Vec::new(),
             sidecar_inbound_refuses_matched_http_connect: false,
             inbound_relay_node_local_registry: Default::default(),
+            service_waypoint_l7_bindings: Vec::new(),
         }
     }
 }
