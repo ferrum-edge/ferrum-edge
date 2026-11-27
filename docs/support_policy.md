@@ -42,9 +42,10 @@ From 1.0.0 onward:
 
 ## Before 1.0.0: build-out (`0.x` releases)
 
-Releases before 1.0.0 are built during active build-out. The repository's own
-engineering policy ([CLAUDE.md](../CLAUDE.md) "Build-Out Policy" and the
-path-scoped rules under `.claude/rules/`) states this directly:
+Releases before 1.0.0 are built during active build-out. The repository's
+engineering policy for those releases (summarized at the end of
+"Compatibility Policy" in [CLAUDE.md](../CLAUDE.md), which states the rules
+from 1.0.0 onward) was:
 
 - **Breaking changes are expected between `0.x` builds.** Configuration shapes,
   environment variable names, database values, admin API responses, and plugin
