@@ -12,7 +12,6 @@
 //! Every test uses a policy id unique to that test, because the registries are
 //! process-scoped and the unit suite runs tests in parallel.
 
-use chrono::Utc;
 use ferrum_edge::_test_support::{
     load_testing_with_policy_identity_for_test, request_deduplication_backdate_inflight_for_test,
     request_deduplication_with_instance_id_for_test,
@@ -88,8 +87,8 @@ fn plugin_config(
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 

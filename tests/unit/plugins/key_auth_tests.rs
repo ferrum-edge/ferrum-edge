@@ -1,6 +1,5 @@
 //! Tests for key_auth plugin
 
-use chrono::Utc;
 use ferrum_edge::ConsumerIndex;
 use ferrum_edge::config::types::{Consumer, default_namespace};
 use ferrum_edge::plugins::{
@@ -13,6 +12,7 @@ use std::collections::HashMap;
 use super::plugin_utils::{
     assert_continue, assert_reject, create_test_consumer, create_test_context,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const UNICODE_API_KEY: &str = "ユニコード-api-key-value-32chars-min";
 
@@ -60,8 +60,8 @@ fn create_unicode_key_consumer() -> Consumer {
         custom_id: None,
         credentials,
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -582,7 +582,6 @@ async fn test_key_auth_empty_key_does_not_match_any_consumer() {
     // empty `key` value, an empty header value must not authenticate as
     // that consumer. The plugin short-circuits empty/whitespace keys
     // before consulting the consumer index.
-    use chrono::Utc;
     use ferrum_edge::config::types::{Consumer, default_namespace};
     use serde_json::{Map, Value};
     use std::collections::HashMap;
@@ -606,8 +605,8 @@ async fn test_key_auth_empty_key_does_not_match_any_consumer() {
         custom_id: None,
         credentials,
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     let consumer_index = ConsumerIndex::new(&[consumer]);
 

@@ -18,7 +18,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use chrono::Utc;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -112,8 +111,8 @@ fn test_proxy() -> Proxy {
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }
@@ -128,8 +127,8 @@ fn audit_plugin_config(config: Value) -> PluginConfig {
         enabled: true,
         scope: PluginScope::Proxy,
         proxy_id: Some(PROXY_ID.to_string()),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         priority_override: None,
         trigger: None,
         api_spec_id: None,

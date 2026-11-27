@@ -2643,7 +2643,7 @@ fn materialize_node_waypoint_udp_listeners(
         cluster_ips: Vec<std::net::IpAddr>,
     }
     let mut by_port: BTreeMap<u16, Vec<Candidate>> = BTreeMap::new();
-    let now = chrono::Utc::now();
+    let now = crate::time_compat::UtcTimestamp::now();
 
     for service in &mesh_slice.services {
         for service_port in service_udp_stream_ports(service) {
@@ -2982,7 +2982,7 @@ fn node_waypoint_udp_listener_proxy(
     listen_port: u16,
     terminates_dtls: bool,
     protocol_label: &'static str,
-    now: chrono::DateTime<chrono::Utc>,
+    now: crate::time_compat::UtcTimestamp,
 ) -> Proxy {
     Proxy {
         labels: Default::default(),
@@ -3068,7 +3068,7 @@ fn node_waypoint_udp_listener_upstream(
     namespace: &str,
     targets: Vec<UpstreamTarget>,
     k8s_service_uid: Option<String>,
-    now: chrono::DateTime<chrono::Utc>,
+    now: crate::time_compat::UtcTimestamp,
 ) -> Upstream {
     Upstream {
         labels: Default::default(),
@@ -3445,7 +3445,7 @@ fn project_mesh_source_locality(
     // timestamp for any upstream whose FINAL (post-projection) content is
     // unchanged. So a fresh bump here is safe: it is the correct timestamp for a
     // genuinely changed upstream and is reconciled away for an unchanged one.
-    let bump = chrono::Utc::now();
+    let bump = crate::time_compat::UtcTimestamp::now();
 
     // Stamp the operator's strict local-first locality preference onto every
     // mesh upstream regardless of whether a source locality resolves: strict
@@ -3736,7 +3736,7 @@ fn mesh_source_workload_locality_resolution(mesh_slice: &MeshSlice) -> MeshSourc
 /// Mesh upstreams are FRESHLY MATERIALIZED on every slice apply: the
 /// materializers (`materialize_mesh_outbound_proxies`, the east-west / egress /
 /// inbound builders) each stamp `created_at`/`updated_at` with a per-apply
-/// `chrono::Utc::now()`, and `project_mesh_source_locality` then bumps
+/// `crate::time_compat::UtcTimestamp::now()`, and `project_mesh_source_locality` then bumps
 /// `updated_at` again whenever it stamps `source_locality`/`locality_lb_strict`
 /// onto an upstream that entered the projection with `source_locality = None`
 /// (which a freshly materialized upstream ALWAYS does). `ConfigDelta` keys
@@ -3936,9 +3936,15 @@ pub(crate) fn reconcile_runtime_overlay_plugin_generations(
         if plugin.updated_at != previous.updated_at {
             continue;
         }
-        let now = chrono::Utc::now();
+        let now = crate::time_compat::UtcTimestamp::now();
         plugin.updated_at = if now <= previous.updated_at {
-            previous.updated_at + chrono::Duration::nanoseconds(1)
+            // At the last representable instant the bump cannot advance; the
+            // reused stamp still reaches ConfigDelta's same-`updated_at`
+            // content comparison, so the change is not hidden.
+            previous
+                .updated_at
+                .checked_add(::time::SignedDuration::nanoseconds(1))
+                .unwrap_or(previous.updated_at)
         } else {
             now
         };
@@ -4004,8 +4010,7 @@ fn upstream_content_eq(a: &Upstream, b: &Upstream) -> bool {
     fn content_value(upstream: &Upstream) -> serde_json::Value {
         let mut normalized = upstream.clone();
         // Neutralize both timestamps so only the remaining fields drive equality.
-        let epoch =
-            chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap_or_else(chrono::Utc::now);
+        let epoch = crate::time_compat::UtcTimestamp::UNIX_EPOCH;
         normalized.created_at = epoch;
         normalized.updated_at = epoch;
         serde_json::to_value(&normalized).unwrap_or(serde_json::Value::Null)
@@ -5616,7 +5621,7 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                 }
             }
             None => {
-                let now = chrono::Utc::now();
+                let now = crate::time_compat::UtcTimestamp::now();
                 let plugin_id = weighted_split_dispatch_plugin_id(&proxy_id);
                 config.plugin_configs.push(PluginConfig {
                     labels: Default::default(),
@@ -7023,7 +7028,7 @@ pub fn warn_connection_sni_bare_service_fqdn(mesh_slice: &MeshSlice, cluster_dom
 }
 
 fn east_west_gateway_proxy(gateway: &EastWestGateway, listen_port: u16) -> Proxy {
-    let now = chrono::Utc::now();
+    let now = crate::time_compat::UtcTimestamp::now();
     Proxy {
         labels: Default::default(),
         id: mesh_east_west_proxy_id(&gateway.namespace, &gateway.name),
@@ -7119,7 +7124,7 @@ fn build_east_west_service_proxies_and_upstreams(
 ) -> (Vec<Proxy>, Vec<Upstream>) {
     let mut proxies = Vec::new();
     let mut upstreams = Vec::new();
-    let now = chrono::Utc::now();
+    let now = crate::time_compat::UtcTimestamp::now();
 
     for service in &mesh_slice.services {
         // Materialize ONE SNI-passthrough proxy per cross-cluster service port,
@@ -7612,7 +7617,7 @@ fn east_west_service_proxy(
     namespace: &str,
     upstream_id: &str,
     listen_port: u16,
-    now: chrono::DateTime<chrono::Utc>,
+    now: crate::time_compat::UtcTimestamp,
 ) -> Proxy {
     Proxy {
         labels: Default::default(),
@@ -8628,7 +8633,7 @@ fn materialize_sidecar_inbound_proxies(
         return;
     };
 
-    let now = chrono::Utc::now();
+    let now = crate::time_compat::UtcTimestamp::now();
     // The local workload(s) are this sidecar's own pods. A SPIFFE id alone is not
     // a unique key — multiple workloads can share a service account / SPIFFE id —
     // so when the sidecar's own labels are known (the slice carries them), also
@@ -9201,7 +9206,7 @@ fn materialize_sidecar_ingress_listener_proxies(
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
     local_spiffe: &str,
-    now: chrono::DateTime<chrono::Utc>,
+    now: crate::time_compat::UtcTimestamp,
 ) {
     // Single cold-path admission for this prepared generation. The surviving
     // set is written onto `mesh.local_ingress_listeners` so back-projection,
@@ -9595,7 +9600,7 @@ fn materialize_sidecar_ingress_dedicated_bind_proxies(
     listeners: &[&crate::modes::mesh::config::ResolvedIngressListener],
     bind_overrides: &std::collections::BTreeMap<u16, std::net::IpAddr>,
     local_spiffe: &str,
-    now: chrono::DateTime<chrono::Utc>,
+    now: crate::time_compat::UtcTimestamp,
 ) {
     if bind_overrides.is_empty() {
         return;
@@ -9730,7 +9735,7 @@ fn mesh_ingress_unix_upstream(
     listener_port: u16,
     socket_path: &str,
     h2c: bool,
-    now: chrono::DateTime<chrono::Utc>,
+    now: crate::time_compat::UtcTimestamp,
 ) -> Upstream {
     let mut tags = HashMap::new();
     tags.insert(
@@ -9795,7 +9800,7 @@ fn mesh_inbound_loopback_proxy(
     hosts: Vec<String>,
     namespace: &str,
     port: u16,
-    now: chrono::DateTime<chrono::Utc>,
+    now: crate::time_compat::UtcTimestamp,
 ) -> Proxy {
     mesh_inbound_loopback_proxy_to(id, hosts, namespace, "127.0.0.1", port, now)
 }
@@ -9809,7 +9814,7 @@ fn mesh_inbound_loopback_proxy_to(
     namespace: &str,
     backend_host: &str,
     port: u16,
-    now: chrono::DateTime<chrono::Utc>,
+    now: crate::time_compat::UtcTimestamp,
 ) -> Proxy {
     Proxy {
         labels: Default::default(),
@@ -9907,7 +9912,7 @@ pub(crate) fn mesh_inbound_tcp_relay_proxy(route: &MeshInboundTcpRoute) -> Proxy
         route.namespace, route.service_name, route.match_port
     )
     .replace(['/', '.'], "-");
-    let now = chrono::Utc::now();
+    let now = crate::time_compat::UtcTimestamp::now();
     Proxy {
         labels: Default::default(),
         id: id.clone(),
@@ -10038,7 +10043,7 @@ pub(crate) fn mesh_ingress_relay_proxy(host: &str, port: u16) -> Proxy {
 }
 
 fn mesh_inbound_connect_relay_proxy(id: &str, host: &str, port: u16) -> Proxy {
-    let now = chrono::Utc::now();
+    let now = crate::time_compat::UtcTimestamp::now();
     Proxy {
         labels: Default::default(),
         id: id.to_string(),
@@ -10195,7 +10200,7 @@ fn materialize_mesh_outbound_proxies(
         // and no plaintext outbound capture listener.
         _ => return,
     };
-    let now = chrono::Utc::now();
+    let now = crate::time_compat::UtcTimestamp::now();
     // Exclude remote-cluster endpoints: direct outbound HBONE targets a
     // destination service's LOCAL-cluster pods (remote clusters are reached via
     // the east-west gateway, not a per-pod HBONE tunnel). Classification is by
@@ -10498,7 +10503,7 @@ fn materialize_mesh_outbound_tcp_upstreams(
         _ => return,
     };
     let multi_cluster = mesh_slice.multi_cluster.as_ref();
-    let now = chrono::Utc::now();
+    let now = crate::time_compat::UtcTimestamp::now();
     let mut materialized = 0usize;
     for service in &mesh_slice.services {
         let tcp_ports = service_tcp_stream_ports(service);
@@ -10727,7 +10732,7 @@ fn materialize_mesh_outbound_udp_upstreams(
         _ => return,
     };
     let multi_cluster = mesh_slice.multi_cluster.as_ref();
-    let now = chrono::Utc::now();
+    let now = crate::time_compat::UtcTimestamp::now();
     let mut materialized = 0usize;
     for service in &mesh_slice.services {
         let udp_ports = service_udp_stream_ports(service);
@@ -11053,7 +11058,7 @@ fn materialize_mesh_external_udp_egress_upstreams(
 
     let mut routes: Vec<MeshExternalUdpEgressRoute> = Vec::new();
     let mut claimed: std::collections::HashSet<(String, u16)> = std::collections::HashSet::new();
-    let now = chrono::Utc::now();
+    let now = crate::time_compat::UtcTimestamp::now();
     let mut upstreams: Vec<Upstream> = Vec::new();
 
     'service_entries: for entry in &mesh_slice.service_entries {
@@ -11400,7 +11405,7 @@ fn mesh_outbound_tcp_relay_proxy_with_id(
     upstream_id: &str,
     scheme: BackendScheme,
 ) -> Proxy {
-    let now = chrono::Utc::now();
+    let now = crate::time_compat::UtcTimestamp::now();
     Proxy {
         labels: Default::default(),
         name: Some(format!("mesh egress {id}")),
@@ -12750,7 +12755,7 @@ fn mesh_outbound_route_proxy(
     hosts: Vec<String>,
     namespace: &str,
     upstream_id: &str,
-    now: chrono::DateTime<chrono::Utc>,
+    now: crate::time_compat::UtcTimestamp,
 ) -> Proxy {
     Proxy {
         labels: Default::default(),
@@ -12826,7 +12831,7 @@ fn mesh_outbound_route_proxy(
 
 fn mesh_outbound_http_bywl_route_proxy(
     spec: &MeshHttpBywlUpstreamSpec<'_>,
-    now: chrono::DateTime<chrono::Utc>,
+    now: crate::time_compat::UtcTimestamp,
 ) -> Proxy {
     let mut proxy = mesh_outbound_route_proxy(
         &spec.proxy_id,
@@ -12867,7 +12872,7 @@ fn mesh_outbound_route_upstream(
     service_fqdn: &str,
     targets: Vec<UpstreamTarget>,
     k8s_service_uid: Option<String>,
-    now: chrono::DateTime<chrono::Utc>,
+    now: crate::time_compat::UtcTimestamp,
 ) -> Upstream {
     Upstream {
         labels: Default::default(),
@@ -13038,7 +13043,7 @@ fn synthesize_mesh_outbound_cors_plugins(
             proxy.plugins.push(PluginAssociation {
                 plugin_config_id: plugin_id.clone(),
             });
-            let now = chrono::Utc::now();
+            let now = crate::time_compat::UtcTimestamp::now();
             synthesized.push(PluginConfig {
                 labels: Default::default(),
                 id: plugin_id,
@@ -15429,7 +15434,7 @@ fn build_egress_proxies_and_upstreams(
     // owns its own listen_port. Two SEs trying to bind the same port produce
     // a non-fatal skip (the second one warns).
     let mut materialized_stream_ports = std::collections::HashSet::new();
-    let now = chrono::Utc::now();
+    let now = crate::time_compat::UtcTimestamp::now();
 
     for entry in service_entries {
         if !service_entry_exported_to_namespace(entry, namespace) {
@@ -15875,7 +15880,7 @@ fn build_http_egress_for_entry(
     port_spec: &crate::modes::mesh::config::ServicePort,
     backend_scheme: BackendScheme,
     namespace: &str,
-    now: chrono::DateTime<chrono::Utc>,
+    now: crate::time_compat::UtcTimestamp,
     materialized_http_hosts: &mut std::collections::HashSet<String>,
     proxies: &mut Vec<Proxy>,
     upstreams: &mut Vec<Upstream>,
@@ -15969,7 +15974,7 @@ fn build_stream_egress_for_entry(
     port_spec: &crate::modes::mesh::config::ServicePort,
     backend_scheme: BackendScheme,
     namespace: &str,
-    now: chrono::DateTime<chrono::Utc>,
+    now: crate::time_compat::UtcTimestamp,
     mesh_reserved_ports: &std::collections::HashSet<u16>,
     allow_plaintext: bool,
     materialized_stream_ports: &mut std::collections::HashSet<u16>,
@@ -16139,7 +16144,7 @@ fn build_egress_upstream(
     service_entry_host: &str,
     namespace: &str,
     targets: Vec<UpstreamTarget>,
-    now: chrono::DateTime<chrono::Utc>,
+    now: crate::time_compat::UtcTimestamp,
 ) -> Upstream {
     Upstream {
         labels: Default::default(),
@@ -16462,7 +16467,7 @@ fn egress_gateway_proxy(
     namespace: &str,
     backend_scheme: Option<BackendScheme>,
     upstream_id: &str,
-    now: chrono::DateTime<chrono::Utc>,
+    now: crate::time_compat::UtcTimestamp,
 ) -> Proxy {
     Proxy {
         labels: Default::default(),
@@ -16557,7 +16562,7 @@ fn stream_egress_gateway_proxy(
     protocol: AppProtocol,
     upstream_id: &str,
     allow_plaintext: bool,
-    now: chrono::DateTime<chrono::Utc>,
+    now: crate::time_compat::UtcTimestamp,
 ) -> Proxy {
     let protocol_label = egress_app_protocol_label(protocol);
     Proxy {
@@ -17971,7 +17976,7 @@ fn scope_request_auth_to_node_waypoint_destinations(
         return refused_routes;
     }
 
-    let now = chrono::Utc::now();
+    let now = crate::time_compat::UtcTimestamp::now();
     let mut without_jwt_rules: Vec<(String, String)> = Vec::new();
     for ((namespace, selected), proxy_indices) in groups {
         let applicable: Vec<&MeshRequestAuthentication> =
@@ -18455,7 +18460,7 @@ fn ensure_global_plugin_inner(
     namespace: &str,
     force: bool,
 ) {
-    let now = chrono::Utc::now();
+    let now = crate::time_compat::UtcTimestamp::now();
     let mesh_plugin = PluginConfig {
         labels: Default::default(),
         id: id.to_string(),
@@ -29008,8 +29013,8 @@ mod tests {
             priority_override: None,
             trigger: None,
             api_spec_id: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: crate::time_compat::UtcTimestamp::now(),
+            updated_at: crate::time_compat::UtcTimestamp::now(),
         }
     }
 
@@ -29377,8 +29382,8 @@ mod tests {
             priority_override: None,
             trigger: None,
             api_spec_id: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: crate::time_compat::UtcTimestamp::now(),
+            updated_at: crate::time_compat::UtcTimestamp::now(),
         };
         let config = GatewayConfig {
             proxies: vec![udp_proxy],
@@ -29484,7 +29489,7 @@ mod tests {
             "default",
             "reviews-u",
             15443,
-            chrono::Utc::now(),
+            crate::time_compat::UtcTimestamp::now(),
         );
         let stream_egress = stream_egress_gateway_proxy(
             "stream-egress",
@@ -29495,7 +29500,7 @@ mod tests {
             AppProtocol::Mongo,
             "mongo-u",
             false,
-            chrono::Utc::now(),
+            crate::time_compat::UtcTimestamp::now(),
         );
 
         assert_mesh_l4_relay_disables_per_direction_timeouts(&inbound);
@@ -29512,7 +29517,7 @@ mod tests {
             "default",
             "127.0.0.1",
             8080,
-            chrono::Utc::now(),
+            crate::time_compat::UtcTimestamp::now(),
         );
         assert_eq!(http_inbound.backend_read_timeout_ms, 30_000);
         assert_eq!(http_inbound.backend_write_timeout_ms, 30_000);
@@ -29538,8 +29543,8 @@ mod tests {
             priority_override: None,
             trigger: None,
             api_spec_id: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: crate::time_compat::UtcTimestamp::now(),
+            updated_at: crate::time_compat::UtcTimestamp::now(),
         };
         // Scoped fail-closed is driven by mesh_authz plugin config with
         // per_pod_policy_scoping, not by MeshConfig.mesh_policies alone.
@@ -30523,7 +30528,7 @@ mod tests {
             mesh_service_host_variants("reviews", "default", "cluster.local"),
             "default",
             8080,
-            chrono::Utc::now(),
+            crate::time_compat::UtcTimestamp::now(),
         ));
         materialize_mesh_outbound_proxies(&mut config, &runtime, &slice);
         assert!(
@@ -30619,7 +30624,7 @@ mod tests {
             mesh_service_host_variants("reviews", "default", "cluster.local"),
             "default",
             9999,
-            chrono::Utc::now(),
+            crate::time_compat::UtcTimestamp::now(),
         ));
         materialize_mesh_outbound_proxies(&mut config, &ambient_runtime(), &slice);
         assert!(
@@ -30889,7 +30894,7 @@ mod tests {
             mesh_service_host_variants("reviews", "default", "cluster.local"),
             "default",
             7777,
-            chrono::Utc::now(),
+            crate::time_compat::UtcTimestamp::now(),
         ));
 
         materialize_sidecar_inbound_proxies(&mut config, &runtime, &slice);
@@ -30934,7 +30939,7 @@ mod tests {
             Vec::new(),
             "default",
             7777,
-            chrono::Utc::now(),
+            crate::time_compat::UtcTimestamp::now(),
         ));
 
         materialize_sidecar_inbound_proxies(&mut config, &runtime, &slice);
@@ -31520,7 +31525,7 @@ mod tests {
             mesh_service_host_variants("reviews", "default", "cluster.local"),
             "default",
             7777,
-            chrono::Utc::now(),
+            crate::time_compat::UtcTimestamp::now(),
         );
         host_only.listen_path = None;
         config.proxies.push(host_only);
@@ -31648,7 +31653,7 @@ mod tests {
             mesh_service_host_variants("reviews", "default", "cluster.local"),
             "default",
             7777,
-            chrono::Utc::now(),
+            crate::time_compat::UtcTimestamp::now(),
         );
         regex_route.listen_path = Some("~^/api/.*".to_string());
         config.proxies.push(regex_route);
@@ -31689,7 +31694,7 @@ mod tests {
             Vec::new(),
             "default",
             9000,
-            chrono::Utc::now(),
+            crate::time_compat::UtcTimestamp::now(),
         );
         tcp_proxy.listen_path = None;
         tcp_proxy.hosts = Vec::new();
@@ -32233,7 +32238,7 @@ mod tests {
     }
 
     fn destination_rule_test_upstream(id: &str, host: &str) -> Upstream {
-        let now = chrono::Utc::now();
+        let now = crate::time_compat::UtcTimestamp::now();
         Upstream {
             labels: Default::default(),
             id: id.to_string(),
@@ -35690,7 +35695,7 @@ mod tests {
     #[test]
     fn inject_mesh_global_plugins_removes_stale_outbound_registry_when_allow_any() {
         let runtime = test_mesh_runtime_config();
-        let now = chrono::Utc::now();
+        let now = crate::time_compat::UtcTimestamp::now();
         let mut config = GatewayConfig {
             plugin_configs: vec![crate::config::types::PluginConfig {
                 labels: Default::default(),
@@ -35729,7 +35734,7 @@ mod tests {
     #[test]
     fn mesh_managed_plugin_cleanup_is_namespace_qualified() {
         let runtime = test_mesh_runtime_config();
-        let now = chrono::Utc::now();
+        let now = crate::time_compat::UtcTimestamp::now();
         let mut config = GatewayConfig {
             plugin_configs: vec![
                 PluginConfig {
@@ -35791,7 +35796,7 @@ mod tests {
         runtime.outbound_listen_addr = "127.0.0.1:15001".parse().unwrap();
         runtime.outbound_traffic_policy =
             crate::modes::mesh::config::OutboundTrafficPolicy::RegistryOnly;
-        let now = chrono::Utc::now();
+        let now = crate::time_compat::UtcTimestamp::now();
         let mut config = GatewayConfig {
             plugin_configs: vec![crate::config::types::PluginConfig {
                 labels: Default::default(),
@@ -35850,7 +35855,7 @@ mod tests {
         let mut runtime = test_mesh_runtime_config();
         runtime.trusted_hbone_assertors =
             vec!["spiffe://cluster.local/ns/istio-system/sa/env-assertor".to_string()];
-        let now = chrono::Utc::now();
+        let now = crate::time_compat::UtcTimestamp::now();
         let mut config = GatewayConfig {
             plugin_configs: vec![crate::config::types::PluginConfig {
                 labels: Default::default(),
@@ -36003,7 +36008,7 @@ mod tests {
         let mut runtime = test_mesh_runtime_config();
         runtime.trusted_hbone_assertors =
             vec!["spiffe://cluster.local/ns/istio-system/sa/env-assertor".to_string()];
-        let now = chrono::Utc::now();
+        let now = crate::time_compat::UtcTimestamp::now();
         let mut config = GatewayConfig {
             plugin_configs: vec![crate::config::types::PluginConfig {
                 labels: Default::default(),
@@ -37607,13 +37612,8 @@ mod tests {
         // fresh wall-clock timestamp instead. Seed the upstream's `updated_at`
         // to `loaded_at` so a buggy clobber-to-`loaded_at` would be a no-op and
         // the assertion below would catch it.
-        // Upstream still stamps with chrono until its own #7419 phase.
-        let loaded_at = chrono::DateTime::<chrono::Utc>::from_timestamp(
-            config.loaded_at.unix_timestamp(),
-            config.loaded_at.subsec_nanos(),
-        )
-        .unwrap();
-        let before = chrono::Utc::now();
+        let loaded_at = config.loaded_at;
+        let before = crate::time_compat::UtcTimestamp::now();
         config.upstreams.push(Upstream {
             labels: Default::default(),
             id: "reviews".to_string(),
@@ -37686,7 +37686,9 @@ mod tests {
     fn fault_rtds_scope_change_creates_plugin_delta_without_touching_other_scopes() {
         use crate::modes::mesh::config::RuntimeValue;
 
-        let generation = chrono::Utc::now() - chrono::Duration::seconds(10);
+        let generation = crate::time_compat::UtcTimestamp::now()
+            .checked_sub(::time::SignedDuration::seconds(10))
+            .unwrap();
         let fault_config = crate::config::types::PluginConfig {
             labels: Default::default(),
             id: "fault-checkout".to_string(),
@@ -37795,7 +37797,9 @@ mod tests {
     fn fault_rtds_numeric_equivalence_preserves_plugin_generation() {
         use crate::modes::mesh::config::RuntimeValue;
 
-        let generation = chrono::Utc::now() - chrono::Duration::seconds(10);
+        let generation = crate::time_compat::UtcTimestamp::now()
+            .checked_sub(::time::SignedDuration::seconds(10))
+            .unwrap();
         let accepted = GatewayConfig {
             plugin_configs: vec![crate::config::types::PluginConfig {
                 labels: Default::default(),
@@ -37845,7 +37849,7 @@ mod tests {
     fn reconcile_test_upstream(
         id: &str,
         port: u16,
-        now: chrono::DateTime<chrono::Utc>,
+        now: crate::time_compat::UtcTimestamp,
     ) -> Upstream {
         Upstream {
             labels: Default::default(),
@@ -37912,7 +37916,7 @@ mod tests {
         let runtime = test_mesh_runtime_config();
 
         // First apply: materialize (fresh now) + project source locality.
-        let first_now = chrono::Utc::now();
+        let first_now = crate::time_compat::UtcTimestamp::now();
         let mut accepted = GatewayConfig::default();
         accepted
             .upstreams
@@ -37926,7 +37930,9 @@ mod tests {
         );
 
         // Second apply: a DIFFERENT fresh `now` (later wall clock), same content.
-        let second_now = first_now + chrono::Duration::seconds(5);
+        let second_now = first_now
+            .checked_add(::time::SignedDuration::seconds(5))
+            .unwrap();
         let mut candidate = GatewayConfig::default();
         candidate
             .upstreams
@@ -37965,14 +37971,16 @@ mod tests {
     /// so its LoadBalancer is rebuilt.
     #[test]
     fn reconcile_mesh_upstream_timestamps_real_change_keeps_modified_delta() {
-        let first_now = chrono::Utc::now();
+        let first_now = crate::time_compat::UtcTimestamp::now();
         let mut accepted = GatewayConfig::default();
         accepted
             .upstreams
             .push(reconcile_test_upstream("reviews", 8080, first_now));
 
         // Re-apply with a CHANGED target port and a fresh timestamp.
-        let second_now = first_now + chrono::Duration::seconds(5);
+        let second_now = first_now
+            .checked_add(::time::SignedDuration::seconds(5))
+            .unwrap();
         let mut candidate = GatewayConfig::default();
         candidate
             .upstreams
@@ -37999,8 +38007,10 @@ mod tests {
 
     #[test]
     fn reconcile_mesh_upstream_timestamps_is_namespace_qualified() {
-        let first_now = chrono::Utc::now();
-        let second_now = first_now + chrono::Duration::seconds(5);
+        let first_now = crate::time_compat::UtcTimestamp::now();
+        let second_now = first_now
+            .checked_add(::time::SignedDuration::seconds(5))
+            .unwrap();
         let mut tenant_a = reconcile_test_upstream("shared", 8080, first_now);
         tenant_a.namespace = "tenant-a".to_string();
         let mut tenant_b = reconcile_test_upstream("shared", 9090, first_now);
@@ -38049,7 +38059,7 @@ mod tests {
     fn reconcile_mesh_upstream_timestamps_fallback_only_change_keeps_modified_delta() {
         use crate::config::types::UpstreamPortOverride;
 
-        let first_now = chrono::Utc::now();
+        let first_now = crate::time_compat::UtcTimestamp::now();
         let mut accepted = GatewayConfig::default();
         let mut accepted_upstream = reconcile_test_upstream("reviews", 8080, first_now);
         accepted_upstream.dispatch_port_override_fallback = Some(UpstreamPortOverride {
@@ -38060,7 +38070,9 @@ mod tests {
 
         // Re-apply with a CHANGED top-level fallback (DR edit) and a fresh
         // timestamp; every SERIALIZED field is identical to the accepted upstream.
-        let second_now = first_now + chrono::Duration::seconds(5);
+        let second_now = first_now
+            .checked_add(::time::SignedDuration::seconds(5))
+            .unwrap();
         let mut candidate = GatewayConfig::default();
         let mut candidate_upstream = reconcile_test_upstream("reviews", 8080, second_now);
         candidate_upstream.dispatch_port_override_fallback = Some(UpstreamPortOverride {
@@ -38101,7 +38113,7 @@ mod tests {
     fn reconcile_mesh_upstream_timestamps_equal_fallback_yields_empty_delta() {
         use crate::config::types::UpstreamPortOverride;
 
-        let first_now = chrono::Utc::now();
+        let first_now = crate::time_compat::UtcTimestamp::now();
         let fallback = Some(UpstreamPortOverride {
             http1_max_pending_requests: Some(8),
             ..Default::default()
@@ -38111,7 +38123,9 @@ mod tests {
         accepted_upstream.dispatch_port_override_fallback = fallback.clone();
         accepted.upstreams.push(accepted_upstream);
 
-        let second_now = first_now + chrono::Duration::seconds(5);
+        let second_now = first_now
+            .checked_add(::time::SignedDuration::seconds(5))
+            .unwrap();
         let mut candidate = GatewayConfig::default();
         let mut candidate_upstream = reconcile_test_upstream("reviews", 8080, second_now);
         candidate_upstream.dispatch_port_override_fallback = fallback;
@@ -38190,9 +38204,11 @@ mod tests {
             ..MeshSlice::default()
         };
         let mut config = GatewayConfig::default();
-        config
-            .upstreams
-            .push(reconcile_test_upstream("reviews", 8080, chrono::Utc::now()));
+        config.upstreams.push(reconcile_test_upstream(
+            "reviews",
+            8080,
+            crate::time_compat::UtcTimestamp::now(),
+        ));
         let mut runtime = test_mesh_runtime_config();
         runtime.locality_lb_strict = false;
 
@@ -38366,8 +38382,8 @@ mod tests {
             backend_tls_refused: false,
             dispatch_port_override_fallback: None,
             api_spec_id: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: crate::time_compat::UtcTimestamp::now(),
+            updated_at: crate::time_compat::UtcTimestamp::now(),
             k8s_service_uid: None,
             admission_upstream_id: None,
             pending_limit_scope: None,
@@ -40161,8 +40177,8 @@ mod tests {
                     priority_override: Some(2005),
                     trigger: None,
                     api_spec_id: None,
-                    created_at: chrono::Utc::now(),
-                    updated_at: chrono::Utc::now(),
+                    created_at: crate::time_compat::UtcTimestamp::now(),
+                    updated_at: crate::time_compat::UtcTimestamp::now(),
                 };
                 let config = GatewayConfig {
                     plugin_configs: vec![existing],
@@ -40193,7 +40209,7 @@ mod tests {
     #[test]
     fn mesh_runtime_updates_mesh_managed_global_plugin_by_id() {
         let runtime = test_mesh_runtime_config();
-        let now = chrono::Utc::now();
+        let now = crate::time_compat::UtcTimestamp::now();
         // Reserved mesh IDs are illegal on the operator-input prepare boundary.
         // Re-injection against prior materializer output updates the existing
         // `(namespace, id)` row instead of duplicating it.
@@ -40339,7 +40355,7 @@ mod tests {
             },
         );
         // An operator-managed global of the same type must not suppress it.
-        let now = chrono::Utc::now();
+        let now = crate::time_compat::UtcTimestamp::now();
         let operator_termination = crate::config::types::PluginConfig {
             labels: Default::default(),
             id: "operator-termination".to_string(),
@@ -40429,7 +40445,7 @@ mod tests {
     #[test]
     fn request_auth_refusal_is_scoped_to_inbound_routes() {
         let runtime = test_mesh_runtime_config();
-        let now = chrono::Utc::now();
+        let now = crate::time_compat::UtcTimestamp::now();
         let mut config = GatewayConfig::default();
         for id in ["__mesh-inbound-api-8080", "__mesh-outbound-reviews-9080"] {
             config.proxies.push(node_waypoint_udp_listener_proxy(
@@ -40545,7 +40561,7 @@ mod tests {
     /// are refused per destination by `mesh_authz` instead (issue #6670).
     #[test]
     fn request_auth_refusal_scopes_to_synthesized_hbone_relays() {
-        let now = chrono::Utc::now();
+        let now = crate::time_compat::UtcTimestamp::now();
         for topology in [
             MeshTopology::Ambient,
             MeshTopology::NodeWaypoint,
@@ -47058,7 +47074,7 @@ mod tests {
             mesh_service_host_variants("reviews", "default", "cluster.local"),
             "default",
             7777,
-            chrono::Utc::now(),
+            crate::time_compat::UtcTimestamp::now(),
         ));
         materialize_sidecar_inbound_proxies(&mut config, &runtime, &slice);
         assert!(

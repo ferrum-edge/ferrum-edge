@@ -357,8 +357,8 @@ pub(crate) struct ApiSpecBackupItem {
     /// Aggregate digest of the external-`$ref` admission snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) external_ref_digest: Option<String>,
-    pub(crate) created_at: chrono::DateTime<chrono::Utc>,
-    pub(crate) updated_at: chrono::DateTime<chrono::Utc>,
+    pub(crate) created_at: crate::time_compat::UtcTimestamp,
+    pub(crate) updated_at: crate::time_compat::UtcTimestamp,
 }
 
 fn default_namespace() -> String {
@@ -1441,8 +1441,8 @@ mod tests {
             resource_hash: "abc".to_string(),
             external_ref_snapshot: None,
             external_ref_digest: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: crate::time_compat::UtcTimestamp::now(),
+            updated_at: crate::time_compat::UtcTimestamp::now(),
         };
         let item = ApiSpecBackupItem::from_api_spec(&spec);
         let restored = item.to_api_spec().expect("decode");
@@ -1509,8 +1509,8 @@ mod tests {
             resource_hash: "a".repeat(64),
             external_ref_snapshot_base64: None,
             external_ref_digest: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: crate::time_compat::UtcTimestamp::now(),
+            updated_at: crate::time_compat::UtcTimestamp::now(),
         }
     }
 

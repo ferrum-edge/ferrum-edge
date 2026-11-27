@@ -7183,7 +7183,7 @@ mod tests {
     use crate::config::types::{
         AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, ResponseBodyMode,
     };
-    use chrono::Utc;
+    use crate::time_compat::UtcTimestamp;
 
     /// A zero-limit re-sample timer that has already expired when it is first
     /// polled registers no wake-up. The driver must then ask for another poll
@@ -7314,7 +7314,7 @@ mod tests {
     /// Build a minimal `Proxy` for thread-local key tests. Uses HTTPS so the
     /// gRPC pool path is the realistic codepath (gRPC over TLS).
     fn grpc_pool_test_proxy() -> Proxy {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         Proxy {
             labels: Default::default(),
             id: "p-grpc".to_string(),

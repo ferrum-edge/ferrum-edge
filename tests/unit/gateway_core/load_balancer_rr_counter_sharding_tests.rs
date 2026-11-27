@@ -6,7 +6,6 @@
 //! RR at 1 vs 8 threads) with `.github/scripts/verify_rr_selection_benchmark.py`
 //! for the contention floor. These unit tests guard layout and selection parity.
 
-use chrono::Utc;
 use crossbeam_utils::CachePadded;
 use ferrum_edge::_test_support::{
     distribute_first_wave_bucket_mods_for_test, select_random_from_shard_for_test,
@@ -17,6 +16,7 @@ use ferrum_edge::config::types::{
     UpstreamPortOverride, UpstreamTarget,
 };
 use ferrum_edge::load_balancer::{LoadBalancer, LoadBalancerCache};
+use ferrum_edge::time_compat::UtcTimestamp;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -55,7 +55,7 @@ fn upstream_with_locality_lb(
     targets: Vec<UpstreamTarget>,
     setting: UpstreamLocalityLbSetting,
 ) -> Upstream {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     Upstream {
         labels: Default::default(),
         id: "u1".to_string(),
@@ -475,7 +475,7 @@ fn random_concurrent_selection_stays_near_even() {
 
 #[test]
 fn port_override_lane_round_robin_stays_even_under_concurrency() {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let mut port_overrides = HashMap::new();
     port_overrides.insert(
         8080,

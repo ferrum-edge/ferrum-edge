@@ -45,6 +45,7 @@ use ferrum_edge::proxy::auth_lifetime::{
 };
 use ferrum_edge::proxy::stream_error::StreamSetupKind;
 use ferrum_edge::retry::ErrorClass;
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const DEFAULT_MAX: u64 = 3_600;
 
@@ -57,8 +58,8 @@ fn consumer(username: &str) -> Arc<Consumer> {
         custom_id: None,
         credentials: std::collections::HashMap::new(),
         acl_groups: Vec::new(),
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     })
 }
 

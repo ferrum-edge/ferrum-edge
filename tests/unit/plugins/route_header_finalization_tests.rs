@@ -4,7 +4,6 @@
 //! rule first; the matched route list applies exactly once afterward so a
 //! later static add/update/remove/rename cannot undo route policy.
 
-use chrono::Utc;
 use ferrum_edge::_test_support::{
     apply_replaceable_after_proxy_hooks_to_rejection_for_test, plugins_for_protocol_for_test,
     run_after_proxy_hooks_for_test, run_before_proxy_hooks_for_test,
@@ -93,8 +92,8 @@ fn make_proxy(id: &str, plugin_ids: &[&str]) -> Proxy {
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }
@@ -118,8 +117,8 @@ fn plugin_config(
         priority_override,
         trigger,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 

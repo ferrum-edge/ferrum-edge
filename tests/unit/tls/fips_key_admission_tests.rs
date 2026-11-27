@@ -9,13 +9,13 @@
 //! is also the proof that an ordinary non-FIPS deployment is behaviourally
 //! unchanged by everything below.
 
-use chrono::Utc;
 use serde_json::json;
 
 use ferrum_edge::config::env_config::{DbTlsMode, EnvConfig};
 use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream};
 use ferrum_edge::fips::keys;
 use ferrum_edge::fips::policy;
+use ferrum_edge::time_compat::UtcTimestamp;
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -32,8 +32,8 @@ fn plugin(name: &str, config: serde_json::Value) -> PluginConfig {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 

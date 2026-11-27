@@ -47,8 +47,8 @@
 //! Nothing in this module logs, formats, or returns trust material. Errors name
 //! the offending field and index only.
 
+use crate::time_compat::UtcTimestamp;
 use arc_swap::ArcSwap;
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -191,10 +191,10 @@ pub struct GatewayTrustBundleRecord {
     /// JWT subject only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_by: Option<String>,
-    #[serde(default = "Utc::now")]
-    pub created_at: DateTime<Utc>,
-    #[serde(default = "Utc::now")]
-    pub updated_at: DateTime<Utc>,
+    #[serde(default = "UtcTimestamp::now")]
+    pub created_at: UtcTimestamp,
+    #[serde(default = "UtcTimestamp::now")]
+    pub updated_at: UtcTimestamp,
 }
 
 impl GatewayTrustBundleRecord {
@@ -206,7 +206,7 @@ impl GatewayTrustBundleRecord {
     /// transaction, so no construction site can seed a value that a later
     /// incarnation could repeat.
     pub fn new(namespace: &str, id: &str, bundle: TrustBundleSet) -> Self {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         Self {
             id: id.to_string(),
             trust_domain: bundle.local.trust_domain.to_string(),
@@ -685,7 +685,7 @@ pub struct GatewayTrustBundleSummary {
     pub x509_authority_count: usize,
     pub jwt_authority_count: usize,
     pub federated_count: usize,
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: UtcTimestamp,
 }
 
 /// Material-free identity of the trust state that actually reached the live

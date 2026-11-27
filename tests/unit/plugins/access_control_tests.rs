@@ -14,6 +14,7 @@ use std::sync::Arc;
 use super::plugin_utils::{
     assert_continue, assert_reject, commit_external_identity_with_authority, create_test_context,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 
 fn create_stream_context(
     consumer: Option<Arc<Consumer>>,
@@ -40,8 +41,8 @@ fn make_consumer_with_groups(username: &str, groups: Vec<&str>) -> Consumer {
         custom_id: None,
         credentials: HashMap::new(),
         acl_groups: groups.into_iter().map(String::from).collect(),
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -703,8 +704,8 @@ async fn test_access_control_stream_connect_allowed_consumer() {
         custom_id: None,
         credentials: HashMap::new(),
         acl_groups: Vec::new(),
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     })));
 
     let result = plugin.on_stream_connect(&mut ctx).await;
@@ -1829,8 +1830,8 @@ fn access_control_plugin_config(
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 

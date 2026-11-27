@@ -16,7 +16,6 @@ use crate::scaffolding::port_registry::TestSocket;
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use chrono::Utc;
 use ferrum_edge::backend_conn_limit::BackendConnectionLimiter;
 use ferrum_edge::config::PoolConfig;
 use ferrum_edge::config::types::{
@@ -30,6 +29,7 @@ use ferrum_edge::proxy::mesh_mtls_pool::{
     MESH_MTLS_GROWTH_PENDING_PER_CONNECTION, MeshMtlsConnectionPool, MeshMtlsRequestBody,
     MeshMtlsSender,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use ferrum_edge::tls::spiffe::build_spiffe_inbound_config;
 use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
@@ -116,7 +116,7 @@ fn svid_slot(bundle: SvidBundle) -> SharedSvidBundle {
 }
 
 fn proxy_for_test(max_connections: Option<u32>) -> Proxy {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let dispatch_port_overrides = max_connections.map(|cap| {
         let mut overrides = HashMap::new();
         overrides.insert(

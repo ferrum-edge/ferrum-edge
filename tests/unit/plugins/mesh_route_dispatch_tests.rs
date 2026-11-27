@@ -6,13 +6,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use chrono::Utc;
 use ferrum_edge::config::types::{
     BackendTlsConfig, GatewayConfig, PluginConfig, PluginScope, Proxy, ResolvedPortOverride,
     RetryConfig, Upstream, UpstreamPortOverride,
 };
 use ferrum_edge::plugins::mesh_route_dispatch::MeshRouteDispatch;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
+use ferrum_edge::time_compat::UtcTimestamp;
 use serde_json::json;
 
 fn test_proxy() -> Arc<Proxy> {
@@ -77,8 +77,8 @@ fn mesh_route_plugin_config(config: serde_json::Value) -> PluginConfig {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 

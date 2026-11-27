@@ -3,7 +3,6 @@
 use crate::scaffolding::port_registry::TestSocket;
 
 use arc_swap::ArcSwap;
-use chrono::Utc;
 use ferrum_edge::admin::audit::{self, list_local_fallback_events};
 use ferrum_edge::admin::{
     AdminState,
@@ -106,13 +105,13 @@ fn jwt_manager() -> JwtManager {
 }
 
 fn token(subject: &str, role: Option<&str>) -> String {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let mut claims = json!({
         "iss": JWT_ISSUER,
         "sub": subject,
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(3600)).unwrap()).unix_timestamp(),
         "jti": uuid::Uuid::new_v4().to_string(),
     });
     if let Some(role) = role {
@@ -129,15 +128,15 @@ fn token(subject: &str, role: Option<&str>) -> String {
 /// Mint an admin token carrying an `ns` claim so the namespace-claim gate can
 /// be exercised without touching process-global environment state.
 fn token_with_ns(subject: &str, ns: &str) -> String {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "iss": JWT_ISSUER,
         "sub": subject,
         "role": "admin",
         "ns": ns,
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(3600)).unwrap()).unix_timestamp(),
         "jti": uuid::Uuid::new_v4().to_string(),
     });
     encode(
@@ -286,8 +285,8 @@ fn create_test_proxy(id: &str, listen_path: &str) -> Proxy {
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }
@@ -306,8 +305,8 @@ fn sample_cached_config() -> GatewayConfig {
             custom_id: None,
             credentials,
             acl_groups: Vec::new(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         }],
         plugin_configs: vec![],
         upstreams: vec![],

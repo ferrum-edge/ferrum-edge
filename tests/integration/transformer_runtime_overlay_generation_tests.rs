@@ -30,7 +30,6 @@
 
 use std::collections::HashMap;
 
-use chrono::Utc;
 use serde_json::{Value, json};
 
 use ferrum_edge::_test_support::materialize_transformer_runtime_overlay_for_test;
@@ -125,8 +124,8 @@ fn test_proxy(id: &str, plugin_ids: &[&str]) -> Proxy {
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }
@@ -141,8 +140,8 @@ fn plugin_config(id: &str, plugin_name: &str, config: Value) -> PluginConfig {
         enabled: true,
         scope: PluginScope::Proxy,
         proxy_id: Some("gated".to_string()),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         priority_override: None,
         trigger: None,
         api_spec_id: None,

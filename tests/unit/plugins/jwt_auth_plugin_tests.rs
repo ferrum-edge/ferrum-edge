@@ -17,6 +17,7 @@ use super::plugin_utils::{
     context_with_materialized_raw_header_bytes, context_with_materialized_raw_header_lines,
     create_test_consumer,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 
 fn make_ctx() -> RequestContext {
     RequestContext::new(
@@ -731,8 +732,8 @@ fn make_consumer_with_jwt_secrets(secrets: &[&str]) -> Consumer {
         custom_id: Some("custom-123".to_string()),
         credentials,
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -1289,8 +1290,8 @@ fn consumer_with_jwt_secret(id: &str, username: &str, secret: &str) -> Consumer 
         custom_id: None,
         credentials,
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 

@@ -15,10 +15,10 @@
 //! * `transaction_log_schema` rejects non-global scopes via
 //!   `GatewayConfig::validate_plugin_references`.
 
-use chrono::Utc;
 use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope};
 use ferrum_edge::plugins::create_plugin;
 use ferrum_edge::plugins::utils::log_schema::registry;
+use ferrum_edge::time_compat::UtcTimestamp;
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -63,8 +63,8 @@ fn graph_plugin(id: &str, namespace: &str, plugin_name: &str, config: Value) -> 
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -760,7 +760,6 @@ fn failed_cache_build_does_not_leak_registry_changes() {
     // a downstream plugin fails to construct, the named-schema registry
     // must still reflect the LAST successfully-applied config — not the
     // staging that was being built for the rejected reload.
-    use chrono::Utc;
     use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope};
     use ferrum_edge::plugin_cache::PluginCache;
 
@@ -779,8 +778,8 @@ fn failed_cache_build_does_not_leak_registry_changes() {
             priority_override: None,
             trigger: None,
             api_spec_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         }
     }
 
@@ -799,8 +798,8 @@ fn failed_cache_build_does_not_leak_registry_changes() {
             priority_override: None,
             trigger: None,
             api_spec_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         }
     }
 

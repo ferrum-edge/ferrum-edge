@@ -1,6 +1,5 @@
 //! Tests for statsd_logging plugin
 
-use chrono::Utc;
 use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope};
 use ferrum_edge::plugin_cache::PluginCache;
 use ferrum_edge::plugins::utils::ByteBudget;
@@ -26,6 +25,7 @@ use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
 use super::plugin_utils::{create_test_context, create_test_transaction_summary};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 fn default_client() -> PluginHttpClient {
     PluginHttpClient::default()
@@ -543,8 +543,8 @@ fn test_statsd_logging_disabled_config_skips_construction_validation() {
             priority_override: None,
             trigger: None,
             api_spec_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         }],
         ..GatewayConfig::default()
     };
@@ -579,8 +579,8 @@ async fn test_statsd_logging_keeps_last_known_good_on_file_mode_load_and_cache_r
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     let mut bad_gateway = GatewayConfig {
         proxies: vec![proxy.clone()],

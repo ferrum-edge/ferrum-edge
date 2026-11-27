@@ -17,7 +17,6 @@
 //! cannot diverge; the tests below assert that parity directly rather than
 //! per protocol.
 
-use chrono::Utc;
 use ferrum_edge::config::types::{
     GatewayConfig, LoadBalancerAlgorithm, SubsetDefinition, Upstream, UpstreamPortOverride,
     UpstreamTarget,
@@ -26,6 +25,7 @@ use ferrum_edge::health_check::ActiveUnhealthyTargets;
 use ferrum_edge::load_balancer::{
     HealthContext, LoadBalancer, LoadBalancerCache, sticky_session_token, target_key,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -733,7 +733,7 @@ fn subset_indexed_path_filters_tiers_with_a_present_empty_health_context() {
 /// is only wired through the config-driven `LoadBalancerCache`, so the balancer
 /// is built the way production builds it.
 fn lb_with_port_override(targets: Vec<UpstreamTarget>, port: u16) -> Arc<LoadBalancer> {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let mut port_overrides = HashMap::new();
     port_overrides.insert(
         port,

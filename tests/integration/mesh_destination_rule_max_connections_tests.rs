@@ -18,7 +18,6 @@
 
 use std::collections::HashMap;
 
-use chrono::Utc;
 use ferrum_edge::_test_support::{
     resolve_backend_connection_proxy_for_target, resolve_backend_max_connections,
 };
@@ -39,6 +38,7 @@ use ferrum_edge::modes::mesh::{
     prepare_gateway_config_via_mesh_slice_with_fixtures,
 };
 use ferrum_edge::proxy::ProxyState;
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const HOST_FQDN: &str = "ws.default.svc.cluster.local";
 
@@ -130,7 +130,7 @@ fn runtime() -> MeshRuntimeConfig {
 /// 8080 leaves 9090 unbounded — the same "phantom / unconfigured port stays
 /// unbounded" contract the dispatch path relies on.
 fn ws_upstream(id: &str) -> Upstream {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     Upstream {
         labels: Default::default(),
         id: id.to_string(),

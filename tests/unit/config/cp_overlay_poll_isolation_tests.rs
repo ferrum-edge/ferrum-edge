@@ -13,7 +13,6 @@ use std::thread;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use chrono::Utc;
 use ferrum_edge::_test_support::{
     CpPublicationGate, K8sOverlaySlot, capture_configsync_snapshot_coverage_for_test,
     cas_publish_db_snapshot_with_k8s_overlay_for_test, cas_publish_incremental_partitions_for_test,
@@ -117,8 +116,8 @@ fn make_proxy(id: &str, namespace: &str) -> Proxy {
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }

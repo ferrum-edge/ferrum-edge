@@ -14,7 +14,6 @@ use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use chrono::Utc;
 use ferrum_edge::_test_support::prepare_audit_intent_with_barriers_for_test;
 use ferrum_edge::admin::audit::{
     AuditActor, AuditDurabilityMode, AuditEvent, AuditEventDelivery, AuditOutcome, AuditPipeline,
@@ -31,6 +30,7 @@ use ferrum_edge::admin::audit_spool::{
 };
 use ferrum_edge::admin::jwt_auth::AdminRole;
 use ferrum_edge::grpc::auth::AllowedNamespaces;
+use ferrum_edge::time_compat::UtcTimestamp;
 use serde_json::json;
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -44,7 +44,7 @@ const TEST_DESTINATION: &str = "sqlite:ferrum:0123456789abcdef0123456789abcdef";
 fn event_with(id: &str, diff: serde_json::Value) -> AuditEvent {
     AuditEvent {
         id: id.to_string(),
-        ts: Utc::now(),
+        ts: UtcTimestamp::now(),
         actor: "audit-user".to_string(),
         action: "update".to_string(),
         resource_type: "proxy".to_string(),
@@ -2012,10 +2012,12 @@ fn db_less_retention_keeps_the_newest_by_timestamp_not_delivery_order() {
         max_records: 2,
         ..LocalAuditRetentionBounds::default()
     };
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let at = |offset_secs: i64| {
         let mut event = event();
-        event.ts = now + chrono::TimeDelta::seconds(offset_secs);
+        event.ts = now
+            .checked_add(::time::SignedDuration::seconds(offset_secs))
+            .unwrap();
         event
     };
     let (a, b, c, d) = (at(-1), at(0), at(1), at(2));

@@ -37,6 +37,7 @@
 //!   live-backend gap. See Round 8 P2 documenting comment for context on why
 //!   this is deferred.
 
+use ferrum_edge::time_compat::UtcTimestamp;
 use ferrum_edge::{
     ExtractedBundle, GatewayConfig,
     admin::api_specs::{EffectiveExternalRefPolicy, ExternalRefSnapshot},
@@ -149,8 +150,8 @@ fn make_plugin(
         priority_override: None,
         trigger: None,
         api_spec_id: api_spec_id.map(str::to_string),
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -183,8 +184,8 @@ fn make_spec(id: &str, proxy_id: &str, namespace: &str, content: &[u8]) -> ApiSp
         resource_hash: String::new(),
         external_ref_snapshot: None,
         external_ref_digest: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -350,9 +351,7 @@ async fn list_spec_owned_plugin_configs_orders_by_created_at_then_id() {
     let spec_id = uid("spec");
     let mut proxy = make_proxy(&proxy_id, ns);
 
-    let timestamp = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
+    let timestamp = "2026-01-01T00:00:00Z".parse::<UtcTimestamp>().unwrap();
     let mut plugin_b = make_plugin("plugin-b", &proxy_id, ns, None);
     let mut plugin_a = make_plugin("plugin-a", &proxy_id, ns, None);
     for plugin in [&mut plugin_b, &mut plugin_a] {
@@ -571,12 +570,8 @@ async fn restore_bundle_preserves_complete_owned_and_hand_added_graph() {
     let spec_plugin_id = uid("restore-owned-plugin");
     let additional_plugin_id = uid("restore-hand-plugin");
     let spec_id = uid("restore-spec");
-    let created_at = chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
-        .unwrap()
-        .to_utc();
-    let updated_at = chrono::DateTime::parse_from_rfc3339("2026-02-03T04:05:06Z")
-        .unwrap()
-        .to_utc();
+    let created_at = "2026-01-02T03:04:05Z".parse::<UtcTimestamp>().unwrap();
+    let updated_at = "2026-02-03T04:05:06Z".parse::<UtcTimestamp>().unwrap();
 
     let mut proxy = make_proxy(&proxy_id, ns);
     proxy.api_spec_id = Some(spec_id.clone());
@@ -1163,7 +1158,10 @@ async fn restore_bundle_rejects_recreated_additional_upstream_identity() {
         .await
         .expect("create intervening replacement upstream");
     let mut pre_delete_upstream = recreated_upstream.clone();
-    pre_delete_upstream.created_at = recreated_upstream.created_at - chrono::Duration::seconds(1);
+    pre_delete_upstream.created_at = recreated_upstream
+        .created_at
+        .checked_sub(::time::SignedDuration::seconds(1))
+        .unwrap();
 
     let mut proxy = make_proxy(&proxy_id, ns);
     proxy.api_spec_id = Some(spec_id.clone());
@@ -1903,8 +1901,8 @@ async fn replace_api_spec_bundle_does_not_delete_same_api_spec_id_in_other_names
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     store
         .create_plugin_config(&other_plugin)
@@ -2323,8 +2321,8 @@ async fn delete_api_spec_does_not_delete_same_api_spec_id_in_other_namespace() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     store
         .create_plugin_config(&other_plugin)
@@ -2396,8 +2394,8 @@ async fn delete_api_spec_cleans_orphaned_proxy_group_plugin() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     store
         .create_plugin_config(&proxy_group_plugin)
@@ -2504,7 +2502,7 @@ async fn delete_api_spec_rejects_removing_last_global_tcp_throttle_target() {
         .create_proxy(&make_proxy(&http_proxy_id, ns))
         .await
         .unwrap();
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     store
         .create_plugin_config(&PluginConfig {
             labels: Default::default(),
@@ -2915,8 +2913,8 @@ async fn replace_with_changed_resources_keeps_hand_added_plugins() {
         .expect("proxy must still exist after replace");
     assert_eq!(proxy_after.id, proxy_id, "proxy id must be unchanged");
     assert_eq!(
-        proxy_after.created_at.timestamp(),
-        created_at_before.timestamp(),
+        proxy_after.created_at.unix_timestamp(),
+        created_at_before.unix_timestamp(),
         "proxy created_at must be unchanged after replace (proxy updated in place)"
     );
 }
@@ -3007,8 +3005,8 @@ fn make_spec_with_metadata(
         resource_hash,
         external_ref_snapshot: None,
         external_ref_digest: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
 
     (bundle, spec)
@@ -3053,8 +3051,8 @@ fn make_spec_from_openapi_body(
         resource_hash,
         external_ref_snapshot: None,
         external_ref_digest: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
 
     (bundle, spec)
@@ -3190,8 +3188,8 @@ async fn submit_truncates_long_description_at_4kib() {
         resource_hash,
         external_ref_snapshot: None,
         external_ref_digest: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
 
     store
@@ -3272,8 +3270,8 @@ async fn swagger_2_0_server_urls_constructed_from_schemes_host_basepath() {
         resource_hash,
         external_ref_snapshot: None,
         external_ref_digest: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
 
     store
@@ -3350,8 +3348,8 @@ async fn replace_with_unchanged_resources_skips_proxy_write() {
         resource_hash: resource_hash1.clone(),
         external_ref_snapshot: None,
         external_ref_digest: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
 
     store
@@ -3393,7 +3391,7 @@ async fn replace_with_unchanged_resources_skips_proxy_write() {
         "resource_hash must match when bundle is identical"
     );
 
-    let now2 = chrono::Utc::now();
+    let now2 = UtcTimestamp::now();
     let spec2 = ApiSpec {
         id: spec_id.clone(),
         namespace: ns.to_string(),
@@ -3433,8 +3431,8 @@ async fn replace_with_unchanged_resources_skips_proxy_write() {
         .expect("get_proxy failed")
         .expect("proxy not found");
     assert_eq!(
-        proxy_after.updated_at.timestamp(),
-        proxy_updated_at_before.timestamp(),
+        proxy_after.updated_at.unix_timestamp(),
+        proxy_updated_at_before.unix_timestamp(),
         "proxy.updated_at must not change when bundle is unchanged"
     );
 
@@ -3500,8 +3498,8 @@ async fn replace_with_changed_resources_updates_proxy() {
         resource_hash: resource_hash1.clone(),
         external_ref_snapshot: None,
         external_ref_digest: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
 
     store
@@ -3536,7 +3534,7 @@ async fn replace_with_changed_resources_updates_proxy() {
         "resource_hash must differ when proxy backend_host changes"
     );
 
-    let now2 = chrono::Utc::now();
+    let now2 = UtcTimestamp::now();
     let spec2 = ApiSpec {
         id: spec_id.clone(),
         namespace: ns.to_string(),
@@ -3698,8 +3696,8 @@ async fn list_filter_spec_version_prefix() {
         resource_hash: rh32,
         external_ref_snapshot: None,
         external_ref_digest: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     store.submit_api_spec_bundle(&b32, &s32).await.unwrap();
 
@@ -3785,7 +3783,9 @@ async fn list_filter_updated_since() {
 
     // The cutoff is "right now" — both specs were inserted just before this,
     // so updated_since = now means 0 results.
-    let cutoff = chrono::Utc::now() + chrono::Duration::seconds(1);
+    let cutoff = UtcTimestamp::now()
+        .checked_add(::time::SignedDuration::seconds(1))
+        .unwrap();
     let filter = ApiSpecListFilter {
         updated_since: Some(cutoff),
         limit: 100,
@@ -3803,7 +3803,9 @@ async fn list_filter_updated_since() {
     );
 
     // With past cutoff, all specs are returned.
-    let past_cutoff = chrono::Utc::now() - chrono::Duration::hours(1);
+    let past_cutoff = UtcTimestamp::now()
+        .checked_sub(::time::SignedDuration::hours(1))
+        .unwrap();
     let filter2 = ApiSpecListFilter {
         updated_since: Some(past_cutoff),
         limit: 100,
@@ -4255,8 +4257,8 @@ async fn replace_with_changed_resources_keeps_manual_proxy_plugin_association() 
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     store
         .create_plugin_config(&manual_plugin)
@@ -4362,8 +4364,8 @@ async fn replace_removes_removed_spec_declared_external_proxy_plugin_association
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     store
         .create_plugin_config(&group_plugin)
@@ -4472,7 +4474,7 @@ async fn replace_metadata_only_shortcut_fails_when_api_specs_row_missing() {
     let (bundle_put, mut spec_put) =
         make_spec_with_metadata(&spec_id, &proxy_id, ns, "Dangling API", "0", &[]);
     spec_put.description = Some("metadata-only PUT with unchanged resources".to_string());
-    spec_put.updated_at = chrono::Utc::now();
+    spec_put.updated_at = UtcTimestamp::now();
 
     let err = store
         .replace_api_spec_bundle(&bundle_put, &spec_put)
@@ -4566,7 +4568,7 @@ async fn replace_same_hash_reconciles_drifted_spec_owned_proxy() {
         .expect("get_proxy failed")
         .expect("proxy must exist");
     drifted_proxy.backend_host = "drifted.internal".to_string();
-    drifted_proxy.updated_at = chrono::Utc::now();
+    drifted_proxy.updated_at = UtcTimestamp::now();
     store
         .update_proxy(&drifted_proxy)
         .await
@@ -4716,7 +4718,7 @@ async fn delete_api_spec_rolls_back_when_spec_owned_upstream_id_fails_to_decode(
 
     // External enabled mesh_route_dispatch naming the spec-owned upstream —
     // the reference the guard must not skip when ID decode fails.
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     store
         .create_plugin_config(&PluginConfig {
             labels: Default::default(),
@@ -4919,7 +4921,7 @@ async fn put_overwrites_imported_updated_at_so_polling_picks_change() {
 
     // Build a replacement bundle with a *fresh* server-side timestamp (simulating
     // what assign_ids_for_put stamps before the bundle reaches the DB).
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let mut proxy_v2 = make_proxy(&proxy_id, ns);
     proxy_v2.updated_at = now; // server-side stamp (fresh)
     proxy_v2.created_at = proxy_after_submit.created_at; // preserved from original
@@ -4956,9 +4958,7 @@ async fn put_overwrites_imported_updated_at_so_polling_picks_change() {
     );
 
     // Now demonstrate the failure mode: replace with a deliberately-stale timestamp.
-    let epoch = chrono::DateTime::parse_from_rfc3339("1970-01-01T00:00:00Z")
-        .unwrap()
-        .to_utc();
+    let epoch = "1970-01-01T00:00:00Z".parse::<UtcTimestamp>().unwrap();
     let mut proxy_stale = make_proxy(&proxy_id, ns);
     proxy_stale.updated_at = epoch; // operator-embedded stale timestamp (NOT overwritten)
     proxy_stale.plugins = vec![];
@@ -5506,8 +5506,8 @@ async fn concurrent_put_same_spec_resource_hash_idempotent() {
     let (bundle_put_b, mut spec_put_b) =
         make_spec_with_metadata(&spec_id, &proxy_id, ns, "Idempotent API", "0", &[]);
     // The api_specs row always gets a fresh updated_at, but the proxy row does not.
-    spec_put_a.updated_at = chrono::Utc::now();
-    spec_put_b.updated_at = chrono::Utc::now();
+    spec_put_a.updated_at = UtcTimestamp::now();
+    spec_put_b.updated_at = UtcTimestamp::now();
 
     let store_a = store.clone();
     let store_b = store.clone();

@@ -2,7 +2,6 @@
 //!
 //! Tests for backend mutual TLS authentication using client certificates
 
-use chrono::Utc;
 use ferrum_edge::config::PoolConfig;
 use ferrum_edge::config::env_config::{EnvConfig, OperatingMode};
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, Proxy};
@@ -25,6 +24,7 @@ use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::file_mode_yaml_for_backend_with;
 use crate::scaffolding::harness::GatewayHarness;
 use crate::scaffolding::ports::reserve_port;
+use ferrum_edge::time_compat::UtcTimestamp;
 
 /// Create a test proxy with mTLS configuration
 fn create_test_mtls_proxy() -> Proxy {
@@ -92,8 +92,8 @@ fn create_test_mtls_proxy() -> Proxy {
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }

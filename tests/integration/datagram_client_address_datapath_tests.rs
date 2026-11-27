@@ -32,7 +32,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::Utc;
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, watch};
 
@@ -182,8 +181,8 @@ fn udp_proxy(listen_port: u16, backend_port: u16) -> Proxy {
         allowed_methods: None,
         allowed_ws_origins: vec![],
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }

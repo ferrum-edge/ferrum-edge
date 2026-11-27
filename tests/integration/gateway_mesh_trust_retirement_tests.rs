@@ -12,7 +12,6 @@ use crate::scaffolding::port_registry::TestSocket;
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use chrono::Utc;
 use ferrum_edge::config::PoolConfig;
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, Proxy, ResponseBodyMode};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
@@ -29,6 +28,7 @@ use ferrum_edge::proxy::mesh_trust_registry::{
     MeshTransportGate, MeshTransportKind, MeshTrustRegistry, TrustWithdrawalReason,
     trust_withdrawal_reason,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use ferrum_edge::tls::spiffe::build_spiffe_inbound_config;
 use http::{Request, Response, StatusCode};
 use http_body_util::Full;
@@ -126,7 +126,7 @@ fn trust_view_with_jwt(td: &str, key_id: &str, public_key_pem: &str) -> TrustBun
 }
 
 fn proxy_for_test() -> Proxy {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     Proxy {
         labels: Default::default(),
         id: "gateway-mesh-trust".to_string(),

@@ -13,6 +13,7 @@ use ferrum_edge::config::store_policy::{
     mesh_route_dispatch_references_upstream_id, store_canonical_resource_hash,
 };
 use ferrum_edge::config::types::{Consumer, PluginConfig, PluginScope, Proxy};
+use ferrum_edge::time_compat::UtcTimestamp;
 use serde_json::{Value, json};
 use std::collections::HashSet;
 
@@ -25,13 +26,13 @@ fn consumer(id: &str, username: &str, custom_id: Option<&str>) -> Consumer {
         custom_id: custom_id.map(str::to_string),
         credentials: Default::default(),
         acl_groups: Vec::new(),
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
 fn plugin(plugin_name: &str, enabled: bool, config: Value) -> PluginConfig {
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     PluginConfig {
         labels: Default::default(),
         id: "pc-1".to_string(),

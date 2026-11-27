@@ -3365,12 +3365,12 @@ mod tests {
     use crate::config::types::{
         AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, ResponseBodyMode,
     };
-    use chrono::Utc;
+    use crate::time_compat::UtcTimestamp;
 
     /// Build a minimal `Proxy` for thread-local key tests. Uses HTTPS so the
     /// direct H2 pool path is the realistic codepath.
     fn http2_pool_test_proxy() -> Proxy {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         Proxy {
             labels: Default::default(),
             id: "p-h2".to_string(),

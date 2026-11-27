@@ -735,7 +735,6 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
 /// (`PluginCacheRequestView::stamp_route_body_policy`) for a proxy whose
 /// plugin chain is exactly `plugins` (`(name, config)` pairs).
 fn route_stamped_ctx(plugins: &[(&str, serde_json::Value)]) -> RequestContext {
-    use chrono::Utc;
     use ferrum_edge::config::types::{
         GatewayConfig, PluginAssociation, PluginConfig, PluginScope, default_namespace,
     };
@@ -756,8 +755,8 @@ fn route_stamped_ctx(plugins: &[(&str, serde_json::Value)]) -> RequestContext {
             priority_override: None,
             trigger: None,
             api_spec_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         })
         .collect();
     proxy.plugins = plugin_configs

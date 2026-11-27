@@ -1066,8 +1066,8 @@ struct HboneProbeTarget<'a> {
     is_udp: bool,
 }
 
-fn gateway_managed_plugin_timestamp() -> chrono::DateTime<chrono::Utc> {
-    chrono::DateTime::from_timestamp(0, 0).unwrap_or_else(chrono::Utc::now)
+fn gateway_managed_plugin_timestamp() -> crate::time_compat::UtcTimestamp {
+    crate::time_compat::UtcTimestamp::UNIX_EPOCH
 }
 
 fn gateway_svid_spiffe_id(slot: &SharedSvidBundle) -> Option<String> {
@@ -13992,8 +13992,7 @@ impl ProxyState {
 
             fn content_value(upstream: &Upstream) -> Option<serde_json::Value> {
                 let mut normalized = upstream.clone();
-                let epoch = chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0)
-                    .unwrap_or_else(chrono::Utc::now);
+                let epoch = crate::time_compat::UtcTimestamp::UNIX_EPOCH;
                 normalized.created_at = epoch;
                 normalized.updated_at = epoch;
                 serde_json::to_value(&normalized).ok()
@@ -76423,7 +76422,7 @@ mod tests {
     fn route_delta_proxy(
         id: &str,
         dispatch_kind: DispatchKind,
-        updated_at: chrono::DateTime<chrono::Utc>,
+        updated_at: crate::time_compat::UtcTimestamp,
     ) -> Proxy {
         let mut proxy = test_proxy(ResponseBodyMode::Stream);
         proxy.id = id.to_string();
@@ -76457,7 +76456,7 @@ mod tests {
         }
     }
 
-    fn route_delta_upstream(updated_at: chrono::DateTime<chrono::Utc>) -> Upstream {
+    fn route_delta_upstream(updated_at: crate::time_compat::UtcTimestamp) -> Upstream {
         let mut upstream = upstream_with_targets("u-dr", &[("127.0.0.1", 8080)]);
         upstream.created_at = updated_at;
         upstream.updated_at = updated_at;
@@ -76472,8 +76471,8 @@ mod tests {
         GatewayConfig,
         GatewayConfig,
     ) {
-        let t0 = chrono::Utc::now();
-        let t1 = t0 + chrono::Duration::seconds(1);
+        let t0 = crate::time_compat::UtcTimestamp::now();
+        let t1 = t0.checked_add(::time::SignedDuration::seconds(1)).unwrap();
         let mut old_upstream = route_delta_upstream(t0);
         mutate_old_upstream(&mut old_upstream);
         let mut new_upstream = route_delta_upstream(t1);
@@ -76509,8 +76508,8 @@ mod tests {
     ) {
         use crate::modes::mesh::config::{AppProtocol, MeshConfig, MeshService, ServicePort};
 
-        let t0 = chrono::Utc::now();
-        let t1 = t0 + chrono::Duration::seconds(1);
+        let t0 = crate::time_compat::UtcTimestamp::now();
+        let t1 = t0.checked_add(::time::SignedDuration::seconds(1)).unwrap();
         let upstream_id = crate::modes::mesh::mesh_outbound_udp_upstream_id("default", "dns", 53);
         let mut old_upstream = upstream_with_targets(&upstream_id, &[("10.0.0.9", 53)]);
         old_upstream.name = Some("dns.default.svc.cluster.local".to_string());
@@ -76580,8 +76579,8 @@ mod tests {
     ) {
         use crate::modes::mesh::config::{AppProtocol, MeshConfig, MeshService, ServicePort};
 
-        let t0 = chrono::Utc::now();
-        let t1 = t0 + chrono::Duration::seconds(1);
+        let t0 = crate::time_compat::UtcTimestamp::now();
+        let t1 = t0.checked_add(::time::SignedDuration::seconds(1)).unwrap();
         let upstream_id =
             crate::modes::mesh::mesh_outbound_tcp_upstream_id("default", "mysql", 3306);
         let mut old_upstream = upstream_with_targets(&upstream_id, &[("10.0.0.9", 3306)]);
@@ -76657,8 +76656,8 @@ mod tests {
             WorkloadPort, WorkloadRef, WorkloadSelector,
         };
 
-        let t0 = chrono::Utc::now();
-        let t1 = t0 + chrono::Duration::seconds(1);
+        let t0 = crate::time_compat::UtcTimestamp::now();
+        let t1 = t0.checked_add(::time::SignedDuration::seconds(1)).unwrap();
         let spiffe = "spiffe://cluster.local/ns/default/sa/redis";
         let workload_ip: std::net::IpAddr = "10.0.0.7".parse().expect("workload ip");
         let upstream_id = crate::modes::mesh::mesh_outbound_tcp_bywl_upstream_id(
@@ -76752,7 +76751,7 @@ mod tests {
     }
 
     fn http_route_proxy_with_upstream() -> Proxy {
-        let t0 = chrono::Utc::now();
+        let t0 = crate::time_compat::UtcTimestamp::now();
         let mut proxy = route_delta_proxy("http", DispatchKind::HttpPool, t0);
         proxy.upstream_id = Some("u-dr".to_string());
         proxy
@@ -76767,8 +76766,8 @@ mod tests {
 
     #[test]
     fn proxy_content_eq_ignores_timestamps_but_not_same_timestamp_edits() {
-        let t0 = chrono::Utc::now();
-        let t1 = t0 + chrono::Duration::seconds(1);
+        let t0 = crate::time_compat::UtcTimestamp::now();
+        let t1 = t0.checked_add(::time::SignedDuration::seconds(1)).unwrap();
         let original = route_delta_proxy("content", DispatchKind::HttpPool, t0);
 
         let mut touched = original.clone();
@@ -76796,8 +76795,8 @@ mod tests {
 
     #[test]
     fn delta_routes_changed_ignores_stream_only_proxy_changes() {
-        let t0 = chrono::Utc::now();
-        let t1 = t0 + chrono::Duration::seconds(1);
+        let t0 = crate::time_compat::UtcTimestamp::now();
+        let t1 = t0.checked_add(::time::SignedDuration::seconds(1)).unwrap();
 
         let old_config =
             route_delta_config(vec![route_delta_proxy("tcp", DispatchKind::TcpRaw, t0)]);
@@ -76834,8 +76833,8 @@ mod tests {
 
     #[test]
     fn delta_routes_changed_detects_http_route_changes_and_transitions() {
-        let t0 = chrono::Utc::now();
-        let t1 = t0 + chrono::Duration::seconds(1);
+        let t0 = crate::time_compat::UtcTimestamp::now();
+        let t1 = t0.checked_add(::time::SignedDuration::seconds(1)).unwrap();
 
         let empty_config = route_delta_config(vec![]);
         let added_http =
@@ -77219,8 +77218,8 @@ mod tests {
     fn delta_routes_changed_qualifies_lossy_mesh_relay_ids_by_namespace() {
         use crate::modes::mesh::config::{AppProtocol, MeshConfig, MeshService, ServicePort};
 
-        let t0 = chrono::Utc::now();
-        let t1 = t0 + chrono::Duration::seconds(1);
+        let t0 = crate::time_compat::UtcTimestamp::now();
+        let t1 = t0.checked_add(::time::SignedDuration::seconds(1)).unwrap();
         let upstream_id_a = crate::modes::mesh::mesh_outbound_tcp_upstream_id("a", "b-c", 3306);
         let upstream_id_b = crate::modes::mesh::mesh_outbound_tcp_upstream_id("a-b", "c", 3306);
         assert_eq!(
@@ -77229,7 +77228,7 @@ mod tests {
         );
 
         let make_upstream =
-            |namespace: &str, timeout_ms: u64, updated_at: chrono::DateTime<chrono::Utc>| {
+            |namespace: &str, timeout_ms: u64, updated_at: crate::time_compat::UtcTimestamp| {
                 let mut upstream = upstream_with_targets(&upstream_id_a, &[("10.0.0.9", 3306)]);
                 upstream.namespace = namespace.to_string();
                 upstream.created_at = updated_at;
@@ -78853,7 +78852,7 @@ mod tests {
         proxy_id: Option<&str>,
         upstream_id: &str,
     ) -> PluginConfig {
-        let now = chrono::Utc::now();
+        let now = crate::time_compat::UtcTimestamp::now();
         PluginConfig {
             labels: Default::default(),
             id: id.to_string(),
@@ -78951,7 +78950,7 @@ mod tests {
         upstream.backend_tls_server_ca_cert_path = Some("/certs/canary-ca.pem".to_string());
         upstream.backend_tls_verify_server_cert = false;
 
-        let now = chrono::Utc::now();
+        let now = crate::time_compat::UtcTimestamp::now();
         let plugin = PluginConfig {
             labels: Default::default(),
             id: "mrd-p".to_string(),
@@ -79020,7 +79019,7 @@ mod tests {
             suppress_global_client_identity: false,
         };
 
-        let now = chrono::Utc::now();
+        let now = crate::time_compat::UtcTimestamp::now();
         let plugin = PluginConfig {
             labels: Default::default(),
             id: "mrd-p".to_string(),
@@ -79079,7 +79078,7 @@ mod tests {
     #[tokio::test]
     async fn capability_targets_normalize_mesh_route_dispatch_direct_backend_hosts() {
         let proxy = warmup_test_proxy("p", BackendScheme::Https, "stable.test", 443);
-        let now = chrono::Utc::now();
+        let now = crate::time_compat::UtcTimestamp::now();
         let plugin = PluginConfig {
             labels: Default::default(),
             id: "mrd-p".to_string(),
@@ -79137,7 +79136,7 @@ mod tests {
         // continued serving. The reject path now mirrors normal
         // Proxy.upstream_id validation.
         let proxy = warmup_test_proxy("p", BackendScheme::Https, "stable.test", 443);
-        let now = chrono::Utc::now();
+        let now = crate::time_compat::UtcTimestamp::now();
         let plugin = PluginConfig {
             labels: Default::default(),
             id: "mrd-p".to_string(),
@@ -79176,7 +79175,7 @@ mod tests {
         // When the rule's upstream_id resolves to a real upstream, the
         // validator returns Ok. Sanity check that we're not over-rejecting.
         let proxy = warmup_test_proxy("p", BackendScheme::Https, "stable.test", 443);
-        let now = chrono::Utc::now();
+        let now = crate::time_compat::UtcTimestamp::now();
         let upstream = upstream_with_targets("real-upstream", &[("backend.test", 8080)]);
         let plugin = PluginConfig {
             labels: Default::default(),
@@ -79212,7 +79211,7 @@ mod tests {
     fn validate_mesh_route_dispatch_upstream_references_are_namespace_qualified() {
         let mut proxy = warmup_test_proxy("p", BackendScheme::Https, "stable.test", 443);
         proxy.namespace = "tenant-a".to_string();
-        let now = chrono::Utc::now();
+        let now = crate::time_compat::UtcTimestamp::now();
         let plugin = PluginConfig {
             labels: Default::default(),
             id: "mrd-p".to_string(),
@@ -79254,7 +79253,7 @@ mod tests {
         tenant_a.namespace = "tenant-a".to_string();
         let mut tenant_b = warmup_test_proxy("b", BackendScheme::Https, "b.test", 443);
         tenant_b.namespace = "tenant-b".to_string();
-        let now = chrono::Utc::now();
+        let now = crate::time_compat::UtcTimestamp::now();
         let plugin = PluginConfig {
             labels: Default::default(),
             id: "global-mrd".to_string(),
@@ -79292,7 +79291,7 @@ mod tests {
 
     #[test]
     fn validate_global_mesh_route_dispatch_without_http_proxies_rejects_dangling_reference() {
-        let now = chrono::Utc::now();
+        let now = crate::time_compat::UtcTimestamp::now();
         let plugin = PluginConfig {
             labels: Default::default(),
             id: "global-mrd".to_string(),
@@ -79327,7 +79326,7 @@ mod tests {
 
     #[test]
     fn validate_global_mesh_route_dispatch_without_http_proxies_uses_own_namespace() {
-        let now = chrono::Utc::now();
+        let now = crate::time_compat::UtcTimestamp::now();
         let plugin = PluginConfig {
             labels: Default::default(),
             id: "global-mrd".to_string(),
@@ -79366,7 +79365,7 @@ mod tests {
         // disabled instance shouldn't block config reload. This mirrors
         // the existing `enabled` check in the validator.
         let proxy = warmup_test_proxy("p", BackendScheme::Https, "stable.test", 443);
-        let now = chrono::Utc::now();
+        let now = crate::time_compat::UtcTimestamp::now();
         let plugin = PluginConfig {
             labels: Default::default(),
             id: "mrd-p".to_string(),
@@ -81982,7 +81981,7 @@ mod tests {
         // before in-flight requests can observe wrong-backend dispatch.
         let state = make_test_proxy_state(make_validation_config(vec![]));
         let proxy = make_validation_proxy("p1", "/api");
-        let now = chrono::Utc::now();
+        let now = crate::time_compat::UtcTimestamp::now();
         let plugin = PluginConfig {
             labels: Default::default(),
             id: "mrd-p1".to_string(),
@@ -82026,7 +82025,7 @@ mod tests {
         // directly after loader validation, and the loader pipeline does not
         // inspect mesh_route_dispatch destinations.
         let proxy = make_validation_proxy("p1", "/api");
-        let now = chrono::Utc::now();
+        let now = crate::time_compat::UtcTimestamp::now();
         let plugin = PluginConfig {
             labels: Default::default(),
             id: "mrd-p1".to_string(),
@@ -82098,7 +82097,7 @@ mod tests {
         proxy.plugins = vec![PluginAssociation {
             plugin_config_id: "pc1".to_string(),
         }];
-        let now = chrono::Utc::now();
+        let now = crate::time_compat::UtcTimestamp::now();
         let plugin = PluginConfig {
             labels: Default::default(),
             id: "pc1".to_string(),
@@ -83339,8 +83338,8 @@ mod tests {
             backend_tls_refused: false,
             dispatch_port_override_fallback: None,
             api_spec_id: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: crate::time_compat::UtcTimestamp::now(),
+            updated_at: crate::time_compat::UtcTimestamp::now(),
             k8s_service_uid: None,
             admission_upstream_id: None,
             pending_limit_scope: None,
@@ -83402,8 +83401,8 @@ mod tests {
                 backend_tls_refused: false,
                 dispatch_port_override_fallback: None,
                 api_spec_id: None,
-                created_at: chrono::Utc::now(),
-                updated_at: chrono::Utc::now(),
+                created_at: crate::time_compat::UtcTimestamp::now(),
+                updated_at: crate::time_compat::UtcTimestamp::now(),
                 k8s_service_uid: None,
                 admission_upstream_id: None,
                 pending_limit_scope: None,
@@ -84038,8 +84037,8 @@ mod tests {
                 ..Default::default()
             }),
             api_spec_id: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: crate::time_compat::UtcTimestamp::now(),
+            updated_at: crate::time_compat::UtcTimestamp::now(),
             k8s_service_uid: None,
             admission_upstream_id: None,
             pending_limit_scope: None,
@@ -84120,8 +84119,8 @@ mod tests {
                 ..Default::default()
             }),
             api_spec_id: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: crate::time_compat::UtcTimestamp::now(),
+            updated_at: crate::time_compat::UtcTimestamp::now(),
             k8s_service_uid: None,
             admission_upstream_id: None,
             pending_limit_scope: None,

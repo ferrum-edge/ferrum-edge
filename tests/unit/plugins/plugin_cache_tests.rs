@@ -1,6 +1,5 @@
 //! Tests for PluginCache — pre-resolved plugin instances per proxy
 
-use chrono::Utc;
 use ferrum_edge::_test_support::{
     PRODUCER_REFUSED_UNDECLARED_CONTRACT, admit_response_body_producer_for_test,
     incremental_plugin_rebuild_targets_for_test,
@@ -2011,7 +2010,7 @@ fn rejected_cors_reload_retains_the_last_good_snapshot() {
 
     let mut invalid = valid.clone();
     invalid.plugin_configs[0].config = json!({"origins": ["*"]});
-    invalid.plugin_configs[0].updated_at = Utc::now();
+    invalid.plugin_configs[0].updated_at = UtcTimestamp::now();
     assert!(cache.rebuild(&invalid).is_err());
 
     let after = cache.get_plugins("ferrum", "p1");
@@ -7124,8 +7123,8 @@ fn test_request_body_buffering_upper_bound_is_config_sensitive() {
                 priority_override: None,
                 trigger: None,
                 api_spec_id: None,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
+                created_at: UtcTimestamp::now(),
+                updated_at: UtcTimestamp::now(),
             },
             PluginConfig {
                 labels: Default::default(),
@@ -7139,8 +7138,8 @@ fn test_request_body_buffering_upper_bound_is_config_sensitive() {
                 priority_override: None,
                 trigger: None,
                 api_spec_id: None,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
+                created_at: UtcTimestamp::now(),
+                updated_at: UtcTimestamp::now(),
             },
             PluginConfig {
                 labels: Default::default(),
@@ -7154,8 +7153,8 @@ fn test_request_body_buffering_upper_bound_is_config_sensitive() {
                 priority_override: None,
                 trigger: None,
                 api_spec_id: None,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
+                created_at: UtcTimestamp::now(),
+                updated_at: UtcTimestamp::now(),
             },
             PluginConfig {
                 labels: Default::default(),
@@ -7169,8 +7168,8 @@ fn test_request_body_buffering_upper_bound_is_config_sensitive() {
                 priority_override: None,
                 trigger: None,
                 api_spec_id: None,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
+                created_at: UtcTimestamp::now(),
+                updated_at: UtcTimestamp::now(),
             },
         ],
     );
@@ -7280,8 +7279,8 @@ async fn test_cors_preflight_runs_before_request_termination() {
                 priority_override: None,
                 trigger: None,
                 api_spec_id: None,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
+                created_at: UtcTimestamp::now(),
+                updated_at: UtcTimestamp::now(),
             },
             PluginConfig {
                 labels: Default::default(),
@@ -7295,8 +7294,8 @@ async fn test_cors_preflight_runs_before_request_termination() {
                 priority_override: None,
                 trigger: None,
                 api_spec_id: None,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
+                created_at: UtcTimestamp::now(),
+                updated_at: UtcTimestamp::now(),
             },
         ],
     );
@@ -7385,8 +7384,8 @@ async fn test_rate_limiter_state_persists_across_calls() {
             priority_override: None,
             trigger: None,
             api_spec_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         }],
     );
     let cache = PluginCache::new(&config).unwrap();
@@ -7539,8 +7538,8 @@ fn test_apply_delta_rejects_invalid_security_plugin() {
                 priority_override: None,
                 trigger: None,
                 api_spec_id: None,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
+                created_at: UtcTimestamp::now(),
+                updated_at: UtcTimestamp::now(),
             },
         ],
     );
@@ -7594,8 +7593,8 @@ fn test_apply_delta_rejects_unknown_jwt_auth_key_and_keeps_last_known_good() {
                 priority_override: None,
                 trigger: None,
                 api_spec_id: None,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
+                created_at: UtcTimestamp::now(),
+                updated_at: UtcTimestamp::now(),
             },
         ],
     );
@@ -8036,8 +8035,8 @@ fn test_plugin_cache_rejects_invalid_waf_config_as_security_plugin() {
             priority_override: None,
             trigger: None,
             api_spec_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         }],
     );
 
@@ -9073,7 +9072,10 @@ fn test_apply_delta_global_to_proxy_scope_refreshes_all_proxy_views() {
         Some("p1"),
         true,
     );
-    proxy_scoped.updated_at = old_global.updated_at + chrono::Duration::seconds(5);
+    proxy_scoped.updated_at = old_global
+        .updated_at
+        .checked_add(::time::SignedDuration::seconds(5))
+        .unwrap();
     let new_config = make_config(
         vec![
             make_proxy("p1", "/api", vec!["pc1"]),
@@ -9134,7 +9136,10 @@ fn fault_delta_proxy_id_move_rebuilds_former_and_new_placements() {
     });
     let mut moved_fault = old_fault;
     moved_fault.proxy_id = Some("p2".to_string());
-    moved_fault.updated_at += chrono::Duration::seconds(1);
+    moved_fault.updated_at = moved_fault
+        .updated_at
+        .checked_add(::time::SignedDuration::seconds(1))
+        .unwrap();
     let new_config = make_config(vec![moved_from, moved_to], vec![moved_fault]);
 
     let delta = ConfigDelta::compute(&old_config, &new_config);
@@ -9210,7 +9215,10 @@ fn fault_delta_scope_moves_rebuild_proxy_and_proxy_group_placements() {
     let mut group_fault = proxy_fault;
     group_fault.scope = PluginScope::ProxyGroup;
     group_fault.proxy_id = None;
-    group_fault.updated_at += chrono::Duration::seconds(1);
+    group_fault.updated_at = group_fault
+        .updated_at
+        .checked_add(::time::SignedDuration::seconds(1))
+        .unwrap();
     let group_config = make_config(
         vec![former_proxy, group_member_one, group_member_two],
         vec![group_fault.clone()],
@@ -9252,7 +9260,10 @@ fn fault_delta_scope_moves_rebuild_proxy_and_proxy_group_placements() {
     let mut moved_back = group_fault;
     moved_back.scope = PluginScope::Proxy;
     moved_back.proxy_id = Some("p1".to_string());
-    moved_back.updated_at += chrono::Duration::seconds(1);
+    moved_back.updated_at = moved_back
+        .updated_at
+        .checked_add(::time::SignedDuration::seconds(1))
+        .unwrap();
     let moved_back_config = make_config(
         vec![new_proxy, former_group_one, former_group_two],
         vec![moved_back],
@@ -9394,7 +9405,10 @@ fn fault_delta_priority_change_is_targeted_and_unchanged_config_is_noop() {
 
     let mut reprioritized = config.clone();
     reprioritized.plugin_configs[0].priority_override = Some(42);
-    reprioritized.plugin_configs[0].updated_at += chrono::Duration::seconds(1);
+    reprioritized.plugin_configs[0].updated_at = reprioritized.plugin_configs[0]
+        .updated_at
+        .checked_add(::time::SignedDuration::seconds(1))
+        .unwrap();
     let delta = ConfigDelta::compute(&config, &reprioritized);
     let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&config, &reprioritized);
     assert_eq!(
@@ -9417,7 +9431,9 @@ fn fault_delta_priority_change_is_targeted_and_unchanged_config_is_noop() {
 
 #[test]
 fn fault_reconciliation_scope_move_advances_the_actual_generation() {
-    let generation = Utc::now() - chrono::Duration::seconds(10);
+    let generation = UtcTimestamp::now()
+        .checked_sub(::time::SignedDuration::seconds(10))
+        .unwrap();
     let mut fault = make_plugin_config("fault", "fault_injection", PluginScope::Global, None, true);
     fault.created_at = generation;
     fault.updated_at = generation;
@@ -9436,7 +9452,9 @@ fn fault_reconciliation_scope_move_advances_the_actual_generation() {
 
 #[test]
 fn fault_reconciliation_priority_change_advances_the_actual_generation() {
-    let generation = Utc::now() - chrono::Duration::seconds(10);
+    let generation = UtcTimestamp::now()
+        .checked_sub(::time::SignedDuration::seconds(10))
+        .unwrap();
     let mut fault = make_plugin_config(
         "fault",
         "fault_injection",
@@ -9464,14 +9482,19 @@ fn fault_reconciliation_priority_change_advances_the_actual_generation() {
 
 #[test]
 fn fault_reconciliation_comparison_is_schema_complete_and_normalizes_only_timestamps() {
-    let generation = Utc::now() - chrono::Duration::seconds(10);
+    let generation = UtcTimestamp::now()
+        .checked_sub(::time::SignedDuration::seconds(10))
+        .unwrap();
     let mut fault = make_plugin_config("fault", "fault_injection", PluginScope::Global, None, true);
     fault.created_at = generation;
     fault.updated_at = generation;
     let accepted = make_config(vec![], vec![fault]);
 
     let mut persistence_only = accepted.clone();
-    persistence_only.plugin_configs[0].created_at += chrono::Duration::seconds(1);
+    persistence_only.plugin_configs[0].created_at = persistence_only.plugin_configs[0]
+        .created_at
+        .checked_add(::time::SignedDuration::seconds(1))
+        .unwrap();
     reconcile_runtime_overlay_plugin_generations_for_test(&mut persistence_only, &accepted);
     assert_eq!(persistence_only.plugin_configs[0].updated_at, generation);
 
@@ -9716,7 +9739,10 @@ fn transaction_log_schema_delta_reload_updates_registry_without_runtime_entries(
 
     let mut new_schema = old_schema;
     new_schema.config = json!({"schemas": {"after": {}}});
-    new_schema.updated_at += chrono::Duration::seconds(1);
+    new_schema.updated_at = new_schema
+        .updated_at
+        .checked_add(::time::SignedDuration::seconds(1))
+        .unwrap();
     let new_config = make_config(vec![make_proxy("p1", "/api", vec![])], vec![new_schema]);
     let delta = ConfigDelta::compute(&old_config, &new_config);
     let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&old_config, &new_config);
@@ -9882,7 +9908,10 @@ fn transaction_log_schema_delta_reload_rebuilds_proxy_group_schema_ref_consumers
     // keeps the shared instance (and whatever state it holds).
     let mut schema_same = schema_plugin.clone();
     schema_same.config = definitions(audit_v1, true);
-    schema_same.updated_at += chrono::Duration::seconds(1);
+    schema_same.updated_at = schema_same
+        .updated_at
+        .checked_add(::time::SignedDuration::seconds(1))
+        .unwrap();
     let config_same = make_config(proxies(), vec![schema_same.clone(), group_logger.clone()]);
     apply(&config_v1, &config_same);
     assert_eq!(
@@ -9903,7 +9932,10 @@ fn transaction_log_schema_delta_reload_rebuilds_proxy_group_schema_ref_consumers
         }),
         true,
     );
-    schema_v2.updated_at += chrono::Duration::seconds(1);
+    schema_v2.updated_at = schema_v2
+        .updated_at
+        .checked_add(::time::SignedDuration::seconds(1))
+        .unwrap();
     let config_v2 = make_config(proxies(), vec![schema_v2, group_logger]);
     apply(&config_same, &config_v2);
     let replaced = group_ptr("p1");
@@ -10759,8 +10791,8 @@ fn make_plugin_config_with_priority(
         priority_override,
         trigger,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -12824,7 +12856,7 @@ async fn test_tcp_connection_throttle_full_reload_preserves_live_admissions() {
 
     let mut replacement = initial.clone();
     replacement.plugin_configs[0].priority_override = Some(1800);
-    replacement.plugin_configs[0].updated_at = Utc::now();
+    replacement.plugin_configs[0].updated_at = UtcTimestamp::now();
     cache.rebuild(&replacement).unwrap();
     let new_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Tcp);
     let mut blocked = make_tcp_stream_context("10.0.0.2");
@@ -12856,7 +12888,7 @@ async fn test_tcp_connection_throttle_delta_reload_applies_new_limit_to_shared_s
 
     let mut replacement = initial.clone();
     replacement.plugin_configs[0].config = json!({"max_connections_per_key": 2});
-    replacement.plugin_configs[0].updated_at = Utc::now();
+    replacement.plugin_configs[0].updated_at = UtcTimestamp::now();
     cache
         .apply_delta(
             &replacement,

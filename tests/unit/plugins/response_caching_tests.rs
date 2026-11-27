@@ -28,6 +28,7 @@ use ferrum_edge::plugins::{
     Plugin, PluginFailurePolicy, PluginHttpClient, PluginResult, RequestContext,
     plugin_failure_policy, validate_plugin_config,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -41,8 +42,8 @@ fn make_consumer(id: &str, username: &str) -> Consumer {
         custom_id: None,
         credentials: HashMap::new(),
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 

@@ -5,7 +5,6 @@
 //! SQLite SQL path because the same `DatabaseStore` implementation is shared by
 //! all SQL backends behind dialect-specific SQL rendering.
 
-use chrono::Utc;
 use ferrum_edge::config::db_backend::is_incremental_full_reload_required;
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
 use ferrum_edge::config::types::{
@@ -13,6 +12,7 @@ use ferrum_edge::config::types::{
     PluginScope, Proxy, Upstream, UpstreamTarget, default_namespace,
 };
 use ferrum_edge::proxy::stream_match::{StreamMatchArm, StreamMatchCriteria};
+use ferrum_edge::time_compat::UtcTimestamp;
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
 use tempfile::TempDir;
@@ -60,8 +60,8 @@ fn malformed_change_rows_withhold_values_and_preserve_incremental_progress() {
                 .bind(resource_type)
                 .bind("'UNREGISTERED_resource_id\"\\tail")
                 .bind(operation)
-                .bind(Utc::now().to_rfc3339())
-                .bind(Utc::now().to_rfc3339())
+                .bind(UtcTimestamp::now().to_rfc3339())
+                .bind(UtcTimestamp::now().to_rfc3339())
                 .execute(&store.pool())
                 .await
                 .unwrap();
@@ -127,8 +127,8 @@ fn test_upstream(id: &str, host: &str, port: u16) -> Upstream {
         backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         k8s_service_uid: None,
         admission_upstream_id: None,
         pending_limit_scope: None,
@@ -148,8 +148,8 @@ fn test_plugin_config(id: &str) -> PluginConfig {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -217,8 +217,8 @@ fn test_proxy(id: &str, listen_path: &str, plugins: Vec<PluginAssociation>) -> P
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }
@@ -286,7 +286,7 @@ async fn sql_proxy_stream_match_round_trips_and_updates_without_widening() {
             ..Default::default()
         }],
     });
-    proxy.updated_at = Utc::now();
+    proxy.updated_at = UtcTimestamp::now();
     let updated_match = proxy.stream_match.clone();
     assert!(
         store
@@ -400,7 +400,7 @@ async fn incremental_poll_uses_durable_sequence_for_create_update_delete() {
 #[tokio::test(flavor = "multi_thread")]
 async fn incremental_poll_does_not_scan_runtime_rows_without_change_records() {
     let (store, _temp_dir) = sqlite_store().await;
-    let ts = Utc::now().to_rfc3339();
+    let ts = UtcTimestamp::now().to_rfc3339();
 
     sqlx::query(
         "INSERT INTO proxies \
@@ -459,7 +459,7 @@ async fn incremental_poll_does_not_scan_runtime_rows_without_change_records() {
 #[tokio::test(flavor = "multi_thread")]
 async fn non_consumer_delete_records_drive_removals_without_resource_row_scans() {
     let (store, _temp_dir) = sqlite_store().await;
-    let ts = Utc::now().to_rfc3339();
+    let ts = UtcTimestamp::now().to_rfc3339();
 
     sqlx::query(
         "INSERT INTO config_changes \
@@ -548,7 +548,7 @@ async fn global_change_sequence_survives_namespace_scope_shrink() {
 #[tokio::test(flavor = "multi_thread")]
 async fn consumer_delete_requires_authoritative_reload_for_quarantine_rehydration() {
     let (store, _temp_dir) = sqlite_store().await;
-    let ts = Utc::now().to_rfc3339();
+    let ts = UtcTimestamp::now().to_rfc3339();
 
     sqlx::query(
         "INSERT INTO config_changes \
@@ -634,7 +634,7 @@ async fn association_additions_and_removals_are_proxy_change_events() {
 #[tokio::test(flavor = "multi_thread")]
 async fn sparse_global_sequence_gap_without_retention_still_polls_incrementally() {
     let (store, _temp_dir) = sqlite_store().await;
-    let ts = Utc::now().to_rfc3339();
+    let ts = UtcTimestamp::now().to_rfc3339();
 
     sqlx::query(
         "INSERT INTO config_changes \
@@ -663,7 +663,7 @@ async fn sparse_global_sequence_gap_without_retention_still_polls_incrementally(
 #[tokio::test(flavor = "multi_thread")]
 async fn retention_gap_reports_cursor_behind_retained_sequence() {
     let (store, _temp_dir) = sqlite_store().await;
-    let ts = Utc::now().to_rfc3339();
+    let ts = UtcTimestamp::now().to_rfc3339();
 
     sqlx::query(
         "INSERT INTO config_change_retention (namespace, retained_sequence, updated_at) \
@@ -738,7 +738,7 @@ async fn change_log_batch_past_one_page_loads_incrementally() {
     // Its own namespace: the cap-lowering tests below override `ferrum`.
     const NAMESPACE: &str = "change-log-paging";
     let (store, _temp_dir) = sqlite_store().await;
-    let ts = Utc::now().to_rfc3339();
+    let ts = UtcTimestamp::now().to_rfc3339();
     sqlx::query(CTE_10K_UPSTREAM_DELETES)
         .bind(NAMESPACE)
         .bind(&ts)
@@ -775,7 +775,7 @@ async fn change_log_batch_past_one_page_loads_incrementally() {
 async fn saturated_change_log_batch_forces_full_reload_fallback() {
     let (store, _temp_dir) = sqlite_store().await;
     let _cap = ChangeLogCap::set("ferrum", 10_000);
-    let ts = Utc::now().to_rfc3339();
+    let ts = UtcTimestamp::now().to_rfc3339();
 
     sqlx::query(CTE_10K_UPSTREAM_DELETES)
         .bind("ferrum")
@@ -1243,8 +1243,8 @@ fn scale_proxy_plugin_config(
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 

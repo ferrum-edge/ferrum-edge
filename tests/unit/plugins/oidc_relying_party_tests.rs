@@ -31,6 +31,7 @@ use super::jwks_auth_support::{
     create_rs256_token_no_kid, create_rs256_token_with_kid,
 };
 use super::plugin_utils::{assert_continue, assert_reject, create_test_consumer};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 /// The issuer every fixture configures; discovery documents must echo it.
 const TEST_ISSUER: &str = "https://issuer.example.com";
@@ -3751,8 +3752,8 @@ fn cli_config_validation_admits_oidc_without_a_tokio_runtime() {
                 priority_override: None,
                 trigger: None,
                 api_spec_id: None,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
+                created_at: UtcTimestamp::now(),
+                updated_at: UtcTimestamp::now(),
             }],
             ..GatewayConfig::default()
         };

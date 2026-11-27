@@ -8,8 +8,8 @@
 //!   GET    /api-specs/by-proxy/{proxy_id} — lookup by proxy
 //!   DELETE /api-specs/{id}                — delete
 
+use crate::time_compat::UtcTimestamp;
 use bytes::Bytes;
-use chrono::Utc;
 use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
@@ -1830,7 +1830,7 @@ fn assign_ids_for_post(bundle: &mut ExtractedBundle) {
     // Stamp server-side timestamps (Fix 1). Mirrors handle_write's convention:
     //   Create → set_created_at(now) + set_updated_at(now).
     // This overwrites any operator-embedded timestamps from the spec document.
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     bundle.proxy.created_at = now;
     bundle.proxy.updated_at = now;
     if let Some(ref mut u) = bundle.upstream {
@@ -2051,7 +2051,7 @@ fn assign_ids_for_put(
 
     // Stamp server-side timestamps (Fix 1). Mirrors handle_write's convention:
     //   Update → set_updated_at(now), preserve created_at from stored row.
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
 
     // Proxy: preserve stored created_at, refresh updated_at.
     bundle.proxy.updated_at = now;
@@ -2954,7 +2954,7 @@ fn build_spec_row_with_snapshot_limits(
         }
         None => (None, None),
     };
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     Ok(ApiSpec {
         id,
         namespace,
@@ -3444,7 +3444,7 @@ pub(crate) async fn exercise_spec_content_response_limits_for_test() -> Result<(
     let make_spec =
         |raw: &[u8], fmt: SpecFormat, reported_size: u64| -> Result<ApiSpec, &'static str> {
             let compressed = spec_codec::compress_gzip(raw).map_err(|_| "gzip compress failed")?;
-            let now = Utc::now();
+            let now = UtcTimestamp::now();
             Ok(ApiSpec {
                 id: "spec-limit-test".to_string(),
                 namespace: "ferrum".to_string(),
@@ -4278,14 +4278,18 @@ fn parse_list_filter(uri: &hyper::Uri) -> Result<ApiSpecListFilter, ApiSpecError
                 filter.title_contains = Some(val);
             }
             "updated_since" if !val.is_empty() => {
-                // Accept ISO-8601 / RFC-3339 format.
-                let dt = chrono::DateTime::parse_from_rfc3339(&val).map_err(|_| {
-                    ApiSpecError::BadRequest(format!(
-                        "invalid updated_since value '{}'; expected RFC3339 timestamp",
-                        val
-                    ))
-                })?;
-                filter.updated_since = Some(dt.to_utc());
+                // Accept ISO-8601 / RFC-3339 format, exactly as chrono's strict
+                // parser did (issue #7419); an instant outside UtcTimestamp's
+                // range is rejected like any invalid value.
+                let dt = crate::time_compat::parse_rfc3339_chrono(&val)
+                    .and_then(|parsed| parsed.to_utc_timestamp())
+                    .map_err(|_| {
+                        ApiSpecError::BadRequest(format!(
+                            "invalid updated_since value '{}'; expected RFC3339 timestamp",
+                            val
+                        ))
+                    })?;
+                filter.updated_since = Some(dt);
             }
             "has_tag" if !val.is_empty() => {
                 // SAFETY-CRITICAL CROSS-FILE INVARIANT (mirrors the ingest-time

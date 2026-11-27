@@ -25,6 +25,7 @@ use ferrum_edge::modes::mesh::config::{MeshConfig, MeshService};
 use ferrum_edge::modes::mesh::revision::MeshConfigRevision;
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 use ferrum_edge::proxy::stream_match::{StreamMatchArm, StreamMatchCriteria};
+use ferrum_edge::time_compat::UtcTimestamp;
 use tokio::sync::broadcast;
 
 fn make_proxy(id: &str, namespace: &str) -> Proxy {
@@ -91,8 +92,8 @@ fn make_proxy(id: &str, namespace: &str) -> Proxy {
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }

@@ -1,6 +1,5 @@
 //! Tests for the CORS plugin
 
-use chrono::Utc;
 use ferrum_edge::PluginCache;
 use ferrum_edge::config::types::{GatewayConfig, PluginAssociation, PluginConfig, PluginScope};
 use ferrum_edge::plugins::cors::CorsPlugin;
@@ -2712,8 +2711,8 @@ fn cors_plugin_config(
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 

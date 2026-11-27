@@ -33,7 +33,7 @@ use crate::common::{
     GatewayChildGuard, configure_coverage_gateway_command, continue_if_backend_available,
     continue_if_tls_fixture_available, host_port_from_db_url, tcp_endpoint_reachable,
 };
-use chrono::Utc;
+use ferrum_edge::time_compat::UtcTimestamp;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use mongodb::bson::{Bson, Document, doc};
 use mongodb::options::ClientOptions;
@@ -502,14 +502,14 @@ impl MongoTestHarness {
     }
 
     fn generate_token(&self) -> Result<String, Box<dyn std::error::Error>> {
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let claims = json!({
             "iss": self.jwt_issuer,
             "sub": "test-admin",
             "role": "admin",
-            "iat": now.timestamp(),
-            "nbf": now.timestamp(),
-            "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
+            "iat": now.unix_timestamp(),
+            "nbf": now.unix_timestamp(),
+            "exp": (now.checked_add(::time::SignedDuration::seconds(3600)).unwrap()).unix_timestamp(),
             "jti": Uuid::new_v4().to_string()
         });
 
@@ -3656,7 +3656,7 @@ async fn test_mongodb_buildout_baseline_initialization() {
 
     // Keep a valid registry row, as live registry mutations require, then
     // remove the default and add a resource-derived name without a registry row.
-    let now = Utc::now().to_rfc3339();
+    let now = UtcTimestamp::now().to_rfc3339();
     registry
         .insert_one(doc! {
             "_id": "keeper", "name": "keeper", "created_at": &now, "updated_at": &now,
@@ -3779,7 +3779,9 @@ async fn test_mongodb_audit_retention_sweep_ages_out_idle_namespaces() {
         store
             .insert_audit_event(&AuditEvent {
                 id: id.to_string(),
-                ts: Utc::now() - chrono::Duration::days(days_ago),
+                ts: UtcTimestamp::now()
+                    .checked_sub(::time::SignedDuration::days(days_ago))
+                    .unwrap(),
                 actor: "tester".to_string(),
                 action: "update".to_string(),
                 resource_type: "proxy".to_string(),

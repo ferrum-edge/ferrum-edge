@@ -8,14 +8,13 @@
 //! and H3→gRPC mesh transport materialization all observe the new pins
 //! (issue #3284 / PR #3673).
 
-use chrono::{DateTime, Utc};
 use ferrum_edge::config::types::*;
 use ferrum_edge::proxy::{ConfigApplyOutcome, ProxyState};
 use ferrum_edge::time_compat::UtcTimestamp;
 use std::collections::HashMap;
 
-fn ts(secs: i64) -> DateTime<Utc> {
-    DateTime::from_timestamp(secs, 0).expect("valid test timestamp")
+fn ts(secs: i64) -> UtcTimestamp {
+    UtcTimestamp::from_unix_timestamp(secs).expect("valid test timestamp")
 }
 
 fn mesh_target(host: &str, port: u16, tags: &[(&str, &str)]) -> UpstreamTarget {
@@ -33,7 +32,7 @@ fn mesh_target(host: &str, port: u16, tags: &[(&str, &str)]) -> UpstreamTarget {
     }
 }
 
-fn upstream_with_target(id: &str, target: UpstreamTarget, updated_at: DateTime<Utc>) -> Upstream {
+fn upstream_with_target(id: &str, target: UpstreamTarget, updated_at: UtcTimestamp) -> Upstream {
     Upstream {
         labels: Default::default(),
         id: id.to_string(),
@@ -69,7 +68,7 @@ fn upstream_with_target(id: &str, target: UpstreamTarget, updated_at: DateTime<U
     }
 }
 
-fn proxy_for_upstream(id: &str, upstream_id: &str, updated_at: DateTime<Utc>) -> Proxy {
+fn proxy_for_upstream(id: &str, upstream_id: &str, updated_at: UtcTimestamp) -> Proxy {
     Proxy {
         labels: Default::default(),
         id: id.to_string(),
@@ -139,7 +138,7 @@ fn proxy_for_upstream(id: &str, upstream_id: &str, updated_at: DateTime<Utc>) ->
     }
 }
 
-fn config_with_mesh_tags(tags: &[(&str, &str)], stamp: DateTime<Utc>) -> GatewayConfig {
+fn config_with_mesh_tags(tags: &[(&str, &str)], stamp: UtcTimestamp) -> GatewayConfig {
     let upstream = upstream_with_target(
         "h3-mesh-grpc-upstream",
         mesh_target("127.0.0.1", 18080, tags),
@@ -152,11 +151,7 @@ fn config_with_mesh_tags(tags: &[(&str, &str)], stamp: DateTime<Utc>) -> Gateway
         consumers: Vec::new(),
         plugin_configs: Vec::new(),
         upstreams: vec![upstream],
-        loaded_at: UtcTimestamp::from_unix_timestamp_nanos(
-            stamp.timestamp(),
-            stamp.timestamp_subsec_nanos(),
-        )
-        .unwrap(),
+        loaded_at: stamp,
         known_namespaces: Vec::new(),
         ..GatewayConfig::default()
     };

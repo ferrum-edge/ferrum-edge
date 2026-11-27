@@ -13,6 +13,7 @@ use ferrum_edge::plugins::soap_ws_security::SoapWsSecurity;
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext, priority,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -8200,8 +8201,8 @@ mod advisory_regressions {
             custom_id: Some("alice".to_string()),
             credentials: HashMap::new(),
             acl_groups: vec!["finance".to_string()],
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         };
         let consumer_index = ConsumerIndex::new(&[consumer]);
 

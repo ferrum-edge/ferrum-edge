@@ -8,9 +8,9 @@
 //! state is dropped, so a re-added target starts clean, and no release can
 //! drive a count negative.
 
-use chrono::Utc;
 use ferrum_edge::config::types::{GatewayConfig, LoadBalancerAlgorithm, Upstream, UpstreamTarget};
 use ferrum_edge::load_balancer::{LoadBalancer, LoadBalancerCache};
+use ferrum_edge::time_compat::UtcTimestamp;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::Path;
@@ -61,8 +61,8 @@ fn upstream(id: &str, algorithm: LoadBalancerAlgorithm, targets: Vec<UpstreamTar
         backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         k8s_service_uid: None,
         admission_upstream_id: None,
         pending_limit_scope: None,

@@ -20,7 +20,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use chrono::Utc;
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, Consumer, DispatchKind, GatewayConfig, Proxy,
@@ -214,8 +213,8 @@ fn create_test_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }
@@ -268,8 +267,8 @@ async fn test_cp_dp_grpc_config_sync() {
             custom_id: Some("custom-1".into()),
             credentials: Default::default(),
             acl_groups: Vec::new(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         }],
         plugin_configs: vec![],
         upstreams: vec![],
@@ -496,8 +495,8 @@ async fn test_namespace_isolation_in_database() {
         custom_id: None,
         credentials: Default::default(),
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     db.create_consumer(&prod_consumer)
         .await
@@ -524,8 +523,8 @@ async fn test_namespace_isolation_in_database() {
         custom_id: None,
         credentials: Default::default(),
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     db.create_consumer(&staging_consumer)
         .await
@@ -661,8 +660,8 @@ async fn test_cp_dp_namespace_isolation_over_grpc() {
             custom_id: None,
             credentials: Default::default(),
             acl_groups: Vec::new(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         }],
         plugin_configs: vec![],
         upstreams: vec![],

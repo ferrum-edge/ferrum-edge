@@ -17,7 +17,6 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use bytes::Bytes;
-use chrono::Utc;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::server::conn::http2::Builder as Http2ServerBuilder;
@@ -102,8 +101,8 @@ fn create_grpc_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }
@@ -313,8 +312,8 @@ fn attach_grpc_web_deadline_plugins(
             priority_override: None,
             trigger: None,
             api_spec_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         },
         PluginConfig {
             labels: Default::default(),
@@ -328,8 +327,8 @@ fn attach_grpc_web_deadline_plugins(
             priority_override: None,
             trigger: None,
             api_spec_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         },
     ]
 }
@@ -362,8 +361,8 @@ fn create_test_upstream(id: &str, targets: Vec<UpstreamTarget>) -> Upstream {
         backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         k8s_service_uid: None,
         admission_upstream_id: None,
         pending_limit_scope: None,
@@ -388,8 +387,8 @@ fn security_headers_plugin(id: &str) -> PluginConfig {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -1597,8 +1596,8 @@ fn test_plugin_config(
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -2264,8 +2263,8 @@ async fn hmac_auth_reuses_prebuffered_native_grpc_body_for_primary_dispatch() {
             serde_json::json!([{ "secret": secret }]),
         )]),
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     let plugin = test_plugin_config(
         "grpc-hmac-auth",
@@ -2285,7 +2284,7 @@ async fn hmac_auth_reuses_prebuffered_native_grpc_body_for_primary_dispatch() {
 
     let path = "/grpc-hmac/my.Service/Echo";
     let grpc_message = b"\x00\x00\x00\x00\x0bsigned body";
-    let date = Utc::now().to_rfc2822();
+    let date = UtcTimestamp::now().to_rfc2822();
     let digest = format!(
         "sha-256={}",
         base64::engine::general_purpose::STANDARD.encode(Sha256::digest(grpc_message))
@@ -2336,8 +2335,8 @@ async fn hmac_auth_rfc9530_content_digest_preserves_grpc_body_and_rejects_ambigu
             serde_json::json!([{ "secret": secret }]),
         )]),
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     let plugin = test_plugin_config(
         "grpc-hmac-cd-auth",
@@ -2357,7 +2356,7 @@ async fn hmac_auth_rfc9530_content_digest_preserves_grpc_body_and_rejects_ambigu
 
     let path = "/grpc-hmac-cd/my.Service/Echo";
     let grpc_message = b"\x00\x00\x00\x00\x0bsigned body";
-    let date = Utc::now().to_rfc2822();
+    let date = UtcTimestamp::now().to_rfc2822();
     let digest = crate::common::content_digest_sha256_header(grpc_message);
     let authorization = crate::common::hmac_v2_authorization(
         "POST",
@@ -2387,7 +2386,7 @@ async fn hmac_auth_rfc9530_content_digest_preserves_grpc_body_and_rejects_ambigu
     assert_eq!(body, grpc_message);
 
     let empty_body: &[u8] = b"";
-    let empty_date = Utc::now().to_rfc2822();
+    let empty_date = UtcTimestamp::now().to_rfc2822();
     let empty_digest = crate::common::content_digest_sha256_header(empty_body);
     let empty_authorization = crate::common::hmac_v2_authorization(
         "POST",
@@ -2418,7 +2417,7 @@ async fn hmac_auth_rfc9530_content_digest_preserves_grpc_body_and_rejects_ambigu
     assert_eq!(empty_response, empty_body);
 
     let legacy = crate::common::empty_digest_header();
-    let ambiguous_date = Utc::now().to_rfc2822();
+    let ambiguous_date = UtcTimestamp::now().to_rfc2822();
     let ambiguous_authorization = crate::common::hmac_v2_authorization(
         "POST",
         path,
@@ -3196,8 +3195,8 @@ async fn grpc_buffered_trailer_writeback_honors_hook_removal_and_duplicate_keys(
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     let state = create_test_proxy_state_with_plugins(vec![proxy], vec![plugin]);
     let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
@@ -3332,8 +3331,8 @@ async fn grpc_buffered_security_removal_wins_over_cookie_rehome_and_trailer_repl
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     let mut security = security_headers_plugin("grpc-security-removal-policy");
     security.config["remove"] = serde_json::json!(["Set-Cookie", "X-Powered-By"]);
@@ -3539,8 +3538,8 @@ async fn grpc_web_transformed_response_suppresses_native_trailers() {
         priority_override: Some(250),
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     let mut sibling = plugin.clone();
     sibling.id = "grpc-web-bridge-sibling".to_string();
@@ -3565,8 +3564,8 @@ async fn grpc_web_transformed_response_suppresses_native_trailers() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     let mut security_headers = security_headers_plugin("grpc-web-security-headers");
     security_headers.config["override_existing"] = serde_json::json!(true);
@@ -3925,8 +3924,8 @@ async fn grpc_web_server_streaming_reaches_h1_and_h2_before_backend_eof() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     let state = create_test_proxy_state_with_plugins(vec![proxy], vec![plugin]);
     let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
@@ -4144,8 +4143,8 @@ async fn grpc_web_preserves_ascii_custom_trailers_on_h1_and_h2_binary_and_text()
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     let state = create_test_proxy_state_with_plugins(vec![proxy], vec![plugin]);
     let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
@@ -4221,8 +4220,8 @@ async fn grpc_web_text_keeps_security_policy_in_initial_headers() {
         priority_override: Some(250),
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     let mut grpc_web_sibling = grpc_web.clone();
     grpc_web_sibling.id = "grpc-web-text-bridge-sibling".to_string();
@@ -4351,8 +4350,8 @@ async fn grpc_web_gateway_backend_error_is_grpc_web_shaped() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     // Protocol-managed `security_headers.set` destinations now fail closed at
     // construction and have dedicated exhaustive coverage. Keep this fixture
@@ -4602,8 +4601,8 @@ async fn grpc_web_backend_path_policy_reject_is_grpc_web_shaped() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     let method_router = PluginConfig {
         labels: Default::default(),
@@ -4619,8 +4618,8 @@ async fn grpc_web_backend_path_policy_reject_is_grpc_web_shaped() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     let state = create_test_proxy_state_with_plugins(vec![proxy], vec![grpc_web, method_router]);
     let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
@@ -4709,8 +4708,8 @@ async fn grpc_retry_does_not_dial_path_changing_target() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     let upstream = create_test_upstream(
         "grpc-retry-method-policy-upstream",

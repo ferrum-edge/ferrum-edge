@@ -3,6 +3,7 @@
 //! Tests credential type whitelist, credential redaction coverage,
 //! and validation constants.
 
+use ferrum_edge::time_compat::UtcTimestamp;
 use serde_json::json;
 
 #[test]
@@ -568,8 +569,8 @@ fn make_consumer(
         custom_id: None,
         credentials,
         acl_groups: Vec::new(),
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -628,7 +629,7 @@ fn test_basic_credential_server_configuration_failures_are_internal_errors() {
 
 #[test]
 fn test_disabled_basic_auth_config_skips_plugin_construction() {
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let mut plugin_config = ferrum_edge::config::types::PluginConfig {
         labels: Default::default(),
         id: "disabled-basic-auth".to_string(),
@@ -716,7 +717,7 @@ fn restore_admission_covers_batch_contracts_before_the_namespace_clear() {
 
 #[test]
 fn test_disabled_unknown_plugin_name_remains_invalid() {
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let plugin_config = ferrum_edge::config::types::PluginConfig {
         labels: Default::default(),
         id: "disabled-unknown-plugin".to_string(),
@@ -740,7 +741,7 @@ fn test_disabled_unknown_plugin_name_remains_invalid() {
 
 #[test]
 fn test_admin_stdout_logging_validation_rejects_unknown_paths() {
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     for (config, path) in [
         (
             json!({"filters": {"errors_only": true}}),
@@ -791,8 +792,8 @@ fn test_admin_stdout_logging_validation_preserves_null_defaults() {
             priority_override: None,
             trigger: None,
             api_spec_id: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         };
         ferrum_edge::_test_support::validate_admin_plugin_config_for_test(&plugin_config)
             .expect("admin validation must preserve null defaults");
@@ -801,7 +802,7 @@ fn test_admin_stdout_logging_validation_preserves_null_defaults() {
 
 #[test]
 fn test_admin_transaction_log_schema_rejects_unknown_closed_object_keys() {
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     for (id, config, expected_path) in [
         (
             "outer-key",
@@ -1061,8 +1062,8 @@ fn recovery_plugin(
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -1207,8 +1208,8 @@ fn recovery_api_spec(spec_id: &str, proxy_id: &str) -> ferrum_edge::config::type
         resource_hash: String::new(),
         external_ref_snapshot: None,
         external_ref_digest: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -2078,7 +2079,7 @@ fn role_projected_resources_refuse_writing_their_placeholders_back() {
 #[test]
 fn test_disabled_kafka_config_still_refuses_native_producer_keys() {
     let env = crate::unit::env_lock::EnvGuard::new(&[]);
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     let plugin_config = ferrum_edge::config::types::PluginConfig {
         labels: Default::default(),
         id: "disabled-kafka-native".to_string(),

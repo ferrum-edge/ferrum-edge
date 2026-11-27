@@ -275,7 +275,7 @@ mod tests {
         BackendAdmissionContext, BackendAdmissionDecision, PluginHttpClient, PluginResult,
         ProxyProtocol, RequestContext,
     };
-    use chrono::Utc;
+    use crate::time_compat::UtcTimestamp;
     use serde_json::{Map, Value, json};
     use std::cell::Cell;
     use std::collections::HashMap;
@@ -354,8 +354,8 @@ mod tests {
             backend_proxy_protocol: None,
             stream_match: None,
             compiled_stream_match: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
             pending_limit_scope: None,
         }
     }
@@ -400,8 +400,8 @@ mod tests {
             backend_tls_refused: false,
             dispatch_port_override_fallback: None,
             api_spec_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
             k8s_service_uid: None,
             admission_upstream_id: None,
             pending_limit_scope: None,
@@ -421,7 +421,7 @@ mod tests {
             consumers: vec![],
             plugin_configs,
             upstreams,
-            loaded_at: crate::time_compat::UtcTimestamp::now(),
+            loaded_at: UtcTimestamp::now(),
             known_namespaces: Vec::new(),
             frontend_tls_cert_path: None,
             frontend_tls_key_path: None,
@@ -449,8 +449,8 @@ mod tests {
             enabled: true,
             scope: PluginScope::ProxyGroup,
             proxy_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
             priority_override: None,
             trigger: None,
             api_spec_id: None,
@@ -1037,8 +1037,8 @@ mod tests {
             custom_id: Some("alice-custom".to_string()),
             credentials,
             acl_groups: vec![],
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         };
 
         let inner = ConsumerIndex::build_inner(&[consumer]);

@@ -13,13 +13,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use chrono::Utc;
 use ferrum_edge::config::types::{
     GatewayConfig, LoadBalancerAlgorithm, Proxy, Upstream, UpstreamPortOverride, UpstreamTarget,
 };
 use ferrum_edge::load_balancer::{LoadBalancerCache, RetryCandidateFilter};
 use ferrum_edge::proxy::hbone_pool::HBONE_TARGET_TAG;
 use ferrum_edge::proxy::unix_backend::MESH_UNIX_SOCKET_TAG;
+use ferrum_edge::time_compat::UtcTimestamp;
 
 const NAMESPACE: &str = "ferrum";
 const UPSTREAM_ID: &str = "h3-retry-eligibility-upstream";
@@ -56,7 +56,7 @@ fn unix_target(idx: usize) -> UpstreamTarget {
 }
 
 fn rr_upstream(targets: Vec<UpstreamTarget>) -> Upstream {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     Upstream {
         labels: Default::default(),
         id: UPSTREAM_ID.to_string(),

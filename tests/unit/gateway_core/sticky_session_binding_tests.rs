@@ -28,7 +28,6 @@
 
 use std::collections::HashMap;
 
-use chrono::Utc;
 use ferrum_edge::config::types::{
     GatewayConfig, LoadBalancerAlgorithm, Proxy, SubsetDefinition, Upstream, UpstreamPortOverride,
     UpstreamTarget,
@@ -42,6 +41,7 @@ use ferrum_edge::load_balancer::{
     HealthContext, LoadBalancerCache, STICKY_SESSION_TOKEN_LEN, is_sticky_session_token,
     sticky_session_token,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use sha2::{Digest, Sha256};
 
 const NAMESPACE: &str = "ferrum";
@@ -67,7 +67,7 @@ fn tagged_target(host: &str, port: u16, tags: &[(&str, &str)]) -> UpstreamTarget
 }
 
 fn sticky_upstream(targets: Vec<UpstreamTarget>) -> Upstream {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     Upstream {
         labels: Default::default(),
         id: UPSTREAM_ID.to_string(),

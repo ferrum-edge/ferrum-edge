@@ -1,12 +1,12 @@
 //! Common test utilities for plugin tests
 
-use chrono::Utc;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, Consumer, DispatchKind, PluginAssociation, PluginConfig, PluginScope,
     Proxy, default_namespace,
 };
 use ferrum_edge::plugins::utils::log_schema::registry;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
+use ferrum_edge::time_compat::UtcTimestamp;
 use hmac::{KeyInit, Mac};
 use http::HeaderMap;
 use serde_json::{Map, Value, json};
@@ -118,8 +118,8 @@ pub fn create_test_consumer() -> Consumer {
         custom_id: Some("custom-123".to_string()),
         credentials,
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -353,8 +353,8 @@ pub fn create_test_proxy() -> Proxy {
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }
@@ -367,7 +367,7 @@ pub fn create_test_transaction_summary() -> ferrum_edge::plugins::TransactionSum
         // `log_with_mirror` from the authoritative RequestContext.
         plugin_trigger_decisions: Default::default(),
         namespace: "ferrum".to_string(),
-        timestamp_received: Utc::now().to_rfc3339(),
+        timestamp_received: UtcTimestamp::now().to_rfc3339(),
         client_ip: "127.0.0.1".to_string(),
         consumer_username: Some("testuser".to_string()),
         principal_origin: Some(ferrum_edge::plugins::utils::principal::PrincipalOrigin::Consumer),
@@ -493,8 +493,8 @@ pub fn create_test_stream_transaction_summary() -> ferrum_edge::plugins::StreamT
         error_class: None,
         disconnect_direction: None,
         disconnect_cause: None,
-        timestamp_connected: Utc::now().to_rfc3339(),
-        timestamp_disconnected: Utc::now().to_rfc3339(),
+        timestamp_connected: UtcTimestamp::now().to_rfc3339(),
+        timestamp_disconnected: UtcTimestamp::now().to_rfc3339(),
         sni_hostname: None,
         metadata: ferrum_edge::plugins::MetadataMap::default(),
     }
@@ -1186,8 +1186,8 @@ pub(crate) fn make_proxy(id: &str, listen_path: &str, plugin_ids: Vec<&str>) -> 
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }
@@ -1214,8 +1214,8 @@ pub(crate) fn make_plugin_config(
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -1239,7 +1239,7 @@ pub(crate) fn make_plugin_config_with_json(
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }

@@ -16,7 +16,6 @@
 use crate::scaffolding::port_registry::TestSocket;
 
 use arc_swap::ArcSwap;
-use chrono::Utc;
 use ferrum_edge::admin::{
     AdminState,
     jwt_auth::{JwtConfig, JwtManager},
@@ -25,6 +24,7 @@ use ferrum_edge::admin::{
 use ferrum_edge::config::db_backend::DatabaseBackend;
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
 use ferrum_edge::config::runtime_config_apply::{LiveApplyCursor, RuntimeConfigApply};
+use ferrum_edge::time_compat::UtcTimestamp;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
@@ -65,14 +65,14 @@ fn jwt_manager() -> JwtManager {
 }
 
 fn admin_token() -> String {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     let claims = json!({
         "iss": JWT_ISSUER,
         "sub": "namespace-live-apply",
         "role": "admin",
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
+        "iat": now.unix_timestamp(),
+        "nbf": now.unix_timestamp(),
+        "exp": (now.checked_add(::time::SignedDuration::seconds(3600)).unwrap()).unix_timestamp(),
         "jti": uuid::Uuid::new_v4().to_string(),
     });
     encode(
@@ -543,7 +543,7 @@ async fn seed_config_change(store: &DatabaseStore, namespace: &str) {
          VALUES (?, 'upstream', 'seed-watermark', 'upsert', ?)",
     )
     .bind(namespace)
-    .bind(Utc::now().to_rfc3339())
+    .bind(UtcTimestamp::now().to_rfc3339())
     .execute(&store.pool())
     .await
     .expect("seed config change");

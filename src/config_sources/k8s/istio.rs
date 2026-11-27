@@ -6540,7 +6540,7 @@ fn route_mirror_plugin(
         return Ok(None);
     }
 
-    let now = chrono::Utc::now();
+    let now = crate::time_compat::UtcTimestamp::now();
     Ok(Some(PluginConfig {
         labels: Default::default(),
         id: format!("istio-vs-mirror-{proxy_id}"),
@@ -7076,7 +7076,7 @@ fn route_cors_plugin(object: &K8sObject, http: &Value, proxy_id: &str) -> Option
         serde_json::json!(unmatched),
     );
 
-    let now = chrono::Utc::now();
+    let now = crate::time_compat::UtcTimestamp::now();
     Some(PluginConfig {
         labels: Default::default(),
         id: format!("istio-vs-cors-{proxy_id}"),

@@ -2,7 +2,6 @@
 //! cache pruning must key resources by `(namespace, id)` so the same id in two
 //! namespaces cannot hide a tenant removal or prune the wrong tenant's state.
 
-use chrono::{DateTime, Utc};
 use ferrum_edge::circuit_breaker::{CircuitBreakerCache, target_key};
 use ferrum_edge::config::db_backend::NamespacedResourceId;
 use ferrum_edge::config::types::*;
@@ -10,16 +9,17 @@ use ferrum_edge::config_delta::ConfigDelta;
 use ferrum_edge::health_check::HealthChecker;
 use ferrum_edge::load_balancer::LoadBalancerCache;
 use ferrum_edge::plugin_cache::PluginCache;
+use ferrum_edge::time_compat::UtcTimestamp;
 use std::collections::HashMap;
 
 /// Fixed fixture timestamp.
 ///
 /// `ConfigDelta` treats any `updated_at` difference as a modification, so
 /// fixtures that are meant to be *identical* across two snapshots must not call
-/// `Utc::now()` independently on each side — that would report every unchanged
+/// `UtcTimestamp::now()` independently on each side — that would report every unchanged
 /// resource as modified and mask the namespace-identity behavior under test.
-fn fixture_timestamp() -> DateTime<Utc> {
-    DateTime::from_timestamp(1_700_000_000, 0).expect("fixed fixture timestamp is valid")
+fn fixture_timestamp() -> UtcTimestamp {
+    UtcTimestamp::from_unix_timestamp(1_700_000_000).expect("fixed fixture timestamp is valid")
 }
 
 fn make_proxy(namespace: &str, id: &str, listen_path: &str) -> Proxy {
@@ -405,8 +405,8 @@ fn consumer_index_delta_prunes_only_matching_namespace() {
 
 #[test]
 fn same_id_modification_is_isolated_per_namespace() {
-    let t1 = Utc::now();
-    let t2 = t1 + chrono::Duration::seconds(5);
+    let t1 = UtcTimestamp::now();
+    let t2 = t1.checked_add(::time::SignedDuration::seconds(5)).unwrap();
     let mut old_proxy = make_proxy("staging", "shared", "/staging");
     old_proxy.updated_at = t1;
     let mut new_proxy = make_proxy("staging", "shared", "/staging-v2");

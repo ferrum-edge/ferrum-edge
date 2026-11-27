@@ -4,7 +4,6 @@
 //! specificity, scope-list and plugin-scope admission, and declared
 //! event-stream responses.
 
-use chrono::Utc;
 use ferrum_edge::_test_support::{
     RESPONSE_BUFFER_RESERVATION_UNIT_BYTES as UNIT, RESPONSE_DECODE_BROTLI_SCRATCH_BYTES,
     ResponseBufferBudgetProbe, openapi_validator_decode_body_in,
@@ -878,8 +877,8 @@ fn validator_plugin_config(scope: PluginScope, proxy_id: Option<&str>) -> Plugin
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 

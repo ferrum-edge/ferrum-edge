@@ -24,8 +24,8 @@ use crate::config::types::{
 use crate::config::types::{PluginAssociation, PluginConfig, PluginScope, Proxy, Upstream};
 use crate::plugins::mcp_openapi_bridge as mcp_bridge;
 use crate::plugins::utils::sse::is_text_event_stream_media_type;
+use crate::time_compat::UtcTimestamp;
 use crate::util::media_type::is_concrete_http_media_type;
-use chrono::Utc;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -958,7 +958,7 @@ fn auto_inject_openapi_validator(
     }
 
     validate_openapi_validator_config_budget(&auto_config)?;
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     plugins.push(PluginConfig {
         labels: Default::default(),
         id: String::new(),
@@ -2337,7 +2337,7 @@ fn auto_inject_mcp_gateway(
     }
 
     validate_generated_config_budget("x-ferrum-mcp", "mcp_gateway", &auto_config)?;
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     plugins.push(PluginConfig {
         labels: Default::default(),
         id: String::new(),
@@ -9559,18 +9559,16 @@ x-ferrum-proxy:
 
     #[test]
     fn test_hash_ignores_created_at_and_updated_at() {
-        use chrono::{TimeZone, Utc};
-
         let mut bundle1 = build_test_bundle("hash-proxy", None);
         let mut bundle2 = build_test_bundle("hash-proxy", None);
 
         // Stamp different timestamps — hash_resource_bundle strips
         // created_at / updated_at via strip_metadata, so these must not
         // affect the hash.
-        bundle1.proxy.created_at = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
-        bundle1.proxy.updated_at = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
-        bundle2.proxy.created_at = Utc.with_ymd_and_hms(2025, 6, 15, 12, 0, 0).unwrap();
-        bundle2.proxy.updated_at = Utc.with_ymd_and_hms(2025, 6, 15, 12, 0, 0).unwrap();
+        bundle1.proxy.created_at = "2024-01-01T00:00:00Z".parse::<UtcTimestamp>().unwrap();
+        bundle1.proxy.updated_at = "2024-01-01T00:00:00Z".parse::<UtcTimestamp>().unwrap();
+        bundle2.proxy.created_at = "2025-06-15T12:00:00Z".parse::<UtcTimestamp>().unwrap();
+        bundle2.proxy.updated_at = "2025-06-15T12:00:00Z".parse::<UtcTimestamp>().unwrap();
 
         let hash1 = hash_resource_bundle(&bundle1).unwrap();
         let hash2 = hash_resource_bundle(&bundle2).unwrap();

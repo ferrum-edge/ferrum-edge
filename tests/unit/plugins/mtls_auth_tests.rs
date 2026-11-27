@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::plugin_utils::{assert_continue, assert_reject};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 /// Create a self-signed test certificate with the given CN and OU.
 /// Returns DER-encoded bytes.
@@ -347,8 +348,8 @@ fn create_mtls_consumer(id: &str, username: &str, identity: &str) -> Consumer {
         custom_id: Some(identity.to_string()),
         credentials,
         acl_groups: Vec::new(),
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 

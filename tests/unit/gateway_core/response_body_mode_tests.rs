@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use chrono::Utc;
 use ferrum_edge::_test_support::{
     canonical_header_content_length_from_map_for_test, coalesce_flush_window_for_test,
     passthrough_streaming_content_length_for_test, preserved_response_content_length_for_test,
@@ -11,6 +10,7 @@ use ferrum_edge::_test_support::{
 };
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, Proxy, ResponseBodyMode};
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 fn test_proxy() -> Proxy {
     Proxy {
@@ -77,8 +77,8 @@ fn test_proxy() -> Proxy {
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }

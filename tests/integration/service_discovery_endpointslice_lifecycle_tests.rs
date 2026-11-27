@@ -10,6 +10,7 @@ use ferrum_edge::config::types::{
 use ferrum_edge::load_balancer::LoadBalancerCache;
 use ferrum_edge::service_discovery::ServiceDiscoverer;
 use ferrum_edge::service_discovery::kubernetes::KubernetesDiscoverer;
+use ferrum_edge::time_compat::UtcTimestamp;
 use std::collections::HashMap;
 use std::sync::Arc;
 use wiremock::matchers::method;
@@ -59,8 +60,8 @@ fn make_upstream(id: &str) -> Upstream {
         backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         api_spec_id: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         k8s_service_uid: None,
         admission_upstream_id: None,
         pending_limit_scope: None,

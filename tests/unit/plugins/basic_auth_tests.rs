@@ -11,6 +11,7 @@ use serde_json::json;
 use super::plugin_utils::{
     assert_continue, assert_reject_body, context_with_materialized_raw_header,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 
 /// A fixed test secret used for all basic_auth tests, passed to the plugin
 /// explicitly through [`new_basic_auth`].
@@ -59,7 +60,6 @@ fn basic_header(user: &str, pass: &str) -> String {
 
 /// Create a consumer with a known HMAC-SHA256 password hash.
 fn create_basic_auth_consumer() -> ferrum_edge::config::types::Consumer {
-    use chrono::Utc;
     use serde_json::Value;
     use std::collections::HashMap;
 
@@ -79,8 +79,8 @@ fn create_basic_auth_consumer() -> ferrum_edge::config::types::Consumer {
         custom_id: None,
         credentials,
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -88,7 +88,6 @@ fn create_basic_auth_consumer_with_hash(
     username: &str,
     password_hash: String,
 ) -> ferrum_edge::config::types::Consumer {
-    use chrono::Utc;
     use serde_json::Value;
     use std::collections::HashMap;
 
@@ -106,8 +105,8 @@ fn create_basic_auth_consumer_with_hash(
         custom_id: None,
         credentials,
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -388,7 +387,6 @@ async fn test_basic_auth_password_with_colon() {
 async fn test_basic_auth_rejects_non_hmac_hash() {
     let plugin = new_basic_auth(&json!({})).unwrap();
 
-    use chrono::Utc;
     use serde_json::Value;
 
     let mut credentials = std::collections::HashMap::new();
@@ -405,8 +403,8 @@ async fn test_basic_auth_rejects_non_hmac_hash() {
         custom_id: None,
         credentials,
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -471,7 +469,6 @@ async fn test_basic_auth_malformed_hmac_hash_is_rejected() {
 // ---- Multi-credential rotation tests ----
 
 fn create_basic_auth_consumer_with_two_passwords() -> ferrum_edge::config::types::Consumer {
-    use chrono::Utc;
     use serde_json::Value;
     use std::collections::HashMap;
 
@@ -495,8 +492,8 @@ fn create_basic_auth_consumer_with_two_passwords() -> ferrum_edge::config::types
         custom_id: None,
         credentials,
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -554,7 +551,6 @@ async fn test_basic_auth_multi_password_wrong_password_rejected() {
 }
 
 fn timing_consumer_with_hashes(hashes: Vec<String>) -> ferrum_edge::config::types::Consumer {
-    use chrono::Utc;
     use serde_json::Value;
     use std::collections::HashMap;
 
@@ -574,8 +570,8 @@ fn timing_consumer_with_hashes(hashes: Vec<String>) -> ferrum_edge::config::type
             ),
         )]),
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 

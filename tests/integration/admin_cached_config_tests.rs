@@ -152,8 +152,8 @@ fn create_test_proxy(id: &str, listen_path: &str, host: &str, port: u16) -> Prox
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }
@@ -174,8 +174,8 @@ fn create_test_gateway_config() -> GatewayConfig {
             custom_id: Some("alice-custom".to_string()),
             credentials: HashMap::new(),
             acl_groups: Vec::new(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         }],
         plugin_configs: vec![PluginConfig {
             labels: Default::default(),
@@ -189,8 +189,8 @@ fn create_test_gateway_config() -> GatewayConfig {
             priority_override: None,
             trigger: None,
             api_spec_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         }],
         upstreams: vec![],
         loaded_at: UtcTimestamp::now(),
@@ -235,8 +235,8 @@ fn create_test_upstream(id: &str, name: &str) -> Upstream {
         backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         k8s_service_uid: None,
         admission_upstream_id: None,
         pending_limit_scope: None,
@@ -1513,8 +1513,8 @@ fn create_pagination_test_config() -> GatewayConfig {
             custom_id: None,
             credentials: HashMap::new(),
             acl_groups: Vec::new(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         });
         plugin_configs.push(PluginConfig {
             labels: Default::default(),
@@ -1528,8 +1528,8 @@ fn create_pagination_test_config() -> GatewayConfig {
             priority_override: None,
             trigger: None,
             api_spec_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         });
     }
     GatewayConfig {
@@ -2012,8 +2012,8 @@ fn proxy_filter_plugin_config(
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -5766,8 +5766,8 @@ async fn test_backup_restore_roundtrip_preserves_api_specs_json_and_yaml() {
             .expect("bundle resource hash"),
             external_ref_snapshot: None,
             external_ref_digest: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         };
         db.submit_api_spec_bundle(&bundle, &spec)
             .await
@@ -5816,8 +5816,8 @@ async fn test_backup_restore_roundtrip_preserves_api_specs_json_and_yaml() {
             .expect("bundle resource hash"),
             external_ref_snapshot: None,
             external_ref_digest: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         };
         db.submit_api_spec_bundle(&bundle, &spec)
             .await
@@ -5927,8 +5927,8 @@ async fn test_restore_rollback_restores_api_specs() {
         resource_hash: String::new(),
         external_ref_snapshot: None,
         external_ref_digest: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     db.submit_api_spec_bundle(&bundle, &spec)
         .await
@@ -6040,8 +6040,8 @@ async fn test_restore_legacy_backup_requires_api_spec_deletion_confirmation() {
         resource_hash: String::new(),
         external_ref_snapshot: None,
         external_ref_digest: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     db.submit_api_spec_bundle(&bundle, &spec)
         .await
@@ -6150,8 +6150,8 @@ async fn test_restore_rejects_hostile_api_spec_metadata_before_delete() {
         resource_hash: String::new(),
         external_ref_snapshot: None,
         external_ref_digest: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     db.submit_api_spec_bundle(&bundle, &kept_spec)
         .await

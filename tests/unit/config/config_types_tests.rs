@@ -1,4 +1,3 @@
-use chrono::Utc;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, BackendTlsConfig, Consumer, DispatchKind, GatewayConfig,
     H2UpgradePolicy, LocalityPreference, MeshSdConfig, PluginAssociation, PluginConfig,
@@ -78,8 +77,8 @@ fn make_proxy(id: &str, listen_path: &str) -> Proxy {
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }
@@ -94,8 +93,8 @@ fn make_consumer(id: &str, username: &str) -> Consumer {
         custom_id: None,
         credentials: HashMap::new(),
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -136,8 +135,8 @@ fn make_upstream(id: &str) -> Upstream {
         backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         k8s_service_uid: None,
         admission_upstream_id: None,
         pending_limit_scope: None,
@@ -973,8 +972,8 @@ fn mtls_plugin(
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -1452,8 +1451,8 @@ fn test_unique_listen_paths_valid() {
                 backend_proxy_protocol: None,
                 stream_match: None,
                 compiled_stream_match: None,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
+                created_at: UtcTimestamp::now(),
+                updated_at: UtcTimestamp::now(),
                 pending_limit_scope: None,
             },
             Proxy {
@@ -1520,8 +1519,8 @@ fn test_unique_listen_paths_valid() {
                 backend_proxy_protocol: None,
                 stream_match: None,
                 compiled_stream_match: None,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
+                created_at: UtcTimestamp::now(),
+                updated_at: UtcTimestamp::now(),
                 pending_limit_scope: None,
             },
         ],
@@ -1604,8 +1603,8 @@ fn test_unique_listen_paths_duplicate() {
                 backend_proxy_protocol: None,
                 stream_match: None,
                 compiled_stream_match: None,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
+                created_at: UtcTimestamp::now(),
+                updated_at: UtcTimestamp::now(),
                 pending_limit_scope: None,
             },
             Proxy {
@@ -1672,8 +1671,8 @@ fn test_unique_listen_paths_duplicate() {
                 backend_proxy_protocol: None,
                 stream_match: None,
                 compiled_stream_match: None,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
+                created_at: UtcTimestamp::now(),
+                updated_at: UtcTimestamp::now(),
                 pending_limit_scope: None,
             },
         ],
@@ -3614,8 +3613,8 @@ fn sni_plugin_config(
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -4366,8 +4365,8 @@ fn retry_proxy_allows_mesh_route_dispatch_override_upstream() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
 
     let mut proxy = make_proxy("p1", "/api");
@@ -4622,8 +4621,8 @@ fn retry_proxy_allows_same_upstream_dispatch_rule_that_adds_retry() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
 
     let mut proxy = make_proxy("p1", "/api");
@@ -4672,8 +4671,8 @@ fn retry_proxy_allows_when_local_dispatch_shadows_conflicting_global() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     // Local instance that shadows the global; routes only to the plain upstream.
     let local_dispatch = PluginConfig {
@@ -4692,8 +4691,8 @@ fn retry_proxy_allows_when_local_dispatch_shadows_conflicting_global() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
 
     let mut proxy = make_proxy("p1", "/api");
@@ -4740,8 +4739,8 @@ fn retry_proxy_allows_unshadowed_global_dispatch_to_mesh() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
 
     let mut proxy = make_proxy("p1", "/api");
@@ -4783,8 +4782,8 @@ fn retry_proxy_allows_foreign_namespace_global_dispatch() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
 
     let mut proxy = make_proxy("p1", "/api");
@@ -4831,8 +4830,8 @@ fn route_dispatch_association_resolves_same_namespace_plugin_id() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     let mut local_dispatch = foreign_dispatch.clone();
     local_dispatch.namespace = ferrum_edge::config::types::default_namespace();
@@ -4876,8 +4875,8 @@ fn test_plugin_config_priority_override_valid() {
         priority_override: Some(5000),
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     assert!(pc.validate_fields().is_ok());
 }
@@ -4896,8 +4895,8 @@ fn test_plugin_config_priority_override_none_valid() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     assert!(pc.validate_fields().is_ok());
 }
@@ -4916,8 +4915,8 @@ fn test_plugin_config_priority_override_too_high() {
         priority_override: Some(10001),
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     let err = pc.validate_fields().unwrap_err();
     assert!(err[0].contains("`priority_override` must be between 0 and 10000"));
@@ -4937,8 +4936,8 @@ fn test_plugin_config_priority_override_boundary() {
         priority_override: Some(10000),
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     assert!(pc.validate_fields().is_ok());
 }
@@ -4957,8 +4956,8 @@ fn test_plugin_config_priority_override_zero() {
         priority_override: Some(0),
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     assert!(pc.validate_fields().is_ok());
 }
@@ -4977,8 +4976,8 @@ fn test_plugin_config_priority_override_serde_roundtrip() {
         priority_override: Some(42),
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     let json = serde_json::to_string(&pc).unwrap();
     assert!(json.contains("\"priority_override\":42"));
@@ -5030,8 +5029,8 @@ fn test_validate_plugin_references_rejects_global_plugin_association() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }];
     let mut proxy = make_proxy("p1", "/api");
     proxy.plugins = vec![PluginAssociation {
@@ -5061,8 +5060,8 @@ fn test_validate_plugin_references_rejects_wrong_proxy_target() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }];
     let mut proxy = make_proxy("p1", "/api");
     proxy.plugins = vec![PluginAssociation {
@@ -5094,8 +5093,8 @@ fn test_validate_plugin_references_accepts_proxy_group_association() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }];
     let mut proxy = make_proxy("p1", "/api");
     proxy.plugins = vec![PluginAssociation {
@@ -5122,8 +5121,8 @@ fn test_validate_plugin_references_proxy_group_shared_across_proxies() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }];
     let mut proxy1 = make_proxy("p1", "/api");
     proxy1.plugins = vec![PluginAssociation {
@@ -5154,8 +5153,8 @@ fn test_validate_plugin_references_rejects_proxy_group_with_proxy_id() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }];
     config.proxies = vec![make_proxy("p1", "/api")];
 
@@ -5180,8 +5179,8 @@ fn test_plugin_scope_proxy_group_serde_round_trip() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     let json = serde_json::to_string(&pc).unwrap();
     assert!(json.contains("\"proxy_group\""));
@@ -5386,8 +5385,8 @@ fn test_validate_unique_resource_ids_allows_proxy_upstream_plugin_id_in_differen
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     let mut staging_plugin = prod_plugin.clone();
     staging_plugin.namespace = "staging".to_string();
@@ -6999,8 +6998,8 @@ fn transaction_log_schema_pc(scope: PluginScope, proxy_id: Option<&str>) -> Plug
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -7017,8 +7016,8 @@ fn prometheus_metrics_pc(id: &str, scope: PluginScope, proxy_id: Option<&str>) -
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -7200,8 +7199,8 @@ fn api_chargeback_rejects_duplicate_effective_instances_on_one_proxy() {
             priority_override: None,
             trigger: None,
             api_spec_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         },
         PluginConfig {
             labels: Default::default(),
@@ -7218,8 +7217,8 @@ fn api_chargeback_rejects_duplicate_effective_instances_on_one_proxy() {
             priority_override: None,
             trigger: None,
             api_spec_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         },
     ];
 
@@ -7264,8 +7263,8 @@ async fn api_chargeback_sink_rejects_duplicate_effective_instances_on_one_proxy(
             priority_override: None,
             trigger: None,
             api_spec_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         },
         PluginConfig {
             labels: Default::default(),
@@ -7283,8 +7282,8 @@ async fn api_chargeback_sink_rejects_duplicate_effective_instances_on_one_proxy(
             priority_override: None,
             trigger: None,
             api_spec_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         },
     ];
 
@@ -7350,8 +7349,8 @@ fn api_chargeback_rejects_conflicting_shared_tunables_in_plugin_references() {
             priority_override: None,
             trigger: None,
             api_spec_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         },
         PluginConfig {
             labels: Default::default(),
@@ -7369,8 +7368,8 @@ fn api_chargeback_rejects_conflicting_shared_tunables_in_plugin_references() {
             priority_override: None,
             trigger: None,
             api_spec_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         },
     ];
 
@@ -7408,8 +7407,8 @@ fn admin_admitted_plugin_scope_implies_runtime_reference_admit() {
             priority_override: None,
             trigger: None,
             api_spec_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         };
 
         if pc.validate_fields().is_err() {
@@ -7452,8 +7451,8 @@ fn dedup_plugin_config(id: &str, scope: PluginScope, proxy_id: Option<&str>) -> 
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -7481,8 +7480,8 @@ fn mcp_gateway_plugin_config(id: &str, scope: PluginScope, proxy_id: Option<&str
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -7824,8 +7823,8 @@ fn a2a_gateway_plugin_config(
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 

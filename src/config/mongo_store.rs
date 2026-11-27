@@ -88,10 +88,10 @@ mod inner {
         ConfigValidationRejection, ValidationAction, ValidationPipeline,
         collect_rejecting_runtime_config_errors, validate_plugin_file_dependencies_off_thread,
     };
+    use crate::time_compat::UtcTimestamp;
     use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
     use anyhow::Context;
     use async_trait::async_trait;
-    use chrono::{DateTime, Utc};
     use dashmap::DashMap;
     use mongodb::bson::{
         Binary, Bson, DateTime as BsonDateTime, Document, doc, spec::BinarySubtype,
@@ -316,8 +316,11 @@ mod inner {
     /// its second — over-inclusive by at most one second, the same safe
     /// direction as the incremental poll's explicit 1s margin (never drop
     /// newer rows).
-    fn mongo_updated_at_lower_bound(ts: DateTime<Utc>) -> String {
-        ts.format("%Y-%m-%dT%H:%M:%S").to_string()
+    fn mongo_updated_at_lower_bound(ts: UtcTimestamp) -> String {
+        // chrono's `%Y-%m-%dT%H:%M:%S`: RFC 3339 whole seconds without the `Z`.
+        let mut bound = ts.to_rfc3339_opts(crate::time_compat::SecondsFormat::Secs, true);
+        bound.pop();
+        bound
     }
 
     fn is_mongo_command_error_with_code(err: &mongodb::error::Error, code: i32) -> bool {
@@ -5372,12 +5375,17 @@ mod inner {
         async fn count_updated_before_in_boundary_second(
             &self,
             base_filter: &Document,
-            since: DateTime<Utc>,
+            since: UtcTimestamp,
         ) -> Result<i64, anyhow::Error> {
             // Restrict to `[floor(since), floor(since)+1s)` — the only window
             // the whole-second floor can over-include.
             let floor = mongo_updated_at_lower_bound(since);
-            let next = mongo_updated_at_lower_bound(since + chrono::Duration::seconds(1));
+            // chrono's year-10000 upper bound (`+10000-...`) sorted below every
+            // stored year-9999 value, so that window was always empty.
+            let Some(next_second) = since.checked_add(::time::SignedDuration::seconds(1)) else {
+                return Ok(0);
+            };
+            let next = mongo_updated_at_lower_bound(next_second);
             let mut filter = base_filter.clone();
             filter.insert("updated_at", doc! { "$gte": &floor, "$lt": &next });
 
@@ -5392,8 +5400,9 @@ mod inner {
                 // Parse the stored RFC 3339 string exactly (faithful across
                 // every AutoSi fractional width) and apply `< since`.
                 if let Ok(raw) = doc.get_str("updated_at")
-                    && let Ok(parsed) = DateTime::parse_from_rfc3339(raw)
-                    && parsed.with_timezone(&Utc) < since
+                    && let Ok(parsed) = crate::time_compat::parse_rfc3339_chrono(raw)
+                        .and_then(|parsed| parsed.to_utc_timestamp())
+                    && parsed < since
                 {
                     overage += 1;
                 }
@@ -8472,7 +8481,7 @@ mod inner {
                 }
             }
 
-            let now = Utc::now();
+            let now = UtcTimestamp::now();
             let mut record = existing
                 .unwrap_or_else(|| NamespaceRecord::new(current_name.to_string(), None, now));
             if let Some(description) = &plan.description {
@@ -10284,7 +10293,7 @@ mod inner {
         doc.insert("diff", serde_json::to_string(&event.diff)?);
         doc.insert(
             "ts",
-            Bson::DateTime(BsonDateTime::from_millis(event.ts.timestamp_millis())),
+            Bson::DateTime(BsonDateTime::from_millis(event.ts.unix_timestamp_millis())),
         );
         Ok(doc)
     }
@@ -10299,8 +10308,8 @@ mod inner {
         let Some(Bson::DateTime(ts)) = doc.remove("ts") else {
             anyhow::bail!("audit event ts must be a BSON DateTime");
         };
-        let ts = DateTime::<Utc>::from_timestamp_millis(ts.timestamp_millis())
-            .ok_or_else(|| anyhow::anyhow!("audit event ts is outside chrono range"))?;
+        let ts = UtcTimestamp::from_unix_timestamp_millis(ts.timestamp_millis())
+            .map_err(|_| anyhow::anyhow!("audit event ts is outside the supported range"))?;
         doc.insert("ts", ts.to_rfc3339());
         let Some(Bson::String(diff_json)) = doc.remove("diff") else {
             anyhow::bail!("audit event diff must be JSON text");
@@ -18983,8 +18992,8 @@ mod inner {
         }
     }
 
-    fn audit_ts_bound(value: &DateTime<Utc>) -> Bson {
-        Bson::DateTime(BsonDateTime::from_millis(value.timestamp_millis()))
+    fn audit_ts_bound(value: &UtcTimestamp) -> Bson {
+        Bson::DateTime(BsonDateTime::from_millis(value.unix_timestamp_millis()))
     }
 
     impl MongoStore {
@@ -19079,7 +19088,11 @@ mod inner {
             retention_days: u64,
         ) -> Result<u64, anyhow::Error> {
             let days_i64 = i64::try_from(retention_days).unwrap_or(i64::MAX);
-            let cutoff = Utc::now() - chrono::Duration::days(days_i64);
+            let cutoff = days_i64
+                .checked_mul(86_400)
+                .and_then(crate::time_compat::chrono_try_seconds)
+                .and_then(|age| UtcTimestamp::now().checked_sub(age))
+                .ok_or_else(|| anyhow::anyhow!("audit retention cutoff is out of range"))?;
             let cutoff_bson = audit_ts_bound(&cutoff);
             let mut total = 0u64;
             for _ in 0..crate::admin::audit::AUDIT_RETENTION_PRUNE_MAX_BATCHES {
@@ -19764,12 +19777,12 @@ mod inner {
 
         #[test]
         fn audit_ts_range_filter_uses_bson_datetimes() {
-            let start = DateTime::parse_from_rfc3339("2026-05-18T01:00:00Z")
-                .expect("start timestamp")
-                .with_timezone(&Utc);
-            let end = DateTime::parse_from_rfc3339("2026-05-18T02:00:00Z")
-                .expect("end timestamp")
-                .with_timezone(&Utc);
+            let start = "2026-05-18T01:00:00Z"
+                .parse::<UtcTimestamp>()
+                .expect("start timestamp");
+            let end = "2026-05-18T02:00:00Z"
+                .parse::<UtcTimestamp>()
+                .expect("end timestamp");
             let filter = crate::admin::audit::AuditListFilter {
                 start: Some(start),
                 end: Some(end),
@@ -19792,11 +19805,11 @@ mod inner {
             );
         }
 
-        /// How a `DateTime<Utc>` is actually persisted into `updated_at`:
+        /// How a `UtcTimestamp` is actually persisted into `updated_at`:
         /// chrono's serde impl (`SecondsFormat::AutoSi`). Mirrors what
         /// `bson::to_document` writes for resource/api-spec docs, so the bound
         /// tests below compare against the real stored bytes.
-        fn stored_updated_at(ts: DateTime<Utc>) -> String {
+        fn stored_updated_at(ts: UtcTimestamp) -> String {
             serde_json::to_string(&ts)
                 .expect("serialize timestamp")
                 .trim_matches('"')
@@ -19805,12 +19818,12 @@ mod inner {
 
         #[test]
         fn mongo_updated_at_lower_bound_floors_to_whole_second() {
-            let whole = DateTime::parse_from_rfc3339("2026-05-18T01:00:00Z")
-                .expect("timestamp")
-                .with_timezone(&Utc);
-            let fractional = DateTime::parse_from_rfc3339("2026-05-18T01:00:00.123Z")
-                .expect("timestamp")
-                .with_timezone(&Utc);
+            let whole = "2026-05-18T01:00:00Z"
+                .parse::<UtcTimestamp>()
+                .expect("timestamp");
+            let fractional = "2026-05-18T01:00:00.123Z"
+                .parse::<UtcTimestamp>()
+                .expect("timestamp");
 
             assert_eq!(mongo_updated_at_lower_bound(whole), "2026-05-18T01:00:00");
             assert_eq!(
@@ -19828,9 +19841,9 @@ mod inner {
             // Regression: `GET /api-specs?updated_since=...T01:00:00Z` must not
             // omit a row stored at `...T01:00:00.123Z`. A naive `Z`-suffixed
             // bound excludes it because `.` (0x2E) sorts before `Z` (0x5A).
-            let bound_instant = DateTime::parse_from_rfc3339("2026-05-18T01:00:00Z")
-                .expect("timestamp")
-                .with_timezone(&Utc);
+            let bound_instant = "2026-05-18T01:00:00Z"
+                .parse::<UtcTimestamp>()
+                .expect("timestamp");
             let bound = mongo_updated_at_lower_bound(bound_instant);
 
             // Stored values at or after the bound, across every AutoSi width.
@@ -19843,9 +19856,9 @@ mod inner {
                 "2026-05-18T01:01:00.5Z",         // later minute, fractional
             ] {
                 let stored = stored_updated_at(
-                    DateTime::parse_from_rfc3339(stored_instant)
-                        .expect("stored timestamp")
-                        .with_timezone(&Utc),
+                    stored_instant
+                        .parse::<UtcTimestamp>()
+                        .expect("stored timestamp"),
                 );
                 assert!(
                     stored.as_str() >= bound.as_str(),
@@ -19860,9 +19873,9 @@ mod inner {
                 "2026-05-17T23:59:59.5Z",
             ] {
                 let stored = stored_updated_at(
-                    DateTime::parse_from_rfc3339(stored_instant)
-                        .expect("stored timestamp")
-                        .with_timezone(&Utc),
+                    stored_instant
+                        .parse::<UtcTimestamp>()
+                        .expect("stored timestamp"),
                 );
                 assert!(
                     stored.as_str() < bound.as_str(),
@@ -19877,15 +19890,17 @@ mod inner {
         // matches every chronologically-`>= since` row but over-includes rows
         // in `[floor(since), since)`; these helpers reproduce the decision the
         // store makes on parsed timestamps (faithful across AutoSi widths).
-        fn parse_stored(stored: &str) -> DateTime<Utc> {
-            DateTime::parse_from_rfc3339(stored)
-                .expect("stored timestamp")
-                .with_timezone(&Utc)
+        fn parse_stored(stored: &str) -> UtcTimestamp {
+            stored.parse::<UtcTimestamp>().expect("stored timestamp")
         }
-        fn in_boundary_window(stored: &str, since: DateTime<Utc>) -> bool {
+        fn in_boundary_window(stored: &str, since: UtcTimestamp) -> bool {
             // `[floor(since), floor(since)+1s)` — the only over-included window.
             let lo = mongo_updated_at_lower_bound(since);
-            let hi = mongo_updated_at_lower_bound(since + chrono::Duration::seconds(1));
+            let hi = mongo_updated_at_lower_bound(
+                since
+                    .checked_add(::time::SignedDuration::seconds(1))
+                    .unwrap(),
+            );
             let s = stored_updated_at(parse_stored(stored));
             s.as_str() >= lo.as_str() && s.as_str() < hi.as_str()
         }
@@ -20010,9 +20025,9 @@ mod inner {
 
         #[test]
         fn audit_event_to_doc_stores_ts_as_bson_datetime() {
-            let ts = DateTime::parse_from_rfc3339("2026-05-18T01:00:00.123Z")
-                .expect("timestamp")
-                .with_timezone(&Utc);
+            let ts = "2026-05-18T01:00:00.123Z"
+                .parse::<UtcTimestamp>()
+                .expect("timestamp");
             let event = crate::admin::audit::AuditEvent {
                 id: "audit-1".to_string(),
                 ts,
@@ -20050,7 +20065,10 @@ mod inner {
             );
 
             let round_trip = doc_to_audit_event(doc).expect("audit event round-trips");
-            assert_eq!(round_trip.ts.timestamp_millis(), ts.timestamp_millis());
+            assert_eq!(
+                round_trip.ts.unix_timestamp_millis(),
+                ts.unix_timestamp_millis()
+            );
             assert_eq!(round_trip.diff, event.diff);
         }
 
@@ -20082,7 +20100,7 @@ mod inner {
 
         #[test]
         fn api_spec_doc_stores_spec_content_as_bson_binary() {
-            let now = chrono::Utc::now();
+            let now = UtcTimestamp::now();
             let spec = ApiSpec {
                 id: "spec-1".to_string(),
                 namespace: "ferrum".to_string(),
@@ -20146,7 +20164,7 @@ mod inner {
 
         #[test]
         fn api_spec_summary_doc_allows_projected_out_spec_content() {
-            let now = chrono::Utc::now();
+            let now = UtcTimestamp::now();
             let spec = ApiSpec {
                 id: "spec-summary".to_string(),
                 namespace: "ferrum".to_string(),
@@ -20193,7 +20211,7 @@ mod inner {
 
         #[test]
         fn proxy_bson_round_trip() {
-            let now = chrono::Utc::now();
+            let now = UtcTimestamp::now();
             let proxy = Proxy {
                 labels: Default::default(),
                 id: "test-proxy".to_string(),
@@ -20285,7 +20303,7 @@ mod inner {
 
         #[test]
         fn consumer_bson_round_trip() {
-            let now = chrono::Utc::now();
+            let now = UtcTimestamp::now();
             let consumer = Consumer {
                 labels: Default::default(),
                 id: "consumer-1".to_string(),
@@ -20315,7 +20333,7 @@ mod inner {
 
         #[test]
         fn plugin_config_bson_round_trip() {
-            let now = chrono::Utc::now();
+            let now = UtcTimestamp::now();
             let pc = PluginConfig {
                 labels: Default::default(),
                 id: "plugin-1".to_string(),
@@ -20351,7 +20369,7 @@ mod inner {
 
         #[test]
         fn upstream_bson_round_trip() {
-            let now = chrono::Utc::now();
+            let now = UtcTimestamp::now();
             let upstream = Upstream {
                 labels: Default::default(),
                 id: "upstream-1".to_string(),
@@ -20426,7 +20444,7 @@ mod inner {
 
         #[test]
         fn proxy_to_doc_sets_id_field() {
-            let now = chrono::Utc::now();
+            let now = UtcTimestamp::now();
             let proxy = Proxy {
                 labels: Default::default(),
                 id: "unique-id-123".to_string(),
@@ -20518,7 +20536,7 @@ mod inner {
         /// likewise omit meaningless null keys. `proxy_to_doc` strips both.
         #[test]
         fn proxy_to_doc_strips_null_index_fields() {
-            let now = chrono::Utc::now();
+            let now = UtcTimestamp::now();
             let proxy = Proxy {
                 labels: Default::default(),
                 id: "http-proxy".to_string(),
@@ -20608,7 +20626,7 @@ mod inner {
 
         #[test]
         fn consumer_to_doc_strips_null_custom_id() {
-            let now = chrono::Utc::now();
+            let now = UtcTimestamp::now();
             let consumer = Consumer {
                 labels: Default::default(),
                 id: "c-1".to_string(),
@@ -20643,8 +20661,8 @@ mod inner {
                 custom_id: None,
                 credentials,
                 acl_groups: vec![],
-                created_at: chrono::Utc::now(),
-                updated_at: chrono::Utc::now(),
+                created_at: UtcTimestamp::now(),
+                updated_at: UtcTimestamp::now(),
             };
 
             let doc = consumer_to_doc(&consumer).unwrap();
@@ -20662,7 +20680,7 @@ mod inner {
 
         #[test]
         fn upstream_to_doc_strips_null_name() {
-            let now = chrono::Utc::now();
+            let now = UtcTimestamp::now();
             let upstream = Upstream {
                 labels: Default::default(),
                 id: "u-1".to_string(),
@@ -20705,7 +20723,7 @@ mod inner {
 
         #[test]
         fn consumer_with_credentials_round_trip() {
-            let now = chrono::Utc::now();
+            let now = UtcTimestamp::now();
             let mut credentials = std::collections::HashMap::new();
             credentials.insert(
                 "key_auth".to_string(),
@@ -20737,7 +20755,7 @@ mod inner {
 
         #[test]
         fn proxy_with_plugin_associations_round_trip() {
-            let now = chrono::Utc::now();
+            let now = UtcTimestamp::now();
             let proxy = Proxy {
                 labels: Default::default(),
                 id: "proxy-with-plugins".to_string(),

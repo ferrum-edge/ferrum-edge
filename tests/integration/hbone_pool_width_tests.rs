@@ -13,7 +13,6 @@ use crate::scaffolding::port_registry::TestSocket;
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use chrono::Utc;
 use ferrum_edge::config::PoolConfig;
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, Proxy, ResponseBodyMode};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
@@ -22,6 +21,7 @@ use ferrum_edge::identity::{SharedSvidBundle, SvidBundle, TrustBundle, TrustBund
 use ferrum_edge::proxy::hbone_pool::{
     H2ConnectTunnel, HBONE_GROWTH_ACTIVE_STREAMS_PER_CONNECTION, HboneConnectionPool,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use ferrum_edge::tls::spiffe::build_spiffe_inbound_config;
 use http::{Response, StatusCode};
 use rcgen::{
@@ -94,7 +94,7 @@ fn svid_slot(bundle: SvidBundle) -> SharedSvidBundle {
 }
 
 fn proxy_for_test() -> Proxy {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     Proxy {
         labels: Default::default(),
         id: "hbone-width".to_string(),

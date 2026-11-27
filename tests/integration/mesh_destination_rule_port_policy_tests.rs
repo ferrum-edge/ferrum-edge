@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use chrono::Utc;
 use ferrum_edge::config::types::{
     DEFAULT_NAMESPACE, GatewayConfig, LoadBalancerAlgorithm, MAX_TARGET_WEIGHT, Proxy, Upstream,
     UpstreamTarget,
@@ -21,6 +20,7 @@ use ferrum_edge::modes::mesh::{
 };
 
 use super::mesh_test_support::{service_for, workload_for};
+use ferrum_edge::time_compat::UtcTimestamp;
 
 fn runtime() -> MeshRuntimeConfig {
     MeshRuntimeConfig {
@@ -81,7 +81,7 @@ fn runtime() -> MeshRuntimeConfig {
 }
 
 fn upstream() -> Upstream {
-    let now = Utc::now();
+    let now = UtcTimestamp::now();
     Upstream {
         labels: Default::default(),
         id: "reviews-u".to_string(),

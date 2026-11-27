@@ -43,10 +43,10 @@ mod unix_bench {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use chrono::Utc;
     use criterion::{Criterion, black_box};
     use ferrum_edge::config::PoolConfig;
     use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, Proxy};
+    use ferrum_edge::time_compat::UtcTimestamp;
     use ferrum_edge::proxy::unix_backend_pool::UnixBackendConnectionPool;
 
     /// A backend that accepts connections and retains at most `retain` of them.
@@ -168,8 +168,8 @@ mod unix_bench {
             backend_proxy_protocol: None,
             stream_match: None,
             compiled_stream_match: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
         }
     }
 

@@ -19,7 +19,6 @@ use crate::scaffolding::port_registry::TestSocket;
 use std::{collections::HashMap, sync::Arc};
 
 use base64::Engine;
-use chrono::{Duration, Utc};
 
 use ferrum_edge::config::db_loader::{IncrementalResult, NamespacedResourceId};
 use ferrum_edge::config::file_loader::load_config_from_file;
@@ -126,8 +125,8 @@ fn test_proxy(id: &str, listen_path: &str) -> Proxy {
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }
@@ -141,8 +140,8 @@ fn test_consumer(id: &str, username: &str) -> Consumer {
         custom_id: None,
         credentials: HashMap::new(),
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -159,8 +158,8 @@ fn test_plugin_config(id: &str, enabled: bool) -> PluginConfig {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -200,8 +199,8 @@ fn test_upstream(id: &str, host: &str, port: u16) -> Upstream {
         backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         k8s_service_uid: None,
         admission_upstream_id: None,
         pending_limit_scope: None,
@@ -497,8 +496,8 @@ async fn update_config_applies_accepted_mmdb_only_reload_without_config_delta() 
                 priority_override: None,
                 trigger: None,
                 api_spec_id: None,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
+                created_at: UtcTimestamp::now(),
+                updated_at: UtcTimestamp::now(),
             },
             test_plugin_config("unrelated-logging", true),
         ],
@@ -605,8 +604,8 @@ async fn incremental_preloads_geo_for_adaptive_route_rebuild_scope_expansion() {
                 priority_override: None,
                 trigger: None,
                 api_spec_id: None,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
+                created_at: UtcTimestamp::now(),
+                updated_at: UtcTimestamp::now(),
             },
             PluginConfig {
                 labels: Default::default(),
@@ -624,8 +623,8 @@ async fn incremental_preloads_geo_for_adaptive_route_rebuild_scope_expansion() {
                 priority_override: None,
                 trigger: None,
                 api_spec_id: None,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
+                created_at: UtcTimestamp::now(),
+                updated_at: UtcTimestamp::now(),
             },
         ],
         loaded_at: UtcTimestamp::now(),
@@ -641,7 +640,9 @@ async fn incremental_preloads_geo_for_adaptive_route_rebuild_scope_expansion() {
     // the incremental build session and would reject this update.
     std::fs::remove_file(&mmdb_path).unwrap();
     p1.backend_host = "replacement.local".to_string();
-    p1.updated_at = Utc::now() + Duration::milliseconds(1);
+    p1.updated_at = UtcTimestamp::now()
+        .checked_add(::time::SignedDuration::milliseconds(1))
+        .unwrap();
     let outcome = state
         .apply_incremental(delta_with_proxy(p1, UtcTimestamp::now()))
         .await;
@@ -694,8 +695,8 @@ async fn incremental_preloaded_geo_handoff_normalizes_padded_db_path() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     let state = proxy_state_with_config(GatewayConfig {
         version: ferrum_edge::config::types::CURRENT_CONFIG_VERSION.to_string(),
@@ -707,7 +708,9 @@ async fn incremental_preloaded_geo_handoff_normalizes_padded_db_path() {
 
     let mut updated_policy = geo_policy;
     updated_policy.config["deny_countries"] = serde_json::json!(["SE"]);
-    updated_policy.updated_at = Utc::now() + Duration::milliseconds(1);
+    updated_policy.updated_at = UtcTimestamp::now()
+        .checked_add(::time::SignedDuration::milliseconds(1))
+        .unwrap();
     assert_eq!(
         state
             .apply_incremental(delta_with_plugin(updated_policy, UtcTimestamp::now()))
@@ -773,8 +776,8 @@ async fn incremental_geo_refresh_preserves_out_of_scope_policy_snapshot() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     let second_policy = PluginConfig {
         labels: Default::default(),
@@ -792,8 +795,8 @@ async fn incremental_geo_refresh_preserves_out_of_scope_policy_snapshot() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     let state = proxy_state_with_config(GatewayConfig {
         version: ferrum_edge::config::types::CURRENT_CONFIG_VERSION.to_string(),
@@ -814,7 +817,9 @@ async fn incremental_geo_refresh_preserves_out_of_scope_policy_snapshot() {
     std::fs::write(&second_mmdb_path, b"corrupt replacement").unwrap();
     let mut updated_first_policy = first_policy;
     updated_first_policy.config["deny_countries"] = serde_json::json!(["SE"]);
-    updated_first_policy.updated_at = Utc::now() + Duration::milliseconds(1);
+    updated_first_policy.updated_at = UtcTimestamp::now()
+        .checked_add(::time::SignedDuration::milliseconds(1))
+        .unwrap();
     assert_eq!(
         state
             .apply_incremental(delta_with_plugin(updated_first_policy, UtcTimestamp::now()))
@@ -893,8 +898,8 @@ async fn dp_full_snapshots_refresh_mmdb_with_and_without_serialized_delta() {
                 priority_override: None,
                 trigger: None,
                 api_spec_id: None,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
+                created_at: UtcTimestamp::now(),
+                updated_at: UtcTimestamp::now(),
             },
             test_plugin_config("unrelated-logging", true),
         ],
@@ -1070,8 +1075,8 @@ async fn dp_full_snapshot_applies_new_geo_policy_over_retained_mmdb() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     };
     let geo_request = || {
         RequestContext::new(
@@ -1401,7 +1406,10 @@ async fn request_termination_invalid_reload_keeps_last_known_good_policy() {
         "status_code": 451,
         "triger": {"path_prefix": "/must-not-publish"}
     });
-    invalid.plugin_configs[0].updated_at += Duration::milliseconds(1);
+    invalid.plugin_configs[0].updated_at = invalid.plugin_configs[0]
+        .updated_at
+        .checked_add(::time::SignedDuration::milliseconds(1))
+        .unwrap();
     let outcome = state.update_config(invalid);
     let ConfigApplyOutcome::Rejected { errors } = outcome else {
         panic!("misspelled request_termination trigger must reject reload");
@@ -1463,7 +1471,10 @@ async fn security_headers_unknown_key_reload_keeps_last_known_good_policy() {
         },
         "set": { "X-Policy": "must-not-publish" }
     });
-    invalid.plugin_configs[0].updated_at += Duration::milliseconds(1);
+    invalid.plugin_configs[0].updated_at = invalid.plugin_configs[0]
+        .updated_at
+        .checked_add(::time::SignedDuration::milliseconds(1))
+        .unwrap();
     let outcome = state.update_config(invalid);
     let ConfigApplyOutcome::Rejected { errors } = outcome else {
         panic!("unknown nested security_headers key must reject reload");
@@ -1524,7 +1535,10 @@ async fn load_testing_unknown_key_reload_keeps_last_known_good_generation() {
         "rmap": true,
         "request_timeot_ms": 5000
     });
-    invalid.plugin_configs[0].updated_at += Duration::milliseconds(1);
+    invalid.plugin_configs[0].updated_at = invalid.plugin_configs[0]
+        .updated_at
+        .checked_add(::time::SignedDuration::milliseconds(1))
+        .unwrap();
     let outcome = state.update_config(invalid);
     let ConfigApplyOutcome::Rejected { errors } = outcome else {
         panic!("unknown load_testing keys must reject reload");
@@ -1636,7 +1650,10 @@ async fn ai_stream_router_unknown_key_reload_keeps_last_known_good_policy() {
     ] {
         let mut invalid = valid.clone();
         invalid.plugin_configs[0].config = bad_config;
-        invalid.plugin_configs[0].updated_at += Duration::milliseconds(1);
+        invalid.plugin_configs[0].updated_at = invalid.plugin_configs[0]
+            .updated_at
+            .checked_add(::time::SignedDuration::milliseconds(1))
+            .unwrap();
         let ConfigApplyOutcome::Rejected { errors } = state.update_config(invalid) else {
             panic!("{label}: unknown ai_stream_router key must reject reload");
         };
@@ -1698,7 +1715,10 @@ async fn compression_unknown_key_reload_keeps_last_known_good_generation() {
         "min_content_lenght": 4096,
         "gzip_leveel": 1
     });
-    invalid.plugin_configs[0].updated_at += Duration::milliseconds(1);
+    invalid.plugin_configs[0].updated_at = invalid.plugin_configs[0]
+        .updated_at
+        .checked_add(::time::SignedDuration::milliseconds(1))
+        .unwrap();
     let ConfigApplyOutcome::Rejected { errors } = state.update_config(invalid) else {
         panic!("unknown compression keys must reject database/CP-DP reload");
     };
@@ -1753,7 +1773,10 @@ async fn correlation_id_invalid_reload_keeps_last_known_good_plugin_generation()
         "header_name": "x-must-not-publish",
         "echo_downsteam": false
     });
-    invalid.plugin_configs[0].updated_at += Duration::milliseconds(1);
+    invalid.plugin_configs[0].updated_at = invalid.plugin_configs[0]
+        .updated_at
+        .checked_add(::time::SignedDuration::milliseconds(1))
+        .unwrap();
     let ConfigApplyOutcome::Rejected { errors } = state.update_config(invalid) else {
         panic!("unknown correlation_id field must reject reload");
     };
@@ -1776,7 +1799,10 @@ async fn correlation_id_invalid_reload_keeps_last_known_good_plugin_generation()
         "header_name": " X-Stable-Request-ID ",
         "echo_downstream": true
     });
-    duplicate.plugin_configs[1].updated_at += Duration::milliseconds(1);
+    duplicate.plugin_configs[1].updated_at = duplicate.plugin_configs[1]
+        .updated_at
+        .checked_add(::time::SignedDuration::milliseconds(1))
+        .unwrap();
     let ConfigApplyOutcome::Rejected { errors } = state.update_config(duplicate) else {
         panic!("duplicate effective correlation header must reject reload");
     };
@@ -1794,7 +1820,10 @@ async fn correlation_id_invalid_reload_keeps_last_known_good_plugin_generation()
 
     let mut priority_tie = valid;
     priority_tie.plugin_configs[1].priority_override = Some(40);
-    priority_tie.plugin_configs[1].updated_at += Duration::milliseconds(1);
+    priority_tie.plugin_configs[1].updated_at = priority_tie.plugin_configs[1]
+        .updated_at
+        .checked_add(::time::SignedDuration::milliseconds(1))
+        .unwrap();
     let ConfigApplyOutcome::Rejected { errors } = state.update_config(priority_tie) else {
         panic!("equal effective correlation priorities must reject reload");
     };
@@ -1871,7 +1900,10 @@ async fn ip_restriction_typo_reload_keeps_last_known_good_policy() {
         "alow": ["192.0.2.0/24"],
         "deny": ["203.0.113.0/24"]
     });
-    invalid.plugin_configs[0].updated_at += Duration::milliseconds(1);
+    invalid.plugin_configs[0].updated_at = invalid.plugin_configs[0]
+        .updated_at
+        .checked_add(::time::SignedDuration::milliseconds(1))
+        .unwrap();
     let ConfigApplyOutcome::Rejected { errors } = state.update_config(invalid) else {
         panic!("misspelled ip_restriction allow list must reject reload");
     };
@@ -1950,7 +1982,10 @@ async fn ai_tool_governor_unknown_key_reload_keeps_last_known_good_policy() {
             }
         }
     });
-    invalid.plugin_configs[0].updated_at += Duration::milliseconds(1);
+    invalid.plugin_configs[0].updated_at = invalid.plugin_configs[0]
+        .updated_at
+        .checked_add(::time::SignedDuration::milliseconds(1))
+        .unwrap();
     let ConfigApplyOutcome::Rejected { errors } = state.update_config(invalid) else {
         panic!("unknown ai_tool_governor tool-policy key must reject reload");
     };
@@ -2006,7 +2041,10 @@ async fn grpc_web_typo_reload_keeps_last_known_good_expose_policy() {
     invalid.plugin_configs[0].config = serde_json::json!({
         "expose_header": ["x-must-not-publish"]
     });
-    invalid.plugin_configs[0].updated_at += Duration::milliseconds(1);
+    invalid.plugin_configs[0].updated_at = invalid.plugin_configs[0]
+        .updated_at
+        .checked_add(::time::SignedDuration::milliseconds(1))
+        .unwrap();
     let ConfigApplyOutcome::Rejected { errors } = state.update_config(invalid) else {
         panic!("misspelled grpc_web expose_headers must reject reload");
     };
@@ -2067,7 +2105,10 @@ async fn ldap_plaintext_reload_keeps_last_known_good_dial_policy() {
         "bind_dn_template": "uid={username},ou=users,dc=example,dc=test",
         "canonical_identity_attribute": "uid"
     });
-    invalid.plugin_configs[0].updated_at += Duration::milliseconds(1);
+    invalid.plugin_configs[0].updated_at = invalid.plugin_configs[0]
+        .updated_at
+        .checked_add(::time::SignedDuration::milliseconds(1))
+        .unwrap();
     let outcome = state.update_config(invalid);
     let ConfigApplyOutcome::Rejected { errors } = outcome else {
         panic!("remote plaintext LDAP reload must be rejected");
@@ -2135,7 +2176,10 @@ async fn ai_transcript_audit_unknown_key_reload_keeps_last_known_good_instance()
             "on_sink_eror": "reject"
         }
     });
-    invalid.plugin_configs[0].updated_at += Duration::milliseconds(1);
+    invalid.plugin_configs[0].updated_at = invalid.plugin_configs[0]
+        .updated_at
+        .checked_add(::time::SignedDuration::milliseconds(1))
+        .unwrap();
     let outcome = state.update_config(invalid);
     let ConfigApplyOutcome::Rejected { errors } = outcome else {
         panic!("unknown ai_transcript_audit keys must reject reload");
@@ -2804,7 +2848,7 @@ async fn apply_incremental_upstream_only_tls_change_reconciles_stream_listeners(
     let mut rotated_upstream = upstream;
     rotated_upstream.backend_tls_server_ca_cert_path =
         Some(ca_b_path.to_str().expect("utf-8 temp path").to_string());
-    rotated_upstream.updated_at = Utc::now();
+    rotated_upstream.updated_at = UtcTimestamp::now();
     let delta = IncrementalResult {
         added_or_modified_proxies: vec![],
         removed_proxy_ids: vec![],
@@ -2884,7 +2928,9 @@ async fn plugin_only_delta_reuses_route_table_for_same_id_proxies_in_two_namespa
     // compared against tenant B's same-id entry and every plugin-only poll
     // would rebuild and republish the whole route table.
     plugin.enabled = false;
-    plugin.updated_at = Utc::now() + Duration::milliseconds(1);
+    plugin.updated_at = UtcTimestamp::now()
+        .checked_add(::time::SignedDuration::milliseconds(1))
+        .unwrap();
     let outcome = state
         .apply_incremental(delta_with_plugin(plugin, UtcTimestamp::now()))
         .await;
@@ -2922,7 +2968,9 @@ async fn proxy_delta_updates_only_the_owning_namespace_for_a_shared_proxy_id() {
 
     let mut updated_b = tenant_b;
     updated_b.backend_host = "tenant-b-v2.local".to_string();
-    updated_b.updated_at = Utc::now() + Duration::milliseconds(1);
+    updated_b.updated_at = UtcTimestamp::now()
+        .checked_add(::time::SignedDuration::milliseconds(1))
+        .unwrap();
     let outcome = state
         .apply_incremental(delta_with_proxy(updated_b, UtcTimestamp::now()))
         .await;
@@ -2967,8 +3015,8 @@ fn ai_rate_limiter_plugin_config(id: &str) -> PluginConfig {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -3060,7 +3108,7 @@ async fn ai_rate_limiter_is_never_installed_on_native_grpc_across_config_paths()
 
     let mut updated = ai_rate_limiter_plugin_config("ai-limit");
     updated.config = serde_json::json!({"token_limit": 2000, "window_seconds": 60});
-    updated.updated_at = Utc::now();
+    updated.updated_at = UtcTimestamp::now();
     assert_eq!(
         dp_state
             .apply_incremental(delta_with_plugin(updated, UtcTimestamp::now()))
@@ -3114,7 +3162,9 @@ async fn consumer_delta_keeps_full_build_precedence_for_shared_api_keys() {
     relabeled
         .labels
         .insert("tier".to_string(), "gold".to_string());
-    relabeled.updated_at = Utc::now() + chrono::Duration::seconds(1);
+    relabeled.updated_at = UtcTimestamp::now()
+        .checked_add(::time::SignedDuration::seconds(1))
+        .unwrap();
     let mut delta = empty_delta_at(UtcTimestamp::now());
     delta.added_or_modified_consumers = vec![relabeled];
     let outcome = state.apply_incremental(delta).await;

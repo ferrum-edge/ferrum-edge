@@ -1,6 +1,5 @@
 //! Tests for load balancer module
 
-use chrono::Utc;
 use ferrum_edge::config::types::{
     GatewayConfig, LoadBalancerAlgorithm, Upstream, UpstreamPortOverride, UpstreamTarget,
 };
@@ -9,6 +8,7 @@ use ferrum_edge::load_balancer::{
     HealthContext, LoadBalancer, LoadBalancerCache, RetryCandidateFilter, target_host_port_key,
     target_key,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use std::collections::HashMap;
 use std::net::IpAddr;
 
@@ -247,8 +247,8 @@ fn test_load_balancer_cache() {
             backend_tls_refused: false,
             dispatch_port_override_fallback: None,
             api_spec_id: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
             k8s_service_uid: None,
             admission_upstream_id: None,
             pending_limit_scope: None,
@@ -627,8 +627,8 @@ fn test_least_latency_cache_record_and_select() {
             backend_tls_refused: false,
             dispatch_port_override_fallback: None,
             api_spec_id: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
             k8s_service_uid: None,
             admission_upstream_id: None,
             pending_limit_scope: None,
@@ -1265,8 +1265,8 @@ fn test_load_balancer_cache_get_hash_on_strategy() {
             backend_tls_refused: false,
             dispatch_port_override_fallback: None,
             api_spec_id: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
             k8s_service_uid: None,
             admission_upstream_id: None,
             pending_limit_scope: None,
@@ -1388,8 +1388,8 @@ fn make_upstream(id: &str, targets: Vec<UpstreamTarget>) -> Upstream {
         backend_tls_refused: false,
         dispatch_port_override_fallback: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         k8s_service_uid: None,
         admission_upstream_id: None,
         pending_limit_scope: None,
@@ -3153,8 +3153,8 @@ fn least_latency_passive_recovery_does_not_restore_warmup_bias() {
             backend_tls_refused: false,
             dispatch_port_override_fallback: None,
             api_spec_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: UtcTimestamp::now(),
+            updated_at: UtcTimestamp::now(),
             k8s_service_uid: None,
             admission_upstream_id: None,
             pending_limit_scope: None,

@@ -1,4 +1,3 @@
-use chrono::Utc;
 use ferrum_edge::_test_support::{
     apply_effective_backend_scheme_headers_for_test, collect_forwardable_websocket_headers_for_test,
 };
@@ -145,8 +144,8 @@ fn test_proxy() -> Proxy {
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
         pending_limit_scope: None,
     }
 }
@@ -992,8 +991,8 @@ fn basic_auth_dispatch_consumer() -> Consumer {
             json!([{"password_hash": password_hash}]),
         )]),
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -3543,8 +3542,8 @@ fn test_request_context_effective_identity_prefers_consumer_then_external_identi
         custom_id: None,
         credentials: HashMap::new(),
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }));
     assert_eq!(ctx.effective_identity(), Some("mapped-consumer"));
 }
@@ -3580,8 +3579,8 @@ fn test_request_context_separates_consumer_username_from_external_identity() {
         custom_id: Some("custom-123".to_string()),
         credentials: HashMap::new(),
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }));
     assert_eq!(ctx.backend_consumer_username(), Some("mapped-consumer"));
     assert_eq!(ctx.backend_authenticated_identity(), None);

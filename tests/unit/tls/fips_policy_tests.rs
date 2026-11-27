@@ -12,11 +12,11 @@
 //! `--features crypto-ring` (the default) and
 //! `--no-default-features --features fips` (the hosted FIPS lane).
 
-use chrono::Utc;
 use ferrum_edge::config::env_config::{DbTlsMode, EnvConfig};
 use ferrum_edge::config::types::{Consumer, GatewayConfig, PluginConfig, PluginScope};
 use ferrum_edge::fips;
 use ferrum_edge::fips::policy;
+use ferrum_edge::time_compat::UtcTimestamp;
 use serde_json::json;
 
 fn plugin(name: &str, config: serde_json::Value) -> PluginConfig {
@@ -32,8 +32,8 @@ fn plugin(name: &str, config: serde_json::Value) -> PluginConfig {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 
@@ -48,8 +48,8 @@ fn consumer_with(basicauth: serde_json::Value) -> Consumer {
         custom_id: None,
         credentials,
         acl_groups: Vec::new(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: UtcTimestamp::now(),
+        updated_at: UtcTimestamp::now(),
     }
 }
 

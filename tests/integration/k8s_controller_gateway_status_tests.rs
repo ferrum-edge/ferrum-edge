@@ -11,6 +11,7 @@ use ferrum_edge::k8s_controller::status::{
     FERRUM_GATEWAY_CONTROLLER_NAME, GatewayApiStatusUpdate, GatewayApiStatusWriter,
     plan_gateway_api_status_updates,
 };
+use ferrum_edge::time_compat::UtcTimestamp;
 use http::{Method, Request, Response, StatusCode};
 use kube::Client;
 use kube::client::Body;
@@ -3178,7 +3179,7 @@ fn global_response_transformer(
     rules: serde_json::Value,
 ) -> ferrum_edge::config::types::PluginConfig {
     use ferrum_edge::config::types::{PluginConfig, PluginScope};
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     PluginConfig {
         labels: Default::default(),
         id: "operator-global-response-transformer".to_string(),
@@ -4433,7 +4434,7 @@ async fn gateway_route_timeouts_reach_the_data_plane() {
 /// gateway recorded rather than only what the client saw.
 fn transaction_log_capture(endpoint_url: String) -> ferrum_edge::config::types::PluginConfig {
     use ferrum_edge::config::types::{PluginConfig, PluginScope};
-    let now = chrono::Utc::now();
+    let now = UtcTimestamp::now();
     PluginConfig {
         labels: Default::default(),
         id: "timeouts-transaction-log".to_string(),

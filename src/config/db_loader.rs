@@ -63,7 +63,6 @@ use crate::time_compat::UtcTimestamp;
 use crate::util::deserialization as config_decode;
 use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
-use chrono::{DateTime, SecondsFormat, Utc};
 use dashmap::DashMap;
 use sqlx::Executor;
 use sqlx::Row;
@@ -10182,7 +10181,7 @@ impl DatabaseStore {
             self.lock_config_change_sequence_tx(&mut tx, name).await?;
         }
 
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let now_rfc = now.to_rfc3339();
         let mut record = existing.unwrap_or_else(|| {
             crate::config::namespace_registry::NamespaceRecord::new(
@@ -12739,7 +12738,12 @@ impl DatabaseStore {
         retention_days: u64,
     ) -> Result<u64, anyhow::Error> {
         let days_i64 = i64::try_from(retention_days).unwrap_or(i64::MAX);
-        let cutoff = audit_ts_string(&(Utc::now() - chrono::Duration::days(days_i64)));
+        let cutoff = days_i64
+            .checked_mul(86_400)
+            .and_then(crate::time_compat::chrono_try_seconds)
+            .and_then(|age| UtcTimestamp::now().checked_sub(age))
+            .map(|cutoff| audit_ts_string(&cutoff))
+            .ok_or_else(|| anyhow::anyhow!("audit retention cutoff is out of range"))?;
         let delete_sql = self.audit_age_delete_sql();
         let mut total = 0u64;
         for _ in 0..crate::admin::audit::AUDIT_RETENTION_PRUNE_MAX_BATCHES {
@@ -14724,18 +14728,23 @@ fn strict_stored_revision(row: &AnyRow) -> Result<u64, anyhow::Error> {
 fn strict_datetime_column(
     row: &AnyRow,
     column: &'static str,
-) -> Result<chrono::DateTime<Utc>, anyhow::Error> {
+) -> Result<UtcTimestamp, anyhow::Error> {
     let raw: String = row
         .try_get(column)
         .map_err(|_| anyhow::anyhow!("gateway trust bundle {column} column is unreadable"))?;
-    if let Ok(value) = chrono::DateTime::parse_from_rfc3339(&raw) {
-        return Ok(value.with_timezone(&Utc));
-    }
-    // SQLite `CURRENT_TIMESTAMP` default format.
-    if let Ok(value) = chrono::NaiveDateTime::parse_from_str(&raw, "%Y-%m-%d %H:%M:%S") {
-        return Ok(value.and_utc());
-    }
-    anyhow::bail!("gateway trust bundle {column} column is not a valid timestamp")
+    parse_stored_timestamp(&raw).map_err(|_| {
+        anyhow::anyhow!("gateway trust bundle {column} column is not a valid timestamp")
+    })
+}
+
+/// Decode stored timestamp text the way the chrono-based loader did (issue
+/// #7419): strict RFC 3339, else SQLite's `CURRENT_TIMESTAMP` default
+/// (`YYYY-MM-DD HH:MM:SS`, UTC). An instant outside `UtcTimestamp`'s year
+/// range is an error like any other undecodable value.
+fn parse_stored_timestamp(raw: &str) -> Result<UtcTimestamp, crate::time_compat::TimestampError> {
+    crate::time_compat::parse_rfc3339_chrono(raw)
+        .or_else(|_| crate::time_compat::parse_naive_from_str_chrono(raw, "%Y-%m-%d %H:%M:%S"))
+        .and_then(|parsed| parsed.to_utc_timestamp())
 }
 
 fn row_to_gateway_trust_bundle_inner(
@@ -15133,8 +15142,8 @@ fn row_to_audit_event(row: &AnyRow) -> Result<crate::admin::audit::AuditEvent, a
     })
 }
 
-fn audit_ts_string(ts: &DateTime<Utc>) -> String {
-    ts.to_rfc3339_opts(SecondsFormat::Nanos, true)
+fn audit_ts_string(ts: &UtcTimestamp) -> String {
+    ts.to_rfc3339_opts(crate::time_compat::SecondsFormat::Nanos, true)
 }
 
 fn serialize_api_spec_string_list(
@@ -15159,30 +15168,23 @@ fn row_namespace_or_default(row: &AnyRow) -> String {
 
 /// Parse a datetime column from a database row. Database stores timestamps as
 /// RFC 3339 strings or SQLite `CURRENT_TIMESTAMP` format.
-fn parse_datetime_column(row: &AnyRow, column: &str) -> chrono::DateTime<Utc> {
+fn parse_datetime_column(row: &AnyRow, column: &str) -> UtcTimestamp {
     match row.try_get::<String, _>(column) {
-        Ok(raw) => chrono::DateTime::parse_from_rfc3339(&raw)
-            .map(|dt| dt.with_timezone(&Utc))
-            .or_else(|_| {
-                // SQLite CURRENT_TIMESTAMP format: "YYYY-MM-DD HH:MM:SS"
-                chrono::NaiveDateTime::parse_from_str(&raw, "%Y-%m-%d %H:%M:%S")
-                    .map(|ndt| ndt.and_utc())
-            })
-            .unwrap_or_else(|_| {
-                warn!(
-                    column,
-                    value = %crate::startup::sanitize_startup_cause(format!("{raw:?}"), &[]),
-                    "Could not parse datetime column, falling back to Utc::now()"
-                );
-                Utc::now()
-            }),
+        Ok(raw) => parse_stored_timestamp(&raw).unwrap_or_else(|_| {
+            warn!(
+                column,
+                value = %crate::startup::sanitize_startup_cause(format!("{raw:?}"), &[]),
+                "Could not parse datetime column, falling back to Utc::now()"
+            );
+            UtcTimestamp::now()
+        }),
         Err(error) => {
             warn!(
                 column,
                 error = %crate::startup::sanitize_startup_cause(error, &[]),
                 "Could not read datetime column, falling back to Utc::now()"
             );
-            Utc::now()
+            UtcTimestamp::now()
         }
     }
 }
@@ -15330,10 +15332,11 @@ mod proxy_insert_sql_drift_tests {
 
     #[test]
     fn audit_ts_string_is_fixed_width_and_lexically_ordered() {
-        let base = chrono::DateTime::parse_from_rfc3339("2026-05-18T03:00:00Z")
-            .expect("base timestamp")
-            .with_timezone(&chrono::Utc);
-        let later = base + chrono::Duration::milliseconds(100);
+        let base: crate::time_compat::UtcTimestamp =
+            "2026-05-18T03:00:00Z".parse().expect("base timestamp");
+        let later = base
+            .checked_add(::time::SignedDuration::milliseconds(100))
+            .expect("later timestamp");
 
         assert_eq!(audit_ts_string(&base), "2026-05-18T03:00:00.000000000Z");
         assert_eq!(audit_ts_string(&later), "2026-05-18T03:00:00.100000000Z");
