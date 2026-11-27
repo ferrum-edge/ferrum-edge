@@ -2501,9 +2501,9 @@ pub fn workload_selector_matches<L: WorkloadLabels + ?Sized>(
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 /// Closed with its JWT rule types (issue #6616), like the authorization
 /// grammar: a misspelled `refused` or `jwt_rules` member would otherwise drop
-/// a refusal or a token requirement. Inventory types (`Workload`,
-/// `MeshService`) deliberately stay open for forward compatibility
-/// (`unknown_mesh_fields_are_tolerated`).
+/// a refusal or a token requirement. Since the 1.0 config freeze every native
+/// mesh resource type is closed, inventory types (`Workload`, `MeshService`)
+/// included (`unknown_mesh_fields_are_rejected`).
 #[serde(deny_unknown_fields)]
 pub struct MeshRequestAuthentication {
     pub name: String,

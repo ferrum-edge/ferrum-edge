@@ -191,10 +191,11 @@ fn mesh_service_path_parameter_opt_in_defaults_off_and_round_trips() {
 }
 
 #[test]
-fn unknown_mesh_fields_are_tolerated() {
-    // Forwards-compat: a newer ferrum schema may add fields under a mesh
-    // resource. Older binaries must ignore them. Serde's default-on-unknown
-    // is fine for our struct shape; this test confirms that.
+fn unknown_mesh_fields_are_rejected() {
+    // 1.0 config freeze: native mesh resources, inventory types included, are
+    // closed. A misspelled or unknown member is refused by name instead of
+    // being dropped. CP and data planes must run the same build, so a field
+    // added by a newer build is never silently ignored by an older one.
     let json = r#"{
         "version": "1",
         "proxies": [],
@@ -217,9 +218,14 @@ fn unknown_mesh_fields_are_tolerated() {
             ]
         }
     }"#;
-    let cfg: GatewayConfig = serde_json::from_str(json).expect("future fields are tolerated");
-    let mesh = cfg.mesh.as_ref().expect("mesh present");
-    assert_eq!(mesh.workloads.len(), 1);
+    let error = serde_json::from_str::<GatewayConfig>(json)
+        .expect_err("unknown workload members are rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("future_field_that_does_not_exist"),
+        "the error must name the unknown member: {error}"
+    );
 }
 
 // ── Per-type smoke tests ─────────────────────────────────────────────────
