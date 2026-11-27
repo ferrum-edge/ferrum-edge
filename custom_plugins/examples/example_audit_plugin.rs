@@ -657,10 +657,13 @@ fn truncate_chars(input: &str, max_chars: usize) -> String {
 }
 
 fn canonical_timestamp(input: &str) -> String {
-    match chrono::DateTime::parse_from_rfc3339(input) {
-        Ok(timestamp) => timestamp
-            .with_timezone(&chrono::Utc)
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    // chrono-compatible parse (issue #7419). A leap second is normalized to
+    // the next second; an instant outside UtcTimestamp's range takes the
+    // invalid-timestamp path below.
+    match crate::time_compat::parse_rfc3339_chrono(input)
+        .and_then(|parsed| parsed.to_utc_timestamp())
+    {
+        Ok(timestamp) => timestamp.to_rfc3339_opts(crate::time_compat::SecondsFormat::Millis, true),
         Err(error) => {
             warn!(
                 plugin = PLUGIN_NAME,
@@ -770,8 +773,24 @@ async fn run_retention(store: Arc<GatewayAuditStore>, retention_days: u64) {
                 continue;
             }
         };
-        let cutoff = (chrono::Utc::now() - chrono::Duration::days(retention_days as i64))
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        // `retention_days` is capped at MAX_RETENTION_DAYS, so the subtraction
+        // cannot leave the supported range; skip the sweep rather than panic
+        // if it ever did.
+        let Some(cutoff) = i64::try_from(retention_days)
+            .ok()
+            .and_then(|days| days.checked_mul(86_400))
+            .and_then(|secs| {
+                crate::time_compat::UtcTimestamp::now()
+                    .checked_sub(time::SignedDuration::seconds(secs))
+            })
+            .map(|ts| ts.to_rfc3339_opts(crate::time_compat::SecondsFormat::Millis, true))
+        else {
+            warn!(
+                plugin = PLUGIN_NAME,
+                "example_audit_plugin: retention cutoff is out of range; skipping sweep"
+            );
+            continue;
+        };
         let mut total_deleted: u64 = 0;
         loop {
             // Fixed table name and chunk size; the cutoff is bound.

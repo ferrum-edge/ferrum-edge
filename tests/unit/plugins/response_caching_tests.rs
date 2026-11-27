@@ -4190,9 +4190,9 @@ fn test_parse_http_date_accepts_all_rfc9110_formats() {
     use ferrum_edge::_test_support::response_caching_parse_http_date as parse;
 
     // All three forms encode the same instant: 1994-11-06 08:49:37 UTC.
-    let expected = chrono::DateTime::parse_from_rfc3339("1994-11-06T08:49:37Z")
-        .unwrap()
-        .with_timezone(&Utc);
+    let expected = "1994-11-06T08:49:37Z"
+        .parse::<ferrum_edge::time_compat::UtcTimestamp>()
+        .unwrap();
 
     // IMF-fixdate (the dominant, already-supported form).
     assert_eq!(
@@ -4212,6 +4212,19 @@ fn test_parse_http_date_accepts_all_rfc9110_formats() {
         Some(expected),
         "asctime date must parse"
     );
+
+    // chrono-compatible parsing (issue #7419): a leap second is accepted and
+    // normalized to the next second; a date chrono accepts but whose instant
+    // lies outside UtcTimestamp's range is treated as unparseable.
+    assert_eq!(
+        parse("Thu, 31 Dec 1998 23:59:60 GMT"),
+        Some(
+            "1999-01-01T00:00:00Z"
+                .parse::<ferrum_edge::time_compat::UtcTimestamp>()
+                .unwrap()
+        )
+    );
+    assert_eq!(parse("Mon, 26 Nov 12345 10:20:30 GMT"), None);
 
     // Genuinely malformed input still yields None.
     assert_eq!(parse("not a date"), None);

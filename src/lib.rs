@@ -7055,7 +7055,9 @@ pub mod _test_support {
     /// Parse an HTTP-date the way `response_caching` does for conditional
     /// requests. Exposes the crate-private helper so tests can assert all
     /// three RFC 9110 §5.6.7 date formats are accepted.
-    pub fn response_caching_parse_http_date(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    pub fn response_caching_parse_http_date(
+        value: &str,
+    ) -> Option<crate::time_compat::UtcTimestamp> {
         crate::plugins::response_caching::parse_http_date(value)
     }
 
