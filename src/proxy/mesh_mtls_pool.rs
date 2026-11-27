@@ -731,8 +731,10 @@ pub struct MeshMtlsConnectionPool {
     tunnel_entries: Arc<DashMap<String, Vec<HbonePoolEntry>>>,
     tunnel_counters: MeshMtlsTunnelCounters,
     /// Advanced FIRST by every drain of the tunnel lane; a carrier whose dial
-    /// began under an older generation is never published or handed out
-    /// (issue #7537, see `publish_tunnel_carrier`).
+    /// began under an older generation is never published (issue #7537, see
+    /// `publish_tunnel_carrier`). Carriers already pooled are judged by the
+    /// drain itself (cleared, or filtered by retired fingerprint), so a
+    /// fingerprint drain leaves current-fingerprint carriers serving.
     tunnel_drain_generation: AtomicU64,
 }
 
@@ -2377,15 +2379,10 @@ impl MeshMtlsConnectionPool {
         key: &str,
     ) -> Option<(MeshH2Transport, HboneStreamLease)> {
         let entries = self.tunnel_entries.get(key)?;
-        reserve_tunnel_carrier(
-            entries.value(),
-            unix_secs(),
-            self.tunnel_drain_generation.load(Ordering::Acquire),
-        )
+        reserve_tunnel_carrier(entries.value(), unix_secs())
     }
 
-    /// Exclusive-lock checkout of the tunnel lane: drop carriers from a drain
-    /// generation that has since been retired, prune dead, retired,
+    /// Exclusive-lock checkout of the tunnel lane: prune dead, retired,
     /// keepalive-failed, credential-expired and idle carriers, then reserve a
     /// slot on the least-loaded carrier with room, or report whether the key
     /// may widen.
@@ -2393,13 +2390,9 @@ impl MeshMtlsConnectionPool {
         let Some(mut entries) = self.tunnel_entries.get_mut(key) else {
             return TunnelCheckout::NeedsCarrier;
         };
-        let generation = self.tunnel_drain_generation.load(Ordering::Acquire);
-        let before = entries.len();
-        entries.retain(|entry| entry.drain_generation == generation);
-        record_mesh_mtls_tunnel_evictions(before - entries.len());
         record_mesh_mtls_tunnel_evictions(prune_tunnel_entries(&mut entries));
         let now = unix_secs();
-        if let Some((transport, reservation)) = reserve_tunnel_carrier(&entries, now, generation) {
+        if let Some((transport, reservation)) = reserve_tunnel_carrier(&entries, now) {
             return TunnelCheckout::Reserved(transport, reservation);
         }
         if select_least_loaded(&entries, now).live >= max_entries {
@@ -2750,11 +2743,7 @@ impl MeshMtlsConnectionPool {
             return;
         }
         record_mesh_mtls_tunnel_evictions(prune_tunnel_entries(&mut entries));
-        entries.push(HbonePoolEntry::new(
-            transport,
-            idle_timeout_seconds,
-            drain_generation,
-        ));
+        entries.push(HbonePoolEntry::new(transport, idle_timeout_seconds));
         if entries.len() > max_entries {
             let overflow = entries.len() - max_entries;
             entries.drain(0..overflow);
@@ -3095,16 +3084,10 @@ pub(crate) fn write_mesh_mtls_tunnel_pool_key(
 fn reserve_tunnel_carrier(
     entries: &[HbonePoolEntry],
     now: u64,
-    drain_generation: u64,
 ) -> Option<(MeshH2Transport, HboneStreamLease)> {
     for _ in 0..=entries.len() {
         let (index, _) = select_least_loaded(entries, now).chosen?;
         let entry = &entries[index];
-        // A carrier from a retired drain generation is never reused; the
-        // write path removes it.
-        if entry.drain_generation != drain_generation {
-            return None;
-        }
         let Some(reservation) = entry.transport.load.try_reserve() else {
             continue;
         };

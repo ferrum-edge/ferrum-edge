@@ -132,24 +132,14 @@ pub(crate) struct HbonePoolEntry {
     /// idle merely because it is only ever served by the fast path.
     pub(crate) last_used_at: AtomicU64,
     pub(crate) idle_timeout_seconds: u64,
-    /// Drain generation of the owning pool lane when this entry was dialed.
-    /// The Sidecar raw-TCP tunnel lane never hands out an entry whose
-    /// generation is behind the lane's current one (issue #7537); the HBONE
-    /// pool keeps `0`.
-    pub(crate) drain_generation: u64,
 }
 
 impl HbonePoolEntry {
-    pub(crate) fn new(
-        transport: MeshH2Transport,
-        idle_timeout_seconds: u64,
-        drain_generation: u64,
-    ) -> Self {
+    pub(crate) fn new(transport: MeshH2Transport, idle_timeout_seconds: u64) -> Self {
         Self {
             transport,
             last_used_at: AtomicU64::new(unix_secs()),
             idle_timeout_seconds,
-            drain_generation,
         }
     }
 }
@@ -2584,7 +2574,6 @@ impl HboneConnectionPool {
                 entries.push(HbonePoolEntry::new(
                     transport.clone(),
                     pool_config.idle_timeout_seconds,
-                    0,
                 ));
                 let max_entries = pool_config.http2_connections_per_host.max(1);
                 if entries.len() > max_entries {
@@ -2597,7 +2586,6 @@ impl HboneConnectionPool {
                 vec![HbonePoolEntry::new(
                     transport.clone(),
                     pool_config.idle_timeout_seconds,
-                    0,
                 )]
             });
         // Keepalive may have failed between the check above and insert, or
