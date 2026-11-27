@@ -1977,13 +1977,16 @@ fn mesh_bound_virtual_service_status_reports_refused_cross_namespace_destination
             refused[0].contains("http[0].route[0]")
                 && refused[0].contains("\"other\"/\"ratings\"")
                 && refused[0].contains("Sidecar and NodeWaypoint mesh data planes refuse")
+                && refused[0].contains("plain Service route where one exists")
+                && refused[0].contains("relative to the controller's cluster domain")
                 && refused[0].contains("#7499"),
             "{host}: {}",
             refused[0]
         );
         assert!(
-            message.contains("1 http[] destination(s) name a Service in another namespace"),
-            "{host}: the condition message counts them: {message}"
+            message.contains("1 http[] destination(s) name a Service in another namespace")
+                && message.contains("FERRUM_MESH_CLUSTER_DOMAIN"),
+            "{host}: the condition message counts them and states the domain caveat: {message}"
         );
         assert!(
             !message.contains(&refused[0]),
@@ -2069,14 +2072,23 @@ fn cross_namespace_status_normalizes_a_custom_cluster_domain() {
         let (_, refused) = cross_namespace_report("custom", cross_namespace_direct(host), custom());
         assert_eq!(refused.len(), 1, "{host}: {refused:?}");
     }
-    // The default domain is not this cluster's suffix any more: the host is
-    // external, as the data plane classifies it.
+    // Mismatched settings: the controller's domain is `corp.example` while a
+    // data plane may still use `cluster.local`. A fully qualified host is read
+    // with the controller's domain (the documented caveat: the two settings
+    // must match for status to predict the refusal), so a `cluster.local`
+    // FQDN is external here and not reported...
     let (_, refused) = cross_namespace_report(
         "custom-external",
         cross_namespace_direct("ratings.other.svc.cluster.local"),
         custom(),
     );
     assert!(refused.is_empty(), "{refused:?}");
+    // ...while the domain-independent forms are reported whatever the domain.
+    for host in ["ratings.other", "ratings.other.svc"] {
+        let (_, refused) =
+            cross_namespace_report("custom-short", cross_namespace_direct(host), custom());
+        assert_eq!(refused.len(), 1, "{host}: {refused:?}");
+    }
 }
 
 /// Issue #7499: the listed destinations are budgeted by count and bytes, and

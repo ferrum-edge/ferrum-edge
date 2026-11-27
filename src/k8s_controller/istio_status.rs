@@ -1525,7 +1525,10 @@ fn virtual_service_status(
                 notes.push(format!(
                     "{} http[] destination(s) name a Service in another namespace and are not \
                      served by Sidecar or NodeWaypoint mesh data planes in this release (issue \
-                     #7499); see status.ferrum.translation.deferred_fields",
+                     #7499); see status.ferrum.translation.deferred_fields (a fully qualified \
+                     host is read with this controller's cluster domain, which must match the \
+                     data planes' FERRUM_MESH_CLUSTER_DOMAIN for this report to predict their \
+                     refusal)",
                     cross_namespace.len()
                 ));
             }
@@ -1602,12 +1605,13 @@ fn virtual_service_cross_namespace_deferred_fields(
              or NodeWaypoint mesh data planes in this release (issue #7499)"
         } else {
             "Sidecar and NodeWaypoint mesh data planes refuse this route destination in this \
-             release and keep routing the host to its plain Service (issue #7499); gateway \
-             routes are unaffected"
+             release and remove the carried route, so the host keeps its plain Service route \
+             where one exists (issue #7499); gateway routes are unaffected"
         };
         let entry = format!(
             "{VIRTUAL_SERVICE_CROSS_NAMESPACE_DEFERRED_PREFIX} http[{}].route[{}] host {:?} names \
-             Service {:?}/{:?} in another namespace: {effect}",
+             Service {:?}/{:?} in another namespace (relative to the controller's cluster \
+             domain): {effect}",
             destination.route_index,
             destination.destination_index,
             destination.host,
