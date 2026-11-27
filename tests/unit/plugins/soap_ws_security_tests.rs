@@ -1142,7 +1142,8 @@ async fn test_timestamp_without_zone_designator_rejected() {
     };
     let millis_z = |t: UtcTimestamp| t.to_rfc3339_opts(SecondsFormat::Millis, true);
     let secs_offset = |t: UtcTimestamp| t.to_rfc3339_opts(SecondsFormat::Secs, false);
-    let cases: [(&str, &dyn Fn(UtcTimestamp) -> String, bool); 4] = [
+    type Case<'a> = (&'a str, &'a dyn Fn(UtcTimestamp) -> String, bool);
+    let cases: [Case<'_>; 4] = [
         ("%Y-%m-%dT%H:%M:%S%.3f", &millis_zoneless, false),
         ("%Y-%m-%dT%H:%M:%S", &secs_zoneless, false),
         ("%Y-%m-%dT%H:%M:%S%.3fZ", &millis_z, true),
@@ -1182,11 +1183,8 @@ async fn test_timestamp_without_zone_designator_rejected() {
             <wsu:Created>{}</wsu:Created>
             <wsu:Expires>{}</wsu:Expires>
         </wsu:Timestamp>"#,
-        now.to_rfc3339_opts(ferrum_edge::time_compat::SecondsFormat::Millis, true),
-        expires_at
-            .to_rfc3339_opts(ferrum_edge::time_compat::SecondsFormat::Millis, true)
-            .trim_end_matches('Z')
-            .to_string()
+        millis_z(now),
+        millis_zoneless(expires_at)
     );
     let body = wrap_soap(&ts);
     let mut ctx = make_ctx_with_soap_body(&body);
