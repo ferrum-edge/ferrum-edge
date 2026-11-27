@@ -595,6 +595,15 @@ at `d96b0292a0f87647f7552f25e0e5ce1b4ae30f8b`. No `contracts-edge-0.9.18` tag
 exists because Edge v0.9.18 was tagged but never published. Earlier contract
 tags remain unchanged.
 
+The **v1.0.0 candidate** follows published v0.9.21 and is the first stable
+release: the [support policy](docs/support_policy.md) applies from 1.0.0, the
+core database schema is frozen with forward-only migrations, unknown
+configuration keys are refused, and settings that were accepted but never
+applied are removed. Its protected production release and the matching
+`contracts-edge-1.0.0` publication must succeed before consumers move their
+pins. Upgrading from 0.9.21 rebuilds every database; see the
+[upgrade guide](docs/upgrade_guide.md#upgrading-to-100).
+
 **v0.9.21** follows published v0.9.20 with security-advisory and correctness
 fixes, mesh VirtualService HTTP routes on Sidecar and NodeWaypoint data planes,
 and fail-closed enforcement of refused enforcing Istio security resources.

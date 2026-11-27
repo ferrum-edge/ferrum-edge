@@ -13,7 +13,8 @@
 //!   secret namespace [`PLUGIN_SECRET_EXAMPLE_ENV`])
 //!
 //! Every inventory member owns its own docs table row and template
-//! assignment; build-out policy keeps no compatibility aliases.
+//! assignment. There are no compatibility aliases; a rename or removal follows
+//! the deprecation rules in `docs/support_policy.md`.
 //!
 //! External unit tests under `tests/unit/config/env_docs_parity_tests.rs`
 //! fail closed when a public inventory setting lacks a

@@ -4656,10 +4656,11 @@ fn validate_scope_filter_identity(slice: &MeshSlice, from_slice: bool) -> Result
                     // The only way an unmarked empty-label slice carries an
                     // unsatisfiable enforcing selector policy is a cross-version
                     // slice from a CP predating the marker (serde defaults
-                    // `labels_ambiguous = false`). Per the Build-Out Policy (no
-                    // legacy shims for old wire/config shapes; CP and DP ship from
-                    // one binary version), that case is out of scope and is not
-                    // failed closed here — set the labels to pin identity.
+                    // `labels_ambiguous = false`). CP and DP must run the same
+                    // build (docs/support_policy.md, CP/DP version skew) and no
+                    // shim reads older wire shapes, so that case is out of scope
+                    // and is not failed closed here — set the labels to pin
+                    // identity.
                     tracing::warn!(
                         policy = %crate::startup::sanitize_startup_scalar(&policy.name),
                         field = "mesh_policies",

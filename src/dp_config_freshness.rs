@@ -125,8 +125,8 @@ impl StaleAction {
     /// Parse `FERRUM_DP_CONFIG_STALE_ACTION`.
     ///
     /// The accepted set is exactly the two documented spellings. No case
-    /// folding, no dash aliases, no surrounding whitespace: this is a new
-    /// build-out setting with no compatibility history, and an accepted alias
+    /// folding, no dash aliases, no surrounding whitespace: the setting has no
+    /// historical spellings to keep, and an accepted alias
     /// that the documentation and the error message both deny is a
     /// configuration surface nobody can reason about. Unknown values fail
     /// closed with an operator-actionable message rather than defaulting to the

@@ -69,7 +69,7 @@ Concepts map directly to the Istio service mesh model: `Workload` corresponds to
 
 ## Maturity and Support Status
 
-Ferrum's mesh subsystem is in active build-out. The paths below ship in one binary and share the same proxy/plugin chain, but they are at very different maturity levels. Use this matrix to decide what to rely on in production. Labels:
+The mesh paths below ship in one binary and share the same proxy/plugin chain, but they are at very different maturity levels. Use this matrix to decide what to rely on in production. Labels:
 
 - **Stable** — exercised end-to-end (functional/integration tests against a live data path), production-suitable.
 - **Beta** — feature-complete and tested, but with a documented sharp edge or a verification step still owed (see [Limitations](#limitations-and-not-supported)).
