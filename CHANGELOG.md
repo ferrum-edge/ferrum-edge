@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Audit log `start`/`end` filters: new 400 message text for an invalid
+  timestamp** (issue #7419, `chrono` replacement). The status code, error
+  envelope and the set of rejected inputs are unchanged; only the detail after
+  `Invalid audit start timestamp: ` / `Invalid audit end timestamp: ` now comes
+  from Ferrum's timestamp parser. As with the API-spec `updated_since` filter
+  (whose message is unchanged), a value chrono accepted whose UTC instant falls
+  outside years -9999..=9999 is now rejected the same way, and a leap second
+  (`:60`) is treated as the following second.
+
 ## [1.0.0] - 2026-11-27
 
 1.0.0 is the first stable release of Ferrum Edge. It follows published 0.9.21
@@ -205,17 +216,6 @@ gateways, control planes, mesh data planes, charts or contract consumers.
   (issue #7419, `chrono` replacement). An invalid timestamp still gets `400`
   with the same error envelope, but the human-readable detail after
   `invalid since timestamp: ` now comes from Ferrum's timestamp parser instead
-  of chrono's. A value chrono accepted whose UTC instant falls outside years
-  -9999..=9999 is now rejected the same way, and a leap second (`:60`) is
-  treated as the following second.
-- **Audit log `start`/`end` filters: new 400 message text for an invalid
-  timestamp** (issue #7419, `chrono` replacement). The status code, error
-  envelope and the set of rejected inputs are unchanged; only the detail after
-  `Invalid audit start timestamp: ` / `Invalid audit end timestamp: ` now comes
-  from Ferrum's timestamp parser. As with the API-spec `updated_since` filter
-  (whose message is unchanged), a value chrono accepted whose UTC instant falls
-  outside years -9999..=9999 is now rejected the same way, and a leap second
-  (`:60`) is treated as the following second.
   of chrono's. The filter parses the same syntax chrono did, with two
   differences: a value whose UTC instant falls outside years -9999..=9999 is
   now rejected with that `400` (for example `9999-12-31T23:59:59-00:01`, which
