@@ -33,6 +33,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of chrono's. A value chrono accepted whose UTC instant falls outside years
   -9999..=9999 is now rejected the same way, and a leap second (`:60`) is
   treated as the following second.
+- **Audit log `start`/`end` filters: new 400 message text for an invalid
+  timestamp** (issue #7419, `chrono` replacement). The status code, error
+  envelope and the set of rejected inputs are unchanged; only the detail after
+  `Invalid audit start timestamp: ` / `Invalid audit end timestamp: ` now comes
+  from Ferrum's timestamp parser. As with the API-spec `updated_since` filter
+  (whose message is unchanged), a value chrono accepted whose UTC instant falls
+  outside years -9999..=9999 is now rejected the same way, and a leap second
+  (`:60`) is treated as the following second.
 
 ### Fixed
 
