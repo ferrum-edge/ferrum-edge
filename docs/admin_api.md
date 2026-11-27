@@ -687,6 +687,8 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 
 Responses return non-secret certificate metadata, source URI, issuer, SANs, validity, fingerprint, ACME directory/account/order metadata, and timestamps. Private keys are persisted but never returned. Create, update, and delete operations ask active TLS source watchers to re-pull immediately; `DELETE` returns `409 Conflict` when any configuration still references the record (see [Managed record deletion](#managed-record-deletion)). SAN strings use the same canonical representation as [TLS Inventory](#tls-inventory).
 
+`GET /admin/tls/acme/certificates/{id}` returns a strong `ETag`, and `PUT`, `DELETE`, and an `allow_overwrite: true` `POST` honour `If-Match` exactly as the managed records do (see [Conditional managed TLS writes](#conditional-managed-tls-writes)). Automatic renewal and order finalization replace the record through the same locked store write, so a tag read before a renewal no longer matches after it.
+
 Import, update, and order finalization return `413 Payload Too Large` when the certificate, private key, or combined certificate chain exceeds `FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES`; the error never echoes material or source identifiers.
 
 Creating a new ACME certificate or account record returns `409 Conflict` once `FERRUM_TLS_ACME_MAX_CERTIFICATES` / `FERRUM_TLS_ACME_MAX_ACCOUNTS` is reached; overwrite and delete stay available so capacity can be reclaimed. An authoritative shared ACME store document that already exceeds `FERRUM_TLS_STORE_MAX_DOCUMENT_BYTES` returns `500 Internal Server Error` on every route that tries to read it, including `GET` and `DELETE` — it is unreachable server state rather than a caller payload. A candidate write that would cross the same ceiling returns `413 Payload Too Large` before rename and leaves the previous document intact. Both diagnostics name the ceiling only, never record IDs, domains, paths, or material.
@@ -826,6 +828,60 @@ config:
 - **Control plane / data plane.** The record never travels on ConfigSync: the plugin config carries only the reference, and each node resolves it from its own `FERRUM_TLS_MANAGED_STORE_PATH`, like every other `managed://` source. Point the CP and every DP at one shared store volume (see [Managed TLS And ACME Across Multiple Replicas](frontend_tls.md#managed-tls-and-acme-across-multiple-replicas)); a DP without the record refuses the provider's tokens.
 
 `DELETE` returns `409 Conflict` when any configuration still references the record (see [Managed record deletion](#managed-record-deletion)).
+
+### Conditional managed TLS writes
+
+Managed TLS records use the same `ETag` / `If-Match` convention as proxies,
+upstreams, consumers, and plugin configs (see
+[Conditional writes](#conditional-writes-etag--if-match)), so two operators
+rotating the same record cannot silently overwrite each other:
+
+- `GET /admin/tls/{certificates|ca-bundles|crls|ocsp-responses|jwks}/{id}` and
+  `GET /admin/tls/acme/certificates/{id}` return a strong `ETag` (not to a
+  token verified by `FERRUM_ADMIN_JWT_VIEWER_SECRET`). The tag is the same
+  keyed MAC used for configuration resources, computed over the complete
+  stored record, including the private key and other material the response
+  never shows, and bound to the record id. It changes on every write of the
+  record, including a same-material rotation (`updated_at` changes).
+- `PUT .../{id}` and `DELETE .../{id}` with `If-Match` are refused with
+  `412 Precondition Failed` and `{"error": "managed TLS record '<id>' has changed since the supplied If-Match entity-tag was issued; re-read it and reapply your changes"}`
+  (`ACME certificate '<id>' ...` for ACME records) unless the stored record
+  still has that tag. Nothing is written, no watcher reload is requested, and
+  no audit event is recorded. The body names only the id, never material.
+- A collection `POST` with `allow_overwrite: true` evaluates `If-Match` for
+  the replacement case: the precondition never holds when the id is free
+  (`412`, RFC 9110 §13.1.1), so a conditional overwrite can never turn into a
+  create. It is evaluated before the overwrite and cross-kind rules, so a
+  matching tag on a `POST` without `allow_overwrite` is still `409`.
+- Strict parsing, `*` (the record must exist), strong comparison, tag lists,
+  and `400` for a malformed or empty header are identical to the
+  configuration resources. `404` (missing id) and the typed-route `409`/`400`
+  kind mismatches are answered before the precondition, as there.
+- **Atomic across instances.** The comparison is made by the TLS store against
+  the authoritative record inside the exclusive cross-process lock that also
+  commits the write (the same read-modify-write that already makes
+  create-without-overwrite and kind conflicts race-free), never by a read in
+  the handler. Every gateway sharing `FERRUM_TLS_MANAGED_STORE_PATH` takes
+  that lock, so no other admin request, replica, or ACME renewal can commit
+  between the comparison and the write. The managed TLS store is the shared
+  file store, not the configuration database, so this holds identically
+  whichever database backend (PostgreSQL, MySQL, SQLite, MongoDB) or mode
+  (`database`, `cp`) serves the Admin API. Tags agree across replicas that
+  share `FERRUM_ADMIN_JWT_SECRET`.
+- A `DELETE` evaluates the precondition after the reference check, so a stale
+  delete of a record that is now referenced answers `409` with `used_by`.
+- Write responses carry no tag; re-read for the tag of the accepted state.
+  Omitting `If-Match` keeps the unconditional behaviour.
+
+```bash
+ETAG=$(curl -si -H "Authorization: Bearer $TOKEN" \
+  http://localhost:9000/admin/tls/certificates/edge-cert \
+  | awk 'tolower($1)=="etag:"{print $2}' | tr -d '\r')
+curl -X PUT -H "Authorization: Bearer $TOKEN" -H "If-Match: $ETAG" \
+  -H 'Content-Type: application/json' -d @rotated-cert.json \
+  http://localhost:9000/admin/tls/certificates/edge-cert
+# 200 if nobody rotated the record since the GET; 412 if anyone did.
+```
 
 ### Managed record deletion
 
@@ -1713,10 +1769,12 @@ curl -X PUT -H "Authorization: Bearer $TOKEN" -H "If-Match: $ETAG" \
   Comparison is strong, so a weak `W/"…"` tag never matches. A comma-separated list
   matches if any member does. A malformed or empty `If-Match` is `400`, never
   treated as absent. Row preconditions apply only to `PUT`/`DELETE` on the
-  four resource routes above and to the consumer credential endpoints
+  four resource routes above, to the consumer credential endpoints
   (`PUT`/`POST`/`DELETE /consumers/{id}/credentials/{cred_type}` and
   `DELETE /consumers/{id}/credentials/{cred_type}/{index}`), which take the
-  Consumer's tag. `POST /restore` supports the separate namespace
+  Consumer's tag, and to the managed TLS record writes described in
+  [Conditional managed TLS writes](#conditional-managed-tls-writes).
+  `POST /restore` supports the separate namespace
   precondition described below. Opt-in deployment removal and spec replacement
   use the separate [deployment authority profile](deployment_mutations.md).
   `If-Match` on any other mutating route (including

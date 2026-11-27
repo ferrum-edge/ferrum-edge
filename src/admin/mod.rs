@@ -6277,25 +6277,30 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_create_acme_certificate(&state, &auth, &body_bytes).await
+            let if_match = route_if_match!();
+            tls_management::handle_create_acme_certificate(&state, &auth, &body_bytes, if_match)
+                .await
         }
         (Method::GET, ["admin", "tls", "acme", "certificates", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
-            tls_management::handle_get_acme_certificate(id).await
+            tls_management::handle_get_acme_certificate(&state, auth.key_tier, id).await
         }
         (Method::PUT, ["admin", "tls", "acme", "certificates", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_update_acme_certificate(&state, &auth, id, &body_bytes).await
+            let if_match = route_if_match!();
+            tls_management::handle_update_acme_certificate(&state, &auth, id, &body_bytes, if_match)
+                .await
         }
         (Method::DELETE, ["admin", "tls", "acme", "certificates", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_delete_acme_certificate(&state, &auth, id).await
+            let if_match = route_if_match!();
+            tls_management::handle_delete_acme_certificate(&state, &auth, id, if_match).await
         }
         (Method::GET, ["admin", "tls", "acme", "accounts"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -6359,29 +6364,40 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_create_certificate(&state, &auth, &body_bytes).await
+            let if_match = route_if_match!();
+            tls_management::handle_create_certificate(&state, &auth, &body_bytes, if_match).await
         }
         (Method::GET, ["admin", "tls", "certificates", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
-            tls_management::handle_get_managed(ManagedTlsMaterialKind::Certificate, id).await
+            tls_management::handle_get_managed(
+                &state,
+                auth.key_tier,
+                ManagedTlsMaterialKind::Certificate,
+                id,
+            )
+            .await
         }
         (Method::PUT, ["admin", "tls", "certificates", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_update_certificate(&state, &auth, id, &body_bytes).await
+            let if_match = route_if_match!();
+            tls_management::handle_update_certificate(&state, &auth, id, &body_bytes, if_match)
+                .await
         }
         (Method::DELETE, ["admin", "tls", "certificates", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
+            let if_match = route_if_match!();
             tls_management::handle_delete_managed(
                 &state,
                 &auth,
                 ManagedTlsMaterialKind::Certificate,
                 id,
+                if_match,
             )
             .await
         }
@@ -6396,29 +6412,39 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_create_ca_bundle(&state, &auth, &body_bytes).await
+            let if_match = route_if_match!();
+            tls_management::handle_create_ca_bundle(&state, &auth, &body_bytes, if_match).await
         }
         (Method::GET, ["admin", "tls", "ca-bundles", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
-            tls_management::handle_get_managed(ManagedTlsMaterialKind::CaBundle, id).await
+            tls_management::handle_get_managed(
+                &state,
+                auth.key_tier,
+                ManagedTlsMaterialKind::CaBundle,
+                id,
+            )
+            .await
         }
         (Method::PUT, ["admin", "tls", "ca-bundles", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_update_ca_bundle(&state, &auth, id, &body_bytes).await
+            let if_match = route_if_match!();
+            tls_management::handle_update_ca_bundle(&state, &auth, id, &body_bytes, if_match).await
         }
         (Method::DELETE, ["admin", "tls", "ca-bundles", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
+            let if_match = route_if_match!();
             tls_management::handle_delete_managed(
                 &state,
                 &auth,
                 ManagedTlsMaterialKind::CaBundle,
                 id,
+                if_match,
             )
             .await
         }
@@ -6433,26 +6459,41 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_create_crl(&state, &auth, &body_bytes).await
+            let if_match = route_if_match!();
+            tls_management::handle_create_crl(&state, &auth, &body_bytes, if_match).await
         }
         (Method::GET, ["admin", "tls", "crls", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
-            tls_management::handle_get_managed(ManagedTlsMaterialKind::Crl, id).await
+            tls_management::handle_get_managed(
+                &state,
+                auth.key_tier,
+                ManagedTlsMaterialKind::Crl,
+                id,
+            )
+            .await
         }
         (Method::PUT, ["admin", "tls", "crls", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_update_crl(&state, &auth, id, &body_bytes).await
+            let if_match = route_if_match!();
+            tls_management::handle_update_crl(&state, &auth, id, &body_bytes, if_match).await
         }
         (Method::DELETE, ["admin", "tls", "crls", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_delete_managed(&state, &auth, ManagedTlsMaterialKind::Crl, id)
-                .await
+            let if_match = route_if_match!();
+            tls_management::handle_delete_managed(
+                &state,
+                &auth,
+                ManagedTlsMaterialKind::Crl,
+                id,
+                if_match,
+            )
+            .await
         }
         (Method::GET, ["admin", "tls", "ocsp-responses"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -6466,29 +6507,40 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_create_ocsp_response(&state, &auth, &body_bytes).await
+            let if_match = route_if_match!();
+            tls_management::handle_create_ocsp_response(&state, &auth, &body_bytes, if_match).await
         }
         (Method::GET, ["admin", "tls", "ocsp-responses", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
-            tls_management::handle_get_managed(ManagedTlsMaterialKind::OcspResponse, id).await
+            tls_management::handle_get_managed(
+                &state,
+                auth.key_tier,
+                ManagedTlsMaterialKind::OcspResponse,
+                id,
+            )
+            .await
         }
         (Method::PUT, ["admin", "tls", "ocsp-responses", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_update_ocsp_response(&state, &auth, id, &body_bytes).await
+            let if_match = route_if_match!();
+            tls_management::handle_update_ocsp_response(&state, &auth, id, &body_bytes, if_match)
+                .await
         }
         (Method::DELETE, ["admin", "tls", "ocsp-responses", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
+            let if_match = route_if_match!();
             tls_management::handle_delete_managed(
                 &state,
                 &auth,
                 ManagedTlsMaterialKind::OcspResponse,
                 id,
+                if_match,
             )
             .await
         }
@@ -6503,26 +6555,41 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_create_jwks(&state, &auth, &body_bytes).await
+            let if_match = route_if_match!();
+            tls_management::handle_create_jwks(&state, &auth, &body_bytes, if_match).await
         }
         (Method::GET, ["admin", "tls", "jwks", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
-            tls_management::handle_get_managed(ManagedTlsMaterialKind::Jwks, id).await
+            tls_management::handle_get_managed(
+                &state,
+                auth.key_tier,
+                ManagedTlsMaterialKind::Jwks,
+                id,
+            )
+            .await
         }
         (Method::PUT, ["admin", "tls", "jwks", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_update_jwks(&state, &auth, id, &body_bytes).await
+            let if_match = route_if_match!();
+            tls_management::handle_update_jwks(&state, &auth, id, &body_bytes, if_match).await
         }
         (Method::DELETE, ["admin", "tls", "jwks", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            tls_management::handle_delete_managed(&state, &auth, ManagedTlsMaterialKind::Jwks, id)
-                .await
+            let if_match = route_if_match!();
+            tls_management::handle_delete_managed(
+                &state,
+                &auth,
+                ManagedTlsMaterialKind::Jwks,
+                id,
+                if_match,
+            )
+            .await
         }
         (Method::POST, ["admin", "tls", "rotate", surface]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -8432,7 +8499,9 @@ struct PersistCounts {
 const DATABASE_OPERATION_FAILED_MESSAGE: &str = "Database unavailable — operation failed";
 pub(crate) const IF_MATCH_UNSUPPORTED_MESSAGE: &str = "If-Match is only supported on PUT and \
      DELETE of /proxies/{id}, /upstreams/{id}, /consumers/{id}, /plugins/config/{id}, on the \
-     /consumers/{id}/credentials/{type}[/{index}] mutations, and on POST /restore";
+     /consumers/{id}/credentials/{type}[/{index}] mutations, on POST /restore, and on POST, PUT \
+     and DELETE of the managed TLS records (/admin/tls/{certificates|ca-bundles|crls|\
+     ocsp-responses|jwks}[/{id}], /admin/tls/acme/certificates[/{id}])";
 
 /// `400` for a mutating route that does not evaluate `If-Match`.
 fn if_match_unsupported_response() -> Response<Full<Bytes>> {
@@ -8457,6 +8526,20 @@ fn if_match_route(method: &Method, segments: &[&str]) -> bool {
             return matches!(*method, Method::PUT | Method::POST | Method::DELETE);
         }
         ["consumers", _, "credentials", _, _] => return *method == Method::DELETE,
+        // Managed TLS material and ACME certificate records: the store
+        // evaluates the tag under the exclusive lock that commits the write
+        // (`tls_management::TlsWritePrecondition`). A collection `POST`
+        // evaluates it for the `allow_overwrite: true` replacement case.
+        ["admin", "tls", collection] if is_tls_record_collection(collection) => {
+            return *method == Method::POST;
+        }
+        ["admin", "tls", collection, _] if is_tls_record_collection(collection) => {
+            return matches!(*method, Method::PUT | Method::DELETE);
+        }
+        ["admin", "tls", "acme", "certificates"] => return *method == Method::POST,
+        ["admin", "tls", "acme", "certificates", _] => {
+            return matches!(*method, Method::PUT | Method::DELETE);
+        }
         _ => {}
     }
     (method == Method::PUT || method == Method::DELETE)
@@ -8464,6 +8547,14 @@ fn if_match_route(method: &Method, segments: &[&str]) -> bool {
             segments,
             ["proxies", _] | ["upstreams", _] | ["consumers", _] | ["plugins", "config", _]
         )
+}
+
+/// The managed TLS collections whose records honour `If-Match`.
+fn is_tls_record_collection(collection: &str) -> bool {
+    matches!(
+        collection,
+        "certificates" | "ca-bundles" | "crls" | "ocsp-responses" | "jwks"
+    )
 }
 
 pub(crate) const RESOURCE_IDENTITY_CONFLICT_MESSAGE: &str =

@@ -2007,6 +2007,29 @@ async fn if_match_and_conditional_do_not_preempt_forbidden_on_delete_and_bodyles
             vec![("If-Match", "malformed")],
             "{}",
         ),
+        // Managed TLS record writes evaluate If-Match, but only after the
+        // admin role gate.
+        (
+            &operator_token,
+            "PUT",
+            "/admin/tls/certificates/c1",
+            vec![("If-Match", "malformed")],
+            "{}",
+        ),
+        (
+            &operator_token,
+            "POST",
+            "/admin/tls/ca-bundles",
+            vec![("If-Match", "malformed")],
+            "{}",
+        ),
+        (
+            &operator_token,
+            "DELETE",
+            "/admin/tls/acme/certificates/a1",
+            vec![("If-Match", "malformed")],
+            "{}",
+        ),
     ] {
         let resp =
             send_raw_admin_request_with_headers(addr, method, path, Some(token), &headers, body)

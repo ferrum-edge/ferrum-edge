@@ -722,6 +722,8 @@ paths:
         Imports already issued ACME certificate material into Ferrum's ACME
         store. Private key bytes are persisted but never returned in responses.
       tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/TlsRecordIfMatch"
       requestBody:
         required: true
         content:
@@ -747,6 +749,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -762,6 +766,9 @@ paths:
       responses:
         "200":
           description: ACME certificate record
+          headers:
+            ETag:
+              $ref: "#/components/headers/TlsRecordETag"
           content:
             application/json:
               schema:
@@ -782,6 +789,7 @@ paths:
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/TlsRecordIfMatch"
       requestBody:
         required: true
         content:
@@ -807,6 +815,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -834,6 +844,7 @@ paths:
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/TlsRecordIfMatch"
       responses:
         "200":
           description: ACME certificate deleted
@@ -857,6 +868,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/TlsRecordInUseConflict"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1225,6 +1238,8 @@ paths:
         CA bundles, CRLs, OCSP responses, and JWKS. Create with `allow_overwrite=true`
         rejects a cross-kind ID collision with `409 Conflict`.
       tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/TlsRecordIfMatch"
       requestBody:
         required: true
         content:
@@ -1250,6 +1265,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1265,6 +1282,9 @@ paths:
       responses:
         "200":
           description: Managed certificate record
+          headers:
+            ETag:
+              $ref: "#/components/headers/TlsRecordETag"
           content:
             application/json:
               schema:
@@ -1291,6 +1311,7 @@ paths:
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/TlsRecordIfMatch"
       requestBody:
         required: true
         content:
@@ -1318,6 +1339,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1345,6 +1368,7 @@ paths:
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/TlsRecordIfMatch"
       responses:
         "200":
           description: Managed certificate deleted
@@ -1368,6 +1392,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/TlsRecordInUseConflict"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1406,6 +1432,8 @@ paths:
         when ordinary mutation auditing is enabled, the event is stored under
         the canonical default namespace (`ferrum`).
       tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/TlsRecordIfMatch"
       requestBody:
         required: true
         content:
@@ -1431,6 +1459,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1446,6 +1476,9 @@ paths:
       responses:
         "200":
           description: Managed CA bundle record
+          headers:
+            ETag:
+              $ref: "#/components/headers/TlsRecordETag"
           content:
             application/json:
               schema:
@@ -1470,6 +1503,7 @@ paths:
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/TlsRecordIfMatch"
       requestBody:
         required: true
         content:
@@ -1497,6 +1531,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1524,6 +1560,7 @@ paths:
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/TlsRecordIfMatch"
       responses:
         "200":
           description: Managed CA bundle deleted
@@ -1547,6 +1584,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/TlsRecordInUseConflict"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1583,6 +1622,8 @@ paths:
         with `allow_overwrite=true` rejects a cross-kind ID collision with
         `409 Conflict`.
       tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/TlsRecordIfMatch"
       requestBody:
         required: true
         content:
@@ -1608,6 +1649,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1623,6 +1666,9 @@ paths:
       responses:
         "200":
           description: Managed CRL record
+          headers:
+            ETag:
+              $ref: "#/components/headers/TlsRecordETag"
           content:
             application/json:
               schema:
@@ -1645,6 +1691,7 @@ paths:
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/TlsRecordIfMatch"
       requestBody:
         required: true
         content:
@@ -1672,6 +1719,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1699,6 +1748,7 @@ paths:
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/TlsRecordIfMatch"
       responses:
         "200":
           description: Managed CRL deleted
@@ -1722,6 +1772,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/TlsRecordInUseConflict"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1758,6 +1810,8 @@ paths:
         with `allow_overwrite=true` rejects a cross-kind ID collision with
         `409 Conflict`.
       tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/TlsRecordIfMatch"
       requestBody:
         required: true
         content:
@@ -1783,6 +1837,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1798,6 +1854,9 @@ paths:
       responses:
         "200":
           description: Managed OCSP response record
+          headers:
+            ETag:
+              $ref: "#/components/headers/TlsRecordETag"
           content:
             application/json:
               schema:
@@ -1820,6 +1879,7 @@ paths:
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/TlsRecordIfMatch"
       requestBody:
         required: true
         content:
@@ -1847,6 +1907,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1874,6 +1936,7 @@ paths:
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/TlsRecordIfMatch"
       responses:
         "200":
           description: Managed OCSP response deleted
@@ -1897,6 +1960,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/TlsRecordInUseConflict"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1938,6 +2003,8 @@ paths:
         write returns; other nodes sharing `FERRUM_TLS_MANAGED_STORE_PATH`
         re-read on their own cadence.
       tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/TlsRecordIfMatch"
       requestBody:
         required: true
         content:
@@ -1963,6 +2030,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1978,6 +2047,9 @@ paths:
       responses:
         "200":
           description: Managed JWKS record
+          headers:
+            ETag:
+              $ref: "#/components/headers/TlsRecordETag"
           content:
             application/json:
               schema:
@@ -2004,6 +2076,7 @@ paths:
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/TlsRecordIfMatch"
       requestBody:
         required: true
         content:
@@ -2031,6 +2104,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -2061,6 +2136,7 @@ paths:
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/TlsRecordIfMatch"
       responses:
         "200":
           description: Managed JWKS document deleted
@@ -2084,6 +2160,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/TlsRecordInUseConflict"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -9557,12 +9635,47 @@ components:
         Omitting the header keeps the write unconditional. A malformed or
         empty header is `400`, never treated as absent. `If-Match` is only
         evaluated on `PUT`/`DELETE` of `/proxies/{id}`, `/upstreams/{id}`,
-        `/consumers/{id}`, and `/plugins/config/{id}`, and on the consumer
-        credential mutations above. `POST /restore` uses
+        `/consumers/{id}`, and `/plugins/config/{id}`, on the consumer
+        credential mutations above, and on the managed TLS record writes
+        (see `TlsRecordIfMatch`). `POST /restore` uses
         the separate NamespaceIfMatch contract; any other `POST`,
         `PUT`, `PATCH`, or `DELETE` carrying it is refused with `400` rather
         than applied unconditionally. As RFC 9110 §13.2.1 requires, a request
         that would otherwise be `404` is `404` regardless of the precondition.
+    TlsRecordIfMatch:
+      name: If-Match
+      in: header
+      required: false
+      schema:
+        type: string
+      description: |
+        Makes a managed TLS or ACME certificate record write conditional
+        (RFC 9110 §13.1.1), with the same syntax, comparison, status codes and
+        error envelope as `If-Match` on `/proxies/{id}`. Send the `ETag` from
+        `GET` on the same record; the write is refused with `412` and nothing
+        changes unless the stored record still has that representation, so an
+        operator rotating material from a stale read can never overwrite
+        another operator's accepted rotation. `*` requires only that the
+        record exists. Comparison is strong: a weak (`W/`) tag never matches. A
+        comma-separated list matches when any member does.
+
+        The comparison runs inside the TLS store's exclusive cross-process
+        write lock, against the authoritative record, in the same
+        read-modify-write that commits the change. Every gateway instance
+        sharing the store directory (`FERRUM_TLS_MANAGED_STORE_PATH`) takes
+        that lock, so no other writer — another admin request, another
+        replica, or ACME renewal — can commit between the comparison and the
+        write.
+
+        On `PUT` and `DELETE` a request that would otherwise be `404` (or a
+        cross-kind `409`) is answered that way regardless of the precondition.
+        On a collection `POST` the precondition applies to the
+        `allow_overwrite: true` replacement case: it is refused with `412` when
+        the id is free (a precondition cannot hold without a current record)
+        or the stored record has changed, before the overwrite rule is applied.
+
+        Omitting the header keeps the write unconditional. A malformed or
+        empty header is `400`, never treated as absent.
     ExpectedProxyIds:
       name: expected_proxy_ids
       in: query
@@ -9747,6 +9860,24 @@ components:
         same `FERRUM_ADMIN_JWT_SECRET` issue identical tags; rotating that
         secret invalidates outstanding tags. Write responses do not carry a
         tag: re-read the resource to obtain the tag for the accepted state.
+      required: false
+      schema:
+        type: string
+        example: '"3f0c8a1e9b2d4c6f8a0e1b3d5c7f9a2e"'
+    TlsRecordETag:
+      description: |
+        Strong entity-tag for the stored managed TLS or ACME certificate
+        record, for use in `If-Match` on that record's `PUT`, `DELETE`, or
+        `allow_overwrite` `POST`. Derived exactly as `ResourceETag`: a MAC
+        keyed from `FERRUM_ADMIN_JWT_SECRET` over the complete stored record
+        (including private key and other material never returned in the body,
+        which is why it is keyed rather than a plain digest), bound to the
+        record id. It changes whenever any stored field changes, including
+        `updated_at`. Present only when the caller's token was verified by
+        `FERRUM_ADMIN_JWT_SECRET` (GHSA-crqx-mp2f-v8c8). Replicas configured
+        with the same secret issue identical tags. Write responses do not
+        carry a tag: re-read the record to obtain the tag for the accepted
+        state.
       required: false
       schema:
         type: string

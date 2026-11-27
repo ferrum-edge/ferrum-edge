@@ -455,3 +455,80 @@ fn ca_invalid_order_transition_applies_terminal_history_bound() {
         AcmeOrderStatus::Failed
     );
 }
+
+/// Conditional ACME certificate writes (the Admin API's `If-Match`): the
+/// precondition is evaluated under the exclusive store lock, so of two
+/// replicas replacing one certificate from the same read exactly one commits.
+#[test]
+fn conditional_certificate_replacement_from_two_instances_commits_exactly_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let seed = AcmeCertificateStore::open(dir.path()).expect("open seed");
+    seed.upsert_certificate(certificate("edge-cert", "pem-v0"), false)
+        .expect("seed");
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let handles: Vec<_> = ["pem-a", "pem-b"]
+        .into_iter()
+        .map(|pem| {
+            let path = dir.path().to_path_buf();
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let instance = AcmeCertificateStore::open(path).expect("open replica");
+                let seen = instance.get_certificate("edge-cert").expect("read");
+                barrier.wait();
+                let outcome = instance.update_existing_certificate_if(
+                    certificate("edge-cert", pem),
+                    |current| {
+                        current.cert_pem == seen.cert_pem && current.updated_at == seen.updated_at
+                    },
+                );
+                (pem, outcome)
+            })
+        })
+        .collect();
+    let outcomes: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("replica thread"))
+        .collect();
+    let winners: Vec<&str> = outcomes
+        .iter()
+        .filter(|(_, outcome)| outcome.is_ok())
+        .map(|(pem, _)| *pem)
+        .collect();
+    assert_eq!(winners.len(), 1, "{outcomes:?}");
+    assert!(outcomes.iter().any(|(_, outcome)| matches!(
+        outcome,
+        Err(AcmeError::CertificatePreconditionFailed(id)) if id == "edge-cert"
+    )));
+    assert_eq!(
+        seed.get_certificate("edge-cert")
+            .expect("read back")
+            .cert_pem,
+        winners[0]
+    );
+
+    // Refused overwrite and delete leave the record in place; a conditional
+    // overwrite of a free id never creates it.
+    assert!(matches!(
+        seed.upsert_certificate_if(certificate("edge-cert", "pem-stale"), true, |_| false),
+        Err(AcmeError::CertificatePreconditionFailed(_))
+    ));
+    assert!(matches!(
+        seed.delete_certificate_if_authorized_and("edge-cert", |_| false, || true),
+        Err(AcmeError::CertificatePreconditionFailed(_))
+    ));
+    assert_eq!(
+        seed.get_certificate("edge-cert").expect("kept").cert_pem,
+        winners[0]
+    );
+    assert!(matches!(
+        seed.upsert_certificate_if(certificate("free-cert", "pem"), true, |current| {
+            current.is_some()
+        }),
+        Err(AcmeError::CertificatePreconditionFailed(_))
+    ));
+    assert!(matches!(
+        seed.get_certificate("free-cert"),
+        Err(AcmeError::NotFound(_))
+    ));
+}

@@ -150,6 +150,14 @@ pub enum ManagedTlsError {
     NotFound(String),
     #[error("managed TLS record '{0}' already exists")]
     AlreadyExists(String),
+    /// The caller's write precondition (`If-Match` at the Admin API) did not
+    /// hold against the authoritative record under the exclusive store lock,
+    /// so nothing was written. Carries only the record id.
+    #[error(
+        "managed TLS record '{0}' has changed since the supplied If-Match entity-tag was issued; \
+         re-read it and reapply your changes"
+    )]
+    PreconditionFailed(String),
     /// Cross-kind ID collision on create-with-overwrite or typed update.
     ///
     /// Managed TLS IDs are globally unique across certificates, CA bundles,
@@ -369,6 +377,24 @@ impl ManagedTlsStore {
         record: ManagedTlsRecord,
         allow_overwrite: bool,
     ) -> Result<ManagedTlsRecord, ManagedTlsError> {
+        self.upsert_if(record, allow_overwrite, |_| true)
+    }
+
+    /// [`Self::upsert`] guarded by a caller precondition.
+    ///
+    /// `precondition` receives the authoritative stored record (or `None` when
+    /// the id is free) under the same exclusive cross-process lock that
+    /// commits the write, before existence, overwrite, and kind rules are
+    /// applied. Returning `false` refuses the write with
+    /// [`ManagedTlsError::PreconditionFailed`] and changes nothing, so a
+    /// conditional overwrite can never commit over a record another writer
+    /// (on this or another instance sharing the store) replaced in between.
+    pub fn upsert_if(
+        &self,
+        record: ManagedTlsRecord,
+        allow_overwrite: bool,
+        precondition: impl FnOnce(Option<&ManagedTlsRecord>) -> bool,
+    ) -> Result<ManagedTlsRecord, ManagedTlsError> {
         validate_managed_id(&record.id)?;
         validate_managed_record_material_size(&record, self.max_material_bytes)?;
         let max_records = self.max_records;
@@ -380,6 +406,9 @@ impl ManagedTlsStore {
         let outcome = self.file.mutate(move |document| {
             let mut record = record;
             let now = UtcTimestamp::now();
+            if !precondition(document.records.get(&record.id)) {
+                return Err(ManagedTlsError::PreconditionFailed(record.id));
+            }
             if let Some(existing) = document.records.get(&record.id) {
                 if !allow_overwrite {
                     return Err(ManagedTlsError::AlreadyExists(record.id));
@@ -419,6 +448,18 @@ impl ManagedTlsStore {
         &self,
         record: ManagedTlsRecord,
     ) -> Result<ManagedTlsRecord, ManagedTlsError> {
+        self.update_existing_if(record, |_| true)
+    }
+
+    /// [`Self::update_existing`] guarded by a caller precondition, evaluated
+    /// against the authoritative existing record (after the existence and
+    /// kind checks) under the exclusive lock that commits the replacement.
+    /// `false` refuses with [`ManagedTlsError::PreconditionFailed`].
+    pub fn update_existing_if(
+        &self,
+        record: ManagedTlsRecord,
+        precondition: impl FnOnce(&ManagedTlsRecord) -> bool,
+    ) -> Result<ManagedTlsRecord, ManagedTlsError> {
         validate_managed_id(&record.id)?;
         validate_managed_record_material_size(&record, self.max_material_bytes)?;
         let outcome = self.file.mutate(move |document| {
@@ -433,6 +474,9 @@ impl ManagedTlsStore {
                     existing_kind: existing.kind.as_str(),
                     requested_kind: record.kind.as_str(),
                 });
+            }
+            if !precondition(existing) {
+                return Err(ManagedTlsError::PreconditionFailed(record.id));
             }
             record.created_at = existing.created_at;
             record.updated_at = now;
@@ -467,7 +511,7 @@ impl ManagedTlsStore {
         id: &str,
         still_authorized: impl Fn() -> bool,
     ) -> Result<Option<ManagedTlsRecord>, ManagedTlsError> {
-        self.delete_if_authorized_inner(id, None, still_authorized)
+        self.delete_if_authorized_inner(id, None, |_| true, still_authorized)
     }
 
     /// Delete `id` only when its stored kind matches `expected_kind` and
@@ -480,13 +524,29 @@ impl ManagedTlsStore {
         expected_kind: ManagedTlsMaterialKind,
         still_authorized: impl Fn() -> bool,
     ) -> Result<Option<ManagedTlsRecord>, ManagedTlsError> {
-        self.delete_if_authorized_inner(id, Some(expected_kind), still_authorized)
+        self.delete_if_authorized_inner(id, Some(expected_kind), |_| true, still_authorized)
+    }
+
+    /// [`Self::delete_kind_if_authorized`] guarded by a caller precondition,
+    /// evaluated against the authoritative record (after the existence and
+    /// kind checks, before the authorization check) under the exclusive lock
+    /// that commits the removal. `false` refuses with
+    /// [`ManagedTlsError::PreconditionFailed`] and removes nothing.
+    pub fn delete_kind_if_authorized_and(
+        &self,
+        id: &str,
+        expected_kind: ManagedTlsMaterialKind,
+        precondition: impl FnOnce(&ManagedTlsRecord) -> bool,
+        still_authorized: impl Fn() -> bool,
+    ) -> Result<Option<ManagedTlsRecord>, ManagedTlsError> {
+        self.delete_if_authorized_inner(id, Some(expected_kind), precondition, still_authorized)
     }
 
     fn delete_if_authorized_inner(
         &self,
         id: &str,
         expected_kind: Option<ManagedTlsMaterialKind>,
+        precondition: impl FnOnce(&ManagedTlsRecord) -> bool,
         still_authorized: impl Fn() -> bool,
     ) -> Result<Option<ManagedTlsRecord>, ManagedTlsError> {
         validate_managed_id(id)?;
@@ -504,6 +564,9 @@ impl ManagedTlsStore {
                         expected: expected.as_str(),
                         actual: existing.kind.as_str(),
                     });
+                }
+                if !precondition(existing) {
+                    return Err(ManagedTlsError::PreconditionFailed(id.clone()));
                 }
                 if !still_authorized() {
                     return Ok((false, None));

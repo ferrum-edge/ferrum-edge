@@ -1741,6 +1741,72 @@ fn row_if_match_operations_match_the_router_and_document_412() {
     assert_eq!(documented, expected);
 }
 
+/// The managed TLS / ACME certificate record `If-Match` contract is documented
+/// on exactly the operations `if_match_route` admits for `/admin/tls/...`,
+/// each with the shared `412`, and every by-id `GET` documents the tag.
+#[test]
+fn tls_record_if_match_operations_match_the_router_and_document_412() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let paths = spec["paths"].as_object().expect("paths object");
+    let mut documented = BTreeSet::new();
+    let mut tagged_reads = BTreeSet::new();
+    for (path, item) in paths {
+        for method in OPENAPI_HTTP_METHODS {
+            let Some(operation) = item.get(*method) else {
+                continue;
+            };
+            if operation
+                .pointer("/responses/200/headers/ETag/$ref")
+                .and_then(serde_json::Value::as_str)
+                == Some("#/components/headers/TlsRecordETag")
+            {
+                tagged_reads.insert(format!("{} {path}", method.to_uppercase()));
+            }
+            let has_if_match = operation["parameters"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|parameter| parameter["$ref"] == "#/components/parameters/TlsRecordIfMatch");
+            if !has_if_match {
+                continue;
+            }
+            assert_eq!(
+                operation["responses"]["412"]["$ref"], "#/components/responses/PreconditionFailed",
+                "{method} {path} takes If-Match and must document the shared 412"
+            );
+            documented.insert(format!("{} {path}", method.to_uppercase()));
+        }
+    }
+    let collections = [
+        "/admin/tls/certificates",
+        "/admin/tls/ca-bundles",
+        "/admin/tls/crls",
+        "/admin/tls/ocsp-responses",
+        "/admin/tls/jwks",
+        "/admin/tls/acme/certificates",
+    ];
+    let mut expected = BTreeSet::new();
+    let mut expected_reads = BTreeSet::new();
+    for collection in collections {
+        expected.insert(format!("POST {collection}"));
+        expected.insert(format!("PUT {collection}/{{id}}"));
+        expected.insert(format!("DELETE {collection}/{{id}}"));
+        expected_reads.insert(format!("GET {collection}/{{id}}"));
+    }
+    assert_eq!(documented, expected);
+    assert_eq!(tagged_reads, expected_reads);
+    assert_eq!(
+        spec.pointer("/components/parameters/TlsRecordIfMatch/in"),
+        Some(&json!("header"))
+    );
+    assert_eq!(
+        spec.pointer("/components/parameters/TlsRecordIfMatch/required"),
+        Some(&json!(false)),
+        "an absent If-Match keeps the write unconditional"
+    );
+}
+
 #[test]
 fn proxy_create_schema_requires_upstream_or_direct_backend() {
     let spec: serde_json::Value =

@@ -286,3 +286,160 @@ fn reads_do_not_wait_for_a_writer_holding_the_store_lock() {
 
     lock.unlock().expect("release the writer lock");
 }
+
+/// Conditional writes (the Admin API's `If-Match`): the precondition is
+/// evaluated against the authoritative record inside the exclusive lock that
+/// commits the write. Two replicas that read the same representation and then
+/// both replace it conditionally must not both commit — exactly one wins and
+/// the other is refused without writing.
+#[test]
+fn conditional_replacement_from_two_instances_commits_exactly_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let seed = ManagedTlsStore::open(dir.path()).expect("open seed");
+    seed.upsert(ca_record("rotating-ca", "v0"), false)
+        .expect("seed");
+
+    for round in 0..8 {
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = ["from-a", "from-b"]
+            .into_iter()
+            .map(|pem| {
+                let path = dir.path().to_path_buf();
+                let barrier = Arc::clone(&barrier);
+                let pem = format!("{pem}-{round}");
+                std::thread::spawn(move || {
+                    let instance = ManagedTlsStore::open(path).expect("open replica");
+                    // Both replicas read the same representation before either
+                    // writes, as two operators opening one record would.
+                    let seen = instance.get("rotating-ca").expect("read");
+                    barrier.wait();
+                    let outcome =
+                        instance.update_existing_if(ca_record("rotating-ca", &pem), |current| {
+                            current.ca_bundle_pem == seen.ca_bundle_pem
+                                && current.updated_at == seen.updated_at
+                        });
+                    (pem, outcome)
+                })
+            })
+            .collect();
+        let outcomes: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("replica thread"))
+            .collect();
+        let winners: Vec<&str> = outcomes
+            .iter()
+            .filter(|(_, outcome)| outcome.is_ok())
+            .map(|(pem, _)| pem.as_str())
+            .collect();
+        assert_eq!(
+            winners.len(),
+            1,
+            "round {round}: exactly one conditional writer commits: {outcomes:?}"
+        );
+        assert!(
+            outcomes.iter().any(|(_, outcome)| matches!(
+                outcome,
+                Err(ManagedTlsError::PreconditionFailed(id)) if id == "rotating-ca"
+            )),
+            "round {round}: the loser is refused with PreconditionFailed: {outcomes:?}"
+        );
+        let stored = seed.get("rotating-ca").expect("read back");
+        assert_eq!(
+            stored.ca_bundle_pem.as_deref(),
+            Some(winners[0]),
+            "round {round}: the stored record is the winner's, never the loser's"
+        );
+    }
+}
+
+#[test]
+fn a_refused_precondition_changes_nothing_on_any_write_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = ManagedTlsStore::open(dir.path()).expect("open");
+    store
+        .upsert(ca_record("held-ca", "original"), false)
+        .expect("seed");
+    let version = store.store_version().expect("version");
+
+    let error = store
+        .update_existing_if(ca_record("held-ca", "stale-put"), |_| false)
+        .expect_err("refused update");
+    assert!(matches!(error, ManagedTlsError::PreconditionFailed(ref id) if id == "held-ca"));
+    // The rendering names the id only, never the record's material.
+    assert!(!error.to_string().contains("original"));
+    assert!(!error.to_string().contains("stale-put"));
+
+    let error = store
+        .upsert_if(ca_record("held-ca", "stale-overwrite"), true, |_| false)
+        .expect_err("refused overwrite");
+    assert!(matches!(error, ManagedTlsError::PreconditionFailed(_)));
+
+    let error = store
+        .delete_kind_if_authorized_and(
+            "held-ca",
+            ManagedTlsMaterialKind::CaBundle,
+            |_| false,
+            || true,
+        )
+        .expect_err("refused delete");
+    assert!(matches!(error, ManagedTlsError::PreconditionFailed(_)));
+
+    assert_eq!(
+        store
+            .get("held-ca")
+            .expect("still present")
+            .ca_bundle_pem
+            .as_deref(),
+        Some("original")
+    );
+    assert_eq!(
+        store.store_version().expect("version"),
+        version,
+        "a refused precondition must not republish the document"
+    );
+
+    // A conditional overwrite whose precondition requires a current record
+    // never turns into a create.
+    let error = store
+        .upsert_if(ca_record("absent-ca", "created"), true, |current| {
+            current.is_some()
+        })
+        .expect_err("conditional overwrite of a free id is refused");
+    assert!(matches!(error, ManagedTlsError::PreconditionFailed(ref id) if id == "absent-ca"));
+    assert!(matches!(
+        store.get("absent-ca"),
+        Err(ManagedTlsError::NotFound(_))
+    ));
+
+    // Existence and kind are still decided first.
+    assert!(matches!(
+        store.update_existing_if(ca_record("absent-ca", "x"), |_| false),
+        Err(ManagedTlsError::NotFound(_))
+    ));
+    assert!(matches!(
+        store.delete_kind_if_authorized_and(
+            "held-ca",
+            ManagedTlsMaterialKind::Crl,
+            |_| false,
+            || true,
+        ),
+        Err(ManagedTlsError::WrongKind { .. })
+    ));
+
+    // A holding precondition commits.
+    store
+        .update_existing_if(ca_record("held-ca", "rotated"), |current| {
+            current.ca_bundle_pem.as_deref() == Some("original")
+        })
+        .expect("matching precondition commits");
+    let removed = store
+        .delete_kind_if_authorized_and(
+            "held-ca",
+            ManagedTlsMaterialKind::CaBundle,
+            |current| current.ca_bundle_pem.as_deref() == Some("rotated"),
+            || true,
+        )
+        .expect("matching delete")
+        .expect("removed");
+    assert_eq!(removed.ca_bundle_pem.as_deref(), Some("rotated"));
+}

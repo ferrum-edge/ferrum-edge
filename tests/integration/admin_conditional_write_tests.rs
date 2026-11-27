@@ -3229,6 +3229,7 @@ async fn mongo_replica_set_conditional_restore_checks_state_and_lease_in_transac
     .await;
     assert_mongo_orphaned_spec_refused(db.clone(), &raw).await;
     assert_mongo_deployment_raw_preservation(db.clone(), &raw).await;
+    assert_tls_record_conditional_writes(db.clone()).await;
     let locks = raw.collection::<mongodb::bson::Document>("config_admission_locks");
     assert_restore_renewal_and_fencing(db.clone(), move |namespace, ttl| {
         let locks = locks.clone();
@@ -3379,6 +3380,7 @@ async fn postgres_conditional_restore_checks_state_and_lease_in_transaction() {
     .await
     .unwrap();
     assert_postgres_stalled_cleanup_is_bounded(Arc::new(stalled_db)).await;
+    assert_tls_record_conditional_writes(db.clone()).await;
     assert_sql_restore_renewal(db.clone()).await;
     assert_http_restore_spans_keeper_renewal(db).await;
 }
@@ -3415,6 +3417,7 @@ async fn mysql_conditional_restore_checks_state_and_lease_in_transaction() {
     assert_deployment_mutation_contract(db.clone()).await;
     assert_deployment_cancellation_and_live_ack(db.clone()).await;
     assert_deployment_concurrent_writer_fences(db.clone()).await;
+    assert_tls_record_conditional_writes(db.clone()).await;
     assert_sql_restore_renewal(db.clone()).await;
     assert_http_restore_spans_keeper_renewal(db).await;
 }
@@ -6199,4 +6202,391 @@ async fn plugin_retarget_put_enforces_expected_proxy_ids() {
     )
     .await;
     assert_eq!(reply.status, 200, "group expected: {}", reply.body);
+}
+
+// ---------------------------------------------------------------------------
+// Managed TLS and ACME certificate records (`/admin/tls/...`)
+// ---------------------------------------------------------------------------
+
+/// A fresh self-signed CA certificate, as PEM.
+fn tls_ca_pem() -> String {
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("ca key");
+    let mut params =
+        rcgen::CertificateParams::new(vec!["conditional-ca.test".to_string()]).expect("params");
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params.self_signed(&key).expect("ca cert").pem()
+}
+
+/// A fresh self-signed leaf certificate and its private key, as PEM.
+fn tls_leaf_pem() -> (String, String) {
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("leaf key");
+    let params =
+        rcgen::CertificateParams::new(vec!["api.example.com".to_string()]).expect("params");
+    let cert = params.self_signed(&key).expect("leaf cert");
+    (cert.pem(), key.serialize_pem())
+}
+
+fn assert_strong_tag(tag: &str) {
+    assert!(
+        tag.starts_with('"') && tag.ends_with('"') && !tag.starts_with("W/"),
+        "the tag is a quoted strong entity-tag: {tag}"
+    );
+}
+
+/// Run two conditional writes holding the same tag concurrently and return
+/// their replies ordered `(winner, loser)`; exactly one must commit.
+async fn race_conditional_writes(
+    base: &str,
+    method: Method,
+    path: &str,
+    tag: &str,
+    first: &Value,
+    second: &Value,
+) -> (Reply, Reply) {
+    let token = admin_token();
+    let (a, b) = tokio::join!(
+        send(method.clone(), base, path, &token, Some(tag), Some(first)),
+        send(method, base, path, &token, Some(tag), Some(second)),
+    );
+    let mut statuses = [a.status, b.status];
+    statuses.sort_unstable();
+    assert_eq!(
+        statuses,
+        [200, 412],
+        "exactly one of two conditional writers holding one tag commits: {} / {}",
+        a.body,
+        b.body
+    );
+    if a.status == 200 { (a, b) } else { (b, a) }
+}
+
+/// `ETag` / `If-Match` on the managed TLS and ACME certificate record writes
+/// (Foundry's "two operators rotate one record" report). The TLS store is the
+/// shared file store, not the configuration database, so the guard is the same
+/// on every backend; this runs inside the required SQLite gate and the three
+/// live-store gates so the database-mode reference fence on `DELETE` is
+/// exercised on each of them too.
+async fn assert_tls_record_conditional_writes(db: Arc<dyn DatabaseBackend>) {
+    let (base, _shutdown) = start_admin(admin_state(db, JWT_SECRET)).await;
+    let token = admin_token();
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+
+    // ---- Managed CA bundle ------------------------------------------------
+    let id = format!("cond-ca-{suffix}");
+    let path = format!("/admin/tls/ca-bundles/{id}");
+    let created = send(
+        Method::POST,
+        &base,
+        "/admin/tls/ca-bundles",
+        &token,
+        None,
+        Some(&json!({"id": id, "name": id, "ca_bundle_pem": tls_ca_pem()})),
+    )
+    .await;
+    assert_eq!(created.status, 201, "seed CA bundle: {}", created.body);
+    assert!(created.etag.is_none(), "write responses carry no tag");
+
+    let opened_by_first = get(&base, &path).await;
+    let opened_by_second = get(&base, &path).await;
+    assert_eq!(opened_by_first.status, 200, "{}", opened_by_first.body);
+    let opened_tag = opened_by_first.etag.expect("GET issues an ETag");
+    assert_strong_tag(&opened_tag);
+    assert_eq!(
+        Some(opened_tag.clone()),
+        opened_by_second.etag,
+        "two reads of one record carry one tag"
+    );
+
+    // Two operators rotate the record from the same read: exactly one wins.
+    let (winner, loser) = race_conditional_writes(
+        &base,
+        Method::PUT,
+        &path,
+        &opened_tag,
+        &json!({"ca_bundle_pem": tls_ca_pem()}),
+        &json!({"ca_bundle_pem": tls_ca_pem()}),
+    )
+    .await;
+    assert_eq!(
+        loser.body,
+        json!({"error": format!(
+            "managed TLS record '{id}' has changed since the supplied If-Match \
+             entity-tag was issued; re-read it and reapply your changes"
+        )}),
+        "the 412 uses the shared envelope and names only the id"
+    );
+    let current = get(&base, &path).await;
+    assert_eq!(
+        current.body["fingerprint_sha256"], winner.body["fingerprint_sha256"],
+        "the stored record is the winner's rotation, never the loser's"
+    );
+    let current_tag = current.etag.expect("GET issues an ETag");
+    assert_ne!(current_tag, opened_tag, "a rotation changes the tag");
+
+    // A stale DELETE is refused and removes nothing.
+    let stale_delete = send(
+        Method::DELETE,
+        &base,
+        &path,
+        &token,
+        Some(&opened_tag),
+        None,
+    )
+    .await;
+    assert_eq!(stale_delete.status, 412, "{}", stale_delete.body);
+    assert_eq!(get(&base, &path).await.status, 200, "record survives");
+
+    // Weak comparison never matches; a malformed header is never "absent".
+    let weak = send(
+        Method::PUT,
+        &base,
+        &path,
+        &token,
+        Some(&format!("W/{current_tag}")),
+        Some(&json!({"ca_bundle_pem": tls_ca_pem()})),
+    )
+    .await;
+    assert_eq!(weak.status, 412, "{}", weak.body);
+    let malformed = send(
+        Method::PUT,
+        &base,
+        &path,
+        &token,
+        Some("unquoted"),
+        Some(&json!({"ca_bundle_pem": tls_ca_pem()})),
+    )
+    .await;
+    assert_eq!(malformed.status, 400, "{}", malformed.body);
+    assert_eq!(get(&base, &path).await.etag, Some(current_tag.clone()));
+
+    // `*` requires only existence; a tag list matches when any member does.
+    let any = send(
+        Method::PUT,
+        &base,
+        &path,
+        &token,
+        Some("*"),
+        Some(&json!({"ca_bundle_pem": tls_ca_pem()})),
+    )
+    .await;
+    assert_eq!(any.status, 200, "{}", any.body);
+    let listed_tag = get(&base, &path).await.etag.expect("tag");
+    let listed = send(
+        Method::PUT,
+        &base,
+        &path,
+        &token,
+        Some(&format!("\"not-it\", {listed_tag}")),
+        Some(&json!({"ca_bundle_pem": tls_ca_pem()})),
+    )
+    .await;
+    assert_eq!(listed.status, 200, "{}", listed.body);
+
+    // `allow_overwrite: true` POST is the same guarded replacement.
+    let overwrite_tag = get(&base, &path).await.etag.expect("tag");
+    let stale_overwrite = send(
+        Method::POST,
+        &base,
+        "/admin/tls/ca-bundles",
+        &token,
+        Some(&opened_tag),
+        Some(
+            &json!({"id": id, "name": id, "ca_bundle_pem": tls_ca_pem(), "allow_overwrite": true}),
+        ),
+    )
+    .await;
+    assert_eq!(stale_overwrite.status, 412, "{}", stale_overwrite.body);
+    let fresh_overwrite = send(
+        Method::POST,
+        &base,
+        "/admin/tls/ca-bundles",
+        &token,
+        Some(&overwrite_tag),
+        Some(
+            &json!({"id": id, "name": id, "ca_bundle_pem": tls_ca_pem(), "allow_overwrite": true}),
+        ),
+    )
+    .await;
+    assert_eq!(fresh_overwrite.status, 201, "{}", fresh_overwrite.body);
+
+    // A conditional overwrite never turns into a create.
+    let free_id = format!("cond-ca-free-{suffix}");
+    let free = send(
+        Method::POST,
+        &base,
+        "/admin/tls/ca-bundles",
+        &token,
+        Some("*"),
+        Some(&json!({"id": free_id, "name": free_id, "ca_bundle_pem": tls_ca_pem(), "allow_overwrite": true})),
+    )
+    .await;
+    assert_eq!(free.status, 412, "{}", free.body);
+    assert_eq!(
+        get(&base, &format!("/admin/tls/ca-bundles/{free_id}"))
+            .await
+            .status,
+        404
+    );
+
+    // Absent precondition: unconditional, exactly as before.
+    let unconditional = send(
+        Method::PUT,
+        &base,
+        &path,
+        &token,
+        None,
+        Some(&json!({"ca_bundle_pem": tls_ca_pem()})),
+    )
+    .await;
+    assert_eq!(unconditional.status, 200, "{}", unconditional.body);
+
+    // A conditional DELETE with the current tag removes the record; a missing
+    // record is 404 whatever the precondition says.
+    let delete_tag = get(&base, &path).await.etag.expect("tag");
+    let deleted = send(
+        Method::DELETE,
+        &base,
+        &path,
+        &token,
+        Some(&delete_tag),
+        None,
+    )
+    .await;
+    assert_eq!(deleted.status, 200, "{}", deleted.body);
+    let missing = send(
+        Method::PUT,
+        &base,
+        &path,
+        &token,
+        Some(&delete_tag),
+        Some(&json!({"ca_bundle_pem": tls_ca_pem()})),
+    )
+    .await;
+    assert_eq!(missing.status, 404, "{}", missing.body);
+
+    // ---- ACME certificate ---------------------------------------------------
+    let acme_id = format!("cond-acme-{suffix}");
+    let acme_path = format!("/admin/tls/acme/certificates/{acme_id}");
+    let acme_body = |with_id: bool| {
+        let (cert_pem, key_pem) = tls_leaf_pem();
+        let mut body = json!({
+            "domains": ["api.example.com"],
+            "directory_url": "https://acme.example/directory",
+            "cert_pem": cert_pem,
+            "key_pem": key_pem,
+        });
+        if with_id {
+            body["id"] = json!(acme_id);
+        }
+        body
+    };
+    let imported = send(
+        Method::POST,
+        &base,
+        "/admin/tls/acme/certificates",
+        &token,
+        None,
+        Some(&acme_body(true)),
+    )
+    .await;
+    assert_eq!(
+        imported.status, 201,
+        "import ACME certificate: {}",
+        imported.body
+    );
+    let acme_read = get(&base, &acme_path).await;
+    assert_eq!(acme_read.status, 200, "{}", acme_read.body);
+    let acme_tag = acme_read.etag.expect("GET issues an ETag");
+    assert_strong_tag(&acme_tag);
+    let (_winner, acme_loser) = race_conditional_writes(
+        &base,
+        Method::PUT,
+        &acme_path,
+        &acme_tag,
+        &acme_body(false),
+        &acme_body(false),
+    )
+    .await;
+    assert_eq!(
+        acme_loser.body,
+        json!({"error": format!(
+            "ACME certificate '{acme_id}' has changed since the supplied If-Match \
+             entity-tag was issued; re-read it and reapply your changes"
+        )})
+    );
+    let acme_stale_delete = send(
+        Method::DELETE,
+        &base,
+        &acme_path,
+        &token,
+        Some(&acme_tag),
+        None,
+    )
+    .await;
+    assert_eq!(acme_stale_delete.status, 412, "{}", acme_stale_delete.body);
+    let acme_current = get(&base, &acme_path).await.etag.expect("tag");
+    let acme_deleted = send(
+        Method::DELETE,
+        &base,
+        &acme_path,
+        &token,
+        Some(&acme_current),
+        None,
+    )
+    .await;
+    assert_eq!(acme_deleted.status, 200, "{}", acme_deleted.body);
+    assert_eq!(get(&base, &acme_path).await.status, 404);
+}
+
+#[tokio::test]
+async fn tls_record_conditional_writes_are_atomic_and_share_the_row_contract() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = make_store(&dir).await;
+    assert_tls_record_conditional_writes(db).await;
+}
+
+/// A primary-key `operator` token reads the records (with the tag) but cannot
+/// write them, and the role gate answers before any precondition. Viewer-key
+/// tokens are capped at `viewer` and cannot read these records at all; the
+/// handler still withholds the tag from them as on the row resources
+/// (GHSA-crqx-mp2f-v8c8).
+#[tokio::test]
+async fn tls_record_operator_reads_carry_the_tag_but_writes_stay_admin_only() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(admin_state(db, JWT_SECRET)).await;
+    let id = format!("cond-ca-tier-{}", uuid::Uuid::new_v4().simple());
+    let created = send(
+        Method::POST,
+        &base,
+        "/admin/tls/ca-bundles",
+        &admin_token(),
+        None,
+        Some(&json!({"id": id, "name": id, "ca_bundle_pem": tls_ca_pem()})),
+    )
+    .await;
+    assert_eq!(created.status, 201, "{}", created.body);
+    let path = format!("/admin/tls/ca-bundles/{id}");
+    let operator = token_with_role(JWT_SECRET, "operator");
+    let read = send(Method::GET, &base, &path, &operator, None, None).await;
+    assert_eq!(read.status, 200, "{}", read.body);
+    assert!(
+        read.etag.is_some(),
+        "a primary-key operator read carries the tag"
+    );
+
+    // An operator cannot write the record, and the role gate answers before
+    // the precondition is considered.
+    let forbidden = send(
+        Method::PUT,
+        &base,
+        &path,
+        &operator,
+        Some("*"),
+        Some(&json!({"ca_bundle_pem": tls_ca_pem()})),
+    )
+    .await;
+    assert_eq!(forbidden.status, 403, "{}", forbidden.body);
+    let cleanup = send(Method::DELETE, &base, &path, &admin_token(), None, None).await;
+    assert_eq!(cleanup.status, 200, "{}", cleanup.body);
 }
