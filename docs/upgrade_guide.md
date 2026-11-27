@@ -263,17 +263,24 @@ destination or DestinationRule-governed split leg named a Service in another
 namespace. 1.0.0 also refuses a weighted split with such a leg when no
 DestinationRule governs it; before, that leg could receive traffic whenever
 the data plane's slice modeled the other namespace's Service and its
-workloads. The refused route's host keeps its plain Service route, and the rest
-of the slice applies.
+workloads. Routes naming the refused split are removed, and the rest of the
+slice applies. The host keeps its plain Service route only where one exists: a
+VirtualService host that no modeled Service owns is no longer routed by the
+mesh data plane. A route that the translator terminates unconditionally with a
+`404` keeps answering that `404`, with the refused split detached.
 
 A mesh-bound VirtualService that names such a destination stays
 `FerrumAccepted=True`, because its gateway routes are unaffected. Its condition
 message now counts the cross-namespace destinations, and each one is listed in
 `status.ferrum.translation.deferred_fields` (at most 32 entries and 8 KiB,
-then one entry counts the rest).
+then one entry counts the rest). The controller judges fully qualified hosts
+against its own cluster domain (`FERRUM_K8S_CLUSTER_DOMAIN`), so the status
+predicts the data planes' refusals only when that equals the data planes'
+`FERRUM_MESH_CLUSTER_DOMAIN`.
 
 **Operator action:** to keep a split, point every leg at a Service in the
-VirtualService's own namespace. Check `deferred_fields` on mesh-bound
+VirtualService's own namespace. Keep `FERRUM_K8S_CLUSTER_DOMAIN` and
+`FERRUM_MESH_CLUSTER_DOMAIN` equal. Check `deferred_fields` on mesh-bound
 VirtualServices for entries that start with `http[].route[].destination`.
 
 ### Admin API behaviour changes (#7491, #7484)

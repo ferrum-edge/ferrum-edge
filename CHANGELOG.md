@@ -146,12 +146,16 @@ gateways, control planes, mesh data planes, charts or contract consumers.
   even when no DestinationRule governs the split (#7528, issue #7499).
   Previously such a leg could receive traffic when the slice modeled that
   Service. This matches the existing refusal of cross-namespace direct,
-  dispatch-rule and DestinationRule-governed destinations; the route is
-  refused and its host keeps the plain Service route. A mesh-bound
-  VirtualService naming such destinations stays `FerrumAccepted`. Its
-  condition message now counts them, and
-  `status.ferrum.translation.deferred_fields` lists each one (budgeted, with
-  zero-weight legs marked as omitted during translation).
+  dispatch-rule and DestinationRule-governed destinations. Routes naming the
+  split are removed, and the host keeps its plain Service route only where one
+  exists; a route the translator terminates unconditionally with a `404` keeps
+  that `404` with the refused split detached. A mesh-bound VirtualService
+  naming such destinations stays `FerrumAccepted`. Its condition message now
+  counts them, and `status.ferrum.translation.deferred_fields` lists each one
+  (budgeted, with zero-weight legs marked as omitted during translation),
+  judged against the controller's cluster domain, so keep
+  `FERRUM_K8S_CLUSTER_DOMAIN` equal to the data planes'
+  `FERRUM_MESH_CLUSTER_DOMAIN`.
 - **Istio DestinationRule `outlierDetection.splitExternalLocalOriginErrors:
   true` is reported as a deferred field** (#7520): a translate-time warning
   plus a tier-scoped `status.ferrum.translation.deferred_fields` entry. Ferrum
