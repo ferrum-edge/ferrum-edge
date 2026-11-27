@@ -3063,7 +3063,6 @@ pub(crate) async fn dial_h2_connect_sender(
         let conn_slot = conn_slot.clone();
         let trust_registry = trust_registry.clone();
         let keepalive_pool = keepalive_pool.clone();
-        let gateway_not_after = gateway_not_after;
         async move {
             let tcp = crate::socket_opts::connect_with_socket_opts(sock_addr)
                 .await

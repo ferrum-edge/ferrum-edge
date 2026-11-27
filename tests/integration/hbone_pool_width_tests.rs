@@ -664,6 +664,7 @@ async fn pooled_connection_is_never_reused_past_the_peer_certificate_expiry() {
     let err = tokio::time::timeout(OPEN_TIMEOUT, open())
         .await
         .expect("open returns within its budget")
+        .map(drop)
         .expect_err("an expired peer gets no new tunnel");
     assert!(
         matches!(

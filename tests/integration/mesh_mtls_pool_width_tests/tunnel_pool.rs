@@ -718,6 +718,7 @@ async fn saturation_wait_is_bounded_by_the_connect_timeout() {
     let err = fixture
         .open()
         .await
+        .map(drop)
         .expect_err("no slot frees inside the connect timeout");
     assert!(
         matches!(err, HbonePoolError::ConnectStream { .. }),
@@ -746,6 +747,7 @@ async fn max_connections_charges_carriers_not_streams() {
     let err = fixture
         .open()
         .await
+        .map(drop)
         .expect_err("second carrier is over cap");
     assert!(
         matches!(err, HbonePoolError::MaxConnectionsExceeded { .. }),
@@ -800,6 +802,7 @@ async fn a_different_pinned_identity_never_reuses_a_connection() {
     let err = fixture
         .open_as(Some(&impostor), None, None, "127.0.0.1")
         .await
+        .map(drop)
         .expect_err("pin mismatch must fail closed");
     assert!(
         matches!(err, HbonePoolError::TlsHandshake { .. }),
@@ -831,6 +834,7 @@ async fn trust_scope_and_sni_partition_connections() {
             "127.0.0.1",
         )
         .await
+        .map(drop)
         .expect_err("wrong trust domain must fail closed");
     assert!(
         matches!(err, HbonePoolError::TlsHandshake { .. }),
@@ -889,6 +893,7 @@ async fn key_delimiter_in_dial_metadata_fails_closed_before_any_dial() {
     let err = fixture
         .open_as(Some(&fixture.peer_id), None, None, "workload|forged")
         .await
+        .map(drop)
         .expect_err("a delimiter in the authority must be refused");
     assert!(
         matches!(err, HbonePoolError::InvalidDialHostTag { .. }),
@@ -901,7 +906,11 @@ async fn key_delimiter_in_dial_metadata_fails_closed_before_any_dial() {
 async fn missing_gateway_svid_fails_closed_before_any_dial() {
     let fixture = Fixture::new(Options::default()).await;
     fixture.gateway_slot.store(Arc::new(None));
-    let err = fixture.open().await.expect_err("no SVID, no tunnel");
+    let err = fixture
+        .open()
+        .await
+        .map(drop)
+        .expect_err("no SVID, no tunnel");
     assert!(
         matches!(err, HbonePoolError::NoSvid),
         "unexpected error: {err:?}"
@@ -1130,6 +1139,7 @@ async fn crl_revocation_of_the_peer_never_reuses_its_pooled_connection() {
     let err = fixture
         .open()
         .await
+        .map(drop)
         .expect_err("a revoked peer gets no new tunnel");
     assert!(
         matches!(err, HbonePoolError::TlsHandshake { .. }),
@@ -1194,6 +1204,7 @@ async fn an_expired_peer_certificate_never_reuses_its_pooled_connection() {
     let err = fixture
         .open()
         .await
+        .map(drop)
         .expect_err("an expired peer gets no new tunnel");
     assert!(
         matches!(err, HbonePoolError::TlsHandshake { .. }),
