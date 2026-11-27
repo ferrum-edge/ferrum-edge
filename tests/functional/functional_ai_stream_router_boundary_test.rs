@@ -672,5 +672,7 @@ fn boundary_config(mode: BoundaryMode, provider_port: u16, normal_backend_port: 
             }
         ]
     });
-    serde_yaml::to_string(&config).expect("serialize ai_stream_router boundary config")
+    // File mode is YAML: the shared helper writes `retry.backoff` (an
+    // externally tagged enum) as a YAML tag (`!fixed`), the form the loader reads.
+    crate::scaffolding::to_file_mode_yaml(&config)
 }

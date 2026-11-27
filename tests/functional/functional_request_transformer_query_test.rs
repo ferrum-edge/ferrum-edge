@@ -547,7 +547,9 @@ fn transformer_retry_config(backend_port: u16) -> String {
             "config": { "rules": transformer_rules() }
         }]
     });
-    serde_yaml::to_string(&config).expect("serialize transformer retry config")
+    // File mode is YAML: the shared helper writes `retry.backoff` (an
+    // externally tagged enum) as a YAML tag (`!fixed`), the form the loader reads.
+    crate::scaffolding::to_file_mode_yaml(&config)
 }
 
 async fn http1_get(harness: &TransformerQueryHarness) -> StatusCode {
