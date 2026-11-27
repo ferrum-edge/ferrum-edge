@@ -14921,15 +14921,23 @@ async fn handle_service_waypoint_services_get(
             &json!({"error": "service-waypoint topology not enabled"}),
         ));
     };
-    // The bound-Service L7 surface of the generation the proxy currently
-    // serves (issue #7500): read from the router's per-generation snapshot,
-    // never rebuilt here. Empty when no proxy runtime is wired.
-    let l7_routes = state
+    // Service records and their bound-Service L7 surface (issue #7500) come
+    // from ONE published generation: the configuration the proxy currently
+    // serves, so a response never pairs one generation's ports with another's
+    // L7 ports. Without a proxy runtime the applied slice's Services are
+    // listed with no L7 surface. Cold path.
+    let served = state
         .proxy_state
         .as_ref()
-        .map(|proxy_state| proxy_state.router_cache.service_waypoint_l7_routes());
-    let services: Vec<serde_json::Value> = slice
-        .services
+        .map(|proxy_state| proxy_state.current_config());
+    let l7_routes = served
+        .as_deref()
+        .map(crate::modes::mesh::service_waypoint_l7::ServiceWaypointL7Routes::build);
+    let service_records = served
+        .as_deref()
+        .and_then(|config| config.mesh.as_deref())
+        .map_or(slice.services.as_slice(), |mesh| mesh.services.as_slice());
+    let services: Vec<serde_json::Value> = service_records
         .iter()
         .map(|svc| {
             let ports: Vec<u16> = svc.ports.iter().map(|p| p.port).collect();

@@ -11,6 +11,7 @@
 //! ServiceWaypoint data plane.
 
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use ferrum_edge::_test_support::{
     cp_filter_config_to_mesh_request_for_test, xds_config_fingerprints_equal_for_test,
@@ -140,12 +141,13 @@ fn translate_into(config: &mut GatewayConfig, namespace: &str, objects: &[K8sObj
     config.proxies.extend(translated.proxies);
     config.upstreams.extend(translated.upstreams);
     config.plugin_configs.extend(translated.plugin_configs);
-    if let Some(mesh) = translated.mesh {
-        config
-            .mesh
-            .get_or_insert_with(Box::default)
-            .virtual_service_http_routes
-            .extend(mesh.virtual_service_http_routes);
+    if let Some(translated_mesh) = translated.mesh {
+        let mesh = config.mesh.get_or_insert_with(Box::default);
+        mesh.virtual_service_http_routes
+            .extend(translated_mesh.virtual_service_http_routes);
+        mesh.destination_rules
+            .extend(translated_mesh.destination_rules);
+        mesh.service_entries.extend(translated_mesh.service_entries);
     }
 }
 
@@ -993,16 +995,16 @@ fn router_builds_the_target_index_and_per_bound_service_partitions() {
     assert!(index.contains(&orders));
     assert_eq!(
         index.classify_authority(&host("reviews", WAYPOINT_NAMESPACE), 8080),
-        ServiceWaypointConnectMode::TerminateL7(reviews.clone())
+        ServiceWaypointConnectMode::TerminateL7(Arc::new(reviews.clone()))
     );
     assert_eq!(
         index.classify_authority("Reviews.Default.svc.cluster.local.", 8080),
-        ServiceWaypointConnectMode::TerminateL7(reviews.clone()),
+        ServiceWaypointConnectMode::TerminateL7(Arc::new(reviews.clone())),
         "Service hosts compare case-insensitively without a trailing dot"
     );
     assert_eq!(
         index.classify_authority(REVIEWS_IP, 8080),
-        ServiceWaypointConnectMode::TerminateL7(reviews.clone()),
+        ServiceWaypointConnectMode::TerminateL7(Arc::new(reviews.clone())),
         "a backing pod authority maps to its bound Service"
     );
     assert_eq!(
@@ -1107,11 +1109,11 @@ fn target_index_refuses_an_ambiguous_backing_endpoint() {
     );
     assert_eq!(
         index.classify_authority(&host("frontend", WAYPOINT_NAMESPACE), 8080),
-        ServiceWaypointConnectMode::TerminateL7(ServiceWaypointL7Target {
+        ServiceWaypointConnectMode::TerminateL7(Arc::new(ServiceWaypointL7Target {
             namespace: WAYPOINT_NAMESPACE.to_string(),
             service: "frontend".to_string(),
             service_port: 8080,
-        }),
+        })),
         "the Service host still names exactly one Service"
     );
 }
@@ -1251,6 +1253,253 @@ fn service_waypoint_carries_no_node_waypoint_capture_inventory() {
     );
     assert!(slice.node_waypoint_capture_destinations.is_empty());
     assert!(!slice.http_routes.is_empty());
+}
+
+// ── Review round 1 (#7541) ─────────────────────────────────────────────────
+
+fn istio_object(kind: &str, name: &str, namespace: &str, spec: serde_json::Value) -> K8sObject {
+    let mut object = virtual_service(name, namespace, spec);
+    object.kind = kind.to_string();
+    object
+}
+
+/// F1: the same carried id in two bound namespaces is two resources, never a
+/// collision that refuses a shared waypoint's whole slice; the same id twice
+/// in one namespace is malformed and still refuses it.
+#[test]
+fn one_route_id_in_two_bound_namespaces_is_not_a_collision() {
+    let runtime = service_waypoint_runtime();
+    let (slice, _) = prepared_service_waypoint(&runtime);
+    let in_waypoint_namespace = |value: &serde_json::Value| {
+        value.get("namespace").and_then(serde_json::Value::as_str) == Some(WAYPOINT_NAMESPACE)
+    };
+    let mut shared = slice.clone();
+    let copy = |values: &[serde_json::Value]| -> Vec<serde_json::Value> {
+        values
+            .iter()
+            .filter(|value| in_waypoint_namespace(value))
+            .map(|value| {
+                let mut value = value.clone();
+                value["namespace"] = json!(TENANT_NAMESPACE);
+                value
+            })
+            .collect()
+    };
+    let proxies = copy(&slice.http_routes.proxies);
+    let upstreams = copy(&slice.http_routes.upstreams);
+    let plugins = copy(&slice.http_routes.plugin_configs);
+    assert!(!proxies.is_empty(), "fixture: a waypoint-namespace route");
+    shared.http_routes.proxies.extend(proxies);
+    shared.http_routes.upstreams.extend(upstreams);
+    shared.http_routes.plugin_configs.extend(plugins);
+    prepare_gateway_config_from_mesh_slice(&shared, &runtime)
+        .expect("one id in two bound namespaces is two routes, not a collision");
+
+    let mut duplicated = slice.clone();
+    let first = duplicated.http_routes.proxies[0].clone();
+    duplicated.http_routes.proxies.push(first);
+    prepare_gateway_config_from_mesh_slice(&duplicated, &runtime)
+        .expect_err("one id twice in one namespace refuses the slice");
+}
+
+/// F2: an external destination's DestinationRule and ServiceEntry survive
+/// waypoint narrowing, so the data plane refuses a direct external backend
+/// whose rule originates TLS (and can originate it on a split leg).
+#[test]
+fn waypoint_narrowing_keeps_policy_for_external_route_destinations() {
+    let mut namespaces = default_virtual_services();
+    namespaces[0].1.push(virtual_service(
+        "reviews-external",
+        WAYPOINT_NAMESPACE,
+        direct_spec(
+            &host("reviews", WAYPOINT_NAMESPACE),
+            "api.example.com",
+            None,
+        ),
+    ));
+    namespaces[0].1.push(istio_object(
+        "DestinationRule",
+        "api-tls",
+        WAYPOINT_NAMESPACE,
+        json!({"host": "api.example.com", "trafficPolicy": {"tls": {"mode": "SIMPLE"}}}),
+    ));
+    namespaces[0].1.push(istio_object(
+        "ServiceEntry",
+        "api",
+        WAYPOINT_NAMESPACE,
+        json!({
+            "hosts": ["api.example.com"],
+            "location": "MESH_EXTERNAL",
+            "ports": [{"number": 8080, "name": "http", "protocol": "HTTP"}],
+            "resolution": "DNS"
+        }),
+    ));
+    let config = cp_config(Some(binding("service")), &namespaces);
+    let runtime = service_waypoint_runtime();
+    let slice = served_slice(&config, &runtime.mesh_slice_request());
+    assert!(
+        carried_route_ids(&slice)
+            .iter()
+            .any(|id| id.contains("reviews-external")),
+        "fixture: the external route is projected"
+    );
+    assert!(
+        slice
+            .destination_rules
+            .iter()
+            .any(|rule| rule.host == "api.example.com"),
+        "the external destination's DestinationRule survives narrowing"
+    );
+    assert!(
+        slice
+            .service_entries
+            .iter()
+            .any(|entry| entry.hosts.iter().any(|host| host == "api.example.com")),
+        "the external destination's ServiceEntry survives narrowing"
+    );
+    let prepared =
+        prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("slice materializes");
+    assert!(
+        !prepared
+            .proxies
+            .iter()
+            .any(|proxy| proxy.id.contains("reviews-external")),
+        "a direct external backend whose DestinationRule originates TLS is refused"
+    );
+    assert!(
+        prepared
+            .proxies
+            .iter()
+            .any(|proxy| proxy.id.contains("reviews-split")),
+        "the rest of the slice keeps serving"
+    );
+}
+
+/// F3: a waypoint-namespace route exported to a bound tenant Service attaches
+/// to that Service's partition when it reaches a same-namespace bound backend.
+#[test]
+fn exported_waypoint_route_attaches_to_the_tenant_service_partition() {
+    let mut namespaces = default_virtual_services();
+    namespaces[0].1.push(virtual_service(
+        "orders-to-reviews",
+        WAYPOINT_NAMESPACE,
+        direct_spec(
+            &host("orders", TENANT_NAMESPACE),
+            &host("reviews", WAYPOINT_NAMESPACE),
+            Some(&[".", TENANT_NAMESPACE]),
+        ),
+    ));
+    let config = cp_config(Some(binding("service")), &namespaces);
+    let runtime = service_waypoint_runtime();
+    let slice = served_slice(&config, &runtime.mesh_slice_request());
+    assert!(
+        slice
+            .http_routes
+            .service_waypoint_attachments
+            .iter()
+            .any(|attachment| {
+                attachment.proxy_id.contains("orders-to-reviews")
+                    && attachment.service_namespace == TENANT_NAMESPACE
+                    && attachment.service_name == "orders"
+            }),
+        "the control plane attaches the route to the tenant Service"
+    );
+    assert!(
+        !slice
+            .http_routes
+            .service_waypoint_attachments
+            .iter()
+            .any(|attachment| {
+                attachment.proxy_id.contains("orders-to-reviews")
+                    && attachment.service_name != "orders"
+            }),
+        "only to the Service its hosts name"
+    );
+    let prepared =
+        prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("slice materializes");
+    let routes = RouterCache::new(&prepared, 1024).service_waypoint_l7_routes();
+    let orders = ServiceWaypointL7Target {
+        namespace: TENANT_NAMESPACE.to_string(),
+        service: "orders".to_string(),
+        service_port: 8080,
+    };
+    let partition = routes.partition(&orders).expect("orders partition");
+    assert!(
+        partition
+            .carried_routes
+            .iter()
+            .any(|route| route.id.contains("orders-to-reviews")
+                && route.namespace == WAYPOINT_NAMESPACE),
+        "the exported waypoint route is in the tenant Service's partition"
+    );
+    assert!(
+        routes
+            .service_summary(TENANT_NAMESPACE, "orders")
+            .virtual_service_route_count
+            >= 2
+    );
+}
+
+/// F4: a bound Service with no reachable HTTP port still owns its hosts, so
+/// another bound Service's partition never admits them.
+#[test]
+fn partition_refuses_the_hosts_of_an_unreachable_bound_service() {
+    let mut spec = direct_spec(
+        &host("reviews", WAYPOINT_NAMESPACE),
+        &host("reviews", WAYPOINT_NAMESPACE),
+        None,
+    );
+    spec["hosts"] = json!([
+        host("reviews", WAYPOINT_NAMESPACE),
+        host("ratings", WAYPOINT_NAMESPACE)
+    ]);
+    let namespaces = vec![(
+        WAYPOINT_NAMESPACE,
+        vec![virtual_service("two-hosts", WAYPOINT_NAMESPACE, spec)],
+    )];
+    let mut config = cp_config(Some(binding("service")), &namespaces);
+    // `ratings` stays bound but has no backing workload: no L7 route.
+    config
+        .mesh
+        .as_mut()
+        .expect("mesh block")
+        .workloads
+        .retain(|workload| workload.service_name != "ratings");
+    let runtime = service_waypoint_runtime();
+    let slice = served_slice(&config, &runtime.mesh_slice_request());
+    let prepared =
+        prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("slice materializes");
+    let routes = RouterCache::new(&prepared, 1024).service_waypoint_l7_routes();
+    assert!(
+        routes
+            .service_summary(WAYPOINT_NAMESPACE, "ratings")
+            .l7_http_ports
+            .is_empty(),
+        "fixture: ratings has no L7 route"
+    );
+    let reviews = ServiceWaypointL7Target {
+        namespace: WAYPOINT_NAMESPACE.to_string(),
+        service: "reviews".to_string(),
+        service_port: 8080,
+    };
+    let partition = routes.partition(&reviews).expect("reviews partition");
+    assert!(
+        partition
+            .carried_routes
+            .iter()
+            .any(|route| route.id.contains("two-hosts")),
+        "fixture: the route is attached to reviews"
+    );
+    for ratings_host in [
+        host("ratings", WAYPOINT_NAMESPACE),
+        "ratings.default".to_string(),
+    ] {
+        assert!(
+            !partition.admits_host(&ratings_host),
+            "{ratings_host} belongs to another bound Service"
+        );
+    }
+    assert!(partition.admits_host(&host("reviews", WAYPOINT_NAMESPACE)));
 }
 
 // ── `GET /service-waypoint/services` ───────────────────────────────────────
@@ -1482,5 +1731,220 @@ mod admin_endpoint {
                 "the entry matches the closed openapi schema and exposes no route rules"
             );
         }
+    }
+}
+
+// ── F7: real MeshSubscribe and xDS ADS round trips ──────────────────────────
+
+mod transport_round_trip {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use arc_swap::ArcSwap;
+    use ferrum_edge::config::types::GatewayConfig;
+    use ferrum_edge::grpc::auth::MESH_LOCAL_SUBSCRIBE_AUDIENCE;
+    use ferrum_edge::grpc::cp_server::{CpScope, DEFAULT_CP_DP_JWT_ISSUER};
+    use ferrum_edge::grpc::dp_client::{self, GrpcJwtSecret};
+    use ferrum_edge::grpc::mesh_registry::MeshNodeRegistry;
+    use ferrum_edge::grpc::mesh_server::MeshGrpcServer;
+    use ferrum_edge::grpc::proto::mesh_config_sync_client::MeshConfigSyncClient;
+    use ferrum_edge::grpc::proto::{ConfigUpdate, MeshSubscribeRequest};
+    use ferrum_edge::modes::mesh::config_consumer::stream_lifecycle::MeshStreamTimings;
+    use ferrum_edge::modes::mesh::config_consumer::xds_client::{
+        XdsClientConfig, start_xds_client_with_shutdown,
+    };
+    use ferrum_edge::modes::mesh::runtime::MeshRuntimeState;
+    use ferrum_edge::modes::mesh::slice::MeshSlice;
+    use ferrum_edge::xds::XdsAdsServer;
+    use tokio::sync::{broadcast, watch};
+    use tonic::transport::Server;
+
+    use crate::scaffolding::port_registry::TestSocket;
+
+    use super::{WAYPOINT_NAME, WAYPOINT_NAMESPACE, binding, cp_config, default_virtual_services};
+
+    const SECRET: &str = "service-waypoint-transport-secret-0000000";
+
+    /// The native `MeshSubscribe` server and the xDS ADS server, on one
+    /// listener, over the same control-plane configuration.
+    async fn start_control_plane(config: GatewayConfig) -> (String, tokio::task::JoinHandle<()>) {
+        let config = Arc::new(ArcSwap::new(Arc::new(config)));
+        let (mesh, _mesh_tx) = MeshGrpcServer::builder(config.clone(), SECRET.to_string())
+            .registry(Arc::new(MeshNodeRegistry::new()))
+            .expected_issuer(DEFAULT_CP_DP_JWT_ISSUER.to_string())
+            .scope(CpScope::All)
+            .build();
+        let (update_tx, _) = broadcast::channel::<ConfigUpdate>(8);
+        let xds = XdsAdsServer::new(
+            config,
+            update_tx,
+            SECRET.to_string(),
+            DEFAULT_CP_DP_JWT_ISSUER.to_string(),
+            WAYPOINT_NAMESPACE.to_string(),
+            32,
+        )
+        .with_scope(CpScope::All);
+        let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .expect("bind control plane");
+        let addr = listener.local_addr().expect("control plane addr");
+        let handle = tokio::spawn(async move {
+            let _ = Server::builder()
+                .add_service(mesh.into_service())
+                .add_service(xds.into_service())
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        (format!("http://{addr}"), handle)
+    }
+
+    /// The slice the native `MeshSubscribe` stream delivers for a
+    /// ServiceWaypoint subscription with proto field 11 set to `flag`.
+    async fn native_slice(url: &str, flag: bool) -> MeshSlice {
+        let node_id = "swp-native";
+        let token = dp_client::generate_dp_jwt_full(
+            SECRET,
+            node_id,
+            DEFAULT_CP_DP_JWT_ISSUER,
+            None,
+            Some(MESH_LOCAL_SUBSCRIBE_AUDIENCE),
+        )
+        .expect("mesh jwt");
+        let auth = format!("Bearer {token}");
+        let channel = tonic::transport::Channel::from_shared(url.to_string())
+            .expect("url")
+            .connect()
+            .await
+            .expect("connect");
+        let mut client =
+            MeshConfigSyncClient::with_interceptor(channel, move |mut req: tonic::Request<()>| {
+                req.metadata_mut().insert(
+                    "authorization",
+                    tonic::metadata::MetadataValue::try_from(auth.as_str()).expect("header"),
+                );
+                Ok(req)
+            });
+        let request = MeshSubscribeRequest {
+            node_id: node_id.to_string(),
+            ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+            namespace: WAYPOINT_NAMESPACE.to_string(),
+            workload_spiffe_id: String::new(),
+            labels: HashMap::new(),
+            waypoint_name: WAYPOINT_NAME.to_string(),
+            ambient_udp_source_scoping: true,
+            remote_discovery: false,
+            node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
+            service_waypoint_http_routes: flag,
+        };
+        let mut stream = client
+            .mesh_subscribe(tonic::Request::new(request))
+            .await
+            .expect("MeshSubscribe opens")
+            .into_inner();
+        loop {
+            let update = tokio::time::timeout(Duration::from_secs(10), stream.message())
+                .await
+                .expect("a MeshSubscribe frame in time")
+                .expect("stream ok")
+                .expect("a frame");
+            if update.heartbeat {
+                continue;
+            }
+            return serde_json::from_str(&update.mesh_slice_json).expect("slice JSON");
+        }
+    }
+
+    /// The slice the production xDS client installs from the ADS stream,
+    /// advertising `flag` in `Node.metadata`.
+    async fn xds_slice(url: &str, flag: bool) -> MeshSlice {
+        let state = MeshRuntimeState::new();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let config = XdsClientConfig {
+            cp_urls: vec![url.to_string()],
+            node_id: "swp-xds".to_string(),
+            cluster: WAYPOINT_NAMESPACE.to_string(),
+            namespace: WAYPOINT_NAMESPACE.to_string(),
+            workload_spiffe_id: None,
+            waypoint_name: Some(WAYPOINT_NAME.to_string()),
+            ambient_udp_source_scoping: true,
+            node_waypoint_capture_scoping: false,
+            sidecar_http_routes: false,
+            service_waypoint_http_routes: flag,
+            stream_channel_capacity: 32,
+            primary_retry_secs: 0,
+            connect_timeout_seconds: 5,
+            labels: Default::default(),
+        };
+        let client = tokio::spawn(start_xds_client_with_shutdown(
+            GrpcJwtSecret::new(SECRET.to_string()),
+            config,
+            state.clone(),
+            shutdown_rx,
+            None,
+            None,
+            MeshStreamTimings::production(),
+        ));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let slice = loop {
+            let snapshot = state.snapshot();
+            if let Some(slice) = (*snapshot).clone() {
+                break slice;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the xDS client installs a slice; status={:?}",
+                state.config_stream_status()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(10), client).await;
+        slice
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mesh_subscribe_and_xds_ads_carry_identical_service_waypoint_routes() {
+        let (url, server) = start_control_plane(cp_config(
+            Some(binding("service")),
+            &default_virtual_services(),
+        ))
+        .await;
+
+        let native = native_slice(&url, true).await;
+        let xds = xds_slice(&url, true).await;
+        assert!(
+            !native.http_routes.proxies.is_empty(),
+            "proto field 11 asks the native server for the routes"
+        );
+        assert!(
+            !native.http_routes.service_waypoint_attachments.is_empty(),
+            "the native slice carries the route attachments"
+        );
+        assert_eq!(
+            xds.http_routes, native.http_routes,
+            "the ADS stream carries the same routes and attachments"
+        );
+        assert_eq!(
+            xds.service_waypoint_bound_services,
+            native.service_waypoint_bound_services
+        );
+
+        // Turning the flag off withdraws the routes on each transport.
+        let native_off = native_slice(&url, false).await;
+        let xds_off = xds_slice(&url, false).await;
+        assert!(native_off.http_routes.is_empty(), "native without field 11");
+        assert!(
+            xds_off.http_routes.is_empty(),
+            "xDS without the metadata flag"
+        );
+        assert_eq!(
+            native_off.service_waypoint_bound_services, native.service_waypoint_bound_services,
+            "the flag changes only the route carriage"
+        );
+
+        server.abort();
     }
 }

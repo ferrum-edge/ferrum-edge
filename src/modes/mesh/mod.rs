@@ -1785,7 +1785,7 @@ fn prepare_normalized_gateway_config_for_mesh(
     materialize_mesh_outbound_proxies(&mut config, runtime, mesh_slice);
     // ServiceWaypoint (issue #7500): the bound Services' default L7 upstreams
     // and routes, before the carried routes are rebound onto them.
-    let service_waypoint_l7_bindings =
+    let (service_waypoint_l7_bindings, service_waypoint_l7_inventory) =
         materialize_service_waypoint_l7_routes(&mut config, runtime, mesh_slice);
     bind_carried_http_routes_to_node_waypoint_transport(&mut config, runtime, mesh_slice)?;
     // After rebinding, so each candidate names the destination route dispatch
@@ -2267,6 +2267,7 @@ fn prepare_normalized_gateway_config_for_mesh(
         // leaves the target index and its route partition at once. Never
         // derived from, and never feeding, `inbound_relay_destinations`.
         mesh.service_waypoint_l7_bindings = service_waypoint_l7_bindings;
+        mesh.service_waypoint_l7_inventory = service_waypoint_l7_inventory;
     }
     materialize_fault_runtime_overlay(&mut config, &mesh_slice.runtime_overlay);
     materialize_transformer_runtime_overlay(&mut config, &mesh_slice.runtime_overlay);
@@ -2402,9 +2403,13 @@ fn materialize_service_waypoint_l7_routes(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
-) -> Vec<service_waypoint_l7::ServiceWaypointL7Binding> {
+) -> (
+    Vec<service_waypoint_l7::ServiceWaypointL7Binding>,
+    service_waypoint_l7::ServiceWaypointL7Inventory,
+) {
     use service_waypoint_l7::{
-        ServiceWaypointL7Binding, ServiceWaypointL7Target, service_waypoint_l7_route_id,
+        ServiceWaypointBoundService, ServiceWaypointL7Binding, ServiceWaypointL7Inventory,
+        ServiceWaypointL7Target, ServiceWaypointRouteAttachment, service_waypoint_l7_route_id,
         service_waypoint_l7_upstream_id,
     };
 
@@ -2412,8 +2417,40 @@ fn materialize_service_waypoint_l7_routes(
         || !service_waypoint_runtime_identity_matches(mesh_slice, runtime)
         || mesh_slice.service_waypoint_bound_services.is_empty()
     {
-        return Vec::new();
+        return (Vec::new(), ServiceWaypointL7Inventory::default());
     }
+    // The full bound-Service inventory, reachable or not: host ownership for
+    // every partition reads it. And the routes the control plane attached to
+    // each bound Service (validated at decode).
+    let inventory = ServiceWaypointL7Inventory {
+        bound_services: mesh_slice
+            .service_waypoint_bound_services
+            .iter()
+            .map(|service| ServiceWaypointBoundService {
+                namespace: service.namespace.clone(),
+                service: service.name.clone(),
+                hosts: mesh_service_host_variants(
+                    &service.name,
+                    &service.namespace,
+                    &runtime.cluster_domain,
+                )
+                .iter()
+                .map(|host| host.trim().trim_end_matches('.').to_ascii_lowercase())
+                .collect(),
+            })
+            .collect(),
+        route_attachments: mesh_slice
+            .http_routes
+            .service_waypoint_attachments
+            .iter()
+            .map(|attachment| ServiceWaypointRouteAttachment {
+                route_namespace: attachment.proxy_namespace.clone(),
+                route_id: attachment.proxy_id.clone(),
+                service_namespace: attachment.service_namespace.clone(),
+                service_name: attachment.service_name.clone(),
+            })
+            .collect(),
+    };
     let bound: BTreeSet<(&str, &str)> = mesh_slice
         .service_waypoint_bound_services
         .iter()
@@ -2612,7 +2649,7 @@ fn materialize_service_waypoint_l7_routes(
             "Materialized ServiceWaypoint bound-Service L7 upstreams and default routes"
         );
     }
-    bindings
+    (bindings, inventory)
 }
 
 /// Whether this runtime is the ServiceWaypoint whose slice carried the
@@ -4771,22 +4808,70 @@ fn decode_http_route_set(
         })
         .collect::<Result<_, _>>()?;
     // Every carried record is a namespaced resource whose id must be unique
-    // within its kind (all share the slice namespace). Two records with one id
-    // would make every later id-keyed step act on the wrong one or on both:
+    // within its kind and namespace. Two records with one `(namespace, id)`
+    // would make every later key-based step act on the wrong one or on both:
     // the route binding finds and rebinds only the first split upstream while
     // the load balancer keeps the last, Sidecar refusal and instance
-    // detachment remove every record of an id, and the route index keeps one
-    // proxy. Refused here, before any binding or filtering, for all three
-    // kinds.
-    refuse_duplicate_carried_ids("proxy", proxies.iter().map(|proxy| proxy.id.as_str()))?;
+    // detachment remove every record of the key, and the route index keeps
+    // one proxy. Refused here, before any binding or filtering, for all three
+    // kinds. The same id in two namespaces is two resources (a ServiceWaypoint
+    // carries several bound Services' namespaces, issue #7500, and the
+    // translator can derive one id in two namespaces), never a collision.
+    refuse_duplicate_carried_ids(
+        "proxy",
+        proxies
+            .iter()
+            .map(|proxy| (proxy.namespace.as_str(), proxy.id.as_str())),
+    )?;
     refuse_duplicate_carried_ids(
         "plugin config",
-        plugin_configs.iter().map(|plugin| plugin.id.as_str()),
+        plugin_configs
+            .iter()
+            .map(|plugin| (plugin.namespace.as_str(), plugin.id.as_str())),
     )?;
     refuse_duplicate_carried_ids(
         "upstream",
-        upstreams.iter().map(|upstream| upstream.id.as_str()),
+        upstreams
+            .iter()
+            .map(|upstream| (upstream.namespace.as_str(), upstream.id.as_str())),
     )?;
+    // ServiceWaypoint route attachments (issue #7500): only a ServiceWaypoint
+    // carries them, within the bound, and each names a carried route and a
+    // Service this waypoint is bound to.
+    let attachments = &set.service_waypoint_attachments;
+    if !attachments.is_empty() {
+        if runtime.topology != MeshTopology::ServiceWaypoint {
+            return Err(anyhow::anyhow!(
+                "Mesh slice carries ServiceWaypoint route attachments on another topology"
+            ));
+        }
+        if attachments.len() > slice::MAX_SERVICE_WAYPOINT_ROUTE_ATTACHMENTS {
+            return Err(anyhow::anyhow!(
+                "Mesh slice carries more than {} ServiceWaypoint route attachments",
+                slice::MAX_SERVICE_WAYPOINT_ROUTE_ATTACHMENTS
+            ));
+        }
+        let bound: BTreeSet<(&str, &str)> = slice
+            .service_waypoint_bound_services
+            .iter()
+            .map(|service| (service.namespace.as_str(), service.name.as_str()))
+            .collect();
+        for (index, attachment) in attachments.iter().enumerate() {
+            let route_carried = proxies.iter().any(|proxy| {
+                proxy.namespace == attachment.proxy_namespace && proxy.id == attachment.proxy_id
+            });
+            let service_bound = bound.contains(&(
+                attachment.service_namespace.as_str(),
+                attachment.service_name.as_str(),
+            ));
+            if !route_carried || !service_bound {
+                return Err(anyhow::anyhow!(
+                    "Mesh slice ServiceWaypoint route attachment {index} names a route the slice \
+                     does not carry or a Service this waypoint is not bound to"
+                ));
+            }
+        }
+    }
 
     // Keyed by (namespace, id): a reference resolves in its own namespace.
     let carried_upstreams: BTreeSet<(&str, &str)> = upstreams
@@ -4936,7 +5021,7 @@ fn carried_route_plugin_record_is_translator_shaped(
         labels,
         id,
         plugin_name,
-        namespace: _,
+        namespace,
         config: _,
         scope,
         proxy_id,
@@ -4967,6 +5052,7 @@ fn carried_route_plugin_record_is_translator_shaped(
     }
     let associated = proxies.iter().any(|proxy| {
         proxy.id == proxy_id
+            && proxy.namespace == *namespace
             && proxy
                 .plugins
                 .iter()
@@ -5169,9 +5255,9 @@ fn carried_route_plugin_body_constructs(plugin_name: &str, config: &serde_json::
 /// The diagnostic names the record by ordinal and never echoes the id.
 fn refuse_duplicate_carried_ids<'a>(
     kind: &str,
-    ids: impl Iterator<Item = &'a str>,
+    ids: impl Iterator<Item = (&'a str, &'a str)>,
 ) -> Result<(), anyhow::Error> {
-    let mut seen: HashSet<&str> = HashSet::new();
+    let mut seen: HashSet<(&str, &str)> = HashSet::new();
     for (index, id) in ids.enumerate() {
         if !seen.insert(id) {
             return Err(anyhow::anyhow!(
