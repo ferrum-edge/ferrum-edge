@@ -174,6 +174,10 @@ struct GammaRouteResources {
     every_match_claimed: bool,
 }
 
+/// One route's attachment to one Service: the ports it attaches to (`None` is
+/// every port) and the keys of the parentRefs that resolved to that Service.
+type ServiceAttachment = (Option<BTreeSet<u16>>, Vec<String>);
+
 /// Port scopes of the routes that already claimed one match descriptor.
 type ClaimedDescriptors = HashMap<RouteMatchDescriptor, Vec<Option<BTreeSet<u16>>>>;
 
@@ -321,8 +325,7 @@ pub(super) fn stage_service_parent_routes(
     ensure_http_route_features(object)?;
     let route = K8sResourceKey::from_object(object);
     let route_namespace = object.metadata.namespace.as_str();
-    let mut services: BTreeMap<(String, String), (Option<BTreeSet<u16>>, Vec<String>)> =
-        BTreeMap::new();
+    let mut services: BTreeMap<(String, String), ServiceAttachment> = BTreeMap::new();
     let parent_refs: Vec<&Value> = object
         .spec
         .get("parentRefs")
