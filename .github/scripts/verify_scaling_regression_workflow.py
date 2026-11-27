@@ -416,7 +416,7 @@ def validate_load_consumer_separation(text: str, failures: list[str]) -> None:
         failures,
     )
     require(
-        'chrono::Duration::seconds(3600)' in text,
+        'SignedDuration::seconds(3600)' in text,
         "consumer JWTs must remain on the 1-hour mint path",
         failures,
     )
