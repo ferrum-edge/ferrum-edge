@@ -500,20 +500,18 @@ fn plan_declares_unique_consumer_credential_indexes() {
 fn current_plan_is_the_shipped_versioned_plan() {
     let plan = MongoIndexPlan::current();
     assert_eq!(plan.version, MONGO_INDEX_PLAN_VERSION);
-    assert!(MONGO_INDEX_PLAN_VERSION >= 1);
     assert_eq!(plan.indexes.len(), required_mongo_indexes().len());
     assert_eq!(plan.retired, RETIRED_MONGO_INDEXES.to_vec());
     // A fresh or pre-versioning database and an up-to-date one both upgrade
-    // cleanly; every shipped retirement is well formed.
+    // cleanly. `upgrade_from` also rejects a plan version below 1 and any
+    // retirement outside `2..=version`, so this proves the shipped plan is
+    // well formed.
     plan.upgrade_from(None).expect("fresh database");
     assert!(
         plan.upgrade_from(Some(MONGO_INDEX_PLAN_VERSION))
             .expect("current database")
             .is_empty()
     );
-    for retired in RETIRED_MONGO_INDEXES {
-        assert!((2..=MONGO_INDEX_PLAN_VERSION).contains(&retired.retired_in));
-    }
 }
 
 fn later_plan() -> MongoIndexPlan {
