@@ -153,7 +153,6 @@ CLASSIFIABLE_FILES: dict[str, frozenset[str]] = {
     "src/modes/injector.rs": frozenset({MESH_PLATFORM_SHARD}),
     "src/modes/node_agent.rs": frozenset({MESH_PLATFORM_SHARD}),
     "src/modes/node_agent_cni_server.rs": frozenset({MESH_PLATFORM_SHARD}),
-    "src/tls_offload.rs": frozenset({PROTOCOLS_SHARD}),
 }
 
 CORE_RELEVANT_PATTERNS = [
@@ -695,7 +694,6 @@ def self_test() -> int:
         ("src/identity/mod.rs", ALL_INTEGRATION_SHARDS),
         ("src/identity/spiffe/mod.rs", ALL_INTEGRATION_SHARDS),
         ("src/tls/mod.rs", MESH_AND_PROTOCOL_SHARDS),
-        ("src/tls_offload.rs", frozenset({PROTOCOLS_SHARD})),
         ("src/dns/mod.rs", ALL_INTEGRATION_SHARDS),
         ("src/grpc/cp_server.rs", ALL_INTEGRATION_SHARDS),
         ("src/grpc/mesh_server.rs", ALL_INTEGRATION_SHARDS),
@@ -740,7 +738,6 @@ def self_test() -> int:
         ("pull_request", ["src/k8s_controller/status.rs"], "shards", mesh_platform, False),
         ("pull_request", ["src/http3/server.rs"], "shards", protocol, False),
         ("pull_request", ["src/dtls/mod.rs"], "shards", protocol, False),
-        ("pull_request", ["src/tls_offload.rs"], "shards", protocol, False),
         ("pull_request", ["src/plugins/cors.rs"], "plugin", unit_shards, True),
         ("pull_request", ["src/plugin_cache.rs"], "plugin", unit_shards, True),
         ("pull_request", ["tests/unit/plugins/cors_tests.rs"], "plugin", unit_shards, True),

@@ -1214,7 +1214,6 @@ See [connection_pooling.md](connection_pooling.md) for the full configuration re
 | `FERRUM_ADAPTIVE_BUFFER_MAX_SIZE` | No | `262144` | Adaptive buffer ceiling in bytes. Clamped to `1024..=1048576` |
 | `FERRUM_ADAPTIVE_BUFFER_DEFAULT_SIZE` | No | `65536` | Initial adaptive buffer size before traffic data exists. Clamped to `1024..=1048576` |
 | `FERRUM_ADAPTIVE_BATCH_LIMIT_DEFAULT` | No | `6000` | Initial adaptive UDP batch limit |
-| `FERRUM_TLS_OFFLOAD_THREADS` | No | `0` | Reserved; TLS handshake offload is not implemented. Must remain `0`; any nonzero value fails startup |
 | `FERRUM_TCP_FASTOPEN_ENABLED` | No | `auto` | TCP Fast Open toggle: `auto`, `true`, or `false` |
 | `FERRUM_TCP_FASTOPEN_QUEUE_LEN` | No | `256` | TCP Fast Open server queue length |
 | `FERRUM_KTLS_ENABLED` | No | `auto` | Linux kTLS probe/gating; TLS 1.2 frontend-TLS TCP relays hand off to the kernel from an unbuffered rustls handshake, everything else keeps the userspace relay |

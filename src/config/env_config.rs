@@ -4337,12 +4337,6 @@ pub struct EnvConfig {
     /// counters every N seconds and computes average rates.  Minimum: 1.
     pub status_metrics_window_seconds: u64,
 
-    // ── TLS handshake offload (reserved) ─────────────────────────────────
-    /// Reserved. TLS handshake offload is not implemented. Must remain `0`
-    /// (the default, including when unset). Any nonzero
-    /// `FERRUM_TLS_OFFLOAD_THREADS` fails startup.
-    pub tls_offload_threads: usize,
-
     // ── TCP socket optimizations (Linux only) ────────────────────────────
     /// Enable TCP Fast Open on server (listening) and client (connecting) sockets.
     /// Saves 1 RTT on repeat connections by allowing data in the SYN packet.
@@ -4888,7 +4882,6 @@ impl Default for EnvConfig {
             shutdown_drain_seconds: 30,
             shutdown_predrain_seconds: 0,
             status_metrics_window_seconds: 30,
-            tls_offload_threads: 0,
             tcp_fastopen_enabled: AutoBool::Auto,
             tcp_fastopen_queue_len: 256,
             ktls_enabled: AutoBool::Auto,
@@ -5656,7 +5649,6 @@ impl EnvConfig {
             shutdown_drain_seconds: u64 = "FERRUM_SHUTDOWN_DRAIN_SECONDS" => 30u64;
             shutdown_predrain_seconds: u64 = "FERRUM_SHUTDOWN_PREDRAIN_SECONDS" => 0u64;
             status_metrics_window_seconds: u64 = "FERRUM_STATUS_METRICS_WINDOW_SECONDS" => 30u64, max(1u64);
-            tls_offload_threads: usize = "FERRUM_TLS_OFFLOAD_THREADS" => 0usize;
             tcp_fastopen_queue_len: u16 = "FERRUM_TCP_FASTOPEN_QUEUE_LEN" => 256u16;
             so_busy_poll_us: u32 = "FERRUM_SO_BUSY_POLL_US" => 0u32;
         }
@@ -6454,7 +6446,6 @@ impl EnvConfig {
             shutdown_drain_seconds,
             shutdown_predrain_seconds,
             status_metrics_window_seconds,
-            tls_offload_threads,
             tcp_fastopen_enabled,
             tcp_fastopen_queue_len,
             ktls_enabled,
@@ -7498,16 +7489,6 @@ impl EnvConfig {
         // non-production posture and let a dev opt-out re-open a gate
         // (issue #7237). One strict parser covers all five flags.
         crate::identity::validate_guardrail_env()?;
-        // Reserved: the offload runtime exists but is not wired at startup.
-        // A nonzero value used to parse and then do nothing; fail closed so
-        // operators cannot tune a knob that is silently ignored.
-        if self.tls_offload_threads != 0 {
-            return Err(
-                "FERRUM_TLS_OFFLOAD_THREADS must remain 0; TLS handshake offload is not \
-                 implemented"
-                    .into(),
-            );
-        }
         if !(1..=86_400).contains(&self.websocket_max_lifetime_seconds) {
             return Err(
                 "FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS must be between 1 and 86400 seconds".into(),

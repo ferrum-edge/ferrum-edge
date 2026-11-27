@@ -253,7 +253,6 @@ mod streaming_size_limit_commit_tests;
 mod tcp_accept_loop_supervision_tests;
 mod tcp_proxy_tests;
 mod tcp_relay_end_reason_tests;
-mod tls_offload_tests;
 mod tls_tests;
 mod udp_amplification_tests;
 mod udp_auth_lifetime_tests;
