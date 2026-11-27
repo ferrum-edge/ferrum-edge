@@ -1770,10 +1770,10 @@ fn prepare_normalized_gateway_config_for_mesh(
     materialize_node_waypoint_udp_listeners(&mut config, runtime, mesh_slice);
     fail_closed_node_waypoint_udp_dtls_scoped_policies(&mut config, runtime);
     // A cross-namespace destination clone (issue #7499) stays in place while
-    // rules apply: its targets are workload addresses and its id is not a
-    // host, so no rule matches it, and `RouteOverrideConnectTimeouts` reads
-    // its references to project the destination rule's connect timeout onto
-    // the Service upstream it copies.
+    // rules apply, but rule matching skips it (it takes its policy from the
+    // destination Service upstream it is refreshed from below), while
+    // `RouteOverrideConnectTimeouts` reads its references to project the
+    // destination rule's connect timeout onto that Service upstream.
     apply_destination_rules(&mut config, runtime, mesh_slice)?;
     project_mesh_source_locality(&mut config, runtime, mesh_slice);
     // After DestinationRules and locality, so the route-scoped clones carry
@@ -13775,6 +13775,14 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
     let mut winning_tier_by_upstream_host: Vec<Vec<Option<DestinationRuleWinner>>> =
         Vec::with_capacity(config.upstreams.len());
     for (upstream_idx, upstream) in config.upstreams.iter().enumerate() {
+        // A cross-namespace destination clone (issue #7499) takes its policy
+        // from the destination Service upstream it is refreshed from after
+        // rules apply, never from a rule matched against its own workload
+        // addresses: no host of it participates.
+        if is_cross_namespace_destination_clone_id(&upstream.id) {
+            winning_tier_by_upstream_host.push(Vec::new());
+            continue;
+        }
         let hosts = upstream_destination_rule_match_hosts(
             upstream,
             logical_service_upstreams
@@ -13862,6 +13870,9 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
             .iter()
             .enumerate()
             .filter_map(|(idx, upstream)| {
+                if is_cross_namespace_destination_clone_id(&upstream.id) {
+                    return None;
+                }
                 let winners = winning_tier_by_upstream_host.get(idx)?;
                 let hosts = upstream_destination_rule_match_hosts(
                     upstream,

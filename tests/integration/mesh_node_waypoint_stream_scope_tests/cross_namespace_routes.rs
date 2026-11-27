@@ -817,3 +817,219 @@ fn mesh_config_validation_bounds_authorized_targets() {
         );
     }
 }
+
+/// Review F2: a workload of a THIRD namespace attached to the authorized
+/// target Service (a cross-namespace `WorkloadEntry`) never reaches the
+/// subscriber, neither as a workload nor as a Service workload reference,
+/// even when the subscriber's view imports that namespace and its bearer
+/// claim does not.
+#[test]
+fn a_third_namespace_workload_attached_to_the_target_never_reaches_the_slice() {
+    use ferrum_edge::modes::mesh::config::WorkloadRef;
+
+    let mut config = translated(vec![virtual_service("direct", direct_spec(RATINGS_OTHER))]);
+    let mut attached = workload_for("vm", "gamma", [("app", "vm")], ["10.0.2.50"]);
+    attached.service_name = "ratings".to_string();
+    attached.service_namespace = Some(OTHER.to_string());
+    let attached_identity = attached.spiffe_id.clone();
+    let mesh = config.mesh.as_mut().expect("mesh block");
+    mesh.services
+        .iter_mut()
+        .find(|service| service.namespace == OTHER && service.name == "ratings")
+        .expect("other/ratings")
+        .workloads
+        .push(WorkloadRef {
+            spiffe_id: attached_identity.clone(),
+        });
+    mesh.workloads.push(attached);
+    for sidecar in &mut mesh.sidecars {
+        for egress in &mut sidecar.egress {
+            egress.hosts.push("gamma/*".to_string());
+        }
+    }
+
+    let runtime = sidecar_runtime();
+    let request = runtime.mesh_slice_request();
+    let all: HashSet<String> = [DEFAULT_NAMESPACE, OTHER, "gamma"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let bearer: HashSet<String> = [DEFAULT_NAMESPACE, OTHER]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let filtered = filter_config_to_mesh_request_for_test(
+        &config,
+        &request,
+        &CpScope::Set(all),
+        Some(&bearer),
+    );
+    for (case, slice) in [
+        (
+            "scoped control plane",
+            MeshSlice::from_gateway_config(&filtered, request.clone()),
+        ),
+        ("unfiltered", slice_for(&config, &runtime)),
+    ] {
+        assert_eq!(
+            slice.http_routes.authorized_cross_namespace_targets.len(),
+            1,
+            "{case}: the route rides"
+        );
+        assert!(
+            !slice
+                .workloads
+                .iter()
+                .any(|workload| workload.spiffe_id == attached_identity),
+            "{case}: the third-namespace workload is not serialized"
+        );
+        let target = slice
+            .services
+            .iter()
+            .find(|service| service.namespace == OTHER && service.name == "ratings")
+            .expect("the target Service rides");
+        assert!(
+            !target
+                .workloads
+                .iter()
+                .any(|reference| reference.spiffe_id == attached_identity),
+            "{case}: the target Service does not reference it either"
+        );
+        let prepared =
+            prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("slice materializes");
+        let clone_id = carried_routes(&prepared)[0]
+            .upstream_id
+            .clone()
+            .expect("bound upstream");
+        assert_ratings_clone(&prepared, &clone_id);
+    }
+}
+
+/// Review F3: the projection never emits more authorizations than a data
+/// plane accepts. A route that would overflow the budget is withheld (route
+/// order), and the rest of the set still applies.
+#[test]
+fn the_projection_withholds_routes_beyond_the_authorization_budget() {
+    use ferrum_edge::modes::mesh::slice::MAX_HTTP_ROUTE_CROSS_NAMESPACE_TARGETS as BUDGET;
+
+    let mut config = translated(vec![virtual_service("direct", direct_spec(RATINGS_OTHER))]);
+    let route = config
+        .proxies
+        .iter()
+        .find(|proxy| proxy.id.starts_with("istio-vs-"))
+        .expect("carried route")
+        .clone();
+    let mut extra_ids = Vec::with_capacity(BUDGET);
+    for index in 0..BUDGET {
+        let mut copy = route.clone();
+        copy.id = format!("{}-x{index}", route.id);
+        copy.listen_path = Some(format!("/r{index}"));
+        extra_ids.push(copy.id.clone());
+        config.proxies.push(copy);
+    }
+    let last = extra_ids.last().cloned().expect("ids");
+    config
+        .mesh
+        .as_mut()
+        .expect("mesh block")
+        .virtual_service_http_routes[0]
+        .proxy_ids
+        .extend(extra_ids);
+
+    let runtime = sidecar_runtime();
+    let slice = slice_for(&config, &runtime);
+    assert_eq!(
+        slice.http_routes.authorized_cross_namespace_targets.len(),
+        BUDGET
+    );
+    let carried = route_ids(&slice);
+    assert_eq!(carried.len(), BUDGET, "exactly one route is withheld");
+    assert!(
+        !carried.contains(&last),
+        "the last route in order is the one withheld"
+    );
+    prepare_gateway_config_from_mesh_slice(&slice, &runtime)
+        .expect("a set at the budget materializes");
+}
+
+/// Review F4: DestinationRules naming the destination workloads' own
+/// addresses never match the route-namespace clone (it takes its policy from
+/// the Service upstream it copies), so they cannot reject the slice before
+/// the clone is refreshed.
+#[test]
+fn endpoint_host_destination_rules_do_not_reject_a_slice_with_a_clone() {
+    use ferrum_edge::modes::mesh::config::WorkloadRef;
+
+    let mut config = translated(vec![
+        virtual_service("direct", direct_spec(RATINGS_OTHER)),
+        destination_rule(
+            "vm-a",
+            DEFAULT_NAMESPACE,
+            "vm-a.example.com",
+            json!({"loadBalancer": {"simple": "RANDOM"}}),
+        ),
+        destination_rule(
+            "vm-b",
+            DEFAULT_NAMESPACE,
+            "vm-b.example.com",
+            json!({"loadBalancer": {"simple": "ROUND_ROBIN"}}),
+        ),
+    ]);
+    let vm_a = workload_for("ratings", OTHER, [("app", "ratings")], ["vm-a.example.com"]);
+    let mut vm_b = workload_for(
+        "ratings-b",
+        OTHER,
+        [("app", "ratings")],
+        ["vm-b.example.com"],
+    );
+    vm_b.service_name = "ratings".to_string();
+    let mesh = config.mesh.as_mut().expect("mesh block");
+    mesh.workloads
+        .retain(|workload| !(workload.namespace == OTHER && workload.service_name == "ratings"));
+    let ratings = mesh
+        .services
+        .iter_mut()
+        .find(|service| service.namespace == OTHER && service.name == "ratings")
+        .expect("other/ratings");
+    ratings.workloads = vec![
+        WorkloadRef {
+            spiffe_id: vm_a.spiffe_id.clone(),
+        },
+        WorkloadRef {
+            spiffe_id: vm_b.spiffe_id.clone(),
+        },
+    ];
+    mesh.workloads.push(vm_a);
+    mesh.workloads.push(vm_b);
+    let rules = mesh.destination_rules.clone();
+
+    let runtime = sidecar_runtime();
+    let mut slice = slice_for(&config, &runtime);
+    // Both endpoint-host rules are visible to the subscriber.
+    for rule in rules {
+        if !slice
+            .destination_rules
+            .iter()
+            .any(|known| known.namespace == rule.namespace && known.name == rule.name)
+        {
+            slice.destination_rules.push(rule);
+        }
+    }
+    let prepared = prepare_gateway_config_from_mesh_slice(&slice, &runtime)
+        .expect("endpoint-host rules do not reject the slice");
+    let routes = carried_routes(&prepared);
+    assert_eq!(routes.len(), 1, "the route is served");
+    let clone = upstream(&prepared, routes[0].upstream_id.as_deref().expect("bound"));
+    let mut hosts: Vec<&str> = clone
+        .targets
+        .iter()
+        .map(|target| target.host.as_str())
+        .collect();
+    hosts.sort_unstable();
+    assert_eq!(hosts, vec!["vm-a.example.com", "vm-b.example.com"]);
+    assert_eq!(
+        clone.algorithm,
+        upstream(&prepared, RATINGS_OTHER_UPSTREAM).algorithm,
+        "the clone carries the Service upstream's policy, not an endpoint rule's"
+    );
+}

@@ -427,10 +427,30 @@ fn a_gateway_only_virtual_service_is_not_gated() {
 }
 
 #[test]
-fn a_two_label_external_host_is_not_a_service_reference() {
-    // No Service in namespace `org`: `httpbin.org` is an external DNS name.
+fn a_relative_two_label_host_is_a_service_reference_even_without_inventory() {
+    // The control plane holds no Service in `beta`, yet a gateway pod's DNS
+    // search suffix completes `ratings.beta` to `beta/ratings`: the host is
+    // gated exactly like the fully qualified form, and the refusal says which
+    // rule made it a Service reference.
+    let mut objects = base_objects();
+    objects.push(virtual_service("unwatched", direct_spec("ratings.beta")));
+    let message = assert_refused(&objects, "unwatched");
+    assert!(message.contains("ReferenceGrant"), "{message}");
+    assert!(message.contains("relative two-label host"), "{message}");
+
+    // A relative two-label external name is refused the same way.
     let mut objects = base_objects();
     objects.push(virtual_service("external", direct_spec("httpbin.org")));
+    let message = assert_refused(&objects, "external");
+    assert!(message.contains("relative two-label host"), "{message}");
+    assert!(message.contains("trailing dot"), "{message}");
+}
+
+#[test]
+fn an_absolute_two_label_external_host_is_not_a_service_reference() {
+    // A trailing dot makes the name absolute: no search suffix completes it.
+    let mut objects = base_objects();
+    objects.push(virtual_service("external", direct_spec("httpbin.org.")));
     let (translation, skipped) = translate(&objects);
     assert!(refusal(&skipped, "external").is_none(), "{skipped:?}");
     assert!(
@@ -439,6 +459,82 @@ fn a_two_label_external_host_is_not_a_service_reference() {
             .authorized_cross_namespace_targets
             .is_empty()
     );
+}
+
+#[test]
+fn a_mesh_and_gateway_virtual_service_refuses_the_gateway_leg_too() {
+    // Bound to `mesh` and a gateway: the refusal rejects the whole
+    // VirtualService, so no gateway proxy reaches the ungranted Service.
+    let mut spec = direct_spec("ratings.beta");
+    spec["gateways"] = json!(["mesh", "istio-system/public"]);
+    let mut objects = base_objects();
+    objects.push(virtual_service("mixed", spec));
+    assert_refused(&objects, "mixed");
+    let (translation, _) = translate(&objects);
+    assert!(
+        !translation
+            .config
+            .proxies
+            .iter()
+            .any(|proxy| proxy.backend_host.contains("ratings.beta")),
+        "no gateway proxy dials the ungranted Service"
+    );
+}
+
+#[test]
+fn a_gateway_only_virtual_service_keeps_istio_ingress_semantics_for_two_label_hosts() {
+    // Gateway-only routes are not mesh-bound and are not gated, whatever the
+    // destination form (the fully qualified form is not gated either).
+    let mut spec = direct_spec("ratings.beta");
+    spec["gateways"] = json!(["istio-system/public"]);
+    let mut objects = base_objects();
+    objects.push(virtual_service("ingress", spec));
+    let (_, skipped) = translate(&objects);
+    assert!(refusal(&skipped, "ingress").is_none(), "{skipped:?}");
+}
+
+#[test]
+fn a_missing_named_port_is_a_reference_refusal() {
+    let mut objects = base_objects();
+    objects.push(virtual_service_grant());
+    objects.push(virtual_service(
+        "named",
+        json!({
+            "hosts": ["reviews.default.svc.cluster.local"],
+            "http": [{"route": [{"destination": {"host": TARGET_HOST, "port": {"name": "grpc"}}}]}]
+        }),
+    ));
+    let message = assert_refused(&objects, "named");
+    assert!(message.contains("port named"), "{message}");
+}
+
+#[test]
+fn more_than_the_binding_budget_of_target_services_is_refused() {
+    let limit = ferrum_edge::modes::mesh::config::MAX_VIRTUAL_SERVICE_CROSS_NAMESPACE_TARGETS;
+    let mut objects = vec![service("reviews", ROUTE_NAMESPACE)];
+    let mut http = Vec::new();
+    for index in 0..=limit {
+        let name = format!("svc-{index}");
+        objects.push(service(&name, TARGET_NAMESPACE));
+        http.push(json!({
+            "match": [{"headers": {"x-target": {"exact": name.clone()}}}],
+            "route": [{"destination": {
+                "host": format!("{name}.other.svc.cluster.local"),
+                "port": {"number": 8080}
+            }}]
+        }));
+    }
+    objects.push(reference_grant(
+        TARGET_NAMESPACE,
+        json!({"group": "networking.istio.io", "kind": "VirtualService", "namespace": ROUTE_NAMESPACE}),
+        json!({"group": "", "kind": "Service"}),
+    ));
+    objects.push(virtual_service(
+        "wide",
+        json!({"hosts": ["reviews.default.svc.cluster.local"], "http": http}),
+    ));
+    let message = assert_refused(&objects, "wide");
+    assert!(message.contains("distinct Services"), "{message}");
 }
 
 #[test]

@@ -824,22 +824,28 @@ fn an_unreachable_split_leg_refuses_the_route_and_prunes_the_split() {
 /// the route.
 #[test]
 fn a_two_label_alias_of_an_unmodeled_service_is_refused() {
-    let config = translated_config(&[virtual_service(
-        "alias",
-        json!({
-            "hosts": ["reviews.default.svc.cluster.local"],
-            "http": [{
-                "route": [{
-                    "destination": {"host": "ratings.other", "port": {"number": 8080}}
+    // A relative two-label alias naming another namespace is a Service
+    // reference that needs a ReferenceGrant (issue #7499): translation
+    // refuses the VirtualService outright.
+    let error = translate_k8s_objects(
+        &[virtual_service(
+            "alias",
+            json!({
+                "hosts": ["reviews.default.svc.cluster.local"],
+                "http": [{
+                    "route": [{
+                        "destination": {"host": "ratings.other", "port": {"number": 8080}}
+                    }]
                 }]
-            }]
-        }),
-    )]);
-    let slice = node_waypoint_slice(&config, &node_waypoint_runtime());
-    assert!(
-        slice.http_routes.proxies.is_empty(),
-        "an unauthorized cross-namespace alias is withheld by the control plane"
-    );
+            }),
+        )],
+        K8sTranslationOptions::new(
+            DEFAULT_NAMESPACE.to_string(),
+            TrustDomain::new("cluster.local").expect("trust domain"),
+        ),
+    )
+    .expect_err("an ungranted cross-namespace alias refuses the VirtualService");
+    assert!(error.to_string().contains("ReferenceGrant"), "{error}");
     let config = translated_config(&[virtual_service(
         "alias",
         json!({

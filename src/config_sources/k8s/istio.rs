@@ -5331,21 +5331,37 @@ pub(crate) fn message_is_virtual_service_cross_namespace_refusal(message: &str) 
     message.contains(VIRTUAL_SERVICE_CROSS_NAMESPACE_REFUSAL)
 }
 
-/// The Service `(namespace, name)` a destination `host` of a VirtualService in
-/// `route_namespace` names in ANOTHER namespace, or `None` (issue #7499).
+/// A destination `host` of a VirtualService that names a Service in ANOTHER
+/// namespace (issue #7499).
+struct CrossNamespaceServiceReference {
+    namespace: String,
+    name: String,
+    /// The host is a relative two-label name (`<svc>.<ns>`), which a
+    /// resolver's cluster search suffix completes to that Service.
+    relative_two_label: bool,
+}
+
+/// The Service in another namespace a destination `host` of a VirtualService
+/// in `route_namespace` names, or `None` (issue #7499).
 ///
 /// The `.svc` forms (`<svc>.<ns>.svc`, `<svc>.<ns>.svc.<cluster domain>`) are
-/// always Service references. A two-label `<svc>.<ns>` host is one only when
-/// the translator observed a Service in `<ns>`: otherwise it is an ordinary
-/// external DNS name (`httpbin.org`). Mesh data planes refuse an unauthorized
-/// two-label destination either way, so this never widens what they route;
-/// it only decides whether translation demands a ReferenceGrant.
+/// always Service references. So is a RELATIVE two-label host (`<svc>.<ns>`),
+/// whatever Services this control plane observes: a gateway proxy dials the
+/// host as written, and the pod resolver's cluster search suffix completes it
+/// to `<svc>.<ns>.svc.<cluster domain>` even when this control plane does not
+/// watch `<ns>`, so treating it as external would let the gateway leg reach an
+/// ungranted Service. Only an ABSOLUTE two-label name (a trailing dot,
+/// `httpbin.org.`) is never completed by a search suffix and is an external
+/// host here. Fail-closed by construction: an external host written as a
+/// relative two-label name is refused like a missing Service.
 fn virtual_service_cross_namespace_service(
     acc: &K8sAccumulator,
     host: &str,
     route_namespace: &str,
-) -> Option<(String, String)> {
-    let normalized = host.trim().trim_end_matches('.').to_ascii_lowercase();
+) -> Option<CrossNamespaceServiceReference> {
+    let trimmed = host.trim();
+    let absolute = trimmed.ends_with('.');
+    let normalized = trimmed.trim_end_matches('.').to_ascii_lowercase();
     if normalized.contains('*') {
         return None;
     }
@@ -5355,10 +5371,14 @@ fn virtual_service_cross_namespace_service(
         return None;
     }
     let two_label = normalized.matches('.').count() == 1;
-    if two_label && !acc.namespace_has_services(namespace) {
+    if two_label && absolute {
         return None;
     }
-    Some((namespace.to_string(), service.to_string()))
+    Some(CrossNamespaceServiceReference {
+        namespace: namespace.to_string(),
+        name: service.to_string(),
+        relative_two_label: two_label,
+    })
 }
 
 /// Whether a VirtualService binds the mesh and syntactically names a Service
@@ -5439,7 +5459,7 @@ fn authorize_virtual_service_cross_namespace_destinations(
             let Some(host) = string_field(destination, "host") else {
                 continue;
             };
-            let Some((namespace, name)) =
+            let Some(reference) =
                 virtual_service_cross_namespace_service(acc, host, route_namespace)
             else {
                 continue;
@@ -5450,11 +5470,27 @@ fn authorize_virtual_service_cross_namespace_destinations(
                 object,
                 &context,
                 destination,
-                host,
-                &namespace,
-                &name,
+                &reference,
             )?;
-            authorized.insert((namespace, name));
+            let key = (reference.namespace, reference.name);
+            if !authorized.contains(&key)
+                && authorized.len()
+                    >= crate::modes::mesh::config::MAX_VIRTUAL_SERVICE_CROSS_NAMESPACE_TARGETS
+            {
+                // The mesh binding carries at most this many authorized
+                // Services; refuse the VirtualService rather than publish a
+                // binding mesh validation rejects.
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "{VIRTUAL_SERVICE_CROSS_NAMESPACE_REFUSAL}: {context} would make this \
+                         VirtualService reach more than {} distinct Services in other \
+                         namespaces, the most one mesh route binding authorizes",
+                        crate::modes::mesh::config::MAX_VIRTUAL_SERVICE_CROSS_NAMESPACE_TARGETS
+                    ),
+                ));
+            }
+            authorized.insert(key);
         }
     }
     Ok(authorized
@@ -5475,19 +5511,28 @@ fn check_virtual_service_cross_namespace_destination(
     object: &K8sObject,
     context: &str,
     destination: &Value,
-    host: &str,
-    namespace: &str,
-    name: &str,
+    reference: &CrossNamespaceServiceReference,
 ) -> Result<(), K8sTranslateError> {
     use super::backend_ref::EndpointSliceRefusal;
 
     let route_namespace = object.metadata.namespace.as_str();
+    let namespace = reference.namespace.as_str();
+    let name = reference.name.as_str();
+    // Say which rule made the host a Service reference, so an operator who
+    // meant an external host knows how to write it.
+    let rule = if reference.relative_two_label {
+        " (a relative two-label host `<svc>.<ns>` names that Service, since the cluster DNS \
+         search suffix completes it; write an external host as an absolute name with a \
+         trailing dot)"
+    } else {
+        ""
+    };
     let refuse = |detail: String| {
         invalid_resource(
             object,
             format!(
                 "{VIRTUAL_SERVICE_CROSS_NAMESPACE_REFUSAL}: {context} destination Service \
-                 {namespace:?}/{name:?} {detail}"
+                 {namespace:?}/{name:?} {detail}{rule}"
             ),
         )
     };
@@ -5521,7 +5566,33 @@ fn check_virtual_service_cross_namespace_destination(
                 .to_string(),
         ));
     }
-    let port = resolve_destination_port(object, destination, host, acc)?.unwrap_or(80);
+    // A named port resolves against the destination Service itself, and a
+    // name it does not declare is the same reference failure as an undeclared
+    // number.
+    let port_value = destination.get("port");
+    let port = match port_value.and_then(|port| port.get("name")) {
+        Some(Value::String(port_name))
+            if port_value.and_then(|port| port.get("number")).is_none() =>
+        {
+            match acc.lookup_service_port(namespace, name, port_name) {
+                Some(port) => port,
+                None => {
+                    return Err(refuse(format!(
+                        "does not declare a port named {port_name:?}"
+                    )));
+                }
+            }
+        }
+        _ => {
+            let port = match port_value.and_then(|port| port.get("number")) {
+                Some(number) => {
+                    optional_port_field(object, Some(number), "route.destination.port.number")?
+                }
+                None => None,
+            };
+            port.unwrap_or(80)
+        }
+    };
     if !acc.service_port_exists(namespace, name, port) {
         return Err(refuse(format!("does not declare port \"{port}\"")));
     }

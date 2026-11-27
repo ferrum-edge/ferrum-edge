@@ -2423,6 +2423,7 @@ impl MeshSlice {
         // Issue #7499: a Sidecar dials an authorized cross-namespace carried
         // route destination through that Service's own workloads, which the
         // namespace-local workload view above never holds.
+        let services = narrow_cross_namespace_target_service_refs(services, &http_routes, mesh);
         let workloads =
             with_cross_namespace_destination_workloads(workloads, &http_routes, &services, mesh);
 
@@ -2804,6 +2805,47 @@ fn retain_authorized_cross_namespace_attachments(
         .collect()
 }
 
+/// The authorized cross-namespace target Services of a carried route set, as
+/// `(namespace, name)` (issue #7499).
+fn cross_namespace_target_services(http_routes: &MeshHttpRouteSet) -> BTreeSet<(&str, &str)> {
+    http_routes
+        .authorized_cross_namespace_targets
+        .iter()
+        .map(|target| (target.namespace.as_str(), target.name.as_str()))
+        .collect()
+}
+
+/// Narrow each authorized cross-namespace target Service's workload
+/// references to workloads of the Service's OWN namespace (issue #7499).
+///
+/// That namespace already passed the control plane's scope ceiling and the
+/// subscriber's bearer `ns` claim (`filter_mesh_config_to_request`). A
+/// workload attached from a third namespace (a `WorkloadEntry` naming the
+/// Service across namespaces) did not, so neither its identity nor its
+/// address may reach this subscriber through the target Service.
+fn narrow_cross_namespace_target_service_refs(
+    mut services: Vec<MeshService>,
+    http_routes: &MeshHttpRouteSet,
+    mesh: &MeshConfig,
+) -> Vec<MeshService> {
+    let targets = cross_namespace_target_services(http_routes);
+    if targets.is_empty() {
+        return services;
+    }
+    for service in &mut services {
+        if !targets.contains(&(service.namespace.as_str(), service.name.as_str())) {
+            continue;
+        }
+        let namespace = service.namespace.clone();
+        service.workloads.retain(|reference| {
+            mesh.workloads.iter().any(|workload| {
+                workload.spiffe_id == reference.spiffe_id && workload.namespace == namespace
+            })
+        });
+    }
+    services
+}
+
 /// Add the workloads backing each Service a carried route is authorized to
 /// reach in another namespace (issue #7499).
 ///
@@ -2825,17 +2867,17 @@ fn with_cross_namespace_destination_workloads(
     if http_routes.authorized_cross_namespace_targets.is_empty() {
         return workloads;
     }
-    let targets: BTreeSet<(&str, &str)> = http_routes
-        .authorized_cross_namespace_targets
-        .iter()
-        .map(|target| (target.namespace.as_str(), target.name.as_str()))
-        .collect();
+    let targets = cross_namespace_target_services(http_routes);
     for service in services
         .iter()
         .filter(|service| targets.contains(&(service.namespace.as_str(), service.name.as_str())))
     {
         for workload in &mesh.workloads {
-            let backs_service = workload.attached_service_namespace() == service.namespace
+            // Only workloads of the Service's own namespace: that namespace
+            // passed the CP scope and bearer ceilings, a third namespace
+            // attaching to the Service did not.
+            let backs_service = workload.namespace == service.namespace
+                && workload.attached_service_namespace() == service.namespace
                 && workload.service_name == service.name
                 && service
                     .workloads
@@ -3828,6 +3870,9 @@ fn node_waypoint_http_route_set(
         .collect();
 
     let mut set = MeshHttpRouteSet::default();
+    // Routes withheld because their cross-namespace authorizations would
+    // overflow `MAX_HTTP_ROUTE_CROSS_NAMESPACE_TARGETS` (issue #7499).
+    let mut cross_namespace_budget_withheld = 0usize;
     let mut carried_upstreams: HashSet<(&str, &str)> = HashSet::new();
     let mut carried_plugins: HashSet<(&str, &str)> = HashSet::new();
     for proxy in &config.proxies {
@@ -3973,6 +4018,16 @@ fn node_waypoint_http_route_set(
             );
             continue;
         }
+        // Issue #7499: a data plane refuses a set over the authorization
+        // budget as a whole, so a route that would overflow it is withheld
+        // here instead (in route order, deterministic), and the rest of the
+        // generation still applies.
+        if set.authorized_cross_namespace_targets.len() + route_targets.len()
+            > MAX_HTTP_ROUTE_CROSS_NAMESPACE_TARGETS
+        {
+            cross_namespace_budget_withheld += 1;
+            continue;
+        }
         let Ok(proxy_value) = serde_json::to_value(proxy) else {
             continue;
         };
@@ -4022,6 +4077,15 @@ fn node_waypoint_http_route_set(
             carried_upstreams.insert((upstream.namespace.as_str(), upstream.id.as_str()));
             set.upstreams.push(value);
         }
+    }
+    if cross_namespace_budget_withheld > 0 {
+        warn!(
+            routes = cross_namespace_budget_withheld,
+            limit = MAX_HTTP_ROUTE_CROSS_NAMESPACE_TARGETS,
+            "VirtualService HTTP routes withheld from the mesh slice: their cross-namespace \
+             destination authorizations would exceed the per-slice budget a data plane accepts \
+             (issue #7499); their hosts keep the plain Service routes"
+        );
     }
     set
 }
