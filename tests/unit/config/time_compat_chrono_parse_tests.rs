@@ -604,3 +604,111 @@ fn year_boundary_inputs_parse_like_chrono_but_do_not_convert() {
             .is_ok()
     );
 }
+
+/// `UtcTimestamp`'s `FromStr` and serde `Deserialize` accept exactly what
+/// chrono's `DateTime<Utc>` does (both use chrono's relaxed RFC 3339 parser).
+/// Accepted values carry chrono's instant (a leap second normalized to the
+/// next-second linear instant); the only refusals chrono does not make are
+/// instants outside `UtcTimestamp`'s `-9999..=9999` range (issue #7419 owner
+/// decisions).
+#[test]
+fn from_str_and_deserialize_match_chrono_on_the_mutation_corpus() {
+    let mut accepted = 0usize;
+    let mut out_of_range = 0usize;
+    for input in corpus() {
+        let input = input.as_str();
+        let theirs_str = input.parse::<DateTime<chrono::Utc>>();
+        let theirs_json =
+            serde_json::from_value::<DateTime<chrono::Utc>>(serde_json::Value::from(input));
+        assert_eq!(
+            theirs_str.is_ok(),
+            theirs_json.is_ok(),
+            "chrono FromStr and serde disagree on {input:?}"
+        );
+        let ours_str = input.parse::<UtcTimestamp>();
+        let ours_json = serde_json::from_value::<UtcTimestamp>(serde_json::Value::from(input));
+        assert_eq!(
+            ours_str.as_ref().ok(),
+            ours_json.as_ref().ok(),
+            "UtcTimestamp FromStr and serde disagree on {input:?}"
+        );
+        match (ours_str, theirs_str) {
+            (Ok(ours), Ok(theirs)) => {
+                accepted += 1;
+                assert_eq!(
+                    ours.unix_timestamp_millis(),
+                    theirs.timestamp_millis(),
+                    "millis for {input:?}"
+                );
+                if let Some(nanos) = theirs.timestamp_nanos_opt() {
+                    assert_eq!(
+                        ours.unix_timestamp_nanos(),
+                        i128::from(nanos),
+                        "nanos for {input:?}"
+                    );
+                }
+            }
+            (Err(error), Ok(theirs)) => {
+                out_of_range += 1;
+                assert_eq!(error, TimestampError::OutOfRange, "{input:?} -> {theirs:?}");
+                // Independently of time_compat: chrono's instant, with a leap
+                // second moved to the next second (owner option B), must lie
+                // outside -9999..=9999.
+                let (mut secs, mut nanos) = (theirs.timestamp(), theirs.timestamp_subsec_nanos());
+                if nanos >= 1_000_000_000 {
+                    secs += 1;
+                    nanos -= 1_000_000_000;
+                }
+                // Past chrono's own maximum, the year is certainly out of range.
+                let year = DateTime::<chrono::Utc>::from_timestamp(secs, nanos)
+                    .map_or(i32::MAX, |normalized| normalized.year());
+                assert!(
+                    !(-9999..=9999).contains(&year),
+                    "{input:?} refused although its UTC year {year} is in range"
+                );
+            }
+            (Ok(ours), Err(error)) => {
+                panic!("UtcTimestamp accepted {input:?} as {ours:?}; chrono: {error}")
+            }
+            (Err(_), Err(_)) => {}
+        }
+    }
+    assert!(accepted > 200, "only {accepted} corpus inputs accepted");
+    assert!(
+        out_of_range > 0,
+        "the corpus must exercise the out-of-range refusal"
+    );
+
+    // The relaxed forms chrono's serde accepts.
+    for input in [
+        "2026-1-2T3:4:5Z",
+        " 2026 - 11 - 26T10 : 20 : 30.5 Z ",
+        "2026-11-26T10:20:30 UTC",
+        "2026-11-26T10:20:30+0530",
+        "2026-11-26T10:20:30 +05 30",
+    ] {
+        let ours: UtcTimestamp = serde_json::from_value(serde_json::Value::from(input))
+            .unwrap_or_else(|error| panic!("{input:?}: {error}"));
+        let theirs: DateTime<chrono::Utc> =
+            serde_json::from_value(serde_json::Value::from(input)).unwrap();
+        assert_eq!(
+            ours.unix_timestamp_nanos(),
+            i128::from(theirs.timestamp_nanos_opt().unwrap())
+        );
+    }
+    // A leap second deserializes to the next-second instant.
+    let leap: UtcTimestamp =
+        serde_json::from_value(serde_json::Value::from("1999-12-31T23:59:60.5Z")).unwrap();
+    assert_eq!(leap.to_rfc3339_z(), "2000-01-01T00:00:00.500Z");
+    // Out-of-range years chrono's serde accepts are refused.
+    assert!(
+        serde_json::from_value::<DateTime<chrono::Utc>>(serde_json::Value::from(
+            "+12345-01-01T00:00:00Z"
+        ))
+        .is_ok()
+    );
+    assert!(
+        serde_json::from_value::<UtcTimestamp>(serde_json::Value::from("+12345-01-01T00:00:00Z"))
+            .is_err()
+    );
+}
