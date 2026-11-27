@@ -234,6 +234,7 @@ mod secondary_request_headers_tests;
 mod send_mmsg_batch_tests;
 mod service_discovery_lifecycle_tests;
 mod service_discovery_tests;
+mod service_waypoint_l7_reachability_tests;
 mod shared_invariant_parity_tests;
 mod sni_tests;
 mod socket_opts_tests;

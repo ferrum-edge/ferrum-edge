@@ -82,6 +82,9 @@ const UDP_SERVICE_PORT: u16 = 5353;
 const REVIEWS_VIP: &str = "10.96.0.11";
 const RATINGS_VIP: &str = "10.96.0.12";
 const DEADLINE: Duration = Duration::from_secs(10);
+/// The Istio root namespace of the fixture mesh (where a `GatewayClass`
+/// `targetRef` policy lives).
+const ROOT_NAMESPACE: &str = "istio-system";
 
 fn host(service: &str) -> String {
     format!("{service}.{NAMESPACE}.svc.cluster.local")
@@ -320,6 +323,10 @@ impl Backends {
 struct Scenario {
     virtual_services: Vec<K8sObject>,
     policies: Vec<MeshPolicy>,
+    ext_authz_providers: Vec<ferrum_edge::modes::mesh::config::MeshExtAuthzProvider>,
+    request_authentications: Vec<ferrum_edge::modes::mesh::config::MeshRequestAuthentication>,
+    /// Hostnames the waypoint's DNS cache resolves to loopback.
+    dns_overrides: Vec<String>,
     /// Bind `ratings` to the waypoint too (it is always modeled).
     unbind_ratings: bool,
     /// A second bound Service sharing the reviews workload's HTTP endpoint,
@@ -415,6 +422,9 @@ fn cp_config(backends: &Backends, scenario: &Scenario) -> GatewayConfig {
             .collect(),
     }];
     mesh.mesh_policies = scenario.policies.clone();
+    mesh.ext_authz_providers = scenario.ext_authz_providers.clone();
+    mesh.request_authentications = scenario.request_authentications.clone();
+    mesh.istio_root_namespace = ROOT_NAMESPACE.to_string();
     config.normalize_fields();
     config.normalize_mesh_fields();
     config
@@ -446,6 +456,17 @@ fn prepared(backends: &Backends, scenario: &Scenario) -> GatewayConfig {
 }
 
 fn build_state(prepared: GatewayConfig) -> ProxyState {
+    build_state_with_dns(prepared, &[])
+}
+
+fn build_state_with_dns(prepared: GatewayConfig, loopback_hosts: &[String]) -> ProxyState {
+    let dns = DnsConfig {
+        global_overrides: loopback_hosts
+            .iter()
+            .map(|host| (host.clone(), "127.0.0.1".to_string()))
+            .collect(),
+        ..DnsConfig::default()
+    };
     let env_config = EnvConfig {
         mode: OperatingMode::Mesh,
         log_level: "error".to_string(),
@@ -458,15 +479,9 @@ fn build_state(prepared: GatewayConfig) -> ProxyState {
         namespace: NAMESPACE.to_string(),
         ..EnvConfig::default()
     };
-    ProxyState::new(
-        prepared,
-        DnsCache::new(DnsConfig::default()),
-        env_config,
-        None,
-        None,
-    )
-    .expect("the ServiceWaypoint generation is accepted by the proxy runtime")
-    .0
+    ProxyState::new(prepared, DnsCache::new(dns), env_config, None, None)
+        .expect("the ServiceWaypoint generation is accepted by the proxy runtime")
+        .0
 }
 
 /// A running ServiceWaypoint and the client side of one mTLS HTTP/2 session.
@@ -487,7 +502,7 @@ impl Waypoint {
 
     async fn start_as(scenario: Scenario, client_spiffe: &str) -> Self {
         let backends = start_backends().await;
-        let state = build_state(prepared(&backends, &scenario));
+        let state = build_state_with_dns(prepared(&backends, &scenario), &scenario.dns_overrides);
         assert!(
             !state.router_cache.service_waypoint_l7_routes().is_empty(),
             "fixture: the waypoint builds bound-Service partitions"
@@ -1642,5 +1657,378 @@ async fn inner_requests_apply_retries_timeouts_and_loopback_mirrors() {
         "the loopback mirror copy",
     )
     .await;
+    waypoint.teardown().await;
+}
+
+/// A loopback ext_authz stub that denies every check and counts them.
+async fn start_denying_ext_authz() -> (
+    SocketAddr,
+    Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&checks);
+    let (addr, handle) = start_scripted_backend(Arc::new(move |_request: &str| {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        (403, Duration::ZERO, "denied-by-provider".to_string())
+    }))
+    .await;
+    (addr, checks, handle)
+}
+
+fn ext_authz_provider(port: u16) -> ferrum_edge::modes::mesh::config::MeshExtAuthzProvider {
+    ferrum_edge::modes::mesh::config::MeshExtAuthzProvider {
+        name: "branch-authz".to_string(),
+        service: "127.0.0.1".to_string(),
+        port,
+        tls: false,
+        path_prefix: Some("/check".to_string()),
+        timeout_ms: 2_000,
+        fail_open: false,
+        status_on_error: 403,
+        include_request_headers_in_check: Vec::new(),
+        include_additional_headers_in_check: Vec::new(),
+        include_request_body_in_check: None,
+        headers_to_upstream_on_allow: Vec::new(),
+        headers_to_downstream_on_deny: Vec::new(),
+        headers_to_downstream_on_allow: Vec::new(),
+    }
+}
+
+/// Acceptance: per-branch CUSTOM AuthorizationPolicy. A CUSTOM delegation
+/// attached to ratings runs ONLY when route dispatch selects the ratings
+/// branch, and its provider's denial refuses that request; the route's own
+/// destination never consults the provider.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_custom_policy_runs_only_for_the_selected_branch() {
+    let (provider_addr, checks, provider_handle) = start_denying_ext_authz().await;
+    let custom_on_ratings = MeshPolicy {
+        name: "custom-ratings".to_string(),
+        namespace: NAMESPACE.to_string(),
+        scope: PolicyScope::TargetRefs {
+            attachments: vec![PolicyTargetAttachment::Service {
+                namespace: NAMESPACE.to_string(),
+                name: "ratings".to_string(),
+            }],
+        },
+        rules: vec![MeshRule {
+            to: vec![ferrum_edge::modes::mesh::config::RequestMatch {
+                paths: vec!["/*".to_string()],
+                ..Default::default()
+            }],
+            action: PolicyAction::Custom {
+                provider: "branch-authz".to_string(),
+            },
+            ..MeshRule::default()
+        }],
+    };
+    let mut waypoint = Waypoint::start(Scenario {
+        virtual_services: vec![virtual_service("reviews-matches", match_dispatch_spec())],
+        policies: vec![custom_on_ratings],
+        ext_authz_providers: vec![ext_authz_provider(provider_addr.port())],
+        ..Scenario::default()
+    })
+    .await;
+    let tunnel = waypoint
+        .tunnel(&format!("{}:{SERVICE_PORT}", host("reviews")), &[])
+        .await;
+    let mut inner = inner_http1(tunnel).await;
+
+    let own = send_h1(&mut inner, get("/", &host("reviews"))).await;
+    assert_eq!(own.status, StatusCode::OK, "{}", own.body);
+    assert_eq!(own.served_by(), "reviews");
+    assert_eq!(
+        checks.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the unselected ratings branch's CUSTOM check never runs"
+    );
+
+    let mut canary = get("/", &host("reviews"));
+    canary
+        .headers_mut()
+        .insert("x-canary", hyper::header::HeaderValue::from_static("true"));
+    let branch = send_h1(&mut inner, canary).await;
+    assert_eq!(
+        branch.status,
+        StatusCode::FORBIDDEN,
+        "the selected branch's provider denies: {}",
+        branch.body
+    );
+    assert_eq!(
+        checks.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "exactly one check, for the selected branch"
+    );
+    assert!(
+        waypoint
+            .backends
+            .requests_to(&waypoint.backends.ratings_log)
+            .is_empty()
+    );
+    provider_handle.abort();
+    waypoint.teardown().await;
+}
+
+/// Acceptance: an AuthorizationPolicy attached to the waypoint's
+/// `GatewayClass` (from the root namespace) applies to every destination the
+/// waypoint serves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gateway_class_target_ref_policy_applies_at_the_waypoint() {
+    let deny_admin = MeshPolicy {
+        name: "deny-admin-on-waypoints".to_string(),
+        namespace: ROOT_NAMESPACE.to_string(),
+        scope: PolicyScope::TargetRefs {
+            attachments: vec![PolicyTargetAttachment::GatewayClass {
+                name: "istio-waypoint".to_string(),
+            }],
+        },
+        rules: vec![MeshRule {
+            to: vec![ferrum_edge::modes::mesh::config::RequestMatch {
+                paths: vec!["/admin*".to_string()],
+                ..Default::default()
+            }],
+            action: PolicyAction::Deny,
+            ..MeshRule::default()
+        }],
+    };
+    let mut waypoint = Waypoint::start(Scenario {
+        policies: vec![deny_admin],
+        ..Scenario::default()
+    })
+    .await;
+    for service in ["reviews", "ratings"] {
+        let tunnel = waypoint
+            .tunnel(&format!("{}:{SERVICE_PORT}", host(service)), &[])
+            .await;
+        let mut inner = inner_http1(tunnel).await;
+        let public = send_h1(&mut inner, get("/public", &host(service))).await;
+        assert_eq!(public.status, StatusCode::OK, "{service}: {}", public.body);
+        let admin = send_h1(&mut inner, get("/admin/keys", &host(service))).await;
+        assert_eq!(
+            admin.status,
+            StatusCode::FORBIDDEN,
+            "{service}: the GatewayClass-attached DENY applies at L7"
+        );
+    }
+    waypoint.teardown().await;
+}
+
+/// Acceptance: destination-scoped RequestAuthentication. The JWT providers
+/// of a RequestAuthentication selecting the reviews workloads validate inner
+/// requests to reviews, and never apply to ratings on the same waypoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn request_authentication_follows_the_destination_service() {
+    use ferrum_edge::modes::mesh::config::{
+        MeshJwtRule, MeshRequestAuthentication, WorkloadSelector,
+    };
+    // RFC 7517 Appendix A.1 EC P-256 public key, used for signatures here.
+    let jwks = json!({"keys": [{
+        "kty": "EC",
+        "crv": "P-256",
+        "x": "MKBCTNIcKUSDii11ySs3526iDZ8AiTo7Tu6KPAqv7D4",
+        "y": "4Etl6SRW2YiLUrN5vfvVHuhp7x8PxltmWWlbbM4IFyM",
+        "use": "sig",
+        "alg": "ES256",
+        "kid": "1"
+    }]})
+    .to_string();
+    let reviews_jwt = MeshRequestAuthentication {
+        name: "reviews-jwt".to_string(),
+        namespace: NAMESPACE.to_string(),
+        scope: PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: [("app".to_string(), "reviews".to_string())]
+                    .into_iter()
+                    .collect(),
+                namespace: Some(NAMESPACE.to_string()),
+            },
+        },
+        jwt_rules: vec![MeshJwtRule {
+            issuer: "https://issuer.example".to_string(),
+            audiences: Vec::new(),
+            jwks_uri: None,
+            jwks: Some(jwks),
+            from_headers: Vec::new(),
+            from_params: Vec::new(),
+            forward_original_token: false,
+            output_claim_to_headers: Vec::new(),
+        }],
+        refused: false,
+    };
+    let mut waypoint = Waypoint::start(Scenario {
+        request_authentications: vec![reviews_jwt],
+        ..Scenario::default()
+    })
+    .await;
+    let forged = "Bearer eyJhbGciOiJFUzI1NiIsImtpZCI6IjEifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIn0.c2lnbmF0dXJl";
+    let with_token = |service: &str| {
+        let mut request = get("/", &host(service));
+        request.headers_mut().insert(
+            hyper::header::AUTHORIZATION,
+            hyper::header::HeaderValue::from_static(forged),
+        );
+        request
+    };
+
+    let reviews_tunnel = waypoint
+        .tunnel(&format!("{}:{SERVICE_PORT}", host("reviews")), &[])
+        .await;
+    let mut reviews = inner_http1(reviews_tunnel).await;
+    let refused = send_h1(&mut reviews, with_token("reviews")).await;
+    assert_eq!(
+        refused.status,
+        StatusCode::UNAUTHORIZED,
+        "reviews' RequestAuthentication rejects a token it cannot verify: {}",
+        refused.body
+    );
+    let anonymous = send_h1(&mut reviews, get("/", &host("reviews"))).await;
+    assert_eq!(
+        anonymous.status,
+        StatusCode::OK,
+        "a request without a token is not refused by RequestAuthentication alone"
+    );
+
+    let ratings_tunnel = waypoint
+        .tunnel(&format!("{}:{SERVICE_PORT}", host("ratings")), &[])
+        .await;
+    let mut ratings = inner_http1(ratings_tunnel).await;
+    let untouched = send_h1(&mut ratings, with_token("ratings")).await;
+    assert_eq!(
+        untouched.status,
+        StatusCode::OK,
+        "reviews' providers never apply to ratings: {}",
+        untouched.body
+    );
+    waypoint.teardown().await;
+}
+
+/// A loopback HTTPS backend with a self-signed certificate for `hostname`.
+async fn start_tls_backend(hostname: &str) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let key = rcgen::KeyPair::generate().expect("tls backend key");
+    let params = rcgen::CertificateParams::new(vec![hostname.to_string()]).expect("params");
+    let cert = params
+        .self_signed(&key)
+        .expect("self-signed tls backend cert");
+    let mut config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.der().clone()],
+            rustls::pki_types::PrivateKeyDer::try_from(key.serialize_der()).expect("key der"),
+        )
+        .expect("tls backend config");
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+    let listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind tls backend");
+    let addr = listener.local_addr().expect("tls backend addr");
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let mut buf = [0_u8; 4096];
+                if matches!(tls.read(&mut buf).await, Ok(0) | Err(_)) {
+                    return;
+                }
+                let body = "tls-external\n";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = tls.write_all(response.as_bytes()).await;
+                let _ = tls.shutdown().await;
+            });
+        }
+    });
+    (addr, handle)
+}
+
+/// Acceptance: a 90/10 split with an external residual leg whose
+/// DestinationRule originates TLS, checked over 1000 selections: the
+/// external leg is dialed over TLS, the Service leg keeps its transport.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_external_residual_leg_originates_the_tls_its_destination_rule_requires() {
+    const EXTERNAL_HOST: &str = "tls-external.test";
+    let (tls_addr, tls_handle) = start_tls_backend(EXTERNAL_HOST).await;
+    let split = json!({
+        "hosts": [host("reviews")],
+        "http": [{
+            "route": [
+                {"destination": {"host": host("reviews"), "port": {"number": SERVICE_PORT}}, "weight": 90},
+                {"destination": {"host": EXTERNAL_HOST, "port": {"number": tls_addr.port()}}, "weight": 10}
+            ]
+        }]
+    });
+    let originate = json!({
+        "host": EXTERNAL_HOST,
+        "trafficPolicy": {"tls": {"mode": "SIMPLE", "sni": EXTERNAL_HOST, "insecureSkipVerify": true}}
+    });
+    let mut waypoint = Waypoint::start(Scenario {
+        virtual_services: vec![
+            virtual_service("reviews-external-split", split),
+            destination_rule("external-tls", originate),
+        ],
+        dns_overrides: vec![EXTERNAL_HOST.to_string()],
+        ..Scenario::default()
+    })
+    .await;
+    let originating_leg = waypoint
+        .state
+        .config
+        .load()
+        .plugin_configs
+        .iter()
+        .any(|plugin| {
+            plugin
+                .config
+                .get("weighted_splits")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .flat_map(|split| {
+                    split
+                        .get("legs")
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten()
+                })
+                .any(|leg| {
+                    leg.get("originate_tls")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                })
+        });
+    assert!(
+        originating_leg,
+        "fixture: the external residual leg originates TLS"
+    );
+    let tunnel = waypoint
+        .tunnel(&format!("{}:{SERVICE_PORT}", host("reviews")), &[])
+        .await;
+    let mut inner = inner_http1(tunnel).await;
+    let mut external = 0usize;
+    let mut reviews = 0usize;
+    for _ in 0..1000 {
+        let response = send_h1(&mut inner, get("/", &host("reviews"))).await;
+        assert_eq!(response.status, StatusCode::OK, "{}", response.body);
+        match response.served_by() {
+            "tls-external" => external += 1,
+            "reviews" => reviews += 1,
+            other => panic!("unexpected backend marker {other:?}"),
+        }
+    }
+    assert!(
+        (850..=950).contains(&reviews) && (50..=150).contains(&external),
+        "90/10 across the Service leg and the TLS-originating external leg: \
+         reviews={reviews} external={external}"
+    );
+    tls_handle.abort();
     waypoint.teardown().await;
 }
