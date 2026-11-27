@@ -109,11 +109,12 @@
 //! only canonical shape and the alias is rejected as an unknown key.
 //!
 //! Every duration and cache control has an enforced inclusive range. Upper
-//! bounds sit far below `chrono::TimeDelta`'s representable range and parsed
+//! bounds sit far below the representable `SignedDuration` range and parsed
 //! WS-Security / SAML instants are clamped to a four-digit year, so no admitted
 //! configuration and no hostile `Created` / `Expires` / `NotBefore` /
-//! `NotOnOrAfter` value can overflow duration or `DateTime` arithmetic and panic
-//! a request task. Durations are converted once at admission.
+//! `NotOnOrAfter` value can overflow duration or timestamp arithmetic; the
+//! remaining additions are checked and fail closed rather than panic a request
+//! task. Durations are converted once at admission.
 //!
 //! ## Nonce replay cache bounds
 //!
@@ -334,15 +335,16 @@ use crate::plugins::utils::log_sampling::warn_sampled;
 
 use crate::fips::backend::digest;
 use crate::fips::backend::signature as ring_sig;
+use crate::time_compat::UtcTimestamp;
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use chrono::{DateTime, Datelike, Utc};
 use roxmltree::{Document, Node, NodeId, ParsingOptions};
 use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
+use time::SignedDuration;
 use tracing::{debug, warn};
 use x509_parser::prelude::*;
 
@@ -545,9 +547,9 @@ const MAX_MULTIPART_PART_HEADERS: usize = 32;
 
 /// Inclusive bounds for every operator-supplied duration and cache control.
 ///
-/// Upper bounds sit far below `chrono::TimeDelta`'s `i64::MAX / 1000` second
-/// ceiling, so no admitted configuration can make duration construction or
-/// `DateTime` arithmetic overflow on the request path. Lower bounds reject the
+/// Upper bounds sit far below the representable `SignedDuration` range, so no
+/// admitted configuration can make duration construction or timestamp
+/// arithmetic overflow on the request path. Lower bounds reject the
 /// degenerate values that silently disable a defense (a zero freshness window
 /// or a zero-entry replay cache).
 const MIN_TIMESTAMP_MAX_AGE_SECONDS: u64 = 1;
@@ -739,11 +741,10 @@ const NONCE_MAX_MAINTENANCE_ENTRIES: usize = 64;
 
 /// Representable-year window for parsed WS-Security / SAML instants.
 ///
-/// `chrono`'s `%Y` accepts years far outside the four-digit range, and its
-/// `DateTime` `Add`/`Sub` impls panic on overflow. Clamping attacker-supplied
-/// instants at parse time keeps every later `instant ± skew` and instant
-/// difference inside range without scattering checked arithmetic through the
-/// validation paths. `xsd:dateTime` values outside this window have no
+/// The chrono-compatible `%Y` parser accepts years far outside the four-digit
+/// range. Clamping attacker-supplied instants at parse time keeps every later
+/// `instant ± skew` and instant difference inside range; the additions are
+/// still checked and fail closed. `xsd:dateTime` values outside this window have no
 /// legitimate WS-Security use.
 const MIN_PARSED_YEAR: i32 = 1970;
 const MAX_PARSED_YEAR: i32 = 9999;
@@ -1114,11 +1115,28 @@ fn resolve_credential_password(path: &str, configured: String) -> Result<String,
 /// performs a fallible or panicking duration construction. The bounds above
 /// already guarantee success; the fallible conversion stays so a future bound
 /// change cannot reintroduce a panicking `Duration::seconds` on the hot path.
-fn admitted_duration(path: &str, key: &str, seconds: u64) -> Result<chrono::Duration, String> {
-    let signed = i64::try_from(seconds).ok();
-    let duration = signed.and_then(chrono::Duration::try_seconds);
+fn admitted_duration(path: &str, key: &str, seconds: u64) -> Result<SignedDuration, String> {
+    let duration = i64::try_from(seconds).ok().map(SignedDuration::seconds);
     let message = || type_error(path, key, "a representable duration");
     duration.ok_or_else(message)
+}
+
+/// `now + skew`, failing closed where an unchecked addition would have
+/// panicked. Unreachable under the admitted duration bounds; kept so the
+/// request path never panics.
+fn instant_plus_skew(now: UtcTimestamp, skew: SignedDuration) -> Result<UtcTimestamp, String> {
+    now.checked_add(skew)
+        .ok_or_else(|| "WS-Security: the current time is outside the supported range".to_string())
+}
+
+/// `window + skew` with the same fail-closed guarantee.
+fn window_plus_skew(
+    window: SignedDuration,
+    skew: SignedDuration,
+) -> Result<SignedDuration, String> {
+    window
+        .checked_add(skew)
+        .ok_or_else(|| "WS-Security: the configured time window is not representable".to_string())
 }
 
 fn sha256_array(value: &[u8]) -> [u8; 32] {
@@ -1198,8 +1216,8 @@ impl CertValidityWindow {
         }
     }
 
-    fn contains(&self, now: DateTime<Utc>) -> bool {
-        let now = now.timestamp();
+    fn contains(&self, now: UtcTimestamp) -> bool {
+        let now = now.unix_timestamp();
         self.not_before <= now && now <= self.not_after
     }
 
@@ -1207,8 +1225,8 @@ impl CertValidityWindow {
     /// loaded (so staged rotation and reloads keep working), but it is
     /// refused on every request until it is valid, and the operator is told
     /// now instead of discovering it from request failures.
-    fn warn_if_outside(&self, field: &str, index: usize, now: DateTime<Utc>) {
-        let now_ts = now.timestamp();
+    fn warn_if_outside(&self, field: &str, index: usize, now: UtcTimestamp) {
+        let now_ts = now.unix_timestamp();
         if now_ts > self.not_after {
             warn!(
                 "soap_ws_security: `{field}[{index}]` has expired; signatures from it are \
@@ -1720,8 +1738,8 @@ pub struct SoapWsSecurity {
     timestamp_require_expires: bool,
     /// Pre-converted at admission; the request path performs no fallible or
     /// panicking duration construction.
-    timestamp_max_age: chrono::Duration,
-    clock_skew: chrono::Duration,
+    timestamp_max_age: SignedDuration,
+    clock_skew: SignedDuration,
 
     // UsernameToken
     username_token_enabled: bool,
@@ -1729,11 +1747,11 @@ pub struct SoapWsSecurity {
     credentials: Vec<Credential>,
     /// Freshness window for the UsernameToken's own `wsu:Created`, the instant
     /// bound into the PasswordDigest. Pre-converted at admission.
-    ut_created_max_age: chrono::Duration,
+    ut_created_max_age: SignedDuration,
     ut_created_max_age_seconds: u64,
-    ut_created_clock_skew: chrono::Duration,
+    ut_created_clock_skew: SignedDuration,
     /// Maximum permitted `|UsernameToken.Created - Timestamp.Created|`.
-    ut_created_max_timestamp_divergence: chrono::Duration,
+    ut_created_max_timestamp_divergence: SignedDuration,
     ut_created_max_timestamp_divergence_seconds: u64,
     /// When true (default), a PasswordDigest token must be accompanied by an
     /// outer `wsu:Timestamp` carrying a `Created` value to bind against.
@@ -1766,10 +1784,10 @@ pub struct SoapWsSecurity {
     /// Service-specific `SubjectConfirmationData/@Recipient` binding, also
     /// required whenever SAML is enabled.
     saml_recipient: Option<String>,
-    saml_max_assertion_lifetime: chrono::Duration,
+    saml_max_assertion_lifetime: SignedDuration,
     saml_max_assertion_lifetime_seconds: u64,
     saml_allowed_confirmation_methods: Vec<String>,
-    saml_clock_skew: chrono::Duration,
+    saml_clock_skew: SignedDuration,
     saml_trusted_signing_certs: Vec<TrustedCert>,
     saml_allowed_signature_algorithms: Vec<SignatureAlgorithm>,
     saml_allowed_digest_algorithms: Vec<DigestAlgorithm>,
@@ -2091,7 +2109,11 @@ impl SoapWsSecurity {
                 .to_vec();
             let principal = format!("x509:sha256:{}", sha256_hex_lower(&der_bytes));
             let validity = CertValidityWindow::from_cert(&cert);
-            validity.warn_if_outside("config.x509_signature.trusted_certs", index, Utc::now());
+            validity.warn_if_outside(
+                "config.x509_signature.trusted_certs",
+                index,
+                UtcTimestamp::now(),
+            );
 
             trusted_certs.push(TrustedCert {
                 public_key_der,
@@ -2307,7 +2329,11 @@ impl SoapWsSecurity {
                 .to_vec();
             let principal = format!("x509:sha256:{}", sha256_hex_lower(&der_bytes));
             let validity = CertValidityWindow::from_cert(&cert);
-            validity.warn_if_outside("config.saml.trusted_signing_certs", index, Utc::now());
+            validity.warn_if_outside(
+                "config.saml.trusted_signing_certs",
+                index,
+                UtcTimestamp::now(),
+            );
 
             saml_trusted_signing_certs.push(TrustedCert {
                 public_key_der,
@@ -2659,7 +2685,7 @@ impl SoapWsSecurity {
     fn timestamp_instant(
         timestamp: Node<'_, '_>,
         local_name: &str,
-    ) -> Result<Option<DateTime<Utc>>, String> {
+    ) -> Result<Option<UtcTimestamp>, String> {
         let Some(node) = unique_ns_child(timestamp, WSU_NAMESPACE_URI, local_name, "WS-Security")?
         else {
             return Ok(None);
@@ -2673,7 +2699,7 @@ impl SoapWsSecurity {
         Ok(Some(parsed))
     }
 
-    fn validate_timestamp(&self, security: Node<'_, '_>, now: DateTime<Utc>) -> Result<(), String> {
+    fn validate_timestamp(&self, security: Node<'_, '_>, now: UtcTimestamp) -> Result<(), String> {
         let ts_node = match Self::timestamp_node(security)? {
             Some(node) => node,
             None => {
@@ -2698,12 +2724,12 @@ impl SoapWsSecurity {
         let max_age = self.timestamp_max_age;
 
         // Created must not be in the future (with clock skew tolerance)
-        if created > now + skew {
+        if created > instant_plus_skew(now, skew)? {
             return Err("WS-Security: Timestamp Created is in the future".to_string());
         }
 
         // Created must not be too old
-        if now - created > max_age + skew {
+        if now - created > window_plus_skew(max_age, skew)? {
             return Err(format!(
                 "WS-Security: Timestamp Created is too old (max age {}s)",
                 self.timestamp_max_age_seconds
@@ -2712,7 +2738,7 @@ impl SoapWsSecurity {
 
         // Expires check
         if let Some(expires) = Self::timestamp_instant(ts_node, "Expires")? {
-            let expires_with_skew = expires.checked_add_signed(skew).ok_or_else(|| {
+            let expires_with_skew = expires.checked_add(skew).ok_or_else(|| {
                 "WS-Security: Expires timestamp is outside the supported range".to_string()
             })?;
 
@@ -2760,7 +2786,7 @@ impl SoapWsSecurity {
         &self,
         security: Node<'_, '_>,
         created_raw: &str,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
     ) -> Result<(), String> {
         let created = parse_ws_datetime(created_raw.trim()).ok_or_else(|| {
             // Never echo the value: it is a digest input under attacker control
@@ -2769,10 +2795,10 @@ impl SoapWsSecurity {
         })?;
 
         let skew = self.ut_created_clock_skew;
-        if created > now + skew {
+        if created > instant_plus_skew(now, skew)? {
             return Err("WS-Security: UsernameToken Created is in the future".to_string());
         }
-        if now - created > self.ut_created_max_age + skew {
+        if now - created > window_plus_skew(self.ut_created_max_age, skew)? {
             return Err(format!(
                 "WS-Security: UsernameToken Created is too old (max age {}s)",
                 self.ut_created_max_age_seconds
@@ -2814,10 +2840,9 @@ impl SoapWsSecurity {
             ));
         }
         if let Some(outer_expires) = outer_expires {
-            let outer_expires_with_skew =
-                outer_expires.checked_add_signed(skew).ok_or_else(|| {
-                    "WS-Security: Timestamp Expires is outside the supported range".to_string()
-                })?;
+            let outer_expires_with_skew = outer_expires.checked_add(skew).ok_or_else(|| {
+                "WS-Security: Timestamp Expires is outside the supported range".to_string()
+            })?;
             if created > outer_expires_with_skew {
                 return Err(
                     "WS-Security: UsernameToken Created is past the Timestamp Expires".to_string(),
@@ -2831,7 +2856,7 @@ impl SoapWsSecurity {
     async fn validate_username_token(
         &self,
         security: Node<'_, '_>,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
     ) -> Result<String, UsernameTokenError> {
         let structural = |message: &str| UsernameTokenError::Structural(message.to_string());
         let ut_node = unique_ns_child(security, WSSE_NAMESPACE_URI, "UsernameToken", "WS-Security")
@@ -3592,7 +3617,7 @@ impl SoapWsSecurity {
         &self,
         security_block: &str,
         created_raw: &str,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
     ) -> Result<(), String> {
         // `security_block` is the *inner* content of a `wsse:Security` header;
         // the wrapper (and its namespace bindings) is supplied here so a test
@@ -3744,7 +3769,7 @@ impl SoapWsSecurity {
         structure: &SoapEnvelopeStructure<'a, 'i>,
         security: Node<'a, 'i>,
         envelope: &str,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
         budget: &mut WorkBudget,
     ) -> Result<&str, String> {
         let sig_node =
@@ -4165,7 +4190,7 @@ impl SoapWsSecurity {
         &self,
         security: Node<'a, 'i>,
         envelope: &str,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
         budget: &mut WorkBudget,
     ) -> Result<String, String> {
         let document = security.document();
@@ -4256,10 +4281,10 @@ impl SoapWsSecurity {
                 self.saml_max_assertion_lifetime_seconds
             ));
         }
-        if now + skew < not_before {
+        if instant_plus_skew(now, skew)? < not_before {
             return Err("WS-Security: SAML Assertion is not yet valid".to_string());
         }
-        let expiry_with_skew = not_on_or_after.checked_add_signed(skew).ok_or_else(|| {
+        let expiry_with_skew = not_on_or_after.checked_add(skew).ok_or_else(|| {
             "WS-Security: SAML NotOnOrAfter is outside the supported range".to_string()
         })?;
         if now > expiry_with_skew {
@@ -4419,7 +4444,7 @@ impl SoapWsSecurity {
     fn validate_saml_subject_confirmation(
         &self,
         subject: Node<'_, '_>,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
     ) -> Result<(), String> {
         let expected_recipient = self
             .saml_recipient
@@ -4477,7 +4502,7 @@ impl SoapWsSecurity {
         &self,
         confirmation: Node<'_, '_>,
         expected_recipient: &str,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
     ) -> Result<(), String> {
         let skew = self.saml_clock_skew;
         let data = unique_ns_child(
@@ -4516,7 +4541,7 @@ impl SoapWsSecurity {
                     "WS-Security: invalid SAML SubjectConfirmationData NotOnOrAfter".to_string()
                 })
             })?;
-        let expiry_with_skew = not_on_or_after.checked_add_signed(skew).ok_or_else(|| {
+        let expiry_with_skew = not_on_or_after.checked_add(skew).ok_or_else(|| {
             "WS-Security: SAML SubjectConfirmationData NotOnOrAfter is outside the supported range"
                 .to_string()
         })?;
@@ -4527,7 +4552,7 @@ impl SoapWsSecurity {
             let not_before = parse_ws_datetime(raw).ok_or_else(|| {
                 "WS-Security: invalid SAML SubjectConfirmationData NotBefore".to_string()
             })?;
-            if now + skew < not_before {
+            if instant_plus_skew(now, skew)? < not_before {
                 return Err(
                     "WS-Security: SAML SubjectConfirmationData is not yet valid".to_string()
                 );
@@ -4557,7 +4582,7 @@ impl SoapWsSecurity {
         &self,
         assertion_node: Node<'_, '_>,
         envelope: &str,
-        now: DateTime<Utc>,
+        now: UtcTimestamp,
         budget: &mut WorkBudget,
     ) -> Result<(), String> {
         let sig_node = unique_ns_child(
@@ -5434,7 +5459,7 @@ impl SoapWsSecurity {
             return Ok(None);
         };
 
-        let now = Utc::now();
+        let now = UtcTimestamp::now();
         let mut budget = WorkBudget::for_envelope(envelope);
         let mut principal = SoapPrincipal::default();
 
@@ -8998,27 +9023,30 @@ pub(crate) fn decode_soap_xml_body_for_test(
 
 /// Parse WS-Security datetime formats (ISO 8601 variants with an explicit
 /// `Z` or `±hh:mm` zone designator).
-fn parse_ws_datetime(s: &str) -> Option<DateTime<Utc>> {
-    // Reject instants outside the representable WS-Security window. `chrono`'s
-    // `%Y` accepts years far beyond four digits and its `DateTime` `Add`/`Sub`
-    // impls panic on overflow. Callers still use checked addition near the
-    // accepted upper boundary; this clamp rejects nonsensical distant years
-    // before any policy arithmetic. No legitimate WS-Security or SAML instant
+fn parse_ws_datetime(s: &str) -> Option<UtcTimestamp> {
+    // Reject instants outside the representable WS-Security window. The
+    // chrono-compatible `%Y` parser accepts years far beyond four digits.
+    // Callers still use checked addition near the accepted upper boundary;
+    // this clamp rejects nonsensical distant years before any policy
+    // arithmetic. No legitimate WS-Security or SAML instant
     // falls outside this range.
     let parsed = parse_ws_datetime_unbounded(s)?;
-    let year = parsed.year();
+    let year = parsed.date().year();
     if !(MIN_PARSED_YEAR..=MAX_PARSED_YEAR).contains(&year) {
         return None;
     }
     Some(parsed)
 }
 
-fn parse_ws_datetime_unbounded(s: &str) -> Option<DateTime<Utc>> {
+fn parse_ws_datetime_unbounded(s: &str) -> Option<UtcTimestamp> {
     let s = s.trim();
 
-    // Try standard RFC 3339 first
-    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-        return Some(dt.with_timezone(&Utc));
+    // Try standard RFC 3339 first. The chrono-compatible parsers (issue
+    // #7419) accept exactly what chrono did; a leap second is normalized to
+    // the next second and an instant outside UtcTimestamp's range is refused
+    // like any other invalid dateTime (the year window below refuses it too).
+    if let Ok(parsed) = crate::time_compat::parse_rfc3339_chrono(s) {
+        return parsed.to_utc_timestamp().ok();
     }
 
     // Try common WS-Security formats
@@ -9030,8 +9058,8 @@ fn parse_ws_datetime_unbounded(s: &str) -> Option<DateTime<Utc>> {
     ];
 
     for fmt in &formats {
-        if let Ok(dt) = DateTime::parse_from_str(s, fmt) {
-            return Some(dt.with_timezone(&Utc));
+        if let Ok(parsed) = crate::time_compat::parse_from_str_chrono(s, fmt) {
+            return parsed.to_utc_timestamp().ok();
         }
     }
 

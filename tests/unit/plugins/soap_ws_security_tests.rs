@@ -7513,34 +7513,39 @@ fn the_created_acceptance_interval_has_exactly_the_span_the_retention_covers() {
     const MAX_AGE: i64 = 10;
     const SKEW: i64 = 5;
     let config = digest_config_with_created_window(MAX_AGE as u64, SKEW as u64);
-    let created_at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
-        .expect("fixed instant")
-        .with_timezone(&chrono::Utc);
-    let created = created_at.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+    let created_at = "2026-01-01T00:00:00Z"
+        .parse::<ferrum_edge::time_compat::UtcTimestamp>()
+        .expect("fixed instant");
+    let created = created_at.to_rfc3339_opts(ferrum_edge::time_compat::SecondsFormat::Millis, true);
+    let shift = |instant: ferrum_edge::time_compat::UtcTimestamp, seconds: i64| {
+        instant
+            .checked_add(time::SignedDuration::seconds(seconds))
+            .expect("shift stays in range")
+    };
 
-    let decide = |now: chrono::DateTime<chrono::Utc>| {
+    let decide = |now: ferrum_edge::time_compat::UtcTimestamp| {
         soap_username_token_created_outcome_for_test(&config, "", &created, now)
             .expect("config must admit")
     };
 
     // Earliest acceptance: the token may arrive a full skew *before* its own
     // Created. This is the earliest instant at which its nonce can be claimed.
-    let earliest = created_at - chrono::Duration::seconds(SKEW);
+    let earliest = shift(created_at, -SKEW);
     assert!(
         decide(earliest).is_ok(),
         "the future-skew boundary is accepted"
     );
     assert!(
-        decide(earliest - chrono::Duration::seconds(1))
+        decide(shift(earliest, -1))
             .expect_err("one second earlier is out of policy")
             .contains("in the future")
     );
 
     // Latest acceptance.
-    let latest = created_at + chrono::Duration::seconds(MAX_AGE + SKEW);
+    let latest = shift(created_at, MAX_AGE + SKEW);
     assert!(decide(latest).is_ok(), "the max-age boundary is accepted");
     assert!(
-        decide(latest + chrono::Duration::seconds(1))
+        decide(shift(latest, 1))
             .expect_err("one second later is out of policy")
             .contains("too old")
     );
@@ -7549,7 +7554,7 @@ fn the_created_acceptance_interval_has_exactly_the_span_the_retention_covers() {
     // the widest span any admissible policy could ever accept it over. The
     // fixed retention strictly exceeds both, which is what makes a later
     // widening safe rather than merely improbable.
-    let acceptance_span = (latest - earliest).num_seconds() as u64;
+    let acceptance_span = (latest - earliest).whole_seconds() as u64;
     assert_eq!(acceptance_span, (MAX_AGE + 2 * SKEW) as u64);
     let widest_admissible_span = 86_400 + 2 * 3_600;
     assert!(
