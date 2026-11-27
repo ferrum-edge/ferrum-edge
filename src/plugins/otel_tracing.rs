@@ -3361,13 +3361,13 @@ fn timestamp_micros(timestamp: &str) -> i64 {
 }
 
 fn timestamp_before_now(duration_ms: f64) -> String {
-    let now = chrono::Utc::now();
+    let now = crate::time_compat::UtcTimestamp::now();
     let bounded_ms = if duration_ms.is_finite() {
         duration_ms.clamp(0.0, i64::MAX as f64 / 1_000.0)
     } else {
         0.0
     };
-    now.checked_sub_signed(chrono::Duration::microseconds(
+    now.checked_sub(time::SignedDuration::microseconds(
         (bounded_ms * 1_000.0) as i64,
     ))
     .unwrap_or(now)
