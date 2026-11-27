@@ -1314,9 +1314,14 @@ impl CpGrpcServer {
             visible_namespaces.contains(&routes.namespace)
                 && Self::namespace_allowed_by_scope(&routes.namespace, scope)
                 && bearer_namespaces.is_none_or(|allowed| allowed.contains(&routes.namespace))
-                && crate::modes::mesh::config::virtual_service_http_routes_exported_to_namespace(
+                && (crate::modes::mesh::config::virtual_service_http_routes_exported_to_namespace(
                     routes, namespace,
                 )
+                    // A ServiceWaypoint may serve its own namespace's route
+                    // for a bound Service in another namespace when the route
+                    // is exported to THAT namespace (issue #7500); the slice
+                    // projection applies the exact owner rule.
+                    || (request.service_waypoint_http_routes && routes.namespace == namespace))
         });
         // A ServiceWaypoint terminates traffic for destination-visible services,
         // but trusted Ambient UDP evidence can name a source pod from any

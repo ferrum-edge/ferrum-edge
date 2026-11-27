@@ -3930,21 +3930,18 @@ fn service_waypoint_http_route_set(
     if bound_hosts.is_empty() {
         return MeshHttpRouteSet::default();
     }
-    let binding_owns_service = |binding: &MeshVirtualServiceHttpRoutes,
-                                service_namespace: &str|
-     -> bool {
-        binding.namespace == service_namespace
-            || (binding.namespace == waypoint_namespace
-                && virtual_service_http_routes_exported_to_namespace(binding, service_namespace))
-    };
+    let binding_owns_service =
+        |binding: &MeshVirtualServiceHttpRoutes, service_namespace: &str| -> bool {
+            service_waypoint_route_owner_admission(binding, waypoint_namespace, service_namespace)
+                .is_ok()
+        };
     node_waypoint_http_route_set(
         config,
         mesh,
         &|binding: &MeshVirtualServiceHttpRoutes| {
-            virtual_service_http_routes_exported_to_namespace(binding, waypoint_namespace)
-                && bound_hosts
-                    .iter()
-                    .any(|(service_namespace, _)| binding_owns_service(binding, service_namespace))
+            bound_hosts
+                .iter()
+                .any(|(service_namespace, _)| binding_owns_service(binding, service_namespace))
         },
         &|binding: &MeshVirtualServiceHttpRoutes, proxy: &Proxy| {
             proxy.hosts.iter().any(|host| {
@@ -3970,6 +3967,131 @@ fn service_waypoint_http_route_set(
         },
         None,
     )
+}
+
+/// Why a ServiceWaypoint does not carry a mesh-bound VirtualService's
+/// `http[]` routes for one Service bound to it (issue #7500). Reported on the
+/// VirtualService status so the author is never left with a silent drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ServiceWaypointRouteExclusionReason {
+    /// The VirtualService lives in the bound Service's own namespace but its
+    /// `exportTo` does not admit the waypoint's namespace, where the waypoint
+    /// proxy runs (Istio visibility: a proxy sees only VirtualServices
+    /// exported to its namespace).
+    NotExportedToWaypointNamespace,
+    /// The VirtualService lives in the waypoint's namespace but its
+    /// `exportTo` does not admit the bound Service's namespace (spec §3.2,
+    /// `istio.io/use-waypoint-namespace`).
+    NotExportedToServiceNamespace,
+    /// The VirtualService lives in neither the bound Service's namespace nor
+    /// the waypoint's (the anti-hijack rule, spec §3.2): never admitted,
+    /// whatever its `exportTo`.
+    ForeignNamespace,
+}
+
+impl ServiceWaypointRouteExclusionReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotExportedToWaypointNamespace => "not_exported_to_waypoint_namespace",
+            Self::NotExportedToServiceNamespace => "not_exported_to_service_namespace",
+            Self::ForeignNamespace => "foreign_namespace",
+        }
+    }
+}
+
+/// The ONE owner/visibility rule for a ServiceWaypoint carrying a
+/// VirtualService's routes for a Service bound to it (issue #7500), shared by
+/// the slice projection and the VirtualService status so the two never
+/// disagree.
+///
+/// A VirtualService in the Service's own namespace must be exported to the
+/// waypoint's namespace: the waypoint is a proxy in that namespace, and the
+/// spec's projection carries a binding only when its `exportTo` admits the
+/// subscription namespace (§3.2, the rule every topology shares); the
+/// anti-hijack bullet adds an owner restriction and lifts no visibility rule.
+/// A VirtualService in the waypoint's namespace must be exported to the
+/// Service's namespace (§3.2). Any other namespace is refused.
+pub fn service_waypoint_route_owner_admission(
+    binding: &MeshVirtualServiceHttpRoutes,
+    waypoint_namespace: &str,
+    service_namespace: &str,
+) -> Result<(), ServiceWaypointRouteExclusionReason> {
+    if binding.namespace == service_namespace {
+        if virtual_service_http_routes_exported_to_namespace(binding, waypoint_namespace) {
+            Ok(())
+        } else {
+            Err(ServiceWaypointRouteExclusionReason::NotExportedToWaypointNamespace)
+        }
+    } else if binding.namespace == waypoint_namespace {
+        if virtual_service_http_routes_exported_to_namespace(binding, service_namespace) {
+            Ok(())
+        } else {
+            Err(ServiceWaypointRouteExclusionReason::NotExportedToServiceNamespace)
+        }
+    } else {
+        Err(ServiceWaypointRouteExclusionReason::ForeignNamespace)
+    }
+}
+
+/// One bound Service a ServiceWaypoint will not carry a VirtualService's
+/// routes for, and why (issue #7500).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ServiceWaypointRouteExclusion {
+    pub service_namespace: String,
+    pub service_name: String,
+    pub reason: ServiceWaypointRouteExclusionReason,
+}
+
+/// The bound Services whose ServiceWaypoint will NOT carry `binding`'s routes
+/// although one of its route hosts names them (issue #7500), for the
+/// VirtualService status. Reads the same host match and owner rule as the
+/// projection; only bindings that claim service traffic count. Sorted and
+/// de-duplicated.
+pub fn service_waypoint_route_exclusions(
+    config: &GatewayConfig,
+    binding: &MeshVirtualServiceHttpRoutes,
+    cluster_domain: &str,
+) -> Vec<ServiceWaypointRouteExclusion> {
+    let Some(mesh) = config.mesh.as_deref() else {
+        return Vec::new();
+    };
+    let hosts: Vec<&str> = config
+        .proxies
+        .iter()
+        .filter(|proxy| {
+            proxy.namespace == binding.namespace && binding.proxy_ids.contains(&proxy.id)
+        })
+        .flat_map(|proxy| proxy.hosts.iter().map(String::as_str))
+        .collect();
+    if hosts.is_empty() {
+        return Vec::new();
+    }
+    let mut exclusions = BTreeSet::new();
+    for waypoint in &mesh.waypoint_bindings {
+        if !waypoint_for_claims_service_traffic(&waypoint.waypoint_for) {
+            continue;
+        }
+        for service in &waypoint.services {
+            let aliases = service_host_aliases(&service.name, &service.namespace, cluster_domain);
+            if !hosts.iter().any(|host| {
+                service_alias_names_host(&aliases, &service.namespace, &binding.namespace, host)
+            }) {
+                continue;
+            }
+            if let Err(reason) = service_waypoint_route_owner_admission(
+                binding,
+                &waypoint.namespace,
+                &service.namespace,
+            ) {
+                exclusions.insert(ServiceWaypointRouteExclusion {
+                    service_namespace: service.namespace.clone(),
+                    service_name: service.name.clone(),
+                    reason,
+                });
+            }
+        }
+    }
+    exclusions.into_iter().collect()
 }
 
 /// Whether `host` (as a route declares it in `route_namespace`) is one of a
