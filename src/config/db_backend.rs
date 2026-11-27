@@ -14,6 +14,7 @@ pub use crate::config::batch_atomicity::{
     NamespaceConfigAdmissionLeaseRef, atomic_batch_unsupported, is_batch_admission_lease_lost,
 };
 use crate::config::gateway_trust::{GatewayTrustBundleIdentity, GatewayTrustBundleRecord};
+pub use crate::config::list_query::ResourceListFilter;
 use crate::config::types::{
     ApiSpec, Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream,
 };
@@ -2950,6 +2951,66 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         limit: i64,
         offset: i64,
     ) -> Result<PaginatedResult<Upstream>, anyhow::Error>;
+
+    // -----------------------------------------------------------------------
+    // Filtered admin lists (`q`, `ids`) and collection revisions
+    // -----------------------------------------------------------------------
+
+    /// [`Self::list_proxies_paginated`] narrowed by `filter` inside the
+    /// backend query, so `total` counts the matches. The matching rule is
+    /// [`crate::config::list_query`]'s, identical on every backend.
+    async fn list_proxies_filtered(
+        &self,
+        namespace: &str,
+        filter: &ResourceListFilter,
+        limit: i64,
+        offset: i64,
+    ) -> Result<PaginatedResult<Proxy>, anyhow::Error>;
+    /// Consumer counterpart of [`Self::list_proxies_filtered`].
+    async fn list_consumers_filtered(
+        &self,
+        namespace: &str,
+        filter: &ResourceListFilter,
+        limit: i64,
+        offset: i64,
+    ) -> Result<PaginatedResult<Consumer>, anyhow::Error>;
+    /// Upstream counterpart of [`Self::list_proxies_filtered`].
+    async fn list_upstreams_filtered(
+        &self,
+        namespace: &str,
+        filter: &ResourceListFilter,
+        limit: i64,
+        offset: i64,
+    ) -> Result<PaginatedResult<Upstream>, anyhow::Error>;
+    /// Plugin-config counterpart of [`Self::list_proxies_filtered`], also
+    /// optionally narrowed to one `proxy_id`.
+    async fn list_plugin_configs_filtered(
+        &self,
+        namespace: &str,
+        filter: &ResourceListFilter,
+        proxy_id: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<PaginatedResult<PluginConfig>, anyhow::Error>;
+    /// Every plugin config in `namespace` that can apply to a proxy whose
+    /// association list is `attached_ids`: all `global` configs plus the
+    /// configs named in `attached_ids` (any scope). Unordered and unpaginated;
+    /// the caller applies the plugin cache's scope rule
+    /// (`plugin_cache::plugin_configs_applied_to_proxy`) to this candidate set.
+    async fn list_plugin_config_candidates_for_proxy(
+        &self,
+        namespace: &str,
+        attached_ids: &[String],
+    ) -> Result<Vec<PluginConfig>, anyhow::Error>;
+    /// Revision of the `resource_types` collections in `namespace`, derived
+    /// from the durable `config_changes` log (see
+    /// [`crate::config::list_query::collection_revision_from_sequences`]).
+    /// Read from the same source the admin list reads use.
+    async fn config_collection_revision(
+        &self,
+        namespace: &str,
+        resource_types: &[&str],
+    ) -> Result<u64, anyhow::Error>;
 
     // -----------------------------------------------------------------------
     // Validation queries

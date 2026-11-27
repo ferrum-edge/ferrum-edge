@@ -42,6 +42,7 @@ pub mod file_loader;
 /// Namespace-keyed gateway trust-bundle resource (issue #3727).
 pub mod gateway_trust;
 pub(crate) mod incremental_apply;
+pub mod list_query;
 pub mod migrations;
 pub mod mongo_index_plan;
 pub mod mongo_store;

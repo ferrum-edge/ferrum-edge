@@ -5807,17 +5807,129 @@ fn remove_shadowed_globals(
     // global one would silently relax a security boundary. The exception is
     // the registered built-in limiters': a custom plugin reporting one of
     // these names follows the ordinary same-standing rule below.
-    let size_limit = matches!(
-        plugin_name,
-        "request_size_limiting" | "response_size_limiting"
-    );
-    if builtin && size_limit {
+    if !scoped_plugin_may_shadow_globals(plugin_name, builtin) {
         return;
     }
     plugins.retain(|plugin| {
         plugin.name() != plugin_name
             || !global_ptrs.contains(&(Arc::as_ptr(plugin) as *const () as usize))
             || crate::plugins::is_builtin_plugin(plugin.as_ref()) != builtin
+    });
+}
+
+/// Whether a scoped instance named `scoped_name` (built-in standing
+/// `scoped_builtin`) may replace same-name globals at all: the registered
+/// built-in size limiters never do (see [`remove_shadowed_globals`]).
+fn scoped_plugin_may_shadow_globals(scoped_name: &str, scoped_builtin: bool) -> bool {
+    let size_limit = matches!(
+        scoped_name,
+        "request_size_limiting" | "response_size_limiting"
+    );
+    !(scoped_builtin && size_limit)
+}
+
+/// The global-shadowing rule [`remove_shadowed_globals`] applies, at the
+/// configuration level: a scoped config replaces a global when the shadowing
+/// is allowed ([`scoped_plugin_may_shadow_globals`]), the names match and the
+/// built-in standings match. Used by [`plugin_configs_applied_to_proxy`].
+fn scoped_plugin_shadows_global(
+    scoped_name: &str,
+    scoped_builtin: bool,
+    global_name: &str,
+    global_builtin: bool,
+) -> bool {
+    scoped_plugin_may_shadow_globals(scoped_name, scoped_builtin)
+        && scoped_name == global_name
+        && scoped_builtin == global_builtin
+}
+
+/// The plugin configurations the plugin cache runs on `proxy`, evaluated at
+/// the configuration level from `plugin_configs` (every config of the
+/// proxy's namespace, or a superset that contains at least its `global`
+/// configs and the configs its association list names). Configs of another
+/// namespace are ignored.
+///
+/// This is the cold-build resolution in `PluginCache::build_cache`, minus
+/// instance construction (the config-only `transaction_log_schema` is never
+/// chained in any scope): every enabled `global` config, then each enabled
+/// `proxy`-scoped
+/// config whose `proxy_id` is the proxy and which the proxy's association
+/// list names, then each enabled `proxy_group` config the association list
+/// names; each scoped config removes the globals it shadows under
+/// [`scoped_plugin_shadows_global`] (a scoped Istio route-transform consumer
+/// shadows nothing). It shares those helpers with the runtime build rather
+/// than restating them. A config whose plugin this build omits at
+/// construction (an optional plugin returning no instance) is still listed:
+/// it is configured to apply, and it still shadows globals at runtime.
+///
+/// The result is ordered by plugin-config id. The Admin API's
+/// `GET /plugins/config?applies_to_proxy=` answers with exactly this set.
+pub fn plugin_configs_applied_to_proxy<'a>(
+    proxy: &Proxy,
+    plugin_configs: &'a [PluginConfig],
+) -> Vec<&'a PluginConfig> {
+    // `transaction_log_schema` is config-only in every scope: the build
+    // constructs it to stage the schema registry but never chains it.
+    let in_namespace = |pc: &&'a PluginConfig| {
+        pc.namespace == proxy.namespace && pc.enabled && pc.plugin_name != "transaction_log_schema"
+    };
+    let mut globals: Vec<&'a PluginConfig> = plugin_configs
+        .iter()
+        .filter(in_namespace)
+        .filter(|pc| pc.scope == PluginScope::Global)
+        .collect();
+    let mut scoped: Vec<&'a PluginConfig> = Vec::new();
+    let attached: HashSet<&str> = proxy
+        .plugins
+        .iter()
+        .map(|association| association.plugin_config_id.as_str())
+        .collect();
+    let mut proxy_scoped: Vec<&'a PluginConfig> = plugin_configs
+        .iter()
+        .filter(in_namespace)
+        .filter(|pc| {
+            pc.scope == PluginScope::Proxy
+                && pc.proxy_id.as_deref() == Some(proxy.id.as_str())
+                && attached.contains(pc.id.as_str())
+        })
+        .collect();
+    proxy_scoped.sort_by(|left, right| left.id.cmp(&right.id));
+    proxy_scoped.dedup_by(|left, right| left.id == right.id);
+    for pc in proxy_scoped {
+        if !is_istio_route_transform_consumer(pc, &proxy.id) {
+            shadow_global_configs(&mut globals, pc);
+        }
+        scoped.push(pc);
+    }
+    let mut seen_group: HashSet<&str> = HashSet::new();
+    for association in proxy_plugin_associations_in_canonical_order(proxy) {
+        if !seen_group.insert(association.plugin_config_id.as_str()) {
+            continue;
+        }
+        if let Some(pc) = plugin_configs
+            .iter()
+            .filter(in_namespace)
+            .find(|pc| pc.scope == PluginScope::ProxyGroup && pc.id == association.plugin_config_id)
+        {
+            shadow_global_configs(&mut globals, pc);
+            scoped.push(pc);
+        }
+    }
+    globals.extend(scoped);
+    globals.sort_by(|left, right| left.id.cmp(&right.id));
+    globals
+}
+
+/// Config-level [`remove_shadowed_global_plugin_by_name`].
+fn shadow_global_configs(globals: &mut Vec<&PluginConfig>, scoped: &PluginConfig) {
+    let scoped_builtin = crate::plugins::is_builtin_plugin_name(&scoped.plugin_name);
+    globals.retain(|global| {
+        !scoped_plugin_shadows_global(
+            &scoped.plugin_name,
+            scoped_builtin,
+            &global.plugin_name,
+            crate::plugins::is_builtin_plugin_name(&global.plugin_name),
+        )
     });
 }
 

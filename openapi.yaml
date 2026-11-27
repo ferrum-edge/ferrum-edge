@@ -6195,10 +6195,19 @@ paths:
         Falls back to cached config when the database is unavailable.
 
         Returns a paginated envelope with `data` and `pagination` fields.
+
+        `q` searches `id`, `name`, `listen_path` and each `hosts` entry (ASCII-case-insensitive substring), `ids` resolves
+        up to 100 ids at once, and `pagination.revision` identifies the
+        collection state the page reflects; pass it back as `if_revision` on
+        the next page to get `409` instead of a page from a changed collection.
+        See `docs/admin_api.md` ("List search, bulk ids and revisions").
       tags: [Proxies]
       parameters:
         - $ref: "#/components/parameters/PaginationOffset"
         - $ref: "#/components/parameters/PaginationLimit"
+        - $ref: "#/components/parameters/ListSearch"
+        - $ref: "#/components/parameters/ListIds"
+        - $ref: "#/components/parameters/ListIfRevision"
       responses:
         "403":
           $ref: "#/components/responses/Forbidden"
@@ -6218,13 +6227,15 @@ paths:
                     items:
                       $ref: "#/components/schemas/Proxy"
                   pagination:
-                    $ref: "#/components/schemas/Pagination"
+                    $ref: "#/components/schemas/CollectionPagination"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/CollectionRevisionConflict"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/ListServiceUnavailable"
 
     post:
       operationId: createProxy
@@ -6622,10 +6633,19 @@ paths:
       summary: List consumers (paginated)
       description: |
         Returns a paginated envelope with `data` and `pagination` fields.
+
+        `q` searches `id`, `username` and `custom_id` (ASCII-case-insensitive substring), `ids` resolves
+        up to 100 ids at once, and `pagination.revision` identifies the
+        collection state the page reflects; pass it back as `if_revision` on
+        the next page to get `409` instead of a page from a changed collection.
+        See `docs/admin_api.md` ("List search, bulk ids and revisions").
       tags: [Consumers]
       parameters:
         - $ref: "#/components/parameters/PaginationOffset"
         - $ref: "#/components/parameters/PaginationLimit"
+        - $ref: "#/components/parameters/ListSearch"
+        - $ref: "#/components/parameters/ListIds"
+        - $ref: "#/components/parameters/ListIfRevision"
       responses:
         "403":
           $ref: "#/components/responses/Forbidden"
@@ -6645,13 +6665,15 @@ paths:
                     items:
                       $ref: "#/components/schemas/Consumer"
                   pagination:
-                    $ref: "#/components/schemas/Pagination"
+                    $ref: "#/components/schemas/CollectionPagination"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/CollectionRevisionConflict"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/ListServiceUnavailable"
 
     post:
       operationId: createConsumer
@@ -7306,10 +7328,38 @@ paths:
         proxy's configs does not have to page through the whole namespace and
         filter client-side. Pagination (and `pagination.total`) is applied over
         the filtered set.
+
+        `q` searches `id` and `plugin_name` (ASCII-case-insensitive substring), `ids` resolves
+        up to 100 ids at once, and `pagination.revision` identifies the
+        collection state the page reflects; pass it back as `if_revision` on
+        the next page to get `409` instead of a page from a changed collection.
+        See `docs/admin_api.md` ("List search, bulk ids and revisions").
+
+        `applies_to_proxy=<id>` returns the plugin configs the data plane's
+        plugin cache applies to that proxy: enabled `global` configs that no
+        attached scoped config of the same plugin shadows, plus the enabled
+        `proxy`-scoped and `proxy_group` configs the proxy's `plugins`
+        association list names. It is computed by the plugin cache's own
+        scope rule (`plugin_cache::plugin_configs_applied_to_proxy`), ordered by
+        id, and combines with `q`, `ids` and `proxy_id` (all ANDed). An unknown
+        proxy id answers `404`.
       tags: [Plugins]
       parameters:
         - $ref: "#/components/parameters/PaginationOffset"
         - $ref: "#/components/parameters/PaginationLimit"
+        - $ref: "#/components/parameters/ListSearch"
+        - $ref: "#/components/parameters/ListIds"
+        - $ref: "#/components/parameters/ListIfRevision"
+        - name: applies_to_proxy
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 255
+          description: |
+            Return the effective plugin configs of this proxy (see the
+            operation description). Must satisfy the resource-id rules; an
+            invalid or repeated value is `400`, an unknown proxy `404`.
         - name: proxy_id
           in: query
           required: false
@@ -7339,13 +7389,17 @@ paths:
                     items:
                       $ref: "#/components/schemas/PluginConfig"
                   pagination:
-                    $ref: "#/components/schemas/Pagination"
+                    $ref: "#/components/schemas/CollectionPagination"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/CollectionRevisionConflict"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/ListServiceUnavailable"
 
     post:
       operationId: createPluginConfig
@@ -7611,10 +7665,19 @@ paths:
       summary: List upstreams (paginated)
       description: |
         Returns a paginated envelope with `data` and `pagination` fields.
+
+        `q` searches `id` and `name` (ASCII-case-insensitive substring), `ids` resolves
+        up to 100 ids at once, and `pagination.revision` identifies the
+        collection state the page reflects; pass it back as `if_revision` on
+        the next page to get `409` instead of a page from a changed collection.
+        See `docs/admin_api.md` ("List search, bulk ids and revisions").
       tags: [Upstreams]
       parameters:
         - $ref: "#/components/parameters/PaginationOffset"
         - $ref: "#/components/parameters/PaginationLimit"
+        - $ref: "#/components/parameters/ListSearch"
+        - $ref: "#/components/parameters/ListIds"
+        - $ref: "#/components/parameters/ListIfRevision"
       responses:
         "403":
           $ref: "#/components/responses/Forbidden"
@@ -7634,13 +7697,15 @@ paths:
                     items:
                       $ref: "#/components/schemas/Upstream"
                   pagination:
-                    $ref: "#/components/schemas/Pagination"
+                    $ref: "#/components/schemas/CollectionPagination"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/CollectionRevisionConflict"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/ListServiceUnavailable"
     post:
       operationId: createUpstream
       summary: Create an upstream
@@ -9731,6 +9796,52 @@ components:
         List endpoints return a paginated envelope containing `data` and
         `pagination` fields even when this parameter is omitted.
 
+    ListSearch:
+      name: q
+      in: query
+      required: false
+      schema:
+        type: string
+        maxLength: 256
+      description: |
+        Server-side search: ASCII-case-insensitive substring match over the
+        collection's search fields (proxies: `id`, `name`, `listen_path`, each
+        `hosts` entry; consumers: `id`, `username`, `custom_id`; upstreams:
+        `id`, `name`; plugin configs: `id`, `plugin_name`). Only `A`-`Z` fold
+        to `a`-`z`; every other character compares exactly on every backend.
+        The value is a literal (no wildcard or regex syntax) and is not
+        trimmed. An empty value means no search. More than 256 UTF-8 bytes, a
+        control character, or a repeated `q` is `400`. `pagination.total`
+        counts the matches. For a `viewer` token, proxy and upstream `name`
+        values containing `@` never match (their URL userinfo is withheld from
+        that role).
+    ListIds:
+      name: ids
+      in: query
+      required: false
+      schema:
+        type: string
+      description: |
+        Comma-separated resource ids (at most 100) to resolve in one request.
+        Ids that do not exist in the namespace are simply absent from `data`.
+        An empty value or element, a duplicate id, more than 100 ids, an id
+        that breaks the resource-id rules, or a repeated `ids` is `400`.
+        Combines with `q` and the other filters (ANDed); results are
+        paginated like any list.
+    ListIfRevision:
+      name: if_revision
+      in: query
+      required: false
+      schema:
+        type: string
+        maxLength: 80
+        pattern: "^[A-Za-z0-9_-]+$"
+      description: |
+        A `pagination.revision` from an earlier page. When the collection's
+        current revision differs, the request answers `409` (with the current
+        revision) instead of a page, so a multi-page walk detects any create,
+        update or delete committed in between, including a same-size change.
+
   # ── Reusable headers ───────────────────────────────────────────────
   headers:
     ResourceETag:
@@ -9956,6 +10067,25 @@ components:
             anyOf:
               - $ref: "#/components/schemas/Error"
               - $ref: "#/components/schemas/DeploymentMutationAcknowledgement"
+    CollectionRevisionConflict:
+      description: >-
+        `if_revision` no longer equals the collection revision: a create,
+        update or delete committed in the listed collection (for
+        `applies_to_proxy`, in plugin configs or proxies) of this namespace
+        since that revision was issued. Restart the walk from `revision`.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/CollectionRevisionConflictBody"
+    ListServiceUnavailable:
+      description: >-
+        No database and no cached config are available, or the collection
+        changed on every one of five consecutive attempts to read a page
+        consistent with a single revision (retry the request).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
     ServiceUnavailable:
       description: >-
         The admin write gate refused the mutation. Either the configured
@@ -21319,6 +21449,60 @@ components:
           format: int64
           minimum: 0
           description: Total number of items in the collection (before pagination)
+
+    CollectionPagination:
+      type: object
+      additionalProperties: false
+      description: |
+        Pagination metadata of the proxy, consumer, upstream and plugin-config
+        lists: `Pagination` plus the collection `revision`.
+      required: [offset, limit, total, revision]
+      properties:
+        offset:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 9223372036854775807
+          description: Number of items skipped
+        limit:
+          type: integer
+          format: int32
+          minimum: 1
+          maximum: 1000
+          description: The page size the server applied (see `Pagination.limit`).
+        total:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Number of items matching the filters (before pagination)
+        revision:
+          type: string
+          maxLength: 80
+          pattern: "^[A-Za-z0-9_-]+$"
+          description: |
+            Opaque collection revision this page reflects. It changes whenever
+            a create, update or delete commits in the listed collection of the
+            namespace (for `applies_to_proxy`, in plugin configs or proxies),
+            and may also change without one (change-log compaction, a config
+            reload); compare it only for equality and never parse it.
+            Database-served lists derive it from the durable change log and
+            bracket each page with two reads of it, so the page reflects
+            exactly this revision; lists served from the in-memory config
+            (`file`, `dp`, `mesh` modes and the database-outage fallback,
+            marked `X-Data-Source: cached`) derive it from a digest of the
+            collection's `viewer` projection. The two kinds never compare
+            equal.
+
+    CollectionRevisionConflictBody:
+      type: object
+      additionalProperties: false
+      required: [error, revision]
+      properties:
+        error:
+          type: string
+        revision:
+          type: string
+          description: The collection's current revision.
 
     # ── Batch ──────────────────────────────────────────────────────────
     BatchCreateRequest:

@@ -79,6 +79,7 @@ mod inner {
         deployment_not_started, validate_deployment_candidate,
     };
     use crate::config::gateway_trust::{GatewayTrustBundleIdentity, GatewayTrustBundleRecord};
+    use crate::config::list_query::{self, ResourceListFilter};
     use crate::config::store_policy::{
         access_control_plugin_allows_consumer, mesh_route_dispatch_referenced_upstream,
         mesh_route_dispatch_references_upstream_id, store_canonical_resource_hash_async,
@@ -10001,6 +10002,48 @@ mod inner {
             .collect()
     }
 
+    /// MongoDB filter document for an admin list query: the namespace, the
+    /// `q` search (see [`crate::config::list_query`] for the matching rule)
+    /// and the `ids` set. Every `$regex` is built by
+    /// [`list_query::SearchTerm::mongo_regex`] and carries no options, so no
+    /// Unicode case folding applies.
+    fn mongo_admin_list_filter(
+        namespace: &str,
+        filter: &ResourceListFilter,
+        search_fields: &[&str],
+        hosts_field: Option<&str>,
+    ) -> Document {
+        let mut query = doc! { "namespace": namespace };
+        if let Some(term) = &filter.search {
+            let pattern = term.mongo_regex();
+            let regex_on = |field: &str| {
+                let mut matcher = Document::new();
+                matcher.insert(field.to_string(), doc! { "$regex": pattern.clone() });
+                matcher
+            };
+            let mut alternatives: Vec<Document> = Vec::new();
+            for field in search_fields {
+                if filter.exclude_at_sign_names && *field == list_query::NAME_FIELD {
+                    let mut no_at_sign = Document::new();
+                    no_at_sign.insert(field.to_string(), doc! { "$not": { "$regex": "@" } });
+                    alternatives.push(doc! { "$and": [regex_on(*field), no_at_sign] });
+                } else {
+                    alternatives.push(regex_on(*field));
+                }
+            }
+            if let Some(hosts_field) = hosts_field
+                && term.can_match_host_list()
+            {
+                alternatives.push(regex_on(hosts_field));
+            }
+            query.insert("$or", alternatives);
+        }
+        if let Some(ids) = &filter.ids {
+            query.insert("_id", doc! { "$in": namespaced_doc_ids(namespace, ids) });
+        }
+        query
+    }
+
     /// Composite MongoDB `_id` for consumer documents.
     ///
     /// Retained as a named alias for [`namespaced_doc_id`] because the
@@ -13147,8 +13190,24 @@ mod inner {
             limit: i64,
             offset: i64,
         ) -> Result<PaginatedResult<Proxy>, anyhow::Error> {
+            self.list_proxies_filtered(namespace, &ResourceListFilter::default(), limit, offset)
+                .await
+        }
+
+        async fn list_proxies_filtered(
+            &self,
+            namespace: &str,
+            filter: &ResourceListFilter,
+            limit: i64,
+            offset: i64,
+        ) -> Result<PaginatedResult<Proxy>, anyhow::Error> {
             let start = std::time::Instant::now();
-            let ns_filter = doc! { "namespace": namespace };
+            let ns_filter = mongo_admin_list_filter(
+                namespace,
+                filter,
+                list_query::PROXY_SEARCH_FIELDS,
+                Some(list_query::PROXY_HOSTS_FIELD),
+            );
             let total = self.proxies().count_documents(ns_filter.clone()).await? as i64;
             let options = FindOptions::builder()
                 .sort(doc! { "_id": 1 })
@@ -13766,8 +13825,24 @@ mod inner {
             limit: i64,
             offset: i64,
         ) -> Result<PaginatedResult<Consumer>, anyhow::Error> {
+            self.list_consumers_filtered(namespace, &ResourceListFilter::default(), limit, offset)
+                .await
+        }
+
+        async fn list_consumers_filtered(
+            &self,
+            namespace: &str,
+            filter: &ResourceListFilter,
+            limit: i64,
+            offset: i64,
+        ) -> Result<PaginatedResult<Consumer>, anyhow::Error> {
             let start = std::time::Instant::now();
-            let ns_filter = doc! { "namespace": namespace };
+            let ns_filter = mongo_admin_list_filter(
+                namespace,
+                filter,
+                list_query::CONSUMER_SEARCH_FIELDS,
+                None,
+            );
             let total = self.consumers().count_documents(ns_filter.clone()).await? as i64;
             let options = FindOptions::builder()
                 .sort(doc! { "_id": 1 })
@@ -13993,8 +14068,31 @@ mod inner {
             limit: i64,
             offset: i64,
         ) -> Result<PaginatedResult<PluginConfig>, anyhow::Error> {
+            self.list_plugin_configs_filtered(
+                namespace,
+                &ResourceListFilter::default(),
+                proxy_id,
+                limit,
+                offset,
+            )
+            .await
+        }
+
+        async fn list_plugin_configs_filtered(
+            &self,
+            namespace: &str,
+            filter: &ResourceListFilter,
+            proxy_id: Option<&str>,
+            limit: i64,
+            offset: i64,
+        ) -> Result<PaginatedResult<PluginConfig>, anyhow::Error> {
             let start = std::time::Instant::now();
-            let mut ns_filter = doc! { "namespace": namespace };
+            let mut ns_filter = mongo_admin_list_filter(
+                namespace,
+                filter,
+                list_query::PLUGIN_CONFIG_SEARCH_FIELDS,
+                None,
+            );
             if let Some(proxy_id) = proxy_id {
                 ns_filter.insert("proxy_id", proxy_id);
             }
@@ -14606,8 +14704,24 @@ mod inner {
             limit: i64,
             offset: i64,
         ) -> Result<PaginatedResult<Upstream>, anyhow::Error> {
+            self.list_upstreams_filtered(namespace, &ResourceListFilter::default(), limit, offset)
+                .await
+        }
+
+        async fn list_upstreams_filtered(
+            &self,
+            namespace: &str,
+            filter: &ResourceListFilter,
+            limit: i64,
+            offset: i64,
+        ) -> Result<PaginatedResult<Upstream>, anyhow::Error> {
             let start = std::time::Instant::now();
-            let ns_filter = doc! { "namespace": namespace };
+            let ns_filter = mongo_admin_list_filter(
+                namespace,
+                filter,
+                list_query::UPSTREAM_SEARCH_FIELDS,
+                None,
+            );
             let total = self.upstreams().count_documents(ns_filter.clone()).await? as i64;
             let options = FindOptions::builder()
                 .sort(doc! { "_id": 1 })
@@ -14623,6 +14737,65 @@ mod inner {
             }
             self.check_slow_query("list_upstreams_paginated", start);
             Ok(PaginatedResult { items, total })
+        }
+
+        async fn list_plugin_config_candidates_for_proxy(
+            &self,
+            namespace: &str,
+            attached_ids: &[String],
+        ) -> Result<Vec<PluginConfig>, anyhow::Error> {
+            let start = std::time::Instant::now();
+            let attached_doc_ids = namespaced_doc_ids(namespace, attached_ids);
+            let filter = doc! {
+                "namespace": namespace,
+                "$or": [
+                    { "scope": "global" },
+                    { "_id": { "$in": attached_doc_ids } },
+                ],
+            };
+            let plugin_configs = self.plugin_configs();
+            let mut cursor = plugin_configs.find(filter).await?;
+            let mut items = Vec::new();
+            while cursor.advance().await? {
+                let doc = cursor.deserialize_current()?;
+                items.push(doc_to_plugin_config(doc)?);
+            }
+            self.check_slow_query("list_plugin_config_candidates", start);
+            Ok(items)
+        }
+
+        async fn config_collection_revision(
+            &self,
+            namespace: &str,
+            resource_types: &[&str],
+        ) -> Result<u64, anyhow::Error> {
+            let newest = if resource_types.is_empty() {
+                None
+            } else {
+                let types: Vec<&str> = resource_types.to_vec();
+                self.config_changes()
+                    .find_one(doc! {
+                        "namespace": namespace,
+                        "resource_type": { "$in": types },
+                    })
+                    .sort(doc! { "sequence": -1 })
+                    .await?
+                    .map(|doc| mongo_change_sequence_from_bson(doc.get("sequence"), "sequence"))
+                    .transpose()?
+            };
+            let oldest = if newest.is_some() {
+                None
+            } else {
+                self.config_changes()
+                    .find_one(doc! { "namespace": namespace })
+                    .sort(doc! { "sequence": 1 })
+                    .await?
+                    .map(|doc| mongo_change_sequence_from_bson(doc.get("sequence"), "sequence"))
+                    .transpose()?
+            };
+            Ok(list_query::collection_revision_from_sequences(
+                newest, oldest,
+            ))
         }
 
         // -------------------------------------------------------------------

@@ -68,6 +68,9 @@ mod common;
 #[path = "../scaffolding/mod.rs"]
 mod scaffolding;
 
+// Its name contains `mysql` on purpose (see
+// `forward_migrations_sqlite_postgres_mysql` below).
+mod admin_list_queries_sqlite_postgres_mysql;
 mod clickhouse;
 mod consul;
 mod container_start_retry;

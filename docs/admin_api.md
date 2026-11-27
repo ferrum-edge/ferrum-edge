@@ -905,13 +905,66 @@ no cached fallback (see [Gateway Trust Bundles](#gateway-trust-bundles)).
 
 ## Pagination
 
-Resource and TLS list endpoints — `GET /proxies`, `/consumers`, `/plugins/config`, `/upstreams`, `/namespaces`, `/proxies/{id}/mcp/tools`, and the ten `GET /admin/tls/*` list routes — return a paginated envelope `{ "data": [...], "pagination": { "offset", "limit", "total" } }` and accept `limit`/`offset` query parameters. An omitted `limit` applies the default of 100 (maximum 1000; `GET /backup` is the intentional full-export mechanism), `0` is coerced to the default, and representable unsigned 64-bit values above 1000 are capped. Malformed or negative values, limits beyond the unsigned 64-bit range, and offsets beyond `2^63 - 1` are rejected with `400`. The offset is retained as a 64-bit value on every target; for an in-memory collection, an offset too large for the target's address space is a valid request beyond the collection and returns an empty page.
+Resource and TLS list endpoints — `GET /proxies`, `/consumers`, `/plugins/config`, `/upstreams`, `/namespaces`, `/proxies/{id}/mcp/tools`, and the ten `GET /admin/tls/*` list routes — return a paginated envelope `{ "data": [...], "pagination": { "offset", "limit", "total" } }` (the four config-collection lists add `revision`; see [List search, bulk ids and revisions](#list-search-bulk-ids-and-revisions)) and accept `limit`/`offset` query parameters. An omitted `limit` applies the default of 100 (maximum 1000; `GET /backup` is the intentional full-export mechanism), `0` is coerced to the default, and representable unsigned 64-bit values above 1000 are capped. Malformed or negative values, limits beyond the unsigned 64-bit range, and offsets beyond `2^63 - 1` are rejected with `400`. The offset is retained as a 64-bit value on every target; for an in-memory collection, an offset too large for the target's address space is a valid request beyond the collection and returns an empty page.
 
 `pagination.limit` reports the page size the server applied, not the number of items returned: an omitted `limit` reports 100 even when fewer rows exist.
 
 Pagination is validated only by routes that consume it, after their authentication, namespace-claim, and role gates. A malformed `limit`/`offset` therefore never preempts the `401` or `403` the caller would otherwise receive, never affects the always-unauthenticated `/live` observability tier, and is ignored on non-paginated routes such as `/backup` and `/cluster`. On the paginated `GET` routes the check runs before the request body is read, so a malformed `limit`/`offset` returns `400` without buffering a body the read endpoint would never use. Route-specific ceilings narrower than the shared bounds — such as the `GET /audit` `offset` cap described below — are applied in that same pre-body check, so they also return `400` rather than a body-size `413`.
 
 Two endpoints intentionally differ and document their own bounds below: `GET /audit` shares these bounds for `limit` but caps `offset` at `2^32 - 1`, and `GET /api-specs` uses a default of 50 and a maximum of 200. Both return their own `{ items, ..., next_offset }` envelope instead of `data`/`pagination`.
+
+The four config-collection lists (`GET /proxies`, `/consumers`, `/upstreams`, `/plugins/config`) add a `revision` to `pagination` and accept the search, bulk-id and revision parameters described next.
+
+## List search, bulk ids and revisions
+
+`GET /proxies`, `GET /consumers`, `GET /upstreams` and `GET /plugins/config` accept these query parameters in addition to `limit`/`offset`. All are additive: a request without them behaves as before, except that `pagination` now also carries `revision`. Each parameter may appear at most once (a repeat is `400`); unknown query parameters stay ignored, as on every other route. Filters combine with each other and with `proxy_id` by AND, `pagination.total` counts the matches, and namespace scoping, `ns`-claim enforcement, role projections and the page-size limits apply unchanged — none of these parameters can reach another namespace or reveal a field the caller's role does not already see.
+
+### `q` — server-side search
+
+An ASCII-case-insensitive substring match over the collection's search fields:
+
+| Collection | Fields |
+|---|---|
+| `/proxies` | `id`, `name`, `listen_path`, each `hosts` entry |
+| `/consumers` | `id`, `username`, `custom_id` |
+| `/upstreams` | `id`, `name` |
+| `/plugins/config` | `id`, `plugin_name` |
+
+- **Literal.** No wildcard or regex syntax: SQL escapes the `LIKE` metacharacters (`%`, `_`, and the escape character `!`), MongoDB escapes every ASCII punctuation character. `q=50%` finds `50%`, nothing else.
+- **Case folding is ASCII-only, on every backend.** `A`–`Z` match `a`–`z`; every other character, including non-ASCII letters, must match exactly (by code point; no Unicode normalization, so NFC and NFD spellings differ). The backends' own folding is deliberately not used: PostgreSQL `lower()`/`ILIKE`, MySQL `_ci`/`_ai` collations and MongoDB `$options: "i"` fold beyond ASCII (for example the Kelvin sign `K` (U+212A) matches `k` under Unicode rules, and `utf8mb4_0900_ai_ci` matches `é` to `e`), and they disagree with SQLite. SQLite uses its ASCII-only `lower()`; PostgreSQL and MySQL use 26 case-sensitive `REPLACE` calls (MySQL additionally compares under `utf8mb4_0900_bin`); MongoDB uses a regex with `[xX]` classes and no options; the in-memory path uses Rust's ASCII lowercase. The same request therefore returns the same rows on PostgreSQL, MySQL, SQLite, MongoDB and from cached config.
+- **Host entries match one at a time.** A term containing `"`, `\`, `,`, `[` or `]` never matches a `hosts` entry (no hostname contains one), so a match can never span two entries of the stored JSON array.
+- **Empty and bounds.** `q=` (empty) means no search. The value is not trimmed. More than 256 UTF-8 bytes, or any control character, is `400`.
+- **Viewer guard.** The `viewer` projection of proxies and upstreams strips URL userinfo, so for a `viewer` token a proxy or upstream `name` containing `@` never matches `q` (otherwise `q` could probe the withheld userinfo). Other roles and other fields are unaffected.
+- **Cost.** A leading-wildcard substring match cannot use an index on any backend, so a search scans the namespace's rows of that collection (the namespace predicate is indexed; no new index or migration was added). Keep `limit` modest on very large namespaces.
+
+### `ids` — bulk reference resolution
+
+`ids=a,b,c` returns those records of the namespace in the usual envelope, ordered by id like every list; ids that do not exist are simply absent. At most 100 ids; an empty value or element, a duplicate, more than 100 ids, or an id that breaks the resource-id rules is `400`. Results are paginated like any list (the default `limit` of 100 covers the maximum id count).
+
+### `applies_to_proxy` — effective plugin policy of one proxy (`/plugins/config` only)
+
+`GET /plugins/config?applies_to_proxy=<proxy-id>` returns the plugin configs the data plane's plugin cache actually applies to that proxy:
+
+- every enabled `global` config, unless an attached enabled scoped config of the same plugin (same name and the same built-in/custom standing) shadows it — the built-in `request_size_limiting` / `response_size_limiting` never shadow a global, and an Istio route-transform consumer shadows nothing, exactly as at runtime;
+- every enabled `proxy`-scoped config whose `proxy_id` is the proxy and which the proxy's `plugins` association list names;
+- every enabled `proxy_group` config the proxy's `plugins` association list names.
+
+Disabled configs and the config-only `transaction_log_schema` are never listed. The set is computed by the plugin cache's own function (`plugin_cache::plugin_configs_applied_to_proxy`, which shares the shadowing and attachment helpers with `PluginCache` construction), ordered by id, paginated in the shared envelope, and narrowed further by `q`, `ids` and `proxy_id` when given. It lists configurations, not instances: a config whose plugin a node's build omits at construction is still listed. An unknown proxy id is `404 {"error": "Proxy not found"}`; an invalid one is `400`. The parameter is ignored on the other list routes (unknown there).
+
+### `pagination.revision` and `if_revision` — snapshot-consistent traversal
+
+Every response of these four lists carries `pagination.revision`, an opaque string that changes whenever a create, update or delete commits in the listed collection of the namespace (for `applies_to_proxy`, in plugin configs **or** proxies, because a proxy's association list is part of the answer). Compare it only for equality; never parse it. It may also change without a write (change-log compaction, a cached-config reload) — that only causes an unnecessary restart, never a missed change.
+
+To walk a collection consistently, read page 1, then send `if_revision=<revision from page 1>` with every later page. If anything changed in between — including a same-size change such as one delete plus one create — the server answers `409 {"error": "...", "revision": "<current>"}` instead of a page; restart from offset 0 (the body's `revision` is the new value).
+
+How the revision is produced:
+
+- **Database-served lists** (`database` and `cp` modes) derive it from the durable `config_changes` log the store already keeps for data-plane polling: the newest retained change sequence of the collection's resource type in the namespace, or, when compaction removed every such row, the namespace's oldest retained sequence. SQL stores serialize each namespace's change-log inserts on the namespace lock row, so sequences become visible in commit order; MongoDB replica sets allocate the sequence inside the write's transaction. A new change is therefore always newer than any value reported before it, whether or not it is later compacted. Each page is read between two reads of the revision and retried (up to five times) until both agree, so a page always reflects exactly the revision it reports; if the collection keeps changing on every attempt the request is `503` and can be retried. The revision is read from the same source as the page (a configured SQL read replica, falling back to the primary), and costs two single-row index seeks per attempt (`config_changes (namespace, sequence)`); a collection whose newest change lies deep under other resource types' changes scans at most the namespace's retained change log (100,000 rows) for it. Standalone MongoDB (no `FERRUM_MONGO_REPLICA_SET`) writes a resource and its change record as two separate operations, so for the instant between them a page can already show the write while the revision does not; the next `if_revision` request detects it. Run MongoDB as a replica set for the strict guarantee (the same requirement as multi-document atomicity).
+- **Lists served from the in-memory config** (`file`, `dp` and `mesh` modes, and the database-outage fallback marked `X-Data-Source: cached`) derive it from a SHA-256 over the collection's id-ordered `viewer` projection (which includes `updated_at` and no secret material), so replicas holding the same config report the same revision and any reload that changes the collection changes it. These modes support `q`, `ids`, `applies_to_proxy` and `if_revision` with the same semantics as the database path.
+
+Database-derived revisions start with `s` and in-memory ones with `c`; the two never compare equal, so an `if_revision` taken from one source and sent while the server answers from the other is a `409`, which is the safe outcome.
+
+An opaque snapshot-bound cursor (a page token that pins the walk to one database snapshot) is not offered: no supported backend can hold a read snapshot open across independent HTTP requests without a server-side session, so the revision check is the portable mechanism.
 
 ## Request body admission
 

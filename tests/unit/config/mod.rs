@@ -50,6 +50,7 @@ mod k8s_gateway_route_listener_fallback_tests;
 mod k8s_mesh_overlay_withdrawal_tests;
 mod k8s_mesh_revision_binding_tests;
 mod l4_route_cross_namespace_parentref_tests;
+mod list_query_tests;
 mod mesh_authz_l4_request_principal_tests;
 mod mesh_authz_path_parameter_spelling_tests;
 mod mesh_slice_selector_policy_scope_tests;

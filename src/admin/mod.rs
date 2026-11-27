@@ -5650,6 +5650,23 @@ async fn handle_admin_request_inner(
         };
     }
 
+    // `q` / `ids` / `if_revision` (and `applies_to_proxy` on plugin configs)
+    // on the four config-collection list routes. Malformed values are a 400
+    // with the shared `{"error": ...}` shape; unknown parameters stay ignored.
+    macro_rules! route_list_query {
+        ($plugin_config_route:expr) => {
+            match crud::list_query::parse_list_query(uri.query(), $plugin_config_route) {
+                Ok(query) => query,
+                Err(message) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        &json!({"error": message}),
+                    ));
+                }
+            }
+        };
+    }
+
     // `?apply=sync|async` on config-database mutations (issue #4139). Strict:
     // an unknown value or duplicate is a 400, because this flag decides
     // whether 2xx still means live.
@@ -5687,7 +5704,15 @@ async fn handle_admin_request_inner(
         // Proxies CRUD
         (Method::GET, ["proxies"]) => {
             let pagination = route_pagination!();
-            crud::handle_list::<Proxy>(&state, &pagination, auth.role, &namespace).await
+            let query = route_list_query!(false);
+            crud::list_query::handle_list_query::<Proxy>(
+                &state,
+                &pagination,
+                auth.role,
+                &namespace,
+                &query,
+            )
+            .await
         }
         (Method::GET, ["proxies", id]) => {
             crud::handle_get::<Proxy>(&state, id, auth.role, auth.key_tier, &namespace).await
@@ -5747,7 +5772,15 @@ async fn handle_admin_request_inner(
         // Consumers CRUD
         (Method::GET, ["consumers"]) => {
             let pagination = route_pagination!();
-            crud::handle_list::<Consumer>(&state, &pagination, auth.role, &namespace).await
+            let query = route_list_query!(false);
+            crud::list_query::handle_list_query::<Consumer>(
+                &state,
+                &pagination,
+                auth.role,
+                &namespace,
+                &query,
+            )
+            .await
         }
         (Method::POST, ["consumers"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
@@ -5890,14 +5923,31 @@ async fn handle_admin_request_inner(
                 Ok(proxy_id) => proxy_id,
                 Err(response) => return Ok(*response),
             };
-            crud::handle_list_filtered::<PluginConfig>(
-                &state,
-                &pagination,
-                auth.role,
-                &namespace,
-                &proxy_id,
-            )
-            .await
+            let mut query = route_list_query!(true);
+            query.proxy_id = proxy_id;
+            match query.applies_to_proxy.clone() {
+                Some(target) => {
+                    crud::list_query::handle_plugin_configs_applied_to_proxy(
+                        &state,
+                        &pagination,
+                        auth.role,
+                        &namespace,
+                        &query,
+                        &target,
+                    )
+                    .await
+                }
+                None => {
+                    crud::list_query::handle_list_query::<PluginConfig>(
+                        &state,
+                        &pagination,
+                        auth.role,
+                        &namespace,
+                        &query,
+                    )
+                    .await
+                }
+            }
         }
         (Method::POST, ["plugins", "config"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
@@ -5953,7 +6003,15 @@ async fn handle_admin_request_inner(
         // Upstreams CRUD
         (Method::GET, ["upstreams"]) => {
             let pagination = route_pagination!();
-            crud::handle_list::<Upstream>(&state, &pagination, auth.role, &namespace).await
+            let query = route_list_query!(false);
+            crud::list_query::handle_list_query::<Upstream>(
+                &state,
+                &pagination,
+                auth.role,
+                &namespace,
+                &query,
+            )
+            .await
         }
         (Method::POST, ["upstreams"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {

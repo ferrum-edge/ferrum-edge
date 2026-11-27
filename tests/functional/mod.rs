@@ -35,6 +35,7 @@ mod functional_cp_dp_resilience_test;
 mod functional_cp_dp_test;
 mod functional_credential_rotation_test;
 mod functional_database_parity_test;
+mod functional_database_parity_test_list_queries;
 mod functional_database_test;
 mod functional_db_failover_test;
 mod functional_db_outage_test;

@@ -37,6 +37,7 @@ use crate::config::types::{
 use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
 use crate::tls::source::{MaterialKind, check_namespace_scoped_material_reference};
 
+pub(crate) mod list_query;
 pub(crate) mod scoped_references;
 use scoped_references::ScopedReferenceClass;
 
