@@ -20919,8 +20919,9 @@ extensionProviders:
         // the namespace embedded in the destination host, not the first match.
         let svc_default = service_with_named_ports("reviews", "default", &[("http", 8080)]);
         let mut svc_prod = service_with_named_ports("reviews", "prod", &[("http", 9090)]);
-        // Selector-backed, so the EndpointSlice attribution a cross-namespace
-        // destination needs (issue #7499) admits it with pod discovery off.
+        // Selector-backed, with pod discovery on and `prod` inside the Pod
+        // watch, so the EndpointSlice attribution a cross-namespace
+        // destination needs (issue #7499) admits it.
         svc_prod.spec["selector"] = serde_json::json!({"app": "reviews"});
         let vs_default = virtual_service_with_destination(
             "reviews-default",
@@ -20956,7 +20957,9 @@ extensionProviders:
         );
         let result = translate_k8s_objects(
             &[svc_default, svc_prod, grant, vs_default, vs_prod],
-            options().with_source_namespaces(vec!["default".to_string(), "prod".to_string()]),
+            options()
+                .with_source_namespaces(vec!["default".to_string(), "prod".to_string()])
+                .with_pod_discovery_enabled(true),
         )
         .expect("translation succeeds");
         let default_proxy = result
