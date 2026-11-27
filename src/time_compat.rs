@@ -130,6 +130,18 @@ impl std::error::Error for TimestampError {}
 ///
 /// Every non-leap value is unaffected, so database text and other encodings
 /// stay byte-identical.
+///
+/// # Years outside `-9999..=9999` (issue #7419 owner decision)
+///
+/// chrono's `DateTime<Utc>` spans years `-262143..=262142`; `UtcTimestamp`
+/// does not, and does not rely on `time`'s `large-dates` feature. The
+/// chrono-compatible parsers still accept exactly what chrono accepts (for
+/// example `9999-12-31T23:30:00-01:00`, an RFC 2822 date in year 12345, or
+/// the relaxed `+12345-01-01T00:00:00Z`), but converting a value whose UTC
+/// instant falls outside this range fails with
+/// [`TimestampError::OutOfRange`]. Each call site reports that as its normal
+/// parse or validation error; nothing is clamped. Values inside the range are
+/// unaffected.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct UtcTimestamp(OffsetDateTime);
 

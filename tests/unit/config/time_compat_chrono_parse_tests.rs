@@ -574,3 +574,33 @@ fn leap_second_normalization_matches_chrono_nanos_and_documents_differences() {
         .unwrap();
     assert_eq!(plain.to_rfc3339(), "1999-12-31T23:59:59.500+00:00");
 }
+
+/// #7419 owner decision (option B for out-of-range years): chrono accepts
+/// these, the ports accept them identically, and conversion to
+/// `UtcTimestamp` refuses them because their UTC instant lies outside
+/// `-9999..=9999`.
+#[test]
+fn year_boundary_inputs_parse_like_chrono_but_do_not_convert() {
+    let strict = "9999-12-31T23:30:00-01:00";
+    assert!(DateTime::parse_from_rfc3339(strict).is_ok());
+    let parsed = parse_rfc3339_chrono(strict).expect("strict RFC 3339 accepts");
+    assert_eq!(parsed.to_utc_timestamp(), Err(TimestampError::OutOfRange));
+
+    let rfc2822 = "Mon, 26 Nov 12345 10:20:30 GMT";
+    assert!(DateTime::parse_from_rfc2822(rfc2822).is_ok());
+    let parsed = parse_rfc2822_chrono(rfc2822).expect("RFC 2822 accepts");
+    assert_eq!(parsed.year(), 12345);
+    assert_eq!(parsed.to_utc_timestamp(), Err(TimestampError::OutOfRange));
+
+    let relaxed = "+12345-01-01T00:00:00Z";
+    assert!(relaxed.parse::<DateTime<FixedOffset>>().is_ok());
+    let parsed = parse_rfc3339_relaxed_chrono(relaxed).expect("relaxed RFC 3339 accepts");
+    assert_eq!(parsed.to_utc_timestamp(), Err(TimestampError::OutOfRange));
+
+    // The nearest in-range neighbours still convert.
+    assert!(
+        parse_rfc3339_chrono("9999-12-31T23:30:00+00:00")
+            .and_then(|parsed| parsed.to_utc_timestamp())
+            .is_ok()
+    );
+}

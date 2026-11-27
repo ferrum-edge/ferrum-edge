@@ -59,9 +59,9 @@
 //! not evidence that two requests shared one.
 
 use crate::fips::approved::Sha256;
+use crate::time_compat::UtcTimestamp;
 use async_trait::async_trait;
 use bytes::Bytes;
-use chrono::{DateTime, NaiveDateTime, Utc};
 use dashmap::DashMap;
 use http::{HeaderName, Method};
 use serde::{Deserialize, Serialize};
@@ -987,8 +987,10 @@ fn age_header_value(age: Duration) -> String {
     age.as_secs().to_string()
 }
 
-fn duration_since_http_date(now: DateTime<Utc>, date: DateTime<Utc>) -> Duration {
-    now.signed_duration_since(date).to_std().unwrap_or_default()
+fn duration_since_http_date(now: UtcTimestamp, date: UtcTimestamp) -> Duration {
+    // A negative difference (date in the future) floors at zero, as chrono's
+    // `signed_duration_since(..).to_std()` did.
+    Duration::try_from(now - date).unwrap_or_default()
 }
 
 /// Plugin configuration.
@@ -2157,11 +2159,12 @@ impl ResponseCaching {
         duration_saturating_add(CACHE_CLOCK_EPOCH.elapsed(), self.clock_offset())
     }
 
-    fn now_wall(&self) -> DateTime<Utc> {
-        match chrono::Duration::from_std(self.clock_offset()) {
-            Ok(offset) => Utc::now() + offset,
-            Err(_) => Utc::now(),
-        }
+    fn now_wall(&self) -> UtcTimestamp {
+        let now = UtcTimestamp::now();
+        time::SignedDuration::try_from(self.clock_offset())
+            .ok()
+            .and_then(|offset| now.checked_add(offset))
+            .unwrap_or(now)
     }
 
     /// Build the base cache key: a canonical, length-framed digest over every
@@ -2961,7 +2964,7 @@ impl ResponseCaching {
     fn freshness_lifetime(
         &self,
         response_headers: &HashMap<String, String>,
-        response_time_wall: DateTime<Utc>,
+        response_time_wall: UtcTimestamp,
         directives: &CacheControlDirectives,
     ) -> Duration {
         if !self.config.respect_cache_control {
@@ -3008,7 +3011,7 @@ impl ResponseCaching {
         ctx: &RequestContext,
         response_headers: &HashMap<String, String>,
         response_time_monotonic: Duration,
-        response_time_wall: DateTime<Utc>,
+        response_time_wall: UtcTimestamp,
     ) -> Duration {
         let apparent_age = header_value(response_headers, "date")
             .and_then(parse_http_date)
@@ -3425,9 +3428,13 @@ fn if_none_match_matches(if_none_match: &str, etag: Option<&str>) -> bool {
 /// against legacy origins and clients instead of silently serving a full
 /// `200` from cache. Each fixed-offset format is interpreted as UTC, matching
 /// the obsolete `GMT` zone these formats always use.
-pub(crate) fn parse_http_date(value: &str) -> Option<DateTime<Utc>> {
-    if let Ok(dt) = DateTime::parse_from_rfc2822(value) {
-        return Some(dt.with_timezone(&Utc));
+pub(crate) fn parse_http_date(value: &str) -> Option<UtcTimestamp> {
+    // chrono-compatible parsers (issue #7419): exactly the inputs chrono
+    // accepted. A leap second is normalized; an instant outside
+    // `UtcTimestamp`'s ±9999-year range is treated as unparseable, like any
+    // invalid date.
+    if let Ok(parsed) = crate::time_compat::parse_rfc2822_chrono(value) {
+        return parsed.to_utc_timestamp().ok();
     }
     // IMF-fixdate (e.g. `Sun, 06 Nov 1994 08:49:37 GMT`), RFC 850
     // (`Sunday, 06-Nov-94 08:49:37 GMT`), then asctime
@@ -3439,8 +3446,8 @@ pub(crate) fn parse_http_date(value: &str) -> Option<DateTime<Utc>> {
         "%a %b %e %H:%M:%S %Y",
     ];
     for format in FORMATS {
-        if let Ok(naive) = NaiveDateTime::parse_from_str(value, format) {
-            return Some(naive.and_utc());
+        if let Ok(naive) = crate::time_compat::parse_naive_from_str_chrono(value, format) {
+            return naive.to_utc_timestamp().ok();
         }
     }
     None
