@@ -26,9 +26,10 @@
 #   - `ferrum-cp` — a Ferrum CONTROL PLANE (FERRUM_MODE=cp, sqlite on an
 #     emptyDir) whose K8s controller (pod discovery: Pods/Services/
 #     EndpointSlices in this namespace only; Istio CRD watching ON for the
-#     two installed kinds, VirtualService and DestinationRule; Gateway API
-#     CRD watching disabled) builds the mesh model from the cluster's REAL
-#     Services, pods and VirtualServices — the only path that populates
+#     three installed kinds, VirtualService, DestinationRule and
+#     PeerAuthentication; Gateway API CRD watching disabled) builds the mesh
+#     model from the cluster's REAL Services, pods and Istio objects — the
+#     only path that populates
 #     `GatewayConfig.mesh` on a CP
 #     (src/config_sources/k8s/mod.rs) — and serves it over the native
 #     `MeshConfigSync.MeshSubscribe` gRPC stream (src/grpc/mesh_server.rs) on
@@ -59,7 +60,8 @@
 # The live VirtualService http[] split gate (issue #7502) adds a native
 # client and two native destinations, all subscribed to that same CP:
 #
-#   - `vs-client` — a Sidecar (topology=sidecar, outbound :15001) on
+#   - `vs-client` — a Sidecar (topology=sidecar, outbound :15001 with an
+#     init container that REDIRECTs the pod's outbound TCP into it) on
 #     FERRUM_MESH_CONFIG_PROTOCOL=native. A file-source client cannot carry
 #     the gateway proxies/upstreams a VirtualService http[] route translates
 #     into, so the split is only reachable through a CP-delivered slice: the
@@ -67,7 +69,8 @@
 #     sidecar_http_routes) and applies them client-side.
 #   - `vssvc-v1` / `vssvc-v2` — capp-shaped native destinations with their
 #     own identities and distinct echo markers (`vs-backend-v1` /
-#     `vs-backend-v2`).
+#     `vs-backend-v2`), STRICT through a selector-scoped PeerAuthentication
+#     (label vs-split-backend=true) that run.sh applies via the control plane.
 #   - `vssvc` — a frontend Service whose selector matches NO pod (one pod
 #     backs exactly one Service, so it cannot also select the v1/v2 pods).
 #     run.sh applies a VirtualService on its host with a header-match rule
@@ -646,8 +649,8 @@ spec:
 # write path for the mesh block. The controller here is scoped to THIS
 # namespace (CpScope::Single derives the watch scope when
 # FERRUM_K8S_WATCH_NAMESPACES is unset): pod discovery, plus Istio CRD watching
-# for the kinds this cluster installs (VirtualService and DestinationRule,
-# from tests/fixtures/k8s/). Istio CRDs are also watched in the Istio root
+# for the kinds this cluster installs (VirtualService, DestinationRule and
+# PeerAuthentication, from tests/fixtures/k8s/). Istio CRDs are also watched in the Istio root
 # namespace (istio-system), so a second Role grants exactly that read there.
 # Gateway-API and istio-root-namespace meshConfig watching stay disabled, so
 # the two Roles below are the complete RBAC surface. FERRUM_K8S_TRUST_DOMAIN must equal the
@@ -685,12 +688,20 @@ rules:
       - virtualservices
       - destinationrules
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["security.istio.io"]
+    resources:
+      - peerauthentications
+    verbs: ["get", "list", "watch"]
   # IstioStatusWriter: read the live status subresource, then merge-patch the
   # FerrumAccepted condition with a resourceVersion/UID precondition.
   - apiGroups: ["networking.istio.io"]
     resources:
       - virtualservices/status
       - destinationrules/status
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["security.istio.io"]
+    resources:
+      - peerauthentications/status
     verbs: ["get", "patch", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -726,6 +737,10 @@ rules:
     resources:
       - virtualservices
       - destinationrules
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["security.istio.io"]
+    resources:
+      - peerauthentications
     verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -865,12 +880,14 @@ spec:
             - name: FERRUM_K8S_WATCH_IDLE_RELIST_SECS
               value: "2"
             # Istio CRD watching is ON (issue #7502): run.sh installs the
-            # pinned VirtualService/DestinationRule CRDs before this pod
-            # starts, the Roles above grant exactly those kinds here and in
-            # istio-system, and the controller translates the split gate's
-            # VirtualService and writes its FerrumAccepted status. No Gateway
-            # API CRDs are installed: keep that watch disabled so reconcile
-            # startup never waits on a forbidden watcher.
+            # pinned VirtualService/DestinationRule/PeerAuthentication CRDs
+            # before this pod starts, the Roles above grant exactly those
+            # kinds here and in istio-system, and the controller translates
+            # the split gate's VirtualService and STRICT PeerAuthentication
+            # and writes their FerrumAccepted status. Gateway API watching
+            # stays disabled (only the ReferenceGrant CRD is installed, and
+            # no Role grants it) so reconcile startup never waits on a
+            # forbidden watcher.
             - name: FERRUM_K8S_WATCH_ISTIO_CRDS
               value: "true"
             - name: FERRUM_K8S_WATCH_GATEWAY_API_CRDS
@@ -1493,12 +1510,13 @@ spec:
 ---
 # ── VirtualService http[] split gate (issue #7502) ──────────────────────────
 # vssvc-v1 / vssvc-v2: capp-shaped native-MeshSubscribe destinations (inbound
-# REDIRECT 8080 -> :15006, SPIRE identity, PERMISSIVE inbound because no
-# PeerAuthentication CRD is installed) answering fixed markers
-# `vs-backend-v1` / `vs-backend-v2`. The client's split legs still dial them
-# over SVID-mTLS pinned to each workload identity: a Sidecar mesh.mtls target
-# has no plaintext fallback. Each Service is backed by exactly one pod with
-# its own service account.
+# REDIRECT 8080 -> :15006, SPIRE identity) answering fixed markers
+# `vs-backend-v1` / `vs-backend-v2`. Their inbound is STRICT: run.sh applies a
+# PeerAuthentication selecting `vs-split-backend: "true"` through the control
+# plane before these pods start, so a leg can only answer a dialer that
+# presents a trusted client SVID (run.sh also proves a certificate-less TLS
+# client is refused). Each Service is backed by exactly one pod with its own
+# service account.
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -1534,6 +1552,7 @@ spec:
     metadata:
       labels:
         app: vssvc-v1
+        vs-split-backend: "true"
         ferrum.io/mesh: enabled
     spec:
       serviceAccountName: vssvc-v1
@@ -1608,6 +1627,10 @@ spec:
               value: /run/spire/sockets/agent.sock
             - name: FERRUM_MESH_WORKLOAD_SPIFFE_ID
               value: spiffe://__TRUST_DOMAIN__/ns/__NAMESPACE__/sa/vssvc-v1
+            # The STRICT PeerAuthentication is applied before this pod starts;
+            # live reload also converges it if a slice ever lands first.
+            - name: FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED
+              value: "true"
             - name: FERRUM_ADMIN_HTTP_PORT
               value: "15020"
             - name: FERRUM_POOL_WARMUP_ENABLED
@@ -1711,6 +1734,7 @@ spec:
     metadata:
       labels:
         app: vssvc-v2
+        vs-split-backend: "true"
         ferrum.io/mesh: enabled
     spec:
       serviceAccountName: vssvc-v2
@@ -1785,6 +1809,10 @@ spec:
               value: /run/spire/sockets/agent.sock
             - name: FERRUM_MESH_WORKLOAD_SPIFFE_ID
               value: spiffe://__TRUST_DOMAIN__/ns/__NAMESPACE__/sa/vssvc-v2
+            # The STRICT PeerAuthentication is applied before this pod starts;
+            # live reload also converges it if a slice ever lands first.
+            - name: FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED
+              value: "true"
             - name: FERRUM_ADMIN_HTTP_PORT
               value: "15020"
             - name: FERRUM_POOL_WARMUP_ENABLED
@@ -1876,9 +1904,14 @@ spec:
 ---
 # vs-client: a native-MeshSubscribe Sidecar CLIENT. It subscribes to ferrum-cp
 # over the same production mTLS + JWT channel as capp and, being a Sidecar,
-# requests the carried VirtualService http[] routes; the curl container drives
-# requests straight at the outbound capture listener (:15001) with the
-# frontend FQDN as Host, like the file-source client probes.
+# requests the carried VirtualService http[] routes. Its init container
+# installs the injector's OUTBOUND capture shape (src/capture/mod.rs): a
+# FERRUM_MESH_OUTBOUND nat chain jumped from OUTPUT that RETURNs pod-local
+# destinations and the proxy's own UID 1337, then REDIRECTs every other TCP
+# connection to :15001. The curl container therefore dials the frontend
+# Service exactly like an application (http://vssvc.<ns>.svc.cluster.local:8080/)
+# and reaches Ferrum only through real capture (SO_ORIGINAL_DST = the vssvc
+# ClusterIP:8080); the Sidecar's own CP, SPIRE and mesh-mTLS dials are exempt.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -1904,6 +1937,36 @@ spec:
       serviceAccountName: vs-client
       securityContext:
         fsGroup: 1337
+      initContainers:
+        - name: ferrum-edge-init
+          image: alpine:3.21
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["NET_ADMIN", "NET_RAW"]
+          command: ["/bin/sh", "-c"]
+          # `set -e` fails the pod closed if the iptables install or any rule
+          # fails. Order matters: pod-local and proxy-UID RETURNs precede the
+          # catch-all REDIRECT, as in the injector's chain.
+          args:
+            - |
+              set -e
+              apk add --no-cache iptables
+              iptables -t nat -N FERRUM_MESH_OUTBOUND 2>/dev/null || true
+              iptables -t nat -C OUTPUT -p tcp -j FERRUM_MESH_OUTBOUND 2>/dev/null || \
+                iptables -t nat -A OUTPUT -p tcp -j FERRUM_MESH_OUTBOUND
+              iptables -t nat -C FERRUM_MESH_OUTBOUND -m addrtype --dst-type LOCAL -j RETURN 2>/dev/null || \
+                iptables -t nat -A FERRUM_MESH_OUTBOUND -m addrtype --dst-type LOCAL -j RETURN
+              iptables -t nat -C FERRUM_MESH_OUTBOUND -m owner --uid-owner 1337 -j RETURN 2>/dev/null || \
+                iptables -t nat -A FERRUM_MESH_OUTBOUND -m owner --uid-owner 1337 -j RETURN
+              iptables -t nat -C FERRUM_MESH_OUTBOUND -p tcp -j REDIRECT --to-ports 15001 2>/dev/null || \
+                iptables -t nat -A FERRUM_MESH_OUTBOUND -p tcp -j REDIRECT --to-ports 15001
+              echo "ferrum outbound capture installed (tcp -> 15001, uid 1337 + local exempt)"
+              iptables -t nat -L FERRUM_MESH_OUTBOUND -n
       containers:
         - name: ferrum-edge
           image: __IMAGE__

@@ -125,17 +125,22 @@ capabilities:
       - category: istio_virtual_service
         feature: headers.X.exact
     live_suite: mesh-e2e-sidecar
-    # Live backing: run.sh installs pinned VirtualService/DestinationRule
-    # CRDs, ferrum-cp watches them (FERRUM_K8S_WATCH_ISTIO_CRDS=true, namespaced
-    # RBAC) and writes FerrumAccepted=True on a kubectl-applied VirtualService
-    # whose header rule (x-canary: true) targets vssvc-v2 and whose fallback
-    # splits 90/10 across vssvc-v1/vssvc-v2. The native vs-client Sidecar
-    # receives the carried http routes over production mTLS + JWT
-    # MeshSubscribe and dials each leg over pinned SVID-mTLS. 1000 sequential
-    # requests must all answer from a leg with the v1 count in [830, 970]
-    # (false-failure probability ~4e-12 even under an independent Bernoulli
-    # model; 100/0 and 50/50 always fail), every x-canary: true request must
-    # reach vssvc-v2, and x-canary: false must fall through to the split.
+    # Live backing: run.sh installs pinned VirtualService, DestinationRule,
+    # PeerAuthentication (and ReferenceGrant) CRDs; ferrum-cp watches the Istio
+    # kinds (FERRUM_K8S_WATCH_ISTIO_CRDS=true, namespaced RBAC), enforces a
+    # selector-scoped STRICT PeerAuthentication on both split destinations, and
+    # writes FerrumAccepted=True on a kubectl-applied VirtualService whose
+    # header rule (x-canary: true) targets vssvc-v2 and whose fallback splits
+    # 90/10 across vssvc-v1/vssvc-v2. The native vs-client Sidecar receives the
+    # carried http routes over production mTLS + JWT MeshSubscribe; its curl
+    # dials http://vssvc.<ns>.svc.cluster.local:8080/ through real outbound
+    # iptables capture, and each leg is dialed over pinned SVID-mTLS (a
+    # certificate-less TLS client is refused by both destinations). 1000
+    # completed requests must all answer from a leg with the v1 count in
+    # [850, 950] (the design's 85-95%; false-failure probability ~2.8e-7 even
+    # under an independent Bernoulli model; 100/0, 50/50 and 96/4 fail), every
+    # x-canary: true request must reach vssvc-v2, and 1000 x-canary: false
+    # requests must fall through to the split inside the same window.
     live_assertions:
       - sidecar.virtual_service.weighted_split_90_10
       - sidecar.virtual_service.header_match_dispatch

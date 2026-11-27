@@ -2379,7 +2379,7 @@ fn live_contract_real_contract_declares_the_multicluster_suite_rows() {
     // ENFORCED and emitted by tests/k8s/multicluster-federation/run.sh.
     let contract = load_contract().expect("real contract loads");
     let multicluster_rows: Vec<_> = contract
-        .ga_capabilities()
+        .live_gated_capabilities()
         .into_iter()
         .filter(|capability| capability.live_suite == "multicluster-federation")
         .collect();
@@ -2481,8 +2481,10 @@ fn live_contract_multicluster_fixture_requires_exactly_the_enforced_rows() {
     );
 
     let contract = load_contract().expect("real contract loads");
+    // Every enrolled, non-deferred row is enforced whatever its maturity
+    // (issue #7502), so a non-GA multicluster row must be required here too.
     let contract_required: BTreeSet<&str> = contract
-        .ga_capabilities()
+        .live_gated_capabilities()
         .into_iter()
         .filter(|capability| {
             capability.live_suite == "multicluster-federation" && capability.live_deferred.is_none()
@@ -2491,7 +2493,7 @@ fn live_contract_multicluster_fixture_requires_exactly_the_enforced_rows() {
         .collect();
     assert!(
         !contract_required.is_empty(),
-        "the multicluster-federation suite must have enforced GA contract rows"
+        "the multicluster-federation suite must have enforced contract rows"
     );
 
     let missing_in_fixture: Vec<&&str> = contract_required.difference(&fixture_required).collect();
@@ -2581,8 +2583,10 @@ fn live_contract_multicluster_release_gate_requires_exactly_the_enforced_rows() 
     );
 
     let contract = load_contract().expect("real contract loads");
+    // Every enrolled, non-deferred row is enforced whatever its maturity
+    // (issue #7502), so a non-GA multicluster row must be required here too.
     let contract_required: BTreeSet<&str> = contract
-        .ga_capabilities()
+        .live_gated_capabilities()
         .into_iter()
         .filter(|capability| {
             capability.live_suite == "multicluster-federation" && capability.live_deferred.is_none()
@@ -2591,7 +2595,7 @@ fn live_contract_multicluster_release_gate_requires_exactly_the_enforced_rows() 
         .collect();
     assert!(
         !contract_required.is_empty(),
-        "the multicluster-federation suite must have enforced GA contract rows"
+        "the multicluster-federation suite must have enforced contract rows"
     );
 
     let missing_in_workflow: Vec<&&str> =

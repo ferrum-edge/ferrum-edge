@@ -53,15 +53,18 @@ set -euo pipefail
 #                                               FerrumAccepted=True status)
 #                                               reaches the native vs-client
 #                                               Sidecar as carried http routes;
-#                                               1000 sequential requests split
-#                                               90/10 across vssvc-v1/vssvc-v2
-#                                               inside a binomial-safe window
+#                                               1000 CAPTURED requests to the
+#                                               frontend Service split 90/10
+#                                               (85-95% window) across two
+#                                               STRICT destinations that refuse
+#                                               a certificate-less TLS client
 #   sidecar.virtual_service.header_match_dispatch
 #                                               the same VirtualService's
 #                                               x-canary: true rule sends every
 #                                               request to vssvc-v2, while
-#                                               x-canary: false falls through
-#                                               to the split (control)
+#                                               1000 x-canary: false requests
+#                                               fall through to the split
+#                                               inside the same window
 #   sidecar.config.native_subscribe_delivered   a Ferrum CP (cp mode, sqlite,
 #                                               K8s pod discovery) serves the
 #                                               mesh model over native
@@ -199,34 +202,50 @@ DR_BACKEND_B_IP=""
 # has no backing pod, so only the carried VirtualService route can answer it;
 # the two legs answer fixed markers (manifests.yaml).
 VS_NAME="vssvc-split"
+VS_PEER_AUTH_NAME="vssvc-strict"
 VS_FRONTEND_HOST="vssvc.$NS.svc.cluster.local"
+# The probes dial the frontend Service like an application would: vs-client's
+# init container REDIRECTs its outbound TCP to the Sidecar's :15001 capture
+# listener (manifests.yaml), so the request reaches Ferrum only through real
+# outbound capture with SO_ORIGINAL_DST = the vssvc ClusterIP:8080.
+VS_FRONTEND_URL="http://$VS_FRONTEND_HOST:8080/"
 VS_V1_HOST="vssvc-v1.$NS.svc.cluster.local"
 VS_V2_HOST="vssvc-v2.$NS.svc.cluster.local"
 VS_V1_MARKER="vs-backend-v1"
 VS_V2_MARKER="vs-backend-v2"
-# 90/10 split sample size and acceptance window for the vssvc-v1 count.
+# 90/10 split sample size and acceptance window for the vssvc-v1 count: the
+# design's 85%..95% band, measured over 1000 requests.
 #
 # The bound is chosen so the gate is safe even if leg selection were an
 # independent Bernoulli(0.9) draw per request (Ferrum actually uses a
 # deterministic smooth weighted round robin over the split upstream, which
 # lands within a few requests of exactly 900 of 1000):
 #   X ~ Binomial(n=1000, p=0.9): mean 900, sd = sqrt(1000*0.9*0.1) = 9.49.
-#   Accept 830 <= X <= 970, i.e. -7.4 sd .. +7.4 sd.
-#   Exact binomial tails: P(X < 830) = 3.9e-12, P(X > 970) = 3.8e-18, so a
-#   correct 90/10 split fails this gate with probability ~4e-12 per run.
-#   A 100/0 split always fails (X = 1000 > 970, and no vssvc-v2 marker); a
-#   50/50 split has mean 500, sd 15.8, and P(X >= 830) is below 1e-90.
+#   Accept 850 <= X <= 950, i.e. -5.3 sd .. +5.3 sd.
+#   Exact binomial tails: P(X < 850) = 2.8e-7, P(X > 950) = 2.8e-9, so a
+#   correct 90/10 split fails this gate with probability ~2.8e-7 per sample.
+#   A 100/0 split always fails (X = 1000 > 950, and no vssvc-v2 marker); a
+#   50/50 split (mean 500, sd 15.8) cannot reach 850; an 80/20 split passes
+#   with probability 2.6e-5; a 96/4 split (X ~ 960) fails.
 VS_SPLIT_REQUESTS=1000
-VS_SPLIT_V1_MIN=830
-VS_SPLIT_V1_MAX=970
+VS_SPLIT_V1_MIN=850
+VS_SPLIT_V1_MAX=950
 # Header-match rule: every x-canary: true request must reach vssvc-v2. If
 # the rule were ignored, each request would follow the 90/10 split and all
-# 100 landing on vssvc-v2 has probability 0.1^100. Control: x-canary: false
-# must NOT match the exact rule, so those requests follow the split and at
-# least one of 20 reaches vssvc-v1 (all 20 on vssvc-v2 under a correct split
-# has probability 0.1^20 = 1e-20).
+# 100 landing on vssvc-v2 has probability 0.1^100.
 VS_HEADER_REQUESTS=100
-VS_HEADER_CONTROL_REQUESTS=20
+# Control: x-canary: false must NOT match the exact rule and must fall through
+# to the SAME 90/10 split, so it gets the same 1000-request sample and the same
+# [850, 950] window (a route pinned to either leg fails it). The split and the
+# control together fail a correct deployment with probability ~5.6e-7.
+VS_HEADER_CONTROL_REQUESTS=1000
+# Wall-clock budget for the whole split-gate probe (apply, status, STRICT
+# evidence, convergence, and all three samples). Each request is bounded by
+# curl -m 5, each sample stops as soon as it can no longer pass, and every
+# in-pod loop also stops at the deadline, so a hanging datapath costs at most
+# this long. A healthy run needs a few minutes (about 2100 requests).
+VS_PROBE_BUDGET_SECS=900
+VS_PROBE_DEADLINE=0
 JWT_ISSUER="mesh-e2e-issuer"
 JWT_KID="fixture-key"
 # The capp echo answers "<APP_BODY>-native" (manifests.yaml) so a native-leg
@@ -705,22 +724,34 @@ install_spire() {
   ferrum_spire_wait_ready "$CONTEXT" "$SPIRE_NS" 5m
 }
 
-# ── Istio CRDs (issue #7502) ────────────────────────────────────────────────
+# ── CRDs (issue #7502) ──────────────────────────────────────────────────────
 #
 # Pinned, offline structural CRDs (tests/fixtures/k8s/), installed and
 # Established BEFORE ferrum-cp starts so its first CRD discovery pass already
-# sees networking.istio.io and starts the VirtualService/DestinationRule
-# watchers (no 300s reprobe wait). Only these two kinds are installed; the
-# controller skips every Istio kind the cluster does not serve.
+# sees networking.istio.io / security.istio.io and starts the VirtualService,
+# DestinationRule and PeerAuthentication watchers (no 300s reprobe wait).
+# Only these Istio kinds are installed; the controller skips every Istio kind
+# the cluster does not serve. The Gateway API ReferenceGrant CRD is installed
+# too so the cluster can hold ReferenceGrant objects, but ferrum-cp keeps
+# Gateway API watching off (the split gate is same-namespace).
+SUITE_CRD_FIXTURES=(
+  istio_virtualservice_crd:virtualservices.networking.istio.io
+  istio_destinationrule_crd:destinationrules.networking.istio.io
+  istio_peerauthentication_crd:peerauthentications.security.istio.io
+  gateway_api_referencegrant_crd:referencegrants.gateway.networking.k8s.io
+)
+
 install_istio_crds() {
-  log "installing pinned Istio VirtualService + DestinationRule CRDs"
-  local crd
-  for crd in istio_virtualservice_crd istio_destinationrule_crd; do
-    kubectl --context "$CONTEXT" apply -f "$ROOT_DIR/tests/fixtures/k8s/$crd.yaml"
+  log "installing pinned VirtualService, DestinationRule, PeerAuthentication and ReferenceGrant CRDs"
+  local entry fixture crd
+  local -a crds=()
+  for entry in "${SUITE_CRD_FIXTURES[@]}"; do
+    fixture="${entry%%:*}"
+    crd="${entry#*:}"
+    kubectl --context "$CONTEXT" apply -f "$ROOT_DIR/tests/fixtures/k8s/$fixture.yaml"
+    crds+=("crd/$crd")
   done
-  kubectl --context "$CONTEXT" wait --for=condition=Established \
-    crd/virtualservices.networking.istio.io \
-    crd/destinationrules.networking.istio.io --timeout=60s
+  kubectl --context "$CONTEXT" wait --for=condition=Established "${crds[@]}" --timeout=60s
 }
 
 register_spire_workloads() {
@@ -1664,12 +1695,13 @@ else:
 # The VirtualService is applied as a real Kubernetes object: ferrum-cp's CRD
 # watcher translates it into carried http routes, writes FerrumAccepted on
 # its status, and serves the routes over native MeshSubscribe to the
-# vs-client Sidecar, which applies them on its outbound listener and dials
-# each leg over SVID-mTLS. Applied here, after every native-transport proof
-# above has already been recorded against a CP with no VirtualService.
-# (No backticks in this heredoc: it interpolates.)
+# vs-client Sidecar, which applies them on its captured outbound listener and
+# dials each leg over SVID-mTLS to a STRICT destination. The probe runs after
+# every original assertion of this suite has been recorded and is bounded by
+# VS_PROBE_BUDGET_SECS, so it can never starve them of the job budget.
+# (No backticks in these heredocs: they interpolate.)
 apply_vs_split() {
-  kubectl --context "$CONTEXT" apply -f - <<YAML
+  kubectl --context "$CONTEXT" --request-timeout=60s apply -f - <<YAML
 apiVersion: networking.istio.io/v1
 kind: VirtualService
 metadata:
@@ -1702,6 +1734,36 @@ spec:
 YAML
 }
 
+# Selector-scoped STRICT PeerAuthentication for both split destinations
+# (label vs-split-backend=true, manifests.yaml), applied through the control
+# plane BEFORE the workloads exist so the destinations' first CP-delivered
+# slice already resolves STRICT. Nothing else in the namespace selects it:
+# capp and every file-source workload keep their documented posture.
+apply_vs_peer_authentication() {
+  log "applying selector-scoped STRICT PeerAuthentication for the split destinations"
+  kubectl --context "$CONTEXT" --request-timeout=60s apply -f - <<YAML
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: $VS_PEER_AUTH_NAME
+  namespace: $NS
+spec:
+  selector:
+    matchLabels:
+      vs-split-backend: "true"
+  mtls:
+    mode: STRICT
+YAML
+}
+
+# Seconds left in the split-gate budget (never negative).
+vs_remaining() {
+  local left
+  left=$(( VS_PROBE_DEADLINE - $(date +%s) ))
+  (( left < 0 )) && left=0
+  printf '%s' "$left"
+}
+
 # Poll the VirtualService status until ferrum-cp has written FerrumAccepted.
 # Echoes "accepted <detail>" when the condition is True AND the translation
 # detail reports the mesh http[] route scope; otherwise the last observation.
@@ -1709,7 +1771,8 @@ wait_for_vs_accepted() {
   local json verdict _
   verdict="status-never-read"
   for _ in $(seq 1 60); do
-    json="$(kubectl --context "$CONTEXT" -n "$NS" get \
+    (( $(vs_remaining) > 0 )) || { verdict="deadline-before-status $verdict"; break; }
+    json="$(timeout 20 kubectl --context "$CONTEXT" -n "$NS" get \
       "virtualservices.networking.istio.io/$VS_NAME" -o json 2>/dev/null || true)"
     printf '%s\n' "$json" > "$RESULTS_DIR/vs-split-status.txt"
     verdict="$(printf '%s' "$json" | python3 -c '
@@ -1747,119 +1810,224 @@ else:
   printf '%s' "$verdict"
 }
 
-# Retry a vs-client request (optional extra header) until it answers 200 with
-# one of the accepted markers ("m1|m2" or a single marker). Echoes the final
-# "<status>\t<body>".
-vs_settle() {
-  local header="$1" accept="$2"
+# STRICT evidence for one split destination: a TLS client WITHOUT a client
+# certificate dials the destination pod's :15006 inbound listener directly
+# (from the file-source client pod, which has no outbound capture). Under
+# STRICT the destination requires a client certificate, so curl must fail at
+# the TLS layer with no HTTP status (see vs_certless_rejected). Under
+# PERMISSIVE the same request completes and returns an HTTP status, which
+# fails this check. Echoes "<curl exit>\t<http code>\t<first error line>".
+vs_certless_probe() {
+  local pod_ip="$1" authority="$2"
   # shellcheck disable=SC2016
-  kubectl --context "$CONTEXT" -n "$NS" exec deploy/vs-client -c curl -- \
+  timeout 30 kubectl --context "$CONTEXT" -n "$NS" exec deploy/client -c curl -- \
     sh -c '
-      host="$1"; header="$2"; accept="$3"
-      out=000
-      body=""
-      for _ in $(seq 1 90); do
+      ip="$1"; authority="$2"
+      rc=0
+      code="$(curl -sS -k -m 5 -o /dev/null -w "%{http_code}" \
+        -H "Host: $authority" "https://$ip:15006/" 2>/tmp/certless.err)" || rc=$?
+      [ -n "$code" ] || code=000
+      err="$(head -n 1 /tmp/certless.err 2>/dev/null | tr -d "\t\r" | cut -c1-160)"
+      printf "%s\t%s\t%s\n" "$rc" "$code" "$err"
+    ' sh "$pod_ip" "$authority" 2>/dev/null || printf 'EXECFAIL\t000\texec-failed\n'
+}
+
+vs_certless_rejected() {
+  local out="$1" rc code
+  rc="${out%%$'\t'*}"
+  code="${out#*$'\t'}"
+  code="${code%%$'\t'*}"
+  # Accepted TLS-layer refusals: 35 (handshake failure), 56 (receive failure:
+  # the TLS 1.3 certificate_required alert or a reset on the first read), 52
+  # (the server closed the TLS session without an HTTP reply) and 16 (the
+  # alert surfaced through the HTTP/2 layer). Connect failures (7) and
+  # timeouts (28) do not count: they would not prove the listener refused a
+  # certificate-less peer.
+  [[ "$code" == "000" && ( "$rc" == "16" || "$rc" == "35" || "$rc" == "52" || "$rc" == "56" ) ]]
+}
+
+# Retry a captured vs-client request (optional extra header) until curl
+# completes the transfer with 200 and one of the accepted markers ("m1|m2" or
+# a single marker), or the remaining budget runs out. Echoes the final
+# "<curl exit>\t<status>\t<body>".
+vs_settle() {
+  local header="$1" accept="$2" budget
+  budget="$(vs_remaining)"
+  (( budget > 0 )) || { printf 'DEADLINE\t000\t\n'; return 0; }
+  # shellcheck disable=SC2016
+  timeout "$(( budget + 15 ))" kubectl --context "$CONTEXT" -n "$NS" exec deploy/vs-client -c curl -- \
+    sh -c '
+      url="$1"; header="$2"; accept="$3"; budget="$4"
+      end=$(( $(date +%s) + budget ))
+      rc=-1; out=000; body=""
+      while [ "$(date +%s)" -lt "$end" ]; do
         : >/tmp/vss 2>/dev/null || true
+        rc=0
         if [ -n "$header" ]; then
-          out="$(curl -s -m 5 -o /tmp/vss -w "%{http_code}" \
-            -H "Host: $host" -H "$header" http://127.0.0.1:15001/ 2>/dev/null || true)"
+          out="$(curl -s -m 5 -o /tmp/vss -w "%{http_code}" -H "$header" "$url" 2>/dev/null)" || rc=$?
         else
-          out="$(curl -s -m 5 -o /tmp/vss -w "%{http_code}" \
-            -H "Host: $host" http://127.0.0.1:15001/ 2>/dev/null || true)"
+          out="$(curl -s -m 5 -o /tmp/vss -w "%{http_code}" "$url" 2>/dev/null)" || rc=$?
         fi
         [ -n "$out" ] || out=000
         body="$(tr -d "\r\n\t" </tmp/vss 2>/dev/null || true)"
-        if [ "$out" = "200" ]; then
+        if [ "$rc" = "0" ] && [ "$out" = "200" ]; then
           case "|$accept|" in
             *"|$body|"*)
-              printf "%s\t%s\n" "$out" "$body"
+              printf "%s\t%s\t%s\n" "$rc" "$out" "$body"
               exit 0
               ;;
           esac
         fi
         sleep 2
       done
-      printf "%s\t%s\n" "$out" "$body"
-    ' sh "$VS_FRONTEND_HOST" "$header" "$accept" 2>/dev/null || printf 'EXECFAIL\t\n'
+      printf "%s\t%s\t%s\n" "$rc" "$out" "$body"
+    ' sh "$VS_FRONTEND_URL" "$header" "$accept" "$budget" 2>/dev/null \
+    || printf 'EXECFAIL\t000\t\n'
 }
 
-# Issue N sequential vs-client requests (optional extra header) and classify
-# each by exact body: "1" = 200 + vssvc-v1 marker, "2" = 200 + vssvc-v2
-# marker, "x" = anything else. Echoes
-# "<v1>\t<v2>\t<other>\t<first other status:body>\t<sequence>".
+vs_settled() {
+  local out="$1"
+  [[ "${out%%$'\t'*}" == "0" && "$(printf '%s' "$out" | cut -f2)" == "200" ]]
+}
+
+# Issue up to N sequential captured vs-client requests (optional extra header)
+# and classify each by curl exit + status + exact body: "1" = a completed
+# 200 transfer with the vssvc-v1 marker, "2" = the vssvc-v2 marker, "x" =
+# anything else (including a transfer error). The sample STOPS as soon as it
+# can no longer pass: on the first "x", when the v1 count exceeds v1_max, when
+# the v2 count exceeds n - v1_min, or at the budget deadline. Echoes
+# "<v1>\t<v2>\t<other>\t<issued>\t<stop reason>\t<first other>\t<sequence>".
 vs_sample() {
-  local n="$1" header="$2"
+  local n="$1" header="$2" v1_min="$3" v1_max="$4" budget
+  budget="$(vs_remaining)"
+  (( budget > 0 )) || { printf '0\t0\t0\t0\tdeadline\t\t\n'; return 0; }
   # shellcheck disable=SC2016
-  kubectl --context "$CONTEXT" -n "$NS" exec deploy/vs-client -c curl -- \
+  timeout "$(( budget + 15 ))" kubectl --context "$CONTEXT" -n "$NS" exec deploy/vs-client -c curl -- \
     sh -c '
-      host="$1"; n="$2"; header="$3"; m1="$4"; m2="$5"
-      v1=0; v2=0; other=0; first=""; sequence=""
-      i=0
+      url="$1"; n="$2"; header="$3"; m1="$4"; m2="$5"; v1min="$6"; v1max="$7"; budget="$8"
+      end=$(( $(date +%s) + budget ))
+      v1=0; v2=0; other=0; i=0; stop=complete; first=""; sequence=""
       while [ "$i" -lt "$n" ]; do
+        if [ "$(date +%s)" -ge "$end" ]; then stop=deadline; break; fi
         i=$((i + 1))
         : >/tmp/vsb 2>/dev/null || true
+        rc=0
         if [ -n "$header" ]; then
-          code="$(curl -s -m 5 -o /tmp/vsb -w "%{http_code}" \
-            -H "Host: $host" -H "$header" http://127.0.0.1:15001/ 2>/dev/null || true)"
+          code="$(curl -s -m 5 -o /tmp/vsb -w "%{http_code}" -H "$header" "$url" 2>/dev/null)" || rc=$?
         else
-          code="$(curl -s -m 5 -o /tmp/vsb -w "%{http_code}" \
-            -H "Host: $host" http://127.0.0.1:15001/ 2>/dev/null || true)"
+          code="$(curl -s -m 5 -o /tmp/vsb -w "%{http_code}" "$url" 2>/dev/null)" || rc=$?
         fi
         [ -n "$code" ] || code=000
         body="$(tr -d "\r\n\t" </tmp/vsb 2>/dev/null || true)"
-        if [ "$code" = "200" ] && [ "$body" = "$m1" ]; then
+        if [ "$rc" = "0" ] && [ "$code" = "200" ] && [ "$body" = "$m1" ]; then
           v1=$((v1 + 1)); sequence="${sequence}1"
-        elif [ "$code" = "200" ] && [ "$body" = "$m2" ]; then
+        elif [ "$rc" = "0" ] && [ "$code" = "200" ] && [ "$body" = "$m2" ]; then
           v2=$((v2 + 1)); sequence="${sequence}2"
         else
           other=$((other + 1)); sequence="${sequence}x"
-          [ -n "$first" ] || first="$code:$(printf "%s" "$body" | cut -c1-120)"
+          first="rc=$rc:$code:$(printf "%s" "$body" | cut -c1-120)"
+          stop=unexpected-response; break
         fi
+        if [ "$v1" -gt "$v1max" ]; then stop=v1-above-max; break; fi
+        if [ "$v2" -gt $((n - v1min)) ]; then stop=v2-above-max; break; fi
       done
-      printf "%s\t%s\t%s\t%s\t%s\n" "$v1" "$v2" "$other" "$first" "$sequence"
-    ' sh "$VS_FRONTEND_HOST" "$n" "$header" "$VS_V1_MARKER" "$VS_V2_MARKER" \
-    2>/dev/null || printf 'EXECFAIL\t0\t0\texec-failed\t\n'
+      printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$v1" "$v2" "$other" "$i" "$stop" "$first" "$sequence"
+    ' sh "$VS_FRONTEND_URL" "$n" "$header" "$VS_V1_MARKER" "$VS_V2_MARKER" "$v1_min" "$v1_max" "$budget" \
+    2>/dev/null || printf '0\t0\t0\t0\texec-failed\t\t\n'
 }
 
 # JWT-authenticated /mesh/config-drift of the vs-client Sidecar (admin API
-# binds loopback, so the curl runs inside the pod). Diagnostics only.
+# binds loopback, which the capture chain RETURNs, so the curl runs inside
+# the pod). Diagnostics only.
 dump_vs_client_config_drift() {
   local admin_token
   admin_token="$(mint_admin_jwt)"
   # shellcheck disable=SC2016
-  kubectl --context "$CONTEXT" -n "$NS" exec deploy/vs-client -c curl -- \
+  timeout 30 kubectl --context "$CONTEXT" -n "$NS" exec deploy/vs-client -c curl -- \
     sh -c 'curl -s -m 10 -H "Authorization: Bearer $1" http://127.0.0.1:15020/mesh/config-drift' \
     sh "$admin_token" > "$RESULTS_DIR/vs-client-config-drift.txt" 2>/dev/null || true
 }
 
-# Two assertions, both always recorded:
+record_vs_split_failure_both() {
+  local reason="$1" diagnostics="$2"
+  log "VirtualService split gate prerequisite failed: $reason"
+  printf 'prerequisite failed: %s\n' "$reason" >>"$diagnostics"
+  record_live_assertion sidecar.virtual_service.weighted_split_90_10 fail \
+    vs-client "vssvc-v1+vssvc-v2" "$reason" "$(basename "$diagnostics")"
+  record_live_assertion sidecar.virtual_service.header_match_dispatch fail \
+    vs-client vssvc-v2 "$reason" "$(basename "$diagnostics")"
+  dump_vs_client_config_drift
+  cat "$diagnostics" >&2
+}
+
+# Split one vs_sample line into the VS_S_* fields.
+vs_parse_sample() {
+  local out="$1"
+  # cut keeps empty fields in place (IFS tab splitting would collapse them).
+  VS_S_V1="$(printf '%s' "$out" | cut -f1)"
+  VS_S_V2="$(printf '%s' "$out" | cut -f2)"
+  VS_S_OTHER="$(printf '%s' "$out" | cut -f3)"
+  VS_S_ISSUED="$(printf '%s' "$out" | cut -f4)"
+  VS_S_STOP="$(printf '%s' "$out" | cut -f5)"
+  VS_S_FIRST="$(printf '%s' "$out" | cut -f6)"
+  VS_S_SEQ="$(printf '%s' "$out" | cut -f7)"
+}
+
+# A sample passes only when every request was issued and completed with one
+# of the two markers and the vssvc-v1 count is inside [min, max].
+vs_sample_passes() {
+  local n="$1" v1_min="$2" v1_max="$3"
+  [[ "$VS_S_STOP" == "complete" && "$VS_S_ISSUED" == "$n" && "$VS_S_OTHER" == "0" \
+    && "$VS_S_V1" =~ ^[0-9]+$ && "$VS_S_V2" =~ ^[0-9]+$ ]] \
+    && (( VS_S_V1 + VS_S_V2 == n && VS_S_V1 >= v1_min && VS_S_V1 <= v1_max ))
+}
+
+# Two assertions, both always recorded (immediately, if a prerequisite fails):
 #   sidecar.virtual_service.weighted_split_90_10
 #     FerrumAccepted=True (with the sidecar_and_node_waypoint route scope) on
-#     the applied VirtualService, the route converged on vs-client, and
-#     VS_SPLIT_REQUESTS sequential requests without the canary header all
-#     answer 200 from one of the two legs with the vssvc-v1 count inside
+#     the applied VirtualService; both split destinations refuse a TLS client
+#     without a certificate (STRICT, so every 200 below required vs-client's
+#     SVID); the route converged on vs-client; and VS_SPLIT_REQUESTS captured
+#     requests to the frontend Service without the canary header all complete
+#     with 200 from one of the two legs, with the vssvc-v1 count inside
 #     [VS_SPLIT_V1_MIN, VS_SPLIT_V1_MAX] (math at the constants above).
 #   sidecar.virtual_service.header_match_dispatch
-#     every one of VS_HEADER_REQUESTS x-canary: true requests answers 200
-#     from vssvc-v2, and the x-canary: false control falls through to the
-#     split (at least one vssvc-v1 answer, no non-200 or unknown body).
+#     every one of VS_HEADER_REQUESTS x-canary: true requests completes with
+#     200 from vssvc-v2, and VS_HEADER_CONTROL_REQUESTS x-canary: false
+#     requests fall through to the split inside the same window.
 probe_virtual_service_http_routes() {
   local diagnostics="$RESULTS_DIR/vs-split.txt"
   : >"$diagnostics"
-  log "probing the VirtualService http[] split gate (vs-client -> vssvc-v1/vssvc-v2 via CP-served carried routes)"
+  VS_PROBE_DEADLINE=$(( $(date +%s) + VS_PROBE_BUDGET_SECS ))
+  log "probing the VirtualService http[] split gate (captured vs-client -> $VS_FRONTEND_URL; budget ${VS_PROBE_BUDGET_SECS}s)"
 
-  local apply_ok=true
   if ! apply_vs_split >>"$diagnostics" 2>&1; then
-    apply_ok=false
+    record_vs_split_failure_both "virtualservice-apply-failed" "$diagnostics"
+    return 1
   fi
-  local status_verdict="not-applied"
-  if [[ "$apply_ok" == "true" ]]; then
-    status_verdict="$(wait_for_vs_accepted)"
-  fi
+  local status_verdict
+  status_verdict="$(wait_for_vs_accepted)"
   log "VirtualService $VS_NAME status: $status_verdict"
   printf 'status: %s\n' "$status_verdict" >>"$diagnostics"
-  local status_ok=false
-  [[ "$status_verdict" == accepted* ]] && status_ok=true
+  if [[ "$status_verdict" != accepted* ]]; then
+    record_vs_split_failure_both "status=$status_verdict" "$diagnostics"
+    return 1
+  fi
+
+  local v1_ip v2_ip strict_v1 strict_v2
+  v1_ip="$(wait_for_pod_ip vssvc-v1 2>/dev/null || true)"
+  v2_ip="$(wait_for_pod_ip vssvc-v2 2>/dev/null || true)"
+  strict_v1="$(vs_certless_probe "$v1_ip" "vssvc-v1.$NS.svc:8080")"
+  strict_v2="$(vs_certless_probe "$v2_ip" "vssvc-v2.$NS.svc:8080")"
+  printf 'strict certless vssvc-v1 (%s): %s\nstrict certless vssvc-v2 (%s): %s\n' \
+    "$v1_ip" "$strict_v1" "$v2_ip" "$strict_v2" >>"$diagnostics"
+  log "VS STRICT evidence (rc/code/error): v1=${strict_v1//$'\t'/ | } v2=${strict_v2//$'\t'/ | }"
+  if ! vs_certless_rejected "$strict_v1" || ! vs_certless_rejected "$strict_v2"; then
+    record_vs_split_failure_both \
+      "split destinations not STRICT: certless TLS v1=${strict_v1//$'\t'/ } v2=${strict_v2//$'\t'/ }" \
+      "$diagnostics"
+    return 1
+  fi
 
   # Convergence: the header rule answering from vssvc-v2 proves the carried
   # route reached vs-client (the unbacked frontend has no Service route of
@@ -1867,73 +2035,57 @@ probe_virtual_service_http_routes() {
   local settle_header settle_split
   settle_header="$(vs_settle "x-canary: true" "$VS_V2_MARKER")"
   settle_split="$(vs_settle "" "$VS_V1_MARKER|$VS_V2_MARKER")"
-  log "VS settle: canary=${settle_header//$'\t'/ } split=${settle_split//$'\t'/ }"
+  log "VS settle (rc/status/body): canary=${settle_header//$'\t'/ } split=${settle_split//$'\t'/ }"
   printf 'settle-canary: %s\nsettle-split: %s\n' "$settle_header" "$settle_split" >>"$diagnostics"
-
-  local out rest v1 v2 other first sequence
-  out="$(vs_sample "$VS_SPLIT_REQUESTS" "")"
-  v1="${out%%$'\t'*}"; rest="${out#*$'\t'}"
-  v2="${rest%%$'\t'*}"; rest="${rest#*$'\t'}"
-  other="${rest%%$'\t'*}"; rest="${rest#*$'\t'}"
-  first="${rest%%$'\t'*}"; sequence="${rest#*$'\t'}"
-  printf 'split n=%s v1=%s v2=%s other=%s first_other=%s\nsplit sequence: %s\n' \
-    "$VS_SPLIT_REQUESTS" "$v1" "$v2" "$other" "$first" "$sequence" >>"$diagnostics"
-  log "VS split: n=$VS_SPLIT_REQUESTS v1=$v1 v2=$v2 other=$other first_other=$first (accept v1 in [$VS_SPLIT_V1_MIN,$VS_SPLIT_V1_MAX])"
-
-  local split_ok=false
-  if [[ "$status_ok" == "true" && "$v1" =~ ^[0-9]+$ && "$v2" =~ ^[0-9]+$ \
-    && "$other" == "0" ]] \
-    && (( v1 + v2 == VS_SPLIT_REQUESTS && v1 >= VS_SPLIT_V1_MIN \
-      && v1 <= VS_SPLIT_V1_MAX && v2 >= 1 )); then
-    split_ok=true
+  if ! vs_settled "$settle_header" || ! vs_settled "$settle_split"; then
+    record_vs_split_failure_both \
+      "route did not converge: canary=${settle_header//$'\t'/ } split=${settle_split//$'\t'/ }" \
+      "$diagnostics"
+    return 1
   fi
 
-  local c_out c_v1 c_v2 c_other c_first n_out n_v1 n_v2 n_other n_first
-  c_out="$(vs_sample "$VS_HEADER_REQUESTS" "x-canary: true")"
-  c_v1="${c_out%%$'\t'*}"; rest="${c_out#*$'\t'}"
-  c_v2="${rest%%$'\t'*}"; rest="${rest#*$'\t'}"
-  c_other="${rest%%$'\t'*}"; rest="${rest#*$'\t'}"
-  c_first="${rest%%$'\t'*}"
-  n_out="$(vs_sample "$VS_HEADER_CONTROL_REQUESTS" "x-canary: false")"
-  n_v1="${n_out%%$'\t'*}"; rest="${n_out#*$'\t'}"
-  n_v2="${rest%%$'\t'*}"; rest="${rest#*$'\t'}"
-  n_other="${rest%%$'\t'*}"; rest="${rest#*$'\t'}"
-  n_first="${rest%%$'\t'*}"
-  printf 'canary n=%s v1=%s v2=%s other=%s first_other=%s\n' \
-    "$VS_HEADER_REQUESTS" "$c_v1" "$c_v2" "$c_other" "$c_first" >>"$diagnostics"
-  printf 'control(x-canary: false) n=%s v1=%s v2=%s other=%s first_other=%s\n' \
-    "$VS_HEADER_CONTROL_REQUESTS" "$n_v1" "$n_v2" "$n_other" "$n_first" >>"$diagnostics"
-  log "VS header match: canary v1=$c_v1 v2=$c_v2 other=$c_other; control v1=$n_v1 v2=$n_v2 other=$n_other"
+  local split_ok=false header_ok=false
+  local split_summary canary_summary control_summary
+  vs_parse_sample "$(vs_sample "$VS_SPLIT_REQUESTS" "" "$VS_SPLIT_V1_MIN" "$VS_SPLIT_V1_MAX")"
+  split_summary="n=$VS_SPLIT_REQUESTS issued=$VS_S_ISSUED v1=$VS_S_V1 v2=$VS_S_V2 other=$VS_S_OTHER stop=$VS_S_STOP first_other=$VS_S_FIRST"
+  printf 'split %s\nsplit sequence: %s\n' "$split_summary" "$VS_S_SEQ" >>"$diagnostics"
+  log "VS split: $split_summary (accept v1 in [$VS_SPLIT_V1_MIN,$VS_SPLIT_V1_MAX])"
+  vs_sample_passes "$VS_SPLIT_REQUESTS" "$VS_SPLIT_V1_MIN" "$VS_SPLIT_V1_MAX" && split_ok=true
 
-  local header_ok=false
-  if [[ "$status_ok" == "true" && "$c_v2" == "$VS_HEADER_REQUESTS" && "$c_v1" == "0" \
-    && "$c_other" == "0" && "$n_v1" =~ ^[0-9]+$ && "$n_other" == "0" ]] \
-    && (( n_v1 >= 1 )); then
-    header_ok=true
-  fi
+  vs_parse_sample "$(vs_sample "$VS_HEADER_REQUESTS" "x-canary: true" 0 0)"
+  canary_summary="n=$VS_HEADER_REQUESTS issued=$VS_S_ISSUED v1=$VS_S_V1 v2=$VS_S_V2 other=$VS_S_OTHER stop=$VS_S_STOP first_other=$VS_S_FIRST"
+  printf 'canary %s\n' "$canary_summary" >>"$diagnostics"
+  local canary_ok=false
+  vs_sample_passes "$VS_HEADER_REQUESTS" 0 0 && canary_ok=true
+
+  vs_parse_sample "$(vs_sample "$VS_HEADER_CONTROL_REQUESTS" "x-canary: false" "$VS_SPLIT_V1_MIN" "$VS_SPLIT_V1_MAX")"
+  control_summary="n=$VS_HEADER_CONTROL_REQUESTS issued=$VS_S_ISSUED v1=$VS_S_V1 v2=$VS_S_V2 other=$VS_S_OTHER stop=$VS_S_STOP first_other=$VS_S_FIRST"
+  printf 'control(x-canary: false) %s\ncontrol sequence: %s\n' "$control_summary" "$VS_S_SEQ" >>"$diagnostics"
+  local control_ok=false
+  vs_sample_passes "$VS_HEADER_CONTROL_REQUESTS" "$VS_SPLIT_V1_MIN" "$VS_SPLIT_V1_MAX" && control_ok=true
+  log "VS header match: canary $canary_summary; control $control_summary"
+  [[ "$canary_ok" == "true" && "$control_ok" == "true" ]] && header_ok=true
 
   dump_vs_client_config_drift
 
   if [[ "$split_ok" == "true" ]]; then
     record_live_assertion sidecar.virtual_service.weighted_split_90_10 pass \
       vs-client "vssvc-v1+vssvc-v2" \
-      "n=$VS_SPLIT_REQUESTS v1=$v1 v2=$v2 (window $VS_SPLIT_V1_MIN-$VS_SPLIT_V1_MAX) $status_verdict" \
+      "$split_summary window=$VS_SPLIT_V1_MIN-$VS_SPLIT_V1_MAX strict-destinations $status_verdict" \
       "$(basename "$diagnostics")"
   else
     record_live_assertion sidecar.virtual_service.weighted_split_90_10 fail \
-      vs-client "vssvc-v1+vssvc-v2" \
-      "status=$status_verdict n=$VS_SPLIT_REQUESTS v1=$v1 v2=$v2 other=$other first_other=$first" \
-      "$(basename "$diagnostics")"
+      vs-client "vssvc-v1+vssvc-v2" "$split_summary" "$(basename "$diagnostics")"
   fi
   if [[ "$header_ok" == "true" ]]; then
     record_live_assertion sidecar.virtual_service.header_match_dispatch pass \
       vs-client vssvc-v2 \
-      "x-canary:true n=$VS_HEADER_REQUESTS v2=$c_v2; x-canary:false control v1=$n_v1 v2=$n_v2" \
+      "x-canary:true $canary_summary; x-canary:false control $control_summary" \
       "$(basename "$diagnostics")"
   else
     record_live_assertion sidecar.virtual_service.header_match_dispatch fail \
       vs-client vssvc-v2 \
-      "status=$status_verdict canary v1=$c_v1 v2=$c_v2 other=$c_other first_other=$c_first; control v1=$n_v1 v2=$n_v2 other=$n_other first_other=$n_first" \
+      "x-canary:true $canary_summary; x-canary:false control $control_summary" \
       "$(basename "$diagnostics")"
   fi
 
@@ -3164,6 +3316,7 @@ main() {
   install_istio_crds
 
   ensure_namespace
+  apply_vs_peer_authentication
   mint_jwt_material
   render_shared_secrets
   mint_native_mtls_pki
@@ -3201,10 +3354,6 @@ main() {
   probe_request_auth
   probe_vs_cors
   probe_native_subscribe
-  # Records both VirtualService split-gate assertions on every path; a
-  # recorded failure must not skip the remaining release-blocking rows (same
-  # reasoning as the native negatives below).
-  probe_virtual_service_http_routes || true
   # Every probe records its own pass/fail live assertion and
   # require_live_assertions is the single fail-closed gate. These two return
   # non-zero on a recorded failure, so under set -e they would abort the run
@@ -3217,6 +3366,12 @@ main() {
   probe_ws_max_connections
   probe_destination_rule_namespace_security
   probe_connect_timeout_two_phase
+  # Issue #7502: the VirtualService split gate runs LAST, after every original
+  # assertion is recorded, and is bounded by VS_PROBE_BUDGET_SECS, so a hang
+  # in the carried-route datapath cannot starve the GA rows of the job
+  # budget. It records both of its assertions on every path; the single
+  # fail-closed gate below decides.
+  probe_virtual_service_http_routes || true
 
   require_live_assertions
   log "mesh-e2e-sidecar suite PASSED; artifacts in $ARTIFACT_DIR"
