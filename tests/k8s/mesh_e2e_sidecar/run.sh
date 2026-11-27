@@ -47,6 +47,21 @@ set -euo pipefail
 #                                               reflected, preflight answered
 #                                               200, unmatched actual/preflight
 #                                               forwarded without gateway ACAO
+#   sidecar.virtual_service.weighted_split_90_10
+#                                               a kubectl-applied Istio
+#                                               VirtualService (CP CRD watch,
+#                                               FerrumAccepted=True status)
+#                                               reaches the native vs-client
+#                                               Sidecar as carried http routes;
+#                                               1000 sequential requests split
+#                                               90/10 across vssvc-v1/vssvc-v2
+#                                               inside a binomial-safe window
+#   sidecar.virtual_service.header_match_dispatch
+#                                               the same VirtualService's
+#                                               x-canary: true rule sends every
+#                                               request to vssvc-v2, while
+#                                               x-canary: false falls through
+#                                               to the split (control)
 #   sidecar.config.native_subscribe_delivered   a Ferrum CP (cp mode, sqlite,
 #                                               K8s pod discovery) serves the
 #                                               mesh model over native
@@ -180,6 +195,38 @@ DR_BACKEND_B_BODY="backend-b"
 DR_LIVE_REQUESTS=8
 DR_BACKEND_A_IP=""
 DR_BACKEND_B_IP=""
+# VirtualService http[] split gate (issue #7502). The frontend Service `vssvc`
+# has no backing pod, so only the carried VirtualService route can answer it;
+# the two legs answer fixed markers (manifests.yaml).
+VS_NAME="vssvc-split"
+VS_FRONTEND_HOST="vssvc.$NS.svc.cluster.local"
+VS_V1_HOST="vssvc-v1.$NS.svc.cluster.local"
+VS_V2_HOST="vssvc-v2.$NS.svc.cluster.local"
+VS_V1_MARKER="vs-backend-v1"
+VS_V2_MARKER="vs-backend-v2"
+# 90/10 split sample size and acceptance window for the vssvc-v1 count.
+#
+# The bound is chosen so the gate is safe even if leg selection were an
+# independent Bernoulli(0.9) draw per request (Ferrum actually uses a
+# deterministic smooth weighted round robin over the split upstream, which
+# lands within a few requests of exactly 900 of 1000):
+#   X ~ Binomial(n=1000, p=0.9): mean 900, sd = sqrt(1000*0.9*0.1) = 9.49.
+#   Accept 830 <= X <= 970, i.e. -7.4 sd .. +7.4 sd.
+#   Exact binomial tails: P(X < 830) = 3.9e-12, P(X > 970) = 3.8e-18, so a
+#   correct 90/10 split fails this gate with probability ~4e-12 per run.
+#   A 100/0 split always fails (X = 1000 > 970, and no vssvc-v2 marker); a
+#   50/50 split has mean 500, sd 15.8, and P(X >= 830) is below 1e-90.
+VS_SPLIT_REQUESTS=1000
+VS_SPLIT_V1_MIN=830
+VS_SPLIT_V1_MAX=970
+# Header-match rule: every x-canary: true request must reach vssvc-v2. If
+# the rule were ignored, each request would follow the 90/10 split and all
+# 100 landing on vssvc-v2 has probability 0.1^100. Control: x-canary: false
+# must NOT match the exact rule, so those requests follow the split and at
+# least one of 20 reaches vssvc-v1 (all 20 on vssvc-v2 under a correct split
+# has probability 0.1^20 = 1e-20).
+VS_HEADER_REQUESTS=100
+VS_HEADER_CONTROL_REQUESTS=20
 JWT_ISSUER="mesh-e2e-issuer"
 JWT_KID="fixture-key"
 # The capp echo answers "<APP_BODY>-native" (manifests.yaml) so a native-leg
@@ -247,6 +294,8 @@ REQUIRED_LIVE_ASSERTIONS=(
   sidecar.destination_rule.lookup_tier_client_wins
   sidecar.destination_rule.tcp_max_connections
   sidecar.virtual_service.cors_policy
+  sidecar.virtual_service.weighted_split_90_10
+  sidecar.virtual_service.header_match_dispatch
   sidecar.config.native_subscribe_delivered
   sidecar.config.native_subscribe_mtls_omitted_client_rejected
   sidecar.config.native_subscribe_mtls_foreign_client_rejected
@@ -266,6 +315,11 @@ REQUIRED_LIVE_ASSERTIONS=(
 # release-blocking native assertion is mTLS + JWT + SAN verification, plus
 # fail-closed negatives and watched projected-Secret rotation. A deleted or
 # skipped negative cannot leave that GA row green.
+# `sidecar.virtual_service.weighted_split_90_10` and
+# `sidecar.virtual_service.header_match_dispatch` back the Experimental row
+# `mesh.virtual_service.sidecar_http_routes` (issue #7502): the capability
+# stays Experimental, but its enrolled live assertions are enforced like
+# every other non-deferred row.
 
 mkdir -p "$ARTIFACT_DIR" "$RESULTS_DIR"
 
@@ -651,8 +705,26 @@ install_spire() {
   ferrum_spire_wait_ready "$CONTEXT" "$SPIRE_NS" 5m
 }
 
+# ── Istio CRDs (issue #7502) ────────────────────────────────────────────────
+#
+# Pinned, offline structural CRDs (tests/fixtures/k8s/), installed and
+# Established BEFORE ferrum-cp starts so its first CRD discovery pass already
+# sees networking.istio.io and starts the VirtualService/DestinationRule
+# watchers (no 300s reprobe wait). Only these two kinds are installed; the
+# controller skips every Istio kind the cluster does not serve.
+install_istio_crds() {
+  log "installing pinned Istio VirtualService + DestinationRule CRDs"
+  local crd
+  for crd in istio_virtualservice_crd istio_destinationrule_crd; do
+    kubectl --context "$CONTEXT" apply -f "$ROOT_DIR/tests/fixtures/k8s/$crd.yaml"
+  done
+  kubectl --context "$CONTEXT" wait --for=condition=Established \
+    crd/virtualservices.networking.istio.io \
+    crd/destinationrules.networking.istio.io --timeout=60s
+}
+
 register_spire_workloads() {
-  log "registering SPIRE workload entries (svc, wssvc, client, rogue, capp, native-mtls-probe, drsvc-a/b)"
+  log "registering SPIRE workload entries (svc, wssvc, client, rogue, capp, native-mtls-probe, drsvc-a/b, vs-client, vssvc-v1/v2)"
   local registered_ok=true
   local -a spire_nodes
   mapfile -t spire_nodes < <(ferrum_spire_agent_nodes "$CONTEXT" "$SPIRE_NS")
@@ -675,7 +747,10 @@ register_spire_workloads() {
     # client's mesh-mTLS with a SPIRE SVID like every other destination. The
     # ferrum-cp pod is NOT a mesh workload and gets no entry. drsvc-a/b are the
     # DestinationRule visibility backends and need SVIDs for mesh-mTLS.
-    for sa in svc wssvc client rogue capp native-mtls-probe drsvc-a drsvc-b; do
+    # vs-client and vssvc-v1/v2 are the VirtualService split gate's native
+    # client and destinations (issue #7502).
+    for sa in svc wssvc client rogue capp native-mtls-probe drsvc-a drsvc-b \
+      vs-client vssvc-v1 vssvc-v2; do
       ferrum_spire_register_k8s_workload \
         "$CONTEXT" "$SPIRE_NS" \
         "spiffe://$TRUST_DOMAIN/ns/$NS/sa/$sa" \
@@ -689,7 +764,7 @@ register_spire_workloads() {
 
   if [[ "$registered_ok" == "true" ]]; then
     record_live_assertion sidecar.spire.workload_entries pass \
-      "" "" "svc-wssvc-client-rogue-capp-native-mtls-probe-drsvc-entries-registered" "spire-entries.txt"
+      "" "" "svc-wssvc-client-rogue-capp-native-mtls-probe-drsvc-vs-entries-registered" "spire-entries.txt"
   else
     record_live_assertion sidecar.spire.workload_entries fail \
       "" "" "workload-entry-registration-failed"
@@ -1188,7 +1263,8 @@ wait_for_rollouts() {
   # native-subscribe convergence; capp's POD readiness itself only requires
   # the app container (the sidecar container has no probe and counts as
   # ready while it waits for its first slice).
-  for deploy in ferrum-cp svc wssvc capp client rogue drsvc-a drsvc-b; do
+  for deploy in ferrum-cp svc wssvc capp client rogue drsvc-a drsvc-b \
+    vssvc-v1 vssvc-v2 vs-client; do
     kubectl --context "$CONTEXT" -n "$NS" rollout status "deploy/$deploy" --timeout=5m
   done
 }
@@ -1579,6 +1655,290 @@ else:
       client capp \
       "traffic status=$status body=$body drift=$drift_verdict" \
       "native-config-drift.txt"
+    return 1
+  fi
+}
+
+# ── VirtualService http[] split gate (issue #7502) ──────────────────────────
+#
+# The VirtualService is applied as a real Kubernetes object: ferrum-cp's CRD
+# watcher translates it into carried http routes, writes FerrumAccepted on
+# its status, and serves the routes over native MeshSubscribe to the
+# vs-client Sidecar, which applies them on its outbound listener and dials
+# each leg over SVID-mTLS. Applied here, after every native-transport proof
+# above has already been recorded against a CP with no VirtualService.
+# (No backticks in this heredoc: it interpolates.)
+apply_vs_split() {
+  kubectl --context "$CONTEXT" apply -f - <<YAML
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: $VS_NAME
+  namespace: $NS
+spec:
+  hosts:
+    - $VS_FRONTEND_HOST
+  http:
+    - match:
+        - headers:
+            x-canary:
+              exact: "true"
+      route:
+        - destination:
+            host: $VS_V2_HOST
+            port:
+              number: 8080
+    - route:
+        - destination:
+            host: $VS_V1_HOST
+            port:
+              number: 8080
+          weight: 90
+        - destination:
+            host: $VS_V2_HOST
+            port:
+              number: 8080
+          weight: 10
+YAML
+}
+
+# Poll the VirtualService status until ferrum-cp has written FerrumAccepted.
+# Echoes "accepted <detail>" when the condition is True AND the translation
+# detail reports the mesh http[] route scope; otherwise the last observation.
+wait_for_vs_accepted() {
+  local json verdict _
+  verdict="status-never-read"
+  for _ in $(seq 1 60); do
+    json="$(kubectl --context "$CONTEXT" -n "$NS" get \
+      "virtualservices.networking.istio.io/$VS_NAME" -o json 2>/dev/null || true)"
+    printf '%s\n' "$json" > "$RESULTS_DIR/vs-split-status.txt"
+    verdict="$(printf '%s' "$json" | python3 -c '
+import json
+import sys
+
+try:
+    doc = json.load(sys.stdin)
+except Exception:
+    print("status-unparseable")
+    sys.exit(0)
+status = doc.get("status") or {}
+accepted = [
+    c for c in status.get("conditions") or []
+    if c.get("type") == "FerrumAccepted"
+]
+scope = ((status.get("ferrum") or {}).get("translation") or {}).get("mesh_http_routes")
+if not accepted:
+    print("ferrum-accepted-missing")
+elif accepted[0].get("status") != "True":
+    print(
+        "ferrum-accepted-not-true status=%s reason=%s"
+        % (accepted[0].get("status"), accepted[0].get("reason"))
+    )
+elif scope != "sidecar_and_node_waypoint":
+    print("mesh-http-routes-scope-unexpected scope=%s" % scope)
+else:
+    print("accepted reason=%s mesh_http_routes=%s" % (accepted[0].get("reason"), scope))
+')"
+    if [[ "$verdict" == accepted* ]]; then
+      break
+    fi
+    sleep 2
+  done
+  printf '%s' "$verdict"
+}
+
+# Retry a vs-client request (optional extra header) until it answers 200 with
+# one of the accepted markers ("m1|m2" or a single marker). Echoes the final
+# "<status>\t<body>".
+vs_settle() {
+  local header="$1" accept="$2"
+  # shellcheck disable=SC2016
+  kubectl --context "$CONTEXT" -n "$NS" exec deploy/vs-client -c curl -- \
+    sh -c '
+      host="$1"; header="$2"; accept="$3"
+      out=000
+      body=""
+      for _ in $(seq 1 90); do
+        : >/tmp/vss 2>/dev/null || true
+        if [ -n "$header" ]; then
+          out="$(curl -s -m 5 -o /tmp/vss -w "%{http_code}" \
+            -H "Host: $host" -H "$header" http://127.0.0.1:15001/ 2>/dev/null || true)"
+        else
+          out="$(curl -s -m 5 -o /tmp/vss -w "%{http_code}" \
+            -H "Host: $host" http://127.0.0.1:15001/ 2>/dev/null || true)"
+        fi
+        [ -n "$out" ] || out=000
+        body="$(tr -d "\r\n\t" </tmp/vss 2>/dev/null || true)"
+        if [ "$out" = "200" ]; then
+          case "|$accept|" in
+            *"|$body|"*)
+              printf "%s\t%s\n" "$out" "$body"
+              exit 0
+              ;;
+          esac
+        fi
+        sleep 2
+      done
+      printf "%s\t%s\n" "$out" "$body"
+    ' sh "$VS_FRONTEND_HOST" "$header" "$accept" 2>/dev/null || printf 'EXECFAIL\t\n'
+}
+
+# Issue N sequential vs-client requests (optional extra header) and classify
+# each by exact body: "1" = 200 + vssvc-v1 marker, "2" = 200 + vssvc-v2
+# marker, "x" = anything else. Echoes
+# "<v1>\t<v2>\t<other>\t<first other status:body>\t<sequence>".
+vs_sample() {
+  local n="$1" header="$2"
+  # shellcheck disable=SC2016
+  kubectl --context "$CONTEXT" -n "$NS" exec deploy/vs-client -c curl -- \
+    sh -c '
+      host="$1"; n="$2"; header="$3"; m1="$4"; m2="$5"
+      v1=0; v2=0; other=0; first=""; sequence=""
+      i=0
+      while [ "$i" -lt "$n" ]; do
+        i=$((i + 1))
+        : >/tmp/vsb 2>/dev/null || true
+        if [ -n "$header" ]; then
+          code="$(curl -s -m 5 -o /tmp/vsb -w "%{http_code}" \
+            -H "Host: $host" -H "$header" http://127.0.0.1:15001/ 2>/dev/null || true)"
+        else
+          code="$(curl -s -m 5 -o /tmp/vsb -w "%{http_code}" \
+            -H "Host: $host" http://127.0.0.1:15001/ 2>/dev/null || true)"
+        fi
+        [ -n "$code" ] || code=000
+        body="$(tr -d "\r\n\t" </tmp/vsb 2>/dev/null || true)"
+        if [ "$code" = "200" ] && [ "$body" = "$m1" ]; then
+          v1=$((v1 + 1)); sequence="${sequence}1"
+        elif [ "$code" = "200" ] && [ "$body" = "$m2" ]; then
+          v2=$((v2 + 1)); sequence="${sequence}2"
+        else
+          other=$((other + 1)); sequence="${sequence}x"
+          [ -n "$first" ] || first="$code:$(printf "%s" "$body" | cut -c1-120)"
+        fi
+      done
+      printf "%s\t%s\t%s\t%s\t%s\n" "$v1" "$v2" "$other" "$first" "$sequence"
+    ' sh "$VS_FRONTEND_HOST" "$n" "$header" "$VS_V1_MARKER" "$VS_V2_MARKER" \
+    2>/dev/null || printf 'EXECFAIL\t0\t0\texec-failed\t\n'
+}
+
+# JWT-authenticated /mesh/config-drift of the vs-client Sidecar (admin API
+# binds loopback, so the curl runs inside the pod). Diagnostics only.
+dump_vs_client_config_drift() {
+  local admin_token
+  admin_token="$(mint_admin_jwt)"
+  # shellcheck disable=SC2016
+  kubectl --context "$CONTEXT" -n "$NS" exec deploy/vs-client -c curl -- \
+    sh -c 'curl -s -m 10 -H "Authorization: Bearer $1" http://127.0.0.1:15020/mesh/config-drift' \
+    sh "$admin_token" > "$RESULTS_DIR/vs-client-config-drift.txt" 2>/dev/null || true
+}
+
+# Two assertions, both always recorded:
+#   sidecar.virtual_service.weighted_split_90_10
+#     FerrumAccepted=True (with the sidecar_and_node_waypoint route scope) on
+#     the applied VirtualService, the route converged on vs-client, and
+#     VS_SPLIT_REQUESTS sequential requests without the canary header all
+#     answer 200 from one of the two legs with the vssvc-v1 count inside
+#     [VS_SPLIT_V1_MIN, VS_SPLIT_V1_MAX] (math at the constants above).
+#   sidecar.virtual_service.header_match_dispatch
+#     every one of VS_HEADER_REQUESTS x-canary: true requests answers 200
+#     from vssvc-v2, and the x-canary: false control falls through to the
+#     split (at least one vssvc-v1 answer, no non-200 or unknown body).
+probe_virtual_service_http_routes() {
+  local diagnostics="$RESULTS_DIR/vs-split.txt"
+  : >"$diagnostics"
+  log "probing the VirtualService http[] split gate (vs-client -> vssvc-v1/vssvc-v2 via CP-served carried routes)"
+
+  local apply_ok=true
+  if ! apply_vs_split >>"$diagnostics" 2>&1; then
+    apply_ok=false
+  fi
+  local status_verdict="not-applied"
+  if [[ "$apply_ok" == "true" ]]; then
+    status_verdict="$(wait_for_vs_accepted)"
+  fi
+  log "VirtualService $VS_NAME status: $status_verdict"
+  printf 'status: %s\n' "$status_verdict" >>"$diagnostics"
+  local status_ok=false
+  [[ "$status_verdict" == accepted* ]] && status_ok=true
+
+  # Convergence: the header rule answering from vssvc-v2 proves the carried
+  # route reached vs-client (the unbacked frontend has no Service route of
+  # its own), then the split fallback must answer from either leg.
+  local settle_header settle_split
+  settle_header="$(vs_settle "x-canary: true" "$VS_V2_MARKER")"
+  settle_split="$(vs_settle "" "$VS_V1_MARKER|$VS_V2_MARKER")"
+  log "VS settle: canary=${settle_header//$'\t'/ } split=${settle_split//$'\t'/ }"
+  printf 'settle-canary: %s\nsettle-split: %s\n' "$settle_header" "$settle_split" >>"$diagnostics"
+
+  local out rest v1 v2 other first sequence
+  out="$(vs_sample "$VS_SPLIT_REQUESTS" "")"
+  v1="${out%%$'\t'*}"; rest="${out#*$'\t'}"
+  v2="${rest%%$'\t'*}"; rest="${rest#*$'\t'}"
+  other="${rest%%$'\t'*}"; rest="${rest#*$'\t'}"
+  first="${rest%%$'\t'*}"; sequence="${rest#*$'\t'}"
+  printf 'split n=%s v1=%s v2=%s other=%s first_other=%s\nsplit sequence: %s\n' \
+    "$VS_SPLIT_REQUESTS" "$v1" "$v2" "$other" "$first" "$sequence" >>"$diagnostics"
+  log "VS split: n=$VS_SPLIT_REQUESTS v1=$v1 v2=$v2 other=$other first_other=$first (accept v1 in [$VS_SPLIT_V1_MIN,$VS_SPLIT_V1_MAX])"
+
+  local split_ok=false
+  if [[ "$status_ok" == "true" && "$v1" =~ ^[0-9]+$ && "$v2" =~ ^[0-9]+$ \
+    && "$other" == "0" ]] \
+    && (( v1 + v2 == VS_SPLIT_REQUESTS && v1 >= VS_SPLIT_V1_MIN \
+      && v1 <= VS_SPLIT_V1_MAX && v2 >= 1 )); then
+    split_ok=true
+  fi
+
+  local c_out c_v1 c_v2 c_other c_first n_out n_v1 n_v2 n_other n_first
+  c_out="$(vs_sample "$VS_HEADER_REQUESTS" "x-canary: true")"
+  c_v1="${c_out%%$'\t'*}"; rest="${c_out#*$'\t'}"
+  c_v2="${rest%%$'\t'*}"; rest="${rest#*$'\t'}"
+  c_other="${rest%%$'\t'*}"; rest="${rest#*$'\t'}"
+  c_first="${rest%%$'\t'*}"
+  n_out="$(vs_sample "$VS_HEADER_CONTROL_REQUESTS" "x-canary: false")"
+  n_v1="${n_out%%$'\t'*}"; rest="${n_out#*$'\t'}"
+  n_v2="${rest%%$'\t'*}"; rest="${rest#*$'\t'}"
+  n_other="${rest%%$'\t'*}"; rest="${rest#*$'\t'}"
+  n_first="${rest%%$'\t'*}"
+  printf 'canary n=%s v1=%s v2=%s other=%s first_other=%s\n' \
+    "$VS_HEADER_REQUESTS" "$c_v1" "$c_v2" "$c_other" "$c_first" >>"$diagnostics"
+  printf 'control(x-canary: false) n=%s v1=%s v2=%s other=%s first_other=%s\n' \
+    "$VS_HEADER_CONTROL_REQUESTS" "$n_v1" "$n_v2" "$n_other" "$n_first" >>"$diagnostics"
+  log "VS header match: canary v1=$c_v1 v2=$c_v2 other=$c_other; control v1=$n_v1 v2=$n_v2 other=$n_other"
+
+  local header_ok=false
+  if [[ "$status_ok" == "true" && "$c_v2" == "$VS_HEADER_REQUESTS" && "$c_v1" == "0" \
+    && "$c_other" == "0" && "$n_v1" =~ ^[0-9]+$ && "$n_other" == "0" ]] \
+    && (( n_v1 >= 1 )); then
+    header_ok=true
+  fi
+
+  dump_vs_client_config_drift
+
+  if [[ "$split_ok" == "true" ]]; then
+    record_live_assertion sidecar.virtual_service.weighted_split_90_10 pass \
+      vs-client "vssvc-v1+vssvc-v2" \
+      "n=$VS_SPLIT_REQUESTS v1=$v1 v2=$v2 (window $VS_SPLIT_V1_MIN-$VS_SPLIT_V1_MAX) $status_verdict" \
+      "$(basename "$diagnostics")"
+  else
+    record_live_assertion sidecar.virtual_service.weighted_split_90_10 fail \
+      vs-client "vssvc-v1+vssvc-v2" \
+      "status=$status_verdict n=$VS_SPLIT_REQUESTS v1=$v1 v2=$v2 other=$other first_other=$first" \
+      "$(basename "$diagnostics")"
+  fi
+  if [[ "$header_ok" == "true" ]]; then
+    record_live_assertion sidecar.virtual_service.header_match_dispatch pass \
+      vs-client vssvc-v2 \
+      "x-canary:true n=$VS_HEADER_REQUESTS v2=$c_v2; x-canary:false control v1=$n_v1 v2=$n_v2" \
+      "$(basename "$diagnostics")"
+  else
+    record_live_assertion sidecar.virtual_service.header_match_dispatch fail \
+      vs-client vssvc-v2 \
+      "status=$status_verdict canary v1=$c_v1 v2=$c_v2 other=$c_other first_other=$c_first; control v1=$n_v1 v2=$n_v2 other=$n_other first_other=$n_first" \
+      "$(basename "$diagnostics")"
+  fi
+
+  if [[ "$split_ok" != "true" || "$header_ok" != "true" ]]; then
+    cat "$diagnostics" >&2
     return 1
   fi
 }
@@ -2747,8 +3107,11 @@ collect_diagnostics() {
     > "$ARTIFACT_DIR/pods-describe.txt" 2>&1 || true
   kubectl --context "$CONTEXT" -n "$NS" get configmap -o yaml \
     > "$ARTIFACT_DIR/configmaps.yaml" 2>&1 || true
+  kubectl --context "$CONTEXT" -n "$NS" get virtualservices.networking.istio.io -o yaml \
+    > "$ARTIFACT_DIR/virtualservices.yaml" 2>&1 || true
   local deploy
   for deploy in svc wssvc client rogue capp ferrum-cp drsvc-a drsvc-b \
+    vs-client vssvc-v1 vssvc-v2 \
     native-omit-client native-foreign-client native-untrusted-ca \
     native-wrong-san native-jwt-invalid native-stale-client; do
     kubectl --context "$CONTEXT" -n "$NS" logs "deploy/$deploy" \
@@ -2798,6 +3161,7 @@ main() {
   create_cluster
   build_and_load_image
   install_spire
+  install_istio_crds
 
   ensure_namespace
   mint_jwt_material
@@ -2837,6 +3201,10 @@ main() {
   probe_request_auth
   probe_vs_cors
   probe_native_subscribe
+  # Records both VirtualService split-gate assertions on every path; a
+  # recorded failure must not skip the remaining release-blocking rows (same
+  # reasoning as the native negatives below).
+  probe_virtual_service_http_routes || true
   # Every probe records its own pass/fail live assertion and
   # require_live_assertions is the single fail-closed gate. These two return
   # non-zero on a recorded failure, so under set -e they would abort the run
