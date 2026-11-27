@@ -1913,106 +1913,230 @@ fn mesh_bound_virtual_service_status_reports_where_http_routes_apply() {
     assert!(!message.contains(VIRTUAL_SERVICE_MESH_HTTP_ROUTES_NOTE));
 }
 
+/// `(condition message, cross-namespace deferred entries)` of a VirtualService
+/// named `name` with `spec`, planned under `options`.
+fn cross_namespace_report(
+    name: &str,
+    spec: Value,
+    options: K8sTranslationOptions,
+) -> (String, Vec<String>) {
+    use ferrum_edge::k8s_controller::istio_status::VIRTUAL_SERVICE_CROSS_NAMESPACE_DEFERRED_PREFIX;
+
+    let obj = object("networking.istio.io/v1", "VirtualService", name, spec);
+    let updates = plan_istio_status_updates(&[obj], options);
+    let update = update_for(&updates, "VirtualService", name);
+    let condition = find_condition(
+        update.status["conditions"].as_array().unwrap(),
+        "FerrumAccepted",
+    );
+    assert_eq!(
+        condition["status"].as_str(),
+        Some("True"),
+        "{name}: gateway routes are still served, so the VirtualService stays accepted"
+    );
+    let refused = update.ferrum_detail.as_ref().unwrap()["translation"]["deferred_fields"]
+        .as_array()
+        .expect("deferred_fields")
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|field| field.starts_with(VIRTUAL_SERVICE_CROSS_NAMESPACE_DEFERRED_PREFIX))
+        .map(str::to_string)
+        .collect();
+    (condition["message"].as_str().unwrap().to_string(), refused)
+}
+
+fn cross_namespace_leg(host: &str, weight: u32) -> Value {
+    json!({"destination": {"host": host, "port": {"number": 8080}}, "weight": weight})
+}
+
+fn cross_namespace_direct(host: &str) -> Value {
+    json!({
+        "hosts": ["reviews.default.svc.cluster.local"],
+        "http": [{"route": [cross_namespace_leg(host, 100)]}]
+    })
+}
+
 /// Issue #7499: Sidecar and NodeWaypoint data planes refuse a carried route
 /// whose destination is a Service in another namespace (and keep routing the
 /// host to its plain Service). A mesh-bound VirtualService naming one stays
-/// `FerrumAccepted=True` (gateway routes are unaffected) and reports each such
-/// destination in `status.ferrum.translation.deferred_fields`. Same-namespace
-/// Services, external hosts and gateway-only VirtualServices report nothing.
+/// `FerrumAccepted=True` (gateway routes are unaffected), counts them in the
+/// condition message and lists each in `status.ferrum.translation.deferred_fields`.
+/// Same-namespace Services, external hosts and gateway-only VirtualServices
+/// report nothing.
 #[test]
 fn mesh_bound_virtual_service_status_reports_refused_cross_namespace_destinations() {
-    use ferrum_edge::k8s_controller::istio_status::VIRTUAL_SERVICE_CROSS_NAMESPACE_DEFERRED_PREFIX;
-
-    let leg = |host: &str, weight: u32| json!({"destination": {"host": host, "port": {"number": 8080}}, "weight": weight});
-    // `(VirtualService, condition message, cross-namespace deferred entries)`.
-    let report = |name: &str, spec: Value| -> (String, Vec<String>) {
-        let obj = object("networking.istio.io/v1", "VirtualService", name, spec);
-        let updates = plan_istio_status_updates(&[obj], options());
-        let update = update_for(&updates, "VirtualService", name);
-        let condition = find_condition(
-            update.status["conditions"].as_array().unwrap(),
-            "FerrumAccepted",
-        );
-        assert_eq!(
-            condition["status"].as_str(),
-            Some("True"),
-            "{name}: gateway routes are still served, so the VirtualService stays accepted"
-        );
-        let refused = update.ferrum_detail.as_ref().unwrap()["translation"]["deferred_fields"]
-            .as_array()
-            .expect("deferred_fields")
-            .iter()
-            .filter_map(Value::as_str)
-            .filter(|field| field.starts_with(VIRTUAL_SERVICE_CROSS_NAMESPACE_DEFERRED_PREFIX))
-            .map(str::to_string)
-            .collect();
-        (condition["message"].as_str().unwrap().to_string(), refused)
-    };
-    let direct = |host: &str| {
-        json!({
-            "hosts": ["reviews.default.svc.cluster.local"],
-            "http": [{"route": [leg(host, 100)]}]
-        })
-    };
-
     for host in [
         "ratings.other.svc.cluster.local",
         "ratings.other.svc",
         "ratings.other",
     ] {
-        let (message, refused) = report("cross", direct(host));
+        let (message, refused) =
+            cross_namespace_report("cross", cross_namespace_direct(host), options());
         assert_eq!(refused.len(), 1, "{host}: {refused:?}");
         assert!(
             refused[0].contains("http[0].route[0]")
                 && refused[0].contains("\"other\"/\"ratings\"")
-                && refused[0].contains("Sidecar and NodeWaypoint")
+                && refused[0].contains("Sidecar and NodeWaypoint mesh data planes refuse")
                 && refused[0].contains("#7499"),
             "{host}: {}",
             refused[0]
         );
         assert!(
-            message.contains("deferred fields:") && message.contains("in another namespace"),
-            "{host}: the condition message carries the note: {message}"
+            message.contains("1 http[] destination(s) name a Service in another namespace"),
+            "{host}: the condition message counts them: {message}"
+        );
+        assert!(
+            !message.contains(&refused[0]),
+            "{host}: the message summarizes instead of repeating each entry"
         );
     }
 
-    // Every split leg is reported, zero-weight legs included.
-    let (_, refused) = report(
+    // Every split leg is reported. A zero-weight leg of a multi-destination
+    // route is omitted during translation, so it is described that way.
+    let (message, refused) = cross_namespace_report(
         "split",
         json!({
             "hosts": ["reviews.default.svc.cluster.local"],
             "http": [{"route": [
-                leg("reviews.default.svc.cluster.local", 90),
-                leg("ratings.other.svc.cluster.local", 10),
-                leg("details.third.svc.cluster.local", 0)
+                cross_namespace_leg("reviews.default.svc.cluster.local", 90),
+                cross_namespace_leg("ratings.other.svc.cluster.local", 10),
+                cross_namespace_leg("details.third.svc.cluster.local", 0)
             ]}]
         }),
+        options(),
     );
     assert_eq!(refused.len(), 2, "{refused:?}");
     assert!(
-        refused[0].contains("http[0].route[1]") && refused[0].contains("\"other\"/\"ratings\"")
+        refused[0].contains("http[0].route[1]")
+            && refused[0].contains("\"other\"/\"ratings\"")
+            && refused[0].contains("data planes refuse")
     );
     assert!(
-        refused[1].contains("http[0].route[2]") && refused[1].contains("\"third\"/\"details\"")
+        refused[1].contains("http[0].route[2]")
+            && refused[1].contains("\"third\"/\"details\"")
+            && refused[1].contains("omitted during translation")
+            && !refused[1].contains("data planes refuse"),
+        "{}",
+        refused[1]
     );
+    assert!(message.contains("2 http[] destination(s)"), "{message}");
+
+    // A single destination is kept by translation whatever its weight, so a
+    // zero-weight single destination is refused by the data planes.
+    let (_, refused) = cross_namespace_report(
+        "single-zero",
+        json!({
+            "hosts": ["reviews.default.svc.cluster.local"],
+            "http": [{"route": [cross_namespace_leg("ratings.other.svc.cluster.local", 0)]}]
+        }),
+        options(),
+    );
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert!(refused[0].contains("data planes refuse"), "{}", refused[0]);
 
     for (name, spec) in [
         (
             "same-namespace",
-            direct("reviews.default.svc.cluster.local"),
+            cross_namespace_direct("reviews.default.svc.cluster.local"),
         ),
-        ("short-name", direct("reviews")),
-        ("external", direct("api.example.com")),
+        ("short-name", cross_namespace_direct("reviews")),
+        ("external", cross_namespace_direct("api.example.com")),
         (
             "gateway-only",
             json!({
                 "hosts": ["reviews.default.svc.cluster.local"],
                 "gateways": ["ingress-gw"],
-                "http": [{"route": [leg("ratings.other.svc.cluster.local", 100)]}]
+                "http": [{"route": [cross_namespace_leg("ratings.other.svc.cluster.local", 100)]}]
             }),
         ),
     ] {
-        let (_, refused) = report(name, spec);
+        let (message, refused) = cross_namespace_report(name, spec, options());
         assert!(refused.is_empty(), "{name}: {refused:?}");
+        assert!(!message.contains("another namespace"), "{name}: {message}");
     }
+}
+
+/// Issue #7499: the configured cluster domain is normalized (surrounding
+/// dots, case) exactly as the data plane's host index normalizes it, so a
+/// custom domain written with a trailing dot classifies the same way.
+#[test]
+fn cross_namespace_status_normalizes_a_custom_cluster_domain() {
+    let custom = || options().with_cluster_domain("Corp.Example.".to_string());
+    for host in [
+        "ratings.other.svc.corp.example",
+        "ratings.other.svc.corp.example.",
+    ] {
+        let (_, refused) = cross_namespace_report("custom", cross_namespace_direct(host), custom());
+        assert_eq!(refused.len(), 1, "{host}: {refused:?}");
+    }
+    // The default domain is not this cluster's suffix any more: the host is
+    // external, as the data plane classifies it.
+    let (_, refused) = cross_namespace_report(
+        "custom-external",
+        cross_namespace_direct("ratings.other.svc.cluster.local"),
+        custom(),
+    );
+    assert!(refused.is_empty(), "{refused:?}");
+}
+
+/// Issue #7499: the listed destinations are budgeted by count and bytes, and
+/// the rest are counted in one entry, so a VirtualService with many legs
+/// cannot push its status update past the API server's request limit.
+#[test]
+fn cross_namespace_status_budgets_the_listed_destinations() {
+    use ferrum_edge::k8s_controller::istio_status::{
+        MAX_VIRTUAL_SERVICE_CROSS_NAMESPACE_DEFERRED_BYTES,
+        MAX_VIRTUAL_SERVICE_CROSS_NAMESPACE_DEFERRED_ENTRIES,
+    };
+
+    let total = MAX_VIRTUAL_SERVICE_CROSS_NAMESPACE_DEFERRED_ENTRIES + 8;
+    let http: Vec<Value> = (0..total)
+        .map(|index| {
+            json!({
+                "match": [{"headers": {"x-leg": {"exact": format!("leg-{index}")}}}],
+                "route": [cross_namespace_leg(&format!("svc-{index}.other.svc.cluster.local"), 100)]
+            })
+        })
+        .collect();
+    let (message, refused) = cross_namespace_report(
+        "many",
+        json!({"hosts": ["reviews.default.svc.cluster.local"], "http": http}),
+        options(),
+    );
+    assert!(
+        message.contains(&format!("{total} http[] destination(s)")),
+        "the message counts every destination: {message}"
+    );
+    let (listed, omitted) = refused.split_at(refused.len() - 1);
+    assert!(listed.len() <= MAX_VIRTUAL_SERVICE_CROSS_NAMESPACE_DEFERRED_ENTRIES);
+    assert!(
+        listed.iter().map(String::len).sum::<usize>()
+            <= MAX_VIRTUAL_SERVICE_CROSS_NAMESPACE_DEFERRED_BYTES
+    );
+    assert!(
+        omitted[0].contains(&format!("{} more destination(s)", total - listed.len())),
+        "{}",
+        omitted[0]
+    );
+
+    // At the budget nothing is omitted.
+    let http: Vec<Value> = (0..4)
+        .map(|index| {
+            json!({
+                "match": [{"headers": {"x-leg": {"exact": format!("leg-{index}")}}}],
+                "route": [cross_namespace_leg(&format!("svc-{index}.other.svc.cluster.local"), 100)]
+            })
+        })
+        .collect();
+    let (_, refused) = cross_namespace_report(
+        "few",
+        json!({"hosts": ["reviews.default.svc.cluster.local"], "http": http}),
+        options(),
+    );
+    assert_eq!(refused.len(), 4);
+    assert!(
+        refused
+            .iter()
+            .all(|entry| !entry.contains("more destination(s)"))
+    );
 }

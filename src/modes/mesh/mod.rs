@@ -5112,6 +5112,10 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
     let mut leg_dispatched: HashMap<(String, String), WeightedSplitLegs> = HashMap::new();
     let mut residual_upstreams: Vec<Upstream> = Vec::new();
     let mut unrepresentable_splits = 0usize;
+    // Destinations (direct, dispatch-rule, or weighted-split leg) that are a
+    // Service in another namespace: every one refuses its route (issue
+    // #7499; the VirtualService status reports them).
+    let mut cross_namespace_refused = 0usize;
     for (namespace, id) in split_ids {
         let Some(split) = config
             .upstreams
@@ -5131,7 +5135,6 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
         let mut service_targets: Vec<(u32, Vec<UpstreamTarget>)> = Vec::new();
         let mut rebound = true;
         let mut governed_by_destination_rule = false;
-        let mut cross_namespace_leg = false;
         for target in &split.targets {
             match hosts.classify(&namespace, &target.host) {
                 CarriedRouteHost::External => {
@@ -5148,6 +5151,19 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                     external_targets.push(target.clone());
                 }
                 CarriedRouteHost::UnmodeledService => rebound = false,
+                // A leg is dispatched through a namespace-local reference
+                // (the split's own targets, or a route override naming the
+                // Service upstream), so a Service in another namespace is
+                // refused as a leg on every path, DestinationRule-governed or
+                // not, before either rebinding is chosen (issue #7499): the
+                // split fails and every route naming it is refused, while the
+                // rest of the slice keeps applying.
+                CarriedRouteHost::Service(service_namespace, _)
+                    if service_namespace != namespace =>
+                {
+                    cross_namespace_refused += 1;
+                    rebound = false;
+                }
                 CarriedRouteHost::Service(service_namespace, service_name) => {
                     if service_has_destination_rule(
                         mesh_slice,
@@ -5204,10 +5220,6 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                         rebound = false;
                         continue;
                     }
-                    // A leg is dispatched through its Service upstream by a
-                    // namespace-local route override, so a Service in another
-                    // namespace cannot be a leg.
-                    cross_namespace_leg |= service_namespace != namespace;
                     match service_legs
                         .iter_mut()
                         .find(|(leg_id, _)| *leg_id == service_upstream_id)
@@ -5226,12 +5238,7 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
         }
         if governed_by_destination_rule {
             let first_external = external_targets.first().cloned();
-            let legs_for_dispatch = if cross_namespace_leg {
-                None
-            } else {
-                weighted_split_legs(config, split, service_legs, external_targets)
-            };
-            match legs_for_dispatch {
+            match weighted_split_legs(config, split, service_legs, external_targets) {
                 Some((split_legs, residuals)) => {
                     residual_upstreams.extend(residuals);
                     leg_dispatched.insert((namespace.clone(), id.clone()), split_legs);
@@ -5292,8 +5299,6 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
     let mut wildcard_direct_backend_refused = 0usize;
     // Sidecar routes that claim the local workload's own inbound route slot.
     let mut local_inbound_route_conflicts = 0usize;
-    // Direct or dispatch-rule destinations in another namespace.
-    let mut cross_namespace_refused = 0usize;
     // Sidecar `rewrite.authority` that does not name the selected destination.
     let mut authority_rewrite_refused = 0usize;
     for index in 0..config.proxies.len() {

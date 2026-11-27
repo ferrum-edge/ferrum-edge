@@ -5319,6 +5319,10 @@ pub(crate) struct VirtualServiceCrossNamespaceDestination {
     pub(crate) host: String,
     pub(crate) namespace: String,
     pub(crate) name: String,
+    /// A zero-weight leg of a multi-destination route: translation drops it
+    /// (`route_backends`), so it never reaches a data plane. A single
+    /// destination is kept whatever its weight, as translation keeps it.
+    pub(crate) omitted_by_translation: bool,
 }
 
 /// The `http[].route[].destination` hosts of a mesh-bound VirtualService that
@@ -5341,10 +5345,14 @@ pub(crate) fn virtual_service_mesh_cross_namespace_destinations(
         return Vec::new();
     }
     let route_namespace = object.metadata.namespace.to_ascii_lowercase();
+    // The data plane's host index compares against the configured suffix
+    // with surrounding dots trimmed and case folded; so does this scan.
+    let cluster_domain = cluster_domain.trim().trim_matches('.').to_ascii_lowercase();
     let mut destinations = Vec::new();
     let http_routes = object.spec.get("http").and_then(Value::as_array);
     for (route_index, http) in http_routes.into_iter().flatten().enumerate() {
         let legs = http.get("route").and_then(Value::as_array);
+        let multi_destination = legs.is_some_and(|legs| legs.len() > 1);
         for (destination_index, leg) in legs.into_iter().flatten().enumerate() {
             let Some(host) = leg
                 .get("destination")
@@ -5357,7 +5365,7 @@ pub(crate) fn virtual_service_mesh_cross_namespace_destinations(
                 continue;
             }
             let Some((name, namespace)) =
-                service_host_components(&normalized, &route_namespace, cluster_domain)
+                service_host_components(&normalized, &route_namespace, &cluster_domain)
             else {
                 continue;
             };
@@ -5370,6 +5378,8 @@ pub(crate) fn virtual_service_mesh_cross_namespace_destinations(
                 host: host.to_string(),
                 namespace: namespace.to_string(),
                 name: name.to_string(),
+                omitted_by_translation: multi_destination
+                    && route_weight(object, leg).is_ok_and(|weight| weight == 0),
             });
         }
     }
