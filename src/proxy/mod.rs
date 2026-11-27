@@ -71678,6 +71678,7 @@ mod tests {
             pod_uid: None,
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         };
 
         let bywl_id = crate::modes::mesh::mesh_outbound_tcp_bywl_upstream_id(
@@ -76713,6 +76714,7 @@ mod tests {
             pod_uid: None,
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         };
         let mesh = MeshConfig {
             services: vec![service],
@@ -80506,6 +80508,7 @@ mod tests {
             pod_uid: None,
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         }
     }
 
@@ -82183,6 +82186,7 @@ mod tests {
                 pod_uid: None,
                 node_waypoint: None,
                 remote_provenance: false,
+                mesh_transport: None,
             }
         }
 

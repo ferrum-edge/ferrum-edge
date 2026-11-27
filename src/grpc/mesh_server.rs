@@ -1253,6 +1253,7 @@ mod tests {
                 cluster: None,
             }),
             remote_provenance: false,
+            mesh_transport: None,
         }
     }
 

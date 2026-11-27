@@ -290,6 +290,60 @@ fn k8s_pod_discovery_translation_survives_mesh_slice_projection() {
     );
 }
 
+/// Issue #7500: a pod the Ferrum injector marked is a Sidecar backend
+/// (`mesh_transport: sidecar_mtls`), an ambient-labeled pod an HBONE one, and
+/// any other pod stays unknown. The marker survives the slice projection, so
+/// a ServiceWaypoint dials each bound backend over the transport it terminates.
+#[test]
+fn k8s_pod_discovery_records_the_workload_mesh_transport() {
+    use ferrum_edge::modes::mesh::config::WorkloadMeshTransport;
+
+    let transport = |pod: K8sObject| {
+        let translation = translate_k8s_objects(&[service(), pod, endpoint_slice()], options())
+            .expect("K8s core translation succeeds");
+        let slice = MeshSlice::from_gateway_config(
+            &translation.config,
+            MeshSliceRequest {
+                node_id: "node-a".to_string(),
+                namespace: "default".to_string(),
+                ..MeshSliceRequest::default()
+            },
+        );
+        assert_eq!(slice.workloads.len(), 1);
+        let native: MeshSlice =
+            serde_json::from_value(serde_json::to_value(&slice).expect("serialize"))
+                .expect("the marker rides the native slice JSON");
+        assert_eq!(
+            native.workloads[0].mesh_transport,
+            slice.workloads[0].mesh_transport
+        );
+        slice.workloads[0].mesh_transport
+    };
+
+    assert_eq!(transport(ready_pod()), None, "an unmarked pod is unknown");
+
+    let mut sidecar = ready_pod();
+    sidecar
+        .metadata
+        .annotations
+        .insert("ferrum.io/injected".to_string(), "true".to_string());
+    assert_eq!(transport(sidecar), Some(WorkloadMeshTransport::SidecarMtls));
+
+    let mut ambient = ready_pod();
+    ambient
+        .metadata
+        .labels
+        .insert("istio.io/dataplane-mode".to_string(), "ambient".to_string());
+    assert_eq!(transport(ambient), Some(WorkloadMeshTransport::Hbone));
+
+    let mut not_injected = ready_pod();
+    not_injected
+        .metadata
+        .annotations
+        .insert("ferrum.io/injected".to_string(), "false".to_string());
+    assert_eq!(transport(not_injected), None);
+}
+
 #[test]
 fn k8s_pod_discovery_attaches_ready_node_waypoint_metadata() {
     let mut waypoint = node_waypoint_pod("node-a", "192.0.2.10", true, 15008);

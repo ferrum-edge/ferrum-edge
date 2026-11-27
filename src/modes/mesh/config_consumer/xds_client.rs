@@ -5925,6 +5925,7 @@ mod tests {
             pod_uid: None,
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         };
         let service = MeshService {
             cluster_ips: Vec::new(),
@@ -6375,6 +6376,7 @@ mod tests {
             pod_uid: None,
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         };
         let policy = |name: &str, action: PolicyAction| MeshPolicy {
             name: name.to_string(),

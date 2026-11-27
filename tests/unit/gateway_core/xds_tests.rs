@@ -47,6 +47,7 @@ fn workload(name: &str, app: &str) -> Workload {
         pod_uid: None,
         node_waypoint: None,
         remote_provenance: false,
+        mesh_transport: None,
     }
 }
 

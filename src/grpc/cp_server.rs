@@ -4096,6 +4096,7 @@ mod tests {
             pod_uid: Some("16b2c3d4-9dad-11d1-80b4-00c04fd430c8".to_string()),
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         };
         let destination_workload = Workload {
             spiffe_id: destination_spiffe,
@@ -4117,6 +4118,7 @@ mod tests {
             pod_uid: Some("26b2c3d4-9dad-11d1-80b4-00c04fd430c8".to_string()),
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         };
         let config = GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
@@ -4298,6 +4300,7 @@ mod tests {
                     cluster: None,
                 }),
                 remote_provenance: false,
+                mesh_transport: None,
             };
         let config = GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
@@ -4412,6 +4415,7 @@ mod tests {
                     cluster: None,
                 }),
                 remote_provenance: false,
+                mesh_transport: None,
             };
         let config = GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
@@ -4777,6 +4781,7 @@ mod tests {
                 cluster: None,
             }),
             remote_provenance: false,
+            mesh_transport: None,
         };
         let namespace_peer_auth = |namespace: &str, mode: MtlsMode| PeerAuthentication {
             name: format!("{namespace}-default"),
@@ -4972,6 +4977,7 @@ mod tests {
                 cluster: None,
             }),
             remote_provenance: false,
+            mesh_transport: None,
         };
         let policy = |namespace: &str, name: &str, scope: PolicyScope| MeshPolicy {
             name: name.to_string(),
@@ -5183,6 +5189,7 @@ mod tests {
                 cluster: None,
             }),
             remote_provenance: false,
+            mesh_transport: None,
         };
         let config = GatewayConfig {
             mesh: Some(Box::new(MeshConfig {

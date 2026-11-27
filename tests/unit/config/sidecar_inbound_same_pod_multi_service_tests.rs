@@ -53,6 +53,7 @@ fn local_workload(
         pod_uid: pod_uid.map(str::to_string),
         node_waypoint: None,
         remote_provenance: false,
+        mesh_transport: None,
     }
 }
 

@@ -2120,6 +2120,7 @@ fn build_discovery(accumulator: &StockXdsAccumulator) -> StockDiscovery {
                     pod_uid: None,
                     node_waypoint: None,
                     remote_provenance: false,
+                    mesh_transport: None,
                 });
                 if !workload
                     .ports

@@ -7242,6 +7242,7 @@ mod tests {
             pod_uid: None,
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         };
 
         // The single-target per-workload upstream the materializer would emit,
@@ -7370,6 +7371,7 @@ mod tests {
             pod_uid: None,
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         };
         let canonical_ip = "10.0.0.7".parse().unwrap();
         let upstream_id = crate::modes::mesh::mesh_outbound_http_bywl_upstream_id(
@@ -7469,6 +7471,7 @@ mod tests {
             pod_uid: None,
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         };
         let service = |name: &str, port: u16| MeshService {
             name: name.to_string(),

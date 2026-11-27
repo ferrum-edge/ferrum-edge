@@ -158,6 +158,7 @@ fn workload(
         pod_uid: Some(pod_uid.to_string()),
         node_waypoint: None,
         remote_provenance: false,
+        mesh_transport: None,
     }
 }
 
@@ -377,6 +378,7 @@ async fn resolve_stream_against_real_accepted_socket_maps_to_pod_scope() {
         pod_uid: Some(POD_A.to_string()),
         node_waypoint: None,
         remote_provenance: false,
+        mesh_transport: None,
     };
     resolver.install_policy_scopes_from_workloads(&[workload]);
 
@@ -509,6 +511,7 @@ mod node_waypoint_capture_inventory {
                 cluster: None,
             }),
             remote_provenance: false,
+            mesh_transport: None,
         }
     }
 
@@ -1457,6 +1460,7 @@ mod node_waypoint_cross_namespace_source_resolution {
                 cluster: None,
             }),
             remote_provenance: false,
+            mesh_transport: None,
         }
     }
 

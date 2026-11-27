@@ -904,6 +904,74 @@ fn identity_backed_service_waypoint_dials_backing_workloads_over_hbone() {
 }
 
 #[test]
+fn identity_backed_service_waypoint_dials_sidecar_backends_over_svid_mtls() {
+    use ferrum_edge::modes::mesh::config::WorkloadMeshTransport;
+
+    let mut runtime = service_waypoint_runtime();
+    runtime.workload_svid_cert_path = Some("/var/run/ferrum/svid.pem".to_string());
+    runtime.workload_svid_key_path = Some("/var/run/ferrum/svid-key.pem".to_string());
+    runtime.workload_svid_trust_bundle_path = Some("/var/run/ferrum/bundle.pem".to_string());
+    let mut config = cp_config(Some(binding("service")), &default_virtual_services());
+    for workload in &mut config.mesh.as_mut().expect("mesh block").workloads {
+        if workload.service_name == "reviews" {
+            workload.mesh_transport = Some(WorkloadMeshTransport::SidecarMtls);
+        }
+    }
+    let slice = served_slice(&config, &runtime.mesh_slice_request());
+    let prepared =
+        prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("slice materializes");
+    let upstream = |service: &str| {
+        prepared
+            .upstreams
+            .iter()
+            .find(|upstream| {
+                upstream.id == service_waypoint_l7_upstream_id(WAYPOINT_NAMESPACE, service, 8080)
+            })
+            .unwrap_or_else(|| panic!("{service} upstream"))
+            .clone()
+    };
+    let reviews = upstream("reviews");
+    let target = &reviews.targets[0];
+    assert_eq!(
+        target.tags.get("mesh.mtls").map(String::as_str),
+        Some("true")
+    );
+    assert!(
+        !target.tags.contains_key("mesh.hbone"),
+        "a Sidecar backend never gets an HBONE dial it cannot terminate"
+    );
+    assert_eq!(
+        target
+            .tags
+            .get("mesh.mtls_authority_host")
+            .map(String::as_str),
+        Some("reviews.default.svc"),
+        "the destination Sidecar routes the Service authority onto its inbound table"
+    );
+    assert_eq!(
+        target
+            .tags
+            .get("mesh.mtls_authority_port")
+            .map(String::as_str),
+        Some("8080")
+    );
+    assert_eq!(
+        target.tags.get("mesh.spiffe_id").map(String::as_str),
+        Some("spiffe://cluster.local/ns/default/sa/reviews")
+    );
+    // An unmarked workload keeps the HBONE default.
+    let ratings = upstream("ratings");
+    assert_eq!(
+        ratings.targets[0]
+            .tags
+            .get("mesh.hbone")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert!(!ratings.targets[0].tags.contains_key("mesh.mtls"));
+}
+
+#[test]
 fn router_builds_the_target_index_and_per_bound_service_partitions() {
     let runtime = service_waypoint_runtime();
     let (slice, prepared) = prepared_service_waypoint(&runtime);

@@ -3140,6 +3140,7 @@ mod tests {
                 cluster: None,
             }),
             remote_provenance: false,
+            mesh_transport: None,
         };
         let config = GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
@@ -3286,6 +3287,7 @@ mod tests {
                 cluster: None,
             }),
             remote_provenance: false,
+            mesh_transport: None,
         };
         let config = GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
@@ -3562,6 +3564,7 @@ mod tests {
             pod_uid: Some("16b2c3d4-9dad-11d1-80b4-00c04fd430c8".to_string()),
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         });
         mesh.mesh_policies.push(MeshPolicy {
             name: "clients-source-policy".to_string(),

@@ -1053,6 +1053,7 @@ fn workload(
         pod_uid: pod_uid.map(str::to_string),
         node_waypoint: None,
         remote_provenance: false,
+        mesh_transport: None,
     }
 }
 
@@ -1290,6 +1291,7 @@ fn all_collections(key_suffix: &str, marker: &str) -> MeshConfig {
             pod_uid: None,
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         }],
         services: vec![MeshService {
             cluster_ips: vec![marker.to_string()],

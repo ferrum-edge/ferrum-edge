@@ -445,6 +445,7 @@ fn workload_in_namespace(namespace: &str, spiffe: &str) -> Workload {
         pod_uid: None,
         node_waypoint: None,
         remote_provenance: false,
+        mesh_transport: None,
     }
 }
 

@@ -2384,9 +2384,12 @@ fn service_waypoint_backing_workloads<'a>(
 /// it; never a remote-cluster workload (no plaintext cross-cluster pod dial).
 ///
 /// Transport per backing workload: a workload with `node_waypoint` metadata is
-/// dialed over HBONE to its node's terminator with that SVID pinned; any other
-/// workload over HBONE to its own `:15008` (or the configured egress HBONE
-/// port) with its SVID pinned. Only the explicit no-identity development
+/// dialed over HBONE to its node's terminator with that SVID pinned; a Ferrum
+/// Sidecar workload (`Workload::mesh_transport` `sidecar_mtls`) over SVID-mTLS
+/// HTTP/2 to its `:15006` (or the configured egress mTLS port) with its SVID
+/// pinned and the Service authority and port stamped; any other workload over
+/// HBONE to its own `:15008` (or the configured egress HBONE port) with its
+/// SVID pinned. Only the explicit no-identity development
 /// posture keeps the plaintext target shape. A port whose workloads resolve no
 /// target (a named `targetPort` that does not resolve, say) materializes
 /// nothing and is not an L7 target.
@@ -2475,10 +2478,37 @@ fn materialize_service_waypoint_l7_routes(
                     continue;
                 };
                 let port_name = service_port.name.as_deref();
+                let sidecar_backend = workload.mesh_transport
+                    == Some(crate::modes::mesh::config::WorkloadMeshTransport::SidecarMtls);
                 let tags = if workload.node_waypoint.is_some() {
                     crate::service_discovery::mesh::mesh_node_waypoint_target_tags(
                         service, workload, protocol, port_name,
                     )
+                } else if secured && sidecar_backend {
+                    // A Ferrum Sidecar backend: SVID-mTLS HTTP/2 to its
+                    // inbound listener, presenting the Service authority and
+                    // port so the destination Sidecar routes the request onto
+                    // its own inbound table (Section 1.4).
+                    let mut tags = crate::service_discovery::mesh::mesh_sidecar_mtls_target_tags(
+                        service, workload, protocol, port_name,
+                    );
+                    if runtime.egress_mtls_port
+                        != crate::proxy::mesh_mtls_pool::ISTIO_SIDECAR_INBOUND_PORT
+                    {
+                        tags.insert(
+                            crate::proxy::mesh_mtls_pool::MESH_MTLS_PORT_TAG.to_string(),
+                            runtime.egress_mtls_port.to_string(),
+                        );
+                    }
+                    tags.insert(
+                        crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_HOST_TAG.to_string(),
+                        format!("{}.{}.svc", service.name, service.namespace),
+                    );
+                    tags.insert(
+                        crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_PORT_TAG.to_string(),
+                        service_port.port.to_string(),
+                    );
+                    tags
                 } else if secured {
                     let mut tags = crate::service_discovery::mesh::mesh_hbone_target_tags(
                         service, workload, protocol, port_name,
@@ -27571,6 +27601,7 @@ mod tests {
             pod_uid: None,
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         }
     }
 
@@ -41651,6 +41682,7 @@ mod tests {
             addresses: vec!["10.244.5.5".to_string()],
             locality: Some("remote-cluster-b/net-b".to_string()),
             remote_provenance: true,
+            mesh_transport: None,
             ..workload("svc-b", "svc-b")
         };
         let svc_local = MeshService {
