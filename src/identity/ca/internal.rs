@@ -26,8 +26,8 @@
 //! - CRL / OCSP publication.
 //! - Cross-trust-domain federation.
 
+use crate::time_compat::UtcTimestamp;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use rcgen::{
     CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose, SerialNumber, SigningKey,
@@ -495,12 +495,12 @@ fn ca_issue_error_marks_unhealthy(error: &CaError) -> bool {
     )
 }
 
-fn issued_cert_not_after(leaf_der: &[u8]) -> Result<DateTime<Utc>, CaError> {
+fn issued_cert_not_after(leaf_der: &[u8]) -> Result<UtcTimestamp, CaError> {
     use x509_parser::prelude::{FromDer, X509Certificate};
 
     let (_, parsed) = X509Certificate::from_der(leaf_der)
         .map_err(|e| CaError::Internal(format!("issued SVID parse failed: {e}")))?;
-    DateTime::<Utc>::from_timestamp(parsed.validity().not_after.timestamp(), 0).ok_or_else(|| {
+    UtcTimestamp::from_unix_timestamp(parsed.validity().not_after.timestamp()).map_err(|_| {
         CaError::Internal("issued SVID notAfter is outside supported timestamp range".to_string())
     })
 }

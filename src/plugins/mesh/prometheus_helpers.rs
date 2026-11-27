@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 
@@ -820,12 +819,12 @@ pub fn record_mesh_cert_expiry_seconds(
 pub fn record_mesh_cert_expiry_at(
     spiffe_id: &SpiffeId,
     source: impl AsRef<str>,
-    not_after: &DateTime<Utc>,
+    not_after: &crate::time_compat::UtcTimestamp,
 ) {
     record_mesh_cert_expiry_unix_seconds(
         spiffe_id.as_str(),
         source,
-        not_after.timestamp().max(0) as u64,
+        not_after.unix_timestamp().max(0) as u64,
         unix_now_seconds(),
     );
 }
