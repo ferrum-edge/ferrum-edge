@@ -1233,6 +1233,7 @@ mod tests {
                 proxies: vec![serde_json::json!({"id": "istio-vs-default-api-0"})],
                 upstreams: vec![serde_json::json!({"id": "istio-vs-upstream-default-api-0"})],
                 plugin_configs: vec![serde_json::json!({"id": "istio-vs-mrd-default-api-0"})],
+                service_waypoint_attachments: Vec::new(),
             }),
             MeshSliceCarrier::MeshPolicies(Vec::new()),
             MeshSliceCarrier::ExtAuthzProviders(Vec::new()),

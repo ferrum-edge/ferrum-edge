@@ -101,13 +101,48 @@ pub struct ServiceWaypointL7Binding {
     pub backing_endpoints: Vec<(IpAddr, u16)>,
 }
 
+/// One Service bound to this ServiceWaypoint, reachable or not, with its
+/// canonical host variants. Host ownership for every route partition is read
+/// from this full inventory, so a bound Service with no reachable HTTP port
+/// still owns its hosts (no other partition admits them).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceWaypointBoundService {
+    pub namespace: String,
+    pub service: String,
+    /// Canonical host variants (ASCII-lowercase, no trailing dot).
+    pub hosts: Vec<String>,
+}
+
+/// The control plane's admission of one carried route for one bound Service
+/// (`MeshHttpRouteSet::service_waypoint_attachments`): the route's host names
+/// the Service and the owner/`exportTo` rule admits the route for it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ServiceWaypointRouteAttachment {
+    pub route_namespace: String,
+    pub route_id: String,
+    pub service_namespace: String,
+    pub service_name: String,
+}
+
+/// The bound-Service inventory and the admitted route attachments of one
+/// ServiceWaypoint generation, back-projected onto the prepared `MeshConfig`
+/// (`service_waypoint_l7_inventory`) beside the L7 bindings. Empty outside a
+/// ServiceWaypoint.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ServiceWaypointL7Inventory {
+    pub bound_services: Vec<ServiceWaypointBoundService>,
+    pub route_attachments: Vec<ServiceWaypointRouteAttachment>,
+}
+
 /// What an outer HBONE `CONNECT` authority resolves to against the bound
 /// Services' HTTP-family ports.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServiceWaypointConnectMode {
     /// Exactly one bound Service HTTP port: terminate HTTP inside the tunnel
-    /// and dispatch through that port's route partition (issue #7501).
-    TerminateL7(ServiceWaypointL7Target),
+    /// and dispatch through that port's route partition (issue #7501). The
+    /// target is the generation's own shared record, so a classification
+    /// allocates nothing.
+    TerminateL7(Arc<ServiceWaypointL7Target>),
     /// The authority maps to more than one bound Service HTTP port (for
     /// example a backing pod `address:port` two bound Services share). Must
     /// be refused before any upgrade; never guessed.
@@ -119,21 +154,21 @@ pub enum ServiceWaypointConnectMode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum IndexedTarget {
-    Target(ServiceWaypointL7Target),
+    Target(Arc<ServiceWaypointL7Target>),
     Ambiguous,
 }
 
 impl IndexedTarget {
     fn mode(&self) -> ServiceWaypointConnectMode {
         match self {
-            Self::Target(target) => ServiceWaypointConnectMode::TerminateL7(target.clone()),
+            Self::Target(target) => ServiceWaypointConnectMode::TerminateL7(Arc::clone(target)),
             Self::Ambiguous => ServiceWaypointConnectMode::Ambiguous,
         }
     }
 
-    fn merge(&mut self, target: &ServiceWaypointL7Target) {
+    fn merge(&mut self, target: &Arc<ServiceWaypointL7Target>) {
         if let Self::Target(existing) = self
-            && existing != target
+            && **existing != **target
         {
             *self = Self::Ambiguous;
         }
@@ -143,11 +178,11 @@ impl IndexedTarget {
 fn insert_indexed<K: std::hash::Hash + Eq>(
     map: &mut HashMap<K, IndexedTarget>,
     key: K,
-    target: &ServiceWaypointL7Target,
+    target: &Arc<ServiceWaypointL7Target>,
 ) {
     map.entry(key)
         .and_modify(|existing| existing.merge(target))
-        .or_insert_with(|| IndexedTarget::Target(target.clone()));
+        .or_insert_with(|| IndexedTarget::Target(Arc::clone(target)));
 }
 
 /// Immutable classification of outer `CONNECT` authorities to bound Service
@@ -167,8 +202,8 @@ impl ServiceWaypointL7TargetIndex {
     pub fn from_bindings(bindings: &[ServiceWaypointL7Binding]) -> Self {
         let mut index = Self::default();
         for binding in bindings {
-            let target = &binding.target;
-            index.live.insert(target.clone());
+            let target = &Arc::new(binding.target.clone());
+            index.live.insert(binding.target.clone());
             for address in &binding.service_addresses {
                 insert_indexed(
                     &mut index.by_service_address,
@@ -190,9 +225,10 @@ impl ServiceWaypointL7TargetIndex {
                     .find(|(port, _)| *port == target.service_port)
                 {
                     Some((_, existing)) => existing.merge(target),
-                    None => {
-                        ports.push((target.service_port, IndexedTarget::Target(target.clone())))
-                    }
+                    None => ports.push((
+                        target.service_port,
+                        IndexedTarget::Target(Arc::clone(target)),
+                    )),
                 }
             }
         }
@@ -258,9 +294,10 @@ pub struct ServiceWaypointL7RoutePartition {
     /// inner `Host` for Service B inside a tunnel to Service A is a host
     /// mismatch, never a route to B).
     pub admitted_hosts: Vec<String>,
-    /// Carried VirtualService routes bound to this Service (same namespace,
-    /// a host naming the Service), in configuration order. They shadow the
-    /// default route on the paths they match.
+    /// Carried VirtualService routes the control plane attached to this
+    /// Service (`ServiceWaypointRouteAttachment`) that survived the data
+    /// plane's binding, in configuration order. They shadow the default route
+    /// on the paths they match.
     pub carried_routes: Vec<Arc<Proxy>>,
     /// The default L7 Service route, used when no carried route matches.
     pub default_route: Arc<Proxy>,
@@ -317,19 +354,25 @@ impl ServiceWaypointL7Routes {
             return Self::default();
         }
         let index = ServiceWaypointL7TargetIndex::from_bindings(bindings);
-        // Every bound Service's host variants, keyed to the Service, so a
-        // carried route host naming another bound Service is never admitted
-        // on this one.
+        let inventory = &mesh.service_waypoint_l7_inventory;
+        // Every bound Service's host variants (reachable or not), keyed to
+        // the Service, so a carried route host naming another bound Service
+        // is never admitted on this one.
         let mut host_owner: HashMap<&str, (&str, &str)> = HashMap::new();
-        for binding in bindings {
-            for host in &binding.hosts {
+        for service in &inventory.bound_services {
+            for host in &service.hosts {
                 host_owner.insert(
                     host.as_str(),
-                    (
-                        binding.target.namespace.as_str(),
-                        binding.target.service.as_str(),
-                    ),
+                    (service.namespace.as_str(), service.service.as_str()),
                 );
+            }
+        }
+        for binding in bindings {
+            for host in &binding.hosts {
+                host_owner.entry(host.as_str()).or_insert((
+                    binding.target.namespace.as_str(),
+                    binding.target.service.as_str(),
+                ));
             }
         }
         let mut partitions = BTreeMap::new();
@@ -342,18 +385,27 @@ impl ServiceWaypointL7Routes {
             else {
                 continue;
             };
-            let names_service = |host: &str| {
-                let host = canonical_host(host);
-                binding.hosts.contains(&host)
-            };
+            let attached: BTreeSet<(&str, &str)> = inventory
+                .route_attachments
+                .iter()
+                .filter(|attachment| {
+                    attachment.service_namespace == target.namespace
+                        && attachment.service_name == target.service
+                })
+                .map(|attachment| {
+                    (
+                        attachment.route_namespace.as_str(),
+                        attachment.route_id.as_str(),
+                    )
+                })
+                .collect();
             let carried_routes: Vec<Arc<Proxy>> = config
                 .proxies
                 .iter()
                 .filter(|proxy| {
-                    proxy.namespace == target.namespace
+                    attached.contains(&(proxy.namespace.as_str(), proxy.id.as_str()))
                         && super::config::is_virtual_service_http_route_proxy_id(&proxy.id)
                         && !proxy.dispatch_kind.is_stream()
-                        && proxy.hosts.iter().any(|host| names_service(host))
                 })
                 .map(|proxy| Arc::new(proxy.clone()))
                 .collect();
@@ -416,7 +468,7 @@ impl ServiceWaypointL7Routes {
         service: &str,
     ) -> ServiceWaypointL7ServiceSummary {
         let mut l7_http_ports = Vec::new();
-        let mut routes: BTreeSet<&str> = BTreeSet::new();
+        let mut routes: BTreeSet<(&str, &str)> = BTreeSet::new();
         for partition in self.partitions.values().filter(|partition| {
             partition.target.namespace == namespace && partition.target.service == service
         }) {
@@ -425,7 +477,7 @@ impl ServiceWaypointL7Routes {
                 partition
                     .carried_routes
                     .iter()
-                    .map(|route| route.id.as_str()),
+                    .map(|route| (route.namespace.as_str(), route.id.as_str())),
             );
         }
         l7_http_ports.sort_unstable();

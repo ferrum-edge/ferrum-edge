@@ -1492,6 +1492,7 @@ fn mesh_config_fields_are_accounted_for_in_overlay_ownership() {
         // ServiceWaypoint L7 bound-Service surface (issue #7500): materialized
         // from the slice on every mesh apply, never Kubernetes-owned.
         service_waypoint_l7_bindings: _,
+        service_waypoint_l7_inventory: _,
     } = MeshConfig::default();
 
     // Every namespaced collection is visible to the ownership accounting.

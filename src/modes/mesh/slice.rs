@@ -717,12 +717,41 @@ pub struct MeshHttpRouteSet {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub plugin_configs: Vec<serde_json::Value>,
+    /// ServiceWaypoint only (issue #7500): which bound Service each carried
+    /// route is admitted for. The control plane decides it from the route's
+    /// hosts and the owner/`exportTo` rule
+    /// (`service_waypoint_route_owner_admission`), which needs the
+    /// VirtualService binding the data plane never sees; the data plane builds
+    /// each bound Service's route partition from exactly these attachments.
+    /// Empty on every other topology (a non-empty list there refuses the
+    /// slice).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
+    pub service_waypoint_attachments: Vec<MeshHttpRouteServiceAttachment>,
 }
 
 impl MeshHttpRouteSet {
     pub fn is_empty(&self) -> bool {
-        self.proxies.is_empty() && self.upstreams.is_empty() && self.plugin_configs.is_empty()
+        self.proxies.is_empty()
+            && self.upstreams.is_empty()
+            && self.plugin_configs.is_empty()
+            && self.service_waypoint_attachments.is_empty()
     }
+}
+
+/// Most ServiceWaypoint route attachments one carried route set may hold
+/// (issue #7500).
+pub const MAX_SERVICE_WAYPOINT_ROUTE_ATTACHMENTS: usize = 4096;
+
+/// One carried route admitted for one Service bound to a ServiceWaypoint
+/// ([`MeshHttpRouteSet::service_waypoint_attachments`], issue #7500).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeshHttpRouteServiceAttachment {
+    pub proxy_namespace: String,
+    pub proxy_id: String,
+    pub service_namespace: String,
+    pub service_name: String,
 }
 
 /// One opaque typed extension config, transported through xDS ECDS.
@@ -2358,12 +2387,19 @@ impl MeshSlice {
             workloads,
             mesh_policies,
         } = if let Some(waypoint) = request.waypoint_name.as_deref() {
+            // The external destinations of the routes this ServiceWaypoint
+            // carries (issue #7500): their DestinationRules and ServiceEntries
+            // must survive the narrowing, or the data plane cannot originate
+            // a leg's TLS or refuse a direct backend that needs it. They add
+            // nothing to the bound-Service or relay inventories.
+            let route_destination_hosts = service_waypoint_route_destination_hosts(&http_routes);
             narrow_for_service_waypoint(
                 waypoint,
                 &request.namespace,
                 &request.cluster_domain,
                 mesh.istio_root_namespace.as_str(),
                 &mesh.waypoint_bindings,
+                &route_destination_hosts,
                 waypoint_resources,
             )
         } else {
@@ -2811,6 +2847,7 @@ fn narrow_for_service_waypoint(
     cluster_domain: &str,
     root_namespace: &str,
     bindings: &[crate::modes::mesh::config::MeshWaypointBinding],
+    route_destination_hosts: &BTreeSet<String>,
     resources: ServiceWaypointNarrowingResources,
 ) -> ServiceWaypointNarrowingResources {
     let Some(binding) = bindings
@@ -2861,7 +2898,14 @@ fn narrow_for_service_waypoint(
                 root_namespace,
                 cluster_domain,
                 &admitted_services,
-            )
+            ) || route_destination_hosts.iter().any(|host| {
+                // A rule naming an external destination of a carried route
+                // (issue #7500), through the one DestinationRule host
+                // matcher. Export visibility and lookup tiers were already
+                // applied by `admit_destination_rules`, and
+                // `apply_destination_rules` re-derives the tier per host.
+                super::destination_rule_host_specificity(&dr.host, &dr.namespace, host).is_some()
+            })
         })
         .collect();
     let admitted_service_entries: Vec<ServiceEntry> = resources
@@ -2874,6 +2918,7 @@ fn narrow_for_service_waypoint(
             se.hosts.iter().any(|h| {
                 let h = h.trim_end_matches('.');
                 host_matches_admitted_service(h, &admitted_hosts)
+                    || service_entry_host_covers_route_destination(h, route_destination_hosts)
             })
         })
         .collect();
@@ -2927,6 +2972,77 @@ fn narrow_for_service_waypoint(
                 }
             })
             .collect(),
+    }
+}
+
+/// Every destination host the ServiceWaypoint routes in `routes` can dial
+/// (issue #7500): direct backends, `mesh_route_dispatch` rule backends, and
+/// weighted-split targets, canonical (trimmed, no trailing dot, lowercase).
+fn service_waypoint_route_destination_hosts(routes: &MeshHttpRouteSet) -> BTreeSet<String> {
+    let mut hosts: BTreeSet<String> = BTreeSet::new();
+    let mut insert = |host: &str| {
+        let host = canonical_destination_rule_host(host);
+        if !host.is_empty() {
+            hosts.insert(host);
+        }
+    };
+    for proxy in &routes.proxies {
+        if let Some(host) = proxy
+            .get("backend_host")
+            .and_then(serde_json::Value::as_str)
+        {
+            insert(host);
+        }
+    }
+    for plugin in &routes.plugin_configs {
+        for rule in plugin
+            .get("config")
+            .and_then(|config| config.get("rules"))
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(host) = rule
+                .get("destination")
+                .and_then(|destination| destination.get("backend_host"))
+                .and_then(serde_json::Value::as_str)
+            {
+                insert(host);
+            }
+        }
+    }
+    for upstream in &routes.upstreams {
+        for target in upstream
+            .get("targets")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(host) = target.get("host").and_then(serde_json::Value::as_str) {
+                insert(host);
+            }
+        }
+    }
+    hosts
+}
+
+/// Whether ServiceEntry host `entry_host` (exact, or a `*.suffix` wildcard)
+/// declares one of a carried route's destination hosts (issue #7500).
+fn service_entry_host_covers_route_destination(
+    entry_host: &str,
+    route_destination_hosts: &BTreeSet<String>,
+) -> bool {
+    let entry_host = canonical_destination_rule_host(entry_host);
+    if route_destination_hosts.contains(&entry_host) {
+        return true;
+    }
+    match entry_host.strip_prefix("*.") {
+        Some(suffix) if !suffix.is_empty() => route_destination_hosts.iter().any(|host| {
+            host.len() > suffix.len() + 1
+                && host.ends_with(suffix)
+                && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
+        }),
+        _ => false,
     }
 }
 
@@ -3916,26 +4032,31 @@ fn service_waypoint_http_route_set(
         .map(|service| (service.namespace.as_str(), service.name.as_str()))
         .collect();
     // The bound Services the inventory models, with their host variants.
-    let bound_hosts: Vec<(&str, Vec<String>)> = mesh
+    let bound_services_with_hosts: Vec<(&str, &str, Vec<String>)> = mesh
         .services
         .iter()
         .filter(|service| bound.contains(&(service.namespace.as_str(), service.name.as_str())))
         .map(|service| {
             (
                 service.namespace.as_str(),
+                service.name.as_str(),
                 service_host_aliases(&service.name, &service.namespace, cluster_domain),
             )
         })
         .collect();
-    if bound_hosts.is_empty() {
+    if bound_services_with_hosts.is_empty() {
         return MeshHttpRouteSet::default();
     }
+    let bound_hosts: Vec<(&str, &Vec<String>)> = bound_services_with_hosts
+        .iter()
+        .map(|(namespace, _, aliases)| (*namespace, aliases))
+        .collect();
     let binding_owns_service =
         |binding: &MeshVirtualServiceHttpRoutes, service_namespace: &str| -> bool {
             service_waypoint_route_owner_admission(binding, waypoint_namespace, service_namespace)
                 .is_ok()
         };
-    node_waypoint_http_route_set(
+    let mut set = node_waypoint_http_route_set(
         config,
         mesh,
         &|binding: &MeshVirtualServiceHttpRoutes| {
@@ -3966,7 +4087,58 @@ fn service_waypoint_http_route_set(
             )
         },
         None,
-    )
+    );
+    // Which bound Service each carried route is admitted for: the data plane
+    // builds each Service's route partition from exactly these, since only
+    // the control plane sees the binding's `exportTo`.
+    let bindings: HashMap<(&str, &str), &MeshVirtualServiceHttpRoutes> = mesh
+        .virtual_service_http_routes
+        .iter()
+        .flat_map(|binding| {
+            binding
+                .proxy_ids
+                .iter()
+                .map(move |id| ((binding.namespace.as_str(), id.as_str()), binding))
+        })
+        .collect();
+    let mut attachments: BTreeSet<MeshHttpRouteServiceAttachment> = BTreeSet::new();
+    for proxy in &set.proxies {
+        let (Some(proxy_namespace), Some(proxy_id)) = (
+            proxy.get("namespace").and_then(serde_json::Value::as_str),
+            proxy.get("id").and_then(serde_json::Value::as_str),
+        ) else {
+            continue;
+        };
+        let Some(&binding) = bindings.get(&(proxy_namespace, proxy_id)) else {
+            continue;
+        };
+        let hosts: Vec<&str> = proxy
+            .get("hosts")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        for (service_namespace, service_name, aliases) in &bound_services_with_hosts {
+            if binding_owns_service(binding, service_namespace)
+                && hosts.iter().any(|host| {
+                    service_alias_names_host(aliases, service_namespace, proxy_namespace, host)
+                })
+            {
+                attachments.insert(MeshHttpRouteServiceAttachment {
+                    proxy_namespace: proxy_namespace.to_string(),
+                    proxy_id: proxy_id.to_string(),
+                    service_namespace: service_namespace.to_string(),
+                    service_name: service_name.to_string(),
+                });
+            }
+        }
+    }
+    set.service_waypoint_attachments = attachments
+        .into_iter()
+        .take(MAX_SERVICE_WAYPOINT_ROUTE_ATTACHMENTS)
+        .collect();
+    set
 }
 
 /// Why a ServiceWaypoint does not carry a mesh-bound VirtualService's

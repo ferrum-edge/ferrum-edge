@@ -5624,6 +5624,14 @@ pub struct MeshConfig {
     #[serde(skip)]
     pub service_waypoint_l7_bindings:
         Vec<crate::modes::mesh::service_waypoint_l7::ServiceWaypointL7Binding>,
+    /// The ServiceWaypoint's full bound-Service inventory (reachable or not,
+    /// with host variants) and the carried routes the control plane attached
+    /// to each bound Service (issue #7500). Read with
+    /// [`Self::service_waypoint_l7_bindings`] to build the per-bound-Service
+    /// route partitions. Same assignment and `serde(skip)` rules.
+    #[serde(skip)]
+    pub service_waypoint_l7_inventory:
+        crate::modes::mesh::service_waypoint_l7::ServiceWaypointL7Inventory,
 }
 
 /// One destination the authenticated inbound CONNECT terminator may relay to,
@@ -6735,6 +6743,7 @@ impl Default for MeshConfig {
             sidecar_inbound_refuses_matched_http_connect: false,
             inbound_relay_node_local_registry: Default::default(),
             service_waypoint_l7_bindings: Vec::new(),
+            service_waypoint_l7_inventory: Default::default(),
         }
     }
 }
