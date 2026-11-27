@@ -459,8 +459,7 @@ fn rewrite_authority_is_carriable(
         format!("{name}.{namespace}.svc"),
         format!("{name}.{namespace}.svc.{domain}"),
     ];
-    aliases.iter().any(|alias| *alias == authority)
-        && service_http_ports(acc, namespace, name).len() == 1
+    aliases.contains(&authority) && service_http_ports(acc, namespace, name).len() == 1
 }
 
 /// Build the dispatch rules and upstreams of one staged attachment.

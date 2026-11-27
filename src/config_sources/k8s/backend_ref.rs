@@ -188,17 +188,8 @@ pub(crate) fn message_is_backend_not_found(message: &str) -> bool {
 /// exact grant for the typed `(group, kind)` pair. Unknown kinds and kinds the
 /// Route cannot materialize fail closed before grant evaluation so an overly
 /// broad grant cannot bless them.
-pub(crate) fn checked_backend_namespace(
-    object: &K8sObject,
-    backend_ref: &Value,
-    acc: &K8sAccumulator,
-    from_kind: &str,
-) -> Result<(BackendKind, String), K8sTranslateError> {
-    checked_backend_namespace_with_grant_policy(object, backend_ref, acc, from_kind, true)
-}
-
-/// [`checked_backend_namespace`] with the cross-namespace ReferenceGrant
-/// requirement made explicit. `require_reference_grant: false` is ONLY for a
+///
+/// `require_reference_grant: false` is ONLY for a
 /// GAMMA consumer route (issue #7538): it steers its own namespace's outbound
 /// traffic to a destination its clients could call directly, so upstream
 /// GAMMA requires no grant. Every other check (backend kind, ExternalName

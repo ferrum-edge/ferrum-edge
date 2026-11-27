@@ -9365,7 +9365,7 @@ fn l4_route_hosts(
     Ok(string_array(&object.spec, "hostnames"))
 }
 
-/// [`super::backend_ref::checked_backend_namespace`] plus the structured
+/// [`super::backend_ref::checked_backend_namespace_with_grant_policy`] plus the structured
 /// translation warning for EndpointSlice attribution: a refused Service
 /// backend, or a selector-backed one admitted without its EndpointSlices being
 /// checked because the controller observes no Pods in its namespace.
