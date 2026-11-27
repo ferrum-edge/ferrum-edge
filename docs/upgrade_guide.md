@@ -18,8 +18,10 @@
 > refuses a database that a newer release migrated, so take a backup before
 > every upgrade: rolling back across a migration means restoring that backup.
 
-This guide describes how to upgrade Ferrum Edge with zero configuration loss and
-a clear rollback path. The approach varies by operating mode, but the core
+This guide describes how to upgrade Ferrum Edge without losing configuration
+and with a clear rollback path. A backup carries namespace-scoped resources
+only; the namespace registry (descriptions) is recorded and recreated
+separately, and writes must be frozen from the final export through cutover. The approach varies by operating mode, but the core
 principle is the same: **export logical configuration, validate the new binary
 against a fresh datastore (or config copy) on non-production ports, then cut
 over production traffic.** File mode has no database; its config format is
@@ -59,12 +61,16 @@ Do these in order; each step links to the section that explains it.
    `health_checks.passive` block in config files, stored upstreams and API-spec
    `x-ferrum-upstream` extensions
    ([Removed settings](#removed-settings-and-passive-health-fields-7520-7524)).
-2. **Validate every document with the 1.0.0 binary** before any production
-   change: file-mode configs, mesh documents, and one `GET /backup` export per
-   namespace ([Unknown configuration keys](#unknown-configuration-keys-are-rejected-7520-7524)).
-   Fix what it names on 0.9.21, then export again.
-3. **Rebuild each database** from those exports with the 1.0.0 binary on
-   staging ports, keeping the 0.9.21 database untouched for rollback
+2. **Check every document with the 1.0.0 binary** before any production
+   change: file-mode configs, mesh documents, and a rehearsal `GET /backup`
+   export per namespace, which you also restore into a scratch 1.0.0 database
+   ([Unknown configuration keys](#unknown-configuration-keys-are-rejected-7520-7524)).
+   Fix what they name on 0.9.21.
+3. **Rebuild each database under a configuration-write freeze**: record the
+   namespace registry, freeze writes, take the final exports, recreate the
+   namespaces and restore with the 1.0.0 binary on staging ports, and cut over
+   before lifting the freeze, keeping the 0.9.21 database untouched for
+   rollback
    ([Database rebuild-and-restore](#every-09x-database-is-rebuilt-and-restored-7523)).
 4. **Upgrade the control plane, then every data plane, in one window**
    ([ConfigSync revision 8](#configsync-revision-8-and-the-cp-first-upgrade-7520-7524)),
@@ -89,16 +95,35 @@ Upgrade each database once by rebuild-and-restore, following
 [Build-Out Database Upgrade](#build-out-database-upgrade-postgresql-mysql-sqlite-mongodb)
 and [admin_backup_restore.md](admin_backup_restore.md):
 
-1. With the 0.9.21 binary still serving, export an unfiltered `GET /backup` per
-   namespace.
-2. Validate each export with the 1.0.0 binary (see
-   [Unknown configuration keys](#unknown-configuration-keys-are-rejected-7520-7524))
-   and fix what it names on 0.9.21 before exporting again.
-3. Initialize an empty database with 1.0.0 (`FERRUM_MODE=migrate
+1. **Rehearse.** With the 0.9.21 binary still serving, export an unfiltered
+   `GET /backup` per namespace, check each export with the 1.0.0 binary (see
+   [Unknown configuration keys](#unknown-configuration-keys-are-rejected-7520-7524)
+   and its limitations), restore it into a scratch 1.0.0 database, and fix what
+   either step names on 0.9.21. Rehearsal exports are not the cutover data.
+2. **Record the namespace registry.** A backup carries only namespace-scoped
+   resources, never the namespace registry row
+   ([admin_backup_restore.md](admin_backup_restore.md#namespace-metadata-is-not-part-of-a-backup)).
+   Record every registered namespace and its `description` with
+   `GET /namespaces` and `GET /namespaces/{name}`.
+3. **Freeze configuration writes** from the final exports through cutover: stop
+   every Admin API writer, including people, automation and API-spec
+   pipelines, against the 0.9.21 database. A write made after a namespace's
+   final export is lost at cutover, and comparing counts does not detect an
+   in-place edit such as a disabled route.
+4. **Under the freeze, repeat the export, check and restore.** Initialize an
+   empty database with 1.0.0 (`FERRUM_MODE=migrate
    FERRUM_MIGRATE_ACTION=up`), start 1.0.0 on staging ports against it,
-   `POST /restore?confirm=true` each export, and compare the restored counts.
-4. Cut over, and keep the 0.9.21 database unchanged until rollback is no longer
-   needed. Roll back by returning the 0.9.21 binary to the 0.9.21 database.
+   recreate each recorded namespace with `POST /namespaces`
+   (`{"name": ..., "description": ...}`; use `PUT /namespaces/{name}` for one
+   that already exists, such as the default `ferrum` namespace),
+   `POST /restore?confirm=true` each final export, and compare the restored
+   counts. Registry timestamps are assigned anew, and a registered namespace
+   that holds no resources comes back only through this recreate step:
+   restore does not create it.
+5. **Cut over** while the freeze still holds, then lift it on the 1.0.0
+   deployment. Keep the 0.9.21 database unchanged until rollback is no longer
+   needed. Roll back by returning the 0.9.21 binary to the 0.9.21 database;
+   writes made on 1.0.0 after cutover are not carried back.
 
 **MongoDB** takes the same path. 1.0.0 applies a versioned, forward-only index
 plan and records the plan version it applied in `_ferrum_migrations`
@@ -120,8 +145,8 @@ migration means restoring that backup, not restarting the old binary.
 
 ### Removed settings and passive-health fields (#7520, #7524)
 
-These were accepted and then ignored. 1.0.0 removes them so that nothing in the
-frozen configuration surface is accepted without effect.
+These were accepted and then ignored. 1.0.0 removes them so that they do not
+become part of the frozen configuration surface.
 
 - **`FERRUM_TLS_OFFLOAD_THREADS`** (#7520). TLS handshake offload was never
   implemented, and any nonzero value has failed startup since #4294.
@@ -163,7 +188,7 @@ Before 1.0.0 only the top-level resources (`Proxy`, `Upstream`, `Consumer`,
 `PluginConfig`, `ApiSpec`) rejected unknown keys; nested objects dropped them
 silently, so a misspelled `health_checks.pasive` or
 `circuit_breaker.failure_treshold` produced a resource with that policy
-missing. 1.0.0 closes every nested object:
+missing. 1.0.0 closes these nested objects:
 
 - in proxies and upstreams: `health_checks` and its `active` / `passive`
   blocks, `targets[]`, `service_discovery` and its `dns_sd`, `kubernetes`,
@@ -194,28 +219,51 @@ A key that 0.9.21 ignored now fails with an error that names it:
   build.
 - `POST /restore` refuses a backup that carries such a key.
 - In database and CP mode, a stored row that carries such a key fails to load.
+  One exception: when MongoDB reads a stored proxy, it projects each embedded
+  `plugins[]` association onto the members `PluginAssociation` declares
+  (`plugin_config_id`) before the strict decode, because deployment mutations
+  keep opaque association metadata in the store. Such stored metadata does not
+  block a load; the same member sent through the Admin API, `/batch`, a restore
+  or a file is still refused.
 - `POST` / `PUT /api-specs` refuses a spec whose `x-ferrum-proxy` or
   `x-ferrum-upstream` carries one.
 
-**Operator action, before upgrading** (run the 1.0.0 binary; it reads the
-files and connects to nothing):
-- File mode: `ferrum-edge validate -m file -c resources.yaml` with the
-  deployment's `ferrum.conf` / environment, and fix every key it names.
-- Mesh: `ferrum-edge validate -m mesh -c slice.yaml` for each localized mesh
-  document.
-- Database and CP: save `GET /backup` per namespace from 0.9.21 and validate it
-  in database mode through the backup loader:
+**Operator action, before upgrading.** Run the 1.0.0 binary with the
+deployment's `ferrum.conf` and environment. `validate` makes no database or
+control-plane connection, but it first resolves external secret sources
+(`_FILE`, `_VAULT`, `_AWS`, `_AZURE`, `_GCP`) exactly as `run` does, so the host
+needs access to any secret provider the deployment uses.
+- File mode: `ferrum-edge validate -m file -c resources.yaml`, and fix every
+  key it names.
+- Mesh: check each localized `{version?, mesh}` document with
+  `FERRUM_MESH_CONFIG_PROTOCOL=file ferrum-edge validate -m mesh -c slice.yaml`.
+  A native or xDS data plane's environment sets
+  `FERRUM_MESH_CONFIG_PROTOCOL=native` or `xds`, which refuses a localized
+  document from `-c`, so override it for this check, and unset
+  `FERRUM_MESH_FILE_CONFIG_PATH` unless it names the same file. The workload
+  identity and CA settings are still required.
+- Database and CP: save `GET /backup` per namespace from 0.9.21 and confirm the
+  file is readable (for example `test -r /path/to/backup.json`), then check it
+  through the database-mode backup loader:
   `FERRUM_DB_CONFIG_BACKUP_PATH=/path/to/backup.json FERRUM_NAMESPACE=<ns> ferrum-edge validate -m database`,
-  with the deployment's usual database environment. This loader strips the
-  backup envelope and checks the namespace's proxies, consumers, plugin configs
-  and upstreams without connecting to the database. Correct each resource it
+  with the deployment's usual database environment. Correct each resource it
   names through the 0.9.21 Admin API, then export again.
 - API specs: fix the same keys in `x-ferrum-proxy` / `x-ferrum-upstream`
   extensions in your source spec documents and re-submit the owning specs.
 
-**Limitations of these checks:**
-- The backup validator does not check the backup's `api_specs` section. Stored
-  API-spec documents are not validated by it at all.
+**Limitations of these checks.** The staging `POST /restore` on 1.0.0 is the
+check of the full backup payload; the backup loader is a partial preflight:
+- It deserializes and validates the namespace's `proxies`, `consumers`,
+  `plugin_configs` and `upstreams`. It strips the envelope fields and the
+  `api_specs` and `gateway_trust_bundles` sections without checking them, so
+  an invalid trust-bundle record or API-spec item passes it and is refused
+  only by the restore.
+- A path that does not exist is not an error: the loader logs a warning, checks
+  nothing, and the command still prints `Validation passed.` (an existing file
+  it cannot read fails). Confirm the file is readable before trusting a pass.
+- It reads at most 64 MiB, while `POST /restore` accepts up to
+  `FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB` (default `100`). Send a larger
+  export straight to the staging restore, with that limit raised to fit it.
 - `POST /restore` copies stored API-spec documents without re-extracting them.
   A spec document whose `x-ferrum-proxy` or `x-ferrum-upstream` still carries an
   unknown or removed key restores successfully, and is refused only the next
@@ -226,7 +274,7 @@ files and connects to nothing):
 
 The ConfigSync build identity is now `1.0.0+configsync.r8`. Revision 7 (#7520)
 removed the two passive-health fields and closed the passive object; revision
-8 (#7524) closes every other nested object. A 0.9.21 peer
+8 (#7524) closes the other nested proxy, upstream and mesh objects. A 0.9.21 peer
 (`0.9.21+configsync.r6`) is refused at `Subscribe` with `ConfigSync build
 mismatch` (see [Build Identity Gate](#build-identity-gate)). Native mesh data
 planes subscribe with `MeshSubscribe`, which refuses a peer with a different
@@ -5433,13 +5481,34 @@ use an unfiltered `GET /backup` per namespace. Multi-tenant deployments repeat
 the export/import pair for every namespace (set `X-Ferrum-Namespace` on both
 calls). Backup files contain live secrets — store them like database dumps.
 
+Two things are **not** carried by the export, and the steps below handle them:
+
+- **The namespace registry.** A backup never contains the namespace registry
+  row (its `description` and timestamps), and restore never creates one
+  ([details](admin_backup_restore.md#namespace-metadata-is-not-part-of-a-backup)).
+  Record each registered namespace and description with `GET /namespaces` and
+  `GET /namespaces/{name}` before exporting, and recreate them on the fresh
+  database with `POST /namespaces` (or `PUT /namespaces/{name}` for one that
+  already exists there, such as the default `ferrum` namespace). Registry
+  timestamps are assigned anew, and a registered namespace that holds no
+  resources exists on the new database only if you recreate it.
+- **Writes after the export.** Anything written to the old database after a
+  namespace's final export is lost at cutover, and comparing counts does not
+  detect an in-place edit. Exports taken while writes continue are rehearsal
+  only: before the final export, **freeze configuration writes** (stop every
+  Admin API writer, including people, automation and API-spec pipelines), then
+  repeat the export, validation and restore under the freeze and keep it in
+  place through cutover.
+
 ### Step-by-Step (all SQL backends and MongoDB)
 
 #### 1. Export a namespace-complete logical backup
 
-With the **current** binary still serving production, capture one full backup per
-namespace from the Admin API (database mode or CP). Do **not** delete or mutate
-the production database; it becomes the rollback artifact.
+With the **current** binary still serving production and configuration
+writes frozen (see above; an export taken without the freeze is a rehearsal),
+capture one full backup per namespace from the Admin API (database mode or CP).
+Do **not** delete or mutate the production database; it becomes the rollback
+artifact.
 
 ```bash
 TOKEN="your-jwt-token"
@@ -5543,8 +5612,9 @@ Verify import **without logging secrets**:
 - **Proxy traffic**: send test requests through port 8100.
 - **Logs**: check for warnings or errors at `FERRUM_LOG_LEVEL=info`.
 
-Repeat export/import for every namespace. When staging validation passes, stop
-the production binary, point `FERRUM_DB_URL` at the validated fresh database (or
+Repeat export/import for every namespace, and recreate the recorded namespace
+registry entries on the fresh database. When staging validation passes, and
+with the write freeze still in place, stop the production binary, point `FERRUM_DB_URL` at the validated fresh database (or
 swap connection strings / DNS), and start the new binary on production ports.
 Leave the **old database files or instance unchanged** — do not drop them until
 rollback is no longer required.
@@ -5562,6 +5632,8 @@ If issues arise after cutover:
 
 The old binary + old database is a consistent pair. The backup JSON from step 1
 is a secondary recovery copy if the old database were damaged independently.
+Configuration written through the new binary after cutover is not carried back
+to the old database.
 
 > **Unsupported for a 0.x database:** running `FERRUM_MODE=migrate` against the
 > production database to apply "pending" core schema changes, relying on startup

@@ -31,9 +31,9 @@ directly. From this release onward the
   schema changes ship as forward migrations (`V002`+), and MongoDB records a
   versioned, forward-only index plan.
 
-Configuration was closed before the freeze. Unknown keys are refused at every
-level of proxies, upstreams, native mesh resources and the remaining open Admin
-API request bodies instead of being silently dropped, and settings that were
+Configuration was closed before the freeze. Unknown keys are refused in the
+nested objects of proxies, upstreams, native mesh resources and the remaining
+open Admin API request bodies instead of being silently dropped, and settings that were
 accepted but never applied are removed: `FERRUM_TLS_OFFLOAD_THREADS`,
 `FERRUM_UDP_GRO_ENABLED`, and the passive-health `gateway_error_codes` and
 `split_external_local_origin_errors` fields. The release also fixes database
@@ -110,9 +110,9 @@ gateways, control planes, mesh data planes, charts or contract consumers.
   rebuild-and-restore is still the only supported upgrade path for a 0.9.x
   MongoDB database, because 1.0.0 rejects stored documents that carry removed or
   unknown keys and no in-place conversion exists.
-- **BREAKING:** unknown keys are rejected at every level of the configuration
-  schema (#7520, #7524). This covers nested proxy and upstream objects
-  (`health_checks` and its `active` / `passive` blocks, `targets[]`,
+- **BREAKING:** unknown keys are rejected in every nested object of the
+  configuration schema (#7520, #7524). This covers nested proxy and upstream
+  objects (`health_checks` and its `active` / `passive` blocks, `targets[]`,
   `service_discovery` and its provider objects, `subsets[]` and their
   `traffic_policy`, `port_overrides`, `locality_lb_setting`,
   `hash_on_cookie_config`, `circuit_breaker`, `retry` and its `backoff` variant
@@ -125,15 +125,21 @@ gateways, control planes, mesh data planes, charts or contract consumers.
   such as `health_checks.pasive` built a resource with that policy missing.
   The Admin API, `/batch`, `POST /restore`, API-spec `x-ferrum-proxy` /
   `x-ferrum-upstream`, file mode, `ferrum-edge validate`, mesh documents and
-  the MeshConfig ConfigMap, database and MongoDB loads and CP-to-DP sync all
-  refuse such a key and name it. `openapi.yaml` marks every such schema
+  the MeshConfig ConfigMap, database and MongoDB loads and CP-to-DP sync
+  refuse such a key and name it. One exception: a MongoDB read of a stored
+  proxy projects each embedded `plugins[]` association onto its declared
+  members (`plugin_config_id`) before the strict decode, because deployment
+  mutations keep opaque association metadata in the store; such stored
+  metadata does not block a load, while the same member is still refused on
+  every write path. `openapi.yaml` marks every such schema
   `additionalProperties: false`, including `Proxy`, `Upstream` and
   `PluginConfigBase`, which were already strict at runtime. Free-form maps
   (`labels`, plugin `config`, consumer `credentials`) stay open; built-in
-  plugin configs already rejected unknown keys at every depth.
+  plugin configs already rejected unknown keys.
 - **BREAKING:** ConfigSync protocol revision 8 (`<version>+configsync.r8`)
   (#7520, #7524). Revision 7 removed the two passive-health fields and closed
-  the passive object; revision 8 closes every other nested object. A 0.9.21
+  the passive object; revision 8 closes the other nested proxy, upstream and
+  mesh objects. A 0.9.21
   peer (`0.9.21+configsync.r6`) is refused at `Subscribe`, so the control
   plane and its data planes must be upgraded together.
 - **BREAKING:** JSON documents with a repeated object member name are refused
@@ -195,20 +201,22 @@ gateways, control planes, mesh data planes, charts or contract consumers.
   backends receive `%5E` for a literal `^` in the path on both the direct
   HTTP/1.1 pool and the `reqwest` dispatch path (a `^` in the query string
   remains literal) (#7479).
-- **TLS events `since` filter: new 400 message text for an invalid timestamp**
-  (issue #7419, `chrono` replacement). The status code, error envelope and the
-  set of rejected inputs are unchanged; only the human-readable detail after
+- **TLS events `since` filter: new 400 message text and a range limit**
+  (issue #7419, `chrono` replacement). An invalid timestamp still gets `400`
+  with the same error envelope, but the human-readable detail after
   `invalid since timestamp: ` now comes from Ferrum's timestamp parser instead
-  of chrono's. A value chrono accepted whose UTC instant falls outside years
-  -9999..=9999 is now rejected the same way, and a leap second (`:60`) is
-  treated as the following second.
+  of chrono's. The filter parses the same syntax chrono did, with two
+  differences: a value whose UTC instant falls outside years -9999..=9999 is
+  now rejected with that `400` (for example `9999-12-31T23:59:59-00:01`, which
+  is in year 10000 in UTC), and a leap second (`:60`) is treated as the
+  following second.
 - **Timestamp parsing outside the TLS events filter follows the same two
-  rules** (issue #7419). Parse sites accept and reject exactly what chrono
-  did, but a leap second (`:60`) is stored as the following second, and an
-  instant chrono accepted outside years -9999..=9999 takes the site's normal
+  rules** (issue #7419). Parse sites accept the same syntax chrono did, with
+  two differences: a leap second (`:60`) is stored as the following second, and
+  an instant chrono accepted outside years -9999..=9999 takes the site's normal
   invalid-timestamp path: `response_caching` treats such an HTTP date header
-  as unparseable, `transaction_debugger` refuses
-  such a `capture_expires_at`, and `soap_ws_security` refuses a
+  as unparseable, `transaction_debugger` refuses such a `capture_expires_at`,
+  and `soap_ws_security` refuses a
   `9999-12-31T23:59:60Z` leap second as out of range. Rendered timestamps of
   in-range values are byte-identical.
 - Docs: the support, versioning and deprecation policy
@@ -328,10 +336,10 @@ gateways, control planes, mesh data planes, charts or contract consumers.
   response headers are sanitized in place. On the comparison benchmark
   `key_auth` throughput rose by about half, to within a few percent of plain
   HTTP.
-- **Built-in plugin hot paths** (#7474). Only the six authorizing plugins run
-  the authorize phase, the per-proxy plugin lookup does one map lookup instead
-  of five, eleven more audited built-ins take the request-header passthrough,
-  and plugins with hooks that do nothing are skipped. Many plugins drop
+- **Built-in plugin hot paths** (#7474). Among built-in plugins only the six
+  authorizing ones run the authorize phase, the per-proxy plugin lookup does
+  one map lookup instead of five, eleven more audited built-ins take the
+  request-header passthrough, and plugins with hooks that do nothing are skipped. Many plugins drop
   per-request allocations, syscalls and lock contention, including
   `compression` (small payloads compress inline), `rate_limiting`,
   `response_caching`, `cors`, `waf`, `prometheus_metrics` and the AI request
