@@ -1262,7 +1262,8 @@ fn has_failover_priority(locality: &Value) -> bool {
 /// `outlierDetection` fields the translator parses past but never applies
 /// (issue #4292), across top-level, `portLevelSettings`, and subset policies.
 ///
-/// Kept in sync with `DEFERRED_OUTLIER_DETECTION_FIELDS` in
+/// Kept in sync with `DEFERRED_OUTLIER_DETECTION_FIELDS` and
+/// `SPLIT_EXTERNAL_LOCAL_ORIGIN_ERRORS_FIELD` in
 /// `src/config_sources/k8s/istio.rs`. Labels name the FIELD only, never the
 /// operator's configured value.
 fn deferred_outlier_detection_fields(spec: &Value) -> Vec<&'static str> {
@@ -1288,6 +1289,19 @@ fn deferred_outlier_detection_fields(spec: &Value) -> Vec<&'static str> {
         deferred.push(
             "trafficPolicy.outlierDetection.minHealthPercent (not applied: ejection is bounded by \
              maxEjectionPercent only)",
+        );
+    }
+    // Only `true` is a gap: `false` (Istio's default) is the single shared
+    // bucket Ferrum always uses.
+    if outlier_detection_blocks(spec).into_iter().any(|block| {
+        block
+            .get("splitExternalLocalOriginErrors")
+            .and_then(Value::as_bool)
+            == Some(true)
+    }) {
+        deferred.push(
+            "trafficPolicy.outlierDetection.splitExternalLocalOriginErrors (not applied: \
+             local-origin failures share the consecutive5xxErrors bucket)",
         );
     }
     deferred

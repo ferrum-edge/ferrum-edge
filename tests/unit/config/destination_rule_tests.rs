@@ -1,6 +1,6 @@
 //! Tests for DestinationRule runtime support:
 //! - SubsetDefinition / SubsetTrafficPolicy serde round-trip
-//! - PassiveHealthCheck new fields serde
+//! - PassiveHealthCheck optional-field serde and unknown-field rejection
 //! - Upstream subset validation (duplicate names, empty labels, max count)
 //! - Proxy upstream_subset validation
 //! - retired pool_max_requests_per_connection is refused
@@ -168,22 +168,21 @@ fn subset_traffic_policy_tls_round_trip_json() {
     assert!(!tls.insecure_skip_verify);
 }
 
-// ── PassiveHealthCheck new fields serde ───────────────────────────────────────
+// ── PassiveHealthCheck optional fields serde ──────────────────────────────────
 
 #[test]
-fn passive_health_check_default_omits_new_fields() {
+fn passive_health_check_default_omits_optional_fields() {
     let phc = PassiveHealthCheck::default();
     assert!(phc.max_ejection_percent.is_none());
-    assert!(phc.gateway_error_codes.is_none());
-    assert!(phc.split_external_local_origin_errors.is_none());
+    assert!(!phc.consecutive_error_mode);
+    assert!(!phc.consecutive_5xx_ejection_disabled);
 }
 
 #[test]
-fn passive_health_check_with_new_fields_round_trip() {
+fn passive_health_check_with_optional_fields_round_trip() {
     let phc = PassiveHealthCheck {
         max_ejection_percent: Some(50),
-        gateway_error_codes: Some(vec![502, 503, 504]),
-        split_external_local_origin_errors: Some(true),
+        consecutive_error_mode: true,
         ..Default::default()
     };
 
@@ -191,8 +190,7 @@ fn passive_health_check_with_new_fields_round_trip() {
     let back: PassiveHealthCheck = serde_json::from_str(&json).unwrap();
 
     assert_eq!(back.max_ejection_percent, Some(50));
-    assert_eq!(back.gateway_error_codes, Some(vec![502, 503, 504]));
-    assert_eq!(back.split_external_local_origin_errors, Some(true));
+    assert!(back.consecutive_error_mode);
 }
 
 #[test]
@@ -200,8 +198,52 @@ fn passive_health_check_skip_serializing_none_fields() {
     let phc = PassiveHealthCheck::default();
     let json = serde_json::to_string(&phc).unwrap();
     assert!(!json.contains("max_ejection_percent"));
-    assert!(!json.contains("gateway_error_codes"));
-    assert!(!json.contains("split_external_local_origin_errors"));
+    assert!(!json.contains("consecutive_error_mode"));
+    assert!(!json.contains("consecutive_5xx_ejection_disabled"));
+}
+
+/// The removed reserved fields (never applied by passive health) and any
+/// other unknown key must fail deserialization rather than being dropped.
+#[test]
+fn passive_health_check_rejects_removed_and_unknown_fields() {
+    for (field, value) in [
+        ("gateway_error_codes", serde_json::json!([502, 503, 504])),
+        (
+            "split_external_local_origin_errors",
+            serde_json::json!(true),
+        ),
+        (
+            "split_external_local_origin_errors",
+            serde_json::json!(false),
+        ),
+        ("unhealthy_treshold", serde_json::json!(3)),
+    ] {
+        let mut body = serde_json::json!({"unhealthy_threshold": 3});
+        body[field] = value;
+        let error = serde_json::from_value::<PassiveHealthCheck>(body)
+            .expect_err("unknown passive health field must be rejected");
+        assert!(
+            error.to_string().contains(field),
+            "error must name the unknown field {field}: {error}"
+        );
+    }
+}
+
+#[test]
+fn upstream_with_removed_passive_field_is_rejected() {
+    let body = serde_json::json!({
+        "id": "u1",
+        "targets": [{"host": "backend.example", "port": 8080}],
+        "health_checks": {
+            "passive": {"gateway_error_codes": [502, 503, 504]}
+        }
+    });
+    let error = serde_json::from_value::<Upstream>(body)
+        .expect_err("an upstream carrying a removed passive field must be rejected");
+    assert!(
+        error.to_string().contains("gateway_error_codes"),
+        "error must name the removed field: {error}"
+    );
 }
 
 // ── Upstream subset validation ───────────────────────────────────────────────

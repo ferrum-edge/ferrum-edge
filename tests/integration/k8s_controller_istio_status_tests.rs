@@ -1411,8 +1411,8 @@ fn request_authentication_output_claim_to_headers_is_not_deferred() {
     assert!(deferred.is_empty(), "{deferred:?}");
 }
 
-/// The three `outlierDetection` knobs Ferrum parses past must be visible, with
-/// no operator-configured value echoed into the status object.
+/// The `outlierDetection` knobs Ferrum parses past must be visible, with no
+/// operator-configured value echoed into the status object.
 #[test]
 fn destination_rule_reports_unenforced_outlier_fields_as_deferred() {
     let deferred = deferred_fields_for(object(
@@ -1426,7 +1426,8 @@ fn destination_rule_reports_unenforced_outlier_fields_as_deferred() {
                     "consecutive5xxErrors": 5,
                     "consecutiveGatewayErrors": 3,
                     "consecutiveLocalOriginFailures": 2,
-                    "minHealthPercent": 40
+                    "minHealthPercent": 40,
+                    "splitExternalLocalOriginErrors": true
                 }
             }
         }),
@@ -1436,6 +1437,7 @@ fn destination_rule_reports_unenforced_outlier_fields_as_deferred() {
         "consecutiveGatewayErrors",
         "consecutiveLocalOriginFailures",
         "minHealthPercent",
+        "splitExternalLocalOriginErrors",
     ] {
         assert!(
             deferred.iter().any(|entry| entry.contains(field)),
@@ -1445,6 +1447,55 @@ fn destination_rule_reports_unenforced_outlier_fields_as_deferred() {
     assert!(
         !deferred.iter().any(|entry| entry.contains("40")),
         "labels must not echo configured values: {deferred:?}"
+    );
+}
+
+/// `splitExternalLocalOriginErrors: false` is Istio's default and the only
+/// mode Ferrum implements, so it must not be reported as a deferred gap, in
+/// any outlierDetection tier.
+#[test]
+fn destination_rule_split_local_origin_false_is_not_deferred() {
+    let deferred = deferred_fields_for(object(
+        "networking.istio.io/v1",
+        "DestinationRule",
+        "dr-outlier-split-false",
+        json!({
+            "host": "reviews.default.svc.cluster.local",
+            "trafficPolicy": {
+                "outlierDetection": {
+                    "consecutive5xxErrors": 5,
+                    "splitExternalLocalOriginErrors": false
+                }
+            }
+        }),
+    ));
+    assert!(
+        !deferred
+            .iter()
+            .any(|entry| entry.contains("splitExternalLocalOriginErrors")),
+        "{deferred:?}"
+    );
+
+    let deferred = deferred_fields_for(object(
+        "networking.istio.io/v1",
+        "DestinationRule",
+        "dr-outlier-split-subset",
+        json!({
+            "host": "reviews.default.svc.cluster.local",
+            "subsets": [{
+                "name": "v1",
+                "labels": {"version": "v1"},
+                "trafficPolicy": {
+                    "outlierDetection": {"splitExternalLocalOriginErrors": true}
+                }
+            }]
+        }),
+    ));
+    assert!(
+        deferred
+            .iter()
+            .any(|entry| entry.contains("splitExternalLocalOriginErrors")),
+        "a subset-tier split=true must be reported: {deferred:?}"
     );
 }
 
