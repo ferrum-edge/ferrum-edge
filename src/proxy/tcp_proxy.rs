@@ -2364,8 +2364,8 @@ pub(crate) struct StreamDisconnectClocks {
 
 pub(crate) fn stream_disconnect_clocks(
     connected_mono: Instant,
-    connected_wall_at: chrono::DateTime<chrono::Utc>,
-    disconnected_wall_at: chrono::DateTime<chrono::Utc>,
+    connected_wall_at: crate::time_compat::UtcTimestamp,
+    disconnected_wall_at: crate::time_compat::UtcTimestamp,
 ) -> StreamDisconnectClocks {
     StreamDisconnectClocks {
         duration_ms: connected_mono.elapsed().as_millis() as f64,
@@ -2996,7 +2996,7 @@ async fn run_tcp_accept_loop(
                     };
 
                     let connected_at = Instant::now();
-                    let connected_wall_at = chrono::Utc::now();
+                    let connected_wall_at = crate::time_compat::UtcTimestamp::now();
                     // Single TCP client-identity boundary: a dual-stack listener
                     // reports an IPv4 peer as `::ffff:a.b.c.d`, and both this value and
                     // any PROXY-protocol-forwarded source below are folded before the
@@ -3392,7 +3392,7 @@ async fn run_tcp_accept_loop(
                         let clocks = stream_disconnect_clocks(
                             connected_at,
                             connected_wall_at,
-                            chrono::Utc::now(),
+                            crate::time_compat::UtcTimestamp::now(),
                         );
                         let (consumer_username, principal_origin) = if !plugins.is_empty() {
                             stream_ctx.summary_identity()

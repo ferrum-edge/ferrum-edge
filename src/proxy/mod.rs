@@ -18671,7 +18671,7 @@ async fn handle_websocket_request_authenticated(
         auth_method: ctx.auth_method,
         metadata: clone_log_metadata(&ctx),
         proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
-        session_start: chrono::Utc::now(),
+        session_start: crate::time_compat::UtcTimestamp::now(),
         session_start_mono: Instant::now(),
     };
     tokio::spawn(async move {
@@ -21170,7 +21170,7 @@ pub struct WsSessionMeta {
     /// Ownership generation captured at WebSocket upgrade admission.
     pub proxy_lifecycle_generation: Option<u64>,
     /// Civil/UTC connect time for human-readable `timestamp_connected` only.
-    pub session_start: chrono::DateTime<chrono::Utc>,
+    pub session_start: crate::time_compat::UtcTimestamp,
     /// Process-monotonic connect instant used for `duration_ms`. Wall-clock
     /// corrections must not freeze, clamp, or inflate WebSocket session duration.
     pub session_start_mono: Instant,
