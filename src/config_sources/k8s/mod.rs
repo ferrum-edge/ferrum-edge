@@ -48,6 +48,11 @@ pub(crate) use istio::{
 // Same for the mesh binding of a VirtualService's `http[]` routes (issue #7390):
 // the status writer reports where they apply from the predicate that decides it.
 pub(crate) use istio::virtual_service_binds_mesh;
+// Issue #7499: the status writer reports each mesh-bound VirtualService
+// destination in another namespace, which mesh data planes refuse.
+pub(crate) use istio::{
+    VirtualServiceCrossNamespaceDestination, virtual_service_mesh_cross_namespace_destinations,
+};
 // Shared with the Istio status writer the same way: Sidecar `ingress[]`
 // classification used by resolution and deferred-field reporting is one
 // predicate, so modeled HTTP and stream listeners cannot be reported deferred.
