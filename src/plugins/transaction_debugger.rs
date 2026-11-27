@@ -90,8 +90,8 @@
 //! summary: the sample exists only on the `transaction_debug` tracing target.
 //! The only state retained across hooks is the content-free record flag above.
 
+use crate::time_compat::UtcTimestamp;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use http::header::HeaderName;
 use serde::ser::SerializeMap;
 use serde_json::Value;
@@ -414,7 +414,7 @@ pub struct TransactionDebugger {
     /// instead of a content-free omission.
     capture_body_prefix: bool,
     /// Requests received at or after this instant are not captured.
-    capture_expires_at: Option<DateTime<Utc>>,
+    capture_expires_at: Option<UtcTimestamp>,
     /// Lowercase request header that must be present for a capture.
     capture_request_header: Option<String>,
     /// Exact value `capture_request_header` must carry, when configured.
@@ -701,10 +701,14 @@ impl TransactionDebugger {
         ctx: &RequestContext,
         selector_headers: &HashMap<String, String>,
     ) -> Option<&'static str> {
-        if self
-            .capture_expires_at
-            .is_some_and(|expires_at| ctx.timestamp_received >= expires_at)
-        {
+        // `RequestContext::timestamp_received` is still chrono-typed (issue
+        // #7419); compare the exact (seconds, nanoseconds) pair until it moves.
+        if self.capture_expires_at.is_some_and(|expires_at| {
+            (
+                ctx.timestamp_received.timestamp(),
+                ctx.timestamp_received.timestamp_subsec_nanos(),
+            ) >= (expires_at.unix_timestamp(), expires_at.subsec_nanos())
+        }) {
             return Some("capture_expired");
         }
         if self.capture_request_header.is_some() {
@@ -2877,7 +2881,7 @@ fn optional_capture_sample_threshold(
 fn optional_capture_expiry(
     config: &Value,
     capture_enabled: bool,
-) -> Result<Option<DateTime<Utc>>, String> {
+) -> Result<Option<UtcTimestamp>, String> {
     const FIELD: &str = "capture_expires_at";
     let raw = match config.get(FIELD) {
         None => return Ok(None),
@@ -2898,8 +2902,12 @@ fn optional_capture_expiry(
             "transaction_debugger: `{FIELD}` requires `log_request_body` or `log_response_body` to be true"
         ));
     }
-    DateTime::parse_from_rfc3339(raw)
-        .map(|instant| Some(instant.with_timezone(&Utc)))
+    // chrono-compatible parse (issue #7419): a leap second is normalized, and
+    // an instant outside UtcTimestamp's ±9999-year range is refused with the
+    // same validation error as any malformed value.
+    crate::time_compat::parse_rfc3339_chrono(raw)
+        .and_then(|parsed| parsed.to_utc_timestamp())
+        .map(Some)
         .map_err(|_| format!("transaction_debugger: `{FIELD}` must be an RFC 3339 timestamp"))
 }
 
