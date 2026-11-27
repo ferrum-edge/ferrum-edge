@@ -1,0 +1,398 @@
+name: Mesh E2E ServiceWaypoint Live Datapath
+
+# Live ServiceWaypoint L7 suite (issue #7503; design spec
+# docs/plans/mesh_virtualservice_servicewaypoint.md section 6.4). One kind
+# cluster runs SPIRE, a Ferrum control plane with Istio + Gateway API CRD
+# watching over production mTLS + JWT, a ServiceWaypoint, its bound Services'
+# native Sidecar backends, a cross-namespace destination and an HBONE client
+# (tests/k8s/mesh_e2e_service_waypoint/).
+#
+# `Mesh E2E ServiceWaypoint Live` is an OPTIONAL always-reporting aggregate: it
+# is not branch-protection-required and not in
+# .github/required-publication-checks.json. The `changes` job follows the same
+# trusted-base relevance shape the required live suites use, with the
+# suite/slug/display substitutions, `persist-credentials: false`, and a
+# temporary bootstrap handshake until the classifier suite reaches `main`.
+#
+# Adoption window: until ServiceWaypoint L7 termination ships (#7500/#7501)
+# the control plane reports VirtualService mesh_http_routes =
+# sidecar_and_node_waypoint. The live job sets FERRUM_SWP_E2E_ALLOW_L7_ABSENT=1
+# so run.sh records every L7 row as an explicit `skip` ("ServiceWaypoint L7 not
+# present") while still requiring the bound-Service projection row, and the
+# gate reports that state as a warning in its summary. The gate-on follow-up
+# removes the flag, after which an absent L7 build fails the suite.
+
+on:
+  workflow_dispatch:
+  pull_request:
+  merge_group:
+    types:
+      - checks_requested
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('mesh-e2e-service-waypoint-live-pr-{0}', github.event.pull_request.number) || (github.event_name == 'merge_group' && format('mesh-e2e-service-waypoint-live-merge-group-{0}', github.event.merge_group.head_sha) || (github.event_name == 'push' && format('mesh-e2e-service-waypoint-live-{0}', github.ref) || 'mesh-e2e-service-waypoint-live-shared')) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
+
+env:
+  FERRUM_IMAGE_REPOSITORY: ferrum-edge
+  FERRUM_IMAGE_TAG: mesh-e2e-service-waypoint
+  CLUSTER: ferrum-swp-e2e
+
+jobs:
+  changes:
+    name: Mesh e2e ServiceWaypoint trigger
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    outputs:
+      relevant: ${{ steps.filter.outputs.relevant }}
+    steps:
+      - name: Checkout Ferrum Edge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          # This optional workflow is not in the policy-frozen checkout list
+          # (verify_workflow_permissions.py), so it drops the persisted
+          # credential: the trusted-base fetch below needs none (public repo).
+          persist-credentials: false
+
+      # Relevance decides whether a REQUIRED live gate runs at all, so it must
+      # never be computed by code the pull request supplies: a PR that widens
+      # its own suite patterns could declare itself irrelevant, skip the live
+      # job, and still turn the required check green.
+      #
+      # Everything below reads ONE immutable trusted commit. The base-branch
+      # tip is fetched from the base repository, pinned once to a full object
+      # id, checked to hold the filter as a regular blob, and then read BY
+      # OBJECT ID rather than by path. A fork head, a rewritten head, or a push
+      # to the base branch mid-run therefore cannot swap the script between
+      # validation and execution, and every failure exits non-zero so the gate
+      # fails closed instead of quietly declaring itself irrelevant.
+      #
+      # This block is the shape .github/scripts/verify_cross_build_policy.py
+      # freezes for the required live suites (live_suite_relevance_errors),
+      # apart from the suite/slug/display substitutions, the checkout's
+      # `persist-credentials: false`, and the temporary bootstrap handshake.
+      # This optional workflow is not in LIVE_SUITE_RELEVANCE_CONTRACTS yet.
+      - name: Check for mesh-e2e-service-waypoint changes
+        id: filter
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+        run: |
+          set -euo pipefail
+
+          filter_path=.github/scripts/live_suite_path_filter.py
+          changed_files="$RUNNER_TEMP/mesh-e2e-service-waypoint-changed-files.txt"
+          trusted_filter="$RUNNER_TEMP/mesh-e2e-service-waypoint-trusted-filter.py"
+          rm -f -- "$changed_files" "$trusted_filter"
+          : > "$changed_files"
+
+          filter_args=(--suite mesh-e2e-service-waypoint --changed-files "$changed_files")
+
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            # `github.base_ref` names a branch in the BASE repository, so a fork
+            # cannot control its contents -- but it is still untrusted text.
+            # Reject anything outside a conservative branch charset before it
+            # reaches a refspec so no option, pathspec, or revision-syntax
+            # metacharacter can be smuggled into a git invocation.
+            if ! printf '%s' "$BASE_REF" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$'; then
+              echo "::error::refusing to resolve an unsafe base ref" >&2
+              exit 1
+            fi
+            case "$BASE_REF" in
+              *..*|*//*|*/|*.lock|*/.*)
+                echo "::error::refusing to resolve an unsafe base ref" >&2
+                exit 1
+                ;;
+            esac
+            fetched=false
+            for attempt in 1 2 3; do
+              if git fetch --no-tags --no-recurse-submodules origin \
+                "+refs/heads/${BASE_REF}:refs/ferrum/trusted-base"; then
+                fetched=true
+                break
+              fi
+              echo "git fetch of ${BASE_REF} failed (attempt ${attempt}/3); retrying" >&2
+              sleep $(( attempt * 10 ))
+            done
+            if [ "$fetched" != true ]; then
+              echo "::error::git fetch of ${BASE_REF} failed after 3 attempts" >&2
+              exit 1
+            fi
+            # Pin the moving tip exactly once; nothing below re-resolves a ref.
+            trusted_sha="$(git rev-parse --verify --quiet refs/ferrum/trusted-base^{commit} || true)"
+          elif [ "$EVENT_NAME" = "merge_group" ]; then
+            # Merge queues synthesize a combined SHA. Use the event's base_sha
+            # as the trusted filter source and the change-set base so a missing
+            # pull_request payload cannot force-skip or check only main.
+            if ! printf '%s' "$MERGE_BASE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error::merge_group base_sha missing or malformed" >&2
+              exit 1
+            fi
+            if ! git cat-file -e "${MERGE_BASE_SHA}^{commit}" 2>/dev/null; then
+              fetched=false
+              for attempt in 1 2 3; do
+                if git fetch --no-tags --no-recurse-submodules origin \
+                  "${MERGE_BASE_SHA}"; then
+                  fetched=true
+                  break
+                fi
+                echo "git fetch of merge_group base failed (attempt ${attempt}/3); retrying" >&2
+                sleep $(( attempt * 10 ))
+              done
+              if [ "$fetched" != true ]; then
+                echo "::error::git fetch of merge_group base_sha failed after 3 attempts" >&2
+                exit 1
+              fi
+            fi
+            trusted_sha="$MERGE_BASE_SHA"
+          else
+            # A push to the default branch and a manual dispatch already run
+            # trusted code, so the checked-out commit IS the trusted base.
+            trusted_sha="$(git rev-parse --verify --quiet 'HEAD^{commit}' || true)"
+            filter_args+=(--force-run)
+          fi
+
+          if ! printf '%s' "$trusted_sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::trusted base did not resolve to a full commit id" >&2
+            exit 1
+          fi
+
+          # Reject anything that is not a regular blob at that exact commit: a
+          # symlink (mode 120000) would make a content read emit its target
+          # path, a gitlink (160000) or tree (040000) carries no script at all,
+          # and a missing entry must fail closed rather than fall back to the
+          # pull request's own copy.
+          entry="$(git ls-tree --full-tree "$trusted_sha" -- "$filter_path")"
+          if [ "$(printf '%s\n' "$entry" | grep -c . || true)" != "1" ]; then
+            echo "::error::${filter_path} is not a single tree entry at ${trusted_sha}" >&2
+            exit 1
+          fi
+          entry_mode="$(printf '%s\n' "$entry" | awk '{print $1}')"
+          entry_type="$(printf '%s\n' "$entry" | awk '{print $2}')"
+          entry_object="$(printf '%s\n' "$entry" | awk '{print $3}')"
+          entry_path="$(printf '%s\n' "$entry" | awk -F'\t' '{print $2}')"
+          if [ "$entry_type" != "blob" ] || [ "$entry_path" != "$filter_path" ]; then
+            echo "::error::${filter_path} is not a blob at ${trusted_sha}" >&2
+            exit 1
+          fi
+          case "$entry_mode" in
+            100644|100755) ;;
+            *)
+              echo "::error::${filter_path} has non-regular mode ${entry_mode}" >&2
+              exit 1
+              ;;
+          esac
+          if ! printf '%s' "$entry_object" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::${filter_path} did not resolve to an object id" >&2
+            exit 1
+          fi
+          if [ "$(git cat-file -s "$entry_object")" -gt 262144 ]; then
+            echo "::error::${filter_path} exceeds the 256 KiB trusted-filter ceiling" >&2
+            exit 1
+          fi
+          git cat-file blob "$entry_object" > "$trusted_filter"
+
+          if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "merge_group" ]; then
+            git diff --name-only --no-renames "${trusted_sha}...HEAD" \
+              | sort > "$changed_files"
+          fi
+
+          # Isolated interpreter: no user site directory, no PYTHON* overrides,
+          # and no implicit path entry, so nothing the pull request committed
+          # can be imported by the trusted filter.
+          python3 -I "$trusted_filter" --self-test
+          # Bootstrap handshake for issue #7503. ONE-WAY and temporary: this
+          # workflow and the `mesh-e2e-service-waypoint` suite in the trusted
+          # classifier land in the same pull request, so while that pull
+          # request is open the TRUSTED copy extracted above predates the suite
+          # name and argparse rejects it. Ask the trusted copy's own usage text
+          # whether it knows the suite and force the suite to RUN when it does
+          # not. The verdict never comes from the pull request's checkout, and
+          # every other failure below still fails the job closed. Delete this
+          # block once the suite is on the trusted base (the gate-on follow-up).
+          if ! python3 -I "$trusted_filter" --help | grep -Fq -- 'mesh-e2e-service-waypoint'; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "## Mesh e2e ServiceWaypoint trigger"
+              echo ""
+              echo "Trusted base ${trusted_sha} predates the mesh-e2e-service-waypoint"
+              echo "classifier suite, so relevance cannot be decided there. Running the suite."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          plan="$(python3 -I "$trusted_filter" "${filter_args[@]}")"
+          relevant="$(printf '%s\n' "$plan" | sed -n 's/^relevant=//p')"
+          case "$relevant" in
+            true|false) ;;
+            *)
+              echo "::error::trusted relevance filter produced no usable verdict" >&2
+              exit 1
+              ;;
+          esac
+          echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
+          echo "Relevance decided by trusted base ${trusted_sha}." >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "$plan" | sed -n '/^## /,$p' >> "$GITHUB_STEP_SUMMARY"
+
+  mesh-e2e-service-waypoint-live:
+    name: Mesh e2e ServiceWaypoint live datapath
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 90
+    outputs:
+      l7_state: ${{ steps.suite.outputs.l7_state }}
+
+    steps:
+      - name: Checkout Ferrum Edge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          # Same default-feature `pr-build` graph as the other live labs that
+          # compile only the ferrum-edge binary; consumer-only key.
+          shared-key: "ci-live-pr-build"
+
+      - name: Build runtime binary
+        run: cargo build --profile pr-build --bin ferrum-edge
+
+      - name: Package runtime image
+        uses: ./.github/actions/package-ferrum-runtime-image
+        with:
+          binary-path: target/pr-build/ferrum-edge
+          image: ${{ env.FERRUM_IMAGE_REPOSITORY }}:${{ env.FERRUM_IMAGE_TAG }}
+
+      - name: Install Kubernetes tools
+        uses: ./.github/actions/setup-kubernetes-tools
+
+      - name: Create kind cluster
+        run: |
+          set -euo pipefail
+          kind create cluster --name "$CLUSTER" --wait 180s
+          kubectl --context "kind-$CLUSTER" get nodes -o wide
+
+      - name: Load runtime image into the cluster
+        run: |
+          set -euo pipefail
+          kind load docker-image "${FERRUM_IMAGE_REPOSITORY}:${FERRUM_IMAGE_TAG}" --name "$CLUSTER"
+
+      - name: Run live ServiceWaypoint mesh e2e suite
+        id: suite
+        env:
+          FERRUM_MESH_E2E_LIVE_ACK_DISPOSABLE: "true"
+          FERRUM_SKIP_IMAGE_BUILD: "1"
+          FERRUM_IMAGE_REPOSITORY: ${{ env.FERRUM_IMAGE_REPOSITORY }}
+          FERRUM_IMAGE_TAG: ${{ env.FERRUM_IMAGE_TAG }}
+          # Adoption window only (#7500/#7501); removed by the gate-on change.
+          FERRUM_SWP_E2E_ALLOW_L7_ABSENT: "1"
+        run: |
+          set -euo pipefail
+          tests/k8s/mesh_e2e_service_waypoint/run.sh
+          state=unknown
+          if [ -f target/mesh-e2e-service-waypoint/l7-state.txt ]; then
+            read -r state < target/mesh-e2e-service-waypoint/l7-state.txt || state=unknown
+          fi
+          case "$state" in
+            present|absent) ;;
+            *) state=unknown ;;
+          esac
+          echo "l7_state=$state" >> "$GITHUB_OUTPUT"
+
+      - name: Collect diagnostics
+        if: always()
+        run: |
+          set +e
+          results="$GITHUB_WORKSPACE/mesh-e2e-service-waypoint-results"
+          mkdir -p "$results"
+          ctx="kind-$CLUSTER"
+          kubectl --context "$ctx" get pods -A -o wide > "$results/pods.txt" 2>&1
+          kubectl --context "$ctx" get events -A --sort-by=.lastTimestamp > "$results/events.txt" 2>&1
+          if [ -d "$GITHUB_WORKSPACE/.context/mesh-e2e-service-waypoint" ]; then
+            cp -R "$GITHUB_WORKSPACE/.context/mesh-e2e-service-waypoint" "$results/artifacts"
+          fi
+          if [ -f target/mesh-e2e-service-waypoint/live-assertions.json ]; then
+            cp target/mesh-e2e-service-waypoint/live-assertions.json "$results/live-assertions.json"
+          fi
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: mesh-e2e-service-waypoint-results
+          path: mesh-e2e-service-waypoint-results
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Delete kind cluster
+        if: always()
+        run: kind delete cluster --name "$CLUSTER" || true
+
+  gate:
+    name: Mesh E2E ServiceWaypoint Live
+    needs:
+      - changes
+      - mesh-e2e-service-waypoint-live
+    if: always()
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Summarize mesh e2e ServiceWaypoint live result
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          RELEVANT: ${{ needs.changes.outputs.relevant }}
+          LIVE_RESULT: ${{ needs.mesh-e2e-service-waypoint-live.result }}
+          L7_STATE: ${{ needs.mesh-e2e-service-waypoint-live.outputs.l7_state }}
+        run: |
+          {
+            echo "## Mesh E2E ServiceWaypoint Live"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "Failed before change detection completed." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          if [ "$RELEVANT" = "false" ]; then
+            echo "Skipped live datapath validation: no ServiceWaypoint suite surfaces changed." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ "$RELEVANT" != "true" ]; then
+            echo "Change detection returned an invalid relevance result: $RELEVANT." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          if [ "$LIVE_RESULT" != "success" ]; then
+            echo "Live datapath validation failed or did not complete: $LIVE_RESULT." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          case "$L7_STATE" in
+            present)
+              echo "Live datapath validation passed: every required service_waypoint.* assertion passed." >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            absent)
+              echo "::warning::ServiceWaypoint L7 not present in this build: the bound-Service projection passed and every L7 assertion was recorded as SKIPPED (not passed)."
+              {
+                echo "**ServiceWaypoint L7 not present.** The control plane still reports"
+                echo "mesh_http_routes = sidecar_and_node_waypoint, so every L7 assertion was"
+                echo "recorded as \`skip\` (never \`pass\`). Only the bound-Service projection was"
+                echo "verified. The gate-on follow-up to #7500/#7501 turns an absent L7 build into"
+                echo "a failure."
+              } >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            *)
+              echo "Live job succeeded but reported no ServiceWaypoint L7 state: $L7_STATE." >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+              ;;
+          esac
