@@ -14,9 +14,13 @@
   <a href="https://hub.docker.com/r/ferrumedge/ferrum-edge"><img src="https://img.shields.io/docker/pulls/ferrumedge/ferrum-edge" alt="Docker Pulls"></a>
 </p>
 
-> **Active build-out:** Breaking changes are expected. Core database changes
-> are folded into the initial schema; recreate development databases when it
-> changes. See the [build-out policy](docs/migrations.md#build-out-schema-policy).
+> **Compatibility:** Releases before 1.0.0 are build-out releases: breaking
+> changes are expected between them, and core database changes are folded into
+> the initial schema (recreate development databases when it changes; see the
+> [migrations guide](docs/migrations.md)). From 1.0.0 onward, the
+> [support policy](docs/support_policy.md) applies: semantic versioning,
+> deprecation periods, support for the newest release, and forward-only schema migrations.
+> Current gaps are listed in [known limitations](docs/known_limitations.md).
 
 ## Overview
 
@@ -531,6 +535,7 @@ Start at the [documentation index](docs/README.md) — every document under
 | Production hardening checklist | [docs/hardening.md](docs/hardening.md) |
 | Threat model | [docs/threat_model.md](docs/threat_model.md) |
 | Support, versioning & deprecation policy | [docs/support_policy.md](docs/support_policy.md) |
+| Known limitations | [docs/known_limitations.md](docs/known_limitations.md) |
 | Full configuration reference | [docs/configuration.md](docs/configuration.md) |
 | Plugin reference | [docs/plugins.md](docs/plugins.md) |
 | Transaction log schema customization | [docs/log_schema.md](docs/log_schema.md) |
@@ -554,7 +559,7 @@ Start at the [documentation index](docs/README.md) — every document under
 | Docker deployment | [docs/docker.md](docs/docker.md) |
 | CI/CD pipeline | [docs/ci_cd.md](docs/ci_cd.md) |
 | Database migrations | [docs/migrations.md](docs/migrations.md) |
-| Upgrade procedure (build-out) | [docs/upgrade_guide.md](docs/upgrade_guide.md) |
+| Upgrade procedure | [docs/upgrade_guide.md](docs/upgrade_guide.md) |
 | Custom plugins | [CUSTOM_PLUGINS.md](CUSTOM_PLUGINS.md) |
 | Feature list | [FEATURES.md](FEATURES.md) |
 | OpenAPI spec | [openapi.yaml](openapi.yaml) |
@@ -569,15 +574,20 @@ publishes them in
 [ferrum-edge/ferrum-contracts](https://github.com/ferrum-edge/ferrum-contracts).
 Consumers (Nexus, Foundry, Anvil, Alloy, GitForgeOps) pin the
 `contracts-edge-<edge-version>` tags from that repository rather than reading
-Edge source. The current published Edge release is **v0.9.21**, published on
-2026-11-22 from release commit `f9915358c8032214f4034a17c28cdf72d14006c3`. Its
-matching `contracts-edge-0.9.21` tag has not been cut yet; until it is
-published, the latest Contracts pairing is v0.9.20. That Contracts tag is
+Edge source. For the current Edge release and its Contracts tag, see the Edge
+[Releases page](https://github.com/ferrum-edge/ferrum-edge/releases) and the
+[Contracts releases](https://github.com/ferrum-edge/ferrum-contracts/releases).
+As of 2026-11-22, the newest published Edge release was **v0.9.21**, published
+from release commit `f9915358c8032214f4034a17c28cdf72d14006c3`, and its
+matching Contracts tag is
+[`contracts-edge-0.9.21`](https://github.com/ferrum-edge/ferrum-contracts/releases/tag/contracts-edge-0.9.21)
+on commit `92d8da5be93ea1ece9f47729b1f7aa10ae8a7c3f`, published on 2026-11-22.
+The v0.9.20 pairing is
 [`contracts-edge-0.9.20`](https://github.com/ferrum-edge/ferrum-contracts/releases/tag/contracts-edge-0.9.20)
 on commit `39da322083044c2e92617209e62983c92387f0ad`, published on
 2026-11-03 for Edge release commit
-`e4a606a00352674daaef08636e3e359e6c48ba18`. It is the first SSH-signed
-Contracts tag; verify it as described in the Contracts
+`e4a606a00352674daaef08636e3e359e6c48ba18`; it was the first SSH-signed
+Contracts tag. Verify Contracts tags as described in the Contracts
 [release signing](https://github.com/ferrum-edge/ferrum-contracts/blob/main/docs/release-signing.md)
 guide. The v0.9.19 pairing is
 [`contracts-edge-0.9.19`](https://github.com/ferrum-edge/ferrum-contracts/tree/d96b0292a0f87647f7552f25e0e5ce1b4ae30f8b)
@@ -588,8 +598,8 @@ tags remain unchanged.
 **v0.9.21** follows published v0.9.20 with security-advisory and correctness
 fixes, mesh VirtualService HTTP routes on Sidecar and NodeWaypoint data planes,
 and fail-closed enforcement of refused enforcing Istio security resources.
-Consumers move their pins to `contracts-edge-0.9.21` once it is published and
-they adopt Edge v0.9.21. See the
+Consumers move their pins to `contracts-edge-0.9.21` when they adopt Edge
+v0.9.21. See the
 [publication record](docs/releases/v0.9.21-publication.md) and the
 [upgrade guide](docs/upgrade_guide.md#upgrading-to-0921).
 

@@ -638,7 +638,7 @@ cargo run -- run
 #### **New Configuration Option**
 1. Add field to appropriate struct in `src/config/types.rs` with `#[serde(default)]`
 2. Add environment variable parsing in `src/config/env_config.rs`
-3. If database-stored: fold the column into the baseline schema (`src/config/migrations/sql_dialect.rs`; MongoDB `mongo_index_plan.rs`) and update `db_loader.rs` — no new migration versions during build-out (see [CONTRIBUTING.md](CONTRIBUTING.md#build-out-schema-policy))
+3. If database-stored: update the schema as [docs/migrations.md](docs/migrations.md) directs (before 1.0.0, fold the column into the baseline in `src/config/migrations/sql_dialect.rs` and MongoDB `mongo_index_plan.rs`; from 1.0.0 onward, add a forward-only migration) and update `db_loader.rs`
 4. For a new `FERRUM_*` variable, document it in `docs/configuration.md` and `ferrum.conf`
 5. Update `openapi.yaml` if the Admin API exposes it
 6. Add tests

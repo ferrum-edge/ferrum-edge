@@ -285,4 +285,4 @@ Add a new channel under `src/notifications/channels/<name>.rs` with:
 - A `<NAME>_CHANNEL_KEYS` allowlist enforced with `reject_unknown_keys` in that `build_channel()` arm; any nested channel configuration must be closed the same way.
 - Snapshot / parse tests in `tests/unit/notifications/channels_tests.rs`.
 
-Email / SMTP ships natively (see [Email (SMTP)](#email-smtp)). PagerDuty and Opsgenie remain deferred follow-ups — the generic webhook covers both via `body_template` and `headers` today.
+Email / SMTP ships natively (see [Email (SMTP)](#email-smtp)). There are no native PagerDuty or Opsgenie channels; the generic webhook covers both via `body_template` and `headers` (see [Known limitations](known_limitations.md#plugins-and-notifications)).
