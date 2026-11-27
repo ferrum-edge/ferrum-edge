@@ -57,6 +57,11 @@ gateways, control planes, mesh data planes, charts or contract consumers.
   namespace, trust-bundle and audit timestamps, and the mesh, CP/DP status, K8s
   and diagnostic timestamps. Remaining work: dropping the direct `chrono`
   dependency and sqlx's `chrono` feature. The
+  2-18 have moved the standalone uses, the config snapshot stamps
+  (`GatewayConfig.loaded_at`, the ConfigSync delta `poll_timestamp`) and the
+  resource, namespace, trust-bundle and audit timestamps to `time_compat`.
+  Remaining work: the mesh, CP/DP status, K8s and diagnostic timestamps; then
+  dropping the direct `chrono` dependency and sqlx's `chrono` feature. The
   exception can be retired only once no dependency still resolves `chrono`.
 - **Three other advisory exceptions were re-reviewed on 2026-11-27 and
   re-affirmed until 2027-03-31** (#7520): RUSTSEC-2024-0436 (`paste`),
