@@ -125,8 +125,8 @@ fn split_90_10() -> serde_json::Value {
     })
 }
 
-/// Header, URI and method match dispatch plus a rewrite, a fault and CORS on
-/// the reviews host.
+/// Header, URI and method match dispatch plus a rewrite and a fault on the
+/// reviews host.
 fn match_dispatch_spec() -> serde_json::Value {
     json!({
         "hosts": [host("reviews")],
@@ -154,14 +154,49 @@ fn match_dispatch_spec() -> serde_json::Value {
                 "route": [{"destination": {"host": host("ratings"), "port": {"number": SERVICE_PORT}}}]
             },
             {
-                "corsPolicy": {
-                    "allowOrigins": [{"exact": "https://ui.example"}],
-                    "allowMethods": ["GET"]
-                },
                 "route": [{"destination": {"host": host("reviews"), "port": {"number": SERVICE_PORT}}}]
             }
         ]
     })
+}
+
+/// Standalone CORS policy on the reviews host. Kept separate from
+/// [`match_dispatch_spec`] because proxy-scoped route-local plugins (such as
+/// `cors`) fail closed when a route must collapse with sibling guarded routes.
+fn cors_policy_spec() -> serde_json::Value {
+    json!({
+        "hosts": [host("reviews")],
+        "http": [{
+            "corsPolicy": {
+                "allowOrigins": [{"exact": "https://ui.example"}],
+                "allowMethods": ["GET"]
+            },
+            "route": [{"destination": {"host": host("reviews"), "port": {"number": SERVICE_PORT}}}]
+        }]
+    })
+}
+
+#[test]
+fn route_local_cors_is_refused_when_dispatch_requires_collapse() {
+    let mut spec = match_dispatch_spec();
+    let fallback = spec["http"]
+        .as_array_mut()
+        .and_then(|routes| routes.last_mut())
+        .expect("fixture: default route");
+    fallback["corsPolicy"] = cors_policy_spec()["http"][0]["corsPolicy"].clone();
+
+    let error = translate_k8s_objects(
+        &[virtual_service("reviews-merged-cors", spec)],
+        K8sTranslationOptions::new(
+            NAMESPACE.to_string(),
+            TrustDomain::new("cluster.local").expect("trust domain"),
+        ),
+    )
+    .expect_err("route-local CORS must not leak onto sibling routes");
+    assert!(
+        error.to_string().contains("merged with another route"),
+        "unexpected collapse error: {error}"
+    );
 }
 
 fn translate(config: &mut GatewayConfig, objects: &[K8sObject]) {
@@ -815,10 +850,9 @@ async fn inner_http1_requests_follow_the_bound_services_90_10_split_over_1000_se
 }
 
 /// Acceptance: URI, header, method and `sourceNamespace` match dispatch, a
-/// URI rewrite, a fault and CORS, served at L7 inside the tunnel over inner
-/// HTTP/2.
+/// URI rewrite and a fault, served at L7 inside the tunnel over inner HTTP/2.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn inner_http2_requests_apply_match_dispatch_rewrite_fault_and_cors() {
+async fn inner_http2_requests_apply_match_dispatch_rewrite_and_fault() {
     let mut waypoint = Waypoint::start(Scenario {
         virtual_services: vec![virtual_service("reviews-matches", match_dispatch_spec())],
         ..Scenario::default()
@@ -903,6 +937,55 @@ async fn inner_http2_requests_apply_match_dispatch_rewrite_fault_and_cors() {
 
     let teapot = collect(send(Method::GET, "/teapot", &[]).await.expect("fault")).await;
     assert_eq!(teapot.status.as_u16(), 418, "the fault abort answers");
+    waypoint.teardown().await;
+}
+
+/// Acceptance: a standalone `http[].corsPolicy` on the reviews host answers
+/// preflight requests at L7 inside the tunnel over inner HTTP/2 without
+/// collapsing onto sibling routes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inner_http2_requests_apply_cors_policy() {
+    let mut waypoint = Waypoint::start(Scenario {
+        virtual_services: vec![virtual_service("reviews-cors", cors_policy_spec())],
+        ..Scenario::default()
+    })
+    .await;
+    let tunnel = waypoint
+        .tunnel(&format!("{}:{SERVICE_PORT}", host("reviews")), &[])
+        .await;
+    let (mut inner, connection) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tunnel))
+            .await
+            .expect("inner HTTP/2 handshake");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let authority = format!("http://{}:{SERVICE_PORT}", host("reviews"));
+    let mut send = |method: Method, path: &str, headers: &[(&str, &str)]| {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(format!("{authority}{path}"));
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let request = builder.body(Empty::<Bytes>::new()).expect("inner request");
+        inner.send_request(request)
+    };
+    let collect = |response: hyper::Response<hyper::body::Incoming>| async move {
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        InnerResponse {
+            status,
+            headers,
+            body: String::from_utf8_lossy(&body).into_owned(),
+        }
+    };
 
     let preflight = collect(
         send(
@@ -925,6 +1008,10 @@ async fn inner_http2_requests_apply_match_dispatch_rewrite_fault_and_cors() {
         Some("https://ui.example"),
         "the CORS policy answers the preflight"
     );
+
+    let plain = collect(send(Method::GET, "/", &[]).await.expect("plain")).await;
+    assert_eq!(plain.status, StatusCode::OK);
+    assert_eq!(plain.served_by(), "reviews");
     waypoint.teardown().await;
 }
 
