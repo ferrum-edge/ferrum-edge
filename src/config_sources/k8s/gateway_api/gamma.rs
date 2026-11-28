@@ -1094,9 +1094,8 @@ fn finalize_group(
             &programmed,
             GammaParentOutcome::Pending {
                 message: "a port-scoped consumer route passes the Service's other ports through \
-                          to the Service in another namespace; mesh data planes refuse a carried \
-                          route with a cross-namespace destination until issue #7499 lands, so \
-                          this route is not carried"
+                          to the Service in another namespace; cross-namespace GAMMA backends are \
+                          unsupported in phase 1, so this route is not carried"
                     .to_string(),
             },
         );
