@@ -1026,7 +1026,11 @@ fn router_builds_the_target_index_and_per_bound_service_partitions() {
 
     let partition = routes.partition(&reviews).expect("reviews partition");
     assert_eq!(
-        partition.default_route.id,
+        partition
+            .default_route
+            .as_ref()
+            .expect("backed reviews default route")
+            .id,
         service_waypoint_l7_route_id(WAYPOINT_NAMESPACE, "reviews", 8080)
     );
     let carried: Vec<&str> = partition
@@ -1087,8 +1091,16 @@ fn target_index_refuses_an_ambiguous_backing_endpoint() {
             service: service.to_string(),
             service_port: 8080,
         },
-        route_id: service_waypoint_l7_route_id(WAYPOINT_NAMESPACE, service, 8080),
-        upstream_id: service_waypoint_l7_upstream_id(WAYPOINT_NAMESPACE, service, 8080),
+        route_id: Some(service_waypoint_l7_route_id(
+            WAYPOINT_NAMESPACE,
+            service,
+            8080,
+        )),
+        upstream_id: Some(service_waypoint_l7_upstream_id(
+            WAYPOINT_NAMESPACE,
+            service,
+            8080,
+        )),
         hosts: vec![host(service, WAYPOINT_NAMESPACE)],
         service_addresses: Vec::new(),
         backing_endpoints: vec![(address, 8080)],
@@ -1458,13 +1470,15 @@ fn partition_refuses_the_hosts_of_an_unreachable_bound_service() {
         vec![virtual_service("two-hosts", WAYPOINT_NAMESPACE, spec)],
     )];
     let mut config = cp_config(Some(binding("service")), &namespaces);
-    // `ratings` stays bound but has no backing workload: no L7 route.
-    config
-        .mesh
-        .as_mut()
-        .expect("mesh block")
-        .workloads
-        .retain(|workload| workload.service_name != "ratings");
+    // `ratings` stays bound on a stream-family (TCP) port only: no L7 HTTP route.
+    for service in &mut config.mesh.as_mut().expect("mesh block").services {
+        if service.name == "ratings" {
+            for port in &mut service.ports {
+                port.protocol = ferrum_edge::modes::mesh::config::AppProtocol::Tcp;
+                port.name = Some("tcp".to_string());
+            }
+        }
+    }
     let runtime = service_waypoint_runtime();
     let slice = served_slice(&config, &runtime.mesh_slice_request());
     let prepared =
@@ -1500,6 +1514,91 @@ fn partition_refuses_the_hosts_of_an_unreachable_bound_service() {
         );
     }
     assert!(partition.admits_host(&host("reviews", WAYPOINT_NAMESPACE)));
+}
+
+/// An unbacked bound Service HTTP port (zero local backing pods, such as a
+/// virtual frontend Service fronted only by a `VirtualService`) still
+/// materializes an L7 binding and partition: `CONNECT` classifies it as
+/// `TerminateL7`, carried VirtualService routes dispatch through it, and an
+/// unmatched path resolves to `None` (`503`) rather than falling through to L4
+/// relay refusal.
+#[test]
+fn unbacked_bound_service_http_port_terminates_l7_and_serves_carried_routes() {
+    let spec = direct_spec(
+        &host("ratings", WAYPOINT_NAMESPACE),
+        &host("reviews", WAYPOINT_NAMESPACE),
+        None,
+    );
+    let namespaces = vec![(
+        WAYPOINT_NAMESPACE,
+        vec![virtual_service(
+            "ratings-to-reviews",
+            WAYPOINT_NAMESPACE,
+            spec,
+        )],
+    )];
+    let mut config = cp_config(Some(binding("service")), &namespaces);
+    config
+        .mesh
+        .as_mut()
+        .expect("mesh block")
+        .workloads
+        .retain(|workload| workload.service_name != "ratings");
+    let runtime = service_waypoint_runtime();
+    let slice = served_slice(&config, &runtime.mesh_slice_request());
+    let prepared =
+        prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("slice materializes");
+    let routes = RouterCache::new(&prepared, 1024).service_waypoint_l7_routes();
+    let ratings = ServiceWaypointL7Target {
+        namespace: WAYPOINT_NAMESPACE.to_string(),
+        service: "ratings".to_string(),
+        service_port: 8080,
+    };
+    assert_eq!(
+        routes
+            .index()
+            .classify_authority(&host("ratings", WAYPOINT_NAMESPACE), 8080),
+        ServiceWaypointConnectMode::TerminateL7(Arc::new(ratings.clone())),
+        "unbacked bound Service HTTP port terminates L7 instead of falling through to L4 relay"
+    );
+    let partition = routes.partition(&ratings).expect("unbacked partition");
+    assert!(
+        partition.default_route.is_none(),
+        "an unbacked bound Service has no default backing route"
+    );
+    let matched = partition
+        .resolve(&host("ratings", WAYPOINT_NAMESPACE), "/")
+        .expect("carried VirtualService serves the unbacked Service");
+    assert!(matched.proxy.id.contains("ratings-to-reviews"));
+    assert_eq!(
+        routes
+            .service_summary(WAYPOINT_NAMESPACE, "ratings")
+            .l7_http_ports,
+        vec![8080]
+    );
+
+    // Without a carried route, the unbacked partition still exists and resolves
+    // to None (503) instead of refusing outer CONNECT at the L4 relay guard.
+    let mut empty_config = cp_config(Some(binding("service")), &[]);
+    empty_config
+        .mesh
+        .as_mut()
+        .expect("mesh block")
+        .workloads
+        .retain(|workload| workload.service_name != "ratings");
+    let empty_slice = served_slice(&empty_config, &runtime.mesh_slice_request());
+    let empty_prepared =
+        prepare_gateway_config_from_mesh_slice(&empty_slice, &runtime).expect("slice materializes");
+    let empty_routes = RouterCache::new(&empty_prepared, 1024).service_waypoint_l7_routes();
+    let empty_partition = empty_routes
+        .partition(&ratings)
+        .expect("unbacked partition without carried routes");
+    assert!(empty_partition.default_route.is_none());
+    assert!(
+        empty_partition
+            .resolve(&host("ratings", WAYPOINT_NAMESPACE), "/")
+            .is_none()
+    );
 }
 
 // ── `GET /service-waypoint/services` ───────────────────────────────────────
@@ -1655,8 +1754,12 @@ mod admin_endpoint {
         .expect("the ServiceWaypoint generation is accepted by the proxy runtime");
         let live = proxy_state.router_cache.service_waypoint_l7_routes();
         assert!(
-            live.partitions()
-                .all(|partition| is_service_waypoint_l7_route_id(&partition.default_route.id)),
+            live.partitions().all(|partition| {
+                partition
+                    .default_route
+                    .as_ref()
+                    .is_some_and(|route| is_service_waypoint_l7_route_id(&route.id))
+            }),
             "the serving generation carries the partitions"
         );
         assert!(!live.is_empty());

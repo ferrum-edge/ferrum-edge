@@ -36004,7 +36004,9 @@ fn check_service_waypoint_routed_path_parameters(
         return Ok(());
     }
     let stripped = crate::policy_path::strip_path_parameters(path);
-    let rerouted = partition.resolve(host.unwrap_or_default(), &stripped);
+    let Some(rerouted) = partition.resolve(host.unwrap_or_default(), &stripped) else {
+        return Err(crate::policy_path::PolicyPathRejection::PathParameter);
+    };
     if rerouted.proxy.namespace == proxy.namespace && rerouted.proxy.id == proxy.id {
         Ok(())
     } else {
@@ -38578,7 +38580,22 @@ async fn handle_proxy_request_inner(
     // Route: host + longest prefix match via router cache (O(1) cache hit, pre-sorted fallback)
     let route_match = if let Some(partition) = service_waypoint_partition {
         // Admitted by host above, so the host is present.
-        Some(partition.resolve(request_host.as_deref().unwrap_or_default(), &path))
+        match partition.resolve(request_host.as_deref().unwrap_or_default(), &path) {
+            Some(matched) => Some(matched),
+            None => {
+                ctx.terminal_record.mark_counted();
+                state.request_count.fetch_add(1, Ordering::Relaxed);
+                let response = build_pre_plugin_reject_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    br#"{"error":"ServiceWaypoint bound Service has no reachable endpoints or matching route"}"#,
+                    &EMPTY_HEADERS,
+                    request_uses_grpc_content_type,
+                    grpc_web_response_content_type,
+                );
+                record_status(&state, response.status().as_u16());
+                return Ok(response);
+            }
+        }
     } else {
         match direct_pod_ip_http_route {
             Some(crate::router_cache::MeshHttpEgressByWorkloadDecision::Route {

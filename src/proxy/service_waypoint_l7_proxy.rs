@@ -478,7 +478,11 @@ pub(super) fn terminate_connect(
             r#"{"error":"HBONE relay destination not allowed"}"#,
         );
     };
-    let default_route = Arc::clone(&partition.default_route);
+    let default_route = partition.default_route.clone().unwrap_or_else(|| {
+        Arc::new(crate::modes::mesh::service_waypoint_unbacked_policy_proxy(
+            &target,
+        ))
+    });
     // Gate 3: the PeerAuthentication transport posture for the bound port.
     if super::mesh_inbound_peer_auth_transport_mismatch(
         state,

@@ -144,16 +144,24 @@ impl ServiceWaypointL7Context {
 ///
 /// Built only from explicit binding evidence
 /// (`MeshSlice::service_waypoint_bound_services`, this runtime's exact
-/// waypoint identity) and only for ports that materialized at least one
-/// reachable backing workload, so the L7 target index can never widen the
-/// inbound relay inventory: a target here is always a bound Service.
+/// waypoint identity), so the L7 target index can never widen the inbound
+/// relay inventory: a target here is always a bound Service. A bound Service
+/// HTTP port with no reachable local-cluster backing workload (for example a
+/// virtual frontend Service routed exclusively by a `VirtualService`) still
+/// carries a binding with `route_id: None` and `upstream_id: None` so outer
+/// `CONNECT` terminates HTTP and dispatches through any attached carried
+/// routes, failing closed with `503` when no carried route matches.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceWaypointL7Binding {
     pub target: ServiceWaypointL7Target,
-    /// Id of the default L7 route ([`service_waypoint_l7_route_id`]).
-    pub route_id: String,
-    /// Id of the default L7 upstream ([`service_waypoint_l7_upstream_id`]).
-    pub upstream_id: String,
+    /// Id of the default L7 route ([`service_waypoint_l7_route_id`]), or
+    /// `None` when the bound Service HTTP port has no reachable backing
+    /// workloads.
+    pub route_id: Option<String>,
+    /// Id of the default L7 upstream ([`service_waypoint_l7_upstream_id`]), or
+    /// `None` when the bound Service HTTP port has no reachable backing
+    /// workloads.
+    pub upstream_id: Option<String>,
     /// The Service's canonical host variants (ASCII-lowercase, no trailing
     /// dot): the short name, `<svc>.<ns>`, `<svc>.<ns>.svc` and the FQDN.
     pub hosts: Vec<String>,
@@ -383,8 +391,10 @@ pub struct ServiceWaypointL7RoutePartition {
     /// plane's binding, in configuration order. They shadow the default route
     /// on the paths they match.
     pub carried_routes: Vec<Arc<Proxy>>,
-    /// The default L7 Service route, used when no carried route matches.
-    pub default_route: Arc<Proxy>,
+    /// The default L7 Service route, used when no carried route matches, or
+    /// `None` when the bound Service HTTP port has no reachable backing
+    /// workloads.
+    pub default_route: Option<Arc<Proxy>>,
     /// Router over `carried_routes` only; `None` when the partition carries
     /// none.
     carried_router: Option<PartitionRouter>,
@@ -418,23 +428,21 @@ impl ServiceWaypointL7RoutePartition {
 
     /// Resolve an admitted inner request to a route of THIS partition only:
     /// the carried VirtualService route matching `host` and `path` (shared
-    /// router semantics), else the bound Service's default L7 route. Never a
-    /// route of another bound Service, never a route of the shared table.
-    pub fn resolve(&self, host: &str, path: &str) -> crate::router_cache::RouteMatch {
+    /// router semantics), else the bound Service's default L7 route if it has
+    /// reachable backing workloads. Never a route of another bound Service,
+    /// never a route of the shared table.
+    pub fn resolve(&self, host: &str, path: &str) -> Option<crate::router_cache::RouteMatch> {
         if let Some(router) = self.carried_router.as_ref()
             && let Some(matched) = router.0.find_proxy(Some(host), path)
         {
-            return matched;
+            return Some(matched);
         }
-        crate::router_cache::RouteMatch {
-            proxy: Arc::clone(&self.default_route),
+        let default_route = self.default_route.as_ref()?;
+        Some(crate::router_cache::RouteMatch {
+            proxy: Arc::clone(default_route),
             path_params: Vec::new(),
-            matched_prefix_len: self
-                .default_route
-                .listen_path
-                .as_deref()
-                .map_or(0, str::len),
-        }
+            matched_prefix_len: default_route.listen_path.as_deref().map_or(0, str::len),
+        })
     }
 
     /// Number of carried VirtualService routes bound to this Service port.
@@ -502,13 +510,18 @@ impl ServiceWaypointL7Routes {
         let mut partitions = BTreeMap::new();
         for binding in bindings {
             let target = &binding.target;
-            let Some(default_route) = config
-                .proxies
-                .iter()
-                .find(|proxy| proxy.namespace == target.namespace && proxy.id == binding.route_id)
-            else {
-                continue;
-            };
+            let default_route =
+                match binding.route_id.as_deref() {
+                    Some(route_id) => {
+                        let Some(proxy) = config.proxies.iter().find(|proxy| {
+                            proxy.namespace == target.namespace && proxy.id == route_id
+                        }) else {
+                            continue;
+                        };
+                        Some(Arc::new(proxy.clone()))
+                    }
+                    None => None,
+                };
             let attached: BTreeSet<(&str, &str)> = inventory
                 .route_attachments
                 .iter()
@@ -573,7 +586,7 @@ impl ServiceWaypointL7Routes {
                     target: target.clone(),
                     admitted_hosts: admitted_hosts.into_iter().collect(),
                     carried_routes,
-                    default_route: Arc::new(default_route.clone()),
+                    default_route,
                     carried_router,
                 },
             );

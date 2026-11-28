@@ -2580,6 +2580,18 @@ fn materialize_service_waypoint_l7_routes(
             }
             if targets.is_empty() {
                 unreachable_ports += 1;
+                bindings.push(ServiceWaypointL7Binding {
+                    target: ServiceWaypointL7Target {
+                        namespace: service.namespace.clone(),
+                        service: service.name.clone(),
+                        service_port: service_port.port,
+                    },
+                    route_id: None,
+                    upstream_id: None,
+                    hosts: hosts.clone(),
+                    service_addresses: service_addresses.clone(),
+                    backing_endpoints: Vec::new(),
+                });
                 continue;
             }
             backing_endpoints.sort();
@@ -2628,8 +2640,8 @@ fn materialize_service_waypoint_l7_routes(
                     service: service.name.clone(),
                     service_port: service_port.port,
                 },
-                route_id,
-                upstream_id,
+                route_id: Some(route_id),
+                upstream_id: Some(upstream_id),
                 hosts: hosts.clone(),
                 service_addresses: service_addresses.clone(),
                 backing_endpoints,
@@ -6601,6 +6613,9 @@ fn clone_service_waypoint_authority_rewrite_upstreams(
         })
         .collect();
     for binding in bindings {
+        let Some(upstream_id) = binding.upstream_id.as_deref() else {
+            continue;
+        };
         let clone_id = service_waypoint_l7::service_waypoint_l7_rewrite_upstream_id(
             &binding.target.namespace,
             &binding.target.service,
@@ -6615,15 +6630,17 @@ fn clone_service_waypoint_authority_rewrite_upstreams(
         {
             continue;
         }
-        let Some(service_upstream) = config.upstreams.iter().find(|upstream| {
-            &upstream.namespace == namespace && upstream.id == binding.upstream_id
-        }) else {
+        let Some(service_upstream) = config
+            .upstreams
+            .iter()
+            .find(|upstream| &upstream.namespace == namespace && upstream.id == upstream_id)
+        else {
             continue;
         };
         let mut clone = service_upstream.clone();
         clone.id = clone_id.clone();
         clone.name = Some(clone_id);
-        clone.admission_upstream_id = Some(binding.upstream_id.clone());
+        clone.admission_upstream_id = Some(upstream_id.to_string());
         for target in &mut clone.targets {
             target
                 .tags
@@ -13507,6 +13524,25 @@ fn mesh_outbound_route_proxy(
         updated_at: now,
         pending_limit_scope: None,
     }
+}
+
+/// Policy-only proxy carrier for an unbacked ServiceWaypoint bound Service HTTP
+/// port (never added to `GatewayConfig::proxies` and never dispatched): carries
+/// the bound Service identity for PeerAuthentication posture checks and tunnel
+/// idle-timeout resolution when the Service has no backing workloads.
+pub(crate) fn service_waypoint_unbacked_policy_proxy(
+    target: &service_waypoint_l7::ServiceWaypointL7Target,
+) -> Proxy {
+    let route_id = service_waypoint_l7::service_waypoint_l7_route_id(
+        &target.namespace,
+        &target.service,
+        target.service_port,
+    );
+    let now = crate::time_compat::UtcTimestamp::now();
+    let mut proxy = mesh_outbound_route_proxy(&route_id, Vec::new(), &target.namespace, "", now);
+    proxy.name = Some(format!("mesh service waypoint {route_id}"));
+    proxy.upstream_id = None;
+    proxy
 }
 
 fn mesh_outbound_http_bywl_route_proxy(

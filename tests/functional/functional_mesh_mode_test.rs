@@ -12459,8 +12459,8 @@ fn waypoint_destination_workload(service: &str, port: u16, address: &str) -> Wor
         addresses: vec![address.to_string()],
         ports: vec![WorkloadPort {
             port,
-            protocol: AppProtocol::Http,
-            name: Some("http".to_string()),
+            protocol: AppProtocol::Tcp,
+            name: Some("tcp".to_string()),
         }],
         trust_domain: TrustDomain::new("cluster.local").expect("trust domain"),
         namespace: WAYPOINT_TARGET_REFS_NAMESPACE.to_string(),
@@ -12484,8 +12484,8 @@ fn waypoint_destination_service(service: &str, port: u16) -> MeshService {
         namespace: WAYPOINT_TARGET_REFS_NAMESPACE.to_string(),
         ports: vec![ServicePort {
             port,
-            protocol: AppProtocol::Http,
-            name: Some("http".to_string()),
+            protocol: AppProtocol::Tcp,
+            name: Some("tcp".to_string()),
             target_port: None,
         }],
         workloads: vec![WorkloadRef {
