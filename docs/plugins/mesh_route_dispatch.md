@@ -83,7 +83,7 @@ Every split id and leg must name an upstream in the plugin's namespace (every na
 | `backend_tls` | Object \| null | omitted | Route-local backend TLS (below). **Direct backends only** — an `upstream_id` destination inherits TLS from the referenced `Upstream` (including mesh `DestinationRule` projection), so per-canary TLS for an upstream override is modeled as a separate upstream resource |
 | `requires_node_waypoint_authz` | bool | `false` | Trusted mesh-translator marker. Under scoped NodeWaypoint authorization, a matching destination carrying it fails closed without an authorized destination stamp (routes without per-destination verdicts; see *NodeWaypoint destination authorization*). Not for hand-authored config |
 
-**`rules[].fault`** — at least one of `delay` / `abort` is required.
+**`rules[].fault`** — at least one of `delay` / `abort` is required; `secondary_abort` requires `abort`.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -93,6 +93,7 @@ Every split id and leg must name an upstream in the plugin's namespace (every na
 | `abort.percentage` | f64 | — | Required. Same `(0.0, 100.0]` range as the delay |
 | `abort.grpc_status` | u32 \| null | omitted | `0`–`16`, emitted only when the immutable pre-plugin request flavor is native gRPC |
 | `abort.body` | String \| null | omitted | Response body; empty when unset |
+| `secondary_abort` | Object \| null | omitted | Optional secondary abort evaluated only when the primary `abort` did not trigger; requires a non-null `abort`. Same fields as `abort` (`status_code`, `percentage`, optional `grpc_status` and `body`), except `secondary_abort.percentage` is conditional on surviving the primary `abort` (used by GAMMA weighted splits that combine an invalid-`backendRef` 500 share and an endpointless-Service 503 share). A `100.0` `secondary_abort` guarantees local termination on every non-primary-aborted request |
 
 **`rules[].rewrite`** — at least one of `uri` / `authority` is required.
 

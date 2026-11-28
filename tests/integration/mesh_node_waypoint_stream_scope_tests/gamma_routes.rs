@@ -770,15 +770,31 @@ fn wildcard_destination_rule_does_not_drop_gamma_dispatch() {
     // 100% abort) targeting the placeholder host MUST still be rejected by the
     // visible wildcard DestinationRule.
     let mut non_terminal_slice = slice;
+    let mut mutated_broken_rule = false;
     for plugin in &mut non_terminal_slice.http_routes.plugin_configs {
-        if plugin.plugin_name == "mesh_route_dispatch"
-            && let Some(rules) = plugin.config.get_mut("rules").and_then(Value::as_array_mut)
-            && let Some(rule) = rules.first_mut().and_then(Value::as_object_mut)
+        if plugin.get("plugin_name").and_then(Value::as_str) == Some("mesh_route_dispatch")
+            && let Some(rules) = plugin
+                .get_mut("config")
+                .and_then(|cfg| cfg.get_mut("rules"))
+                .and_then(Value::as_array_mut)
         {
-            rule.remove("fault");
-            rule.insert("redirect".to_string(), Value::Null);
+            for rule in rules {
+                let is_broken = rule
+                    .pointer("/match/uri/regex")
+                    .and_then(Value::as_str)
+                    .is_some_and(|re| re.starts_with("/broken"));
+                if is_broken && let Some(rule_obj) = rule.as_object_mut() {
+                    rule_obj.remove("fault");
+                    rule_obj.insert("redirect".to_string(), Value::Null);
+                    mutated_broken_rule = true;
+                }
+            }
         }
     }
+    assert!(
+        mutated_broken_rule,
+        "negative control must locate and mutate the /broken GAMMA dispatch rule"
+    );
     let non_terminal_prepared =
         prepare_gateway_config_from_mesh_slice(&non_terminal_slice, &runtime)
             .expect("slice prepares when non-terminal placeholder GAMMA route is dropped");

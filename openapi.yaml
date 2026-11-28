@@ -29287,6 +29287,15 @@ components:
                   Operators who need RTDS-driven fault percentages
                   should use a global / proxy-scoped `fault_injection`
                   plugin instead.
+                allOf:
+                  - if:
+                      required: [secondary_abort]
+                      properties:
+                        secondary_abort: {type: object}
+                    then:
+                      required: [abort]
+                      properties:
+                        abort: {type: object}
                 properties:
                   delay:
                     type: [object, "null"]
@@ -29342,6 +29351,42 @@ components:
                           gRPC. Plain HTTP, WebSocket, and gRPC-Web requests
                           never receive a stray `grpc-status` header even if
                           an earlier hook rewrites `content-type`.
+                      body:
+                        type: [string, "null"]
+                        description: Optional response body; empty when omitted.
+                  secondary_abort:
+                    type: [object, "null"]
+                    additionalProperties: false
+                    required: [status_code, percentage]
+                    description: |
+                      Optional secondary abort evaluated only when the primary
+                      `abort` did not trigger. Requires `abort` to be configured
+                      (non-null) when non-null. Its `percentage` is conditional
+                      on surviving the primary `abort` (used by GAMMA weighted
+                      splits that combine an invalid-`backendRef` 500 share and
+                      an endpointless-Service 503 share).
+                    properties:
+                      status_code:
+                        type: integer
+                        minimum: 200
+                        maximum: 599
+                      percentage:
+                        type: number
+                        format: double
+                        exclusiveMinimum: 0
+                        maximum: 100
+                        description: |
+                          Conditional percent of requests surviving the primary
+                          `abort` that trigger this secondary abort. Positive
+                          values below one 64-bit sampler bucket round up to
+                          that first bucket so every accepted value can trigger.
+                      grpc_status:
+                        type: [integer, "null"]
+                        minimum: 0
+                        maximum: 16
+                        description: |
+                          Optional gRPC status code emitted only when the
+                          immutable pre-plugin request flavor is native gRPC.
                       body:
                         type: [string, "null"]
                         description: Optional response body; empty when omitted.

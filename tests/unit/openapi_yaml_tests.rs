@@ -14285,6 +14285,50 @@ fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
     assert_component_validity(&spec, "MeshRouteDispatchConfig", &tiny_fault, true);
     MeshRouteDispatch::new(&tiny_fault).expect("tiny positive percentage is runtime-valid");
 
+    let secondary_abort_fault = json!({
+        "rules": [{
+            "match": {"methods": ["GET"]},
+            "destination": {"upstream_id": "api"},
+            "fault": {
+                "abort": {"status_code": 500, "percentage": 10.0},
+                "secondary_abort": {"status_code": 503, "percentage": 100.0}
+            }
+        }]
+    });
+    assert_component_validity(
+        &spec,
+        "MeshRouteDispatchConfig",
+        &secondary_abort_fault,
+        true,
+    );
+    MeshRouteDispatch::new(&secondary_abort_fault)
+        .expect("primary + secondary_abort is runtime-valid");
+
+    for invalid_secondary in [
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "api"},
+                "fault": {
+                    "secondary_abort": {"status_code": 503, "percentage": 50.0}
+                }
+            }]
+        }),
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "api"},
+                "fault": {
+                    "abort": null,
+                    "secondary_abort": {"status_code": 503, "percentage": 50.0}
+                }
+            }]
+        }),
+    ] {
+        assert_component_validity(&spec, "MeshRouteDispatchConfig", &invalid_secondary, false);
+        assert!(MeshRouteDispatch::new(&invalid_secondary).is_err());
+    }
+
     // Weighted splits dispatched leg by leg (issue #7387): an instance may
     // carry only splits, and both contracts refuse the same malformed tables.
     let weighted_splits = json!({
