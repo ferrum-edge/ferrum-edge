@@ -2027,7 +2027,7 @@ mod transport_round_trip {
             SECRET,
             node_id,
             DEFAULT_CP_DP_JWT_ISSUER,
-            None,
+            Some(WAYPOINT_NAMESPACE),
             Some(MESH_LOCAL_SUBSCRIBE_AUDIENCE),
         )
         .expect("mesh jwt");

@@ -298,7 +298,7 @@ fn k8s_pod_discovery_translation_survives_mesh_slice_projection() {
 fn k8s_pod_discovery_records_the_workload_mesh_transport() {
     use ferrum_edge::modes::mesh::config::WorkloadMeshTransport;
 
-    let transport = |pod: K8sObject| {
+    let transport = |pod: K8sObject, service_waypoint_http_routes: bool| {
         let translation = translate_k8s_objects(&[service(), pod, endpoint_slice()], options())
             .expect("K8s core translation succeeds");
         let slice = MeshSlice::from_gateway_config(
@@ -306,6 +306,7 @@ fn k8s_pod_discovery_records_the_workload_mesh_transport() {
             MeshSliceRequest {
                 node_id: "node-a".to_string(),
                 namespace: "default".to_string(),
+                service_waypoint_http_routes,
                 ..MeshSliceRequest::default()
             },
         );
@@ -320,28 +321,48 @@ fn k8s_pod_discovery_records_the_workload_mesh_transport() {
         slice.workloads[0].mesh_transport
     };
 
-    assert_eq!(transport(ready_pod()), None, "an unmarked pod is unknown");
+    assert_eq!(
+        transport(ready_pod(), true),
+        None,
+        "an unmarked pod is unknown"
+    );
 
     let mut sidecar = ready_pod();
     sidecar
         .metadata
         .annotations
         .insert("ferrum.io/injected".to_string(), "true".to_string());
-    assert_eq!(transport(sidecar), Some(WorkloadMeshTransport::SidecarMtls));
+    assert_eq!(
+        transport(sidecar.clone(), true),
+        Some(WorkloadMeshTransport::SidecarMtls)
+    );
+    assert_eq!(
+        transport(sidecar, false),
+        None,
+        "mesh_transport is stripped for subscribers without service_waypoint_http_routes"
+    );
 
     let mut ambient = ready_pod();
     ambient
         .metadata
         .labels
         .insert("istio.io/dataplane-mode".to_string(), "ambient".to_string());
-    assert_eq!(transport(ambient), Some(WorkloadMeshTransport::Hbone));
+    assert_eq!(
+        transport(ambient.clone(), true),
+        Some(WorkloadMeshTransport::Hbone)
+    );
+    assert_eq!(
+        transport(ambient, false),
+        None,
+        "mesh_transport is stripped for subscribers without service_waypoint_http_routes"
+    );
 
     let mut not_injected = ready_pod();
     not_injected
         .metadata
         .annotations
         .insert("ferrum.io/injected".to_string(), "false".to_string());
-    assert_eq!(transport(not_injected), None);
+    assert_eq!(transport(not_injected, true), None);
 }
 
 #[test]
