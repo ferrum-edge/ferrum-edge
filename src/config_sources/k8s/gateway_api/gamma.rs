@@ -418,7 +418,7 @@ fn path_predicate(listen_path: &str) -> (Option<Value>, u64, u64) {
     }
     let base = listen_path.trim_end_matches('/');
     if base.is_empty() {
-        return (None, 1, 1);
+        return (Some(json!({ "prefix": "/" })), 1, 1);
     }
     (
         Some(json!({ "regex": format!("{}(/.*)?", regex::escape(base)) })),
