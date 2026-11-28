@@ -4421,9 +4421,9 @@ fn node_waypoint_http_route_set(
         }
         // Issue #7499: a destination in another namespace rides only when
         // every binding listing the route authorizes that Service and this
-        // subscriber sees its port. Anything else withholds the route, so its
-        // host keeps the plain Service route; the data plane refuses a route
-        // whose cross-namespace destination arrives without an entry.
+        // subscriber sees its port. Anything else withholds the route, leaving
+        // plain Service routing where it already exists; the data plane refuses
+        // a route whose cross-namespace destination arrives without an entry.
         let mut route_targets: BTreeSet<(String, String)> = BTreeSet::new();
         let mut cross_namespace_withheld = false;
         for (host, port) in &destinations {
