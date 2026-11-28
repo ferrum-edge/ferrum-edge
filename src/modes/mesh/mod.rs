@@ -2619,6 +2619,7 @@ fn materialize_service_waypoint_l7_routes(
                 now,
             );
             proxy.name = Some(format!("mesh service waypoint {route_id}"));
+            proxy.backend_port = service_port.port;
             proxy.allow_path_parameters = service.allow_path_parameters;
             match config.upstreams.iter_mut().find(|existing| {
                 existing.namespace == upstream.namespace && existing.id == upstream.id
@@ -13541,6 +13542,7 @@ pub(crate) fn service_waypoint_unbacked_policy_proxy(
     let now = crate::time_compat::UtcTimestamp::now();
     let mut proxy = mesh_outbound_route_proxy(&route_id, Vec::new(), &target.namespace, "", now);
     proxy.name = Some(format!("mesh service waypoint {route_id}"));
+    proxy.backend_port = target.service_port;
     proxy.upstream_id = None;
     proxy
 }

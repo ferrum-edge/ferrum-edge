@@ -1567,9 +1567,15 @@ fn unbacked_bound_service_http_port_terminates_l7_and_serves_carried_routes() {
         "an unbacked bound Service has no default backing route"
     );
     let matched = partition
-        .resolve(&host("ratings", WAYPOINT_NAMESPACE), "/")
+        .resolve(&host("ratings", WAYPOINT_NAMESPACE), "/api")
         .expect("carried VirtualService serves the unbacked Service");
     assert!(matched.proxy.id.contains("ratings-to-reviews"));
+    assert!(
+        partition
+            .resolve(&host("ratings", WAYPOINT_NAMESPACE), "/")
+            .is_none(),
+        "unmatched path on an unbacked Service misses (503) instead of falling through"
+    );
     assert_eq!(
         routes
             .service_summary(WAYPOINT_NAMESPACE, "ratings")

@@ -38585,14 +38585,54 @@ async fn handle_proxy_request_inner(
             None => {
                 ctx.terminal_record.mark_counted();
                 state.request_count.fetch_add(1, Ordering::Relaxed);
-                let response = build_pre_plugin_reject_response(
+                let mut response = build_pre_plugin_reject_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     br#"{"error":"ServiceWaypoint bound Service has no reachable endpoints or matching route"}"#,
                     &EMPTY_HEADERS,
                     request_uses_grpc_content_type,
                     grpc_web_response_content_type,
                 );
+                if let Some(correlation_plugins) = epoch.plugin_cache.unrouted_correlation_plugins()
+                {
+                    let headers =
+                        Box::pin(prepare_unrouted_correlation(&correlation_plugins, &mut ctx))
+                            .await;
+                    for (name, value) in &headers {
+                        if let (Ok(name), Ok(value)) = (
+                            hyper::header::HeaderName::from_bytes(name.as_bytes()),
+                            hyper::header::HeaderValue::from_str(value),
+                        ) {
+                            response.headers_mut().insert(name, value);
+                        }
+                    }
+                }
+                crate::diagnostic_ref::record_route_miss(
+                    ctx.diagnostic_slot(),
+                    crate::diagnostic_ref::ROUTE_NOT_FOUND_PHASE,
+                    start_time,
+                    response.status().as_u16(),
+                    grpc_web_response_content_type.is_some(),
+                );
                 record_status(&state, response.status().as_u16());
+                if let Some(unrouted_log_plugins) =
+                    epoch.plugin_cache.unrouted_transaction_log_plugins()
+                {
+                    ctx.materialize_headers();
+                    if !ctx.metadata.contains_key("ferrum.frontend_scheme") {
+                        ctx.metadata.insert(
+                            "ferrum.frontend_scheme".to_string(),
+                            request_scheme.to_string(),
+                        );
+                    }
+                    Box::pin(log_unrouted_request(
+                        &unrouted_log_plugins,
+                        &ctx,
+                        &state.env_config.namespace,
+                        StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                        start_time,
+                    ))
+                    .await;
+                }
                 return Ok(response);
             }
         }

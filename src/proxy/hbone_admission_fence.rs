@@ -400,18 +400,23 @@ pub enum HboneRelayDestinationGate {
     /// sweep therefore re-applies no authorize chain to the outer tunnel (an
     /// `AuthorizationPolicy` with HTTP-only rules cannot be judged against a
     /// tunnel), only the credential and PeerAuthentication gates and this
-    /// gate: the port must still be a bound Service HTTP port in the current
-    /// generation's `ServiceWaypointL7TargetIndex`, or the tunnel is revoked
-    /// as `relay_destination` (binding withdrawn, Service removed, port no
-    /// longer HTTP-family, workloads gone).
-    ServiceWaypointL7(crate::modes::mesh::service_waypoint_l7::ServiceWaypointL7Target),
+    /// gate: the original CONNECT authority must still classify to this exact
+    /// bound Service HTTP port in the current generation's
+    /// `ServiceWaypointL7TargetIndex`, or the tunnel is revoked as
+    /// `relay_destination` (binding withdrawn, Service removed, port no longer
+    /// HTTP-family, or backing pod endpoint withdrawn for an endpoint-addressed
+    /// CONNECT).
+    ServiceWaypointL7(
+        crate::modes::mesh::service_waypoint_l7::ServiceWaypointL7Target,
+        Option<(String, u16)>,
+    ),
 }
 
 impl HboneRelayDestinationGate {
     /// Whether this tunnel terminates HTTP inside itself (issue #7501), so
     /// its outer CONNECT carries no authorize-chain verdict to re-issue.
     pub fn terminates_l7(&self) -> bool {
-        matches!(self, Self::ServiceWaypointL7(_))
+        matches!(self, Self::ServiceWaypointL7(..))
     }
 }
 
@@ -2153,7 +2158,9 @@ impl HboneAdmissionFence {
         // arrives, so the outer tunnel has no authorize verdict to re-issue and
         // no reuse classification to re-fold. Only the transport and
         // bound-Service gates apply, in the CONNECT path's order.
-        if let HboneRelayDestinationGate::ServiceWaypointL7(target) = &snapshot.destination_gate {
+        if let HboneRelayDestinationGate::ServiceWaypointL7(target, connect_authority) =
+            &snapshot.destination_gate
+        {
             if mesh_inbound_peer_auth_transport_mismatch_for_policy(
                 policy,
                 snapshot.ctx.mesh_direction,
@@ -2167,12 +2174,17 @@ impl HboneAdmissionFence {
             {
                 return Some(HboneRevocationReason::PeerAuthTransport);
             }
-            if !epoch
-                .route_table
-                .service_waypoint_l7_routes()
-                .index()
-                .contains(target)
-            {
+            let index = epoch.route_table.service_waypoint_l7_routes().index();
+            let still_admitted = match connect_authority {
+                Some((host, port)) => matches!(
+                    index.classify_authority(host, *port),
+                    crate::modes::mesh::service_waypoint_l7::ServiceWaypointConnectMode::TerminateL7(
+                        ref current,
+                    ) if current.as_ref() == target
+                ),
+                None => index.contains(target),
+            };
+            if !still_admitted {
                 return Some(HboneRevocationReason::RelayDestination);
             }
             return None;
@@ -2271,11 +2283,18 @@ impl HboneAdmissionFence {
                 !sidecar_inbound_refuses_matched_http_connect(proxy, direction, mesh)
             }
             // Decided before the authorize chain above, and never reaches here.
-            HboneRelayDestinationGate::ServiceWaypointL7(target) => epoch
-                .route_table
-                .service_waypoint_l7_routes()
-                .index()
-                .contains(target),
+            HboneRelayDestinationGate::ServiceWaypointL7(target, connect_authority) => {
+                let index = epoch.route_table.service_waypoint_l7_routes().index();
+                match connect_authority {
+                    Some((host, port)) => matches!(
+                        index.classify_authority(host, *port),
+                        crate::modes::mesh::service_waypoint_l7::ServiceWaypointConnectMode::TerminateL7(
+                            ref current,
+                        ) if current.as_ref() == target
+                    ),
+                    None => index.contains(target),
+                }
+            }
         };
         if !destination_owned {
             return Some(HboneRevocationReason::RelayDestination);

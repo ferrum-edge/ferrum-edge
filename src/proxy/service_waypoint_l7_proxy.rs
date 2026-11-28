@@ -478,11 +478,22 @@ pub(super) fn terminate_connect(
             r#"{"error":"HBONE relay destination not allowed"}"#,
         );
     };
-    let default_route = partition.default_route.clone().unwrap_or_else(|| {
-        Arc::new(crate::modes::mesh::service_waypoint_unbacked_policy_proxy(
-            &target,
-        ))
+    let connect_authority = req.uri().authority().and_then(|authority| {
+        authority
+            .port_u16()
+            .map(|port| (authority.host().to_string(), port))
     });
+    let default_route = match partition.default_route.as_ref() {
+        Some(route) if route.backend_port != 0 => Arc::clone(route),
+        Some(route) => {
+            let mut carrier = (**route).clone();
+            carrier.backend_port = target.service_port;
+            Arc::new(carrier)
+        }
+        None => Arc::new(crate::modes::mesh::service_waypoint_unbacked_policy_proxy(
+            &target,
+        )),
+    };
     // Gate 3: the PeerAuthentication transport posture for the bound port.
     if super::mesh_inbound_peer_auth_transport_mismatch(
         state,
@@ -553,6 +564,7 @@ pub(super) fn terminate_connect(
         mesh_inbound_pre_handshake_app_port,
         destination_gate: HboneRelayDestinationGate::ServiceWaypointL7(
             ServiceWaypointL7Target::clone(&target),
+            connect_authority,
         ),
         resolved_ip: None,
         // Not a configured proxy: the bound-Service gate is the presence check.

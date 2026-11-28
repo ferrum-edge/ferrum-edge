@@ -45745,12 +45745,14 @@ components:
         l7_http_ports:
           type: array
           description: |
-            HTTP-family ports of this Service that the waypoint materialized a
-            bound-Service L7 route and upstream for (issue #7500), ascending.
-            Empty when the Service is not bound to this waypoint by a binding
-            that claims service traffic (`waypoint_for` `service` or `all`),
-            or when no backing workload is reachable on any of its HTTP ports.
-            Stream-family ports never appear here.
+            HTTP-family ports of this Service that the waypoint terminates L7
+            HTTP for (issues #7500/#7501), ascending, including bound virtual
+            Services with zero backing workloads (which serve carried
+            VirtualService routes and return 503 when unmatched). Empty when
+            the Service is not bound to this waypoint by a binding that claims
+            service traffic (`waypoint_for` `service` or `all`), or when it
+            declares no HTTP-family ports. Stream-family ports never appear
+            here.
           items:
             type: integer
             minimum: 1
