@@ -2251,13 +2251,28 @@ impl MeshSlice {
                     // No applicable Sidecar: the rest of this slice is already
                     // namespace-local (or waypoint-bound), so keep the same
                     // resource-namespace visibility rule — but never drop a
-                    // root-namespace rule, which is Istio's mesh-wide default
-                    // tier and applies with or without a Sidecar resource.
+                    // root-namespace rule (Istio's mesh-wide default tier) or
+                    // an exported service-owner rule for a visible external
+                    // ServiceEntry host (whose ownership was already proved
+                    // against `service_entry_hosts`).
+                    let visible_external_owner = host_candidates.iter().any(|candidate| {
+                        matches!(
+                            destination_host_owner(
+                                candidate,
+                                &cluster_domain,
+                                &mesh_service_identities,
+                                &service_entry_hosts,
+                            ),
+                            Some(DestinationHostOwner::ExternalHost { namespace: owner })
+                                if owner == dr.namespace && owner == resource_namespace
+                        )
+                    });
                     return resource_namespace_visible(
                         &service_waypoint_namespaces,
                         &dr.namespace,
                         &namespace,
-                    ) || dr.namespace.trim() == mesh.istio_root_namespace.trim();
+                    ) || dr.namespace.trim() == mesh.istio_root_namespace.trim()
+                        || visible_external_owner;
                 };
                 let host_refs: Vec<&str> = host_candidates.iter().map(String::as_str).collect();
                 sidecar.includes_service(resource_namespace, &host_refs, None)

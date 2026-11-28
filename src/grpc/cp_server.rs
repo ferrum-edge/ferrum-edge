@@ -1160,7 +1160,6 @@ impl CpGrpcServer {
                 &mut filtered,
                 request,
                 Some(scope),
-                bearer_namespaces,
             );
         }
         if let Some(mesh) = filtered.mesh.as_mut() {
@@ -1196,17 +1195,21 @@ impl CpGrpcServer {
     /// mesh `virtual_service_http_routes` binding of that namespace, their
     /// `istio-vs-upstream-*` upstreams, and their proxy-scoped `istio-vs-*`
     /// plugins. Only the namespaces of THIS waypoint's service-claiming
-    /// binding are considered, each bounded by the CP scope and the bearer
-    /// `ns` claim. The resources stay in-process: `MeshSlice::from_gateway_config`
-    /// applies the binding gate, the anti-hijack namespace rule, host and
-    /// destination admission and self-containment before anything reaches the
-    /// data plane.
+    /// binding are considered, each bounded by the CP scope (consistent with
+    /// `mesh.services`, `mesh.workloads`, `mesh.mesh_policies`, and
+    /// `mesh.request_authentications` for bound Services: the waypoint's
+    /// credential authenticates its own subscription namespace — xDS ADS
+    /// mandates a single-namespace `ns` claim on multi-namespace CPs — while
+    /// the authoritative `WaypointBinding` in that namespace authorizes
+    /// serving bound Services and their exported routes). The resources stay
+    /// in-process: `MeshSlice::from_gateway_config` applies the binding gate,
+    /// the anti-hijack namespace rule, host and destination admission and
+    /// self-containment before anything reaches the data plane.
     fn retain_service_waypoint_route_resources(
         config: &GatewayConfig,
         filtered: &mut GatewayConfig,
         request: &MeshSliceRequest,
         scope: Option<&CpScope>,
-        bearer_namespaces: Option<&HashSet<String>>,
     ) {
         let Some(mesh) = config.mesh.as_deref() else {
             return;
@@ -1222,7 +1225,6 @@ impl CpGrpcServer {
             .filter(|namespace| {
                 *namespace != request.namespace
                     && Self::namespace_allowed_by_scope(namespace, scope)
-                    && bearer_namespaces.is_none_or(|allowed| allowed.contains(*namespace))
             })
             .collect();
         if namespaces.is_empty() {
@@ -1310,10 +1312,26 @@ impl CpGrpcServer {
                     policy, namespace,
                 )
         });
+        let service_waypoint_bound_namespaces: BTreeSet<String> =
+            if request.service_waypoint_http_routes {
+                crate::modes::mesh::slice::service_waypoint_bound_service_refs(
+                    &mesh.waypoint_bindings,
+                    request.waypoint_name.as_deref(),
+                    namespace,
+                )
+                .into_iter()
+                .map(|service| service.namespace)
+                .filter(|bound_ns| Self::namespace_allowed_by_scope(bound_ns, scope))
+                .collect()
+            } else {
+                BTreeSet::new()
+            };
         mesh.virtual_service_http_routes.retain(|routes| {
             visible_namespaces.contains(&routes.namespace)
                 && Self::namespace_allowed_by_scope(&routes.namespace, scope)
-                && bearer_namespaces.is_none_or(|allowed| allowed.contains(&routes.namespace))
+                && (bearer_namespaces.is_none_or(|allowed| allowed.contains(&routes.namespace))
+                    || (request.service_waypoint_http_routes
+                        && service_waypoint_bound_namespaces.contains(&routes.namespace)))
                 && (crate::modes::mesh::config::virtual_service_http_routes_exported_to_namespace(
                     routes, namespace,
                 )
@@ -1606,16 +1624,25 @@ impl CpGrpcServer {
             )
         });
         // The configured root namespace is an Istio lookup tier, not an
-        // ordinary destination namespace. Preserve its rules through this
-        // coarse CP prefilter even when a Sidecar imports only the target
-        // service namespace; `MeshSlice::from_gateway_config` subsequently
+        // ordinary destination namespace. Preserve its rules — and rules in
+        // namespaces that exported a visible ServiceEntry — through this
+        // coarse CP prefilter; `MeshSlice::from_gateway_config` subsequently
         // applies export visibility, host scope, and the shared
-        // client → service → root resolver. Dropping root rules here made the
-        // fallback depend on an unrelated Sidecar host pattern.
+        // client → service → root resolver (and ServiceWaypoint narrowing).
+        // Dropping an exported external ServiceEntry owner's DestinationRule
+        // here would let its ServiceEntry and route survive without its TLS
+        // policy.
+        let service_entry_namespaces: BTreeSet<&str> = mesh
+            .service_entries
+            .iter()
+            .map(|entry| entry.namespace.as_str())
+            .collect();
         mesh.destination_rules.retain(|rule| {
             visible_namespaces.contains(&rule.namespace)
                 || (!istio_root_namespace.trim().is_empty()
                     && rule.namespace.trim() == istio_root_namespace.trim())
+                || (allow_cross_namespace_mesh_visibility
+                    && service_entry_namespaces.contains(rule.namespace.as_str()))
         });
         mesh.proxy_configs.retain(|config| {
             Self::policy_scope_can_apply_to_namespace(

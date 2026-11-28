@@ -1474,6 +1474,115 @@ fn waypoint_narrowing_keeps_policy_for_external_route_destinations() {
     );
 }
 
+/// An exported external ServiceEntry and its service-owner DestinationRule in
+/// a third namespace with NO bound Service must survive CP filtering, slice
+/// admission and waypoint narrowing so the data plane enforces its TLS policy
+/// (refusing a plaintext direct external backend).
+#[test]
+fn exported_external_owner_outside_bound_namespaces_keeps_tls_policy() {
+    const EXTERNAL_NS: &str = "external-owner";
+    let mut namespaces = default_virtual_services();
+    namespaces[0].1.push(virtual_service(
+        "reviews-ext-third-ns",
+        WAYPOINT_NAMESPACE,
+        direct_spec(
+            &host("reviews", WAYPOINT_NAMESPACE),
+            "third.external.example.com",
+            None,
+        ),
+    ));
+    namespaces.push((
+        EXTERNAL_NS,
+        vec![
+            istio_object(
+                "ServiceEntry",
+                "third-external",
+                EXTERNAL_NS,
+                json!({
+                    "exportTo": ["*"],
+                    "hosts": ["third.external.example.com"],
+                    "location": "MESH_EXTERNAL",
+                    "ports": [{"number": 8080, "name": "http", "protocol": "HTTP"}],
+                    "resolution": "DNS"
+                }),
+            ),
+            istio_object(
+                "DestinationRule",
+                "third-external-tls",
+                EXTERNAL_NS,
+                json!({
+                    "exportTo": ["*"],
+                    "host": "third.external.example.com",
+                    "trafficPolicy": {"tls": {"mode": "SIMPLE"}}
+                }),
+            ),
+            // Unreferenced ServiceEntry + DestinationRule in the same third
+            // namespace must still be dropped by waypoint narrowing.
+            istio_object(
+                "ServiceEntry",
+                "unused-external",
+                EXTERNAL_NS,
+                json!({
+                    "exportTo": ["*"],
+                    "hosts": ["unused.external.example.com"],
+                    "location": "MESH_EXTERNAL",
+                    "ports": [{"number": 8080, "name": "http", "protocol": "HTTP"}],
+                    "resolution": "DNS"
+                }),
+            ),
+            istio_object(
+                "DestinationRule",
+                "unused-external-tls",
+                EXTERNAL_NS,
+                json!({
+                    "exportTo": ["*"],
+                    "host": "unused.external.example.com",
+                    "trafficPolicy": {"tls": {"mode": "SIMPLE"}}
+                }),
+            ),
+        ],
+    ));
+    let config = cp_config(Some(binding("service")), &namespaces);
+    let runtime = service_waypoint_runtime();
+    let slice = served_slice(&config, &runtime.mesh_slice_request());
+    assert!(
+        carried_route_ids(&slice)
+            .iter()
+            .any(|id| id.contains("reviews-ext-third-ns")),
+        "fixture: external route is projected"
+    );
+    assert!(
+        slice
+            .destination_rules
+            .iter()
+            .any(|rule| rule.namespace == EXTERNAL_NS && rule.host == "third.external.example.com"),
+        "exported external owner's DestinationRule survives CP filter, admission and narrowing"
+    );
+    assert!(
+        !slice
+            .destination_rules
+            .iter()
+            .any(|rule| rule.host == "unused.external.example.com"),
+        "unreferenced external DestinationRule is still narrowed out"
+    );
+    let prepared =
+        prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("slice materializes");
+    assert!(
+        !prepared
+            .proxies
+            .iter()
+            .any(|proxy| proxy.id.contains("reviews-ext-third-ns")),
+        "direct external backend with SIMPLE TLS rule from external owner namespace is refused"
+    );
+    assert!(
+        prepared
+            .proxies
+            .iter()
+            .any(|proxy| proxy.id.contains("reviews-split")),
+        "unrelated routes keep serving"
+    );
+}
+
 /// Review round 2 F3: a service-tier WILDCARD DestinationRule that proves its
 /// ownership only through a broader wildcard ServiceEntry survives admission
 /// and narrowing for a DIRECT external backend, so the data plane refuses the
@@ -1981,7 +2090,10 @@ mod transport_round_trip {
 
     use crate::scaffolding::port_registry::TestSocket;
 
-    use super::{WAYPOINT_NAME, WAYPOINT_NAMESPACE, binding, cp_config, default_virtual_services};
+    use super::{
+        TENANT_NAMESPACE, WAYPOINT_NAME, WAYPOINT_NAMESPACE, binding, carried_route_ids, cp_config,
+        default_virtual_services,
+    };
 
     const SECRET: &str = "service-waypoint-transport-secret-0000000";
 
@@ -2134,13 +2246,31 @@ mod transport_round_trip {
 
         let native = native_slice(&url, true).await;
         let xds = xds_slice(&url, true).await;
+        let native_ids = carried_route_ids(&native);
         assert!(
-            !native.http_routes.proxies.is_empty(),
-            "proto field 11 asks the native server for the routes"
+            native_ids.iter().any(|id| id.contains("reviews-split")),
+            "native carries waypoint-namespace route: {native_ids:?}"
         );
         assert!(
-            !native.http_routes.service_waypoint_attachments.is_empty(),
-            "the native slice carries the route attachments"
+            native_ids.iter().any(|id| id.contains("orders-api")),
+            "native carries bound tenant-namespace route under single-ns waypoint JWT: {native_ids:?}"
+        );
+        assert!(
+            native
+                .http_routes
+                .service_waypoint_attachments
+                .iter()
+                .any(|att| {
+                    att.service_namespace == TENANT_NAMESPACE
+                        && att.service_name == "orders"
+                        && att.route_proxy_id.contains("orders-api")
+                }),
+            "native carries the bound tenant route attachment"
+        );
+        let xds_ids = carried_route_ids(&xds);
+        assert!(
+            xds_ids.iter().any(|id| id.contains("orders-api")),
+            "ADS carries bound tenant-namespace route under single-ns waypoint JWT: {xds_ids:?}"
         );
         assert_eq!(
             xds.http_routes, native.http_routes,
