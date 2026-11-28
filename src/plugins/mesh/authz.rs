@@ -1605,20 +1605,29 @@ fn parse_node_waypoint_route_destination_workloads(
 /// the grant they would not be loaded at all (review F4, round 5).
 fn parse_node_waypoint_route_destination_policies(
     config: &Value,
-) -> Result<HashSet<(String, String)>, String> {
+) -> Result<(HashMap<usize, (String, String)>, HashSet<(String, String)>), String> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct PolicyRef {
         namespace: String,
         name: String,
+        #[serde(default)]
+        record_index: Option<usize>,
     }
     match config.get("node_waypoint_route_destination_policies") {
         Some(value) => {
             crate::util::json_object::from_json_object_vec_value::<PolicyRef>(value.clone())
                 .map(|refs| {
-                    refs.into_iter()
-                        .map(|policy| (policy.namespace, policy.name))
-                        .collect()
+                    let mut by_index = HashMap::new();
+                    let mut by_key = HashSet::new();
+                    for policy in refs {
+                        if let Some(index) = policy.record_index {
+                            by_index.insert(index, (policy.namespace, policy.name));
+                        } else {
+                            by_key.insert((policy.namespace, policy.name));
+                        }
+                    }
+                    (by_index, by_key)
                 })
                 .map_err(|error| {
                     format!(
@@ -1626,7 +1635,7 @@ fn parse_node_waypoint_route_destination_policies(
                     )
                 })
         }
-        None => Ok(HashSet::new()),
+        None => Ok((HashMap::new(), HashSet::new())),
     }
 }
 
@@ -3236,11 +3245,12 @@ impl MeshAuthz {
         // destinations' scopes, but never the source-scope census: without the
         // grant they would not be loaded, and a grant changes only the routes
         // that name its target.
-        let route_destination_policies = if per_pod_policy_scoping {
-            parse_node_waypoint_route_destination_policies(config)?
-        } else {
-            HashSet::new()
-        };
+        let (route_destination_policy_indices, route_destination_policy_keys) =
+            if per_pod_policy_scoping {
+                parse_node_waypoint_route_destination_policies(config)?
+            } else {
+                (HashMap::new(), HashSet::new())
+            };
         let route_destination_workloads = if per_pod_policy_scoping {
             parse_node_waypoint_route_destination_workloads(config)?
         } else {
@@ -3250,11 +3260,16 @@ impl MeshAuthz {
             let ordinary: Vec<MeshPolicy> = slice
                 .mesh_policies
                 .iter()
-                .filter(|policy| {
-                    !route_destination_policies
-                        .contains(&(policy.namespace.clone(), policy.name.clone()))
+                .enumerate()
+                .filter(|(index, policy)| {
+                    let excluded_by_index = route_destination_policy_indices
+                        .get(index)
+                        .is_some_and(|(ns, name)| ns == &policy.namespace && name == &policy.name);
+                    let excluded_by_key = route_destination_policy_keys
+                        .contains(&(policy.namespace.clone(), policy.name.clone()));
+                    !excluded_by_index && !excluded_by_key
                 })
-                .cloned()
+                .map(|(_, policy)| policy.clone())
                 .collect();
             policies_enforce_scoped_rules(&ordinary)
         };

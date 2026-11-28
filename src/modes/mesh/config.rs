@@ -9493,7 +9493,7 @@ fn normalize_mesh_fields_internal(
 ) {
     for se in service_entries {
         for host in &mut se.hosts {
-            *host = normalize_mesh_hostname_like(host);
+            *host = normalize_mesh_hostname_preserving_absolute_two_label(host);
         }
         normalize_mesh_export_to(&mut se.export_to);
         for ep in &mut se.endpoints {

@@ -4578,14 +4578,17 @@ fn decode_http_route_set(
             ));
         }
     }
-    // The AuthorizationPolicies carried only for those destinations: each
-    // once, never of this slice's own namespace. An entry only ever keeps a
-    // policy out of the missing-source-scope census.
-    for (label, entries) in [
-        ("policy", &set.cross_namespace_destination_policies),
+    // The AuthorizationPolicies and RequestAuthentications carried only for
+    // those destinations: each once, never of this slice's own namespace
+    // (unless owned by the mesh root namespace). An optional `record_index`
+    // pins the exact appended record so a colliding ordinary record with the
+    // same `(namespace, name)` remains visible to the ordinary census.
+    for (label, entries, is_policy) in [
+        ("policy", &set.cross_namespace_destination_policies, true),
         (
             "request authentication",
             &set.cross_namespace_destination_request_authentications,
+            false,
         ),
     ] {
         if entries.len() > slice::MAX_HTTP_ROUTE_CROSS_NAMESPACE_DESTINATION_WORKLOADS {
@@ -4596,6 +4599,17 @@ fn decode_http_route_set(
         }
         let mut seen: HashSet<&slice::MeshHttpRouteDestinationPolicy> = HashSet::new();
         for (index, entry) in entries.iter().enumerate() {
+            let record_matches = match entry.record_index {
+                None => true,
+                Some(record_index) if is_policy => slice
+                    .mesh_policies
+                    .get(record_index)
+                    .is_some_and(|p| p.namespace == entry.namespace && p.name == entry.name),
+                Some(record_index) => slice
+                    .request_authentications
+                    .get(record_index)
+                    .is_some_and(|r| r.namespace == entry.namespace && r.name == entry.name),
+            };
             let well_formed = [entry.namespace.as_str(), entry.name.as_str()]
                 .iter()
                 .all(|value| {
@@ -4606,6 +4620,7 @@ fn decode_http_route_set(
                 && (entry.namespace != slice.namespace
                     || (!slice.istio_root_namespace.is_empty()
                         && entry.namespace == slice.istio_root_namespace))
+                && record_matches
                 && seen.insert(entry);
             if !well_formed {
                 return Err(anyhow::anyhow!(
@@ -6182,7 +6197,17 @@ fn embed_cross_namespace_destination_workloads_in_authz(
     if !destination_policies.is_empty() {
         let policies: Vec<serde_json::Value> = destination_policies
             .iter()
-            .map(|policy| serde_json::json!({"namespace": policy.namespace, "name": policy.name}))
+            .map(|policy| match policy.record_index {
+                Some(record_index) => serde_json::json!({
+                    "namespace": policy.namespace,
+                    "name": policy.name,
+                    "record_index": record_index,
+                }),
+                None => serde_json::json!({
+                    "namespace": policy.namespace,
+                    "name": policy.name,
+                }),
+            })
             .collect();
         authz.insert(
             "node_waypoint_route_destination_policies".to_string(),
@@ -18811,16 +18836,28 @@ fn scope_request_auth_to_node_waypoint_destinations(
     // unrelated ordinary route (e.g., an existing local+external combined
     // split) into a 503 refusal, while routes reaching cross-namespace targets
     // still fail closed against every destination resource.
-    let grant_only_request_auths: HashSet<(&str, &str)> = mesh_slice
+    let mut grant_only_request_auth_indices: HashSet<usize> = HashSet::new();
+    let mut grant_only_request_auth_keys: HashSet<(&str, &str)> = HashSet::new();
+    for entry in &mesh_slice
         .http_routes
         .cross_namespace_destination_request_authentications
-        .iter()
-        .map(|entry| (entry.namespace.as_str(), entry.name.as_str()))
-        .collect();
+    {
+        if let Some(record_index) = entry.record_index {
+            if resources
+                .get(record_index)
+                .is_some_and(|ra| ra.namespace == entry.namespace && ra.name == entry.name)
+            {
+                grant_only_request_auth_indices.insert(record_index);
+            }
+        } else {
+            grant_only_request_auth_keys.insert((entry.namespace.as_str(), entry.name.as_str()));
+        }
+    }
     let carries_any_destination_resources = (0..resources.len()).any(|index| !own.contains(&index));
     let carries_ordinary_destination_resources = (0..resources.len()).any(|index| {
         !own.contains(&index)
-            && !grant_only_request_auths.contains(&(
+            && !grant_only_request_auth_indices.contains(&index)
+            && !grant_only_request_auth_keys.contains(&(
                 resources[index].namespace.as_str(),
                 resources[index].name.as_str(),
             ))

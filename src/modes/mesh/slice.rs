@@ -745,13 +745,19 @@ impl MeshHttpRouteSet {
     }
 }
 
-/// One AuthorizationPolicy a NodeWaypoint slice carries only for authorized
-/// cross-namespace route destinations (issue #7499).
+/// One AuthorizationPolicy or RequestAuthentication a NodeWaypoint slice
+/// carries only for authorized cross-namespace route destinations (issue #7499).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MeshHttpRouteDestinationPolicy {
     pub namespace: String,
     pub name: String,
+    /// Exact index in `MeshSlice.mesh_policies` or
+    /// `MeshSlice.request_authentications` of the appended grant-only record,
+    /// so a colliding ordinary record with the same `(namespace, name)` stays
+    /// visible to the ordinary census while the appended record stays out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_index: Option<usize>,
 }
 
 /// One workload key the slice builder added only for authorized
@@ -3112,14 +3118,6 @@ fn with_cross_namespace_destination_policies(
             Vec::new(),
         );
     }
-    let ordinary_policy_keys: HashSet<(String, String)> = mesh_policies
-        .iter()
-        .map(|policy| (policy.namespace.clone(), policy.name.clone()))
-        .collect();
-    let ordinary_ra_keys: HashSet<(String, String)> = request_authentications
-        .iter()
-        .map(|resource| (resource.namespace.clone(), resource.name.clone()))
-        .collect();
     let mut added_policies: BTreeSet<MeshHttpRouteDestinationPolicy> = BTreeSet::new();
     let mut added_request_authentications: BTreeSet<MeshHttpRouteDestinationPolicy> =
         BTreeSet::new();
@@ -3140,13 +3138,13 @@ fn with_cross_namespace_destination_policies(
             .any(|workload| governs(&policy.namespace, &policy.scope, workload))
             && !mesh_policies.contains(policy)
         {
-            if !ordinary_policy_keys.contains(&(policy.namespace.clone(), policy.name.clone())) {
-                added_policies.insert(MeshHttpRouteDestinationPolicy {
-                    namespace: policy.namespace.clone(),
-                    name: policy.name.clone(),
-                });
-            }
+            let record_index = mesh_policies.len();
             mesh_policies.push(policy.clone());
+            added_policies.insert(MeshHttpRouteDestinationPolicy {
+                namespace: policy.namespace.clone(),
+                name: policy.name.clone(),
+                record_index: Some(record_index),
+            });
         }
     }
     for resource in &mesh.request_authentications {
@@ -3155,13 +3153,13 @@ fn with_cross_namespace_destination_policies(
             .any(|workload| governs(&resource.namespace, &resource.scope, workload))
             && !request_authentications.contains(resource)
         {
-            if !ordinary_ra_keys.contains(&(resource.namespace.clone(), resource.name.clone())) {
-                added_request_authentications.insert(MeshHttpRouteDestinationPolicy {
-                    namespace: resource.namespace.clone(),
-                    name: resource.name.clone(),
-                });
-            }
+            let record_index = request_authentications.len();
             request_authentications.push(resource.clone());
+            added_request_authentications.insert(MeshHttpRouteDestinationPolicy {
+                namespace: resource.namespace.clone(),
+                name: resource.name.clone(),
+                record_index: Some(record_index),
+            });
         }
     }
     (

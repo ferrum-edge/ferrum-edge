@@ -767,3 +767,91 @@ fn a_grant_keeps_the_remote_endpoints_of_the_ordinary_route() {
         );
     }
 }
+
+/// A grant-only RequestAuthentication that collides in `(namespace, name)`
+/// with an ordinary waypoint-selecting RequestAuthentication must remain
+/// tracked per-record so adding the grant never turns an unrelated mixed route
+/// into a 503 refusal, while both records stay enforced on their targets.
+#[test]
+fn a_colliding_grant_only_request_auth_does_not_refuse_unrelated_routes() {
+    use ferrum_edge::modes::mesh::config::{MeshJwtRule, MeshRequestAuthentication};
+
+    let make_ra = |scope: PolicyScope, issuer: &str| MeshRequestAuthentication {
+        name: "shared-ra".to_string(),
+        namespace: "istio-system".to_string(),
+        scope,
+        jwt_rules: vec![MeshJwtRule {
+            issuer: issuer.to_string(),
+            audiences: Vec::new(),
+            jwks_uri: None,
+            jwks: Some(r#"{"keys":[]}"#.to_string()),
+            from_headers: Vec::new(),
+            from_params: Vec::new(),
+            forward_original_token: false,
+            output_claim_to_headers: Vec::new(),
+        }],
+        refused: false,
+    };
+
+    let build = |with_grant: bool| {
+        let mut cfg = fixture(with_grant, false);
+        let mesh = cfg.mesh.as_mut().expect("mesh block");
+        mesh.request_authentications = vec![
+            // Ordinary record selecting the waypoint itself.
+            make_ra(PolicyScope::MeshWide, "https://ordinary.example.com"),
+            // Distinct record with the SAME `(namespace, name)` selecting ONLY
+            // the cross-namespace destination `other/ratings`.
+            make_ra(selector(OTHER, "ratings"), "https://dest-only.example.com"),
+        ];
+        data_plane(&cfg, &node_waypoint_runtime())
+    };
+
+    let ungranted = build(false);
+    let granted = build(true);
+
+    for (label, cfg) in [("ungranted", &ungranted), ("granted", &granted)] {
+        let mixed = cfg
+            .proxies
+            .iter()
+            .find(|proxy| proxy.listen_path == "/mixed")
+            .unwrap_or_else(|| panic!("{label}: /mixed route present"));
+        assert!(
+            !mixed.plugins.iter().any(|assoc| {
+                assoc.plugin_config_id == MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID
+                    || assoc
+                        .plugin_config_id
+                        .starts_with(MESH_REQUEST_AUTH_REFUSED_PARTITION_ID_PREFIX)
+            }),
+            "{label}: colliding grant-only RA must not attach 503 refusal to /mixed: {:?}",
+            mixed.plugins
+        );
+    }
+
+    // The granted route still enforces the destination-only RA's issuer.
+    let granted_route = granted
+        .proxies
+        .iter()
+        .find(|proxy| proxy.id.contains(GRANTED_ROUTE_MARKER))
+        .expect("granted route");
+    let dest_jwks_ids: Vec<&str> = granted_route
+        .plugins
+        .iter()
+        .map(|assoc| assoc.plugin_config_id.as_str())
+        .filter(|id| id.starts_with(MESH_REQUEST_AUTH_DESTINATION_PLUGIN_ID_PREFIX))
+        .collect();
+    assert!(
+        dest_jwks_ids.iter().any(|id| {
+            granted.plugin_configs.iter().any(|plugin| {
+                plugin.id == *id
+                    && plugin.config["providers"]
+                        .as_array()
+                        .is_some_and(|providers| {
+                            providers
+                                .iter()
+                                .any(|p| p["issuer"] == "https://dest-only.example.com")
+                        })
+            })
+        }),
+        "granted route must still enforce the colliding destination-only RequestAuthentication"
+    );
+}

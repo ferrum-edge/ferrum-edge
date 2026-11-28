@@ -18,16 +18,19 @@ use ferrum_edge::_test_support::{
     filter_config_to_mesh_request_for_test, install_plugin_finalizers_for_test,
     run_before_proxy_hooks_for_test,
 };
-use ferrum_edge::config::types::{GatewayConfig, LoadBalancerAlgorithm, PluginScope, Proxy};
+use ferrum_edge::config::types::{
+    BackendScheme, GatewayConfig, LoadBalancerAlgorithm, PluginScope, Proxy,
+};
 use ferrum_edge::grpc::cp_server::CpScope;
 use ferrum_edge::identity::spiffe::SpiffeId;
 use ferrum_edge::modes::mesh::config::{
-    MeshJwtRule, MeshPolicy, MeshRequestAuthentication, PolicyScope, WorkloadSelector,
+    AppProtocol, MeshJwtRule, MeshPolicy, MeshRequestAuthentication, PolicyScope, Resolution,
+    ServiceEntry, ServiceEntryLocation, ServicePort, WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::runtime::PolicyScopeCache;
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::modes::mesh::{
-    MESH_AUTHZ_PLUGIN_ID, MESH_REQUEST_AUTH_DESTINATION_PLUGIN_ID_PREFIX,
+    MESH_AUTHZ_PLUGIN_ID, MESH_REQUEST_AUTH_DESTINATION_PLUGIN_ID_PREFIX, MeshTopology,
     prepare_gateway_config_from_mesh_slice,
 };
 use ferrum_edge::plugins::mesh::authz::MeshAuthz;
@@ -1209,6 +1212,22 @@ fn a_service_only_sidecar_import_withholds_an_absolute_external_host() {
     mesh.services
         .push(service_for("catalog", DEFAULT_NAMESPACE, &[&catalog]));
     mesh.workloads.push(catalog);
+    mesh.service_entries.push(ServiceEntry {
+        name: "catalog-abs-se".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        hosts: vec!["catalog.default.".to_string()],
+        endpoints: Vec::new(),
+        resolution: Resolution::Dns,
+        location: ServiceEntryLocation::MeshExternal,
+        ports: vec![ServicePort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+            target_port: None,
+        }],
+        export_to: vec!["*".to_string()],
+        workload_selector: None,
+    });
     mesh.sidecars
         .first_mut()
         .expect("importing sidecar")
@@ -1219,7 +1238,15 @@ fn a_service_only_sidecar_import_withholds_an_absolute_external_host() {
         "./reviews.default.svc.cluster.local".to_string(),
         "./catalog.default".to_string(),
     ];
-    let same_ns_prepared = prepare(&slice_for(&same_ns, &node_waypoint_runtime()));
+    same_ns.normalize_mesh_fields();
+    let same_ns_slice = slice_for(&same_ns, &node_waypoint_runtime());
+    assert!(
+        !same_ns_slice.service_entries.iter().any(|entry| {
+            entry.name == "catalog-abs-se" && entry.hosts.iter().any(|h| h == "catalog.default.")
+        }),
+        "relative ./catalog.default import must not retain absolute ServiceEntry catalog.default."
+    );
+    let same_ns_prepared = prepare(&same_ns_slice);
     let same_ns_routes = carried_routes(&same_ns_prepared);
     assert!(
         same_ns_routes
@@ -1234,7 +1261,8 @@ fn a_service_only_sidecar_import_withholds_an_absolute_external_host() {
         "relative ./catalog.default import withholds absolute external host catalog.default."
     );
 
-    // Explicit absolute import (`./catalog.default.`) admits `catalog.default.`.
+    // Explicit absolute import (`./catalog.default.`) admits `catalog.default.`
+    // AND retains the matching ServiceEntry host and admitted ports.
     let mut abs_import = same_ns;
     abs_import
         .mesh
@@ -1249,12 +1277,115 @@ fn a_service_only_sidecar_import_withholds_an_absolute_external_host() {
         .hosts
         .push("./catalog.default.".to_string());
     abs_import.normalize_mesh_fields();
-    let abs_prepared = prepare(&slice_for(&abs_import, &node_waypoint_runtime()));
+    let abs_slice = slice_for(&abs_import, &node_waypoint_runtime());
+    let retained_se = abs_slice
+        .service_entries
+        .iter()
+        .find(|entry| entry.name == "catalog-abs-se")
+        .expect("explicit ./catalog.default. import must retain matching ServiceEntry");
+    assert_eq!(retained_se.hosts, vec!["catalog.default.".to_string()]);
+    assert_eq!(
+        retained_se.ports.iter().map(|p| p.port).collect::<Vec<_>>(),
+        vec![8080],
+        "retained ServiceEntry keeps its admitted port"
+    );
+    let abs_prepared = prepare(&abs_slice);
     assert!(
         carried_routes(&abs_prepared)
             .iter()
             .any(|route| route.backend_host == "catalog.default."),
         "explicit ./catalog.default. import admits absolute external host catalog.default."
+    );
+}
+
+/// An EgressGateway serving an absolute two-label `ServiceEntry` (`secure.default.`)
+/// must preserve its absolute host identity through normalization so a matching
+/// absolute `DestinationRule` (`secure.default.` with `tls.mode: SIMPLE`) projects
+/// `BackendScheme::Https`, while a relative Service `DestinationRule` (`catalog.default`)
+/// does not originate TLS for absolute `catalog.default.`.
+#[test]
+fn egress_gateway_originates_tls_for_absolute_two_label_service_entry() {
+    let mut config = config_with(
+        direct_spec(RATINGS_OTHER),
+        vec![
+            destination_rule(
+                "secure-abs-tls",
+                DEFAULT_NAMESPACE,
+                "secure.default.",
+                json!({"tls": {"mode": "SIMPLE"}}),
+            ),
+            destination_rule(
+                "catalog-rel-tls",
+                DEFAULT_NAMESPACE,
+                "catalog.default",
+                json!({"tls": {"mode": "SIMPLE"}}),
+            ),
+        ],
+        Vec::new(),
+        Vec::new(),
+    );
+    let mesh = config.mesh.as_mut().expect("mesh block");
+    mesh.service_entries.push(ServiceEntry {
+        name: "secure-abs-se".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        hosts: vec!["secure.default.".to_string()],
+        endpoints: Vec::new(),
+        resolution: Resolution::Dns,
+        location: ServiceEntryLocation::MeshExternal,
+        ports: vec![ServicePort {
+            port: 80,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+            target_port: None,
+        }],
+        export_to: vec!["*".to_string()],
+        workload_selector: None,
+    });
+    mesh.service_entries.push(ServiceEntry {
+        name: "catalog-abs-se".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        hosts: vec!["catalog.default.".to_string()],
+        endpoints: Vec::new(),
+        resolution: Resolution::Dns,
+        location: ServiceEntryLocation::MeshExternal,
+        ports: vec![ServicePort {
+            port: 80,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+            target_port: None,
+        }],
+        export_to: vec!["*".to_string()],
+        workload_selector: None,
+    });
+    mesh.sidecars.clear();
+    config.normalize_mesh_fields();
+
+    let mut runtime = node_waypoint_runtime();
+    runtime.topology = MeshTopology::EgressGateway;
+    let slice = slice_for(&config, &runtime);
+    let prepared = prepare_gateway_config_from_mesh_slice(&slice, &runtime)
+        .expect("egress gateway slice prepares");
+
+    let secure_proxy = prepared
+        .proxies
+        .iter()
+        .find(|proxy| proxy.hosts.iter().any(|h| h == "secure.default."))
+        .expect("egress proxy for secure.default.");
+    assert_eq!(
+        secure_proxy.backend_scheme,
+        Some(BackendScheme::Https),
+        "absolute DR secure.default. SIMPLE must project HTTPS backend_scheme on EgressGateway"
+    );
+
+    let catalog_proxy = prepared
+        .proxies
+        .iter()
+        .find(|proxy| proxy.hosts.iter().any(|h| h == "catalog.default."))
+        .expect("egress proxy for catalog.default.");
+    assert_eq!(
+        catalog_proxy.backend_scheme,
+        Some(BackendScheme::Http),
+        "relative DR catalog.default must not originate TLS for absolute ServiceEntry catalog.default."
     );
 }
 
