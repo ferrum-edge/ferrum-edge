@@ -15894,7 +15894,10 @@ pub(crate) fn destination_rule_host_specificity(
         && rule_host.bytes().filter(|byte| *byte == b'.').count() == 1
     {
         candidate.starts_with(&format!("{rule_host}.svc."))
-    } else if rule_host.ends_with(".svc") {
+    } else if !rule_absolute_two_label
+        && rule_host.ends_with(".svc")
+        && rule_host.bytes().filter(|byte| *byte == b'.').count() == 2
+    {
         candidate.starts_with(&format!("{rule_host}."))
     } else {
         false

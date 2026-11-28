@@ -1233,12 +1233,37 @@ fn a_service_only_sidecar_import_withholds_an_absolute_external_host() {
             .any(|route| route.backend_host == "catalog.default."),
         "relative ./catalog.default import withholds absolute external host catalog.default."
     );
+
+    // Explicit absolute import (`./catalog.default.`) admits `catalog.default.`.
+    let mut abs_import = same_ns;
+    abs_import
+        .mesh
+        .as_mut()
+        .expect("mesh block")
+        .sidecars
+        .first_mut()
+        .expect("importing sidecar")
+        .egress
+        .first_mut()
+        .expect("egress listener")
+        .hosts
+        .push("./catalog.default.".to_string());
+    abs_import.normalize_mesh_fields();
+    let abs_prepared = prepare(&slice_for(&abs_import, &node_waypoint_runtime()));
+    assert!(
+        carried_routes(&abs_prepared)
+            .iter()
+            .any(|route| route.backend_host == "catalog.default."),
+        "explicit ./catalog.default. import admits absolute external host catalog.default."
+    );
 }
 
 /// A client-namespace DestinationRule for relative Service alias
 /// `catalog.default` with TLS origination must not withhold a direct external
-/// route to absolute `catalog.default.`, and an absolute DestinationRule for
-/// `catalog.default.` must not match `catalog.default.svc.cluster.local`.
+/// route to absolute `catalog.default.`, an absolute DestinationRule for
+/// `catalog.default.` must not match `catalog.default.svc.cluster.local`, and
+/// an absolute DestinationRule with TLS origination MUST govern (and withhold)
+/// its matching direct external route.
 #[test]
 fn service_destination_rule_does_not_match_absolute_external_two_label_host() {
     let mut config = config_with(
@@ -1257,14 +1282,26 @@ fn service_destination_rule_does_not_match_absolute_external_two_label_host() {
                 "catalog.default.",
                 json!({"loadBalancer": {"simple": "RANDOM"}}),
             ),
+            destination_rule(
+                "secure-abs-tls",
+                DEFAULT_NAMESPACE,
+                "secure.default.",
+                json!({"tls": {"mode": "SIMPLE"}}),
+            ),
             virtual_service(
                 "catalog-abs-ext",
                 json!({
                     "hosts": ["reviews.default.svc.cluster.local"],
-                    "http": [{
-                        "match": [{"uri": {"prefix": "/abs-ext"}}],
-                        "route": [{"destination": {"host": "catalog.default.", "port": {"number": 8080}}}]
-                    }]
+                    "http": [
+                        {
+                            "match": [{"uri": {"prefix": "/abs-ext"}}],
+                            "route": [{"destination": {"host": "catalog.default.", "port": {"number": 8080}}}]
+                        },
+                        {
+                            "match": [{"uri": {"prefix": "/secure-abs"}}],
+                            "route": [{"destination": {"host": "secure.default.", "port": {"number": 8080}}}]
+                        }
+                    ]
                 }),
             ),
         ],
@@ -1295,6 +1332,12 @@ fn service_destination_rule_does_not_match_absolute_external_two_label_host() {
             .iter()
             .any(|route| route.backend_host == "catalog.default."),
         "relative Service DR with TLS origination must not withhold direct external catalog.default."
+    );
+    assert!(
+        !carried_routes(&prepared)
+            .iter()
+            .any(|route| route.backend_host == "secure.default."),
+        "absolute DR secure.default. with TLS origination must govern and withhold direct external secure.default."
     );
     assert!(
         !prepared.upstreams.iter().any(|upstream| {

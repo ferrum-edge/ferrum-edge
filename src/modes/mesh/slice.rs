@@ -3112,6 +3112,14 @@ fn with_cross_namespace_destination_policies(
             Vec::new(),
         );
     }
+    let ordinary_policy_keys: HashSet<(String, String)> = mesh_policies
+        .iter()
+        .map(|policy| (policy.namespace.clone(), policy.name.clone()))
+        .collect();
+    let ordinary_ra_keys: HashSet<(String, String)> = request_authentications
+        .iter()
+        .map(|resource| (resource.namespace.clone(), resource.name.clone()))
+        .collect();
     let mut added_policies: BTreeSet<MeshHttpRouteDestinationPolicy> = BTreeSet::new();
     let mut added_request_authentications: BTreeSet<MeshHttpRouteDestinationPolicy> =
         BTreeSet::new();
@@ -3132,10 +3140,12 @@ fn with_cross_namespace_destination_policies(
             .any(|workload| governs(&policy.namespace, &policy.scope, workload))
             && !mesh_policies.contains(policy)
         {
-            added_policies.insert(MeshHttpRouteDestinationPolicy {
-                namespace: policy.namespace.clone(),
-                name: policy.name.clone(),
-            });
+            if !ordinary_policy_keys.contains(&(policy.namespace.clone(), policy.name.clone())) {
+                added_policies.insert(MeshHttpRouteDestinationPolicy {
+                    namespace: policy.namespace.clone(),
+                    name: policy.name.clone(),
+                });
+            }
             mesh_policies.push(policy.clone());
         }
     }
@@ -3145,10 +3155,12 @@ fn with_cross_namespace_destination_policies(
             .any(|workload| governs(&resource.namespace, &resource.scope, workload))
             && !request_authentications.contains(resource)
         {
-            added_request_authentications.insert(MeshHttpRouteDestinationPolicy {
-                namespace: resource.namespace.clone(),
-                name: resource.name.clone(),
-            });
+            if !ordinary_ra_keys.contains(&(resource.namespace.clone(), resource.name.clone())) {
+                added_request_authentications.insert(MeshHttpRouteDestinationPolicy {
+                    namespace: resource.namespace.clone(),
+                    name: resource.name.clone(),
+                });
+            }
             request_authentications.push(resource.clone());
         }
     }
@@ -4958,11 +4970,17 @@ fn policy_host_scope(
         }
         // An external ServiceEntry host has no Kubernetes alias family — it is
         // matched verbatim, and egress-scoped against its DECLARING namespace
-        // exactly like the ServiceEntry that owns it.
+        // exactly like the ServiceEntry that owns it. Preserve the trailing dot
+        // on an absolute two-label spelling (`catalog.default.`) so a relative
+        // Service import (`./catalog.default`) never admits it.
         PolicyTargetRef::ExternalHost { namespace } => PolicyHostScope {
             service_namespace: Some(namespace.clone()),
             scope_namespace: namespace,
-            host_candidates: vec![host],
+            host_candidates: vec![if absolute_two_label {
+                format!("{host}.")
+            } else {
+                host
+            }],
         },
         PolicyTargetRef::Unresolved => PolicyHostScope {
             service_namespace: None,

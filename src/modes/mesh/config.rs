@@ -4206,7 +4206,16 @@ pub enum SidecarHostPattern<'a> {
 impl MeshSidecarEgress {
     /// Parse one `egress.hosts` entry into a [`SidecarHostPattern`].
     pub fn parse_host_pattern(host: &str) -> SidecarHostPattern<'_> {
-        let trimmed = host.trim().trim_end_matches('.');
+        let raw = host.trim();
+        let host_part = raw.split_once('/').map_or(raw, |(_, h)| h);
+        let keep_trailing_dot =
+            host_part.ends_with('.') && host_part.trim_end_matches('.').matches('.').count() == 1;
+        let trimmed = if keep_trailing_dot {
+            let without_dots = raw.trim_end_matches('.');
+            &raw[..without_dots.len() + 1]
+        } else {
+            raw.trim_end_matches('.')
+        };
         match trimmed.split_once('/') {
             Some(("*", "*")) => SidecarHostPattern::AllowAll,
             Some(("*", host)) if !host.is_empty() && !host.contains('/') => {
@@ -9498,7 +9507,7 @@ fn normalize_mesh_fields_internal(
     }
     normalize_mesh_policy_fields(policies);
     for dr in destination_rules {
-        dr.host = normalize_mesh_hostname_like(&dr.host);
+        dr.host = normalize_mesh_hostname_preserving_absolute_two_label(&dr.host);
         // `exportTo` is semantic identity carried through native, file, and
         // xDS JSON. Canonicalize the same whitespace the evaluator and
         // validator recognize so equivalent visibility does not produce
@@ -9517,7 +9526,7 @@ fn normalize_mesh_fields_internal(
     for sidecar in sidecars {
         for egress in &mut sidecar.egress {
             for host in &mut egress.hosts {
-                *host = normalize_mesh_hostname_like(host);
+                *host = normalize_sidecar_egress_host_entry(host);
             }
         }
     }
@@ -9537,6 +9546,32 @@ fn normalize_mesh_fields_internal(
 /// `MeshConfig::normalize()`, so the consumer must normalize its own key.
 pub(crate) fn normalize_mesh_hostname_like(value: &str) -> String {
     value.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Canonicalize a hostname while preserving a single trailing dot on an
+/// absolute two-label DNS name (`catalog.default.`), so it stays distinct from
+/// the relative `<svc>.<ns>` Kubernetes Service shorthand.
+pub(crate) fn normalize_mesh_hostname_preserving_absolute_two_label(value: &str) -> String {
+    let trimmed = value.trim();
+    let absolute_two_label =
+        trimmed.ends_with('.') && trimmed.trim_end_matches('.').matches('.').count() == 1;
+    let stripped = trimmed.trim_end_matches('.').to_ascii_lowercase();
+    if absolute_two_label {
+        format!("{stripped}.")
+    } else {
+        stripped
+    }
+}
+
+fn normalize_sidecar_egress_host_entry(value: &str) -> String {
+    let trimmed = value.trim();
+    if let Some((ns, host)) = trimmed.split_once('/') {
+        let ns_norm = ns.trim().to_ascii_lowercase();
+        let host_norm = normalize_mesh_hostname_preserving_absolute_two_label(host);
+        format!("{ns_norm}/{host_norm}")
+    } else {
+        normalize_mesh_hostname_preserving_absolute_two_label(trimmed)
+    }
 }
 
 fn normalize_mesh_policy_fields(policies: &mut [MeshPolicy]) {
