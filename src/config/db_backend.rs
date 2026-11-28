@@ -14,6 +14,8 @@ pub use crate::config::batch_atomicity::{
     NamespaceConfigAdmissionLeaseRef, atomic_batch_unsupported, is_batch_admission_lease_lost,
 };
 use crate::config::gateway_trust::{GatewayTrustBundleIdentity, GatewayTrustBundleRecord};
+use crate::config::list_query;
+pub use crate::config::list_query::ResourceListFilter;
 use crate::config::types::{
     ApiSpec, Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream,
 };
@@ -217,6 +219,24 @@ pub(crate) fn stored_bytes_digest(bytes: &[u8]) -> serde_json::Value {
         "sha256": hex::encode(crate::fips::approved::Sha256::digest(bytes)),
         "len": bytes.len(),
     })
+}
+
+/// Revision reads bracketing one database list page before the route gives up
+/// with `503`. Each retry means a write to the same collection committed while
+/// the page was being read.
+pub const LIST_REVISION_READ_ATTEMPTS: usize = 5;
+
+/// Outcome of a revision-bracketed admin list or `applies_to_proxy` read.
+#[derive(Debug)]
+pub enum RevisionedListRead<T> {
+    Read { value: T, revision: u64 },
+    Mismatch { current: u64 },
+    Unstable,
+}
+
+/// Format a database collection revision sequence into its API token.
+pub fn store_revision_token(sequence: u64) -> String {
+    format!("s{sequence}")
 }
 
 /// Snapshot view of one stored [`ApiSpec`]. Every field is carried verbatim
@@ -2958,6 +2978,256 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         limit: i64,
         offset: i64,
     ) -> Result<PaginatedResult<Upstream>, anyhow::Error>;
+
+    // -----------------------------------------------------------------------
+    // Filtered admin lists (`q`, `ids`) and collection revisions
+    // -----------------------------------------------------------------------
+
+    /// [`Self::list_proxies_paginated`] narrowed by `filter` inside the
+    /// backend query, so `total` counts the matches. The matching rule is
+    /// [`crate::config::list_query`]'s, identical on every backend.
+    async fn list_proxies_filtered(
+        &self,
+        namespace: &str,
+        filter: &ResourceListFilter,
+        limit: i64,
+        offset: i64,
+    ) -> Result<PaginatedResult<Proxy>, anyhow::Error>;
+    /// Consumer counterpart of [`Self::list_proxies_filtered`].
+    async fn list_consumers_filtered(
+        &self,
+        namespace: &str,
+        filter: &ResourceListFilter,
+        limit: i64,
+        offset: i64,
+    ) -> Result<PaginatedResult<Consumer>, anyhow::Error>;
+    /// Upstream counterpart of [`Self::list_proxies_filtered`].
+    async fn list_upstreams_filtered(
+        &self,
+        namespace: &str,
+        filter: &ResourceListFilter,
+        limit: i64,
+        offset: i64,
+    ) -> Result<PaginatedResult<Upstream>, anyhow::Error>;
+    /// Plugin-config counterpart of [`Self::list_proxies_filtered`], also
+    /// optionally narrowed to one `proxy_id`.
+    async fn list_plugin_configs_filtered(
+        &self,
+        namespace: &str,
+        filter: &ResourceListFilter,
+        proxy_id: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<PaginatedResult<PluginConfig>, anyhow::Error>;
+    /// Every plugin config in `namespace` that can apply to a proxy whose
+    /// association list is `attached_ids`: all `global` configs plus the
+    /// configs named in `attached_ids` (any scope). Unordered and unpaginated;
+    /// the caller applies the plugin cache's scope rule
+    /// (`plugin_cache::plugin_configs_applied_to_proxy`) to this candidate set.
+    async fn list_plugin_config_candidates_for_proxy(
+        &self,
+        namespace: &str,
+        attached_ids: &[String],
+    ) -> Result<Vec<PluginConfig>, anyhow::Error>;
+    /// Revision of the `resource_types` collections in `namespace`, derived
+    /// from the durable `config_changes` log (see
+    /// [`crate::config::list_query::collection_revision_from_sequences`]).
+    /// Read from the same source the admin list reads use.
+    async fn config_collection_revision(
+        &self,
+        namespace: &str,
+        resource_types: &[&str],
+    ) -> Result<u64, anyhow::Error>;
+
+    /// Read a filtered page of proxies bracketed by `config_collection_revision`
+    /// on one consistent read source.
+    async fn list_proxies_revisioned(
+        &self,
+        namespace: &str,
+        filter: &ResourceListFilter,
+        limit: i64,
+        offset: i64,
+        if_revision: Option<&str>,
+    ) -> Result<RevisionedListRead<PaginatedResult<Proxy>>, anyhow::Error> {
+        let resource_types = [list_query::PROXY_RESOURCE_TYPE];
+        for _ in 0..LIST_REVISION_READ_ATTEMPTS {
+            let before = self
+                .config_collection_revision(namespace, &resource_types)
+                .await?;
+            if let Some(expected) = if_revision
+                && expected != store_revision_token(before)
+            {
+                return Ok(RevisionedListRead::Mismatch { current: before });
+            }
+            let value = self
+                .list_proxies_filtered(namespace, filter, limit, offset)
+                .await?;
+            let after = self
+                .config_collection_revision(namespace, &resource_types)
+                .await?;
+            if before == after {
+                return Ok(RevisionedListRead::Read {
+                    value,
+                    revision: before,
+                });
+            }
+        }
+        Ok(RevisionedListRead::Unstable)
+    }
+
+    /// Consumer counterpart of [`Self::list_proxies_revisioned`].
+    async fn list_consumers_revisioned(
+        &self,
+        namespace: &str,
+        filter: &ResourceListFilter,
+        limit: i64,
+        offset: i64,
+        if_revision: Option<&str>,
+    ) -> Result<RevisionedListRead<PaginatedResult<Consumer>>, anyhow::Error> {
+        let resource_types = [list_query::CONSUMER_RESOURCE_TYPE];
+        for _ in 0..LIST_REVISION_READ_ATTEMPTS {
+            let before = self
+                .config_collection_revision(namespace, &resource_types)
+                .await?;
+            if let Some(expected) = if_revision
+                && expected != store_revision_token(before)
+            {
+                return Ok(RevisionedListRead::Mismatch { current: before });
+            }
+            let value = self
+                .list_consumers_filtered(namespace, filter, limit, offset)
+                .await?;
+            let after = self
+                .config_collection_revision(namespace, &resource_types)
+                .await?;
+            if before == after {
+                return Ok(RevisionedListRead::Read {
+                    value,
+                    revision: before,
+                });
+            }
+        }
+        Ok(RevisionedListRead::Unstable)
+    }
+
+    /// Upstream counterpart of [`Self::list_proxies_revisioned`].
+    async fn list_upstreams_revisioned(
+        &self,
+        namespace: &str,
+        filter: &ResourceListFilter,
+        limit: i64,
+        offset: i64,
+        if_revision: Option<&str>,
+    ) -> Result<RevisionedListRead<PaginatedResult<Upstream>>, anyhow::Error> {
+        let resource_types = [list_query::UPSTREAM_RESOURCE_TYPE];
+        for _ in 0..LIST_REVISION_READ_ATTEMPTS {
+            let before = self
+                .config_collection_revision(namespace, &resource_types)
+                .await?;
+            if let Some(expected) = if_revision
+                && expected != store_revision_token(before)
+            {
+                return Ok(RevisionedListRead::Mismatch { current: before });
+            }
+            let value = self
+                .list_upstreams_filtered(namespace, filter, limit, offset)
+                .await?;
+            let after = self
+                .config_collection_revision(namespace, &resource_types)
+                .await?;
+            if before == after {
+                return Ok(RevisionedListRead::Read {
+                    value,
+                    revision: before,
+                });
+            }
+        }
+        Ok(RevisionedListRead::Unstable)
+    }
+
+    /// Plugin-config counterpart of [`Self::list_proxies_revisioned`].
+    async fn list_plugin_configs_revisioned(
+        &self,
+        namespace: &str,
+        filter: &ResourceListFilter,
+        proxy_id: Option<&str>,
+        limit: i64,
+        offset: i64,
+        if_revision: Option<&str>,
+    ) -> Result<RevisionedListRead<PaginatedResult<PluginConfig>>, anyhow::Error> {
+        let resource_types = [list_query::PLUGIN_CONFIG_RESOURCE_TYPE];
+        for _ in 0..LIST_REVISION_READ_ATTEMPTS {
+            let before = self
+                .config_collection_revision(namespace, &resource_types)
+                .await?;
+            if let Some(expected) = if_revision
+                && expected != store_revision_token(before)
+            {
+                return Ok(RevisionedListRead::Mismatch { current: before });
+            }
+            let value = self
+                .list_plugin_configs_filtered(namespace, filter, proxy_id, limit, offset)
+                .await?;
+            let after = self
+                .config_collection_revision(namespace, &resource_types)
+                .await?;
+            if before == after {
+                return Ok(RevisionedListRead::Read {
+                    value,
+                    revision: before,
+                });
+            }
+        }
+        Ok(RevisionedListRead::Unstable)
+    }
+
+    /// Read a proxy and its candidate plugin configs bracketed by the combined
+    /// `(plugin_config, proxy)` revision on one consistent read source.
+    async fn list_plugin_configs_applied_to_proxy_revisioned(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+        if_revision: Option<&str>,
+    ) -> Result<RevisionedListRead<Option<(Proxy, Vec<PluginConfig>)>>, anyhow::Error> {
+        let resource_types = [
+            list_query::PLUGIN_CONFIG_RESOURCE_TYPE,
+            list_query::PROXY_RESOURCE_TYPE,
+        ];
+        for _ in 0..LIST_REVISION_READ_ATTEMPTS {
+            let before = self
+                .config_collection_revision(namespace, &resource_types)
+                .await?;
+            if let Some(expected) = if_revision
+                && expected != store_revision_token(before)
+            {
+                return Ok(RevisionedListRead::Mismatch { current: before });
+            }
+            let value = match self.get_proxy(namespace, proxy_id).await? {
+                Some(proxy) => {
+                    let attached: Vec<String> = proxy
+                        .plugins
+                        .iter()
+                        .map(|association| association.plugin_config_id.clone())
+                        .collect();
+                    let candidates = self
+                        .list_plugin_config_candidates_for_proxy(namespace, &attached)
+                        .await?;
+                    Some((proxy, candidates))
+                }
+                None => None,
+            };
+            let after = self
+                .config_collection_revision(namespace, &resource_types)
+                .await?;
+            if before == after {
+                return Ok(RevisionedListRead::Read {
+                    value,
+                    revision: before,
+                });
+            }
+        }
+        Ok(RevisionedListRead::Unstable)
+    }
 
     // -----------------------------------------------------------------------
     // Validation queries

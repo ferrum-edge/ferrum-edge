@@ -2600,13 +2600,14 @@ fn docker_fixtures_pin_host_ports_outside_the_ephemeral_range() {
 // ---------------------------------------------------------------------------
 
 /// Every source that starts a testcontainers image.
-const CONTAINER_START_SOURCES: [&str; 7] = [
+const CONTAINER_START_SOURCES: [&str; 8] = [
     "tests/service_integration/common/containers.rs",
     "tests/service_integration/common/hydra.rs",
     "tests/service_integration/clickhouse.rs",
     "tests/service_integration/db_tls.rs",
     "tests/service_integration/mysql.rs",
     "tests/service_integration/forward_migrations_sqlite_postgres_mysql.rs",
+    "tests/service_integration/admin_list_queries_sqlite_postgres_mysql.rs",
     "tests/secrets_functional/common/containers.rs",
 ];
 
