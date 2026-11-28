@@ -3221,6 +3221,7 @@ const EXPECTED_OBJECT_ADMISSION_FIELDS: &[&str] = &[
     "src/plugins/api_chargeback_sink.rs:ClickHouseConfig.tls",
     "src/plugins/mesh_route_dispatch.rs:FaultActionConfig.abort",
     "src/plugins/mesh_route_dispatch.rs:FaultActionConfig.delay",
+    "src/plugins/mesh_route_dispatch.rs:FaultActionConfig.secondary_abort",
     "src/plugins/mesh_route_dispatch.rs:RouteDestination.backend_tls",
     "src/plugins/mesh_route_dispatch.rs:RouteRule.destination",
     "src/plugins/mesh_route_dispatch.rs:RouteRule.fault",

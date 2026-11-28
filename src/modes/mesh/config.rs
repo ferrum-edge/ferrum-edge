@@ -7434,6 +7434,28 @@ fn validate_mesh_extension_configs(
 /// distinct `istio-vs-l4_` space and never appear in an HTTP route binding.
 pub const VIRTUAL_SERVICE_HTTP_ROUTE_PROXY_ID_PREFIX: &str = "istio-vs-";
 
+/// Prefix of every Gateway API GAMMA route proxy id (an `HTTPRoute` /
+/// `GRPCRoute` with a `Service` parentRef, issue #7538). It lies inside the
+/// carried-route `istio-vs-` space, so every carried-route check applies, and
+/// is additionally admitted ONLY on an outbound mesh listener
+/// (`modes::mesh::mesh_route_admitted_for_direction`).
+pub const GAMMA_HTTP_ROUTE_PROXY_ID_PREFIX: &str = "istio-vs-gamma_";
+
+/// Prefix of every GAMMA weighted-backend upstream id, inside the carried
+/// `istio-vs-upstream-` space.
+pub(crate) const GAMMA_ROUTE_UPSTREAM_ID_PREFIX: &str = "istio-vs-upstream-gamma_";
+
+/// Non-forwarding placeholder destination used by GAMMA proxies (whose own
+/// default is never dialed because `reject_unmatched` answers misses with 404)
+/// and by GAMMA rules that terminate locally (fault, redirect, zero-weight, or
+/// an unavailable backend Service). Excluded from Sidecar egress checks.
+pub(crate) const GAMMA_NO_FORWARD_HOST: &str = "gamma-no-forward.ferrum.invalid.";
+
+/// Whether `id` names a Gateway API GAMMA route proxy.
+pub fn is_gamma_http_route_proxy_id(id: &str) -> bool {
+    id.starts_with(GAMMA_HTTP_ROUTE_PROXY_ID_PREFIX)
+}
+
 /// Whether `id` names a VirtualService HTTP route proxy (not an L4 one).
 pub fn is_virtual_service_http_route_proxy_id(id: &str) -> bool {
     id.starts_with(VIRTUAL_SERVICE_HTTP_ROUTE_PROXY_ID_PREFIX)

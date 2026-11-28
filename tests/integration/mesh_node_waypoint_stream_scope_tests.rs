@@ -2141,6 +2141,10 @@ mod cross_namespace_node_waypoint;
 /// routes that name the granted target (issue #7499).
 mod cross_namespace_grant_invariant;
 
+/// Gateway API GAMMA routes (`Service` parentRefs) carried on Sidecar and
+/// NodeWaypoint slices (issue #7538).
+mod gamma_routes;
+
 /// Per-destination authorization for `mesh_route_dispatch` branches of a
 /// carried VirtualService route (issue #7383).
 mod route_branch_authz;
