@@ -45,7 +45,7 @@ themselves).
 
 Upgrading from 0.9.21 is a one-time step. Every PostgreSQL, MySQL, SQLite and
 MongoDB database created by a 0.9.x release is rebuilt from a validated logical
-backup, and the ConfigSync protocol revision is now 8, so the control plane and
+backup, and the ConfigSync protocol revision is now 10, so the control plane and
 its data planes are upgraded together, control plane first. Read
 [Upgrading to 1.0.0](docs/upgrade_guide.md#upgrading-to-100) before updating
 gateways, control planes, mesh data planes, charts or contract consumers.
@@ -169,12 +169,13 @@ gateways, control planes, mesh data planes, charts or contract consumers.
   dispatch-rule, and weighted-split legs, with or without a DestinationRule)
   when authorized by a matching Gateway API `ReferenceGrant` in the target
   Service's namespace (#7499). Unauthorized cross-namespace destinations fail
-  closed: the `VirtualService` is rejected with `FerrumAccepted=False` /
-  `RefNotPermitted`, routes naming an unauthorized destination or split are
-  withheld, and the host keeps its plain Service route only where one exists (a
-  route terminated unconditionally with `404` keeps that `404` with the refused
-  split detached). Eligible authorized cross-namespace destinations are reported
-  in `status.ferrum.translation.cross_namespace_destinations`, judged against
+  closed: admission rejects the entire mesh-bound `VirtualService` (including
+  any gateway routes on a dual-bound object) before route translation with
+  `FerrumAccepted=False` / `RefNotPermitted`; during data-plane slice
+  materialization, any carried route arriving without authorization metadata is
+  withheld while plain Service routing remains (and an already-translated
+  unconditional `404` keeps its `404` with the refused split detached). Eligible
+  authorized cross-namespace destinations are reported in `status.ferrum.translation.cross_namespace_destinations`, judged against
   the controller's cluster domain (`FERRUM_K8S_CLUSTER_DOMAIN`), so keep it
   equal to the data planes' `FERRUM_MESH_CLUSTER_DOMAIN`.
 - **Istio DestinationRule `outlierDetection.splitExternalLocalOriginErrors:

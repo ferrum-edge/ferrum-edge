@@ -45,7 +45,7 @@ configuration that 0.9.21 accepted, so review every section before upgrading.
 Every PostgreSQL, MySQL, SQLite and MongoDB database created by a 0.9.x
 release is rebuilt from a logical backup
 ([Database rebuild-and-restore](#every-09x-database-is-rebuilt-and-restored-7523)).
-CP/DP must run the same build, and the ConfigSync revision is now `8`. The
+CP/DP must run the same build, and the ConfigSync revision is now `10`. The
 matching `contracts-edge-1.0.0` release must be cut from the verified release
 commit after the Edge release is published; move downstream contract pins when
 each consumer adopts 1.0.0.
@@ -77,7 +77,7 @@ Do these in order; each step links to the section that explains it.
    rollback
    ([Database rebuild-and-restore](#every-09x-database-is-rebuilt-and-restored-7523)).
 5. **Upgrade the control plane, then every data plane, in one window**
-   ([ConfigSync revision 8](#configsync-revision-8-and-the-cp-first-upgrade-7520-7524)),
+   ([ConfigSync revision 10](#configsync-revision-10-and-the-cp-first-upgrade-7520-7524-7499-7500)),
    including native mesh data planes.
 6. **Move contract pins** to `contracts-edge-1.0.0` once it is published and
    each consumer adopts Edge 1.0.0.
@@ -319,11 +319,14 @@ legs) when authorized by a matching Gateway API `ReferenceGrant` in the target
 Service's namespace (`from: networking.istio.io/VirtualService` in the route's
 namespace, `to: ""/Service` matching the target Service or namespace-wide).
 Every destination without a matching `ReferenceGrant` is refused fail-closed:
-the `VirtualService` is rejected with `FerrumAccepted=False` /
-`RefNotPermitted`, routes naming an unauthorized destination or split are
-withheld from the data plane, and the host keeps its plain Service route only
-where one exists (a route the translator terminates unconditionally with a `404`
-keeps that `404` with the refused split detached).
+admission runs before route translation and rejects the entire mesh-bound
+`VirtualService` (including any gateway routes on a dual-bound object) with
+`FerrumAccepted=False` / `RefNotPermitted`, emitting no routes for it. If a
+previously translated carried route arrives at a data plane without
+authorization metadata during slice materialization, the data plane withholds
+routes naming the unauthorized destination or split, leaving plain Service
+routing where one exists (and keeping any already-translated unconditional
+`404` with the refused split detached).
 
 Authorized cross-namespace destinations are reported under
 `status.ferrum.translation.cross_namespace_destinations` (rather than
