@@ -431,7 +431,8 @@ impl XdsAdsServer {
         .with_enforce_sidecar_identity_narrowing(self.sidecar_identity_narrowing)
         .with_ambient_udp_source_scoping(scoping.ambient_udp_source_scoping)
         .with_node_waypoint_capture_scoping(scoping.node_waypoint_capture_scoping)
-        .with_sidecar_http_routes(scoping.sidecar_http_routes);
+        .with_sidecar_http_routes(scoping.sidecar_http_routes)
+        .with_service_waypoint_http_routes(scoping.service_waypoint_http_routes);
         CpGrpcServer::filter_config_to_mesh_request_for_scope_and_bearer(
             config,
             &request,
@@ -570,7 +571,8 @@ impl XdsAdsServer {
             .with_enforce_sidecar_identity_narrowing(self.sidecar_identity_narrowing)
             .with_ambient_udp_source_scoping(scoping.ambient_udp_source_scoping)
             .with_node_waypoint_capture_scoping(scoping.node_waypoint_capture_scoping)
-            .with_sidecar_http_routes(scoping.sidecar_http_routes);
+            .with_sidecar_http_routes(scoping.sidecar_http_routes)
+            .with_service_waypoint_http_routes(scoping.service_waypoint_http_routes);
         let mut config = config.clone();
         config.normalize_fields();
         config.normalize_mesh_fields();
@@ -1473,7 +1475,7 @@ fn warn_xds_request_rejected(
     );
 }
 
-fn config_fingerprint(config: &GatewayConfig) -> XdsConfigFingerprint {
+pub(crate) fn config_fingerprint(config: &GatewayConfig) -> XdsConfigFingerprint {
     // This serializes the full GatewayConfig, including HashMap fields whose
     // iteration order is process-local. That is fine for the in-memory xDS
     // snapshot cache: fingerprints only need to be stable within one process
@@ -3138,6 +3140,7 @@ mod tests {
                 cluster: None,
             }),
             remote_provenance: false,
+            mesh_transport: None,
         };
         let config = GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
@@ -3174,6 +3177,7 @@ mod tests {
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: true,
             sidecar_http_routes: false,
+            service_waypoint_http_routes: false,
         };
         let capture_carriers = |server: &XdsAdsServer| {
             server
@@ -3283,6 +3287,7 @@ mod tests {
                 cluster: None,
             }),
             remote_provenance: false,
+            mesh_transport: None,
         };
         let config = GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
@@ -3302,6 +3307,7 @@ mod tests {
                     ambient_udp_source_scoping: false,
                     node_waypoint_capture_scoping: true,
                     sidecar_http_routes: false,
+                    service_waypoint_http_routes: false,
                 },
             ),
         };
@@ -3507,6 +3513,7 @@ mod tests {
                 ambient_udp_source_scoping: false,
                 node_waypoint_capture_scoping: false,
                 sidecar_http_routes: false,
+                service_waypoint_http_routes: false,
             },
         ));
         assert!(server.waypoint_names.get(&tenant_key).is_some());
@@ -3557,6 +3564,7 @@ mod tests {
             pod_uid: Some("16b2c3d4-9dad-11d1-80b4-00c04fd430c8".to_string()),
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         });
         mesh.mesh_policies.push(MeshPolicy {
             name: "clients-source-policy".to_string(),
@@ -3591,6 +3599,7 @@ mod tests {
                 ambient_udp_source_scoping: true,
                 node_waypoint_capture_scoping: false,
                 sidecar_http_routes: false,
+                service_waypoint_http_routes: false,
             },
         );
         let bearer_restricted = bearer_restricted_server.filter_config_for_xds_request(
@@ -3601,6 +3610,7 @@ mod tests {
                 ambient_udp_source_scoping: true,
                 node_waypoint_capture_scoping: false,
                 sidecar_http_routes: false,
+                service_waypoint_http_routes: false,
             },
         );
         let bearer_multi_namespace = bearer_multi_namespace_server.filter_config_for_xds_request(
@@ -3611,6 +3621,7 @@ mod tests {
                 ambient_udp_source_scoping: true,
                 node_waypoint_capture_scoping: false,
                 sidecar_http_routes: false,
+                service_waypoint_http_routes: false,
             },
         );
 
@@ -3669,6 +3680,7 @@ mod tests {
                 ambient_udp_source_scoping: false,
                 node_waypoint_capture_scoping: false,
                 sidecar_http_routes: false,
+                service_waypoint_http_routes: false,
             },
         );
         let snapshot =

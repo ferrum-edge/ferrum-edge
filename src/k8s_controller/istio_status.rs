@@ -1531,12 +1531,27 @@ fn virtual_service_status(
             let mesh_http_routes = (http_route_count > 0
                 && crate::config_sources::k8s::virtual_service_binds_mesh(object))
             .then_some(VIRTUAL_SERVICE_MESH_HTTP_ROUTES_SCOPE);
+            // Issue #7500: a Service this VirtualService routes is bound to a
+            // ServiceWaypoint that will not carry its routes (owner or
+            // `exportTo` rule). Never a silent drop: report each one.
+            let (service_waypoint_excluded, service_waypoint_exclusions) =
+                virtual_service_service_waypoint_exclusions(object, translation, cluster_domain);
             let mut notes = Vec::new();
             if !deferred.is_empty() {
                 notes.push(format!("deferred fields: {}", deferred.join(", ")));
             }
             if !clamped.is_empty() {
                 notes.push(format!("clamped fields: {}", clamped.join(", ")));
+            }
+            if service_waypoint_excluded > 0 {
+                notes.push(format!(
+                    "{} Service(s) these http[] routes name are bound to a ServiceWaypoint that \
+                     does not carry them (a VirtualService in the Service's namespace must be \
+                     exported to the waypoint's namespace, one in the waypoint's namespace must \
+                     be exported to the Service's namespace, and any other namespace is refused; \
+                     issue #7500); see status.ferrum.translation.service_waypoint_route_exclusions",
+                    service_waypoint_excluded
+                ));
             }
             if mesh_http_routes.is_some() {
                 notes.push(VIRTUAL_SERVICE_MESH_HTTP_ROUTES_NOTE.to_string());
@@ -1569,6 +1584,10 @@ fn virtual_service_status(
                 detail["translation"]["cross_namespace_destinations"] =
                     json!(cross_namespace_destinations);
             }
+            if !service_waypoint_exclusions.is_empty() {
+                detail["translation"]["service_waypoint_route_exclusions"] =
+                    Value::Array(service_waypoint_exclusions);
+            }
             accepted_status(object, true, "Accepted", &message, Some(detail))
         }
         Err(error) => {
@@ -1598,6 +1617,52 @@ fn virtual_service_status(
     }
 }
 
+/// Most bound Services listed in
+/// `status.ferrum.translation.service_waypoint_route_exclusions` (issue
+/// #7500); one more entry counts the rest.
+pub const MAX_VIRTUAL_SERVICE_SERVICE_WAYPOINT_EXCLUSIONS: usize = 32;
+
+/// The bound Services whose ServiceWaypoint will not carry this mesh-bound
+/// VirtualService's routes, each `{service: "<ns>/<name>", reason}`, read with
+/// the projection's own rule (`slice::service_waypoint_route_exclusions`).
+/// Only the Service the VirtualService itself names is reported, never the
+/// waypoint's identity. Bounded by
+/// [`MAX_VIRTUAL_SERVICE_SERVICE_WAYPOINT_EXCLUSIONS`].
+fn virtual_service_service_waypoint_exclusions(
+    object: &K8sObject,
+    translation: &K8sTranslation,
+    cluster_domain: &str,
+) -> (usize, Vec<Value>) {
+    let Some(mesh) = translation.config.mesh.as_deref() else {
+        return (0, Vec::new());
+    };
+    let Some(binding) = mesh.virtual_service_http_routes.iter().find(|binding| {
+        binding.namespace == object.metadata.namespace && binding.name == object.metadata.name
+    }) else {
+        return (0, Vec::new());
+    };
+    let exclusions = crate::modes::mesh::slice::service_waypoint_route_exclusions(
+        &translation.config,
+        binding,
+        cluster_domain,
+    );
+    let mut entries: Vec<Value> = exclusions
+        .iter()
+        .take(MAX_VIRTUAL_SERVICE_SERVICE_WAYPOINT_EXCLUSIONS)
+        .map(|exclusion| {
+            json!({
+                "service": format!("{}/{}", exclusion.service_namespace, exclusion.service_name),
+                "reason": exclusion.reason.as_str(),
+            })
+        })
+        .collect();
+    if exclusions.len() > MAX_VIRTUAL_SERVICE_SERVICE_WAYPOINT_EXCLUSIONS {
+        entries.push(json!({
+            "omitted": exclusions.len() - MAX_VIRTUAL_SERVICE_SERVICE_WAYPOINT_EXCLUSIONS,
+        }));
+    }
+    (exclusions.len(), entries)
+}
 /// VirtualService HTTP-route fields the translator parses past but never
 /// projects. `tcp` / `tls` route arrays are not listed here: they are
 /// translated to stream proxies (L4 match predicates compile onto

@@ -223,8 +223,12 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
     assert!(batch_source.contains("crud::validate_transaction_log_schema_candidates("));
     assert!(batch_source.contains("&batch.plugin_configs,"));
     assert!(batch_source.contains("is_enabled_config_graph_participant"));
+    // Restore payload admission lives in `restore_admission.rs` (issue
+    // #7532), shared with `ferrum-edge validate --backup`; the candidate
+    // pipeline it calls stays in `mod.rs`.
+    let admission_source = include_str!("../../../src/admin/restore_admission.rs");
     let restore_validator = batch_source
-        .find("async fn validate_restore_candidate_on_blocking_pool(")
+        .find("fn restore_candidate_validation_errors(")
         .expect("restore candidate validator must exist");
     let restore_handler = batch_source
         .find("async fn handle_restore(")
@@ -235,24 +239,27 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
         "restore must reject malformed resource IDs/namespaces before persistence"
     );
     assert!(
-        batch_source[restore_validator..restore_handler]
-            .contains("tokio::task::spawn_blocking(move ||"),
+        batch_source[restore_handler..].contains("tokio::task::spawn_blocking(move ||"),
         "restore graph construction must run off the Tokio worker"
     );
     assert!(
-        batch_source[restore_handler..].contains("validate_restore_candidate_on_blocking_pool("),
-        "restore must use the blocking candidate validator"
+        batch_source[restore_handler..].contains("restore_admission::admit_restore_payload("),
+        "restore must use the shared blocking admission"
     );
     assert!(
-        batch_source[restore_handler..].contains("candidate.normalize_fields()"),
+        admission_source.contains("super::restore_candidate_validation_errors("),
+        "shared admission must run the restore candidate validator"
+    );
+    assert!(
+        admission_source.contains("candidate.normalize_fields()"),
         "restore must normalize the actual candidate before validation"
     );
     assert!(
-        !batch_source[restore_handler..].contains("payload.proxies.clone()"),
+        !admission_source.contains("payload.proxies.clone()"),
         "restore must not validate a disposable clone of the wire payload"
     );
     assert!(
-        batch_source[restore_handler..].contains("payload.proxies = candidate.proxies"),
+        admission_source.contains("payload.proxies = candidate.proxies"),
         "restore must persist the validated canonical instance"
     );
     assert!(
@@ -665,9 +672,12 @@ fn test_disabled_basic_auth_config_skips_plugin_construction() {
 #[test]
 fn restore_admission_covers_batch_contracts_before_the_namespace_clear() {
     let source = include_str!("../../../src/admin/mod.rs");
+    // The payload admission restore runs before the clear is shared with
+    // `ferrum-edge validate --backup` (issue #7532).
+    let admission = include_str!("../../../src/admin/restore_admission.rs");
 
     let pipeline_start = source
-        .find("fn validate_restore_candidate_on_blocking_pool")
+        .find("fn restore_candidate_validation_errors(")
         .expect("restore validation pipeline must exist");
     let pipeline_end = pipeline_start
         + source[pipeline_start..]
@@ -691,28 +701,30 @@ fn restore_admission_covers_batch_contracts_before_the_namespace_clear() {
     let clear = restore
         .find("delete_all_resources(")
         .expect("restore must clear the namespace");
+    let admitted = restore
+        .find("restore_admission::admit_restore_payload(")
+        .expect("restore must run the shared payload admission");
+    assert!(
+        admitted < clear,
+        "payload admission must run before the destructive namespace clear"
+    );
     for check in [
         "candidate.validate_mtls_auth_compatibility()",
-        "collect_plugin_config_admission_errors(",
+        "collect_plugin_config_admission_errors_with(",
+        "validate_candidate_plugin_graph(",
+        "hash_consumer_credentials(",
     ] {
-        let at = restore
-            .find(check)
-            .unwrap_or_else(|| panic!("restore must run {check}"));
         assert!(
-            at < clear,
-            "{check} must run before the destructive namespace clear"
+            admission.contains(check),
+            "shared restore admission must run {check}"
         );
     }
 
     // The plugin-name/definition admission helper is shared with batch, so the
-    // two cannot drift apart.
-    let shared_calls = source
-        .matches("collect_plugin_config_admission_errors(")
-        .count();
-    assert!(
-        shared_calls >= 3,
-        "batch and restore must share the admission helper"
-    );
+    // two cannot drift apart: batch calls the state wrapper, restore admission
+    // the explicit-client form the wrapper delegates to.
+    assert!(source.contains("collect_plugin_config_admission_errors(state, &batch.plugin_configs"));
+    assert!(source.contains("    collect_plugin_config_admission_errors_with(\n"));
 }
 
 #[test]

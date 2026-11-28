@@ -335,11 +335,14 @@ points:
 
 | Document | Entry points that read it | Version handling today |
 |---|---|---|
-| `GET /backup` export, unmodified | `POST /restore`; the database-mode fallback file `FERRUM_DB_CONFIG_BACKUP_PATH` (also checked by `ferrum-edge validate` in database mode) | The fallback loader strips the export envelope and runs the version-migration chain in memory. `POST /restore` refuses a document whose `version` names a format version other than the current one, and has no migration step. |
+| `GET /backup` export, unmodified | `POST /restore` (whose payload admission `ferrum-edge validate --backup` runs offline); the database-mode fallback file `FERRUM_DB_CONFIG_BACKUP_PATH` (also checked by `ferrum-edge validate` in database mode) | The fallback loader strips the export envelope and runs the version-migration chain in memory. `POST /restore` refuses a document whose `version` names a format version other than the current one, and has no migration step. |
 | File-mode configuration file | File mode (`FERRUM_FILE_CONFIG_PATH`) and `ferrum-edge validate`; `FERRUM_MODE=migrate` with `FERRUM_MIGRATE_ACTION=config` rewrites it on disk | Runs the version-migration chain in memory. |
 
-No migration step exists yet, because `"1"` is the only version. The two
-documents are not interchangeable: file mode refuses unknown top-level fields,
+No migration step exists yet, because `"1"` is the only version. A section
+added without changing `version` is additive: an export without it keeps
+restoring unchanged. The backup's `api_specs` and `namespace_registry` sections
+carry their own `section_version`, which a change to the section's own shape
+increments. The two documents are not interchangeable: file mode refuses unknown top-level fields,
 so a `GET /backup` export (which carries `ferrum_version`, `exported_at`,
 `counts` and other envelope fields) is not a valid file-mode configuration.
 

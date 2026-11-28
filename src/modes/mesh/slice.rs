@@ -9,15 +9,16 @@ use crate::identity::spiffe::SpiffeId;
 use crate::modes::mesh::config::{
     DestinationRuleLookupTier, MeshConfig, MeshDestinationRule, MeshPolicy, MeshProxyConfig,
     MeshRequestAuthentication, MeshRuntimeOverlay, MeshService, MeshSidecar, MeshSidecarEgress,
-    MeshTelemetryResource, MeshVirtualServiceCorsPolicy, MeshWaypointServiceRef, MtlsMode,
-    MultiClusterConfig, NodeWaypointAssertor, OutboundTrafficPolicy, PeerAuthentication,
-    PolicyScope, ResolvedIngressListener, ServiceEntry, SidecarHostPattern, TrustBundleSet,
-    WaypointAttachment, Workload, WorkloadLabels, destination_rule_exported_to_namespace,
-    destination_rule_is_namespace_private, destination_rule_lookup_tier, is_false, is_zero_usize,
-    policy_scope_applies_to_workload, policy_scope_applies_with_waypoint,
-    policy_target_attachment_applies_to_service, proxy_config_applies_to_workload,
-    scope_applies_to_workload, service_entry_applies_to_workload,
-    virtual_service_cors_policy_exported_to_namespace, workload_selector_matches,
+    MeshTelemetryResource, MeshVirtualServiceCorsPolicy, MeshVirtualServiceHttpRoutes,
+    MeshWaypointServiceRef, MtlsMode, MultiClusterConfig, NodeWaypointAssertor,
+    OutboundTrafficPolicy, PeerAuthentication, PolicyScope, ResolvedIngressListener, ServiceEntry,
+    SidecarHostPattern, TrustBundleSet, WaypointAttachment, Workload, WorkloadLabels,
+    destination_rule_exported_to_namespace, destination_rule_is_namespace_private,
+    destination_rule_lookup_tier, is_false, is_zero_usize, policy_scope_applies_to_workload,
+    policy_scope_applies_with_waypoint, policy_target_attachment_applies_to_service,
+    proxy_config_applies_to_workload, scope_applies_to_workload, service_entry_applies_to_workload,
+    virtual_service_cors_policy_exported_to_namespace,
+    virtual_service_http_routes_exported_to_namespace, workload_selector_matches,
 };
 use crate::modes::mesh::dns_proxy::DEFAULT_CLUSTER_DOMAIN;
 use crate::startup::sanitize_startup_cause;
@@ -84,6 +85,22 @@ pub struct MeshSliceRequest {
     /// Ambient (the L4 data plane), ServiceWaypoint and the gateway topologies
     /// leave it `false` and receive no routes.
     pub sidecar_http_routes: bool,
+    /// This subscriber is a **ServiceWaypoint** that materializes the
+    /// VirtualService `http[]` routes of the Services bound to it (issue
+    /// #7500). Set only for `MeshTopology::ServiceWaypoint`. Kept distinct from
+    /// [`Self::node_waypoint_capture_scoping`] and [`Self::sidecar_http_routes`]
+    /// so a ServiceWaypoint never receives a NodeWaypoint capture inventory and
+    /// mixed versions negotiate the capability explicitly.
+    ///
+    /// The projection is strictly gated on
+    /// [`MeshSlice::service_waypoint_bound_services`]: with no binding that
+    /// claims service traffic the slice carries NO routes, even while
+    /// `narrow_for_service_waypoint` fail-opens the `services` routing view
+    /// during a rollout. A route is carried only when one of its hosts names a
+    /// bound Service and its VirtualService lives in that Service's own
+    /// namespace or in the waypoint's namespace (anti-hijack rule); it never
+    /// widens the bound-Service set or the inbound relay inventory.
+    pub service_waypoint_http_routes: bool,
 }
 
 impl Default for MeshSliceRequest {
@@ -101,6 +118,7 @@ impl Default for MeshSliceRequest {
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
             sidecar_http_routes: false,
+            service_waypoint_http_routes: false,
         }
     }
 }
@@ -125,6 +143,7 @@ impl MeshSliceRequest {
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
             sidecar_http_routes: false,
+            service_waypoint_http_routes: false,
         }
     }
 
@@ -147,6 +166,7 @@ impl MeshSliceRequest {
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
             sidecar_http_routes: false,
+            service_waypoint_http_routes: false,
         }
     }
 
@@ -205,6 +225,14 @@ impl MeshSliceRequest {
     /// [`MeshSliceRequest::sidecar_http_routes`].
     pub fn with_sidecar_http_routes(mut self, enabled: bool) -> Self {
         self.sidecar_http_routes = enabled;
+        self
+    }
+
+    /// Returns `self` marked as a ServiceWaypoint that materializes the
+    /// VirtualService `http[]` routes of its bound Services (issue #7500). See
+    /// [`MeshSliceRequest::service_waypoint_http_routes`].
+    pub fn with_service_waypoint_http_routes(mut self, enabled: bool) -> Self {
+        self.service_waypoint_http_routes = enabled;
         self
     }
 
@@ -689,16 +717,6 @@ pub struct MeshHttpRouteSet {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub plugin_configs: Vec<serde_json::Value>,
-    /// The Services in other namespaces each carried route may reach (issue
-    /// #7499), one entry per `(route, Service)`. The control plane writes an
-    /// entry only for a destination its route's VirtualService binding
-    /// authorizes (`MeshVirtualServiceHttpRoutes::authorized_cross_namespace_targets`),
-    /// inside the control plane's namespace scope and the subscriber's bearer
-    /// `ns` claim, and only when the Service is in this slice's `services`.
-    /// The data plane serves a cross-namespace destination only when its route
-    /// has a matching entry, and refuses that route otherwise
-    /// (`cross_namespace_refused`). Per route rather than per slice, so one
-    /// route's authorization never widens another's.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub authorized_cross_namespace_targets: Vec<MeshHttpRouteCrossNamespaceTarget>,
@@ -729,6 +747,17 @@ pub struct MeshHttpRouteSet {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub cross_namespace_destination_request_authentications: Vec<MeshHttpRouteDestinationPolicy>,
+    /// ServiceWaypoint only (issue #7500): which bound Service each carried
+    /// route is admitted for. The control plane decides it from the route's
+    /// hosts and the owner/`exportTo` rule
+    /// (`service_waypoint_route_owner_admission`), which needs the
+    /// VirtualService binding the data plane never sees; the data plane builds
+    /// each bound Service's route partition from exactly these attachments.
+    /// Empty on every other topology (a non-empty list there refuses the
+    /// slice).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
+    pub service_waypoint_attachments: Vec<MeshHttpRouteServiceAttachment>,
 }
 
 impl MeshHttpRouteSet {
@@ -742,7 +771,19 @@ impl MeshHttpRouteSet {
             && self
                 .cross_namespace_destination_request_authentications
                 .is_empty()
+            && self.service_waypoint_attachments.is_empty()
     }
+}
+
+/// One carried route admitted for one Service bound to a ServiceWaypoint
+/// ([`MeshHttpRouteSet::service_waypoint_attachments`], issue #7500).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeshHttpRouteServiceAttachment {
+    pub proxy_namespace: String,
+    pub proxy_id: String,
+    pub service_namespace: String,
+    pub service_name: String,
 }
 
 /// One AuthorizationPolicy or RequestAuthentication a NodeWaypoint slice
@@ -1999,18 +2040,47 @@ impl MeshSlice {
                 .into_iter()
                 .filter(|upstream| admitted_upstream_ids.contains(upstream.id.as_str())),
         );
-        // VirtualService HTTP routes (issues #7233, #7423), for the topologies
-        // that serve them (NodeWaypoint and Sidecar): the routes bound to the
-        // mesh in this subscription's namespace whose `exportTo` admits it,
-        // with every destination admitted by an applicable Sidecar egress
-        // scope exactly like the L4 routes above. Ambient (the L4 data plane),
-        // ServiceWaypoint and the gateway topologies request none.
-        let http_routes = if request.node_waypoint_capture_scoping || request.sidecar_http_routes {
+        // Inbound-HBONE relay evidence (issue #4251). Empty unless this
+        // exact waypoint identity has a matching binding that claims
+        // service traffic (`waypoint_for=service` or `all`) — never
+        // inferred from the (possibly fail-open) `services` view. Resolved
+        // here because the ServiceWaypoint `http_routes` projection below is
+        // gated on it (issue #7500).
+        let service_waypoint_bound_services = service_waypoint_bound_service_refs(
+            &mesh.waypoint_bindings,
+            request.waypoint_name.as_deref(),
+            &request.namespace,
+        );
+        // VirtualService HTTP routes (issues #7233, #7423, #7500), for the
+        // topologies that serve them. NodeWaypoint and Sidecar: the routes
+        // bound to the mesh in this subscription's namespace whose `exportTo`
+        // admits it, with every destination admitted by an applicable Sidecar
+        // egress scope exactly like the L4 routes above. ServiceWaypoint: only
+        // the routes of the Services bound to this exact waypoint, strictly
+        // gated on that binding evidence (never on the fail-open `services`
+        // view) and on the anti-hijack namespace rule
+        // (`service_waypoint_http_route_set`). Ambient (the L4 data plane) and
+        // the gateway topologies request none.
+        let http_routes = if request.service_waypoint_http_routes {
+            service_waypoint_http_route_set(
+                config,
+                mesh,
+                &request.namespace,
+                &service_waypoint_bound_services,
+                &cluster_domain,
+            )
+        } else if request.node_waypoint_capture_scoping || request.sidecar_http_routes {
             node_waypoint_http_route_set(
                 config,
                 mesh,
-                &namespace,
-                &service_waypoint_namespaces,
+                &|binding: &MeshVirtualServiceHttpRoutes| {
+                    resource_namespace_visible(
+                        &service_waypoint_namespaces,
+                        &binding.namespace,
+                        &namespace,
+                    ) && virtual_service_http_routes_exported_to_namespace(binding, &namespace)
+                },
+                &|_: &MeshVirtualServiceHttpRoutes, _: &Proxy| true,
                 &|proxy_namespace: &str, host: &str, port: u16| {
                     let Some(sidecar) = applicable_sidecar else {
                         return true;
@@ -2335,13 +2405,28 @@ impl MeshSlice {
                     // No applicable Sidecar: the rest of this slice is already
                     // namespace-local (or waypoint-bound), so keep the same
                     // resource-namespace visibility rule — but never drop a
-                    // root-namespace rule, which is Istio's mesh-wide default
-                    // tier and applies with or without a Sidecar resource.
+                    // root-namespace rule (Istio's mesh-wide default tier) or
+                    // an exported service-owner rule for a visible external
+                    // ServiceEntry host (whose ownership was already proved
+                    // against `service_entry_hosts`).
+                    let visible_external_owner = host_candidates.iter().any(|candidate| {
+                        matches!(
+                            destination_host_owner(
+                                candidate,
+                                &cluster_domain,
+                                &mesh_service_identities,
+                                &service_entry_hosts,
+                            ),
+                            Some(DestinationHostOwner::ExternalHost { namespace: owner })
+                                if owner == dr.namespace && owner == resource_namespace
+                        )
+                    });
                     return resource_namespace_visible(
                         &service_waypoint_namespaces,
                         &dr.namespace,
                         &namespace,
-                    ) || dr.namespace.trim() == mesh.istio_root_namespace.trim();
+                    ) || dr.namespace.trim() == mesh.istio_root_namespace.trim()
+                        || visible_external_owner;
                 };
                 let host_refs: Vec<&str> = host_candidates.iter().map(String::as_str).collect();
                 sidecar.includes_service(resource_namespace, &host_refs, None)
@@ -2467,12 +2552,22 @@ impl MeshSlice {
             workloads,
             mesh_policies,
         } = if let Some(waypoint) = request.waypoint_name.as_deref() {
+            // The external destinations of the routes this ServiceWaypoint
+            // carries (issue #7500): their DestinationRules and ServiceEntries
+            // must survive the narrowing, or the data plane cannot originate
+            // a leg's TLS or refuse a direct backend that needs it. They add
+            // nothing to the bound-Service or relay inventories.
+            let route_destination_hosts: BTreeSet<String> =
+                carried_route_destination_hosts(&http_routes, &[])
+                    .into_iter()
+                    .collect();
             narrow_for_service_waypoint(
                 waypoint,
                 &request.namespace,
                 &request.cluster_domain,
                 mesh.istio_root_namespace.as_str(),
                 &mesh.waypoint_bindings,
+                &route_destination_hosts,
                 waypoint_resources,
             )
         } else {
@@ -2568,15 +2663,6 @@ impl MeshSlice {
                 .find(|binding| binding.name == name && binding.namespace == request_namespace)
                 .and_then(|binding| binding.gateway_class_name.clone())
         });
-        // Inbound-HBONE relay evidence (issue #4251). Empty unless this
-        // exact waypoint identity has a matching binding that claims
-        // service traffic (`waypoint_for=service` or `all`) — never
-        // inferred from the (possibly fail-open) `services` view.
-        let service_waypoint_bound_services = service_waypoint_bound_service_refs(
-            &mesh.waypoint_bindings,
-            request.waypoint_name.as_deref(),
-            &request_namespace,
-        );
         let mut slice = Self {
             node_id: request.node_id,
             namespace: request_namespace.clone(),
@@ -2643,7 +2729,33 @@ impl MeshSlice {
             mesh.istio_root_namespace.as_str(),
             &cluster_domain,
         );
+        // `Workload::mesh_transport` (issue #7500) is read only by a
+        // ServiceWaypoint, and it is a field a data plane built before it
+        // refuses (`Workload` denies unknown fields). Carry it only to a
+        // subscriber that announced the ServiceWaypoint route capability, the
+        // one consumer, so a control plane upgraded ahead of its Sidecar,
+        // Ambient or NodeWaypoint data planes never sends them a slice they
+        // cannot decode. Both transports serialize this slice, so stripping it
+        // here covers native `MeshSubscribe` and every xDS workload carrier.
+        if !request.service_waypoint_http_routes {
+            strip_workload_mesh_transport(&mut slice);
+        }
         slice
+    }
+}
+
+/// Remove [`Workload::mesh_transport`] from every workload a slice carries
+/// (issue #7500; see the negotiation note in `MeshSlice::from_gateway_config`).
+fn strip_workload_mesh_transport(slice: &mut MeshSlice) {
+    let local = slice.local_inbound_workloads.iter_mut().flatten();
+    for workload in slice
+        .workloads
+        .iter_mut()
+        .chain(slice.ambient_udp_source_workloads.iter_mut())
+        .chain(slice.node_waypoint_capture_destinations.iter_mut())
+        .chain(local)
+    {
+        workload.mesh_transport = None;
     }
 }
 
@@ -2801,7 +2913,7 @@ struct ServiceWaypointNarrowingResources {
 /// the binding lists no services, or the request carried no `waypoint_name`.
 /// This is the relay's binding evidence; it is independent of the
 /// routing-view fail-open in [`narrow_for_service_waypoint`].
-fn service_waypoint_bound_service_refs(
+pub(crate) fn service_waypoint_bound_service_refs(
     bindings: &[crate::modes::mesh::config::MeshWaypointBinding],
     waypoint_name: Option<&str>,
     waypoint_namespace: &str,
@@ -3238,6 +3350,7 @@ fn narrow_for_service_waypoint(
     cluster_domain: &str,
     root_namespace: &str,
     bindings: &[crate::modes::mesh::config::MeshWaypointBinding],
+    route_destination_hosts: &BTreeSet<String>,
     resources: ServiceWaypointNarrowingResources,
 ) -> ServiceWaypointNarrowingResources {
     let Some(binding) = bindings
@@ -3288,7 +3401,14 @@ fn narrow_for_service_waypoint(
                 root_namespace,
                 cluster_domain,
                 &admitted_services,
-            )
+            ) || route_destination_hosts.iter().any(|host| {
+                // A rule naming an external destination of a carried route
+                // (issue #7500), through the one DestinationRule host
+                // matcher. Export visibility and lookup tiers were already
+                // applied by `admit_destination_rules`, and
+                // `apply_destination_rules` re-derives the tier per host.
+                super::destination_rule_host_specificity(&dr.host, &dr.namespace, host).is_some()
+            })
         })
         .collect();
     let admitted_service_entries: Vec<ServiceEntry> = resources
@@ -3301,6 +3421,7 @@ fn narrow_for_service_waypoint(
             se.hosts.iter().any(|h| {
                 let h = h.trim_end_matches('.');
                 host_matches_admitted_service(h, &admitted_hosts)
+                    || service_entry_host_covers_route_destination(h, route_destination_hosts)
             })
         })
         .collect();
@@ -3354,6 +3475,26 @@ fn narrow_for_service_waypoint(
                 }
             })
             .collect(),
+    }
+}
+
+/// Whether ServiceEntry host `entry_host` (exact, or a `*.suffix` wildcard)
+/// declares one of a carried route's destination hosts (issue #7500).
+fn service_entry_host_covers_route_destination(
+    entry_host: &str,
+    route_destination_hosts: &BTreeSet<String>,
+) -> bool {
+    let entry_host = canonical_destination_rule_host(entry_host);
+    if route_destination_hosts.contains(&entry_host) {
+        return true;
+    }
+    match entry_host.strip_prefix("*.") {
+        Some(suffix) if !suffix.is_empty() => route_destination_hosts.iter().any(|host| {
+            host.len() > suffix.len() + 1
+                && host.ends_with(suffix)
+                && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
+        }),
+        _ => false,
     }
 }
 
@@ -4089,12 +4230,17 @@ pub(crate) fn mesh_route_dispatch_rule_upstream_ids(config: &serde_json::Value) 
 /// not translator-owned — or one with a destination the applicable Sidecar
 /// egress scope does not admit is dropped, fail-closed: the waypoint then
 /// serves that host through its materialized Service route instead.
+///
+/// `binding_admitted` decides which [`MeshConfig::virtual_service_http_routes`]
+/// bindings this subscriber sees at all, and `route_admitted` which of a
+/// binding's route proxies it serves (ServiceWaypoint host and owner
+/// admission, issue #7500; every other topology admits them all).
 #[allow(clippy::too_many_arguments)]
 fn node_waypoint_http_route_set(
     config: &GatewayConfig,
     mesh: &MeshConfig,
-    namespace: &str,
-    service_waypoint_namespaces: &Option<BTreeSet<String>>,
+    binding_admitted: &dyn Fn(&MeshVirtualServiceHttpRoutes) -> bool,
+    route_admitted: &dyn Fn(&MeshVirtualServiceHttpRoutes, &Proxy) -> bool,
     destination_admitted: &dyn Fn(&str, &str, u16) -> bool,
     portless_rewrite_cluster_domain: Option<&str>,
     cluster_domain: &str,
@@ -4102,9 +4248,7 @@ fn node_waypoint_http_route_set(
 ) -> MeshHttpRouteSet {
     use crate::config::types::{PluginConfig, Upstream};
     use crate::modes::mesh::config::{
-        MeshVirtualServiceHttpRoutes, is_virtual_service_http_route_proxy_id,
-        virtual_service_http_routes_authorize_target,
-        virtual_service_http_routes_exported_to_namespace,
+        is_virtual_service_http_route_proxy_id, virtual_service_http_routes_authorize_target,
     };
 
     // Every visible binding that lists a route. One route is listed by one
@@ -4112,9 +4256,7 @@ fn node_waypoint_http_route_set(
     // must be authorized by all of them (issue #7499), never by the union.
     let mut bound: HashMap<(&str, &str), Vec<&MeshVirtualServiceHttpRoutes>> = HashMap::new();
     for binding in &mesh.virtual_service_http_routes {
-        if !resource_namespace_visible(service_waypoint_namespaces, &binding.namespace, namespace)
-            || !virtual_service_http_routes_exported_to_namespace(binding, namespace)
-        {
+        if !binding_admitted(binding) {
             continue;
         }
         for id in &binding.proxy_ids {
@@ -4163,6 +4305,9 @@ fn node_waypoint_http_route_set(
             || proxy
                 .backend_scheme
                 .is_some_and(|scheme| scheme.is_stream())
+            || !bindings
+                .iter()
+                .all(|binding| route_admitted(binding, proxy))
         {
             continue;
         }
@@ -4367,6 +4512,349 @@ fn node_waypoint_http_route_set(
         );
     }
     set
+}
+
+/// Project the VirtualService HTTP routes a ServiceWaypoint serves (issue
+/// #7500): the routes of the Services bound to this exact waypoint, through
+/// the same self-containment checks as [`node_waypoint_http_route_set`].
+///
+/// Strictly gated on `bound_services`
+/// ([`MeshSlice::service_waypoint_bound_services`], non-empty only when this
+/// waypoint's `MeshWaypointBinding` claims service traffic with
+/// `waypoint_for` `service` or `all`). An empty binding projects an EMPTY set,
+/// even while `narrow_for_service_waypoint` fail-opens the `services` routing
+/// view during a rollout: route admission never fails open.
+///
+/// A route proxy rides the slice only when ALL of these hold:
+/// - its VirtualService binding is exported to the waypoint namespace (the
+///   subscription namespace, as on every other topology);
+/// - one of the proxy's `hosts` names a canonical host variant of a bound
+///   Service `(svc_ns, svc)` (a dotless short host only in its own
+///   namespace), so proxies of the same VirtualService that target unrelated
+///   hosts stay off the slice;
+/// - **anti-hijack namespace rule:** for that bound Service, the
+///   VirtualService lives in `svc_ns` itself, or in the waypoint's own
+///   namespace with an `exportTo` that admits `svc_ns` (a Service bound to a
+///   waypoint in another namespace through `istio.io/use-waypoint-namespace`).
+///   A VirtualService in an unrelated third namespace is never admitted onto
+///   another tenant's waypoint, even with `exportTo: ["*"]`;
+/// - every destination (direct backend, `mesh_route_dispatch` rule
+///   destination, weighted-split target) is a bound Service or an external
+///   host ([`service_waypoint_route_destination_admitted`]). A destination
+///   that is an unbound in-cluster Service is refused, so a route never
+///   reaches a Service this waypoint is not the terminator for. An
+///   authorized cross-namespace target (issue #7499) is not a bound Service
+///   and is refused here until that authorization contract exists; it never
+///   widens `bound_services` either way.
+///
+/// The projection reads only the routes; the bound-Service set itself and the
+/// inbound relay inventory derived from it are never widened by a route.
+fn service_waypoint_http_route_set(
+    config: &GatewayConfig,
+    mesh: &MeshConfig,
+    waypoint_namespace: &str,
+    bound_services: &[MeshWaypointServiceRef],
+    cluster_domain: &str,
+) -> MeshHttpRouteSet {
+    if bound_services.is_empty() {
+        return MeshHttpRouteSet::default();
+    }
+    let bound: BTreeSet<(&str, &str)> = bound_services
+        .iter()
+        .map(|service| (service.namespace.as_str(), service.name.as_str()))
+        .collect();
+    // The bound Services the inventory models, with their host variants.
+    let bound_services_with_hosts: Vec<(&str, &str, Vec<String>)> = mesh
+        .services
+        .iter()
+        .filter(|service| bound.contains(&(service.namespace.as_str(), service.name.as_str())))
+        .map(|service| {
+            (
+                service.namespace.as_str(),
+                service.name.as_str(),
+                service_host_aliases(&service.name, &service.namespace, cluster_domain),
+            )
+        })
+        .collect();
+    if bound_services_with_hosts.is_empty() {
+        return MeshHttpRouteSet::default();
+    }
+    let bound_hosts: Vec<(&str, &Vec<String>)> = bound_services_with_hosts
+        .iter()
+        .map(|(namespace, _, aliases)| (*namespace, aliases))
+        .collect();
+    let binding_owns_service =
+        |binding: &MeshVirtualServiceHttpRoutes, service_namespace: &str| -> bool {
+            service_waypoint_route_owner_admission(binding, waypoint_namespace, service_namespace)
+                .is_ok()
+        };
+    let mut set = node_waypoint_http_route_set(
+        config,
+        mesh,
+        &|binding: &MeshVirtualServiceHttpRoutes| {
+            bound_hosts
+                .iter()
+                .any(|(service_namespace, _)| binding_owns_service(binding, service_namespace))
+        },
+        &|binding: &MeshVirtualServiceHttpRoutes, proxy: &Proxy| {
+            proxy.hosts.iter().any(|host| {
+                bound_hosts.iter().any(|(service_namespace, aliases)| {
+                    binding_owns_service(binding, service_namespace)
+                        && service_alias_names_host(
+                            aliases,
+                            service_namespace,
+                            &proxy.namespace,
+                            host,
+                        )
+                })
+            })
+        },
+        &|proxy_namespace: &str, host: &str, _port: u16| {
+            service_waypoint_route_destination_admitted(
+                mesh,
+                &bound,
+                cluster_domain,
+                proxy_namespace,
+                host,
+            )
+        },
+        None,
+        cluster_domain,
+        &|_, _, _| false,
+    );
+    // Which bound Service each carried route is admitted for: the data plane
+    // builds each Service's route partition from exactly these, since only
+    // the control plane sees the binding's `exportTo`.
+    let bindings: HashMap<(&str, &str), &MeshVirtualServiceHttpRoutes> = mesh
+        .virtual_service_http_routes
+        .iter()
+        .flat_map(|binding| {
+            binding
+                .proxy_ids
+                .iter()
+                .map(move |id| ((binding.namespace.as_str(), id.as_str()), binding))
+        })
+        .collect();
+    let mut attachments: BTreeSet<MeshHttpRouteServiceAttachment> = BTreeSet::new();
+    for proxy in &set.proxies {
+        let (Some(proxy_namespace), Some(proxy_id)) = (
+            proxy.get("namespace").and_then(serde_json::Value::as_str),
+            proxy.get("id").and_then(serde_json::Value::as_str),
+        ) else {
+            continue;
+        };
+        let Some(&binding) = bindings.get(&(proxy_namespace, proxy_id)) else {
+            continue;
+        };
+        let hosts: Vec<&str> = proxy
+            .get("hosts")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        for (service_namespace, service_name, aliases) in &bound_services_with_hosts {
+            if binding_owns_service(binding, service_namespace)
+                && hosts.iter().any(|host| {
+                    service_alias_names_host(aliases, service_namespace, proxy_namespace, host)
+                })
+            {
+                attachments.insert(MeshHttpRouteServiceAttachment {
+                    proxy_namespace: proxy_namespace.to_string(),
+                    proxy_id: proxy_id.to_string(),
+                    service_namespace: service_namespace.to_string(),
+                    service_name: service_name.to_string(),
+                });
+            }
+        }
+    }
+    // Never truncated: each attachment is one carried route host naming one
+    // bound Service, so the list is bounded by the carried routes themselves.
+    set.service_waypoint_attachments = attachments.into_iter().collect();
+    set
+}
+
+/// Why a ServiceWaypoint does not carry a mesh-bound VirtualService's
+/// `http[]` routes for one Service bound to it (issue #7500). Reported on the
+/// VirtualService status so the author is never left with a silent drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ServiceWaypointRouteExclusionReason {
+    /// The VirtualService lives in the bound Service's own namespace but its
+    /// `exportTo` does not admit the waypoint's namespace, where the waypoint
+    /// proxy runs (Istio visibility: a proxy sees only VirtualServices
+    /// exported to its namespace).
+    NotExportedToWaypointNamespace,
+    /// The VirtualService lives in the waypoint's namespace but its
+    /// `exportTo` does not admit the bound Service's namespace (spec §3.2,
+    /// `istio.io/use-waypoint-namespace`).
+    NotExportedToServiceNamespace,
+    /// The VirtualService lives in neither the bound Service's namespace nor
+    /// the waypoint's (the anti-hijack rule, spec §3.2): never admitted,
+    /// whatever its `exportTo`.
+    ForeignNamespace,
+}
+
+impl ServiceWaypointRouteExclusionReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotExportedToWaypointNamespace => "not_exported_to_waypoint_namespace",
+            Self::NotExportedToServiceNamespace => "not_exported_to_service_namespace",
+            Self::ForeignNamespace => "foreign_namespace",
+        }
+    }
+}
+
+/// The ONE owner/visibility rule for a ServiceWaypoint carrying a
+/// VirtualService's routes for a Service bound to it (issue #7500), shared by
+/// the slice projection and the VirtualService status so the two never
+/// disagree.
+///
+/// A VirtualService in the Service's own namespace must be exported to the
+/// waypoint's namespace: the waypoint is a proxy in that namespace, and the
+/// spec's projection carries a binding only when its `exportTo` admits the
+/// subscription namespace (§3.2, the rule every topology shares); the
+/// anti-hijack bullet adds an owner restriction and lifts no visibility rule.
+/// A VirtualService in the waypoint's namespace must be exported to the
+/// Service's namespace (§3.2). Any other namespace is refused.
+pub fn service_waypoint_route_owner_admission(
+    binding: &MeshVirtualServiceHttpRoutes,
+    waypoint_namespace: &str,
+    service_namespace: &str,
+) -> Result<(), ServiceWaypointRouteExclusionReason> {
+    if binding.namespace == service_namespace {
+        if virtual_service_http_routes_exported_to_namespace(binding, waypoint_namespace) {
+            Ok(())
+        } else {
+            Err(ServiceWaypointRouteExclusionReason::NotExportedToWaypointNamespace)
+        }
+    } else if binding.namespace == waypoint_namespace {
+        if virtual_service_http_routes_exported_to_namespace(binding, service_namespace) {
+            Ok(())
+        } else {
+            Err(ServiceWaypointRouteExclusionReason::NotExportedToServiceNamespace)
+        }
+    } else {
+        Err(ServiceWaypointRouteExclusionReason::ForeignNamespace)
+    }
+}
+
+/// One bound Service a ServiceWaypoint will not carry a VirtualService's
+/// routes for, and why (issue #7500).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ServiceWaypointRouteExclusion {
+    pub service_namespace: String,
+    pub service_name: String,
+    pub reason: ServiceWaypointRouteExclusionReason,
+}
+
+/// The bound Services whose ServiceWaypoint will NOT carry `binding`'s routes
+/// although one of its route hosts names them (issue #7500), for the
+/// VirtualService status. Reads the same host match and owner rule as the
+/// projection; only bindings that claim service traffic count. Sorted and
+/// de-duplicated.
+pub fn service_waypoint_route_exclusions(
+    config: &GatewayConfig,
+    binding: &MeshVirtualServiceHttpRoutes,
+    cluster_domain: &str,
+) -> Vec<ServiceWaypointRouteExclusion> {
+    let Some(mesh) = config.mesh.as_deref() else {
+        return Vec::new();
+    };
+    let hosts: Vec<&str> = config
+        .proxies
+        .iter()
+        .filter(|proxy| {
+            proxy.namespace == binding.namespace && binding.proxy_ids.contains(&proxy.id)
+        })
+        .flat_map(|proxy| proxy.hosts.iter().map(String::as_str))
+        .collect();
+    if hosts.is_empty() {
+        return Vec::new();
+    }
+    let mut exclusions = BTreeSet::new();
+    for waypoint in &mesh.waypoint_bindings {
+        if !waypoint_for_claims_service_traffic(&waypoint.waypoint_for) {
+            continue;
+        }
+        for service in &waypoint.services {
+            let aliases = service_host_aliases(&service.name, &service.namespace, cluster_domain);
+            if !hosts.iter().any(|host| {
+                service_alias_names_host(&aliases, &service.namespace, &binding.namespace, host)
+            }) {
+                continue;
+            }
+            if let Err(reason) = service_waypoint_route_owner_admission(
+                binding,
+                &waypoint.namespace,
+                &service.namespace,
+            ) {
+                exclusions.insert(ServiceWaypointRouteExclusion {
+                    service_namespace: service.namespace.clone(),
+                    service_name: service.name.clone(),
+                    reason,
+                });
+            }
+        }
+    }
+    exclusions.into_iter().collect()
+}
+
+/// Whether `host` (as a route declares it in `route_namespace`) is one of a
+/// Service's `aliases` ([`service_host_aliases`]). The dotless short alias
+/// resolves in the route's own namespace only, as Istio resolves short hosts.
+fn service_alias_names_host(
+    aliases: &[String],
+    service_namespace: &str,
+    route_namespace: &str,
+    host: &str,
+) -> bool {
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    !host.is_empty()
+        && aliases.iter().any(|alias| {
+            *alias == host && (alias.contains('.') || service_namespace == route_namespace)
+        })
+}
+
+/// Whether a ServiceWaypoint carried route may name destination `host`
+/// (issue #7500): a bound Service, or a host that is not an in-cluster
+/// Service. A Service the inventory models but this waypoint is not bound to
+/// is refused, and so is any `*.svc[.<cluster domain>]` name the inventory
+/// does not model (the data plane would have no secured upstream for it and
+/// must never dial a Service DNS name in plaintext).
+fn service_waypoint_route_destination_admitted(
+    mesh: &MeshConfig,
+    bound: &BTreeSet<(&str, &str)>,
+    cluster_domain: &str,
+    route_namespace: &str,
+    host: &str,
+) -> bool {
+    let canonical = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if canonical.is_empty() {
+        return false;
+    }
+    if let Some(service) = mesh.services.iter().find(|service| {
+        service_alias_names_host(
+            &service_host_aliases(&service.name, &service.namespace, cluster_domain),
+            &service.namespace,
+            route_namespace,
+            &canonical,
+        )
+    }) {
+        // A bound Service in the route's own namespace. A Service in another
+        // namespace is never carried until the cross-namespace authorization
+        // contract (issue #7499) lands: the data plane would refuse it anyway
+        // (`cross_namespace_refused`), and the VirtualService status already
+        // lists every such destination in `deferred_fields`.
+        return service.namespace == route_namespace
+            && bound.contains(&(service.namespace.as_str(), service.name.as_str()));
+    }
+    let cluster_domain = cluster_domain
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let names_cluster_service = canonical.ends_with(".svc")
+        || (!cluster_domain.is_empty() && canonical.ends_with(&format!(".svc.{cluster_domain}")));
+    !names_cluster_service
 }
 
 /// Whether a route's `mesh_route_dispatch` instance has a rule that rewrites
@@ -4754,15 +5242,50 @@ where
     false
 }
 
-/// The canonical target hosts of carried VirtualService HTTP route and L4
-/// route upstreams (`targets[].host`), deduplicated and sorted. Shared by
-/// wildcard admission and host-exclusion resolution so both see the same
-/// destination inventory.
+/// The canonical destination hosts of carried VirtualService HTTP and L4
+/// routes, deduplicated and sorted: route upstream targets (`targets[].host`),
+/// and the HTTP routes' direct backends and `mesh_route_dispatch` rule
+/// backends (`backend_host`). Shared by wildcard DestinationRule admission,
+/// host-exclusion resolution and ServiceWaypoint narrowing (issue #7500), so
+/// all three see the same destination inventory: a direct external backend's
+/// rule must survive admission for the data plane to refuse a TLS-originating
+/// one.
 fn carried_route_destination_hosts(
     http_routes: &MeshHttpRouteSet,
     virtual_service_l4_upstreams: &[serde_json::Value],
 ) -> Vec<String> {
     let mut hosts: BTreeSet<String> = BTreeSet::new();
+    let mut insert_backend = |host: &str| {
+        let host = canonical_destination_rule_host(host);
+        if !host.is_empty() {
+            hosts.insert(host);
+        }
+    };
+    for proxy in &http_routes.proxies {
+        if let Some(host) = proxy
+            .get("backend_host")
+            .and_then(serde_json::Value::as_str)
+        {
+            insert_backend(host);
+        }
+    }
+    for plugin in &http_routes.plugin_configs {
+        for rule in plugin
+            .get("config")
+            .and_then(|config| config.get("rules"))
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(host) = rule
+                .get("destination")
+                .and_then(|destination| destination.get("backend_host"))
+                .and_then(serde_json::Value::as_str)
+            {
+                insert_backend(host);
+            }
+        }
+    }
     for upstream in http_routes
         .upstreams
         .iter()
@@ -6559,6 +7082,7 @@ mod tests {
             pod_uid: None,
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         }
     }
 
@@ -6759,6 +7283,7 @@ mod tests {
                 ambient_udp_source_scoping: true,
                 node_waypoint_capture_scoping: false,
                 sidecar_http_routes: false,
+                service_waypoint_http_routes: false,
                 ..MeshSliceRequest::default()
             },
         );
@@ -6917,6 +7442,7 @@ mod tests {
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
             sidecar_http_routes: false,
+            service_waypoint_http_routes: false,
         }
     }
 
@@ -6937,6 +7463,7 @@ mod tests {
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
             sidecar_http_routes: false,
+            service_waypoint_http_routes: false,
         }
     }
 
@@ -8150,6 +8677,7 @@ mod tests {
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
             sidecar_http_routes: false,
+            service_waypoint_http_routes: false,
         };
         let slice = MeshSlice::from_gateway_config(&config, request);
         // The slice should inherit labels from the matched workload.
@@ -8210,6 +8738,7 @@ mod tests {
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
             sidecar_http_routes: false,
+            service_waypoint_http_routes: false,
         };
 
         let slice = MeshSlice::from_gateway_config(&config, request);
@@ -8294,6 +8823,7 @@ mod tests {
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
             sidecar_http_routes: false,
+            service_waypoint_http_routes: false,
         };
 
         let slice = MeshSlice::from_gateway_config(&config, request);
@@ -8369,6 +8899,7 @@ mod tests {
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
             sidecar_http_routes: false,
+            service_waypoint_http_routes: false,
         };
 
         let slice = MeshSlice::from_gateway_config(&config, request);
@@ -8417,6 +8948,7 @@ mod tests {
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
             sidecar_http_routes: false,
+            service_waypoint_http_routes: false,
         };
         let slice = MeshSlice::from_gateway_config(&config, request);
         // Explicit labels should be used, not the workload's labels.
@@ -9006,6 +9538,7 @@ mod tests {
                 ambient_udp_source_scoping: false,
                 node_waypoint_capture_scoping: false,
                 sidecar_http_routes: false,
+                service_waypoint_http_routes: false,
             },
         );
 
@@ -9628,6 +10161,7 @@ mod tests {
                 pod_uid: None,
                 node_waypoint: None,
                 remote_provenance: false,
+                mesh_transport: None,
             }],
             ..MeshSlice::default()
         };
@@ -9663,6 +10197,7 @@ mod tests {
                 pod_uid: None,
                 node_waypoint: None,
                 remote_provenance: false,
+                mesh_transport: None,
             }],
             ..MeshSlice::default()
         };
@@ -9835,6 +10370,7 @@ mod tests {
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
             sidecar_http_routes: false,
+            service_waypoint_http_routes: false,
         }
     }
 
@@ -9855,6 +10391,7 @@ mod tests {
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
             sidecar_http_routes: false,
+            service_waypoint_http_routes: false,
         }
     }
 

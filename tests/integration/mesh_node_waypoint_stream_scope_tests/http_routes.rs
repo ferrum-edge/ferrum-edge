@@ -246,7 +246,10 @@ fn http_routes_are_not_carried_to_other_topologies_or_namespaces() {
     let config = translated_config(&[virtual_service("split", split_spec(json!({})))]);
 
     // Issue #7423: Sidecar slices carry the routes too (see the Sidecar
-    // section below); Ambient (the L4 data plane) and ServiceWaypoint do not.
+    // section below); Ambient (the L4 data plane) does not, and a
+    // ServiceWaypoint with no bound-Service binding (issue #7500) gets none:
+    // its projection never fails open
+    // (`mesh_service_waypoint_http_routes_tests`).
     for topology in [MeshTopology::Ambient, MeshTopology::ServiceWaypoint] {
         let runtime = runtime_for_topology(topology);
         let slice = MeshSlice::from_gateway_config(&config, runtime.mesh_slice_request());
@@ -260,6 +263,7 @@ fn http_routes_are_not_carried_to_other_topologies_or_namespaces() {
         namespace: "other".to_string(),
         node_waypoint_capture_scoping: true,
         sidecar_http_routes: false,
+        service_waypoint_http_routes: false,
         ..node_waypoint_runtime().mesh_slice_request()
     };
     let slice = MeshSlice::from_gateway_config(&config, other_namespace);
@@ -405,9 +409,12 @@ fn data_plane_materializes_carried_routes_and_exposes_route_upstreams_to_authz()
 fn data_plane_refuses_http_routes_outside_node_waypoint_and_sidecar() {
     let config = translated_config(&[virtual_service("split", split_spec(json!({})))]);
     let slice = node_waypoint_slice(&config, &node_waypoint_runtime());
+    // Ambient never accepts carried routes. A ServiceWaypoint accepts only a
+    // set built for its own waypoint identity with bound-Service evidence
+    // (issue #7500), which this NodeWaypoint slice does not carry.
     for topology in [MeshTopology::Ambient, MeshTopology::ServiceWaypoint] {
         prepare_gateway_config_from_mesh_slice(&slice, &runtime_for_topology(topology))
-            .expect_err("only a NodeWaypoint or a Sidecar serves carried HTTP routes");
+            .expect_err("this topology must refuse a NodeWaypoint's carried HTTP routes");
     }
 }
 
@@ -1028,6 +1035,7 @@ fn sidecar_requests_and_receives_bound_routes_their_plugins_and_upstreams() {
     // A request without the flag (Ambient-shaped) gets nothing.
     let unflagged = MeshSliceRequest {
         sidecar_http_routes: false,
+        service_waypoint_http_routes: false,
         ..runtime.mesh_slice_request()
     };
     assert!(

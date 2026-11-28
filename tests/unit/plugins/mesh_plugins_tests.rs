@@ -183,6 +183,7 @@ fn ambient_udp_source_scoping_slice() -> MeshSlice {
         pod_uid: Some("6ba7b810-9dad-11d1-80b4-00c04fd430c8".to_string()),
         node_waypoint: None,
         remote_provenance: false,
+        mesh_transport: None,
     };
     MeshSlice {
         namespace: "default".to_string(),
@@ -1240,6 +1241,7 @@ fn ambient_udp_cross_namespace_slice(policies: Vec<MeshPolicy>) -> MeshSlice {
         pod_uid: Some("6ba7b810-9dad-11d1-80b4-00c04fd430c8".to_string()),
         node_waypoint: None,
         remote_provenance: false,
+        mesh_transport: None,
     };
     MeshSlice {
         // Destination workload identity the relay terminates for. The
@@ -1276,6 +1278,7 @@ fn ambient_udp_service_waypoint_slice(policies: Vec<MeshPolicy>) -> MeshSlice {
         pod_uid: Some("6ba7b810-9dad-11d1-80b4-00c04fd430c8".to_string()),
         node_waypoint: None,
         remote_provenance: false,
+        mesh_transport: None,
     };
     let destination = Workload {
         spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/svc-ns/sa/reviews")
@@ -1298,6 +1301,7 @@ fn ambient_udp_service_waypoint_slice(policies: Vec<MeshPolicy>) -> MeshSlice {
         pod_uid: Some("7ba7b810-9dad-11d1-80b4-00c04fd430c8".to_string()),
         node_waypoint: None,
         remote_provenance: false,
+        mesh_transport: None,
     };
     MeshSlice {
         namespace: "waypoint-ns".to_string(),
@@ -5356,6 +5360,7 @@ async fn mesh_authz_node_waypoint_service_egress_uses_destination_policy_scope()
             pod_uid: None,
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         }],
         ..MeshSlice::default()
     };
@@ -5511,6 +5516,7 @@ async fn mesh_authz_node_waypoint_service_egress_requires_all_destination_scopes
                 pod_uid: None,
                 node_waypoint: None,
                 remote_provenance: false,
+                mesh_transport: None,
             },
             Workload {
                 spiffe_id: canary_spiffe,
@@ -5535,6 +5541,7 @@ async fn mesh_authz_node_waypoint_service_egress_requires_all_destination_scopes
                 pod_uid: None,
                 node_waypoint: None,
                 remote_provenance: false,
+                mesh_transport: None,
             },
         ],
         ..MeshSlice::default()
@@ -5644,6 +5651,7 @@ async fn mesh_authz_node_waypoint_direct_service_backend_uses_destination_scope(
             pod_uid: None,
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         }],
         ..MeshSlice::default()
     };
@@ -5777,6 +5785,7 @@ async fn mesh_authz_node_waypoint_does_not_authorize_backend_when_upstream_is_se
             pod_uid: None,
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         }],
         ..MeshSlice::default()
     };
@@ -5914,6 +5923,7 @@ async fn mesh_authz_node_waypoint_short_service_backend_resolves_in_proxy_namesp
                 pod_uid: None,
                 node_waypoint: None,
                 remote_provenance: false,
+                mesh_transport: None,
             },
             Workload {
                 spiffe_id: other_spiffe,
@@ -5935,6 +5945,7 @@ async fn mesh_authz_node_waypoint_short_service_backend_resolves_in_proxy_namesp
                 pod_uid: None,
                 node_waypoint: None,
                 remote_provenance: false,
+                mesh_transport: None,
             },
         ],
         ..MeshSlice::default()
@@ -6150,6 +6161,7 @@ async fn mesh_authz_node_waypoint_virtual_service_split_upstream_uses_route_targ
             pod_uid: None,
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         }],
         ..MeshSlice::default()
     };
@@ -6278,6 +6290,7 @@ fn node_waypoint_endpoint_route_slice() -> MeshSlice {
             pod_uid: None,
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         }],
         ..MeshSlice::default()
     }
@@ -6804,6 +6817,7 @@ async fn mesh_authz_node_waypoint_destination_scopes_follow_target_port_eligibil
                 pod_uid: None,
                 node_waypoint: None,
                 remote_provenance: false,
+                mesh_transport: None,
             },
             Workload {
                 spiffe_id: canary_spiffe,
@@ -6828,6 +6842,7 @@ async fn mesh_authz_node_waypoint_destination_scopes_follow_target_port_eligibil
                 pod_uid: None,
                 node_waypoint: None,
                 remote_provenance: false,
+                mesh_transport: None,
             },
         ],
         ..MeshSlice::default()
@@ -6961,6 +6976,7 @@ async fn mesh_authz_node_waypoint_destination_scopes_skip_unroutable_workloads()
                 pod_uid: None,
                 node_waypoint: None,
                 remote_provenance: false,
+                mesh_transport: None,
             },
             Workload {
                 spiffe_id: pending_spiffe,
@@ -6985,6 +7001,7 @@ async fn mesh_authz_node_waypoint_destination_scopes_skip_unroutable_workloads()
                 pod_uid: None,
                 node_waypoint: None,
                 remote_provenance: false,
+                mesh_transport: None,
             },
         ],
         ..MeshSlice::default()
@@ -7606,6 +7623,7 @@ fn capture_destination(namespace: &str, app: &str, address: &str, ports: &[u16])
         pod_uid: None,
         node_waypoint: None,
         remote_provenance: false,
+        mesh_transport: None,
     }
 }
 

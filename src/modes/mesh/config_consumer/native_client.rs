@@ -129,6 +129,10 @@ pub struct NativeMeshClientConfig {
     /// This DP is a Sidecar that serves mesh-bound VirtualService `http[]`
     /// routes (issue #7423). See `MeshSliceRequest::sidecar_http_routes`.
     pub sidecar_http_routes: bool,
+    /// This DP is a ServiceWaypoint that materializes the VirtualService
+    /// `http[]` routes of its bound Services (issue #7500). See
+    /// `MeshSliceRequest::service_waypoint_http_routes`.
+    pub service_waypoint_http_routes: bool,
     /// Shared CP-failover primary-retry interval
     /// (`FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS`). When > 0 and connected to a
     /// fallback CP after a first slice is installed, the client proactively
@@ -156,6 +160,7 @@ impl NativeMeshClientConfig {
             ambient_udp_source_scoping: self.ambient_udp_source_scoping,
             node_waypoint_capture_scoping: self.node_waypoint_capture_scoping,
             sidecar_http_routes: self.sidecar_http_routes,
+            service_waypoint_http_routes: self.service_waypoint_http_routes,
             // Ordinary LOCAL mesh subscription: this data plane talks to its
             // own control plane and presents the distinct, fixed local-mesh
             // JWT audience. The CP rejects both missing audiences (legacy
@@ -971,6 +976,7 @@ mod tests {
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
             sidecar_http_routes: false,
+            service_waypoint_http_routes: false,
             primary_retry_secs: 0,
             timings: MeshStreamTimings::production(),
         }

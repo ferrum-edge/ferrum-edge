@@ -100,6 +100,20 @@ pub struct ManagedTlsRecord {
     pub jwks_json: Option<String>,
     pub created_at: UtcTimestamp,
     pub updated_at: UtcTimestamp,
+    /// Store version of the commit that last wrote this record (`0` for a
+    /// record not yet written through a store that stamps it).
+    ///
+    /// Stamped under the exclusive lock from the document's monotonic
+    /// `store_version`, so every successful create or replacement — including
+    /// a same-material rotation, a write whose clock repeats `updated_at`, and
+    /// a delete-then-recreate — gives the record a value it never had before.
+    /// The Admin API `ETag` covers it, so every write invalidates every tag
+    /// issued earlier.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::tls::shared_store::revision_is_unset"
+    )]
+    pub revision: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -150,6 +164,20 @@ pub enum ManagedTlsError {
     NotFound(String),
     #[error("managed TLS record '{0}' already exists")]
     AlreadyExists(String),
+    /// The caller's write precondition (`If-Match` at the Admin API) did not
+    /// hold against the authoritative record under the exclusive store lock,
+    /// so nothing was written. Carries only the record id.
+    #[error(
+        "managed TLS record '{0}' has changed since the supplied If-Match entity-tag was issued; \
+         re-read it and reapply your changes"
+    )]
+    PreconditionFailed(String),
+    /// The caller's reference scan found the record still referenced. Raised
+    /// under the exclusive lock only after the authoritative existence and
+    /// kind checks, so a record replaced under another kind reports that
+    /// mismatch instead of the replacement's references. Carries only the id.
+    #[error("managed TLS record '{0}' is still referenced")]
+    StillReferenced(String),
     /// Cross-kind ID collision on create-with-overwrite or typed update.
     ///
     /// Managed TLS IDs are globally unique across certificates, CA bundles,
@@ -247,6 +275,14 @@ impl VersionedStoreFile for ManagedTlsStoreFile {
     fn logical_record_count(&self) -> u64 {
         self.records.len() as u64
     }
+}
+
+/// The store version the commit in progress will publish, used as the
+/// written record's [`ManagedTlsRecord::revision`]. `SharedStoreFile::mutate`
+/// publishes exactly `store_version + 1` of the document it handed to the
+/// mutation, and that version only ever grows.
+fn next_record_revision(document: &ManagedTlsStoreFile) -> u64 {
+    document.store_version.saturating_add(1)
 }
 
 #[derive(Debug)]
@@ -369,6 +405,24 @@ impl ManagedTlsStore {
         record: ManagedTlsRecord,
         allow_overwrite: bool,
     ) -> Result<ManagedTlsRecord, ManagedTlsError> {
+        self.upsert_if(record, allow_overwrite, |_| true)
+    }
+
+    /// [`Self::upsert`] guarded by a caller precondition.
+    ///
+    /// `precondition` receives the authoritative stored record (or `None` when
+    /// the id is free) under the same exclusive cross-process lock that
+    /// commits the write, after the overwrite and kind rules (so their `409`s
+    /// keep precedence). Returning `false` refuses the write with
+    /// [`ManagedTlsError::PreconditionFailed`] and changes nothing, so a
+    /// conditional overwrite can never commit over a record another writer
+    /// (on this or another instance sharing the store) replaced in between.
+    pub fn upsert_if(
+        &self,
+        record: ManagedTlsRecord,
+        allow_overwrite: bool,
+        precondition: impl FnOnce(Option<&ManagedTlsRecord>) -> bool,
+    ) -> Result<ManagedTlsRecord, ManagedTlsError> {
         validate_managed_id(&record.id)?;
         validate_managed_record_material_size(&record, self.max_material_bytes)?;
         let max_records = self.max_records;
@@ -380,30 +434,49 @@ impl ManagedTlsStore {
         let outcome = self.file.mutate(move |document| {
             let mut record = record;
             let now = UtcTimestamp::now();
-            if let Some(existing) = document.records.get(&record.id) {
-                if !allow_overwrite {
-                    return Err(ManagedTlsError::AlreadyExists(record.id));
+            // The overwrite and cross-kind rules answer first; the caller's
+            // precondition is evaluated only against a record this write
+            // could legitimately replace (or against a free id, which a
+            // conditional precondition never accepts).
+            let preserved_created_at = match document.records.get(&record.id) {
+                Some(existing) => {
+                    if !allow_overwrite {
+                        return Err(ManagedTlsError::AlreadyExists(record.id));
+                    }
+                    if existing.kind != record.kind {
+                        return Err(ManagedTlsError::KindConflict {
+                            id: record.id,
+                            existing_kind: existing.kind.as_str(),
+                            requested_kind: record.kind.as_str(),
+                        });
+                    }
+                    if !precondition(Some(existing)) {
+                        return Err(ManagedTlsError::PreconditionFailed(record.id));
+                    }
+                    Some(existing.created_at)
                 }
-                if existing.kind != record.kind {
-                    return Err(ManagedTlsError::KindConflict {
-                        id: record.id,
-                        existing_kind: existing.kind.as_str(),
-                        requested_kind: record.kind.as_str(),
-                    });
+                None => {
+                    if !precondition(None) {
+                        return Err(ManagedTlsError::PreconditionFailed(record.id));
+                    }
+                    None
                 }
-                record.created_at = existing.created_at;
-                record.updated_at = now;
-            } else {
-                if document.records.len() >= max_records {
-                    record_store_admission_rejected(
-                        TlsPersistentStoreKind::Managed,
-                        TlsStoreAdmissionReason::RecordLimit,
-                    );
-                    return Err(ManagedTlsError::RecordLimitReached);
+            };
+            match preserved_created_at {
+                Some(created_at) => record.created_at = created_at,
+                None => {
+                    if document.records.len() >= max_records {
+                        record_store_admission_rejected(
+                            TlsPersistentStoreKind::Managed,
+                            TlsStoreAdmissionReason::RecordLimit,
+                        );
+                        return Err(ManagedTlsError::RecordLimitReached);
+                    }
+                    record.created_at = now;
                 }
-                record.created_at = now;
-                record.updated_at = now;
             }
+            record.updated_at = now;
+            record.revision = next_record_revision(document);
             document.records.insert(record.id.clone(), record.clone());
             Ok(record)
         })?;
@@ -418,6 +491,18 @@ impl ManagedTlsStore {
     pub fn update_existing(
         &self,
         record: ManagedTlsRecord,
+    ) -> Result<ManagedTlsRecord, ManagedTlsError> {
+        self.update_existing_if(record, |_| true)
+    }
+
+    /// [`Self::update_existing`] guarded by a caller precondition, evaluated
+    /// against the authoritative existing record (after the existence and
+    /// kind checks) under the exclusive lock that commits the replacement.
+    /// `false` refuses with [`ManagedTlsError::PreconditionFailed`].
+    pub fn update_existing_if(
+        &self,
+        record: ManagedTlsRecord,
+        precondition: impl FnOnce(&ManagedTlsRecord) -> bool,
     ) -> Result<ManagedTlsRecord, ManagedTlsError> {
         validate_managed_id(&record.id)?;
         validate_managed_record_material_size(&record, self.max_material_bytes)?;
@@ -434,8 +519,12 @@ impl ManagedTlsStore {
                     requested_kind: record.kind.as_str(),
                 });
             }
+            if !precondition(existing) {
+                return Err(ManagedTlsError::PreconditionFailed(record.id));
+            }
             record.created_at = existing.created_at;
             record.updated_at = now;
+            record.revision = next_record_revision(document);
             document.records.insert(record.id.clone(), record.clone());
             Ok(record)
         })?;
@@ -467,7 +556,7 @@ impl ManagedTlsStore {
         id: &str,
         still_authorized: impl Fn() -> bool,
     ) -> Result<Option<ManagedTlsRecord>, ManagedTlsError> {
-        self.delete_if_authorized_inner(id, None, still_authorized)
+        self.delete_if_authorized_inner(id, None, false, |_| true, still_authorized)
     }
 
     /// Delete `id` only when its stored kind matches `expected_kind` and
@@ -480,13 +569,39 @@ impl ManagedTlsStore {
         expected_kind: ManagedTlsMaterialKind,
         still_authorized: impl Fn() -> bool,
     ) -> Result<Option<ManagedTlsRecord>, ManagedTlsError> {
-        self.delete_if_authorized_inner(id, Some(expected_kind), still_authorized)
+        self.delete_if_authorized_inner(id, Some(expected_kind), false, |_| true, still_authorized)
+    }
+
+    /// [`Self::delete_kind_if_authorized`] with the caller's reference-scan
+    /// verdict and precondition, decided under the exclusive lock that
+    /// commits the removal in one fixed order: existence (`NotFound`), kind
+    /// (`WrongKind`), `referenced` ([`ManagedTlsError::StillReferenced`]),
+    /// the authorization fence (`Ok(None)`), then `precondition`
+    /// ([`ManagedTlsError::PreconditionFailed`]). Any refusal removes
+    /// nothing.
+    pub fn delete_kind_if_authorized_and(
+        &self,
+        id: &str,
+        expected_kind: ManagedTlsMaterialKind,
+        referenced: bool,
+        precondition: impl FnOnce(&ManagedTlsRecord) -> bool,
+        still_authorized: impl Fn() -> bool,
+    ) -> Result<Option<ManagedTlsRecord>, ManagedTlsError> {
+        self.delete_if_authorized_inner(
+            id,
+            Some(expected_kind),
+            referenced,
+            precondition,
+            still_authorized,
+        )
     }
 
     fn delete_if_authorized_inner(
         &self,
         id: &str,
         expected_kind: Option<ManagedTlsMaterialKind>,
+        referenced: bool,
+        precondition: impl FnOnce(&ManagedTlsRecord) -> bool,
         still_authorized: impl Fn() -> bool,
     ) -> Result<Option<ManagedTlsRecord>, ManagedTlsError> {
         validate_managed_id(id)?;
@@ -505,8 +620,17 @@ impl ManagedTlsStore {
                         actual: existing.kind.as_str(),
                     });
                 }
+                if referenced {
+                    return Err(ManagedTlsError::StillReferenced(id.clone()));
+                }
+                // A lapsed authorization fence answers before the caller's
+                // precondition, so a delete that lost its fence always reports
+                // that (and never a stale tag that would hide it).
                 if !still_authorized() {
                     return Ok((false, None));
+                }
+                if !precondition(existing) {
+                    return Err(ManagedTlsError::PreconditionFailed(id.clone()));
                 }
                 match document.records.remove(&id) {
                     Some(record) => Ok((true, Some(record))),
@@ -575,6 +699,7 @@ impl ManagedTlsRecord {
             jwks_json: None,
             created_at: now,
             updated_at: now,
+            revision: 0,
         }
     }
 
@@ -599,6 +724,7 @@ impl ManagedTlsRecord {
             jwks_json: None,
             created_at: now,
             updated_at: now,
+            revision: 0,
         }
     }
 
@@ -618,6 +744,7 @@ impl ManagedTlsRecord {
             jwks_json: None,
             created_at: now,
             updated_at: now,
+            revision: 0,
         }
     }
 
@@ -642,6 +769,7 @@ impl ManagedTlsRecord {
             jwks_json: None,
             created_at: now,
             updated_at: now,
+            revision: 0,
         }
     }
 
@@ -666,6 +794,7 @@ impl ManagedTlsRecord {
             jwks_json: Some(jwks_json),
             created_at: now,
             updated_at: now,
+            revision: 0,
         }
     }
 

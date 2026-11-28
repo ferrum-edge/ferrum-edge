@@ -1071,6 +1071,12 @@ pub struct XdsNodeMetadata {
     /// (`HttpRoutesCarrier`). Absent on other topologies, which receive none.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub sidecar_http_routes: bool,
+    /// This node is a ServiceWaypoint that materializes the VirtualService
+    /// `http[]` routes of its bound Services (issue #7500), so the CP carries
+    /// them on its slice (`HttpRoutesCarrier`) when the waypoint binding claims
+    /// service traffic. Absent on other topologies, which receive none.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub service_waypoint_http_routes: bool,
 }
 
 /// Per-node scoping flags the CP remembers for an ADS stream and replays into
@@ -1088,15 +1094,20 @@ pub struct XdsNodeScoping {
     /// cross-namespace inventory: it only selects whether the slice carries
     /// the routes already visible to the subscription namespace.
     pub sidecar_http_routes: bool,
+    /// ServiceWaypoint VirtualService `http[]` route carriage (issue #7500).
+    /// Gated CP-side on the waypoint's bound-Service evidence; it widens no
+    /// bound-Service set and no inbound relay inventory.
+    pub service_waypoint_http_routes: bool,
 }
 
 impl XdsNodeScoping {
     /// `true` when the node requested no cross-namespace inventory and no
-    /// Sidecar route carriage.
+    /// Sidecar or ServiceWaypoint route carriage.
     pub fn is_default(&self) -> bool {
         !self.ambient_udp_source_scoping
             && !self.node_waypoint_capture_scoping
             && !self.sidecar_http_routes
+            && !self.service_waypoint_http_routes
     }
 }
 
@@ -1106,6 +1117,7 @@ impl From<&XdsNodeMetadata> for XdsNodeScoping {
             ambient_udp_source_scoping: metadata.ambient_udp_source_scoping,
             node_waypoint_capture_scoping: metadata.node_waypoint_capture_scoping,
             sidecar_http_routes: metadata.sidecar_http_routes,
+            service_waypoint_http_routes: metadata.service_waypoint_http_routes,
         }
     }
 }
@@ -1127,6 +1139,7 @@ pub fn encode_node_metadata_with_scoping(
         ambient_udp_source_scoping: scoping.ambient_udp_source_scoping,
         node_waypoint_capture_scoping: scoping.node_waypoint_capture_scoping,
         sidecar_http_routes: scoping.sidecar_http_routes,
+        service_waypoint_http_routes: scoping.service_waypoint_http_routes,
     };
     if metadata.workload_spiffe_id.is_none()
         && metadata.waypoint_name.is_none()
@@ -1224,6 +1237,7 @@ mod tests {
                 cross_namespace_destination_workloads: Vec::new(),
                 cross_namespace_destination_policies: Vec::new(),
                 cross_namespace_destination_request_authentications: Vec::new(),
+                service_waypoint_attachments: Vec::new(),
             }),
             MeshSliceCarrier::MeshPolicies(Vec::new()),
             MeshSliceCarrier::ExtAuthzProviders(Vec::new()),
@@ -1301,6 +1315,7 @@ mod tests {
                 ambient_udp_source_scoping: true,
                 node_waypoint_capture_scoping: false,
                 sidecar_http_routes: false,
+                service_waypoint_http_routes: false,
             },
         ));
         assert!(udp_scope.ambient_udp_source_scoping);
@@ -1311,6 +1326,7 @@ mod tests {
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: false,
             sidecar_http_routes: true,
+            service_waypoint_http_routes: false,
         };
         let sidecar_bytes = encode_node_metadata_with_scoping(None, None, sidecar_routes);
         assert!(!sidecar_bytes.is_empty());

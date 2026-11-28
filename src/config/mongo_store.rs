@@ -121,8 +121,9 @@ mod inner {
     use crate::config::mongo_index_plan::{
         HMAC_SECRET_HASHES_FIELD, MONGO_INDEX_PLAN_VERSION, MONGO_INDEX_PLAN_VERSION_COLLECTION,
         MONGO_INDEX_PLAN_VERSION_DOCUMENT_ID, MongoIndexPlan, MongoMigrationStatus,
-        REQUIRED_GUARD_COLLECTIONS, RecordedIndexPlanState, RequiredMongoIndex, RetiredMongoIndex,
-        classify_guard_collections, classify_plan_against_live, recorded_plan_state_from_document,
+        PRE_RELEASE_MARKER_COLLECTIONS, REQUIRED_GUARD_COLLECTIONS, RecordedIndexPlanState,
+        RequiredMongoIndex, RetiredMongoIndex, classify_guard_collections,
+        classify_plan_against_live, recorded_plan_state_from_document, refuse_pre_release_database,
         required_mongo_indexes,
     };
     use crate::config::namespace_registry::{
@@ -348,12 +349,52 @@ mod inner {
         Ok(recorded_plan_state_from_document(document.as_ref())?)
     }
 
+    /// Refuse a database a 0.9.x release initialized: it holds Ferrum
+    /// documents (see `PRE_RELEASE_MARKER_COLLECTIONS`) but records no index
+    /// plan. A database with a plan record, or with no Ferrum document at all,
+    /// passes. Read-only, so a refusal changes nothing.
+    ///
+    /// `recorded` was read before the collection scan. A concurrent 1.x
+    /// initializer on a fresh database writes its in-progress marker before
+    /// any Ferrum document (the seeded registry row included), so when the
+    /// scan finds a document the plan record is read again on the same
+    /// handle and the database is refused only if it is still unrecorded:
+    /// a replica that lost the initialization race is not told to rebuild.
+    async fn ensure_not_pre_release_database(
+        db: &Database,
+        recorded: &RecordedIndexPlanState,
+    ) -> Result<(), anyhow::Error> {
+        if recorded.version.is_some() || recorded.in_progress.is_some() {
+            return Ok(());
+        }
+        let mut populated = None;
+        for &collection in PRE_RELEASE_MARKER_COLLECTIONS {
+            if db
+                .collection::<Document>(collection)
+                .find_one(doc! {})
+                .projection(doc! { "_id": 1 })
+                .await?
+                .is_some()
+            {
+                populated = Some(collection);
+                break;
+            }
+        }
+        if populated.is_none() {
+            return Ok(());
+        }
+        let recorded_after_scan = read_recorded_index_plan_state(db).await?;
+        refuse_pre_release_database(&recorded_after_scan, populated)?;
+        Ok(())
+    }
+
     /// Refuse to publish a reconnect candidate whose database a newer release
-    /// started or finished upgrading: this binary's plan assumptions would no
-    /// longer hold for it.
+    /// started or finished upgrading, or that a 0.9.x release initialized:
+    /// this binary's plan assumptions would no longer hold for it.
     async fn ensure_candidate_index_plan_compatible(db: &Database) -> Result<(), anyhow::Error> {
         let recorded = read_recorded_index_plan_state(db).await?;
         MongoIndexPlan::current().upgrade_from_state(&recorded)?;
+        ensure_not_pre_release_database(db, &recorded).await?;
         Ok(())
     }
 
@@ -2517,6 +2558,8 @@ mod inner {
             // that a newer release upgraded as merely "missing" indexes.
             let recorded = self.recorded_index_plan_state().await?;
             MongoIndexPlan::current().upgrade_from_state(&recorded)?;
+            // A 0.9.x database is refused by status as well as by `up`.
+            ensure_not_pre_release_database(&self.db(), &recorded).await?;
 
             Ok(MongoMigrationStatus {
                 indexes: classify_plan_against_live(&live_by_collection),
@@ -2577,7 +2620,9 @@ mod inner {
         ) -> Result<(), anyhow::Error> {
             // Read-only refusal: an incompatible database is rejected before
             // the lease (an upsert into `_ferrum_migration_locks`) is taken.
-            plan.upgrade_from_state(&self.recorded_index_plan_state().await?)?;
+            let recorded = self.recorded_index_plan_state().await?;
+            plan.upgrade_from_state(&recorded)?;
+            ensure_not_pre_release_database(&self.db(), &recorded).await?;
 
             let mut migration_lease = self.acquire_migration_lease().await?;
             // Run every initialization step inside a scoped future so a failure
@@ -8052,6 +8097,7 @@ mod inner {
                 trust: restore
                     .gateway_trust_bundles
                     .map(|records| records.to_vec()),
+                namespace_registry: restore.namespace_registry.clone(),
             };
             let plan =
                 Self::prepare_atomic_batch_plan(graph, chunk_size, fault, Some(replacement))?;
@@ -8434,6 +8480,30 @@ mod inner {
                             .await?;
                     }
                 }
+                // The backup's registry row (issue #7532), behind the same
+                // digest comparison and lease pin as every resource above.
+                if let Some(description) = &replacement.namespace_registry {
+                    let existing = self
+                        .get_namespace_in_session(&mut *session, &plan.lease_namespace)
+                        .await?;
+                    if existing
+                        .as_ref()
+                        .is_none_or(|record| &record.description != description)
+                    {
+                        let now = UtcTimestamp::now();
+                        let mut record = existing.unwrap_or_else(|| {
+                            NamespaceRecord::new(plan.lease_namespace.clone(), None, now)
+                        });
+                        record.description = description.clone();
+                        record.updated_at = now;
+                        self.upsert_namespace_registry_document_in_session(
+                            &mut *session,
+                            &plan.lease_namespace,
+                            &record,
+                        )
+                        .await?;
+                    }
+                }
             }
 
             if let Some((owner, generation)) = &plan.admission_lease {
@@ -8726,27 +8796,13 @@ mod inner {
             } else {
                 // Upsert materializes a derived-only tenant (resources but no
                 // registry document) so a description-only update has the same
-                // well-defined atomic outcome. An explicit `null` clears the
-                // field on both backends.
-                let description_bson = match &record.description {
-                    Some(value) => Bson::String(value.clone()),
-                    None => Bson::Null,
-                };
-                self.namespaces()
-                    .update_one(
-                        doc! { "_id": current_name },
-                        doc! {
-                            "$set": {
-                                "name": current_name,
-                                "description": description_bson,
-                                "created_at": record.created_at.to_rfc3339(),
-                                "updated_at": record.updated_at.to_rfc3339(),
-                            }
-                        },
-                    )
-                    .upsert(true)
-                    .session(&mut *session)
-                    .await?;
+                // well-defined atomic outcome.
+                self.upsert_namespace_registry_document_in_session(
+                    &mut *session,
+                    current_name,
+                    &record,
+                )
+                .await?;
                 Self::check_namespace_registry_fault_in_session(
                     plan.fault,
                     NamespaceRegistryPhase::RegistryRow,
@@ -9279,6 +9335,37 @@ mod inner {
                 .await?;
             self.upstream_ref_guards()
                 .delete_many(prefix_filter)
+                .session(&mut *session)
+                .await?;
+            Ok(())
+        }
+
+        /// Insert-or-update the registry document for `name` inside the
+        /// caller's session. An explicit `null` description clears the field
+        /// on both backends.
+        async fn upsert_namespace_registry_document_in_session(
+            &self,
+            session: &mut ClientSession,
+            name: &str,
+            record: &NamespaceRecord,
+        ) -> mongodb::error::Result<()> {
+            let description_bson = match &record.description {
+                Some(value) => Bson::String(value.clone()),
+                None => Bson::Null,
+            };
+            self.namespaces()
+                .update_one(
+                    doc! { "_id": name },
+                    doc! {
+                        "$set": {
+                            "name": name,
+                            "description": description_bson,
+                            "created_at": record.created_at.to_rfc3339(),
+                            "updated_at": record.updated_at.to_rfc3339(),
+                        }
+                    },
+                )
+                .upsert(true)
                 .session(&mut *session)
                 .await?;
             Ok(())
@@ -9866,6 +9953,8 @@ mod inner {
         expected: SnapshotDigest,
         spec_docs: Vec<Document>,
         trust: Option<Vec<GatewayTrustBundleRecord>>,
+        /// See `ConditionalNamespaceRestore::namespace_registry`.
+        namespace_registry: Option<Option<String>>,
     }
 
     // -----------------------------------------------------------------------

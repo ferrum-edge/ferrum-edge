@@ -915,8 +915,22 @@ fn representative_exposition() -> String {
             ("http3", 0),
             ("hbone", 0),
             ("mesh_mtls", 0),
+            ("mesh_mtls_tunnel", 1),
         ],
         32,
+        data_ns_label,
+    );
+    ferrum_edge::data_path_metrics::render_mesh_mtls_tunnel_pool(
+        &mut data_path,
+        &ferrum_edge::proxy::mesh_mtls_pool::MeshMtlsTunnelPoolStats {
+            connections: 1,
+            active_streams: 3,
+            connections_opened: 2,
+            streams_reused: 5,
+            streams_new_connection: 2,
+            saturation_waits_admitted: 1,
+            saturation_waits_timed_out: 0,
+        },
         data_ns_label,
     );
     output.push_str(&data_path);
@@ -1146,6 +1160,10 @@ fn representative_metrics_exposition_matches_contract() {
         "ferrum_unmatched_requests_total",
         "ferrum_tcp_connection_throttle_rejections_total",
         "ferrum_mesh_tcp_egress_connections_total",
+        "ferrum_mesh_mtls_tunnel_pool_active_streams",
+        "ferrum_mesh_mtls_tunnel_pool_connections_opened_total",
+        "ferrum_mesh_mtls_tunnel_pool_streams_total",
+        "ferrum_mesh_mtls_tunnel_pool_saturation_waits_total",
         "ferrum_mesh_hbone_inner_pool_events_total",
         "ferrum_mesh_remote_discovery_poll_failures_total",
         "ferrum_mesh_remote_discovery_poll_successes_total",

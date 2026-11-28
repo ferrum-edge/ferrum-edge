@@ -103,7 +103,9 @@ pub fn load_config_backup(
     // Remove only its known envelope fields: unknown runtime fields must still
     // fail GatewayConfig's deny_unknown_fields admission. In particular, an
     // export is never an authority for gateway trust, and API specs are not
-    // runtime configuration. Do not deserialize or apply either section here.
+    // runtime configuration, and the namespace registry row is admin metadata
+    // that only `POST /restore` writes. Do not deserialize or apply any of
+    // these sections here; `ferrum-edge validate --backup` checks them.
     if let Some(object) = value.as_object_mut() {
         for field in [
             "ferrum_version",
@@ -113,6 +115,7 @@ pub fn load_config_backup(
             "conditional",
             "gateway_trust_bundles",
             "api_specs",
+            "namespace_registry",
         ] {
             object.remove(field);
         }

@@ -1053,6 +1053,7 @@ fn workload(
         pod_uid: pod_uid.map(str::to_string),
         node_waypoint: None,
         remote_provenance: false,
+        mesh_transport: None,
     }
 }
 
@@ -1290,6 +1291,7 @@ fn all_collections(key_suffix: &str, marker: &str) -> MeshConfig {
             pod_uid: None,
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         }],
         services: vec![MeshService {
             cluster_ips: vec![marker.to_string()],
@@ -1488,6 +1490,10 @@ fn mesh_config_fields_are_accounted_for_in_overlay_ownership() {
         // Live handle to the node-agent's enrolled-pod registry (issue #4249):
         // installed by the mesh serving runtime, never Kubernetes-owned.
         inbound_relay_node_local_registry: _,
+        // ServiceWaypoint L7 bound-Service surface (issue #7500): materialized
+        // from the slice on every mesh apply, never Kubernetes-owned.
+        service_waypoint_l7_bindings: _,
+        service_waypoint_l7_inventory: _,
     } = MeshConfig::default();
 
     // Every namespaced collection is visible to the ownership accounting.

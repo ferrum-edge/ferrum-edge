@@ -12112,7 +12112,14 @@ impl ProxyState {
         let mut targets = Vec::new();
 
         for proxy in &config.proxies {
-            if !proxy.dispatch_kind.is_http_family() {
+            // A ServiceWaypoint route not served yet (issue #7500) is never
+            // probed: probing would dial a bound Service's backend before any
+            // request was authorized at `:15008`.
+            if !proxy.dispatch_kind.is_http_family()
+                || crate::modes::mesh::service_waypoint_l7::service_waypoint_route_unserved(
+                    config, &proxy.id,
+                )
+            {
                 continue;
             }
 
@@ -12405,7 +12412,12 @@ impl ProxyState {
             };
             let base_proxies: Vec<&Proxy> = base_proxies
                 .into_iter()
-                .filter(|proxy| proxy.dispatch_kind.is_http_family())
+                .filter(|proxy| {
+                    proxy.dispatch_kind.is_http_family()
+                        && !crate::modes::mesh::service_waypoint_l7::service_waypoint_route_unserved(
+                            config, &proxy.id,
+                        )
+                })
                 .collect();
             if base_proxies.is_empty() {
                 continue;
@@ -13490,7 +13502,13 @@ impl ProxyState {
         // for and parking that connection on a client dispatch never uses.
         let pool_key_for = |candidate: &Proxy| self.connection_pool.pool_key_for_warmup(candidate);
         for proxy in &config.proxies {
-            if !proxy.dispatch_kind.is_http_family() {
+            // ServiceWaypoint routes not served yet (issue #7500) are never
+            // warmed: no backend connection ahead of an authorized request.
+            if !proxy.dispatch_kind.is_http_family()
+                || crate::modes::mesh::service_waypoint_l7::service_waypoint_route_unserved(
+                    &config, &proxy.id,
+                )
+            {
                 continue;
             }
             // Mirror the runtime dispatch decision: would this proxy ever
@@ -26950,6 +26968,10 @@ async fn handle_tls_connection(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio_rustls::TlsAcceptor;
 
+    let mesh_inbound_listener = matches!(
+        tls_connection_metadata.mesh_direction,
+        Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
+    );
     // Set TCP keepalive on inbound connection
     set_tcp_keepalive(&stream);
 
@@ -27079,6 +27101,25 @@ async fn handle_tls_connection(
 
     // Use hyper-util's auto builder which negotiates HTTP/1.1 or HTTP/2 via ALPN.
     // HTTP/2 clients get multiplexed streams; HTTP/1.1 clients get upgrade support.
+    // A mesh inbound listener terminates authenticated mesh transports that
+    // multiplex long-lived CONNECT tunnels (Sidecar raw-TCP and Ambient HBONE
+    // egress pool them, issue #7537). A tunnel whose local application stops
+    // reading holds up to one stream window of connection credit, so the
+    // connection window must cover every admitted stream or a few stalled
+    // tunnels starve their siblings. Other listeners keep the frontend values.
+    let h2_flow = if mesh_inbound_listener {
+        crate::proxy::hbone_pool::connect_multiplex_flow_control(
+            state.env_config.frontend_h2_initial_stream_window_size,
+            state.env_config.frontend_h2_initial_connection_window_size,
+            Some(state.env_config.server_http2_max_concurrent_streams),
+        )
+    } else {
+        crate::proxy::hbone_pool::ConnectMultiplexFlowControl {
+            stream_window: state.env_config.frontend_h2_initial_stream_window_size,
+            connection_window: state.env_config.frontend_h2_initial_connection_window_size,
+            max_streams: state.env_config.server_http2_max_concurrent_streams,
+        }
+    };
     let mut builder =
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
     {
@@ -27106,11 +27147,11 @@ async fn handle_tls_connection(
             state.env_config.http_client_write_timeout_seconds,
         ))
         .max_header_list_size(h2_parser_max_header_list_size(state.max_header_size_bytes))
-        .initial_stream_window_size(state.env_config.frontend_h2_initial_stream_window_size)
-        .initial_connection_window_size(state.env_config.frontend_h2_initial_connection_window_size)
+        .initial_stream_window_size(h2_flow.stream_window)
+        .initial_connection_window_size(h2_flow.connection_window)
         .adaptive_window(false)
         .max_frame_size(state.env_config.frontend_h2_max_frame_size)
-        .max_concurrent_streams(state.env_config.server_http2_max_concurrent_streams)
+        .max_concurrent_streams(h2_flow.max_streams)
         .max_pending_accept_reset_streams(Some(
             state
                 .env_config
@@ -71685,6 +71726,7 @@ mod tests {
             pod_uid: None,
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         };
 
         let bywl_id = crate::modes::mesh::mesh_outbound_tcp_bywl_upstream_id(
@@ -76720,6 +76762,7 @@ mod tests {
             pod_uid: None,
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         };
         let mesh = MeshConfig {
             services: vec![service],
@@ -80513,6 +80556,7 @@ mod tests {
             pod_uid: None,
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         }
     }
 
@@ -82190,6 +82234,7 @@ mod tests {
                 pod_uid: None,
                 node_waypoint: None,
                 remote_provenance: false,
+                mesh_transport: None,
             }
         }
 

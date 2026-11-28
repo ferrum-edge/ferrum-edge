@@ -196,8 +196,9 @@ pub(crate) async fn handle_mesh_tcp_egress(
 
     // Select the transport from the target's tag (mutually exclusive — the
     // materializer stamps exactly one). Ambient relays over the shared HBONE
-    // pool (capability-probe-gated); Sidecar relays over a fresh mesh-mTLS
-    // CONNECT tunnel with no capability registry.
+    // pool (capability-probe-gated); Sidecar relays over the mesh-mTLS pool's
+    // raw-TCP tunnel lane (pooled SVID-mTLS carriers, issue #7537) with no
+    // capability registry.
     let (tunnel, transport) = if hbone_pool::target_hbone_enabled(&target) {
         // In-cluster target-effective capability keying: the enrollment pass builds probe
         // keys from the relay proxy AFTER per-target override resolution

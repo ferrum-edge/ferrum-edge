@@ -2064,3 +2064,113 @@ fn cross_namespace_admission_normalizes_a_custom_cluster_domain() {
     );
     assert_eq!(status, "True", "{message}");
 }
+
+/// Issue #7500: a mesh-bound VirtualService whose route host names a Service
+/// bound to a ServiceWaypoint, but which that waypoint will not carry, says so
+/// on its status with the projection's own reason: never a silent drop.
+#[test]
+fn virtual_service_status_reports_service_waypoint_route_exclusions() {
+    let in_namespace = |api_version: &str, kind: &str, namespace: &str, name: &str, spec: Value| {
+        let mut obj = object(api_version, kind, name, spec);
+        obj.metadata.namespace = namespace.to_string();
+        obj.metadata.uid = format!("uid-{namespace}-{name}");
+        obj
+    };
+    let gateway = in_namespace(
+        "gateway.networking.k8s.io/v1",
+        "Gateway",
+        "wp",
+        "waypoint",
+        json!({
+            "gatewayClassName": "istio-waypoint",
+            "listeners": [{"name": "mesh", "port": 15008, "protocol": "HBONE"}]
+        }),
+    );
+    let mut service = in_namespace(
+        "v1",
+        "Service",
+        "tenant",
+        "orders",
+        json!({"ports": [{"name": "http", "port": 8080, "protocol": "TCP", "targetPort": 8080}]}),
+    );
+    service
+        .metadata
+        .annotations
+        .insert("istio.io/use-waypoint".to_string(), "waypoint".to_string());
+    service.metadata.annotations.insert(
+        "istio.io/use-waypoint-namespace".to_string(),
+        "wp".to_string(),
+    );
+    let route = |namespace: &str, name: &str, export_to: Option<&[&str]>| {
+        let mut spec = json!({
+            "hosts": ["orders.tenant.svc.cluster.local"],
+            "http": [{"route": [{"destination": {
+                "host": "orders.tenant.svc.cluster.local",
+                "port": {"number": 8080}
+            }}]}]
+        });
+        if let Some(export_to) = export_to {
+            spec["exportTo"] = json!(export_to);
+        }
+        in_namespace(
+            "networking.istio.io/v1",
+            "VirtualService",
+            namespace,
+            name,
+            spec,
+        )
+    };
+    let objects = vec![
+        gateway,
+        service,
+        route("tenant", "orders-local", Some(&["."])),
+        route("tenant", "orders-exported", None),
+        route("evil", "hijack", Some(&["*"])),
+        route("wp", "from-waypoint", Some(&["."])),
+        route("wp", "from-waypoint-exported", Some(&[".", "tenant"])),
+    ];
+    let options = K8sTranslationOptions::new(
+        "wp".to_string(),
+        TrustDomain::new("cluster.local").expect("test trust domain"),
+    )
+    .with_source_namespaces(Vec::new());
+    let updates = plan_istio_status_updates(&objects, options);
+    let exclusions = |name: &str| -> (String, Value) {
+        let update = update_for(&updates, "VirtualService", name);
+        let condition = find_condition(
+            update.status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(condition["status"].as_str(), Some("True"), "{name}");
+        (
+            condition["message"].as_str().unwrap().to_string(),
+            update.ferrum_detail.as_ref().unwrap()["translation"]
+                ["service_waypoint_route_exclusions"]
+                .clone(),
+        )
+    };
+    for (name, reason) in [
+        ("orders-local", "not_exported_to_waypoint_namespace"),
+        ("hijack", "foreign_namespace"),
+        ("from-waypoint", "not_exported_to_service_namespace"),
+    ] {
+        let (message, detail) = exclusions(name);
+        assert_eq!(
+            detail,
+            json!([{"service": "tenant/orders", "reason": reason}]),
+            "{name}"
+        );
+        assert!(
+            message.contains("bound to a ServiceWaypoint that does not carry them"),
+            "{name}: {message}"
+        );
+    }
+    for name in ["orders-exported", "from-waypoint-exported"] {
+        let (message, detail) = exclusions(name);
+        assert!(detail.is_null(), "{name} is carried: {detail}");
+        assert!(
+            !message.contains("ServiceWaypoint that does not carry"),
+            "{name}"
+        );
+    }
+}

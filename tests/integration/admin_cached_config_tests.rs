@@ -5708,7 +5708,9 @@ async fn test_backup_restore_roundtrip_preserves_api_specs_json_and_yaml() {
             "proxy-json",
             "/spec-json",
             ferrum_edge::config::types::SpecFormat::Json,
-            br#"{"openapi":"3.1.0","info":{"title":"JSON API","version":"1.0.0"},"paths":{}}"#
+            // Every stored spec declares `x-ferrum-proxy` (submission requires
+            // it), and restore re-runs that extension admission (issue #7532).
+            br#"{"openapi":"3.1.0","info":{"title":"JSON API","version":"1.0.0"},"paths":{},"x-ferrum-proxy":{"id":"proxy-json","listen_path":"/spec-json","backend_host":"backend.example.com","backend_port":443}}"#
                 .as_slice(),
         ),
         (
@@ -5716,7 +5718,7 @@ async fn test_backup_restore_roundtrip_preserves_api_specs_json_and_yaml() {
             "proxy-yaml",
             "/spec-yaml",
             ferrum_edge::config::types::SpecFormat::Yaml,
-            b"openapi: \"3.0.3\"\ninfo:\n  title: YAML API\n  version: \"2.0.0\"\npaths: {}\n"
+            b"openapi: \"3.0.3\"\ninfo:\n  title: YAML API\n  version: \"2.0.0\"\npaths: {}\nx-ferrum-proxy:\n  id: proxy-yaml\n  listen_path: /spec-yaml\n  backend_host: backend.example.com\n  backend_port: 443\n"
                 .as_slice(),
         ),
     ] {

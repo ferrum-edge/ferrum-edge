@@ -43,6 +43,7 @@ fn build_slice(n_workloads: usize) -> MeshSlice {
             pod_uid: None,
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         });
 
         mesh.services.push(MeshService {

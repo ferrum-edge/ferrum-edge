@@ -4310,7 +4310,10 @@ fn pending_limit_logical_id(upstream: &Upstream) -> &str {
             .starts_with(crate::modes::mesh::MESH_OUTBOUND_HTTP_BYWL_UPSTREAM_ID_PREFIX)
         // A cross-namespace destination source (issue #7499) is the same
         // Service port's upstream: its clones share the Service's lane.
-        || crate::modes::mesh::is_cross_namespace_destination_source_id(&upstream.id);
+        || crate::modes::mesh::is_cross_namespace_destination_source_id(&upstream.id)
+        || upstream.id.starts_with(
+            crate::modes::mesh::service_waypoint_l7::SERVICE_WAYPOINT_L7_UPSTREAM_ID_PREFIX,
+        );
     if is_mesh_http_egress {
         upstream
             .name
@@ -4373,7 +4376,18 @@ impl GatewayConfig {
         let mut by_path: HashMap<(&str, Option<u16>, &str), Vec<&Proxy>> = HashMap::new();
         let mut host_only: HashMap<(&str, Option<u16>), Vec<&Proxy>> = HashMap::new();
         for proxy in &self.proxies {
-            if proxy.dispatch_kind.is_stream() {
+            // A ServiceWaypoint default L7 Service route (issue #7500) shares
+            // its bound Service's hosts and `/` with the carried VirtualService
+            // routes bound to that Service, by design: it is never in the
+            // shared route tiers and is reached only through its bound
+            // Service's route partition, where carried routes shadow it on the
+            // paths they match. Operator ids cannot start with `_`, so only the
+            // mesh materializer creates one.
+            if proxy.dispatch_kind.is_stream()
+                || crate::modes::mesh::service_waypoint_l7::is_service_waypoint_l7_route_id(
+                    &proxy.id,
+                )
+            {
                 continue;
             }
             match proxy.listen_path.as_deref() {

@@ -57,6 +57,7 @@ fn mesh_config_round_trips_through_serde() {
                 pod_uid: None,
                 node_waypoint: None,
                 remote_provenance: false,
+                mesh_transport: None,
             }],
             services: vec![MeshService {
                 cluster_ips: Vec::new(),

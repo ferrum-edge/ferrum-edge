@@ -687,6 +687,8 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 
 Responses return non-secret certificate metadata, source URI, issuer, SANs, validity, fingerprint, ACME directory/account/order metadata, and timestamps. Private keys are persisted but never returned. Create, update, and delete operations ask active TLS source watchers to re-pull immediately; `DELETE` returns `409 Conflict` when any configuration still references the record (see [Managed record deletion](#managed-record-deletion)). SAN strings use the same canonical representation as [TLS Inventory](#tls-inventory).
 
+`GET /admin/tls/acme/certificates/{id}` returns a strong `ETag`, and `PUT`, `DELETE`, and an `allow_overwrite: true` `POST` honour `If-Match` exactly as the managed records do (see [Conditional managed TLS writes](#conditional-managed-tls-writes)). Automatic renewal and order finalization replace the record through the same locked store write, so a tag read before a renewal no longer matches after it.
+
 Import, update, and order finalization return `413 Payload Too Large` when the certificate, private key, or combined certificate chain exceeds `FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES`; the error never echoes material or source identifiers.
 
 Creating a new ACME certificate or account record returns `409 Conflict` once `FERRUM_TLS_ACME_MAX_CERTIFICATES` / `FERRUM_TLS_ACME_MAX_ACCOUNTS` is reached; overwrite and delete stay available so capacity can be reclaimed. An authoritative shared ACME store document that already exceeds `FERRUM_TLS_STORE_MAX_DOCUMENT_BYTES` returns `500 Internal Server Error` on every route that tries to read it, including `GET` and `DELETE` — it is unreachable server state rather than a caller payload. A candidate write that would cross the same ceiling returns `413 Payload Too Large` before rename and leaves the previous document intact. Both diagnostics name the ceiling only, never record IDs, domains, paths, or material.
@@ -826,6 +828,80 @@ config:
 - **Control plane / data plane.** The record never travels on ConfigSync: the plugin config carries only the reference, and each node resolves it from its own `FERRUM_TLS_MANAGED_STORE_PATH`, like every other `managed://` source. Point the CP and every DP at one shared store volume (see [Managed TLS And ACME Across Multiple Replicas](frontend_tls.md#managed-tls-and-acme-across-multiple-replicas)); a DP without the record refuses the provider's tokens.
 
 `DELETE` returns `409 Conflict` when any configuration still references the record (see [Managed record deletion](#managed-record-deletion)).
+
+### Conditional managed TLS writes
+
+Managed TLS records use the same `ETag` / `If-Match` convention as proxies,
+upstreams, consumers, and plugin configs (see
+[Conditional writes](#conditional-writes-etag--if-match)), so two operators
+rotating the same record cannot silently overwrite each other:
+
+- `GET /admin/tls/{certificates|ca-bundles|crls|ocsp-responses|jwks}/{id}` and
+  `GET /admin/tls/acme/certificates/{id}` return a strong `ETag` (not to a
+  token verified by `FERRUM_ADMIN_JWT_VIEWER_SECRET`). The tag is the same
+  keyed MAC used for configuration resources, computed over the complete
+  stored record, including the private key and other material the response
+  never shows, and bound to the record id. Every successful write stamps the
+  record with a new store revision (the monotonic version of the commit that
+  wrote it), so the tag changes on every write, including a same-material
+  rotation, a write whose clock repeats `updated_at`, and a
+  delete-then-recreate: no write ever leaves an earlier tag valid. A record
+  stored before this release carries no revision until it is next written,
+  and only the written record gains one, so upgrading never grows the
+  untouched records of a store close to `FERRUM_TLS_STORE_MAX_DOCUMENT_BYTES`.
+- `PUT .../{id}` and `DELETE .../{id}` with `If-Match` are refused with
+  `412 Precondition Failed` and `{"error": "managed TLS record '<id>' has changed since the supplied If-Match entity-tag was issued; re-read it and reapply your changes"}`
+  (`ACME certificate '<id>' ...` for ACME records) unless the stored record
+  still has that tag. Nothing is written, no watcher reload is requested, and
+  no audit event is recorded. The body names only the id, never material.
+- A collection `POST` with `allow_overwrite: true` evaluates `If-Match` for
+  the replacement case: the precondition never holds when the id is free
+  (`412`, RFC 9110 §13.1.1), so a conditional overwrite can never turn into a
+  create. The existing-record rules answer first: an existing id without
+  `allow_overwrite` (`409`) and a cross-kind collision (`409`) are reported
+  as such whatever the tag, and the precondition is evaluated only against a
+  same-kind record the write could replace.
+- Strict parsing, `*` (the record must exist), strong comparison, tag lists,
+  and `400` for a malformed or empty header are identical to the
+  configuration resources; `*` combined with anything else (`*, *`, `*,`,
+  `,*`) is malformed (`400`) there as here.
+- **Status precedence**, the same on `PUT`, `DELETE`, and overwrite `POST`
+  and in every interleaving, because each later check is re-made under the
+  store lock: `400` malformed `If-Match`; `404` missing id; the kind mismatch
+  (`409` on `PUT` and `POST`, `400` on `DELETE`); `409` existing id without
+  `allow_overwrite` (`POST`); on `DELETE`, `409` while the record is still
+  referenced and `503` when the reference fence lapsed before the removal;
+  then `412` for a stale tag. The reference scan runs before the store
+  lock is taken, but its verdict is applied under the lock after the
+  authoritative existence and kind checks, so references to a replacement of
+  another kind never mask the kind mismatch.
+- **Atomic across instances.** The comparison is made by the TLS store against
+  the authoritative record inside the exclusive cross-process lock that also
+  commits the write (the same read-modify-write that already makes
+  create-without-overwrite and kind conflicts race-free), never by a read in
+  the handler. Every gateway sharing `FERRUM_TLS_MANAGED_STORE_PATH` takes
+  that lock, so no other admin request, replica, or ACME renewal can commit
+  between the comparison and the write. The managed TLS store is the shared
+  file store, not the configuration database, so this holds identically
+  whichever database backend (PostgreSQL, MySQL, SQLite, MongoDB) or mode
+  (`database`, `cp`) serves the Admin API. Tags agree across replicas that
+  share `FERRUM_ADMIN_JWT_SECRET`.
+- A `DELETE` evaluates the precondition after the reference check and the
+  fence re-check, so a stale delete of a record that is now referenced
+  answers `409` with `used_by`, and one whose fence lapsed answers `503`;
+  `412` means the record itself changed.
+- Write responses carry no tag; re-read for the tag of the accepted state.
+  Omitting `If-Match` keeps the unconditional behaviour.
+
+```bash
+ETAG=$(curl -si -H "Authorization: Bearer $TOKEN" \
+  http://localhost:9000/admin/tls/certificates/edge-cert \
+  | awk 'tolower($1)=="etag:"{print $2}' | tr -d '\r')
+curl -X PUT -H "Authorization: Bearer $TOKEN" -H "If-Match: $ETAG" \
+  -H 'Content-Type: application/json' -d @rotated-cert.json \
+  http://localhost:9000/admin/tls/certificates/edge-cert
+# 200 if nobody rotated the record since the GET; 412 if anyone did.
+```
 
 ### Managed record deletion
 
@@ -1709,14 +1785,18 @@ curl -X PUT -H "Authorization: Bearer $TOKEN" -H "If-Match: $ETAG" \
   `FERRUM_ADMIN_JWT_SECRET` so it cannot be used to test guesses of a redacted
   value; replicas sharing that secret issue identical tags, and rotating it
   invalidates outstanding tags (writes then return `412` until re-read).
-- **Strict parsing for row writes.** `*` requires only that the resource exists.
+- **Strict parsing for row writes.** `*` requires only that the resource exists;
+  it must be the whole header, so `*` combined with anything else (`*, *`,
+  `*,`, `,*`, or `*` beside a tag) is `400`.
   Comparison is strong, so a weak `W/"…"` tag never matches. A comma-separated list
   matches if any member does. A malformed or empty `If-Match` is `400`, never
   treated as absent. Row preconditions apply only to `PUT`/`DELETE` on the
-  four resource routes above and to the consumer credential endpoints
+  four resource routes above, to the consumer credential endpoints
   (`PUT`/`POST`/`DELETE /consumers/{id}/credentials/{cred_type}` and
   `DELETE /consumers/{id}/credentials/{cred_type}/{index}`), which take the
-  Consumer's tag. `POST /restore` supports the separate namespace
+  Consumer's tag, and to the managed TLS record writes described in
+  [Conditional managed TLS writes](#conditional-managed-tls-writes).
+  `POST /restore` supports the separate namespace
   precondition described below. Opt-in deployment removal and spec replacement
   use the separate [deployment authority profile](deployment_mutations.md).
   `If-Match` on any other mutating route (including
@@ -2164,7 +2244,7 @@ The backup output can be passed unchanged to `POST /batch` (additive) or `POST /
 - **Closed restore envelope.** `POST /restore` rejects unknown top-level keys with `400` before anything is deleted.
 - **Validate, snapshot, then replace.** Restore validates the payload and snapshots the current namespace under a persistent namespace guard before the destructive clear; if the snapshot cannot be taken it aborts with `503` before deleting anything.
 
-Two destructive-restore exceptions to know: restoring a backup without an `api_specs` section into a namespace that still holds specs requires `?confirm_api_spec_deletion=true`, and an **absent** `gateway_trust_bundles` array leaves trust untouched while a **present** one (including an empty one, which revokes) is authoritative. [Namespace registry metadata is not part of a backup](admin_backup_restore.md#namespace-metadata-is-not-part-of-a-backup), and [MongoDB restore refuses malformed split identities](admin_backup_restore.md#mongodb-restore-refuses-malformed-split-identities).
+Two destructive-restore exceptions to know: restoring a backup without an `api_specs` section into a namespace that still holds specs requires `?confirm_api_spec_deletion=true`, and an **absent** `gateway_trust_bundles` array leaves trust untouched while a **present** one (including an empty one, which revokes) is authoritative. A full export carries the namespace's registry row (`namespace_registry`), which restore writes back only into the namespace it came from ([details](admin_backup_restore.md#the-namespace-registry-row-is-part-of-a-full-backup)); stored API-spec documents go through the same extension admission a spec submit runs; `ferrum-edge validate --backup <file>` runs the same payload admission offline ([details](admin_backup_restore.md#checking-a-backup-offline--ferrum-edge-validate---backup)); and [MongoDB restore refuses malformed split identities](admin_backup_restore.md#mongodb-restore-refuses-malformed-split-identities).
 
 ### Read-only configuration export (`GET /config/export`)
 
@@ -3435,13 +3515,17 @@ Response:
       "namespace": "default",
       "name": "reviews",
       "ports": [8080],
-      "workload_count": 3
+      "workload_count": 3,
+      "l7_http_ports": [8080],
+      "virtual_service_route_count": 1
     },
     {
       "namespace": "default",
       "name": "ratings",
       "ports": [8081],
-      "workload_count": 1
+      "workload_count": 1,
+      "l7_http_ports": [8081],
+      "virtual_service_route_count": 0
     }
   ]
 }
@@ -3454,8 +3538,10 @@ Field semantics:
 - `service_count` — number of services admitted into the slice for this waypoint.
 - `services[].ports` — service ports from the admitted `MeshService`; port protocol metadata is intentionally omitted from this compact operability view.
 - `services[].workload_count` — number of workload SPIFFE references behind that service in the installed slice.
+- `services[].l7_http_ports` — HTTP-family ports of the Service that this waypoint materialized a bound-Service L7 route and upstream for (issue #7500), ascending. Empty when the Service is not bound by a binding that claims service traffic (`waypoint_for` `service` or `all`), or when none of its HTTP ports has a reachable backing workload. Stream-family ports never appear. Read from the generation the proxy currently serves.
+- `services[].virtual_service_route_count` — number of distinct materialized VirtualService route proxies attached to the bound Service in that generation (a route attaches to the Service its hosts name, not to its split legs). It counts data-plane routes, not authored `http[]` entries: one entry with several `match` clauses can materialize several route proxies. Route rules and match predicates are not exposed. These routes are materialized but not yet served on `:15008` (issue #7501).
 
-`services` are returned in slice order. The payload exposes service names, namespaces, ports, and workload counts, but no request bodies, credentials, or backend TLS material.
+`services` are returned in slice order. The payload exposes service names, namespaces, ports, workload counts, L7 ports, and route counts, but no route rules, request bodies, credentials, or backend TLS material.
 
 ## Mesh Config Drift (mesh mode)
 

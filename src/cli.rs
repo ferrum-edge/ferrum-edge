@@ -127,6 +127,19 @@ pub struct ValidateArgs {
     /// emit a warning instead. Runtime (`run`) is unchanged.
     #[arg(long = "allow-empty-namespace")]
     pub allow_empty_namespace: bool,
+
+    /// Check a `GET /backup` export offline instead of a resources file.
+    ///
+    /// Runs the database-independent admission `POST /restore` runs on the
+    /// same build — every section, including `gateway_trust_bundles`,
+    /// `api_specs` (with each stored spec document's extension admission) and
+    /// `namespace_registry` — under the restore body limit
+    /// (`FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB`). A missing or unreadable file
+    /// fails. Requires database or cp mode (`-m database` / `-m cp`) with the
+    /// deployment's environment; `FERRUM_NAMESPACE` names the restore target.
+    /// Makes no database connection.
+    #[arg(long = "backup", value_name = "FILE")]
+    pub backup: Option<PathBuf>,
 }
 
 #[derive(clap::Args)]
@@ -919,6 +932,72 @@ fn report_field(env_key: &str, rendered: &str) -> String {
     crate::secrets::report_env_field(env_key, rendered)
 }
 
+/// `ferrum-edge validate --backup <FILE>` (issue #7532): run `POST /restore`'s
+/// database-independent admission over a `GET /backup` export.
+fn validate_backup_export(
+    path: &std::path::Path,
+    env_config: &crate::config::EnvConfig,
+) -> Result<(), String> {
+    use crate::config::OperatingMode;
+    let serves_proxy = match env_config.mode {
+        OperatingMode::Database => true,
+        OperatingMode::ControlPlane => false,
+        _ => {
+            return Err(
+                "--backup checks a GET /backup export against POST /restore, which only database \
+                 and cp modes serve; run it with -m database or -m cp and the deployment's \
+                 environment"
+                    .to_string(),
+            );
+        }
+    };
+    let summary =
+        crate::admin::restore_admission::check_backup_export(path, env_config, serves_proxy)
+            .map_err(|errors| {
+                let rendered: Vec<String> = errors
+                    .iter()
+                    .map(|error| crate::startup::sanitize_startup_cause(error, &[]))
+                    .collect();
+                format!(
+                    "Backup validation failed ({} error(s)); POST /restore would refuse this \
+                     export:\n  {}",
+                    rendered.len(),
+                    rendered.join("\n  ")
+                )
+            })?;
+    println!("Backup export: OK (accepted by POST /restore admission on this build)");
+    println!("  Proxies: {}", summary.proxies);
+    println!("  Consumers: {}", summary.consumers);
+    println!("  Plugin configs: {}", summary.plugin_configs);
+    println!("  Upstreams: {}", summary.upstreams);
+    let section = |count: Option<usize>| match count {
+        Some(count) => count.to_string(),
+        None => "section absent".to_string(),
+    };
+    println!("  API specs: {}", section(summary.api_specs));
+    println!(
+        "  Gateway trust bundles: {}",
+        section(summary.gateway_trust_bundles)
+    );
+    use crate::admin::restore_admission::NamespaceRegistryOutcome;
+    println!(
+        "  Namespace registry row: {}",
+        match summary.namespace_registry {
+            NamespaceRegistryOutcome::Applied => "present; written to the target namespace",
+            NamespaceRegistryOutcome::OtherNamespace =>
+                "present but taken from another namespace; not applied to this target",
+            NamespaceRegistryOutcome::Absent => "section absent; the target row is left untouched",
+        }
+    );
+    println!(
+        "  Not checked offline (they depend on the target database): another namespace \
+         owning prometheus_metrics, the confirm_api_spec_deletion confirmation a backup \
+         without api_specs needs, and a conditional restore's If-Match."
+    );
+    println!("\nValidation passed.");
+    Ok(())
+}
+
 /// Validate configuration without starting the gateway.
 pub fn execute_validate(args: &ValidateArgs) -> Result<(), String> {
     use crate::config::{EnvConfig, OperatingMode, file_loader};
@@ -943,6 +1022,10 @@ pub fn execute_validate(args: &ValidateArgs) -> Result<(), String> {
         "  Namespace: {}",
         report_field("FERRUM_NAMESPACE", &env_config.namespace)
     );
+
+    if let Some(backup_path) = args.backup.as_deref() {
+        return validate_backup_export(backup_path, &env_config);
+    }
 
     if env_config.mode == OperatingMode::File {
         let config_path = env_config
@@ -1025,14 +1108,28 @@ pub fn execute_validate(args: &ValidateArgs) -> Result<(), String> {
     if env_config.mode == OperatingMode::Database
         && let Some(path) = env_config.db_config_backup_path.as_deref()
     {
-        crate::config::config_backup::load_config_backup(path, &env_config.namespace).map_err(
-            |error| {
+        let loaded = crate::config::config_backup::load_config_backup(path, &env_config.namespace)
+            .map_err(|error| {
                 format!(
                     "Config backup validation failed: {}",
                     render_startup_error(error, &[])
                 )
-            },
-        )?;
+            })?;
+        // A missing fallback file is a warning at startup (it may not have
+        // been written yet), so it does not fail `validate` either; but the
+        // report must say that nothing was checked (issue #7532).
+        match loaded {
+            Some(_) => println!(
+                "Config backup ({}): OK",
+                report_field("FERRUM_DB_CONFIG_BACKUP_PATH", path)
+            ),
+            None => println!(
+                "Config backup ({}): WARNING: file not found; nothing was checked, and \
+                 database startup has no fallback until the file exists. To check a \
+                 GET /backup export, use `ferrum-edge validate --backup <file>`.",
+                report_field("FERRUM_DB_CONFIG_BACKUP_PATH", path)
+            ),
+        }
     }
 
     // Env-level TLS/security surfaces that `run` hard-fails on must also fail

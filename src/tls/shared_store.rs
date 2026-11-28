@@ -62,6 +62,17 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 
+/// `skip_serializing_if` predicate for the per-record `revision` stamp on
+/// managed TLS and ACME certificate records. A record no store write has
+/// stamped yet (a document written before the field existed) keeps its exact
+/// serialized shape, so rewriting the document for one record never grows
+/// every untouched record and pushes a store near
+/// `FERRUM_TLS_STORE_MAX_DOCUMENT_BYTES` over its ceiling (which would refuse
+/// even a delete).
+pub(crate) fn revision_is_unset(revision: &u64) -> bool {
+    *revision == 0
+}
+
 /// Retry cadence while waiting for a contended advisory lock.
 const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(5);
 

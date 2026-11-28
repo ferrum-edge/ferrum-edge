@@ -24,12 +24,15 @@ CNI_LIFECYCLE_DOCUMENTATION_PATHS: frozenset[str] = frozenset()
 
 ISTIO_STATUS_CAS_DOCUMENTATION_PATHS: frozenset[str] = frozenset()
 
+MESH_E2E_SERVICE_WAYPOINT_DOCUMENTATION_PATHS: frozenset[str] = frozenset()
+
 LIVE_SUITE_DOCUMENTATION_PATHS = (
     MESH_FEDERATION_DOCUMENTATION_PATHS
     | MESH_E2E_SIDECAR_DOCUMENTATION_PATHS
     | AMBIENT_HOST_UDP_DOCUMENTATION_PATHS
     | CNI_LIFECYCLE_DOCUMENTATION_PATHS
     | ISTIO_STATUS_CAS_DOCUMENTATION_PATHS
+    | MESH_E2E_SERVICE_WAYPOINT_DOCUMENTATION_PATHS
 )
 
 _LIVE_SERIAL_PARENT_CHANNEL_RE = re.compile(r'\blive_serial="\$\{?NATIVE_CP_SERVED_SERIAL\b')
@@ -51,6 +54,18 @@ MESH_E2E_SIDECAR_CRD_FIXTURE_PATHS: frozenset[str] = frozenset(
         "tests/fixtures/k8s/istio_virtualservice_crd.yaml",
         "tests/fixtures/k8s/istio_destinationrule_crd.yaml",
         "tests/fixtures/k8s/istio_peerauthentication_crd.yaml",
+        "tests/fixtures/k8s/gateway_api_referencegrant_crd.yaml",
+    }
+)
+
+
+# Runtime inputs of the mesh-e2e-service-waypoint suite outside its harness
+# directory: the pinned CRD fixtures its run.sh installs (issue #7503).
+MESH_E2E_SERVICE_WAYPOINT_CRD_FIXTURE_PATHS: frozenset[str] = frozenset(
+    {
+        "tests/fixtures/k8s/istio_virtualservice_crd.yaml",
+        "tests/fixtures/k8s/istio_authorizationpolicy_status_crd.yaml",
+        "tests/fixtures/k8s/gateway_api_gateway_crd.yaml",
         "tests/fixtures/k8s/gateway_api_referencegrant_crd.yaml",
     }
 )
@@ -128,6 +143,30 @@ SUITE_PATTERNS: dict[str, list[str]] = {
         r"^src/identity/",
         r"^src/plugins/mesh/",
         *exact_path_patterns(MESH_E2E_SIDECAR_DOCUMENTATION_PATHS),
+    ],
+    # Optional ServiceWaypoint L7 suite (issue #7503): its harness, workflow,
+    # pinned CRDs and the runtime it drives (CRD/Gateway API translation, mesh
+    # slices, HBONE termination and admission, mesh plugins, identity).
+    "mesh-e2e-service-waypoint": [
+        r"^\.github/workflows/mesh-e2e-service-waypoint-live\.yml$",
+        r"^\.github/scripts/live_suite_path_filter\.py$",
+        r"^\.github/actions/package-ferrum-runtime-image/",
+        r"^\.github/actions/setup-kubernetes-tools/",
+        r"^\.github/actions/(setup-rust-ci|setup-sccache|setup-fast-linker)/",
+        r"^tests/k8s/mesh_e2e_service_waypoint/",
+        *exact_path_patterns(MESH_E2E_SERVICE_WAYPOINT_CRD_FIXTURE_PATHS),
+        r"^tests/k8s/lib/(live_assertions|spire)\.sh$",
+        r"^Dockerfile(\..*)?$",
+        r"^\.dockerignore$",
+        r"^src/modes/mesh/",
+        r"^src/grpc/mesh_",
+        r"^src/k8s_controller/",
+        r"^src/config_sources/k8s/",
+        r"^src/proxy/hbone_",
+        r"^src/plugins/mesh/",
+        r"^src/plugins/mesh_route_dispatch\.rs$",
+        r"^src/identity/",
+        *exact_path_patterns(MESH_E2E_SERVICE_WAYPOINT_DOCUMENTATION_PATHS),
     ],
     "ambient-host-udp": [
         r"^\.github/workflows/(ambient-host-udp-live|release)\.yml$",
@@ -211,6 +250,16 @@ SUITE_LOCAL_ACTION_DEPENDENCIES: dict[str, tuple[str, ...]] = {
         "setup-sccache",
     ),
     "cni-lifecycle": (
+        "package-ferrum-runtime-image",
+        "setup-fast-linker",
+        "setup-kubernetes-tools",
+        "setup-rust-ci",
+        "setup-sccache",
+    ),
+    # mesh-e2e-service-waypoint-live.yml runs setup-rust-ci (which runs
+    # setup-sccache and setup-fast-linker), package-ferrum-runtime-image and
+    # setup-kubernetes-tools.
+    "mesh-e2e-service-waypoint": (
         "package-ferrum-runtime-image",
         "setup-fast-linker",
         "setup-kubernetes-tools",
@@ -1350,6 +1399,28 @@ def self_test() -> int:
         ("mesh-federation", ["charts/ferrum-mesh/values.yaml"], False),
         ("mesh-federation", ["docs/spire_deployment.md"], False),
         ("mesh-federation", ["Cargo.toml"], False),
+        ("mesh-e2e-service-waypoint", ["tests/k8s/mesh_e2e_service_waypoint/run.sh"], True),
+        ("mesh-e2e-service-waypoint", ["tests/k8s/mesh_e2e_service_waypoint/manifests.yaml"], True),
+        ("mesh-e2e-service-waypoint", [".github/workflows/mesh-e2e-service-waypoint-live.yml"], True),
+        ("mesh-e2e-service-waypoint", ["tests/fixtures/k8s/gateway_api_gateway_crd.yaml"], True),
+        ("mesh-e2e-service-waypoint", ["tests/fixtures/k8s/gateway_api_referencegrant_crd.yaml"], True),
+        ("mesh-e2e-service-waypoint", ["tests/fixtures/k8s/istio_virtualservice_crd.yaml"], True),
+        ("mesh-e2e-service-waypoint", ["tests/fixtures/k8s/istio_authorizationpolicy_status_crd.yaml"], True),
+        ("mesh-e2e-service-waypoint", ["tests/fixtures/k8s/istio_peerauthentication_crd.yaml"], False),
+        ("mesh-e2e-service-waypoint", ["src/proxy/hbone_proxy.rs"], True),
+        ("mesh-e2e-service-waypoint", ["src/proxy/hbone_admission_fence.rs"], True),
+        ("mesh-e2e-service-waypoint", ["src/modes/mesh/slice.rs"], True),
+        ("mesh-e2e-service-waypoint", ["src/config_sources/k8s/gateway_api.rs"], True),
+        ("mesh-e2e-service-waypoint", ["src/plugins/mesh_route_dispatch.rs"], True),
+        ("mesh-e2e-service-waypoint", ["tests/k8s/mesh_e2e_sidecar/run.sh"], False),
+        ("mesh-e2e-service-waypoint", [".github/actions/setup-rust-ci/action.yml"], True),
+        ("mesh-e2e-service-waypoint", [".github/actions/setup-sccache/action.yml"], True),
+        ("mesh-e2e-service-waypoint", [".github/actions/setup-fast-linker/action.yml"], True),
+        ("mesh-e2e-service-waypoint", [".github/actions/setup-bpf-linker/action.yml"], False),
+        ("mesh-e2e-service-waypoint", ["src/proxy/mod.rs"], False),
+        ("mesh-e2e-service-waypoint", ["docs/mesh.md"], False),
+        ("mesh-e2e-service-waypoint", ["Cargo.lock"], False),
+        ("mesh-e2e-sidecar", ["tests/k8s/mesh_e2e_service_waypoint/run.sh"], False),
         ("mesh-e2e-sidecar", ["tests/k8s/mesh_e2e_sidecar/run.sh"], True),
         ("mesh-e2e-sidecar", ["tests/k8s/lib/native_probe_classify.py"], True),
         ("mesh-e2e-sidecar", ["tests/fixtures/k8s/istio_virtualservice_crd.yaml"], True),
