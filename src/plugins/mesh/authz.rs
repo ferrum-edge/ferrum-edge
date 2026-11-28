@@ -1603,9 +1603,15 @@ fn parse_node_waypoint_route_destination_workloads(
 /// (issue #7499). They govern those destinations' scopes like any policy,
 /// but never decide whether an unresolved SOURCE scope fails closed: without
 /// the grant they would not be loaded at all (review F4, round 5).
+#[derive(Default)]
+struct RouteDestinationPolicies {
+    by_index: HashMap<usize, (String, String)>,
+    by_key: HashSet<(String, String)>,
+}
+
 fn parse_node_waypoint_route_destination_policies(
     config: &Value,
-) -> Result<(HashMap<usize, (String, String)>, HashSet<(String, String)>), String> {
+) -> Result<RouteDestinationPolicies, String> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct PolicyRef {
@@ -1618,16 +1624,15 @@ fn parse_node_waypoint_route_destination_policies(
         Some(value) => {
             crate::util::json_object::from_json_object_vec_value::<PolicyRef>(value.clone())
                 .map(|refs| {
-                    let mut by_index = HashMap::new();
-                    let mut by_key = HashSet::new();
+                    let mut out = RouteDestinationPolicies::default();
                     for policy in refs {
                         if let Some(index) = policy.record_index {
-                            by_index.insert(index, (policy.namespace, policy.name));
+                            out.by_index.insert(index, (policy.namespace, policy.name));
                         } else {
-                            by_key.insert((policy.namespace, policy.name));
+                            out.by_key.insert((policy.namespace, policy.name));
                         }
                     }
-                    (by_index, by_key)
+                    out
                 })
                 .map_err(|error| {
                     format!(
@@ -1635,7 +1640,7 @@ fn parse_node_waypoint_route_destination_policies(
                     )
                 })
         }
-        None => Ok((HashMap::new(), HashSet::new())),
+        None => Ok(RouteDestinationPolicies::default()),
     }
 }
 
@@ -3245,12 +3250,11 @@ impl MeshAuthz {
         // destinations' scopes, but never the source-scope census: without the
         // grant they would not be loaded, and a grant changes only the routes
         // that name its target.
-        let (route_destination_policy_indices, route_destination_policy_keys) =
-            if per_pod_policy_scoping {
-                parse_node_waypoint_route_destination_policies(config)?
-            } else {
-                (HashMap::new(), HashSet::new())
-            };
+        let route_destination_policies = if per_pod_policy_scoping {
+            parse_node_waypoint_route_destination_policies(config)?
+        } else {
+            RouteDestinationPolicies::default()
+        };
         let route_destination_workloads = if per_pod_policy_scoping {
             parse_node_waypoint_route_destination_workloads(config)?
         } else {
@@ -3262,10 +3266,12 @@ impl MeshAuthz {
                 .iter()
                 .enumerate()
                 .filter(|(index, policy)| {
-                    let excluded_by_index = route_destination_policy_indices
+                    let excluded_by_index = route_destination_policies
+                        .by_index
                         .get(index)
                         .is_some_and(|(ns, name)| ns == &policy.namespace && name == &policy.name);
-                    let excluded_by_key = route_destination_policy_keys
+                    let excluded_by_key = route_destination_policies
+                        .by_key
                         .contains(&(policy.namespace.clone(), policy.name.clone()));
                     !excluded_by_index && !excluded_by_key
                 })
