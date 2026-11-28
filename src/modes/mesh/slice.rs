@@ -4068,17 +4068,21 @@ fn service_waypoint_http_route_set(
                 .any(|(service_namespace, _)| binding_owns_service(binding, service_namespace))
         },
         &|binding: &MeshVirtualServiceHttpRoutes, proxy: &Proxy| {
-            proxy.hosts.iter().any(|host| {
-                bound_hosts.iter().any(|(service_namespace, aliases)| {
-                    binding_owns_service(binding, service_namespace)
-                        && service_alias_names_host(
-                            aliases,
-                            service_namespace,
-                            &proxy.namespace,
-                            host,
-                        )
+            // Gateway API GAMMA routes (issue #7538 phase 1) are not served by
+            // ServiceWaypoint yet and must never enter a bound Service's L7
+            // partition or `virtual_service_route_count`.
+            !crate::modes::mesh::config::is_gamma_http_route_proxy_id(&proxy.id)
+                && proxy.hosts.iter().any(|host| {
+                    bound_hosts.iter().any(|(service_namespace, aliases)| {
+                        binding_owns_service(binding, service_namespace)
+                            && service_alias_names_host(
+                                aliases,
+                                service_namespace,
+                                &proxy.namespace,
+                                host,
+                            )
+                    })
                 })
-            })
         },
         &|proxy_namespace: &str, host: &str, _port: u16| {
             service_waypoint_route_destination_admitted(

@@ -209,6 +209,44 @@ fn gamma_routes_ride_the_sidecar_and_node_waypoint_slices_only() {
             "{topology:?} is not served GAMMA routes in this release"
         );
     }
+
+    // Even when the GAMMA parent and backend Services are explicitly bound to a
+    // ServiceWaypoint, the ServiceWaypoint projection must exclude GAMMA routes
+    // so they never enter L7 partitions or `virtual_service_route_count`.
+    let mut bound_config = config;
+    bound_config
+        .mesh
+        .as_mut()
+        .expect("mesh")
+        .waypoint_bindings
+        .push(ferrum_edge::modes::mesh::config::MeshWaypointBinding {
+            name: "waypoint-sw".to_string(),
+            namespace: DEFAULT_NAMESPACE.to_string(),
+            waypoint_for: "service".to_string(),
+            gateway_class_name: None,
+            services: vec![
+                ferrum_edge::modes::mesh::config::MeshWaypointServiceRef {
+                    namespace: DEFAULT_NAMESPACE.to_string(),
+                    name: "reviews".to_string(),
+                },
+                ferrum_edge::modes::mesh::config::MeshWaypointServiceRef {
+                    namespace: DEFAULT_NAMESPACE.to_string(),
+                    name: "ratings".to_string(),
+                },
+            ],
+        });
+    let mut sw_runtime = runtime_for_topology(MeshTopology::ServiceWaypoint);
+    sw_runtime.waypoint_name = Some("waypoint-sw".to_string());
+    let sw_slice = slice_for(&bound_config, &sw_runtime);
+    assert!(
+        !sw_slice.service_waypoint_bound_services.is_empty(),
+        "ServiceWaypoint binding projected bound Services"
+    );
+    assert!(
+        sw_slice.http_routes.is_empty(),
+        "bound ServiceWaypoint must exclude GAMMA routes from http_routes and attachments: {:?}",
+        sw_slice.http_routes
+    );
 }
 
 /// F1: the same snapshot handed to a gateway (non-mesh) data plane, or seen on
