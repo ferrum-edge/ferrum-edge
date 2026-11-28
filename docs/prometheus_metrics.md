@@ -60,10 +60,16 @@ Ferrum accepts exactly one enabled, process-global `prometheus_metrics` plugin. 
 | `ferrum_mesh_tcp_connections_closed_total` | counter | Mesh identity, protocol, response flags, security policy, namespace | Closed TCP connections. |
 | `ferrum_mesh_tcp_connections_opened_total` | counter | Mesh identity, protocol, response flags, security policy, namespace | Opened TCP connections. |
 | `ferrum_mesh_tcp_egress_connections_total` | counter | `transport`, `result`, `namespace` | Raw-TCP mesh egress relays by transport and outcome. |
+| `ferrum_mesh_mtls_tunnel_pool_active_streams` | gauge | `namespace` | Sidecar raw-TCP CONNECT streams currently multiplexed over pooled mesh-mTLS connections. Divide by `ferrum_connection_pool_entries{pool="mesh_mtls_tunnel"}` for streams per connection. |
+| `ferrum_mesh_mtls_tunnel_pool_connections_opened_total` | counter | `namespace` | Sidecar tunnel connections dialed. A rate close to the tunnel open rate means tunnels are not being multiplexed (short idle timeout, frequent SVID rotation, or a stream cap of 1). |
+| `ferrum_mesh_mtls_tunnel_pool_streams_total` | counter | `carrier`, `namespace` | Sidecar raw-TCP tunnels by `carrier="reused"` (an existing pooled connection) or `carrier="new"` (a connection dialed for the tunnel). |
+| `ferrum_mesh_mtls_tunnel_pool_saturation_waits_total` | counter | `result`, `namespace` | Tunnels that found every pooled connection at its stream cap with the pool at `FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST`; `result="timed_out"` closed the captured connection after the connect timeout. |
 | `ferrum_mesh_tcp_received_bytes_total` | counter | Mesh identity, protocol, response flags, security policy, namespace | Request bytes received client->backend on closed connections (Istio `TCP_RECEIVED_BYTES` semantics). |
 | `ferrum_mesh_tcp_sent_bytes_total` | counter | Mesh identity, protocol, response flags, security policy, namespace | Response bytes sent backend->client on closed connections (Istio `TCP_SENT_BYTES` semantics). |
 
 **Suggested alert:** `sum(rate(ferrum_mesh_tcp_egress_connections_total{result="failure"}[5m]))` above baseline. Investigate orig-dst capture, outbound registry admits, and HBONE/mTLS dial failures for stream-family ports.
+
+**Sidecar tunnel saturation:** a nonzero `rate(ferrum_mesh_mtls_tunnel_pool_saturation_waits_total{result="timed_out"}[5m])` means raw-TCP tunnels to one destination exceeded `maxConcurrentStreams × FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST`; raise either, or the destination's `connectTimeout` if the overflow is short-lived.
 
 ### Admin audit delivery
 
@@ -249,7 +255,7 @@ Everything except `ferrum_backend_retry_attempts_total`, `ferrum_frontend_tls_ha
 | Family | Type | Labels | Guidance |
 |--------|------|--------|----------|
 | `ferrum_backend_retry_attempts_total` | counter | `namespace` | Retries scheduled by the retry policy across every dispatch transport (HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket, raw TCP). Compare against `ferrum_requests_total` to measure retry amplification. |
-| `ferrum_connection_pool_entries` | gauge | `pool`, `namespace` | Resident entries per backend pool. `pool="http"` counts cached reqwest clients (one per distinct pool key); `grpc`, `http2`, `http3`, `hbone`, and `mesh_mtls` count resident multiplexed-connection entries. The scrape counts stored entries without a health filter; unhealthy and idle entries are screened at lookup and removed by cleanup, which can lag the scrape. |
+| `ferrum_connection_pool_entries` | gauge | `pool`, `namespace` | Resident entries per backend pool. `pool="http"` counts cached reqwest clients (one per distinct pool key); `grpc`, `http2`, `http3`, `hbone`, and `mesh_mtls` count resident multiplexed-connection entries, and `mesh_mtls_tunnel` counts the pooled Sidecar raw-TCP tunnel connections. The scrape counts stored entries without a health filter; unhealthy and idle entries are screened at lookup and removed by cleanup, which can lag the scrape. |
 | `ferrum_connection_pool_max_idle_per_host` | gauge | `namespace` | Configured idle ceiling per backend host for the reqwest pool. |
 | `ferrum_connection_pool_h1_idle_connections` | gauge | `namespace` | Idle connections in the direct HTTP/1.1 backend pool at scrape time. Bounded by each backend's recent peak concurrency, not by the idle ceiling. |
 | `ferrum_connection_pool_h1_connections_opened_total` | counter | `namespace` | Direct HTTP/1.1 backend dials, including fresh dials that replay an idle keep-alive race. Compare its rate with `ferrum_connection_pool_h1_connections_reused_total`: under steady load almost every checkout should reuse. |
@@ -640,6 +646,10 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_mesh_inbound_plaintext_allowed` | gauge | `gateway_namespace` | `mesh` | `documented_only` | `always` | 1 when the mesh inbound listener was allowed to come up without enforced mTLS (dev opt-out posture; production mode refuses this). 0 otherwise. |
 | `ferrum_mesh_metric_series_overflow_total` | counter | `family`, `gateway_namespace` | `mesh` | `documented_only` | `conditional` | Mesh metric series admissions dropped because the per-family live-series budget (prometheus_metrics.mesh_series_budget_per_family) was exhausted. The budget is shared by ordinary identity series and CEL-derived keys; overflow has fixed family labels only. |
 | `ferrum_mesh_mtls_handshake_failures_total` | counter | `reason`, `gateway_namespace` | `mesh` | `alert_and_dashboard` | `conditional` | Frontend mesh TLS/mTLS handshake failures. |
+| `ferrum_mesh_mtls_tunnel_pool_active_streams` | gauge | `namespace` | `mesh` | `documented_only` | `conditional` | Raw-TCP CONNECT streams open on pooled Sidecar mesh-mTLS tunnel connections, at scrape time. |
+| `ferrum_mesh_mtls_tunnel_pool_connections_opened_total` | counter | `namespace` | `mesh` | `documented_only` | `conditional` | SVID-mTLS HTTP/2 connections the Sidecar raw-TCP tunnel pool dialed. |
+| `ferrum_mesh_mtls_tunnel_pool_saturation_waits_total` | counter | `result`, `namespace` | `mesh` | `documented_only` | `conditional` | Sidecar raw-TCP tunnels that waited for a stream slot because every pooled connection was at its stream cap and the pool was at its connection limit, by outcome. |
+| `ferrum_mesh_mtls_tunnel_pool_streams_total` | counter | `carrier`, `namespace` | `mesh` | `documented_only` | `conditional` | Sidecar raw-TCP CONNECT tunnels opened, by whether they rode an already-pooled connection (reused) or one dialed for them (new). |
 | `ferrum_mesh_node_topology_degraded` | gauge | `reason`, `namespace` | `mesh` | `documented_only` | `conditional` | Node-agent detected missing eBPF prerequisites or a build without eBPF capture. 1 with a reason label means degraded, 0 with reason="none" means nominal. |
 | `ferrum_mesh_node_waypoint_asserted_identity_total` | counter | `result`, `reason`, `gateway_namespace` | `mesh_node_waypoint` | `dashboard` | `conditional` | Asserted source-identity decisions on inbound NodeWaypoint HBONE. Rejection reasons are compile-time-bounded; SPIFFE IDs never appear as labels. |
 | `ferrum_mesh_node_waypoint_capture_active_connections` | gauge | `gateway_namespace` | `mesh_node_waypoint` | `documented_only` | `conditional` | Captured inbound connections currently holding an admission permit. |

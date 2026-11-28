@@ -1,3 +1,8 @@
+// Pooled Sidecar raw-TCP egress through a real Ferrum destination relay
+// (issue #7537); a submodule so the `integration::mesh_hbone_tests` shard
+// filter runs it.
+mod sidecar_raw_tcp_pool;
+
 use crate::scaffolding::port_registry::TestSocket;
 
 use bytes::Bytes;

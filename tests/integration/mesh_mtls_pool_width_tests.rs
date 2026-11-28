@@ -12,6 +12,10 @@
 //! responses can be held back, so "pending requests" is a deterministic
 //! quantity rather than a race.
 
+// Pooled Sidecar raw-TCP tunnels (issue #7537) live in a submodule so the
+// existing `integration::mesh_mtls_pool_width_tests` shard filter runs them.
+mod tunnel_pool;
+
 use crate::scaffolding::port_registry::TestSocket;
 
 use arc_swap::ArcSwap;
