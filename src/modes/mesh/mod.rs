@@ -24,6 +24,7 @@ pub mod policy_deny_log;
 pub mod revision;
 pub mod runtime;
 pub mod runtime_overlay_consumers;
+pub mod service_waypoint_l7;
 pub mod slice;
 pub mod validate;
 
@@ -159,7 +160,7 @@ pub(crate) struct TrustedMeshGeneratedResourceIds {
 }
 
 impl TrustedMeshGeneratedResourceIds {
-    fn from_materialized_config(config: &GatewayConfig) -> Self {
+    pub(crate) fn from_materialized_config(config: &GatewayConfig) -> Self {
         let mut trusted = Self::default();
         for proxy in &config.proxies {
             if proxy.id.starts_with("__mesh") {
@@ -354,15 +355,24 @@ impl MeshTopology {
         matches!(self, Self::NodeWaypoint)
     }
 
-    /// Whether this topology serves the VirtualService `http[]` routes a mesh
-    /// slice carries (`MeshSlice::http_routes`, issues #7233 and #7423): the
-    /// NodeWaypoint capture listener and the Sidecar outbound capture
-    /// listener. Ambient is the L4 data plane and does no L7 routing (as in
-    /// Istio). ServiceWaypoint does not serve them yet: its control-plane
-    /// projection and data-plane materialization are tracked in issue #7500.
+    /// Whether this topology accepts and materializes the VirtualService
+    /// `http[]` routes a mesh slice carries (`MeshSlice::http_routes`, issues
+    /// #7233, #7423 and #7500): the NodeWaypoint capture listener, the
+    /// Sidecar outbound capture listener, and the ServiceWaypoint, which
+    /// rebinds its bound Services' routes onto their default L7 upstreams and
+    /// partitions them per bound Service (`service_waypoint_l7`). Ambient is
+    /// the L4 data plane and does no L7 routing (as in Istio).
+    ///
+    /// A ServiceWaypoint does not yet SERVE them: its only listener is the
+    /// inbound HBONE `:15008`, where `mesh_route_admitted_for_direction`
+    /// refuses every carried route, and HTTP termination inside an HBONE
+    /// tunnel is issue #7501.
     #[inline]
     pub(crate) fn serves_virtual_service_http_routes(self) -> bool {
-        matches!(self, Self::NodeWaypoint | Self::Sidecar)
+        matches!(
+            self,
+            Self::NodeWaypoint | Self::Sidecar | Self::ServiceWaypoint
+        )
     }
 
     /// Whether this topology asks the control plane for the VirtualService
@@ -371,6 +381,14 @@ impl MeshTopology {
     #[inline]
     fn requests_sidecar_http_routes(self) -> bool {
         matches!(self, Self::Sidecar)
+    }
+
+    /// Whether this topology asks the control plane for the VirtualService
+    /// `http[]` routes of the Services bound to it
+    /// (`MeshSliceRequest::service_waypoint_http_routes`, issue #7500).
+    #[inline]
+    fn requests_service_waypoint_http_routes(self) -> bool {
+        matches!(self, Self::ServiceWaypoint)
     }
 }
 
@@ -672,6 +690,23 @@ pub struct MeshRuntimeConfig {
 }
 
 impl MeshRuntimeConfig {
+    /// Whether this ServiceWaypoint holds a workload identity (a CA backend
+    /// or all three file SVID paths), so its default L7 upstreams (issue
+    /// #7500) must dial backing workloads over HBONE. Without one the mesh is
+    /// in the explicit no-CA development posture (a production-mode listener
+    /// that would serve without identity is refused at startup), and the
+    /// targets keep the plaintext shape.
+    fn service_waypoint_secured_transport_required(&self) -> bool {
+        self.topology == MeshTopology::ServiceWaypoint && self.has_workload_identity_source()
+    }
+
+    fn has_workload_identity_source(&self) -> bool {
+        self.ca_backend != CaBackend::None
+            || (self.workload_svid_cert_path.is_some()
+                && self.workload_svid_key_path.is_some()
+                && self.workload_svid_trust_bundle_path.is_some())
+    }
+
     fn node_waypoint_secured_transport_required(&self) -> bool {
         if self.topology != MeshTopology::NodeWaypoint {
             return false;
@@ -1037,6 +1072,7 @@ impl MeshRuntimeConfig {
             ambient_udp_source_scoping: self.topology.uses_ambient_udp_source_scoping(),
             node_waypoint_capture_scoping: self.topology.uses_node_waypoint_capture_scoping(),
             sidecar_http_routes: self.topology.requests_sidecar_http_routes(),
+            service_waypoint_http_routes: self.topology.requests_service_waypoint_http_routes(),
             labels: self.workload_labels.clone(),
             // Same `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` interval the xDS
             // client uses — the knob is protocol-agnostic failover/failback.
@@ -1090,6 +1126,7 @@ impl MeshRuntimeConfig {
             ambient_udp_source_scoping: self.topology.uses_ambient_udp_source_scoping(),
             node_waypoint_capture_scoping: self.topology.uses_node_waypoint_capture_scoping(),
             sidecar_http_routes: self.topology.requests_sidecar_http_routes(),
+            service_waypoint_http_routes: self.topology.requests_service_waypoint_http_routes(),
             stream_channel_capacity: self.xds_stream_channel_capacity,
             primary_retry_secs: self.xds_primary_retry_secs,
             connect_timeout_seconds: self.xds_connect_timeout_seconds,
@@ -1570,6 +1607,7 @@ impl MeshRuntimeConfig {
             ambient_udp_source_scoping: self.topology.uses_ambient_udp_source_scoping(),
             node_waypoint_capture_scoping: self.topology.uses_node_waypoint_capture_scoping(),
             sidecar_http_routes: self.topology.requests_sidecar_http_routes(),
+            service_waypoint_http_routes: self.topology.requests_service_waypoint_http_routes(),
         }
     }
 
@@ -1745,6 +1783,10 @@ fn prepare_normalized_gateway_config_for_mesh(
     // under the service-port key or dial-port key their dispatch path uses.
     // Topology-aware: Ambient emits HBONE routes; Sidecar emits SVID-mTLS routes.
     materialize_mesh_outbound_proxies(&mut config, runtime, mesh_slice);
+    // ServiceWaypoint (issue #7500): the bound Services' default L7 upstreams
+    // and routes, before the carried routes are rebound onto them.
+    let (service_waypoint_l7_bindings, service_waypoint_l7_inventory) =
+        materialize_service_waypoint_l7_routes(&mut config, runtime, mesh_slice);
     bind_carried_http_routes_to_node_waypoint_transport(&mut config, runtime, mesh_slice)?;
     // After rebinding, so each candidate names the destination route dispatch
     // actually selects (the Service port's upstream, not its DNS name).
@@ -1773,6 +1815,7 @@ fn prepare_normalized_gateway_config_for_mesh(
     // After DestinationRules and locality, so the route-scoped clones carry
     // the same projected policy as the Service upstreams they copy.
     clone_sidecar_carried_destination_upstreams(&mut config, runtime, mesh_slice);
+    clone_service_waypoint_authority_rewrite_upstreams(&mut config, &service_waypoint_l7_bindings);
     // Project slice-filtered ServiceEntries back into the prepared mesh
     // block so introspection consumers (admin diagnostics, projected-config
     // snapshots, future helpers) see the same `export_to` / sidecar-narrowed
@@ -2219,6 +2262,13 @@ fn prepare_normalized_gateway_config_for_mesh(
             matches!(runtime.topology, MeshTopology::Sidecar);
         mesh.inbound_relay_own_address_ports = own_address_ports;
         mesh.inbound_relay_node_local_registry = node_local_registry;
+        // The ServiceWaypoint L7 surface (issue #7500), assigned
+        // UNCONDITIONALLY like the relay inventory above: empty outside a
+        // ServiceWaypoint and without binding evidence, so an unbound Service
+        // leaves the target index and its route partition at once. Never
+        // derived from, and never feeding, `inbound_relay_destinations`.
+        mesh.service_waypoint_l7_bindings = service_waypoint_l7_bindings;
+        mesh.service_waypoint_l7_inventory = service_waypoint_l7_inventory;
     }
     materialize_fault_runtime_overlay(&mut config, &mesh_slice.runtime_overlay);
     materialize_transformer_runtime_overlay(&mut config, &mesh_slice.runtime_overlay);
@@ -2313,6 +2363,307 @@ fn service_waypoint_backing_workloads<'a>(
         }
     }
     backing
+}
+
+/// Materialize the default L7 surface of every HTTP-family port of a Service
+/// bound to this ServiceWaypoint (issue #7500), and return the records the
+/// router builds `ServiceWaypointL7TargetIndex` and the per-bound-Service
+/// route partitions from.
+///
+/// Per bound Service port: a default L7 upstream
+/// (`__mesh-sw-upstream-{ns}-{svc}-{port}`, named by the Service FQDN so
+/// DestinationRules apply, joined to the per-port owner map) holding the
+/// Service's local-cluster backing workloads, and a default L7 route
+/// (`__mesh-sw-service-{ns}-{svc}-{port}`) used when no carried VirtualService
+/// route matches. The carried routes are rebound onto these upstreams by
+/// `bind_carried_http_routes_to_node_waypoint_transport`.
+///
+/// Fail closed exactly like the inbound relay inventory
+/// (`service_waypoint_backing_workloads`): nothing unless this runtime's exact
+/// waypoint identity matches the slice and the slice carries bound-Service
+/// evidence; only the bound Services the slice still models; only backing
+/// workloads the Service's `workloads[]` authorizes and that are attached to
+/// it; never a remote-cluster workload (no plaintext cross-cluster pod dial).
+///
+/// Transport per backing workload: a workload with `node_waypoint` metadata is
+/// dialed over HBONE to its node's terminator with that SVID pinned; a Ferrum
+/// Sidecar workload (`Workload::mesh_transport` `sidecar_mtls`) over SVID-mTLS
+/// HTTP/2 to its `:15006` (or the configured egress mTLS port) with its SVID
+/// pinned and the Service authority and port stamped; any other workload over
+/// HBONE to its own `:15008` (or the configured egress HBONE port) with its
+/// SVID pinned. Only the explicit no-identity development
+/// posture keeps the plaintext target shape. A port whose workloads resolve no
+/// target (a named `targetPort` that does not resolve, say) materializes
+/// nothing and is not an L7 target.
+///
+/// These routes are never in the shared route tiers and never admitted by
+/// `mesh_route_admitted_for_direction`, so the HBONE `:15008` listener keeps
+/// its L4 relay behavior until HTTP termination inside the tunnel lands
+/// (issue #7501).
+fn materialize_service_waypoint_l7_routes(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+    mesh_slice: &MeshSlice,
+) -> (
+    Vec<service_waypoint_l7::ServiceWaypointL7Binding>,
+    service_waypoint_l7::ServiceWaypointL7Inventory,
+) {
+    use service_waypoint_l7::{
+        ServiceWaypointBoundService, ServiceWaypointL7Binding, ServiceWaypointL7Inventory,
+        ServiceWaypointL7Target, ServiceWaypointRouteAttachment, service_waypoint_l7_route_id,
+        service_waypoint_l7_upstream_id,
+    };
+
+    if runtime.topology != MeshTopology::ServiceWaypoint
+        || !service_waypoint_runtime_identity_matches(mesh_slice, runtime)
+        || mesh_slice.service_waypoint_bound_services.is_empty()
+    {
+        return (Vec::new(), ServiceWaypointL7Inventory::default());
+    }
+    // The full bound-Service inventory, reachable or not: host ownership for
+    // every partition reads it. And the routes the control plane attached to
+    // each bound Service (validated at decode).
+    let inventory = ServiceWaypointL7Inventory {
+        bound_services: mesh_slice
+            .service_waypoint_bound_services
+            .iter()
+            .map(|service| ServiceWaypointBoundService {
+                namespace: service.namespace.clone(),
+                service: service.name.clone(),
+                hosts: mesh_service_host_variants(
+                    &service.name,
+                    &service.namespace,
+                    &runtime.cluster_domain,
+                )
+                .iter()
+                .map(|host| host.trim().trim_end_matches('.').to_ascii_lowercase())
+                .collect(),
+            })
+            .collect(),
+        route_attachments: mesh_slice
+            .http_routes
+            .service_waypoint_attachments
+            .iter()
+            .map(|attachment| ServiceWaypointRouteAttachment {
+                route_namespace: attachment.proxy_namespace.clone(),
+                route_id: attachment.proxy_id.clone(),
+                service_namespace: attachment.service_namespace.clone(),
+                service_name: attachment.service_name.clone(),
+            })
+            .collect(),
+    };
+    let bound: BTreeSet<(&str, &str)> = mesh_slice
+        .service_waypoint_bound_services
+        .iter()
+        .map(|reference| (reference.namespace.as_str(), reference.name.as_str()))
+        .collect();
+    let secured = runtime.service_waypoint_secured_transport_required();
+    let multi_cluster = mesh_slice.multi_cluster.as_ref();
+    let now = crate::time_compat::UtcTimestamp::now();
+    let mut bindings = Vec::new();
+    let mut unreachable_ports = 0usize;
+    for service in &mesh_slice.services {
+        if !bound.contains(&(service.namespace.as_str(), service.name.as_str())) {
+            continue;
+        }
+        let backing: Vec<&crate::modes::mesh::config::Workload> = mesh_slice
+            .workloads
+            .iter()
+            .filter(|workload| {
+                !workload.remote_provenance
+                    && !crate::modes::mesh::multicluster::workload_is_remote(
+                        workload,
+                        multi_cluster,
+                    )
+                    && workload.attached_service_namespace() == service.namespace
+                    && workload.service_name == service.name
+                    && service
+                        .workloads
+                        .iter()
+                        .any(|reference| reference.spiffe_id == workload.spiffe_id)
+            })
+            .collect();
+        let host_variants =
+            mesh_service_host_variants(&service.name, &service.namespace, &runtime.cluster_domain);
+        let hosts: Vec<String> = host_variants
+            .iter()
+            .map(|host| host.trim().trim_end_matches('.').to_ascii_lowercase())
+            .collect();
+        let service_addresses: Vec<std::net::IpAddr> = service
+            .cluster_ips
+            .iter()
+            .filter_map(|address| address.parse::<std::net::IpAddr>().ok())
+            .map(|address| address.to_canonical())
+            .collect();
+        let service_fqdn = format!(
+            "{}.{}.svc.{}",
+            service.name,
+            service.namespace,
+            runtime.cluster_domain.trim_matches('.')
+        );
+        for service_port in service_http_family_ports(service) {
+            let protocol = service
+                .protocol_overrides
+                .get(&service_port.port)
+                .copied()
+                .unwrap_or(service_port.protocol);
+            let mut targets: Vec<UpstreamTarget> = Vec::new();
+            let mut backing_endpoints: Vec<(std::net::IpAddr, u16)> = Vec::new();
+            for workload in &backing {
+                // A declared `targetPort` that does not resolve skips the
+                // workload rather than dialing the Service port.
+                let Some(app_port) = service_port.backend_port_for(&workload.ports) else {
+                    continue;
+                };
+                let port_name = service_port.name.as_deref();
+                let sidecar_backend = workload.mesh_transport
+                    == Some(crate::modes::mesh::config::WorkloadMeshTransport::SidecarMtls);
+                let tags = if workload.node_waypoint.is_some() {
+                    crate::service_discovery::mesh::mesh_node_waypoint_target_tags(
+                        service, workload, protocol, port_name,
+                    )
+                } else if secured && sidecar_backend {
+                    // A Ferrum Sidecar backend: SVID-mTLS HTTP/2 to its
+                    // inbound listener, presenting the Service authority and
+                    // port so the destination Sidecar routes the request onto
+                    // its own inbound table (Section 1.4).
+                    let mut tags = crate::service_discovery::mesh::mesh_sidecar_mtls_target_tags(
+                        service, workload, protocol, port_name,
+                    );
+                    if runtime.egress_mtls_port
+                        != crate::proxy::mesh_mtls_pool::ISTIO_SIDECAR_INBOUND_PORT
+                    {
+                        tags.insert(
+                            crate::proxy::mesh_mtls_pool::MESH_MTLS_PORT_TAG.to_string(),
+                            runtime.egress_mtls_port.to_string(),
+                        );
+                    }
+                    tags.insert(
+                        crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_HOST_TAG.to_string(),
+                        format!("{}.{}.svc", service.name, service.namespace),
+                    );
+                    tags.insert(
+                        crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_PORT_TAG.to_string(),
+                        service_port.port.to_string(),
+                    );
+                    tags
+                } else if secured {
+                    let mut tags = crate::service_discovery::mesh::mesh_hbone_target_tags(
+                        service, workload, protocol, port_name,
+                    );
+                    if runtime.egress_hbone_port != hbone::ISTIO_HBONE_PORT {
+                        tags.insert(
+                            crate::proxy::hbone_pool::HBONE_PORT_TAG.to_string(),
+                            runtime.egress_hbone_port.to_string(),
+                        );
+                    }
+                    tags
+                } else {
+                    crate::service_discovery::mesh::mesh_node_waypoint_plaintext_target_tags(
+                        service, workload, protocol, port_name,
+                    )
+                };
+                for address in &workload.addresses {
+                    if let Ok(ip) = address.parse::<std::net::IpAddr>() {
+                        backing_endpoints.push((ip.to_canonical(), app_port));
+                    }
+                    targets.push(UpstreamTarget {
+                        host: address.clone(),
+                        port: app_port,
+                        service_port_policy_key: Some(service_port.port),
+                        weight: 1,
+                        tags: tags.clone(),
+                        locality: workload.locality.clone(),
+                        path: None,
+                    });
+                }
+            }
+            if targets.is_empty() {
+                unreachable_ports += 1;
+                bindings.push(ServiceWaypointL7Binding {
+                    target: ServiceWaypointL7Target {
+                        namespace: service.namespace.clone(),
+                        service: service.name.clone(),
+                        service_port: service_port.port,
+                    },
+                    route_id: None,
+                    upstream_id: None,
+                    hosts: hosts.clone(),
+                    service_addresses: service_addresses.clone(),
+                    backing_endpoints: Vec::new(),
+                });
+                continue;
+            }
+            backing_endpoints.sort();
+            backing_endpoints.dedup();
+            let upstream_id = service_waypoint_l7_upstream_id(
+                &service.namespace,
+                &service.name,
+                service_port.port,
+            );
+            let route_id =
+                service_waypoint_l7_route_id(&service.namespace, &service.name, service_port.port);
+            let upstream = mesh_outbound_route_upstream(
+                &upstream_id,
+                &service.namespace,
+                &service_fqdn,
+                targets,
+                service.uid.clone(),
+                now,
+            );
+            let mut proxy = mesh_outbound_route_proxy(
+                &route_id,
+                host_variants.clone(),
+                &service.namespace,
+                &upstream_id,
+                now,
+            );
+            proxy.name = Some(format!("mesh service waypoint {route_id}"));
+            proxy.backend_port = service_port.port;
+            proxy.allow_path_parameters = service.allow_path_parameters;
+            match config.upstreams.iter_mut().find(|existing| {
+                existing.namespace == upstream.namespace && existing.id == upstream.id
+            }) {
+                Some(existing) => *existing = upstream,
+                None => config.upstreams.push(upstream),
+            }
+            match config
+                .proxies
+                .iter_mut()
+                .find(|existing| existing.namespace == proxy.namespace && existing.id == proxy.id)
+            {
+                Some(existing) => *existing = proxy,
+                None => config.proxies.push(proxy),
+            }
+            bindings.push(ServiceWaypointL7Binding {
+                target: ServiceWaypointL7Target {
+                    namespace: service.namespace.clone(),
+                    service: service.name.clone(),
+                    service_port: service_port.port,
+                },
+                route_id: Some(route_id),
+                upstream_id: Some(upstream_id),
+                hosts: hosts.clone(),
+                service_addresses: service_addresses.clone(),
+                backing_endpoints,
+            });
+        }
+    }
+    if unreachable_ports > 0 {
+        debug!(
+            unreachable_ports,
+            "ServiceWaypoint bound Service HTTP ports with no reachable local-cluster backing \
+             workload materialize no L7 route"
+        );
+    }
+    if !bindings.is_empty() {
+        info!(
+            l7_service_ports = bindings.len(),
+            transport = if secured { "hbone" } else { "plaintext_dev" },
+            "Materialized ServiceWaypoint bound-Service L7 upstreams and default routes"
+        );
+    }
+    (bindings, inventory)
 }
 
 /// Whether this runtime is the ServiceWaypoint whose slice carried the
@@ -4341,10 +4692,36 @@ fn decode_http_route_set(
     }
     if !runtime.topology.serves_virtual_service_http_routes() {
         return Err(anyhow::anyhow!(
-            "Mesh slice carries VirtualService HTTP routes, which only a NodeWaypoint or a \
-             Sidecar serves"
+            "Mesh slice carries VirtualService HTTP routes, which only a NodeWaypoint, a \
+             Sidecar or a ServiceWaypoint serves"
         ));
     }
+    // The namespaces a carried record may live in. A ServiceWaypoint serves
+    // the routes of the Services bound to it (issue #7500), which live in the
+    // bound Services' own namespaces or in the waypoint's; the control plane
+    // projects none without binding evidence, so a carried set with none, or
+    // one built for another waypoint identity, is refused outright. Every
+    // other topology carries only its own namespace's routes.
+    let carried_namespaces: BTreeSet<&str> = if runtime.topology == MeshTopology::ServiceWaypoint {
+        if !service_waypoint_runtime_identity_matches(slice, runtime)
+            || slice.service_waypoint_bound_services.is_empty()
+        {
+            return Err(anyhow::anyhow!(
+                "Mesh slice carries VirtualService HTTP routes for a ServiceWaypoint without \
+                 binding evidence for this waypoint"
+            ));
+        }
+        std::iter::once(slice.namespace.as_str())
+            .chain(
+                slice
+                    .service_waypoint_bound_services
+                    .iter()
+                    .map(|service| service.namespace.as_str()),
+            )
+            .collect()
+    } else {
+        std::iter::once(slice.namespace.as_str()).collect()
+    };
     let proxies: Vec<Proxy> = set
         .proxies
         .iter()
@@ -4352,7 +4729,7 @@ fn decode_http_route_set(
         .map(|(index, value)| {
             let proxy: Proxy = crate::util::json_object::from_json_object_value(value.clone())
                 .map_err(|_| anyhow::anyhow!("Mesh slice HTTP route proxy {index} is malformed"))?;
-            if proxy.namespace != slice.namespace
+            if !carried_namespaces.contains(proxy.namespace.as_str())
                 || !config::is_virtual_service_http_route_proxy_id(&proxy.id)
                 || proxy.dispatch_kind.is_stream()
                 || proxy
@@ -4375,14 +4752,15 @@ fn decode_http_route_set(
                 crate::util::json_object::from_json_object_value(value.clone()).map_err(|_| {
                     anyhow::anyhow!("Mesh slice HTTP route plugin config {index} is malformed")
                 })?;
-            let owned = plugin.namespace == slice.namespace
+            let owned = carried_namespaces.contains(plugin.namespace.as_str())
                 && plugin
                     .id
                     .starts_with(slice::VIRTUAL_SERVICE_HTTP_ROUTE_PROXY_PLUGIN_PREFIX)
-                && plugin
-                    .proxy_id
-                    .as_deref()
-                    .is_some_and(|proxy_id| proxies.iter().any(|proxy| proxy.id == proxy_id));
+                && plugin.proxy_id.as_deref().is_some_and(|proxy_id| {
+                    proxies
+                        .iter()
+                        .any(|proxy| proxy.id == proxy_id && proxy.namespace == plugin.namespace)
+                });
             if !owned {
                 return Err(anyhow::anyhow!(
                     "Mesh slice HTTP route plugin config {index} has invalid ownership"
@@ -4430,7 +4808,7 @@ fn decode_http_route_set(
                 crate::util::json_object::from_json_object_value(value.clone()).map_err(|_| {
                     anyhow::anyhow!("Mesh slice HTTP route upstream {index} is malformed")
                 })?;
-            if upstream.namespace != slice.namespace
+            if !carried_namespaces.contains(upstream.namespace.as_str())
                 || !upstream
                     .id
                     .starts_with(slice::VIRTUAL_SERVICE_HTTP_ROUTE_UPSTREAM_ID_PREFIX)
@@ -4444,32 +4822,82 @@ fn decode_http_route_set(
         })
         .collect::<Result<_, _>>()?;
     // Every carried record is a namespaced resource whose id must be unique
-    // within its kind (all share the slice namespace). Two records with one id
-    // would make every later id-keyed step act on the wrong one or on both:
+    // within its kind and namespace. Two records with one `(namespace, id)`
+    // would make every later key-based step act on the wrong one or on both:
     // the route binding finds and rebinds only the first split upstream while
     // the load balancer keeps the last, Sidecar refusal and instance
-    // detachment remove every record of an id, and the route index keeps one
-    // proxy. Refused here, before any binding or filtering, for all three
-    // kinds.
-    refuse_duplicate_carried_ids("proxy", proxies.iter().map(|proxy| proxy.id.as_str()))?;
+    // detachment remove every record of the key, and the route index keeps
+    // one proxy. Refused here, before any binding or filtering, for all three
+    // kinds. The same id in two namespaces is two resources (a ServiceWaypoint
+    // carries several bound Services' namespaces, issue #7500, and the
+    // translator can derive one id in two namespaces), never a collision.
+    refuse_duplicate_carried_ids(
+        "proxy",
+        proxies
+            .iter()
+            .map(|proxy| (proxy.namespace.as_str(), proxy.id.as_str())),
+    )?;
     refuse_duplicate_carried_ids(
         "plugin config",
-        plugin_configs.iter().map(|plugin| plugin.id.as_str()),
+        plugin_configs
+            .iter()
+            .map(|plugin| (plugin.namespace.as_str(), plugin.id.as_str())),
     )?;
     refuse_duplicate_carried_ids(
         "upstream",
-        upstreams.iter().map(|upstream| upstream.id.as_str()),
+        upstreams
+            .iter()
+            .map(|upstream| (upstream.namespace.as_str(), upstream.id.as_str())),
     )?;
+    // ServiceWaypoint route attachments (issue #7500): only a ServiceWaypoint
+    // carries them, within the bound, and each names a carried route and a
+    // Service this waypoint is bound to.
+    let attachments = &set.service_waypoint_attachments;
+    if !attachments.is_empty() {
+        if runtime.topology != MeshTopology::ServiceWaypoint {
+            return Err(anyhow::anyhow!(
+                "Mesh slice carries ServiceWaypoint route attachments on another topology"
+            ));
+        }
+        if attachments.len() > slice::MAX_SERVICE_WAYPOINT_ROUTE_ATTACHMENTS {
+            return Err(anyhow::anyhow!(
+                "Mesh slice carries more than {} ServiceWaypoint route attachments",
+                slice::MAX_SERVICE_WAYPOINT_ROUTE_ATTACHMENTS
+            ));
+        }
+        let bound: BTreeSet<(&str, &str)> = slice
+            .service_waypoint_bound_services
+            .iter()
+            .map(|service| (service.namespace.as_str(), service.name.as_str()))
+            .collect();
+        for (index, attachment) in attachments.iter().enumerate() {
+            let route_carried = proxies.iter().any(|proxy| {
+                proxy.namespace == attachment.proxy_namespace && proxy.id == attachment.proxy_id
+            });
+            let service_bound = bound.contains(&(
+                attachment.service_namespace.as_str(),
+                attachment.service_name.as_str(),
+            ));
+            if !route_carried || !service_bound {
+                return Err(anyhow::anyhow!(
+                    "Mesh slice ServiceWaypoint route attachment {index} names a route the slice \
+                     does not carry or a Service this waypoint is not bound to"
+                ));
+            }
+        }
+    }
 
-    let carried_upstreams: BTreeSet<&str> = upstreams
+    // Keyed by (namespace, id): a reference resolves in its own namespace.
+    let carried_upstreams: BTreeSet<(&str, &str)> = upstreams
         .iter()
-        .map(|upstream| upstream.id.as_str())
+        .map(|upstream| (upstream.namespace.as_str(), upstream.id.as_str()))
         .collect();
-    let mut referenced_upstreams: BTreeSet<&str> = BTreeSet::new();
+    let mut referenced_upstreams: BTreeSet<(&str, &str)> = BTreeSet::new();
     for (index, proxy) in proxies.iter().enumerate() {
         for association in &proxy.plugins {
             let resolves = plugin_configs.iter().any(|plugin| {
                 plugin.id == association.plugin_config_id
+                    && plugin.namespace == proxy.namespace
                     && plugin.proxy_id.as_deref() == Some(proxy.id.as_str())
             });
             if !resolves {
@@ -4479,7 +4907,12 @@ fn decode_http_route_set(
                 ));
             }
         }
-        referenced_upstreams.extend(proxy.upstream_id.as_deref());
+        referenced_upstreams.extend(
+            proxy
+                .upstream_id
+                .as_deref()
+                .map(|upstream_id| (proxy.namespace.as_str(), upstream_id)),
+        );
     }
     // EVERY carried route plugin-config record, whatever its `plugin_name`,
     // must be one of the kinds the translator attaches to a route, with that
@@ -4516,8 +4949,11 @@ fn decode_http_route_set(
     }
     for plugin in &plugin_configs {
         if plugin.plugin_name == "mesh_route_dispatch" {
-            referenced_upstreams
-                .extend(slice::mesh_route_dispatch_rule_upstream_ids(&plugin.config));
+            referenced_upstreams.extend(
+                slice::mesh_route_dispatch_rule_upstream_ids(&plugin.config)
+                    .into_iter()
+                    .map(|upstream_id| (plugin.namespace.as_str(), upstream_id)),
+            );
         }
     }
     if referenced_upstreams != carried_upstreams {
@@ -4599,7 +5035,7 @@ fn carried_route_plugin_record_is_translator_shaped(
         labels,
         id,
         plugin_name,
-        namespace: _,
+        namespace,
         config: _,
         scope,
         proxy_id,
@@ -4630,6 +5066,7 @@ fn carried_route_plugin_record_is_translator_shaped(
     }
     let associated = proxies.iter().any(|proxy| {
         proxy.id == proxy_id
+            && proxy.namespace == *namespace
             && proxy
                 .plugins
                 .iter()
@@ -4832,9 +5269,9 @@ fn carried_route_plugin_body_constructs(plugin_name: &str, config: &serde_json::
 /// The diagnostic names the record by ordinal and never echoes the id.
 fn refuse_duplicate_carried_ids<'a>(
     kind: &str,
-    ids: impl Iterator<Item = &'a str>,
+    ids: impl Iterator<Item = (&'a str, &'a str)>,
 ) -> Result<(), anyhow::Error> {
-    let mut seen: HashSet<&str> = HashSet::new();
+    let mut seen: HashSet<(&str, &str)> = HashSet::new();
     for (index, id) in ids.enumerate() {
         if !seen.insert(id) {
             return Err(anyhow::anyhow!(
@@ -5089,15 +5526,39 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
     } else {
         Vec::new()
     };
-    // The materialized upstream for a modeled Service port, if any.
+    // The materialized upstream for a modeled Service port, if any. A
+    // ServiceWaypoint rebinds onto its bound Services' default L7 upstreams
+    // (`materialize_service_waypoint_l7_routes`, issue #7500); a Service it is
+    // not bound to has none, so a route naming one is refused.
+    let service_waypoint = runtime.topology == MeshTopology::ServiceWaypoint;
     let service_upstream = |config: &GatewayConfig, namespace: &str, name: &str, port: u16| {
-        let id = mesh_outbound_upstream_id(namespace, name, port);
+        let id = if service_waypoint {
+            service_waypoint_l7::service_waypoint_l7_upstream_id(namespace, name, port)
+        } else {
+            mesh_outbound_upstream_id(namespace, name, port)
+        };
         config
             .upstreams
             .iter()
             .any(|upstream| upstream.namespace == namespace && upstream.id == id)
             .then_some(id)
     };
+
+    // Whether a bound Service port's materialized upstream dials any backing
+    // workload over Sidecar mTLS (the transport that routes by `:authority`).
+    let service_upstream_dials_sidecar_mtls =
+        |config: &GatewayConfig, namespace: &str, name: &str, port: u16| {
+            service_upstream(config, namespace, name, port).is_some_and(|id| {
+                config.upstreams.iter().any(|upstream| {
+                    upstream.namespace == namespace
+                        && upstream.id == id
+                        && upstream
+                            .targets
+                            .iter()
+                            .any(crate::proxy::mesh_mtls_pool::target_mesh_mtls_enabled)
+                })
+            })
+        };
 
     // 1. Weighted splits. Each leg is resolved to its dial targets first, then
     // ONE scale is applied to every leg (external legs included) so the
@@ -5123,6 +5584,9 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
     // Service in another namespace: every one refuses its route (issue
     // #7499; the VirtualService status reports them).
     let mut cross_namespace_refused = 0usize;
+    // Routes refused for naming an in-cluster Service this data plane does not
+    // model (no materialized Service upstream for it).
+    let mut unmodeled_service_refused = 0usize;
     for (namespace, id) in split_ids {
         let Some(split) = config
             .upstreams
@@ -5157,7 +5621,10 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                     legs.push((target.weight, vec![target.clone()]));
                     external_targets.push(target.clone());
                 }
-                CarriedRouteHost::UnmodeledService => rebound = false,
+                CarriedRouteHost::UnmodeledService => {
+                    unmodeled_service_refused += 1;
+                    rebound = false;
+                }
                 // A leg is dispatched through a namespace-local reference
                 // (the split's own targets, or a route override naming the
                 // Service upstream), so a Service in another namespace is
@@ -5243,7 +5710,13 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
             failed_splits.insert((namespace, id));
             continue;
         }
-        if governed_by_destination_rule {
+        // A ServiceWaypoint (issue #7501) dispatches EVERY split leg by leg:
+        // its inner requests are authorized per destination, so each leg
+        // must be judged on its own Service's policies and port. A flattened
+        // split would be authorized as one merged destination, where a DENY
+        // scoped to one leg's Service refuses every leg and a port-specific
+        // rule has no single port to read.
+        if governed_by_destination_rule || service_waypoint {
             let first_external = external_targets.first().cloned();
             match weighted_split_legs(config, split, service_legs, external_targets) {
                 Some((split_legs, residuals)) => {
@@ -5388,7 +5861,10 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                         }
                         candidates.insert(format!("{backend_host}|{backend_port}"));
                     }
-                    CarriedRouteHost::UnmodeledService => keep = false,
+                    CarriedRouteHost::UnmodeledService => {
+                        unmodeled_service_refused += 1;
+                        keep = false;
+                    }
                     // A Service upstream lives in its own namespace while the
                     // route and its references resolve in the route's, so a
                     // cross-namespace destination would leave a dangling
@@ -5411,7 +5887,10 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                                 candidates.insert(id.clone());
                                 proxy_upstream = Some(id);
                             }
-                            None => keep = false,
+                            None => {
+                                unmodeled_service_refused += 1;
+                                keep = false;
+                            }
                         }
                     }
                 }
@@ -5449,8 +5928,11 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                 };
                 // Sidecar: an explicit `rewrite.authority` is forwarded as the
                 // `:authority` the destination Sidecar routes by, so it must
-                // name the selected destination Service (checked below).
-                let rewrite_authority = sidecar
+                // name the selected destination Service (checked below). A
+                // ServiceWaypoint (issue #7501) applies the same rule to a
+                // destination it dials over Sidecar mTLS; one it dials over
+                // HBONE forwards the rewritten `Host` to the application.
+                let rewrite_authority = (sidecar || service_waypoint)
                     .then(|| {
                         rule.get("rewrite")
                             .and_then(|rewrite| rewrite.get("authority"))
@@ -5507,7 +5989,10 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                         }
                         candidates.insert(format!("{host}|{port}"));
                     }
-                    CarriedRouteHost::UnmodeledService => keep = false,
+                    CarriedRouteHost::UnmodeledService => {
+                        unmodeled_service_refused += 1;
+                        keep = false;
+                    }
                     CarriedRouteHost::Service(service_namespace, _)
                         if service_namespace != namespace =>
                     {
@@ -5516,6 +6001,13 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                     }
                     CarriedRouteHost::Service(service_namespace, service_name) => {
                         if let Some(authority) = rewrite_authority
+                            && (sidecar
+                                || service_upstream_dials_sidecar_mtls(
+                                    config,
+                                    &service_namespace,
+                                    &service_name,
+                                    port,
+                                ))
                             && !authority_names_service(
                                 authority,
                                 &service_namespace,
@@ -5534,10 +6026,36 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                         }
                         match service_upstream(config, &service_namespace, &service_name, port) {
                             Some(id) => {
+                                // ServiceWaypoint (issue #7501): an admitted
+                                // authority rewrite to a Service reached over
+                                // Sidecar mTLS dials a tag-free clone of its
+                                // upstream (created after DestinationRules,
+                                // `clone_service_waypoint_authority_rewrite_upstreams`),
+                                // so the rewritten authority is forwarded
+                                // instead of the stamped Service authority.
+                                let id = if service_waypoint
+                                    && rewrite_authority.is_some()
+                                    && service_upstream_dials_sidecar_mtls(
+                                        config,
+                                        &service_namespace,
+                                        &service_name,
+                                        port,
+                                    ) {
+                                    service_waypoint_l7::service_waypoint_l7_rewrite_upstream_id(
+                                        &service_namespace,
+                                        &service_name,
+                                        port,
+                                    )
+                                } else {
+                                    id
+                                };
                                 candidates.insert(id.clone());
                                 rule_rewrites.push((plugin_index, rule_index, id));
                             }
-                            None => keep = false,
+                            None => {
+                                unmodeled_service_refused += 1;
+                                keep = false;
+                            }
                         }
                     }
                 }
@@ -5676,9 +6194,34 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
             }
         }
     }
+    if runtime.topology == MeshTopology::ServiceWaypoint {
+        // Issue #7501: the ServiceWaypoint refusal family counts each refusal
+        // this preparation made (a refused route is refused again on every
+        // slice apply until its configuration changes).
+        use crate::proxy::service_waypoint_l7_proxy::{
+            ServiceWaypointRouteRefusal, record_route_refusals,
+        };
+        record_route_refusals(
+            ServiceWaypointRouteRefusal::CrossNamespaceRefused,
+            cross_namespace_refused as u64,
+        );
+        record_route_refusals(
+            ServiceWaypointRouteRefusal::UnmodeledService,
+            unmodeled_service_refused as u64,
+        );
+        record_route_refusals(
+            ServiceWaypointRouteRefusal::AuthorityRewriteRefused,
+            authority_rewrite_refused as u64,
+        );
+        record_route_refusals(
+            ServiceWaypointRouteRefusal::UnrepresentableSplit,
+            (unrepresentable_splits + oversized_weighted_routes) as u64,
+        );
+    }
     if !dropped.is_empty() {
         warn!(
             routes = dropped.len(),
+            unmodeled_service_refused,
             unrepresentable_weighted_splits = unrepresentable_splits,
             oversized_weighted_routes,
             tls_origination_refused,
@@ -6029,6 +6572,88 @@ fn clone_sidecar_carried_destination_upstreams(
     }
 }
 
+/// Create the tag-free clones of ServiceWaypoint bound-Service upstreams that
+/// authority-rewriting carried rules dial (issue #7501), after
+/// DestinationRules and locality, so each clone carries the same projected
+/// policy as the upstream it copies.
+///
+/// A ServiceWaypoint's Sidecar targets permanently carry the destination
+/// Service authority (`MESH_MTLS_AUTHORITY_HOST_TAG` / `_PORT_TAG`), which
+/// Sidecar dispatch presents in place of the request's own authority, so the
+/// destination Sidecar routes ordinary requests onto its inbound table. A rule
+/// with `rewrite.authority` must forward the rewritten authority instead: the
+/// binding admits it only when the rewrite names the selected Service in a
+/// form its Sidecar routes, and points the rule at
+/// [`service_waypoint_l7::service_waypoint_l7_rewrite_upstream_id`]. That
+/// clone has the same targets with no authority tags, and the Service
+/// upstream's admission identity, so the destination's request lanes are
+/// shared. Plain destinations and HBONE-only upstreams are left unchanged.
+/// Identities are read forward from the generation's bindings, never parsed
+/// from ids.
+fn clone_service_waypoint_authority_rewrite_upstreams(
+    config: &mut GatewayConfig,
+    bindings: &[service_waypoint_l7::ServiceWaypointL7Binding],
+) {
+    let referenced: HashSet<(String, String)> = config
+        .plugin_configs
+        .iter()
+        .filter(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+        .flat_map(|plugin| {
+            plugin
+                .config
+                .get("rules")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|rule| {
+                    rule.get("destination")
+                        .and_then(|destination| destination.get("upstream_id"))
+                        .and_then(serde_json::Value::as_str)
+                })
+                .map(|id| (plugin.namespace.clone(), id.to_string()))
+        })
+        .collect();
+    for binding in bindings {
+        let Some(upstream_id) = binding.upstream_id.as_deref() else {
+            continue;
+        };
+        let clone_id = service_waypoint_l7::service_waypoint_l7_rewrite_upstream_id(
+            &binding.target.namespace,
+            &binding.target.service,
+            binding.target.service_port,
+        );
+        let namespace = &binding.target.namespace;
+        if !referenced.contains(&(namespace.clone(), clone_id.clone()))
+            || config
+                .upstreams
+                .iter()
+                .any(|upstream| &upstream.namespace == namespace && upstream.id == clone_id)
+        {
+            continue;
+        }
+        let Some(service_upstream) = config
+            .upstreams
+            .iter()
+            .find(|upstream| &upstream.namespace == namespace && upstream.id == upstream_id)
+        else {
+            continue;
+        };
+        let mut clone = service_upstream.clone();
+        clone.id = clone_id.clone();
+        clone.name = Some(clone_id);
+        clone.admission_upstream_id = Some(upstream_id.to_string());
+        for target in &mut clone.targets {
+            target
+                .tags
+                .remove(crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_HOST_TAG);
+            target
+                .tags
+                .remove(crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_PORT_TAG);
+        }
+        config.upstreams.push(clone);
+    }
+}
+
 /// Resolve `match.source_namespace` on the carried VirtualService routes a
 /// Sidecar serves (issue #7423).
 ///
@@ -6303,7 +6928,13 @@ fn thread_node_waypoint_route_branches_to_authz(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
 ) {
-    if runtime.topology != MeshTopology::NodeWaypoint {
+    // A ServiceWaypoint terminates the bound Services' carried routes at L7
+    // inside its HBONE tunnels (issue #7501) and judges every branch and leg
+    // on its own destination exactly as a NodeWaypoint does.
+    if !matches!(
+        runtime.topology,
+        MeshTopology::NodeWaypoint | MeshTopology::ServiceWaypoint
+    ) {
         return;
     }
     let route_dispatch_rules: HashMap<(&str, &str), &serde_json::Value> = config
@@ -8009,6 +8640,18 @@ pub(crate) fn mesh_route_admitted_for_direction(
     id: &str,
     request_direction: Option<MeshTrafficDirection>,
 ) -> bool {
+    // A ServiceWaypoint default L7 Service route (issue #7500) is served only
+    // through its bound Service's route partition, after HTTP termination
+    // inside an admitted HBONE tunnel (issue #7501,
+    // `ServiceWaypointL7RoutePartition::resolve`), which never consults this
+    // predicate. No listener's shared route lookup may serve it: on the
+    // `:15008` listener a direct request would otherwise reach the bound
+    // Service's workloads outside the CONNECT admission path. The same holds
+    // for carried `istio-vs-*` routes below: the partition serves them inside
+    // a tunnel, and every direct inbound listener keeps refusing them.
+    if service_waypoint_l7::is_service_waypoint_l7_route_id(id) {
+        return false;
+    }
     match mesh_route_direction(id) {
         Some(route_direction) => request_direction == Some(route_direction),
         None => {
@@ -12884,6 +13527,26 @@ fn mesh_outbound_route_proxy(
     }
 }
 
+/// Policy-only proxy carrier for an unbacked ServiceWaypoint bound Service HTTP
+/// port (never added to `GatewayConfig::proxies` and never dispatched): carries
+/// the bound Service identity for PeerAuthentication posture checks and tunnel
+/// idle-timeout resolution when the Service has no backing workloads.
+pub(crate) fn service_waypoint_unbacked_policy_proxy(
+    target: &service_waypoint_l7::ServiceWaypointL7Target,
+) -> Proxy {
+    let route_id = service_waypoint_l7::service_waypoint_l7_route_id(
+        &target.namespace,
+        &target.service,
+        target.service_port,
+    );
+    let now = crate::time_compat::UtcTimestamp::now();
+    let mut proxy = mesh_outbound_route_proxy(&route_id, Vec::new(), &target.namespace, "", now);
+    proxy.name = Some(format!("mesh service waypoint {route_id}"));
+    proxy.backend_port = target.service_port;
+    proxy.upstream_id = None;
+    proxy
+}
+
 fn mesh_outbound_http_bywl_route_proxy(
     spec: &MeshHttpBywlUpstreamSpec<'_>,
     now: crate::time_compat::UtcTimestamp,
@@ -13224,14 +13887,29 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
         .flat_map(|svc| {
             service_http_family_ports(svc)
                 .into_iter()
-                .map(|sp| {
-                    (
-                        NamespacedResourceId::new(
-                            svc.namespace.as_str(),
-                            mesh_outbound_upstream_id(&svc.namespace, &svc.name, sp.port),
+                .flat_map(|sp| {
+                    // A ServiceWaypoint's default L7 Service upstreams (issue
+                    // #7500) are per-port Service upstreams too.
+                    [
+                        (
+                            NamespacedResourceId::new(
+                                svc.namespace.as_str(),
+                                mesh_outbound_upstream_id(&svc.namespace, &svc.name, sp.port),
+                            ),
+                            sp.port,
                         ),
-                        sp.port,
-                    )
+                        (
+                            NamespacedResourceId::new(
+                                svc.namespace.as_str(),
+                                service_waypoint_l7::service_waypoint_l7_upstream_id(
+                                    &svc.namespace,
+                                    &svc.name,
+                                    sp.port,
+                                ),
+                            ),
+                            sp.port,
+                        ),
+                    ]
                 })
                 .chain(service_tcp_stream_ports(svc).into_iter().map(|sp| {
                     (
@@ -16999,7 +17677,13 @@ fn inject_mesh_global_plugins(
     {
         embedded.remove("http_routes");
     }
-    if runtime.topology == MeshTopology::NodeWaypoint {
+    // Both waypoints serve carried VirtualService routes (NodeWaypoint since
+    // #7233, ServiceWaypoint since #7501), so both resolve route upstreams to
+    // destination workloads.
+    if matches!(
+        runtime.topology,
+        MeshTopology::NodeWaypoint | MeshTopology::ServiceWaypoint
+    ) {
         mesh_authz_config["cluster_domains"] =
             serde_json::json!(node_waypoint_authz_cluster_domains(&runtime.cluster_domain));
         mesh_authz_config["node_waypoint_route_upstreams"] =
@@ -17707,8 +18391,14 @@ fn scope_request_auth_to_node_waypoint_destinations(
                 .starts_with(MESH_REQUEST_AUTH_DESTINATION_PLUGIN_ID_PREFIX)
         });
     }
-    if runtime.topology != MeshTopology::NodeWaypoint
-        || mesh_slice.request_authentications.is_empty()
+    // ServiceWaypoint (issue #7501): the bound Services' default L7 routes and
+    // carried routes are terminated at L7 inside the HBONE tunnel, so their
+    // JWTs are validated against the DESTINATION's resources exactly like a
+    // NodeWaypoint's routes.
+    if !matches!(
+        runtime.topology,
+        MeshTopology::NodeWaypoint | MeshTopology::ServiceWaypoint
+    ) || mesh_slice.request_authentications.is_empty()
     {
         return Vec::new();
     }
@@ -17763,7 +18453,10 @@ fn scope_request_auth_to_node_waypoint_destinations(
     // exist, a route that reaches a modeled destination this index cannot
     // resolve cannot be shown to be outside them.
     let carries_destination_resources = (0..resources.len()).any(|index| !own.contains(&index));
-    let secured_transport = runtime.node_waypoint_secured_transport_required();
+    // Only a secured NodeWaypoint dials through node-waypoint metadata; a
+    // ServiceWaypoint dials every local backing workload.
+    let secured_transport = runtime.topology == MeshTopology::NodeWaypoint
+        && runtime.node_waypoint_secured_transport_required();
     // The workloads each mesh Service upstream can actually dial, keyed by
     // `(namespace, id)` and derived with the same rules as
     // `build_outbound_mesh_targets`: the Service's LOCAL members, with a
@@ -17784,7 +18477,7 @@ fn scope_request_auth_to_node_waypoint_destinations(
             continue;
         }
         for port in &service.ports {
-            let dialable = local
+            let dialable: Vec<&config::Workload> = local
                 .iter()
                 .copied()
                 .filter(|workload| {
@@ -17793,6 +18486,31 @@ fn scope_request_auth_to_node_waypoint_destinations(
                         && port.backend_port_for(&workload.ports).is_some()
                 })
                 .collect();
+            // The ServiceWaypoint default L7 upstream of the same Service
+            // port dials exactly the same workloads.
+            dialable_upstream_workloads.insert(
+                (
+                    service.namespace.as_str(),
+                    service_waypoint_l7::service_waypoint_l7_upstream_id(
+                        &service.namespace,
+                        &service.name,
+                        port.port,
+                    ),
+                ),
+                Vec::clone(&dialable),
+            );
+            // And so does its authority-rewrite clone (issue #7501).
+            dialable_upstream_workloads.insert(
+                (
+                    service.namespace.as_str(),
+                    service_waypoint_l7::service_waypoint_l7_rewrite_upstream_id(
+                        &service.namespace,
+                        &service.name,
+                        port.port,
+                    ),
+                ),
+                Vec::clone(&dialable),
+            );
             dialable_upstream_workloads.insert(
                 (
                     service.namespace.as_str(),
@@ -17942,7 +18660,12 @@ fn scope_request_auth_to_node_waypoint_destinations(
         };
         for (upstream_id, backend_host, backend_port) in destinations {
             if let Some(dialable) = upstream_id
-                .filter(|id| id.starts_with(MESH_OUTBOUND_UPSTREAM_ID_PREFIX))
+                .filter(|id| {
+                    id.starts_with(MESH_OUTBOUND_UPSTREAM_ID_PREFIX)
+                        || id.starts_with(
+                            service_waypoint_l7::SERVICE_WAYPOINT_L7_UPSTREAM_ID_PREFIX,
+                        )
+                })
                 .and_then(|id| {
                     dialable_upstream_workloads.get(&(proxy.namespace.as_str(), id.to_string()))
                 })
@@ -17963,8 +18686,12 @@ fn scope_request_auth_to_node_waypoint_destinations(
                 // above, so a missing one here has none locally.
                 unresolved_modeled |=
                     index.target_requires_scope(&proxy.namespace, upstream_id, backend_host)
-                        && upstream_id
-                            .is_none_or(|id| !id.starts_with(MESH_OUTBOUND_UPSTREAM_ID_PREFIX));
+                        && upstream_id.is_none_or(|id| {
+                            !id.starts_with(MESH_OUTBOUND_UPSTREAM_ID_PREFIX)
+                                && !id.starts_with(
+                                    service_waypoint_l7::SERVICE_WAYPOINT_L7_UPSTREAM_ID_PREFIX,
+                                )
+                        });
                 admit(own.clone());
                 continue;
             };
@@ -18626,6 +19353,11 @@ pub async fn run(
     // monotonic across reload/SVID rotation; enabling only gates new increments.
     crate::modes::mesh::node_waypoint_observability::set_enabled(
         runtime.topology == MeshTopology::NodeWaypoint,
+    );
+    // ServiceWaypoint L7 termination families (issue #7501): advertised by a
+    // ServiceWaypoint from startup, so dashboards can pin a zero baseline.
+    crate::proxy::service_waypoint_l7_proxy::set_metrics_enabled(
+        runtime.topology == MeshTopology::ServiceWaypoint,
     );
 
     // Configure the process-singleton policy-deny recorder before anything can
@@ -27232,6 +27964,7 @@ mod tests {
             pod_uid: None,
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         }
     }
 
@@ -32246,6 +32979,29 @@ mod tests {
                     .subscribe_request("test")
                     .sidecar_http_routes,
                 expected
+            );
+            // Issue #7500: only a ServiceWaypoint asks for its bound Services'
+            // routes, on its own distinct flag (native field 11, xDS node
+            // metadata, MeshSliceRequest).
+            let service_waypoint = topology == MeshTopology::ServiceWaypoint;
+            assert_eq!(
+                scoped.native_client_config().service_waypoint_http_routes,
+                service_waypoint
+            );
+            assert_eq!(
+                scoped.xds_client_config().service_waypoint_http_routes,
+                service_waypoint
+            );
+            assert_eq!(
+                scoped.mesh_slice_request().service_waypoint_http_routes,
+                service_waypoint
+            );
+            assert_eq!(
+                scoped
+                    .native_client_config()
+                    .subscribe_request("test")
+                    .service_waypoint_http_routes,
+                service_waypoint
             );
         }
 
@@ -41289,6 +42045,7 @@ mod tests {
             addresses: vec!["10.244.5.5".to_string()],
             locality: Some("remote-cluster-b/net-b".to_string()),
             remote_provenance: true,
+            mesh_transport: None,
             ..workload("svc-b", "svc-b")
         };
         let svc_local = MeshService {

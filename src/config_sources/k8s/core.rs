@@ -12,7 +12,8 @@ use crate::ebpf::pod_watcher::{EnrollmentDecision, evaluate_enrollment};
 use crate::identity::spiffe::SpiffeId;
 use crate::modes::mesh::config::{
     AppProtocol, MeshService, NodeWaypointEndpoint, ServicePort, ServiceTargetPort, Workload,
-    WorkloadPort, WorkloadRef, WorkloadSelector, default_node_waypoint_hbone_port,
+    WorkloadMeshTransport, WorkloadPort, WorkloadRef, WorkloadSelector,
+    default_node_waypoint_hbone_port,
 };
 
 use super::backend_ref::{EndpointSliceFindings, EndpointSliceGuard};
@@ -2220,7 +2221,32 @@ fn workload_from_pod(
         pod_uid: (!pod.uid.is_empty()).then(|| pod.uid.clone()),
         node_waypoint,
         remote_provenance: false,
+        mesh_transport: workload_mesh_transport_for_pod(pod),
     })
+}
+
+/// The transport a mesh peer uses to reach this pod's own data plane (issue
+/// #7500): a pod the Ferrum injector marked (`ferrum.io/injected: "true"`)
+/// runs a Ferrum Sidecar on `:15006`; an `istio.io/dataplane-mode: ambient`
+/// pod (label or annotation) is reached over HBONE. Anything else is unknown,
+/// and a ServiceWaypoint keeps its HBONE default for it.
+fn workload_mesh_transport_for_pod(pod: &CorePod) -> Option<WorkloadMeshTransport> {
+    if pod
+        .annotations
+        .get("ferrum.io/injected")
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
+    {
+        return Some(WorkloadMeshTransport::SidecarMtls);
+    }
+    let ambient = |value: Option<&String>| {
+        value.is_some_and(|value| value.trim().eq_ignore_ascii_case("ambient"))
+    };
+    if ambient(pod.labels.get("istio.io/dataplane-mode"))
+        || ambient(pod.annotations.get("istio.io/dataplane-mode"))
+    {
+        return Some(WorkloadMeshTransport::Hbone);
+    }
+    None
 }
 
 fn identity_only_workload_from_pod(
@@ -2264,6 +2290,7 @@ fn identity_only_workload_from_pod(
         pod_uid: Some(pod.uid.clone()),
         node_waypoint,
         remote_provenance: false,
+        mesh_transport: None,
     })
 }
 

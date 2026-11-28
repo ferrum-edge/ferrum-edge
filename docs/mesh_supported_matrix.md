@@ -129,14 +129,14 @@ enrolled rows and required live assertion IDs; fixture detail is in the
   |---|---|
   | NodeWaypoint | Applied (Experimental). |
   | Sidecar | Applied (Experimental), client-side on the outbound capture listener, over SVID-mTLS to each destination workload. Never served on the inbound `:15006` listener. Live-gated in `mesh-e2e-sidecar` (issue #7502): a Kubernetes VirtualService that the control plane translates (`FerrumAccepted=True`) and serves over native `MeshSubscribe` splits 1000 captured requests 90/10 (85-95% window) on a Sidecar client across two STRICT-mTLS destinations and dispatches its `x-canary` header rule. Other `http[]` actions (rewrites, retries, timeouts, faults, mirrors, DestinationRule leg-by-leg dispatch) have deterministic integration coverage only. |
-  | ServiceWaypoint (GAMMA) | **Not applied** — a ServiceWaypoint is an L4 HBONE relay with no HTTP route table; projection for the bound Services, where Istio applies waypoint L7 routing, is open work (#7500, #7501). |
+  | ServiceWaypoint (GAMMA) | Applied (Beta) — the control plane projects the bound Services' routes (gated on a `waypoint_for: service`/`all` binding, with the anti-hijack namespace rule), the data plane materializes them per bound Service (issue #7500), and the HBONE `:15008` listener terminates HTTP/1.1 and HTTP/2 inside an authenticated `CONNECT` to a bound Service HTTP port and serves each inner request through that Service's partition (issue #7501): host pinning, destination-scoped per-branch authorization, admission-fence revocation. Stream-family ports and `connect-udp` stay L4 relays. Deterministic integration coverage over real HBONE tunnels; no live kind suite yet (#7503). Cross-namespace legs wait on #7499. |
   | Ambient | **Not applied** — as in Istio, the L4 ambient data plane does not do L7 routing; bind a waypoint. |
   | Ingress gateways (`spec.gateways` naming a Gateway) | Applied as gateway routes; unrelated to the mesh slice. |
 
   The Kubernetes status of a mesh-bound VirtualService with `http[]` routes
-  says so: `status.ferrum.translation.mesh_http_routes: sidecar_and_node_waypoint`
-  and a `FerrumAccepted` message note naming the data planes that ignore them
-  (issues #7390, #7423). See [mesh.md → Mesh data planes: NodeWaypoint route
+  says so: `status.ferrum.translation.mesh_http_routes: sidecar_node_and_service_waypoint`
+  and a `FerrumAccepted` message note naming the data plane that ignores them
+  (Ambient; issues #7390, #7423, #7501). See [mesh.md → Mesh data planes: NodeWaypoint route
   carriage](mesh.md#mesh-data-planes-nodewaypoint-route-carriage).
 
 ## Wildcard-host egress ServiceEntries
@@ -340,8 +340,7 @@ ledger unless they change the support contract.
 | Deferral | Issue | Doc anchor |
 |---|---|---|
 | Cross-namespace VirtualService `http[]` destinations on Sidecar and NodeWaypoint (today every such destination, direct, dispatch branch or weighted-split leg, refuses its carried route and the host keeps its Service route where one exists; the VirtualService stays `FerrumAccepted`, counts them in its message and lists them in `status.ferrum.translation.deferred_fields`) | [#7499](https://github.com/ferrum-edge/ferrum-edge/issues/7499) | [mesh.md → NodeWaypoint route carriage](mesh.md#mesh-data-planes-nodewaypoint-route-carriage) |
-| ServiceWaypoint `http_routes` control-plane projection, wire contract, and data-plane materialization (today a ServiceWaypoint receives no HTTP routes) | [#7500](https://github.com/ferrum-edge/ferrum-edge/issues/7500) | [mesh.md → Service Waypoint](mesh.md#service-waypoint) |
-| ServiceWaypoint L7 HTTP/1.1 and HTTP/2 termination and bound-Service dispatch on HBONE `:15008` (today an L4 relay only) | [#7501](https://github.com/ferrum-edge/ferrum-edge/issues/7501) | [mesh.md → Service Waypoint](mesh.md#service-waypoint) |
+| ServiceWaypoint `http_routes` projection of authorized cross-namespace legs (today the bound Services' same-namespace routes are projected and materialized; a route with a cross-namespace destination is not carried until the #7499 authorization contract lands) | [#7500](https://github.com/ferrum-edge/ferrum-edge/issues/7500) | [mesh.md → ServiceWaypoint route projection](mesh.md#servicewaypoint-route-projection) |
 | Live ServiceWaypoint end-to-end suite in kind (today ServiceWaypoint has no live data-path suite) | [#7503](https://github.com/ferrum-edge/ferrum-edge/issues/7503) | [mesh.md → Topology maturity](mesh.md#topology-maturity) |
 
 All mesh limitations, including these, are also summarized with workarounds in

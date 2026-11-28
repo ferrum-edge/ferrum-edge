@@ -112,7 +112,7 @@ fn virtual_service_http_routing_is_scoped_to_the_topologies_that_apply_it() {
     );
     for topology in [
         "| Sidecar | Applied",
-        "| ServiceWaypoint (GAMMA) | **Not applied**",
+        "| ServiceWaypoint (GAMMA) | Applied (Beta)",
         "| Ambient | **Not applied**",
         "| NodeWaypoint | Applied",
     ] {
@@ -122,11 +122,11 @@ fn virtual_service_http_routing_is_scoped_to_the_topologies_that_apply_it() {
         );
     }
     assert!(
-        MESH_SUPPORTED_MATRIX.contains("mesh_http_routes: sidecar_and_node_waypoint"),
+        MESH_SUPPORTED_MATRIX.contains("mesh_http_routes: sidecar_node_and_service_waypoint"),
         "matrix must name the status field that reports the scope"
     );
     assert!(
-        FEATURES.contains("Ambient and ServiceWaypoint data planes do not apply `http[]` routes"),
+        FEATURES.contains("Ambient data planes do not apply `http[]` routes"),
         "FEATURES must qualify VirtualService route splits by topology"
     );
 }

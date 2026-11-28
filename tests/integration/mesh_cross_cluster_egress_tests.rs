@@ -83,6 +83,7 @@ fn remote_workload(network: Option<&str>) -> Workload {
         pod_uid: None,
         node_waypoint: None,
         remote_provenance: true,
+        mesh_transport: None,
     }
 }
 

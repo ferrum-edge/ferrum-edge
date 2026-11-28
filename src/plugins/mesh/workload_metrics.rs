@@ -3041,6 +3041,14 @@ fn remote_source_facts(
 /// The HBONE baggage identity of an HBONE request, read exactly as
 /// `mesh_authz` reads it: every pristine wire field-line plus `folded`.
 fn hbone_identity_for_request(ctx: &RequestContext, folded: Option<&str>) -> Option<HboneIdentity> {
+    // An inner request of an L7-terminated ServiceWaypoint tunnel (issue
+    // #7501) is attributed from its OUTER CONNECT's assertion only, exactly as
+    // `mesh_authz` judges it; its own `baggage` header is never an assertion.
+    if let Some(service_waypoint) = ctx.service_waypoint_l7.as_deref() {
+        return Some(HboneIdentity::from_baggage_values(
+            service_waypoint.outer_baggage.as_deref(),
+        ));
+    }
     is_hbone_request(ctx).then(|| hbone_baggage_identity(ctx, folded))
 }
 

@@ -445,6 +445,7 @@ fn workload_in_namespace(namespace: &str, spiffe: &str) -> Workload {
         pod_uid: None,
         node_waypoint: None,
         remote_provenance: false,
+        mesh_transport: None,
     }
 }
 
@@ -1054,3 +1055,7 @@ fn slice_filter_does_not_stamp_service_binding_evidence_for_unknown_waypoint_for
         "unknown waypoint_for must not stamp inbound-relay service binding evidence"
     );
 }
+
+/// ServiceWaypoint L7 termination on HBONE `:15008` over real tunnels
+/// (issue #7501).
+mod l7_termination;

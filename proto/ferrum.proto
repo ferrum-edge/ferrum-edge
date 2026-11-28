@@ -178,8 +178,18 @@ message MeshSubscribeRequest {
   // routes visible to the subscription namespace (with `exportTo` and any
   // Sidecar egress scope applied) on the slice's `http_routes`, exactly as for
   // a NodeWaypoint. It widens no inventory. Absent/false means the slice
-  // carries no HTTP routes (Ambient, ServiceWaypoint and gateway subscribers).
+  // carries no HTTP routes (Ambient and gateway subscribers; a ServiceWaypoint
+  // asks with `service_waypoint_http_routes`).
   bool sidecar_http_routes = 10;
+  // True when this subscriber is a ServiceWaypoint that materializes the
+  // VirtualService `http[]` routes of the Services bound to it (issue #7500).
+  // The CP carries them on the slice's `http_routes` only when the waypoint's
+  // `MeshWaypointBinding` claims service traffic (`waypoint_for` `service` or
+  // `all`) and lists bound Services, and only for a VirtualService that lives
+  // in a bound Service's own namespace or in the waypoint's namespace (the
+  // anti-hijack rule). It never widens the bound-Service set or the inbound
+  // relay inventory. Absent/false means the slice carries no HTTP routes.
+  bool service_waypoint_http_routes = 11;
 }
 
 // A MeshSubscribe response frame.

@@ -4423,6 +4423,10 @@ impl MetricsRegistry {
         // visible on the next scrape. Labels are the pod's own fixed
         // container/probe pairs plus a bounded outcome.
         crate::modes::mesh::app_probe::render_prometheus(output, &gateway_ns_label);
+        // Issue #7501: ServiceWaypoint L7 termination tunnels and refusals.
+        // Process-static, closed-cardinality; labelled with the gateway
+        // `namespace` like `ferrum_mesh_hbone_tunnel_revocations_total`.
+        crate::proxy::service_waypoint_l7_proxy::render_prometheus(output, &ns_label);
     }
 
     fn append_grpc_stream_auth_prometheus(&self, output: &mut String) {

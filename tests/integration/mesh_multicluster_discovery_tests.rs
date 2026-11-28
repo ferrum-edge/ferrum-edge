@@ -69,6 +69,7 @@ fn workload(spiffe_id: &str, service: &str, addr: &str, locality: Option<&str>) 
         pod_uid: None,
         node_waypoint: None,
         remote_provenance: false,
+        mesh_transport: None,
     }
 }
 
@@ -577,6 +578,7 @@ mod audience_binding {
             remote_discovery,
             node_waypoint_capture_scoping: false,
             sidecar_http_routes: false,
+            service_waypoint_http_routes: false,
         };
         client.mesh_subscribe(tonic::Request::new(request)).await?;
         Ok(())

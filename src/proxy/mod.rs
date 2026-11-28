@@ -143,6 +143,7 @@ pub mod proxy_protocol;
 pub mod relay_shards;
 pub(crate) mod response_buffer_budget;
 pub mod response_watchdog;
+pub mod service_waypoint_l7_proxy;
 pub mod sni;
 pub mod stream_error;
 pub mod stream_listener;
@@ -7972,6 +7973,11 @@ pub struct ProxyState {
     /// frontend. `None` when `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS=0`
     /// (unlimited). Held for the tunnel lifetime, never on a datagram path.
     pub h3_connect_udp_sessions: Option<Arc<tokio::sync::Semaphore>>,
+    /// Concurrent L7-terminated ServiceWaypoint HBONE tunnels (issue #7501),
+    /// sized by `FERRUM_MAX_CONNECTIONS`, so one outer HTTP/2 connection
+    /// cannot multiply inner HTTP servers without bound. `None` when
+    /// `FERRUM_MAX_CONNECTIONS=0` (unlimited). Held for the tunnel lifetime.
+    pub service_waypoint_l7_tunnels: Option<Arc<tokio::sync::Semaphore>>,
     /// Per-client concurrent CONNECT-UDP tunnel counters, keyed by
     /// `connect_udp::connect_udp_client_key` (IPv6 grouped by prefix). `None`
     /// when `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS_PER_IP=0` (disabled). Held
@@ -8435,6 +8441,11 @@ struct RequestConnectionMetadata {
     /// it to the terminal transaction log, which records the detail the
     /// response's reference resolves to.
     diagnostic_slot: Option<Arc<crate::diagnostic_ref::DiagnosticSlot>>,
+    /// Set ONLY by the ServiceWaypoint L7 inner server
+    /// (`service_waypoint_l7_proxy`) for a request served inside an admitted,
+    /// L7-terminated HBONE tunnel (issue #7501). `None` on every listener.
+    service_waypoint_l7:
+        Option<Arc<crate::modes::mesh::service_waypoint_l7::ServiceWaypointL7Context>>,
 }
 
 static H1_FRAMING_OBSERVER_FAILED_WARN: crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter =
@@ -11187,6 +11198,13 @@ impl ProxyState {
         } else {
             None
         };
+        let service_waypoint_l7_tunnels = (env_config.max_connections > 0).then(|| {
+            Arc::new(tokio::sync::Semaphore::new(
+                env_config
+                    .max_connections
+                    .min(crate::util::conn_limit::MAX_CONN_LIMIT),
+            ))
+        });
         warn_if_websocket_idle_disabled(&config, env_config.websocket_idle_timeout_seconds);
         // Create connection pools with global configuration from environment.
         // `EnvConfig::from_env` already ran this parser, so a failure here is
@@ -11769,6 +11787,7 @@ impl ProxyState {
             trusted_proxies,
             websocket_conn_limit,
             h3_connect_udp_sessions,
+            service_waypoint_l7_tunnels,
             per_ip_connect_udp_sessions: if http3_connect_udp_max_sessions_per_ip > 0 {
                 Some(Arc::new(dashmap::DashMap::with_shard_amount(
                     pool_shard_amount,
@@ -14666,6 +14685,18 @@ impl ProxyState {
         self.update_config_with_mesh_ids(new_config, Some(trusted_mesh_ids), Some(trust))
     }
 
+    /// Test support for `_test_support::publish_prepared_mesh_config_for_test`:
+    /// publish a mesh-prepared configuration trusting exactly the reserved ids
+    /// its preparation materialized, with no gateway trust commit.
+    #[doc(hidden)]
+    pub(crate) fn update_prepared_mesh_config_for_test(
+        &self,
+        new_config: GatewayConfig,
+    ) -> ConfigApplyOutcome {
+        let trusted = TrustedMeshGeneratedResourceIds::from_materialized_config(&new_config);
+        self.update_config_with_mesh_ids(new_config, Some(&trusted), None)
+    }
+
     fn update_config_with_mesh_ids(
         &self,
         mut new_config: GatewayConfig,
@@ -16347,6 +16378,8 @@ async fn handle_connection(
             client_trust_session: None,
             authorization_connection_closer: Some(authorization_closer.clone()),
             diagnostic_slot: None,
+            // Only the ServiceWaypoint L7 inner server sets this.
+            service_waypoint_l7: None,
         };
         async move {
             let request = construct_frontend_proxy_request(
@@ -17754,7 +17787,7 @@ async fn handle_websocket_request_authenticated(
                         // telemetry see the source workload, not the gateway SVID.
                         // `None` on an unauthenticated client → gateway SVID
                         // (HTTP-path parity).
-                        ctx.peer_spiffe_id.as_ref(),
+                        ctx.mesh_source_principal(),
                     )
                     .await
                     .map(|handshake| WsBackendHandshake::Mesh(Box::new(handshake))),
@@ -27184,6 +27217,8 @@ async fn handle_tls_connection(
             client_trust_session: client_trust_session.clone(),
             authorization_connection_closer: Some(authorization_closer.clone()),
             diagnostic_slot: None,
+            // Only the ServiceWaypoint L7 inner server sets this.
+            service_waypoint_l7: None,
         };
         async move {
             let request = construct_frontend_proxy_request(
@@ -35952,6 +35987,33 @@ pub(crate) fn check_routed_path_parameters(
     }
 }
 
+/// [`check_routed_path_parameters`] for an inner request of an L7-terminated
+/// ServiceWaypoint tunnel (issue #7501): the parameter-stripped path is
+/// re-resolved inside the SAME bound-Service partition, and a `;` is admitted
+/// only when it resolves to the same route. Stricter than the shared rule (no
+/// ancestor exemption), because the partition holds one Service's routes.
+fn check_service_waypoint_routed_path_parameters(
+    path: &str,
+    has_path_parameter: bool,
+    proxy: &Proxy,
+    partition: &crate::modes::mesh::service_waypoint_l7::ServiceWaypointL7RoutePartition,
+    host: Option<&str>,
+) -> Result<(), crate::policy_path::PolicyPathRejection> {
+    crate::policy_path::check_path_parameters(has_path_parameter, proxy.allow_path_parameters)?;
+    if !has_path_parameter {
+        return Ok(());
+    }
+    let stripped = crate::policy_path::strip_path_parameters(path);
+    let Some(rerouted) = partition.resolve(host.unwrap_or_default(), &stripped) else {
+        return Err(crate::policy_path::PolicyPathRejection::PathParameter);
+    };
+    if rerouted.proxy.namespace == proxy.namespace && rerouted.proxy.id == proxy.id {
+        Ok(())
+    } else {
+        Err(crate::policy_path::PolicyPathRejection::PathParameter)
+    }
+}
+
 /// Refuse a recognized gRPC-Web request that no `grpc_web` translator claimed
 /// (none is on the route; publication refuses a trigger on the translator)
 /// when a plugin on the route owns gateway-assertion request headers.
@@ -37616,6 +37678,10 @@ async fn handle_proxy_request_inner(
     let accepted_local_ip = connection_metadata
         .accepted_local_addr
         .map(|addr| addr.ip());
+    // Set ONLY for an inner request of an L7-terminated ServiceWaypoint HBONE
+    // tunnel (issue #7501). Such a request is never itself an HBONE CONNECT:
+    // a nested CONNECT is refused like any other non-WebSocket CONNECT.
+    let service_waypoint_l7 = connection_metadata.service_waypoint_l7.clone();
 
     let mut method = req.method().as_str().to_owned();
     let inbound_version = req.version();
@@ -37635,14 +37701,16 @@ async fn handle_proxy_request_inner(
         // allowlist below still gates the wire method (`CONNECT`).
         method = "GET".to_string();
     }
-    let is_hbone_connect = is_hbone_connect_request(&req, &state.env_config);
+    let is_hbone_connect =
+        service_waypoint_l7.is_none() && is_hbone_connect_request(&req, &state.env_config);
     // Datagram-over-HBONE CONNECT (F3 §3.3 Stage 4) — disjoint from the
     // byte-stream `is_hbone_connect` (different wire marker). EITHER shape is a
     // CONNECT-relay for the shared dispatch machinery (path normalization,
     // body-buffering avoidance, route-miss relay synthesis, CONNECT-405 bypass),
     // so the combined `is_hbone_connect_any` drives those; the `udp` flavor is
     // routed to the unframing UDP handler at the final dispatch branch.
-    let is_udp_hbone_connect = is_udp_hbone_connect_request(&req, &state.env_config);
+    let is_udp_hbone_connect =
+        service_waypoint_l7.is_none() && is_udp_hbone_connect_request(&req, &state.env_config);
     let is_hbone_connect_any = is_hbone_connect || is_udp_hbone_connect;
     let raw_path = req.uri().path();
     let path = if is_hbone_connect_any && raw_path.is_empty() {
@@ -37713,6 +37781,17 @@ async fn handle_proxy_request_inner(
     ctx.client_trust_session = connection_metadata.client_trust_session;
     ctx.authorization_connection_closer = connection_metadata.authorization_connection_closer;
     ctx.set_diagnostic_slot(connection_metadata.diagnostic_slot);
+    if let Some(service_waypoint) = service_waypoint_l7.as_ref() {
+        // An inner request of an L7-terminated ServiceWaypoint tunnel (issue
+        // #7501): its provenance is the outer tunnel's, never the request's.
+        // The peer identity is the outer connection's verified certificate
+        // principal, re-derived per request so the leaf's validity window
+        // bounds every request; nothing the inner request carries feeds it.
+        ctx.service_waypoint_l7 = Some(Arc::clone(service_waypoint));
+        if !service_waypoint_l7_proxy::admit_inner_peer_identity(&state, &mut ctx) {
+            return Ok(service_waypoint_l7_proxy::inner_peer_identity_refusal());
+        }
+    }
     if let Some(identity) = connection_metadata.node_waypoint_identity {
         // In node-waypoint topology, the node-agent/eBPF cookie-derived pod
         // identity is the authenticated source workload for policy. It
@@ -38371,6 +38450,109 @@ async fn handle_proxy_request_inner(
         ));
     }
 
+    // ServiceWaypoint L7 termination (issue #7501). An authenticated HBONE
+    // CONNECT on the inbound listener whose authority names an HTTP-family
+    // port of a bound Service is terminated, never relayed at L4 and never
+    // routed through the shared table: the outer gates run, the tunnel is
+    // fenced, and its inner HTTP requests are served by the bound Service's
+    // route partition. An authority that maps to two bound Services is
+    // refused before any upgrade. Every other CONNECT (stream-family ports,
+    // `connect-udp`, unbound destinations) keeps the L4 relay and its guard
+    // below, unchanged. The index is empty outside a ServiceWaypoint.
+    if is_hbone_connect
+        && ctx.mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
+    {
+        let service_waypoint_routes = epoch.route_table.service_waypoint_l7_routes();
+        if !service_waypoint_routes.is_empty()
+            && let Some((connect_host, connect_port)) = req
+                .uri()
+                .authority()
+                .and_then(|authority| authority.port_u16().map(|port| (authority.host(), port)))
+        {
+            match service_waypoint_routes
+                .index()
+                .classify_authority(connect_host, connect_port)
+            {
+                crate::modes::mesh::service_waypoint_l7::ServiceWaypointConnectMode::TerminateL7(
+                    target,
+                ) => {
+                    return Ok(service_waypoint_l7_proxy::terminate_connect(
+                        &state,
+                        &epoch,
+                        req,
+                        &mut ctx,
+                        target,
+                        remote_addr,
+                        is_tls,
+                        mesh_inbound_pre_handshake_app_port,
+                        hbone_admission_sweep_epoch,
+                    ));
+                }
+                crate::modes::mesh::service_waypoint_l7::ServiceWaypointConnectMode::Ambiguous => {
+                    return Ok(service_waypoint_l7_proxy::refuse_ambiguous_connect(
+                        &state, &mut ctx,
+                    ));
+                }
+                crate::modes::mesh::service_waypoint_l7::ServiceWaypointConnectMode::NotL7Target => {
+                }
+            }
+        }
+    }
+
+    // An inner request of an L7-terminated ServiceWaypoint tunnel resolves
+    // ONLY inside its bound Service's route partition (issue #7501), and only
+    // after its `Host` / `:authority` was pinned to that Service: a request
+    // naming another Service (bound here or not) or any other host is refused
+    // `403 service_waypoint_host_mismatch` and never consults another route.
+    let service_waypoint_partition = match ctx.service_waypoint_l7.clone() {
+        None => None,
+        Some(service_waypoint) => {
+            let partition = epoch
+                .route_table
+                .service_waypoint_l7_routes()
+                .partition(&service_waypoint.target);
+            let refusal = match partition {
+                None => Some((
+                    service_waypoint_l7_proxy::ServiceWaypointRouteRefusal::BindingAbsent,
+                    service_waypoint_l7_proxy::SERVICE_WAYPOINT_BINDING_ABSENT_POLICY,
+                    service_waypoint_l7_proxy::BINDING_ABSENT_BODY,
+                )),
+                Some(partition)
+                    if !partition.admits_request_host(request_host.as_deref(), authority_port) =>
+                {
+                    Some((
+                        service_waypoint_l7_proxy::ServiceWaypointRouteRefusal::HostMismatch,
+                        service_waypoint_l7_proxy::SERVICE_WAYPOINT_HOST_MISMATCH_POLICY,
+                        service_waypoint_l7_proxy::HOST_MISMATCH_BODY,
+                    ))
+                }
+                Some(_) => None,
+            };
+            if let Some((reason, deny_policy, body)) = refusal {
+                // Transport facts only: never the request host.
+                crate::warn_sampled!(
+                    service_port = service_waypoint.target.service_port,
+                    denial = deny_policy,
+                    "Refused ServiceWaypoint inner request outside its tunnel's bound Service"
+                );
+                service_waypoint_l7_proxy::record_route_refusals(reason, 1);
+                service_waypoint_l7_proxy::record_inner_refusal(&mut ctx, deny_policy);
+                ctx.terminal_record.mark_counted();
+                state.request_count.fetch_add(1, Ordering::Relaxed);
+                let response = build_pre_plugin_reject_response(
+                    StatusCode::FORBIDDEN,
+                    body.as_bytes(),
+                    &EMPTY_HEADERS,
+                    request_uses_grpc_content_type,
+                    grpc_web_response_content_type,
+                );
+                record_status(&state, response.status().as_u16());
+                return Ok(response);
+            }
+            partition
+        }
+    };
+
     // Direct Pod-IP HTTP mesh egress is selected by captured original
     // destination before Host routing. The client-controlled Host header cannot
     // safely identify the destination service for a direct pod-IP dial.
@@ -38396,44 +38578,104 @@ async fn handle_proxy_request_inner(
     );
 
     // Route: host + longest prefix match via router cache (O(1) cache hit, pre-sorted fallback)
-    let route_match = match direct_pod_ip_http_route {
-        Some(crate::router_cache::MeshHttpEgressByWorkloadDecision::Route {
-            proxy,
-            service_port,
-        }) => {
-            ctx.mesh_outbound_destination_authz_port = Some(service_port);
-            Some(crate::router_cache::RouteMatch {
-                proxy,
-                path_params: Vec::new(),
-                matched_prefix_len: 0,
-            })
+    let route_match = if let Some(partition) = service_waypoint_partition {
+        // Admitted by host above, so the host is present.
+        match partition.resolve(request_host.as_deref().unwrap_or_default(), &path) {
+            Some(matched) => Some(matched),
+            None => {
+                ctx.terminal_record.mark_counted();
+                state.request_count.fetch_add(1, Ordering::Relaxed);
+                let mut response = build_pre_plugin_reject_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    br#"{"error":"ServiceWaypoint bound Service has no reachable endpoints or matching route"}"#,
+                    &EMPTY_HEADERS,
+                    request_uses_grpc_content_type,
+                    grpc_web_response_content_type,
+                );
+                if let Some(correlation_plugins) = epoch.plugin_cache.unrouted_correlation_plugins()
+                {
+                    let headers =
+                        Box::pin(prepare_unrouted_correlation(&correlation_plugins, &mut ctx))
+                            .await;
+                    for (name, value) in &headers {
+                        if let (Ok(name), Ok(value)) = (
+                            hyper::header::HeaderName::from_bytes(name.as_bytes()),
+                            hyper::header::HeaderValue::from_str(value),
+                        ) {
+                            response.headers_mut().insert(name, value);
+                        }
+                    }
+                }
+                crate::diagnostic_ref::record_route_miss(
+                    ctx.diagnostic_slot(),
+                    crate::diagnostic_ref::ROUTE_NOT_FOUND_PHASE,
+                    start_time,
+                    response.status().as_u16(),
+                    grpc_web_response_content_type.is_some(),
+                );
+                record_status(&state, response.status().as_u16());
+                if let Some(unrouted_log_plugins) =
+                    epoch.plugin_cache.unrouted_transaction_log_plugins()
+                {
+                    ctx.materialize_headers();
+                    if !ctx.metadata.contains_key("ferrum.frontend_scheme") {
+                        ctx.metadata.insert(
+                            "ferrum.frontend_scheme".to_string(),
+                            request_scheme.to_string(),
+                        );
+                    }
+                    Box::pin(log_unrouted_request(
+                        &unrouted_log_plugins,
+                        &ctx,
+                        &state.env_config.namespace,
+                        StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                        start_time,
+                    ))
+                    .await;
+                }
+                return Ok(response);
+            }
         }
-        Some(crate::router_cache::MeshHttpEgressByWorkloadDecision::CloseNotRoutable) => {
-            debug!(
-                orig_dst = ?ctx.orig_dst,
-                client_ip = %ctx.client_ip,
-                "Direct Pod-IP HTTP mesh egress destination is declared but not routable; rejecting captured request"
-            );
-            ctx.terminal_record.mark_counted();
-            state.request_count.fetch_add(1, Ordering::Relaxed);
-            let response = build_pre_plugin_reject_response(
+    } else {
+        match direct_pod_ip_http_route {
+            Some(crate::router_cache::MeshHttpEgressByWorkloadDecision::Route {
+                proxy,
+                service_port,
+            }) => {
+                ctx.mesh_outbound_destination_authz_port = Some(service_port);
+                Some(crate::router_cache::RouteMatch {
+                    proxy,
+                    path_params: Vec::new(),
+                    matched_prefix_len: 0,
+                })
+            }
+            Some(crate::router_cache::MeshHttpEgressByWorkloadDecision::CloseNotRoutable) => {
+                debug!(
+                    orig_dst = ?ctx.orig_dst,
+                    client_ip = %ctx.client_ip,
+                    "Direct Pod-IP HTTP mesh egress destination is declared but not routable; rejecting captured request"
+                );
+                ctx.terminal_record.mark_counted();
+                state.request_count.fetch_add(1, Ordering::Relaxed);
+                let response = build_pre_plugin_reject_response(
                 StatusCode::BAD_GATEWAY,
                 br#"{"error":"Original destination is not a mesh-routable direct workload HTTP destination"}"#,
                 &EMPTY_HEADERS,
                 request_uses_grpc_content_type,
                 grpc_web_response_content_type,
             );
-            record_status(&state, response.status().as_u16());
-            return Ok(response);
+                record_status(&state, response.status().as_u16());
+                return Ok(response);
+            }
+            None => state.router_cache.find_proxy_in_epoch(
+                &epoch,
+                request_host.as_deref(),
+                &path,
+                ctx.frontend_listen_port,
+                is_tls,
+                gateway_listener_identity.as_ref(),
+            ),
         }
-        None => state.router_cache.find_proxy_in_epoch(
-            &epoch,
-            request_host.as_deref(),
-            &path,
-            ctx.frontend_listen_port,
-            is_tls,
-            gateway_listener_identity.as_ref(),
-        ),
     };
 
     // Materialized mesh routes (`__mesh-inbound-*` / `__mesh-outbound-*`) are
@@ -38444,12 +38686,18 @@ async fn handle_proxy_request_inner(
     // a peer's inbound request is not re-tunnelled out an outbound HBONE route,
     // and an app's outbound request is not shortcut to the local inbound loopback
     // (and neither 404s past a valid lower-priority route).
+    //
+    // A ServiceWaypoint partition route (issue #7501) is exempt: it was
+    // resolved inside an admitted L7 tunnel, never by the shared lookup that
+    // this direction filter guards, which keeps refusing carried and default
+    // L7 routes on every direct inbound listener.
     let route_match = match route_match {
         Some(rm)
-            if !crate::modes::mesh::mesh_route_admitted_for_direction(
-                &rm.proxy.id,
-                ctx.mesh_direction,
-            ) =>
+            if service_waypoint_partition.is_none()
+                && !crate::modes::mesh::mesh_route_admitted_for_direction(
+                    &rm.proxy.id,
+                    ctx.mesh_direction,
+                ) =>
         {
             state
                 .router_cache
@@ -38918,25 +39166,35 @@ async fn handle_proxy_request_inner(
     // match and grants nothing, and this runs before every plugin phase and
     // backend dispatch, so no policy surface is skipped by a path a
     // parameter-stripping backend would resolve differently.
-    if let Err(rejection) = check_routed_path_parameters(
-        &state,
-        &epoch,
-        &path,
-        request_path_has_parameter,
-        &proxy,
-        RouteLookupScope {
-            host: request_host.as_deref(),
-            frontend_port: ctx.frontend_listen_port,
-            frontend_is_tls: is_tls,
-            gateway_listener: gateway_listener_identity.as_ref(),
-            mesh: crate::router_cache::MeshRouteScope {
-                direction: ctx.mesh_direction,
-                orig_dst_port: ctx.orig_dst.map(|addr| addr.port()),
-                authority_port,
+    let path_parameter_check = match service_waypoint_partition {
+        Some(partition) => check_service_waypoint_routed_path_parameters(
+            &path,
+            request_path_has_parameter,
+            &proxy,
+            partition,
+            request_host.as_deref(),
+        ),
+        None => check_routed_path_parameters(
+            &state,
+            &epoch,
+            &path,
+            request_path_has_parameter,
+            &proxy,
+            RouteLookupScope {
+                host: request_host.as_deref(),
+                frontend_port: ctx.frontend_listen_port,
+                frontend_is_tls: is_tls,
+                gateway_listener: gateway_listener_identity.as_ref(),
+                mesh: crate::router_cache::MeshRouteScope {
+                    direction: ctx.mesh_direction,
+                    orig_dst_port: ctx.orig_dst.map(|addr| addr.port()),
+                    authority_port,
+                },
+                routed_by_direct_workload,
             },
-            routed_by_direct_workload,
-        },
-    ) {
+        ),
+    };
+    if let Err(rejection) = path_parameter_check {
         warn!(
             reason = rejection.reason(),
             "Rejected request: path parameter not admitted for the routed proxy"
@@ -42593,7 +42851,7 @@ async fn handle_proxy_request_inner(
         let grpc_transport = match resolve_grpc_dispatch_transport(
             &state,
             upstream_target.as_deref(),
-            ctx.peer_spiffe_id.as_ref(),
+            ctx.mesh_source_principal(),
         ) {
             Ok(transport) => transport,
             Err(transport_error) => {
@@ -44104,7 +44362,7 @@ async fn handle_proxy_request_inner(
                 let grpc_retry_transport = match resolve_grpc_dispatch_transport(
                     &state,
                     grpc_current_target.as_deref(),
-                    ctx.peer_spiffe_id.as_ref(),
+                    ctx.mesh_source_principal(),
                 ) {
                     Ok(transport) => transport,
                     Err(transport_error) => {
@@ -63681,7 +63939,8 @@ async fn proxy_to_backend_hbone(
     // 2). `None` means this gateway has no resolvable SVID identity — nothing
     // to key a reusable connection under — and the dial below then reports the
     // same refusal it always did.
-    let asserted_source_identity = source_identity_ctx.and_then(|ctx| ctx.peer_spiffe_id.as_ref());
+    let asserted_source_identity =
+        source_identity_ctx.and_then(RequestContext::mesh_source_principal);
     let inner_pool_config = state.hbone_pool.pool_config_for(proxy);
     let inner_plan = state
         .hbone_pool
@@ -71678,6 +71937,7 @@ mod tests {
             pod_uid: None,
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         };
 
         let bywl_id = crate::modes::mesh::mesh_outbound_tcp_bywl_upstream_id(
@@ -76713,6 +76973,7 @@ mod tests {
             pod_uid: None,
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         };
         let mesh = MeshConfig {
             services: vec![service],
@@ -80506,6 +80767,7 @@ mod tests {
             pod_uid: None,
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         }
     }
 
@@ -82183,6 +82445,7 @@ mod tests {
                 pod_uid: None,
                 node_waypoint: None,
                 remote_provenance: false,
+                mesh_transport: None,
             }
         }
 

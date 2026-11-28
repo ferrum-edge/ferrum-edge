@@ -14921,16 +14921,37 @@ async fn handle_service_waypoint_services_get(
             &json!({"error": "service-waypoint topology not enabled"}),
         ));
     };
-    let services: Vec<serde_json::Value> = slice
-        .services
+    // Service records and their bound-Service L7 surface (issue #7500) come
+    // from ONE published generation: the configuration the proxy currently
+    // serves, so a response never pairs one generation's ports with another's
+    // L7 ports. Without a proxy runtime the applied slice's Services are
+    // listed with no L7 surface. Cold path.
+    let served = state
+        .proxy_state
+        .as_ref()
+        .map(|proxy_state| proxy_state.current_config());
+    let l7_routes = served
+        .as_deref()
+        .map(crate::modes::mesh::service_waypoint_l7::ServiceWaypointL7Routes::build);
+    let service_records = served
+        .as_deref()
+        .and_then(|config| config.mesh.as_deref())
+        .map_or(slice.services.as_slice(), |mesh| mesh.services.as_slice());
+    let services: Vec<serde_json::Value> = service_records
         .iter()
         .map(|svc| {
             let ports: Vec<u16> = svc.ports.iter().map(|p| p.port).collect();
+            let l7 = l7_routes
+                .as_ref()
+                .map(|routes| routes.service_summary(&svc.namespace, &svc.name))
+                .unwrap_or_default();
             json!({
                 "namespace": svc.namespace,
                 "name": svc.name,
                 "ports": ports,
                 "workload_count": svc.workloads.len(),
+                "l7_http_ports": l7.l7_http_ports,
+                "virtual_service_route_count": l7.virtual_service_route_count,
             })
         })
         .collect();

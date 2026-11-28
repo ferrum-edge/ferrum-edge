@@ -3435,13 +3435,17 @@ Response:
       "namespace": "default",
       "name": "reviews",
       "ports": [8080],
-      "workload_count": 3
+      "workload_count": 3,
+      "l7_http_ports": [8080],
+      "virtual_service_route_count": 1
     },
     {
       "namespace": "default",
       "name": "ratings",
       "ports": [8081],
-      "workload_count": 1
+      "workload_count": 1,
+      "l7_http_ports": [8081],
+      "virtual_service_route_count": 0
     }
   ]
 }
@@ -3454,8 +3458,10 @@ Field semantics:
 - `service_count` — number of services admitted into the slice for this waypoint.
 - `services[].ports` — service ports from the admitted `MeshService`; port protocol metadata is intentionally omitted from this compact operability view.
 - `services[].workload_count` — number of workload SPIFFE references behind that service in the installed slice.
+- `services[].l7_http_ports` — HTTP-family ports of the Service that this waypoint terminates L7 HTTP for (issues #7500/#7501), ascending, including bound virtual Services with zero backing workloads (which serve carried `VirtualService` routes and return `503` when unmatched). Empty when the Service is not bound by a binding that claims service traffic (`waypoint_for` `service` or `all`), or when it declares no HTTP-family ports. Stream-family ports never appear. Read from the generation the proxy currently serves.
+- `services[].virtual_service_route_count` — number of distinct VirtualService `http[]` routes attached to the bound Service in that generation (a route attaches to the Service its hosts name, not to its split legs). Route rules and match predicates are not exposed.
 
-`services` are returned in slice order. The payload exposes service names, namespaces, ports, and workload counts, but no request bodies, credentials, or backend TLS material.
+`services` are returned in slice order. The payload exposes service names, namespaces, ports, workload counts, L7 ports, and route counts, but no route rules, request bodies, credentials, or backend TLS material.
 
 ## Mesh Config Drift (mesh mode)
 

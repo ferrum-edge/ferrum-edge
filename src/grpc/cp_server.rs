@@ -1154,6 +1154,15 @@ impl CpGrpcServer {
         bearer_namespaces: Option<&HashSet<String>>,
     ) -> GatewayConfig {
         let mut filtered = Self::clone_non_mesh_config_for_namespace(config, &request.namespace);
+        if request.service_waypoint_http_routes {
+            Self::retain_service_waypoint_route_resources(
+                config,
+                &mut filtered,
+                request,
+                Some(scope),
+                bearer_namespaces,
+            );
+        }
         if let Some(mesh) = filtered.mesh.as_mut() {
             Self::filter_mesh_config_to_request(
                 mesh,
@@ -1172,6 +1181,106 @@ impl CpGrpcServer {
         }
         Self::apply_trust_projection(&mut filtered, &projection);
         filtered
+    }
+
+    /// Keep the translator-owned VirtualService HTTP route resources a
+    /// ServiceWaypoint subscription can be served from its bound Services'
+    /// namespaces (issue #7500).
+    ///
+    /// [`Self::clone_non_mesh_config_for_namespace`] keeps only the
+    /// subscription namespace's proxies, upstreams and plugin configs. A
+    /// Service bound to this waypoint through `istio.io/use-waypoint-namespace`
+    /// lives in another namespace, and its own VirtualService routes live
+    /// there too. This copies back exactly the route resources the slice
+    /// builder may project for it: `istio-vs-*` route proxies listed by a
+    /// mesh `virtual_service_http_routes` binding of that namespace, their
+    /// `istio-vs-upstream-*` upstreams, and their proxy-scoped `istio-vs-*`
+    /// plugins. Only the namespaces of THIS waypoint's service-claiming
+    /// binding are considered, each bounded by the CP scope and the bearer
+    /// `ns` claim. The resources stay in-process: `MeshSlice::from_gateway_config`
+    /// applies the binding gate, the anti-hijack namespace rule, host and
+    /// destination admission and self-containment before anything reaches the
+    /// data plane.
+    fn retain_service_waypoint_route_resources(
+        config: &GatewayConfig,
+        filtered: &mut GatewayConfig,
+        request: &MeshSliceRequest,
+        scope: Option<&CpScope>,
+        bearer_namespaces: Option<&HashSet<String>>,
+    ) {
+        let Some(mesh) = config.mesh.as_deref() else {
+            return;
+        };
+        let bound = crate::modes::mesh::slice::service_waypoint_bound_service_refs(
+            &mesh.waypoint_bindings,
+            request.waypoint_name.as_deref(),
+            &request.namespace,
+        );
+        let namespaces: BTreeSet<&str> = bound
+            .iter()
+            .map(|service| service.namespace.as_str())
+            .filter(|namespace| {
+                *namespace != request.namespace
+                    && Self::namespace_allowed_by_scope(namespace, scope)
+                    && bearer_namespaces.is_none_or(|allowed| allowed.contains(*namespace))
+            })
+            .collect();
+        if namespaces.is_empty() {
+            return;
+        }
+        let route_ids: HashSet<(&str, &str)> = mesh
+            .virtual_service_http_routes
+            .iter()
+            .filter(|binding| namespaces.contains(binding.namespace.as_str()))
+            .flat_map(|binding| {
+                binding
+                    .proxy_ids
+                    .iter()
+                    .map(move |id| (binding.namespace.as_str(), id.as_str()))
+            })
+            .collect();
+        if route_ids.is_empty() {
+            return;
+        }
+        filtered.proxies.extend(
+            config
+                .proxies
+                .iter()
+                .filter(|proxy| {
+                    route_ids.contains(&(proxy.namespace.as_str(), proxy.id.as_str()))
+                        && crate::modes::mesh::config::is_virtual_service_http_route_proxy_id(
+                            &proxy.id,
+                        )
+                })
+                .cloned(),
+        );
+        filtered.upstreams.extend(
+            config
+                .upstreams
+                .iter()
+                .filter(|upstream| {
+                    namespaces.contains(upstream.namespace.as_str())
+                        && upstream.id.starts_with(
+                            crate::modes::mesh::slice::VIRTUAL_SERVICE_HTTP_ROUTE_UPSTREAM_ID_PREFIX,
+                        )
+                })
+                .cloned(),
+        );
+        filtered.plugin_configs.extend(
+            config
+                .plugin_configs
+                .iter()
+                .filter(|plugin| {
+                    namespaces.contains(plugin.namespace.as_str())
+                        && plugin.id.starts_with(
+                            crate::modes::mesh::slice::VIRTUAL_SERVICE_HTTP_ROUTE_PROXY_PLUGIN_PREFIX,
+                        )
+                        && plugin.proxy_id.as_deref().is_some_and(|proxy_id| {
+                            route_ids.contains(&(plugin.namespace.as_str(), proxy_id))
+                        })
+                })
+                .cloned(),
+        );
     }
 
     fn filter_mesh_config_to_namespace(mesh: &mut MeshConfig, namespace: &str) {
@@ -1205,9 +1314,14 @@ impl CpGrpcServer {
             visible_namespaces.contains(&routes.namespace)
                 && Self::namespace_allowed_by_scope(&routes.namespace, scope)
                 && bearer_namespaces.is_none_or(|allowed| allowed.contains(&routes.namespace))
-                && crate::modes::mesh::config::virtual_service_http_routes_exported_to_namespace(
+                && (crate::modes::mesh::config::virtual_service_http_routes_exported_to_namespace(
                     routes, namespace,
                 )
+                    // A ServiceWaypoint may serve its own namespace's route
+                    // for a bound Service in another namespace when the route
+                    // is exported to THAT namespace (issue #7500); the slice
+                    // projection applies the exact owner rule.
+                    || (request.service_waypoint_http_routes && routes.namespace == namespace))
         });
         // A ServiceWaypoint terminates traffic for destination-visible services,
         // but trusted Ambient UDP evidence can name a source pod from any
@@ -3987,6 +4101,7 @@ mod tests {
             pod_uid: Some("16b2c3d4-9dad-11d1-80b4-00c04fd430c8".to_string()),
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         };
         let destination_workload = Workload {
             spiffe_id: destination_spiffe,
@@ -4008,6 +4123,7 @@ mod tests {
             pod_uid: Some("26b2c3d4-9dad-11d1-80b4-00c04fd430c8".to_string()),
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         };
         let config = GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
@@ -4189,6 +4305,7 @@ mod tests {
                     cluster: None,
                 }),
                 remote_provenance: false,
+                mesh_transport: None,
             };
         let config = GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
@@ -4303,6 +4420,7 @@ mod tests {
                     cluster: None,
                 }),
                 remote_provenance: false,
+                mesh_transport: None,
             };
         let config = GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
@@ -4668,6 +4786,7 @@ mod tests {
                 cluster: None,
             }),
             remote_provenance: false,
+            mesh_transport: None,
         };
         let namespace_peer_auth = |namespace: &str, mode: MtlsMode| PeerAuthentication {
             name: format!("{namespace}-default"),
@@ -4702,6 +4821,7 @@ mod tests {
             workload_spiffe_id: Some(this_waypoint.to_string()),
             node_waypoint_capture_scoping: true,
             sidecar_http_routes: false,
+            service_waypoint_http_routes: false,
             ..MeshSliceRequest::default()
         };
 
@@ -4862,6 +4982,7 @@ mod tests {
                 cluster: None,
             }),
             remote_provenance: false,
+            mesh_transport: None,
         };
         let policy = |namespace: &str, name: &str, scope: PolicyScope| MeshPolicy {
             name: name.to_string(),
@@ -4917,6 +5038,7 @@ mod tests {
             workload_spiffe_id: Some(this_waypoint.to_string()),
             node_waypoint_capture_scoping: true,
             sidecar_http_routes: false,
+            service_waypoint_http_routes: false,
             ..MeshSliceRequest::default()
         };
         let names = |policies: &[MeshPolicy]| {
@@ -5072,6 +5194,7 @@ mod tests {
                 cluster: None,
             }),
             remote_provenance: false,
+            mesh_transport: None,
         };
         let config = GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
@@ -5112,6 +5235,7 @@ mod tests {
             enforce_sidecar_egress: true,
             node_waypoint_capture_scoping: true,
             sidecar_http_routes: false,
+            service_waypoint_http_routes: false,
             ..MeshSliceRequest::default()
         };
 

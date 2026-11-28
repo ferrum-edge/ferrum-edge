@@ -377,8 +377,8 @@ impl HboneRevocationReason {
 
 /// Which relay-destination ownership guard admitted the tunnel, so the sweep
 /// re-applies exactly that guard (`handle_hbone_request` /
-/// `handle_hbone_udp_request` parity).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `handle_hbone_udp_request` / ServiceWaypoint L7 termination parity).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HboneRelayDestinationGate {
     /// Synthesized Ambient/NodeWaypoint/ServiceWaypoint inbound relay: the
     /// destination must remain one this proxy terminates for.
@@ -394,6 +394,30 @@ pub enum HboneRelayDestinationGate {
     /// CONNECT that matched an HTTP route on the inbound listener (issue
     /// #6110).
     Configured,
+    /// ServiceWaypoint L7 termination (issue #7501): the tunnel carries inner
+    /// HTTP requests for this bound Service HTTP port, each of which runs the
+    /// full plugin chain against the generation current when it arrives. The
+    /// sweep therefore re-applies no authorize chain to the outer tunnel (an
+    /// `AuthorizationPolicy` with HTTP-only rules cannot be judged against a
+    /// tunnel), only the credential and PeerAuthentication gates and this
+    /// gate: the original CONNECT authority must still classify to this exact
+    /// bound Service HTTP port in the current generation's
+    /// `ServiceWaypointL7TargetIndex`, or the tunnel is revoked as
+    /// `relay_destination` (binding withdrawn, Service removed, port no longer
+    /// HTTP-family, or backing pod endpoint withdrawn for an endpoint-addressed
+    /// CONNECT).
+    ServiceWaypointL7(
+        crate::modes::mesh::service_waypoint_l7::ServiceWaypointL7Target,
+        Option<(String, u16)>,
+    ),
+}
+
+impl HboneRelayDestinationGate {
+    /// Whether this tunnel terminates HTTP inside itself (issue #7501), so
+    /// its outer CONNECT carries no authorize-chain verdict to re-issue.
+    pub fn terminates_l7(&self) -> bool {
+        matches!(self, Self::ServiceWaypointL7(..))
+    }
 }
 
 /// The peer credential an HBONE CONNECT was admitted on, retained so a sweep
@@ -2129,6 +2153,43 @@ impl HboneAdmissionFence {
             return Some(reason);
         }
 
+        // ServiceWaypoint L7 termination (issue #7501): every inner request
+        // runs the whole plugin chain against the generation current when it
+        // arrives, so the outer tunnel has no authorize verdict to re-issue and
+        // no reuse classification to re-fold. Only the transport and
+        // bound-Service gates apply, in the CONNECT path's order.
+        if let HboneRelayDestinationGate::ServiceWaypointL7(target, connect_authority) =
+            &snapshot.destination_gate
+        {
+            if mesh_inbound_peer_auth_transport_mismatch_for_policy(
+                policy,
+                snapshot.ctx.mesh_direction,
+                snapshot.mesh_inbound_pre_handshake_app_port,
+                proxy,
+                snapshot.upstream_target.as_deref(),
+                snapshot.is_tls,
+                snapshot.has_verified_peer_certificate,
+            )
+            .is_some()
+            {
+                return Some(HboneRevocationReason::PeerAuthTransport);
+            }
+            let index = epoch.route_table.service_waypoint_l7_routes().index();
+            let still_admitted = match connect_authority {
+                Some((host, port)) => matches!(
+                    index.classify_authority(host, *port),
+                    crate::modes::mesh::service_waypoint_l7::ServiceWaypointConnectMode::TerminateL7(
+                        ref current,
+                    ) if current.as_ref() == target
+                ),
+                None => index.contains(target),
+            };
+            if !still_admitted {
+                return Some(HboneRevocationReason::RelayDestination);
+            }
+            return None;
+        }
+
         // Resolved ONCE, from the generation now current, and shared by the two
         // gates below that need it. `authorize_chain_denies` resolved it
         // unconditionally before the reuse gate existed — including for the
@@ -2180,7 +2241,7 @@ impl HboneAdmissionFence {
         }
 
         let mesh = epoch.config.mesh.as_deref();
-        let destination_owned = match snapshot.destination_gate {
+        let destination_owned = match &snapshot.destination_gate {
             HboneRelayDestinationGate::InboundRelay => {
                 let authority_owned = inbound_hbone_relay_effective_destination_decision(
                     proxy,
@@ -2220,6 +2281,19 @@ impl HboneAdmissionFence {
                 // the peer's next bare CONNECT would be refused (issue #6110).
                 let direction = snapshot.ctx.mesh_direction;
                 !sidecar_inbound_refuses_matched_http_connect(proxy, direction, mesh)
+            }
+            // Decided before the authorize chain above, and never reaches here.
+            HboneRelayDestinationGate::ServiceWaypointL7(target, connect_authority) => {
+                let index = epoch.route_table.service_waypoint_l7_routes().index();
+                match connect_authority {
+                    Some((host, port)) => matches!(
+                        index.classify_authority(host, *port),
+                        crate::modes::mesh::service_waypoint_l7::ServiceWaypointConnectMode::TerminateL7(
+                            ref current,
+                        ) if current.as_ref() == target
+                    ),
+                    None => index.contains(target),
+                }
             }
         };
         if !destination_owned {

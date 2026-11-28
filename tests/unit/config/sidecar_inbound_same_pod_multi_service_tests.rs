@@ -53,6 +53,7 @@ fn local_workload(
         pod_uid: pod_uid.map(str::to_string),
         node_waypoint: None,
         remote_provenance: false,
+        mesh_transport: None,
     }
 }
 
@@ -106,6 +107,7 @@ fn enforced_slice_request(spiffe: &str) -> MeshSliceRequest {
         ambient_udp_source_scoping: false,
         node_waypoint_capture_scoping: false,
         sidecar_http_routes: false,
+        service_waypoint_http_routes: false,
     }
 }
 

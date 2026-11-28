@@ -156,9 +156,16 @@ fn both_sides_guard_each_step_the_same_way() {
     let frontend = frontend_resolution();
     let resolver = resolver_mesh_steps();
     let pairs = [
-        // A mesh route of the other direction is re-resolved.
+        // A mesh route of the other direction is re-resolved, except for an
+        // admitted ServiceWaypoint partition route.
         (
-            "                ctx.mesh_direction,\n            ) =>",
+            concat!(
+                "            if service_waypoint_partition.is_none()\n",
+                "                && !crate::modes::mesh::mesh_route_admitted_for_direction(\n",
+                "                    &rm.proxy.id,\n",
+                "                    ctx.mesh_direction,\n",
+                "                ) =>"
+            ),
             "                mesh.direction,\n            ) =>",
         ),
         // Port-sibling selection is direction-gated.
@@ -218,10 +225,25 @@ fn the_h1_h2_frontend_replays_the_inputs_it_routed_with() {
         assert!(lookup.contains(input), "frontend lookup lost {input:?}");
     }
 
-    let check = call_arguments(
-        PROXY_SOURCE,
-        "if let Err(rejection) = check_routed_path_parameters(",
+    let check_match = PROXY_SOURCE
+        .find("let path_parameter_check = match service_waypoint_partition {")
+        .expect("path parameter check match");
+    let check_section = &PROXY_SOURCE[check_match..];
+    let check_arm = check_section
+        .find("None => check_routed_path_parameters(")
+        .expect("shared path parameter check arm");
+    let check_use = check_section
+        .find("if let Err(rejection) = path_parameter_check {")
+        .expect("path parameter check rejection handling");
+    assert!(
+        check_arm < check_use,
+        "path_parameter_check must be checked after the match"
     );
+    assert!(
+        !check_section[check_arm..check_use].contains("let path_parameter_check"),
+        "path_parameter_check must not be shadowed before rejection handling"
+    );
+    let check = call_arguments(check_section, "None => check_routed_path_parameters(");
     for input in [
         "&path",
         "host: request_host.as_deref()",
