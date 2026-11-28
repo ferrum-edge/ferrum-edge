@@ -114,6 +114,7 @@ fn validate_args_with_empty_namespace(
         verbose: 0,
         fips_mode: None,
         allow_empty_namespace,
+        backup: None,
     }
 }
 

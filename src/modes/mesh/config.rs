@@ -150,6 +150,32 @@ pub struct Workload {
     /// ever set locally, after `fetch()`, by the remote-poll loop.
     #[serde(skip)]
     pub remote_provenance: bool,
+    /// How a mesh peer reaches this workload's own data plane (issue #7500):
+    /// a Ferrum Sidecar in the pod (`sidecar_mtls`: SVID-mTLS HTTP/2 to its
+    /// inbound `:15006`) or an ambient HBONE terminator (`hbone`: HTTP/2
+    /// CONNECT over mTLS to `:15008`). A ServiceWaypoint reads it to dial a
+    /// bound Service's backing workload over the transport that workload
+    /// actually terminates. Absent means unknown: the ServiceWaypoint keeps
+    /// HBONE (the ambient default), which a Sidecar-only pod refuses at the
+    /// HBONE capability check (fail closed, never plaintext). The Kubernetes
+    /// translator sets `sidecar_mtls` for a pod the Ferrum injector marked
+    /// (`ferrum.io/injected: "true"`) and `hbone` for an
+    /// `istio.io/dataplane-mode: ambient` pod; native/file authors set it
+    /// explicitly. It is a dispatch hint only and widens no authorization:
+    /// the selected transport still pins the workload's SPIFFE identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh_transport: Option<WorkloadMeshTransport>,
+}
+
+/// Transport a mesh peer uses to reach a workload's own data plane
+/// ([`Workload::mesh_transport`], issue #7500).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkloadMeshTransport {
+    /// A Ferrum Sidecar: SVID-mTLS HTTP/2 to its inbound `:15006`.
+    SidecarMtls,
+    /// An ambient HBONE terminator: HTTP/2 CONNECT over mTLS to `:15008`.
+    Hbone,
 }
 
 impl Workload {
@@ -5581,6 +5607,31 @@ pub struct MeshConfig {
     #[serde(skip)]
     pub inbound_relay_node_local_registry:
         crate::modes::mesh::enrolled_destinations::NodeLocalEnrolledDestinationsHandle,
+    /// The ServiceWaypoint L7 surface materialized for this generation (issue
+    /// #7500): one record per HTTP-family port of a Service bound to THIS
+    /// waypoint that materialized a default L7 route and upstream. The router
+    /// builds `ServiceWaypointL7TargetIndex` and the per-bound-Service route
+    /// partitions from it once per generation.
+    ///
+    /// Derived only from explicit binding evidence
+    /// (`MeshSlice.service_waypoint_bound_services` for this runtime's exact
+    /// waypoint identity), never from the fail-open `services` view, and
+    /// independent of [`Self::inbound_relay_destinations`]: a carried
+    /// VirtualService route or split leg never adds a record. Assigned
+    /// UNCONDITIONALLY on every mesh apply (empty outside a ServiceWaypoint),
+    /// so an unbound Service leaves at once. `serde(skip)`: runtime-only,
+    /// never operator-settable and never on the `config_json` wire.
+    #[serde(skip)]
+    pub service_waypoint_l7_bindings:
+        Vec<crate::modes::mesh::service_waypoint_l7::ServiceWaypointL7Binding>,
+    /// The ServiceWaypoint's full bound-Service inventory (reachable or not,
+    /// with host variants) and the carried routes the control plane attached
+    /// to each bound Service (issue #7500). Read with
+    /// [`Self::service_waypoint_l7_bindings`] to build the per-bound-Service
+    /// route partitions. Same assignment and `serde(skip)` rules.
+    #[serde(skip)]
+    pub service_waypoint_l7_inventory:
+        crate::modes::mesh::service_waypoint_l7::ServiceWaypointL7Inventory,
 }
 
 /// One destination the authenticated inbound CONNECT terminator may relay to,
@@ -6691,6 +6742,8 @@ impl Default for MeshConfig {
             sidecar_inbound_http_app_ports: Vec::new(),
             sidecar_inbound_refuses_matched_http_connect: false,
             inbound_relay_node_local_registry: Default::default(),
+            service_waypoint_l7_bindings: Vec::new(),
+            service_waypoint_l7_inventory: Default::default(),
         }
     }
 }

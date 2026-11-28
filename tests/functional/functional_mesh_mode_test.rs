@@ -361,6 +361,7 @@ fn east_west_service_slice(node_id: &str) -> MeshSlice {
             pod_uid: Some("functional-reviews-pod".to_string()),
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         }],
         services: vec![MeshService {
             cluster_ips: Vec::new(),
@@ -3589,6 +3590,7 @@ fn inbound_authz_slice(
         pod_uid: None,
         node_waypoint: None,
         remote_provenance: false,
+        mesh_transport: None,
     };
     let echo_service = MeshService {
         cluster_ips: Vec::new(),
@@ -3842,6 +3844,7 @@ fn cross_namespace_workload_entry_inbound_slice(
         pod_uid: None,
         node_waypoint: None,
         remote_provenance: false,
+        mesh_transport: None,
     };
     let attached_service = MeshService {
         cluster_ips: Vec::new(),
@@ -4710,6 +4713,7 @@ fn egress_service_slice(
             pod_uid: None,
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         }],
         services: vec![MeshService {
             cluster_ips: Vec::new(),
@@ -6918,6 +6922,7 @@ fn cross_cluster_dest_slice(
             pod_uid: None,
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         }],
         services: vec![MeshService {
             cluster_ips: Vec::new(),
@@ -7010,6 +7015,7 @@ fn cross_cluster_east_west_slice(
             pod_uid: None,
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         }],
         services: vec![MeshService {
             cluster_ips: Vec::new(),
@@ -7075,6 +7081,7 @@ fn cross_cluster_client_slice(
             // production; set here directly so `workload_is_remote` classifies
             // it remote without a live discovery poll).
             remote_provenance: true,
+            mesh_transport: None,
         }],
         services: vec![MeshService {
             cluster_ips: Vec::new(),
@@ -8101,6 +8108,7 @@ fn cross_cluster_ambient_dest_slice(
             pod_uid: Some(pod_uid.to_string()),
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         }],
         services: vec![MeshService {
             cluster_ips: Vec::new(),
@@ -8183,6 +8191,7 @@ fn cross_cluster_ambient_east_west_slice(
             pod_uid: None,
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         }],
         services: vec![MeshService {
             cluster_ips: Vec::new(),
@@ -8254,6 +8263,7 @@ fn cross_cluster_ambient_client_slice(
             // production; set directly so `workload_is_remote` classifies it
             // remote without a live discovery poll).
             remote_provenance: true,
+            mesh_transport: None,
         }],
         services: vec![MeshService {
             cluster_ips: Vec::new(),
@@ -10295,6 +10305,7 @@ fn udp_dest_slice(
             pod_uid: Some(pod_uid.to_string()),
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         }],
         services: vec![MeshService {
             cluster_ips: Vec::new(),
@@ -10997,6 +11008,7 @@ fn third_workload_refusal_slice(
                 pod_uid: None,
                 node_waypoint: None,
                 remote_provenance: false,
+                mesh_transport: None,
             },
             Workload {
                 spiffe_id: c_id.clone(),
@@ -11022,6 +11034,7 @@ fn third_workload_refusal_slice(
                 pod_uid: None,
                 node_waypoint: None,
                 remote_provenance: false,
+                mesh_transport: None,
             },
         ],
         services: vec![
@@ -11690,6 +11703,7 @@ fn sidecar_ingress_local_workload(
         pod_uid: None,
         node_waypoint: None,
         remote_provenance: false,
+        mesh_transport: None,
     };
     let service = MeshService {
         cluster_ips: Vec::new(),
@@ -12458,6 +12472,7 @@ fn waypoint_destination_workload(service: &str, port: u16, address: &str) -> Wor
         pod_uid: None,
         node_waypoint: None,
         remote_provenance: false,
+        mesh_transport: None,
     }
 }
 
@@ -13632,6 +13647,7 @@ fn live_source_capture_slice(
             pod_uid: None,
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         }],
         services: vec![MeshService {
             cluster_ips: vec![cluster_ip.to_string()],
@@ -15930,6 +15946,7 @@ fn live_xc_workload(address: String, remote: bool) -> Workload {
         pod_uid: Some("live-xc-destination".to_string()),
         node_waypoint: None,
         remote_provenance: remote,
+        mesh_transport: None,
     }
 }
 
@@ -16010,6 +16027,7 @@ fn live_xc_source_slice(
         pod_uid: Some(LIVE_XC_SOURCE_POD_UID.to_string()),
         node_waypoint: None,
         remote_provenance: false,
+        mesh_transport: None,
     };
     MeshSlice {
         node_id: node_id.to_string(),
@@ -18114,6 +18132,7 @@ fn unix_ingress_mesh_document(server_spiffe: &str, entries: &[UnixIngressEntry])
         pod_uid: None,
         node_waypoint: None,
         remote_provenance: false,
+        mesh_transport: None,
     };
     let service = MeshService {
         cluster_ips: Vec::new(),

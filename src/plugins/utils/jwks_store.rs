@@ -326,9 +326,13 @@ fn managed_read_failure_class(error: &ManagedTlsError) -> Option<JwksFailureClas
         | ManagedTlsError::KindConflict { .. }
         | ManagedTlsError::AlreadyExists(_) => Some(JwksFailureClass::Empty),
         ManagedTlsError::MaterialTooLarge => Some(JwksFailureClass::Oversized),
+        // Write-side refusals never come from a read; they say nothing about
+        // what the store holds, so they are not an authoritative absence.
         ManagedTlsError::InvalidPath(_)
         | ManagedTlsError::DocumentTooLarge { .. }
         | ManagedTlsError::RecordLimitReached
+        | ManagedTlsError::PreconditionFailed(_)
+        | ManagedTlsError::StillReferenced(_)
         | ManagedTlsError::Read(_)
         | ManagedTlsError::Write(_)
         | ManagedTlsError::Parse(_)

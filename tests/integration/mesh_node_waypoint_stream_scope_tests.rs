@@ -158,6 +158,7 @@ fn workload(
         pod_uid: Some(pod_uid.to_string()),
         node_waypoint: None,
         remote_provenance: false,
+        mesh_transport: None,
     }
 }
 
@@ -377,6 +378,7 @@ async fn resolve_stream_against_real_accepted_socket_maps_to_pod_scope() {
         pod_uid: Some(POD_A.to_string()),
         node_waypoint: None,
         remote_provenance: false,
+        mesh_transport: None,
     };
     resolver.install_policy_scopes_from_workloads(&[workload]);
 
@@ -461,6 +463,7 @@ mod node_waypoint_capture_inventory {
             ambient_udp_source_scoping: false,
             node_waypoint_capture_scoping: true,
             sidecar_http_routes: false,
+            service_waypoint_http_routes: false,
             stream_channel_capacity: 1,
             primary_retry_secs: 0,
             connect_timeout_seconds: 0,
@@ -508,6 +511,7 @@ mod node_waypoint_capture_inventory {
                 cluster: None,
             }),
             remote_provenance: false,
+            mesh_transport: None,
         }
     }
 
@@ -644,6 +648,7 @@ mod node_waypoint_capture_inventory {
             workload_spiffe_id: Some(THIS_WAYPOINT.to_string()),
             node_waypoint_capture_scoping: true,
             sidecar_http_routes: false,
+            service_waypoint_http_routes: false,
             ..MeshSliceRequest::default()
         }
     }
@@ -1455,6 +1460,7 @@ mod node_waypoint_cross_namespace_source_resolution {
                 cluster: None,
             }),
             remote_provenance: false,
+            mesh_transport: None,
         }
     }
 
@@ -1508,6 +1514,7 @@ mod node_waypoint_cross_namespace_source_resolution {
             workload_spiffe_id: Some(THIS_WAYPOINT.to_string()),
             node_waypoint_capture_scoping: true,
             sidecar_http_routes: false,
+            service_waypoint_http_routes: false,
             ..MeshSliceRequest::default()
         }
     }

@@ -3266,6 +3266,56 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_mesh_mtls_tunnel_pool_active_streams",
+    "type": "gauge",
+    "help": "Raw-TCP CONNECT streams open on pooled Sidecar mesh-mTLS tunnel connections, at scrape time.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_mtls_tunnel_pool_connections_opened_total",
+    "type": "counter",
+    "help": "SVID-mTLS HTTP/2 connections the Sidecar raw-TCP tunnel pool dialed.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_mtls_tunnel_pool_saturation_waits_total",
+    "type": "counter",
+    "help": "Sidecar raw-TCP tunnels that waited for a stream slot because every pooled connection was at its stream cap and the pool was at its connection limit, by outcome.",
+    "labels": [
+      "result",
+      "namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_mtls_tunnel_pool_streams_total",
+    "type": "counter",
+    "help": "Sidecar raw-TCP CONNECT tunnels opened, by whether they rode an already-pooled connection (reused) or one dialed for them (new).",
+    "labels": [
+      "carrier",
+      "namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_mesh_node_topology_degraded",
     "type": "gauge",
     "help": "Node-agent detected missing eBPF prerequisites or a build without eBPF capture. 1 with a reason label means degraded, 0 with reason=\"none\" means nominal.",

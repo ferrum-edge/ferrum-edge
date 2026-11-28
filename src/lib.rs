@@ -621,6 +621,34 @@ pub mod _test_support {
         Ok((*config).clone())
     }
 
+    /// The control plane's filtered configuration for one mesh subscription:
+    /// the input both the native `MeshSubscribe` stream and the xDS ADS
+    /// stream project a slice from
+    /// (`CpGrpcServer::filter_config_to_mesh_request_for_scope_and_bearer`,
+    /// cluster-wide scope, no bearer `ns` claim).
+    pub fn cp_filter_config_to_mesh_request_for_test(
+        config: &crate::config::types::GatewayConfig,
+        request: &crate::modes::mesh::slice::MeshSliceRequest,
+    ) -> crate::config::types::GatewayConfig {
+        crate::grpc::cp_server::CpGrpcServer::filter_config_to_mesh_request_for_scope_and_bearer(
+            config,
+            request,
+            &crate::grpc::cp_server::CpScope::All,
+            None,
+        )
+    }
+
+    /// Whether two filtered configurations have the same xDS stream/snapshot
+    /// cache fingerprint (`xds::server::config_fingerprint`): equal means an
+    /// xDS stream would keep serving its cached snapshot.
+    pub fn xds_config_fingerprints_equal_for_test(
+        left: &crate::config::types::GatewayConfig,
+        right: &crate::config::types::GatewayConfig,
+    ) -> bool {
+        crate::xds::server::config_fingerprint(left)
+            == crate::xds::server::config_fingerprint(right)
+    }
+
     /// How specifically DestinationRule `rule_host` (declared in `namespace`)
     /// names `candidate`: `None` for no match, `Some(None)` for an exact host
     /// or Service alias, `Some(Some(n))` for a wildcard with an `n`-byte suffix.
@@ -672,6 +700,44 @@ pub mod _test_support {
         let (body, _no_pump) =
             crate::proxy::body::ReplayableRequestBody::with_gateway_upload_pump(data, None, 0);
         http_body_util::Either::Right(body)
+    }
+
+    /// `ferrum-edge validate --backup` over `path` with the policy a
+    /// control-plane-shaped test `AdminState` (no `ProxyState`, no cached
+    /// mesh) gives `POST /restore` (issue #7532). `Ok(())` exactly when the
+    /// offline check accepts the file.
+    pub fn backup_export_check_for_test(
+        path: &std::path::Path,
+        namespace: &str,
+        backend_allow_ips: crate::config::BackendEgressPolicy,
+        max_spec_body_mib: usize,
+        restore_max_body_mib: usize,
+    ) -> Result<(), Vec<String>> {
+        let policy = crate::admin::restore_admission::offline_policy_for_test(
+            backend_allow_ips,
+            max_spec_body_mib,
+            restore_max_body_mib,
+            false,
+        );
+        crate::admin::restore_admission::check_backup_file(
+            path,
+            namespace,
+            restore_max_body_mib,
+            &policy,
+        )
+        .map(|_| ())
+    }
+
+    /// The production `ferrum-edge validate --backup` entry point over `path`
+    /// for an explicit `EnvConfig`: `serves_proxy` is `true` for database mode
+    /// (the serving node's plugin client) and `false` for a control plane.
+    pub fn backup_export_check_with_env_for_test(
+        path: &std::path::Path,
+        env_config: &crate::config::EnvConfig,
+        serves_proxy: bool,
+    ) -> Result<(), Vec<String>> {
+        crate::admin::restore_admission::check_backup_export(path, env_config, serves_proxy)
+            .map(|_| ())
     }
 
     /// Structural admission of a `POST /restore` envelope (issue #5538).
@@ -6537,6 +6603,7 @@ pub mod _test_support {
                 sender,
                 gate: crate::proxy::mesh_trust_registry::MeshTransportGate::new(),
                 load: crate::proxy::hbone_pool::HboneConnectionLoad::default(),
+                credential_not_after: u64::MAX,
             },
             "backend.test",
             80,

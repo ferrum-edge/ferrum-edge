@@ -441,10 +441,18 @@ deletion, and ignoring it would leave the target namespace half-cleared before
 the import, so this check is deliberately fail-closed. Repair or deliberately
 remove the offending document and re-run the restore.
 
-Namespace backup payloads carry namespace-scoped configuration resources, never
-the registry document itself, so restore never transplants a source tenant's
-description or registry timestamps into the authenticated target namespace. See
-[admin_api.md](admin_api.md) for the full boundary.
+A full, unfiltered `GET /backup` also carries the exported namespace's registry
+document as the `namespace_registry` section (its `name` and `description`;
+filtered and cached-fallback exports omit it). `POST /restore` applies it only
+when `name` is the target namespace, so restore never transplants a source
+tenant's description into a different namespace, and registry timestamps are
+never exported. A registry document that already matches the backup is not
+rewritten, so an unchanged backup (including the seeded `ferrum` row) restores
+on a standalone `mongod`. A backup that would change the registry document is
+refused with `501` before anything is deleted, because standalone MongoDB
+cannot write the registry atomically: configure `FERRUM_MONGO_REPLICA_SET`, or
+remove the `namespace_registry` section to restore the configuration alone. See
+[admin_backup_restore.md](admin_backup_restore.md) for the full rules.
 
 A direct `DELETE /proxies/{id}` for an API-spec-owned proxy is different: its
 ownership cascade spans the proxy, scoped plugins, the `api_specs` owner
@@ -799,6 +807,26 @@ already matches). `up` records the plan version it applied in the
 version is older than the recorded one refuses to start or migrate, and an old
 index is dropped only when a later plan version explicitly retires it by name.
 See [docs/migrations.md](migrations.md#mongodb-migrations).
+
+### Databases created by 0.9.x releases are refused
+
+0.9.x releases never recorded an index-plan version. A 1.0.0 binary therefore
+treats a database that holds a document in any Ferrum collection (`proxies`,
+`consumers`, `plugin_configs`, `upstreams`, `api_specs`,
+`gateway_trust_bundles`, `namespaces`, `config_changes`,
+`consumer_identity_index`, `audit_events`) but has no `core_index_plan`
+record as a 0.9.x database. Startup, `FERRUM_MIGRATE_ACTION=up` and
+`FERRUM_MIGRATE_ACTION=status` refuse it before any write with
+`migration history integrity check failed: kind=pre_release_database
+backend=mongodb`, naming the collection and the rebuild-and-restore
+procedure, the same outcome a 0.9.x PostgreSQL, MySQL or SQLite database gets.
+Rebuild it: export each namespace with `GET /backup` from the 0.9.x
+deployment, check each export with `ferrum-edge validate --backup`, point
+1.0.0 at an empty database, and `POST /restore` each export (see
+[upgrade_guide.md](upgrade_guide.md#every-09x-database-is-rebuilt-and-restored-7523)
+and [admin_backup_restore.md](admin_backup_restore.md)). An empty database is
+never refused, and every 1.0.0+ `up` writes its plan record before it creates
+a collection or document, so a 1.x database always has one.
 
 ### Adding New Fields
 

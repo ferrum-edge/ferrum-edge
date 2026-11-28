@@ -137,6 +137,7 @@ fn sample_certificate(id: &str) -> AcmeCertificateRecord {
         not_after: Some(now),
         created_at: now,
         updated_at: now,
+        revision: 0,
     }
 }
 

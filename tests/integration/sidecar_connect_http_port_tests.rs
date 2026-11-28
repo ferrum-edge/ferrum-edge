@@ -97,6 +97,7 @@ fn local_service(spiffe: &str, http_port: u16, tcp_port: u16) -> (Workload, Mesh
         pod_uid: None,
         node_waypoint: None,
         remote_provenance: false,
+        mesh_transport: None,
     };
     let service = MeshService {
         cluster_ips: Vec::new(),

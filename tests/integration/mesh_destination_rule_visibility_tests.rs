@@ -102,6 +102,7 @@ fn workload_in(namespace: &str, name: &str) -> Workload {
         pod_uid: None,
         node_waypoint: None,
         remote_provenance: false,
+        mesh_transport: None,
     }
 }
 

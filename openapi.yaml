@@ -722,6 +722,8 @@ paths:
         Imports already issued ACME certificate material into Ferrum's ACME
         store. Private key bytes are persisted but never returned in responses.
       tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/TlsRecordIfMatch"
       requestBody:
         required: true
         content:
@@ -747,6 +749,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -762,6 +766,9 @@ paths:
       responses:
         "200":
           description: ACME certificate record
+          headers:
+            ETag:
+              $ref: "#/components/headers/TlsRecordETag"
           content:
             application/json:
               schema:
@@ -782,6 +789,7 @@ paths:
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/TlsRecordIfMatch"
       requestBody:
         required: true
         content:
@@ -807,6 +815,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -834,6 +844,7 @@ paths:
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/TlsRecordIfMatch"
       responses:
         "200":
           description: ACME certificate deleted
@@ -857,6 +868,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/TlsRecordInUseConflict"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1225,6 +1238,8 @@ paths:
         CA bundles, CRLs, OCSP responses, and JWKS. Create with `allow_overwrite=true`
         rejects a cross-kind ID collision with `409 Conflict`.
       tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/TlsRecordIfMatch"
       requestBody:
         required: true
         content:
@@ -1250,6 +1265,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1265,6 +1282,9 @@ paths:
       responses:
         "200":
           description: Managed certificate record
+          headers:
+            ETag:
+              $ref: "#/components/headers/TlsRecordETag"
           content:
             application/json:
               schema:
@@ -1291,6 +1311,7 @@ paths:
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/TlsRecordIfMatch"
       requestBody:
         required: true
         content:
@@ -1318,6 +1339,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1345,6 +1368,7 @@ paths:
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/TlsRecordIfMatch"
       responses:
         "200":
           description: Managed certificate deleted
@@ -1368,6 +1392,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/TlsRecordInUseConflict"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1406,6 +1432,8 @@ paths:
         when ordinary mutation auditing is enabled, the event is stored under
         the canonical default namespace (`ferrum`).
       tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/TlsRecordIfMatch"
       requestBody:
         required: true
         content:
@@ -1431,6 +1459,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1446,6 +1476,9 @@ paths:
       responses:
         "200":
           description: Managed CA bundle record
+          headers:
+            ETag:
+              $ref: "#/components/headers/TlsRecordETag"
           content:
             application/json:
               schema:
@@ -1470,6 +1503,7 @@ paths:
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/TlsRecordIfMatch"
       requestBody:
         required: true
         content:
@@ -1497,6 +1531,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1524,6 +1560,7 @@ paths:
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/TlsRecordIfMatch"
       responses:
         "200":
           description: Managed CA bundle deleted
@@ -1547,6 +1584,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/TlsRecordInUseConflict"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1583,6 +1622,8 @@ paths:
         with `allow_overwrite=true` rejects a cross-kind ID collision with
         `409 Conflict`.
       tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/TlsRecordIfMatch"
       requestBody:
         required: true
         content:
@@ -1608,6 +1649,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1623,6 +1666,9 @@ paths:
       responses:
         "200":
           description: Managed CRL record
+          headers:
+            ETag:
+              $ref: "#/components/headers/TlsRecordETag"
           content:
             application/json:
               schema:
@@ -1645,6 +1691,7 @@ paths:
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/TlsRecordIfMatch"
       requestBody:
         required: true
         content:
@@ -1672,6 +1719,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1699,6 +1748,7 @@ paths:
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/TlsRecordIfMatch"
       responses:
         "200":
           description: Managed CRL deleted
@@ -1722,6 +1772,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/TlsRecordInUseConflict"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1758,6 +1810,8 @@ paths:
         with `allow_overwrite=true` rejects a cross-kind ID collision with
         `409 Conflict`.
       tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/TlsRecordIfMatch"
       requestBody:
         required: true
         content:
@@ -1783,6 +1837,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1798,6 +1854,9 @@ paths:
       responses:
         "200":
           description: Managed OCSP response record
+          headers:
+            ETag:
+              $ref: "#/components/headers/TlsRecordETag"
           content:
             application/json:
               schema:
@@ -1820,6 +1879,7 @@ paths:
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/TlsRecordIfMatch"
       requestBody:
         required: true
         content:
@@ -1847,6 +1907,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1874,6 +1936,7 @@ paths:
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/TlsRecordIfMatch"
       responses:
         "200":
           description: Managed OCSP response deleted
@@ -1897,6 +1960,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/TlsRecordInUseConflict"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1938,6 +2003,8 @@ paths:
         write returns; other nodes sharing `FERRUM_TLS_MANAGED_STORE_PATH`
         re-read on their own cadence.
       tags: [TLS]
+      parameters:
+        - $ref: "#/components/parameters/TlsRecordIfMatch"
       requestBody:
         required: true
         content:
@@ -1963,6 +2030,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1978,6 +2047,9 @@ paths:
       responses:
         "200":
           description: Managed JWKS record
+          headers:
+            ETag:
+              $ref: "#/components/headers/TlsRecordETag"
           content:
             application/json:
               schema:
@@ -2004,6 +2076,7 @@ paths:
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/TlsRecordIfMatch"
       requestBody:
         required: true
         content:
@@ -2031,6 +2104,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -2061,6 +2136,7 @@ paths:
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
+        - $ref: "#/components/parameters/TlsRecordIfMatch"
       responses:
         "200":
           description: Managed JWKS document deleted
@@ -2084,6 +2160,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/TlsRecordInUseConflict"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -3599,8 +3677,10 @@ paths:
         Returns `404 Not Found` when service-waypoint topology is not
         active, when no mesh slice has been installed yet, or when the
         installed slice has no `waypoint_name`. The payload exposes service
-        names, namespaces, ports, and workload counts, but no request bodies,
-        credentials, or backend TLS material.
+        names, namespaces, ports, workload counts, the bound-Service L7 HTTP
+        ports and the number of VirtualService routes attached to each
+        Service, but no route rules, request bodies, credentials, or backend
+        TLS material.
       tags: [Service-Waypoint]
       security:
         - bearerAuth: []
@@ -3620,10 +3700,14 @@ paths:
                     name: reviews
                     ports: [8080]
                     workload_count: 3
+                    l7_http_ports: [8080]
+                    virtual_service_route_count: 1
                   - namespace: default
                     name: ratings
                     ports: [8081]
                     workload_count: 1
+                    l7_http_ports: [8081]
+                    virtual_service_route_count: 0
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -5687,13 +5771,16 @@ paths:
         resources always include `id`s; `POST /restore` requires those ids,
         while `POST /batch` will auto-generate them if a caller strips them.
 
-        The payload carries namespace-**scoped configuration resources** only.
-        It deliberately does NOT carry the namespace registry row itself — the
-        namespace `description` and its registry `created_at`/`updated_at` are
-        not exported, because `POST /restore` writes into the authenticated
-        target namespace and must not transplant a source tenant's metadata
-        into a different target. Manage that metadata with
-        `POST /namespaces` and `PUT /namespaces/{name}`.
+        The payload carries the namespace-**scoped configuration resources**
+        and, on a full (unfiltered) database-backed export of a namespace that
+        has a registry row, that row's `name` and `description` in the
+        `namespace_registry` section (issue #7532). Resource-filtered exports
+        and the cached fallback omit the section. `POST /restore` applies it
+        only when its `name` is the restore's target namespace, so restoring
+        one tenant's export into a different namespace never transplants the
+        source tenant's description; the registry `created_at`/`updated_at`
+        timestamps are not exported. On a conditional export the section is
+        read from the same snapshot as the namespace ETag, which covers it.
 
         Falls back to the in-memory cached configuration when the database is
         unavailable, indicated by the `X-Data-Source: cached` response header.
@@ -5873,19 +5960,54 @@ paths:
         batch-shaped body without ids is a `400` and does not delete existing
         config.
 
-        ### Namespace registry metadata is out of scope
+        ### Namespace registry row
 
-        The payload carries namespace-scoped configuration resources, not the
-        namespace registry row. Restoring **in place** therefore preserves the
-        target namespace's registry metadata (description and registry
-        timestamps) unchanged, including across the destructive clear.
-        Importing into a **fresh target** yields a namespace that holds
-        resources but has no registry row and therefore no description — a
-        derived-only namespace, for which `GET /namespaces/{name}` synthesizes
-        a record with observation timestamps. Use `POST /namespaces` or
-        `PUT /namespaces/{name}` to materialize a durable registry row. This is
-        intentional: restore targets an authenticated namespace and must not
-        transplant source-tenant metadata into a different target.
+        A full, unfiltered database-backed `GET /backup` carries the exported
+        namespace's registry row in `namespace_registry` (issue #7532). Restore
+        admits that section with the rest of the payload, before anything is
+        deleted. When the section's `name` is the target namespace
+        (`X-Ferrum-Namespace`), restore takes registry admission (the global
+        namespace-registry lease, then the namespace's lease — the order every
+        registry mutation uses) instead of plain namespace admission and holds
+        it from before the clear until the row is written, so no
+        `POST`/`PUT`/`DELETE /namespaces` can interleave. A row that already
+        matches the backup is not rewritten, so an unchanged backup restores on
+        every backend, standalone MongoDB included. Otherwise an existing row's
+        description is replaced and its `created_at` kept, a derived-only
+        namespace is registered, and an empty unregistered namespace — a
+        registered namespace that held no resources when it was exported — is
+        created with new timestamps. A change on a backend that cannot write
+        the registry atomically (standalone MongoDB) is refused with `501`
+        before anything is deleted; remove the `namespace_registry` section to
+        restore the configuration alone. A section from another namespace is
+        not applied, so a cross-namespace restore never relabels its target. A
+        backup without the section (every 0.9.x export, filtered and
+        cached-fallback exports) leaves the target's registry row untouched.
+
+        A conditional restore (`If-Match`) writes the row inside its
+        replacement transaction, after the namespace ETag comparison: the ETag
+        covers the registry row, so a registry change after the backup is a
+        `412` with nothing applied, and the write can never replace a newer
+        description. A non-conditional restore writes the row after the
+        chunked import commits, still under the registry admission and the
+        write-topology permit and before live apply is awaited; if that single
+        write fails, the response is a `500` with `configuration_restored:
+        true`, and retrying the restore or `PUT /namespaces/{name}` completes
+        it.
+
+        ### Stored API-spec documents are admitted
+
+        Each `api_specs` item's stored document goes through the same strict
+        extension admission `POST` / `PUT /api-specs` runs (`x-ferrum-proxy`,
+        `x-ferrum-upstream` and `x-ferrum-plugins` decoded into the closed
+        resource types, plus the `x-ferrum-validate` / `x-ferrum-mcp` shape
+        checks), so a document that carries an unknown or removed key is
+        refused with `400` before anything is deleted, rather than restoring and
+        failing on its next submission. External `$ref`s are not re-fetched; the
+        stored external-ref snapshot is integrity-checked instead.
+
+        `ferrum-edge validate --backup <file>` runs the same payload admission
+        offline (see docs/cli.md).
 
         ### MongoDB: malformed split identities are refused
 
@@ -5967,7 +6089,13 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "501":
-          description: Conditional restore requires a transaction-capable MongoDB deployment.
+          description: >-
+            Nothing was deleted. Either a conditional restore needs a
+            transaction-capable MongoDB deployment, or the backup's
+            `namespace_registry` section would change the target namespace's
+            registry row, which standalone MongoDB cannot write atomically
+            (`detail` names `FERRUM_MONGO_REPLICA_SET`). An unchanged registry
+            row restores on standalone MongoDB.
           content:
             application/json:
               schema:
@@ -6052,6 +6180,17 @@ paths:
                       Operator guidance to verify API specs with GET /api-specs
                       and re-submit originals via POST /api-specs if missing.
                       Present only when `api_specs_not_restored` is set.
+                  configuration_restored:
+                    type: boolean
+                    enum: [true]
+                    description: >-
+                      Present (`true`) only when a non-conditional restore
+                      committed the namespace configuration but the registry
+                      row from the backup's `namespace_registry` section could
+                      not be written afterwards. Retry the restore, or set the
+                      description with `PUT /namespaces/{name}`. A conditional
+                      restore writes the row in its replacement transaction
+                      and never returns this.
         "400":
           description: Missing `?confirm=true`, malformed JSON/headers, or backup validation errors (`validation_errors`)
           content:
@@ -9537,9 +9676,11 @@ components:
         the `ETag` from `GET` on the same resource; the write is refused with
         `412` unless the stored resource still has that representation, so a
         draft opened before someone else's accepted change can never revert
-        it. `*` requires only that the resource exists. Comparison is strong:
-        a weak (`W/`) tag never matches. A comma-separated list matches when
-        any member does.
+        it. `*` requires only that the resource exists and must be the whole
+        header (`*` combined with anything else, such as `*, *`, `*,` or
+        `,*`, is `400`). Comparison is strong: a weak (`W/`)
+        tag never matches. A comma-separated list matches when any member
+        does.
 
         The comparison and the write are atomic with respect to every admin
         writer of this namespace — including another control-plane replica
@@ -9557,12 +9698,53 @@ components:
         Omitting the header keeps the write unconditional. A malformed or
         empty header is `400`, never treated as absent. `If-Match` is only
         evaluated on `PUT`/`DELETE` of `/proxies/{id}`, `/upstreams/{id}`,
-        `/consumers/{id}`, and `/plugins/config/{id}`, and on the consumer
-        credential mutations above. `POST /restore` uses
+        `/consumers/{id}`, and `/plugins/config/{id}`, on the consumer
+        credential mutations above, and on the managed TLS record writes
+        (see `TlsRecordIfMatch`). `POST /restore` uses
         the separate NamespaceIfMatch contract; any other `POST`,
         `PUT`, `PATCH`, or `DELETE` carrying it is refused with `400` rather
         than applied unconditionally. As RFC 9110 §13.2.1 requires, a request
         that would otherwise be `404` is `404` regardless of the precondition.
+    TlsRecordIfMatch:
+      name: If-Match
+      in: header
+      required: false
+      schema:
+        type: string
+      description: |
+        Makes a managed TLS or ACME certificate record write conditional
+        (RFC 9110 §13.1.1), with the same syntax, comparison, status codes and
+        error envelope as `If-Match` on `/proxies/{id}`. Send the `ETag` from
+        `GET` on the same record; the write is refused with `412` and nothing
+        changes unless the stored record still has that representation, so an
+        operator rotating material from a stale read can never overwrite
+        another operator's accepted rotation. `*` requires only that the
+        record exists. Comparison is strong: a weak (`W/`) tag never matches. A
+        comma-separated list matches when any member does.
+
+        The comparison runs inside the TLS store's exclusive cross-process
+        write lock, against the authoritative record, in the same
+        read-modify-write that commits the change. Every gateway instance
+        sharing the store directory (`FERRUM_TLS_MANAGED_STORE_PATH`) takes
+        that lock, so no other writer — another admin request, another
+        replica, or ACME renewal — can commit between the comparison and the
+        write.
+
+        Status precedence, identical on `PUT`, `DELETE`, and overwrite `POST`
+        in every interleaving (each check is re-made under the store lock):
+        `400` malformed header; `404` missing id; the kind mismatch (`409` on
+        `PUT`/`POST`, `400` on `DELETE`); `409` existing id without
+        `allow_overwrite` (`POST`); on `DELETE`, `409` while still referenced
+        and `503` when the reference fence lapsed; then `412` for a stale tag.
+        On a collection `POST` the precondition applies to the
+        `allow_overwrite: true` replacement case and never holds when the id
+        is free (`412`), so a conditional overwrite never creates a record.
+
+        Omitting the header keeps the write unconditional. A malformed or
+        empty header (including `*` combined with anything else, such as
+        `*, *`, `*,` or `,*`) is `400`, never treated as absent. The reference
+        scan's verdict is applied under the store lock after the existence and
+        kind checks.
     ExpectedProxyIds:
       name: expected_proxy_ids
       in: query
@@ -9747,6 +9929,27 @@ components:
         same `FERRUM_ADMIN_JWT_SECRET` issue identical tags; rotating that
         secret invalidates outstanding tags. Write responses do not carry a
         tag: re-read the resource to obtain the tag for the accepted state.
+      required: false
+      schema:
+        type: string
+        example: '"3f0c8a1e9b2d4c6f8a0e1b3d5c7f9a2e"'
+    TlsRecordETag:
+      description: |
+        Strong entity-tag for the stored managed TLS or ACME certificate
+        record, for use in `If-Match` on that record's `PUT`, `DELETE`, or
+        `allow_overwrite` `POST`. Derived exactly as `ResourceETag`: a MAC
+        keyed from `FERRUM_ADMIN_JWT_SECRET` over the complete stored record
+        (including private key and other material never returned in the body,
+        which is why it is keyed rather than a plain digest), bound to the
+        record id. Every successful write stamps the record with a new,
+        monotonically increasing store revision that the tag covers, so the
+        tag changes on every write (a same-material rotation and a
+        delete-then-recreate included) and no write leaves an earlier tag
+        valid. Present only when the caller's token was verified by
+        `FERRUM_ADMIN_JWT_SECRET` (GHSA-crqx-mp2f-v8c8). Replicas configured
+        with the same secret issue identical tags. Write responses do not
+        carry a tag: re-read the record to obtain the tag for the accepted
+        state.
       required: false
       schema:
         type: string
@@ -21386,6 +21589,11 @@ components:
             `POST /restore` or `/gateway-trust-bundles` to persist trust.
           items:
             $ref: "#/components/schemas/GatewayTrustBundle"
+        namespace_registry:
+          $ref: "#/components/schemas/NamespaceRegistryBackupSection"
+          description: >-
+            Backup-only section. Accepted and ignored on `POST /batch`; use
+            `POST /restore` or `/namespaces` to write the namespace registry.
 
     BatchCreateResponse:
       type: object
@@ -21752,6 +21960,49 @@ components:
             $ref: "#/components/schemas/GatewayTrustBundle"
         api_specs:
           $ref: "#/components/schemas/ApiSpecsBackupSection"
+        namespace_registry:
+          $ref: "#/components/schemas/NamespaceRegistryBackupSection"
+
+    NamespaceRegistryBackupSection:
+      type: object
+      description: |
+        The exported namespace's registry row (issue #7532). `GET /backup`
+        includes it only on a full, unfiltered database-backed export of a
+        namespace that has a registry row; resource-filtered and
+        cached-fallback exports, and exports taken before this section
+        existed (every 0.9.x export), omit it.
+
+        `POST /restore` admits it before anything is deleted. When `name`
+        equals the target namespace (`X-Ferrum-Namespace`), restore writes the
+        row under registry admission: a matching row is left as is, an
+        existing row's description is replaced (its `created_at` is kept), a
+        namespace that only has derived existence is registered, and an empty
+        unregistered namespace is created with new timestamps. A conditional
+        restore writes it inside its replacement transaction (the namespace
+        ETag covers the row); a non-conditional restore writes it after the
+        import commits and before live apply. A change standalone MongoDB
+        cannot write atomically is refused with `501` before the clear. A
+        section taken from another namespace is validated but not applied, so
+        restoring one tenant's export into a different namespace never
+        relabels that namespace. An absent section leaves the target registry
+        row untouched. Accepted and ignored on `POST /batch`.
+      required: [section_version, name]
+      additionalProperties: false
+      properties:
+        section_version:
+          type: string
+          enum: ["1"]
+          description: Section version. `"1"` is the only version.
+        name:
+          type: string
+          description: The namespace the export was taken from.
+        description:
+          type: [string, "null"]
+          maxLength: 1024
+          description: |
+            The registry description, normalized as on `POST /namespaces`
+            (trimmed; empty or whitespace-only is no description). Omitted when
+            the namespace has none.
 
     ApiSpecsBackupSection:
       type: object
@@ -22003,6 +22254,8 @@ components:
               refused rather than silently reduced to the first.
           items:
             $ref: "#/components/schemas/GatewayTrustBundle"
+        namespace_registry:
+          $ref: "#/components/schemas/NamespaceRegistryBackupSection"
         ferrum_version:
           type: string
           description: >-
@@ -45764,7 +46017,9 @@ components:
     # ── Service-Waypoint Services ─────────────────────────────────────
     ServiceWaypointServiceEntry:
       type: object
-      required: [namespace, name, ports, workload_count]
+      additionalProperties: false
+      required:
+        [namespace, name, ports, workload_count, l7_http_ports, virtual_service_route_count]
       properties:
         namespace:
           type: string
@@ -45787,9 +46042,36 @@ components:
           format: int64
           description: Number of workload SPIFFE references behind this service in the installed slice.
           example: 3
+        l7_http_ports:
+          type: array
+          description: |
+            HTTP-family ports of this Service that the waypoint materialized a
+            bound-Service L7 route and upstream for (issue #7500), ascending.
+            Empty when the Service is not bound to this waypoint by a binding
+            that claims service traffic (`waypoint_for` `service` or `all`),
+            or when no backing workload is reachable on any of its HTTP ports.
+            Stream-family ports never appear here.
+          items:
+            type: integer
+            minimum: 1
+            maximum: 65535
+          example: [8080]
+        virtual_service_route_count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            Number of distinct materialized VirtualService route proxies
+            attached to this bound Service in the generation the proxy serves
+            (issue #7500). This counts data-plane routes, not authored
+            `http[]` entries: one entry with several `match` clauses can
+            materialize several route proxies. Raw route rules and match
+            predicates are not exposed.
+          example: 1
 
     ServiceWaypointServicesResponse:
       type: object
+      additionalProperties: false
       required: [waypoint_name, namespace, service_count, services]
       properties:
         waypoint_name:

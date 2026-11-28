@@ -182,9 +182,15 @@ pub fn render_prometheus(proxy_state: Option<&ProxyState>, ns_label: &str) -> St
             ("http3", state.h3_pool.pool_size()),
             ("hbone", state.hbone_pool.pool_size()),
             ("mesh_mtls", state.mesh_mtls_pool.pool_size()),
+            ("mesh_mtls_tunnel", state.mesh_mtls_pool.tunnel_pool_size()),
         ];
         render_connection_pools(&mut output, &pools, max_idle_per_host, ns_label);
         render_direct_h1_pool(&mut output, &state.http2_pool.h1_pool_stats(), ns_label);
+        render_mesh_mtls_tunnel_pool(
+            &mut output,
+            &state.mesh_mtls_pool.tunnel_pool_stats(),
+            ns_label,
+        );
     }
     output
 }
@@ -625,6 +631,65 @@ pub fn render_direct_h1_pool(
     ] {
         output.push_str(&format!(
             "ferrum_connection_pool_h1_idle_evictions_total{{reason=\"{reason}\"{ns_label}}} {count}\n"
+        ));
+    }
+}
+
+/// Append the Sidecar raw-TCP tunnel lane families (issue #7537): open
+/// CONNECT streams on pooled carriers at scrape time, carrier dials, tunnels
+/// by whether their carrier was reused or dialed for them, and stream-slot
+/// waits on saturated, width-capped keys by outcome. Carrier count is the
+/// `pool="mesh_mtls_tunnel"` series of `ferrum_connection_pool_entries`.
+pub fn render_mesh_mtls_tunnel_pool(
+    output: &mut String,
+    stats: &crate::proxy::mesh_mtls_pool::MeshMtlsTunnelPoolStats,
+    ns_label: &str,
+) {
+    output.push_str(
+        "# HELP ferrum_mesh_mtls_tunnel_pool_active_streams Raw-TCP CONNECT streams open on pooled Sidecar mesh-mTLS tunnel connections, at scrape time.\n",
+    );
+    output.push_str("# TYPE ferrum_mesh_mtls_tunnel_pool_active_streams gauge\n");
+    push_scalar(
+        output,
+        "ferrum_mesh_mtls_tunnel_pool_active_streams",
+        ns_label,
+        stats.active_streams as u64,
+    );
+
+    output.push_str(
+        "# HELP ferrum_mesh_mtls_tunnel_pool_connections_opened_total SVID-mTLS HTTP/2 connections the Sidecar raw-TCP tunnel pool dialed.\n",
+    );
+    output.push_str("# TYPE ferrum_mesh_mtls_tunnel_pool_connections_opened_total counter\n");
+    push_scalar(
+        output,
+        "ferrum_mesh_mtls_tunnel_pool_connections_opened_total",
+        ns_label,
+        stats.connections_opened,
+    );
+
+    output.push_str(
+        "# HELP ferrum_mesh_mtls_tunnel_pool_streams_total Sidecar raw-TCP CONNECT tunnels opened, by whether they rode an already-pooled connection (reused) or one dialed for them (new).\n",
+    );
+    output.push_str("# TYPE ferrum_mesh_mtls_tunnel_pool_streams_total counter\n");
+    for (carrier, count) in [
+        ("reused", stats.streams_reused),
+        ("new", stats.streams_new_connection),
+    ] {
+        output.push_str(&format!(
+            "ferrum_mesh_mtls_tunnel_pool_streams_total{{carrier=\"{carrier}\"{ns_label}}} {count}\n"
+        ));
+    }
+
+    output.push_str(
+        "# HELP ferrum_mesh_mtls_tunnel_pool_saturation_waits_total Sidecar raw-TCP tunnels that waited for a stream slot because every pooled connection was at its stream cap and the pool was at its connection limit, by outcome.\n",
+    );
+    output.push_str("# TYPE ferrum_mesh_mtls_tunnel_pool_saturation_waits_total counter\n");
+    for (result, count) in [
+        ("admitted", stats.saturation_waits_admitted),
+        ("timed_out", stats.saturation_waits_timed_out),
+    ] {
+        output.push_str(&format!(
+            "ferrum_mesh_mtls_tunnel_pool_saturation_waits_total{{result=\"{result}\"{ns_label}}} {count}\n"
         ));
     }
 }

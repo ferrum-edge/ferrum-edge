@@ -87,31 +87,38 @@ impl IfMatch {
 /// unconditional would reintroduce exactly the overwrite it was guarding
 /// against.
 pub(crate) fn parse_if_match(headers: &hyper::HeaderMap) -> Result<Option<IfMatch>, String> {
-    let mut values = headers.get_all(hyper::header::IF_MATCH).iter().peekable();
-    if values.peek().is_none() {
+    let mut lines = Vec::new();
+    for value in headers.get_all(hyper::header::IF_MATCH) {
+        lines.push(
+            value
+                .to_str()
+                .map_err(|_| "If-Match header must be visible ASCII".to_string())?,
+        );
+    }
+    if lines.is_empty() {
         return Ok(None);
     }
-    let mut any = false;
+    // `*` is a single alternative to an entity-tag list (RFC 9110 §13.1.1),
+    // never a list member: it is recognized only as the complete trimmed
+    // value of the sole field line. `*,`, `,*`, `*, *`, a second field line,
+    // or `*` beside a tag are all malformed rather than a looser "exists"
+    // precondition.
+    if let [line] = lines.as_slice()
+        && line.trim_matches([' ', '\t']) == "*"
+    {
+        return Ok(Some(IfMatch::Any));
+    }
     let mut tags = Vec::new();
-    for value in values {
-        let text = value
-            .to_str()
-            .map_err(|_| "If-Match header must be visible ASCII".to_string())?;
-        parse_if_match_field(text, &mut any, &mut tags)?;
+    for line in lines {
+        parse_if_match_field(line, &mut tags)?;
     }
-    match (any, tags.is_empty()) {
-        (true, true) => Ok(Some(IfMatch::Any)),
-        (true, false) => Err("If-Match '*' cannot be combined with entity-tags".to_string()),
-        (false, true) => Err("If-Match header must not be empty".to_string()),
-        (false, false) => Ok(Some(IfMatch::Tags(tags))),
+    if tags.is_empty() {
+        return Err("If-Match header must not be empty".to_string());
     }
+    Ok(Some(IfMatch::Tags(tags)))
 }
 
-fn parse_if_match_field(
-    text: &str,
-    any: &mut bool,
-    tags: &mut Vec<EntityTag>,
-) -> Result<(), String> {
+fn parse_if_match_field(text: &str, tags: &mut Vec<EntityTag>) -> Result<(), String> {
     let bytes = text.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -121,8 +128,10 @@ fn parse_if_match_field(
                 continue;
             }
             b'*' => {
-                *any = true;
-                i += 1;
+                return Err(
+                    "If-Match '*' must be the entire header value, alone and unrepeated"
+                        .to_string(),
+                );
             }
             _ => {
                 let weak = bytes[i..].starts_with(b"W/");
