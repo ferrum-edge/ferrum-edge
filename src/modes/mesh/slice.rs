@@ -3074,11 +3074,15 @@ fn with_cross_namespace_destination_policies(
         return (mesh_policies, request_authentications, Vec::new());
     }
     let mut added_policies: BTreeSet<MeshHttpRouteDestinationPolicy> = BTreeSet::new();
-    // A workload selector governs only workloads of its resource's own
-    // namespace (Istio semantics); a selector without an explicit namespace
-    // must never broaden a third namespace's resource onto the destination.
+    let root_namespace = mesh.istio_root_namespace.trim();
+    // A workload selector governs workloads of its resource's own namespace,
+    // or any namespace when owned by the mesh root namespace (Istio semantics);
+    // a selector without an explicit namespace must never broaden a third
+    // namespace's resource onto the destination.
     let governs = |resource_namespace: &str, scope: &PolicyScope, workload: &Workload| {
-        (matches!(scope, PolicyScope::MeshWide) || resource_namespace == workload.namespace)
+        (matches!(scope, PolicyScope::MeshWide)
+            || resource_namespace == workload.namespace
+            || (!root_namespace.is_empty() && resource_namespace == root_namespace))
             && scope_applies_to_workload(scope, &workload.namespace, &workload.selector.labels)
     };
     for policy in &mesh.mesh_policies {
@@ -4878,10 +4882,8 @@ fn policy_host_scope(
     mesh_service_identities: &BTreeSet<(String, String)>,
     service_entry_hosts: &BTreeMap<String, ServiceEntryHostOwner>,
 ) -> PolicyHostScope {
-    let host = policy_host
-        .trim()
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
+    let raw_host = policy_host.trim();
+    let host = raw_host.trim_end_matches('.').to_ascii_lowercase();
     let rule_namespace = policy_namespace
         .trim()
         .trim_end_matches('.')
@@ -4892,7 +4894,7 @@ fn policy_host_scope(
         .to_ascii_lowercase();
 
     match policy_target_service_ref(
-        &host,
+        raw_host,
         &rule_namespace,
         &cluster_domain,
         mesh_service_identities,
@@ -4938,12 +4940,14 @@ enum PolicyTargetRef {
 /// inventory; nothing here infers ownership from the POLICY's namespace except
 /// Istio's own short-name rule, which is definitionally self-scoped.
 fn policy_target_service_ref(
-    host: &str,
+    raw_host: &str,
     rule_namespace: &str,
     cluster_domain: &str,
     mesh_service_identities: &BTreeSet<(String, String)>,
     service_entry_hosts: &BTreeMap<String, ServiceEntryHostOwner>,
 ) -> PolicyTargetRef {
+    let trimmed = raw_host.trim();
+    let host = trimmed.trim_end_matches('.').to_ascii_lowercase();
     if host.is_empty() || rule_namespace.is_empty() || host.contains('*') {
         return PolicyTargetRef::Unresolved;
     }
@@ -4953,16 +4957,18 @@ fn policy_target_service_ref(
     //    make a namespace the owner of its OWN service.
     if !host.contains('.') {
         return PolicyTargetRef::ClusterService {
-            name: host.to_string(),
+            name: host,
             namespace: rule_namespace.to_string(),
         };
     }
 
     // 2-4. Everything else is a CONCRETE destination host, resolved by the
     //      shared helper the data-plane materialization tier pass also uses so
-    //      the two cannot rank one destination's owners differently.
+    //      the two cannot rank one destination's owners differently. Pass the
+    //      untrimmed-dot spelling so an absolute two-label DNS name
+    //      (`ratings.other.`) stays external rather than aliasing `<svc>.<ns>`.
     match destination_host_owner(
-        host,
+        trimmed,
         cluster_domain,
         mesh_service_identities,
         service_entry_hosts,
@@ -5032,7 +5038,12 @@ pub(crate) fn destination_host_owner(
     mesh_service_identities: &BTreeSet<(String, String)>,
     service_entry_hosts: &BTreeMap<String, ServiceEntryHostOwner>,
 ) -> Option<DestinationHostOwner> {
-    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    let trimmed = host.trim();
+    // An absolute two-label DNS name (`ratings.other.`) is anchored at the DNS
+    // root and never completes through the cluster search path to `<svc>.<ns>`.
+    let absolute_two_label =
+        trimmed.ends_with('.') && trimmed.trim_end_matches('.').matches('.').count() == 1;
+    let host = trimmed.trim_end_matches('.').to_ascii_lowercase();
     let cluster_domain = cluster_domain
         .trim()
         .trim_end_matches('.')
@@ -5078,7 +5089,8 @@ pub(crate) fn destination_host_owner(
         });
     }
 
-    if let Some((name, namespace)) = split_canonical_service_host(&host)
+    if !absolute_two_label
+        && let Some((name, namespace)) = split_canonical_service_host(&host)
         && mesh_service_identity_exists(mesh_service_identities, namespace, name)
     {
         return Some(DestinationHostOwner::ClusterService {

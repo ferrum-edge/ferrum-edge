@@ -37,19 +37,20 @@ use ferrum_edge::modes::mesh::multicluster::{
 };
 use ferrum_edge::modes::mesh::runtime::PolicyScopeCache;
 use ferrum_edge::modes::mesh::{
-    MESH_AUTHZ_PLUGIN_ID, MESH_REQUEST_AUTH_DESTINATION_PLUGIN_ID_PREFIX, MeshRuntimeConfig,
-    prepare_gateway_config_from_mesh_slice_with_remote_endpoints_for_test,
+    MESH_AUTHZ_PLUGIN_ID, MESH_REQUEST_AUTH_DESTINATION_PLUGIN_ID_PREFIX,
+    MESH_REQUEST_AUTH_REFUSED_PARTITION_ID_PREFIX, MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID,
+    MeshRuntimeConfig, prepare_gateway_config_from_mesh_slice_with_remote_endpoints_for_test,
 };
 use ferrum_edge::plugins::mesh::authz::MeshAuthz;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
 use serde_json::{Value, json};
 
 use super::super::mesh_test_support::{
-    DEFAULT_NAMESPACE, policy_allow_principal, policy_deny_principal, workload_for,
+    DEFAULT_NAMESPACE, policy_allow_principal, policy_deny_principal, service_for, workload_for,
 };
 use super::cross_namespace_routes::{
-    OTHER, RATINGS_OTHER, SOURCE_PREFIX, destination_rule, node_waypoint_runtime, sidecar_runtime,
-    slice_for, translated_with_grant, virtual_service,
+    OTHER, RATINGS_OTHER, SOURCE_PREFIX, destination_rule, k8s_service, node_waypoint_runtime,
+    sidecar_runtime, slice_for, translated_with_grant, virtual_service,
 };
 
 /// The VirtualService whose routes name the granted target.
@@ -98,26 +99,38 @@ fn request_auth(
 fn fixture(with_grant: bool, with_entry: bool) -> GatewayConfig {
     let mut config = translated_with_grant(
         vec![
+            k8s_service("details", DEFAULT_NAMESPACE),
             // Names the granted target: a DestinationRule-governed 90/10
-            // split with a leg to `other/ratings`, on its own path so it
-            // shadows no route the fixture serves without the grant.
+            // split with a leg to `other/ratings`, plus a direct granted route
+            // (so destination RequestAuthentication attaches cleanly without
+            // diverging across legs), both on their own paths so they shadow
+            // no route the fixture serves without the grant.
             virtual_service(
                 "granted",
                 json!({
                     "hosts": ["reviews.default.svc.cluster.local"],
-                    "http": [{
-                        "match": [{"uri": {"prefix": "/granted"}}],
-                        "route": [
-                            {"destination": {
-                                "host": "reviews.default.svc.cluster.local",
-                                "port": {"number": 8080}
-                            }, "weight": 90},
-                            {"destination": {
+                    "http": [
+                        {
+                            "match": [{"uri": {"prefix": "/granted-direct"}}],
+                            "route": [{"destination": {
                                 "host": RATINGS_OTHER,
                                 "port": {"number": 8080}
-                            }, "weight": 10}
-                        ]
-                    }]
+                            }}]
+                        },
+                        {
+                            "match": [{"uri": {"prefix": "/granted"}}],
+                            "route": [
+                                {"destination": {
+                                    "host": "reviews.default.svc.cluster.local",
+                                    "port": {"number": 8080}
+                                }, "weight": 90},
+                                {"destination": {
+                                    "host": RATINGS_OTHER,
+                                    "port": {"number": 8080}
+                                }, "weight": 10}
+                            ]
+                        }
+                    ]
                 }),
             ),
             // Names only `default/reviews`.
@@ -131,6 +144,29 @@ fn fixture(with_grant: bool, with_entry: bool) -> GatewayConfig {
                             "host": "reviews.default.svc.cluster.local",
                             "port": {"number": 8080}
                         }}]
+                    }]
+                }),
+            ),
+            // Unrelated combined mixed split (local Service + external host,
+            // no governing DestinationRule so it stays a single combined
+            // upstream): a grant-only RequestAuthentication must never turn
+            // this route into a 503 refusal.
+            virtual_service(
+                "mixed",
+                json!({
+                    "hosts": ["details.default.svc.cluster.local"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/mixed"}}],
+                        "route": [
+                            {"destination": {
+                                "host": "details.default.svc.cluster.local",
+                                "port": {"number": 8080}
+                            }, "weight": 50},
+                            {"destination": {
+                                "host": "partner.example.com",
+                                "port": {"number": 8080}
+                            }, "weight": 50}
+                        ]
                     }]
                 }),
             ),
@@ -154,6 +190,15 @@ fn fixture(with_grant: bool, with_entry: bool) -> GatewayConfig {
         with_grant,
     );
     let mesh = config.mesh.as_mut().expect("mesh block");
+    let details = workload_for(
+        "details",
+        DEFAULT_NAMESPACE,
+        [("app", "details")],
+        ["10.0.0.19"],
+    );
+    mesh.services
+        .push(service_for("details", DEFAULT_NAMESPACE, &[&details]));
+    mesh.workloads.push(details);
     if with_entry {
         let mut entry = workload_for("vm", DEFAULT_NAMESPACE, [("app", "vm")], ["10.0.0.50"]);
         entry.service_name = "ratings".to_string();
@@ -345,6 +390,48 @@ fn strip_timestamps(value: &mut Value) {
     }
 }
 
+/// Remove only `granted_proxies` from a `__mesh_request_auth_refused*`
+/// plugin's `proxy_id` trigger leaves. Returns `false` when the refusal was
+/// explicitly scoped to `proxy_id` leaves and only named granted routes (so
+/// the refusal never affects any retained route). Any unscoped refusal or any
+/// refusal naming a retained route stays in the compared view.
+fn retain_refusal_for_ungranted_routes(value: &mut Value, granted_proxies: &HashSet<&str>) -> bool {
+    fn strip_leaf(leaf: &mut Value, granted_proxies: &HashSet<&str>) -> Option<bool> {
+        let ids = leaf
+            .get_mut("match")
+            .and_then(Value::as_object_mut)?
+            .get_mut("proxy_id")
+            .and_then(Value::as_array_mut)?;
+        ids.retain(|id| !id.as_str().is_some_and(|id| granted_proxies.contains(id)));
+        Some(!ids.is_empty())
+    }
+    let Some(when) = value
+        .get_mut("trigger")
+        .and_then(Value::as_object_mut)
+        .and_then(|trigger| trigger.get_mut("when"))
+    else {
+        return true;
+    };
+    if let Some(any) = when.get_mut("any").and_then(Value::as_array_mut) {
+        let mut kept = Vec::new();
+        for mut leaf in std::mem::take(any) {
+            match strip_leaf(&mut leaf, granted_proxies) {
+                Some(false) => {}
+                Some(true) | None => kept.push(leaf),
+            }
+        }
+        if kept.is_empty() {
+            return false;
+        }
+        *any = kept;
+        return true;
+    }
+    match strip_leaf(when, granted_proxies) {
+        Some(false) => false,
+        Some(true) | None => true,
+    }
+}
+
 /// The parts of `config` the grant must not change, keyed for a readable
 /// diff: every proxy, upstream and plugin config that is not one of the
 /// granted routes' own objects, and the routing workload set.
@@ -434,6 +521,14 @@ fn ungranted_view(config: &GatewayConfig) -> BTreeMap<String, Value> {
         }
         let mut value = serde_json::to_value(plugin).expect("plugin serializes");
         strip_timestamps(&mut value);
+        if (plugin.id == MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID
+            || plugin
+                .id
+                .starts_with(MESH_REQUEST_AUTH_REFUSED_PARTITION_ID_PREFIX))
+            && !retain_refusal_for_ungranted_routes(&mut value, &granted_proxies)
+        {
+            continue;
+        }
         if plugin.id == MESH_AUTHZ_PLUGIN_ID {
             normalize_authz(&mut value["config"], &kept_upstream_ids);
         }
@@ -525,6 +620,45 @@ async fn assert_grant_changes_only_its_routes(runtime: MeshRuntimeConfig, with_e
             .any(|upstream| upstream.id.starts_with(SOURCE_PREFIX)),
         "{case}: the granted route reaches a destination source"
     );
+    assert!(
+        granted
+            .proxies
+            .iter()
+            .any(|proxy| proxy.id.contains("-default-mixed-"))
+            && ungranted
+                .proxies
+                .iter()
+                .any(|proxy| proxy.id.contains("-default-mixed-")),
+        "{case}: the unrelated mixed split is materialized in both configs"
+    );
+    if topology == ferrum_edge::modes::mesh::MeshTopology::NodeWaypoint {
+        let direct_granted = granted
+            .proxies
+            .iter()
+            .find(|proxy| names_granted_route(&proxy.id) && proxy.listen_path == "/granted-direct")
+            .unwrap_or_else(|| panic!("{case}: direct granted route materialized"));
+        assert!(
+            direct_granted.plugins.iter().any(|association| {
+                association
+                    .plugin_config_id
+                    .starts_with(MESH_REQUEST_AUTH_DESTINATION_PLUGIN_ID_PREFIX)
+            }),
+            "{case}: direct granted route carries destination RequestAuthentication"
+        );
+        let refusal_targets_direct = granted.plugin_configs.iter().any(|plugin| {
+            (plugin.id == MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID
+                || plugin
+                    .id
+                    .starts_with(MESH_REQUEST_AUTH_REFUSED_PARTITION_ID_PREFIX))
+                && serde_json::to_string(&plugin.trigger)
+                    .unwrap_or_default()
+                    .contains(&direct_granted.id)
+        });
+        assert!(
+            !refusal_targets_direct,
+            "{case}: direct granted route serves traffic rather than 503 refusal"
+        );
+    }
 
     let with = ungranted_view(&granted);
     let without = ungranted_view(&ungranted);

@@ -4598,7 +4598,9 @@ fn decode_http_route_set(
                     && value.trim() == *value
                     && value.len() <= config::MAX_VIRTUAL_SERVICE_CROSS_NAMESPACE_TARGET_LEN
             })
-            && entry.namespace != slice.namespace
+            && (entry.namespace != slice.namespace
+                || (!slice.istio_root_namespace.is_empty()
+                    && entry.namespace == slice.istio_root_namespace))
             && seen_destination_policies.insert(entry);
         if !well_formed {
             return Err(anyhow::anyhow!(
@@ -18782,10 +18784,56 @@ fn scope_request_auth_to_node_waypoint_destinations(
         })
         .map(|plugin| &plugin.config)
         .collect();
-    // Resources this waypoint carries only for its destinations. While any
-    // exist, a route that reaches a modeled destination this index cannot
-    // resolve cannot be shown to be outside them.
-    let carries_destination_resources = (0..resources.len()).any(|index| !own.contains(&index));
+    // Resources this waypoint carries only for its destinations. Split out
+    // resources carried solely for grant-added cross-namespace destination
+    // workloads so adding a ReferenceGrant cannot turn an unrelated ordinary
+    // route (e.g., an existing local+external combined split) into a 503
+    // refusal, while routes reaching cross-namespace targets still fail closed
+    // against every destination resource.
+    let carries_any_destination_resources = (0..resources.len()).any(|index| !own.contains(&index));
+    let carries_ordinary_destination_resources = (0..resources.len()).any(|index| {
+        if own.contains(&index) {
+            return false;
+        }
+        let resource = &resources[index];
+        let selects_ordinary = mesh_slice
+            .workloads
+            .iter()
+            .chain(mesh_slice.node_waypoint_capture_destinations.iter())
+            .any(|workload| {
+                scope_applies_to_workload(
+                    &resource.scope,
+                    &workload.namespace,
+                    &workload.selector.labels,
+                )
+            });
+        let selects_grant_only = cross_namespace_destination_workloads
+            .iter()
+            .any(|workload| {
+                scope_applies_to_workload(
+                    &resource.scope,
+                    &workload.namespace,
+                    &workload.selector.labels,
+                )
+            });
+        let targets_subscriber_namespace = resource.namespace == runtime.namespace
+            || matches!(
+                &resource.scope,
+                config::PolicyScope::Namespace { namespace } if namespace == &runtime.namespace
+            )
+            || matches!(
+                &resource.scope,
+                config::PolicyScope::WorkloadSelector { selector }
+                    if selector.namespace.as_deref() == Some(runtime.namespace.as_str())
+            );
+        selects_ordinary || targets_subscriber_namespace || !selects_grant_only
+    });
+    let authorized_cross_namespace_routes: HashSet<&str> = mesh_slice
+        .http_routes
+        .authorized_cross_namespace_targets
+        .iter()
+        .map(|target| target.proxy_id.as_str())
+        .collect();
     let secured_transport = runtime.node_waypoint_secured_transport_required();
     // The workloads each mesh Service upstream can actually dial, keyed by
     // `(namespace, id)` and derived with the same rules as
@@ -18963,7 +19011,7 @@ fn scope_request_auth_to_node_waypoint_destinations(
                 .map(|(index, _)| index)
                 .collect::<BTreeSet<usize>>()
         };
-        for (upstream_id, backend_host, backend_port) in destinations {
+        for &(upstream_id, backend_host, backend_port) in &destinations {
             if let Some(dialable) = upstream_id
                 .filter(|id| id.starts_with(MESH_OUTBOUND_UPSTREAM_ID_PREFIX))
                 .and_then(|id| {
@@ -18996,7 +19044,20 @@ fn scope_request_auth_to_node_waypoint_destinations(
                 admit(resources_selecting(&scope.namespace, &scope.labels));
             }
         }
-        if unresolved_modeled && carries_destination_resources {
+        let proxy_reaches_cross_namespace = authorized_cross_namespace_routes
+            .contains(proxy.id.as_str())
+            || destinations.iter().any(|(upstream_id, _, _)| {
+                upstream_id.is_some_and(|id| {
+                    is_cross_namespace_destination_clone_id(id)
+                        || is_cross_namespace_destination_source_id(id)
+                })
+            });
+        let relevant_destination_resources = if proxy_reaches_cross_namespace {
+            carries_any_destination_resources
+        } else {
+            carries_ordinary_destination_resources
+        };
+        if unresolved_modeled && relevant_destination_resources {
             // Mirrors `mesh_authz`'s `destination_scope_missing` refusal.
             unresolved_routes += 1;
             refused_routes.push((proxy.namespace.clone(), proxy.id.clone()));

@@ -34,11 +34,13 @@ use ferrum_edge::plugins::mesh::authz::MeshAuthz;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext, create_plugin};
 use serde_json::{Value, json};
 
-use super::super::mesh_test_support::{DEFAULT_NAMESPACE, policy_allow_principal};
+use super::super::mesh_test_support::{
+    DEFAULT_NAMESPACE, policy_allow_principal, service_for, workload_for,
+};
 use super::cross_namespace_routes::{
     CLONE_PREFIX, OTHER, RATINGS_OTHER, assert_references_resolve, branch_spec, carried_routes,
-    destination_rule, direct_spec, ninety_ten_spec, node_waypoint_runtime, ratings_source,
-    route_ids, sidecar_runtime, slice_for, translated, upstream, virtual_service,
+    destination_rule, direct_spec, k8s_service, ninety_ten_spec, node_waypoint_runtime,
+    ratings_source, route_ids, sidecar_runtime, slice_for, translated, upstream, virtual_service,
 };
 
 const TRUSTED: &str = "spiffe://cluster.local/ns/default/sa/trusted";
@@ -977,33 +979,75 @@ async fn a_destination_node_waypoint_admits_what_the_source_waypoint_authorized_
 }
 
 /// Review F6 (round 5): on a NodeWaypoint, a route to the absolute two-label
-/// DNS name `ratings.other.` is an external route and never inherits the
-/// destination policy of the modeled Service `other/ratings`, which an
-/// authorized route of the same slice reaches under that policy.
+/// DNS name `ratings.other.` (or `catalog.default.`) is an external route and
+/// never inherits the destination policy of the modeled Service, even when the
+/// ordinary backend-alias index is populated for that Service and ordinary
+/// scoped policies are active.
 #[tokio::test]
 async fn an_absolute_two_label_route_never_inherits_the_service_policy() {
     let mut config = config_with(
         direct_spec(RATINGS_OTHER),
-        vec![virtual_service(
-            "external",
-            json!({
-                "hosts": ["reviews.default.svc.cluster.local"],
-                "http": [{
-                    "match": [{"uri": {"prefix": "/external"}}],
-                    "route": [{"destination": {"host": "ratings.other.", "port": {"number": 8080}}}]
-                }]
-            }),
-        )],
-        vec![ratings_trusted_only()],
+        vec![
+            k8s_service("catalog", DEFAULT_NAMESPACE),
+            virtual_service(
+                "external",
+                json!({
+                    "hosts": ["reviews.default.svc.cluster.local"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/external"}}],
+                        "route": [{"destination": {"host": "ratings.other.", "port": {"number": 8080}}}]
+                    }]
+                }),
+            ),
+            // Ordinary same-namespace Service controls: populate the ordinary
+            // backend-alias index and ordinary scoped-policy census so removing
+            // trailing-dot preservation would immediately apply `catalog`'s
+            // policy to `catalog.default.`.
+            virtual_service(
+                "catalog-relative",
+                json!({
+                    "hosts": ["reviews.default.svc.cluster.local"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/catalog-relative"}}],
+                        "route": [{"destination": {"host": "catalog.default", "port": {"number": 8080}}}]
+                    }]
+                }),
+            ),
+            virtual_service(
+                "catalog-absolute",
+                json!({
+                    "hosts": ["reviews.default.svc.cluster.local"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/catalog-absolute"}}],
+                        "route": [{"destination": {"host": "catalog.default.", "port": {"number": 8080}}}]
+                    }]
+                }),
+            ),
+        ],
+        vec![
+            ratings_trusted_only(),
+            policy_allow_principal(
+                "catalog-trusted-only",
+                DEFAULT_NAMESPACE,
+                selector("catalog"),
+                TRUSTED,
+            ),
+        ],
         Vec::new(),
     );
+    let catalog = workload_for(
+        "catalog",
+        DEFAULT_NAMESPACE,
+        [("app", "catalog")],
+        ["10.0.0.15"],
+    );
+    let mesh = config.mesh.as_mut().expect("mesh block");
+    mesh.services
+        .push(service_for("catalog", DEFAULT_NAMESPACE, &[&catalog]));
+    mesh.workloads.push(catalog);
     // Keep the importing Sidecar so `other/ratings` stays visible to `default`,
-    // and add `*/*` so the external host `ratings.other.` is not narrowed out.
-    config
-        .mesh
-        .as_mut()
-        .expect("mesh block")
-        .sidecars
+    // and add `*/*` so the external hosts are not narrowed out.
+    mesh.sidecars
         .first_mut()
         .expect("importing sidecar")
         .egress
@@ -1029,6 +1073,20 @@ async fn an_absolute_two_label_route_never_inherits_the_service_policy() {
         })
         .map(|route| (*route).clone())
         .expect("the authorized route is served");
+    let catalog_relative = routes
+        .iter()
+        .find(|route| route.listen_path == "/catalog-relative")
+        .map(|route| (*route).clone())
+        .expect("relative Service route is served");
+    let catalog_absolute = routes
+        .iter()
+        .find(|route| route.listen_path == "/catalog-absolute")
+        .map(|route| (*route).clone())
+        .expect("absolute external route is served");
+    assert_eq!(
+        catalog_absolute.upstream_id, None,
+        "absolute two-label host stays direct external"
+    );
 
     let authz = authz(&prepared);
     let (result, _, _) = serve(&authz, &[], &authorized, UNTRUSTED, false).await;
@@ -1037,5 +1095,177 @@ async fn an_absolute_two_label_route_never_inherits_the_service_policy() {
     assert!(
         matches!(result, PluginResult::Continue),
         "the external DNS route is not the Service: {result:?}"
+    );
+    let (result, _, _) = serve(&authz, &[], &catalog_relative, UNTRUSTED, false).await;
+    assert_denied(
+        &result,
+        "relative two-label Service spelling receives its ordinary destination policy",
+    );
+    let mut catalog_relative_direct = catalog_absolute.clone();
+    catalog_relative_direct.backend_host = "catalog.default".to_string();
+    let (result, _, _) = serve(&authz, &[], &catalog_relative_direct, UNTRUSTED, false).await;
+    assert_denied(
+        &result,
+        "relative two-label direct backend hits the populated ordinary backend-alias index",
+    );
+    let (result, _, _) = serve(&authz, &[], &catalog_absolute, UNTRUSTED, false).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "absolute two-label DNS spelling never inherits the ordinary Service policy: {result:?}"
+    );
+}
+
+/// A Sidecar egress import scoped strictly to the in-cluster Service admits
+/// the relative `<svc>.<ns>` Service route and withholds the absolute
+/// `<svc>.<ns>.` external host rather than aliasing it to the Service.
+#[test]
+fn a_service_only_sidecar_import_withholds_an_absolute_external_host() {
+    let mut config = config_with(
+        direct_spec("ratings.other"),
+        vec![virtual_service(
+            "external",
+            json!({
+                "hosts": ["reviews.default.svc.cluster.local"],
+                "http": [{
+                    "match": [{"uri": {"prefix": "/external"}}],
+                    "route": [{"destination": {"host": "ratings.other.", "port": {"number": 8080}}}]
+                }]
+            }),
+        )],
+        Vec::new(),
+        Vec::new(),
+    );
+    // Import ONLY the two concrete Kubernetes Services (no `./*` or `*/*`).
+    config
+        .mesh
+        .as_mut()
+        .expect("mesh block")
+        .sidecars
+        .first_mut()
+        .expect("importing sidecar")
+        .egress
+        .first_mut()
+        .expect("egress listener")
+        .hosts = vec![
+        "./reviews.default.svc.cluster.local".to_string(),
+        "other/ratings.other.svc.cluster.local".to_string(),
+    ];
+    let slice = slice_for(&config, &node_waypoint_runtime());
+    let prepared = prepare(&slice);
+    let routes = carried_routes(&prepared);
+    assert!(
+        routes.iter().any(|route| {
+            route
+                .upstream_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with(CLONE_PREFIX))
+        }),
+        "Service-only import admits the relative Service route"
+    );
+    assert!(
+        !routes
+            .iter()
+            .any(|route| route.backend_host == "ratings.other."),
+        "Service-only import withholds the absolute external DNS route"
+    );
+}
+
+/// A root-namespace (`istio-system`) selector-scoped AuthorizationPolicy and
+/// RequestAuthentication matching only the granted cross-namespace destination
+/// must ride the source NodeWaypoint slice and govern the granted route while
+/// leaving unrelated local routes untouched.
+#[tokio::test]
+async fn a_root_namespace_selector_policy_governs_only_the_granted_destination() {
+    let root_policy = policy_allow_principal(
+        "root-ratings-only",
+        "istio-system",
+        selector("ratings"),
+        TRUSTED,
+    );
+    let root_jwt = request_auth("root-ratings-jwt", "istio-system", "ratings");
+    let config = config_with(
+        direct_spec(RATINGS_OTHER),
+        vec![virtual_service(
+            "local",
+            json!({
+                "hosts": ["reviews.default.svc.cluster.local"],
+                "http": [{
+                    "match": [{"uri": {"prefix": "/local"}}],
+                    "route": [{"destination": {"host": "reviews.default.svc.cluster.local", "port": {"number": 8080}}}]
+                }]
+            }),
+        )],
+        vec![root_policy],
+        vec![root_jwt],
+    );
+    let runtime = node_waypoint_runtime();
+    let request = runtime.mesh_slice_request();
+    let scope = CpScope::Set(
+        [DEFAULT_NAMESPACE, OTHER, "istio-system"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    );
+    let filtered = filter_config_to_mesh_request_for_test(&config, &request, &scope, None);
+    let slice = MeshSlice::from_gateway_config(&filtered, request);
+    assert!(
+        policy_names(&slice)
+            .contains(&("istio-system".to_string(), "root-ratings-only".to_string())),
+        "root-namespace selector policy rides the NodeWaypoint slice for the granted destination"
+    );
+    assert!(
+        slice
+            .request_authentications
+            .iter()
+            .any(|ra| ra.namespace == "istio-system" && ra.name == "root-ratings-jwt"),
+        "root-namespace selector RequestAuthentication rides the slice for the granted destination"
+    );
+    let prepared = prepare(&slice);
+    let routes = carried_routes(&prepared);
+    let granted = routes
+        .iter()
+        .find(|route| {
+            route
+                .upstream_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with(CLONE_PREFIX))
+        })
+        .map(|route| (*route).clone())
+        .expect("granted route");
+    let local = routes
+        .iter()
+        .find(|route| route.listen_path == "/local")
+        .map(|route| (*route).clone())
+        .expect("local route");
+
+    assert!(
+        granted.plugins.iter().any(|association| {
+            association
+                .plugin_config_id
+                .starts_with(MESH_REQUEST_AUTH_DESTINATION_PLUGIN_ID_PREFIX)
+        }),
+        "granted route carries the root-namespace destination RequestAuthentication"
+    );
+    assert!(
+        !local.plugins.iter().any(|association| {
+            association
+                .plugin_config_id
+                .starts_with(MESH_REQUEST_AUTH_DESTINATION_PLUGIN_ID_PREFIX)
+        }),
+        "local route does not inherit the grant-only root RequestAuthentication"
+    );
+
+    let authz = authz(&prepared);
+    let (result, _, _) = serve(&authz, &[], &granted, TRUSTED, false).await;
+    assert!(matches!(result, PluginResult::Continue), "TRUSTED allowed");
+    let (result, _, _) = serve(&authz, &[], &granted, UNTRUSTED, false).await;
+    assert_denied(
+        &result,
+        "UNTRUSTED denied by root-namespace selector policy",
+    );
+    let (result, _, _) = serve(&authz, &[], &local, UNTRUSTED, false).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "unrelated local route is unaffected by the root-namespace selector policy"
     );
 }
