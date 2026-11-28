@@ -31,6 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const PROBABILITY_DENOMINATOR: f64 = 18_446_744_073_709_551_616.0;
 const DELAY_STREAM_DOMAIN: u64 = 0xD1B5_4A32_D192_ED03;
 const ABORT_STREAM_DOMAIN: u64 = 0x94D0_49BB_1331_11EB;
+const SECONDARY_ABORT_STREAM_DOMAIN: u64 = 0x517C_C1B7_2722_0A95;
 
 /// Shared maximum accepted delay for proxy-scoped and route-local faults.
 /// Long-lived transport cancellation is not uniformly available on every
@@ -103,6 +104,16 @@ impl FaultRoller {
             delay_triggered: delay_percentage.is_some_and(|pct| probability_hit(delay_sample, pct)),
             abort_triggered: abort_percentage.is_some_and(|pct| probability_hit(abort_sample, pct)),
         }
+    }
+
+    /// Independent roll for a conditional secondary abort (evaluated only when
+    /// the primary abort did not trigger). Uses a distinct domain-separated
+    /// stream so its sample never correlates with the primary abort roll.
+    pub fn roll_secondary_abort(&self, percentage: f64) -> bool {
+        let ordinal = self.counter.fetch_add(1, Ordering::Relaxed);
+        let stream_position = ordinal.wrapping_add(self.seed);
+        let sample = splitmix64(stream_position ^ SECONDARY_ABORT_STREAM_DOMAIN);
+        probability_hit(sample, percentage)
     }
 }
 

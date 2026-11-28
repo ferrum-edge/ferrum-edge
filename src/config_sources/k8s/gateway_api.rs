@@ -38,6 +38,11 @@ use super::backend_tls_policy::MAX_POLICY_ANCESTORS;
 use crate::config::db_backend::NamespacedResourceId;
 use crate::config::types::{HashOnCookieConfig, PluginConfig, Proxy};
 
+// Gateway API GAMMA: HTTPRoute / GRPCRoute with `Service` parentRefs (issue
+// #7538). A child module so it reuses this translator's private rule, filter
+// and backend builders unchanged.
+pub(super) mod gamma;
+
 // Use an absolute DNS name (trailing dot) so resolvers must query this exact
 // label and cannot append search domains from resolv.conf.
 const ZERO_WEIGHT_BACKEND_HOST: &str = "ferrum-zero-weight.invalid.";
@@ -337,6 +342,26 @@ pub(super) fn translate(
         // keyed on source kind. This also preserves listener isolation because
         // HTTP-family proxies do not retain the listener that admitted them.
         "HTTPRoute" | "GRPCRoute" => {
+            // GAMMA `Service` parents (issue #7538) are staged here and
+            // materialized by `finalize_gamma_routes` once the whole snapshot
+            // is known. They are independent of the route's Gateway parents:
+            // route content is admitted once for both, but a Gateway parent
+            // that is refused (a missing listener or section, a namespace the
+            // listener does not allow) only withdraws the Gateway attachment
+            // and never the Service one. The Gateway parents' status is still
+            // derived from the listeners, exactly as for an accepted route.
+            if gamma::route_has_service_parent_ref(object) {
+                ensure_http_route_features(object)?;
+                gamma::stage_service_parent_routes(acc, object)?;
+                if let Err(error) = ensure_route_parent_refs_allowed(object, acc) {
+                    acc.warnings.push(format!(
+                        "{} {:?}/{:?}: no Gateway parent admits the route ({error}); its Service \
+                         parents are still served",
+                        object.kind, object.metadata.namespace, object.metadata.name
+                    ));
+                    return Ok(true);
+                }
+            }
             let (proxies, plugins) = http_route_resources(object, acc)?;
             upsert_http_route_resources(acc, proxies, plugins, &object.kind);
             Ok(true)
@@ -390,6 +415,12 @@ pub(super) fn translate(
         "BackendLBPolicy" | "XBackendTrafficPolicy" => Ok(true),
         _ => Ok(false),
     }
+}
+
+/// Materialize the staged GAMMA routes (issue #7538) after every object has
+/// been translated; see [`gamma::finalize`].
+pub(super) fn finalize_gamma_routes(acc: &mut K8sAccumulator) {
+    gamma::finalize(acc);
 }
 
 /// Default session token name when `sessionPersistence.sessionName` is omitted
@@ -3579,6 +3610,10 @@ fn can_merge_http_route_proxy(
     // Reject different slots before proxy_source allocates an ownership key.
     // Unique host/path snapshots otherwise allocate on every quadratic miss.
     occupies_same_route_slot(existing, proxy)
+        // A GAMMA (Service-parent) route proxy only ever merges with another
+        // GAMMA proxy, never with a parentless legacy Gateway API claim that
+        // happens to share the slot (issue #7538).
+        && gamma::is_gamma_route_proxy_id(&existing.id) == gamma::is_gamma_route_proxy_id(&proxy.id)
         && acc.proxy_source(&existing.namespace, &existing.id) == Some(SourceKind::GatewayApi)
         && route_proxy_listener(acc, existing) == route_proxy_listener(acc, proxy)
         && namespaced_resource_key(&existing.namespace, &existing.id)
@@ -9330,7 +9365,7 @@ fn l4_route_hosts(
     Ok(string_array(&object.spec, "hostnames"))
 }
 
-/// [`super::backend_ref::checked_backend_namespace`] plus the structured
+/// [`super::backend_ref::checked_backend_namespace_with_grant_policy`] plus the structured
 /// translation warning for EndpointSlice attribution: a refused Service
 /// backend, or a selector-backed one admitted without its EndpointSlices being
 /// checked because the controller observes no Pods in its namespace.
@@ -9340,12 +9375,29 @@ fn checked_backend_namespace(
     acc: &mut K8sAccumulator,
     from_kind: &str,
 ) -> Result<(super::backend_ref::BackendKind, String), K8sTranslateError> {
+    checked_backend_namespace_with_grant_policy(object, backend_ref, acc, from_kind, true)
+}
+
+/// [`checked_backend_namespace`] with an explicit ReferenceGrant policy; see
+/// `backend_ref::checked_backend_namespace_with_grant_policy`.
+fn checked_backend_namespace_with_grant_policy(
+    object: &K8sObject,
+    backend_ref: &Value,
+    acc: &mut K8sAccumulator,
+    from_kind: &str,
+    require_reference_grant: bool,
+) -> Result<(super::backend_ref::BackendKind, String), K8sTranslateError> {
     use super::backend_ref::{
         BackendKind, endpoint_slice_unverified_warning, message_is_endpoint_slice_refusal,
     };
 
-    let checked =
-        super::backend_ref::checked_backend_namespace(object, backend_ref, acc, from_kind);
+    let checked = super::backend_ref::checked_backend_namespace_with_grant_policy(
+        object,
+        backend_ref,
+        acc,
+        from_kind,
+        require_reference_grant,
+    );
     match &checked {
         Err(K8sTranslateError::InvalidResource { message, .. })
             if message_is_endpoint_slice_refusal(message) =>

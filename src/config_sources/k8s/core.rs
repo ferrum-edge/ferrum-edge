@@ -2695,7 +2695,7 @@ fn string_array_from_value(value: &Value, field: &str) -> Vec<String> {
         .collect()
 }
 
-fn service_app_protocol(port_entry: &Value, port_name: Option<&str>) -> AppProtocol {
+pub(super) fn service_app_protocol(port_entry: &Value, port_name: Option<&str>) -> AppProtocol {
     // L4 transport wins over any L7 naming/appProtocol hint: a Service port with
     // `protocol: UDP` is UDP regardless of an `appProtocol: http` or a name like
     // `http3`, because those L7 hints describe the application protocol carried

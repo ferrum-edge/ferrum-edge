@@ -1116,6 +1116,20 @@ single-cluster Gateway API behaviors, not cross-cluster or UDP mesh surfaces.
   Gateway API path. Istio `VirtualService` separately supports
   `destination.port.name`, resolved against `Service.spec.ports[].name`.
 
+## GAMMA (Service parentRefs)
+
+An `HTTPRoute` or `GRPCRoute` whose `parentRefs` name a core `Service` attaches to the Service frontend for mesh traffic (GEP-1294). Ferrum translates it into a carried mesh route for Sidecar and NodeWaypoint data planes and writes its `status.parents[]` entries under controller name `ferrum.io/mesh-controller`; the full behaviour is in [mesh.md](mesh.md#mesh-data-planes-nodewaypoint-route-carriage) (the Gateway API bullet). The rules that differ from a Gateway-bound route:
+
+| Surface | Behavior |
+|---|---|
+| Parent resolution | `sectionName` names a Service port; `port` must be a Service port; both must agree, and the port must be one mesh data planes route HTTP on. A missing, headless or `ExternalName` Service is `Accepted=False` / `NoMatchingParent` for that parent only. `hostnames` is ignored (GEP-1294: implementations SHOULD NOT infer functionality from it). |
+| Gateway parents on the same route | Independent: a refused Gateway parent never withdraws the Service attachment. |
+| Cross-namespace backendRefs | A consumer route (route namespace differs from the Service's) needs **no** ReferenceGrant, as upstream GAMMA and the MESH-HTTP `MeshConsumerRoute` test expect. A producer route needs a ReferenceGrant from the backend's namespace, because it redirects every client's traffic; without one the share fails closed (500, `ResolvedRefs=False` / `RefNotPermitted`). This is stricter than GEP-1294's allowance for producer routes, and looser than VirtualService `http[]` routes (a ReferenceGrant for every cross-namespace destination, issue #7499). Until cross-namespace legs are carried (#7499), such a route is `Accepted=True`, `Programmed=False` / `Pending`. |
+| Conflicts | A mesh-bound VirtualService for the Service host, exported to the route's namespace, wins (`Conflicted`). A GRPCRoute wins over an HTTPRoute on the same Service port (GEP-1294 route type specificity); the HTTPRoute keeps its other ports. Same-kind routes merge; an identical match is served by the oldest route. |
+| Unmatched requests | Rejected with 404 (GAMMA: once routes are attached, a request matching none of them is rejected). |
+
+The upstream MESH profiles (`MESH-HTTP`, `MESH-GRPC`) are not run by the conformance job yet: the lab has no injected client and server pods in the suite's `gateway-conformance-mesh` / `gateway-conformance-mesh-consumer` namespaces and does not declare `SupportMesh`, so no mesh conformance is claimed (issue #7538). The v1.5.1 mesh tests assert traffic only; none of them reads `status.parents[].controllerName`.
+
 ## CI Evidence
 
 The standalone `gateway-api-conformance.yml` workflow is the only job that deploys the lab (see [Workflow, triggers, and gating](#workflow-triggers-and-gating)). The lab consists of:

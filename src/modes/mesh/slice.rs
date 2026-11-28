@@ -3850,8 +3850,15 @@ fn node_waypoint_http_route_set(
         }
         let mut upstream_ids: BTreeSet<&str> = BTreeSet::new();
         upstream_ids.extend(proxy.upstream_id.as_deref());
+        let is_gamma_proxy = crate::modes::mesh::config::is_gamma_http_route_proxy_id(&proxy.id);
         let mut destinations: Vec<(&str, u16)> = Vec::new();
-        if !proxy.backend_host.is_empty() && proxy.backend_port != 0 {
+        if !proxy.backend_host.is_empty()
+            && proxy.backend_port != 0
+            && !(is_gamma_proxy
+                && proxy
+                    .backend_host
+                    .eq_ignore_ascii_case(crate::modes::mesh::config::GAMMA_NO_FORWARD_HOST))
+        {
             destinations.push((proxy.backend_host.as_str(), proxy.backend_port));
         }
         for &plugin in &route_plugins {
@@ -3878,7 +3885,14 @@ fn node_waypoint_http_route_set(
                     .and_then(serde_json::Value::as_u64)
                     .and_then(|port| u16::try_from(port).ok())
                     .unwrap_or(proxy.backend_port);
-                if destination.get("upstream_id").is_none() && !host.is_empty() && port != 0 {
+                if destination.get("upstream_id").is_none()
+                    && !host.is_empty()
+                    && port != 0
+                    && !(is_gamma_proxy
+                        && host.eq_ignore_ascii_case(
+                            crate::modes::mesh::config::GAMMA_NO_FORWARD_HOST,
+                        ))
+                {
                     destinations.push((host, port));
                 }
             }
@@ -4054,17 +4068,21 @@ fn service_waypoint_http_route_set(
                 .any(|(service_namespace, _)| binding_owns_service(binding, service_namespace))
         },
         &|binding: &MeshVirtualServiceHttpRoutes, proxy: &Proxy| {
-            proxy.hosts.iter().any(|host| {
-                bound_hosts.iter().any(|(service_namespace, aliases)| {
-                    binding_owns_service(binding, service_namespace)
-                        && service_alias_names_host(
-                            aliases,
-                            service_namespace,
-                            &proxy.namespace,
-                            host,
-                        )
+            // Gateway API GAMMA routes (issue #7538 phase 1) are not served by
+            // ServiceWaypoint yet and must never enter a bound Service's L7
+            // partition or `virtual_service_route_count`.
+            !crate::modes::mesh::config::is_gamma_http_route_proxy_id(&proxy.id)
+                && proxy.hosts.iter().any(|host| {
+                    bound_hosts.iter().any(|(service_namespace, aliases)| {
+                        binding_owns_service(binding, service_namespace)
+                            && service_alias_names_host(
+                                aliases,
+                                service_namespace,
+                                &proxy.namespace,
+                                host,
+                            )
+                    })
                 })
-            })
         },
         &|proxy_namespace: &str, host: &str, _port: u16| {
             service_waypoint_route_destination_admitted(

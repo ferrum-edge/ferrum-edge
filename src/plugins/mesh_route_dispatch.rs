@@ -468,22 +468,44 @@ fn validate_fault_action(rule_idx: usize, fault: &FaultActionConfig) -> Result<(
         validate_fault_percentage(rule_idx, "fault.delay.percentage", delay.percentage)?;
     }
     if let Some(abort) = fault.abort.as_ref() {
-        if !(200..=599).contains(&abort.status_code) {
+        validate_fault_abort(rule_idx, "fault.abort", abort)?;
+    }
+    if let Some(secondary_abort) = fault.secondary_abort.as_ref() {
+        if fault.abort.is_none() {
             return Err(format!(
-                "`mesh_route_dispatch.rules[{rule_idx}].fault.abort.status_code` must be \
-                 200-599, got \"{}\"",
-                abort.status_code
+                "`mesh_route_dispatch.rules[{rule_idx}].fault.secondary_abort` requires \
+                 `fault.abort` to be configured"
             ));
         }
-        validate_fault_percentage(rule_idx, "fault.abort.percentage", abort.percentage)?;
-        if let Some(code) = abort.grpc_status
-            && code > 16
-        {
-            return Err(format!(
-                "`mesh_route_dispatch.rules[{rule_idx}].fault.abort.grpc_status` must be \
-                 0-16, got \"{code}\""
-            ));
-        }
+        validate_fault_abort(rule_idx, "fault.secondary_abort", secondary_abort)?;
+    }
+    Ok(())
+}
+
+fn validate_fault_abort(
+    rule_idx: usize,
+    field_prefix: &str,
+    abort: &FaultAbortConfig,
+) -> Result<(), String> {
+    if !(200..=599).contains(&abort.status_code) {
+        return Err(format!(
+            "`mesh_route_dispatch.rules[{rule_idx}].{field_prefix}.status_code` must be \
+             200-599, got \"{}\"",
+            abort.status_code
+        ));
+    }
+    validate_fault_percentage(
+        rule_idx,
+        &format!("{field_prefix}.percentage"),
+        abort.percentage,
+    )?;
+    if let Some(code) = abort.grpc_status
+        && code > 16
+    {
+        return Err(format!(
+            "`mesh_route_dispatch.rules[{rule_idx}].{field_prefix}.grpc_status` must be \
+             0-16, got \"{code}\""
+        ));
     }
     Ok(())
 }
@@ -1642,7 +1664,7 @@ impl UriMatcher {
 /// `Regex::find`, which may be a shorter prefix even when a later alternative
 /// spans the whole input. The operator pattern stays in its own non-capturing
 /// group so inline flags and alternation retain their original semantics.
-fn compile_full_match_regex(pattern: &str) -> Result<Regex, regex::Error> {
+pub(crate) fn compile_full_match_regex(pattern: &str) -> Result<Regex, regex::Error> {
     Regex::new(&format!(r"\A(?:{pattern})\z"))
 }
 
@@ -2123,6 +2145,13 @@ pub struct FaultActionConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub abort: Option<FaultAbortConfig>,
+    /// Optional secondary abort evaluated only when the primary `abort` did not
+    /// trigger (used when a GAMMA weighted split has both an invalid
+    /// `backendRef` 500 share and an endpointless-Service 503 share). Its
+    /// `percentage` is conditional on surviving the primary `abort`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
+    pub secondary_abort: Option<FaultAbortConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2441,11 +2470,16 @@ fn rule_answers_before_dispatch(
     rule: &RouteRule,
     facts: EarlyRouteTotalFacts<'_>,
 ) -> bool {
-    let always_aborts = rule
-        .fault
-        .as_ref()
-        .and_then(|fault| fault.abort.as_ref())
-        .is_some_and(|abort| abort.percentage >= 100.0);
+    let always_aborts = rule.fault.as_ref().is_some_and(|fault| {
+        fault
+            .abort
+            .as_ref()
+            .is_some_and(|abort| abort.percentage >= 100.0)
+            || fault
+                .secondary_abort
+                .as_ref()
+                .is_some_and(|abort| abort.percentage >= 100.0)
+    });
     let fault_preempted =
         facts.route_faults_may_be_preempted || ctx.metadata.contains_key("fault_injected");
     let veto = node_waypoint_rule_destination_vetoed(ctx, &rule.destination);
@@ -3537,7 +3571,15 @@ async fn apply_fault_action(
         ),
     };
 
-    if !outcome.delay_triggered && !outcome.abort_triggered {
+    let secondary_abort_triggered = !outcome.abort_triggered
+        && fault.secondary_abort.as_ref().is_some_and(|secondary| {
+            match rule.fault_roller.as_ref() {
+                Some(roller) => roller.roll_secondary_abort(secondary.percentage),
+                None => FaultRoller::new().roll_secondary_abort(secondary.percentage),
+            }
+        });
+
+    if !outcome.delay_triggered && !outcome.abort_triggered && !secondary_abort_triggered {
         return None;
     }
 
@@ -3568,9 +3610,15 @@ async fn apply_fault_action(
         }
     }
 
-    if outcome.abort_triggered
-        && let Some(abort) = fault.abort.as_ref()
-    {
+    let triggered_abort = if outcome.abort_triggered {
+        fault.abort.as_ref()
+    } else if secondary_abort_triggered {
+        fault.secondary_abort.as_ref()
+    } else {
+        None
+    };
+
+    if let Some(abort) = triggered_abort {
         let mut reject_headers = HashMap::new();
         // gRPC-only: emit `grpc-status` so the proxy's trailers-only
         // normalization in `proxy/mod.rs` can turn the rejection into a

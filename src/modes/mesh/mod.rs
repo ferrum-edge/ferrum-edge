@@ -5550,6 +5550,15 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
         .map(|upstream| (upstream.namespace.clone(), upstream.id.clone()))
         .collect();
     let mut failed_splits: HashSet<(String, String)> = HashSet::new();
+    // Splits that failed ONLY because all in-cluster same-namespace Service
+    // backends have no reachable workload endpoints (e.g. scaled to zero),
+    // rather than an unmodeled/cross-namespace/unrepresentable refusal.
+    let mut unavailable_splits: HashSet<(String, String)> = HashSet::new();
+    // GAMMA weighted splits where some backends are healthy and others have
+    // zero reachable endpoints: the split keeps its healthy legs, and rules
+    // naming it get a proportional 503 abort for the unavailable weight share
+    // (Gateway API v1.5 HTTPRouteRule).
+    let mut partial_unavailable_splits: HashMap<(String, String), f64> = HashMap::new();
     // (namespace, split id) -> legs `(leg upstream id, weight)`.
     let mut leg_dispatched: HashMap<(String, String), WeightedSplitLegs> = HashMap::new();
     let mut residual_upstreams: Vec<Upstream> = Vec::new();
@@ -5575,7 +5584,10 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
         // The Service legs' rebound targets alone: what a leg-dispatched
         // split upstream keeps (see below).
         let mut service_targets: Vec<(u32, Vec<UpstreamTarget>)> = Vec::new();
+        let is_gamma_split = id.starts_with(config::GAMMA_ROUTE_UPSTREAM_ID_PREFIX);
         let mut rebound = true;
+        let mut only_unavailable = true;
+        let mut unavailable_weight: u64 = 0;
         let mut governed_by_destination_rule = false;
         for target in &split.targets {
             match hosts.classify(&namespace, &target.host) {
@@ -5592,7 +5604,10 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                     legs.push((target.weight, vec![target.clone()]));
                     external_targets.push(target.clone());
                 }
-                CarriedRouteHost::UnmodeledService => rebound = false,
+                CarriedRouteHost::UnmodeledService => {
+                    rebound = false;
+                    only_unavailable = false;
+                }
                 // A leg is dispatched through a namespace-local reference
                 // (the split's own targets, or a route override naming the
                 // Service upstream), so a Service in another namespace is
@@ -5605,6 +5620,7 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                 {
                     cross_namespace_refused += 1;
                     rebound = false;
+                    only_unavailable = false;
                 }
                 CarriedRouteHost::Service(service_namespace, service_name) => {
                     if service_has_destination_rule(
@@ -5618,14 +5634,24 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                     let Some(service_upstream_id) =
                         service_upstream(config, &service_namespace, &service_name, target.port)
                     else {
-                        rebound = false;
+                        if is_gamma_split {
+                            unavailable_weight =
+                                unavailable_weight.saturating_add(u64::from(target.weight));
+                        } else {
+                            rebound = false;
+                        }
                         continue;
                     };
                     let Some(service_upstream) = config.upstreams.iter().find(|upstream| {
                         upstream.namespace == service_namespace.as_str()
                             && upstream.id == service_upstream_id
                     }) else {
-                        rebound = false;
+                        if is_gamma_split {
+                            unavailable_weight =
+                                unavailable_weight.saturating_add(u64::from(target.weight));
+                        } else {
+                            rebound = false;
+                        }
                         continue;
                     };
                     let leg_targets = service_upstream
@@ -5659,7 +5685,12 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                         })
                         .collect::<Vec<_>>();
                     if leg_targets.is_empty() {
-                        rebound = false;
+                        if is_gamma_split {
+                            unavailable_weight =
+                                unavailable_weight.saturating_add(u64::from(target.weight));
+                        } else {
+                            rebound = false;
+                        }
                         continue;
                     }
                     match service_legs
@@ -5675,8 +5706,20 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
             }
         }
         if !rebound || legs.is_empty() {
+            if only_unavailable && (!rebound || unavailable_weight > 0) {
+                unavailable_splits.insert((namespace.clone(), id.clone()));
+            }
             failed_splits.insert((namespace, id));
             continue;
+        }
+        if is_gamma_split && unavailable_weight > 0 {
+            let healthy_weight: u64 = legs.iter().map(|(weight, _)| u64::from(*weight)).sum();
+            let total_weight = healthy_weight.saturating_add(unavailable_weight);
+            if total_weight > 0 {
+                let pct = ((unavailable_weight as f64) / (total_weight as f64) * 100.0)
+                    .clamp(f64::MIN_POSITIVE, 100.0);
+                partial_unavailable_splits.insert((namespace.clone(), id.clone()), pct);
+            }
         }
         if governed_by_destination_rule {
             let first_external = external_targets.first().cloned();
@@ -5730,6 +5773,13 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
     let mut dropped: HashSet<(String, String)> = HashSet::new();
     let mut upstream_updates: Vec<(usize, String)> = Vec::new();
     let mut rule_updates: Vec<(usize, usize, String)> = Vec::new();
+    // GAMMA dispatch rules whose in-cluster backend Service has no reachable
+    // endpoints (scaled to zero): fail ONLY that rule with 503 so healthy
+    // rules on the same GAMMA proxy and unmatched-404 rejection stay active.
+    let mut unavailable_gamma_rules: Vec<(usize, usize)> = Vec::new();
+    // GAMMA dispatch rules referencing a partially unavailable weighted split:
+    // keep the healthy split legs and add a proportional 503 abort fault.
+    let mut partial_unavailable_gamma_rules: Vec<(usize, usize, f64)> = Vec::new();
     // Routes that dispatch a weighted split leg by leg: (proxy index, the
     // route's first `mesh_route_dispatch` instance if any, split ids).
     let mut weighted_routes: Vec<(usize, Option<usize>, Vec<String>)> = Vec::new();
@@ -5754,6 +5804,7 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
         }
         let namespace = proxy.namespace.clone();
         let proxy_id = proxy.id.clone();
+        let is_gamma_route = config::is_gamma_http_route_proxy_id(&proxy_id);
         let backend_host = proxy.backend_host.clone();
         let backend_port = proxy.backend_port;
         let mut keep = !source_namespace_refused.contains(&(namespace.clone(), proxy_id.clone()));
@@ -5805,6 +5856,15 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                 }
                 candidates.insert(upstream_id.to_string());
                 note_split(upstream_id, &mut candidates, &mut route_splits);
+            }
+            None if is_gamma_route
+                && backend_host.eq_ignore_ascii_case(config::GAMMA_NO_FORWARD_HOST)
+                && gamma_proxy_rejects_unmatched(config, proxy) =>
+            {
+                // The GAMMA proxy's own default is proven unreachable
+                // (`mesh_route_dispatch` with `reject_unmatched: true` answers
+                // unmatched requests with 404), so a visible wildcard or
+                // TLS-originating DestinationRule must not drop the GAMMA proxy.
             }
             None if !backend_host.is_empty() && backend_port != 0 => {
                 match hosts.classify(&namespace, &backend_host) {
@@ -5896,6 +5956,23 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                     .get("upstream_id")
                     .and_then(serde_json::Value::as_str)
                 {
+                    if is_gamma_route
+                        && unavailable_splits
+                            .contains(&(namespace.clone(), upstream_id.to_string()))
+                    {
+                        unavailable_gamma_rules.push((plugin_index, rule_index));
+                        continue;
+                    }
+                    if is_gamma_route
+                        && let Some(&unavailable_pct) = partial_unavailable_splits
+                            .get(&(namespace.clone(), upstream_id.to_string()))
+                    {
+                        partial_unavailable_gamma_rules.push((
+                            plugin_index,
+                            rule_index,
+                            unavailable_pct,
+                        ));
+                    }
                     if failed_splits.contains(&(namespace.clone(), upstream_id.to_string())) {
                         keep = false;
                     }
@@ -5929,6 +6006,14 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                     .and_then(|port| u16::try_from(port).ok())
                     .unwrap_or(backend_port);
                 if host.is_empty() || port == 0 {
+                    continue;
+                }
+                if is_gamma_route
+                    && host.eq_ignore_ascii_case(config::GAMMA_NO_FORWARD_HOST)
+                    && gamma_rule_terminates_unconditionally(rule)
+                {
+                    // Proven non-forwarding terminal rule (redirect or 100% abort):
+                    // never dials `GAMMA_NO_FORWARD_HOST`, so skip DR checks.
                     continue;
                 }
                 match hosts.classify(&namespace, host) {
@@ -5971,6 +6056,9 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                             Some(id) => {
                                 candidates.insert(id.clone());
                                 rule_rewrites.push((plugin_index, rule_index, id));
+                            }
+                            None if is_gamma_route => {
+                                unavailable_gamma_rules.push((plugin_index, rule_index));
                             }
                             None => keep = false,
                         }
@@ -6047,6 +6135,55 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
             "upstream_id".to_string(),
             serde_json::Value::String(upstream_id),
         );
+    }
+    for (plugin_index, rule_index) in unavailable_gamma_rules {
+        let Some(rule) = config
+            .plugin_configs
+            .get_mut(plugin_index)
+            .and_then(|plugin| plugin.config.get_mut("rules"))
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|rules| rules.get_mut(rule_index))
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        if let Some(destination) = rule
+            .get_mut("destination")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            destination.remove("upstream_id");
+            destination.remove("backend_tls");
+            destination.insert(
+                "backend_host".to_string(),
+                serde_json::Value::String(config::GAMMA_NO_FORWARD_HOST.to_string()),
+            );
+            destination.insert("backend_port".to_string(), serde_json::json!(80));
+        }
+        if !rule
+            .get("redirect")
+            .is_some_and(serde_json::Value::is_object)
+        {
+            apply_gamma_unavailable_abort(rule, 100.0);
+        }
+    }
+    for (plugin_index, rule_index, unavailable_pct) in partial_unavailable_gamma_rules {
+        let Some(rule) = config
+            .plugin_configs
+            .get_mut(plugin_index)
+            .and_then(|plugin| plugin.config.get_mut("rules"))
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|rules| rules.get_mut(rule_index))
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        if rule
+            .get("redirect")
+            .is_some_and(serde_json::Value::is_object)
+        {
+            continue;
+        }
+        apply_gamma_unavailable_abort(rule, unavailable_pct);
     }
     // Give each leg-dispatched route its legs, on its own dispatch instance
     // (or a new one under the translator's id), so the dispatch finalizer of
@@ -6208,6 +6345,116 @@ fn carried_route_terminates_unconditionally(config: &GatewayConfig, proxy: &Prox
                 && plugin.trigger.is_none()
         })
     })
+}
+
+/// Whether a GAMMA route proxy has an enabled `mesh_route_dispatch` plugin with
+/// `reject_unmatched: true`, proving its proxy-level default backend is never
+/// dialed.
+fn gamma_proxy_rejects_unmatched(config: &GatewayConfig, proxy: &Proxy) -> bool {
+    proxy.plugins.iter().any(|association| {
+        config.plugin_configs.iter().any(|plugin| {
+            plugin.plugin_name == "mesh_route_dispatch"
+                && plugin.namespace == proxy.namespace
+                && plugin.id == association.plugin_config_id
+                && plugin.enabled
+                && plugin
+                    .config
+                    .get("reject_unmatched")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+        })
+    })
+}
+
+/// Whether a GAMMA dispatch rule terminates 100% of matched requests locally
+/// (redirect or 100% abort/secondary_abort), proving its placeholder
+/// `GAMMA_NO_FORWARD_HOST` destination is never dialed.
+fn gamma_rule_terminates_unconditionally(rule: &serde_json::Value) -> bool {
+    if rule
+        .get("redirect")
+        .is_some_and(serde_json::Value::is_object)
+    {
+        return true;
+    }
+    let Some(fault) = rule.get("fault") else {
+        return false;
+    };
+    let abort_is_total = |key: &str| {
+        fault
+            .get(key)
+            .and_then(|abort| abort.get("percentage"))
+            .and_then(serde_json::Value::as_f64)
+            .is_some_and(|pct| pct.is_finite() && pct >= 100.0)
+    };
+    abort_is_total("abort") || abort_is_total("secondary_abort")
+}
+
+/// Apply an unavailable-Service 503 abort share (`unavailable_pct`, conditional
+/// on the valid-backend share of a GAMMA rule) without erasing a distinct
+/// primary abort status such as an invalid-`backendRef` 500 share.
+fn apply_gamma_unavailable_abort(
+    rule: &mut serde_json::Map<String, serde_json::Value>,
+    unavailable_pct: f64,
+) {
+    let clamped = unavailable_pct.clamp(f64::MIN_POSITIVE, 100.0);
+    let fault = rule
+        .entry("fault".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(fault_obj) = fault.as_object_mut() else {
+        *fault = serde_json::json!({
+            "abort": {
+                "status_code": 503,
+                "percentage": clamped,
+            }
+        });
+        return;
+    };
+    let existing_abort = fault_obj
+        .get("abort")
+        .and_then(serde_json::Value::as_object)
+        .map(|abort| {
+            (
+                abort.get("status_code").and_then(serde_json::Value::as_u64),
+                abort
+                    .get("percentage")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0),
+            )
+        });
+    match existing_abort {
+        Some((_, existing_pct)) if existing_pct >= 100.0 => {}
+        Some((Some(503), existing_pct)) => {
+            let combined = (existing_pct + (100.0 - existing_pct) * (clamped / 100.0))
+                .clamp(f64::MIN_POSITIVE, 100.0);
+            if let Some(abort) = fault_obj
+                .get_mut("abort")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                abort.insert("percentage".to_string(), serde_json::json!(combined));
+            }
+        }
+        Some(_) => {
+            // Preserve the existing primary abort (e.g. invalid-backendRef 500)
+            // and attach the 503 share as a conditional `secondary_abort` over
+            // the surviving valid-backend share.
+            fault_obj.insert(
+                "secondary_abort".to_string(),
+                serde_json::json!({
+                    "status_code": 503,
+                    "percentage": clamped,
+                }),
+            );
+        }
+        None => {
+            fault_obj.insert(
+                "abort".to_string(),
+                serde_json::json!({
+                    "status_code": 503,
+                    "percentage": clamped,
+                }),
+            );
+        }
+    }
 }
 
 /// Pin the destination Service authority on a Sidecar mesh-mTLS target a
@@ -8289,7 +8536,7 @@ fn sni_passthrough_destination_rule_view(dr: &MeshDestinationRule) -> MeshDestin
 /// `Udp` is a distinct L4 transport with its own datagram capture/egress lane.
 /// Neither is HTTP-family — only `Udp` is also excluded from the raw-TCP
 /// stream lane (see [`service_udp_stream_ports`]).
-fn is_http_family_mesh_protocol(protocol: AppProtocol) -> bool {
+pub(crate) fn is_http_family_mesh_protocol(protocol: AppProtocol) -> bool {
     matches!(
         protocol,
         AppProtocol::Http | AppProtocol::Http2 | AppProtocol::Grpc | AppProtocol::Unknown
@@ -8444,6 +8691,14 @@ pub(crate) fn mesh_route_admitted_for_direction(
     id: &str,
     request_direction: Option<MeshTrafficDirection>,
 ) -> bool {
+    // A Gateway API GAMMA route (`Service` parentRef, issue #7538) applies
+    // only to mesh traffic a client sends to the Service: never on a gateway
+    // (non-mesh) listener, which would otherwise serve it to anyone who names
+    // the Service host and dial its backend without the mesh binding, and
+    // never on an inbound mesh listener.
+    if config::is_gamma_http_route_proxy_id(id) {
+        return request_direction == Some(MeshTrafficDirection::Outbound);
+    }
     // A ServiceWaypoint default L7 Service route (issue #7500) is served only
     // through its bound Service's route partition, after HTTP termination
     // inside an admitted HBONE tunnel (issue #7501). No listener's shared
@@ -17377,8 +17632,10 @@ fn mirror_mesh_authz_baggage_gate_fields(target: &mut serde_json::Value, gate: &
 /// `gateway_config_from_mesh_slice_with_federation` decodes their
 /// `istio-vs-upstream-*` weighted-split upstreams into the config, so this
 /// returns those upstreams. `gwapi-route-upstream-*` ids stay admitted for
-/// parity with `mesh_authz`, but Gateway API HTTPRoute routes bind Gateway
-/// listeners and never ride a mesh slice. Every other topology returns
+/// parity with `mesh_authz`, but Gateway-bound HTTPRoute routes never ride a
+/// mesh slice; GAMMA (Service-parent) routes ride as `istio-vs-gamma_*` with
+/// `istio-vs-upstream-gamma_*` upstreams, which this covers (issue #7538).
+/// Every other topology returns
 /// nothing, since its slice carries no HTTP route.
 fn node_waypoint_authz_route_upstreams(config: &GatewayConfig) -> Vec<serde_json::Value> {
     config

@@ -12,6 +12,12 @@ use super::K8sObject;
 /// Gateway API controller identity Ferrum stamps on status it owns.
 pub const FERRUM_GATEWAY_CONTROLLER_NAME: &str = "ferrum.io/gateway-controller";
 
+/// Controller identity Ferrum stamps on the `status.parents[]` entries of
+/// GAMMA routes, whose parent is a `Service` rather than a Gateway (issue
+/// #7538). Mesh routing has no GatewayClass, so its status carries the mesh's
+/// own controller name.
+pub const FERRUM_MESH_CONTROLLER_NAME: &str = "ferrum.io/mesh-controller";
+
 /// Observed `GatewayClass` ownership relative to Ferrum.
 ///
 /// The three states stay distinct so an absent class cannot be confused with a

@@ -24,7 +24,15 @@ pub(crate) use gateway_api::{
     merge_backend_lb_policy_status, namespace_selector_matches, parse_gateway_api_duration_ms,
     parse_reference_grant_permissions,
 };
-pub use gateway_class::{FERRUM_GATEWAY_CONTROLLER_NAME, GatewayClassAuthority};
+pub use gateway_class::{
+    FERRUM_GATEWAY_CONTROLLER_NAME, FERRUM_MESH_CONTROLLER_NAME, GatewayClassAuthority,
+};
+// Issue #7538: the Gateway API status writer reports each GAMMA `Service`
+// parentRef from the outcome translation recorded under the same key.
+pub(crate) use gateway_api::gamma::{
+    GAMMA_ROUTE_PROGRAMMED_SCOPE_NOTE, gamma_parent_ref_key, parent_ref_is_service,
+    route_has_service_parent_ref,
+};
 // Re-exported for the integration suite's at-cap/over-cap L4 candidate and
 // projection assertions (`tests/integration/mesh_l7_routing_tests.rs`), which
 // must observe the same constants the translator enforces rather than
@@ -556,6 +564,40 @@ pub struct K8sTranslation {
     /// Services (issue #6108). The status writer reads this so `ResolvedRefs`
     /// matches what translation refused.
     pub(crate) endpoint_slices: backend_ref::EndpointSliceGuard,
+    /// The outcome of every `Service` parentRef of an `HTTPRoute` /
+    /// `GRPCRoute` (Gateway API GAMMA, issue #7538), keyed by route and the
+    /// canonical parent key. The status writer projects `status.parents[]`
+    /// for these parents from this map alone.
+    pub gamma_route_parents: HashMap<GammaParentKey, GammaParentOutcome>,
+}
+
+/// One `Service` parentRef of an `HTTPRoute` / `GRPCRoute` (GAMMA, issue
+/// #7538): the route and the key `gamma_parent_ref_key` derives.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GammaParentKey {
+    pub route: K8sResourceKey,
+    pub parent_ref: String,
+}
+
+/// Translation outcome of one GAMMA `Service` parentRef, in the vocabulary the
+/// status writer publishes on `status.parents[].conditions`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GammaParentOutcome {
+    /// Carried as a mesh route (`Accepted=True`, `Programmed=True`).
+    /// `producer` is a route in the Service's own namespace.
+    Programmed { producer: bool },
+    /// Accepted, but no rule could be materialized.
+    NoRules,
+    /// Accepted but not carried yet (`Programmed=False`, reason `Pending`).
+    Pending { message: String },
+    /// The parentRef names no routable Service or port
+    /// (`Accepted=False`, reason `NoMatchingParent`).
+    NoMatchingParent { message: String },
+    /// A valid value mesh data planes do not apply
+    /// (`Accepted=False`, reason `UnsupportedValue`).
+    UnsupportedValue { message: String },
+    /// Lost GAMMA precedence (`Accepted=False`, reason `Conflicted`).
+    Conflicted { message: String },
 }
 
 /// One refused Gateway API listener claim, in the shape
@@ -1072,6 +1114,24 @@ pub(crate) struct K8sAccumulator {
     /// (ExternalName excluded). Gateway API backendRefs refuse one whose
     /// EndpointSlices cannot be attributed to observed Pods.
     selectorless_services: HashSet<(String, String)>,
+    /// `(namespace, name)` of every collected headless Service
+    /// (`spec.clusterIP: None`). A headless Service has no frontend, so it is
+    /// never a GAMMA route parent (issue #7538).
+    headless_services: HashSet<(String, String)>,
+    /// `(namespace, name)` → the Service ports mesh data planes route HTTP on
+    /// (`modes::mesh::is_http_family_mesh_protocol` over the same port
+    /// classification the mesh Service inventory uses), for GAMMA port scoping.
+    pub(crate) service_http_family_ports:
+        HashMap<(String, String), std::collections::BTreeSet<u16>>,
+    /// `(namespace, name)` → the Service's IPv4 cluster IPs, which a GAMMA
+    /// route also answers on (a client may address the Service frontend by
+    /// its cluster IP).
+    pub(crate) service_cluster_ipv4s: HashMap<(String, String), Vec<String>>,
+    /// GAMMA `(route, Service)` attachments admitted in the per-object pass,
+    /// awaiting snapshot-wide precedence in `gateway_api::finalize_gamma_routes`.
+    pub(crate) gamma_staged_routes: Vec<gateway_api::gamma::GammaStagedRoute>,
+    /// Outcome of every GAMMA Service parentRef (issue #7538).
+    pub(crate) gamma_route_parents: HashMap<GammaParentKey, GammaParentOutcome>,
     /// Gateway API backendRef EndpointSlice attribution verdicts, built from
     /// the collected Pod/Node/EndpointSlice inventory before routes translate.
     endpoint_slice_guard: backend_ref::EndpointSliceGuard,
@@ -1223,6 +1283,11 @@ impl K8sAccumulator {
             service_port_specs: HashMap::new(),
             external_name_services: HashSet::new(),
             selectorless_services: HashSet::new(),
+            headless_services: HashSet::new(),
+            service_http_family_ports: HashMap::new(),
+            service_cluster_ipv4s: HashMap::new(),
+            gamma_staged_routes: Vec::new(),
+            gamma_route_parents: HashMap::new(),
             endpoint_slice_guard: backend_ref::EndpointSliceGuard::default(),
             queued_warnings: HashSet::new(),
             mesh_config_registry: mesh_config::MeshConfigProviderRegistry::default(),
@@ -1298,6 +1363,13 @@ impl K8sAccumulator {
     /// Whether the collected Service `namespace/service` is `type: ExternalName`.
     pub(crate) fn service_is_external_name(&self, namespace: &str, service: &str) -> bool {
         self.external_name_services
+            .contains(&(namespace.to_string(), service.to_string()))
+    }
+
+    /// Whether the collected Service `namespace/service` is headless
+    /// (`spec.clusterIP: None`).
+    pub(crate) fn service_is_headless(&self, namespace: &str, service: &str) -> bool {
+        self.headless_services
             .contains(&(namespace.to_string(), service.to_string()))
     }
 
@@ -1946,6 +2018,7 @@ impl K8sAccumulator {
             refused_route_attachments,
             transport_refused_route_attachments: transport_refused,
             endpoint_slices: self.endpoint_slice_guard,
+            gamma_route_parents: self.gamma_route_parents,
         }
     }
 }
@@ -2368,6 +2441,10 @@ where
         ));
     }
 
+    // GAMMA precedence (issue #7538) needs the complete snapshot: every
+    // mesh-bound VirtualService binding and every Service-parent route.
+    gateway_api::finalize_gamma_routes(&mut acc);
+
     if acc.options.pod_discovery_enabled {
         core::finalize(&mut acc)?;
     }
@@ -2679,6 +2756,47 @@ pub(crate) fn collect_service(
                 truncated: port_specs_truncated,
             },
         );
+    let service_key = (
+        object.metadata.namespace.clone(),
+        object.metadata.name.clone(),
+    );
+    let http_family_ports: std::collections::BTreeSet<u16> = ports
+        .iter()
+        .filter(|port_entry| {
+            crate::modes::mesh::is_http_family_mesh_protocol(core::service_app_protocol(
+                port_entry,
+                string_field(port_entry, "name"),
+            ))
+        })
+        .filter_map(|port_entry| port_entry.get("port").and_then(Value::as_u64))
+        .filter_map(|port| u16::try_from(port).ok())
+        .collect();
+    acc.service_http_family_ports
+        .insert(service_key.clone(), http_family_ports);
+    let mut cluster_ipv4s: Vec<String> = string_field(&object.spec, "clusterIP")
+        .into_iter()
+        .chain(
+            object
+                .spec
+                .get("clusterIPs")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str),
+        )
+        .filter_map(|address| address.parse::<std::net::Ipv4Addr>().ok())
+        .filter(|address| !address.is_unspecified())
+        .map(|address| address.to_string())
+        .collect();
+    cluster_ipv4s.sort();
+    cluster_ipv4s.dedup();
+    acc.service_cluster_ipv4s.insert(service_key, cluster_ipv4s);
+    if string_field(&object.spec, "clusterIP") == Some("None") {
+        acc.headless_services.insert((
+            object.metadata.namespace.clone(),
+            object.metadata.name.clone(),
+        ));
+    }
     if backend_ref::service_object_is_external_name(object) {
         let namespace = object.metadata.namespace.clone();
         let name = object.metadata.name.clone();
