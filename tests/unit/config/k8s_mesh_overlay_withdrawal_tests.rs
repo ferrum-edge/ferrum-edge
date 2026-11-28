@@ -1371,6 +1371,7 @@ fn all_collections(key_suffix: &str, marker: &str) -> MeshConfig {
             namespace: "shared".to_string(),
             export_to: Vec::new(),
             proxy_ids: vec![format!("istio-vs-shared-{marker}-0")],
+            authorized_cross_namespace_targets: Vec::new(),
         }],
         proxy_configs: vec![MeshProxyConfig {
             name: name("proxy-config"),

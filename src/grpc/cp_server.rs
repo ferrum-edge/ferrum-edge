@@ -1326,8 +1326,8 @@ impl CpGrpcServer {
             } else {
                 BTreeSet::new()
             };
-        mesh.virtual_service_http_routes.retain(|routes| {
-            visible_namespaces.contains(&routes.namespace)
+        mesh.virtual_service_http_routes.retain_mut(|routes| {
+            let retained = visible_namespaces.contains(&routes.namespace)
                 && Self::namespace_allowed_by_scope(&routes.namespace, scope)
                 && (bearer_namespaces.is_none_or(|allowed| allowed.contains(&routes.namespace))
                     || (request.service_waypoint_http_routes
@@ -1339,8 +1339,41 @@ impl CpGrpcServer {
                     // for a bound Service in another namespace when the route
                     // is exported to THAT namespace (issue #7500); the slice
                     // projection applies the exact owner rule.
-                    || (request.service_waypoint_http_routes && routes.namespace == namespace))
+                    || (request.service_waypoint_http_routes && routes.namespace == namespace));
+            // Issue #7499: an authorized cross-namespace destination is a
+            // ceiling, not a grant of visibility. Keep only targets in a
+            // namespace this subscription sees, that the CP scope serves for
+            // cross-namespace routing, and that the bearer `ns` claim
+            // authorizes. The slice builder then also requires the Service in
+            // the subscriber's own view.
+            if retained {
+                routes.authorized_cross_namespace_targets.retain(|target| {
+                    visible_namespaces.contains(&target.namespace)
+                        && Self::cross_namespace_route_target_allowed_by_scope(
+                            &target.namespace,
+                            scope,
+                        )
+                        && bearer_namespaces
+                            .is_none_or(|allowed| allowed.contains(&target.namespace))
+                });
+            }
+            retained
         });
+        // Issue #7499: the namespaces of the authorized cross-namespace
+        // destinations that survived the ceilings above. A NodeWaypoint judges
+        // those destinations' AuthorizationPolicy itself, so their namespaces'
+        // policies survive the `mesh_policies` retain below (the slice builder
+        // keeps only those selecting a destination workload).
+        let cross_namespace_destination_namespaces: BTreeSet<String> =
+            if request.node_waypoint_capture_scoping {
+                mesh.virtual_service_http_routes
+                    .iter()
+                    .flat_map(|routes| routes.authorized_cross_namespace_targets.iter())
+                    .map(|target| target.namespace.clone())
+                    .collect()
+            } else {
+                BTreeSet::new()
+            };
         // A ServiceWaypoint terminates traffic for destination-visible services,
         // but trusted Ambient UDP evidence can name a source pod from any
         // namespace this CP is allowed to serve. An explicit bearer claim
@@ -1568,6 +1601,16 @@ impl CpGrpcServer {
                                 &istio_root_namespace,
                             )
                         }))
+                || cross_namespace_destination_namespaces
+                    .iter()
+                    .any(|destination_namespace| {
+                        Self::policy_scope_can_apply_to_namespace(
+                            &policy.namespace,
+                            &policy.scope,
+                            destination_namespace,
+                            &istio_root_namespace,
+                        )
+                    })
         });
         mesh.peer_authentications.retain(|policy| {
             Self::peer_auth_can_apply_to_namespace(policy, namespace, &istio_root_namespace)
@@ -1612,6 +1655,9 @@ impl CpGrpcServer {
                         .iter()
                         .any(|destination_namespace| can_apply_to(destination_namespace))
                         || capture_destination_namespaces
+                            .iter()
+                            .any(|destination_namespace| can_apply_to(destination_namespace))
+                        || cross_namespace_destination_namespaces
                             .iter()
                             .any(|destination_namespace| can_apply_to(destination_namespace))))
         });
@@ -1868,6 +1914,22 @@ impl CpGrpcServer {
         match scope {
             Some(CpScope::Set(scope_namespaces)) => scope_namespaces.contains(namespace),
             _ => true,
+        }
+    }
+
+    /// Whether a VirtualService HTTP route may reach a Service in `namespace`
+    /// across namespaces under this CP scope (issue #7499). Stricter than
+    /// [`Self::namespace_allowed_by_scope`]: a `Single` CP is one tenant's
+    /// authority and never routes a carried route into another namespace,
+    /// whatever a binding lists; a `Set` CP only into namespaces it serves.
+    fn cross_namespace_route_target_allowed_by_scope(
+        namespace: &str,
+        scope: Option<&CpScope>,
+    ) -> bool {
+        match scope {
+            Some(CpScope::Single(scope_namespace)) => namespace == scope_namespace,
+            Some(CpScope::Set(scope_namespaces)) => scope_namespaces.contains(namespace),
+            Some(CpScope::All) | None => true,
         }
     }
 

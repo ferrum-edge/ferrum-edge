@@ -51112,14 +51112,21 @@ pub(crate) fn destination_active_request_scope<'a>(
     // upstream it copies, precomputed onto the effective proxy's pending scope
     // (also on upstream-id route overrides), so a Service port has one lane
     // whichever route dials it.
-    let destination = proxy
-        .pending_limit_scope
-        .as_deref()
+    let admission = proxy.pending_limit_scope.as_deref();
+    let destination = admission
         .and_then(crate::backend_pending_limit::BackendPendingScopeBase::admission_destination)
         .or(proxy.upstream_id.as_deref())
         .unwrap_or(proxy.id.as_str());
+    // A cross-namespace destination clone (issue #7499) is admitted in the
+    // destination Service's namespace, so every route reaching that Service
+    // port shares one lane.
+    let namespace = admission
+        .and_then(
+            crate::backend_pending_limit::BackendPendingScopeBase::admission_destination_namespace,
+        )
+        .unwrap_or(proxy.namespace.as_str());
     crate::backend_active_request_limit::DestinationScope {
-        namespace: proxy.namespace.as_str(),
+        namespace,
         destination,
         policy_port,
         subset: proxy.upstream_subset.as_deref(),

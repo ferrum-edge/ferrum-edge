@@ -963,8 +963,9 @@ pub fn check_peer_version_compatibility(
 /// freeze), so a snapshot or delta member that a revision-7 peer tolerated as
 /// ignorable now fails to decode.
 ///
-/// Revision 9: reserved for the cross-namespace VirtualService route binding
-/// change (`authorized_cross_namespace_targets`, issue #7499).
+/// Revision 9: the mesh VirtualService HTTP route binding
+/// (`MeshVirtualServiceHttpRoutes`) gained `authorized_cross_namespace_targets`
+/// (issue #7499), which a pre-change peer's closed binding refuses.
 ///
 /// Revision 10: a mesh `Workload` gained `mesh_transport` (issue #7500),
 /// which a pre-change peer's closed `Workload` refuses.

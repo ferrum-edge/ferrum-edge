@@ -682,11 +682,14 @@ rules:
     verbs: ["get", "list", "watch"]
   # Istio CRD watch (issue #7502): only the kinds the fixture installs. The
   # controller skips kinds a served group does not serve, so no grant is
-  # needed for the rest of the Istio watch set.
+  # needed for the rest of the Istio watch set. `sidecars` is installed for
+  # the cross-namespace gate's second control plane (issue #7499); this
+  # control plane watches it too (no Sidecar exists in this namespace).
   - apiGroups: ["networking.istio.io"]
     resources:
       - virtualservices
       - destinationrules
+      - sidecars
     verbs: ["get", "list", "watch"]
   - apiGroups: ["security.istio.io"]
     resources:
@@ -737,6 +740,7 @@ rules:
     resources:
       - virtualservices
       - destinationrules
+      - sidecars
     verbs: ["get", "list", "watch"]
   - apiGroups: ["security.istio.io"]
     resources:

@@ -2203,6 +2203,14 @@ impl BackendTlsConfig {
     }
 }
 
+/// The upstream a route-scoped mesh clone is admitted as
+/// ([`Upstream::admission_upstream_id`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AdmissionUpstreamRef {
+    pub namespace: String,
+    pub id: String,
+}
+
 /// An upstream defines a group of backend targets with load balancing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2372,17 +2380,20 @@ pub struct Upstream {
     pub pending_limit_scope:
         Option<std::sync::Arc<crate::backend_pending_limit::BackendPendingScopeBase>>,
     /// Canonical admission identity of a route-scoped upstream clone (issue
-    /// #7423): the id of the upstream (same namespace) it copies. A Sidecar
+    /// #7423): the `(namespace, id)` of the upstream it copies. A Sidecar
     /// dials carried VirtualService destinations through such clones
-    /// (`modes::mesh::clone_sidecar_carried_destination_upstreams`), which
-    /// keep their own routing and load-balancer identity but must share the
-    /// destination's admission lanes (`http2MaxRequests`,
-    /// `http1MaxPendingRequests`) with the upstream they copy.
+    /// (`modes::mesh::clone_sidecar_carried_destination_upstreams`, same
+    /// namespace), and both Sidecar and NodeWaypoint dial an authorized
+    /// cross-namespace destination through a route-namespace clone of the
+    /// destination Service's upstream (issue #7499). Clones keep their own
+    /// routing and load-balancer identity but must share the destination's
+    /// admission lanes (`http2MaxRequests`, `http1MaxPendingRequests`) with
+    /// the upstream they copy, in that upstream's namespace.
     /// [`GatewayConfig::resolve_pending_limit_scopes`] folds it into the
     /// precomputed scopes. `#[serde(skip)]` — set only by mesh
     /// materialization; never an operator input field.
     #[serde(skip)]
-    pub admission_upstream_id: Option<String>,
+    pub admission_upstream_id: Option<AdmissionUpstreamRef>,
     #[serde(default = "UtcTimestamp::now")]
     pub created_at: UtcTimestamp,
     #[serde(default = "UtcTimestamp::now")]
@@ -4279,14 +4290,14 @@ const LISTEN_PATH_PARAMETER_ERROR: &str = "listen_path with `;` requires `allow_
 /// from multiplying the Service's cap. The optional Kubernetes UID remains an
 /// additive recreate fence, and the policy port is appended at acquire time.
 /// The upstream a route-scoped clone is admitted as
-/// (`Upstream::admission_upstream_id`, same namespace), if it resolves.
+/// (`Upstream::admission_upstream_id`, in its own namespace), if it resolves.
 fn admission_source_upstream<'a>(
     upstream: &Upstream,
     upstreams: &HashMap<(&str, &str), &'a Upstream>,
 ) -> Option<&'a Upstream> {
-    let source = upstream.admission_upstream_id.as_deref()?;
+    let source = upstream.admission_upstream_id.as_ref()?;
     upstreams
-        .get(&(upstream.namespace.as_str(), source))
+        .get(&(source.namespace.as_str(), source.id.as_str()))
         .copied()
 }
 
@@ -4297,6 +4308,9 @@ fn pending_limit_logical_id(upstream: &Upstream) -> &str {
         || upstream
             .id
             .starts_with(crate::modes::mesh::MESH_OUTBOUND_HTTP_BYWL_UPSTREAM_ID_PREFIX)
+        // A cross-namespace destination source (issue #7499) is the same
+        // Service port's upstream: its clones share the Service's lane.
+        || crate::modes::mesh::is_cross_namespace_destination_source_id(&upstream.id)
         || upstream.id.starts_with(
             crate::modes::mesh::service_waypoint_l7::SERVICE_WAYPOINT_L7_UPSTREAM_ID_PREFIX,
         );
@@ -5099,14 +5113,18 @@ impl GatewayConfig {
         let scope_for = |upstream: &Upstream, subset: Option<&str>| {
             let source = admission_source_upstream(upstream, &upstream_by_key);
             let admitted = source.unwrap_or(upstream);
+            // In the admitted upstream's namespace: a cross-namespace clone
+            // (issue #7499) shares the destination Service's lane there.
             let scope = crate::backend_pending_limit::BackendPendingScopeBase::new(
-                upstream.namespace.as_str(),
+                admitted.namespace.as_str(),
                 pending_limit_logical_id(admitted),
                 admitted.k8s_service_uid.as_deref(),
                 subset,
             );
             match source {
-                Some(source) => scope.with_admission_destination(source.id.as_str()),
+                Some(source) => {
+                    scope.with_admission_destination(source.namespace.as_str(), source.id.as_str())
+                }
                 None => scope,
             }
         };

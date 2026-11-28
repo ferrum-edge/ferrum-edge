@@ -45,10 +45,12 @@ configuration that 0.9.21 accepted, so review every section before upgrading.
 Every PostgreSQL, MySQL, SQLite and MongoDB database created by a 0.9.x
 release is rebuilt from a logical backup
 ([Database rebuild-and-restore](#every-09x-database-is-rebuilt-and-restored-7523)).
-CP/DP must run the same build, and the ConfigSync revision is now `8`. The
-matching `contracts-edge-1.0.0` release must be cut from the verified release
-commit after the Edge release is published; move downstream contract pins when
-each consumer adopts 1.0.0.
+CP/DP must run the same build, and the ConfigSync revision is now `10`
+(`1.0.0+configsync.r10`;
+[ConfigSync revision 10](#configsync-revision-10-and-the-cp-first-upgrade-7520-7524-7499-7500)).
+The matching `contracts-edge-1.0.0` release must be cut from the verified
+release commit after the Edge release is published; move downstream contract
+pins when each consumer adopts 1.0.0.
 
 ### Upgrade order for 0.9.21 deployments
 
@@ -77,7 +79,7 @@ Do these in order; each step links to the section that explains it.
    rollback
    ([Database rebuild-and-restore](#every-09x-database-is-rebuilt-and-restored-7523)).
 5. **Upgrade the control plane, then every data plane, in one window**
-   ([ConfigSync revision 8](#configsync-revision-8-and-the-cp-first-upgrade-7520-7524)),
+   ([ConfigSync revision 10](#configsync-revision-10-and-the-cp-first-upgrade-7520-7524-7499-7500)),
    including native mesh data planes.
 6. **Move contract pins** to `contracts-edge-1.0.0` once it is published and
    each consumer adopts Edge 1.0.0.
@@ -277,16 +279,18 @@ check of the full backup payload; the backup loader is a partial preflight:
   time it is submitted with `POST` / `PUT /api-specs`. Neither check finds such
   a key; review the source spec documents themselves.
 
-### ConfigSync revision 8 and the CP-first upgrade (#7520, #7524)
+### ConfigSync revision 10 and the CP-first upgrade (#7520, #7524, #7499, #7500)
 
-The ConfigSync build identity is now `1.0.0+configsync.r8`. Revision 7 (#7520)
+The ConfigSync build identity is now `1.0.0+configsync.r10`. Revision 7 (#7520)
 removed the two passive-health fields and closed the passive object; revision
-8 (#7524) closes the other nested proxy, upstream and mesh objects. A 0.9.21 peer
-(`0.9.21+configsync.r6`) is refused at `Subscribe` with `ConfigSync build
-mismatch` (see [Build Identity Gate](#build-identity-gate)). Native mesh data
-planes subscribe with `MeshSubscribe`, which refuses a peer with a different
-major.minor version, so a 0.9.x mesh data plane is refused by a 1.0.0 control
-plane as well.
+8 (#7524) closes the other nested proxy, upstream and mesh objects; revision 9
+(#7499) adds cross-namespace VirtualService destination metadata; revision 10
+(#7500) adds ServiceWaypoint route projection metadata. A 0.9.21 peer
+(`0.9.21+configsync.r6`) or any peer on an earlier 1.0.0 revision is refused at
+`Subscribe` with `ConfigSync build mismatch` (see
+[Build Identity Gate](#build-identity-gate)). Native mesh data planes subscribe
+with `MeshSubscribe`, which refuses a peer with a different major.minor version,
+so a 0.9.x mesh data plane is refused by a 1.0.0 control plane as well.
 
 **Operator action:** follow [Upgrade Order](#upgrade-order): upgrade every
 control plane first (on its rebuilt database), then every data plane and mesh
@@ -309,34 +313,35 @@ last value. YAML documents were already refused this way.
 **Operator action:** run `ferrum-edge validate` on JSON config files and remove
 repeated members. A `GET /backup` export never contains them.
 
-### Cross-namespace VirtualService destinations are refused and reported (#7528, issue #7499)
+### Cross-namespace VirtualService destinations require a ReferenceGrant (#7499)
 
-Cross-namespace VirtualService `http[]` destinations are not served by Sidecar
-or NodeWaypoint mesh data planes in 1.0.0 (issue #7499 is open). They already
-refused a carried route whose direct destination, `mesh_route_dispatch` rule
-destination or DestinationRule-governed split leg named a Service in another
-namespace. 1.0.0 also refuses a weighted split with such a leg when no
-DestinationRule governs it; before, that leg could receive traffic whenever
-the data plane's slice modeled the other namespace's Service and its
-workloads. Routes naming the refused split are removed, and the rest of the
-slice applies. The host keeps its plain Service route only where one exists: a
-VirtualService host that no modeled Service owns is no longer routed by the
-mesh data plane. A route that the translator terminates unconditionally with a
-`404` keeps answering that `404`, with the refused split detached.
+Sidecar and NodeWaypoint mesh data planes now serve cross-namespace Istio
+`VirtualService` `http[]` destinations (direct, dispatch-rule, and weighted-split
+legs) when authorized by a matching Gateway API `ReferenceGrant` in the target
+Service's namespace (`from: networking.istio.io/VirtualService` in the route's
+namespace, `to: ""/Service` matching the target Service or namespace-wide).
+Every destination without a matching `ReferenceGrant` is refused fail-closed:
+admission runs before route translation and rejects the entire mesh-bound
+`VirtualService` (including any gateway routes on a dual-bound object) with
+`FerrumAccepted=False` / `RefNotPermitted`, emitting no routes for it. If a
+previously translated carried route arrives at a data plane without
+authorization metadata during slice materialization, the data plane withholds
+routes naming the unauthorized destination or split, leaving plain Service
+routing where one exists (and keeping any already-translated unconditional
+`404` with the refused split detached).
 
-A mesh-bound VirtualService that names such a destination stays
-`FerrumAccepted=True`, because its gateway routes are unaffected. Its condition
-message now counts the cross-namespace destinations, and each one is listed in
-`status.ferrum.translation.deferred_fields` (at most 32 entries and 8 KiB,
-then one entry counts the rest). The controller judges fully qualified hosts
-against its own cluster domain (`FERRUM_K8S_CLUSTER_DOMAIN`), so the status
-predicts the data planes' refusals only when that equals the data planes'
-`FERRUM_MESH_CLUSTER_DOMAIN`.
+Authorized cross-namespace destinations are reported under
+`status.ferrum.translation.cross_namespace_destinations` (rather than
+`deferred_fields`). The controller judges fully qualified hosts against its own
+cluster domain (`FERRUM_K8S_CLUSTER_DOMAIN`), so the status matches data-plane
+enforcement only when that equals the data planes' `FERRUM_MESH_CLUSTER_DOMAIN`.
 
-**Operator action:** to keep a split, point every leg at a Service in the
-VirtualService's own namespace. Keep `FERRUM_K8S_CLUSTER_DOMAIN` and
-`FERRUM_MESH_CLUSTER_DOMAIN` equal. Check `deferred_fields` on mesh-bound
-VirtualServices for entries that start with `http[].route[].destination`.
+**Operator action:** create a `ReferenceGrant` in each target Service's
+namespace authorizing the `VirtualService`'s namespace (or move split legs into
+the route's own namespace). Keep `FERRUM_K8S_CLUSTER_DOMAIN` and
+`FERRUM_MESH_CLUSTER_DOMAIN` equal. Inspect `FerrumAccepted=False` /
+`RefNotPermitted` and `status.ferrum.translation.cross_namespace_destinations`
+on mesh-bound VirtualServices after upgrading.
 
 ### Admin API behaviour changes (#7491, #7484)
 
@@ -616,9 +621,9 @@ follows weighted splits, match dispatch, rewrites, retries, timeouts, faults and
 mirrors, exactly as on a NodeWaypoint.
 
 - A route whose destination is an in-cluster Service the Sidecar's slice does
-  not model is refused, and the host keeps its Service route. So is a route that
-  claims the Sidecar's own inbound route (same path and host); the inbound route
-  is always kept.
+  not model is refused, and the host keeps its Service route when one exists.
+  So is a route that claims the Sidecar's own inbound route (same path and
+  host); the inbound route is always kept.
 - `match.sourceNamespace` is decided from the Sidecar's own workload, per
   `match[]` condition. A condition naming another namespace is removed on its
   own, and its OR siblings, later rules and the route's unconditional fallback
@@ -633,8 +638,8 @@ mirrors, exactly as on a NodeWaypoint.
   the route. Plain Service traffic is unchanged.
 - A carried route whose direct or dispatch-rule destination is a Service in
   another namespace is refused on every topology, NodeWaypoint included, and its
-  host keeps the Service route. Before, such a route left a dangling upstream
-  reference that refused the whole configuration.
+  host keeps its Service route when one exists. Before, such a route left a
+  dangling upstream reference that refused the whole configuration.
 - Carried traffic shares the destination's DestinationRule `http2MaxRequests`
   and `http1MaxPendingRequests` budgets with plain Service traffic.
 - Destination AuthorizationPolicy and RequestAuthentication still apply at the
@@ -1478,7 +1483,7 @@ waypoint's namespace now take effect: their in-mesh destinations dial over the
 NodeWaypoint transport, a route whose destination is an in-cluster Service the
 waypoint does not model (including a two-label `<svc>.<ns>` host), or whose
 direct external backend has a TLS-originating or wildcard DestinationRule, is
-refused (the host keeps its Service route), a weighted split that names a
+refused (the host keeps its Service route when one exists), a weighted split that names a
 DestinationRule-governed Service or external host is dispatched leg by leg
 (#7387; see the section below), a malformed or empty `spec.gateways` no longer counts
 as `mesh`, and when a merged route's `mesh_route_dispatch` rules can select a

@@ -141,16 +141,26 @@ capabilities:
     # under an independent Bernoulli model; 100/0, 50/50 and 96/4 fail), every
     # x-canary: true request must reach vssvc-v2, and 1000 x-canary: false
     # requests must fall through to the split inside the same window.
+    # Cross-namespace destinations (issue #7499) run on a second,
+    # multi-namespace control plane (trust bundle, ReferenceGrant watch) in two
+    # namespaces of their own: a granted destination answers a carried direct
+    # route and a DestinationRule-governed 50/50 split leg through real
+    # capture, and deleting the ReferenceGrant turns the VirtualService
+    # RefNotPermitted and removes the route while the client's ordinary
+    # Service route keeps answering.
     live_assertions:
       - sidecar.virtual_service.weighted_split_90_10
       - sidecar.virtual_service.header_match_dispatch
+      - sidecar.virtual_service.cross_namespace_direct_destination
+      - sidecar.virtual_service.cross_namespace_weighted_split_leg
+      - sidecar.virtual_service.cross_namespace_grant_withdrawal_refused
     platform_profile: kind-spire-sidecar
     docs_anchor: docs/mesh.md#mesh-data-planes-nodewaypoint-route-carriage
     owner: mesh
     exclusions:
       - Ambient and ServiceWaypoint data planes apply no mesh http[] routes and are excluded.
       - NodeWaypoint route carriage is Experimental with its topology and is not covered by this live row.
-      - Cross-namespace carried destinations are refused on every topology until issue #7499.
+      - Cross-namespace carried destinations (served only when a ReferenceGrant in the destination namespace admits them, issue #7499) are proven on a second, multi-namespace control plane in their own namespaces; the main fixture's control plane stays single-namespace.
       - The live split rides one Sidecar client in one namespace; DestinationRule-governed leg-by-leg dispatch is covered by integration tests only.
 
   - id: mesh.peer_authentication.strict_mtls

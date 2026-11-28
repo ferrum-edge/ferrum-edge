@@ -706,6 +706,9 @@ fn live_contract_real_contract_declares_the_sidecar_suite_rows() {
         "sidecar.virtual_service.cors_policy",
         "sidecar.virtual_service.weighted_split_90_10",
         "sidecar.virtual_service.header_match_dispatch",
+        "sidecar.virtual_service.cross_namespace_direct_destination",
+        "sidecar.virtual_service.cross_namespace_weighted_split_leg",
+        "sidecar.virtual_service.cross_namespace_grant_withdrawal_refused",
         "sidecar.config.native_subscribe_delivered",
         "sidecar.config.native_subscribe_mtls_omitted_client_rejected",
         "sidecar.config.native_subscribe_mtls_foreign_client_rejected",
@@ -738,8 +741,12 @@ fn live_contract_real_contract_declares_the_sidecar_suite_rows() {
         vec![
             "sidecar.virtual_service.weighted_split_90_10".to_string(),
             "sidecar.virtual_service.header_match_dispatch".to_string(),
+            "sidecar.virtual_service.cross_namespace_direct_destination".to_string(),
+            "sidecar.virtual_service.cross_namespace_weighted_split_leg".to_string(),
+            "sidecar.virtual_service.cross_namespace_grant_withdrawal_refused".to_string(),
         ],
-        "the Sidecar VirtualService http[] routing row enrolls exactly the split and header-match assertions"
+        "the Sidecar VirtualService http[] routing row enrolls exactly the split, header-match \
+         and cross-namespace (issue #7499) assertions"
     );
     let deferred: Vec<&str> = sidecar_rows
         .iter()

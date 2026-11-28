@@ -123,13 +123,22 @@ enrolled rows and required live assertion IDs; fixture detail is in the
   rule-bearing upstream and authorized on its own policy; an external leg whose
   rule originates TLS is dialed over TLS, and a direct external backend whose
   rule originates TLS, or that any wildcard rule names, is refused (issues
-  #7387, #7395).
+  #7387, #7395). A route destination in **another namespace** needs a Gateway
+  API `ReferenceGrant` in the destination namespace (from
+  `networking.istio.io/VirtualService` to core `Service`), an existing
+  non-`ExternalName` Service declaring the port, and EndpointSlice attribution,
+  or the VirtualService is refused (`FerrumAccepted=False`, `RefNotPermitted`);
+  an admitted destination is routed by a Sidecar or NodeWaypoint that sees the
+  Service (a NodeWaypoint authorizes it against the destination namespace's
+  AuthorizationPolicy and RequestAuthentication), and the grant never makes the
+  Service reachable through ordinary capture (issue #7499; see [mesh.md →
+  Cross-namespace destinations](mesh.md#cross-namespace-destinations)).
 
   | Topology | Mesh-bound VirtualService `http[]` routes |
   |---|---|
   | NodeWaypoint | Applied (Experimental). |
   | Sidecar | Applied (Experimental), client-side on the outbound capture listener, over SVID-mTLS to each destination workload. Never served on the inbound `:15006` listener. Live-gated in `mesh-e2e-sidecar` (issue #7502): a Kubernetes VirtualService that the control plane translates (`FerrumAccepted=True`) and serves over native `MeshSubscribe` splits 1000 captured requests 90/10 (85-95% window) on a Sidecar client across two STRICT-mTLS destinations and dispatches its `x-canary` header rule. Other `http[]` actions (rewrites, retries, timeouts, faults, mirrors, DestinationRule leg-by-leg dispatch) have deterministic integration coverage only. |
-  | ServiceWaypoint (GAMMA) | **Not applied** yet — the control plane projects the bound Services' routes (gated on a `waypoint_for: service`/`all` binding, with the anti-hijack namespace rule) and the data plane materializes them per bound Service (issue #7500), but the HBONE `:15008` listener stays an L4 relay and serves none of them until HTTP termination inside the tunnel lands (#7501). Cross-namespace legs wait on #7499. |
+  | ServiceWaypoint (GAMMA) | **Not applied** yet — the control plane projects the bound Services' routes (gated on a `waypoint_for: service`/`all` binding, with the anti-hijack namespace rule, admitting bound Service destinations in the route's own namespace and external hosts) and the data plane materializes them per bound Service (issue #7500), but the HBONE `:15008` listener stays an L4 relay and serves none of them until HTTP termination inside the tunnel lands (#7501). Cross-namespace Service destinations remain excluded from ServiceWaypoint projection even when ReferenceGrant-admitted for Sidecar and NodeWaypoint under #7499. |
   | Ambient | **Not applied** — as in Istio, the L4 ambient data plane does not do L7 routing; bind a waypoint. |
   | Ingress gateways (`spec.gateways` naming a Gateway) | Applied as gateway routes; unrelated to the mesh slice. |
 
@@ -339,10 +348,9 @@ ledger unless they change the support contract.
 
 | Deferral | Issue | Doc anchor |
 |---|---|---|
-| Cross-namespace VirtualService `http[]` destinations on Sidecar and NodeWaypoint (today every such destination, direct, dispatch branch or weighted-split leg, refuses its carried route and the host keeps its Service route where one exists; the VirtualService stays `FerrumAccepted`, counts them in its message and lists them in `status.ferrum.translation.deferred_fields`) | [#7499](https://github.com/ferrum-edge/ferrum-edge/issues/7499) | [mesh.md → NodeWaypoint route carriage](mesh.md#mesh-data-planes-nodewaypoint-route-carriage) |
-| ServiceWaypoint `http_routes` projection of authorized cross-namespace legs (today the bound Services' same-namespace routes are projected and materialized; a route with a cross-namespace destination is not carried until the #7499 authorization contract lands) | [#7500](https://github.com/ferrum-edge/ferrum-edge/issues/7500) | [mesh.md → ServiceWaypoint route projection](mesh.md#servicewaypoint-route-projection) |
+| ServiceWaypoint `http_routes` projection of authorized cross-namespace legs (today the bound Services' same-namespace routes are projected and materialized; a route with a cross-namespace destination is not carried onto a ServiceWaypoint yet, even when ReferenceGrant-admitted for Sidecar and NodeWaypoint under #7499) | [#7500](https://github.com/ferrum-edge/ferrum-edge/issues/7500) | [mesh.md → ServiceWaypoint route projection](mesh.md#servicewaypoint-route-projection) |
 | ServiceWaypoint L7 HTTP/1.1 and HTTP/2 termination and bound-Service dispatch on HBONE `:15008` (today an L4 relay only) | [#7501](https://github.com/ferrum-edge/ferrum-edge/issues/7501) | [mesh.md → Service Waypoint](mesh.md#service-waypoint) |
-| Live ServiceWaypoint end-to-end suite in kind (today ServiceWaypoint has no live data-path suite) | [#7503](https://github.com/ferrum-edge/ferrum-edge/issues/7503) | [mesh.md → Topology maturity](mesh.md#topology-maturity) |
+| Live ServiceWaypoint end-to-end L7 assertions in kind (today `mesh-e2e-service-waypoint-live.yml` verifies bound-Service projection and explicitly skips L7 assertions until #7501 ships) | [#7503](https://github.com/ferrum-edge/ferrum-edge/issues/7503) | [mesh.md → Topology maturity](mesh.md#topology-maturity) |
 
 All mesh limitations, including these, are also summarized with workarounds in
 [known_limitations.md](known_limitations.md#service-mesh).

@@ -901,8 +901,10 @@ fn a_destination_rule_split_with_an_unmodeled_leg_is_refused() {
     );
 }
 
-/// Refusals that remain: a leg in another namespace cannot be dispatched by
-/// a namespace-local route override, so the split is refused.
+/// Refusals that remain: a leg in another namespace needs a ReferenceGrant
+/// (issue #7499), so translation refuses the VirtualService (a granted leg is
+/// served: see `cross_namespace_routes.rs` and
+/// `cross_namespace_node_waypoint.rs`).
 #[test]
 fn a_destination_rule_split_with_a_leg_in_another_namespace_is_refused() {
     let objects = vec![
@@ -916,16 +918,15 @@ fn a_destination_rule_split_with_a_leg_in_another_namespace_is_refused() {
         ),
         pool_destination_rule("reviews-dr", "reviews.default.svc.cluster.local", 3, "1s"),
     ];
-    let mut config = translated_config(&objects, Vec::new());
-    let foreign = workload_for("ratings", "other", [("app", "ratings")], ["10.0.1.12"]);
-    let mesh = config.mesh.as_mut().expect("mesh block");
-    mesh.services
-        .push(service_for("ratings", "other", &[&foreign]));
-    mesh.workloads.push(foreign);
-    let slice = slice_for(&config);
-    let prepared = prepare_gateway_config_from_mesh_slice(&slice, &node_waypoint_runtime())
-        .expect("the slice materializes without the refused split");
-    assert!(carried_routes(&prepared).is_empty());
+    let error = translate_k8s_objects(
+        &objects,
+        K8sTranslationOptions::new(
+            DEFAULT_NAMESPACE.to_string(),
+            TrustDomain::new("cluster.local").expect("trust domain"),
+        ),
+    )
+    .expect_err("an ungranted cross-namespace leg refuses the VirtualService");
+    assert!(error.to_string().contains("ReferenceGrant"), "{error}");
 }
 
 /// Refusals that remain: a split with more legs than leg selection tracks is

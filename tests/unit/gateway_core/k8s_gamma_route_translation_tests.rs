@@ -552,8 +552,8 @@ fn consumer_route_with_a_local_backend_is_namespace_local() {
 }
 
 /// Consumer routes need no ReferenceGrant for a cross-namespace backendRef
-/// (upstream GAMMA; the MESH-HTTP `MeshConsumerRoute` test relies on it). Until
-/// cross-namespace legs are carried (#7499) the route is accepted and `Pending`.
+/// (upstream GAMMA; the MESH-HTTP `MeshConsumerRoute` test relies on it). Cross-namespace
+/// GAMMA backends are unsupported in phase 1, so the route is accepted and `Pending`.
 #[test]
 fn consumer_route_cross_namespace_backend_needs_no_reference_grant() {
     let route = http_route(

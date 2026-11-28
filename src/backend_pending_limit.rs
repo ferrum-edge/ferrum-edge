@@ -201,6 +201,11 @@ pub struct BackendPendingScopeBase {
     /// copies (issue #7423, `Upstream::admission_upstream_id`). `None` keeps
     /// the dialed upstream id.
     admission_destination: Option<Arc<str>>,
+    /// The namespace of [`Self::admission_destination`]: a cross-namespace
+    /// VirtualService destination clone (issue #7499) lives in its route's
+    /// namespace and is admitted in the destination Service's. `None` keeps
+    /// the dialing proxy's namespace.
+    admission_destination_namespace: Option<Arc<str>>,
 }
 
 impl BackendPendingScopeBase {
@@ -244,15 +249,24 @@ impl BackendPendingScopeBase {
             prefix: Arc::from(buf),
             digest,
             admission_destination: None,
+            admission_destination_namespace: None,
         }
     }
 
     /// Admit the destination under `upstream_id` for the active-request
     /// breaker (see the field docs). The pending-limit identity is unchanged.
     #[must_use]
-    pub fn with_admission_destination(mut self, upstream_id: &str) -> Self {
+    pub fn with_admission_destination(mut self, namespace: &str, upstream_id: &str) -> Self {
         self.admission_destination = Some(Arc::from(upstream_id));
+        self.admission_destination_namespace = Some(Arc::from(namespace));
         self
+    }
+
+    /// The namespace the active-request breaker keys
+    /// [`Self::admission_destination`] by, when set.
+    #[inline]
+    pub fn admission_destination_namespace(&self) -> Option<&str> {
+        self.admission_destination_namespace.as_deref()
     }
 
     /// The canonical upstream id the active-request breaker keys this

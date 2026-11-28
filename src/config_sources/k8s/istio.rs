@@ -85,6 +85,13 @@ pub(super) fn translate(
             Ok(true)
         }
         "VirtualService" => {
+            // Issue #7499: a mesh-bound VirtualService's destinations in other
+            // namespaces are admitted (ReferenceGrant, existing non-ExternalName
+            // Service and port, EndpointSlice attribution) before anything is
+            // translated, so a refusal rejects the VirtualService atomically
+            // (`FerrumAccepted=False`, `RefNotPermitted`).
+            let authorized_cross_namespace_targets =
+                authorize_virtual_service_cross_namespace_destinations(acc, object)?;
             let (proxies, upstreams, plugins) = virtual_service_routes(object, acc)?;
             // Resolved before anything is upserted so an invalid `exportTo`
             // refuses the VirtualService atomically.
@@ -150,6 +157,7 @@ pub(super) fn translate(
                             namespace: object.metadata.namespace.clone(),
                             export_to,
                             proxy_ids,
+                            authorized_cross_namespace_targets,
                         },
                     );
                 }
@@ -1976,13 +1984,21 @@ fn destination_rule(
 ) -> Result<MeshDestinationRule, K8sTranslateError> {
     let host_raw = string_field(&object.spec, "host")
         .ok_or_else(|| invalid_resource(object, "DestinationRule requires spec.host"))?;
-    let host = host_raw.trim_end_matches('.').to_ascii_lowercase();
-    if host.is_empty() {
+    let host_trimmed = host_raw.trim();
+    let absolute_two_label =
+        host_trimmed.ends_with('.') && host_trimmed.trim_end_matches('.').matches('.').count() == 1;
+    let host_stripped = host_trimmed.trim_end_matches('.').to_ascii_lowercase();
+    if host_stripped.is_empty() {
         return Err(invalid_resource(
             object,
             "DestinationRule spec.host must be a non-empty hostname",
         ));
     }
+    let host = if absolute_two_label {
+        format!("{host_stripped}.")
+    } else {
+        host_stripped
+    };
 
     let traffic_policy = object
         .spec
@@ -5311,80 +5327,336 @@ pub(crate) fn virtual_service_binds_mesh(object: &K8sObject) -> bool {
     })
 }
 
-/// One `http[].route[].destination` of a mesh-bound VirtualService that names
-/// a Service in another namespace (issue #7499).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct VirtualServiceCrossNamespaceDestination {
-    pub(crate) route_index: usize,
-    pub(crate) destination_index: usize,
-    pub(crate) host: String,
-    pub(crate) namespace: String,
-    pub(crate) name: String,
-    /// A zero-weight leg of a multi-destination route: translation drops it
-    /// (`route_backends`), so it never reaches a data plane. A single
-    /// destination is kept whatever its weight, as translation keeps it.
-    pub(crate) omitted_by_translation: bool,
+/// The phrase every cross-namespace VirtualService destination refusal
+/// carries (issue #7499); see
+/// [`message_is_virtual_service_cross_namespace_refusal`].
+pub(crate) const VIRTUAL_SERVICE_CROSS_NAMESPACE_REFUSAL: &str =
+    "cross-namespace VirtualService destination is not permitted";
+
+/// Stable classification of a cross-namespace VirtualService destination
+/// refusal. The Istio status writer reports it as
+/// `FerrumAccepted=False`/`RefNotPermitted` instead of `Invalid`.
+pub(crate) fn message_is_virtual_service_cross_namespace_refusal(message: &str) -> bool {
+    message.contains(VIRTUAL_SERVICE_CROSS_NAMESPACE_REFUSAL)
 }
 
-/// The `http[].route[].destination` hosts of a mesh-bound VirtualService that
-/// name a Service in a namespace other than the VirtualService's own (issue
-/// #7499), every leg included (zero-weight legs and dispatch branches).
+/// A destination `host` of a VirtualService that names a Service in ANOTHER
+/// namespace (issue #7499).
+struct CrossNamespaceServiceReference {
+    namespace: String,
+    name: String,
+    /// The host is a relative two-label name (`<svc>.<ns>`), which a
+    /// resolver's cluster search suffix completes to that Service.
+    relative_two_label: bool,
+}
+
+/// The Service in another namespace a destination `host` of a VirtualService
+/// in `route_namespace` names, or `None` (issue #7499).
 ///
-/// Sidecar and NodeWaypoint data planes refuse such a carried route and serve
-/// its host through the plain Service route, so the status writer reports
-/// each one. The host is read with the alias forms the data plane's
-/// carried-route host classification recognizes as a Service (`<svc>.<ns>`,
-/// `<svc>.<ns>.svc`, `<svc>.<ns>.svc.<cluster domain>`, any case, an optional
-/// trailing dot); a short name is the VirtualService's own namespace and any
-/// other host is external. A VirtualService that does not bind the mesh is
-/// never carried to a mesh data plane and yields nothing.
-pub(crate) fn virtual_service_mesh_cross_namespace_destinations(
+/// The `.svc` forms (`<svc>.<ns>.svc`, `<svc>.<ns>.svc.<cluster domain>`) are
+/// always Service references. So is a RELATIVE two-label host (`<svc>.<ns>`),
+/// whatever Services this control plane observes: a gateway proxy dials the
+/// host as written, and the pod resolver's cluster search suffix completes it
+/// to `<svc>.<ns>.svc.<cluster domain>` even when this control plane does not
+/// watch `<ns>`, so treating it as external would let the gateway leg reach an
+/// ungranted Service. Only an ABSOLUTE two-label name (a trailing dot,
+/// `httpbin.org.`) is never completed by a search suffix and is an external
+/// host here. Fail-closed by construction: an external host written as a
+/// relative two-label name is refused like a missing Service.
+fn virtual_service_cross_namespace_service(
+    acc: &K8sAccumulator,
+    host: &str,
+    route_namespace: &str,
+) -> Option<CrossNamespaceServiceReference> {
+    let trimmed = host.trim();
+    let absolute = trimmed.ends_with('.');
+    let normalized = trimmed.trim_end_matches('.').to_ascii_lowercase();
+    if normalized.contains('*') {
+        return None;
+    }
+    let cluster_domain = normalized_mesh_cluster_domain(&acc.options.cluster_domain);
+    let (service, namespace) =
+        service_host_components(&normalized, route_namespace, &cluster_domain)?;
+    if namespace == route_namespace {
+        return None;
+    }
+    let two_label = normalized.matches('.').count() == 1;
+    if two_label && absolute {
+        return None;
+    }
+    Some(CrossNamespaceServiceReference {
+        namespace: namespace.to_string(),
+        name: service.to_string(),
+        relative_two_label: two_label,
+    })
+}
+
+/// Whether a VirtualService binds the mesh and syntactically names a Service
+/// in another namespace (issue #7499). Decides whether the EndpointSlice
+/// attribution guard is built for a snapshot; over-matching only builds it
+/// more often.
+pub(super) fn virtual_service_may_name_cross_namespace_service(
     object: &K8sObject,
     cluster_domain: &str,
-) -> Vec<VirtualServiceCrossNamespaceDestination> {
+) -> bool {
     if object.kind != "VirtualService" || !virtual_service_binds_mesh(object) {
-        return Vec::new();
+        return false;
     }
-    let route_namespace = object.metadata.namespace.to_ascii_lowercase();
-    // The data plane's host index compares against the configured suffix
-    // with surrounding dots trimmed and case folded; so does this scan.
-    let cluster_domain = cluster_domain.trim().trim_matches('.').to_ascii_lowercase();
-    let mut destinations = Vec::new();
+    let cluster_domain = normalized_mesh_cluster_domain(cluster_domain);
+    virtual_service_destination_hosts(object).any(|host| {
+        let normalized = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        service_host_components(&normalized, &object.metadata.namespace, &cluster_domain)
+            .is_some_and(|(_, namespace)| namespace != object.metadata.namespace)
+    })
+}
+
+/// The cluster domain normalized the way the mesh data plane's host index
+/// normalizes `FERRUM_MESH_CLUSTER_DOMAIN` (surrounding whitespace and dots
+/// dropped, lowercase), so the translator and the data plane classify a
+/// fully qualified host the same way when the two settings agree (issue #7499).
+fn normalized_mesh_cluster_domain(cluster_domain: &str) -> String {
+    cluster_domain.trim().trim_matches('.').to_ascii_lowercase()
+}
+
+/// Every `spec.http[].route[].destination.host` of a VirtualService.
+fn virtual_service_destination_hosts(object: &K8sObject) -> impl Iterator<Item = &str> {
+    object
+        .spec
+        .get("http")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|http| {
+            http.get("route")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(|route| route.get("destination"))
+        .filter_map(|destination| string_field(destination, "host"))
+}
+
+/// Admit every destination of a mesh-bound VirtualService that names a
+/// Service in another namespace, and return those Services (issue #7499).
+///
+/// A VirtualService in namespace `A` reaches Service `B/svc` only when:
+///
+/// 1. a Gateway API `ReferenceGrant` in `B` permits `from`
+///    `networking.istio.io/VirtualService` in `A` `to` core `Service` (`name`
+///    omitted or `svc`);
+/// 2. `B/svc` exists in the translated inventory, so a control plane that does
+///    not watch `B` (its namespace scope) never admits it;
+/// 3. `B/svc` is not `type: ExternalName` (a DNS alias can name a third
+///    namespace's Service or a loopback host, bypassing the grant);
+/// 4. the destination port is one `B/svc` declares;
+/// 5. the shared EndpointSlice attribution guard (issue #6108) finds no
+///    `ForeignEndpoint`, `UnattributedEndpoint` or `Unverifiable` endpoint.
+///    `FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS` admits external
+///    endpoints only for same-namespace references, so it never widens a
+///    cross-namespace destination.
+///
+/// Every `http[].route[]` destination is checked, zero-weight legs included,
+/// and the first refusal rejects the whole VirtualService: no partial or
+/// ungranted route is emitted. A VirtualService that does not bind the mesh
+/// is gateway-only (its routes never ride a mesh slice) and is not checked
+/// here. A refusal message carries [`VIRTUAL_SERVICE_CROSS_NAMESPACE_REFUSAL`].
+fn authorize_virtual_service_cross_namespace_destinations(
+    acc: &K8sAccumulator,
+    object: &K8sObject,
+) -> Result<Vec<crate::modes::mesh::config::MeshWaypointServiceRef>, K8sTranslateError> {
+    if !virtual_service_binds_mesh(object) {
+        return Ok(Vec::new());
+    }
+    let route_namespace = object.metadata.namespace.as_str();
+    let mut authorized: BTreeSet<(String, String)> = BTreeSet::new();
     let http_routes = object.spec.get("http").and_then(Value::as_array);
     for (route_index, http) in http_routes.into_iter().flatten().enumerate() {
-        let legs = http.get("route").and_then(Value::as_array);
-        let multi_destination = legs.is_some_and(|legs| legs.len() > 1);
-        for (destination_index, leg) in legs.into_iter().flatten().enumerate() {
-            let Some(host) = leg
-                .get("destination")
-                .and_then(|destination| string_field(destination, "host"))
+        let destinations = http.get("route").and_then(Value::as_array);
+        for (destination_index, route) in destinations.into_iter().flatten().enumerate() {
+            let Some(destination) = route.get("destination") else {
+                continue;
+            };
+            let Some(host) = string_field(destination, "host") else {
+                continue;
+            };
+            let Some(reference) =
+                virtual_service_cross_namespace_service(acc, host, route_namespace)
             else {
                 continue;
             };
-            let normalized = host.trim().to_ascii_lowercase();
-            if normalized.contains('*') {
-                continue;
+            let context = format!("`http[{route_index}].route[{destination_index}]`");
+            check_virtual_service_cross_namespace_destination(
+                acc,
+                object,
+                &context,
+                destination,
+                &reference,
+            )?;
+            let key = (reference.namespace, reference.name);
+            if !authorized.contains(&key)
+                && authorized.len()
+                    >= crate::modes::mesh::config::MAX_VIRTUAL_SERVICE_CROSS_NAMESPACE_TARGETS
+            {
+                // The mesh binding carries at most this many authorized
+                // Services; refuse the VirtualService rather than publish a
+                // binding mesh validation rejects.
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "{VIRTUAL_SERVICE_CROSS_NAMESPACE_REFUSAL}: {context} would make this \
+                         VirtualService reach more than {} distinct Services in other \
+                         namespaces, the most one mesh route binding authorizes",
+                        crate::modes::mesh::config::MAX_VIRTUAL_SERVICE_CROSS_NAMESPACE_TARGETS
+                    ),
+                ));
             }
-            let Some((name, namespace)) =
-                service_host_components(&normalized, &route_namespace, &cluster_domain)
-            else {
-                continue;
-            };
-            if namespace == route_namespace {
-                continue;
-            }
-            destinations.push(VirtualServiceCrossNamespaceDestination {
-                route_index,
-                destination_index,
-                host: host.to_string(),
-                namespace: namespace.to_string(),
-                name: name.to_string(),
-                omitted_by_translation: multi_destination
-                    && route_weight(object, leg).is_ok_and(|weight| weight == 0),
-            });
+            authorized.insert(key);
         }
     }
-    destinations
+    Ok(authorized
+        .into_iter()
+        .map(
+            |(namespace, name)| crate::modes::mesh::config::MeshWaypointServiceRef {
+                namespace,
+                name,
+            },
+        )
+        .collect())
+}
+
+/// The five admission checks of [`authorize_virtual_service_cross_namespace_destinations`]
+/// for one destination. Supplied values are Debug-quoted.
+fn check_virtual_service_cross_namespace_destination(
+    acc: &K8sAccumulator,
+    object: &K8sObject,
+    context: &str,
+    destination: &Value,
+    reference: &CrossNamespaceServiceReference,
+) -> Result<(), K8sTranslateError> {
+    use super::backend_ref::EndpointSliceRefusal;
+
+    let route_namespace = object.metadata.namespace.as_str();
+    let namespace = reference.namespace.as_str();
+    let name = reference.name.as_str();
+    // Say which rule made the host a Service reference, so an operator who
+    // meant an external host knows how to write it.
+    let rule = if reference.relative_two_label {
+        " (a relative two-label host `<svc>.<ns>` names that Service, since the cluster DNS \
+         search suffix completes it; write an external host as an absolute name with a \
+         trailing dot)"
+    } else {
+        ""
+    };
+    let refuse = |detail: String| {
+        invalid_resource(
+            object,
+            format!(
+                "{VIRTUAL_SERVICE_CROSS_NAMESPACE_REFUSAL}: {context} destination Service \
+                 {namespace:?}/{name:?} {detail}{rule}"
+            ),
+        )
+    };
+    let from_group = super::k8s_api_group(&object.api_version);
+    if !acc.reference_grant_allows(
+        route_namespace,
+        from_group,
+        "VirtualService",
+        namespace,
+        "",
+        "Service",
+        Some(name),
+    ) {
+        return Err(refuse(format!(
+            "is in another namespace; a ReferenceGrant in namespace {namespace:?} must permit \
+             from group {from_group:?} kind \"VirtualService\" in namespace \
+             {route_namespace:?} to core Service {name:?}"
+        )));
+    }
+    if !acc.service_exists(namespace, name) {
+        return Err(refuse(
+            "is not in the control plane's Service inventory (it does not exist, or its \
+             namespace is outside the control plane's watch scope)"
+                .to_string(),
+        ));
+    }
+    if acc.service_is_external_name(namespace, name) {
+        return Err(refuse(
+            "has type ExternalName, which can alias a Service in a third namespace or a \
+             loopback host and is never a cross-namespace mesh destination"
+                .to_string(),
+        ));
+    }
+    // A named port resolves against the destination Service itself, and a
+    // name it does not declare is the same reference failure as an undeclared
+    // number.
+    let port_value = destination.get("port");
+    let port = match port_value.and_then(|port| port.get("name")) {
+        Some(Value::String(port_name))
+            if port_value.and_then(|port| port.get("number")).is_none() =>
+        {
+            match acc.lookup_service_port(namespace, name, port_name) {
+                Some(port) => port,
+                None => {
+                    return Err(refuse(format!(
+                        "does not declare a port named {port_name:?}"
+                    )));
+                }
+            }
+        }
+        _ => {
+            let port = match port_value.and_then(|port| port.get("number")) {
+                Some(number) => {
+                    optional_port_field(object, Some(number), "route.destination.port.number")?
+                }
+                None => None,
+            };
+            port.unwrap_or(80)
+        }
+    };
+    if !acc.service_port_exists(namespace, name, port) {
+        return Err(refuse(format!("does not declare port \"{port}\"")));
+    }
+    // Review F1 (round 5): the guard records an unverifiable finding only for
+    // a selector-less Service, and admits a selector-backed one it cannot
+    // check (Gateway API keeps that). A dual-bound VirtualService's gateway
+    // leg dials the destination's DNS name, so Kubernetes Service routing
+    // follows EVERY EndpointSlice labelled with it, selector or not; a
+    // cross-namespace destination whose slices this controller cannot
+    // attribute is refused whatever its selector.
+    if !acc.options.pod_discovery_enabled || !acc.options.includes_pod_namespace(namespace) {
+        return Err(refuse(
+            "is refused by EndpointSlice attribution (Unverifiable): the controller observes \
+             no Pods in its namespace (pod discovery is off, or the namespace is outside the \
+             Pod watch scope), so it cannot attribute the Service's endpoints; enable \
+             FERRUM_K8S_POD_DISCOVERY_ENABLED and watch that namespace"
+                .to_string(),
+        ));
+    }
+    if let Some(refusal) = acc
+        .endpoint_slice_guard()
+        .refusal(route_namespace, namespace, name)
+    {
+        let reason = match refusal {
+            EndpointSliceRefusal::ForeignEndpoint => {
+                "is refused by EndpointSlice attribution (ForeignEndpoint): an endpoint names or \
+                 carries the IP of a Pod outside its namespace, or an address that is not a Pod \
+                 of that namespace"
+            }
+            EndpointSliceRefusal::UnattributedEndpoint => {
+                "is refused by EndpointSlice attribution (UnattributedEndpoint): an endpoint IP \
+                 is not the IP of a Pod observed in its namespace; \
+                 FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS never admits such an endpoint \
+                 across namespaces"
+            }
+            EndpointSliceRefusal::Unverifiable => {
+                "is refused by EndpointSlice attribution (Unverifiable): the Service has no \
+                 selector and the controller observes no Pods in its namespace; enable \
+                 FERRUM_K8S_POD_DISCOVERY_ENABLED and watch that namespace"
+            }
+        };
+        return Err(refuse(reason.to_string()));
+    }
+    Ok(())
 }
 
 fn virtual_service_routes(
@@ -5999,11 +6271,23 @@ fn route_backends(
             ));
         };
         let port = resolve_destination_port(object, destination, host, acc)?.unwrap_or(80);
+        // An absolute two-label name (`httpbin.org.`) is external, whatever
+        // Service its relative spelling would name (issue #7499).
+        let absolute_two_label = {
+            let trimmed = host.trim();
+            trimmed.ends_with('.') && trimmed.trim_end_matches('.').matches('.').count() == 1
+        };
+        // The Service identity is parsed the way cross-namespace admission
+        // parses it (review F7, round 5): host folded and stripped of its root
+        // dot, cluster domain normalized like the data plane's.
+        let normalized_host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        let cluster_domain = normalized_mesh_cluster_domain(&acc.options.cluster_domain);
         let service_identity = service_host_components(
-            host,
+            &normalized_host,
             &object.metadata.namespace,
-            &acc.options.cluster_domain,
+            &cluster_domain,
         )
+        .filter(|_| !absolute_two_label)
         .and_then(|(svc, ns)| {
             acc.service_port_exists(ns, svc, port)
                 .then(|| (ns.to_string(), svc.to_string(), port))
@@ -6060,16 +6344,35 @@ fn resolve_destination_port(
     let Some(name) = string_field(port_value, "name") else {
         return Ok(None);
     };
-    let cluster_domain = &acc.options.cluster_domain;
-    let Some((svc, ns)) = service_host_components(host, &object.metadata.namespace, cluster_domain)
+    // Review F7 (round 5): resolve the Service the way cross-namespace
+    // admission does (host folded, cluster domain normalized like the data
+    // plane's, and an absolute two-label name like `ratings.other.` treated as
+    // external rather than a Service), so a host admission accepted never
+    // fails here on case or a trailing dot and an external two-label host
+    // never resolves a Kubernetes Service's named port.
+    let cluster_domain = normalized_mesh_cluster_domain(&acc.options.cluster_domain);
+    let trimmed_host = host.trim();
+    let normalized_host = trimmed_host.trim_end_matches('.').to_ascii_lowercase();
+    let is_absolute_two_label =
+        trimmed_host.ends_with('.') && normalized_host.split('.').count() == 2;
+    let Some((svc, ns)) = (!is_absolute_two_label)
+        .then(|| {
+            service_host_components(
+                &normalized_host,
+                &object.metadata.namespace,
+                &cluster_domain,
+            )
+        })
+        .flatten()
     else {
         return Err(invalid_resource(
             object,
             format!(
                 "VirtualService route.destination.host {:?} is not a recognized in-cluster \
                  service form; \
-                 port.name resolution only supports <svc>, <svc>.<ns>, <svc>.<ns>.svc, or \
-                 <svc>.<ns>.svc.{:?} (optional trailing dot)",
+                 port.name resolution only supports <svc>, <svc>.<ns> (relative; no trailing dot), \
+                 <svc>.<ns>.svc, or <svc>.<ns>.svc.{:?} (optional trailing dot on single-label \
+                 and .svc forms)",
                 host, cluster_domain
             ),
         ));
@@ -20636,7 +20939,11 @@ extensionProviders:
         // port name but different port numbers; lookup must resolve against
         // the namespace embedded in the destination host, not the first match.
         let svc_default = service_with_named_ports("reviews", "default", &[("http", 8080)]);
-        let svc_prod = service_with_named_ports("reviews", "prod", &[("http", 9090)]);
+        let mut svc_prod = service_with_named_ports("reviews", "prod", &[("http", 9090)]);
+        // Selector-backed, with pod discovery on and `prod` inside the Pod
+        // watch, so the EndpointSlice attribution a cross-namespace
+        // destination needs (issue #7499) admits it.
+        svc_prod.spec["selector"] = serde_json::json!({"app": "reviews"});
         let vs_default = virtual_service_with_destination(
             "reviews-default",
             serde_json::json!({
@@ -20651,12 +20958,29 @@ extensionProviders:
                 "port": {"name": "http"}
             }),
         );
-        // Cross-namespace destination is allowed: VS in `default` pointing at
-        // a Service in `prod` — must resolve to the prod port number.
+        // Cross-namespace destination admitted by a ReferenceGrant in `prod`
+        // (issue #7499): VS in `default` pointing at a Service in `prod` —
+        // must resolve to the prod port number.
         vs_prod.metadata.namespace = "default".to_string();
+        let grant = object_with_metadata(
+            "ReferenceGrant",
+            "gateway.networking.k8s.io/v1beta1",
+            "allow-default-virtual-services",
+            "prod",
+            serde_json::json!({
+                "from": [{
+                    "group": "networking.istio.io",
+                    "kind": "VirtualService",
+                    "namespace": "default"
+                }],
+                "to": [{"group": "", "kind": "Service", "name": "reviews"}]
+            }),
+        );
         let result = translate_k8s_objects(
-            &[svc_default, svc_prod, vs_default, vs_prod],
-            options().with_source_namespaces(vec!["default".to_string(), "prod".to_string()]),
+            &[svc_default, svc_prod, grant, vs_default, vs_prod],
+            options()
+                .with_source_namespaces(vec!["default".to_string(), "prod".to_string()])
+                .with_pod_discovery_enabled(true),
         )
         .expect("translation succeeds");
         let default_proxy = result
@@ -20916,13 +21240,15 @@ extensionProviders:
 
     #[test]
     fn vs_destination_port_name_accepts_trailing_dot_on_short_forms() {
-        // Trailing dot must apply uniformly across all accepted shapes, not
-        // only the 5-label FQDN. Otherwise an operator typing `reviews.` or
-        // `reviews.default.` gets an inconsistent rejection vs. the FQDN.
+        // Trailing dot applies to single-label and `.svc` Service forms; a
+        // rooted two-label host (`reviews.default.`) is an absolute external
+        // FQDN (matching cross-namespace admission and the mesh host
+        // classifier) and must be refused for Kubernetes named-port lookup
+        // even when a matching Service exists.
         let svc = service_with_named_ports("reviews", "default", &[("http", 8080)]);
         for host in [
             "reviews.",
-            "reviews.default.",
+            "reviews.default",
             "reviews.default.svc.",
             "reviews.default.svc.cluster.local.",
         ] {
@@ -20934,9 +21260,24 @@ extensionProviders:
                 }),
             );
             let result = translate_k8s_objects(&[svc.clone(), vs], options())
-                .unwrap_or_else(|e| panic!("trailing-dot host {host:?} must resolve: {e}"));
+                .unwrap_or_else(|e| panic!("supported host {host:?} must resolve: {e}"));
             assert_eq!(result.config.proxies[0].backend_port, 8080);
         }
+
+        let external_two_label = virtual_service_with_destination(
+            "reviews-external-vs",
+            serde_json::json!({
+                "host": "reviews.default.",
+                "port": {"name": "http"}
+            }),
+        );
+        let err = translate_k8s_objects(&[svc, external_two_label], options())
+            .expect_err("absolute two-label host must not resolve a Kubernetes Service port.name");
+        assert!(
+            err.to_string()
+                .contains("not a recognized in-cluster service form"),
+            "unexpected error for absolute two-label host: {err}"
+        );
     }
 
     #[test]

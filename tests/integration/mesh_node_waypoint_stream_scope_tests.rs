@@ -2129,6 +2129,18 @@ mod node_waypoint_cross_namespace_source_resolution {
 /// VirtualService HTTP routes carried on a NodeWaypoint mesh slice (issue #7233).
 mod http_routes;
 
+/// Cross-namespace VirtualService `http[]` destinations authorized by
+/// ReferenceGrant (issue #7499).
+mod cross_namespace_routes;
+
+/// The same destinations on a NodeWaypoint, authorized against the
+/// destination namespace's policy (issue #7499).
+mod cross_namespace_node_waypoint;
+
+/// The ReferenceGrant invariant: adding or removing a grant changes only the
+/// routes that name the granted target (issue #7499).
+mod cross_namespace_grant_invariant;
+
 /// Gateway API GAMMA routes (`Service` parentRefs) carried on Sidecar and
 /// NodeWaypoint slices (issue #7538).
 mod gamma_routes;

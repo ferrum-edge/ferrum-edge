@@ -48,6 +48,24 @@ pub enum MeshAuthzProtocol {
     /// bytes and never parsed.
     #[default]
     L4,
+    /// A mesh CONNECT relay that a trusted NodeWaypoint assertor forwarded
+    /// for a source it fronts, after judging this destination's
+    /// HTTP-family policy itself (issue #7499, review F2 round 5).
+    ///
+    /// The relayed requests are opaque here exactly as on [`Self::L4`], but
+    /// the source NodeWaypoint terminated them and evaluated every
+    /// AuthorizationPolicy of this destination at Layer 7 before relaying
+    /// (an HTTP request on its own terms, a raw stream as a strict Layer-4
+    /// session): the Istio ambient model, where Layer-7 policy is enforced by
+    /// the waypoint and the destination admits what the waypoint relayed.
+    /// So an HTTP-only predicate was already decided upstream: an `ALLOW`
+    /// rule's HTTP-only fields count as satisfied (its identity and transport
+    /// fields are still judged here), and a `DENY` / `AUDIT` / `CUSTOM` rule
+    /// that reads an HTTP-only field is the upstream's to apply and does not
+    /// match here. Every other field keeps [`Self::L4`] semantics. Only
+    /// `mesh_authz` sets it, and only for an honored assertion from an
+    /// assertor whose explicit grant fronts the asserted identity.
+    UpstreamEnforcedL7,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -696,7 +714,7 @@ fn matches_request_principals(
         return true;
     }
     if request.protocol != MeshAuthzProtocol::Http {
-        return deny_missing_http_attribute_matches(action);
+        return missing_http_attribute_matches(action, request);
     }
     request.request_principal.as_ref().is_some_and(|principal| {
         patterns
@@ -733,7 +751,7 @@ fn matches_not_request_principals(
         return true;
     }
     if request.protocol != MeshAuthzProtocol::Http {
-        return deny_missing_http_attribute_matches(action);
+        return missing_http_attribute_matches(action, request);
     }
     let Some(principal) = request.request_principal.as_ref() else {
         return true;
@@ -825,7 +843,7 @@ fn request_match(
                     .methods
                     .iter()
                     .any(|allowed| allowed.eq_ignore_ascii_case(method)) => {}
-            None if deny_missing_http_attribute_matches(action) => {}
+            None if missing_http_attribute_matches(action, request) => {}
             _ => return false,
         }
     }
@@ -840,7 +858,7 @@ fn request_match(
                 return false;
             }
             Some(_) => {}
-            None if deny_missing_http_attribute_matches(action) => {}
+            None if missing_http_attribute_matches(action, request) => {}
             None => return false,
         }
     }
@@ -851,7 +869,7 @@ fn request_match(
                     .paths
                     .iter()
                     .any(|pattern| wildcard_match(pattern, path)) => {}
-            None if deny_missing_http_attribute_matches(action) => {}
+            None if missing_http_attribute_matches(action, request) => {}
             _ => return false,
         }
     }
@@ -866,7 +884,7 @@ fn request_match(
                 return false;
             }
             Some(_) => {}
-            None if deny_missing_http_attribute_matches(action) => {}
+            None if missing_http_attribute_matches(action, request) => {}
             None => return false,
         }
     }
@@ -877,7 +895,7 @@ fn request_match(
                     .hosts
                     .iter()
                     .any(|pattern| normalized_host_matches(pattern, host)) => {}
-            None if deny_missing_http_attribute_matches(action) => {}
+            None if missing_http_attribute_matches(action, request) => {}
             _ => return false,
         }
     }
@@ -892,7 +910,7 @@ fn request_match(
                 return false;
             }
             Some(_) => {}
-            None if deny_missing_http_attribute_matches(action) => {}
+            None if missing_http_attribute_matches(action, request) => {}
             None => return false,
         }
     }
@@ -937,7 +955,7 @@ fn request_match(
             // has no header map at all, takes the unobservable-attribute
             // branch and stays fail-closed there.
             None if request.protocol != MeshAuthzProtocol::Http
-                && deny_missing_http_attribute_matches(action) => {}
+                && missing_http_attribute_matches(action, request) => {}
             _ => return false,
         }
     }
@@ -957,6 +975,21 @@ fn request_match(
 /// something this path cannot read.
 fn deny_missing_http_attribute_matches(action: &PolicyAction) -> bool {
     matches!(action, PolicyAction::Deny | PolicyAction::Custom { .. })
+}
+
+/// How an HTTP-only field this request cannot carry resolves for `action`:
+/// [`deny_missing_http_attribute_matches`] everywhere, except on a relay whose
+/// HTTP-family policy a trusted NodeWaypoint already enforced
+/// ([`MeshAuthzProtocol::UpstreamEnforcedL7`]): there an `ALLOW` rule's
+/// HTTP-only field counts as satisfied and any other rule reading one does
+/// not match, because the upstream applied it.
+fn missing_http_attribute_matches(action: &PolicyAction, request: &MeshAuthzRequest) -> bool {
+    match request.protocol {
+        MeshAuthzProtocol::UpstreamEnforcedL7 => matches!(action, PolicyAction::Allow),
+        MeshAuthzProtocol::Http | MeshAuthzProtocol::L4 => {
+            deny_missing_http_attribute_matches(action)
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1116,7 +1149,13 @@ fn matches_conditions(
         // not send), which follows the ordinary values / notValues rules
         // below exactly as Istio compiles them.
         if !condition_kind_is_sourceable(kind, request) {
-            return deny_missing_http_attribute_matches(action);
+            // Only an HTTP-only key can have been decided upstream; every
+            // other unsourceable key keeps the Layer-4 resolution.
+            return if condition_kind_is_http_only(kind) {
+                missing_http_attribute_matches(action, request)
+            } else {
+                deny_missing_http_attribute_matches(action)
+            };
         }
         let context = ConditionMatchContext {
             kind,
@@ -1224,6 +1263,18 @@ fn istio_service_account_match(candidate: &str, value: &str, policy_namespace: &
         return false;
     };
     namespace == policy_namespace && service_account == candidate
+}
+
+/// Whether `kind` is an attribute Istio marks "HTTP only".
+fn condition_kind_is_http_only(kind: MeshConditionKeyKind) -> bool {
+    matches!(
+        kind,
+        MeshConditionKeyKind::RequestHeader
+            | MeshConditionKeyKind::RequestAuthPrincipal
+            | MeshConditionKeyKind::RequestAuthPresenter
+            | MeshConditionKeyKind::RequestAuthAudiences
+            | MeshConditionKeyKind::RequestAuthClaim
+    )
 }
 
 /// Can this evaluation context observe the attribute of kind `kind`?

@@ -820,9 +820,8 @@ fn gamma_route_backends(
         }
         if backend_namespace != object.metadata.namespace && resources.blocked.is_none() {
             resources.blocked = Some(GammaParentOutcome::Pending {
-                message: "a backendRef names a Service in another namespace; mesh data planes \
-                          refuse a carried route with a cross-namespace destination until issue \
-                          #7499 lands, so this route is not carried"
+                message: "a backendRef names a Service in another namespace; cross-namespace \
+                          GAMMA backends are unsupported in phase 1, so this route is not carried"
                     .to_string(),
             });
         }
@@ -1095,9 +1094,8 @@ fn finalize_group(
             &programmed,
             GammaParentOutcome::Pending {
                 message: "a port-scoped consumer route passes the Service's other ports through \
-                          to the Service in another namespace; mesh data planes refuse a carried \
-                          route with a cross-namespace destination until issue #7499 lands, so \
-                          this route is not carried"
+                          to the Service in another namespace; cross-namespace GAMMA backends are \
+                          unsupported in phase 1, so this route is not carried"
                     .to_string(),
             },
         );
@@ -1206,6 +1204,7 @@ fn finalize_group(
                 Vec::new()
             },
             proxy_ids: vec![proxy_id],
+            authorized_cross_namespace_targets: Vec::new(),
         });
     record_serving_parents(
         acc,

@@ -1452,7 +1452,21 @@ pub const VIRTUAL_SERVICE_MESH_HTTP_ROUTES_SCOPE: &str = "sidecar_and_node_waypo
 /// mesh-bound VirtualService's `http[]` routes (issues #7390, #7423).
 pub const VIRTUAL_SERVICE_MESH_HTTP_ROUTES_NOTE: &str = "mesh http[] routes are applied only by \
      Sidecar and NodeWaypoint data planes; Ambient and ServiceWaypoint data planes ignore them \
-     and route to the destination Service";
+     and leave plain Service routing where it already exists";
+
+/// The `FerrumAccepted` message note for a mesh-bound VirtualService whose
+/// `http[]` routes reach Services in other namespaces (issue #7499). Those
+/// destinations passed ReferenceGrant, Service and EndpointSlice admission;
+/// whether a given data plane routes them still depends on that data plane's
+/// view, so the note says what happens when it cannot.
+pub const VIRTUAL_SERVICE_CROSS_NAMESPACE_DESTINATIONS_NOTE: &str = "cross-namespace destinations \
+     admitted by ReferenceGrant (status.ferrum.translation.cross_namespace_destinations) are \
+     routed by Sidecar and NodeWaypoint data planes whose control-plane namespace scope covers \
+     the destination namespace and that see the destination Service (namespace visibility or a \
+     Sidecar egress import); a NodeWaypoint authorizes them against the destination \
+     namespace's AuthorizationPolicy and RequestAuthentication, and a data plane that cannot \
+     route one does not receive the route, leaving plain Service routing for that host where it \
+     already exists";
 
 /// Status for `VirtualService`. The translator consumes `spec.http` routes
 /// (incl. `mirror` / `rewrite` / `redirect` / `corsPolicy`) and `spec.tcp` /
@@ -1488,27 +1502,29 @@ fn virtual_service_status(
 
     match result {
         Ok(translation) => {
-            let static_deferred = virtual_service_deferred_fields(&object.spec);
-            // Issue #7499: Sidecar and NodeWaypoint data planes refuse a
-            // carried route whose destination is a Service in another
-            // namespace and keep routing that host to its plain Service. The
-            // VirtualService stays accepted (gateway routes are unaffected),
-            // but each such destination is reported, read with the data
-            // plane's own Service host forms: listed (within a budget) in
-            // `deferred_fields`, counted in the condition message.
-            let cross_namespace =
-                crate::config_sources::k8s::virtual_service_mesh_cross_namespace_destinations(
-                    object,
-                    cluster_domain,
-                );
-            let mut deferred: Vec<String> = static_deferred
-                .iter()
-                .map(|field| field.to_string())
-                .collect();
-            deferred.extend(virtual_service_cross_namespace_deferred_fields(
-                &cross_namespace,
-            ));
+            let deferred = virtual_service_deferred_fields(&object.spec);
             let clamped = virtual_service_clamped_fields(&object.spec);
+            // Issue #7499: the cross-namespace Services this VirtualService's
+            // mesh binding was admitted to reach, read from the translation
+            // itself so status reports exactly what the translator authorized.
+            let cross_namespace_destinations: Vec<String> = translation
+                .config
+                .mesh
+                .as_ref()
+                .and_then(|mesh| {
+                    mesh.virtual_service_http_routes.iter().find(|binding| {
+                        binding.namespace == object.metadata.namespace
+                            && binding.name == object.metadata.name
+                    })
+                })
+                .map(|binding| {
+                    binding
+                        .authorized_cross_namespace_targets
+                        .iter()
+                        .map(|target| format!("{}/{}", target.namespace, target.name))
+                        .collect()
+                })
+                .unwrap_or_default();
             // Issues #7390, #7423: a mesh-bound VirtualService's `http[]`
             // routes reach only Sidecar and NodeWaypoint data planes
             // (`MeshSlice.http_routes`); Ambient and ServiceWaypoint data planes
@@ -1523,19 +1539,8 @@ fn virtual_service_status(
             let (service_waypoint_excluded, service_waypoint_exclusions) =
                 virtual_service_service_waypoint_exclusions(object, translation, cluster_domain);
             let mut notes = Vec::new();
-            if !static_deferred.is_empty() {
-                notes.push(format!("deferred fields: {}", static_deferred.join(", ")));
-            }
-            if !cross_namespace.is_empty() {
-                notes.push(format!(
-                    "{} http[] destination(s) name a Service in another namespace and are not \
-                     served by Sidecar, NodeWaypoint or ServiceWaypoint mesh data planes in this \
-                     release (issue #7499); see status.ferrum.translation.deferred_fields (a fully qualified \
-                     host is read with this controller's cluster domain, which must match the \
-                     data planes' FERRUM_MESH_CLUSTER_DOMAIN for this report to predict their \
-                     refusal)",
-                    cross_namespace.len()
-                ));
+            if !deferred.is_empty() {
+                notes.push(format!("deferred fields: {}", deferred.join(", ")));
             }
             if !clamped.is_empty() {
                 notes.push(format!("clamped fields: {}", clamped.join(", ")));
@@ -1552,6 +1557,9 @@ fn virtual_service_status(
             }
             if mesh_http_routes.is_some() {
                 notes.push(VIRTUAL_SERVICE_MESH_HTTP_ROUTES_NOTE.to_string());
+            }
+            if !cross_namespace_destinations.is_empty() {
+                notes.push(VIRTUAL_SERVICE_CROSS_NAMESPACE_DESTINATIONS_NOTE.to_string());
             }
             let message = if notes.is_empty() {
                 format!(
@@ -1574,6 +1582,10 @@ fn virtual_service_status(
             if let Some(scope) = mesh_http_routes {
                 detail["translation"]["mesh_http_routes"] = json!(scope);
             }
+            if !cross_namespace_destinations.is_empty() {
+                detail["translation"]["cross_namespace_destinations"] =
+                    json!(cross_namespace_destinations);
+            }
             if !service_waypoint_exclusions.is_empty() {
                 detail["translation"]["service_waypoint_route_exclusions"] =
                     Value::Array(service_waypoint_exclusions);
@@ -1582,6 +1594,19 @@ fn virtual_service_status(
         }
         Err(error) => {
             let message = format!("Ferrum rejected this VirtualService: {error}");
+            // Issue #7499: a destination in another namespace that ReferenceGrant,
+            // Service or EndpointSlice admission refused is a reference
+            // resolution failure, reported with the Gateway API vocabulary.
+            let reason = match error {
+                K8sTranslateError::InvalidResource { message, .. }
+                    if crate::config_sources::k8s::message_is_virtual_service_cross_namespace_refusal(
+                        message,
+                    ) =>
+                {
+                    "RefNotPermitted"
+                }
+                _ => "Invalid",
+            };
             let detail = json!({
                 "translation": {
                     "hosts": host_count,
@@ -1589,7 +1614,7 @@ fn virtual_service_status(
                     "error": format!("{error}"),
                 }
             });
-            accepted_status(object, false, "Invalid", &message, Some(detail))
+            accepted_status(object, false, reason, &message, Some(detail))
         }
     }
 }
@@ -1640,66 +1665,6 @@ fn virtual_service_service_waypoint_exclusions(
     }
     (exclusions.len(), entries)
 }
-
-/// Text that starts every `deferred_fields` entry for a mesh-bound
-/// VirtualService destination in another namespace (issue #7499).
-pub const VIRTUAL_SERVICE_CROSS_NAMESPACE_DEFERRED_PREFIX: &str = "http[].route[].destination";
-
-/// Most cross-namespace destinations listed individually in
-/// `deferred_fields` (issue #7499); the rest are counted in one entry.
-pub const MAX_VIRTUAL_SERVICE_CROSS_NAMESPACE_DEFERRED_ENTRIES: usize = 32;
-
-/// Most bytes the individually listed cross-namespace destinations take in
-/// `deferred_fields` (issue #7499), so a VirtualService with thousands of legs
-/// cannot push its status update past the API server's request limit.
-pub const MAX_VIRTUAL_SERVICE_CROSS_NAMESPACE_DEFERRED_BYTES: usize = 8 * 1024;
-
-/// The `deferred_fields` entries for a mesh-bound VirtualService's
-/// destinations in another namespace (issue #7499): one per destination, in
-/// spec order, within [`MAX_VIRTUAL_SERVICE_CROSS_NAMESPACE_DEFERRED_ENTRIES`]
-/// and [`MAX_VIRTUAL_SERVICE_CROSS_NAMESPACE_DEFERRED_BYTES`], then one entry
-/// counting the destinations left out. Hosts and Services are Debug-quoted.
-fn virtual_service_cross_namespace_deferred_fields(
-    destinations: &[crate::config_sources::k8s::VirtualServiceCrossNamespaceDestination],
-) -> Vec<String> {
-    let mut entries = Vec::new();
-    let mut bytes = 0usize;
-    for (index, destination) in destinations.iter().enumerate() {
-        let effect = if destination.omitted_by_translation {
-            "is a zero-weight leg of a multi-destination route, omitted during translation, so \
-             no data plane receives it; a Service in another namespace is not served by Sidecar \
-             or NodeWaypoint mesh data planes in this release (issue #7499)"
-        } else {
-            "Sidecar and NodeWaypoint mesh data planes refuse this route destination in this \
-             release and remove the carried route, so the host keeps its plain Service route \
-             where one exists (issue #7499); gateway routes are unaffected"
-        };
-        let entry = format!(
-            "{VIRTUAL_SERVICE_CROSS_NAMESPACE_DEFERRED_PREFIX} http[{}].route[{}] host {:?} names \
-             Service {:?}/{:?} in another namespace (relative to the controller's cluster \
-             domain): {effect}",
-            destination.route_index,
-            destination.destination_index,
-            destination.host,
-            destination.namespace,
-            destination.name,
-        );
-        if entries.len() >= MAX_VIRTUAL_SERVICE_CROSS_NAMESPACE_DEFERRED_ENTRIES
-            || bytes + entry.len() > MAX_VIRTUAL_SERVICE_CROSS_NAMESPACE_DEFERRED_BYTES
-        {
-            entries.push(format!(
-                "{VIRTUAL_SERVICE_CROSS_NAMESPACE_DEFERRED_PREFIX}: {} more destination(s) naming \
-                 a Service in another namespace are not listed (status size budget; issue #7499)",
-                destinations.len() - index
-            ));
-            break;
-        }
-        bytes += entry.len();
-        entries.push(entry);
-    }
-    entries
-}
-
 /// VirtualService HTTP-route fields the translator parses past but never
 /// projects. `tcp` / `tls` route arrays are not listed here: they are
 /// translated to stream proxies (L4 match predicates compile onto
