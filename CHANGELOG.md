@@ -151,32 +151,32 @@ gateways, control planes, mesh data planes, charts or contract consumers.
   `PluginConfigBase`, which were already strict at runtime. Free-form maps
   (`labels`, plugin `config`, consumer `credentials`) stay open; built-in
   plugin configs already rejected unknown keys.
-- **BREAKING:** ConfigSync protocol revision 8 (`<version>+configsync.r8`)
-  (#7520, #7524). Revision 7 removed the two passive-health fields and closed
-  the passive object; revision 8 closes the other nested proxy, upstream and
-  mesh objects. A 0.9.21
-  peer (`0.9.21+configsync.r6`) is refused at `Subscribe`, so the control
-  plane and its data planes must be upgraded together.
+- **BREAKING:** ConfigSync protocol revision 10 (`<version>+configsync.r10`)
+  (#7520, #7524, #7499, #7500). Revision 7 removed the two passive-health fields
+  and closed the passive object; revision 8 closes the other nested proxy,
+  upstream and mesh objects; revision 9 adds cross-namespace VirtualService
+  destination metadata; revision 10 adds ServiceWaypoint route projection
+  metadata. A 0.9.21 peer (`0.9.21+configsync.r6`) or any peer on an earlier
+  revision is refused at `Subscribe`, so the control plane and its data planes
+  must be upgraded together.
 - **BREAKING:** JSON documents with a repeated object member name are refused
   by file-mode JSON config loading, the offline config backup loader
   (`FERRUM_DB_CONFIG_BACKUP_PATH`) and config migration
   (`FERRUM_MIGRATE_ACTION=config`) (#7487). They match YAML's existing
   duplicate-key refusal instead of keeping the last value.
-- **Mesh / Istio:** Sidecar and NodeWaypoint data planes now refuse a
-  VirtualService weighted-split leg that names a Service in another namespace
-  even when no DestinationRule governs the split (#7528, issue #7499).
-  Previously such a leg could receive traffic when the slice modeled that
-  Service. This matches the existing refusal of cross-namespace direct,
-  dispatch-rule and DestinationRule-governed destinations. Routes naming the
-  split are removed, and the host keeps its plain Service route only where one
-  exists; a route the translator terminates unconditionally with a `404` keeps
-  that `404` with the refused split detached. A mesh-bound VirtualService
-  naming such destinations stays `FerrumAccepted`. Its condition message now
-  counts them, and `status.ferrum.translation.deferred_fields` lists each one
-  (budgeted, with zero-weight legs marked as omitted during translation),
-  judged against the controller's cluster domain, so keep
-  `FERRUM_K8S_CLUSTER_DOMAIN` equal to the data planes'
-  `FERRUM_MESH_CLUSTER_DOMAIN`.
+- **Mesh / Istio:** Sidecar and NodeWaypoint data planes now serve
+  cross-namespace Istio `VirtualService` `http[]` destinations (direct,
+  dispatch-rule, and weighted-split legs, with or without a DestinationRule)
+  when authorized by a matching Gateway API `ReferenceGrant` in the target
+  Service's namespace (#7499). Unauthorized cross-namespace destinations fail
+  closed: the `VirtualService` is rejected with `FerrumAccepted=False` /
+  `RefNotPermitted`, routes naming an unauthorized destination or split are
+  withheld, and the host keeps its plain Service route only where one exists (a
+  route terminated unconditionally with `404` keeps that `404` with the refused
+  split detached). Eligible authorized cross-namespace destinations are reported
+  in `status.ferrum.translation.cross_namespace_destinations`, judged against
+  the controller's cluster domain (`FERRUM_K8S_CLUSTER_DOMAIN`), so keep it
+  equal to the data planes' `FERRUM_MESH_CLUSTER_DOMAIN`.
 - **Istio DestinationRule `outlierDetection.splitExternalLocalOriginErrors:
   true` is reported as a deferred field** (#7520): a translate-time warning
   plus a tier-scoped `status.ferrum.translation.deferred_fields` entry. Ferrum

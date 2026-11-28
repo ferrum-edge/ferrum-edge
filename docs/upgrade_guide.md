@@ -277,16 +277,18 @@ check of the full backup payload; the backup loader is a partial preflight:
   time it is submitted with `POST` / `PUT /api-specs`. Neither check finds such
   a key; review the source spec documents themselves.
 
-### ConfigSync revision 8 and the CP-first upgrade (#7520, #7524)
+### ConfigSync revision 10 and the CP-first upgrade (#7520, #7524, #7499, #7500)
 
-The ConfigSync build identity is now `1.0.0+configsync.r8`. Revision 7 (#7520)
+The ConfigSync build identity is now `1.0.0+configsync.r10`. Revision 7 (#7520)
 removed the two passive-health fields and closed the passive object; revision
-8 (#7524) closes the other nested proxy, upstream and mesh objects. A 0.9.21 peer
-(`0.9.21+configsync.r6`) is refused at `Subscribe` with `ConfigSync build
-mismatch` (see [Build Identity Gate](#build-identity-gate)). Native mesh data
-planes subscribe with `MeshSubscribe`, which refuses a peer with a different
-major.minor version, so a 0.9.x mesh data plane is refused by a 1.0.0 control
-plane as well.
+8 (#7524) closes the other nested proxy, upstream and mesh objects; revision 9
+(#7499) adds cross-namespace VirtualService destination metadata; revision 10
+(#7500) adds ServiceWaypoint route projection metadata. A 0.9.21 peer
+(`0.9.21+configsync.r6`) or any peer on an earlier 1.0.0 revision is refused at
+`Subscribe` with `ConfigSync build mismatch` (see
+[Build Identity Gate](#build-identity-gate)). Native mesh data planes subscribe
+with `MeshSubscribe`, which refuses a peer with a different major.minor version,
+so a 0.9.x mesh data plane is refused by a 1.0.0 control plane as well.
 
 **Operator action:** follow [Upgrade Order](#upgrade-order): upgrade every
 control plane first (on its rebuilt database), then every data plane and mesh
@@ -309,34 +311,32 @@ last value. YAML documents were already refused this way.
 **Operator action:** run `ferrum-edge validate` on JSON config files and remove
 repeated members. A `GET /backup` export never contains them.
 
-### Cross-namespace VirtualService destinations are refused and reported (#7528, issue #7499)
+### Cross-namespace VirtualService destinations require a ReferenceGrant (#7499)
 
-Cross-namespace VirtualService `http[]` destinations are not served by Sidecar
-or NodeWaypoint mesh data planes in 1.0.0 (issue #7499 is open). They already
-refused a carried route whose direct destination, `mesh_route_dispatch` rule
-destination or DestinationRule-governed split leg named a Service in another
-namespace. 1.0.0 also refuses a weighted split with such a leg when no
-DestinationRule governs it; before, that leg could receive traffic whenever
-the data plane's slice modeled the other namespace's Service and its
-workloads. Routes naming the refused split are removed, and the rest of the
-slice applies. The host keeps its plain Service route only where one exists: a
-VirtualService host that no modeled Service owns is no longer routed by the
-mesh data plane. A route that the translator terminates unconditionally with a
-`404` keeps answering that `404`, with the refused split detached.
+Sidecar and NodeWaypoint mesh data planes now serve cross-namespace Istio
+`VirtualService` `http[]` destinations (direct, dispatch-rule, and weighted-split
+legs) when authorized by a matching Gateway API `ReferenceGrant` in the target
+Service's namespace (`from: networking.istio.io/VirtualService` in the route's
+namespace, `to: ""/Service` matching the target Service or namespace-wide).
+Every destination without a matching `ReferenceGrant` is refused fail-closed:
+the `VirtualService` is rejected with `FerrumAccepted=False` /
+`RefNotPermitted`, routes naming an unauthorized destination or split are
+withheld from the data plane, and the host keeps its plain Service route only
+where one exists (a route the translator terminates unconditionally with a `404`
+keeps that `404` with the refused split detached).
 
-A mesh-bound VirtualService that names such a destination stays
-`FerrumAccepted=True`, because its gateway routes are unaffected. Its condition
-message now counts the cross-namespace destinations, and each one is listed in
-`status.ferrum.translation.deferred_fields` (at most 32 entries and 8 KiB,
-then one entry counts the rest). The controller judges fully qualified hosts
-against its own cluster domain (`FERRUM_K8S_CLUSTER_DOMAIN`), so the status
-predicts the data planes' refusals only when that equals the data planes'
-`FERRUM_MESH_CLUSTER_DOMAIN`.
+Authorized cross-namespace destinations are reported under
+`status.ferrum.translation.cross_namespace_destinations` (rather than
+`deferred_fields`). The controller judges fully qualified hosts against its own
+cluster domain (`FERRUM_K8S_CLUSTER_DOMAIN`), so the status matches data-plane
+enforcement only when that equals the data planes' `FERRUM_MESH_CLUSTER_DOMAIN`.
 
-**Operator action:** to keep a split, point every leg at a Service in the
-VirtualService's own namespace. Keep `FERRUM_K8S_CLUSTER_DOMAIN` and
-`FERRUM_MESH_CLUSTER_DOMAIN` equal. Check `deferred_fields` on mesh-bound
-VirtualServices for entries that start with `http[].route[].destination`.
+**Operator action:** create a `ReferenceGrant` in each target Service's
+namespace authorizing the `VirtualService`'s namespace (or move split legs into
+the route's own namespace). Keep `FERRUM_K8S_CLUSTER_DOMAIN` and
+`FERRUM_MESH_CLUSTER_DOMAIN` equal. Inspect `FerrumAccepted=False` /
+`RefNotPermitted` and `status.ferrum.translation.cross_namespace_destinations`
+on mesh-bound VirtualServices after upgrading.
 
 ### Admin API behaviour changes (#7491, #7484)
 
