@@ -61,9 +61,9 @@ use ferrum_edge::proxy::{
 use serde_json::json;
 
 use super::super::mesh_hbone_tests::{
-    HboneMtlsCerts, connect_hbone_h2_mtls, frame_datagram, generate_hbone_mtls_certs,
-    hbone_client_config, hbone_server_config, read_framed_datagram, start_external_udp_echo,
-    udp_connect_request,
+    HboneMtlsCerts, connect_hbone_h2_mtls, discover_bindable_non_loopback_local_ip, frame_datagram,
+    generate_hbone_mtls_certs, hbone_client_config, hbone_server_config, read_framed_datagram,
+    start_external_udp_echo_on, udp_connect_request,
 };
 use super::super::mesh_test_support::{
     BackendCaptureLog, BackendResponder, runtime_for_topology, start_http_backend, workload_for,
@@ -267,7 +267,7 @@ fn mesh_service(
     }
 }
 
-/// The real loopback backends behind the bound Services.
+/// The local test backends behind the bound Services.
 struct Backends {
     reviews: SocketAddr,
     reviews_log: BackendCaptureLog,
@@ -294,10 +294,8 @@ fn marker_responder(marker: &'static str) -> (BackendResponder, BackendCaptureLo
     (responder, log)
 }
 
-async fn start_tcp_echo() -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind_test("127.0.0.1:0")
-        .await
-        .expect("bind tcp echo");
+async fn start_tcp_echo_on(addr: SocketAddr) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind_test(addr).await.expect("bind tcp echo");
     let addr = listener.local_addr().expect("tcp echo addr");
     let handle = tokio::spawn(async move {
         loop {
@@ -323,12 +321,17 @@ async fn start_tcp_echo() -> (SocketAddr, tokio::task::JoinHandle<()>) {
 }
 
 async fn start_backends() -> Backends {
+    start_backends_at(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)).await
+}
+
+async fn start_backends_at(stream_ip: std::net::IpAddr) -> Backends {
     let (reviews_responder, reviews_log) = marker_responder("reviews");
     let (ratings_responder, ratings_log) = marker_responder("ratings");
     let (reviews, reviews_handle) = start_http_backend(reviews_responder).await;
     let (ratings, ratings_handle) = start_http_backend(ratings_responder).await;
-    let (tcp_echo, tcp_handle) = start_tcp_echo().await;
-    let (udp_echo, udp_handle) = start_external_udp_echo().await;
+    let stream_bind = SocketAddr::new(stream_ip, 0);
+    let (tcp_echo, tcp_handle) = start_tcp_echo_on(stream_bind).await;
+    let (udp_echo, udp_handle) = start_external_udp_echo_on(stream_bind).await;
     Backends {
         reviews,
         reviews_log,
@@ -377,44 +380,58 @@ struct Scenario {
 fn cp_config(backends: &Backends, scenario: &Scenario) -> GatewayConfig {
     let mut config = GatewayConfig::default();
     translate(&mut config, &scenario.virtual_services);
+    let split_stream_backend = !backends.tcp_echo.ip().is_loopback();
     let mut reviews = workload_for("reviews", NAMESPACE, [("app", "reviews")], ["127.0.0.1"]);
-    reviews.ports = vec![
-        workload_port(backends.reviews.port(), AppProtocol::Http, "http"),
-        workload_port(backends.tcp_echo.port(), AppProtocol::Tcp, "tcp"),
-        workload_port(backends.udp_echo.port(), AppProtocol::Udp, "udp"),
-    ];
+    reviews.ports = if split_stream_backend {
+        vec![workload_port(
+            backends.reviews.port(),
+            AppProtocol::Http,
+            "http",
+        )]
+    } else {
+        vec![
+            workload_port(backends.reviews.port(), AppProtocol::Http, "http"),
+            workload_port(backends.tcp_echo.port(), AppProtocol::Tcp, "tcp"),
+            workload_port(backends.udp_echo.port(), AppProtocol::Udp, "udp"),
+        ]
+    };
     let mut ratings = workload_for("ratings", NAMESPACE, [("app", "ratings")], ["127.0.0.1"]);
     ratings.ports = vec![workload_port(
         backends.ratings.port(),
         AppProtocol::Http,
         "http",
     )];
+    let reviews_service_ports = if split_stream_backend {
+        vec![service_port(
+            SERVICE_PORT,
+            AppProtocol::Http,
+            "http",
+            backends.reviews.port(),
+        )]
+    } else {
+        vec![
+            service_port(
+                SERVICE_PORT,
+                AppProtocol::Http,
+                "http",
+                backends.reviews.port(),
+            ),
+            service_port(
+                STREAM_SERVICE_PORT,
+                AppProtocol::Tcp,
+                "tcp",
+                backends.tcp_echo.port(),
+            ),
+            service_port(
+                UDP_SERVICE_PORT,
+                AppProtocol::Udp,
+                "udp",
+                backends.udp_echo.port(),
+            ),
+        ]
+    };
     let mut services = vec![
-        mesh_service(
-            "reviews",
-            REVIEWS_VIP,
-            vec![
-                service_port(
-                    SERVICE_PORT,
-                    AppProtocol::Http,
-                    "http",
-                    backends.reviews.port(),
-                ),
-                service_port(
-                    STREAM_SERVICE_PORT,
-                    AppProtocol::Tcp,
-                    "tcp",
-                    backends.tcp_echo.port(),
-                ),
-                service_port(
-                    UDP_SERVICE_PORT,
-                    AppProtocol::Udp,
-                    "udp",
-                    backends.udp_echo.port(),
-                ),
-            ],
-            &reviews,
-        ),
+        mesh_service("reviews", REVIEWS_VIP, reviews_service_ports, &reviews),
         mesh_service(
             "ratings",
             RATINGS_VIP,
@@ -446,6 +463,36 @@ fn cp_config(backends: &Backends, scenario: &Scenario) -> GatewayConfig {
         bound.push("reviews-alias".to_string());
     }
     let mut workloads = vec![reviews, ratings];
+    if split_stream_backend {
+        let mut reviews_stream =
+            workload_for("reviews-stream", NAMESPACE, [("app", "reviews-stream")], []);
+        reviews_stream.addresses = vec![backends.tcp_echo.ip().to_string()];
+        reviews_stream.ports = vec![
+            workload_port(backends.tcp_echo.port(), AppProtocol::Tcp, "tcp"),
+            workload_port(backends.udp_echo.port(), AppProtocol::Udp, "udp"),
+        ];
+        services.push(mesh_service(
+            "reviews-stream",
+            "10.96.0.14",
+            vec![
+                service_port(
+                    STREAM_SERVICE_PORT,
+                    AppProtocol::Tcp,
+                    "tcp",
+                    backends.tcp_echo.port(),
+                ),
+                service_port(
+                    UDP_SERVICE_PORT,
+                    AppProtocol::Udp,
+                    "udp",
+                    backends.udp_echo.port(),
+                ),
+            ],
+            &reviews_stream,
+        ));
+        bound.push("reviews-stream".to_string());
+        workloads.push(reviews_stream);
+    }
     if scenario.ambiguous_alias {
         // The alias Service's own backing record: the SAME pod (identity,
         // address and port) attached to `reviews-alias`, so both bound
@@ -495,12 +542,6 @@ fn prepared(backends: &Backends, scenario: &Scenario) -> GatewayConfig {
     let slice = MeshSlice::from_gateway_config(&filtered, request);
     let mut prepared =
         prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("slice materializes");
-    // The kind suites relay to pod IPs; these backends listen on loopback, so
-    // the L4 relay is given the own-namespace loopback privilege a Sidecar
-    // holds. The L7 path never consults it (it dials materialized upstreams).
-    if let Some(mesh) = prepared.mesh.as_deref_mut() {
-        mesh.inbound_relay_admits_loopback_namespace = true;
-    }
     if let Some(grants) = scenario.assertor_grants.as_ref() {
         let authz = prepared
             .plugin_configs
@@ -1298,9 +1339,12 @@ async fn an_ambiguous_backing_endpoint_authority_is_refused_before_any_upgrade()
 /// on the L4 relay: the bytes are relayed verbatim, nothing is terminated.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stream_family_ports_and_connect_udp_stay_on_the_l4_relay() {
-    let mut waypoint = Waypoint::start(Scenario::default()).await;
-    // A raw TCP stream to the reviews workload's stream-family port.
-    let tcp_endpoint = format!("127.0.0.1:{}", waypoint.backends.tcp_echo.port());
+    let stream_ip = discover_bindable_non_loopback_local_ip().await;
+    let backends = start_backends_at(stream_ip).await;
+    let mut waypoint = Waypoint::start_with(backends, Scenario::default(), CLIENT_SPIFFE).await;
+
+    // A raw TCP stream to the reviews-stream workload's stream-family port.
+    let tcp_endpoint = waypoint.backends.tcp_echo.to_string();
     let (response, mut send) = waypoint.connect_with(&tcp_endpoint, &[]).await;
     assert_eq!(response.status(), StatusCode::OK, "the L4 relay admits it");
     let mut recv = response.into_body();
@@ -1313,8 +1357,8 @@ async fn stream_family_ports_and_connect_udp_stay_on_the_l4_relay() {
         .expect("echo bytes");
     assert_eq!(&echoed[..], b"not-http\x00\x01", "relayed verbatim at L4");
 
-    // A connect-udp tunnel naming the reviews workload's UDP port.
-    let udp_endpoint = format!("127.0.0.1:{}", waypoint.backends.udp_echo.port());
+    // A connect-udp tunnel naming the reviews-stream workload's UDP port.
+    let udp_endpoint = waypoint.backends.udp_echo.to_string();
     let (udp_response, mut udp_send) = {
         let (response, send) = waypoint
             .sender
@@ -1336,13 +1380,31 @@ async fn stream_family_ports_and_connect_udp_stay_on_the_l4_relay() {
     let reply = tokio::time::timeout(DEADLINE, read_framed_datagram(&mut udp_recv))
         .await
         .expect("datagram reply within the deadline");
-    assert_eq!(reply, b"datagram");
+    assert_eq!(reply, b"pong:datagram");
 
     // Neither tunnel was terminated at L7.
     assert_eq!(l7_tunnels_active(), 0);
     for reason in ServiceWaypointL7TunnelTermination::ALL {
         assert_eq!(l7_tunnel_terminations(reason), 0, "{}", reason.as_str());
     }
+    waypoint.teardown().await;
+}
+
+/// A bound, running loopback workload is not a ServiceWaypoint L4 target.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn l4_relay_refuses_a_bound_loopback_stream_workload() {
+    let mut waypoint = Waypoint::start(Scenario::default()).await;
+    let target = waypoint.backends.tcp_echo;
+    assert!(
+        target.ip().is_loopback(),
+        "fixture: TCP echo is on loopback"
+    );
+    let (response, _) = waypoint.connect_with(&target.to_string(), &[]).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "ServiceWaypoint L4 relay refuses a bound loopback target"
+    );
     waypoint.teardown().await;
 }
 

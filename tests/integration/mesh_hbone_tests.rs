@@ -1453,7 +1453,13 @@ async fn start_egress_udp_gateway(
 /// sent the datagram.
 pub(super) async fn start_external_udp_echo() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>)
 {
-    let socket = tokio::net::UdpSocket::bind_test("127.0.0.1:0")
+    start_external_udp_echo_on(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await
+}
+
+pub(super) async fn start_external_udp_echo_on(
+    addr: std::net::SocketAddr,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let socket = tokio::net::UdpSocket::bind_test(addr)
         .await
         .expect("bind external udp echo");
     let addr = socket.local_addr().expect("external udp echo addr");
@@ -5126,7 +5132,7 @@ async fn probe_udp_egress_local_ip(dest: SocketAddr) -> Result<IpAddr, String> {
 
 /// Fail closed when the runner has only loopback: a 127.0.0.2 C can be
 /// refused by PR #4315's loopback-namespace guard instead of ownership.
-async fn discover_bindable_non_loopback_local_ip() -> IpAddr {
+pub(super) async fn discover_bindable_non_loopback_local_ip() -> IpAddr {
     let probes = [
         SocketAddr::from((Ipv4Addr::new(1, 1, 1, 1), 53)),
         SocketAddr::from((Ipv4Addr::new(8, 8, 8, 8), 53)),
