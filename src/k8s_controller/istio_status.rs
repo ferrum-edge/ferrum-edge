@@ -1465,7 +1465,8 @@ pub const VIRTUAL_SERVICE_CROSS_NAMESPACE_DESTINATIONS_NOTE: &str = "cross-names
      the destination namespace and that see the destination Service (namespace visibility or a \
      Sidecar egress import); a NodeWaypoint authorizes them against the destination \
      namespace's AuthorizationPolicy and RequestAuthentication, and a data plane that cannot \
-     route one does not receive the route and keeps routing that host to its plain Service";
+     route one does not receive the route, leaving plain Service routing for that host where it \
+     already exists";
 
 /// Status for `VirtualService`. The translator consumes `spec.http` routes
 /// (incl. `mirror` / `rewrite` / `redirect` / `corsPolicy`) and `spec.tcp` /

@@ -5673,8 +5673,10 @@ fn destination_rule_originates_tls_for_host(mesh_slice: &MeshSlice, host: &str, 
 /// claiming the local inbound slot, an authority rewrite its destination
 /// cannot route, a route whose `sourceNamespace` conditions all name another
 /// namespace while it serves matched requests only), concerns a well-formed
-/// route this data plane cannot or should not serve: the route is dropped and
-/// its host keeps the materialized Service route. Malformed input never takes
+/// route this data plane cannot or should not serve: the route is dropped,
+/// leaving plain Service routing where it already exists (while an
+/// already-translated unconditional 404 keeps its 404 with the refused split
+/// detached). Malformed input never takes
 /// that path, because the Service route would serve requests the carried
 /// route's match gate answers with 404: a carried set with malformed,
 /// duplicate or dangling records, or a dispatch instance the plugin
@@ -6187,8 +6189,10 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                     // (`validate_upstream_references` stays namespace-local).
                     // An authorized destination in another namespace (issue
                     // #7499) is bound to a route-namespace clone of that
-                    // Service port's upstream; any other one refuses the route
-                    // (the host keeps its Service route).
+                    // Service port's upstream; any other one refuses the route,
+                    // leaving plain Service routing where it already exists
+                    // (while an already-translated unconditional 404 keeps its
+                    // 404 with a refused split detached).
                     CarriedRouteHost::Service(service_namespace, service_name)
                         if service_namespace != namespace =>
                     {

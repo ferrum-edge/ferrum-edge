@@ -4522,7 +4522,7 @@ fn node_waypoint_http_route_set(
             limit = MAX_HTTP_ROUTE_CROSS_NAMESPACE_TARGETS,
             "VirtualService HTTP routes withheld from the mesh slice: their cross-namespace \
              destination authorizations would exceed the per-slice budget a data plane accepts \
-             (issue #7499); their hosts keep the plain Service routes"
+             (issue #7499); plain Service routing remains where it already exists"
         );
     }
     set
