@@ -323,6 +323,7 @@ fn normalize_authz(config: &mut Value, kept_upstreams: &BTreeSet<String>) {
         policies.retain(|policy| !grant_only(policy));
     }
     if let Some(slice) = object.get_mut("mesh_slice").and_then(Value::as_object_mut) {
+        slice.remove("version");
         if let Some(Value::Array(policies)) = slice.get_mut("mesh_policies") {
             policies.retain(|policy| !grant_only(policy));
         }
@@ -332,6 +333,15 @@ fn normalize_authz(config: &mut Value, kept_upstreams: &BTreeSet<String>) {
         if let Some(Value::Array(resources)) = slice.get_mut("request_authentications") {
             resources.retain(|resource| resource["namespace"].as_str() != Some(OTHER));
         }
+    }
+}
+
+/// Remove wall-clock timestamps (`created_at`, `updated_at`) before comparing
+/// two independent `data_plane` preparations of the fixture.
+fn strip_timestamps(value: &mut Value) {
+    if let Some(object) = value.as_object_mut() {
+        object.remove("created_at");
+        object.remove("updated_at");
     }
 }
 
@@ -397,19 +407,20 @@ fn ungranted_view(config: &GatewayConfig) -> BTreeMap<String, Value> {
 
     let mut view = BTreeMap::new();
     for proxy in &kept_proxies {
-        view.insert(
-            format!("proxy {}/{}", proxy.namespace, proxy.id),
-            serde_json::to_value(proxy).expect("proxy serializes"),
-        );
+        let mut value = serde_json::to_value(proxy).expect("proxy serializes");
+        strip_timestamps(&mut value);
+        view.insert(format!("proxy {}/{}", proxy.namespace, proxy.id), value);
     }
     for upstream in config
         .upstreams
         .iter()
         .filter(|upstream| kept_upstream_ids.contains(&upstream.id))
     {
+        let mut value = serde_json::to_value(upstream).expect("upstream serializes");
+        strip_timestamps(&mut value);
         view.insert(
             format!("upstream {}/{}", upstream.namespace, upstream.id),
-            serde_json::to_value(upstream).expect("upstream serializes"),
+            value,
         );
     }
     for plugin in &config.plugin_configs {
@@ -422,6 +433,7 @@ fn ungranted_view(config: &GatewayConfig) -> BTreeMap<String, Value> {
             continue;
         }
         let mut value = serde_json::to_value(plugin).expect("plugin serializes");
+        strip_timestamps(&mut value);
         if plugin.id == MESH_AUTHZ_PLUGIN_ID {
             normalize_authz(&mut value["config"], &kept_upstream_ids);
         }

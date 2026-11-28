@@ -997,8 +997,20 @@ async fn an_absolute_two_label_route_never_inherits_the_service_policy() {
         vec![ratings_trusted_only()],
         Vec::new(),
     );
-    // No Sidecar egress scope narrows the external host here.
-    config.mesh.as_mut().expect("mesh block").sidecars.clear();
+    // Keep the importing Sidecar so `other/ratings` stays visible to `default`,
+    // and add `*/*` so the external host `ratings.other.` is not narrowed out.
+    config
+        .mesh
+        .as_mut()
+        .expect("mesh block")
+        .sidecars
+        .first_mut()
+        .expect("importing sidecar")
+        .egress
+        .first_mut()
+        .expect("egress listener")
+        .hosts
+        .push("*/*".to_string());
     let prepared = prepare(&slice_for(&config, &node_waypoint_runtime()));
     let routes = carried_routes(&prepared);
     let external = routes
