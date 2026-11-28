@@ -635,7 +635,10 @@ async fn assert_grant_changes_only_its_routes(runtime: MeshRuntimeConfig, with_e
         let direct_granted = granted
             .proxies
             .iter()
-            .find(|proxy| names_granted_route(&proxy.id) && proxy.listen_path == "/granted-direct")
+            .find(|proxy| {
+                names_granted_route(&proxy.id)
+                    && proxy.listen_path.as_deref() == Some("/granted-direct")
+            })
             .unwrap_or_else(|| panic!("{case}: direct granted route materialized"));
         let refusal_targets_direct = granted.plugin_configs.iter().any(|plugin| {
             (plugin.id == MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID
@@ -813,26 +816,34 @@ fn a_colliding_grant_only_request_auth_does_not_refuse_unrelated_routes() {
         let mixed = cfg
             .proxies
             .iter()
-            .find(|proxy| proxy.listen_path == "/mixed")
+            .find(|proxy| proxy.listen_path.as_deref() == Some("/mixed"))
             .unwrap_or_else(|| panic!("{label}: /mixed route present"));
+        let refusal_applies_to_mixed = cfg.plugin_configs.iter().any(|plugin| {
+            plugin.enabled
+                && (plugin.id == MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID
+                    || plugin
+                        .id
+                        .starts_with(MESH_REQUEST_AUTH_REFUSED_PARTITION_ID_PREFIX))
+                && (plugin.trigger.is_none()
+                    || serde_json::to_string(&plugin.trigger)
+                        .unwrap_or_default()
+                        .contains(&mixed.id))
+        });
         assert!(
-            !mixed.plugins.iter().any(|assoc| {
-                assoc.plugin_config_id == MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID
-                    || assoc
-                        .plugin_config_id
-                        .starts_with(MESH_REQUEST_AUTH_REFUSED_PARTITION_ID_PREFIX)
-            }),
-            "{label}: colliding grant-only RA must not attach 503 refusal to /mixed: {:?}",
-            mixed.plugins
+            !refusal_applies_to_mixed,
+            "{label}: colliding grant-only RA must not trigger 503 refusal on /mixed"
         );
     }
 
-    // The granted route still enforces the destination-only RA's issuer.
+    // The granted direct route still enforces the destination-only RA's issuer.
     let granted_route = granted
         .proxies
         .iter()
-        .find(|proxy| proxy.id.contains(GRANTED_ROUTE_MARKER))
-        .expect("granted route");
+        .find(|proxy| {
+            proxy.id.contains(GRANTED_ROUTE_MARKER)
+                && proxy.listen_path.as_deref() == Some("/granted-direct")
+        })
+        .expect("granted direct route");
     let dest_jwks_ids: Vec<&str> = granted_route
         .plugins
         .iter()

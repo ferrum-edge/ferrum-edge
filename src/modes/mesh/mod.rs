@@ -17002,7 +17002,7 @@ fn build_http_egress_for_entry(
     let proxy_hosts: Vec<&String> = entry
         .hosts
         .iter()
-        .filter(|host| !materialized_http_hosts.contains(*host))
+        .filter(|host| !materialized_http_hosts.contains(host.trim_end_matches('.')))
         .collect();
     if proxy_hosts.is_empty() {
         warn!(
@@ -17026,6 +17026,10 @@ fn build_http_egress_for_entry(
             None => (port_spec.port, port_spec.name.clone()),
         };
     for host in proxy_hosts {
+        let route_host = host.trim_end_matches('.');
+        if materialized_http_hosts.contains(route_host) {
+            continue;
+        }
         let targets = build_egress_upstream_targets(
             entry,
             host,
@@ -17051,7 +17055,7 @@ fn build_http_egress_for_entry(
             continue;
         }
 
-        materialized_http_hosts.insert(host.clone());
+        materialized_http_hosts.insert(route_host.to_string());
 
         upstreams.push(build_egress_upstream(
             &upstream_id,
@@ -17063,7 +17067,7 @@ fn build_http_egress_for_entry(
 
         let proxy = egress_gateway_proxy(
             &proxy_id,
-            host,
+            route_host,
             namespace,
             Some(backend_scheme),
             &upstream_id,

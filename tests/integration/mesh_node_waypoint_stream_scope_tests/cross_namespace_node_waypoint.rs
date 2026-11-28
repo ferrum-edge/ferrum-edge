@@ -1078,12 +1078,12 @@ async fn an_absolute_two_label_route_never_inherits_the_service_policy() {
         .expect("the authorized route is served");
     let catalog_relative = routes
         .iter()
-        .find(|route| route.listen_path == "/catalog-relative")
+        .find(|route| route.listen_path.as_deref() == Some("/catalog-relative"))
         .map(|route| (*route).clone())
         .expect("relative Service route is served");
     let catalog_absolute = routes
         .iter()
-        .find(|route| route.listen_path == "/catalog-absolute")
+        .find(|route| route.listen_path.as_deref() == Some("/catalog-absolute"))
         .map(|route| (*route).clone())
         .expect("absolute external route is served");
     assert_eq!(
@@ -1241,17 +1241,18 @@ fn a_service_only_sidecar_import_withholds_an_absolute_external_host() {
     same_ns.normalize_mesh_fields();
     let same_ns_slice = slice_for(&same_ns, &node_waypoint_runtime());
     assert!(
-        !same_ns_slice.service_entries.iter().any(|entry| {
-            entry.name == "catalog-abs-se" && entry.hosts.iter().any(|h| h == "catalog.default.")
-        }),
-        "relative ./catalog.default import must not retain absolute ServiceEntry catalog.default."
+        !same_ns_slice
+            .service_entries
+            .iter()
+            .any(|entry| entry.name == "catalog-abs-se"),
+        "relative ./catalog.default import must not retain absolute ServiceEntry catalog-abs-se"
     );
     let same_ns_prepared = prepare(&same_ns_slice);
     let same_ns_routes = carried_routes(&same_ns_prepared);
     assert!(
         same_ns_routes
             .iter()
-            .any(|route| route.listen_path == "/rel"),
+            .any(|route| route.listen_path.as_deref() == Some("/rel")),
         "relative ./catalog.default import admits relative Service route"
     );
     assert!(
@@ -1369,8 +1370,8 @@ fn egress_gateway_originates_tls_for_absolute_two_label_service_entry() {
     let secure_proxy = prepared
         .proxies
         .iter()
-        .find(|proxy| proxy.hosts.iter().any(|h| h == "secure.default."))
-        .expect("egress proxy for secure.default.");
+        .find(|proxy| proxy.hosts.iter().any(|h| h == "secure.default"))
+        .expect("egress proxy for secure.default");
     assert_eq!(
         secure_proxy.backend_scheme,
         Some(BackendScheme::Https),
@@ -1380,12 +1381,32 @@ fn egress_gateway_originates_tls_for_absolute_two_label_service_entry() {
     let catalog_proxy = prepared
         .proxies
         .iter()
-        .find(|proxy| proxy.hosts.iter().any(|h| h == "catalog.default."))
-        .expect("egress proxy for catalog.default.");
+        .find(|proxy| proxy.hosts.iter().any(|h| h == "catalog.default"))
+        .expect("egress proxy for catalog.default");
     assert_eq!(
         catalog_proxy.backend_scheme,
         Some(BackendScheme::Http),
         "relative DR catalog.default must not originate TLS for absolute ServiceEntry catalog.default."
+    );
+
+    // Verify the host-only router matches canonicalized (dot-stripped) incoming
+    // authority lookups onto the HTTPS/HTTP egress proxies.
+    let router = ferrum_edge::router_cache::RouterCache::new(&prepared, 16);
+    let matched_secure = router
+        .find_proxy(Some("secure.default"), "/")
+        .expect("canonicalized incoming authority secure.default resolves to egress proxy");
+    assert_eq!(matched_secure.proxy.id, secure_proxy.id);
+    assert_eq!(
+        matched_secure.proxy.backend_scheme,
+        Some(BackendScheme::Https)
+    );
+    let matched_catalog = router
+        .find_proxy(Some("catalog.default"), "/")
+        .expect("canonicalized incoming authority catalog.default resolves to egress proxy");
+    assert_eq!(matched_catalog.proxy.id, catalog_proxy.id);
+    assert_eq!(
+        matched_catalog.proxy.backend_scheme,
+        Some(BackendScheme::Http)
     );
 }
 
@@ -1543,7 +1564,7 @@ async fn a_root_namespace_selector_policy_governs_only_the_granted_destination()
         .expect("granted route");
     let local = routes
         .iter()
-        .find(|route| route.listen_path == "/local")
+        .find(|route| route.listen_path.as_deref() == Some("/local"))
         .map(|route| (*route).clone())
         .expect("local route");
 
