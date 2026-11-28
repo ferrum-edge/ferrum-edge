@@ -97,14 +97,11 @@ use super::{
 /// Readable prefix of a group's one route proxy (inside
 /// [`crate::modes::mesh::config::GAMMA_HTTP_ROUTE_PROXY_ID_PREFIX`]).
 const GAMMA_SERVICE_PROXY_READABLE_PREFIX: &str = "istio-vs-gamma_service";
-/// Prefix of every GAMMA weighted-backend upstream id, inside the carried
-/// `istio-vs-upstream-` space.
-pub(crate) const GAMMA_ROUTE_UPSTREAM_ID_PREFIX: &str = "istio-vs-upstream-gamma_";
 /// Prefix of the `mesh.virtual_service_http_routes` binding name a GAMMA route
 /// group writes (`gamma_<service namespace>_<service>`). Kubernetes names never
 /// contain `_`, so it never collides with a VirtualService binding.
 pub(crate) const GAMMA_ROUTE_BINDING_NAME_PREFIX: &str = "gamma_";
-use crate::modes::mesh::config::GAMMA_NO_FORWARD_HOST;
+use crate::modes::mesh::config::{GAMMA_NO_FORWARD_HOST, GAMMA_ROUTE_UPSTREAM_ID_PREFIX};
 /// Internal path-precedence metadata on a GAMMA dispatch rule; stripped before
 /// the rule leaves translation.
 const GAMMA_PATH_PRECEDENCE_KEY: &str = "_ferrum_gamma_path_precedence";

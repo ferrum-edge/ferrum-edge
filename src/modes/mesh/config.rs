@@ -7340,6 +7340,10 @@ pub const VIRTUAL_SERVICE_HTTP_ROUTE_PROXY_ID_PREFIX: &str = "istio-vs-";
 /// (`modes::mesh::mesh_route_admitted_for_direction`).
 pub const GAMMA_HTTP_ROUTE_PROXY_ID_PREFIX: &str = "istio-vs-gamma_";
 
+/// Prefix of every GAMMA weighted-backend upstream id, inside the carried
+/// `istio-vs-upstream-` space.
+pub(crate) const GAMMA_ROUTE_UPSTREAM_ID_PREFIX: &str = "istio-vs-upstream-gamma_";
+
 /// Non-forwarding placeholder destination used by GAMMA proxies (whose own
 /// default is never dialed because `reject_unmatched` answers misses with 404)
 /// and by GAMMA rules that terminate locally (fault, redirect, zero-weight, or

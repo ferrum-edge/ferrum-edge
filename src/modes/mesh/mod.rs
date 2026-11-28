@@ -5149,9 +5149,7 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
         // The Service legs' rebound targets alone: what a leg-dispatched
         // split upstream keeps (see below).
         let mut service_targets: Vec<(u32, Vec<UpstreamTarget>)> = Vec::new();
-        let is_gamma_split = id.starts_with(
-            crate::config_sources::k8s::gateway_api::gamma::GAMMA_ROUTE_UPSTREAM_ID_PREFIX,
-        );
+        let is_gamma_split = id.starts_with(config::GAMMA_ROUTE_UPSTREAM_ID_PREFIX);
         let mut rebound = true;
         let mut only_unavailable = true;
         let mut unavailable_weight: u64 = 0;
@@ -5425,10 +5423,12 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                 note_split(upstream_id, &mut candidates, &mut route_splits);
             }
             None if is_gamma_route
-                && backend_host.eq_ignore_ascii_case(config::GAMMA_NO_FORWARD_HOST) =>
+                && backend_host.eq_ignore_ascii_case(config::GAMMA_NO_FORWARD_HOST)
+                && gamma_proxy_rejects_unmatched(config, proxy) =>
             {
-                // The GAMMA proxy's own default is never dialed (`reject_unmatched`
-                // answers unmatched requests with 404), so a visible wildcard or
+                // The GAMMA proxy's own default is proven unreachable
+                // (`mesh_route_dispatch` with `reject_unmatched: true` answers
+                // unmatched requests with 404), so a visible wildcard or
                 // TLS-originating DestinationRule must not drop the GAMMA proxy.
             }
             None if !backend_host.is_empty() && backend_port != 0 => {
@@ -5575,9 +5575,9 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                 }
                 if is_gamma_route
                     && host.eq_ignore_ascii_case(config::GAMMA_NO_FORWARD_HOST)
-                    && (rule.get("fault").is_some() || rule.get("redirect").is_some())
+                    && gamma_rule_terminates_unconditionally(rule)
                 {
-                    // Proven non-forwarding terminal rule (fault/redirect):
+                    // Proven non-forwarding terminal rule (redirect or 100% abort):
                     // never dials `GAMMA_NO_FORWARD_HOST`, so skip DR checks.
                     continue;
                 }
@@ -5725,15 +5725,7 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
             destination.insert("backend_port".to_string(), serde_json::json!(80));
         }
         if !rule.contains_key("redirect") {
-            rule.insert(
-                "fault".to_string(),
-                serde_json::json!({
-                    "abort": {
-                        "status_code": 503,
-                        "percentage": 100.0,
-                    }
-                }),
-            );
+            apply_gamma_unavailable_abort(rule, 100.0);
         }
     }
     for (plugin_index, rule_index, unavailable_pct) in partial_unavailable_gamma_rules {
@@ -5750,35 +5742,7 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
         if rule.contains_key("redirect") {
             continue;
         }
-        match rule
-            .get_mut("fault")
-            .and_then(serde_json::Value::as_object_mut)
-            .and_then(|fault| fault.get_mut("abort"))
-            .and_then(serde_json::Value::as_object_mut)
-        {
-            Some(abort) => {
-                let existing = abort
-                    .get("percentage")
-                    .and_then(serde_json::Value::as_f64)
-                    .unwrap_or(0.0);
-                if existing < 100.0 {
-                    let combined = (existing + (100.0 - existing) * (unavailable_pct / 100.0))
-                        .clamp(f64::MIN_POSITIVE, 100.0);
-                    abort.insert("percentage".to_string(), serde_json::json!(combined));
-                }
-            }
-            None => {
-                rule.insert(
-                    "fault".to_string(),
-                    serde_json::json!({
-                        "abort": {
-                            "status_code": 503,
-                            "percentage": unavailable_pct,
-                        }
-                    }),
-                );
-            }
-        }
+        apply_gamma_unavailable_abort(rule, unavailable_pct);
     }
     // Give each leg-dispatched route its legs, on its own dispatch instance
     // (or a new one under the translator's id), so the dispatch finalizer of
@@ -5940,6 +5904,113 @@ fn carried_route_terminates_unconditionally(config: &GatewayConfig, proxy: &Prox
                 && plugin.trigger.is_none()
         })
     })
+}
+
+/// Whether a GAMMA route proxy has an enabled `mesh_route_dispatch` plugin with
+/// `reject_unmatched: true`, proving its proxy-level default backend is never
+/// dialed.
+fn gamma_proxy_rejects_unmatched(config: &GatewayConfig, proxy: &Proxy) -> bool {
+    proxy.plugins.iter().any(|association| {
+        config.plugin_configs.iter().any(|plugin| {
+            plugin.plugin_name == "mesh_route_dispatch"
+                && plugin.namespace == proxy.namespace
+                && plugin.id == association.plugin_config_id
+                && plugin.enabled
+                && plugin
+                    .config
+                    .get("reject_unmatched")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+        })
+    })
+}
+
+/// Whether a GAMMA dispatch rule terminates 100% of matched requests locally
+/// (redirect or 100% abort/secondary_abort), proving its placeholder
+/// `GAMMA_NO_FORWARD_HOST` destination is never dialed.
+fn gamma_rule_terminates_unconditionally(rule: &serde_json::Value) -> bool {
+    if rule.get("redirect").is_some() {
+        return true;
+    }
+    let Some(fault) = rule.get("fault") else {
+        return false;
+    };
+    let abort_is_total = |key: &str| {
+        fault
+            .get(key)
+            .and_then(|abort| abort.get("percentage"))
+            .and_then(serde_json::Value::as_f64)
+            .is_some_and(|pct| pct.is_finite() && pct >= 100.0)
+    };
+    abort_is_total("abort") || abort_is_total("secondary_abort")
+}
+
+/// Apply an unavailable-Service 503 abort share (`unavailable_pct`, conditional
+/// on the valid-backend share of a GAMMA rule) without erasing a distinct
+/// primary abort status such as an invalid-`backendRef` 500 share.
+fn apply_gamma_unavailable_abort(
+    rule: &mut serde_json::Map<String, serde_json::Value>,
+    unavailable_pct: f64,
+) {
+    let clamped = unavailable_pct.clamp(f64::MIN_POSITIVE, 100.0);
+    let fault = rule
+        .entry("fault".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(fault_obj) = fault.as_object_mut() else {
+        *fault = serde_json::json!({
+            "abort": {
+                "status_code": 503,
+                "percentage": clamped,
+            }
+        });
+        return;
+    };
+    let existing_abort = fault_obj
+        .get("abort")
+        .and_then(serde_json::Value::as_object)
+        .map(|abort| {
+            (
+                abort.get("status_code").and_then(serde_json::Value::as_u64),
+                abort
+                    .get("percentage")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0),
+            )
+        });
+    match existing_abort {
+        Some((_, existing_pct)) if existing_pct >= 100.0 => {}
+        Some((Some(503), existing_pct)) => {
+            let combined = (existing_pct + (100.0 - existing_pct) * (clamped / 100.0))
+                .clamp(f64::MIN_POSITIVE, 100.0);
+            if let Some(abort) = fault_obj
+                .get_mut("abort")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                abort.insert("percentage".to_string(), serde_json::json!(combined));
+            }
+        }
+        Some(_) => {
+            // Preserve the existing primary abort (e.g. invalid-backendRef 500)
+            // and attach the 503 share as a conditional `secondary_abort` over
+            // the surviving valid-backend share.
+            fault_obj.insert(
+                "secondary_abort".to_string(),
+                serde_json::json!({
+                    "status_code": 503,
+                    "percentage": clamped,
+                }),
+            );
+        }
+        None => {
+            fault_obj.insert(
+                "abort".to_string(),
+                serde_json::json!({
+                    "status_code": 503,
+                    "percentage": clamped,
+                }),
+            );
+        }
+    }
 }
 
 /// Pin the destination Service authority on a Sidecar mesh-mTLS target a

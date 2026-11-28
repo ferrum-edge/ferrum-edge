@@ -1233,7 +1233,7 @@ fn an_invalid_path_regex_is_rejected_at_admission_without_poisoning_other_routes
         }),
     );
     let mut objects = base_services();
-    objects.push(bad);
+    objects.push(bad.clone());
     objects.push(good);
     let result = translate(&objects);
     let rules = dispatch_rules(&result.config);

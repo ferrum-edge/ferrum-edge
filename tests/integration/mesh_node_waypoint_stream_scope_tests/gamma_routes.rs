@@ -548,9 +548,24 @@ fn weighted_split_with_scaled_to_zero_backend_fails_proportionally_with_503() {
         .expect("GAMMA dispatch plugin");
     let rules = dispatch.config["rules"].as_array().expect("rules array");
     let rule = &rules[0];
+    let split_upstream_id = rule["destination"]["upstream_id"]
+        .as_str()
+        .expect("healthy share keeps routing through the rebound split upstream");
+    let split_upstream = prepared
+        .upstreams
+        .iter()
+        .find(|upstream| upstream.id == split_upstream_id)
+        .expect("rebound split upstream exists");
     assert!(
-        rule["destination"].get("upstream_id").is_some(),
-        "healthy share keeps routing through the rebound split upstream: {rule}"
+        !split_upstream.targets.is_empty(),
+        "rebound split upstream keeps healthy targets"
+    );
+    assert!(
+        split_upstream.targets.iter().all(|target| {
+            target.tags.get("mesh_service_name").map(String::as_str) == Some("reviews")
+        }),
+        "surviving split targets must point only to healthy reviews, got {:?}",
+        split_upstream.targets
     );
     assert_eq!(rule["fault"]["abort"]["status_code"], json!(503));
     let pct = rule["fault"]["abort"]["percentage"]
@@ -563,8 +578,158 @@ fn weighted_split_with_scaled_to_zero_backend_fails_proportionally_with_503() {
 }
 
 #[test]
+fn weighted_split_preserves_distinct_500_invalid_and_503_unavailable_shares() {
+    let route = object(
+        "HTTPRoute",
+        "gateway.networking.k8s.io/v1",
+        DEFAULT_NAMESPACE,
+        "reviews-mixed-invalid-and-scaled-zero",
+        json!({
+            "parentRefs": [{"group": "", "kind": "Service", "name": "reviews", "port": 8080}],
+            "rules": [{
+                "matches": [{"path": {"type": "PathPrefix", "value": "/mix"}}],
+                "backendRefs": [
+                    {"name": "reviews", "port": 8080, "weight": 80},
+                    {"name": "ratings", "port": 8080, "weight": 10},
+                    {"name": "missing-svc", "port": 8080, "weight": 10}
+                ]
+            }]
+        }),
+    );
+    let mut config = translated_config(&[
+        k8s_service(DEFAULT_NAMESPACE, "reviews"),
+        k8s_service(DEFAULT_NAMESPACE, "ratings"),
+        route,
+    ]);
+    // Scale only the 10% valid canary (`ratings`) to zero endpoints; the 10%
+    // invalid `missing-svc` backendRef already carries a 10% 500 abort.
+    let mesh = config.mesh.as_mut().expect("mesh");
+    mesh.workloads.retain(|w| w.service_name != "ratings");
+    for svc in &mut mesh.services {
+        if svc.name == "ratings" {
+            svc.workloads.clear();
+        }
+    }
+    let runtime = runtime_for_topology(MeshTopology::NodeWaypoint);
+    let slice = slice_for(&config, &runtime);
+    let prepared = prepare_gateway_config_from_mesh_slice(&slice, &runtime)
+        .expect("mixed 500 + 503 GAMMA split materializes");
+    let gamma_id = carried_ids(&slice.http_routes.proxies).remove(0);
+    let dispatch = prepared
+        .plugin_configs
+        .iter()
+        .find(|plugin| {
+            plugin.plugin_name == "mesh_route_dispatch"
+                && plugin.proxy_id.as_deref() == Some(gamma_id.as_str())
+        })
+        .expect("GAMMA dispatch plugin");
+    ferrum_edge::plugins::mesh_route_dispatch::MeshRouteDispatchConfig::from_value_normalized(
+        &dispatch.config,
+    )
+    .expect("emitted secondary_abort dispatch config passes validation");
+    let rule = &dispatch.config["rules"].as_array().expect("rules array")[0];
+    let split_upstream_id = rule["destination"]["upstream_id"]
+        .as_str()
+        .expect("healthy 80% share routes through rebound split upstream");
+    let split_upstream = prepared
+        .upstreams
+        .iter()
+        .find(|upstream| upstream.id == split_upstream_id)
+        .expect("rebound split upstream");
+    assert!(
+        !split_upstream.targets.is_empty()
+            && split_upstream.targets.iter().all(|target| {
+                target.tags.get("mesh_service_name").map(String::as_str) == Some("reviews")
+            }),
+        "surviving targets must belong only to healthy reviews, got {:?}",
+        split_upstream.targets
+    );
+    assert_eq!(rule["fault"]["abort"]["status_code"], json!(500));
+    let pct_500 = rule["fault"]["abort"]["percentage"]
+        .as_f64()
+        .expect("500 pct");
+    assert!(
+        (pct_500 - 10.0).abs() < 1e-6,
+        "invalid backendRef keeps 10% 500 share, got {pct_500}"
+    );
+    assert_eq!(rule["fault"]["secondary_abort"]["status_code"], json!(503));
+    let pct_503_cond = rule["fault"]["secondary_abort"]["percentage"]
+        .as_f64()
+        .expect("conditional 503 pct");
+    let expected_cond = 10.0 / 90.0 * 100.0;
+    assert!(
+        (pct_503_cond - expected_cond).abs() < 1e-6,
+        "10% unavailable share of 90% valid share = {expected_cond}%, got {pct_503_cond}"
+    );
+
+    // When ALL valid legs scale to zero, 10% still returns 500 and the remaining
+    // 90% returns 503 (secondary_abort 100%) without overwriting the 500 share.
+    let mesh = config.mesh.as_mut().expect("mesh");
+    mesh.workloads.retain(|w| w.service_name != "reviews");
+    for svc in &mut mesh.services {
+        if svc.name == "reviews" {
+            svc.workloads.clear();
+        }
+    }
+    let slice_all_zero = slice_for(&config, &runtime);
+    let prepared_all_zero = prepare_gateway_config_from_mesh_slice(&slice_all_zero, &runtime)
+        .expect("all-valid-zero + invalid split materializes");
+    let dispatch_all_zero = prepared_all_zero
+        .plugin_configs
+        .iter()
+        .find(|plugin| {
+            plugin.plugin_name == "mesh_route_dispatch"
+                && plugin.proxy_id.as_deref() == Some(gamma_id.as_str())
+        })
+        .expect("GAMMA dispatch plugin");
+    ferrum_edge::plugins::mesh_route_dispatch::MeshRouteDispatchConfig::from_value_normalized(
+        &dispatch_all_zero.config,
+    )
+    .expect("emitted all-zero secondary_abort config passes validation");
+    let rule_all_zero = &dispatch_all_zero.config["rules"]
+        .as_array()
+        .expect("rules array")[0];
+    assert_eq!(rule_all_zero["fault"]["abort"]["status_code"], json!(500));
+    assert!(
+        (rule_all_zero["fault"]["abort"]["percentage"]
+            .as_f64()
+            .unwrap()
+            - 10.0)
+            .abs()
+            < 1e-6
+    );
+    assert_eq!(
+        rule_all_zero["fault"]["secondary_abort"]["status_code"],
+        json!(503)
+    );
+    assert_eq!(
+        rule_all_zero["fault"]["secondary_abort"]["percentage"],
+        json!(100.0)
+    );
+}
+
+#[test]
 fn wildcard_destination_rule_does_not_drop_gamma_dispatch() {
-    let mut config = producer_config();
+    let route = object(
+        "HTTPRoute",
+        "gateway.networking.k8s.io/v1",
+        DEFAULT_NAMESPACE,
+        "reviews-with-terminal-rule",
+        json!({
+            "parentRefs": [{"group": "", "kind": "Service", "name": "reviews", "port": 8080}],
+            "rules": [
+                {
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/broken"}}],
+                    "backendRefs": [{"name": "missing-svc", "port": 8080}]
+                },
+                {
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/ok"}}],
+                    "backendRefs": [{"name": "reviews", "port": 8080}]
+                }
+            ]
+        }),
+    );
+    let mut config = translated_config(&[k8s_service(DEFAULT_NAMESPACE, "reviews"), route]);
     let mesh = config.mesh.as_mut().expect("mesh");
     mesh.destination_rules
         .push(ferrum_edge::modes::mesh::config::MeshDestinationRule {
@@ -578,11 +743,18 @@ fn wildcard_destination_rule_does_not_drop_gamma_dispatch() {
         });
     let runtime = runtime_for_topology(MeshTopology::NodeWaypoint);
     let slice = slice_for(&config, &runtime);
+    assert!(
+        slice
+            .destination_rules
+            .iter()
+            .any(|dr| dr.name == "mesh-wide-wildcard" && dr.host == "*"),
+        "wildcard DestinationRule must survive slice projection"
+    );
     let prepared = prepare_gateway_config_from_mesh_slice(&slice, &runtime)
         .expect("GAMMA slice materializes under wildcard DestinationRule");
     let gamma_id = carried_ids(&slice.http_routes.proxies).remove(0);
     assert!(
         prepared.proxies.iter().any(|proxy| proxy.id == gamma_id),
-        "visible wildcard DestinationRule must not drop GAMMA dispatch proxy"
+        "visible wildcard DestinationRule must not drop GAMMA dispatch proxy or its 100%-abort rule"
     );
 }
