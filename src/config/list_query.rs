@@ -63,7 +63,12 @@ pub const PLUGIN_CONFIG_SEARCH_FIELDS: &[&str] = &["id", "plugin_name"];
 /// The proxy host list (a JSON array string in SQL, an array in MongoDB).
 pub const PROXY_HOSTS_FIELD: &str = "hosts";
 
-/// The field [`ResourceListFilter::exclude_at_sign_names`] guards.
+/// Scalar fields [`ResourceListFilter::exclude_at_sign_names`] guards against
+/// URL-userinfo probing on `viewer` reads (every searchable field that a
+/// legacy stored row could carry URL userinfo in and that `viewer` redacts).
+pub const VIEWER_AT_SIGN_GUARDED_FIELDS: &[&str] = &["name", "listen_path"];
+
+/// The `name` field (retained alias for [`VIEWER_AT_SIGN_GUARDED_FIELDS`]).
 pub const NAME_FIELD: &str = "name";
 
 /// A validated, ASCII-folded search term.
@@ -194,9 +199,41 @@ impl ResourceListFilter {
     }
 }
 
+/// Validate a resource ID supplied in a read-side list query (`ids` or
+/// `applies_to_proxy`).
+///
+/// Accepts every write-admitted resource ID plus mesh/system-generated IDs
+/// published on cached lists (such as `__mesh-outbound-…` and `__mesh_authz`,
+/// which start with `_`). Remains bounded to [`crate::config::types::MAX_ID_LENGTH`]
+/// (254 bytes) and restricted to ASCII `[A-Za-z0-9._:-]` without `..`. Write
+/// admission keeps the stricter [`crate::config::types::validate_resource_id`].
+pub fn validate_list_query_resource_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("ID must not be empty".to_string());
+    }
+    if id.len() > crate::config::types::MAX_ID_LENGTH {
+        return Err(format!(
+            "ID must be at most {} characters, got {}",
+            crate::config::types::MAX_ID_LENGTH,
+            id.len()
+        ));
+    }
+    if id.contains("..")
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b':'))
+    {
+        return Err(format!(
+            "ID {id:?} is invalid: must contain only alphanumeric characters, dots, underscores, \
+             hyphens, or colons (without `..`)"
+        ));
+    }
+    Ok(())
+}
+
 /// Parse an `ids` value: comma-separated resource ids, at most
 /// [`MAX_LIST_IDS`], no empty element and no duplicate. Each id must satisfy
-/// `validate_resource_id`.
+/// [`validate_list_query_resource_id`].
 pub fn parse_list_ids(raw: &str) -> Result<Vec<String>, String> {
     if raw.is_empty() {
         return Err("ids must name at least one id".to_string());
@@ -210,7 +247,7 @@ pub fn parse_list_ids(raw: &str) -> Result<Vec<String>, String> {
         if ids.len() == MAX_LIST_IDS {
             return Err(format!("ids must name at most {MAX_LIST_IDS} ids"));
         }
-        crate::config::types::validate_resource_id(id).map_err(|error| format!("ids: {error}"))?;
+        validate_list_query_resource_id(id).map_err(|error| format!("ids: {error}"))?;
         if !seen.insert(id) {
             return Err(format!("ids must not repeat an id ({id:?})"));
         }
@@ -223,15 +260,24 @@ pub fn parse_list_ids(raw: &str) -> Result<Vec<String>, String> {
 pub trait ListSearchable {
     fn list_id(&self) -> &str;
     /// Whether `term` matches one of the kind's search fields. With
-    /// `exclude_at_sign_names`, a `name` containing `@` never matches.
+    /// `exclude_at_sign_names`, any searchable field that `viewer` redacts for
+    /// URL userinfo (`name`, `listen_path`, and `hosts` when any element
+    /// contains `@`) never matches when containing `@`.
     fn matches_search(&self, term: &SearchTerm, exclude_at_sign_names: bool) -> bool;
 }
 
-fn name_matches(term: &SearchTerm, name: Option<&str>, exclude_at_sign_names: bool) -> bool {
-    match name {
-        Some(name) if exclude_at_sign_names && name.contains('@') => false,
+fn guarded_field_matches(term: &SearchTerm, value: Option<&str>, exclude_at_sign: bool) -> bool {
+    match value {
+        Some(value) if exclude_at_sign && value.contains('@') => false,
         other => term.matches_optional(other),
     }
+}
+
+fn guarded_hosts_match(term: &SearchTerm, hosts: &[String], exclude_at_sign: bool) -> bool {
+    if exclude_at_sign && hosts.iter().any(|host| host.contains('@')) {
+        return false;
+    }
+    term.matches_hosts(hosts)
 }
 
 impl ListSearchable for Proxy {
@@ -241,9 +287,9 @@ impl ListSearchable for Proxy {
 
     fn matches_search(&self, term: &SearchTerm, exclude_at_sign_names: bool) -> bool {
         term.matches(&self.id)
-            || name_matches(term, self.name.as_deref(), exclude_at_sign_names)
-            || term.matches_optional(self.listen_path.as_deref())
-            || term.matches_hosts(&self.hosts)
+            || guarded_field_matches(term, self.name.as_deref(), exclude_at_sign_names)
+            || guarded_field_matches(term, self.listen_path.as_deref(), exclude_at_sign_names)
+            || guarded_hosts_match(term, &self.hosts, exclude_at_sign_names)
     }
 }
 
@@ -265,7 +311,8 @@ impl ListSearchable for Upstream {
     }
 
     fn matches_search(&self, term: &SearchTerm, exclude_at_sign_names: bool) -> bool {
-        term.matches(&self.id) || name_matches(term, self.name.as_deref(), exclude_at_sign_names)
+        term.matches(&self.id)
+            || guarded_field_matches(term, self.name.as_deref(), exclude_at_sign_names)
     }
 }
 

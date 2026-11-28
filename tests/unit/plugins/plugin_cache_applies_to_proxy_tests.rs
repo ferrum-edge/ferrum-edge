@@ -92,31 +92,52 @@ fn sorted(mut names: Vec<String>) -> Vec<String> {
 }
 
 #[test]
-fn applied_configs_match_the_built_plugin_cache_for_every_proxy() {
+fn applied_configs_match_the_built_plugin_cache_within_namespace_and_exclude_foreign_globals() {
     let mut config = fixture();
-    // Mirror the data plane's single-namespace load: the cache is built from
-    // the gateway's own namespace only.
+    // Mirror a single-namespace data plane: the cache is built from the
+    // proxy's own namespace only.
     config.plugin_configs.retain(|pc| pc.namespace == "ferrum");
     let cache = PluginCache::new(&config).expect("fixture plugin cache builds");
     let full = fixture();
+    // Runtime PluginCache clones process-wide globals across namespaces when
+    // multi-namespace configs are loaded (e.g. a mesh waypoint namespace
+    // global alongside a tenant bound-Service proxy), while the Admin API
+    // helper intentionally stays within `proxy.namespace` to preserve
+    // X-Ferrum-Namespace authorization boundaries.
+    let multi_ns_cache = PluginCache::new(&full).expect("multi-namespace plugin cache builds");
     for proxy in &config.proxies {
         let runtime: Vec<String> = cache
             .get_plugins("ferrum", &proxy.id)
             .iter()
             .map(|plugin| plugin.name().to_string())
             .collect();
-        // Evaluate against the unfiltered (multi-namespace) set to prove the
-        // namespace guard too.
-        let applied: Vec<String> = plugin_configs_applied_to_proxy(proxy, &full.plugin_configs)
+        let applied_configs = plugin_configs_applied_to_proxy(proxy, &full.plugin_configs);
+        assert!(
+            applied_configs.iter().all(|pc| pc.namespace == "ferrum"),
+            "proxy {:?}: applies_to_proxy must never leak foreign-namespace globals",
+            proxy.id
+        );
+        let applied: Vec<String> = applied_configs
             .into_iter()
             .map(|pc| pc.plugin_name.clone())
             .collect();
         assert_eq!(
             sorted(applied),
             sorted(runtime),
-            "proxy {:?}: applies_to_proxy must equal the plugin cache's chain",
+            "proxy {:?}: applies_to_proxy must equal the same-namespace plugin cache chain",
             proxy.id
         );
+        // Confirm the multi-namespace runtime cache does include the foreign
+        // global (`g-other` cors) on a proxy that does not shadow cors (`b`),
+        // documenting the intentional namespace-boundary difference.
+        if proxy.id == "b" {
+            let multi_cors_count = multi_ns_cache
+                .get_plugins("ferrum", "b")
+                .iter()
+                .filter(|p| p.name() == "cors")
+                .count();
+            assert!(multi_cors_count >= 2);
+        }
     }
 }
 

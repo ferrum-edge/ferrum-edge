@@ -213,6 +213,76 @@ fn viewer_guard_excludes_names_that_may_carry_url_userinfo() {
         ids: None,
     };
     assert!(by_path.matches(&p));
+
+    // Legacy proxy rows with `@` in listen_path or hosts are also withheld
+    // from viewer search probes, while clean fields remain searchable.
+    let p_path_secret = proxy(json!({
+        "id": "p-3",
+        "name": "clean-name",
+        "listen_path": "/u:secretpw@internal/api",
+        "hosts": ["clean.example.com"],
+        "backend_host": "backend.internal",
+        "backend_port": 8080
+    }));
+    let p_host_secret = proxy(json!({
+        "id": "p-4",
+        "name": "clean-host-proxy",
+        "listen_path": "/ok",
+        "hosts": ["ops:topsecret@api.example.com"],
+        "backend_host": "backend.internal",
+        "backend_port": 8080
+    }));
+    let secret_unguarded = ResourceListFilter {
+        search: Some(term("secretpw")),
+        exclude_at_sign_names: false,
+        ids: None,
+    };
+    let secret_guarded = ResourceListFilter {
+        exclude_at_sign_names: true,
+        ..secret_unguarded.clone()
+    };
+    assert!(secret_unguarded.matches(&p_path_secret));
+    assert!(!secret_guarded.matches(&p_path_secret));
+
+    let host_unguarded = ResourceListFilter {
+        search: Some(term("topsecret")),
+        exclude_at_sign_names: false,
+        ids: None,
+    };
+    let host_guarded = ResourceListFilter {
+        exclude_at_sign_names: true,
+        ..host_unguarded.clone()
+    };
+    assert!(host_unguarded.matches(&p_host_secret));
+    assert!(!host_guarded.matches(&p_host_secret));
+    assert!(
+        ResourceListFilter {
+            search: Some(term("clean-host")),
+            exclude_at_sign_names: true,
+            ids: None,
+        }
+        .matches(&p_host_secret)
+    );
+}
+
+#[test]
+fn list_query_ids_accept_generated_mesh_identifiers_and_reject_unsafe_shapes() {
+    let parsed = parse_list_ids("__mesh-outbound-default-ratings-8080,__mesh_authz,svc:8080")
+        .expect("read-side generated IDs must be accepted");
+    assert_eq!(
+        parsed,
+        vec![
+            "__mesh-outbound-default-ratings-8080",
+            "__mesh_authz",
+            "svc:8080"
+        ]
+    );
+    for bad in ["a..b", "a/b", "bad id", &"x".repeat(255)] {
+        assert!(
+            parse_list_ids(bad).is_err(),
+            "unsafe list id {bad:?} must be rejected"
+        );
+    }
 }
 
 #[test]

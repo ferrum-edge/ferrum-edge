@@ -7477,11 +7477,19 @@ paths:
         `applies_to_proxy=<id>` returns the plugin configs the data plane's
         plugin cache applies to that proxy: enabled `global` configs that no
         attached scoped config of the same plugin shadows, plus the enabled
-        `proxy`-scoped and `proxy_group` configs the proxy's `plugins`
-        association list names. It is computed by the plugin cache's own
+        `applies_to_proxy` narrows the list to the effective plugin configs of
+        one proxy **within the proxy's namespace**: every enabled `global`
+        config in that namespace not shadowed by an attached scoped config of
+        the same plugin, plus the enabled `proxy`-scoped and `proxy_group`
+        configs the proxy's `plugins` association list names. Process-wide
+        `global` configs belonging to other namespaces (such as mesh-injected
+        globals in a waypoint namespace when a bound-Service proxy lives in a
+        tenant namespace) are not exposed across the `X-Ferrum-Namespace`
+        authorization boundary. It is computed by the plugin cache's own
         scope rule (`plugin_cache::plugin_configs_applied_to_proxy`), ordered by
         id, and combines with `q`, `ids` and `proxy_id` (all ANDed). An unknown
-        proxy id answers `404`.
+        proxy id answers `404` (or `503` when the database read fell back to a
+        cached snapshot and absence is uncertain).
       tags: [Plugins]
       parameters:
         - $ref: "#/components/parameters/PaginationOffset"
@@ -7494,11 +7502,14 @@ paths:
           required: false
           schema:
             type: string
-            maxLength: 255
+            maxLength: 254
           description: |
-            Return the effective plugin configs of this proxy (see the
-            operation description). Must satisfy the resource-id rules; an
-            invalid or repeated value is `400`, an unknown proxy `404`.
+            Return the effective plugin configs of this proxy within its
+            namespace (see the operation description). Accepts write-admitted
+            resource IDs as well as system/mesh-generated IDs (up to 254
+            ASCII `[A-Za-z0-9._:-]` characters without `..`); an invalid or
+            repeated value is `400`, an unknown proxy `404` (or `503` on
+            cached fallback).
         - name: proxy_id
           in: query
           required: false
@@ -21689,11 +21700,17 @@ components:
             and may also change without one (change-log compaction, a config
             reload); compare it only for equality and never parse it.
             Database-served lists derive it from the durable change log and
-            bracket each page with two reads of it, so the page reflects
-            exactly this revision; lists served from the in-memory config
+            bracket each page with two reads of it on the same read source, so
+            the page reflects exactly this revision (on standalone MongoDB
+            without a replica set, the resource write and change-log insert are
+            separate operations, so a concurrent reader can momentarily observe
+            a write before its revision advances; run MongoDB as a replica set
+            for the strict guarantee). Lists served from the in-memory config
             (`file`, `dp`, `mesh` modes and the database-outage fallback,
             marked `X-Data-Source: cached`) derive it from a digest of the
-            collection's `viewer` projection. The two kinds never compare
+            collection's id-ordered projection for the caller's role (so viewer
+            tokens never depend on redacted secrets while privileged callers see
+            changes to any field visible to them). The two kinds never compare
             equal.
 
     CollectionRevisionConflictBody:

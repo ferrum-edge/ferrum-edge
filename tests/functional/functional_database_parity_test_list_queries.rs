@@ -168,20 +168,20 @@ fn plugin_configs() -> Vec<Value> {
 }
 
 fn file_mode_config() -> String {
-    // JSON is valid YAML for the file loader.
-    // The in-memory path lists in config order; keep the file id-ordered so
-    // the expectations (id order, as every database returns) hold verbatim.
-    let by_id = |mut items: Vec<Value>| {
-        items.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
+    // JSON is valid YAML for the file loader. Intentionally keep collections
+    // unsorted (reverse id order) to prove the cached-config list path sorts
+    // canonically by `id` just like every database backend.
+    let reversed = |mut items: Vec<Value>| {
+        items.sort_by(|left, right| right["id"].as_str().cmp(&left["id"].as_str()));
         items
     };
-    let mut proxies = by_id(proxies());
+    let mut proxies = reversed(proxies());
     for proxy in &mut proxies {
         proxy["namespace"] = json!("ferrum");
     }
-    let consumers = by_id(consumers());
-    let upstreams = by_id(upstreams());
-    let plugin_configs = by_id(plugin_configs());
+    let consumers = reversed(consumers());
+    let upstreams = reversed(upstreams());
+    let plugin_configs = reversed(plugin_configs());
     serde_json::to_string(&json!({
         "version": "1",
         "proxies": proxies,
@@ -510,6 +510,33 @@ async fn assert_walks_are_consistent_under_concurrent_churn(admin: &Admin<'_>, l
         )
         .await;
 
+    // Deterministic controlled interleaving: mutate mid-walk and verify 409
+    // regardless of scheduler timing during the concurrent churn loop below.
+    {
+        let first = admin.ok("/consumers?limit=1").await;
+        let walk_revision = revision(&first);
+        admin
+            .write(Method::DELETE, "/consumers/c-churn-0?apply=async", None)
+            .await;
+        admin
+            .write(
+                Method::POST,
+                "/consumers?apply=async",
+                Some(&json!({"id": "c-churn-0", "username": "churn-0"})),
+            )
+            .await;
+        let (status, body) = admin
+            .get(&format!(
+                "/consumers?limit=1&offset=1&if_revision={walk_revision}"
+            ))
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "{label}: deterministic mid-walk same-size change must produce 409: {body}"
+        );
+    }
+
     let writer = {
         let client = Client::new();
         let url = admin.gateway.admin_url("");
@@ -541,10 +568,14 @@ async fn assert_walks_are_consistent_under_concurrent_churn(admin: &Admin<'_>, l
         })
     };
 
-    let mut conflicts = 0usize;
-    let mut completed = 0usize;
+    let mut _completed = 0usize;
     while !writer.is_finished() {
-        let first = admin.ok("/consumers?limit=1").await;
+        let (first_status, first) = admin.get("/consumers?limit=1").await;
+        if first_status == StatusCode::SERVICE_UNAVAILABLE {
+            // Revision bracket exhausted retries under concurrent churn; retry walk.
+            continue;
+        }
+        assert_eq!(first_status, StatusCode::OK, "{label}: {first}");
         let walk_revision = revision(&first);
         let total = first["pagination"]["total"].as_u64().unwrap() as usize;
         let mut seen: Vec<String> = ids(&first);
@@ -555,8 +586,7 @@ async fn assert_walks_are_consistent_under_concurrent_churn(admin: &Admin<'_>, l
                     "/consumers?limit=1&offset={offset}&if_revision={walk_revision}"
                 ))
                 .await;
-            if status == StatusCode::CONFLICT {
-                conflicts += 1;
+            if status == StatusCode::CONFLICT || status == StatusCode::SERVICE_UNAVAILABLE {
                 aborted = true;
                 break;
             }
@@ -567,7 +597,7 @@ async fn assert_walks_are_consistent_under_concurrent_churn(admin: &Admin<'_>, l
         if aborted {
             continue;
         }
-        completed += 1;
+        _completed += 1;
         let unique: BTreeSet<String> = seen.iter().cloned().collect();
         assert_eq!(
             unique.len(),
@@ -595,11 +625,6 @@ async fn assert_walks_are_consistent_under_concurrent_churn(admin: &Admin<'_>, l
     }
     stop.store(true, Ordering::Relaxed);
     writer.await.expect("churn writer");
-    assert!(
-        conflicts > 0,
-        "{label}: 25 same-size changes during the walks must produce at least one 409 \
-         (completed walks: {completed})"
-    );
 }
 
 async fn run_database_scenario(gateway: &TestGateway, label: &str, concurrent: bool) {

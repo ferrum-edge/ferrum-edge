@@ -10112,7 +10112,9 @@ mod inner {
             };
             let mut alternatives: Vec<Document> = Vec::new();
             for field in search_fields {
-                if filter.exclude_at_sign_names && *field == list_query::NAME_FIELD {
+                if filter.exclude_at_sign_names
+                    && list_query::VIEWER_AT_SIGN_GUARDED_FIELDS.contains(field)
+                {
                     let mut no_at_sign = Document::new();
                     no_at_sign.insert(field.to_string(), doc! { "$not": { "$regex": "@" } });
                     alternatives.push(doc! { "$and": [regex_on(field), no_at_sign] });
@@ -10123,7 +10125,13 @@ mod inner {
             if let Some(hosts_field) = hosts_field
                 && term.can_match_host_list()
             {
-                alternatives.push(regex_on(hosts_field));
+                if filter.exclude_at_sign_names {
+                    let mut no_at_sign = Document::new();
+                    no_at_sign.insert(hosts_field.to_string(), doc! { "$not": { "$regex": "@" } });
+                    alternatives.push(doc! { "$and": [regex_on(hosts_field), no_at_sign] });
+                } else {
+                    alternatives.push(regex_on(hosts_field));
+                }
             }
             query.insert("$or", alternatives);
         }

@@ -4769,6 +4769,18 @@ impl DatabaseStore {
         id: &str,
         operation: &str,
     ) -> Result<Option<Proxy>, anyhow::Error> {
+        let pool = self.pool();
+        self.load_proxy_with_associations_from_pool(namespace, id, operation, &pool)
+            .await
+    }
+
+    async fn load_proxy_with_associations_from_pool(
+        &self,
+        namespace: &str,
+        id: &str,
+        operation: &str,
+        pool: &AnyPool,
+    ) -> Result<Option<Proxy>, anyhow::Error> {
         // Namespace predicate keeps ID-only admin reads tenant-scoped
         // (issue #2122): a caller can never see a same-id proxy that lives in
         // another namespace.
@@ -4776,7 +4788,7 @@ impl DatabaseStore {
             sqlx::query(self.q("SELECT * FROM proxies WHERE id = ? AND namespace = ?"))
                 .bind(id)
                 .bind(namespace)
-                .fetch_optional(&self.pool())
+                .fetch_optional(pool)
                 .await?;
 
         let row = match row {
@@ -4786,7 +4798,9 @@ impl DatabaseStore {
 
         let proxy_ids = [id.to_string()];
         let mut plugins_by_proxy = self
-            .load_proxy_plugin_associations_for_proxy_ids(namespace, &proxy_ids, operation, true)
+            .load_proxy_plugin_associations_for_proxy_ids_from_pool(
+                namespace, &proxy_ids, operation, pool,
+            )
             .await?;
         let plugins = plugins_by_proxy.remove(id).unwrap_or_default();
         Self::ensure_no_unmatched_proxy_plugin_associations(operation, &plugins_by_proxy)?;
@@ -4794,6 +4808,29 @@ impl DatabaseStore {
         let mut proxy = row_to_proxy(&row, id.to_string(), plugins)?;
         proxy.normalize_fields();
         Ok(Some(proxy))
+    }
+
+    async fn get_proxy_from_pool(
+        &self,
+        namespace: &str,
+        id: &str,
+        pool: &AnyPool,
+    ) -> Result<Option<Proxy>, anyhow::Error> {
+        let start = Instant::now();
+        let proxy = self
+            .load_proxy_with_associations_from_pool(namespace, id, "get_proxy", pool)
+            .await?;
+        if let Some(proxy) = proxy.as_ref() {
+            self.reject_invalid_loaded_proxy_plugin_association_page(
+                "get_proxy",
+                namespace,
+                std::slice::from_ref(proxy),
+                pool,
+            )
+            .await?;
+        }
+        self.check_slow_query("get_proxy", start);
+        Ok(proxy)
     }
 
     /// Check whether a proxy with the given ID exists in `namespace`.
@@ -5580,7 +5617,9 @@ impl DatabaseStore {
             let mut alternatives = Vec::new();
             for field in search_fields {
                 let matcher = format!("{} LIKE ? ESCAPE '!'", self.ascii_fold_sql(field));
-                if filter.exclude_at_sign_names && *field == list_query::NAME_FIELD {
+                if filter.exclude_at_sign_names
+                    && list_query::VIEWER_AT_SIGN_GUARDED_FIELDS.contains(field)
+                {
                     alternatives.push(format!("({field} NOT LIKE '%@%' AND {matcher})"));
                 } else {
                     alternatives.push(matcher);
@@ -5590,10 +5629,12 @@ impl DatabaseStore {
             if let Some(hosts_field) = hosts_field
                 && term.can_match_host_list()
             {
-                alternatives.push(format!(
-                    "{} LIKE ? ESCAPE '!'",
-                    self.ascii_fold_sql(hosts_field)
-                ));
+                let matcher = format!("{} LIKE ? ESCAPE '!'", self.ascii_fold_sql(hosts_field));
+                if filter.exclude_at_sign_names {
+                    alternatives.push(format!("({hosts_field} NOT LIKE '%@%' AND {matcher})"));
+                } else {
+                    alternatives.push(matcher);
+                }
                 binds.push(pattern.clone());
             }
             where_clause.push_str(" AND (");
@@ -5805,6 +5846,247 @@ impl DatabaseStore {
             newest.map(to_u64).transpose()?,
             oldest.map(to_u64).transpose()?,
         ))
+    }
+
+    /// Execute a revision-bracketed admin list or `applies_to_proxy` read on
+    /// one consistent pool per attempt. If a read replica fails mid-bracket,
+    /// the entire `(before, read, after)` bracket restarts on the primary pool
+    /// so revision and payload never come from different servers.
+    async fn revisioned_admin_read<T, F, Fut>(
+        &self,
+        operation: &'static str,
+        namespace: &str,
+        resource_types: &[&str],
+        if_revision: Option<&str>,
+        read: F,
+    ) -> Result<crate::config::db_backend::RevisionedListRead<T>, anyhow::Error>
+    where
+        F: Fn(AnyPool) -> Fut,
+        Fut: std::future::Future<Output = Result<T, anyhow::Error>>,
+    {
+        for _ in 0..crate::config::db_backend::LIST_REVISION_READ_ATTEMPTS {
+            let admin_read = self.admin_read_pool();
+            let source = admin_read.source;
+            let attempt = async {
+                let before = self
+                    .config_collection_revision_from_pool(
+                        namespace,
+                        resource_types,
+                        &admin_read.pool,
+                    )
+                    .await?;
+                if let Some(expected) = if_revision
+                    && expected != crate::config::db_backend::store_revision_token(before)
+                {
+                    return Ok(Some(
+                        crate::config::db_backend::RevisionedListRead::Mismatch { current: before },
+                    ));
+                }
+                let value = read(admin_read.pool.clone()).await?;
+                let after = self
+                    .config_collection_revision_from_pool(
+                        namespace,
+                        resource_types,
+                        &admin_read.pool,
+                    )
+                    .await?;
+                if before == after {
+                    Ok(Some(crate::config::db_backend::RevisionedListRead::Read {
+                        value,
+                        revision: before,
+                    }))
+                } else {
+                    Ok(None)
+                }
+            }
+            .await;
+
+            match attempt {
+                Ok(Some(done)) => return Ok(done),
+                Ok(None) => continue,
+                Err(error)
+                    if source == AdminReadSource::ReadReplica
+                        && should_fallback_read_replica_error(&error) =>
+                {
+                    self.mark_read_replica_unavailable(operation, &error);
+                    warn!("Read replica admin query failed; retrying {operation} against primary");
+                    let primary_pool = self.pool();
+                    let before = self
+                        .config_collection_revision_from_pool(
+                            namespace,
+                            resource_types,
+                            &primary_pool,
+                        )
+                        .await?;
+                    if let Some(expected) = if_revision
+                        && expected != crate::config::db_backend::store_revision_token(before)
+                    {
+                        return Ok(crate::config::db_backend::RevisionedListRead::Mismatch {
+                            current: before,
+                        });
+                    }
+                    let value = read(primary_pool.clone()).await?;
+                    let after = self
+                        .config_collection_revision_from_pool(
+                            namespace,
+                            resource_types,
+                            &primary_pool,
+                        )
+                        .await?;
+                    if before == after {
+                        info!("Admin read fallback to primary succeeded for {operation}");
+                        return Ok(crate::config::db_backend::RevisionedListRead::Read {
+                            value,
+                            revision: before,
+                        });
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(crate::config::db_backend::RevisionedListRead::Unstable)
+    }
+
+    pub async fn list_proxies_revisioned(
+        &self,
+        namespace: &str,
+        filter: &ResourceListFilter,
+        limit: i64,
+        offset: i64,
+        if_revision: Option<&str>,
+    ) -> Result<crate::config::db_backend::RevisionedListRead<PaginatedResult<Proxy>>, anyhow::Error>
+    {
+        let resource_types = [list_query::PROXY_RESOURCE_TYPE];
+        self.revisioned_admin_read(
+            "list_proxies_revisioned",
+            namespace,
+            &resource_types,
+            if_revision,
+            |pool| async move {
+                self.list_proxies_paginated_from_admin_read(namespace, filter, limit, offset, &pool)
+                    .await
+            },
+        )
+        .await
+    }
+
+    pub async fn list_consumers_revisioned(
+        &self,
+        namespace: &str,
+        filter: &ResourceListFilter,
+        limit: i64,
+        offset: i64,
+        if_revision: Option<&str>,
+    ) -> Result<
+        crate::config::db_backend::RevisionedListRead<PaginatedResult<Consumer>>,
+        anyhow::Error,
+    > {
+        let resource_types = [list_query::CONSUMER_RESOURCE_TYPE];
+        self.revisioned_admin_read(
+            "list_consumers_revisioned",
+            namespace,
+            &resource_types,
+            if_revision,
+            |pool| async move {
+                self.list_consumers_paginated_from_admin_read(
+                    namespace, filter, limit, offset, &pool,
+                )
+                .await
+            },
+        )
+        .await
+    }
+
+    pub async fn list_upstreams_revisioned(
+        &self,
+        namespace: &str,
+        filter: &ResourceListFilter,
+        limit: i64,
+        offset: i64,
+        if_revision: Option<&str>,
+    ) -> Result<
+        crate::config::db_backend::RevisionedListRead<PaginatedResult<Upstream>>,
+        anyhow::Error,
+    > {
+        let resource_types = [list_query::UPSTREAM_RESOURCE_TYPE];
+        self.revisioned_admin_read(
+            "list_upstreams_revisioned",
+            namespace,
+            &resource_types,
+            if_revision,
+            |pool| async move {
+                self.list_upstreams_paginated_from_admin_read(
+                    namespace, filter, limit, offset, &pool,
+                )
+                .await
+            },
+        )
+        .await
+    }
+
+    pub async fn list_plugin_configs_revisioned(
+        &self,
+        namespace: &str,
+        filter: &ResourceListFilter,
+        proxy_id: Option<&str>,
+        limit: i64,
+        offset: i64,
+        if_revision: Option<&str>,
+    ) -> Result<
+        crate::config::db_backend::RevisionedListRead<PaginatedResult<PluginConfig>>,
+        anyhow::Error,
+    > {
+        let resource_types = [list_query::PLUGIN_CONFIG_RESOURCE_TYPE];
+        self.revisioned_admin_read(
+            "list_plugin_configs_revisioned",
+            namespace,
+            &resource_types,
+            if_revision,
+            |pool| async move {
+                self.list_plugin_configs_paginated_from_admin_read(
+                    namespace, filter, proxy_id, limit, offset, &pool,
+                )
+                .await
+            },
+        )
+        .await
+    }
+
+    pub async fn list_plugin_configs_applied_to_proxy_revisioned(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+        if_revision: Option<&str>,
+    ) -> Result<
+        crate::config::db_backend::RevisionedListRead<Option<(Proxy, Vec<PluginConfig>)>>,
+        anyhow::Error,
+    > {
+        let resource_types = [
+            list_query::PLUGIN_CONFIG_RESOURCE_TYPE,
+            list_query::PROXY_RESOURCE_TYPE,
+        ];
+        self.revisioned_admin_read(
+            "list_plugin_configs_applied_to_proxy_revisioned",
+            namespace,
+            &resource_types,
+            if_revision,
+            |pool| async move {
+                let Some(proxy) = self.get_proxy_from_pool(namespace, proxy_id, &pool).await?
+                else {
+                    return Ok(None);
+                };
+                let attached: Vec<String> = proxy
+                    .plugins
+                    .iter()
+                    .map(|association| association.plugin_config_id.clone())
+                    .collect();
+                let candidates = self
+                    .list_plugin_config_candidates_from_pool(namespace, &attached, &pool)
+                    .await?;
+                Ok(Some((proxy, candidates)))
+            },
+        )
+        .await
     }
 
     // ---- Paginated list queries for Admin API ----
@@ -13977,6 +14259,105 @@ impl DatabaseBackend for DatabaseStore {
         resource_types: &[&str],
     ) -> Result<u64, anyhow::Error> {
         DatabaseStore::config_collection_revision(self, namespace, resource_types).await
+    }
+
+    async fn list_proxies_revisioned(
+        &self,
+        namespace: &str,
+        filter: &ResourceListFilter,
+        limit: i64,
+        offset: i64,
+        if_revision: Option<&str>,
+    ) -> Result<crate::config::db_backend::RevisionedListRead<PaginatedResult<Proxy>>, anyhow::Error>
+    {
+        DatabaseStore::list_proxies_revisioned(self, namespace, filter, limit, offset, if_revision)
+            .await
+    }
+
+    async fn list_consumers_revisioned(
+        &self,
+        namespace: &str,
+        filter: &ResourceListFilter,
+        limit: i64,
+        offset: i64,
+        if_revision: Option<&str>,
+    ) -> Result<
+        crate::config::db_backend::RevisionedListRead<PaginatedResult<Consumer>>,
+        anyhow::Error,
+    > {
+        DatabaseStore::list_consumers_revisioned(
+            self,
+            namespace,
+            filter,
+            limit,
+            offset,
+            if_revision,
+        )
+        .await
+    }
+
+    async fn list_upstreams_revisioned(
+        &self,
+        namespace: &str,
+        filter: &ResourceListFilter,
+        limit: i64,
+        offset: i64,
+        if_revision: Option<&str>,
+    ) -> Result<
+        crate::config::db_backend::RevisionedListRead<PaginatedResult<Upstream>>,
+        anyhow::Error,
+    > {
+        DatabaseStore::list_upstreams_revisioned(
+            self,
+            namespace,
+            filter,
+            limit,
+            offset,
+            if_revision,
+        )
+        .await
+    }
+
+    async fn list_plugin_configs_revisioned(
+        &self,
+        namespace: &str,
+        filter: &ResourceListFilter,
+        proxy_id: Option<&str>,
+        limit: i64,
+        offset: i64,
+        if_revision: Option<&str>,
+    ) -> Result<
+        crate::config::db_backend::RevisionedListRead<PaginatedResult<PluginConfig>>,
+        anyhow::Error,
+    > {
+        DatabaseStore::list_plugin_configs_revisioned(
+            self,
+            namespace,
+            filter,
+            proxy_id,
+            limit,
+            offset,
+            if_revision,
+        )
+        .await
+    }
+
+    async fn list_plugin_configs_applied_to_proxy_revisioned(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+        if_revision: Option<&str>,
+    ) -> Result<
+        crate::config::db_backend::RevisionedListRead<Option<(Proxy, Vec<PluginConfig>)>>,
+        anyhow::Error,
+    > {
+        DatabaseStore::list_plugin_configs_applied_to_proxy_revisioned(
+            self,
+            namespace,
+            proxy_id,
+            if_revision,
+        )
+        .await
     }
 
     async fn get_gateway_trust_bundle(

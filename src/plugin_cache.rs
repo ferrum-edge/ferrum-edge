@@ -5843,11 +5843,14 @@ fn scoped_plugin_shadows_global(
         && scoped_builtin == global_builtin
 }
 
-/// The plugin configurations the plugin cache runs on `proxy`, evaluated at
-/// the configuration level from `plugin_configs` (every config of the
-/// proxy's namespace, or a superset that contains at least its `global`
-/// configs and the configs its association list names). Configs of another
-/// namespace are ignored.
+/// The plugin configurations the plugin cache runs on `proxy` within `proxy`'s
+/// own namespace, evaluated at the configuration level from `plugin_configs`
+/// (every config of the proxy's namespace, or a superset that contains at least
+/// its `global` configs and the configs its association list names). Configs of
+/// another namespace are intentionally excluded to preserve `X-Ferrum-Namespace`
+/// authorization boundaries (even when a multi-namespace mesh data plane
+/// injects process-wide globals in a waypoint namespace while materializing
+/// bound-Service proxies in a tenant namespace).
 ///
 /// This is the cold-build resolution in `PluginCache::build_cache`, minus
 /// instance construction (the config-only `transaction_log_schema` is never

@@ -22,7 +22,9 @@ use std::time::Duration;
 use ferrum_edge::_test_support::DbPoolConfig;
 use ferrum_edge::config::db_loader::DatabaseStore;
 use ferrum_edge::config::list_query::{ResourceListFilter, SearchTerm};
-use ferrum_edge::config::types::{Consumer, LoadBalancerAlgorithm, Upstream, UpstreamTarget};
+use ferrum_edge::config::types::{
+    Consumer, LoadBalancerAlgorithm, Proxy, Upstream, UpstreamTarget,
+};
 use ferrum_edge::time_compat::UtcTimestamp;
 use testcontainers::core::IntoContainerPort;
 use testcontainers::runners::AsyncRunner;
@@ -205,6 +207,117 @@ async fn run_store_contract(store: Arc<DatabaseStore>, label: &str, writers: usi
         .unwrap();
     let guarded_ids: Vec<String> = guarded.items.into_iter().map(|u| u.id).collect();
     assert_eq!(guarded_ids, ["u-plain"], "{label}");
+
+    // The viewer `@` guard on proxy `listen_path` and `hosts` as well as `name`.
+    let mut legacy_path_proxy: Proxy = serde_json::from_value(serde_json::json!({
+        "id": "px-at-path",
+        "namespace": NAMESPACE,
+        "name": "Clean Proxy Path",
+        "listen_path": "/ops:pathsecret@internal",
+        "hosts": ["clean.example.com"],
+        "backend_host": "127.0.0.1",
+        "backend_port": 8080
+    }))
+    .unwrap();
+    legacy_path_proxy.normalize_fields();
+    let mut legacy_host_proxy: Proxy = serde_json::from_value(serde_json::json!({
+        "id": "px-at-host",
+        "namespace": NAMESPACE,
+        "name": "Clean Proxy Host",
+        "listen_path": "/clean",
+        "hosts": ["ops:hostsecret@example.com"],
+        "backend_host": "127.0.0.1",
+        "backend_port": 8080
+    }))
+    .unwrap();
+    legacy_host_proxy.normalize_fields();
+    store
+        .create_proxy(&legacy_path_proxy)
+        .await
+        .expect("create proxy with @ in listen_path");
+    store
+        .create_proxy(&legacy_host_proxy)
+        .await
+        .expect("create proxy with @ in hosts");
+
+    assert_eq!(
+        store
+            .list_proxies_filtered(NAMESPACE, &search("pathsecret"), 100, 0)
+            .await
+            .unwrap()
+            .total,
+        1,
+        "{label}"
+    );
+    assert_eq!(
+        store
+            .list_proxies_filtered(
+                NAMESPACE,
+                &ResourceListFilter {
+                    exclude_at_sign_names: true,
+                    ..search("pathsecret")
+                },
+                100,
+                0
+            )
+            .await
+            .unwrap()
+            .total,
+        0,
+        "{label}: viewer must not match @-bearing listen_path"
+    );
+    assert_eq!(
+        store
+            .list_proxies_filtered(NAMESPACE, &search("hostsecret"), 100, 0)
+            .await
+            .unwrap()
+            .total,
+        1,
+        "{label}"
+    );
+    assert_eq!(
+        store
+            .list_proxies_filtered(
+                NAMESPACE,
+                &ResourceListFilter {
+                    exclude_at_sign_names: true,
+                    ..search("hostsecret")
+                },
+                100,
+                0
+            )
+            .await
+            .unwrap()
+            .total,
+        0,
+        "{label}: viewer must not match @-bearing hosts"
+    );
+
+    // Revisioned applies_to_proxy read returns consistent revision and detects stale if_revision.
+    let applied_read = store
+        .list_plugin_configs_applied_to_proxy_revisioned(NAMESPACE, "px-at-host", None)
+        .await
+        .unwrap();
+    let applied_rev = match applied_read {
+        ferrum_edge::config::db_backend::RevisionedListRead::Read {
+            value: Some((proxy, _)),
+            revision,
+        } => {
+            assert_eq!(proxy.id, "px-at-host", "{label}");
+            revision
+        }
+        other => panic!("{label}: expected consistent applies_to_proxy read, got {other:?}"),
+    };
+    let stale_read = store
+        .list_plugin_configs_applied_to_proxy_revisioned(NAMESPACE, "px-at-host", Some("s0stale"))
+        .await
+        .unwrap();
+    match stale_read {
+        ferrum_edge::config::db_backend::RevisionedListRead::Mismatch { current } => {
+            assert_eq!(current, applied_rev, "{label}");
+        }
+        other => panic!("{label}: expected Mismatch for stale if_revision, got {other:?}"),
+    }
 
     run_concurrent_revision_contract(store, label, writers).await;
 }
