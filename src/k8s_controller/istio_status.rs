@@ -605,7 +605,7 @@ pub fn plan_istio_status_updates_budgeted(
                 peer_authentication_status(object, result, &options.istio_root_namespace)
             }
             "DestinationRule" => destination_rule_status(object, result),
-            "VirtualService" => virtual_service_status(object, result),
+            "VirtualService" => virtual_service_status(object, result, &options.cluster_domain),
             "ServiceEntry" => service_entry_status(object, result),
             "RequestAuthentication" => {
                 request_authentication_status(object, result, &options.istio_root_namespace)
@@ -1484,6 +1484,7 @@ pub const VIRTUAL_SERVICE_CROSS_NAMESPACE_DESTINATIONS_NOTE: &str = "cross-names
 fn virtual_service_status(
     object: &K8sObject,
     result: Result<&K8sTranslation, &K8sTranslateError>,
+    cluster_domain: &str,
 ) -> (Value, Option<Value>) {
     let host_count = object
         .spec

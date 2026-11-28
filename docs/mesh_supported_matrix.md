@@ -348,9 +348,9 @@ ledger unless they change the support contract.
 
 | Deferral | Issue | Doc anchor |
 |---|---|---|
-| ServiceWaypoint `http_routes` projection of authorized cross-namespace legs (today the bound Services' same-namespace routes are projected and materialized; a route with a cross-namespace destination is not carried onto a ServiceWaypoint yet) | [#7500](https://github.com/ferrum-edge/ferrum-edge/issues/7500) | [mesh.md → ServiceWaypoint route projection](mesh.md#servicewaypoint-route-projection) |
+| ServiceWaypoint `http_routes` projection of authorized cross-namespace legs (today the bound Services' same-namespace routes are projected and materialized; a route with a cross-namespace destination is not carried onto a ServiceWaypoint yet, even when ReferenceGrant-admitted for Sidecar and NodeWaypoint under #7499) | [#7500](https://github.com/ferrum-edge/ferrum-edge/issues/7500) | [mesh.md → ServiceWaypoint route projection](mesh.md#servicewaypoint-route-projection) |
 | ServiceWaypoint L7 HTTP/1.1 and HTTP/2 termination and bound-Service dispatch on HBONE `:15008` (today an L4 relay only) | [#7501](https://github.com/ferrum-edge/ferrum-edge/issues/7501) | [mesh.md → Service Waypoint](mesh.md#service-waypoint) |
-| Live ServiceWaypoint end-to-end suite in kind (today ServiceWaypoint has no live data-path suite) | [#7503](https://github.com/ferrum-edge/ferrum-edge/issues/7503) | [mesh.md → Topology maturity](mesh.md#topology-maturity) |
+| Live ServiceWaypoint end-to-end L7 assertions in kind (today `mesh-e2e-service-waypoint-live.yml` verifies bound-Service projection and explicitly skips L7 assertions until #7501 ships) | [#7503](https://github.com/ferrum-edge/ferrum-edge/issues/7503) | [mesh.md → Topology maturity](mesh.md#topology-maturity) |
 
 All mesh limitations, including these, are also summarized with workarounds in
 [known_limitations.md](known_limitations.md#service-mesh).

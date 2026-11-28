@@ -2105,7 +2105,7 @@ fn virtual_service_status_reports_service_waypoint_route_exclusions() {
         let mut spec = json!({
             "hosts": ["orders.tenant.svc.cluster.local"],
             "http": [{"route": [{"destination": {
-                "host": "orders.tenant.svc.cluster.local",
+                "host": "echo.external.example",
                 "port": {"number": 8080}
             }}]}]
         });

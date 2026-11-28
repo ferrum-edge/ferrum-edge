@@ -4307,7 +4307,7 @@ fn node_waypoint_http_route_set(
                 .is_some_and(|scheme| scheme.is_stream())
             || !bindings
                 .iter()
-                .all(|binding| route_admitted(binding, proxy))
+                .any(|binding| route_admitted(binding, proxy))
         {
             continue;
         }
@@ -4624,17 +4624,19 @@ fn service_waypoint_http_route_set(
     );
     // Which bound Service each carried route is admitted for: the data plane
     // builds each Service's route partition from exactly these, since only
-    // the control plane sees the binding's `exportTo`.
-    let bindings: HashMap<(&str, &str), &MeshVirtualServiceHttpRoutes> = mesh
-        .virtual_service_http_routes
-        .iter()
-        .flat_map(|binding| {
-            binding
-                .proxy_ids
-                .iter()
-                .map(move |id| ((binding.namespace.as_str(), id.as_str()), binding))
-        })
-        .collect();
+    // the control plane sees the binding's `exportTo`. Uses the same
+    // any-qualifying-binding selection as `node_waypoint_http_route_set`'s
+    // `route_admitted` check so projection and attachment construction agree
+    // when distinct bindings in one namespace list the same proxy ID.
+    let mut bindings: HashMap<(&str, &str), Vec<&MeshVirtualServiceHttpRoutes>> = HashMap::new();
+    for binding in &mesh.virtual_service_http_routes {
+        for id in &binding.proxy_ids {
+            bindings
+                .entry((binding.namespace.as_str(), id.as_str()))
+                .or_default()
+                .push(binding);
+        }
+    }
     let mut attachments: BTreeSet<MeshHttpRouteServiceAttachment> = BTreeSet::new();
     for proxy in &set.proxies {
         let (Some(proxy_namespace), Some(proxy_id)) = (
@@ -4643,7 +4645,7 @@ fn service_waypoint_http_route_set(
         ) else {
             continue;
         };
-        let Some(&binding) = bindings.get(&(proxy_namespace, proxy_id)) else {
+        let Some(route_bindings) = bindings.get(&(proxy_namespace, proxy_id)) else {
             continue;
         };
         let hosts: Vec<&str> = proxy
@@ -4654,7 +4656,9 @@ fn service_waypoint_http_route_set(
             .filter_map(serde_json::Value::as_str)
             .collect();
         for (service_namespace, service_name, aliases) in &bound_services_with_hosts {
-            if binding_owns_service(binding, service_namespace)
+            if route_bindings
+                .iter()
+                .any(|binding| binding_owns_service(binding, service_namespace))
                 && hosts.iter().any(|host| {
                     service_alias_names_host(aliases, service_namespace, proxy_namespace, host)
                 })
@@ -4840,11 +4844,11 @@ fn service_waypoint_route_destination_admitted(
             &canonical,
         )
     }) {
-        // A bound Service in the route's own namespace. A Service in another
-        // namespace is never carried until the cross-namespace authorization
-        // contract (issue #7499) lands: the data plane would refuse it anyway
-        // (`cross_namespace_refused`), and the VirtualService status already
-        // lists every such destination in `deferred_fields`.
+        // A bound Service in the route's own namespace. Issue #7499 admits
+        // ReferenceGrant-authorized cross-namespace destinations on Sidecar
+        // and NodeWaypoint, but ServiceWaypoint (#7500) still excludes
+        // cross-namespace destinations here: its data plane refuses them
+        // (`cross_namespace_refused`) and never widens `bound_services`.
         return service.namespace == route_namespace
             && bound.contains(&(service.namespace.as_str(), service.name.as_str()));
     }

@@ -4898,6 +4898,26 @@ fn decode_http_route_set(
             .iter()
             .map(|upstream| (upstream.namespace.as_str(), upstream.id.as_str())),
     )?;
+    // Issue #7499: cross-namespace destination authorizations and destination-only
+    // evidence apply only to Sidecar and NodeWaypoint slices. Reject them on
+    // ServiceWaypoint before preparation can strip matching workloads from
+    // ordinary routing or inbound relay views.
+    if (!set.authorized_cross_namespace_targets.is_empty()
+        || !set.cross_namespace_destination_workloads.is_empty()
+        || !set.cross_namespace_destination_policies.is_empty()
+        || !set
+            .cross_namespace_destination_request_authentications
+            .is_empty())
+        && !matches!(
+            runtime.topology,
+            MeshTopology::Sidecar | MeshTopology::NodeWaypoint
+        )
+    {
+        return Err(anyhow::anyhow!(
+            "Mesh slice carries cross-namespace HTTP route destination evidence on a topology \
+             that does not support it"
+        ));
+    }
     // Issue #7499: each cross-namespace authorization names a carried route
     // and a Service in ANOTHER namespace, once. Anything else is malformed and
     // refuses the slice; a well-formed entry still authorizes nothing the

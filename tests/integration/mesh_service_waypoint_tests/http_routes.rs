@@ -126,6 +126,62 @@ fn direct_spec(
     spec
 }
 
+fn k8s_service(name: &str, namespace: &str) -> K8sObject {
+    K8sObject {
+        api_version: "v1".to_string(),
+        kind: "Service".to_string(),
+        metadata: K8sMetadata {
+            name: name.to_string(),
+            uid: String::new(),
+            namespace: namespace.to_string(),
+            generation: None,
+            labels: Default::default(),
+            annotations: Default::default(),
+            creation_timestamp: None,
+            deletion_timestamp: None,
+        },
+        spec: json!({
+            "ports": [{"port": 8080}]
+        }),
+        status: serde_json::Value::Object(serde_json::Map::new()),
+    }
+}
+
+fn reference_grant(
+    name: &str,
+    namespace: &str,
+    from_namespace: &str,
+    to_service: &str,
+) -> K8sObject {
+    K8sObject {
+        api_version: "gateway.networking.k8s.io/v1beta1".to_string(),
+        kind: "ReferenceGrant".to_string(),
+        metadata: K8sMetadata {
+            name: name.to_string(),
+            uid: String::new(),
+            namespace: namespace.to_string(),
+            generation: None,
+            labels: Default::default(),
+            annotations: Default::default(),
+            creation_timestamp: None,
+            deletion_timestamp: None,
+        },
+        spec: json!({
+            "from": [{
+                "group": "networking.istio.io",
+                "kind": "VirtualService",
+                "namespace": from_namespace
+            }],
+            "to": [{
+                "group": "",
+                "kind": "Service",
+                "name": to_service
+            }]
+        }),
+        status: serde_json::Value::Object(serde_json::Map::new()),
+    }
+}
+
 /// Translate one namespace's VirtualServices into `config` (proxies,
 /// upstreams, route plugins, and the mesh route bindings).
 fn translate_into(config: &mut GatewayConfig, namespace: &str, objects: &[K8sObject]) {
@@ -134,7 +190,8 @@ fn translate_into(config: &mut GatewayConfig, namespace: &str, objects: &[K8sObj
         K8sTranslationOptions::new(
             namespace.to_string(),
             TrustDomain::new("cluster.local").expect("trust domain"),
-        ),
+        )
+        .with_source_namespaces(Vec::new()),
     )
     .expect("VirtualService translates");
     let translated = translated.config;
@@ -612,15 +669,24 @@ fn waypoint_namespace_route_on_a_tenant_service_needs_export_to_that_tenant() {
     let route = |export_to: &[&str], destination: &str| {
         vec![(
             WAYPOINT_NAMESPACE,
-            vec![virtual_service(
-                "orders-from-waypoint",
-                WAYPOINT_NAMESPACE,
-                direct_spec(
-                    &host("orders", TENANT_NAMESPACE),
-                    destination,
-                    Some(export_to),
+            vec![
+                k8s_service("orders", TENANT_NAMESPACE),
+                reference_grant(
+                    "allow-orders",
+                    TENANT_NAMESPACE,
+                    WAYPOINT_NAMESPACE,
+                    "orders",
                 ),
-            )],
+                virtual_service(
+                    "orders-from-waypoint",
+                    WAYPOINT_NAMESPACE,
+                    direct_spec(
+                        &host("orders", TENANT_NAMESPACE),
+                        destination,
+                        Some(export_to),
+                    ),
+                ),
+            ],
         )]
     };
     let request = service_waypoint_runtime().mesh_slice_request();
@@ -643,14 +709,12 @@ fn waypoint_namespace_route_on_a_tenant_service_needs_export_to_that_tenant() {
         "istio.io/use-waypoint-namespace: the waypoint namespace may route its bound \
          tenant Service when it exports the route to that tenant"
     );
-    // Review round 2 F5: a destination in another namespace (here the tenant
-    // Service itself, from a waypoint-namespace route) is never carried until
-    // the cross-namespace authorization contract (#7499) lands, since the
-    // data plane would refuse it; the VirtualService status lists it in
-    // `deferred_fields`.
+    // Review round 2 F5: even when a ReferenceGrant admits the cross-namespace
+    // destination at translation (#7499), ServiceWaypoint projection (#7500)
+    // still refuses cross-namespace destinations.
     assert!(
         !carried(&[".", TENANT_NAMESPACE], &host("orders", TENANT_NAMESPACE)),
-        "a cross-namespace destination is not carried until #7499"
+        "a cross-namespace destination is not carried on ServiceWaypoint"
     );
 }
 
@@ -824,6 +888,15 @@ fn inbound_relay_destinations_never_widen_to_cross_namespace_split_legs() {
     // refuses it, and neither the bound-Service evidence nor the workloads
     // the slice carries grow.
     let mut namespaces = default_virtual_services();
+    namespaces[0]
+        .1
+        .push(k8s_service("billing", PAYMENTS_NAMESPACE));
+    namespaces[0].1.push(reference_grant(
+        "allow-billing",
+        PAYMENTS_NAMESPACE,
+        WAYPOINT_NAMESPACE,
+        "billing",
+    ));
     namespaces[0].1.push(virtual_service(
         "ratings-to-billing",
         WAYPOINT_NAMESPACE,
@@ -849,9 +922,12 @@ fn inbound_relay_destinations_never_widen_to_cross_namespace_split_legs() {
     );
 
     // Even a producer that DID carry such a route (here, the NodeWaypoint
-    // projection of the same namespace, which applies no binding gate)
-    // cannot widen the data plane: the leg is refused and the relay
-    // inventory stays the bound backing pods.
+    // projection of the same namespace, which admits #7499 cross-namespace
+    // targets) cannot widen the ServiceWaypoint data plane:
+    // 1. carrying #7499 cross-namespace metadata onto ServiceWaypoint is
+    //    rejected fail-closed at decode;
+    // 2. stripping that metadata leaves the cross-namespace route refused at
+    //    binding without widening the relay inventory.
     let node_waypoint_request =
         runtime_for_topology(MeshTopology::NodeWaypoint).mesh_slice_request();
     let node_waypoint = MeshSlice::from_gateway_config(&config, node_waypoint_request);
@@ -863,6 +939,26 @@ fn inbound_relay_destinations_never_widen_to_cross_namespace_split_legs() {
     );
     let mut forged = slice.clone();
     forged.http_routes = node_waypoint.http_routes.clone();
+    assert!(
+        prepare_gateway_config_from_mesh_slice(&forged, &runtime).is_err(),
+        "ServiceWaypoint rejects #7499 cross-namespace metadata at decode"
+    );
+    forged
+        .http_routes
+        .authorized_cross_namespace_targets
+        .clear();
+    forged
+        .http_routes
+        .cross_namespace_destination_workloads
+        .clear();
+    forged
+        .http_routes
+        .cross_namespace_destination_policies
+        .clear();
+    forged
+        .http_routes
+        .cross_namespace_destination_request_authentications
+        .clear();
     let prepared = prepare_gateway_config_from_mesh_slice(&forged, &runtime)
         .expect("the data plane refuses the route, not the slice");
     assert_eq!(
@@ -888,6 +984,90 @@ fn inbound_relay_destinations_never_widen_to_cross_namespace_split_legs() {
             .iter()
             .all(|binding| binding.target.namespace != PAYMENTS_NAMESPACE),
         "the L7 target set is the bound Services only"
+    );
+}
+
+#[test]
+fn service_waypoint_rejects_cross_namespace_destination_workloads_at_decode() {
+    use ferrum_edge::modes::mesh::slice::MeshHttpRouteDestinationWorkload;
+
+    let runtime = service_waypoint_runtime();
+    let config = cp_config(Some(binding("service")), &default_virtual_services());
+    let mut slice = served_slice(&config, &runtime.mesh_slice_request());
+    let tenant_workload = slice
+        .workloads
+        .iter()
+        .find(|workload| workload.namespace == TENANT_NAMESPACE)
+        .expect("bound tenant workload")
+        .clone();
+    slice
+        .http_routes
+        .cross_namespace_destination_workloads
+        .push(MeshHttpRouteDestinationWorkload {
+            namespace: tenant_workload.namespace,
+            spiffe_id: tenant_workload.spiffe_id,
+        });
+    assert!(
+        prepare_gateway_config_from_mesh_slice(&slice, &runtime).is_err(),
+        "ServiceWaypoint rejects #7499 destination-workload markers before they can strip bound backends"
+    );
+}
+
+#[test]
+fn service_waypoint_projection_and_attachments_agree_across_distinct_bindings_for_one_proxy() {
+    use ferrum_edge::modes::mesh::config::MeshVirtualServiceHttpRoutes;
+
+    let mut config = cp_config(
+        Some(binding("service")),
+        &[(
+            WAYPOINT_NAMESPACE,
+            vec![virtual_service(
+                "orders-from-waypoint",
+                WAYPOINT_NAMESPACE,
+                direct_spec(
+                    &host("orders", TENANT_NAMESPACE),
+                    &host("reviews", WAYPOINT_NAMESPACE),
+                    Some(&[".", TENANT_NAMESPACE]),
+                ),
+            )],
+        )],
+    );
+    let mesh = config.mesh.as_mut().expect("mesh block");
+    let primary = mesh
+        .virtual_service_http_routes
+        .iter()
+        .find(|entry| entry.name == "orders-from-waypoint")
+        .expect("translated binding")
+        .clone();
+    // A second binding in the waypoint namespace referencing the same proxy ID
+    // but exported only to the waypoint namespace must not veto the qualifying
+    // binding or strip its ServiceWaypoint attachment.
+    mesh.virtual_service_http_routes
+        .push(MeshVirtualServiceHttpRoutes {
+            namespace: primary.namespace.clone(),
+            name: "orders-from-waypoint-secondary".to_string(),
+            export_to: vec![".".to_string()],
+            proxy_ids: primary.proxy_ids.clone(),
+            authorized_cross_namespace_targets: Vec::new(),
+        });
+    let slice = served_slice(&config, &service_waypoint_runtime().mesh_slice_request());
+    assert!(
+        carried_route_ids(&slice)
+            .iter()
+            .any(|id| id.contains("orders-from-waypoint")),
+        "qualifying binding projects the route without being vetoed by a sibling binding"
+    );
+    assert!(
+        slice
+            .http_routes
+            .service_waypoint_attachments
+            .iter()
+            .any(|a| {
+                a.service_namespace == TENANT_NAMESPACE
+                    && a.service_name == "orders"
+                    && a.proxy_id.contains("orders-from-waypoint")
+            }),
+        "attachment construction uses the same qualifying binding selection"
     );
 }
 
