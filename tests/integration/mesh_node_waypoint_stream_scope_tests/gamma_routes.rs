@@ -497,3 +497,92 @@ fn unavailable_canary_backend_fails_only_its_rule_and_keeps_gamma_dispatch() {
         "healthy rule has no abort fault"
     );
 }
+
+#[test]
+fn weighted_split_with_scaled_to_zero_backend_fails_proportionally_with_503() {
+    let route = object(
+        "HTTPRoute",
+        "gateway.networking.k8s.io/v1",
+        DEFAULT_NAMESPACE,
+        "reviews-weighted-canary",
+        json!({
+            "parentRefs": [{"group": "", "kind": "Service", "name": "reviews", "port": 8080}],
+            "rules": [{
+                "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
+                "backendRefs": [
+                    {"name": "reviews", "port": 8080, "weight": 90},
+                    {"name": "ratings", "port": 8080, "weight": 10}
+                ]
+            }]
+        }),
+    );
+    let mut config = translated_config(&[
+        k8s_service(DEFAULT_NAMESPACE, "reviews"),
+        k8s_service(DEFAULT_NAMESPACE, "ratings"),
+        route,
+    ]);
+    // Scale only the 10% canary backend (`ratings`) to zero endpoints.
+    let mesh = config.mesh.as_mut().expect("mesh");
+    mesh.workloads.retain(|w| w.service_name != "ratings");
+    for svc in &mut mesh.services {
+        if svc.name == "ratings" {
+            svc.workloads.clear();
+        }
+    }
+    let runtime = runtime_for_topology(MeshTopology::NodeWaypoint);
+    let slice = slice_for(&config, &runtime);
+    let prepared = prepare_gateway_config_from_mesh_slice(&slice, &runtime)
+        .expect("weighted GAMMA split materializes when one leg has zero endpoints");
+    let gamma_id = carried_ids(&slice.http_routes.proxies).remove(0);
+    assert!(
+        prepared.proxies.iter().any(|proxy| proxy.id == gamma_id),
+        "GAMMA proxy remains materialized"
+    );
+    let dispatch = prepared
+        .plugin_configs
+        .iter()
+        .find(|plugin| {
+            plugin.plugin_name == "mesh_route_dispatch"
+                && plugin.proxy_id.as_deref() == Some(gamma_id.as_str())
+        })
+        .expect("GAMMA dispatch plugin");
+    let rules = dispatch.config["rules"].as_array().expect("rules array");
+    let rule = &rules[0];
+    assert!(
+        rule["destination"].get("upstream_id").is_some(),
+        "healthy share keeps routing through the rebound split upstream: {rule}"
+    );
+    assert_eq!(rule["fault"]["abort"]["status_code"], json!(503));
+    let pct = rule["fault"]["abort"]["percentage"]
+        .as_f64()
+        .expect("proportional 503 percentage");
+    assert!(
+        (pct - 10.0).abs() < 1e-6,
+        "10% unavailable weight produces 10% 503 abort, got {pct}"
+    );
+}
+
+#[test]
+fn wildcard_destination_rule_does_not_drop_gamma_dispatch() {
+    let mut config = producer_config();
+    let mesh = config.mesh.as_mut().expect("mesh");
+    mesh.destination_rules
+        .push(ferrum_edge::modes::mesh::config::MeshDestinationRule {
+            name: "mesh-wide-wildcard".to_string(),
+            namespace: DEFAULT_NAMESPACE.to_string(),
+            host: "*".to_string(),
+            export_to: vec!["*".to_string()],
+            traffic_policy: None,
+            port_level_settings: std::collections::HashMap::new(),
+            subsets: Vec::new(),
+        });
+    let runtime = runtime_for_topology(MeshTopology::NodeWaypoint);
+    let slice = slice_for(&config, &runtime);
+    let prepared = prepare_gateway_config_from_mesh_slice(&slice, &runtime)
+        .expect("GAMMA slice materializes under wildcard DestinationRule");
+    let gamma_id = carried_ids(&slice.http_routes.proxies).remove(0);
+    assert!(
+        prepared.proxies.iter().any(|proxy| proxy.id == gamma_id),
+        "visible wildcard DestinationRule must not drop GAMMA dispatch proxy"
+    );
+}

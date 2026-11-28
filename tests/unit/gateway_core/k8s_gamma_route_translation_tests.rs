@@ -1243,20 +1243,20 @@ fn an_invalid_path_regex_is_rejected_at_admission_without_poisoning_other_routes
         "only the valid attachment's rule is emitted: {rules:?}"
     );
     assert_eq!(rules[0]["match"]["uri"]["regex"], json!("/ok(/.*)?"));
-    let bad_status = result
-        .gamma_route_statuses
-        .iter()
-        .find(|status| status.route.name == "bad-regex")
-        .expect("bad-regex status recorded");
     assert!(
-        bad_status.parents.iter().all(|parent| {
-            parent.conditions.iter().any(|c| {
-                c.condition_type == "Accepted"
-                    && c.status == "False"
-                    && c.reason == "UnsupportedValue"
-            })
-        }),
-        "bad-regex reported Accepted=False/UnsupportedValue: {bad_status:?}"
+        matches!(
+            outcome(&result, &bad, PARENT),
+            Some(GammaParentOutcome::UnsupportedValue { .. })
+        ),
+        "bad-regex reported UnsupportedValue: {:?}",
+        outcome(&result, &bad, PARENT)
+    );
+    let bad_parents = route_parents_status(&objects, "HTTPRoute", "bad-regex");
+    assert_condition(
+        mesh_parent(&bad_parents),
+        "Accepted",
+        "False",
+        "UnsupportedValue",
     );
 }
 
