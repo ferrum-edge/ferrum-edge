@@ -1984,13 +1984,21 @@ fn destination_rule(
 ) -> Result<MeshDestinationRule, K8sTranslateError> {
     let host_raw = string_field(&object.spec, "host")
         .ok_or_else(|| invalid_resource(object, "DestinationRule requires spec.host"))?;
-    let host = host_raw.trim_end_matches('.').to_ascii_lowercase();
-    if host.is_empty() {
+    let host_trimmed = host_raw.trim();
+    let absolute_two_label =
+        host_trimmed.ends_with('.') && host_trimmed.trim_end_matches('.').matches('.').count() == 1;
+    let host_stripped = host_trimmed.trim_end_matches('.').to_ascii_lowercase();
+    if host_stripped.is_empty() {
         return Err(invalid_resource(
             object,
             "DestinationRule spec.host must be a non-empty hostname",
         ));
     }
+    let host = if absolute_two_label {
+        format!("{host_stripped}.")
+    } else {
+        host_stripped
+    };
 
     let traffic_policy = object
         .spec

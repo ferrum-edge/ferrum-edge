@@ -637,14 +637,6 @@ async fn assert_grant_changes_only_its_routes(runtime: MeshRuntimeConfig, with_e
             .iter()
             .find(|proxy| names_granted_route(&proxy.id) && proxy.listen_path == "/granted-direct")
             .unwrap_or_else(|| panic!("{case}: direct granted route materialized"));
-        assert!(
-            direct_granted.plugins.iter().any(|association| {
-                association
-                    .plugin_config_id
-                    .starts_with(MESH_REQUEST_AUTH_DESTINATION_PLUGIN_ID_PREFIX)
-            }),
-            "{case}: direct granted route carries destination RequestAuthentication"
-        );
         let refusal_targets_direct = granted.plugin_configs.iter().any(|plugin| {
             (plugin.id == MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID
                 || plugin
@@ -654,10 +646,29 @@ async fn assert_grant_changes_only_its_routes(runtime: MeshRuntimeConfig, with_e
                     .unwrap_or_default()
                     .contains(&direct_granted.id)
         });
-        assert!(
-            !refusal_targets_direct,
-            "{case}: direct granted route serves traffic rather than 503 refusal"
-        );
+        if with_entry {
+            // With `default/vm` attached to `other/ratings`, the Service's
+            // workloads have divergent RequestAuthentication sets (`ratings`
+            // selects `ratings-jwt`, `vm` selects none), so the direct route
+            // fails closed under `__mesh_request_auth_refused`.
+            assert!(
+                refusal_targets_direct,
+                "{case}: heterogeneous Service workloads refuse the direct granted route"
+            );
+        } else {
+            assert!(
+                direct_granted.plugins.iter().any(|association| {
+                    association
+                        .plugin_config_id
+                        .starts_with(MESH_REQUEST_AUTH_DESTINATION_PLUGIN_ID_PREFIX)
+                }),
+                "{case}: homogeneous direct granted route carries destination RequestAuthentication"
+            );
+            assert!(
+                !refusal_targets_direct,
+                "{case}: homogeneous direct granted route serves traffic rather than 503 refusal"
+            );
+        }
     }
 
     let with = ungranted_view(&granted);

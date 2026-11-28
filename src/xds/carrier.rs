@@ -1223,6 +1223,7 @@ mod tests {
                 authorized_cross_namespace_targets: Vec::new(),
                 cross_namespace_destination_workloads: Vec::new(),
                 cross_namespace_destination_policies: Vec::new(),
+                cross_namespace_destination_request_authentications: Vec::new(),
             }),
             MeshSliceCarrier::MeshPolicies(Vec::new()),
             MeshSliceCarrier::ExtAuthzProviders(Vec::new()),

@@ -4581,31 +4581,37 @@ fn decode_http_route_set(
     // The AuthorizationPolicies carried only for those destinations: each
     // once, never of this slice's own namespace. An entry only ever keeps a
     // policy out of the missing-source-scope census.
-    let destination_policies = &set.cross_namespace_destination_policies;
-    if destination_policies.len() > slice::MAX_HTTP_ROUTE_CROSS_NAMESPACE_DESTINATION_WORKLOADS {
-        return Err(anyhow::anyhow!(
-            "Mesh slice HTTP route set lists more than {} cross-namespace destination policies",
-            slice::MAX_HTTP_ROUTE_CROSS_NAMESPACE_DESTINATION_WORKLOADS
-        ));
-    }
-    let mut seen_destination_policies: HashSet<&slice::MeshHttpRouteDestinationPolicy> =
-        HashSet::new();
-    for (index, entry) in destination_policies.iter().enumerate() {
-        let well_formed = [entry.namespace.as_str(), entry.name.as_str()]
-            .iter()
-            .all(|value| {
-                !value.is_empty()
-                    && value.trim() == *value
-                    && value.len() <= config::MAX_VIRTUAL_SERVICE_CROSS_NAMESPACE_TARGET_LEN
-            })
-            && (entry.namespace != slice.namespace
-                || (!slice.istio_root_namespace.is_empty()
-                    && entry.namespace == slice.istio_root_namespace))
-            && seen_destination_policies.insert(entry);
-        if !well_formed {
+    for (label, entries) in [
+        ("policy", &set.cross_namespace_destination_policies),
+        (
+            "request authentication",
+            &set.cross_namespace_destination_request_authentications,
+        ),
+    ] {
+        if entries.len() > slice::MAX_HTTP_ROUTE_CROSS_NAMESPACE_DESTINATION_WORKLOADS {
             return Err(anyhow::anyhow!(
-                "Mesh slice HTTP route cross-namespace destination policy {index} is malformed"
+                "Mesh slice HTTP route set lists more than {} cross-namespace destination {label} entries",
+                slice::MAX_HTTP_ROUTE_CROSS_NAMESPACE_DESTINATION_WORKLOADS
             ));
+        }
+        let mut seen: HashSet<&slice::MeshHttpRouteDestinationPolicy> = HashSet::new();
+        for (index, entry) in entries.iter().enumerate() {
+            let well_formed = [entry.namespace.as_str(), entry.name.as_str()]
+                .iter()
+                .all(|value| {
+                    !value.is_empty()
+                        && value.trim() == *value
+                        && value.len() <= config::MAX_VIRTUAL_SERVICE_CROSS_NAMESPACE_TARGET_LEN
+                })
+                && (entry.namespace != slice.namespace
+                    || (!slice.istio_root_namespace.is_empty()
+                        && entry.namespace == slice.istio_root_namespace))
+                && seen.insert(entry);
+            if !well_formed {
+                return Err(anyhow::anyhow!(
+                    "Mesh slice HTTP route cross-namespace destination {label} {index} is malformed"
+                ));
+            }
         }
     }
 
@@ -15845,8 +15851,14 @@ pub(crate) fn destination_rule_host_specificity(
     namespace: &str,
     candidate: &str,
 ) -> Option<DestinationRuleHostSpecificity> {
-    let rule_host = rule_host.trim().trim_end_matches('.').to_ascii_lowercase();
-    let candidate = candidate.trim().trim_end_matches('.').to_ascii_lowercase();
+    let rule_trimmed = rule_host.trim();
+    let rule_absolute_two_label =
+        rule_trimmed.ends_with('.') && rule_trimmed.trim_end_matches('.').matches('.').count() == 1;
+    let cand_trimmed = candidate.trim();
+    let cand_absolute_two_label =
+        cand_trimmed.ends_with('.') && cand_trimmed.trim_end_matches('.').matches('.').count() == 1;
+    let rule_host = rule_trimmed.trim_end_matches('.').to_ascii_lowercase();
+    let candidate = cand_trimmed.trim_end_matches('.').to_ascii_lowercase();
     if candidate.is_empty() {
         return None;
     }
@@ -15870,11 +15882,17 @@ pub(crate) fn destination_rule_host_specificity(
             .then_some(DestinationRuleHostSpecificity::Wildcard(suffix.len()));
     }
     let exact = if candidate == rule_host {
-        true
+        rule_absolute_two_label == cand_absolute_two_label
     } else if !rule_host.contains('.') {
-        let namespaced = format!("{rule_host}.{}", namespace.trim());
-        candidate == namespaced || candidate.starts_with(&format!("{namespaced}.svc."))
-    } else if rule_host.bytes().filter(|byte| *byte == b'.').count() == 1 {
+        if cand_absolute_two_label {
+            false
+        } else {
+            let namespaced = format!("{rule_host}.{}", namespace.trim());
+            candidate == namespaced || candidate.starts_with(&format!("{namespaced}.svc."))
+        }
+    } else if !rule_absolute_two_label
+        && rule_host.bytes().filter(|byte| *byte == b'.').count() == 1
+    {
         candidate.starts_with(&format!("{rule_host}.svc."))
     } else if rule_host.ends_with(".svc") {
         candidate.starts_with(&format!("{rule_host}."))
@@ -18784,49 +18802,25 @@ fn scope_request_auth_to_node_waypoint_destinations(
         })
         .map(|plugin| &plugin.config)
         .collect();
-    // Resources this waypoint carries only for its destinations. Split out
-    // resources carried solely for grant-added cross-namespace destination
-    // workloads so adding a ReferenceGrant cannot turn an unrelated ordinary
-    // route (e.g., an existing local+external combined split) into a 503
-    // refusal, while routes reaching cross-namespace targets still fail closed
-    // against every destination resource.
+    // Resources this waypoint carries only for its destinations. Use the
+    // slice's explicit grant-only RequestAuthentication provenance so neither
+    // remote-cluster replicas nor a root-namespace subscriber can turn an
+    // unrelated ordinary route (e.g., an existing local+external combined
+    // split) into a 503 refusal, while routes reaching cross-namespace targets
+    // still fail closed against every destination resource.
+    let grant_only_request_auths: HashSet<(&str, &str)> = mesh_slice
+        .http_routes
+        .cross_namespace_destination_request_authentications
+        .iter()
+        .map(|entry| (entry.namespace.as_str(), entry.name.as_str()))
+        .collect();
     let carries_any_destination_resources = (0..resources.len()).any(|index| !own.contains(&index));
     let carries_ordinary_destination_resources = (0..resources.len()).any(|index| {
-        if own.contains(&index) {
-            return false;
-        }
-        let resource = &resources[index];
-        let selects_ordinary = mesh_slice
-            .workloads
-            .iter()
-            .chain(mesh_slice.node_waypoint_capture_destinations.iter())
-            .any(|workload| {
-                scope_applies_to_workload(
-                    &resource.scope,
-                    &workload.namespace,
-                    &workload.selector.labels,
-                )
-            });
-        let selects_grant_only = cross_namespace_destination_workloads
-            .iter()
-            .any(|workload| {
-                scope_applies_to_workload(
-                    &resource.scope,
-                    &workload.namespace,
-                    &workload.selector.labels,
-                )
-            });
-        let targets_subscriber_namespace = resource.namespace == runtime.namespace
-            || matches!(
-                &resource.scope,
-                config::PolicyScope::Namespace { namespace } if namespace == &runtime.namespace
-            )
-            || matches!(
-                &resource.scope,
-                config::PolicyScope::WorkloadSelector { selector }
-                    if selector.namespace.as_deref() == Some(runtime.namespace.as_str())
-            );
-        selects_ordinary || targets_subscriber_namespace || !selects_grant_only
+        !own.contains(&index)
+            && !grant_only_request_auths.contains(&(
+                resources[index].namespace.as_str(),
+                resources[index].name.as_str(),
+            ))
     });
     let authorized_cross_namespace_routes: HashSet<&str> = mesh_slice
         .http_routes

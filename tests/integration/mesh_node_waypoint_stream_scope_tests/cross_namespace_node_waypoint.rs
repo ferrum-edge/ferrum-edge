@@ -1168,6 +1168,141 @@ fn a_service_only_sidecar_import_withholds_an_absolute_external_host() {
             .any(|route| route.backend_host == "ratings.other."),
         "Service-only import withholds the absolute external DNS route"
     );
+
+    // Same-namespace relative-alias import (`./catalog.default`): admits the
+    // relative `catalog.default` Service route and withholds `catalog.default.`.
+    let mut same_ns = config_with(
+        direct_spec(RATINGS_OTHER),
+        vec![
+            k8s_service("catalog", DEFAULT_NAMESPACE),
+            virtual_service(
+                "catalog-rel",
+                json!({
+                    "hosts": ["reviews.default.svc.cluster.local"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/rel"}}],
+                        "route": [{"destination": {"host": "catalog.default", "port": {"number": 8080}}}]
+                    }]
+                }),
+            ),
+            virtual_service(
+                "catalog-abs",
+                json!({
+                    "hosts": ["reviews.default.svc.cluster.local"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/abs"}}],
+                        "route": [{"destination": {"host": "catalog.default.", "port": {"number": 8080}}}]
+                    }]
+                }),
+            ),
+        ],
+        Vec::new(),
+        Vec::new(),
+    );
+    let catalog = workload_for(
+        "catalog",
+        DEFAULT_NAMESPACE,
+        [("app", "catalog")],
+        ["10.0.0.15"],
+    );
+    let mesh = same_ns.mesh.as_mut().expect("mesh block");
+    mesh.services
+        .push(service_for("catalog", DEFAULT_NAMESPACE, &[&catalog]));
+    mesh.workloads.push(catalog);
+    mesh.sidecars
+        .first_mut()
+        .expect("importing sidecar")
+        .egress
+        .first_mut()
+        .expect("egress listener")
+        .hosts = vec![
+        "./reviews.default.svc.cluster.local".to_string(),
+        "./catalog.default".to_string(),
+    ];
+    let same_ns_prepared = prepare(&slice_for(&same_ns, &node_waypoint_runtime()));
+    let same_ns_routes = carried_routes(&same_ns_prepared);
+    assert!(
+        same_ns_routes
+            .iter()
+            .any(|route| route.listen_path == "/rel"),
+        "relative ./catalog.default import admits relative Service route"
+    );
+    assert!(
+        !same_ns_routes
+            .iter()
+            .any(|route| route.backend_host == "catalog.default."),
+        "relative ./catalog.default import withholds absolute external host catalog.default."
+    );
+}
+
+/// A client-namespace DestinationRule for relative Service alias
+/// `catalog.default` with TLS origination must not withhold a direct external
+/// route to absolute `catalog.default.`, and an absolute DestinationRule for
+/// `catalog.default.` must not match `catalog.default.svc.cluster.local`.
+#[test]
+fn service_destination_rule_does_not_match_absolute_external_two_label_host() {
+    let mut config = config_with(
+        direct_spec(RATINGS_OTHER),
+        vec![
+            k8s_service("catalog", DEFAULT_NAMESPACE),
+            destination_rule(
+                "catalog-service-tls",
+                DEFAULT_NAMESPACE,
+                "catalog.default",
+                json!({"tls": {"mode": "SIMPLE"}}),
+            ),
+            destination_rule(
+                "catalog-abs-rule",
+                DEFAULT_NAMESPACE,
+                "catalog.default.",
+                json!({"loadBalancer": {"simple": "RANDOM"}}),
+            ),
+            virtual_service(
+                "catalog-abs-ext",
+                json!({
+                    "hosts": ["reviews.default.svc.cluster.local"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/abs-ext"}}],
+                        "route": [{"destination": {"host": "catalog.default.", "port": {"number": 8080}}}]
+                    }]
+                }),
+            ),
+        ],
+        Vec::new(),
+        Vec::new(),
+    );
+    let catalog = workload_for(
+        "catalog",
+        DEFAULT_NAMESPACE,
+        [("app", "catalog")],
+        ["10.0.0.15"],
+    );
+    let mesh = config.mesh.as_mut().expect("mesh block");
+    mesh.services
+        .push(service_for("catalog", DEFAULT_NAMESPACE, &[&catalog]));
+    mesh.workloads.push(catalog);
+    mesh.sidecars
+        .first_mut()
+        .expect("importing sidecar")
+        .egress
+        .first_mut()
+        .expect("egress listener")
+        .hosts
+        .push("*/*".to_string());
+    let prepared = prepare(&slice_for(&config, &node_waypoint_runtime()));
+    assert!(
+        carried_routes(&prepared)
+            .iter()
+            .any(|route| route.backend_host == "catalog.default."),
+        "relative Service DR with TLS origination must not withhold direct external catalog.default."
+    );
+    assert!(
+        !prepared.upstreams.iter().any(|upstream| {
+            upstream.id == "__mesh-out-upstream-default-catalog-8080"
+                && upstream.algorithm == LoadBalancerAlgorithm::Random
+        }),
+        "absolute external DR catalog.default. must not apply to Service FQDN catalog.default.svc.cluster.local"
+    );
 }
 
 /// A root-namespace (`istio-system`) selector-scoped AuthorizationPolicy and

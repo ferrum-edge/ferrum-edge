@@ -722,6 +722,13 @@ pub struct MeshHttpRouteSet {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub cross_namespace_destination_policies: Vec<MeshHttpRouteDestinationPolicy>,
+    /// The RequestAuthentications a NodeWaypoint slice carries ONLY because
+    /// they select one of those destination records (issue #7499). Kept out of
+    /// the ordinary unresolved-destination refusal census so adding a grant
+    /// never turns an unrelated ordinary route into a 503.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
+    pub cross_namespace_destination_request_authentications: Vec<MeshHttpRouteDestinationPolicy>,
 }
 
 impl MeshHttpRouteSet {
@@ -732,6 +739,9 @@ impl MeshHttpRouteSet {
             && self.authorized_cross_namespace_targets.is_empty()
             && self.cross_namespace_destination_workloads.is_empty()
             && self.cross_namespace_destination_policies.is_empty()
+            && self
+                .cross_namespace_destination_request_authentications
+                .is_empty()
     }
 }
 
@@ -2485,21 +2495,31 @@ impl MeshSlice {
         // RequestAuthentication itself (a Sidecar source judges none, #4158),
         // so its slice also carries the destination namespace's resources
         // that select those destination workloads.
-        let (mesh_policies, request_authentications, cross_namespace_destination_policies) =
-            if request.node_waypoint_capture_scoping {
-                with_cross_namespace_destination_policies(
-                    mesh_policies,
-                    request_authentications,
-                    mesh,
-                    &workloads,
-                    &http_routes,
-                    &namespace,
-                )
-            } else {
-                (mesh_policies, request_authentications, Vec::new())
-            };
+        let (
+            mesh_policies,
+            request_authentications,
+            cross_namespace_destination_policies,
+            cross_namespace_destination_request_authentications,
+        ) = if request.node_waypoint_capture_scoping {
+            with_cross_namespace_destination_policies(
+                mesh_policies,
+                request_authentications,
+                mesh,
+                &workloads,
+                &http_routes,
+                &namespace,
+            )
+        } else {
+            (
+                mesh_policies,
+                request_authentications,
+                Vec::new(),
+                Vec::new(),
+            )
+        };
         let http_routes = MeshHttpRouteSet {
             cross_namespace_destination_policies,
+            cross_namespace_destination_request_authentications,
             ..http_routes
         };
 
@@ -2649,7 +2669,15 @@ impl DestinationRuleHostExclusion {
 }
 
 fn canonical_destination_rule_host(host: &str) -> String {
-    host.trim().trim_end_matches('.').to_ascii_lowercase()
+    let trimmed = host.trim();
+    let absolute_two_label =
+        trimmed.ends_with('.') && trimmed.trim_end_matches('.').matches('.').count() == 1;
+    let stripped = trimmed.trim_end_matches('.').to_ascii_lowercase();
+    if absolute_two_label {
+        format!("{stripped}.")
+    } else {
+        stripped
+    }
 }
 
 /// Resolve, on the control plane, Istio's exported-rule host selection for
@@ -3049,10 +3077,16 @@ fn with_cross_namespace_destination_policies(
     Vec<MeshPolicy>,
     Vec<MeshRequestAuthentication>,
     Vec<MeshHttpRouteDestinationPolicy>,
+    Vec<MeshHttpRouteDestinationPolicy>,
 ) {
     let targets = cross_namespace_target_services(http_routes);
     if targets.is_empty() {
-        return (mesh_policies, request_authentications, Vec::new());
+        return (
+            mesh_policies,
+            request_authentications,
+            Vec::new(),
+            Vec::new(),
+        );
     }
     // Only the records added for authorized routes (review F4, round 5): a
     // record the ordinary view already held keeps the resources it had.
@@ -3071,9 +3105,16 @@ fn with_cross_namespace_destination_policies(
         })
         .collect();
     if destinations.is_empty() {
-        return (mesh_policies, request_authentications, Vec::new());
+        return (
+            mesh_policies,
+            request_authentications,
+            Vec::new(),
+            Vec::new(),
+        );
     }
     let mut added_policies: BTreeSet<MeshHttpRouteDestinationPolicy> = BTreeSet::new();
+    let mut added_request_authentications: BTreeSet<MeshHttpRouteDestinationPolicy> =
+        BTreeSet::new();
     let root_namespace = mesh.istio_root_namespace.trim();
     // A workload selector governs workloads of its resource's own namespace,
     // or any namespace when owned by the mesh root namespace (Istio semantics);
@@ -3104,6 +3145,10 @@ fn with_cross_namespace_destination_policies(
             .any(|workload| governs(&resource.namespace, &resource.scope, workload))
             && !request_authentications.contains(resource)
         {
+            added_request_authentications.insert(MeshHttpRouteDestinationPolicy {
+                namespace: resource.namespace.clone(),
+                name: resource.name.clone(),
+            });
             request_authentications.push(resource.clone());
         }
     }
@@ -3111,6 +3156,7 @@ fn with_cross_namespace_destination_policies(
         mesh_policies,
         request_authentications,
         added_policies.into_iter().collect(),
+        added_request_authentications.into_iter().collect(),
     )
 }
 
@@ -4883,6 +4929,8 @@ fn policy_host_scope(
     service_entry_hosts: &BTreeMap<String, ServiceEntryHostOwner>,
 ) -> PolicyHostScope {
     let raw_host = policy_host.trim();
+    let absolute_two_label =
+        raw_host.ends_with('.') && raw_host.trim_end_matches('.').matches('.').count() == 1;
     let host = raw_host.trim_end_matches('.').to_ascii_lowercase();
     let rule_namespace = policy_namespace
         .trim()
@@ -4919,7 +4967,14 @@ fn policy_host_scope(
         PolicyTargetRef::Unresolved => PolicyHostScope {
             service_namespace: None,
             scope_namespace: rule_namespace,
-            host_candidates: vec![host],
+            // Preserve the trailing dot on an unresolved absolute two-label
+            // external host (`catalog.default.`) so a same-namespace relative
+            // Service import (`./catalog.default`) never admits it.
+            host_candidates: vec![if absolute_two_label {
+                format!("{host}.")
+            } else {
+                host
+            }],
         },
     }
 }
