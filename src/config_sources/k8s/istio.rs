@@ -6345,16 +6345,26 @@ fn resolve_destination_port(
         return Ok(None);
     };
     // Review F7 (round 5): resolve the Service the way cross-namespace
-    // admission does (host folded and stripped of its root dot, the cluster
-    // domain normalized like the data plane's), so a host admission accepted
-    // never fails here on case or a trailing dot in either spelling.
+    // admission does (host folded, cluster domain normalized like the data
+    // plane's, and an absolute two-label name like `ratings.other.` treated as
+    // external rather than a Service), so a host admission accepted never
+    // fails here on case or a trailing dot and an external two-label host
+    // never resolves a Kubernetes Service's named port.
     let cluster_domain = normalized_mesh_cluster_domain(&acc.options.cluster_domain);
-    let normalized_host = host.trim().trim_end_matches('.').to_ascii_lowercase();
-    let Some((svc, ns)) = service_host_components(
-        &normalized_host,
-        &object.metadata.namespace,
-        &cluster_domain,
-    ) else {
+    let trimmed_host = host.trim();
+    let normalized_host = trimmed_host.trim_end_matches('.').to_ascii_lowercase();
+    let is_absolute_two_label =
+        trimmed_host.ends_with('.') && normalized_host.split('.').count() == 2;
+    let Some((svc, ns)) = (!is_absolute_two_label)
+        .then(|| {
+            service_host_components(
+                &normalized_host,
+                &object.metadata.namespace,
+                &cluster_domain,
+            )
+        })
+        .flatten()
+    else {
         return Err(invalid_resource(
             object,
             format!(

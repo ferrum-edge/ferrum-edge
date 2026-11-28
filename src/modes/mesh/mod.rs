@@ -6146,7 +6146,7 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                 // The route never dials its split (the translator attached
                 // the unconditional 404 because an unsupported predicate left
                 // no dispatch rule). Refusing the route would drop that 404
-                // and hand its requests to the plain Service route, so the
+                // and leave any existing plain Service route exposed, so the
                 // refused split is detached instead and pruned below.
                 detached_terminating_routes.push(index);
             }
@@ -6422,9 +6422,10 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
         if keep && !route_splits.is_empty() {
             // Leg-by-leg dispatch is authorized per leg, so every candidate
             // must fit the verdict table, and every split must fit the one
-            // dispatch instance's table; otherwise the route is refused (the
-            // host keeps its Service route) instead of the generated instance
-            // failing construction and refusing the whole generation.
+            // dispatch instance's table; otherwise the route is refused
+            // (leaving plain Service routing where it already exists) instead
+            // of the generated instance failing construction and refusing the
+            // whole generation.
             if candidates.len() > crate::plugins::mesh::authz::MAX_NODE_WAYPOINT_ROUTE_BRANCHES
                 || route_splits.len() > crate::plugins::mesh_route_dispatch::MAX_WEIGHTED_SPLITS
             {
@@ -6689,8 +6690,8 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
     // same path stays with that route.
     expand_carried_route_service_hosts(config, &hosts, &runtime.cluster_domain);
     if !dropped.is_empty() {
-        // Re-run materialization so the hosts the dropped routes shadowed
-        // get their Service routes back.
+        // Re-run materialization so any host with reachable backends that a
+        // dropped route shadowed regains its plain Service route.
         materialize_mesh_outbound_proxies(config, runtime, mesh_slice);
     }
     Ok(referenced_clones)
@@ -7700,8 +7701,8 @@ fn clone_sidecar_carried_destination_upstreams(
 /// When every rule of an instance is removed (issue #7440):
 /// * with `reject_unmatched` the route serves only matched requests, so it now
 ///   applies to no request from this workload: it is returned
-///   (`(namespace, proxy id)`) for the binding to refuse, and its host keeps
-///   the Service route;
+///   (`(namespace, proxy id)`) for the binding to refuse, leaving plain
+///   Service routing where it already exists;
 /// * without it the route still has a fallback (a URI-only OR sibling or a
 ///   later unconditional `http[]` entry, both served by the route's own
 ///   destination), so only the empty instance is removed, from the plugin

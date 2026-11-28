@@ -1452,7 +1452,7 @@ pub const VIRTUAL_SERVICE_MESH_HTTP_ROUTES_SCOPE: &str = "sidecar_and_node_waypo
 /// mesh-bound VirtualService's `http[]` routes (issues #7390, #7423).
 pub const VIRTUAL_SERVICE_MESH_HTTP_ROUTES_NOTE: &str = "mesh http[] routes are applied only by \
      Sidecar and NodeWaypoint data planes; Ambient and ServiceWaypoint data planes ignore them \
-     and route to the destination Service";
+     and leave plain Service routing where it already exists";
 
 /// The `FerrumAccepted` message note for a mesh-bound VirtualService whose
 /// `http[]` routes reach Services in other namespaces (issue #7499). Those
