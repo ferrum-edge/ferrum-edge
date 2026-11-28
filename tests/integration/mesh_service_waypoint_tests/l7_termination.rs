@@ -1560,13 +1560,28 @@ async fn a_tunnel_the_peer_closes_ends_cleanly_and_releases_its_gauge_slot() {
     let tunnel = waypoint
         .tunnel(&format!("{}:{SERVICE_PORT}", host("reviews")), &[])
         .await;
-    let mut inner = inner_http1(tunnel).await;
+    let (mut inner, connection): (InnerH1, _) =
+        hyper::client::conn::http1::handshake(TokioIo::new(tunnel))
+            .await
+            .expect("inner HTTP/1.1 handshake");
+    // Recover the open CONNECT transport so the peer explicitly sends END_STREAM.
+    let driver = tokio::spawn(connection.without_shutdown());
     assert_eq!(
         send_h1(&mut inner, get("/", &host("reviews"))).await.status,
         StatusCode::OK
     );
     assert_eq!(l7_tunnels_active(), 1);
     drop(inner);
+    let parts = tokio::time::timeout(DEADLINE, driver)
+        .await
+        .expect("inner HTTP/1.1 driver timed out")
+        .expect("inner HTTP/1.1 driver panicked")
+        .expect("inner HTTP/1.1 connection failed");
+    let mut tunnel = parts.io.into_inner();
+    tunnel
+        .send
+        .send_data(Bytes::new(), true)
+        .expect("send outer H2 END_STREAM");
     wait_until(
         || l7_tunnel_terminations(ServiceWaypointL7TunnelTermination::CleanClose) == 1,
         "the clean_close termination",
@@ -1574,6 +1589,7 @@ async fn a_tunnel_the_peer_closes_ends_cleanly_and_releases_its_gauge_slot() {
     .await;
     wait_until(|| l7_tunnels_active() == 0, "the gauge release").await;
     assert_eq!(waypoint.state.hbone_admission_fence.live_tunnels(), 0);
+    drop(tunnel);
     waypoint.teardown().await;
 }
 
