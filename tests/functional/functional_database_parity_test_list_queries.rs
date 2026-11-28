@@ -91,7 +91,7 @@ fn consumers() -> Vec<Value> {
     vec![
         json!({"id": "c-alice", "username": "Alice", "custom_id": "CRM-1"}),
         json!({"id": "c-bob", "username": "bob"}),
-        json!({"id": "c-cafe", "username": "café"}),
+        json!({"id": "c-accent", "username": "café"}),
     ]
 }
 
@@ -328,7 +328,7 @@ async fn assert_search_ids_and_applies_to(admin: &Admin<'_>, label: &str) {
         ("/proxies", "com\",\"", &[]),
         ("/consumers", "ALICE", &["c-alice"]),
         ("/consumers", "crm-1", &["c-alice"]),
-        ("/consumers", "café", &["c-cafe"]),
+        ("/consumers", "café", &["c-accent"]),
         ("/consumers", "CAFÉ", &[]),
         ("/consumers", "cafe", &[]),
         ("/upstreams", "POOL", &["u-alpha", "u-beta"]),
