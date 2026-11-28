@@ -15,7 +15,9 @@ use serde_json::{Value, json};
 use tracing::warn;
 use uuid::Uuid;
 
+use super::preconditions::{self, IfMatch};
 use super::{AdminState, PaginationParams};
+use crate::admin::jwt_auth::AdminKeyTier;
 use crate::tls::acme::{AcmeCertificateRecord, AcmeError, AcmeIssuedCertificateInput};
 #[cfg(feature = "acme")]
 use crate::tls::acme::{
@@ -222,6 +224,8 @@ pub(super) async fn handle_list_acme_certificates(
 }
 
 pub(super) async fn handle_get_acme_certificate(
+    state: &AdminState,
+    key_tier: AdminKeyTier,
     id: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let store = match acme_certificate_store_response() {
@@ -229,9 +233,13 @@ pub(super) async fn handle_get_acme_certificate(
         Err(response) => return Ok(*response),
     };
     match store.get_certificate(id) {
-        Ok(record) => Ok(super::json_response(
-            StatusCode::OK,
-            &json!(record.summary()),
+        Ok(record) => Ok(with_tls_record_etag(
+            super::json_response(StatusCode::OK, &json!(record.summary())),
+            state,
+            key_tier,
+            ACME_CERTIFICATE_ETAG_KIND,
+            &record.id,
+            &record,
         )),
         Err(error) => Ok(acme_error_response(error)),
     }
@@ -305,6 +313,8 @@ pub(super) async fn handle_list_acme_accounts(
 }
 
 pub(super) async fn handle_get_managed(
+    state: &AdminState,
+    key_tier: AdminKeyTier,
     kind: ManagedTlsMaterialKind,
     id: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
@@ -313,9 +323,13 @@ pub(super) async fn handle_get_managed(
         Err(response) => return Ok(*response),
     };
     match store.get(id) {
-        Ok(record) if record.kind == kind => Ok(super::json_response(
-            StatusCode::OK,
-            &json!(record.summary()),
+        Ok(record) if record.kind == kind => Ok(with_tls_record_etag(
+            super::json_response(StatusCode::OK, &json!(record.summary())),
+            state,
+            key_tier,
+            MANAGED_TLS_ETAG_KIND,
+            &record.id,
+            &record,
         )),
         Ok(record) => Ok(super::json_response(
             StatusCode::BAD_REQUEST,
@@ -336,6 +350,7 @@ pub(super) async fn handle_create_certificate(
     state: &AdminState,
     actor: &crate::admin::audit::AuditActor,
     body_bytes: &[u8],
+    if_match: Option<&IfMatch>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(response) = state.admit_non_config_db_write().await {
         return Ok(response);
@@ -357,7 +372,16 @@ pub(super) async fn handle_create_certificate(
             ));
         }
     };
-    Ok(respond_managed_upsert(state, actor, store, record, overwrite, StatusCode::CREATED).await)
+    Ok(respond_managed_upsert(
+        state,
+        actor,
+        store,
+        record,
+        overwrite,
+        TlsWritePrecondition::new(state, if_match),
+        StatusCode::CREATED,
+    )
+    .await)
 }
 
 pub(super) async fn handle_update_certificate(
@@ -365,6 +389,7 @@ pub(super) async fn handle_update_certificate(
     actor: &crate::admin::audit::AuditActor,
     id: &str,
     body_bytes: &[u8],
+    if_match: Option<&IfMatch>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(response) = state.admit_non_config_db_write().await {
         return Ok(response);
@@ -387,13 +412,21 @@ pub(super) async fn handle_update_certificate(
             ));
         }
     };
-    Ok(respond_managed_update(state, actor, store, record).await)
+    Ok(respond_managed_update(
+        state,
+        actor,
+        store,
+        record,
+        TlsWritePrecondition::new(state, if_match),
+    )
+    .await)
 }
 
 pub(super) async fn handle_create_ca_bundle(
     state: &AdminState,
     actor: &crate::admin::audit::AuditActor,
     body_bytes: &[u8],
+    if_match: Option<&IfMatch>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(response) = state.admit_non_config_db_write().await {
         return Ok(response);
@@ -415,7 +448,16 @@ pub(super) async fn handle_create_ca_bundle(
             ));
         }
     };
-    Ok(respond_managed_upsert(state, actor, store, record, overwrite, StatusCode::CREATED).await)
+    Ok(respond_managed_upsert(
+        state,
+        actor,
+        store,
+        record,
+        overwrite,
+        TlsWritePrecondition::new(state, if_match),
+        StatusCode::CREATED,
+    )
+    .await)
 }
 
 pub(super) async fn handle_update_ca_bundle(
@@ -423,6 +465,7 @@ pub(super) async fn handle_update_ca_bundle(
     actor: &crate::admin::audit::AuditActor,
     id: &str,
     body_bytes: &[u8],
+    if_match: Option<&IfMatch>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(response) = state.admit_non_config_db_write().await {
         return Ok(response);
@@ -445,13 +488,21 @@ pub(super) async fn handle_update_ca_bundle(
             ));
         }
     };
-    Ok(respond_managed_update(state, actor, store, record).await)
+    Ok(respond_managed_update(
+        state,
+        actor,
+        store,
+        record,
+        TlsWritePrecondition::new(state, if_match),
+    )
+    .await)
 }
 
 pub(super) async fn handle_create_crl(
     state: &AdminState,
     actor: &crate::admin::audit::AuditActor,
     body_bytes: &[u8],
+    if_match: Option<&IfMatch>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(response) = state.admit_non_config_db_write().await {
         return Ok(response);
@@ -473,7 +524,16 @@ pub(super) async fn handle_create_crl(
             ));
         }
     };
-    Ok(respond_managed_upsert(state, actor, store, record, overwrite, StatusCode::CREATED).await)
+    Ok(respond_managed_upsert(
+        state,
+        actor,
+        store,
+        record,
+        overwrite,
+        TlsWritePrecondition::new(state, if_match),
+        StatusCode::CREATED,
+    )
+    .await)
 }
 
 pub(super) async fn handle_update_crl(
@@ -481,6 +541,7 @@ pub(super) async fn handle_update_crl(
     actor: &crate::admin::audit::AuditActor,
     id: &str,
     body_bytes: &[u8],
+    if_match: Option<&IfMatch>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(response) = state.admit_non_config_db_write().await {
         return Ok(response);
@@ -502,13 +563,21 @@ pub(super) async fn handle_update_crl(
             ));
         }
     };
-    Ok(respond_managed_update(state, actor, store, record).await)
+    Ok(respond_managed_update(
+        state,
+        actor,
+        store,
+        record,
+        TlsWritePrecondition::new(state, if_match),
+    )
+    .await)
 }
 
 pub(super) async fn handle_create_ocsp_response(
     state: &AdminState,
     actor: &crate::admin::audit::AuditActor,
     body_bytes: &[u8],
+    if_match: Option<&IfMatch>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(response) = state.admit_non_config_db_write().await {
         return Ok(response);
@@ -530,7 +599,16 @@ pub(super) async fn handle_create_ocsp_response(
             ));
         }
     };
-    Ok(respond_managed_upsert(state, actor, store, record, overwrite, StatusCode::CREATED).await)
+    Ok(respond_managed_upsert(
+        state,
+        actor,
+        store,
+        record,
+        overwrite,
+        TlsWritePrecondition::new(state, if_match),
+        StatusCode::CREATED,
+    )
+    .await)
 }
 
 pub(super) async fn handle_update_ocsp_response(
@@ -538,6 +616,7 @@ pub(super) async fn handle_update_ocsp_response(
     actor: &crate::admin::audit::AuditActor,
     id: &str,
     body_bytes: &[u8],
+    if_match: Option<&IfMatch>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(response) = state.admit_non_config_db_write().await {
         return Ok(response);
@@ -560,13 +639,21 @@ pub(super) async fn handle_update_ocsp_response(
             ));
         }
     };
-    Ok(respond_managed_update(state, actor, store, record).await)
+    Ok(respond_managed_update(
+        state,
+        actor,
+        store,
+        record,
+        TlsWritePrecondition::new(state, if_match),
+    )
+    .await)
 }
 
 pub(super) async fn handle_create_jwks(
     state: &AdminState,
     actor: &crate::admin::audit::AuditActor,
     body_bytes: &[u8],
+    if_match: Option<&IfMatch>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(response) = state.admit_non_config_db_write().await {
         return Ok(response);
@@ -588,13 +675,23 @@ pub(super) async fn handle_create_jwks(
             ));
         }
     };
-    Ok(respond_managed_upsert(state, actor, store, record, overwrite, StatusCode::CREATED).await)
+    Ok(respond_managed_upsert(
+        state,
+        actor,
+        store,
+        record,
+        overwrite,
+        TlsWritePrecondition::new(state, if_match),
+        StatusCode::CREATED,
+    )
+    .await)
 }
 
 pub(super) async fn handle_create_acme_certificate(
     state: &AdminState,
     actor: &crate::admin::audit::AuditActor,
     body_bytes: &[u8],
+    if_match: Option<&IfMatch>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(response) = state.admit_non_config_db_write().await {
         return Ok(response);
@@ -616,17 +713,16 @@ pub(super) async fn handle_create_acme_certificate(
             ));
         }
     };
-    Ok(
-        respond_acme_certificate_upsert(
-            state,
-            actor,
-            store,
-            record,
-            overwrite,
-            StatusCode::CREATED,
-        )
-        .await,
+    Ok(respond_acme_certificate_upsert(
+        state,
+        actor,
+        store,
+        record,
+        overwrite,
+        TlsWritePrecondition::new(state, if_match),
+        StatusCode::CREATED,
     )
+    .await)
 }
 
 pub(super) async fn handle_create_acme_order(
@@ -1234,6 +1330,7 @@ pub(super) async fn handle_update_acme_certificate(
     actor: &crate::admin::audit::AuditActor,
     id: &str,
     body_bytes: &[u8],
+    if_match: Option<&IfMatch>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(response) = state.admit_non_config_db_write().await {
         return Ok(response);
@@ -1255,13 +1352,21 @@ pub(super) async fn handle_update_acme_certificate(
             ));
         }
     };
-    Ok(respond_acme_certificate_update(state, actor, store, record).await)
+    Ok(respond_acme_certificate_update(
+        state,
+        actor,
+        store,
+        record,
+        TlsWritePrecondition::new(state, if_match),
+    )
+    .await)
 }
 
 pub(super) async fn handle_delete_acme_certificate(
     state: &AdminState,
     actor: &crate::admin::audit::AuditActor,
     id: &str,
+    if_match: Option<&IfMatch>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(response) = state.admit_non_config_db_write().await {
         return Ok(response);
@@ -1282,16 +1387,10 @@ pub(super) async fn handle_delete_acme_certificate(
         Ok(found) => found,
         Err(response) => return Ok(*response),
     };
-    if !usage.is_empty() {
-        return Ok(super::json_response(
-            StatusCode::CONFLICT,
-            &json!({
-                "error": "ACME certificate is still referenced",
-                "id": id,
-                "used_by": usage,
-            }),
-        ));
-    }
+    // Carried into the locked delete so the authoritative existence check
+    // answers before the reference conflict.
+    let referenced = !usage.is_empty();
+    let precondition = TlsWritePrecondition::new(state, if_match);
     let owned_id = id.to_string();
     let settlement_state = state.clone();
     let settlement_actor = actor.clone();
@@ -1299,8 +1398,17 @@ pub(super) async fn handle_delete_acme_certificate(
         let delete_id = owned_id.clone();
         let deleted = match offload_store_write("acme_certificate_delete", move || {
             tls_store_delete_hook(&delete_id);
-            let deleted = store
-                .delete_certificate_if_authorized(&delete_id, tls_reference_fence_check(&fence));
+            let deleted = store.delete_certificate_if_authorized_and(
+                &delete_id,
+                referenced,
+                |current| {
+                    precondition.holds(
+                        ACME_CERTIFICATE_ETAG_KIND,
+                        Some((current.id.as_str(), current)),
+                    )
+                },
+                tls_reference_fence_check(&fence),
+            );
             drop(fence);
             deleted
         })
@@ -1310,6 +1418,14 @@ pub(super) async fn handle_delete_acme_certificate(
             Err(response) => return *response,
         };
         match deleted {
+            Err(AcmeError::CertificateStillReferenced(_)) => super::json_response(
+                StatusCode::CONFLICT,
+                &json!({
+                    "error": "ACME certificate is still referenced",
+                    "id": owned_id,
+                    "used_by": usage,
+                }),
+            ),
             Ok(None) => tls_reference_fence_lost_response(),
             Ok(Some(record)) => {
                 request_managed_source_reloads();
@@ -1494,6 +1610,7 @@ pub(super) async fn handle_update_jwks(
     actor: &crate::admin::audit::AuditActor,
     id: &str,
     body_bytes: &[u8],
+    if_match: Option<&IfMatch>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(response) = state.admit_non_config_db_write().await {
         return Ok(response);
@@ -1515,7 +1632,14 @@ pub(super) async fn handle_update_jwks(
             ));
         }
     };
-    Ok(respond_managed_update(state, actor, store, record).await)
+    Ok(respond_managed_update(
+        state,
+        actor,
+        store,
+        record,
+        TlsWritePrecondition::new(state, if_match),
+    )
+    .await)
 }
 
 pub(super) async fn handle_delete_managed(
@@ -1523,6 +1647,7 @@ pub(super) async fn handle_delete_managed(
     actor: &crate::admin::audit::AuditActor,
     kind: ManagedTlsMaterialKind,
     id: &str,
+    if_match: Option<&IfMatch>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Err(response) = state.admit_non_config_db_write().await {
         return Ok(response);
@@ -1542,17 +1667,13 @@ pub(super) async fn handle_delete_managed(
         Ok(found) => found,
         Err(response) => return Ok(*response),
     };
-    if !usage.is_empty() {
-        return Ok(super::json_response(
-            StatusCode::CONFLICT,
-            &json!({
-                "error": "managed TLS record is still referenced",
-                "id": id,
-                "used_by": usage,
-            }),
-        ));
-    }
+    // The scan verdict is carried into the locked delete rather than answered
+    // here: the scan matches the id under any kind, so the authoritative
+    // existence and kind checks must answer first (a record replaced under
+    // another kind is a kind mismatch, not this route's reference conflict).
+    let referenced = !usage.is_empty();
     let (resource_type, path_segment, refresh_jwks) = managed_tls_audit_metadata(kind);
+    let precondition = TlsWritePrecondition::new(state, if_match);
     let owned_id = id.to_string();
     let settlement_state = state.clone();
     let settlement_actor = actor.clone();
@@ -1560,9 +1681,13 @@ pub(super) async fn handle_delete_managed(
         let delete_id = owned_id.clone();
         let deleted = match offload_store_write("managed_tls_delete", move || {
             tls_store_delete_hook(&delete_id);
-            let deleted = store.delete_kind_if_authorized(
+            let deleted = store.delete_kind_if_authorized_and(
                 &delete_id,
                 kind,
+                referenced,
+                |current| {
+                    precondition.holds(MANAGED_TLS_ETAG_KIND, Some((current.id.as_str(), current)))
+                },
                 tls_reference_fence_check(&fence),
             );
             drop(fence);
@@ -1574,6 +1699,14 @@ pub(super) async fn handle_delete_managed(
             Err(response) => return *response,
         };
         match deleted {
+            Err(ManagedTlsError::StillReferenced(_)) => super::json_response(
+                StatusCode::CONFLICT,
+                &json!({
+                    "error": "managed TLS record is still referenced",
+                    "id": owned_id,
+                    "used_by": usage,
+                }),
+            ),
             Ok(None) => tls_reference_fence_lost_response(),
             Ok(Some(record)) => {
                 request_managed_source_reloads();
@@ -2363,6 +2496,107 @@ fn managed_tls_audit_metadata(kind: ManagedTlsMaterialKind) -> (&'static str, &'
     }
 }
 
+/// Resource kind bound into the `ETag` MAC of a managed TLS record
+/// (certificates, CA bundles, CRLs, OCSP responses, JWKS share one id space).
+const MANAGED_TLS_ETAG_KIND: &str = "managed_tls_record";
+
+/// Resource kind bound into the `ETag` MAC of an ACME certificate record.
+const ACME_CERTIFICATE_ETAG_KIND: &str = "acme_certificate";
+
+/// The strong `ETag` of a stored TLS record, using the same derivation as the
+/// configuration resources (`preconditions::resource_etag`): an HMAC keyed
+/// from `FERRUM_ADMIN_JWT_SECRET` over the canonical rendering of the whole
+/// stored record. The record holds private key and other secret material, so
+/// the tag is keyed rather than a plain digest — an unkeyed digest would be an
+/// offline oracle for guessing that material. The TLS stores are global, so
+/// the tag is bound to the default namespace.
+fn tls_record_etag<T: serde::Serialize>(
+    key: &crate::fips::approved::HmacSha256Key,
+    resource_kind: &str,
+    id: &str,
+    record: &T,
+) -> Option<String> {
+    let representation = serde_json::to_value(record).ok()?;
+    Some(preconditions::resource_etag(
+        key,
+        resource_kind,
+        crate::config::types::DEFAULT_NAMESPACE,
+        id,
+        &representation,
+    ))
+}
+
+/// Attach the record's `ETag` to a `GET` response.
+///
+/// As on `GET /proxies/{id}` and the other conditional resources, the tag is
+/// issued only to a token the primary admin key verified: it is keyed by that
+/// secret, and a viewer-key token (which can never write) has no use for it
+/// (GHSA-crqx-mp2f-v8c8).
+fn with_tls_record_etag<T: serde::Serialize>(
+    mut response: Response<Full<Bytes>>,
+    state: &AdminState,
+    key_tier: AdminKeyTier,
+    resource_kind: &str,
+    id: &str,
+    record: &T,
+) -> Response<Full<Bytes>> {
+    if key_tier != AdminKeyTier::Primary {
+        return response;
+    }
+    if let Some(key) = state.jwt_manager.resource_etag_key()
+        && let Some(tag) = tls_record_etag(&key, resource_kind, id, record)
+        && let Ok(value) = hyper::header::HeaderValue::from_str(&preconditions::quoted(&tag))
+    {
+        response.headers_mut().insert(hyper::header::ETAG, value);
+    }
+    response
+}
+
+/// An `If-Match` precondition carried into a TLS store mutation.
+///
+/// It is evaluated by the store against the authoritative record *inside*
+/// the exclusive cross-process lock that commits the write
+/// (`tls::shared_store::SharedStoreFile::mutate`), never by a read in the
+/// handler, so no writer on this or any other instance sharing the store can
+/// commit between the comparison and the write. With no `If-Match` the write
+/// is unconditional, exactly as before.
+struct TlsWritePrecondition {
+    if_match: Option<IfMatch>,
+    key: Option<crate::fips::approved::HmacSha256Key>,
+}
+
+impl TlsWritePrecondition {
+    fn new(state: &AdminState, if_match: Option<&IfMatch>) -> Self {
+        let if_match = if_match.cloned();
+        let key = if if_match.is_some() {
+            state.jwt_manager.resource_etag_key()
+        } else {
+            None
+        };
+        Self { if_match, key }
+    }
+
+    /// Whether the write may proceed against `current` (the id and the
+    /// authoritative stored record, `None` when the id is free).
+    ///
+    /// Absent `If-Match` always holds. A present one never holds without a
+    /// current record (RFC 9110 §13.1.1, `*` included), and a specific tag
+    /// cannot be verified when no tag key is configured.
+    fn holds<T: serde::Serialize>(&self, resource_kind: &str, current: Option<(&str, &T)>) -> bool {
+        let Some(if_match) = self.if_match.as_ref() else {
+            return true;
+        };
+        let Some((id, current)) = current else {
+            return false;
+        };
+        let tag = self
+            .key
+            .as_ref()
+            .and_then(|key| tls_record_etag(key, resource_kind, id, current));
+        if_match.matches(tag.as_deref())
+    }
+}
+
 /// Persist a managed TLS record off the runtime worker inside a detached
 /// settlement task so client cancellation cannot drop watcher reload
 /// notification, JWKS consumer refresh, or the success audit.
@@ -2372,6 +2606,7 @@ async fn respond_managed_upsert(
     store: Arc<crate::tls::managed::ManagedTlsStore>,
     record: ManagedTlsRecord,
     overwrite: bool,
+    precondition: TlsWritePrecondition,
     success: StatusCode,
 ) -> Response<Full<Bytes>> {
     let (resource_type, path_segment, refresh_jwks) = managed_tls_audit_metadata(record.kind);
@@ -2379,7 +2614,12 @@ async fn respond_managed_upsert(
     let settlement_actor = actor.clone();
     let settlement = crate::admin::audit::spawn_with_request_slot(async move {
         let outcome = match offload_store_write("managed_tls_upsert", move || {
-            store.upsert(record, overwrite)
+            store.upsert_if(record, overwrite, |current| {
+                precondition.holds(
+                    MANAGED_TLS_ETAG_KIND,
+                    current.map(|current| (current.id.as_str(), current)),
+                )
+            })
         })
         .await
         {
@@ -2428,18 +2668,22 @@ async fn respond_managed_update(
     actor: &crate::admin::audit::AuditActor,
     store: Arc<crate::tls::managed::ManagedTlsStore>,
     record: ManagedTlsRecord,
+    precondition: TlsWritePrecondition,
 ) -> Response<Full<Bytes>> {
     let (resource_type, path_segment, refresh_jwks) = managed_tls_audit_metadata(record.kind);
     let settlement_state = state.clone();
     let settlement_actor = actor.clone();
     let settlement = crate::admin::audit::spawn_with_request_slot(async move {
-        let outcome =
-            match offload_store_write("managed_tls_update", move || store.update_existing(record))
-                .await
-            {
-                Ok(outcome) => outcome,
-                Err(response) => return *response,
-            };
+        let outcome = match offload_store_write("managed_tls_update", move || {
+            store.update_existing_if(record, |current| {
+                precondition.holds(MANAGED_TLS_ETAG_KIND, Some((current.id.as_str(), current)))
+            })
+        })
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(response) => return *response,
+        };
         match outcome {
             Ok(record) => {
                 request_managed_source_reloads();
@@ -2483,13 +2727,19 @@ async fn respond_acme_certificate_upsert(
     store: Arc<crate::tls::acme::AcmeCertificateStore>,
     record: AcmeCertificateRecord,
     overwrite: bool,
+    precondition: TlsWritePrecondition,
     success: StatusCode,
 ) -> Response<Full<Bytes>> {
     let settlement_state = state.clone();
     let settlement_actor = actor.clone();
     let settlement = crate::admin::audit::spawn_with_request_slot(async move {
         let outcome = match offload_store_write("acme_certificate_upsert", move || {
-            store.upsert_certificate(record, overwrite)
+            store.upsert_certificate_if(record, overwrite, |current| {
+                precondition.holds(
+                    ACME_CERTIFICATE_ETAG_KIND,
+                    current.map(|current| (current.id.as_str(), current)),
+                )
+            })
         })
         .await
         {
@@ -2535,12 +2785,18 @@ async fn respond_acme_certificate_update(
     actor: &crate::admin::audit::AuditActor,
     store: Arc<crate::tls::acme::AcmeCertificateStore>,
     record: AcmeCertificateRecord,
+    precondition: TlsWritePrecondition,
 ) -> Response<Full<Bytes>> {
     let settlement_state = state.clone();
     let settlement_actor = actor.clone();
     let settlement = crate::admin::audit::spawn_with_request_slot(async move {
         let outcome = match offload_store_write("acme_certificate_update", move || {
-            store.update_existing_certificate(record)
+            store.update_existing_certificate_if(record, |current| {
+                precondition.holds(
+                    ACME_CERTIFICATE_ETAG_KIND,
+                    Some((current.id.as_str(), current)),
+                )
+            })
         })
         .await
         {
@@ -2760,6 +3016,12 @@ fn managed_error_response(error: ManagedTlsError) -> Response<Full<Bytes>> {
         ManagedTlsError::AlreadyExists(_) | ManagedTlsError::KindConflict { .. } => {
             StatusCode::CONFLICT
         }
+        // Same status and envelope as a stale `If-Match` on `/proxies/{id}`;
+        // the rendering names only the record id, never its material.
+        ManagedTlsError::PreconditionFailed(_) => StatusCode::PRECONDITION_FAILED,
+        // The delete handler renders this with its `used_by` list; this
+        // mapping is the fallback for any other caller.
+        ManagedTlsError::StillReferenced(_) => StatusCode::CONFLICT,
         ManagedTlsError::InvalidId(_)
         | ManagedTlsError::InvalidPath(_)
         | ManagedTlsError::MissingMaterial { .. }
@@ -2795,6 +3057,8 @@ fn acme_error_response(error: AcmeError) -> Response<Full<Bytes>> {
         AcmeError::OrderNotFound(_) => StatusCode::NOT_FOUND,
         AcmeError::AlreadyExists(_) => StatusCode::CONFLICT,
         AcmeError::OrderAlreadyExists(_) => StatusCode::CONFLICT,
+        AcmeError::CertificatePreconditionFailed(_) => StatusCode::PRECONDITION_FAILED,
+        AcmeError::CertificateStillReferenced(_) => StatusCode::CONFLICT,
         // The request is well-formed but the stored order's lifecycle state
         // forbids it (a terminal order cannot be reopened).
         AcmeError::IllegalOrderTransition { .. } => StatusCode::CONFLICT,
@@ -3911,6 +4175,65 @@ fn tls_record_usage_unavailable_response() -> Response<Full<Bytes>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The production tag helper must tell apart two records that differ
+    /// only by their store revision — same material, same clock-derived
+    /// timestamps — so no write can leave an earlier tag valid, and the
+    /// precondition must honour exactly that distinction.
+    #[test]
+    fn tls_record_tag_changes_with_the_revision_alone() {
+        let key = preconditions::etag_key("tls-record-tag-test-secret-0123456789abcdef")
+            .expect("tag key");
+        let mut first = ManagedTlsRecord::new_ca_bundle(
+            "rev-ca".to_string(),
+            "rev-ca".to_string(),
+            None,
+            "pem".to_string(),
+        );
+        first.revision = 3;
+        let mut second = first.clone();
+        second.revision = 4;
+        let first_tag =
+            tls_record_etag(&key, MANAGED_TLS_ETAG_KIND, "rev-ca", &first).expect("tag");
+        assert_eq!(
+            Some(first_tag.clone()),
+            tls_record_etag(&key, MANAGED_TLS_ETAG_KIND, "rev-ca", &first.clone()),
+            "one representation, one tag"
+        );
+        assert_ne!(
+            Some(first_tag.clone()),
+            tls_record_etag(&key, MANAGED_TLS_ETAG_KIND, "rev-ca", &second),
+            "a revision bump alone must change the tag"
+        );
+        let precondition = TlsWritePrecondition {
+            if_match: Some(IfMatch::Tags(vec![preconditions::EntityTag {
+                weak: false,
+                opaque: first_tag,
+            }])),
+            key: Some(key.clone()),
+        };
+        assert!(precondition.holds(MANAGED_TLS_ETAG_KIND, Some(("rev-ca", &first))));
+        assert!(!precondition.holds(MANAGED_TLS_ETAG_KIND, Some(("rev-ca", &second))));
+
+        let mut certificate = AcmeCertificateRecord::new_issued(AcmeIssuedCertificateInput {
+            id: "rev-cert".to_string(),
+            domains: vec!["example.com".to_string()],
+            directory_url: "https://acme.example/directory".to_string(),
+            account_id: None,
+            order_url: None,
+            cert_pem: "cert".to_string(),
+            key_pem: "key".to_string(),
+            chain_pem: None,
+        })
+        .expect("record");
+        certificate.revision = 1;
+        let mut renewed = certificate.clone();
+        renewed.revision = 2;
+        assert_ne!(
+            tls_record_etag(&key, ACME_CERTIFICATE_ETAG_KIND, "rev-cert", &certificate),
+            tls_record_etag(&key, ACME_CERTIFICATE_ETAG_KIND, "rev-cert", &renewed)
+        );
+    }
 
     /// Issue #3737: a read-side whole-document refusal is shared-state
     /// unavailability and returns `500`; a candidate document rejected before

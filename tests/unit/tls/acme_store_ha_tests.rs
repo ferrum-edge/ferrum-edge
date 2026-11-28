@@ -455,3 +455,150 @@ fn ca_invalid_order_transition_applies_terminal_history_bound() {
         AcmeOrderStatus::Failed
     );
 }
+
+/// Conditional ACME certificate writes (the Admin API's `If-Match`): the
+/// precondition is evaluated under the exclusive store lock, so of two
+/// replicas replacing one certificate from the same read exactly one commits.
+#[test]
+fn conditional_certificate_replacement_from_two_instances_commits_exactly_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let seed = AcmeCertificateStore::open(dir.path()).expect("open seed");
+    seed.upsert_certificate(certificate("edge-cert", "pem-v0"), false)
+        .expect("seed");
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let handles: Vec<_> = ["pem-a", "pem-b"]
+        .into_iter()
+        .map(|pem| {
+            let path = dir.path().to_path_buf();
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let instance = AcmeCertificateStore::open(path).expect("open replica");
+                let seen = instance.get_certificate("edge-cert").expect("read");
+                barrier.wait();
+                let outcome = instance.update_existing_certificate_if(
+                    certificate("edge-cert", pem),
+                    |current| {
+                        current.cert_pem == seen.cert_pem && current.updated_at == seen.updated_at
+                    },
+                );
+                (pem, outcome)
+            })
+        })
+        .collect();
+    let outcomes: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("replica thread"))
+        .collect();
+    let winners: Vec<&str> = outcomes
+        .iter()
+        .filter(|(_, outcome)| outcome.is_ok())
+        .map(|(pem, _)| *pem)
+        .collect();
+    assert_eq!(winners.len(), 1, "{outcomes:?}");
+    assert!(outcomes.iter().any(|(_, outcome)| matches!(
+        outcome,
+        Err(AcmeError::CertificatePreconditionFailed(id)) if id == "edge-cert"
+    )));
+    assert_eq!(
+        seed.get_certificate("edge-cert")
+            .expect("read back")
+            .cert_pem,
+        winners[0]
+    );
+
+    // Refused overwrite and delete leave the record in place; a conditional
+    // overwrite of a free id never creates it.
+    assert!(matches!(
+        seed.upsert_certificate_if(certificate("edge-cert", "pem-stale"), true, |_| false),
+        Err(AcmeError::CertificatePreconditionFailed(_))
+    ));
+    assert!(matches!(
+        seed.delete_certificate_if_authorized_and("edge-cert", false, |_| false, || true),
+        Err(AcmeError::CertificatePreconditionFailed(_))
+    ));
+    assert_eq!(
+        seed.get_certificate("edge-cert").expect("kept").cert_pem,
+        winners[0]
+    );
+    assert!(matches!(
+        seed.upsert_certificate_if(certificate("free-cert", "pem"), true, |current| {
+            current.is_some()
+        }),
+        Err(AcmeError::CertificatePreconditionFailed(_))
+    ));
+    assert!(matches!(
+        seed.get_certificate("free-cert"),
+        Err(AcmeError::NotFound(_))
+    ));
+}
+
+/// Review F3/F4 for ACME certificates: a lapsed delete fence answers before
+/// the precondition, an existing id without `allow_overwrite` keeps its 409,
+/// and every write stamps a new revision even for identical material.
+#[test]
+fn certificate_writes_stamp_revisions_and_keep_rule_precedence() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = AcmeCertificateStore::open(dir.path()).expect("open");
+    let created = store
+        .upsert_certificate(certificate("rev-cert", "pem"), false)
+        .expect("create");
+    assert!(created.revision > 0);
+    let replaced = store
+        .update_existing_certificate_if(certificate("rev-cert", "pem"), |_| true)
+        .expect("same-material replacement");
+    assert!(replaced.revision > created.revision);
+    let renewed = store
+        .upsert_certificate(certificate("rev-cert", "pem"), true)
+        .expect("renewal-style overwrite");
+    assert!(renewed.revision > replaced.revision);
+
+    assert!(matches!(
+        store.upsert_certificate_if(certificate("rev-cert", "pem"), false, |_| false),
+        Err(AcmeError::AlreadyExists(_))
+    ));
+    assert!(matches!(
+        store.delete_certificate_if_authorized_and("rev-cert", false, |_| false, || false),
+        Ok(None)
+    ));
+    assert!(store.get_certificate("rev-cert").is_ok(), "nothing removed");
+}
+
+/// Review round 2, F1: an unstamped (legacy) ACME certificate record keeps
+/// its serialized shape, so rewriting the document for another record never
+/// grows it.
+#[test]
+fn an_unstamped_certificate_record_serializes_without_a_revision() {
+    let record = certificate("legacy-cert", "pem");
+    assert_eq!(record.revision, 0);
+    let value = serde_json::to_value(&record).expect("serialize");
+    assert!(value.get("revision").is_none(), "{value}");
+    let stamped = AcmeCertificateRecord {
+        revision: 7,
+        ..record
+    };
+    assert_eq!(
+        serde_json::to_value(&stamped).expect("serialize")["revision"],
+        serde_json::json!(7)
+    );
+}
+
+/// Review round 2, F3 for ACME certificates: a reference verdict never masks
+/// a missing record, and answers before a lapsed fence or a stale tag.
+#[test]
+fn a_certificate_reference_verdict_keeps_its_place_in_the_order() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = AcmeCertificateStore::open(dir.path()).expect("open");
+    store
+        .upsert_certificate(certificate("ref-cert", "pem"), false)
+        .expect("seed");
+    assert!(matches!(
+        store.delete_certificate_if_authorized_and("absent-cert", true, |_| false, || false),
+        Err(AcmeError::NotFound(_))
+    ));
+    assert!(matches!(
+        store.delete_certificate_if_authorized_and("ref-cert", true, |_| false, || false),
+        Err(AcmeError::CertificateStillReferenced(ref id)) if id == "ref-cert"
+    ));
+    assert!(store.get_certificate("ref-cert").is_ok());
+}
