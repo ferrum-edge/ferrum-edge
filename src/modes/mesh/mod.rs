@@ -4830,11 +4830,11 @@ fn decode_http_route_set(
             // `sourceNamespace` filtering or detachment can rewrite or drop it
             // (issue #7440). Otherwise a malformed instance on a route the
             // binding refuses would be dropped with the route, handing its
-            // host to the plain Service route (which serves requests the
-            // instance's match gate answers with 404), or have its offending
-            // destination rewritten into a valid one. A refusal rejects the
-            // slice, so the last accepted generation keeps serving. The
-            // record around the config is checked below, after the proxy
+            // host to any plain Service route (which serves requests the
+            // instance's match gate answers with 404 when one exists), or have
+            // its offending destination rewritten into a valid one. A refusal
+            // rejects the slice, so the last accepted generation keeps serving.
+            // The record around the config is checked below, after the proxy
             // associations are resolved.
             if plugin.plugin_name == "mesh_route_dispatch"
                 && crate::plugins::mesh_route_dispatch::MeshRouteDispatch::new(&plugin.config)

@@ -621,9 +621,9 @@ follows weighted splits, match dispatch, rewrites, retries, timeouts, faults and
 mirrors, exactly as on a NodeWaypoint.
 
 - A route whose destination is an in-cluster Service the Sidecar's slice does
-  not model is refused, and the host keeps its Service route. So is a route that
-  claims the Sidecar's own inbound route (same path and host); the inbound route
-  is always kept.
+  not model is refused, and the host keeps its Service route when one exists.
+  So is a route that claims the Sidecar's own inbound route (same path and
+  host); the inbound route is always kept.
 - `match.sourceNamespace` is decided from the Sidecar's own workload, per
   `match[]` condition. A condition naming another namespace is removed on its
   own, and its OR siblings, later rules and the route's unconditional fallback
@@ -638,8 +638,8 @@ mirrors, exactly as on a NodeWaypoint.
   the route. Plain Service traffic is unchanged.
 - A carried route whose direct or dispatch-rule destination is a Service in
   another namespace is refused on every topology, NodeWaypoint included, and its
-  host keeps the Service route. Before, such a route left a dangling upstream
-  reference that refused the whole configuration.
+  host keeps its Service route when one exists. Before, such a route left a
+  dangling upstream reference that refused the whole configuration.
 - Carried traffic shares the destination's DestinationRule `http2MaxRequests`
   and `http1MaxPendingRequests` budgets with plain Service traffic.
 - Destination AuthorizationPolicy and RequestAuthentication still apply at the
@@ -1483,7 +1483,7 @@ waypoint's namespace now take effect: their in-mesh destinations dial over the
 NodeWaypoint transport, a route whose destination is an in-cluster Service the
 waypoint does not model (including a two-label `<svc>.<ns>` host), or whose
 direct external backend has a TLS-originating or wildcard DestinationRule, is
-refused (the host keeps its Service route), a weighted split that names a
+refused (the host keeps its Service route when one exists), a weighted split that names a
 DestinationRule-governed Service or external host is dispatched leg by leg
 (#7387; see the section below), a malformed or empty `spec.gateways` no longer counts
 as `mesh`, and when a merged route's `mesh_route_dispatch` rules can select a

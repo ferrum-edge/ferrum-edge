@@ -6370,8 +6370,9 @@ fn resolve_destination_port(
             format!(
                 "VirtualService route.destination.host {:?} is not a recognized in-cluster \
                  service form; \
-                 port.name resolution only supports <svc>, <svc>.<ns>, <svc>.<ns>.svc, or \
-                 <svc>.<ns>.svc.{:?} (optional trailing dot)",
+                 port.name resolution only supports <svc>, <svc>.<ns> (relative; no trailing dot), \
+                 <svc>.<ns>.svc, or <svc>.<ns>.svc.{:?} (optional trailing dot on single-label \
+                 and .svc forms)",
                 host, cluster_domain
             ),
         ));
@@ -21239,13 +21240,15 @@ extensionProviders:
 
     #[test]
     fn vs_destination_port_name_accepts_trailing_dot_on_short_forms() {
-        // Trailing dot must apply uniformly across all accepted shapes, not
-        // only the 5-label FQDN. Otherwise an operator typing `reviews.` or
-        // `reviews.default.` gets an inconsistent rejection vs. the FQDN.
+        // Trailing dot applies to single-label and `.svc` Service forms; a
+        // rooted two-label host (`reviews.default.`) is an absolute external
+        // FQDN (matching cross-namespace admission and the mesh host
+        // classifier) and must be refused for Kubernetes named-port lookup
+        // even when a matching Service exists.
         let svc = service_with_named_ports("reviews", "default", &[("http", 8080)]);
         for host in [
             "reviews.",
-            "reviews.default.",
+            "reviews.default",
             "reviews.default.svc.",
             "reviews.default.svc.cluster.local.",
         ] {
@@ -21257,9 +21260,24 @@ extensionProviders:
                 }),
             );
             let result = translate_k8s_objects(&[svc.clone(), vs], options())
-                .unwrap_or_else(|e| panic!("trailing-dot host {host:?} must resolve: {e}"));
+                .unwrap_or_else(|e| panic!("supported host {host:?} must resolve: {e}"));
             assert_eq!(result.config.proxies[0].backend_port, 8080);
         }
+
+        let external_two_label = virtual_service_with_destination(
+            "reviews-external-vs",
+            serde_json::json!({
+                "host": "reviews.default.",
+                "port": {"name": "http"}
+            }),
+        );
+        let err = translate_k8s_objects(&[svc, external_two_label], options())
+            .expect_err("absolute two-label host must not resolve a Kubernetes Service port.name");
+        assert!(
+            err.to_string()
+                .contains("not a recognized in-cluster service form"),
+            "unexpected error for absolute two-label host: {err}"
+        );
     }
 
     #[test]
