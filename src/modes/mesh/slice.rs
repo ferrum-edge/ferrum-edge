@@ -4539,13 +4539,13 @@ fn node_waypoint_http_route_set(
 ///   A VirtualService in an unrelated third namespace is never admitted onto
 ///   another tenant's waypoint, even with `exportTo: ["*"]`;
 /// - every destination (direct backend, `mesh_route_dispatch` rule
-///   destination, weighted-split target) is a bound Service or an external
-///   host ([`service_waypoint_route_destination_admitted`]). A destination
-///   that is an unbound in-cluster Service is refused, so a route never
-///   reaches a Service this waypoint is not the terminator for. An
-///   authorized cross-namespace target (issue #7499) is not a bound Service
-///   and is refused here until that authorization contract exists; it never
-///   widens `bound_services` either way.
+///   destination, weighted-split target) is a bound Service in the route's own
+///   namespace or an external host
+///   ([`service_waypoint_route_destination_admitted`]). A destination that is
+///   an unbound in-cluster Service or a Service in another namespace (even
+///   when bound to this waypoint or ReferenceGrant-authorized under issue
+///   #7499 for Sidecar and NodeWaypoint) is refused here; a route never widens
+///   `bound_services` either way.
 ///
 /// The projection reads only the routes; the bound-Service set itself and the
 /// inbound relay inventory derived from it are never widened by a route.

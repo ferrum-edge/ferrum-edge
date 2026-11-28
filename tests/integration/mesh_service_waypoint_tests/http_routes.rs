@@ -191,7 +191,8 @@ fn translate_into(config: &mut GatewayConfig, namespace: &str, objects: &[K8sObj
             namespace.to_string(),
             TrustDomain::new("cluster.local").expect("trust domain"),
         )
-        .with_source_namespaces(Vec::new()),
+        .with_source_namespaces(Vec::new())
+        .with_pod_discovery_enabled(true),
     )
     .expect("VirtualService translates");
     let translated = translated.config;
@@ -205,6 +206,7 @@ fn translate_into(config: &mut GatewayConfig, namespace: &str, objects: &[K8sObj
         mesh.destination_rules
             .extend(translated_mesh.destination_rules);
         mesh.service_entries.extend(translated_mesh.service_entries);
+        mesh.sidecars.extend(translated_mesh.sidecars);
     }
 }
 
@@ -897,6 +899,22 @@ fn inbound_relay_destinations_never_widen_to_cross_namespace_split_legs() {
         WAYPOINT_NAMESPACE,
         "billing",
     ));
+    namespaces[0].1.push(K8sObject {
+        api_version: "networking.istio.io/v1".to_string(),
+        kind: "Sidecar".to_string(),
+        metadata: K8sMetadata {
+            name: "default".to_string(),
+            uid: String::new(),
+            namespace: WAYPOINT_NAMESPACE.to_string(),
+            generation: None,
+            labels: Default::default(),
+            annotations: Default::default(),
+            creation_timestamp: None,
+            deletion_timestamp: None,
+        },
+        spec: json!({"egress": [{"hosts": ["./*", format!("{PAYMENTS_NAMESPACE}/*")]}]}),
+        status: serde_json::Value::Object(serde_json::Map::new()),
+    });
     namespaces[0].1.push(virtual_service(
         "ratings-to-billing",
         WAYPOINT_NAMESPACE,
@@ -928,8 +946,11 @@ fn inbound_relay_destinations_never_widen_to_cross_namespace_split_legs() {
     //    rejected fail-closed at decode;
     // 2. stripping that metadata leaves the cross-namespace route refused at
     //    binding without widening the relay inventory.
-    let node_waypoint_request =
-        runtime_for_topology(MeshTopology::NodeWaypoint).mesh_slice_request();
+    let node_waypoint_request = MeshRuntimeConfig {
+        sidecar_enforced: true,
+        ..runtime_for_topology(MeshTopology::NodeWaypoint)
+    }
+    .mesh_slice_request();
     let node_waypoint = MeshSlice::from_gateway_config(&config, node_waypoint_request);
     assert!(
         carried_route_ids(&node_waypoint)
@@ -1005,7 +1026,7 @@ fn service_waypoint_rejects_cross_namespace_destination_workloads_at_decode() {
         .cross_namespace_destination_workloads
         .push(MeshHttpRouteDestinationWorkload {
             namespace: tenant_workload.namespace,
-            spiffe_id: tenant_workload.spiffe_id,
+            spiffe_id: tenant_workload.spiffe_id.as_str().to_string(),
         });
     assert!(
         prepare_gateway_config_from_mesh_slice(&slice, &runtime).is_err(),
