@@ -1599,3 +1599,755 @@ async fn backup_rejects_undecodable_duplicate_and_whitespace_filters() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Issue #7532: `ferrum-edge validate --backup` ⇔ `POST /restore`, stored spec
+// extension admission, and the namespace registry section.
+// ---------------------------------------------------------------------------
+
+async fn post_restore_in_namespace(
+    base: &str,
+    bearer: &str,
+    namespace: &str,
+    body: &str,
+) -> (u16, Value) {
+    let response = reqwest::Client::new()
+        .post(format!("{base}/restore?confirm=true"))
+        .bearer_auth(bearer)
+        .header("Content-Type", "application/json")
+        .header("X-Ferrum-Namespace", namespace)
+        .body(body.to_string())
+        .send()
+        .await
+        .expect("POST restore");
+    let status = response.status().as_u16();
+    let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+    (status, body)
+}
+
+fn backup_check(dir: &TempDir, namespace: &str, body: &str) -> Result<(), Vec<String>> {
+    let path = dir
+        .path()
+        .join(format!("backup-{}.json", uuid::Uuid::new_v4()));
+    std::fs::write(&path, body).unwrap();
+    // Mirrors `base_admin_state()`: unrestricted egress, 25 MiB specs, 100 MiB
+    // restore bodies, no `ProxyState`, no cached mesh.
+    ferrum_edge::_test_support::backup_export_check_for_test(
+        &path,
+        namespace,
+        ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        25,
+        100,
+    )
+}
+
+fn plain_proxy(id: &str, listen_path: &str) -> Value {
+    json!({
+        "id": id,
+        "listen_path": listen_path,
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": 8080
+    })
+}
+
+/// A backup `api_specs` item for `document`, owned by proxy `proxy_id`.
+fn spec_item(spec_id: &str, proxy_id: &str, document: &Value) -> Value {
+    use base64::Engine as _;
+    let raw = serde_json::to_vec(document).unwrap();
+    let compressed = ferrum_edge::admin::spec_codec::compress_gzip(&raw).unwrap();
+    json!({
+        "id": spec_id,
+        "proxy_id": proxy_id,
+        "spec_version": document["openapi"],
+        "spec_format": "json",
+        "spec_content_base64": base64::engine::general_purpose::STANDARD.encode(&compressed),
+        "content_encoding": "gzip",
+        "uncompressed_size": raw.len(),
+        "content_hash": ferrum_edge::admin::spec_codec::sha256_hex(&raw),
+        "title": "t",
+        "info_version": "1",
+        "resource_hash": "a".repeat(64),
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z"
+    })
+}
+
+fn spec_backup(upstream_extension: Option<Value>) -> Value {
+    let mut document = json!({
+        "openapi": "3.0.3",
+        "info": {"title": "t", "version": "1"},
+        "paths": {},
+        "x-ferrum-proxy": {
+            "id": "spec-proxy",
+            "listen_path": "/spec",
+            "backend_host": "127.0.0.1",
+            "backend_port": 8080
+        }
+    });
+    if let Some(upstream) = upstream_extension {
+        document["x-ferrum-upstream"] = upstream;
+    }
+    let mut proxy = plain_proxy("spec-proxy", "/spec");
+    proxy["api_spec_id"] = json!("spec-1");
+    json!({
+        "version": "1",
+        "proxies": [proxy],
+        "api_specs": {
+            "section_version": "2",
+            "items": [spec_item("spec-1", "spec-proxy", &document)]
+        }
+    })
+}
+
+/// [`spec_backup`] with its stored document edited by `edit` (the
+/// materialized resources are unchanged, so only the stored document's own
+/// admission decides the verdict).
+fn spec_backup_with_document(edit: impl FnOnce(&mut Value)) -> Value {
+    let mut document = json!({
+        "openapi": "3.0.3",
+        "info": {"title": "t", "version": "1"},
+        "paths": {},
+        "x-ferrum-proxy": {
+            "id": "spec-proxy",
+            "listen_path": "/spec",
+            "backend_host": "127.0.0.1",
+            "backend_port": 8080
+        }
+    });
+    edit(&mut document);
+    let mut backup = spec_backup(None);
+    backup["api_specs"]["items"][0] = spec_item("spec-1", "spec-proxy", &document);
+    backup
+}
+
+/// One admin request with the namespace and `If-Match` headers a
+/// conditional backup/restore needs. Returns the status, JSON body and `ETag`.
+async fn admin_request(
+    method: reqwest::Method,
+    base: &str,
+    path: &str,
+    bearer: &str,
+    namespace: Option<&str>,
+    if_match: Option<&str>,
+    body: Option<String>,
+) -> (u16, Value, Option<String>) {
+    let mut request = reqwest::Client::new()
+        .request(method, format!("{base}{path}"))
+        .bearer_auth(bearer);
+    if let Some(namespace) = namespace {
+        request = request.header("X-Ferrum-Namespace", namespace);
+    }
+    if let Some(if_match) = if_match {
+        request = request.header("If-Match", if_match);
+    }
+    if let Some(body) = body {
+        request = request
+            .header("Content-Type", "application/json")
+            .body(body);
+    }
+    let response = request.send().await.expect("admin request");
+    let status = response.status().as_u16();
+    let etag = response
+        .headers()
+        .get("etag")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+    (status, body, etag)
+}
+
+/// The invariant of issue #7532: on the same build, the offline backup check
+/// accepts a payload exactly when `POST /restore` accepts it, section by
+/// section — resources, trust bundles, API specs (including each stored
+/// document's extension admission) and the namespace registry row.
+#[tokio::test]
+async fn backup_export_check_agrees_with_restore_for_every_section() {
+    let tmp = TempDir::new().unwrap();
+    let (base, _shutdown) = start_admin(admin_state(make_store(&tmp).await)).await;
+    let admin = token("preflight-admin", Some("admin"));
+    let trust_record = json!({
+        "trust_domain": "example.org",
+        "bundle": {"local": {
+            "trust_domain": "example.org",
+            "jwt_authorities": [{"key_id": "k1", "public_key_pem": "pem"}]
+        }}
+    });
+
+    let cases: Vec<(&str, Value, bool)> = vec![
+        (
+            "valid resources",
+            json!({"version": "1", "proxies": [plain_proxy("p1", "/a")]}),
+            true,
+        ),
+        ("explicit empty", json!({}), true),
+        (
+            "unknown envelope key",
+            json!({"version": "1", "proxise": []}),
+            false,
+        ),
+        ("incompatible version", json!({"version": "9"}), false),
+        (
+            "missing resource id",
+            json!({"proxies": [{"listen_path": "/a", "backend_host": "h", "backend_port": 1}]}),
+            false,
+        ),
+        (
+            "nested unknown key",
+            json!({"upstreams": [{
+                "id": "u1",
+                "targets": [{"host": "127.0.0.1", "port": 8080}],
+                "health_checks": {"pasive": {"unhealthy_threshold": 1}}
+            }]}),
+            false,
+        ),
+        (
+            "trust bundles not a singleton",
+            json!({"gateway_trust_bundles": [trust_record.clone(), trust_record.clone()]}),
+            false,
+        ),
+        ("api spec admitted", spec_backup(None), true),
+        (
+            "api spec with a removed passive-health key",
+            spec_backup(Some(json!({
+                "id": "spec-upstream",
+                "targets": [{"host": "127.0.0.1", "port": 8080}],
+                "health_checks": {"passive": {"gateway_error_codes": [502]}}
+            }))),
+            false,
+        ),
+        (
+            "api spec with an unknown proxy key",
+            {
+                let mut backup = spec_backup(None);
+                // Re-encode the document with a stale proxy extension key.
+                let document = json!({
+                    "openapi": "3.0.3",
+                    "info": {"title": "t", "version": "1"},
+                    "paths": {},
+                    "x-ferrum-proxy": {
+                        "id": "spec-proxy",
+                        "listen_path": "/spec",
+                        "backend_host": "127.0.0.1",
+                        "backend_port": 8080,
+                        "pool_max_requests_per_connection": 10
+                    }
+                });
+                backup["api_specs"]["items"][0] = spec_item("spec-1", "spec-proxy", &document);
+                backup
+            },
+            false,
+        ),
+        (
+            "api spec with a non-object x-ferrum-validate side",
+            spec_backup_with_document(|document| {
+                document["x-ferrum-validate"] = json!({"request": true});
+            }),
+            false,
+        ),
+        (
+            "api spec with a non-boolean x-ferrum-validate import flag",
+            spec_backup_with_document(|document| {
+                document["x-ferrum-validate"] = json!({"reject_unsupported_parameters": "yes"});
+            }),
+            false,
+        ),
+        (
+            "api spec with a malformed x-ferrum-validate bypass",
+            spec_backup_with_document(|document| {
+                document["x-ferrum-validate"] = json!({"bypass": {"paths": "/health"}});
+            }),
+            false,
+        ),
+        (
+            "api spec with a well-formed x-ferrum-validate object",
+            spec_backup_with_document(|document| {
+                document["x-ferrum-validate"] = json!({
+                    "request": {"enabled": true},
+                    "reject_unsupported_parameters": true
+                });
+            }),
+            true,
+        ),
+        (
+            "api spec whose x-ferrum-mcp endpoint the proxy cannot serve",
+            spec_backup_with_document(|document| {
+                document["x-ferrum-proxy"]["allowed_methods"] = json!(["GET"]);
+                document["x-ferrum-mcp"] = json!(true);
+            }),
+            false,
+        ),
+        (
+            "namespace registry with an unknown section version",
+            json!({"namespace_registry": {"section_version": "2", "name": "tenant"}}),
+            false,
+        ),
+        (
+            "namespace registry with an unknown member",
+            json!({"namespace_registry": {
+                "section_version": "1", "name": "tenant", "descripton": "typo"
+            }}),
+            false,
+        ),
+        (
+            "namespace registry admitted",
+            json!({"namespace_registry": {
+                "section_version": "1", "name": "tenant", "description": "Tenant"
+            }}),
+            true,
+        ),
+    ];
+
+    for (index, (label, payload, expected)) in cases.into_iter().enumerate() {
+        let namespace = format!("preflight-{index}");
+        let body = payload.to_string();
+        let checked = backup_check(&tmp, &namespace, &body);
+        let (status, response) = post_restore_in_namespace(&base, &admin, &namespace, &body).await;
+        assert_eq!(
+            checked.is_ok(),
+            expected,
+            "{label}: offline check verdict {checked:?}"
+        );
+        assert_eq!(
+            status == 200,
+            expected,
+            "{label}: restore answered {status}: {response}"
+        );
+        if !expected {
+            assert_eq!(status, 400, "{label}: restore refusal is a 400: {response}");
+        }
+    }
+}
+
+/// A missing file and a file over the restore body limit are refused by the
+/// check, as restore refuses an oversized body with `413`.
+#[tokio::test]
+async fn backup_export_check_refuses_missing_and_oversized_files() {
+    let tmp = TempDir::new().unwrap();
+    let missing = ferrum_edge::_test_support::backup_export_check_for_test(
+        &tmp.path().join("no-such-backup.json"),
+        "ferrum",
+        ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        25,
+        100,
+    )
+    .expect_err("a missing file must fail the check");
+    assert!(missing[0].contains("not found"), "{missing:?}");
+
+    let oversized = json!({"version": "1", "padding": "x".repeat(1024 * 1024 + 16)}).to_string();
+    let path = tmp.path().join("oversized.json");
+    std::fs::write(&path, &oversized).unwrap();
+    let refused = ferrum_edge::_test_support::backup_export_check_for_test(
+        &path,
+        "ferrum",
+        ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        25,
+        1,
+    )
+    .expect_err("a file over the restore body limit must fail the check");
+    assert!(refused[0].contains("body limit"), "{refused:?}");
+
+    let mut state = admin_state(make_store(&tmp).await);
+    state.admin_restore_max_body_size_mib = 1;
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("preflight-admin", Some("admin"));
+    let (status, _) = post_restore_in_namespace(&base, &admin, "ferrum", &oversized).await;
+    assert_eq!(status, 413, "restore refuses the same body by size");
+}
+
+/// `GET /backup` carries the namespace registry row, and restoring the export
+/// into the same namespace on an empty database recreates it, including for a
+/// registered namespace that holds no resources. A different target namespace
+/// is never relabelled with the source's row.
+#[tokio::test]
+async fn namespace_registry_row_round_trips_through_backup_and_restore() {
+    let tmp = TempDir::new().unwrap();
+    let (source, _source_shutdown) = start_admin(admin_state(make_store(&tmp).await)).await;
+    let admin = token("registry-admin", Some("admin"));
+    let (status, created) = post_admin_raw(
+        &source,
+        "/namespaces",
+        &admin,
+        &json!({"name": "tenant-a", "description": "Tenant A production"}).to_string(),
+    )
+    .await;
+    assert_eq!(status, 201, "create namespace: {created}");
+
+    let (status, backup, _) =
+        get_backup_with_headers(&source, "/backup", &admin, None, None, Some("tenant-a")).await;
+    assert_eq!(status, 200, "backup: {backup}");
+    assert_eq!(
+        backup["namespace_registry"],
+        json!({
+            "section_version": "1",
+            "name": "tenant-a",
+            "description": "Tenant A production"
+        }),
+        "a full export carries the registry row: {backup}"
+    );
+    // A filtered export omits it.
+    let (status, filtered, _) = get_backup_with_headers(
+        &source,
+        "/backup?resources=proxies",
+        &admin,
+        None,
+        None,
+        Some("tenant-a"),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(filtered.get("namespace_registry").is_none(), "{filtered}");
+
+    let body = backup.to_string();
+    backup_check(&tmp, "tenant-a", &body).expect("the export passes the offline check");
+
+    // Rebuild: an empty database, the same namespace.
+    let (target, _target_shutdown) = start_admin(admin_state(make_store(&tmp).await)).await;
+    let (status, restored) = post_restore_in_namespace(&target, &admin, "tenant-a", &body).await;
+    assert_eq!(status, 200, "restore: {restored}");
+    let (status, row) = get_admin_json(&target, "/namespaces/tenant-a", &admin).await;
+    assert_eq!(status, 200, "the registry row is recreated: {row}");
+    assert_eq!(row["description"], "Tenant A production");
+
+    // A different target is not relabelled with tenant-a's row.
+    let (status, restored) = post_restore_in_namespace(&target, &admin, "tenant-b", &body).await;
+    assert_eq!(status, 200, "cross-namespace restore: {restored}");
+    let (status, row) = get_admin_json(&target, "/namespaces/tenant-b", &admin).await;
+    assert_ne!(
+        row["description"], "Tenant A production",
+        "a cross-namespace restore must not copy the source registry row ({status}): {row}"
+    );
+}
+
+/// Database-mode restore validates plugins with the serving node's client,
+/// which runs node-local egress checks; the offline check on the same
+/// database-mode environment must refuse what that restore refuses, and the
+/// control-plane-shaped check (no serving node) must accept what a control
+/// plane accepts (issue #7532, review F5).
+#[tokio::test]
+async fn backup_export_check_agrees_with_database_mode_restore_on_serving_node_plugins() {
+    use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy, EnvConfig, OperatingMode};
+    use ferrum_edge::dns::{DnsCache, DnsConfig};
+    use ferrum_edge::proxy::ProxyState;
+
+    let tmp = TempDir::new().unwrap();
+    // Public-only egress denies loopback, which `load_testing` dials.
+    let policy = BackendEgressPolicy::from_allow_ips(BackendAllowIps::Public);
+    let env = EnvConfig {
+        mode: OperatingMode::Database,
+        namespace: "ferrum".to_string(),
+        backend_allow_ips: policy.clone(),
+        admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
+        ..Default::default()
+    };
+    let (proxy_state, _health_checks) = ProxyState::new(
+        GatewayConfig::default(),
+        DnsCache::new(DnsConfig::default()),
+        env.clone(),
+        None,
+        None,
+    )
+    .unwrap();
+    let mut state = admin_state(make_store(&tmp).await);
+    state.backend_allow_ips = policy;
+    state.proxy_state = Some(proxy_state);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("preflight-admin", Some("admin"));
+
+    let body = json!({
+        "version": "1",
+        "plugin_configs": [{
+            "id": "load-test",
+            "plugin_name": "load_testing",
+            "scope": "global",
+            "enabled": true,
+            "config": {
+                "key": "test-load-key-0123456789abcdef!!",
+                "concurrent_clients": 1,
+                "duration_seconds": 1,
+                "gateway_port": 8000
+            }
+        }]
+    })
+    .to_string();
+    let path = tmp.path().join("serving-node-plugin.json");
+    std::fs::write(&path, &body).unwrap();
+
+    let (status, response) = post_restore_in_namespace(&base, &admin, "ferrum", &body).await;
+    assert_eq!(
+        status, 400,
+        "database-mode restore refuses loopback egress: {response}"
+    );
+    let offline =
+        ferrum_edge::_test_support::backup_export_check_with_env_for_test(&path, &env, true)
+            .expect_err("the database-mode offline check must refuse what restore refuses");
+    assert!(
+        offline
+            .iter()
+            .any(|message| message.contains("load_testing")),
+        "{offline:?}"
+    );
+    // A control plane admits config for other nodes and checks shape only.
+    ferrum_edge::_test_support::backup_export_check_with_env_for_test(&path, &env, false)
+        .expect("the control-plane offline check accepts what a control plane accepts");
+}
+
+/// Restore hashes plaintext Basic-auth passwords with
+/// `FERRUM_BASIC_AUTH_HMAC_SECRET` before anything is deleted; the offline
+/// check runs the same preparation, so it refuses exactly when restore does
+/// (issue #7532, review F6). The process environment is not mutated: the
+/// verdicts must agree whichever way this environment is configured.
+#[tokio::test]
+async fn backup_export_check_agrees_with_restore_on_basic_auth_preparation() {
+    let tmp = TempDir::new().unwrap();
+    let (base, _shutdown) = start_admin(admin_state(make_store(&tmp).await)).await;
+    let admin = token("preflight-admin", Some("admin"));
+    let body = json!({
+        "version": "1",
+        "consumers": [{
+            "id": "basic-consumer",
+            "username": "basic-user",
+            "credentials": {"basicauth": [{"password": "plaintext-password-0123456789"}]}
+        }]
+    })
+    .to_string();
+    let offline = backup_check(&tmp, "ferrum", &body);
+    let (status, response) = post_restore_in_namespace(&base, &admin, "ferrum", &body).await;
+    assert_eq!(
+        offline.is_ok(),
+        status == 200,
+        "offline verdict {offline:?} vs restore {status}: {response}"
+    );
+    match offline {
+        Ok(()) => {}
+        Err(messages) => {
+            assert_eq!(status, 500, "{response}");
+            assert!(
+                messages
+                    .iter()
+                    .any(|message| message.contains("secret hashing")),
+                "{messages:?}"
+            );
+            assert!(
+                response["restore_errors"]
+                    .as_array()
+                    .is_some_and(|errors| errors.iter().any(|error| error
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("secret hashing"))),
+                "{response}"
+            );
+        }
+    }
+}
+
+/// A restore that writes the registry row and a concurrent
+/// `PUT /namespaces/{name}` take their admission leases in one order, so both
+/// complete (no deadlock), and the final row is the outcome of one serial
+/// order: either the update ran last (its own row) or restore ran last (the
+/// backup's description, written after the update) (issue #7532, review F2).
+#[tokio::test]
+async fn restore_registry_write_and_namespace_update_serialize() {
+    let tmp = TempDir::new().unwrap();
+    let (base, _shutdown) = start_admin(admin_state(make_store(&tmp).await)).await;
+    let admin = token("registry-admin", Some("admin"));
+    let (status, created) = post_admin_raw(
+        &base,
+        "/namespaces",
+        &admin,
+        &json!({"name": "tenant-d", "description": "seed"}).to_string(),
+    )
+    .await;
+    assert_eq!(status, 201, "create namespace: {created}");
+    let body = json!({
+        "version": "1",
+        "proxies": [plain_proxy("serial-proxy", "/serial")],
+        "namespace_registry": {
+            "section_version": "1",
+            "name": "tenant-d",
+            "description": "from-backup"
+        }
+    })
+    .to_string();
+
+    for round in 0..4 {
+        let put_description = format!("from-put-{round}");
+        let restore = tokio::spawn({
+            let base = base.clone();
+            let admin = admin.clone();
+            let body = body.clone();
+            async move { post_restore_in_namespace(&base, &admin, "tenant-d", &body).await }
+        });
+        let update = tokio::spawn({
+            let base = base.clone();
+            let admin = admin.clone();
+            let body = json!({"description": &put_description}).to_string();
+            async move {
+                admin_request(
+                    reqwest::Method::PUT,
+                    &base,
+                    "/namespaces/tenant-d",
+                    &admin,
+                    None,
+                    None,
+                    Some(body),
+                )
+                .await
+            }
+        });
+        let ((restore_status, restored), (update_status, updated, _)) =
+            tokio::time::timeout(std::time::Duration::from_secs(60), async {
+                (restore.await.unwrap(), update.await.unwrap())
+            })
+            .await
+            .expect("restore and the namespace update must both complete");
+        assert_eq!(restore_status, 200, "round {round} restore: {restored}");
+        assert_eq!(update_status, 200, "round {round} update: {updated}");
+
+        let (status, row) = get_admin_json(&base, "/namespaces/tenant-d", &admin).await;
+        assert_eq!(status, 200, "{row}");
+        if row["description"] == json!(put_description) {
+            assert_eq!(
+                row["updated_at"], updated["updated_at"],
+                "round {round}: the update ran last, so the row is its own: {row}"
+            );
+        } else {
+            assert_eq!(row["description"], "from-backup", "round {round}: {row}");
+            assert_ne!(
+                row["updated_at"], updated["updated_at"],
+                "round {round}: restore ran last and rewrote the updated row: {row}"
+            );
+        }
+        let (status, proxy, _) = admin_request(
+            reqwest::Method::GET,
+            &base,
+            "/proxies/serial-proxy",
+            &admin,
+            Some("tenant-d"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, 200, "round {round}: the restored proxy: {proxy:?}");
+    }
+}
+
+/// The conditional backup body and its `ETag` describe one registry
+/// generation, and the registry row is part of the namespace state a
+/// conditional restore is conditioned on (issue #7532, review F3). Order 1:
+/// the registry changes after the backup, so the restore is refused (`412`)
+/// and the newer description is kept. Order 2: a restore conditioned on the
+/// current state writes the backup's row inside its transaction, and a
+/// description set afterwards is kept (nothing writes the backup's row late).
+#[tokio::test]
+async fn conditional_restore_is_conditioned_on_the_registry_row() {
+    let tmp = TempDir::new().unwrap();
+    let (base, _shutdown) = start_admin(admin_state(make_store(&tmp).await)).await;
+    let admin = token("registry-admin", Some("admin"));
+    let (status, created) = post_admin_raw(
+        &base,
+        "/namespaces",
+        &admin,
+        &json!({"name": "tenant-c", "description": "original"}).to_string(),
+    )
+    .await;
+    assert_eq!(status, 201, "create namespace: {created}");
+    let put_description = |description: &str| {
+        let base = base.clone();
+        let admin = admin.clone();
+        let body = json!({"description": description}).to_string();
+        async move {
+            admin_request(
+                reqwest::Method::PUT,
+                &base,
+                "/namespaces/tenant-c",
+                &admin,
+                None,
+                None,
+                Some(body),
+            )
+            .await
+        }
+    };
+    let conditional_backup = || {
+        let base = base.clone();
+        let admin = admin.clone();
+        async move {
+            admin_request(
+                reqwest::Method::GET,
+                &base,
+                "/backup?conditional=true",
+                &admin,
+                Some("tenant-c"),
+                None,
+                None,
+            )
+            .await
+        }
+    };
+    let conditional_restore = |body: String, tag: String| {
+        let base = base.clone();
+        let admin = admin.clone();
+        async move {
+            admin_request(
+                reqwest::Method::POST,
+                &base,
+                "/restore?confirm=true",
+                &admin,
+                Some("tenant-c"),
+                Some(&tag),
+                Some(body),
+            )
+            .await
+        }
+    };
+    let description = || {
+        let base = base.clone();
+        let admin = admin.clone();
+        async move {
+            let (status, row) = get_admin_json(&base, "/namespaces/tenant-c", &admin).await;
+            assert_eq!(status, 200, "{row}");
+            row["description"].clone()
+        }
+    };
+
+    let (status, backup, tag) = conditional_backup().await;
+    assert_eq!(status, 200, "{backup}");
+    let tag = tag.expect("a conditional backup carries the namespace ETag");
+    assert_eq!(
+        backup["namespace_registry"]["description"], "original",
+        "the body's registry section is the generation the ETag covers: {backup}"
+    );
+    let body = backup.to_string();
+
+    // Order 1: the registry row changes after the backup.
+    let (status, updated, _) = put_description("newer").await;
+    assert_eq!(status, 200, "{updated}");
+    let (status, refused, _) = conditional_restore(body.clone(), tag.clone()).await;
+    assert_eq!(
+        status, 412,
+        "a registry change after the backup is a precondition failure: {refused}"
+    );
+    assert_eq!(description().await, "newer");
+
+    // Order 2: conditioned on the current state, the backup's row is written.
+    let (status, current, current_tag) = conditional_backup().await;
+    assert_eq!(status, 200, "{current}");
+    assert_eq!(current["namespace_registry"]["description"], "newer");
+    let current_tag = current_tag.expect("ETag");
+    assert_ne!(
+        current_tag, tag,
+        "the registry row is part of the namespace ETag"
+    );
+    let (status, restored, _) = conditional_restore(body.clone(), current_tag.clone()).await;
+    assert_eq!(status, 200, "{restored}");
+    assert_eq!(description().await, "original");
+    let (status, updated, _) = put_description("after-restore").await;
+    assert_eq!(status, 200, "{updated}");
+    assert_eq!(description().await, "after-restore");
+    // The tag the restore consumed no longer matches either.
+    let (status, refused, _) = conditional_restore(body, current_tag).await;
+    assert_eq!(status, 412, "{refused}");
+    assert_eq!(description().await, "after-restore");
+}

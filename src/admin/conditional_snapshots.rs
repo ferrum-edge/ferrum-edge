@@ -199,6 +199,13 @@ fn serialize_snapshot(
     snapshot: &ConditionalNamespaceSnapshot,
 ) -> Result<(Vec<u8>, String), anyhow::Error> {
     let config = &snapshot.config;
+    // The registry section comes from the snapshot's own registry row, which
+    // is a member of the namespace ETag's representation: the body and the
+    // `ETag` always describe one generation (issue #7532).
+    let namespace_registry = snapshot
+        .namespace_record
+        .as_ref()
+        .map(super::backup::NamespaceRegistryBackupSection::from_record);
     let tag = namespace_tag(state, namespace, &snapshot.digest()?)?;
     let metadata = ConditionalBackupMetadata {
         namespace_etag: preconditions::quoted(&tag),
@@ -232,6 +239,10 @@ fn serialize_snapshot(
         plugin_configs: &config.plugin_configs,
         api_specs: Some(&specs),
         gateway_trust_bundles: Some(&config.gateway_trust_bundles),
+        // Part of the namespace ETag: a conditional restore of this body is
+        // refused (`412`) once the registry row changed, and otherwise writes
+        // the row inside its replacement transaction.
+        namespace_registry: namespace_registry.as_ref(),
         conditional: Some(&metadata),
     };
     Ok((serde_json::to_vec(&backup)?, metadata.namespace_etag))
@@ -326,6 +337,7 @@ pub(super) async fn restore(
     namespace: &str,
     payload: &RestorePayload,
     validated_api_specs: &[crate::config::types::ApiSpec],
+    namespace_registry: Option<Option<String>>,
     if_match: &IfMatch,
     mode: &BatchConfigWriteMode,
     admission: &mut crud::NamespaceConfigAdmissionGuard,
@@ -365,6 +377,7 @@ pub(super) async fn restore(
         expected,
         api_specs: validated_api_specs,
         gateway_trust_bundles: payload.gateway_trust_bundles.as_deref(),
+        namespace_registry,
     };
     if let Err(error) = db.restore_namespace_conditionally(&restore, mode).await {
         return store_error(&error);

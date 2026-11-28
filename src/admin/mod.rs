@@ -19,6 +19,7 @@ pub mod metrics;
 pub mod plugin_config_projection;
 pub(crate) mod preconditions;
 pub mod provisioning;
+pub(crate) mod restore_admission;
 pub mod spec_codec;
 pub(crate) mod tls_management;
 #[cfg(feature = "test-support")]
@@ -49,11 +50,10 @@ use crate::admin::audit::{AuditActor, NamespaceCeilingDecision};
 use crate::admin::backup::{
     ApiSpecsBackupSection, BACKUP_API_SPECS_FILTER_DEPENDENCY_ERROR,
     BACKUP_UNSUPPORTED_RESOURCE_FILTER_ERROR, BackupCounts, BackupPayload, BatchCreateRequest,
-    RestorePayload, borrow_backup_resources, clear_api_spec_ownership_tags,
-    filter_config_by_namespace, parse_backup_resources, parse_confirm_api_spec_deletion,
-    parse_restore_confirm, restore_missing_resource_id_errors,
+    NamespaceRegistryBackupSection, RestorePayload, borrow_backup_resources,
+    clear_api_spec_ownership_tags, filter_config_by_namespace, parse_backup_resources,
+    parse_confirm_api_spec_deletion, parse_restore_confirm,
     validate_backup_api_specs_resource_filter, validate_backup_resources_allowlist,
-    validate_restore_api_specs_section_with_total_limit,
 };
 use crate::admin::jwt_auth::{AdminRole, JwtError, JwtManager};
 use crate::config::db_backend::{
@@ -8337,14 +8337,6 @@ fn normalize_restore_payload_timestamps(payload: &mut RestorePayload, restored_a
     }
 }
 
-fn hash_payload_consumers(consumers: &mut [Consumer], errors: &mut Vec<String>) {
-    for consumer in consumers {
-        if let Err(e) = crud::hash_consumer_credentials(consumer) {
-            errors.push(format!("consumer {} secret hashing: {}", consumer.id, e));
-        }
-    }
-}
-
 fn restore_payload_from_config(config: GatewayConfig) -> RestorePayload {
     RestorePayload {
         version: config.version,
@@ -8357,6 +8349,9 @@ fn restore_payload_from_config(config: GatewayConfig) -> RestorePayload {
         // generation rather than leaving whatever the failed import wrote
         // (issue #3727).
         gateway_trust_bundles: Some(config.gateway_trust_bundles),
+        // Rollback replays resources and trust only; the registry row is
+        // written after a successful restore, never by its compensation.
+        namespace_registry: None,
         // Accepted-and-ignored `GET /backup` metadata. Listed explicitly
         // rather than spread from `Default` so the literal stays exhaustive:
         // a new `RestorePayload` section must make a deliberate choice here.
@@ -8880,6 +8875,7 @@ fn snapshot_resources_missing_after_intervening_write(
         // concurrency, so replaying it here could clobber a rotation that
         // intervening writer committed; leave it to the explicit rollback path.
         gateway_trust_bundles: None,
+        namespace_registry: None,
         // Accepted-and-ignored `GET /backup` metadata. Listed explicitly
         // rather than spread from `Default` so the literal stays exhaustive:
         // a new `RestorePayload` section must make a deliberate choice here.
@@ -10150,7 +10146,6 @@ pub(crate) fn collect_plugin_config_admission_errors(
     plugin_configs: &[PluginConfig],
     validation_errors: &mut Vec<String>,
 ) {
-    let known_plugins = plugins::available_plugins();
     // Built once: on a control plane (no `ProxyState`) this constructs a fresh
     // validation client, and restore admits payloads with far more plugin rows
     // than a batch write.
@@ -10161,6 +10156,24 @@ pub(crate) fn collect_plugin_config_admission_errors(
             return;
         }
     };
+    collect_plugin_config_admission_errors_with(
+        &http_client,
+        &state.backend_allow_ips,
+        plugin_configs,
+        validation_errors,
+    );
+}
+
+/// [`collect_plugin_config_admission_errors`] with an explicit validation
+/// client and egress policy, so restore admission (and the offline
+/// `validate --backup` check) can run it without an `AdminState`.
+pub(crate) fn collect_plugin_config_admission_errors_with(
+    http_client: &plugins::PluginHttpClient,
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
+    plugin_configs: &[PluginConfig],
+    validation_errors: &mut Vec<String>,
+) {
+    let known_plugins = plugins::available_plugins();
     for plugin_config in plugin_configs {
         if !known_plugins.contains(&plugin_config.plugin_name.as_str()) {
             validation_errors.push(format!(
@@ -10175,7 +10188,7 @@ pub(crate) fn collect_plugin_config_admission_errors(
             if let Err(err) = crate::plugins::validate_plugin_config_policy_only(
                 &plugin_config.plugin_name,
                 &plugin_config.config,
-                &state.backend_allow_ips,
+                backend_allow_ips,
             ) {
                 validation_errors.push(format!(
                     "PluginConfig '{}': invalid config: {}",
@@ -11662,6 +11675,8 @@ enum ConsistentApiSpecsBackup {
     ConfigUnavailable,
     /// Spec documents could not be loaded after config succeeded.
     SpecsUnavailable,
+    /// The namespace registry row could not be read after config succeeded.
+    RegistryUnavailable,
     /// Backup JSON serialization failed (fail closed rather than emitting `{}`).
     SerializationFailed,
 }
@@ -11686,6 +11701,7 @@ fn serialize_backup_payload(
     source: &'static str,
     resource_filter: Option<&HashSet<&str>>,
     api_specs_owned: Option<ApiSpecsBackupSection>,
+    namespace_registry: Option<NamespaceRegistryBackupSection>,
 ) -> Result<SerializedBackupPayload, serde_json::Error> {
     let include_proxies = backup_resource_includes(resource_filter, "proxies");
     let include_consumers = backup_resource_includes(resource_filter, "consumers");
@@ -11779,6 +11795,16 @@ fn serialize_backup_payload(
     // actually released, never what the namespace happens to hold.
     let gateway_trust_bundles_count = gateway_trust_bundles.map(<[_]>::len).unwrap_or(0);
 
+    // The namespace registry row (issue #7532), like trust, is carried only
+    // by a full authoritative export: a filtered export must contain only the
+    // classes the caller named, and a cached fallback cannot read the
+    // registry. Absence leaves the target registry untouched on restore.
+    let namespace_registry = if source == "database" && resource_filter.is_none() {
+        namespace_registry
+    } else {
+        None
+    };
+
     let backup = BackupPayload {
         version: &config.version,
         ferrum_version: crate::FERRUM_VERSION,
@@ -11798,6 +11824,7 @@ fn serialize_backup_payload(
         upstreams,
         gateway_trust_bundles,
         api_specs: api_specs_section,
+        namespace_registry: namespace_registry.as_ref(),
         conditional: None,
     };
 
@@ -11852,6 +11879,21 @@ async fn build_consistent_api_specs_backup(
         }
     };
 
+    // Only a full export carries the registry row; do not read it otherwise.
+    let namespace_registry = if resource_filter.is_none() {
+        match db.get_namespace(namespace).await {
+            Ok(record) => record
+                .as_ref()
+                .map(NamespaceRegistryBackupSection::from_record),
+            Err(_error) => {
+                warn_persistence_failure_redacted("backup_namespace_registry_load");
+                return ConsistentApiSpecsBackup::RegistryUnavailable;
+            }
+        }
+    } else {
+        None
+    };
+
     let (
         body_bytes,
         proxy_count,
@@ -11865,6 +11907,7 @@ async fn build_consistent_api_specs_backup(
         "database",
         resource_filter,
         Some(ApiSpecsBackupSection::from_specs(&specs)),
+        namespace_registry,
     ) {
         Ok(tuple) => tuple,
         Err(err) => {
@@ -12105,6 +12148,22 @@ async fn handle_backup(
                     &json!({"error": "Database unavailable while exporting API specs"}),
                 ));
             }
+            ConsistentApiSpecsBackup::RegistryUnavailable => {
+                audit_backup_failure(
+                    state,
+                    actor,
+                    namespace,
+                    request_ctx,
+                    resource_filter.as_ref(),
+                    audit::failure_category::UNAVAILABLE,
+                    audit::outcome::UNAVAILABLE,
+                )
+                .await;
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({"error": "Database unavailable while exporting the namespace registry"}),
+                ));
+            }
             ConsistentApiSpecsBackup::SerializationFailed => {
                 audit_backup_failure(
                     state,
@@ -12217,7 +12276,7 @@ async fn handle_backup(
         upstream_count,
         api_specs_count,
         gateway_trust_bundles_count,
-    ) = match serialize_backup_payload(config, source, resource_filter.as_ref(), None) {
+    ) = match serialize_backup_payload(config, source, resource_filter.as_ref(), None, None) {
         Ok(tuple) => tuple,
         Err(err) => {
             error!(error = %err, "failed to serialize backup payload");
@@ -12258,29 +12317,12 @@ async fn handle_backup(
     .await)
 }
 
-async fn validate_restore_candidate_on_blocking_pool(
-    mut candidate: GatewayConfig,
-    cert_expiry_days: u64,
-    backend_allow_ips: crate::config::BackendEgressPolicy,
-) -> Result<(GatewayConfig, Vec<String>), anyhow::Error> {
-    tokio::task::spawn_blocking(move || {
-        let errors = restore_candidate_validation_errors(
-            &mut candidate,
-            cert_expiry_days,
-            &backend_allow_ips,
-        );
-        (candidate, errors)
-    })
-    .await
-    .map_err(|error| anyhow::anyhow!("restore validation task failed: {error}"))
-}
-
 /// Every database-independent admission error for a restore candidate, in the
 /// order the restore response reports them: the validation pipeline, then
 /// operator-provided upstream fields, then `allowed_ws_origins` admission.
 ///
-/// Runs on the blocking pool through
-/// [`validate_restore_candidate_on_blocking_pool`]; tests reach it
+/// Runs on the blocking pool inside
+/// [`restore_admission::admit_restore_payload`]; tests reach it
 /// synchronously through `_test_support`.
 fn restore_candidate_validation_errors(
     candidate: &mut GatewayConfig,
@@ -12431,80 +12473,55 @@ async fn handle_restore(
             return Ok(atomic_batch_unsupported_response(&unsupported));
         }
     }
-    let mut namespace_config_admission_guard = match crud::lock_namespace_config_admission(
-        db.clone(),
-        namespace,
-    )
-    .await
-    {
-        Ok(guard) => guard,
-        Err(_error) => {
-            warn_persistence_failure_redacted("restore_namespace_admission_acquire");
-            return Ok(json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &json!({
-                    "error": "Restore aborted: config admission unavailable. Existing config was NOT deleted.",
-                    "failure_class": "connectivity",
-                }),
-            ));
-        }
-    };
-
-    // Phase 1: Parse all resources directly into typed structs before deleting
-    // anything. This avoids an intermediate serde_json::Value copy (~50% less
-    // peak memory at scale).
-    //
-    // `from_json_object_slice` forces the JSON-object branch, and
+    // Phase 1: Parse the body straight into typed structs before deleting
+    // anything. `from_json_object_slice` forces the JSON-object branch, and
     // `RestorePayload` denies unknown fields (issue #5538): a top-level array,
     // a positional sequence, a scalar, or a misspelled collection key is a
     // `400` here rather than an envelope whose collections all defaulted to
     // empty and whose "successful" restore deleted the namespace.
-    let parsed = crate::util::json_object::from_json_object_slice::<RestorePayload>(body);
-    let mut payload: RestorePayload = match parsed {
-        Ok(v) => v,
-        Err(e) => {
-            return Ok(json_response(
-                StatusCode::BAD_REQUEST,
-                &json!({"error": format!("Invalid JSON body: {}", e)}),
-            ));
-        }
+    let payload = match restore_admission::parse_restore_payload(body) {
+        Ok(payload) => payload,
+        Err(error) => return Ok(restore_admission_error_response(&error)),
     };
-    provisioning::stamp_resources(
-        &mut payload.proxies,
-        &mut payload.consumers,
-        &mut payload.upstreams,
-        &mut payload.plugin_configs,
-        provisioner,
-        true,
-    );
 
-    // Validate config version compatibility when present
-    if !payload.version.is_empty()
-        && payload.version != crate::config::types::CURRENT_CONFIG_VERSION
-    {
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
+    // A `namespace_registry` section taken from this namespace makes restore
+    // a registry mutation too (issue #7532). It then takes registry admission
+    // — the global registry key, then this namespace's key, the total order
+    // every registry mutation uses — instead of plain namespace config
+    // admission. The namespace guard is the same lease plain admission takes
+    // and serves as restore's config admission guard; the global lease is
+    // held beside it until the registry row is written, so no registry
+    // mutation can interleave and the two acquisitions cannot deadlock.
+    let registry_section_applies = payload
+        .namespace_registry
+        .as_ref()
+        .is_some_and(|section| section.name == namespace);
+    let admission_unavailable = || {
+        warn_persistence_failure_redacted("restore_namespace_admission_acquire");
+        json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
             &json!({
-                "error": format!(
-                    "Incompatible config version '{}'. This gateway expects version '{}'",
-                    payload.version,
-                    crate::config::types::CURRENT_CONFIG_VERSION
-                )
+                "error": "Restore aborted: config admission unavailable. Existing config was NOT deleted.",
+                "failure_class": "connectivity",
             }),
-        ));
-    }
-
-    let missing_id_errors = restore_missing_resource_id_errors(&payload);
-    if !missing_id_errors.is_empty() {
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({
-                "error": "Restore payload validation failed — existing config was NOT deleted",
-                "validation_errors": missing_id_errors,
-            }),
-        ));
-    }
-
+        )
+    };
+    let (mut namespace_registry_lease, mut namespace_config_admission_guard) =
+        if registry_section_applies {
+            match crud::lock_namespace_registry_admission(db.clone(), &[namespace])
+                .await
+                .ok()
+                .and_then(crud::NamespaceRegistryAdmission::into_global_and_namespace)
+            {
+                Some((registry_lease, guard)) => (Some(registry_lease), guard),
+                None => return Ok(admission_unavailable()),
+            }
+        } else {
+            match crud::lock_namespace_config_admission(db.clone(), namespace).await {
+                Ok(guard) => (None, guard),
+                Err(_error) => return Ok(admission_unavailable()),
+            }
+        };
     info!(
         "Restore: parsed payload — {} proxies, {} consumers, {} plugin_configs, {} upstreams, {} api_specs ({} bytes)",
         payload.proxies.len(),
@@ -12519,52 +12536,30 @@ async fn handle_restore(
         body.len()
     );
 
-    // Phase 2: Normalize the *actual* restore payload once, then validate that
-    // same canonical instance. SQL and Mongo batch writers persist the values
-    // they receive without repeating domain normalization, so discarding a
-    // temporary clone here would admit mixed-case hosts/SNI/SAN and blank
-    // optional identifiers that CRUD/file/database loaders never store.
-    let mut candidate = GatewayConfig {
-        version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
-        proxies: std::mem::take(&mut payload.proxies),
-        consumers: std::mem::take(&mut payload.consumers),
-        plugin_configs: std::mem::take(&mut payload.plugin_configs),
-        upstreams: std::mem::take(&mut payload.upstreams),
-        loaded_at: crate::time_compat::UtcTimestamp::now(),
-        known_namespaces: Vec::new(),
-        mesh: state
-            .cached_gateway_config()
-            .and_then(|config| config.mesh.clone()),
-        ..Default::default()
-    };
-    candidate.normalize_fields();
-    // Namespace boundaries are part of the candidate under validation and the
-    // instance later prepared for snapshot-guarded persistence.
-    for proxy in &mut candidate.proxies {
-        proxy.namespace = namespace.to_string();
-    }
-    for consumer in &mut candidate.consumers {
-        consumer.namespace = namespace.to_string();
-    }
-    for plugin_config in &mut candidate.plugin_configs {
-        plugin_config.namespace = namespace.to_string();
-    }
-    for upstream in &mut candidate.upstreams {
-        upstream.namespace = namespace.to_string();
-    }
-    let cert_expiry_days = state
-        .proxy_state
-        .as_ref()
-        .map(|ps| ps.env_config.tls_cert_expiry_warning_days)
-        .unwrap_or(crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS);
-    let (candidate, mut validation_errors) = match validate_restore_candidate_on_blocking_pool(
-        candidate,
-        cert_expiry_days,
-        state.backend_allow_ips.clone(),
-    )
+    // Phase 2: every database-independent admission step — resources,
+    // `gateway_trust_bundles`, `api_specs` (with each stored spec document's
+    // extension admission) and `namespace_registry` — through the one function
+    // `ferrum-edge validate --backup` also runs, so the offline check accepts
+    // exactly what this accepts (issue #7532). CPU-bound (normalization,
+    // plugin construction, spec decompression), so it runs on the blocking
+    // pool; it completes before any durable mutation.
+    let policy = restore_admission::RestoreAdmissionPolicy::from_admin_state(state);
+    let admission_namespace = namespace.to_string();
+    let admission_provisioner = provisioner.map(str::to_string);
+    let admission_subject = actor.sub.clone();
+    let admitted = match tokio::task::spawn_blocking(move || {
+        restore_admission::admit_restore_payload(
+            payload,
+            &admission_namespace,
+            admission_provisioner.as_deref(),
+            Some(&admission_subject),
+            &policy,
+        )
+    })
     .await
     {
-        Ok(result) => result,
+        Ok(Ok(admitted)) => admitted,
+        Ok(Err(error)) => return Ok(restore_admission_error_response(&error)),
         Err(_error) => {
             warn_persistence_failure_redacted("restore_payload_validation_task");
             return Ok(json_response(
@@ -12575,7 +12570,16 @@ async fn handle_restore(
             ));
         }
     };
-    if candidate
+    let restore_admission::AdmittedRestore {
+        mut payload,
+        api_specs: admitted_api_specs,
+        namespace_registry_description,
+        namespace_registry_present: _,
+    } = admitted;
+
+    // Phase 3: checks that depend on the target database rather than on the
+    // payload.
+    if payload
         .plugin_configs
         .iter()
         .any(|plugin| plugin.enabled && plugin.plugin_name == "prometheus_metrics")
@@ -12586,10 +12590,17 @@ async fn handle_restore(
         )
         .await
         {
-            Ok(true) => validation_errors.push(
-                "prometheus_metrics permits at most one enabled global instance; another namespace already owns the process registry"
-                    .to_string(),
-            ),
+            Ok(true) => {
+                return Ok(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({
+                        "error": restore_admission::RESTORE_VALIDATION_FAILED_MESSAGE,
+                        "validation_errors": [
+                            "prometheus_metrics permits at most one enabled global instance; another namespace already owns the process registry"
+                        ],
+                    }),
+                ));
+            }
             Ok(false) => {}
             Err(_error) => {
                 warn_persistence_failure_redacted("restore_prometheus_metrics_ownership_check");
@@ -12602,172 +12613,11 @@ async fn handle_restore(
             }
         }
     }
-    // Restore replaces the whole namespace, so the candidate is authoritative:
-    // no DB overlay is needed to decide mTLS transport compatibility. Without
-    // this check restore is the only way to persist an enabled `mtls_auth`
-    // instance on a stream proxy that terminates no TLS, which then rejects
-    // every connection with a 401 (issue #4282).
-    if let Err(errors) = candidate.validate_mtls_auth_compatibility() {
-        validation_errors.extend(errors);
-    }
-    // Match `POST /batch` and single-resource admission: plugin names and
-    // definitions are validated even for `enabled: false` rows, which the
-    // pipeline's `PluginConfigs` step deliberately skips (issue #4283).
-    collect_plugin_config_admission_errors(
-        state,
-        &candidate.plugin_configs,
-        &mut validation_errors,
-    );
-    match crud::validate_plugin_graph_restore_candidate(state, &candidate) {
-        Ok(()) => {}
-        Err(
-            crud::AfterValidateError::BadRequest(errors)
-            | crud::AfterValidateError::Conflict(errors),
-        ) => {
-            validation_errors.extend(errors);
-        }
-        Err(crud::AfterValidateError::Db(_error)) => {
-            warn_persistence_failure_redacted("restore_plugin_security_composition_check");
-            return Ok(json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &json!({
-                    "error": "Restore aborted: plugin security composition could not be validated because the database is unavailable. Existing config was NOT deleted."
-                }),
-            ));
-        }
-        Err(crud::AfterValidateError::Response(_)) => validation_errors
-            .push("Plugin-graph candidate validation returned an unexpected response".to_string()),
-    }
-    if !validation_errors.is_empty() {
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({
-                "error": "Restore payload validation failed — existing config was NOT deleted",
-                "validation_errors": validation_errors
-            }),
-        ));
-    }
 
-    // Reassemble the restore payload from the validated canonical candidate so
-    // credential/timestamp preparation and persistence keep that exact
-    // instance. Do not reintroduce the discarded wire-form original.
-    payload.proxies = candidate.proxies;
-    payload.consumers = candidate.consumers;
-    payload.plugin_configs = candidate.plugin_configs;
-    payload.upstreams = candidate.upstreams;
-
-    // Gateway trust bundles are namespace-keyed, and the target namespace comes
-    // from `X-Ferrum-Namespace`, not from the payload. Force it (as every other
-    // resource does above) so a backup taken in namespace A cannot write a
-    // record into namespace B, then validate the whole section BEFORE the
-    // destructive clear so an invalid rotation aborts with config intact
-    // (issue #3727).
-    if let Some(records) = payload.gateway_trust_bundles.as_mut() {
-        let mut trust_errors = Vec::new();
-        // The resource is a namespace singleton. Forcing several records into
-        // one namespace and letting the reconciler take whichever came first
-        // would make the restored trust state depend on payload order, so more
-        // than one is refused before anything is deleted.
-        if records.len() > 1 {
-            trust_errors.push(GATEWAY_TRUST_BUNDLE_RESTORE_NOT_SINGLETON_MESSAGE.to_string());
-        }
-        for record in records.iter_mut() {
-            record.namespace = namespace.to_string();
-            // Attribution is server-owned: the restoring admin subject, never
-            // whatever the backup file claimed.
-            record.updated_by = Some(actor.sub.clone());
-            // A backup file's revision is not authority: the store assigns a
-            // fresh backend-monotonic revision to whatever it physically writes.
-            record.revision = 0;
-            record.normalize_fields();
-            if let Err(errors) = record.validate_fields() {
-                trust_errors.extend(errors);
-            }
-        }
-        if !trust_errors.is_empty() {
-            return Ok(json_response(
-                StatusCode::BAD_REQUEST,
-                &json!({
-                    "error": "Restore payload validation failed — existing config was NOT deleted",
-                    "validation_errors": trust_errors
-                }),
-            ));
-        }
-    }
-
-    // Validate or prepare the versioned api_specs section before any durable
-    // mutation. Legacy backups that omit the section entirely require an
-    // explicit confirmation when the target namespace currently holds specs.
-    //
-    // Decompression + declared-format parse are CPU-bound and can touch up to
-    // the admin body ceiling per item; run them on the blocking pool so the
-    // async runtime stays responsive. Validation still completes before any
-    // delete/write.
-    let validated_api_specs: Vec<crate::config::types::ApiSpec> = match payload.api_specs.take() {
-        Some(section) => {
-            // Move the canonical resource vectors through the blocking task and
-            // take them back out of its result, so the ownership graph the API
-            // specs are validated against is the same instance that is later
-            // persisted. Do not clone the wire payload for validation here.
-            let proxies = std::mem::take(&mut payload.proxies);
-            let upstreams = std::mem::take(&mut payload.upstreams);
-            let plugin_configs = std::mem::take(&mut payload.plugin_configs);
-            let max_spec_body_mib = state.admin_spec_max_body_size_mib;
-            let max_total_spec_bytes = state
-                .admin_restore_max_body_size_mib
-                .saturating_mul(1024 * 1024);
-            let validation = tokio::task::spawn_blocking(move || {
-                let result = validate_restore_api_specs_section_with_total_limit(
-                    &section,
-                    &proxies,
-                    &upstreams,
-                    &plugin_configs,
-                    max_spec_body_mib,
-                    max_total_spec_bytes,
-                );
-                (result, proxies, upstreams, plugin_configs)
-            })
-            .await;
-            // Reassemble on every successful join, for both validation
-            // outcomes; a join failure is a fail-closed abort before any
-            // durable mutation, so the moved vectors are not needed again.
-            let (validated, proxies, upstreams, plugin_configs) = match validation {
-                Ok(result) => result,
-                Err(_error) => {
-                    warn_persistence_failure_redacted("restore_api_specs_validation_join");
-                    return Ok(json_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        &json!({
-                            "error": "Restore aborted: API spec validation task failed. Existing config was NOT deleted."
-                        }),
-                    ));
-                }
-            };
-            payload.proxies = proxies;
-            payload.upstreams = upstreams;
-            payload.plugin_configs = plugin_configs;
-            match validated {
-                Ok(mut specs) => {
-                    for spec in &mut specs {
-                        spec.namespace = namespace.to_string();
-                    }
-                    // Reuse the already-validated, namespace-stamped `Vec<ApiSpec>`
-                    // directly on both conditional and unconditional restore
-                    // paths instead of re-encoding to base64 and synchronously
-                    // re-validating external-ref snapshots on Tokio workers.
-                    specs
-                }
-                Err(api_spec_errors) => {
-                    return Ok(json_response(
-                        StatusCode::BAD_REQUEST,
-                        &json!({
-                            "error": "Restore payload validation failed — existing config was NOT deleted",
-                            "validation_errors": api_spec_errors
-                        }),
-                    ));
-                }
-            }
-        }
+    // A backup without the versioned api_specs section requires an explicit
+    // confirmation when the target namespace currently holds specs.
+    let validated_api_specs: Vec<crate::config::types::ApiSpec> = match admitted_api_specs {
+        Some(specs) => specs,
         None => {
             let existing_specs = match db.count_api_specs(namespace).await {
                 Ok(count) => count,
@@ -12801,23 +12651,29 @@ async fn handle_restore(
         }
     };
 
-    // Complete all fallible payload preparation before changing durable state.
-    let mut preparation_errors = Vec::new();
+    // Complete all payload preparation before changing durable state. The
+    // fallible step (Basic-auth credential hashing) already ran inside
+    // admission, so the offline check refuses what it would refuse.
     normalize_restore_payload_timestamps(&mut payload, UtcTimestamp::now());
     // Namespace was already stamped on the validated candidate; re-apply
     // idempotently so preparation stays fail-closed if a resource somehow
     // lost its boundary.
     apply_payload_namespace(&mut payload, namespace);
-    hash_payload_consumers(&mut payload.consumers, &mut preparation_errors);
-    if !preparation_errors.is_empty() {
-        return Ok(json_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &json!({
-                "error": "Restore preparation failed; existing config was not changed and prior config retained",
-                "restore_errors": preparation_errors,
-            }),
-        ));
-    }
+
+    // Decide the registry row write under the held registry admission, before
+    // anything is deleted (issue #7532): an identical row needs no write, and
+    // a change the backend cannot make atomically (standalone MongoDB) is
+    // refused here, while the existing configuration is untouched.
+    let namespace_registry_write = match plan_restore_namespace_registry(
+        db.as_ref(),
+        namespace,
+        namespace_registry_description,
+    )
+    .await
+    {
+        Ok(write) => write,
+        Err(response) => return Ok(response),
+    };
 
     // Acquire one datastore owner before the authoritative rollback snapshot
     // and retain it through clear, import, and any compensating replay. This is
@@ -12846,6 +12702,14 @@ async fn handle_restore(
     };
 
     if let Some(if_match) = if_match {
+        // The registry row is written inside the conditional replacement
+        // transaction itself, which compares the namespace ETag (whose
+        // representation includes the registry row) under the same pinned
+        // namespace lease: a registry change after the backup is a `412`, and
+        // the write can never overwrite a newer description.
+        let registry_description = namespace_registry_write
+            .as_ref()
+            .map(|write| write.description.clone());
         let response = conditional_snapshots::restore(
             state,
             actor,
@@ -12853,6 +12717,7 @@ async fn handle_restore(
             namespace,
             &payload,
             &validated_api_specs,
+            registry_description,
             if_match,
             &restore_mode,
             &mut namespace_config_admission_guard,
@@ -12866,6 +12731,13 @@ async fn handle_restore(
             ));
         }
         if response.status().is_success() {
+            if let Some(write) = namespace_registry_write {
+                record_restore_namespace_registry_audit(state, actor, db.clone(), namespace, write)
+                    .await;
+            }
+            // The registry row committed with the replacement; the global
+            // registry lease is not needed for live apply.
+            drop(namespace_registry_lease);
             return Ok(state
                 .complete_live_config_mutation_after_commit_boxed(
                     namespace,
@@ -12973,6 +12845,10 @@ async fn handle_restore(
         {
             restore_guard.retain_restore_cleared();
         }
+        // Recovery never writes the registry row. Release the global registry
+        // lease first, so reacquiring the namespace key alone cannot wait on a
+        // registry mutation that is itself waiting for this global key.
+        drop(namespace_registry_lease.take());
         drop(namespace_config_admission_guard);
         namespace_config_admission_guard = match crud::lock_namespace_config_admission(
             db.clone(),
@@ -13257,7 +13133,8 @@ async fn handle_restore(
             // durable fence across the lease reacquisition and carries the
             // rollback. Every early return below drops it in the failed-import
             // phase, so its Drop retains the fence over the partially imported
-            // namespace.
+            // namespace. The registry lease goes first, as after a lost clear.
+            drop(namespace_registry_lease.take());
             drop(namespace_config_admission_guard);
             let rollback_guard = match crud::lock_namespace_config_admission(db.clone(), namespace)
                 .await
@@ -13440,14 +13317,268 @@ async fn handle_restore(
         log_audit_enqueue_failure(&error);
     }
 
+    // The registry row is written while restore still holds the registry
+    // admission it took before the clear and the write-topology permit, and
+    // before live apply is awaited (issue #7532). It runs after the restore
+    // guard is released because a registry write takes that same namespace
+    // fence without an owner.
+    let response = match namespace_registry_write {
+        Some(write) => match namespace_registry_lease.as_ref() {
+            Some(registry_lease) => match write_restore_namespace_registry(
+                state,
+                actor,
+                db.clone(),
+                namespace,
+                registry_lease,
+                &namespace_config_admission_guard,
+                write,
+            )
+            .await
+            {
+                Ok(()) => json_response(StatusCode::OK, &response),
+                Err(partial) => partial,
+            },
+            // A write is planned only when the section applies, which is
+            // exactly when the registry lease was taken; fail closed anyway.
+            None => restore_namespace_registry_partial_failure(),
+        },
+        None => json_response(StatusCode::OK, &response),
+    };
+    // The registry row is settled; live apply needs only the namespace guard
+    // and the write-topology permit.
+    drop(namespace_registry_lease);
+
     Ok(state
         .complete_live_config_mutation_after_commit_boxed(
             namespace,
             (namespace_config_admission_guard, _write_permit),
-            json_response(StatusCode::OK, &response),
+            response,
             apply_mode,
         )
         .await)
+}
+
+/// Map a restore admission refusal onto the response restore has always
+/// returned for it.
+fn restore_admission_error_response(
+    error: &restore_admission::RestoreAdmissionError,
+) -> Response<Full<Bytes>> {
+    match error {
+        restore_admission::RestoreAdmissionError::Invalid(message) => {
+            json_response(StatusCode::BAD_REQUEST, &json!({"error": message}))
+        }
+        restore_admission::RestoreAdmissionError::Validation(errors) => json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({
+                "error": restore_admission::RESTORE_VALIDATION_FAILED_MESSAGE,
+                "validation_errors": errors,
+            }),
+        ),
+        restore_admission::RestoreAdmissionError::Preparation(errors) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({
+                "error": "Restore preparation failed; existing config was not changed and prior config retained",
+                "restore_errors": errors,
+            }),
+        ),
+        restore_admission::RestoreAdmissionError::Unavailable(_detail) => {
+            warn_persistence_failure_redacted("restore_plugin_validation_client");
+            json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({
+                    "error": "Restore aborted: plugin security composition could not be validated. Existing config was NOT deleted."
+                }),
+            )
+        }
+    }
+}
+
+/// The registry row write a restore with a same-namespace `namespace_registry`
+/// section performs (issue #7532), decided before anything is deleted.
+struct RestoreNamespaceRegistryWrite {
+    /// The row as it stood under the held registry admission.
+    existing: Option<crate::config::namespace_registry::NamespaceRecord>,
+    /// The description the backup's section carries.
+    description: Option<String>,
+}
+
+/// `error` of the `501` a restore whose `namespace_registry` section would
+/// change the registry row returns when the backend cannot change it
+/// atomically (standalone MongoDB).
+const RESTORE_NAMESPACE_REGISTRY_UNSUPPORTED_MESSAGE: &str = "Restore aborted: this backup's namespace_registry section changes the namespace registry row, which this database cannot write atomically. Existing config was NOT deleted. Configure a MongoDB replica set (FERRUM_MONGO_REPLICA_SET), or remove the namespace_registry section to restore the configuration alone.";
+
+/// Decide what restore does with the target namespace's registry row, under
+/// the registry admission restore already holds.
+///
+/// `None` description (no applicable section) and a row that already matches
+/// the backup need no write, so an unchanged backup restores on every backend,
+/// standalone MongoDB included. A change on a backend without atomic registry
+/// writes is refused with `501` before the clear.
+#[allow(clippy::result_large_err)]
+async fn plan_restore_namespace_registry(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    description: Option<Option<String>>,
+) -> Result<Option<RestoreNamespaceRegistryWrite>, Response<Full<Bytes>>> {
+    let Some(description) = description else {
+        return Ok(None);
+    };
+    let existing = match db.get_namespace(namespace).await {
+        Ok(existing) => existing,
+        Err(_error) => {
+            warn_persistence_failure_redacted("restore_namespace_registry_read");
+            return Err(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({
+                    "error": "Restore aborted: the namespace registry row could not be read. Existing config was NOT deleted.",
+                    "failure_class": "connectivity",
+                }),
+            ));
+        }
+    };
+    if existing
+        .as_ref()
+        .is_some_and(|record| record.description == description)
+    {
+        return Ok(None);
+    }
+    if let Err(unsupported) = db.ensure_namespace_registry_atomicity_supported() {
+        return Err(json_response(
+            StatusCode::NOT_IMPLEMENTED,
+            &json!({
+                "error": RESTORE_NAMESPACE_REGISTRY_UNSUPPORTED_MESSAGE,
+                "detail": unsupported.detail(),
+            }),
+        ));
+    }
+    Ok(Some(RestoreNamespaceRegistryWrite {
+        existing,
+        description,
+    }))
+}
+
+/// The `500` a restore returns when its configuration committed but the
+/// registry row write that follows it failed.
+fn restore_namespace_registry_partial_failure() -> Response<Full<Bytes>> {
+    json_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        &json!({
+            "error": "Restore committed the namespace configuration, but the namespace registry row from the backup's namespace_registry section was not written. Retry the restore, or set the description with PUT /namespaces/{name}.",
+            "restore_errors": ["namespace registry write failed after the configuration was restored"],
+            "configuration_restored": true,
+        }),
+    )
+}
+
+/// Write the planned registry row after a non-conditional restore committed
+/// its configuration, under the registry admission (global key plus the
+/// namespace's key) restore took before the clear and while the
+/// write-topology permit is still held.
+///
+/// A row that exists, or a namespace that now holds the restored resources,
+/// is updated (which also registers a namespace that had only derived
+/// existence); an empty, unregistered namespace is created. A failure is the
+/// partial `500`: resource writes are chunked, so there is no transaction the
+/// row could join.
+#[allow(clippy::result_large_err)]
+async fn write_restore_namespace_registry(
+    state: &AdminState,
+    actor: &AuditActor,
+    db: Arc<dyn DatabaseBackend>,
+    namespace: &str,
+    registry_lease: &crud::NamespaceRegistryGlobalLease,
+    namespace_guard: &crud::NamespaceConfigAdmissionGuard,
+    write: RestoreNamespaceRegistryWrite,
+) -> Result<(), Response<Full<Bytes>>> {
+    let occupied = match write.existing {
+        Some(_) => true,
+        None => match db.namespace_has_resources(namespace).await {
+            Ok(occupied) => occupied,
+            Err(_error) => {
+                warn_persistence_failure_redacted("restore_namespace_registry_occupancy");
+                return Err(restore_namespace_registry_partial_failure());
+            }
+        },
+    };
+    let holds = registry_lease.holds_with(namespace_guard);
+    let written = if occupied {
+        settle_namespace_registry_completion(
+            registry_lease
+                .run_to_completion_while_held(db.update_namespace(
+                    namespace,
+                    namespace,
+                    Some(write.description.clone()),
+                    &holds,
+                ))
+                .await,
+        )
+    } else {
+        let record = crate::config::namespace_registry::NamespaceRecord::new(
+            namespace.to_string(),
+            write.description.clone(),
+            UtcTimestamp::now(),
+        );
+        settle_namespace_registry_completion(
+            registry_lease
+                .run_to_completion_while_held(db.create_namespace(&record, &holds))
+                .await,
+        )
+        .map(|()| record)
+    };
+    drop(holds);
+    match written {
+        Ok(_record) => {
+            record_restore_namespace_registry_audit(state, actor, db, namespace, write).await;
+            Ok(())
+        }
+        Err(_response) => {
+            warn_persistence_failure_redacted("restore_namespace_registry_write");
+            Err(restore_namespace_registry_partial_failure())
+        }
+    }
+}
+
+/// Audit the registry row a restore wrote: `create` for a namespace that had
+/// no row, otherwise `update` with the before/after descriptions.
+async fn record_restore_namespace_registry_audit(
+    state: &AdminState,
+    actor: &AuditActor,
+    db: Arc<dyn DatabaseBackend>,
+    namespace: &str,
+    write: RestoreNamespaceRegistryWrite,
+) {
+    let event = match write.existing {
+        Some(before) => {
+            let mut after = before.clone();
+            after.description = write.description;
+            audit::AuditEvent::new(
+                actor,
+                "update",
+                "namespace",
+                namespace,
+                namespace,
+                audit::update_diff(before.audit_body(), after.audit_body()),
+            )
+        }
+        None => {
+            let record = crate::config::namespace_registry::NamespaceRecord::new(
+                namespace.to_string(),
+                write.description,
+                UtcTimestamp::now(),
+            );
+            audit::AuditEvent::new(
+                actor,
+                "create",
+                "namespace",
+                namespace,
+                namespace,
+                audit::create_diff(record.audit_body()),
+            )
+        }
+    };
+    if let Err(error) = audit::record(state.admin_audit_enabled, db, event).await {
+        log_audit_enqueue_failure(&error);
+    }
 }
 
 fn parse_audit_filter(
@@ -13750,7 +13881,19 @@ async fn run_namespace_registry_mutation<T, F>(
 where
     F: std::future::Future<Output = Result<T, anyhow::Error>>,
 {
-    let completion = match admission.run_to_completion_while_held(future).await {
+    settle_namespace_registry_completion(admission.run_to_completion_while_held(future).await)
+}
+
+/// The outcome mapping of [`run_namespace_registry_mutation`], shared with
+/// restore's registry row write, which observes a split registry lease.
+#[allow(clippy::result_large_err)]
+fn settle_namespace_registry_completion<T>(
+    completion: Result<
+        crud::NamespaceConfigAdmissionCompletion<Result<T, anyhow::Error>>,
+        anyhow::Error,
+    >,
+) -> Result<T, Response<Full<Bytes>>> {
+    let completion = match completion {
         Ok(completion) => completion,
         Err(_error) => {
             warn_persistence_failure_redacted("namespace_registry_admission_lost_before_write");

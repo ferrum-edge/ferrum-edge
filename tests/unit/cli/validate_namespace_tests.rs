@@ -91,6 +91,7 @@ fn file_args(spec: &str, allow_empty_namespace: bool) -> ValidateArgs {
         verbose: 0,
         fips_mode: None,
         allow_empty_namespace,
+        backup: None,
     }
 }
 
@@ -102,6 +103,7 @@ fn mesh_args(spec: &str, allow_empty_namespace: bool) -> ValidateArgs {
         verbose: 0,
         fips_mode: None,
         allow_empty_namespace,
+        backup: None,
     }
 }
 

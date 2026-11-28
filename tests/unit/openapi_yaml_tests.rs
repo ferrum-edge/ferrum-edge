@@ -21521,6 +21521,10 @@ fn restore_request_publishes_the_complete_closed_envelope() {
         ("upstreams", json!([])),
         ("api_specs", json!({"section_version": "2", "items": []})),
         ("gateway_trust_bundles", json!([])),
+        (
+            "namespace_registry",
+            json!({"section_version": "1", "name": "tenant", "description": "Tenant"}),
+        ),
         ("ferrum_version", json!("0.9.5")),
         ("exported_at", json!("2026-09-16T00:00:00Z")),
         ("source", json!("database")),
@@ -21605,6 +21609,11 @@ fn restore_request_publishes_the_complete_closed_envelope() {
         json!({"conditional": 5}),
         json!({"conditional": "tag"}),
         json!({"conditional": true}),
+        // The registry section is closed and object-typed on both axes.
+        json!({"namespace_registry": {"section_version": "1", "name": "t", "extra": 1}}),
+        json!({"namespace_registry": {"section_version": "1"}}),
+        json!({"namespace_registry": []}),
+        json!({"namespace_registry": "tenant"}),
         json!([]),
         json!(["1", [], [], [], []]),
         json!("a string"),
@@ -21720,6 +21729,10 @@ fn batch_create_request_publishes_the_complete_closed_envelope() {
         ),
         ("api_specs", json!({"section_version": "2", "items": []})),
         ("gateway_trust_bundles", json!([])),
+        (
+            "namespace_registry",
+            json!({"section_version": "1", "name": "tenant", "description": null}),
+        ),
     ]);
 
     let published: BTreeSet<&str> = batch["properties"]
@@ -21790,6 +21803,10 @@ fn batch_create_request_publishes_the_complete_closed_envelope() {
         json!({"conditional": 5}),
         json!({"conditional": "tag"}),
         json!({"conditional": true}),
+        json!({"namespace_registry": {"section_version": "1", "name": "t", "extra": 1}}),
+        json!({"namespace_registry": {"section_version": "1"}}),
+        json!({"namespace_registry": []}),
+        json!({"namespace_registry": "tenant"}),
         json!({"proxise": []}),
         json!({"proxies": [], "unknown_top_level": true}),
         json!([]),
