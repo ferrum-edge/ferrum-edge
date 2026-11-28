@@ -2263,7 +2263,8 @@ mod transport_round_trip {
                 .any(|att| {
                     att.service_namespace == TENANT_NAMESPACE
                         && att.service_name == "orders"
-                        && att.route_proxy_id.contains("orders-api")
+                        && att.proxy_namespace == TENANT_NAMESPACE
+                        && att.proxy_id.contains("orders-api")
                 }),
             "native carries the bound tenant route attachment"
         );
