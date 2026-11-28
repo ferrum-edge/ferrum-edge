@@ -838,7 +838,16 @@ fn routes_on_unbound_hosts_or_to_unbound_services_are_not_carried() {
                     None,
                 ),
             ),
-            // A route on a bound Service with a leg in another namespace.
+            // A route on a bound Service with a leg in another namespace
+            // (ReferenceGrant-admitted for Sidecar/NodeWaypoint under #7499,
+            // still excluded by ServiceWaypoint projection under #7500).
+            k8s_service("billing", PAYMENTS_NAMESPACE),
+            reference_grant(
+                "allow-billing",
+                PAYMENTS_NAMESPACE,
+                WAYPOINT_NAMESPACE,
+                "billing",
+            ),
             virtual_service(
                 "ratings-to-billing",
                 WAYPOINT_NAMESPACE,
