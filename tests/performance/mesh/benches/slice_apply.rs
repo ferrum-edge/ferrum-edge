@@ -41,6 +41,7 @@ fn build_gateway_config(n_workloads: usize) -> GatewayConfig {
             pod_uid: None,
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         });
 
         mesh.services.push(MeshService {

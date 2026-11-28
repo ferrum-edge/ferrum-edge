@@ -2536,6 +2536,7 @@ fn relay_guard_workload(service: &str, addresses: &[&str], ports: &[u16]) -> Wor
         pod_uid: None,
         node_waypoint: None,
         remote_provenance: false,
+        mesh_transport: None,
     }
 }
 

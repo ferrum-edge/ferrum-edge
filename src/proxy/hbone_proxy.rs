@@ -3019,6 +3019,7 @@ mod tests {
             pod_uid: None,
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         });
         // The per-address port bound the apply path projects for an own-pod
         // terminator (issue #4249): the own-address / loopback arms read it,

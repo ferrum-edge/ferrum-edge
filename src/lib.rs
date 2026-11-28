@@ -621,6 +621,34 @@ pub mod _test_support {
         Ok((*config).clone())
     }
 
+    /// The control plane's filtered configuration for one mesh subscription:
+    /// the input both the native `MeshSubscribe` stream and the xDS ADS
+    /// stream project a slice from
+    /// (`CpGrpcServer::filter_config_to_mesh_request_for_scope_and_bearer`,
+    /// cluster-wide scope, no bearer `ns` claim).
+    pub fn cp_filter_config_to_mesh_request_for_test(
+        config: &crate::config::types::GatewayConfig,
+        request: &crate::modes::mesh::slice::MeshSliceRequest,
+    ) -> crate::config::types::GatewayConfig {
+        crate::grpc::cp_server::CpGrpcServer::filter_config_to_mesh_request_for_scope_and_bearer(
+            config,
+            request,
+            &crate::grpc::cp_server::CpScope::All,
+            None,
+        )
+    }
+
+    /// Whether two filtered configurations have the same xDS stream/snapshot
+    /// cache fingerprint (`xds::server::config_fingerprint`): equal means an
+    /// xDS stream would keep serving its cached snapshot.
+    pub fn xds_config_fingerprints_equal_for_test(
+        left: &crate::config::types::GatewayConfig,
+        right: &crate::config::types::GatewayConfig,
+    ) -> bool {
+        crate::xds::server::config_fingerprint(left)
+            == crate::xds::server::config_fingerprint(right)
+    }
+
     /// How specifically DestinationRule `rule_host` (declared in `namespace`)
     /// names `candidate`: `None` for no match, `Some(None)` for an exact host
     /// or Service alias, `Some(Some(n))` for a wildcard with an `n`-byte suffix.

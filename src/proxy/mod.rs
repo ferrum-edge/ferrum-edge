@@ -12112,7 +12112,14 @@ impl ProxyState {
         let mut targets = Vec::new();
 
         for proxy in &config.proxies {
-            if !proxy.dispatch_kind.is_http_family() {
+            // A ServiceWaypoint route not served yet (issue #7500) is never
+            // probed: probing would dial a bound Service's backend before any
+            // request was authorized at `:15008`.
+            if !proxy.dispatch_kind.is_http_family()
+                || crate::modes::mesh::service_waypoint_l7::service_waypoint_route_unserved(
+                    config, &proxy.id,
+                )
+            {
                 continue;
             }
 
@@ -12405,7 +12412,12 @@ impl ProxyState {
             };
             let base_proxies: Vec<&Proxy> = base_proxies
                 .into_iter()
-                .filter(|proxy| proxy.dispatch_kind.is_http_family())
+                .filter(|proxy| {
+                    proxy.dispatch_kind.is_http_family()
+                        && !crate::modes::mesh::service_waypoint_l7::service_waypoint_route_unserved(
+                            config, &proxy.id,
+                        )
+                })
                 .collect();
             if base_proxies.is_empty() {
                 continue;
@@ -13490,7 +13502,13 @@ impl ProxyState {
         // for and parking that connection on a client dispatch never uses.
         let pool_key_for = |candidate: &Proxy| self.connection_pool.pool_key_for_warmup(candidate);
         for proxy in &config.proxies {
-            if !proxy.dispatch_kind.is_http_family() {
+            // ServiceWaypoint routes not served yet (issue #7500) are never
+            // warmed: no backend connection ahead of an authorized request.
+            if !proxy.dispatch_kind.is_http_family()
+                || crate::modes::mesh::service_waypoint_l7::service_waypoint_route_unserved(
+                    &config, &proxy.id,
+                )
+            {
                 continue;
             }
             // Mirror the runtime dispatch decision: would this proxy ever
@@ -71701,6 +71719,7 @@ mod tests {
             pod_uid: None,
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         };
 
         let bywl_id = crate::modes::mesh::mesh_outbound_tcp_bywl_upstream_id(
@@ -76736,6 +76755,7 @@ mod tests {
             pod_uid: None,
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         };
         let mesh = MeshConfig {
             services: vec![service],
@@ -80529,6 +80549,7 @@ mod tests {
             pod_uid: None,
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         }
     }
 
@@ -82206,6 +82227,7 @@ mod tests {
                 pod_uid: None,
                 node_waypoint: None,
                 remote_provenance: false,
+                mesh_transport: None,
             }
         }
 

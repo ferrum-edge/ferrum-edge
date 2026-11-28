@@ -747,6 +747,7 @@ fn destination_local_service(
         pod_uid: Some(DESTINATION_POD_UID.to_string()),
         node_waypoint: None,
         remote_provenance: false,
+        mesh_transport: None,
     };
     let service = MeshService {
         cluster_ips: Vec::new(),

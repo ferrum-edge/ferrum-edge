@@ -3677,8 +3677,10 @@ paths:
         Returns `404 Not Found` when service-waypoint topology is not
         active, when no mesh slice has been installed yet, or when the
         installed slice has no `waypoint_name`. The payload exposes service
-        names, namespaces, ports, and workload counts, but no request bodies,
-        credentials, or backend TLS material.
+        names, namespaces, ports, workload counts, the bound-Service L7 HTTP
+        ports and the number of VirtualService routes attached to each
+        Service, but no route rules, request bodies, credentials, or backend
+        TLS material.
       tags: [Service-Waypoint]
       security:
         - bearerAuth: []
@@ -3698,10 +3700,14 @@ paths:
                     name: reviews
                     ports: [8080]
                     workload_count: 3
+                    l7_http_ports: [8080]
+                    virtual_service_route_count: 1
                   - namespace: default
                     name: ratings
                     ports: [8081]
                     workload_count: 1
+                    l7_http_ports: [8081]
+                    virtual_service_route_count: 0
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -45958,7 +45964,9 @@ components:
     # ── Service-Waypoint Services ─────────────────────────────────────
     ServiceWaypointServiceEntry:
       type: object
-      required: [namespace, name, ports, workload_count]
+      additionalProperties: false
+      required:
+        [namespace, name, ports, workload_count, l7_http_ports, virtual_service_route_count]
       properties:
         namespace:
           type: string
@@ -45981,9 +45989,36 @@ components:
           format: int64
           description: Number of workload SPIFFE references behind this service in the installed slice.
           example: 3
+        l7_http_ports:
+          type: array
+          description: |
+            HTTP-family ports of this Service that the waypoint materialized a
+            bound-Service L7 route and upstream for (issue #7500), ascending.
+            Empty when the Service is not bound to this waypoint by a binding
+            that claims service traffic (`waypoint_for` `service` or `all`),
+            or when no backing workload is reachable on any of its HTTP ports.
+            Stream-family ports never appear here.
+          items:
+            type: integer
+            minimum: 1
+            maximum: 65535
+          example: [8080]
+        virtual_service_route_count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            Number of distinct materialized VirtualService route proxies
+            attached to this bound Service in the generation the proxy serves
+            (issue #7500). This counts data-plane routes, not authored
+            `http[]` entries: one entry with several `match` clauses can
+            materialize several route proxies. Raw route rules and match
+            predicates are not exposed.
+          example: 1
 
     ServiceWaypointServicesResponse:
       type: object
+      additionalProperties: false
       required: [waypoint_name, namespace, service_count, services]
       properties:
         waypoint_name:

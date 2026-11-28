@@ -962,7 +962,13 @@ pub fn check_peer_version_compatibility(
 /// every native mesh resource object denies unknown fields (1.0 config
 /// freeze), so a snapshot or delta member that a revision-7 peer tolerated as
 /// ignorable now fails to decode.
-pub const CONFIG_SYNC_PROTOCOL_REVISION: u32 = 8;
+///
+/// Revision 9: reserved for the cross-namespace VirtualService route binding
+/// change (`authorized_cross_namespace_targets`, issue #7499).
+///
+/// Revision 10: a mesh `Workload` gained `mesh_transport` (issue #7500),
+/// which a pre-change peer's closed `Workload` refuses.
+pub const CONFIG_SYNC_PROTOCOL_REVISION: u32 = 10;
 
 /// Leading text of every ConfigSync build-mismatch refusal. The DP recognises
 /// the CP's `FAILED_PRECONDITION` Subscribe status by this prefix.

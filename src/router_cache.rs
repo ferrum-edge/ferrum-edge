@@ -431,6 +431,13 @@ pub(crate) struct HostRouteTable {
     // warning where the only consumer is `#[cfg(not(linux))]`-compiled out.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     mesh_udp_egress: HashMap<(std::net::IpAddr, u16), MeshTcpEgressDecision>,
+    /// ServiceWaypoint L7 bound-Service target index and per-bound-Service
+    /// route partitions (issue #7500), built once per generation from the
+    /// prepared `mesh` block (`MeshConfig::service_waypoint_l7_bindings`) and
+    /// the materialized proxies. Empty outside a ServiceWaypoint. The default
+    /// L7 routes it partitions are kept out of every tier above: they are
+    /// reachable only through their bound Service's partition.
+    service_waypoint_l7: Arc<crate::modes::mesh::service_waypoint_l7::ServiceWaypointL7Routes>,
 }
 
 /// Gateway listener routing admission for one exact request/config generation.
@@ -2368,6 +2375,15 @@ impl RouterCache {
         )
     }
 
+    /// The current generation's ServiceWaypoint L7 bound-Service target index
+    /// and per-bound-Service route partitions (issue #7500). Empty outside a
+    /// ServiceWaypoint. Lock-free snapshot read.
+    pub fn service_waypoint_l7_routes(
+        &self,
+    ) -> Arc<crate::modes::mesh::service_waypoint_l7::ServiceWaypointL7Routes> {
+        Arc::clone(&self.route_snapshot.load().table.service_waypoint_l7)
+    }
+
     /// Cache statistics for metrics: (prefix_entries, regex_entries, prefix_evictions, regex_evictions, max_entries).
     pub fn cache_stats(&self) -> (usize, usize, u64, u64, usize) {
         (
@@ -3143,7 +3159,14 @@ impl RouterCache {
         }
 
         for proxy in &config.proxies {
-            if crate::modes::mesh::is_mesh_outbound_http_bywl_route_id(&proxy.id) {
+            // ServiceWaypoint default L7 Service routes (issue #7500) are
+            // reachable only through their bound Service's route partition
+            // (`service_waypoint_l7`), never through the host/path tiers.
+            if crate::modes::mesh::is_mesh_outbound_http_bywl_route_id(&proxy.id)
+                || crate::modes::mesh::service_waypoint_l7::is_service_waypoint_l7_route_id(
+                    &proxy.id,
+                )
+            {
                 mesh_sibling_skip_ids
                     .entry(proxy.namespace.clone())
                     .or_default()
@@ -3414,6 +3437,9 @@ impl RouterCache {
             mesh_http_egress_by_workload,
             mesh_tcp_inbound,
             mesh_udp_egress,
+            service_waypoint_l7: Arc::new(
+                crate::modes::mesh::service_waypoint_l7::ServiceWaypointL7Routes::build(config),
+            ),
         }
     }
 }
@@ -7235,6 +7261,7 @@ mod tests {
             pod_uid: None,
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         };
 
         // The single-target per-workload upstream the materializer would emit,
@@ -7363,6 +7390,7 @@ mod tests {
             pod_uid: None,
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         };
         let canonical_ip = "10.0.0.7".parse().unwrap();
         let upstream_id = crate::modes::mesh::mesh_outbound_http_bywl_upstream_id(
@@ -7462,6 +7490,7 @@ mod tests {
             pod_uid: None,
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         };
         let service = |name: &str, port: u16| MeshService {
             name: name.to_string(),
