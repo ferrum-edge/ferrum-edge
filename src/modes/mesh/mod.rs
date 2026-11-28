@@ -5724,7 +5724,10 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
             );
             destination.insert("backend_port".to_string(), serde_json::json!(80));
         }
-        if !rule.contains_key("redirect") {
+        if !rule
+            .get("redirect")
+            .is_some_and(serde_json::Value::is_object)
+        {
             apply_gamma_unavailable_abort(rule, 100.0);
         }
     }
@@ -5739,7 +5742,10 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
         else {
             continue;
         };
-        if rule.contains_key("redirect") {
+        if rule
+            .get("redirect")
+            .is_some_and(serde_json::Value::is_object)
+        {
             continue;
         }
         apply_gamma_unavailable_abort(rule, unavailable_pct);
@@ -5929,7 +5935,10 @@ fn gamma_proxy_rejects_unmatched(config: &GatewayConfig, proxy: &Proxy) -> bool 
 /// (redirect or 100% abort/secondary_abort), proving its placeholder
 /// `GAMMA_NO_FORWARD_HOST` destination is never dialed.
 fn gamma_rule_terminates_unconditionally(rule: &serde_json::Value) -> bool {
-    if rule.get("redirect").is_some() {
+    if rule
+        .get("redirect")
+        .is_some_and(serde_json::Value::is_object)
+    {
         return true;
     }
     let Some(fault) = rule.get("fault") else {

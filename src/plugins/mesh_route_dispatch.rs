@@ -2470,11 +2470,16 @@ fn rule_answers_before_dispatch(
     rule: &RouteRule,
     facts: EarlyRouteTotalFacts<'_>,
 ) -> bool {
-    let always_aborts = rule
-        .fault
-        .as_ref()
-        .and_then(|fault| fault.abort.as_ref())
-        .is_some_and(|abort| abort.percentage >= 100.0);
+    let always_aborts = rule.fault.as_ref().is_some_and(|fault| {
+        fault
+            .abort
+            .as_ref()
+            .is_some_and(|abort| abort.percentage >= 100.0)
+            || fault
+                .secondary_abort
+                .as_ref()
+                .is_some_and(|abort| abort.percentage >= 100.0)
+    });
     let fault_preempted =
         facts.route_faults_may_be_preempted || ctx.metadata.contains_key("fault_injected");
     let veto = node_waypoint_rule_destination_vetoed(ctx, &rule.destination);

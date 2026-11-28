@@ -562,7 +562,11 @@ fn weighted_split_with_scaled_to_zero_backend_fails_proportionally_with_503() {
     );
     assert!(
         split_upstream.targets.iter().all(|target| {
-            target.tags.get("mesh_service_name").map(String::as_str) == Some("reviews")
+            target
+                .tags
+                .get(ferrum_edge::config::types::UPSTREAM_TARGET_SERVICE_NAME_TAG)
+                .map(String::as_str)
+                == Some("reviews")
         }),
         "surviving split targets must point only to healthy reviews, got {:?}",
         split_upstream.targets
@@ -639,7 +643,11 @@ fn weighted_split_preserves_distinct_500_invalid_and_503_unavailable_shares() {
     assert!(
         !split_upstream.targets.is_empty()
             && split_upstream.targets.iter().all(|target| {
-                target.tags.get("mesh_service_name").map(String::as_str) == Some("reviews")
+                target
+                    .tags
+                    .get(ferrum_edge::config::types::UPSTREAM_TARGET_SERVICE_NAME_TAG)
+                    .map(String::as_str)
+                    == Some("reviews")
             }),
         "surviving targets must belong only to healthy reviews, got {:?}",
         split_upstream.targets
@@ -756,5 +764,29 @@ fn wildcard_destination_rule_does_not_drop_gamma_dispatch() {
     assert!(
         prepared.proxies.iter().any(|proxy| proxy.id == gamma_id),
         "visible wildcard DestinationRule must not drop GAMMA dispatch proxy or its 100%-abort rule"
+    );
+
+    // Negative control: a non-terminal placeholder rule (`redirect: null`, no
+    // 100% abort) targeting the placeholder host MUST still be rejected by the
+    // visible wildcard DestinationRule.
+    let mut non_terminal_slice = slice;
+    for plugin in &mut non_terminal_slice.http_routes.plugin_configs {
+        if plugin.plugin_name == "mesh_route_dispatch"
+            && let Some(rules) = plugin.config.get_mut("rules").and_then(Value::as_array_mut)
+            && let Some(rule) = rules.first_mut().and_then(Value::as_object_mut)
+        {
+            rule.remove("fault");
+            rule.insert("redirect".to_string(), Value::Null);
+        }
+    }
+    let non_terminal_prepared =
+        prepare_gateway_config_from_mesh_slice(&non_terminal_slice, &runtime)
+            .expect("slice prepares when non-terminal placeholder GAMMA route is dropped");
+    assert!(
+        !non_terminal_prepared
+            .proxies
+            .iter()
+            .any(|proxy| proxy.id == gamma_id),
+        "non-terminal placeholder rule with `redirect: null` must be dropped under wildcard DR"
     );
 }
