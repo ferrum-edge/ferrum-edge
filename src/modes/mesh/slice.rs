@@ -4228,8 +4228,8 @@ pub(crate) fn mesh_route_dispatch_rule_upstream_ids(config: &serde_json::Value) 
 /// it and its `mesh_route_dispatch` rules name. A route that is not
 /// self-contained — an association or upstream that is missing, shared, or
 /// not translator-owned — or one with a destination the applicable Sidecar
-/// egress scope does not admit is dropped, fail-closed: the waypoint then
-/// serves that host through its materialized Service route instead.
+/// egress scope does not admit is dropped, fail-closed, leaving plain Service
+/// routing for that host where it already exists.
 ///
 /// `binding_admitted` decides which [`MeshConfig::virtual_service_http_routes`]
 /// bindings this subscriber sees at all, and `route_admitted` which of a

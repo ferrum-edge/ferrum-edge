@@ -5653,8 +5653,8 @@ fn destination_rule_originates_tls_for_host(mesh_slice: &MeshSlice, host: &str, 
 ///
 /// A route with a destination that is an in-cluster Service the slice does not
 /// model, or a modeled Service port with no materialized upstream, is dropped
-/// with its plugins, fail-closed; its host then gets the materialized Service
-/// route. So is a leg-dispatched route that cannot be represented (more legs
+/// with its plugins, fail-closed, leaving plain Service routing where it
+/// already exists. So is a leg-dispatched route that cannot be represented (more legs
 /// or candidate destinations than authorization tracks, or a residual
 /// upstream id already in use), and a route with a direct external backend
 /// (its own, or a dispatch rule's) whose DestinationRule asks to originate
@@ -6190,9 +6190,7 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                     // An authorized destination in another namespace (issue
                     // #7499) is bound to a route-namespace clone of that
                     // Service port's upstream; any other one refuses the route,
-                    // leaving plain Service routing where it already exists
-                    // (while an already-translated unconditional 404 keeps its
-                    // 404 with a refused split detached).
+                    // leaving plain Service routing where it already exists.
                     CarriedRouteHost::Service(service_namespace, service_name)
                         if service_namespace != namespace =>
                     {
@@ -6623,8 +6621,8 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
              or (Sidecar) a route claims the local workload's own inbound route, applies \
              only to other source namespaces, or rewrites the authority to a host its \
              destination does not answer, or a destination in another namespace is not \
-             authorized for its route (issue #7499); their hosts use the materialized Service \
-             routes"
+             authorized for its route (issue #7499); plain Service routing remains where \
+             it already exists"
         );
         config
             .proxies
