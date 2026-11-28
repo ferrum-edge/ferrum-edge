@@ -45,10 +45,12 @@ configuration that 0.9.21 accepted, so review every section before upgrading.
 Every PostgreSQL, MySQL, SQLite and MongoDB database created by a 0.9.x
 release is rebuilt from a logical backup
 ([Database rebuild-and-restore](#every-09x-database-is-rebuilt-and-restored-7523)).
-CP/DP must run the same build, and the ConfigSync revision is now `10`. The
-matching `contracts-edge-1.0.0` release must be cut from the verified release
-commit after the Edge release is published; move downstream contract pins when
-each consumer adopts 1.0.0.
+CP/DP must run the same build, and the ConfigSync revision is now `10`
+(`1.0.0+configsync.r10`;
+[ConfigSync revision 10](#configsync-revision-10-and-the-cp-first-upgrade-7520-7524-7499-7500)).
+The matching `contracts-edge-1.0.0` release must be cut from the verified
+release commit after the Edge release is published; move downstream contract
+pins when each consumer adopts 1.0.0.
 
 ### Upgrade order for 0.9.21 deployments
 
