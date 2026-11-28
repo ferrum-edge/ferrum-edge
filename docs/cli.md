@@ -111,6 +111,7 @@ ferrum-edge validate [OPTIONS]
 | `--fips-mode <MODE>` | | FIPS deployment mode: `off` (default) or `enforce`. Must be supplied via this flag or the environment — a value set only in `ferrum.conf` arrives after the crypto provider is installed and is refused. See [FIPS mode](fips.md) |
 | `--verbose` | `-v` | Increase log verbosity (repeatable: `-v`=info, `-vv`=debug, `-vvv`=trace) |
 | `--allow-empty-namespace` | | Accept a file-mode or mesh file-protocol document that contains namespaced resources but none survive `FERRUM_NAMESPACE` filtering. Without this flag that case is a validation failure (exit 1). Runtime (`run`) is unchanged. |
+| `--backup <FILE>` | | Check a `GET /backup` export offline against `POST /restore` instead of validating a resources file (see [Backup export check](#backup-export-check)). Requires `-m database` or `-m cp`. |
 
 ### What is validated
 
@@ -172,11 +173,68 @@ Resource discovery runs after external secret resolution and settings loading. A
 
 **Externally sourced values are never printed.** Failure diagnostics name the base variable, the provider, and the reason, but not the source reference, even when a provider SDK echoes it (a one- or two-byte reference that cannot be removed safely causes the provider detail to be replaced with a fixed key-level failure). After materialization, externally sourced values are withheld from later settings and spec diagnostics, from warnings emitted during parsing (matched verbatim, trimmed, per list entry, case-normalized, and JSON-escaped), and from `validate` report fields. For example, a malformed `FERRUM_PROXY_HTTP_PORT_FILE` reports `Invalid FERRUM_PROXY_HTTP_PORT value <redacted: value from external secret source>. Expected a valid u16 integer`, and `FERRUM_MODE_FILE` containing `database` prints `Mode: <redacted: value from external secret source>` (`run` withholds its `Operating mode:` log line the same way). The overall result, including `Validation passed.` and spec counts, is unaffected. Rejection and startup diagnostics also withhold directly supplied scalar values, keeping field names, failure reasons, allowed bounds, and recovery guidance.
 
+### Backup export check
+
+`ferrum-edge validate --backup <FILE>` checks a `GET /backup` export without a
+database connection (issue #7532). It runs the database-independent admission
+`POST /restore` runs, through the same function, so on the same build a file
+the check accepts is accepted by restore's payload validation and a file that
+validation refuses is refused by the check, for every section:
+
+- the closed restore envelope and its `version`;
+- every proxy, consumer, plugin config and upstream (ids, field validation,
+  uniqueness, references, plugin construction and composition), with plugins
+  constructed by the serving node's client under `-m database` (node-local
+  egress checks included) and checked for shape only under `-m cp`;
+- consumer credential preparation: plaintext Basic-auth passwords are hashed
+  with `FERRUM_BASIC_AUTH_HMAC_SECRET`, so a missing or too-short secret is
+  refused as restore refuses it;
+- `gateway_trust_bundles` (singleton rule and record validation);
+- `api_specs`: size, compression and hash checks, document format and
+  version, the ownership graph, and the same strict extension admission of
+  each stored document that `POST` / `PUT /api-specs` run, so stale or removed
+  keys in `x-ferrum-proxy` / `x-ferrum-upstream` are found here, plus the
+  static `x-ferrum-validate` (import flag, `request` / `response` / `bypass`
+  shapes) and `x-ferrum-mcp` (keys, literal listen path, `POST` allowance,
+  endpoint path) checks;
+- `namespace_registry` (section version, name, description).
+
+Behaviour:
+
+- A missing or unreadable file exits 1.
+- The file is read under the restore body limit,
+  `FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB` (default `100`), not the 64 MiB
+  ceiling of `FERRUM_DB_CONFIG_BACKUP_PATH`; a larger file exits 1, as restore
+  answers it with `413`.
+- Run it with `-m database` or `-m cp` and the restoring node's environment:
+  plugin validation, the backend egress policy and the spec size limits come
+  from it, and `FERRUM_NAMESPACE` names the restore target (a
+  `namespace_registry` section from another namespace is reported as not
+  applied).
+- On success it prints the counts restore would write and exits 0. Refusals are
+  printed with the same redaction as every other `validate` diagnostic.
+- Not decided offline, because they depend on the target database: another
+  namespace already owning the process-global `prometheus_metrics` instance,
+  the `confirm_api_spec_deletion` confirmation for a backup without an
+  `api_specs` section when the target holds specs, a conditional
+  restore's `If-Match`, and on standalone MongoDB whether the
+  `namespace_registry` section would change the registry row (`501`). On a control plane whose cached configuration carries a
+  mesh model, restore also checks mesh references against that model.
+
+The `FERRUM_DB_CONFIG_BACKUP_PATH` check in database mode is unchanged in scope
+(the startup fallback loader: runtime resources of the served namespace, 64 MiB
+ceiling). A configured fallback path that does not exist is reported as
+`file not found; nothing was checked` rather than passing silently; it does not
+fail `validate`, because a missing fallback file is a warning at startup too.
+
 ### Examples
 
 ```bash
 # Validate a spec file
 ferrum-edge validate --spec resources.yaml
+
+# Check a GET /backup export before restoring it into namespace tenant-a
+FERRUM_NAMESPACE=tenant-a ferrum-edge validate -m database --backup tenant-a-backup.json
 
 # Validate with explicit settings
 ferrum-edge validate --settings /etc/ferrum/ferrum.conf --spec /etc/ferrum/resources.yaml

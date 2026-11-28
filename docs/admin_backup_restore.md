@@ -251,7 +251,8 @@ Both the config resources and the full `api_specs` documents are read from the *
 
 The whole section is validated **before** the delete phase; any failure returns `400` with `validation_errors` and leaves existing config untouched. In addition to the section version, per-item size/compression bounds, `content_hash`, and the stored-metadata bounds that ordinary `POST`/`PUT` admission enforces, restore checks:
 
-- **Document format and version.** Each document is parsed with the same bounded parser as ingestion under its declared `spec_format`, and the `swagger`/`openapi` version it declares must be supported *and* equal to the item's `spec_version`. Restore does not re-extract resources or resolve external `$ref`s, so historical backups stay restorable as-is. Parse/version errors are reported generically and never echo document fragments or the submitted values.
+- **Document format and version.** Each document is parsed with the same bounded parser as ingestion under its declared `spec_format`, and the `swagger`/`openapi` version it declares must be supported *and* equal to the item's `spec_version`. Parse/version errors are reported generically and never echo document fragments or the submitted values.
+- **Extension admission (issue #7532).** Each stored document goes through the same strict extension admission `POST` / `PUT /api-specs` runs: `x-ferrum-proxy`, `x-ferrum-upstream` and `x-ferrum-plugins` are decoded into the closed resource types with their id, scope, ownership and credential checks, and `x-ferrum-validate` / `x-ferrum-mcp` get their shape checks. A document that carries an unknown or removed key (for example the removed passive-health `gateway_error_codes` under `x-ferrum-upstream.health_checks.passive`) is refused before anything is deleted, with the error a submission of that document returns, so a backup that restores is a backup whose specs can be re-submitted. External `$ref`s are not re-fetched (the restoring node may not be allowed to); the stored external-ref snapshot is integrity-checked instead.
 - **Server-managed ownership graph.** The declared owning proxy must exist and carry the spec's `api_spec_id`, and no second proxy may claim it; a spec may own at most one upstream, and a spec-owned upstream may not be referenced by any other proxy; every spec-owned plugin config must be proxy-scoped to the owning proxy and associated with it. Hand-managed resources (`api_spec_id` absent) are not inspected, so the direct-admin drift that API-spec `PUT`/`DELETE` deliberately supports — hand-added plugins/upstreams on a spec-owned proxy, or a spec-owned proxy pointed at a hand-managed upstream — still restores unchanged.
 
 #### Legacy backups that omit `api_specs`
@@ -300,8 +301,9 @@ or revisions.
 `FERRUM_DB_CONFIG_BACKUP_PATH` for **database-mode** outage bootstrap. Raw
 `GatewayConfig` JSON remains accepted. The loader requires a supported config
 `version`, ignores only the known administrative envelope fields
-(`ferrum_version`, `exported_at`, `source`, `counts`, `gateway_trust_bundles`,
-`api_specs`), and rejects unknown runtime fields. It reads a stable regular file
+(`ferrum_version`, `exported_at`, `source`, `counts`, `conditional`,
+`gateway_trust_bundles`, `api_specs`, `namespace_registry`), and rejects
+unknown runtime fields. It reads a stable regular file
 of at most 64 MiB; provision updates by atomic replacement, with permissions
 appropriate for unredacted credentials.
 
@@ -324,28 +326,121 @@ settles it. `GET /gateway-trust/status` reports `authority_unresolved: true`
 for that duration. Use `POST /restore` to move administrative resources between
 databases; mounting an export as a startup backup does not write to the database.
 
-### Namespace metadata is not part of a backup
+<a id="namespace-metadata-is-not-part-of-a-backup"></a>
 
-A namespace backup payload carries namespace-**scoped configuration
-resources** — proxies, consumers, plugin configs, upstreams, API specs, and
-gateway trust bundles — and never the namespace registry row itself (its
-`description` and its `created_at`/`updated_at`). This boundary is deliberate:
-`POST /restore` writes into the **authenticated target namespace**, so
-transplanting the source tenant's registry metadata into a different target
-would silently relabel that target from an artifact taken elsewhere.
+### The namespace registry row is part of a full backup
 
-The consequences are explicit rather than implied:
+A full, unfiltered database-backed `GET /backup` carries the exported
+namespace's registry row in a `namespace_registry` section (issue #7532):
 
-- Restoring **in place** (same namespace the backup came from) leaves that
-  namespace's registry row untouched: description and timestamps are preserved
-  exactly as they were, including across the destructive clear.
-- Importing into a **fresh target** yields a namespace that holds resources but
-  has no registry row and therefore no description — a derived-only namespace.
-  It still appears in `GET /namespaces`, and `GET /namespaces/{name}` returns a
-  synthesized record with observation timestamps (see [Derived-only namespace
-  timestamps](admin_api.md#derived-only-namespace-timestamps)). Use `POST /namespaces` or
-  `PUT /namespaces/{name}` to materialize a durable registry row with the
-  description you want.
+```json
+"namespace_registry": {
+  "section_version": "1",
+  "name": "tenant-a",
+  "description": "Tenant A production"
+}
+```
+
+The section is emitted only when the namespace has a registry row, and is
+omitted from `?resources=` filtered exports and cached-fallback exports.
+Registry timestamps are not carried. A conditional export
+(`?conditional=true`) reads the section from the same snapshot as its
+namespace `ETag`, and that `ETag` covers the registry row.
+
+On `POST /restore` the section is validated with the rest of the payload,
+before anything is deleted (`section_version` must be `"1"`, `name` must be a
+valid namespace name, and `description` follows the `POST /namespaces` rules).
+Restore then writes the row:
+
+- **Same namespace** (the section's `name` is the target namespace): a row
+  that already matches the backup is left as it is; otherwise an
+  existing row's description is replaced and its `created_at` kept; a namespace
+  that only had derived existence is registered; an empty, unregistered
+  namespace — a registered namespace that held no resources when it was
+  exported — is created with new timestamps. A rebuild therefore recreates
+  every registered namespace, including empty ones, by restoring each
+  namespace's export into the namespace of the same name.
+- **Different namespace** (restoring tenant A's export into tenant B): the
+  section is not applied, and B's registry row is left as it is. Restore writes
+  into the authenticated target namespace and must not relabel it with another
+  tenant's metadata.
+- **No section** (every 0.9.x export, filtered and cached-fallback exports):
+  the target's registry row is left exactly as it is, including across the
+  destructive clear.
+
+When the section names the target namespace, restore takes registry
+admission — the global namespace-registry lease, then the namespace's own
+lease, the order `POST`, `PUT` and `DELETE /namespaces` use — instead of plain
+namespace admission, and holds it from before the clear until the row is
+written. No registry mutation can interleave with the restore, and the two
+cannot deadlock.
+
+- **Conditional restore** (`If-Match`): the row is written inside the
+  replacement transaction, after the namespace `ETag` comparison. The `ETag`
+  covers the registry row, so a description changed after the backup makes the
+  restore a `412` with nothing applied, and the write can never replace a
+  newer description.
+- **Non-conditional restore**: the row is written after the chunked import
+  commits, still under the registry admission and the write-topology permit,
+  and before live apply is awaited. If that single write fails, restore
+  returns `500` with `configuration_restored: true`: the configuration is
+  restored and committed, and retrying the restore (or
+  `PUT /namespaces/{name}`) writes the row.
+
+On standalone MongoDB, which cannot write the registry atomically, an
+unchanged row (for example the seeded `ferrum` row) restores normally, while a
+backup that would change the row is refused with `501` before anything is
+deleted. Configure `FERRUM_MONGO_REPLICA_SET`, or remove the
+`namespace_registry` section to restore the configuration alone.
+
+The section is additive, so the backup's top-level `version` stays `"1"`
+(see [support_policy.md](support_policy.md#backup-export-and-file-config-format)):
+exports without it keep restoring unchanged, and `namespace_registry.section_version`
+versions the section itself.
+
+### Checking a backup offline — `ferrum-edge validate --backup`
+
+`ferrum-edge validate --backup <file>` checks a `GET /backup` export without a
+database (issue #7532). It runs exactly the database-independent admission
+`POST /restore` runs on the same build — the envelope, every resource
+collection, `gateway_trust_bundles`, `api_specs` (with each stored document's
+extension admission) and `namespace_registry` — through the same function, so a
+file the check accepts is accepted by restore's payload validation and a file
+restore's payload validation refuses is refused by the check. It reads the file
+under the restore body limit (`FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB`, default
+`100`), not the 64 MiB fallback-file ceiling, and a missing or unreadable file
+exits non-zero.
+
+```bash
+FERRUM_NAMESPACE=tenant-a ferrum-edge validate -m database --backup tenant-a.json
+```
+
+Run it with `-m database` or `-m cp` and the environment of the node you will
+restore on: plugin validation, the backend egress policy and the spec body
+limits come from it, and `FERRUM_NAMESPACE` names the restore target. Three
+refusals depend on the target database rather than on the file and are only
+decided by the restore itself: another namespace already owning the
+process-global `prometheus_metrics` instance, the `confirm_api_spec_deletion`
+confirmation a backup *without* an `api_specs` section needs when the target
+holds specs, a conditional restore's `If-Match` precondition, and on
+standalone MongoDB whether the `namespace_registry` section would change the
+registry row (`501`). On a control plane whose cached configuration carries a
+mesh model, restore also validates mesh references against that model, which
+the offline check does not have.
+
+The check also prepares the payload as restore does: plaintext Basic-auth
+passwords are hashed with `FERRUM_BASIC_AUTH_HMAC_SECRET`, so a deployment
+without a usable secret is refused offline as restore refuses it. With
+`-m database` plugins are validated with the serving node's client, so
+node-local egress checks (for example a `load_testing` instance whose loopback
+dial the backend egress policy denies) refuse the file as database-mode
+restore does; `-m cp` checks plugin shape only, as a control plane does.
+
+`FERRUM_DB_CONFIG_BACKUP_PATH` is a different, narrower check: `validate -m
+database` loads it through the startup fallback loader (the namespace's
+runtime resources only, at most 64 MiB). A fallback path that does not exist is
+a warning at startup, and `validate` reports it as `file not found; nothing
+was checked` instead of passing silently.
 
 ### MongoDB restore refuses malformed split identities
 

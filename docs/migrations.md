@@ -66,8 +66,11 @@ design. Export a namespace-complete logical backup with the 0.9.x binary,
 initialize an empty database with 1.0.0, and restore into it, as described in
 [admin_backup_restore.md](admin_backup_restore.md) and the step-by-step
 [database rebuild procedure](upgrade_guide.md#build-out-database-upgrade-postgresql-mysql-sqlite-mongodb).
-MongoDB databases take the same path. From 1.0.0 onward, upgrades between
-releases apply forward migrations in place.
+MongoDB databases take the same path, and a 1.0.0 binary refuses a populated
+MongoDB database that records no index-plan version (one a 0.9.x release
+created) at startup, `migrate up` and `migrate status`, naming the rebuild
+procedure (see [MongoDB Migrations](#mongodb-migrations)). From 1.0.0 onward,
+upgrades between releases apply forward migrations in place.
 
 ### Canonical schema locations
 
@@ -701,7 +704,16 @@ plan in `src/config/mongo_index_plan.rs`:
    binary's `MONGO_INDEX_PLAN_VERSION`, refuse before any write, including the
    migration-lease document: an older binary must not run against a database
    a newer release upgraded or started upgrading. A record that is not a
-   positive integer is also refused.
+   positive integer is also refused. A database with **no** record that holds
+   a document in any Ferrum collection (`proxies`, `consumers`,
+   `plugin_configs`, `upstreams`, `api_specs`, `gateway_trust_bundles`,
+   `namespaces`, `config_changes`, `consumer_identity_index`,
+   `audit_events`) was initialized by a 0.9.x release and is refused too
+   (`migration history integrity check failed: kind=pre_release_database`,
+   naming the collection and the rebuild-and-restore procedure). Every 1.0.0+
+   `up` records `in_progress_version` before it creates a collection or a
+   document, so a 1.x database always has a record; an empty database (none of
+   those collections holds a document) is new and is initialized.
 2. Take the migration lease and repeat that check under it.
 3. If this plan version is not yet recorded as applied, set
    `in_progress_version` to it before the first schema change.
@@ -718,10 +730,12 @@ the migration lease (valid renewal and an owner-qualified lock document), so a
 runner that lost its lease stops instead of changing another runner's indexes.
 A failure before step 5 leaves the marker in place: an older binary keeps
 refusing the database, and a rerun of the same release resumes and finishes
-the same idempotent forward step. A database with no record (fresh, or
-initialized by a release before 1.0.0) is treated as version 0. Reconnecting
-to the primary or a failover URL reads the candidate database's plan state and
-keeps the current connection if the candidate was upgraded by a newer release.
+the same idempotent forward step. An empty database with no record is treated
+as version 0 and initialized; a populated database with no record is a 0.9.x
+database and is refused (step 1). Reconnecting to the primary or a failover
+URL reads the candidate database's plan state and keeps the current connection
+if the candidate was upgraded by a newer release or initialized by a 0.9.x
+release.
 
 Conflicting existing index options still fail initialization: `createIndex` is
 a no-op only when the full index spec (keys + options) matches. Migrate
@@ -730,8 +744,9 @@ every retirement it would drop (each only when the recorded version is below
 its `retired_in`). Migrate status connects, runs `listIndexes`, reports the
 recorded, in-progress, and binary plan versions and each required index as
 present, missing, or mismatched, plus whether the required guard-collection
-shells exist. Status refuses a newer applied or in-progress plan version, and
-connectivity or authentication failures return nonzero.
+shells exist. Status refuses a newer applied or in-progress plan version and a
+0.9.x database (the same marker as step 1), and connectivity or authentication
+failures return nonzero.
 
 ### Changing the MongoDB index plan
 
@@ -749,7 +764,9 @@ Each change bumps `MONGO_INDEX_PLAN_VERSION` by one in the release that makes it
 Never edit an existing plan entry's keys or options in place (MongoDB refuses
 a same-key index with different options) and never edit or remove a shipped
 retirement. Upgrading a MongoDB database created before 1.0.0 to 1.0.0 follows
-the same one-time [rebuild-and-restore](#build-out-schema-policy) as SQL.
+the same one-time [rebuild-and-restore](#build-out-schema-policy) as SQL, and
+like SQL a 1.0.0 binary refuses such a database at startup, in `migrate up`
+and in `migrate status`.
 
 ### What Gets Created
 

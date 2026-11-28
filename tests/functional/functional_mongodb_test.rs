@@ -1125,6 +1125,163 @@ async fn test_mongodb_batch_atomicity_refused_on_standalone() {
     println!("\n=== MongoDB Standalone Batch Refusal Test PASSED ===\n");
 }
 
+/// Standalone MongoDB seeds the default namespace's registry row, and a full
+/// `GET /backup` exports it. Restoring that unchanged export must succeed: the
+/// row already matches, so restore writes no registry row and needs no
+/// replica set. A backup that would change the row is refused with `501`
+/// before anything is deleted, since standalone MongoDB cannot write the
+/// registry atomically (issue #7532).
+#[tokio::test]
+#[ignore]
+async fn test_mongodb_standalone_restores_an_unchanged_backup_with_its_registry_row() {
+    println!("\n=== MongoDB Standalone Registry Restore Test ===\n");
+
+    let mongo_url =
+        std::env::var("FERRUM_TEST_MONGO_URL").unwrap_or_else(|_| DEFAULT_MONGO_URL.to_string());
+    // Same required standalone backend (and fail-closed gate) as the other
+    // standalone cells in this job.
+    let mongo_host_port = host_port_from_db_url(&mongo_url);
+    if !continue_if_backend_available(
+        "mongodb",
+        mongodb_is_available(&mongo_url).await,
+        &format!("not available at {mongo_host_port}"),
+    ) {
+        return;
+    }
+
+    // A fresh database, so the seeded registry row and this test's resources
+    // are the whole `ferrum` namespace being backed up and restored.
+    let database = format!("ferrum_registry_restore_{}", Uuid::new_v4().simple());
+    let mut harness = MongoTestHarness::new().await.expect("Create harness");
+    let mut started = Err(String::new());
+    for attempt in 1..=3 {
+        match harness
+            .try_start_gateway_plaintext_with_env(
+                &mongo_url,
+                None,
+                &[("FERRUM_MONGO_DATABASE", database.as_str())],
+            )
+            .await
+        {
+            Ok(()) => {
+                started = Ok(());
+                break;
+            }
+            Err(error) => {
+                let message = error.to_string();
+                drop(error);
+                eprintln!(
+                    "standalone registry restore start attempt {attempt}/3 failed: {message}"
+                );
+                started = Err(message);
+                harness.reallocate_ports().await.expect("reallocate ports");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+    started.expect("Start gateway with standalone MongoDB");
+
+    let client = reqwest::Client::new();
+    let auth_header = format!("Bearer {}", harness.generate_token().expect("token"));
+    let proxy = json!({
+        "id": "registry-restore-proxy",
+        "listen_path": "/registry-restore",
+        "backend_host": "127.0.0.1",
+        "backend_port": 9
+    });
+    let (status, body) = admin_call(
+        &client,
+        &harness,
+        &auth_header,
+        reqwest::Method::POST,
+        "/proxies",
+        Some(&proxy),
+    )
+    .await;
+    assert_eq!(status, 201, "create proxy: {body:?}");
+
+    let (status, backup) = admin_call(
+        &client,
+        &harness,
+        &auth_header,
+        reqwest::Method::GET,
+        "/backup",
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "backup: {backup:?}");
+    assert_eq!(
+        backup["namespace_registry"]["name"], "ferrum",
+        "a full standalone export carries the seeded registry row: {backup:?}"
+    );
+
+    let (status, restored) = admin_call(
+        &client,
+        &harness,
+        &auth_header,
+        reqwest::Method::POST,
+        "/restore?confirm=true",
+        Some(&backup),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "an unchanged backup restores on standalone MongoDB: {restored:?}"
+    );
+    let (status, _) = admin_call(
+        &client,
+        &harness,
+        &auth_header,
+        reqwest::Method::GET,
+        "/proxies/registry-restore-proxy",
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "the restored proxy is present");
+    println!("  OK: unchanged backup restored");
+
+    let mut changed = backup.clone();
+    changed["namespace_registry"]["description"] = json!("changed on restore");
+    changed["proxies"] = json!([]);
+    let (status, refused) = admin_call(
+        &client,
+        &harness,
+        &auth_header,
+        reqwest::Method::POST,
+        "/restore?confirm=true",
+        Some(&changed),
+    )
+    .await;
+    assert_eq!(
+        status, 501,
+        "a registry change is refused on standalone MongoDB: {refused:?}"
+    );
+    assert!(
+        refused["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("FERRUM_MONGO_REPLICA_SET"),
+        "the refusal names the configuration that enables it: {refused:?}"
+    );
+    let (status, _) = admin_call(
+        &client,
+        &harness,
+        &auth_header,
+        reqwest::Method::GET,
+        "/proxies/registry-restore-proxy",
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "the refused restore deleted nothing");
+    println!("  OK: registry change refused before the clear");
+
+    drop(harness);
+    if let Ok(client) = MongoClient::with_uri_str(&mongo_url).await {
+        let _ = client.database(&database).drop().await;
+    }
+    println!("\n=== MongoDB Standalone Registry Restore Test PASSED ===\n");
+}
+
 /// Replica-set MongoDB persists the whole graph in one transaction. A duplicate
 /// in a later dependency phase must roll back the earlier phases, and the
 /// corrected retry must apply cleanly.
@@ -3922,6 +4079,113 @@ async fn test_mongodb_index_plan_version_is_recorded_and_forward_only() {
         "completion clears the in-progress marker: {record:?}"
     );
     db.drop().await.unwrap();
+}
+
+/// A MongoDB database a 0.9.x release initialized holds Ferrum documents but
+/// no `core_index_plan` record. `up` (also run at startup) and `status` refuse
+/// it read-only with the rebuild-and-restore instruction; an empty database is
+/// initialized normally.
+#[tokio::test]
+#[ignore = "requires a live MongoDB server"]
+async fn test_mongodb_pre_release_database_is_refused() {
+    use ferrum_edge::config::db_backend::DatabaseBackend;
+    use ferrum_edge::config::mongo_index_plan::MONGO_INDEX_PLAN_VERSION_COLLECTION;
+    use ferrum_edge::config::mongo_store::MongoStore;
+
+    let url =
+        std::env::var("FERRUM_TEST_MONGO_URL").unwrap_or_else(|_| DEFAULT_MONGO_URL.to_string());
+    if !continue_if_backend_available("mongodb", mongodb_is_available(&url).await, "unreachable") {
+        return;
+    }
+    let client = MongoClient::with_uri_str(&url).await.unwrap();
+    let connect = |database_name: String| {
+        let url = url.clone();
+        async move {
+            MongoStore::connect(
+                &url,
+                &database_name,
+                None,
+                None,
+                None,
+                Some(10),
+                Some(10),
+                false,
+                None,
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    // A 0.9.x-shaped database: Ferrum documents, no plan record.
+    let legacy_name = format!("ferrum_pre_release_{}", Uuid::new_v4().simple());
+    let legacy = client.database(&legacy_name);
+    legacy
+        .collection::<Document>("proxies")
+        .insert_one(doc! { "_id": "ferrum:legacy", "namespace": "ferrum", "id": "legacy" })
+        .await
+        .unwrap();
+    let store = connect(legacy_name.clone()).await;
+    for (label, result) in [
+        ("up", store.run_migrations().await.map(|_| ())),
+        ("status", store.migration_status().await.map(|_| ())),
+    ] {
+        let error = result.expect_err("a 0.9.x database must be refused");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("kind=pre_release_database") && rendered.contains("proxies"),
+            "{label}: unexpected refusal: {rendered}"
+        );
+        assert!(
+            rendered.contains("rebuild the database"),
+            "{label}: the refusal must name the rebuild-and-restore procedure: {rendered}"
+        );
+    }
+    // Read-only: no plan record, migration lease or guard collection appears.
+    let collections = legacy.list_collection_names().await.unwrap();
+    assert!(
+        !collections
+            .iter()
+            .any(|name| name == MONGO_INDEX_PLAN_VERSION_COLLECTION
+                || name == "_ferrum_migration_locks"),
+        "a refused database must not be written: {collections:?}"
+    );
+    legacy.drop().await.unwrap();
+
+    // An empty database is new: initialized and recorded, then re-run cleanly.
+    let fresh_name = format!("ferrum_pre_release_fresh_{}", Uuid::new_v4().simple());
+    let fresh = connect(fresh_name.clone()).await;
+    fresh
+        .run_migrations()
+        .await
+        .expect("an empty database initializes");
+    fresh
+        .run_migrations()
+        .await
+        .expect("a 1.x database re-runs");
+    let status = fresh
+        .migration_status()
+        .await
+        .expect("status of a 1.x database");
+    assert!(status.recorded_plan_version.is_some());
+    client.database(&fresh_name).drop().await.unwrap();
+
+    // Two 1.x initializers racing on one fresh database: the replica that
+    // loses the race sees the winner's seeded registry row and must not
+    // mistake it for a 0.9.x database (it re-reads the plan record first).
+    for _ in 0..5 {
+        let race_name = format!("ferrum_pre_release_race_{}", Uuid::new_v4().simple());
+        let first = connect(race_name.clone()).await;
+        let second = connect(race_name.clone()).await;
+        let (first_result, second_result) =
+            tokio::join!(first.run_migrations(), second.run_migrations());
+        first_result.expect("the first concurrent initializer succeeds");
+        second_result.expect("the second concurrent initializer succeeds");
+        client.database(&race_name).drop().await.unwrap();
+    }
 }
 
 /// The periodic audit age-retention sweep must reach MongoDB namespaces that

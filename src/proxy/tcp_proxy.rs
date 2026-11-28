@@ -12700,6 +12700,7 @@ mod node_waypoint_stream_scope_tests {
             pod_uid: Some("11111111-1111-1111-1111-111111111111".to_string()),
             node_waypoint: None,
             remote_provenance: false,
+            mesh_transport: None,
         };
         resolver.install_policy_scopes_from_workloads(&[workload]);
 

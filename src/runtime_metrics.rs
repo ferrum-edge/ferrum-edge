@@ -41,6 +41,9 @@ pub enum PoolKind {
     Hbone,
     /// Sidecar egress SVID-mTLS HTTP/2 pool (`mesh_mtls_pool`).
     MeshMtls,
+    /// Sidecar raw-TCP egress CONNECT carriers pooled by `mesh_mtls_pool`'s
+    /// tunnel lane (issue #7537).
+    MeshMtlsTunnel,
     /// Sidecar ingress Unix-domain HTTP/1.1 + h2c pool (`unix_backend_pool`).
     UnixBackend,
 }
@@ -54,6 +57,7 @@ impl PoolKind {
             Self::Grpc => "grpc",
             Self::Hbone => "hbone",
             Self::MeshMtls => "mesh_mtls",
+            Self::MeshMtlsTunnel => "mesh_mtls_tunnel",
             Self::UnixBackend => "unix_backend",
         }
     }

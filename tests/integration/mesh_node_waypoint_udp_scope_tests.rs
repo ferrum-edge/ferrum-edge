@@ -85,6 +85,7 @@ fn workload(
         pod_uid: Some(pod_uid.to_string()),
         node_waypoint: None,
         remote_provenance: false,
+        mesh_transport: None,
     }
 }
 

@@ -1,0 +1,1355 @@
+# Live ServiceWaypoint mesh e2e workloads (issue #7503, design spec
+# docs/plans/mesh_virtualservice_servicewaypoint.md section 6.4).
+#
+# Applied ONCE by run.sh after the placeholders below are substituted (awk) and
+# after the pinned CRDs are Established. One kind cluster runs SPIRE, a Ferrum
+# control plane, a ServiceWaypoint, its bound Services' native Sidecar
+# backends, a cross-namespace destination, and an HBONE client:
+#
+#   - `ferrum-cp` (namespace __NAMESPACE__) — FERRUM_MODE=cp, sqlite, K8s
+#     controller with pod discovery, Istio CRD watching (VirtualService,
+#     AuthorizationPolicy) and Gateway API CRD watching (Gateway,
+#     ReferenceGrant) over a two-namespace scope (__NAMESPACE__ and
+#     __BETA_NAMESPACE__, FERRUM_CP_NAMESPACES). It serves native
+#     MeshSubscribe on :50051 with production mTLS + JWT. A multi-namespace
+#     CP verifies data-plane tokens against a trust bundle of
+#     namespace-bound RS256 credentials (run.sh mints the keys and every
+#     data plane's token); no data plane holds a signing secret.
+#   - `__WAYPOINT__` — a waypoint Gateway (gatewayClassName: istio-waypoint,
+#     istio.io/waypoint-for: service) and two ServiceWaypoint replicas of
+#     that waypoint: `__WAYPOINT__` subscribes with a token whose `ns` claim
+#     covers both namespaces, `__WAYPOINT__-narrow` with `ns` = __NAMESPACE__
+#     only (the cross-namespace negative). Each is a Deployment
+#     (FERRUM_MESH_TOPOLOGY=service_waypoint, FERRUM_MESH_WAYPOINT_NAME=__WAYPOINT__,
+#     native MeshSubscribe, SPIRE identity sa/__WAYPOINT__) listening for HBONE
+#     on :15008.
+#   - Bound Services (label istio.io/use-waypoint: __WAYPOINT__):
+#       swsvc        frontend, no backing pod; carries the split VirtualService
+#       swsvc-v1     native Sidecar backend answering `sw-backend-v1`
+#       swsvc-v2     native Sidecar backend answering `sw-backend-v2`
+#       swx          frontend, no backing pod; carries the cross-namespace
+#                    VirtualService to xsvc.__BETA_NAMESPACE__
+#   - `xsvc` (namespace __BETA_NAMESPACE__) — native Sidecar backend answering
+#     `sw-xsvc-beta`, the cross-namespace destination admitted only while a
+#     ReferenceGrant in __BETA_NAMESPACE__ allows it.
+#   - `hbone-client` — an init container fetches the pod's SPIRE X.509 SVID
+#     (spire-agent api fetch x509) into an emptyDir; the curl container then
+#     opens authenticated HTTP/2 CONNECT tunnels to the waypoint's :15008
+#     (curl --proxy https://<waypoint>:15008 --proxy-http2 --proxytunnel with
+#     the SVID as the proxy client certificate) and sends inner HTTP/1.1
+#     requests through them: exactly the HBONE shape the waypoint terminates.
+#
+# Backends answer GET /slow after 90 s so the suite can hold one inner request
+# (and its L7 tunnel) open across a binding withdrawal.
+#
+# Secrets (`ferrum-mesh-e2e-secrets` with the admin JWT secret,
+# `ferrum-native-mtls-cp`, `ferrum-native-mtls-dp`, `ferrum-cp-trust`, and one
+# `ferrum-cp-token-<node>` per data plane) are minted per run by run.sh; this
+# manifest references but does not define them.
+#
+# Backend transport: swsvc-v1, swsvc-v2 and xsvc run Ferrum Sidecars and carry
+# the pod annotation `ferrum.io/injected: "true"`, which the K8s translator
+# records as the Sidecar transport, so the ServiceWaypoint dials them over
+# SVID-mTLS to :15006. The suite has no HBONE-terminating (ambient) backend.
+#
+# Substituted placeholders:
+#   __NAMESPACE__        waypoint namespace (ferrum)
+#   __BETA_NAMESPACE__   cross-namespace destination namespace (beta)
+#   __TRUST_DOMAIN__     cluster trust domain (mesh-e2e.test)
+#   __IMAGE__            ferrum runtime image ref
+#   __SPIRE_AGENT_IMAGE__ the SPIRE agent image tests/k8s/lib/spire.sh deploys
+#   __WAYPOINT__         waypoint Gateway / FERRUM_MESH_WAYPOINT_NAME (swp)
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: __NAMESPACE__
+  labels:
+    ferrum.io/mesh: enabled
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: __BETA_NAMESPACE__
+  labels:
+    ferrum.io/mesh: enabled
+---
+# Istio CRDs are watched in every scope namespace AND the Istio root namespace
+# (FERRUM_K8S_ISTIO_ROOT_NAMESPACE, default istio-system); its watch must list
+# successfully or the K8s config revision never gets evidence for that scope.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: istio-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ferrum-cp
+  namespace: __NAMESPACE__
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ferrum-cp
+  namespace: __NAMESPACE__
+rules:
+  # Pod discovery (FERRUM_K8S_POD_DISCOVERY_ENABLED).
+  - apiGroups: [""]
+    resources: ["pods", "services"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  # Istio CRD watch: only the kinds this suite installs.
+  - apiGroups: ["networking.istio.io"]
+    resources: ["virtualservices"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["security.istio.io"]
+    resources: ["authorizationpolicies"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.istio.io"]
+    resources: ["virtualservices/status"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["security.istio.io"]
+    resources: ["authorizationpolicies/status"]
+    verbs: ["get", "patch", "update"]
+  # Gateway API watch: the waypoint Gateway and the cross-namespace
+  # ReferenceGrant, plus the core Secret/ConfigMap watch the Gateway API
+  # controller runs per watched namespace.
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gateways", "referencegrants"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gateways/status"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ferrum-cp
+  namespace: __NAMESPACE__
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ferrum-cp
+subjects:
+  - kind: ServiceAccount
+    name: ferrum-cp
+    namespace: __NAMESPACE__
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ferrum-cp
+  namespace: __BETA_NAMESPACE__
+rules:
+  # Pod discovery (FERRUM_K8S_POD_DISCOVERY_ENABLED).
+  - apiGroups: [""]
+    resources: ["pods", "services"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  # Istio CRD watch: only the kinds this suite installs.
+  - apiGroups: ["networking.istio.io"]
+    resources: ["virtualservices"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["security.istio.io"]
+    resources: ["authorizationpolicies"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.istio.io"]
+    resources: ["virtualservices/status"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["security.istio.io"]
+    resources: ["authorizationpolicies/status"]
+    verbs: ["get", "patch", "update"]
+  # Gateway API watch: the waypoint Gateway and the cross-namespace
+  # ReferenceGrant, plus the core Secret/ConfigMap watch the Gateway API
+  # controller runs per watched namespace.
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gateways", "referencegrants"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gateways/status"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ferrum-cp
+  namespace: __BETA_NAMESPACE__
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ferrum-cp
+subjects:
+  - kind: ServiceAccount
+    name: ferrum-cp
+    namespace: __NAMESPACE__
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ferrum-cp-istio-root
+  namespace: istio-system
+rules:
+  - apiGroups: ["networking.istio.io"]
+    resources: ["virtualservices"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["security.istio.io"]
+    resources: ["authorizationpolicies"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ferrum-cp-istio-root
+  namespace: istio-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ferrum-cp-istio-root
+subjects:
+  - kind: ServiceAccount
+    name: ferrum-cp
+    namespace: __NAMESPACE__
+---
+# Gateway API watching also watches Namespace objects cluster-wide (labels feed
+# Gateway allowedRoutes namespace selectors), which needs a ClusterRole. Read
+# only, Namespaces only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ferrum-cp-swp-e2e-namespaces
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ferrum-cp-swp-e2e-namespaces
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ferrum-cp-swp-e2e-namespaces
+subjects:
+  - kind: ServiceAccount
+    name: ferrum-cp
+    namespace: __NAMESPACE__
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ferrum-cp
+  namespace: __NAMESPACE__
+spec:
+  selector:
+    app: ferrum-cp
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: 50051
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ferrum-cp
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ferrum-cp
+  template:
+    metadata:
+      labels:
+        app: ferrum-cp
+    spec:
+      serviceAccountName: ferrum-cp
+      securityContext:
+        fsGroup: 1337
+      containers:
+        - name: ferrum-edge
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          args: ["run"]
+          securityContext:
+            runAsUser: 1337
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+          ports:
+            - name: grpc
+              containerPort: 50051
+          readinessProbe:
+            tcpSocket:
+              port: 50051
+            initialDelaySeconds: 1
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 60
+          env:
+            - name: FERRUM_MODE
+              value: cp
+            - name: FERRUM_NAMESPACE
+              value: __NAMESPACE__
+            # Two-namespace scope: the waypoint namespace and the
+            # cross-namespace destination namespace. A Set scope requires a
+            # JWT `ns` claim on every subscription and partitions every
+            # namespace's resources (src/modes/control_plane.rs).
+            - name: FERRUM_CP_NAMESPACES
+              value: __NAMESPACE__,__BETA_NAMESPACE__
+            - name: FERRUM_DB_TYPE
+              value: sqlite
+            - name: FERRUM_DB_URL
+              value: sqlite:/data/ferrum.db?mode=rwc
+            - name: FERRUM_ADMIN_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: ferrum-mesh-e2e-secrets
+                  key: admin-jwt-secret
+            # A multi-namespace CP refuses the fleet-wide HS256 secret: it
+            # verifies data-plane tokens against namespace-bound credentials
+            # (docs/cp_namespace_tenancy.md "Trust binding"). run.sh mints
+            # one RS256 key per credential; the bundle holds only public keys.
+            - name: FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH
+              value: /cp-trust/bundle.json
+            - name: FERRUM_CP_GRPC_LISTEN_ADDR
+              value: 0.0.0.0:50051
+            - name: FERRUM_CP_GRPC_TLS_CERT_PATH
+              value: /transport/server.pem
+            - name: FERRUM_CP_GRPC_TLS_KEY_PATH
+              value: /transport/server-key.pem
+            - name: FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH
+              value: /transport/client-ca.pem
+            - name: FERRUM_K8S_CONTROLLER_ENABLED
+              value: "true"
+            - name: FERRUM_K8S_POD_DISCOVERY_ENABLED
+              value: "true"
+            - name: FERRUM_K8S_WATCH_IDLE_RELIST_SECS
+              value: "2"
+            - name: FERRUM_K8S_WATCH_ISTIO_CRDS
+              value: "true"
+            - name: FERRUM_K8S_WATCH_GATEWAY_API_CRDS
+              value: "true"
+            - name: FERRUM_K8S_WATCH_MESH_CONFIG
+              value: "false"
+            - name: FERRUM_K8S_TRUST_DOMAIN
+              value: __TRUST_DOMAIN__
+            - name: FERRUM_POOL_WARMUP_ENABLED
+              value: "false"
+            - name: FERRUM_LOG_LEVEL
+              value: info
+          volumeMounts:
+            - name: cp-data
+              mountPath: /data
+            - name: transport
+              mountPath: /transport
+              readOnly: true
+            - name: cp-trust
+              mountPath: /cp-trust
+              readOnly: true
+      volumes:
+        - name: cp-data
+          emptyDir: {}
+        - name: cp-trust
+          secret:
+            secretName: ferrum-cp-trust
+            defaultMode: 0440
+        - name: transport
+          projected:
+            defaultMode: 0440
+            sources:
+              - secret:
+                  name: ferrum-native-mtls-cp
+                  items:
+                    - key: server.pem
+                      path: server.pem
+                    - key: server-key.pem
+                      path: server-key.pem
+                    - key: client-ca.pem
+                      path: client-ca.pem
+---
+# ── Waypoint Gateway + ServiceWaypoint ──────────────────────────────────────
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: __WAYPOINT__
+  namespace: __NAMESPACE__
+  labels:
+    istio.io/waypoint-for: service
+spec:
+  gatewayClassName: istio-waypoint
+  listeners:
+    - name: mesh
+      port: 15008
+      protocol: HBONE
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: __WAYPOINT__
+  namespace: __NAMESPACE__
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: __WAYPOINT__
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: __WAYPOINT__
+  template:
+    metadata:
+      labels:
+        app: __WAYPOINT__
+    spec:
+      serviceAccountName: __WAYPOINT__
+      containers:
+        - name: ferrum-edge
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          args: ["run"]
+          securityContext:
+            runAsUser: 1337
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+          ports:
+            - name: hbone
+              containerPort: 15008
+          env:
+            - name: FERRUM_MODE
+              value: mesh
+            - name: FERRUM_MESH_TOPOLOGY
+              value: service_waypoint
+            - name: FERRUM_MESH_WAYPOINT_NAME
+              value: __WAYPOINT__
+            - name: FERRUM_MESH_CONFIG_PROTOCOL
+              value: native
+            - name: FERRUM_DP_CP_GRPC_URLS
+              value: https://ferrum-cp.__NAMESPACE__.svc.cluster.local:50051
+            - name: FERRUM_DP_GRPC_TLS_CA_CERT_PATH
+              value: /transport/ca.pem
+            - name: FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH
+              value: /transport/client.pem
+            - name: FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH
+              value: /transport/client-key.pem
+            # Externally issued MeshSubscribe token minted by run.sh (RS256,
+            # `kid` bound by the CP trust bundle, `sub` = this node id); no
+            # signing secret exists on the node.
+            - name: FERRUM_DP_CP_GRPC_TOKEN_FILE
+              value: /cp-token/token
+            - name: FERRUM_MESH_NODE_ID
+              value: __WAYPOINT__
+            - name: FERRUM_NAMESPACE
+              value: __NAMESPACE__
+            - name: FERRUM_MESH_PRODUCTION_MODE
+              value: "true"
+            - name: FERRUM_MESH_CA_BACKEND
+              value: spire_agent
+            - name: FERRUM_MESH_SPIRE_AGENT_SOCKET
+              value: /run/spire/sockets/agent.sock
+            - name: FERRUM_MESH_WORKLOAD_SPIFFE_ID
+              value: spiffe://__TRUST_DOMAIN__/ns/__NAMESPACE__/sa/__WAYPOINT__
+            - name: FERRUM_ADMIN_HTTP_PORT
+              value: "15020"
+            # Admin JWT for /metrics, /service-waypoint/services and
+            # /mesh/policy-denies/recent (run.sh mints the HS256 bearer).
+            - name: FERRUM_ADMIN_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: ferrum-mesh-e2e-secrets
+                  key: admin-jwt-secret
+            - name: FERRUM_POOL_WARMUP_ENABLED
+              value: "false"
+            - name: FERRUM_LOG_LEVEL
+              value: info
+          volumeMounts:
+            - name: spire-agent-socket
+              mountPath: /run/spire/sockets
+              readOnly: true
+            - name: transport
+              mountPath: /transport
+              readOnly: true
+            - name: cp-token
+              mountPath: /cp-token
+              readOnly: true
+        # Loopback admin prober (the admin API binds 127.0.0.1).
+        - name: curl
+          image: curlimages/curl:8.10.1
+          command: ["sh", "-c", "sleep 365d"]
+      volumes:
+        - name: spire-agent-socket
+          hostPath:
+            path: /run/spire/sockets
+            type: DirectoryOrCreate
+        - name: cp-token
+          secret:
+            secretName: ferrum-cp-token-swp
+            defaultMode: 0440
+        - name: transport
+          projected:
+            defaultMode: 0440
+            sources:
+              - secret:
+                  name: ferrum-native-mtls-dp
+                  items:
+                    - key: ca.pem
+                      path: ca.pem
+                    - key: client.pem
+                      path: client.pem
+                    - key: client-key.pem
+                      path: client-key.pem
+---
+# The same ServiceWaypoint (FERRUM_MESH_WAYPOINT_NAME=__WAYPOINT__, same
+# identity) subscribing with a token whose `ns` claim is only __NAMESPACE__.
+# The data-plane token's `ns` is a hard ceiling (design spec 2.1 item 5), so
+# this replica must keep refusing the __BETA_NAMESPACE__ leg that the wide
+# replica above routes once a ReferenceGrant admits it.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: __WAYPOINT__-narrow
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: __WAYPOINT__-narrow
+  template:
+    metadata:
+      labels:
+        app: __WAYPOINT__-narrow
+    spec:
+      serviceAccountName: __WAYPOINT__
+      containers:
+        - name: ferrum-edge
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          args: ["run"]
+          securityContext:
+            runAsUser: 1337
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+          ports:
+            - name: hbone
+              containerPort: 15008
+          env:
+            - name: FERRUM_MODE
+              value: mesh
+            - name: FERRUM_MESH_TOPOLOGY
+              value: service_waypoint
+            - name: FERRUM_MESH_WAYPOINT_NAME
+              value: __WAYPOINT__
+            - name: FERRUM_MESH_CONFIG_PROTOCOL
+              value: native
+            - name: FERRUM_DP_CP_GRPC_URLS
+              value: https://ferrum-cp.__NAMESPACE__.svc.cluster.local:50051
+            - name: FERRUM_DP_GRPC_TLS_CA_CERT_PATH
+              value: /transport/ca.pem
+            - name: FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH
+              value: /transport/client.pem
+            - name: FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH
+              value: /transport/client-key.pem
+            # Externally issued MeshSubscribe token minted by run.sh (RS256,
+            # `kid` bound by the CP trust bundle, `sub` = this node id); no
+            # signing secret exists on the node.
+            - name: FERRUM_DP_CP_GRPC_TOKEN_FILE
+              value: /cp-token/token
+            - name: FERRUM_MESH_NODE_ID
+              value: __WAYPOINT__-narrow
+            - name: FERRUM_NAMESPACE
+              value: __NAMESPACE__
+            - name: FERRUM_MESH_PRODUCTION_MODE
+              value: "true"
+            - name: FERRUM_MESH_CA_BACKEND
+              value: spire_agent
+            - name: FERRUM_MESH_SPIRE_AGENT_SOCKET
+              value: /run/spire/sockets/agent.sock
+            - name: FERRUM_MESH_WORKLOAD_SPIFFE_ID
+              value: spiffe://__TRUST_DOMAIN__/ns/__NAMESPACE__/sa/__WAYPOINT__
+            - name: FERRUM_ADMIN_HTTP_PORT
+              value: "15020"
+            # Admin JWT for /metrics, /service-waypoint/services and
+            # /mesh/policy-denies/recent (run.sh mints the HS256 bearer).
+            - name: FERRUM_ADMIN_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: ferrum-mesh-e2e-secrets
+                  key: admin-jwt-secret
+            - name: FERRUM_POOL_WARMUP_ENABLED
+              value: "false"
+            - name: FERRUM_LOG_LEVEL
+              value: info
+          volumeMounts:
+            - name: spire-agent-socket
+              mountPath: /run/spire/sockets
+              readOnly: true
+            - name: transport
+              mountPath: /transport
+              readOnly: true
+            - name: cp-token
+              mountPath: /cp-token
+              readOnly: true
+        # Loopback admin prober (the admin API binds 127.0.0.1).
+        - name: curl
+          image: curlimages/curl:8.10.1
+          command: ["sh", "-c", "sleep 365d"]
+      volumes:
+        - name: spire-agent-socket
+          hostPath:
+            path: /run/spire/sockets
+            type: DirectoryOrCreate
+        - name: cp-token
+          secret:
+            secretName: ferrum-cp-token-swp-narrow
+            defaultMode: 0440
+        - name: transport
+          projected:
+            defaultMode: 0440
+            sources:
+              - secret:
+                  name: ferrum-native-mtls-dp
+                  items:
+                    - key: ca.pem
+                      path: ca.pem
+                    - key: client.pem
+                      path: client.pem
+                    - key: client-key.pem
+                      path: client-key.pem
+---
+# ── Bound Services and their native Sidecar backends ────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: swsvc-v1
+  namespace: __NAMESPACE__
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: swsvc-v1
+  namespace: __NAMESPACE__
+  labels:
+    istio.io/use-waypoint: __WAYPOINT__
+spec:
+  selector:
+    app: swsvc-v1
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      appProtocol: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: swsvc-v1
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: swsvc-v1
+  template:
+    metadata:
+      annotations:
+        # Ferrum Sidecar backend: the ServiceWaypoint dials it over SVID-mTLS
+        # to :15006 (WorkloadMeshTransport::SidecarMtls, issue #7500). An
+        # unmarked pod would be dialed over HBONE, which a Sidecar does not
+        # terminate, so a 200 through the waypoint proves the mTLS path.
+        ferrum.io/injected: "true"
+      labels:
+        app: swsvc-v1
+        ferrum.io/mesh: enabled
+    spec:
+      serviceAccountName: swsvc-v1
+      securityContext:
+        fsGroup: 1337
+      initContainers:
+        - name: ferrum-edge-init
+          image: alpine:3.21
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["NET_ADMIN", "NET_RAW"]
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              apk add --no-cache iptables
+              iptables -t nat -N FERRUM_INBOUND 2>/dev/null || true
+              iptables -t nat -C PREROUTING -p tcp -j FERRUM_INBOUND 2>/dev/null || \
+                iptables -t nat -A PREROUTING -p tcp -j FERRUM_INBOUND
+              iptables -t nat -C FERRUM_INBOUND -p tcp --dport 15006 -j RETURN 2>/dev/null || \
+                iptables -t nat -A FERRUM_INBOUND -p tcp --dport 15006 -j RETURN
+              iptables -t nat -C FERRUM_INBOUND -p tcp --dport 8080 -j REDIRECT --to-ports 15006 2>/dev/null || \
+                iptables -t nat -A FERRUM_INBOUND -p tcp --dport 8080 -j REDIRECT --to-ports 15006
+              echo "ferrum inbound capture installed (8080 -> 15006)"
+              iptables -t nat -L FERRUM_INBOUND -n
+      containers:
+        - name: ferrum-edge
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          args: ["run"]
+          securityContext:
+            runAsUser: 1337
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+          ports:
+            - name: inbound
+              containerPort: 15006
+          env:
+            - name: FERRUM_MODE
+              value: mesh
+            - name: FERRUM_MESH_TOPOLOGY
+              value: sidecar
+            - name: FERRUM_MESH_CONFIG_PROTOCOL
+              value: native
+            - name: FERRUM_DP_CP_GRPC_URLS
+              value: https://ferrum-cp.__NAMESPACE__.svc.cluster.local:50051
+            - name: FERRUM_DP_GRPC_TLS_CA_CERT_PATH
+              value: /transport/ca.pem
+            - name: FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH
+              value: /transport/client.pem
+            - name: FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH
+              value: /transport/client-key.pem
+            # Externally issued MeshSubscribe token minted by run.sh (RS256,
+            # `kid` bound by the CP trust bundle, `sub` = this node id); no
+            # signing secret exists on the node.
+            - name: FERRUM_DP_CP_GRPC_TOKEN_FILE
+              value: /cp-token/token
+            - name: FERRUM_MESH_NODE_ID
+              value: swsvc-v1
+            - name: FERRUM_NAMESPACE
+              value: __NAMESPACE__
+            - name: FERRUM_MESH_PRODUCTION_MODE
+              value: "true"
+            - name: FERRUM_MESH_CA_BACKEND
+              value: spire_agent
+            - name: FERRUM_MESH_SPIRE_AGENT_SOCKET
+              value: /run/spire/sockets/agent.sock
+            - name: FERRUM_MESH_WORKLOAD_SPIFFE_ID
+              value: spiffe://__TRUST_DOMAIN__/ns/__NAMESPACE__/sa/swsvc-v1
+            - name: FERRUM_ADMIN_HTTP_PORT
+              value: "15020"
+            - name: FERRUM_POOL_WARMUP_ENABLED
+              value: "false"
+            - name: FERRUM_LOG_LEVEL
+              value: info
+          volumeMounts:
+            - name: spire-agent-socket
+              mountPath: /run/spire/sockets
+              readOnly: true
+            - name: transport
+              mountPath: /transport
+              readOnly: true
+            - name: cp-token
+              mountPath: /cp-token
+              readOnly: true
+        - name: app
+          image: python:3.12-alpine
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 1
+            periodSeconds: 1
+            timeoutSeconds: 1
+            failureThreshold: 30
+          command:
+            - python
+            - -u
+            - -c
+            - |
+              import socket, threading, time
+              BODY = b"sw-backend-v1\n"
+              RESPONSE = (
+                  b"HTTP/1.1 200 OK\r\n"
+                  b"content-length: " + str(len(BODY)).encode() + b"\r\n"
+                  b"\r\n" + BODY
+              )
+              def handle(conn):
+                  try:
+                      data = conn.recv(4096)
+                      if not data:
+                          return
+                      line = data.split(b"\r\n", 1)[0]
+                      # GET /slow holds the response open so the suite can
+                      # keep one L7 HBONE tunnel alive across a binding change.
+                      if b" /slow" in line:
+                          time.sleep(90)
+                      conn.sendall(RESPONSE)
+                  except OSError:
+                      pass
+                  finally:
+                      conn.close()
+              def serve():
+                  s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                  s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                  s.bind(("0.0.0.0", 8080))
+                  s.listen(128)
+                  while True:
+                      conn, _ = s.accept()
+                      threading.Thread(target=handle, args=(conn,), daemon=True).start()
+              threading.Thread(target=serve, daemon=True).start()
+              while True:
+                  time.sleep(3600)
+      volumes:
+        - name: spire-agent-socket
+          hostPath:
+            path: /run/spire/sockets
+            type: DirectoryOrCreate
+        - name: cp-token
+          secret:
+            secretName: ferrum-cp-token-swsvc-v1
+            defaultMode: 0440
+        - name: transport
+          projected:
+            defaultMode: 0440
+            sources:
+              - secret:
+                  name: ferrum-native-mtls-dp
+                  items:
+                    - key: ca.pem
+                      path: ca.pem
+                    - key: client.pem
+                      path: client.pem
+                    - key: client-key.pem
+                      path: client-key.pem
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: swsvc-v2
+  namespace: __NAMESPACE__
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: swsvc-v2
+  namespace: __NAMESPACE__
+  labels:
+    istio.io/use-waypoint: __WAYPOINT__
+spec:
+  selector:
+    app: swsvc-v2
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      appProtocol: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: swsvc-v2
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: swsvc-v2
+  template:
+    metadata:
+      annotations:
+        # Ferrum Sidecar backend: the ServiceWaypoint dials it over SVID-mTLS
+        # to :15006 (WorkloadMeshTransport::SidecarMtls, issue #7500). An
+        # unmarked pod would be dialed over HBONE, which a Sidecar does not
+        # terminate, so a 200 through the waypoint proves the mTLS path.
+        ferrum.io/injected: "true"
+      labels:
+        app: swsvc-v2
+        ferrum.io/mesh: enabled
+    spec:
+      serviceAccountName: swsvc-v2
+      securityContext:
+        fsGroup: 1337
+      initContainers:
+        - name: ferrum-edge-init
+          image: alpine:3.21
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["NET_ADMIN", "NET_RAW"]
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              apk add --no-cache iptables
+              iptables -t nat -N FERRUM_INBOUND 2>/dev/null || true
+              iptables -t nat -C PREROUTING -p tcp -j FERRUM_INBOUND 2>/dev/null || \
+                iptables -t nat -A PREROUTING -p tcp -j FERRUM_INBOUND
+              iptables -t nat -C FERRUM_INBOUND -p tcp --dport 15006 -j RETURN 2>/dev/null || \
+                iptables -t nat -A FERRUM_INBOUND -p tcp --dport 15006 -j RETURN
+              iptables -t nat -C FERRUM_INBOUND -p tcp --dport 8080 -j REDIRECT --to-ports 15006 2>/dev/null || \
+                iptables -t nat -A FERRUM_INBOUND -p tcp --dport 8080 -j REDIRECT --to-ports 15006
+              echo "ferrum inbound capture installed (8080 -> 15006)"
+              iptables -t nat -L FERRUM_INBOUND -n
+      containers:
+        - name: ferrum-edge
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          args: ["run"]
+          securityContext:
+            runAsUser: 1337
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+          ports:
+            - name: inbound
+              containerPort: 15006
+          env:
+            - name: FERRUM_MODE
+              value: mesh
+            - name: FERRUM_MESH_TOPOLOGY
+              value: sidecar
+            - name: FERRUM_MESH_CONFIG_PROTOCOL
+              value: native
+            - name: FERRUM_DP_CP_GRPC_URLS
+              value: https://ferrum-cp.__NAMESPACE__.svc.cluster.local:50051
+            - name: FERRUM_DP_GRPC_TLS_CA_CERT_PATH
+              value: /transport/ca.pem
+            - name: FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH
+              value: /transport/client.pem
+            - name: FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH
+              value: /transport/client-key.pem
+            # Externally issued MeshSubscribe token minted by run.sh (RS256,
+            # `kid` bound by the CP trust bundle, `sub` = this node id); no
+            # signing secret exists on the node.
+            - name: FERRUM_DP_CP_GRPC_TOKEN_FILE
+              value: /cp-token/token
+            - name: FERRUM_MESH_NODE_ID
+              value: swsvc-v2
+            - name: FERRUM_NAMESPACE
+              value: __NAMESPACE__
+            - name: FERRUM_MESH_PRODUCTION_MODE
+              value: "true"
+            - name: FERRUM_MESH_CA_BACKEND
+              value: spire_agent
+            - name: FERRUM_MESH_SPIRE_AGENT_SOCKET
+              value: /run/spire/sockets/agent.sock
+            - name: FERRUM_MESH_WORKLOAD_SPIFFE_ID
+              value: spiffe://__TRUST_DOMAIN__/ns/__NAMESPACE__/sa/swsvc-v2
+            - name: FERRUM_ADMIN_HTTP_PORT
+              value: "15020"
+            - name: FERRUM_POOL_WARMUP_ENABLED
+              value: "false"
+            - name: FERRUM_LOG_LEVEL
+              value: info
+          volumeMounts:
+            - name: spire-agent-socket
+              mountPath: /run/spire/sockets
+              readOnly: true
+            - name: transport
+              mountPath: /transport
+              readOnly: true
+            - name: cp-token
+              mountPath: /cp-token
+              readOnly: true
+        - name: app
+          image: python:3.12-alpine
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 1
+            periodSeconds: 1
+            timeoutSeconds: 1
+            failureThreshold: 30
+          command:
+            - python
+            - -u
+            - -c
+            - |
+              import socket, threading, time
+              BODY = b"sw-backend-v2\n"
+              RESPONSE = (
+                  b"HTTP/1.1 200 OK\r\n"
+                  b"content-length: " + str(len(BODY)).encode() + b"\r\n"
+                  b"\r\n" + BODY
+              )
+              def handle(conn):
+                  try:
+                      data = conn.recv(4096)
+                      if not data:
+                          return
+                      line = data.split(b"\r\n", 1)[0]
+                      # GET /slow holds the response open so the suite can
+                      # keep one L7 HBONE tunnel alive across a binding change.
+                      if b" /slow" in line:
+                          time.sleep(90)
+                      conn.sendall(RESPONSE)
+                  except OSError:
+                      pass
+                  finally:
+                      conn.close()
+              def serve():
+                  s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                  s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                  s.bind(("0.0.0.0", 8080))
+                  s.listen(128)
+                  while True:
+                      conn, _ = s.accept()
+                      threading.Thread(target=handle, args=(conn,), daemon=True).start()
+              threading.Thread(target=serve, daemon=True).start()
+              while True:
+                  time.sleep(3600)
+      volumes:
+        - name: spire-agent-socket
+          hostPath:
+            path: /run/spire/sockets
+            type: DirectoryOrCreate
+        - name: cp-token
+          secret:
+            secretName: ferrum-cp-token-swsvc-v2
+            defaultMode: 0440
+        - name: transport
+          projected:
+            defaultMode: 0440
+            sources:
+              - secret:
+                  name: ferrum-native-mtls-dp
+                  items:
+                    - key: ca.pem
+                      path: ca.pem
+                    - key: client.pem
+                      path: client.pem
+                    - key: client-key.pem
+                      path: client-key.pem
+---
+# Frontend for the split VirtualService. Bound to the waypoint, selector matches NO pod (one
+# pod backs exactly one Service), so only a carried VirtualService route can
+# answer it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: swsvc
+  namespace: __NAMESPACE__
+  labels:
+    istio.io/use-waypoint: __WAYPOINT__
+spec:
+  selector:
+    app: swsvc-frontend-unbacked
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      appProtocol: http
+---
+# Frontend for the cross-namespace VirtualService. Bound to the waypoint, selector matches NO pod (one
+# pod backs exactly one Service), so only a carried VirtualService route can
+# answer it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: swx
+  namespace: __NAMESPACE__
+  labels:
+    istio.io/use-waypoint: __WAYPOINT__
+spec:
+  selector:
+    app: swx-frontend-unbacked
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      appProtocol: http
+---
+# ── Cross-namespace destination (namespace __BETA_NAMESPACE__) ─────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: xsvc
+  namespace: __BETA_NAMESPACE__
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: xsvc
+  namespace: __BETA_NAMESPACE__
+spec:
+  selector:
+    app: xsvc
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      appProtocol: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: xsvc
+  namespace: __BETA_NAMESPACE__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: xsvc
+  template:
+    metadata:
+      annotations:
+        # Ferrum Sidecar backend: the ServiceWaypoint dials it over SVID-mTLS
+        # to :15006 (WorkloadMeshTransport::SidecarMtls, issue #7500). An
+        # unmarked pod would be dialed over HBONE, which a Sidecar does not
+        # terminate, so a 200 through the waypoint proves the mTLS path.
+        ferrum.io/injected: "true"
+      labels:
+        app: xsvc
+        ferrum.io/mesh: enabled
+    spec:
+      serviceAccountName: xsvc
+      securityContext:
+        fsGroup: 1337
+      initContainers:
+        - name: ferrum-edge-init
+          image: alpine:3.21
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["NET_ADMIN", "NET_RAW"]
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              apk add --no-cache iptables
+              iptables -t nat -N FERRUM_INBOUND 2>/dev/null || true
+              iptables -t nat -C PREROUTING -p tcp -j FERRUM_INBOUND 2>/dev/null || \
+                iptables -t nat -A PREROUTING -p tcp -j FERRUM_INBOUND
+              iptables -t nat -C FERRUM_INBOUND -p tcp --dport 15006 -j RETURN 2>/dev/null || \
+                iptables -t nat -A FERRUM_INBOUND -p tcp --dport 15006 -j RETURN
+              iptables -t nat -C FERRUM_INBOUND -p tcp --dport 8080 -j REDIRECT --to-ports 15006 2>/dev/null || \
+                iptables -t nat -A FERRUM_INBOUND -p tcp --dport 8080 -j REDIRECT --to-ports 15006
+              echo "ferrum inbound capture installed (8080 -> 15006)"
+              iptables -t nat -L FERRUM_INBOUND -n
+      containers:
+        - name: ferrum-edge
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          args: ["run"]
+          securityContext:
+            runAsUser: 1337
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+          ports:
+            - name: inbound
+              containerPort: 15006
+          env:
+            - name: FERRUM_MODE
+              value: mesh
+            - name: FERRUM_MESH_TOPOLOGY
+              value: sidecar
+            - name: FERRUM_MESH_CONFIG_PROTOCOL
+              value: native
+            - name: FERRUM_DP_CP_GRPC_URLS
+              value: https://ferrum-cp.__NAMESPACE__.svc.cluster.local:50051
+            - name: FERRUM_DP_GRPC_TLS_CA_CERT_PATH
+              value: /transport/ca.pem
+            - name: FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH
+              value: /transport/client.pem
+            - name: FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH
+              value: /transport/client-key.pem
+            # Externally issued MeshSubscribe token minted by run.sh (RS256,
+            # `kid` bound by the CP trust bundle, `sub` = this node id); no
+            # signing secret exists on the node.
+            - name: FERRUM_DP_CP_GRPC_TOKEN_FILE
+              value: /cp-token/token
+            - name: FERRUM_MESH_NODE_ID
+              value: xsvc
+            - name: FERRUM_NAMESPACE
+              value: __BETA_NAMESPACE__
+            - name: FERRUM_MESH_PRODUCTION_MODE
+              value: "true"
+            - name: FERRUM_MESH_CA_BACKEND
+              value: spire_agent
+            - name: FERRUM_MESH_SPIRE_AGENT_SOCKET
+              value: /run/spire/sockets/agent.sock
+            - name: FERRUM_MESH_WORKLOAD_SPIFFE_ID
+              value: spiffe://__TRUST_DOMAIN__/ns/__BETA_NAMESPACE__/sa/xsvc
+            - name: FERRUM_ADMIN_HTTP_PORT
+              value: "15020"
+            - name: FERRUM_POOL_WARMUP_ENABLED
+              value: "false"
+            - name: FERRUM_LOG_LEVEL
+              value: info
+          volumeMounts:
+            - name: spire-agent-socket
+              mountPath: /run/spire/sockets
+              readOnly: true
+            - name: transport
+              mountPath: /transport
+              readOnly: true
+            - name: cp-token
+              mountPath: /cp-token
+              readOnly: true
+        - name: app
+          image: python:3.12-alpine
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 1
+            periodSeconds: 1
+            timeoutSeconds: 1
+            failureThreshold: 30
+          command:
+            - python
+            - -u
+            - -c
+            - |
+              import socket, threading, time
+              BODY = b"sw-xsvc-beta\n"
+              RESPONSE = (
+                  b"HTTP/1.1 200 OK\r\n"
+                  b"content-length: " + str(len(BODY)).encode() + b"\r\n"
+                  b"\r\n" + BODY
+              )
+              def handle(conn):
+                  try:
+                      data = conn.recv(4096)
+                      if not data:
+                          return
+                      line = data.split(b"\r\n", 1)[0]
+                      # GET /slow holds the response open so the suite can
+                      # keep one L7 HBONE tunnel alive across a binding change.
+                      if b" /slow" in line:
+                          time.sleep(90)
+                      conn.sendall(RESPONSE)
+                  except OSError:
+                      pass
+                  finally:
+                      conn.close()
+              def serve():
+                  s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                  s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                  s.bind(("0.0.0.0", 8080))
+                  s.listen(128)
+                  while True:
+                      conn, _ = s.accept()
+                      threading.Thread(target=handle, args=(conn,), daemon=True).start()
+              threading.Thread(target=serve, daemon=True).start()
+              while True:
+                  time.sleep(3600)
+      volumes:
+        - name: spire-agent-socket
+          hostPath:
+            path: /run/spire/sockets
+            type: DirectoryOrCreate
+        - name: cp-token
+          secret:
+            secretName: ferrum-cp-token-xsvc
+            defaultMode: 0440
+        - name: transport
+          projected:
+            defaultMode: 0440
+            sources:
+              - secret:
+                  name: ferrum-native-mtls-dp
+                  items:
+                    - key: ca.pem
+                      path: ca.pem
+                    - key: client.pem
+                      path: client.pem
+                    - key: client-key.pem
+                      path: client-key.pem
+---
+# ── HBONE client ────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hbone-client
+  namespace: __NAMESPACE__
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hbone-client
+  namespace: __NAMESPACE__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hbone-client
+  template:
+    metadata:
+      labels:
+        app: hbone-client
+    spec:
+      serviceAccountName: hbone-client
+      securityContext:
+        # curlimages/curl runs as curl_user (100:101); the init container
+        # writes the SVID as that user so the curl container can read the key.
+        runAsUser: 100
+        runAsGroup: 101
+        fsGroup: 101
+      initContainers:
+        # SPIRE issues this pod's X.509 SVID through the Workload API (k8s
+        # attestor: namespace + service account); `api fetch x509 -write`
+        # stores svid.0.pem, svid.0.key and bundle.0.pem in the emptyDir. The
+        # entry is registered before this Deployment is applied.
+        - name: fetch-svid
+          image: __SPIRE_AGENT_IMAGE__
+          imagePullPolicy: IfNotPresent
+          command: ["/opt/spire/bin/spire-agent"]
+          args:
+            - api
+            - fetch
+            - x509
+            - -socketPath
+            - /run/spire/sockets/agent.sock
+            - -timeout
+            - 60s
+            - -write
+            - /svid
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+          volumeMounts:
+            - name: spire-agent-socket
+              mountPath: /run/spire/sockets
+              readOnly: true
+            - name: svid
+              mountPath: /svid
+      containers:
+        - name: curl
+          image: curlimages/curl:8.10.1
+          command: ["sh", "-c", "sleep 365d"]
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+          volumeMounts:
+            - name: svid
+              mountPath: /svid
+              readOnly: true
+      volumes:
+        - name: spire-agent-socket
+          hostPath:
+            path: /run/spire/sockets
+            type: DirectoryOrCreate
+        - name: svid
+          emptyDir: {}

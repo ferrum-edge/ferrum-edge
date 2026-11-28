@@ -440,6 +440,14 @@ pub struct ConditionalNamespaceRestore<'a> {
     pub api_specs: &'a [ApiSpec],
     /// Omission preserves trust; an empty slice explicitly revokes it.
     pub gateway_trust_bundles: Option<&'a [GatewayTrustBundleRecord]>,
+    /// `Some(description)` writes the namespace's registry row (creating it
+    /// when absent, keeping `created_at` when present) inside the same
+    /// transaction, after the digest comparison (issue #7532). The registry
+    /// row is a member of the digest's representation and every registry
+    /// mutation of this name holds this namespace's admission lease, which
+    /// the transaction pins, so the write can never replace a description
+    /// newer than the one `expected` covers. `None` leaves the row untouched.
+    pub namespace_registry: Option<Option<String>>,
 }
 
 impl ConditionalNamespaceRestore<'_> {

@@ -16,6 +16,15 @@ use crate::config::types::{
 /// remain restorable via the explicit deletion-confirmation preflight.
 pub(crate) const API_SPECS_BACKUP_SECTION_VERSION: &str = "2";
 
+/// Section version of the `namespace_registry` backup section (issue #7532).
+///
+/// The section is additive: a `GET /backup` export without it (every 0.9.x
+/// export, and filtered or cached-fallback exports) keeps restoring unchanged,
+/// so the top-level backup `version` stays `"1"` (see docs/support_policy.md,
+/// "Backup, export, and file-config format"). A later change to the section's
+/// own shape increments this value and ships its migration step.
+pub(crate) const NAMESPACE_REGISTRY_BACKUP_SECTION_VERSION: &str = "1";
+
 /// Stable client text when `resources=` contains an unsupported token.
 /// Never echoes the rejected token.
 pub(crate) const BACKUP_UNSUPPORTED_RESOURCE_FILTER_ERROR: &str =
@@ -265,6 +274,66 @@ pub(crate) struct BackupPayload<'a> {
     /// cannot describe managed relationships.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) api_specs: Option<&'a ApiSpecsBackupSection>,
+    /// The exported namespace's registry row (issue #7532). Emitted only on a
+    /// full, unfiltered database export of a namespace that has a registry
+    /// row, so a restore can recreate a registered namespace — including one
+    /// that holds no resources — with its description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) namespace_registry: Option<&'a NamespaceRegistryBackupSection>,
+}
+
+/// The namespace registry row carried by a backup (issue #7532).
+///
+/// `name` records which namespace the export was taken from; restore always
+/// applies the row to the target namespace (`X-Ferrum-Namespace`), exactly as
+/// it re-stamps every resource. Registry timestamps are not carried: restore
+/// keeps an existing row's `created_at` and assigns new timestamps to a row it
+/// creates, the same as `POST /namespaces`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NamespaceRegistryBackupSection {
+    pub(crate) section_version: String,
+    pub(crate) name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) description: Option<String>,
+}
+
+impl NamespaceRegistryBackupSection {
+    pub(crate) fn from_record(record: &crate::config::namespace_registry::NamespaceRecord) -> Self {
+        Self {
+            section_version: NAMESPACE_REGISTRY_BACKUP_SECTION_VERSION.to_string(),
+            name: record.name.clone(),
+            description: record.description.clone(),
+        }
+    }
+
+    /// Admission of the section, shared by restore and `validate --backup`.
+    /// Returns the normalized description restore writes.
+    pub(crate) fn admit(&self) -> Result<Option<String>, Vec<String>> {
+        let mut errors = Vec::new();
+        if self.section_version != NAMESPACE_REGISTRY_BACKUP_SECTION_VERSION {
+            errors.push(format!(
+                "namespace_registry: unsupported section_version (expected \"{NAMESPACE_REGISTRY_BACKUP_SECTION_VERSION}\")"
+            ));
+        }
+        if let Err(error) = crate::config::namespace_registry::validate_namespace_name(&self.name) {
+            errors.push(format!("namespace_registry: name: {error}"));
+        }
+        let description = match crate::config::namespace_registry::normalize_description(
+            self.description.clone(),
+        ) {
+            Ok(description) => description,
+            Err(error) => {
+                errors.push(format!("namespace_registry: {error}"));
+                None
+            }
+        };
+        if errors.is_empty() {
+            Ok(description)
+        } else {
+            Err(errors)
+        }
+    }
 }
 
 /// Opt-in tokens from the exact complete namespace snapshot exported above.
@@ -512,6 +581,14 @@ pub(crate) struct BatchCreateRequest {
     #[serde(default, rename = "gateway_trust_bundles")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object_vec")]
     _gateway_trust_bundles: Option<Vec<GatewayTrustBundleRecord>>,
+    /// Same object-only `namespace_registry` section restore types; batch
+    /// ignores it (it never writes the namespace registry).
+    #[serde(
+        default,
+        rename = "namespace_registry",
+        deserialize_with = "crate::util::json_object::deserialize_optional_object"
+    )]
+    _namespace_registry: Option<NamespaceRegistryBackupSection>,
 }
 
 impl From<BatchCreateRequest> for RestorePayload {
@@ -532,6 +609,7 @@ impl From<BatchCreateRequest> for RestorePayload {
             _conditional: _,
             _api_specs: _,
             _gateway_trust_bundles: _,
+            _namespace_registry: _,
         } = request;
         RestorePayload {
             version: String::new(),
@@ -541,6 +619,7 @@ impl From<BatchCreateRequest> for RestorePayload {
             upstreams,
             api_specs: None,
             gateway_trust_bundles: None,
+            namespace_registry: None,
             _ferrum_version: None,
             _exported_at: None,
             _source: None,
@@ -624,6 +703,12 @@ pub(crate) struct RestorePayload {
     #[serde(default)]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object_vec")]
     pub gateway_trust_bundles: Option<Vec<GatewayTrustBundleRecord>>,
+    /// The exported namespace's registry row (issue #7532). `None` (every
+    /// 0.9.x export, and filtered or cached-fallback exports) leaves the
+    /// target namespace's registry row exactly as it is.
+    #[serde(default)]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
+    pub namespace_registry: Option<NamespaceRegistryBackupSection>,
     /// Accepted-and-ignored `GET /backup` metadata. Declared so
     /// `deny_unknown_fields` still admits an unmodified backup artifact.
     #[serde(default, rename = "ferrum_version")]
@@ -851,8 +936,9 @@ pub(crate) fn validate_restore_api_specs_section_with_total_limit(
         }
         // Validate document syntax for the *declared* format with the same
         // bounded parser as ingestion, and detect the spec-language version the
-        // document actually declares. Do not re-extract resources or resolve
-        // external refs — historical backups must remain restorable as-is.
+        // document actually declares. External refs are not resolved here (the
+        // restoring node may not be configured to fetch them); the stored
+        // external-ref snapshot was integrity-checked by `to_api_spec`.
         // Parse errors are mapped to generic messages so serde snippets that
         // may contain document fragments never enter operator responses/logs.
         let document_version =
@@ -900,6 +986,23 @@ pub(crate) fn validate_restore_api_specs_section_with_total_limit(
         {
             errors.push(format!(
                 "api_spec '{}': x-ferrum-proxy.plugins declaration is malformed",
+                item.id
+            ));
+            continue;
+        }
+        // Run the same strict extension admission `POST` / `PUT /api-specs`
+        // runs (issue #7532), so a spec document whose `x-ferrum-proxy`,
+        // `x-ferrum-upstream` or `x-ferrum-plugins` carries an unknown or
+        // removed key is refused here, before anything is deleted, instead of
+        // restoring and failing on its next submission. The error is the same
+        // one a submission of this document returns.
+        if let Err(error) = crate::admin::api_specs::extractor::admit_stored_spec_extensions(
+            &decompressed,
+            spec.spec_format,
+            &spec.namespace,
+        ) {
+            errors.push(format!(
+                "api_spec '{}': the stored spec document would be refused by POST/PUT /api-specs: {error}",
                 item.id
             ));
             continue;
@@ -1516,8 +1619,8 @@ mod tests {
 
     #[test]
     fn validate_api_specs_section_accepts_json_and_yaml_round_trip_items() {
-        let json_raw = br#"{"openapi":"3.1.0","info":{"title":"j","version":"1"},"paths":{}}"#;
-        let yaml_raw = b"openapi: \"3.0.3\"\ninfo:\n  title: y\n  version: \"1\"\npaths: {}\n";
+        let json_raw = br#"{"openapi":"3.1.0","info":{"title":"j","version":"1"},"paths":{},"x-ferrum-proxy":{"listen_path":"/p","backend_host":"backend.example.com","backend_port":443}}"#;
+        let yaml_raw = b"openapi: \"3.0.3\"\ninfo:\n  title: y\n  version: \"1\"\npaths: {}\nx-ferrum-proxy:\n  listen_path: /p\n  backend_host: backend.example.com\n  backend_port: 443\n";
         let section = ApiSpecsBackupSection {
             section_version: API_SPECS_BACKUP_SECTION_VERSION.to_string(),
             items: vec![sample_spec_item("spec-json", "proxy-json", json_raw), {
@@ -1540,7 +1643,7 @@ mod tests {
 
     #[test]
     fn validate_api_specs_section_rejects_hostile_size_and_shape() {
-        let raw = br#"{"openapi":"3.1.0","info":{"title":"t","version":"1"},"paths":{}}"#;
+        let raw = br#"{"openapi":"3.1.0","info":{"title":"t","version":"1"},"paths":{},"x-ferrum-proxy":{"listen_path":"/p","backend_host":"backend.example.com","backend_port":443}}"#;
         let mut item = sample_spec_item("spec-1", "proxy-1", raw);
         item.spec_content_base64 = "!!!not-base64!!!".to_string();
         let section = ApiSpecsBackupSection {
@@ -1598,7 +1701,7 @@ mod tests {
 
     #[test]
     fn validate_api_specs_section_rejects_aggregate_expansion_before_decompression() {
-        let raw = br#"{"openapi":"3.1.0","info":{"title":"t","version":"1"},"paths":{}}"#;
+        let raw = br#"{"openapi":"3.1.0","info":{"title":"t","version":"1"},"paths":{},"x-ferrum-proxy":{"listen_path":"/p","backend_host":"backend.example.com","backend_port":443}}"#;
         let section = ApiSpecsBackupSection {
             section_version: API_SPECS_BACKUP_SECTION_VERSION.to_string(),
             items: vec![
@@ -1623,7 +1726,7 @@ mod tests {
 
     #[test]
     fn validate_api_specs_section_rejects_actual_expansion_over_aggregate_limit() {
-        let raw = br#"{"openapi":"3.1.0","info":{"title":"t","version":"1"},"paths":{}}"#;
+        let raw = br#"{"openapi":"3.1.0","info":{"title":"t","version":"1"},"paths":{},"x-ferrum-proxy":{"listen_path":"/p","backend_host":"backend.example.com","backend_port":443}}"#;
         let mut item = sample_spec_item("spec-1", "proxy-1", raw);
         item.uncompressed_size = 0;
         let section = ApiSpecsBackupSection {
@@ -1647,7 +1750,7 @@ mod tests {
 
     #[test]
     fn validate_api_specs_section_rejects_unbounded_resource_hash() {
-        let raw = br#"{"openapi":"3.1.0","info":{"title":"t","version":"1"},"paths":{}}"#;
+        let raw = br#"{"openapi":"3.1.0","info":{"title":"t","version":"1"},"paths":{},"x-ferrum-proxy":{"listen_path":"/p","backend_host":"backend.example.com","backend_port":443}}"#;
         let mut item = sample_spec_item("spec-1", "proxy-1", raw);
         item.resource_hash = "not-a-sha256".to_string();
         let section = ApiSpecsBackupSection {
@@ -1667,7 +1770,7 @@ mod tests {
     fn validate_api_specs_section_rejects_retired_shapes() {
         // Issue #7218: restore keeps no pre-1.0 legacy shapes — section
         // version "1" and an empty `resource_hash` are refused.
-        let raw = br#"{"openapi":"3.1.0","info":{"title":"t","version":"1"},"paths":{}}"#;
+        let raw = br#"{"openapi":"3.1.0","info":{"title":"t","version":"1"},"paths":{},"x-ferrum-proxy":{"listen_path":"/p","backend_host":"backend.example.com","backend_port":443}}"#;
         let proxies = vec![sample_owned_proxy("spec-1", "proxy-1")];
         let v1 = ApiSpecsBackupSection {
             section_version: "1".to_string(),
@@ -1693,7 +1796,7 @@ mod tests {
 
     #[test]
     fn validate_api_specs_section_rejects_orphan_ownership_tags() {
-        let raw = br#"{"openapi":"3.1.0","info":{"title":"t","version":"1"},"paths":{}}"#;
+        let raw = br#"{"openapi":"3.1.0","info":{"title":"t","version":"1"},"paths":{},"x-ferrum-proxy":{"listen_path":"/p","backend_host":"backend.example.com","backend_port":443}}"#;
         let section = ApiSpecsBackupSection {
             section_version: API_SPECS_BACKUP_SECTION_VERSION.to_string(),
             items: vec![sample_spec_item("spec-1", "proxy-1", raw)],
@@ -1731,7 +1834,7 @@ mod tests {
 
     #[test]
     fn validate_api_specs_section_rejects_hostile_metadata_and_format_mismatch() {
-        let raw = br#"{"openapi":"3.1.0","info":{"title":"t","version":"1"},"paths":{}}"#;
+        let raw = br#"{"openapi":"3.1.0","info":{"title":"t","version":"1"},"paths":{},"x-ferrum-proxy":{"listen_path":"/p","backend_host":"backend.example.com","backend_port":443}}"#;
         let proxies = vec![sample_owned_proxy("spec-1", "proxy-1")];
 
         // Forbidden LIKE wildcard in a stored tag must fail closed.
@@ -1785,7 +1888,7 @@ mod tests {
         );
 
         // Declared JSON with YAML body must not be admitted.
-        let yaml_raw = b"openapi: \"3.0.3\"\ninfo:\n  title: y\n  version: \"1\"\npaths: {}\n";
+        let yaml_raw = b"openapi: \"3.0.3\"\ninfo:\n  title: y\n  version: \"1\"\npaths: {}\nx-ferrum-proxy:\n  listen_path: /p\n  backend_host: backend.example.com\n  backend_port: 443\n";
         let mut item = sample_spec_item("spec-1", "proxy-1", yaml_raw);
         item.spec_format = SpecFormat::Json;
         let section = ApiSpecsBackupSection {
@@ -1824,7 +1927,7 @@ mod tests {
 
         // A document with no supported OpenAPI/Swagger version must not persist,
         // even though it is syntactically valid JSON for the declared format.
-        let versionless = br#"{"info":{"title":"t","version":"1"},"paths":{}}"#;
+        let versionless = br#"{"info":{"title":"t","version":"1"},"paths":{},"x-ferrum-proxy":{"listen_path":"/p","backend_host":"backend.example.com","backend_port":443}}"#;
         let section = ApiSpecsBackupSection {
             section_version: API_SPECS_BACKUP_SECTION_VERSION.to_string(),
             items: vec![sample_spec_item("spec-1", "proxy-1", versionless)],
@@ -1838,7 +1941,7 @@ mod tests {
         );
 
         // Stored `spec_version` must equal the version the document declares.
-        let raw = br#"{"swagger":"2.0","info":{"title":"t","version":"1"},"paths":{}}"#;
+        let raw = br#"{"swagger":"2.0","info":{"title":"t","version":"1"},"paths":{},"x-ferrum-proxy":{"listen_path":"/p","backend_host":"backend.example.com","backend_port":443}}"#;
         let mut item = sample_spec_item("spec-1", "proxy-1", raw);
         item.spec_version = "3.1.0".to_string();
         let section = ApiSpecsBackupSection {
@@ -1895,7 +1998,7 @@ mod tests {
 
     #[test]
     fn validate_api_specs_section_rejects_impossible_ownership_graphs() {
-        let raw = br#"{"openapi":"3.1.0","info":{"title":"t","version":"1"},"paths":{}}"#;
+        let raw = br#"{"openapi":"3.1.0","info":{"title":"t","version":"1"},"paths":{},"x-ferrum-proxy":{"listen_path":"/p","backend_host":"backend.example.com","backend_port":443}}"#;
         let section = || ApiSpecsBackupSection {
             section_version: API_SPECS_BACKUP_SECTION_VERSION.to_string(),
             items: vec![sample_spec_item("spec-1", "proxy-1", raw)],
@@ -2050,7 +2153,7 @@ mod tests {
 
     #[test]
     fn restore_rejects_external_ref_pair_mismatch_and_corrupt_snapshot() {
-        let raw = br#"{"openapi":"3.1.0","info":{"title":"t","version":"1"},"paths":{}}"#;
+        let raw = br#"{"openapi":"3.1.0","info":{"title":"t","version":"1"},"paths":{},"x-ferrum-proxy":{"listen_path":"/p","backend_host":"backend.example.com","backend_port":443}}"#;
         let mut item = sample_spec_item("spec-extref", "proxy-extref", raw);
         item.external_ref_digest = Some("a".repeat(64));
         let section = ApiSpecsBackupSection {

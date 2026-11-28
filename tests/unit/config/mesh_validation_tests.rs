@@ -49,6 +49,7 @@ fn fresh_workload() -> Workload {
         pod_uid: None,
         node_waypoint: None,
         remote_provenance: false,
+        mesh_transport: None,
     }
 }
 
@@ -1889,6 +1890,7 @@ fn gateway_config_validate_mesh_fields_dispatches() {
                 pod_uid: None,
                 node_waypoint: None,
                 remote_provenance: false,
+                mesh_transport: None,
             }],
             ..Default::default()
         })),

@@ -64,6 +64,7 @@ fn rebuild_over_xds(slice: &MeshSlice) -> MeshSlice {
         ambient_udp_source_scoping: false,
         node_waypoint_capture_scoping: false,
         sidecar_http_routes: false,
+        service_waypoint_http_routes: false,
         stream_channel_capacity: 1,
         primary_retry_secs: 0,
         connect_timeout_seconds: 0,
@@ -904,6 +905,7 @@ fn shared_spiffe_workload(service: &str, labels: &[(&str, &str)]) -> Workload {
         pod_uid: None,
         node_waypoint: None,
         remote_provenance: false,
+        mesh_transport: None,
     }
 }
 

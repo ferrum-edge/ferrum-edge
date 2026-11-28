@@ -119,15 +119,29 @@ thread_local! {
     static HBONE_POOL_KEY_BUF: RefCell<String> = RefCell::new(String::with_capacity(160));
 }
 
+/// One pooled raw-`h2` CONNECT carrier. Shared by the HBONE pool and the
+/// Sidecar mesh-mTLS raw-TCP tunnel lane (issue #7537), which reuse the same
+/// selection (`select_least_loaded`), pruning, keepalive eviction and idle
+/// sweeper over this entry type.
 #[derive(Debug)]
-struct HbonePoolEntry {
-    transport: MeshH2Transport,
+pub(crate) struct HbonePoolEntry {
+    pub(crate) transport: MeshH2Transport,
     /// Unix seconds of the last checkout. Stored atomically so the shared-lock
     /// fast path (`try_cached_sender_read`) can refresh recency without taking
     /// the exclusive shard write lock — a busy connection must not be pruned as
     /// idle merely because it is only ever served by the fast path.
-    last_used_at: AtomicU64,
-    idle_timeout_seconds: u64,
+    pub(crate) last_used_at: AtomicU64,
+    pub(crate) idle_timeout_seconds: u64,
+}
+
+impl HbonePoolEntry {
+    pub(crate) fn new(transport: MeshH2Transport, idle_timeout_seconds: u64) -> Self {
+        Self {
+            transport,
+            last_used_at: AtomicU64::new(unix_secs()),
+            idle_timeout_seconds,
+        }
+    }
 }
 
 /// Outcome of the write-path scan of one key's connections.
@@ -181,6 +195,12 @@ struct HboneConnectionLoadInner {
     /// The DestinationRule `maxConcurrentStreams` / global pool stream cap
     /// this connection was dialed (and keyed) under; `usize::MAX` when none.
     configured_max_streams: usize,
+    /// Wall-clock Unix second at which the last open stream on this
+    /// connection closed (issue #7537), `0` before any did. Idle expiry runs
+    /// from the later of this and the last checkout, and never while a stream
+    /// is open, so a carrier serving a long-lived tunnel is not evicted from
+    /// under it (which would strand its `maxConnections` slot).
+    last_released_at: AtomicU64,
 }
 
 impl Default for HboneConnectionLoadInner {
@@ -189,6 +209,7 @@ impl Default for HboneConnectionLoadInner {
             active_streams: AtomicUsize::new(0),
             peer_max_streams: AtomicUsize::new(usize::MAX),
             configured_max_streams: usize::MAX,
+            last_released_at: AtomicU64::new(0),
         }
     }
 }
@@ -210,23 +231,24 @@ impl HboneConnectionLoad {
             active_streams: AtomicUsize::new(0),
             peer_max_streams: AtomicUsize::new(configured_max_streams),
             configured_max_streams,
+            last_released_at: AtomicU64::new(0),
         }))
     }
 
     #[inline]
-    fn active_streams(&self) -> usize {
+    pub(crate) fn active_streams(&self) -> usize {
         self.0.active_streams.load(Ordering::Relaxed)
     }
 
     #[inline]
-    fn peer_max_streams(&self) -> usize {
+    pub(crate) fn peer_max_streams(&self) -> usize {
         self.0.peer_max_streams.load(Ordering::Relaxed)
     }
 
     /// True when one more CONNECT would only queue pending-open inside `h2`
     /// behind the peer's stream cap.
     #[inline]
-    fn is_saturated(&self) -> bool {
+    pub(crate) fn is_saturated(&self) -> bool {
         self.active_streams() >= self.peer_max_streams()
     }
 
@@ -235,6 +257,32 @@ impl HboneConnectionLoad {
     fn lease(&self) -> HboneStreamLease {
         self.0.active_streams.fetch_add(1, Ordering::Relaxed);
         HboneStreamLease(self.clone())
+    }
+
+    /// Reserve one CONNECT stream slot only while the connection is under its
+    /// effective stream cap (issue #7537). A compare-and-swap, so concurrent
+    /// checkouts racing for the last slot cannot overshoot the cap the way a
+    /// separate "is it saturated?" read followed by [`Self::lease`] can. The
+    /// lease is handed to [`open_h2_connect_stream_reserved`], which counts the
+    /// stream from this moment until its tunnel drops. Lock-free: one relaxed
+    /// load of the cap and one CAS loop on the counter.
+    pub(crate) fn try_reserve(&self) -> Option<HboneStreamLease> {
+        let cap = self.peer_max_streams();
+        let mut current = self.0.active_streams.load(Ordering::Relaxed);
+        loop {
+            if current >= cap {
+                return None;
+            }
+            match self.0.active_streams.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(HboneStreamLease(self.clone())),
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     /// Record the peer's current stream cap. Called once a CONNECT response has
@@ -254,8 +302,33 @@ pub(crate) struct HboneStreamLease(HboneConnectionLoad);
 
 impl Drop for HboneStreamLease {
     fn drop(&mut self) {
-        self.0.0.active_streams.fetch_sub(1, Ordering::Relaxed);
+        // The last stream out starts the connection's idle clock. One clock
+        // read, only when the connection goes idle.
+        if self.0.0.active_streams.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0
+                .0
+                .last_released_at
+                .store(unix_secs(), Ordering::Relaxed);
+        }
     }
+}
+
+/// Whether a pooled connection is idle past its timeout (issue #7537): never
+/// while it carries an open stream, and otherwise measured from the later of
+/// its last checkout and the moment its last stream closed.
+pub(crate) fn pooled_entry_idle_expired(entry: &HbonePoolEntry, now: u64) -> bool {
+    if entry.transport.load.active_streams() > 0 {
+        return false;
+    }
+    let last_active = entry.last_used_at.load(Ordering::Relaxed).max(
+        entry
+            .transport
+            .load
+            .0
+            .last_released_at
+            .load(Ordering::Relaxed),
+    );
+    entry_idle_expired(last_active, entry.idle_timeout_seconds, now)
 }
 
 /// One established gateway-to-mesh HTTP/2 transport, carried together with the
@@ -271,6 +344,14 @@ pub(crate) struct MeshH2Transport {
     pub(crate) sender: SendRequest<Bytes>,
     pub(crate) gate: MeshTransportGate,
     pub(crate) load: HboneConnectionLoad,
+    /// Wall-clock Unix second after which this connection's TLS credentials
+    /// no longer hold (issue #7537): the earlier of the peer leaf's and this
+    /// gateway's own leaf's `notAfter`, as observed at the handshake. A pooled
+    /// connection is never handed out past it, so a carrier whose peer SVID
+    /// expired cannot keep serving new CONNECT streams on a session the
+    /// handshake verified while the credential was still valid. `0` (an
+    /// unreadable leaf) is never poolable; `u64::MAX` means unbounded.
+    pub(crate) credential_not_after: u64,
 }
 
 impl std::fmt::Debug for MeshH2Transport {
@@ -296,16 +377,67 @@ impl MeshH2Transport {
             sender,
             gate: MeshTransportGate::new(),
             load: HboneConnectionLoad::default(),
+            credential_not_after: u64::MAX,
         }
     }
 
-    fn is_retired(&self) -> bool {
+    pub(crate) fn is_retired(&self) -> bool {
         self.gate.is_retired()
     }
 
-    fn keepalive_failed(&self) -> bool {
+    pub(crate) fn keepalive_failed(&self) -> bool {
         self.gate.keepalive_failed()
     }
+
+    /// True once the wall clock is past [`Self::credential_not_after`]. One
+    /// integer compare against the `unix_secs()` the checkout scan already read.
+    #[inline]
+    pub(crate) fn credential_expired(&self, now_unix_secs: u64) -> bool {
+        now_unix_secs > self.credential_not_after
+    }
+}
+
+/// Last wall-clock Unix second at which every CRL in `crls` is still usable
+/// (`nextUpdate - 1`: webpki refuses at `now >= nextUpdate`), `u64::MAX` for
+/// an empty set. Parsing a large CRL set on every dial would be wasted work,
+/// so the result for the most recent set (by `Arc` identity) is cached; dials
+/// are the cold path and the lock is held only for the comparison.
+fn crl_list_not_after(crls: &crate::tls::CrlList) -> u64 {
+    static CACHE: std::sync::Mutex<Option<(crate::tls::CrlList, u64)>> =
+        std::sync::Mutex::new(None);
+    if crls.is_empty() {
+        return u64::MAX;
+    }
+    if let Ok(cache) = CACHE.lock()
+        && let Some((cached, not_after)) = cache.as_ref()
+        && Arc::ptr_eq(cached, crls)
+    {
+        return *not_after;
+    }
+    // A record without a parseable `nextUpdate` never passed admission; if one
+    // appears anyway it bounds nothing here and the verifier refuses it.
+    let not_after = crate::tls::crl_policy::earliest_next_update_unix(crls)
+        .map(|next_update| u64::try_from(next_update.saturating_sub(1)).unwrap_or(0))
+        .unwrap_or(u64::MAX);
+    if let Ok(mut cache) = CACHE.lock() {
+        *cache = Some((Arc::clone(crls), not_after));
+    }
+    not_after
+}
+
+/// `notAfter` of a DER leaf as wall-clock Unix seconds, `0` when the leaf
+/// cannot be parsed (so a credential whose expiry cannot be read is never
+/// pooled) and when it predates the epoch.
+pub(crate) fn leaf_not_after_unix_secs(leaf_der: &[u8]) -> u64 {
+    use crate::plugins::utils::cert_validity::CertValidityWindow;
+    use x509_parser::prelude::*;
+
+    let Ok((_, parsed)) = X509Certificate::from_der(leaf_der) else {
+        return 0;
+    };
+    CertValidityWindow::from_certificate(&parsed)
+        .map(|validity| u64::try_from(validity.not_after_unix).unwrap_or(0))
+        .unwrap_or(0)
 }
 
 /// Handle the HBONE pool's keepalive task uses to evict *this* transport from
@@ -315,11 +447,26 @@ impl MeshH2Transport {
 pub(crate) struct HboneKeepalivePoolHandle {
     entries: Arc<DashMap<String, Vec<HbonePoolEntry>>>,
     key: String,
+    /// Which pool's eviction counter the removal is charged to: the HBONE
+    /// pool or the Sidecar mesh-mTLS raw-TCP tunnel lane (issue #7537).
+    pool_kind: crate::runtime_metrics::PoolKind,
 }
 
 impl HboneKeepalivePoolHandle {
+    pub(crate) fn new(
+        entries: Arc<DashMap<String, Vec<HbonePoolEntry>>>,
+        key: String,
+        pool_kind: crate::runtime_metrics::PoolKind,
+    ) -> Self {
+        Self {
+            entries,
+            key,
+            pool_kind,
+        }
+    }
+
     fn evict(&self, gate: &MeshTransportGate) {
-        evict_hbone_entry_for_gate(&self.entries, &self.key, gate);
+        evict_hbone_entry_for_gate(&self.entries, &self.key, gate, self.pool_kind);
     }
 }
 
@@ -1062,7 +1209,11 @@ impl HboneConnectionPool {
         backend_svid_generation: BackendSvidGeneration,
     ) -> Self {
         let entries = Arc::new(DashMap::with_shard_amount(shard_amount));
-        spawn_idle_entry_sweeper(&entries, &pool_config);
+        spawn_idle_entry_sweeper(
+            &entries,
+            &pool_config,
+            crate::runtime_metrics::PoolKind::Hbone,
+        );
         Self {
             entries,
             creation_locks: DashMap::with_shard_amount(shard_amount),
@@ -2420,11 +2571,10 @@ impl HboneConnectionPool {
             .entry(key.to_string())
             .and_modify(|entries| {
                 record_hbone_evictions(prune_pool_entries(entries));
-                entries.push(HbonePoolEntry {
-                    transport: transport.clone(),
-                    last_used_at: AtomicU64::new(unix_secs()),
-                    idle_timeout_seconds: pool_config.idle_timeout_seconds,
-                });
+                entries.push(HbonePoolEntry::new(
+                    transport.clone(),
+                    pool_config.idle_timeout_seconds,
+                ));
                 let max_entries = pool_config.http2_connections_per_host.max(1);
                 if entries.len() > max_entries {
                     let overflow = entries.len() - max_entries;
@@ -2433,17 +2583,21 @@ impl HboneConnectionPool {
                 }
             })
             .or_insert_with(|| {
-                vec![HbonePoolEntry {
-                    transport: transport.clone(),
-                    last_used_at: AtomicU64::new(unix_secs()),
-                    idle_timeout_seconds: pool_config.idle_timeout_seconds,
-                }]
+                vec![HbonePoolEntry::new(
+                    transport.clone(),
+                    pool_config.idle_timeout_seconds,
+                )]
             });
         // Keepalive may have failed between the check above and insert, or
         // between insert and this recheck. Evict by gate identity so a newer
         // replacement under the same key is not removed (issue #4162).
         if transport.keepalive_failed() {
-            evict_hbone_entry_for_gate(&self.entries, key, &transport.gate);
+            evict_hbone_entry_for_gate(
+                &self.entries,
+                key,
+                &transport.gate,
+                crate::runtime_metrics::PoolKind::Hbone,
+            );
         }
         debug!(
             dial_host,
@@ -2511,6 +2665,7 @@ impl HboneConnectionPool {
                         sender,
                         gate: transport.gate,
                         load: transport.load,
+                        credential_not_after: transport.credential_not_after,
                     },
                     live_connections: selection.live,
                     active_streams,
@@ -2588,10 +2743,11 @@ impl HboneConnectionPool {
             conn_admission,
             self.trust_registry(),
             MeshTransportKind::Hbone,
-            Some(HboneKeepalivePoolHandle {
-                entries: Arc::clone(&self.entries),
-                key: pool_key.to_string(),
-            }),
+            Some(HboneKeepalivePoolHandle::new(
+                Arc::clone(&self.entries),
+                pool_key.to_string(),
+                crate::runtime_metrics::PoolKind::Hbone,
+            )),
             self.effective_max_header_list_size(),
         )
         .await
@@ -2926,6 +3082,10 @@ pub(crate) async fn dial_h2_connect_sender(
     // `sni_override = Some(port alias)`). For the in-cluster callers both
     // `expected_trust_domain` and `sni_override` are `None` so behavior is
     // unchanged.
+    // The verifier also refuses a chain once an enforced CRL passes its
+    // `nextUpdate` (issue #7537): a pooled session must stop serving new
+    // streams then too, so the CRL set's earliest expiry bounds the carrier.
+    let crl_not_after = crl_list_not_after(&crls);
     let tls_config = build_spiffe_outbound_config(
         gateway_svid.clone(),
         expected_peer.cloned(),
@@ -2945,6 +3105,18 @@ pub(crate) async fn dial_h2_connect_sender(
                 message: e.to_string(),
             }
         })?;
+    // The gateway leaf this handshake presents bounds the session's
+    // credential lifetime as much as the peer's does (issue #7537). Cold path:
+    // one DER parse per dial.
+    let gateway_not_after = {
+        let snapshot = gateway_svid.load_full();
+        snapshot
+            .as_ref()
+            .as_ref()
+            .and_then(|bundle| bundle.cert_chain_der.first())
+            .map(|leaf| leaf_not_after_unix_secs(leaf.as_slice()))
+            .unwrap_or(0)
+    };
 
     crate::dns::connect_candidates(&candidates, dial_port, connect_timeout, |sock_addr| {
         let connector = connector.clone();
@@ -2986,6 +3158,16 @@ pub(crate) async fn dial_h2_connect_sender(
                     ),
                 });
             }
+            // The verified peer leaf's `notAfter`, folded with the gateway's
+            // own: past it the pools never hand this connection out again.
+            let peer_not_after = tls_stream
+                .get_ref()
+                .1
+                .peer_certificates()
+                .and_then(|chain| chain.first())
+                .map(|leaf| leaf_not_after_unix_secs(leaf.as_ref()))
+                .unwrap_or(0);
+            let credential_not_after = peer_not_after.min(gateway_not_after).min(crl_not_after);
 
             let (stream_window_size, connection_window_size) = h2_window_sizes(pool_config);
             let mut builder = h2::client::Builder::new();
@@ -3103,6 +3285,7 @@ pub(crate) async fn dial_h2_connect_sender(
                 load: HboneConnectionLoad::with_configured_stream_cap(
                     pool_config.http2_max_concurrent_streams,
                 ),
+                credential_not_after,
             })
         }
     })
@@ -3133,6 +3316,42 @@ pub(crate) async fn open_h2_connect_stream(
     baggage: Option<&str>,
     marker: Option<&'static str>,
 ) -> Result<H2ConnectTunnel, HbonePoolError> {
+    open_h2_connect_stream_with_lease(transport, None, target_host, target_port, baggage, marker)
+        .await
+}
+
+/// [`open_h2_connect_stream`] for a caller that already reserved this
+/// stream's slot on the connection with [`HboneConnectionLoad::try_reserve`]
+/// (the Sidecar mesh-mTLS raw-TCP tunnel lane, issue #7537). The reservation
+/// becomes the tunnel's stream lease, so the slot stays counted from the
+/// checkout until the tunnel drops and is released on any failed open.
+pub(crate) async fn open_h2_connect_stream_reserved(
+    transport: MeshH2Transport,
+    reservation: HboneStreamLease,
+    target_host: &str,
+    target_port: u16,
+    baggage: Option<&str>,
+    marker: Option<&'static str>,
+) -> Result<H2ConnectTunnel, HbonePoolError> {
+    open_h2_connect_stream_with_lease(
+        transport,
+        Some(reservation),
+        target_host,
+        target_port,
+        baggage,
+        marker,
+    )
+    .await
+}
+
+async fn open_h2_connect_stream_with_lease(
+    transport: MeshH2Transport,
+    reservation: Option<HboneStreamLease>,
+    target_host: &str,
+    target_port: u16,
+    baggage: Option<&str>,
+    marker: Option<&'static str>,
+) -> Result<H2ConnectTunnel, HbonePoolError> {
     let authority = authority_for_host_port(target_host, target_port);
     // Synchronous refusal: a transport retired between checkout and CONNECT may
     // not open a new stream, even though its socket has not finished closing.
@@ -3145,7 +3364,9 @@ pub(crate) async fn open_h2_connect_stream(
             message: MESH_KEEPALIVE_FAILED_MESSAGE.to_string(),
         });
     }
-    let MeshH2Transport { sender, gate, load } = transport;
+    let MeshH2Transport {
+        sender, gate, load, ..
+    } = transport;
 
     let mut request = Request::builder()
         .method(Method::CONNECT)
@@ -3195,8 +3416,12 @@ pub(crate) async fn open_h2_connect_stream(
         });
     }
     // Counted from the send: a CONNECT parked pending-open behind the peer's
-    // stream cap is load too. A failed open drops the lease on the way out.
-    let stream_lease = load.lease();
+    // stream cap is load too. A failed open drops the lease on the way out. A
+    // caller-reserved slot was already counted at checkout.
+    let stream_lease = match reservation {
+        Some(reserved) => reserved,
+        None => load.lease(),
+    };
     let (response_fut, send_stream) =
         sender
             .send_request(request, false)
@@ -3389,7 +3614,9 @@ async fn open_h2_ws_connect_stream_head(
             message: MESH_KEEPALIVE_FAILED_MESSAGE.to_string(),
         });
     }
-    let MeshH2Transport { sender, gate, load } = transport;
+    let MeshH2Transport {
+        sender, gate, load, ..
+    } = transport;
     // Owned copy for the error variants (which carry a `String`).
     let authority = authority.to_string();
     // RFC 8441 Extended CONNECT keeps `:scheme` and `:path` (unlike a bare
@@ -3835,7 +4062,66 @@ pub fn hbone_ws_inner_host(
     }
 }
 
-fn h2_window_sizes(pool_config: &PoolConfig) -> (u32, u32) {
+/// HTTP/2 flow control for a connection that multiplexes long-lived CONNECT
+/// byte tunnels (issue #7537): both ends of a Sidecar or Ambient mesh
+/// transport use it, the source for its pooled carriers and the destination
+/// for its mesh inbound listener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectMultiplexFlowControl {
+    pub stream_window: u32,
+    pub connection_window: u32,
+    pub max_streams: u32,
+}
+
+/// The largest HTTP/2 flow-control window (RFC 9113 §6.9.1).
+pub const H2_MAX_FLOW_CONTROL_WINDOW: u32 = (1 << 31) - 1;
+
+/// Size receive windows and stream admission together so a stalled stream can
+/// never starve its siblings on the same connection (issue #7537).
+///
+/// A tunnel whose consumer stops reading keeps up to one stream window of the
+/// connection's receive credit. If the connection window covers every stream
+/// it admits at a full stream window, then however many streams stall, each
+/// live stream still has its own whole window. This returns the requested
+/// stream window and stream cap with the connection window raised to
+/// `max_streams × stream_window` (never lowered below the configured one).
+/// When that exceeds the HTTP/2 maximum window, the stream window shrinks to
+/// fit (not below the protocol's 65,535-byte initial window); if even that
+/// cannot fit, the stream cap shrinks. An unlimited stream cap (`None`)
+/// becomes the number of full stream windows the ceiling holds, since
+/// admission without a bound cannot be covered.
+pub fn connect_multiplex_flow_control(
+    stream_window: u32,
+    connection_window: u32,
+    max_streams: Option<u32>,
+) -> ConnectMultiplexFlowControl {
+    use crate::config::types::MIN_HTTP2_WINDOW_SIZE;
+
+    let ceiling = u64::from(H2_MAX_FLOW_CONTROL_WINDOW);
+    let mut stream = u64::from(stream_window.max(MIN_HTTP2_WINDOW_SIZE));
+    // An unlimited cap keeps the stream window and admits as many streams as
+    // the ceiling covers at that window.
+    let mut streams = match max_streams {
+        Some(cap) => u64::from(cap.max(1)),
+        None => (ceiling / stream).max(1),
+    };
+    if streams.saturating_mul(stream) > ceiling {
+        stream = (ceiling / streams).max(u64::from(MIN_HTTP2_WINDOW_SIZE));
+    }
+    if streams.saturating_mul(stream) > ceiling {
+        streams = (ceiling / stream).max(1);
+    }
+    let connection = u64::from(connection_window)
+        .max(streams * stream)
+        .min(ceiling);
+    ConnectMultiplexFlowControl {
+        stream_window: u32::try_from(stream).unwrap_or(H2_MAX_FLOW_CONTROL_WINDOW),
+        connection_window: u32::try_from(connection).unwrap_or(H2_MAX_FLOW_CONTROL_WINDOW),
+        max_streams: u32::try_from(streams).unwrap_or(u32::MAX),
+    }
+}
+
+pub(crate) fn h2_window_sizes(pool_config: &PoolConfig) -> (u32, u32) {
     if pool_config.http2_adaptive_window {
         (
             pool_config
@@ -3871,23 +4157,24 @@ fn hbone_key_svid_fingerprint(key: &str) -> Option<&str> {
 }
 
 /// Outcome of scanning one key's connections for a checkout (issue #5465).
-struct LeastLoadedSelection {
+pub(crate) struct LeastLoadedSelection {
     /// Index and open-stream count of the live, non-expired entry with the
     /// fewest open CONNECT streams among those still under their peer's stream
     /// cap; ties go to the lowest index.
-    chosen: Option<(usize, usize)>,
+    pub(crate) chosen: Option<(usize, usize)>,
     /// Same, ignoring the stream cap: where a caller queues when every live
     /// connection is saturated and the key is at its configured width.
-    least_loaded: Option<(usize, usize)>,
+    pub(crate) least_loaded: Option<(usize, usize)>,
     /// Live, non-expired entries seen (the key's current width).
-    live: usize,
+    pub(crate) live: usize,
 }
 
 /// Measured-load selection: fewest open tunnels wins, an exact tie prefers the
 /// earliest connection so light load concentrates on one connection while the
 /// ones added under pressure idle out, and a connection at its peer's
 /// `SETTINGS_MAX_CONCURRENT_STREAMS` is never chosen while a sibling has room.
-fn select_least_loaded(entries: &[HbonePoolEntry], now: u64) -> LeastLoadedSelection {
+/// A connection past its credential deadline (issue #7537) is never chosen.
+pub(crate) fn select_least_loaded(entries: &[HbonePoolEntry], now: u64) -> LeastLoadedSelection {
     let mut chosen: Option<(usize, usize)> = None;
     let mut least_loaded: Option<(usize, usize)> = None;
     let mut live = 0;
@@ -3897,11 +4184,8 @@ fn select_least_loaded(entries: &[HbonePoolEntry], now: u64) -> LeastLoadedSelec
         // One relaxed load each.
         if entry.transport.is_retired()
             || entry.transport.keepalive_failed()
-            || entry_idle_expired(
-                entry.last_used_at.load(Ordering::Relaxed),
-                entry.idle_timeout_seconds,
-                now,
-            )
+            || entry.transport.credential_expired(now)
+            || pooled_entry_idle_expired(entry, now)
         {
             continue;
         }
@@ -3924,32 +4208,36 @@ fn select_least_loaded(entries: &[HbonePoolEntry], now: u64) -> LeastLoadedSelec
     }
 }
 
-fn prune_pool_entries(entries: &mut Vec<HbonePoolEntry>) -> usize {
+pub(crate) fn prune_pool_entries(entries: &mut Vec<HbonePoolEntry>) -> usize {
     let before = entries.len();
     let now = unix_secs();
     entries.retain(|entry| {
         // Retired by a gateway trust withdrawal: evict without consulting the
         // socket at all (issue #3859). Keepalive-failed transports are evicted
-        // the same way so a black-holed peer cannot stay "healthy" (issue #4162).
-        if entry.transport.is_retired() || entry.transport.keepalive_failed() {
+        // the same way so a black-holed peer cannot stay "healthy" (issue #4162),
+        // and so are connections whose peer or gateway leaf has expired since
+        // the handshake (issue #7537).
+        if entry.transport.is_retired()
+            || entry.transport.keepalive_failed()
+            || entry.transport.credential_expired(now)
+        {
             return false;
         }
         let sender = entry.transport.sender.clone();
         if matches!(sender.ready().now_or_never(), Some(Err(_))) {
             return false;
         }
-        !entry_idle_expired(
-            entry.last_used_at.load(Ordering::Relaxed),
-            entry.idle_timeout_seconds,
-            now,
-        )
+        !pooled_entry_idle_expired(entry, now)
     });
     before.saturating_sub(entries.len())
 }
 
 fn record_hbone_evictions(count: usize) {
-    crate::runtime_metrics::global_ref()
-        .record_pool_evictions(crate::runtime_metrics::PoolKind::Hbone, count as u64);
+    record_pool_kind_evictions(crate::runtime_metrics::PoolKind::Hbone, count);
+}
+
+fn record_pool_kind_evictions(pool_kind: crate::runtime_metrics::PoolKind, count: usize) {
+    crate::runtime_metrics::global_ref().record_pool_evictions(pool_kind, count as u64);
 }
 
 /// Seconds between idle sweeps: the global idle timeout clamped to `1..=60`,
@@ -3972,9 +4260,10 @@ fn idle_prune_interval_secs(pool_config: &PoolConfig) -> u64 {
 /// Holds only a `Weak` reference to the entry map, so the task ends with the
 /// pool, exactly like the direct pools' sweepers. Spawned only inside a Tokio
 /// runtime.
-fn spawn_idle_entry_sweeper(
+pub(crate) fn spawn_idle_entry_sweeper(
     entries: &Arc<DashMap<String, Vec<HbonePoolEntry>>>,
     pool_config: &PoolConfig,
+    pool_kind: crate::runtime_metrics::PoolKind,
 ) {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return;
@@ -3989,7 +4278,7 @@ fn spawn_idle_entry_sweeper(
             ticker.tick().await;
             let Some(entries) = weak.upgrade() else { break };
             entries.retain(|_, entries| {
-                record_hbone_evictions(prune_pool_entries(entries));
+                record_pool_kind_evictions(pool_kind, prune_pool_entries(entries));
                 !entries.is_empty()
             });
         }
@@ -4005,6 +4294,7 @@ fn evict_hbone_entry_for_gate(
     entries: &DashMap<String, Vec<HbonePoolEntry>>,
     key: &str,
     gate: &MeshTransportGate,
+    pool_kind: crate::runtime_metrics::PoolKind,
 ) {
     let mut removed = 0;
     {
@@ -4015,7 +4305,7 @@ fn evict_hbone_entry_for_gate(
         }
     }
     entries.remove_if(key, |_, remaining| remaining.is_empty());
-    record_hbone_evictions(removed);
+    record_pool_kind_evictions(pool_kind, removed);
 }
 
 // `last_used_secs`/`now_secs` are wall-clock `unix_secs()`. `GenericPool` no

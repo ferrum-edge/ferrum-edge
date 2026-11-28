@@ -171,6 +171,16 @@ pub struct AcmeCertificateRecord {
     pub not_after: Option<UtcTimestamp>,
     pub created_at: UtcTimestamp,
     pub updated_at: UtcTimestamp,
+    /// Store version of the commit that last wrote this record (`0` for a
+    /// record not yet written through a store that stamps it). Every
+    /// successful create or replacement, renewal included, stamps a value the
+    /// record never had before, so the Admin API `ETag` (which covers it)
+    /// changes on every write even when material and clock repeat.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::tls::shared_store::revision_is_unset"
+    )]
+    pub revision: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -605,6 +615,19 @@ pub enum AcmeError {
     NotFound(String),
     #[error("ACME certificate '{0}' already exists")]
     AlreadyExists(String),
+    /// The caller's write precondition (`If-Match` at the Admin API) did not
+    /// hold against the authoritative certificate record under the exclusive
+    /// store lock, so nothing was written. Carries only the record id.
+    #[error(
+        "ACME certificate '{0}' has changed since the supplied If-Match entity-tag was issued; \
+         re-read it and reapply your changes"
+    )]
+    CertificatePreconditionFailed(String),
+    /// The caller's reference scan found the certificate still referenced,
+    /// raised under the exclusive lock after the authoritative existence
+    /// check. Carries only the id.
+    #[error("ACME certificate '{0}' is still referenced")]
+    CertificateStillReferenced(String),
     #[error("ACME order '{0}' was not found")]
     OrderNotFound(String),
     #[error("ACME order '{0}' already exists")]
@@ -883,6 +906,22 @@ impl AcmeCertificateStore {
         record: AcmeCertificateRecord,
         allow_overwrite: bool,
     ) -> Result<AcmeCertificateRecord, AcmeError> {
+        self.upsert_certificate_if(record, allow_overwrite, |_| true)
+    }
+
+    /// [`Self::upsert_certificate`] guarded by a caller precondition.
+    ///
+    /// `precondition` receives the authoritative stored record (or `None` when
+    /// the id is free) under the same exclusive cross-process lock that
+    /// commits the write, after the overwrite rule (so its `409` keeps
+    /// precedence). Returning `false` refuses the write with
+    /// [`AcmeError::CertificatePreconditionFailed`] and changes nothing.
+    pub fn upsert_certificate_if(
+        &self,
+        record: AcmeCertificateRecord,
+        allow_overwrite: bool,
+        precondition: impl FnOnce(Option<&AcmeCertificateRecord>) -> bool,
+    ) -> Result<AcmeCertificateRecord, AcmeError> {
         validate_acme_id(&record.id)?;
         validate_acme_domains(&record.domains)?;
         validate_acme_certificate_material_size(&record, self.max_material_bytes)?;
@@ -890,23 +929,41 @@ impl AcmeCertificateStore {
         let outcome = self.file.mutate(move |document| {
             let mut record = record;
             let now = UtcTimestamp::now();
-            if let Some(existing) = document.certificates.get(&record.id) {
-                if !allow_overwrite {
-                    return Err(AcmeError::AlreadyExists(record.id));
+            // The overwrite rule answers first; the caller's precondition is
+            // evaluated only against a record this write could replace (or a
+            // free id, which a conditional precondition never accepts).
+            let preserved_created_at = match document.certificates.get(&record.id) {
+                Some(existing) => {
+                    if !allow_overwrite {
+                        return Err(AcmeError::AlreadyExists(record.id));
+                    }
+                    if !precondition(Some(existing)) {
+                        return Err(AcmeError::CertificatePreconditionFailed(record.id));
+                    }
+                    Some(existing.created_at)
                 }
-                record.created_at = existing.created_at;
-                record.updated_at = now;
-            } else {
-                if document.certificates.len() >= max_certificates {
-                    record_store_admission_rejected(
-                        TlsPersistentStoreKind::AcmeCertificates,
-                        TlsStoreAdmissionReason::RecordLimit,
-                    );
-                    return Err(AcmeError::RecordLimitReached);
+                None => {
+                    if !precondition(None) {
+                        return Err(AcmeError::CertificatePreconditionFailed(record.id));
+                    }
+                    None
                 }
-                record.created_at = now;
-                record.updated_at = now;
+            };
+            match preserved_created_at {
+                Some(created_at) => record.created_at = created_at,
+                None => {
+                    if document.certificates.len() >= max_certificates {
+                        record_store_admission_rejected(
+                            TlsPersistentStoreKind::AcmeCertificates,
+                            TlsStoreAdmissionReason::RecordLimit,
+                        );
+                        return Err(AcmeError::RecordLimitReached);
+                    }
+                    record.created_at = now;
+                }
             }
+            record.updated_at = now;
+            record.revision = document.store_version.saturating_add(1);
             document
                 .certificates
                 .insert(record.id.clone(), record.clone());
@@ -922,6 +979,18 @@ impl AcmeCertificateStore {
         &self,
         record: AcmeCertificateRecord,
     ) -> Result<AcmeCertificateRecord, AcmeError> {
+        self.update_existing_certificate_if(record, |_| true)
+    }
+
+    /// [`Self::update_existing_certificate`] guarded by a caller precondition,
+    /// evaluated against the authoritative existing record under the
+    /// exclusive lock that commits the replacement. `false` refuses with
+    /// [`AcmeError::CertificatePreconditionFailed`].
+    pub fn update_existing_certificate_if(
+        &self,
+        record: AcmeCertificateRecord,
+        precondition: impl FnOnce(&AcmeCertificateRecord) -> bool,
+    ) -> Result<AcmeCertificateRecord, AcmeError> {
         validate_acme_id(&record.id)?;
         validate_acme_domains(&record.domains)?;
         validate_acme_certificate_material_size(&record, self.max_material_bytes)?;
@@ -931,8 +1000,14 @@ impl AcmeCertificateStore {
             let Some(existing) = document.certificates.get(&record.id) else {
                 return Err(AcmeError::NotFound(record.id));
             };
+            if !precondition(existing) {
+                return Err(AcmeError::CertificatePreconditionFailed(record.id));
+            }
             record.created_at = existing.created_at;
             record.updated_at = now;
+            // The version this commit publishes (`mutate` writes exactly
+            // `store_version + 1`), so every replacement is distinguishable.
+            record.revision = document.store_version.saturating_add(1);
             document
                 .certificates
                 .insert(record.id.clone(), record.clone());
@@ -966,15 +1041,40 @@ impl AcmeCertificateStore {
         id: &str,
         still_authorized: impl Fn() -> bool,
     ) -> Result<Option<AcmeCertificateRecord>, AcmeError> {
+        self.delete_certificate_if_authorized_and(id, false, |_| true, still_authorized)
+    }
+
+    /// [`Self::delete_certificate_if_authorized`] with the caller's
+    /// reference-scan verdict and precondition, decided under the exclusive
+    /// lock that commits the removal in one fixed order: existence
+    /// (`NotFound`), `referenced` ([`AcmeError::CertificateStillReferenced`]),
+    /// the authorization fence (`Ok(None)`), then `precondition`
+    /// ([`AcmeError::CertificatePreconditionFailed`]). Any refusal removes
+    /// nothing.
+    pub fn delete_certificate_if_authorized_and(
+        &self,
+        id: &str,
+        referenced: bool,
+        precondition: impl FnOnce(&AcmeCertificateRecord) -> bool,
+        still_authorized: impl Fn() -> bool,
+    ) -> Result<Option<AcmeCertificateRecord>, AcmeError> {
         validate_acme_id(id)?;
         let id = id.to_string();
         let outcome = self.file.mutate_if_confirmed(
             |document| {
-                if !document.certificates.contains_key(&id) {
+                let Some(existing) = document.certificates.get(&id) else {
                     return Err(AcmeError::NotFound(id.clone()));
+                };
+                if referenced {
+                    return Err(AcmeError::CertificateStillReferenced(id.clone()));
                 }
+                // A lapsed authorization fence answers before the caller's
+                // precondition, so a stale tag never hides a lost fence.
                 if !still_authorized() {
                     return Ok((false, None));
+                }
+                if !precondition(existing) {
+                    return Err(AcmeError::CertificatePreconditionFailed(id.clone()));
                 }
                 match document.certificates.remove(&id) {
                     Some(record) => Ok((true, Some(record))),
@@ -1544,6 +1644,7 @@ impl AcmeCertificateRecord {
             not_after,
             created_at: now,
             updated_at: now,
+            revision: 0,
         })
     }
 

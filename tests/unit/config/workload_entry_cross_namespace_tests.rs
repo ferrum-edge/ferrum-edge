@@ -560,6 +560,7 @@ fn workloads_carrier_round_trips_service_namespace() {
         pod_uid: None,
         node_waypoint: None,
         remote_provenance: false,
+        mesh_transport: None,
     };
     let carrier = MeshSliceCarrier::Workloads(vec![workload]);
     let encoded = carrier.encode_value().expect("encode");
@@ -598,6 +599,7 @@ fn mesh_validation_rejects_spoofed_cross_namespace_service_namespace() {
         pod_uid: None,
         node_waypoint: None,
         remote_provenance: false,
+        mesh_transport: None,
     };
     let service = MeshService {
         name: "reviews".to_string(),
@@ -646,6 +648,7 @@ fn mesh_validation_accepts_authorized_cross_namespace_service_namespace() {
         pod_uid: None,
         node_waypoint: None,
         remote_provenance: false,
+        mesh_transport: None,
     };
     let service = MeshService {
         name: "reviews".to_string(),

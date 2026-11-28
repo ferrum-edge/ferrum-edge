@@ -281,6 +281,7 @@ fn ephemeral_snapshot(
         .saturating_add(ps.h3_pool.pool_size() as u64)
         .saturating_add(ps.hbone_pool.pool_size() as u64)
         .saturating_add(ps.mesh_mtls_pool.pool_size() as u64)
+        .saturating_add(ps.mesh_mtls_pool.tunnel_pool_size() as u64)
         .saturating_add(stream_backend_sessions);
 
     EphemeralPortSnapshot {

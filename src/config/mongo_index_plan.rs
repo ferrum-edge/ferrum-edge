@@ -114,6 +114,44 @@ pub const MONGO_INDEX_PLAN_VERSION_COLLECTION: &str = "_ferrum_migrations";
 /// applying (`in_progress_version`).
 pub const MONGO_INDEX_PLAN_VERSION_DOCUMENT_ID: &str = "core_index_plan";
 
+/// Collections a 0.9.x release wrote Ferrum documents into.
+///
+/// 1.0.0 is the first release that records an index-plan version, and every
+/// 1.0.0+ `up` writes its `in_progress_version` marker before it creates a
+/// collection or a document. A database that holds a document in any of these
+/// collections but has **no** `core_index_plan` record (neither `version` nor
+/// `in_progress_version`) was therefore initialized by a 0.9.x release; see
+/// [`MongoIndexPlanError::PreReleaseDatabase`]. An empty database (none of these
+/// collections holds a document) is a new database and is never refused.
+pub const PRE_RELEASE_MARKER_COLLECTIONS: &[&str] = &[
+    "proxies",
+    "consumers",
+    "plugin_configs",
+    "upstreams",
+    "api_specs",
+    "gateway_trust_bundles",
+    "namespaces",
+    "config_changes",
+    "consumer_identity_index",
+    "audit_events",
+];
+
+/// Refuse a populated database that carries no index-plan record (see
+/// [`PRE_RELEASE_MARKER_COLLECTIONS`]). `populated_collection` is the first
+/// marker collection found holding a document, or `None` when all are empty.
+pub fn refuse_pre_release_database(
+    recorded: &RecordedIndexPlanState,
+    populated_collection: Option<&'static str>,
+) -> Result<(), MongoIndexPlanError> {
+    if recorded.version.is_some() || recorded.in_progress.is_some() {
+        return Ok(());
+    }
+    match populated_collection {
+        Some(collection) => Err(MongoIndexPlanError::PreReleaseDatabase { collection }),
+        None => Ok(()),
+    }
+}
+
 /// An index an earlier plan created that a later plan version drops.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetiredMongoIndex {
@@ -256,6 +294,9 @@ pub enum MongoIndexPlanError {
     InProgressVersionNewer { in_progress: i64, supported: i64 },
     /// The recorded version document is not a positive integer version.
     InvalidRecordedVersion,
+    /// The database holds Ferrum documents but no index-plan record, so a
+    /// 0.9.x release initialized it (see [`PRE_RELEASE_MARKER_COLLECTIONS`]).
+    PreReleaseDatabase { collection: &'static str },
     /// A plan declares a version below 1.
     InvalidPlanVersion { version: i64 },
     /// A retirement is declared outside `2..=version`.
@@ -290,6 +331,16 @@ impl std::fmt::Display for MongoIndexPlanError {
                  \"{supported}\"; refusing to run an older binary against a partly upgraded \
                  database. Rerun the newer release to finish the upgrade, or restore the \
                  backup taken before it (docs/admin_backup_restore.md)"
+            ),
+            Self::PreReleaseDatabase { collection } => write!(
+                f,
+                "migration history integrity check failed: kind=pre_release_database \
+                 backend=mongodb: collection `{collection}` holds Ferrum documents but the \
+                 database records no index plan version (`_ferrum_migrations` \
+                 `core_index_plan`), so a 0.9.x release created it. This release refuses it: \
+                 rebuild the database and restore it from a `GET /backup` export as described \
+                 in docs/upgrade_guide.md (\"Every 0.9.x database is rebuilt and restored\") \
+                 and docs/admin_backup_restore.md"
             ),
             Self::InvalidRecordedVersion => f.write_str(
                 "MongoDB index plan version record is not a positive integer; refusing to \

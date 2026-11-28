@@ -9129,6 +9129,33 @@ impl DatabaseStore {
                         .await?;
                 }
             }
+            // The backup's registry row (issue #7532), behind the same digest
+            // comparison and lease pin as every resource above.
+            if let Some(description) = &restore.namespace_registry {
+                let existing = self.get_namespace_tx(&mut tx, graph.namespace).await?;
+                if existing
+                    .as_ref()
+                    .is_none_or(|record| &record.description != description)
+                {
+                    let now = UtcTimestamp::now();
+                    let mut record = existing.unwrap_or_else(|| {
+                        crate::config::namespace_registry::NamespaceRecord::new(
+                            graph.namespace.to_string(),
+                            None,
+                            now,
+                        )
+                    });
+                    record.description = description.clone();
+                    record.updated_at = now;
+                    self.upsert_namespace_registry_row_tx(
+                        &mut tx,
+                        graph.namespace,
+                        &record,
+                        &now.to_rfc3339(),
+                    )
+                    .await?;
+                }
+            }
             touched_namespaces.insert(graph.namespace.to_string());
         }
 
