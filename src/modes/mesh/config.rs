@@ -7340,6 +7340,12 @@ pub const VIRTUAL_SERVICE_HTTP_ROUTE_PROXY_ID_PREFIX: &str = "istio-vs-";
 /// (`modes::mesh::mesh_route_admitted_for_direction`).
 pub const GAMMA_HTTP_ROUTE_PROXY_ID_PREFIX: &str = "istio-vs-gamma_";
 
+/// Non-forwarding placeholder destination used by GAMMA proxies (whose own
+/// default is never dialed because `reject_unmatched` answers misses with 404)
+/// and by GAMMA rules that terminate locally (fault, redirect, zero-weight, or
+/// an unavailable backend Service). Excluded from Sidecar egress checks.
+pub(crate) const GAMMA_NO_FORWARD_HOST: &str = "gamma-no-forward.ferrum.invalid.";
+
 /// Whether `id` names a Gateway API GAMMA route proxy.
 pub fn is_gamma_http_route_proxy_id(id: &str) -> bool {
     id.starts_with(GAMMA_HTTP_ROUTE_PROXY_ID_PREFIX)

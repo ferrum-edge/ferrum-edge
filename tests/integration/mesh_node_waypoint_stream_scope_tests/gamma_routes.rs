@@ -379,3 +379,121 @@ fn sidecar_serves_gamma_routes_on_outbound_capture_only() {
         );
     }
 }
+
+#[test]
+fn restrictive_sidecar_egress_keeps_gamma_route_despite_no_forward_placeholder() {
+    let mut config = producer_config();
+    let mesh = config.mesh.as_mut().expect("mesh");
+    mesh.sidecars
+        .push(ferrum_edge::modes::mesh::config::MeshSidecar {
+            name: "strict".to_string(),
+            namespace: DEFAULT_NAMESPACE.to_string(),
+            workload_selector: None,
+            egress: vec![ferrum_edge::modes::mesh::config::MeshSidecarEgress {
+                hosts: vec![
+                    "./reviews.default.svc.cluster.local".to_string(),
+                    "./ratings.default.svc.cluster.local".to_string(),
+                ],
+                port: None,
+            }],
+            ingress: Vec::new(),
+            ingress_declared: false,
+            outbound_traffic_policy: None,
+            egress_inherits_defaults: false,
+        });
+    let runtime = MeshRuntimeConfig {
+        sidecar_enforced: true,
+        ..runtime_for_topology(MeshTopology::Sidecar)
+    };
+    let slice = slice_for(&config, &runtime);
+    assert_eq!(
+        carried_ids(&slice.http_routes.proxies).len(),
+        1,
+        "strict Sidecar importing parent and backends keeps the GAMMA route"
+    );
+}
+
+#[test]
+fn unavailable_canary_backend_fails_only_its_rule_and_keeps_gamma_dispatch() {
+    let route = object(
+        "HTTPRoute",
+        "gateway.networking.k8s.io/v1",
+        DEFAULT_NAMESPACE,
+        "reviews-canary",
+        json!({
+            "parentRefs": [{"group": "", "kind": "Service", "name": "reviews", "port": 8080}],
+            "rules": [
+                {
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/canary"}}],
+                    "backendRefs": [{"name": "ratings", "port": 8080}]
+                },
+                {
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/stable"}}],
+                    "backendRefs": [{"name": "reviews", "port": 8080}]
+                }
+            ]
+        }),
+    );
+    let mut config = translated_config(&[
+        k8s_service(DEFAULT_NAMESPACE, "reviews"),
+        k8s_service(DEFAULT_NAMESPACE, "ratings"),
+        route,
+    ]);
+    // Scale `ratings` to zero endpoints while `reviews` remains healthy.
+    let mesh = config.mesh.as_mut().expect("mesh");
+    mesh.workloads.retain(|w| w.service_name != "ratings");
+    for svc in &mut mesh.services {
+        if svc.name == "ratings" {
+            svc.workloads.clear();
+        }
+    }
+    let runtime = runtime_for_topology(MeshTopology::NodeWaypoint);
+    let slice = slice_for(&config, &runtime);
+    let prepared = prepare_gateway_config_from_mesh_slice(&slice, &runtime)
+        .expect("GAMMA slice materializes with scaled-to-zero canary backend");
+    let gamma_id = carried_ids(&slice.http_routes.proxies).remove(0);
+    assert!(
+        prepared.proxies.iter().any(|proxy| proxy.id == gamma_id),
+        "GAMMA proxy remains materialized when one rule backend has zero endpoints"
+    );
+    let dispatch = prepared
+        .plugin_configs
+        .iter()
+        .find(|plugin| {
+            plugin.plugin_name == "mesh_route_dispatch"
+                && plugin.proxy_id.as_deref() == Some(gamma_id.as_str())
+        })
+        .expect("GAMMA dispatch plugin");
+    assert_eq!(
+        dispatch.config["reject_unmatched"],
+        json!(true),
+        "unmatched paths still return 404 rather than falling through to plain Service"
+    );
+    let rules = dispatch.config["rules"].as_array().expect("rules array");
+    let canary = rules
+        .iter()
+        .find(|rule| rule["match"]["uri"]["regex"] == json!("/canary(/.*)?"))
+        .expect("canary rule preserved");
+    assert_eq!(
+        canary["fault"]["abort"]["status_code"],
+        json!(503),
+        "unavailable canary rule fails closed with 503"
+    );
+    assert!(
+        canary["destination"].get("upstream_id").is_none(),
+        "unavailable canary rule has no dangling upstream_id"
+    );
+    let stable = rules
+        .iter()
+        .find(|rule| rule["match"]["uri"]["regex"] == json!("/stable(/.*)?"))
+        .expect("stable rule preserved");
+    assert_eq!(
+        stable["destination"]["upstream_id"],
+        json!("__mesh-out-upstream-default-reviews-8080"),
+        "healthy rule keeps routing to its mesh Service upstream"
+    );
+    assert!(
+        stable.get("fault").is_none(),
+        "healthy rule has no abort fault"
+    );
+}

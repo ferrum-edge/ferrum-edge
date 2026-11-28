@@ -5115,6 +5115,10 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
         .map(|upstream| (upstream.namespace.clone(), upstream.id.clone()))
         .collect();
     let mut failed_splits: HashSet<(String, String)> = HashSet::new();
+    // Splits that failed ONLY because an in-cluster same-namespace Service
+    // backend has no reachable workload endpoints (e.g. scaled to zero),
+    // rather than an unmodeled/cross-namespace/unrepresentable refusal.
+    let mut unavailable_splits: HashSet<(String, String)> = HashSet::new();
     // (namespace, split id) -> legs `(leg upstream id, weight)`.
     let mut leg_dispatched: HashMap<(String, String), WeightedSplitLegs> = HashMap::new();
     let mut residual_upstreams: Vec<Upstream> = Vec::new();
@@ -5141,6 +5145,7 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
         // split upstream keeps (see below).
         let mut service_targets: Vec<(u32, Vec<UpstreamTarget>)> = Vec::new();
         let mut rebound = true;
+        let mut only_unavailable = true;
         let mut governed_by_destination_rule = false;
         for target in &split.targets {
             match hosts.classify(&namespace, &target.host) {
@@ -5157,7 +5162,10 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                     legs.push((target.weight, vec![target.clone()]));
                     external_targets.push(target.clone());
                 }
-                CarriedRouteHost::UnmodeledService => rebound = false,
+                CarriedRouteHost::UnmodeledService => {
+                    rebound = false;
+                    only_unavailable = false;
+                }
                 // A leg is dispatched through a namespace-local reference
                 // (the split's own targets, or a route override naming the
                 // Service upstream), so a Service in another namespace is
@@ -5170,6 +5178,7 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                 {
                     cross_namespace_refused += 1;
                     rebound = false;
+                    only_unavailable = false;
                 }
                 CarriedRouteHost::Service(service_namespace, service_name) => {
                     if service_has_destination_rule(
@@ -5240,6 +5249,9 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
             }
         }
         if !rebound || legs.is_empty() {
+            if !rebound && only_unavailable {
+                unavailable_splits.insert((namespace.clone(), id.clone()));
+            }
             failed_splits.insert((namespace, id));
             continue;
         }
@@ -5295,6 +5307,10 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
     let mut dropped: HashSet<(String, String)> = HashSet::new();
     let mut upstream_updates: Vec<(usize, String)> = Vec::new();
     let mut rule_updates: Vec<(usize, usize, String)> = Vec::new();
+    // GAMMA dispatch rules whose in-cluster backend Service has no reachable
+    // endpoints (scaled to zero): fail ONLY that rule with 503 so healthy
+    // rules on the same GAMMA proxy and unmatched-404 rejection stay active.
+    let mut unavailable_gamma_rules: Vec<(usize, usize)> = Vec::new();
     // Routes that dispatch a weighted split leg by leg: (proxy index, the
     // route's first `mesh_route_dispatch` instance if any, split ids).
     let mut weighted_routes: Vec<(usize, Option<usize>, Vec<String>)> = Vec::new();
@@ -5319,6 +5335,7 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
         }
         let namespace = proxy.namespace.clone();
         let proxy_id = proxy.id.clone();
+        let is_gamma_route = config::is_gamma_http_route_proxy_id(&proxy_id);
         let backend_host = proxy.backend_host.clone();
         let backend_port = proxy.backend_port;
         let mut keep = !source_namespace_refused.contains(&(namespace.clone(), proxy_id.clone()));
@@ -5461,6 +5478,13 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                     .get("upstream_id")
                     .and_then(serde_json::Value::as_str)
                 {
+                    if is_gamma_route
+                        && unavailable_splits
+                            .contains(&(namespace.clone(), upstream_id.to_string()))
+                    {
+                        unavailable_gamma_rules.push((plugin_index, rule_index));
+                        continue;
+                    }
                     if failed_splits.contains(&(namespace.clone(), upstream_id.to_string())) {
                         keep = false;
                     }
@@ -5537,6 +5561,9 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
                                 candidates.insert(id.clone());
                                 rule_rewrites.push((plugin_index, rule_index, id));
                             }
+                            None if is_gamma_route => {
+                                unavailable_gamma_rules.push((plugin_index, rule_index));
+                            }
                             None => keep = false,
                         }
                     }
@@ -5612,6 +5639,41 @@ fn bind_carried_http_routes_to_node_waypoint_transport(
             "upstream_id".to_string(),
             serde_json::Value::String(upstream_id),
         );
+    }
+    for (plugin_index, rule_index) in unavailable_gamma_rules {
+        let Some(rule) = config
+            .plugin_configs
+            .get_mut(plugin_index)
+            .and_then(|plugin| plugin.config.get_mut("rules"))
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|rules| rules.get_mut(rule_index))
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        if let Some(destination) = rule
+            .get_mut("destination")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            destination.remove("upstream_id");
+            destination.remove("backend_tls");
+            destination.insert(
+                "backend_host".to_string(),
+                serde_json::Value::String(config::GAMMA_NO_FORWARD_HOST.to_string()),
+            );
+            destination.insert("backend_port".to_string(), serde_json::json!(80));
+        }
+        if !rule.contains_key("redirect") {
+            rule.insert(
+                "fault".to_string(),
+                serde_json::json!({
+                    "abort": {
+                        "status_code": 503,
+                        "percentage": 100.0,
+                    }
+                }),
+            );
+        }
     }
     // Give each leg-dispatched route its legs, on its own dispatch instance
     // (or a new one under the translator's id), so the dispatch finalizer of

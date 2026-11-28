@@ -104,14 +104,7 @@ pub(crate) const GAMMA_ROUTE_UPSTREAM_ID_PREFIX: &str = "istio-vs-upstream-gamma
 /// group writes (`gamma_<service namespace>_<service>`). Kubernetes names never
 /// contain `_`, so it never collides with a VirtualService binding.
 pub(crate) const GAMMA_ROUTE_BINDING_NAME_PREFIX: &str = "gamma_";
-/// Destination of a rule that never forwards (a fault, a redirect, an
-/// all-zero-weight rule) and of the route proxy's own default, which no
-/// request reaches (every request matches a rule or is rejected). An absolute
-/// name under the reserved `.invalid` TLD that never resolves, with three
-/// labels and no `.svc` suffix so a mesh data plane classifies it as an
-/// external host rather than an unmodeled `<svc>.<ns>` Service (which would
-/// refuse the whole route).
-const GAMMA_NO_FORWARD_HOST: &str = "gamma-no-forward.ferrum.invalid.";
+use crate::modes::mesh::config::GAMMA_NO_FORWARD_HOST;
 /// Internal path-precedence metadata on a GAMMA dispatch rule; stripped before
 /// the rule leaves translation.
 const GAMMA_PATH_PRECEDENCE_KEY: &str = "_ferrum_gamma_path_precedence";
@@ -377,14 +370,16 @@ pub(super) fn stage_service_parent_routes(
         .as_deref()
         .and_then(parse_k8s_timestamp);
     for ((service_namespace, service_name), parents) in services {
-        let http_ports = service_http_ports(acc, &service_namespace, &service_name);
-        // A parent with no port attaches to every port; a scope that covers
-        // every HTTP-family port of the Service is no scope.
+        // A parent with no port attaches to every port of the Service; an
+        // explicit port list ALWAYS keeps its trusted `match.port` predicate
+        // (even when it covers every HTTP-family port on the Service), because
+        // the GAMMA proxy is host/path-scoped and would otherwise match
+        // requests arriving on other ports of the Service host.
         let ports = if parents.iter().any(|parent| parent.port.is_none()) {
             None
         } else {
             let scoped: BTreeSet<u16> = parents.iter().filter_map(|parent| parent.port).collect();
-            (!http_ports.is_subset(&scoped)).then_some(scoped)
+            (!scoped.is_empty()).then_some(scoped)
         };
         let mut staged = GammaStagedRoute {
             object: object.clone(),
@@ -668,6 +663,16 @@ fn build_route_resources(
             {
                 criteria.insert("uri".to_string(), uri);
             }
+            if let Some(reason) = invalid_gamma_match_regex(&criteria)
+                && resources.blocked.is_none()
+            {
+                resources.blocked = Some(GammaParentOutcome::UnsupportedValue {
+                    message: format!(
+                        "rules[{rule_index}].matches[{}] {reason}",
+                        entry_descriptor.match_index
+                    ),
+                });
+            }
             let mut dispatch_rule = gateway_api_dispatch_route_rule(
                 object,
                 Value::Object(criteria),
@@ -700,6 +705,46 @@ fn build_route_resources(
         }
     }
     Ok(resources)
+}
+
+/// Validate any regex matcher in a GAMMA dispatch rule's match criteria using
+/// the dispatcher's own full-match compiler so an invalid or over-complex
+/// regex is rejected on its own route attachment instead of poisoning the
+/// receiving mesh slice.
+fn invalid_gamma_match_regex(criteria: &serde_json::Map<String, Value>) -> Option<&'static str> {
+    let check_regex = |pattern: &str| {
+        !pattern.is_empty()
+            && crate::plugins::mesh_route_dispatch::compile_full_match_regex(pattern).is_ok()
+    };
+    if let Some(pattern) = criteria
+        .get("uri")
+        .and_then(|uri| uri.get("regex"))
+        .and_then(Value::as_str)
+        && !check_regex(pattern)
+    {
+        return Some("path regular expression is invalid or too complex");
+    }
+    for (field, label) in [
+        (
+            "headers",
+            "header regular expression is invalid or too complex",
+        ),
+        (
+            "query_params",
+            "query parameter regular expression is invalid or too complex",
+        ),
+    ] {
+        if let Some(entries) = criteria.get(field).and_then(Value::as_object) {
+            for matcher in entries.values() {
+                if let Some(pattern) = matcher.get("regex").and_then(Value::as_str)
+                    && !check_regex(pattern)
+                {
+                    return Some(label);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Resolve one rule's `backendRefs` to mesh Service backends.

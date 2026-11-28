@@ -3693,8 +3693,15 @@ fn node_waypoint_http_route_set(
         }
         let mut upstream_ids: BTreeSet<&str> = BTreeSet::new();
         upstream_ids.extend(proxy.upstream_id.as_deref());
+        let is_gamma_proxy = config::is_gamma_http_route_proxy_id(&proxy.id);
         let mut destinations: Vec<(&str, u16)> = Vec::new();
-        if !proxy.backend_host.is_empty() && proxy.backend_port != 0 {
+        if !proxy.backend_host.is_empty()
+            && proxy.backend_port != 0
+            && !(is_gamma_proxy
+                && proxy
+                    .backend_host
+                    .eq_ignore_ascii_case(config::GAMMA_NO_FORWARD_HOST))
+        {
             destinations.push((proxy.backend_host.as_str(), proxy.backend_port));
         }
         for &plugin in &route_plugins {
@@ -3721,7 +3728,11 @@ fn node_waypoint_http_route_set(
                     .and_then(serde_json::Value::as_u64)
                     .and_then(|port| u16::try_from(port).ok())
                     .unwrap_or(proxy.backend_port);
-                if destination.get("upstream_id").is_none() && !host.is_empty() && port != 0 {
+                if destination.get("upstream_id").is_none()
+                    && !host.is_empty()
+                    && port != 0
+                    && !(is_gamma_proxy && host.eq_ignore_ascii_case(config::GAMMA_NO_FORWARD_HOST))
+                {
                     destinations.push((host, port));
                 }
             }

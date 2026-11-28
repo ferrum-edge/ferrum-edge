@@ -1187,7 +1187,7 @@ fn a_port_scoped_parent_guards_every_rule_and_passes_other_http_ports_through() 
 }
 
 #[test]
-fn a_parent_port_covering_every_http_port_is_unscoped() {
+fn an_explicit_parent_port_keeps_its_port_predicate_even_on_single_port_service() {
     let route = http_route(
         "default",
         "reviews-route",
@@ -1200,8 +1200,63 @@ fn a_parent_port_covering_every_http_port_is_unscoped() {
     objects.push(route);
     let rules = dispatch_rules(&translate(&objects).config);
     assert!(
-        rules.iter().all(|rule| rule["match"].get("port").is_none()),
-        "a single-port Service needs no port predicate: {rules:?}"
+        !rules.is_empty()
+            && rules
+                .iter()
+                .all(|rule| rule["match"].get("port") == Some(&json!(8080))),
+        "an explicit Service parent port must keep its port predicate: {rules:?}"
+    );
+}
+
+#[test]
+fn an_invalid_path_regex_is_rejected_at_admission_without_poisoning_other_routes() {
+    let bad = http_route(
+        "default",
+        "bad-regex",
+        json!({
+            "parentRefs": [service_parent("reviews")],
+            "rules": [{
+                "matches": [{"path": {"type": "RegularExpression", "value": "[unclosed"}}],
+                "backendRefs": [{"name": "reviews", "port": 8080}]
+            }]
+        }),
+    );
+    let good = http_route(
+        "default",
+        "good-route",
+        json!({
+            "parentRefs": [service_parent("reviews")],
+            "rules": [{
+                "matches": [{"path": {"type": "PathPrefix", "value": "/ok"}}],
+                "backendRefs": [{"name": "reviews", "port": 8080}]
+            }]
+        }),
+    );
+    let mut objects = base_services();
+    objects.push(bad);
+    objects.push(good);
+    let result = translate(&objects);
+    let rules = dispatch_rules(&result.config);
+    assert_eq!(
+        rules.len(),
+        1,
+        "only the valid attachment's rule is emitted: {rules:?}"
+    );
+    assert_eq!(rules[0]["match"]["uri"]["regex"], json!("/ok(/.*)?"));
+    let bad_status = result
+        .gamma_route_statuses
+        .iter()
+        .find(|status| status.route.name == "bad-regex")
+        .expect("bad-regex status recorded");
+    assert!(
+        bad_status.parents.iter().all(|parent| {
+            parent.conditions.iter().any(|c| {
+                c.condition_type == "Accepted"
+                    && c.status == "False"
+                    && c.reason == "UnsupportedValue"
+            })
+        }),
+        "bad-regex reported Accepted=False/UnsupportedValue: {bad_status:?}"
     );
 }
 

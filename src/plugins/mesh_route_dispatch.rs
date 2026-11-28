@@ -1642,7 +1642,7 @@ impl UriMatcher {
 /// `Regex::find`, which may be a shorter prefix even when a later alternative
 /// spans the whole input. The operator pattern stays in its own non-capturing
 /// group so inline flags and alternation retain their original semantics.
-fn compile_full_match_regex(pattern: &str) -> Result<Regex, regex::Error> {
+pub(crate) fn compile_full_match_regex(pattern: &str) -> Result<Regex, regex::Error> {
     Regex::new(&format!(r"\A(?:{pattern})\z"))
 }
 
