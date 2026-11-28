@@ -14304,7 +14304,35 @@ fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
     MeshRouteDispatch::new(&secondary_abort_fault)
         .expect("primary + secondary_abort is runtime-valid");
 
+    let delay_with_null_secondary = json!({
+        "rules": [{
+            "match": {"methods": ["GET"]},
+            "destination": {"upstream_id": "api"},
+            "fault": {
+                "delay": {"duration_ms": 10, "percentage": 5.0},
+                "secondary_abort": null
+            }
+        }]
+    });
+    assert_component_validity(
+        &spec,
+        "MeshRouteDispatchConfig",
+        &delay_with_null_secondary,
+        true,
+    );
+    MeshRouteDispatch::new(&delay_with_null_secondary)
+        .expect("valid delay with null secondary_abort is runtime-valid");
+
     for invalid_secondary in [
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "api"},
+                "fault": {
+                    "secondary_abort": null
+                }
+            }]
+        }),
         json!({
             "rules": [{
                 "match": {"methods": ["GET"]},
@@ -14320,6 +14348,16 @@ fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
                 "destination": {"upstream_id": "api"},
                 "fault": {
                     "abort": null,
+                    "secondary_abort": {"status_code": 503, "percentage": 50.0}
+                }
+            }]
+        }),
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "api"},
+                "fault": {
+                    "delay": {"duration_ms": 10, "percentage": 5.0},
                     "secondary_abort": {"status_code": 503, "percentage": 50.0}
                 }
             }]

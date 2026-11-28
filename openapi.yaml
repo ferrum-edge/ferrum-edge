@@ -29288,6 +29288,14 @@ components:
                   should use a global / proxy-scoped `fault_injection`
                   plugin instead.
                 allOf:
+                  - anyOf:
+                      - type: "null"
+                      - required: [delay]
+                        properties:
+                          delay: {type: object}
+                      - required: [abort]
+                        properties:
+                          abort: {type: object}
                   - if:
                       required: [secondary_abort]
                       properties:
